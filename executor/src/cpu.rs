@@ -3502,6 +3502,8 @@ fn route_offered_load(image: &SimulationImage) -> Vec<u128> {
                 image.stop_time_ns.max(1).div_ceil(packets)
             }
             FlowGeneratorKind::Rate(rate) => rate.pacing_interval_ns,
+            FlowGeneratorKind::Collective(collective) => collective.interval_ns,
+            FlowGeneratorKind::Dcqcn(dcqcn) => dcqcn.rate.pacing_interval_ns,
         };
         let Ok(flow_slot) = usize::try_from(generator.flow.0) else {
             continue;
@@ -3747,11 +3749,9 @@ fn install_local_result(
             if existing_unmarked != packet_unmarked {
                 return Err(ExecutionError::DuplicatePayload(packet.id));
             }
-            // Scalar observation retains the first descriptor. ECN is monotone, so an
-            // unmarked copy is necessarily earlier than a marked copy across LP shards.
-            if existing.ecn_marked && !packet.ecn_marked {
-                *existing = packet;
-            }
+            // ECN is monotone across the route; retain the strongest observed codepoint exactly
+            // as the scalar oracle does.
+            existing.ecn_marked |= packet.ecn_marked;
         } else {
             observed_packets.insert(packet.id, packet);
         }
@@ -4245,6 +4245,7 @@ fn target_interleaved_outbox_image() -> SimulationImage {
                 tx_ready_pending: false,
                 generators: vec![],
                 tcp_receivers: vec![],
+                dcqcn_receivers: vec![],
                 next_origin_seq: 3,
                 next_payload_seq: 3,
                 sourced_packets: 0,
@@ -4258,6 +4259,7 @@ fn target_interleaved_outbox_image() -> SimulationImage {
                 tx_ready_pending: false,
                 generators: vec![],
                 tcp_receivers: vec![],
+                dcqcn_receivers: vec![],
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -4271,6 +4273,7 @@ fn target_interleaved_outbox_image() -> SimulationImage {
                 tx_ready_pending: false,
                 generators: vec![],
                 tcp_receivers: vec![],
+                dcqcn_receivers: vec![],
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,

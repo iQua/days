@@ -47,6 +47,7 @@ fn image(stop_time_ns: u64, event_time_ns: u64, channel_delay_ns: u64) -> Simula
                 tx_ready_pending: false,
                 generators: vec![],
                 tcp_receivers: vec![],
+                dcqcn_receivers: vec![],
                 next_origin_seq: 1,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -60,6 +61,7 @@ fn image(stop_time_ns: u64, event_time_ns: u64, channel_delay_ns: u64) -> Simula
                 tx_ready_pending: false,
                 generators: vec![],
                 tcp_receivers: vec![],
+                dcqcn_receivers: vec![],
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -877,6 +879,7 @@ fn blocked_feedback_image() -> SimulationImage {
                     }),
                 }],
                 tcp_receivers: vec![],
+                dcqcn_receivers: vec![],
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -890,6 +893,7 @@ fn blocked_feedback_image() -> SimulationImage {
                 tx_ready_pending: true,
                 generators: vec![],
                 tcp_receivers: vec![],
+                dcqcn_receivers: vec![],
                 next_origin_seq: 1,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -1027,6 +1031,7 @@ fn canonical_exchange_image() -> SimulationImage {
                 tx_ready_pending: false,
                 generators: vec![],
                 tcp_receivers: vec![],
+                dcqcn_receivers: vec![],
                 next_origin_seq: 1,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -1040,6 +1045,7 @@ fn canonical_exchange_image() -> SimulationImage {
                 tx_ready_pending: false,
                 generators: vec![],
                 tcp_receivers: vec![],
+                dcqcn_receivers: vec![],
                 next_origin_seq: 1,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -1053,6 +1059,7 @@ fn canonical_exchange_image() -> SimulationImage {
                 tx_ready_pending: false,
                 generators: vec![],
                 tcp_receivers: vec![],
+                dcqcn_receivers: vec![],
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -1457,6 +1464,7 @@ fn heterogeneous_image(seed: u64) -> SimulationImage {
                 tx_ready_pending: false,
                 generators: vec![],
                 tcp_receivers: vec![],
+                dcqcn_receivers: vec![],
                 next_origin_seq: packet_count,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -1470,6 +1478,7 @@ fn heterogeneous_image(seed: u64) -> SimulationImage {
                 tx_ready_pending: false,
                 generators: vec![],
                 tcp_receivers: vec![],
+                dcqcn_receivers: vec![],
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -1483,6 +1492,7 @@ fn heterogeneous_image(seed: u64) -> SimulationImage {
                 tx_ready_pending: false,
                 generators: vec![],
                 tcp_receivers: vec![],
+                dcqcn_receivers: vec![],
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -2078,6 +2088,7 @@ fn equal_time_star_image() -> SimulationImage {
                 tx_ready_pending: false,
                 generators: vec![],
                 tcp_receivers: vec![],
+                dcqcn_receivers: vec![],
                 next_origin_seq: 0,
                 next_payload_seq: 2,
                 sourced_packets: 2,
@@ -2091,6 +2102,7 @@ fn equal_time_star_image() -> SimulationImage {
                 tx_ready_pending: false,
                 generators: vec![],
                 tcp_receivers: vec![],
+                dcqcn_receivers: vec![],
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -2104,6 +2116,7 @@ fn equal_time_star_image() -> SimulationImage {
                 tx_ready_pending: false,
                 generators: vec![],
                 tcp_receivers: vec![],
+                dcqcn_receivers: vec![],
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -2790,6 +2803,7 @@ fn incast_image(sender_count: usize) -> SimulationImage {
             tx_ready_pending: false,
             generators: vec![],
             tcp_receivers: vec![],
+            dcqcn_receivers: vec![],
             next_origin_seq: 2,
             next_payload_seq: 0,
             sourced_packets: 1,
@@ -2862,6 +2876,7 @@ fn incast_image(sender_count: usize) -> SimulationImage {
         tx_ready_pending: false,
         generators: vec![],
         tcp_receivers: vec![],
+        dcqcn_receivers: vec![],
         next_origin_seq: 0,
         next_payload_seq: 0,
         sourced_packets: 0,
@@ -2907,6 +2922,7 @@ fn incast_image(sender_count: usize) -> SimulationImage {
     }
 }
 
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 fn high_lp_only_image(node_count: usize) -> SimulationImage {
     assert!(node_count > 1_024);
     let source = NodeId(node_count as u64 - 2);
@@ -2934,6 +2950,7 @@ fn high_lp_only_image(node_count: usize) -> SimulationImage {
             tx_ready_pending: false,
             generators: vec![],
             tcp_receivers: vec![],
+            dcqcn_receivers: vec![],
             next_origin_seq: 0,
             next_payload_seq: 0,
             sourced_packets: 0,
@@ -2961,6 +2978,7 @@ fn high_lp_only_image(node_count: usize) -> SimulationImage {
         tx_ready_pending: false,
         generators: vec![],
         tcp_receivers: vec![],
+        dcqcn_receivers: vec![],
         next_origin_seq: 1,
         next_payload_seq: 0,
         sourced_packets: 0,
@@ -2987,6 +3005,7 @@ fn high_lp_only_image(node_count: usize) -> SimulationImage {
         tx_ready_pending: false,
         generators: vec![],
         tcp_receivers: vec![],
+        dcqcn_receivers: vec![],
         next_origin_seq: 0,
         next_payload_seq: 0,
         sourced_packets: 0,
@@ -3050,6 +3069,7 @@ fn high_lp_only_image(node_count: usize) -> SimulationImage {
     }
 }
 
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 fn multiple_high_lp_image(node_count: usize) -> SimulationImage {
     assert!(node_count > 1_026);
     let mut image = high_lp_only_image(node_count);

@@ -51,6 +51,7 @@ fn host_state(egress_link: LinkId) -> HostState {
         tx_ready_pending: false,
         generators: vec![],
         tcp_receivers: vec![],
+        dcqcn_receivers: vec![],
         next_origin_seq: 0,
         next_payload_seq: 0,
         sourced_packets: 0,

@@ -129,6 +129,7 @@ pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), Validat
     validate_global_time_capacity(image, backend)?;
     validate_service_event_consistency(image)?;
     let future_work = validate_counters(image)?;
+    validate_dcqcn_arithmetic_capacity(image, &future_work)?;
     validate_origin_sequences(image, &future_work)?;
     validate_payload_sequences(image, &future_work)?;
     validate_preloaded_arrival_capacity(image)?;
@@ -144,18 +145,18 @@ fn validate_backend_capabilities(
         return Ok(());
     }
     for generator in image.host_states.iter().flat_map(|state| &state.generators) {
-        if matches!(generator.kind, FlowGeneratorKind::Rate(_)) {
+        if matches!(generator.kind, FlowGeneratorKind::Collective(_)) {
             return Err(ValidationError::new(format!(
-                "backend {backend} does not support rate-based sources; use Scalar or Cpu"
+                "backend {backend} does not support collective generators; use Scalar or Cpu"
+            )));
+        }
+        if matches!(generator.kind, FlowGeneratorKind::Dcqcn(_)) {
+            return Err(ValidationError::new(format!(
+                "backend {backend} does not support DCQCN controller or CNP state planes; use Scalar or Cpu"
             )));
         }
     }
     for packet in &image.initial_packets {
-        if packet.ecn_marked {
-            return Err(ValidationError::new(format!(
-                "backend {backend} does not support the ECN-marked packet plane; use Scalar or Cpu"
-            )));
-        }
         if matches!(packet.kind, PacketKind::Pfc(_)) {
             return Err(ValidationError::new(format!(
                 "backend {backend} does not support PFC control payloads; use Scalar or Cpu"
@@ -169,12 +170,7 @@ fn validate_backend_capabilities(
             )));
         }
         match queue.drop_mark {
-            crate::DropMarkPolicy::TailDrop => {}
-            crate::DropMarkPolicy::EcnThreshold(_) => {
-                return Err(ValidationError::new(format!(
-                    "backend {backend} does not support ECN threshold marking; use Scalar or Cpu"
-                )));
-            }
+            crate::DropMarkPolicy::TailDrop | crate::DropMarkPolicy::EcnThreshold(_) => {}
             crate::DropMarkPolicy::Red(_) => {
                 return Err(ValidationError::new(format!(
                     "backend {backend} does not support RED admission; use Scalar or Cpu"
@@ -182,19 +178,11 @@ fn validate_backend_capabilities(
             }
         }
         match queue.scheduler {
-            SchedulerKind::DeficitRoundRobin(_) => {
-                return Err(ValidationError::new(format!(
-                    "backend {backend} does not support DRR scheduling; use Scalar or Cpu"
-                )));
-            }
-            SchedulerKind::WeightedRoundRobin(_) => {
-                return Err(ValidationError::new(format!(
-                    "backend {backend} does not support WRR scheduling; use Scalar or Cpu"
-                )));
-            }
             SchedulerKind::Fifo
             | SchedulerKind::StaticPriority { .. }
-            | SchedulerKind::WeightedFairQueue(_) => {}
+            | SchedulerKind::WeightedFairQueue(_)
+            | SchedulerKind::DeficitRoundRobin(_)
+            | SchedulerKind::WeightedRoundRobin(_) => {}
         }
     }
     Ok(())
@@ -514,7 +502,13 @@ fn derived_pfc_max_frame_bytes(
     controlled_link: LinkId,
 ) -> Result<[u64; 8], ValidationError> {
     let mut maximum = [0_u64; 8];
-    for packet in executable_resident_packets(image) {
+    let resident_packets = executable_resident_packets(image);
+    let live_dcqcn_cnp_flows = resident_packets
+        .iter()
+        .filter(|packet| dcqcn_data_can_still_emit_cnp(image, packet))
+        .map(|packet| packet.flow)
+        .collect::<BTreeSet<_>>();
+    for packet in resident_packets {
         let flow = flow(image, packet.flow).expect("packet validation established the flow");
         if packet_route(flow, packet.kind).contains(&controlled_link)
             && packet_can_still_cross_link(image, packet, controlled_link)
@@ -534,14 +528,31 @@ fn derived_pfc_max_frame_bytes(
                 FlowGeneratorKind::Rate(rate) => rate
                     .packet_size_bytes
                     .min(rate.total_bytes - generator.bytes_emitted),
+                FlowGeneratorKind::Collective(collective) => collective
+                    .packet_size_bytes
+                    .min(collective.chunk_bytes - generator.bytes_emitted),
+                FlowGeneratorKind::Dcqcn(dcqcn) => dcqcn
+                    .rate
+                    .packet_size_bytes
+                    .min(dcqcn.rate.total_bytes - generator.bytes_emitted),
             };
             maximum[priority] = maximum[priority].max(size);
         }
         if flow.reverse_route.contains(&controlled_link) {
-            if let FlowGeneratorKind::Tcp(tcp) = generator.kind {
-                if executable || tcp.bytes_in_flight != 0 {
-                    maximum[priority] = maximum[priority].max(tcp.ack_size_bytes);
+            match generator.kind {
+                FlowGeneratorKind::Tcp(tcp) => {
+                    if executable || tcp.bytes_in_flight != 0 {
+                        maximum[priority] = maximum[priority].max(tcp.ack_size_bytes);
+                    }
                 }
+                FlowGeneratorKind::Dcqcn(dcqcn) => {
+                    if executable || live_dcqcn_cnp_flows.contains(&flow.id) {
+                        maximum[priority] = maximum[priority].max(dcqcn.cnp_size_bytes);
+                    }
+                }
+                FlowGeneratorKind::Constant(_)
+                | FlowGeneratorKind::Rate(_)
+                | FlowGeneratorKind::Collective(_) => {}
             }
         }
     }
@@ -1011,6 +1022,9 @@ fn validate_generators(image: &SimulationImage) -> Result<(), ValidationError> {
     let mut owners =
         BTreeMap::<crate::FlowId, (NodeId, GeneratorStatus, PayloadId, u64, bool)>::new();
     let mut receiver_owners = BTreeMap::<crate::FlowId, NodeId>::new();
+    let mut dcqcn_receiver_owners = BTreeMap::<crate::FlowId, NodeId>::new();
+    let mut collective_positions =
+        BTreeMap::<(u64, crate::CollectivePhase, u32, u32), crate::FlowId>::new();
     let mut claimed_tcp_timers = BTreeMap::<(NodeId, PayloadId, u64), crate::FlowId>::new();
     for owner in image
         .nodes
@@ -1049,6 +1063,33 @@ fn validate_generators(image: &SimulationImage) -> Result<(), ValidationError> {
                 return Err(ValidationError::new(format!(
                     "flow {:?} has duplicate receiver state",
                     receiver.flow
+                )));
+            }
+        }
+        let mut previous_dcqcn_receiver = None;
+        for receiver in &state.dcqcn_receivers {
+            if previous_dcqcn_receiver.is_some_and(|flow| flow >= receiver.flow) {
+                return Err(ValidationError::new(format!(
+                    "host node {:?} has duplicate or non-increasing DCQCN receiver flow {:?}",
+                    owner.id, receiver.flow
+                )));
+            }
+            previous_dcqcn_receiver = Some(receiver.flow);
+            let receiver_flow = flow(image, receiver.flow).ok_or_else(|| {
+                ValidationError::new(format!(
+                    "host node {:?} DCQCN receiver references unknown flow {:?}",
+                    owner.id, receiver.flow
+                ))
+            })?;
+            if receiver_flow.target != owner.id
+                || receiver.cnp_size_bytes == 0
+                || dcqcn_receiver_owners
+                    .insert(receiver.flow, owner.id)
+                    .is_some()
+            {
+                return Err(ValidationError::new(format!(
+                    "host node {:?} owns inconsistent DCQCN receiver state for flow {:?}",
+                    owner.id, receiver.flow
                 )));
             }
         }
@@ -1437,8 +1478,514 @@ fn validate_generators(image: &SimulationImage) -> Result<(), ValidationError> {
                 continue;
             }
 
+            if let FlowGeneratorKind::Collective(collective) = generator.kind {
+                let position = (
+                    collective.collective_id,
+                    collective.phase,
+                    collective.rank,
+                    collective.step,
+                );
+                if let Some(previous_flow) = collective_positions.insert(position, flow.id) {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} has duplicate collective stage position ({}, {:?}, {}, {}), already owned by flow {:?}",
+                        flow.id,
+                        collective.collective_id,
+                        collective.phase,
+                        collective.rank,
+                        collective.step,
+                        previous_flow
+                    )));
+                }
+                if collective.chunk_policy != crate::CollectiveChunkPolicy::EqualRemainderLast
+                    || collective.channel_policy != crate::CollectiveChannelPolicy::RingNext
+                    || collective.algorithm == crate::CollectiveAlgorithm::AllGather
+                        && collective.phase != crate::CollectivePhase::AllGather
+                {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} collective policy or phase is inconsistent with its algorithm",
+                        flow.id
+                    )));
+                }
+                if collective.group_size < 2
+                    || collective.rank >= collective.group_size
+                    || collective.step == 0
+                    || collective.step >= collective.group_size
+                    || collective.chunk_bytes == 0
+                    || collective.packet_size_bytes == 0
+                    || collective.interval_ns == 0
+                {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} collective dimensions, chunk, packet size, and interval must be in range",
+                        flow.id
+                    )));
+                }
+                collective
+                    .chunk_offset_bytes
+                    .checked_add(collective.chunk_bytes)
+                    .ok_or_else(|| {
+                        ValidationError::new(format!(
+                            "flow {:?} collective chunk endpoint exceeds u64",
+                            flow.id
+                        ))
+                    })?;
+                if collective.inbound_bytes_received > collective.inbound_predecessor_bytes {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} collective inbound bytes {} exceed required bytes {}",
+                        flow.id,
+                        collective.inbound_bytes_received,
+                        collective.inbound_predecessor_bytes
+                    )));
+                }
+
+                let final_step = collective.group_size - 1;
+                let root = collective.step == 1
+                    && (collective.algorithm == crate::CollectiveAlgorithm::AllGather
+                        || collective.phase == crate::CollectivePhase::ReduceScatter);
+                let expected_local = if root {
+                    None
+                } else {
+                    let (phase, step) = if collective.step > 1 {
+                        (collective.phase, collective.step - 1)
+                    } else {
+                        (crate::CollectivePhase::ReduceScatter, final_step)
+                    };
+                    image
+                        .host_states
+                        .iter()
+                        .flat_map(|state| &state.generators)
+                        .find(|candidate| {
+                            matches!(candidate.kind, FlowGeneratorKind::Collective(stage)
+                                if stage.collective_id == collective.collective_id
+                                    && stage.phase == phase
+                                    && stage.rank == collective.rank
+                                    && stage.step == step)
+                        })
+                        .map(|candidate| candidate.flow)
+                };
+                let previous_rank = if collective.rank == 0 {
+                    collective.group_size - 1
+                } else {
+                    collective.rank - 1
+                };
+                let expected_inbound = if root {
+                    None
+                } else {
+                    let (phase, step) = if collective.step > 1 {
+                        (collective.phase, collective.step - 1)
+                    } else {
+                        (crate::CollectivePhase::ReduceScatter, final_step)
+                    };
+                    image
+                        .host_states
+                        .iter()
+                        .flat_map(|state| &state.generators)
+                        .find(|candidate| {
+                            matches!(candidate.kind, FlowGeneratorKind::Collective(stage)
+                                if stage.collective_id == collective.collective_id
+                                    && stage.phase == phase
+                                    && stage.rank == previous_rank
+                                    && stage.step == step)
+                        })
+                        .map(|candidate| candidate.flow)
+                };
+                if collective.local_predecessor != expected_local
+                    || collective.inbound_predecessor != expected_inbound
+                {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} collective predecessor identities do not match the declared algorithm recurrence",
+                        flow.id
+                    )));
+                }
+                if root {
+                    if !collective.local_predecessor_complete
+                        || !collective.inbound_predecessor_complete
+                        || collective.inbound_predecessor_bytes != collective.chunk_bytes
+                        || collective.inbound_bytes_received != 0
+                    {
+                        return Err(ValidationError::new(format!(
+                            "flow {:?} collective root prerequisite state is inconsistent",
+                            flow.id
+                        )));
+                    }
+                } else {
+                    let local = expected_local
+                        .and_then(|id| collective_generator(image, id))
+                        .ok_or_else(|| {
+                            ValidationError::new(format!(
+                                "flow {:?} collective local predecessor is missing",
+                                flow.id
+                            ))
+                        })?;
+                    if collective.local_predecessor_complete
+                        != (local.next_emission.status == GeneratorStatus::Finished)
+                    {
+                        return Err(ValidationError::new(format!(
+                            "flow {:?} collective local completion flag disagrees with predecessor state",
+                            flow.id
+                        )));
+                    }
+                    let inbound = expected_inbound
+                        .and_then(|id| {
+                            image
+                                .host_states
+                                .iter()
+                                .flat_map(|state| &state.generators)
+                                .find(|candidate| candidate.flow == id)
+                        })
+                        .and_then(|candidate| match candidate.kind {
+                            FlowGeneratorKind::Collective(stage) => Some((candidate, stage)),
+                            _ => None,
+                        })
+                        .ok_or_else(|| {
+                            ValidationError::new(format!(
+                                "flow {:?} collective inbound predecessor is missing",
+                                flow.id
+                            ))
+                        })?;
+                    if inbound.1.chunk_bytes != collective.inbound_predecessor_bytes
+                        || inbound.1.chunk_offset_bytes != collective.chunk_offset_bytes
+                        || image
+                            .flows
+                            .iter()
+                            .find(|candidate| candidate.id == inbound.0.flow)
+                            .is_none_or(|predecessor_flow| predecessor_flow.target != flow.source)
+                    {
+                        return Err(ValidationError::new(format!(
+                            "flow {:?} collective inbound predecessor does not deliver the declared chunk to its source",
+                            flow.id
+                        )));
+                    }
+                    if collective.inbound_predecessor_complete
+                        != (collective.inbound_bytes_received
+                            == collective.inbound_predecessor_bytes)
+                    {
+                        return Err(ValidationError::new(format!(
+                            "flow {:?} collective inbound completion flag disagrees with received bytes",
+                            flow.id
+                        )));
+                    }
+                    if collective.inbound_predecessor_complete
+                        && inbound.0.next_emission.status != GeneratorStatus::Finished
+                    {
+                        return Err(ValidationError::new(format!(
+                            "flow {:?} collective inbound dependency completed before its predecessor finished",
+                            flow.id
+                        )));
+                    }
+                }
+
+                let remaining = remaining_generator_packets(generator)?;
+                if generator.next_emission.status == GeneratorStatus::Blocked
+                    && (generator.packets_emitted != 0 || generator.bytes_emitted != 0)
+                {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} collective is dependency-blocked after emitting {} packets and {} bytes",
+                        flow.id, generator.packets_emitted, generator.bytes_emitted
+                    )));
+                }
+                match generator.next_emission.status {
+                    GeneratorStatus::Scheduled
+                        if remaining == 0 || !collective.prerequisites_complete() =>
+                    {
+                        return Err(ValidationError::new(format!(
+                            "flow {:?} has an invalid scheduled collective emission",
+                            flow.id
+                        )));
+                    }
+                    GeneratorStatus::Blocked
+                        if remaining == 0 || collective.prerequisites_complete() =>
+                    {
+                        return Err(ValidationError::new(format!(
+                            "flow {:?} has an invalid blocked collective emission",
+                            flow.id
+                        )));
+                    }
+                    GeneratorStatus::Finished if remaining != 0 => {
+                        return Err(ValidationError::new(format!(
+                            "flow {:?} collective is Finished with {remaining} packets remaining",
+                            flow.id
+                        )));
+                    }
+                    GeneratorStatus::Stopped
+                        if generator.next_emission.departure_time_ns <= image.stop_time_ns =>
+                    {
+                        return Err(ValidationError::new(format!(
+                            "flow {:?} collective is Stopped at {}, which is not beyond stop time {}",
+                            flow.id, generator.next_emission.departure_time_ns, image.stop_time_ns
+                        )));
+                    }
+                    GeneratorStatus::Scheduled
+                    | GeneratorStatus::Blocked
+                    | GeneratorStatus::Finished
+                    | GeneratorStatus::Stopped => {}
+                }
+                if generator.next_emission.status == GeneratorStatus::Scheduled {
+                    let packet = packet(image, generator.next_emission.payload).ok_or_else(|| {
+                        ValidationError::new(format!(
+                            "flow {:?} scheduled collective emission references unknown packet {:?}",
+                            flow.id, generator.next_emission.payload
+                        ))
+                    })?;
+                    let expected_size = collective
+                        .packet_size_bytes
+                        .min(collective.chunk_bytes - generator.bytes_emitted);
+                    if packet.flow != flow.id
+                        || packet.kind != PacketKind::Data
+                        || packet.size_bytes != expected_size
+                    {
+                        return Err(ValidationError::new(format!(
+                            "flow {:?} scheduled collective packet {:?} does not match the next chunk packet",
+                            flow.id, packet.id
+                        )));
+                    }
+                    let matching_events = arrival_counts
+                        .get(&(
+                            owner.id,
+                            packet.id,
+                            generator.next_emission.departure_time_ns,
+                        ))
+                        .copied()
+                        .unwrap_or(0);
+                    if matching_events != 1 {
+                        return Err(ValidationError::new(format!(
+                            "flow {:?} scheduled collective emission has {matching_events} matching PacketArrival events; expected 1",
+                            flow.id
+                        )));
+                    }
+                    validate_scheduled_payload_sequence(
+                        image,
+                        owner,
+                        state,
+                        packet.id,
+                        flow.id,
+                        generator.packets_emitted,
+                    )?;
+                }
+                continue;
+            }
+
+            if let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind {
+                dcqcn.controller.config.validate().map_err(|error| {
+                    ValidationError::new(format!(
+                        "flow {:?} has invalid DCQCN configuration: {error}",
+                        flow.id
+                    ))
+                })?;
+                let rate = dcqcn.rate;
+                if rate.pacing_interval_ns == 0
+                    || rate.packet_size_bytes == 0
+                    || rate.total_bytes == 0
+                    || rate.rate_denominator != 1
+                    || rate.rate_numerator_bits_per_second != dcqcn.controller.current_rate_bps
+                    || dcqcn.cnp_size_bytes == 0
+                {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} DCQCN rate, packet, CNP, or controller state is inconsistent",
+                        flow.id
+                    )));
+                }
+                if dcqcn.controller.alpha_ppb > crate::DCQCN_FRACTION_SCALE
+                    || dcqcn.controller.current_rate_bps < dcqcn.controller.config.minimum_rate_bps
+                    || dcqcn.controller.current_rate_bps > dcqcn.controller.config.maximum_rate_bps
+                    || dcqcn.controller.target_rate_bps < dcqcn.controller.config.minimum_rate_bps
+                    || dcqcn.controller.target_rate_bps > dcqcn.controller.config.maximum_rate_bps
+                    || dcqcn.controller.stage_steps >= crate::DCQCN_STAGE_STEPS
+                    || dcqcn.controller.stage == crate::DcqcnIncreaseStage::Hyper
+                        && dcqcn.controller.stage_steps != 0
+                    || dcqcn.controller.cnp_seen && dcqcn.controller.last_cnp_time_ns.is_none()
+                {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} DCQCN fixed-point controller state is out of range",
+                        flow.id
+                    )));
+                }
+                if generator.bytes_emitted > rate.total_bytes {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} DCQCN emitted bytes {} exceed total bytes {}",
+                        flow.id, generator.bytes_emitted, rate.total_bytes
+                    )));
+                }
+                let scale = u128::from(rate.rate_denominator)
+                    .checked_mul(1_000_000_000)
+                    .ok_or_else(|| {
+                        ValidationError::new(format!(
+                            "flow {:?} DCQCN credit scale exceeds u128",
+                            flow.id
+                        ))
+                    })?;
+                let tick_credit = u128::from(dcqcn.controller.current_rate_bps)
+                    .checked_mul(u128::from(rate.pacing_interval_ns))
+                    .ok_or_else(|| {
+                        ValidationError::new(format!(
+                            "flow {:?} DCQCN tick credit exceeds u128",
+                            flow.id
+                        ))
+                    })?;
+                let remaining_ticks = if matches!(
+                    generator.next_emission.status,
+                    GeneratorStatus::Scheduled | GeneratorStatus::Blocked
+                ) && generator.next_emission.departure_time_ns
+                    <= image.stop_time_ns
+                {
+                    BigUint::from(
+                        (image.stop_time_ns - generator.next_emission.departure_time_ns)
+                            / rate.pacing_interval_ns,
+                    ) + 1_u8
+                } else {
+                    BigUint::from(0_u8)
+                };
+                let maximum_future_credit = BigUint::from(rate.credit_quanta)
+                    + BigUint::from(dcqcn.controller.config.maximum_rate_bps)
+                        * BigUint::from(rate.pacing_interval_ns)
+                        * remaining_ticks;
+                if maximum_future_credit > BigUint::from(u128::MAX) {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} DCQCN pacing credit can exceed u128 before stop",
+                        flow.id
+                    )));
+                }
+                let remaining_bytes = rate.total_bytes - generator.bytes_emitted;
+                let active = matches!(
+                    generator.next_emission.status,
+                    GeneratorStatus::Scheduled | GeneratorStatus::Blocked
+                );
+                if active != (remaining_bytes != 0)
+                    && generator.next_emission.status != GeneratorStatus::Stopped
+                {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} DCQCN status {:?} is inconsistent with {remaining_bytes} remaining bytes",
+                        flow.id, generator.next_emission.status
+                    )));
+                }
+                if generator.next_emission.status == GeneratorStatus::Finished
+                    && remaining_bytes != 0
+                {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} DCQCN is Finished with {remaining_bytes} bytes remaining",
+                        flow.id
+                    )));
+                }
+                if active {
+                    let data = packet(image, generator.next_emission.payload).ok_or_else(|| {
+                        ValidationError::new(format!(
+                            "flow {:?} DCQCN pacing timer references unknown packet {:?}",
+                            flow.id, generator.next_emission.payload
+                        ))
+                    })?;
+                    let expected_size = rate.packet_size_bytes.min(remaining_bytes);
+                    if data.flow != flow.id
+                        || data.kind != PacketKind::Data
+                        || data.size_bytes != expected_size
+                    {
+                        return Err(ValidationError::new(format!(
+                            "flow {:?} DCQCN pacing token {:?} does not match its next data packet",
+                            flow.id, data.id
+                        )));
+                    }
+                    let packet_cost = u128::from(expected_size)
+                        .checked_mul(8)
+                        .and_then(|bits| bits.checked_mul(scale))
+                        .ok_or_else(|| {
+                            ValidationError::new(format!(
+                                "flow {:?} DCQCN next-packet credit cost exceeds u128",
+                                flow.id
+                            ))
+                        })?;
+                    let can_emit = rate
+                        .credit_quanta
+                        .checked_add(tick_credit)
+                        .is_some_and(|credit| credit >= packet_cost);
+                    let expected_status = if can_emit {
+                        GeneratorStatus::Scheduled
+                    } else {
+                        GeneratorStatus::Blocked
+                    };
+                    if generator.next_emission.status != expected_status {
+                        return Err(ValidationError::new(format!(
+                            "flow {:?} DCQCN timer status disagrees with next-tick credit",
+                            flow.id
+                        )));
+                    }
+                    let deadline = generator.next_emission.departure_time_ns;
+                    if deadline < rate.first_pacing_time_ns
+                        || (deadline - rate.first_pacing_time_ns) % rate.pacing_interval_ns != 0
+                        || pacing_counts
+                            .get(&(owner.id, data.id, deadline))
+                            .copied()
+                            .unwrap_or(0)
+                            != 1
+                    {
+                        return Err(ValidationError::new(format!(
+                            "flow {:?} DCQCN data pacing event is missing or off-grid",
+                            flow.id
+                        )));
+                    }
+                } else if generator.next_emission.status == GeneratorStatus::Stopped
+                    && generator.next_emission.departure_time_ns <= image.stop_time_ns
+                {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} DCQCN is Stopped at or before stop time",
+                        flow.id
+                    )));
+                }
+                let control = packet(image, dcqcn.control_timer_payload).ok_or_else(|| {
+                    ValidationError::new(format!(
+                        "flow {:?} DCQCN control timer references unknown token {:?}",
+                        flow.id, dcqcn.control_timer_payload
+                    ))
+                })?;
+                if control.flow != flow.id
+                    || control.kind != PacketKind::DcqcnControlTimer
+                    || control.size_bytes != 0
+                    || control.ecn_marked
+                {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} DCQCN control token is inconsistent",
+                        flow.id
+                    )));
+                }
+                let control_matches = pacing_counts
+                    .get(&(owner.id, control.id, dcqcn.controller.next_control_time_ns))
+                    .copied()
+                    .unwrap_or(0);
+                let expected_control =
+                    usize::from(dcqcn.controller.next_control_time_ns <= image.stop_time_ns);
+                if control_matches != expected_control {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} DCQCN has {control_matches} matching control events; expected {expected_control}",
+                        flow.id
+                    )));
+                }
+                if flow.reverse_route.is_empty() {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} DCQCN requires a reverse CNP route",
+                        flow.id
+                    )));
+                }
+                let target = node(image, flow.target).expect("flow validation established target");
+                let receiver = image.host_states[target.state_slot as usize]
+                    .dcqcn_receivers
+                    .iter()
+                    .find(|receiver| receiver.flow == flow.id)
+                    .ok_or_else(|| {
+                        ValidationError::new(format!(
+                            "flow {:?} DCQCN has no receiver state at target {:?}",
+                            flow.id, flow.target
+                        ))
+                    })?;
+                if receiver.cnp_interval_ns != dcqcn.controller.config.cnp_interval_ns
+                    || receiver.cnp_size_bytes != dcqcn.cnp_size_bytes
+                {
+                    return Err(ValidationError::new(format!(
+                        "flow {:?} DCQCN receiver and controller CNP parameters disagree",
+                        flow.id
+                    )));
+                }
+                continue;
+            }
+
             let FlowGeneratorKind::Constant(constant) = generator.kind else {
-                unreachable!("TCP and rate generators continue above")
+                unreachable!("non-constant generators continue above")
             };
             if constant.interval_ns == 0 {
                 return Err(ValidationError::new(format!(
@@ -1598,6 +2145,19 @@ fn validate_generators(image: &SimulationImage) -> Result<(), ValidationError> {
                 )));
             }
             Some((.., true)) => {}
+        }
+    }
+    for (receiver_flow, receiver_owner) in dcqcn_receiver_owners {
+        let is_dcqcn = image
+            .host_states
+            .iter()
+            .flat_map(|state| &state.generators)
+            .find(|generator| generator.flow == receiver_flow)
+            .is_some_and(|generator| matches!(generator.kind, FlowGeneratorKind::Dcqcn(_)));
+        if !is_dcqcn {
+            return Err(ValidationError::new(format!(
+                "host node {receiver_owner:?} owns DCQCN receiver state for flow {receiver_flow:?}, but the flow generator is not DCQCN"
+            )));
         }
     }
     for packet in image
@@ -1875,10 +2435,18 @@ fn validate_packets_and_derive_delays(
         })
         .map(|packet| packet.flow)
         .collect::<BTreeSet<_>>();
+    // A CE packet already admitted into the image can still create its CNP after the source has
+    // finished producing data.  Its reverse path is therefore live independently of generator
+    // status, just as an in-flight TCP data packet keeps its ACK path live.
+    let live_dcqcn_cnp_flows = executable_resident_packets(image)
+        .into_iter()
+        .filter(|packet| dcqcn_data_can_still_emit_cnp(image, packet))
+        .map(|packet| packet.flow)
+        .collect::<BTreeSet<_>>();
     let mut possible = BTreeMap::<(LinkId, NodeId), u64>::new();
     let mut required = BTreeSet::<(LinkId, NodeId)>::new();
     for packet in &image.initial_packets {
-        if packet.size_bytes == 0 {
+        if packet.size_bytes == 0 && packet.kind != PacketKind::DcqcnControlTimer {
             return Err(ValidationError::new(format!(
                 "packet {:?} has zero size, which cannot certify positive serialization",
                 packet.id
@@ -1890,6 +2458,15 @@ fn validate_packets_and_derive_delays(
                 packet.id, packet.flow
             ))
         })?;
+        if packet.kind == PacketKind::DcqcnControlTimer {
+            if packet.size_bytes != 0 || packet.ecn_marked {
+                return Err(ValidationError::new(format!(
+                    "DCQCN control token {:?} must be zero-byte NotEct state",
+                    packet.id
+                )));
+            }
+            continue;
+        }
         if let PacketKind::Pfc(header) = packet.kind {
             if packet.size_bytes != 64 {
                 return Err(ValidationError::new(format!(
@@ -1989,7 +2566,62 @@ fn validate_packets_and_derive_delays(
                     (1, flow.route.as_slice(), flow.target)
                 }
                 FlowGeneratorKind::Rate(rate) => {
-                    (rate.packet_size_bytes, flow.route.as_slice(), flow.target)
+                    let remaining = rate.total_bytes.saturating_sub(generator.bytes_emitted);
+                    let tail = remaining % rate.packet_size_bytes;
+                    let minimum = if remaining == 0 || tail == 0 {
+                        rate.packet_size_bytes
+                    } else {
+                        tail
+                    };
+                    (minimum, flow.route.as_slice(), flow.target)
+                }
+                FlowGeneratorKind::Collective(collective) => {
+                    let tail = collective.chunk_bytes % collective.packet_size_bytes;
+                    let minimum = if tail == 0 {
+                        collective.packet_size_bytes
+                    } else {
+                        tail
+                    };
+                    (minimum, flow.route.as_slice(), flow.target)
+                }
+                FlowGeneratorKind::Dcqcn(dcqcn) => {
+                    let cnp_can_be_emitted =
+                        generator_can_emit || live_dcqcn_cnp_flows.contains(&flow.id);
+                    for (index, link_id) in flow.reverse_route.iter().enumerate() {
+                        let link = link(image, *link_id)
+                            .expect("validated reverse route names an existing link");
+                        let delay = link.delay_ns(dcqcn.cnp_size_bytes).map_err(|error| {
+                            ValidationError::new(format!(
+                                "link {:?} delay overflows for flow {:?} DCQCN CNP: {error}",
+                                link.id, flow.id
+                            ))
+                        })?;
+                        let route = (
+                            link.id,
+                            route_target(image, &flow.reverse_route, index, flow.source)
+                                .expect("validated reverse route has a direct target"),
+                        );
+                        insert_derived_delay(&mut possible, route, delay);
+                        if cnp_can_be_emitted {
+                            required.insert(route);
+                        }
+                    }
+                    (
+                        {
+                            let remaining = dcqcn
+                                .rate
+                                .total_bytes
+                                .saturating_sub(generator.bytes_emitted);
+                            let tail = remaining % dcqcn.rate.packet_size_bytes;
+                            if remaining == 0 || tail == 0 {
+                                dcqcn.rate.packet_size_bytes
+                            } else {
+                                tail
+                            }
+                        },
+                        flow.route.as_slice(),
+                        flow.target,
+                    )
                 }
             };
             for (index, link_id) in route.iter().enumerate() {
@@ -2388,8 +3020,10 @@ fn executable_resident_packets(image: &SimulationImage) -> Vec<&crate::PacketDes
         .flat_map(|state| &state.generators)
         .filter(|generator| {
             generator.next_emission.status == GeneratorStatus::Scheduled
-                || matches!(generator.kind, FlowGeneratorKind::Rate(_))
-                    && generator.next_emission.status == GeneratorStatus::Blocked
+                || matches!(
+                    generator.kind,
+                    FlowGeneratorKind::Rate(_) | FlowGeneratorKind::Dcqcn(_)
+                ) && generator.next_emission.status == GeneratorStatus::Blocked
         })
         .map(|generator| generator.next_emission.payload)
         .collect::<BTreeSet<_>>();
@@ -2402,7 +3036,52 @@ fn executable_resident_packets(image: &SimulationImage) -> Vec<&crate::PacketDes
             !matches!(packet.kind, PacketKind::TcpData(_)) || live_payloads.contains(&packet.id)
         })
         .filter(|packet| !matches!(packet.kind, PacketKind::Pfc(_)))
+        .filter(|packet| packet.kind != PacketKind::DcqcnControlTimer)
         .collect()
+}
+
+fn dcqcn_data_can_still_emit_cnp(
+    image: &SimulationImage,
+    packet: &crate::PacketDescriptor,
+) -> bool {
+    if packet.kind != PacketKind::Data {
+        return false;
+    }
+    let Some(flow) = flow(image, packet.flow) else {
+        return false;
+    };
+    let Some(source) = node(image, flow.source) else {
+        return false;
+    };
+    if !image.host_states[source.state_slot as usize]
+        .generators
+        .iter()
+        .any(|generator| {
+            generator.flow == flow.id && matches!(generator.kind, FlowGeneratorKind::Dcqcn(_))
+        })
+    {
+        return false;
+    }
+    if packet.ecn_marked {
+        return true;
+    }
+    flow.route.iter().copied().any(|candidate| {
+        let Some(route_link) = link(image, candidate) else {
+            return false;
+        };
+        let Some(owner) = node(image, route_link.source) else {
+            return false;
+        };
+        owner.kind == NodeKind::Switch
+            && image.switch_states[owner.state_slot as usize]
+                .queues
+                .iter()
+                .any(|queue| {
+                    queue.egress_link == Some(candidate)
+                        && queue.drop_mark != crate::DropMarkPolicy::TailDrop
+                })
+            && packet_can_still_reach_egress(image, packet, candidate)
+    })
 }
 
 /// Returns whether a resident packet can still cross `candidate` from its checkpoint position.
@@ -2547,6 +3226,28 @@ fn maximum_drr_frame_bytes(
                 }
                 if reverse_reaches && (future_data != 0 || tcp.bytes_in_flight != 0) {
                     maximum = maximum.max(tcp.ack_size_bytes);
+                }
+            }
+            FlowGeneratorKind::Collective(collective) => {
+                if forward_reaches && executable_generator_packets(image, generator)? != 0 {
+                    maximum = maximum.max(
+                        collective
+                            .packet_size_bytes
+                            .min(collective.chunk_bytes - generator.bytes_emitted),
+                    );
+                }
+            }
+            FlowGeneratorKind::Dcqcn(dcqcn) => {
+                if forward_reaches && executable_generator_packets(image, generator)? != 0 {
+                    maximum = maximum.max(
+                        dcqcn
+                            .rate
+                            .packet_size_bytes
+                            .min(dcqcn.rate.total_bytes - generator.bytes_emitted),
+                    );
+                }
+                if reverse_reaches && executable_generator_packets(image, generator)? != 0 {
+                    maximum = maximum.max(dcqcn.cnp_size_bytes);
                 }
             }
         }
@@ -3195,7 +3896,7 @@ fn validate_events(
                         event.payload, flow.source
                     )));
                 }
-                if !packet.kind.is_data() {
+                if !packet.kind.is_data() && packet.kind != PacketKind::DcqcnControlTimer {
                     return Err(ValidationError::new(format!(
                         "PacingTimer event {index} references non-data payload {:?}",
                         event.payload
@@ -3260,12 +3961,33 @@ fn divide_rounding_up(numerator: &BigUint, denominator: &BigUint) -> BigUint {
     (numerator + denominator - 1_u8) / denominator
 }
 
+fn pacing_rate(generator: &crate::FlowGeneratorState) -> crate::RateGenerator {
+    match generator.kind {
+        FlowGeneratorKind::Rate(rate) => rate,
+        FlowGeneratorKind::Dcqcn(dcqcn) => dcqcn.rate,
+        _ => unreachable!("only rate-paced generators have pacing state"),
+    }
+}
+
+fn with_rate_numerator(
+    generator: &crate::FlowGeneratorState,
+    numerator: u64,
+) -> crate::FlowGeneratorState {
+    let mut adjusted = *generator;
+    match &mut adjusted.kind {
+        FlowGeneratorKind::Rate(rate) => rate.rate_numerator_bits_per_second = numerator,
+        FlowGeneratorKind::Dcqcn(dcqcn) => {
+            dcqcn.rate.rate_numerator_bits_per_second = numerator;
+        }
+        _ => unreachable!("only rate-paced generators have pacing state"),
+    }
+    adjusted
+}
+
 fn remaining_rate_pacing_ticks(
     generator: &crate::FlowGeneratorState,
 ) -> Result<BigUint, ValidationError> {
-    let FlowGeneratorKind::Rate(rate) = generator.kind else {
-        unreachable!("only rate generators have pacing ticks")
-    };
+    let rate = pacing_rate(generator);
     let remaining_bytes = BigUint::from(rate.total_bytes - generator.bytes_emitted);
     let packet_size = BigUint::from(rate.packet_size_bytes);
     let full_packets = &remaining_bytes / &packet_size;
@@ -3314,9 +4036,7 @@ fn executable_rate_pacing_ticks(
         return Ok(BigUint::from(0_u8));
     }
     remaining_generator_packets(generator)?;
-    let FlowGeneratorKind::Rate(rate) = generator.kind else {
-        unreachable!("only rate generators have pacing ticks")
-    };
+    let rate = pacing_rate(generator);
     let available_ticks = BigUint::from(
         (image.stop_time_ns - generator.next_emission.departure_time_ns) / rate.pacing_interval_ns,
     ) + 1_u8;
@@ -3331,9 +4051,7 @@ fn rate_packets_within_ticks(
     if ticks == &BigUint::from(0_u8) || remaining_packets == 0 {
         return Ok(0);
     }
-    let FlowGeneratorKind::Rate(rate) = generator.kind else {
-        unreachable!("only rate generators have pacing ticks")
-    };
+    let rate = pacing_rate(generator);
     let remaining_bytes = rate.total_bytes - generator.bytes_emitted;
     let full_packets = BigUint::from(remaining_bytes / rate.packet_size_bytes);
     let partial_packet = !remaining_bytes.is_multiple_of(rate.packet_size_bytes);
@@ -3381,13 +4099,97 @@ fn rate_payload_allocations(
     rate_packets_within_ticks(generator, &successor_ticks)
 }
 
+fn executable_dcqcn_packets(
+    image: &SimulationImage,
+    generator: &crate::FlowGeneratorState,
+) -> Result<u64, ValidationError> {
+    let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind else {
+        unreachable!("DCQCN packet capacity requires DCQCN state")
+    };
+    let fastest = with_rate_numerator(generator, dcqcn.controller.config.maximum_rate_bps);
+    executable_rate_packets(image, &fastest)
+}
+
+fn executable_dcqcn_pacing_ticks(
+    image: &SimulationImage,
+    generator: &crate::FlowGeneratorState,
+) -> Result<BigUint, ValidationError> {
+    let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind else {
+        unreachable!("DCQCN pacing capacity requires DCQCN state")
+    };
+    let slowest = with_rate_numerator(generator, dcqcn.controller.config.minimum_rate_bps);
+    executable_rate_pacing_ticks(image, &slowest)
+}
+
+fn dcqcn_payload_allocations(
+    image: &SimulationImage,
+    generator: &crate::FlowGeneratorState,
+) -> Result<u64, ValidationError> {
+    let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind else {
+        unreachable!("DCQCN payload capacity requires DCQCN state")
+    };
+    let fastest = with_rate_numerator(generator, dcqcn.controller.config.maximum_rate_bps);
+    rate_payload_allocations(image, &fastest)
+}
+
+fn executable_dcqcn_control_ticks(
+    image: &SimulationImage,
+    dcqcn: crate::DcqcnGenerator,
+) -> BigUint {
+    if dcqcn.controller.next_control_time_ns > image.stop_time_ns {
+        return BigUint::from(0_u8);
+    }
+    BigUint::from(
+        (image.stop_time_ns - dcqcn.controller.next_control_time_ns)
+            / dcqcn.controller.config.control_interval_ns,
+    ) + 1_u8
+}
+
+fn latest_dcqcn_control_time(
+    image: &SimulationImage,
+    generator: &crate::FlowGeneratorState,
+) -> Result<u64, ValidationError> {
+    let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind else {
+        unreachable!("DCQCN control deadline requires DCQCN state")
+    };
+    let ticks = executable_dcqcn_control_ticks(image, dcqcn);
+    if ticks == BigUint::from(0_u8) {
+        return Ok(0);
+    }
+    let computed_successor = BigUint::from(dcqcn.controller.next_control_time_ns)
+        + BigUint::from(dcqcn.controller.config.control_interval_ns) * &ticks;
+    if computed_successor > BigUint::from(u64::MAX) {
+        return Err(ValidationError::new(format!(
+            "flow {:?} DCQCN control timer successor exceeds u64",
+            generator.flow
+        )));
+    }
+    let latest_event =
+        computed_successor - BigUint::from(dcqcn.controller.config.control_interval_ns);
+    u64::try_from(latest_event).map_err(|_| {
+        ValidationError::new(format!(
+            "flow {:?} latest DCQCN control time exceeds u64",
+            generator.flow
+        ))
+    })
+}
+
+fn latest_dcqcn_pacing_time(
+    image: &SimulationImage,
+    generator: &crate::FlowGeneratorState,
+) -> Result<u64, ValidationError> {
+    let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind else {
+        unreachable!("DCQCN pacing deadline requires DCQCN state")
+    };
+    let slowest = with_rate_numerator(generator, dcqcn.controller.config.minimum_rate_bps);
+    latest_rate_pacing_time(image, &slowest)
+}
+
 fn latest_rate_pacing_time(
     image: &SimulationImage,
     generator: &crate::FlowGeneratorState,
 ) -> Result<u64, ValidationError> {
-    let FlowGeneratorKind::Rate(rate) = generator.kind else {
-        unreachable!("only rate generators have pacing deadlines")
-    };
+    let rate = pacing_rate(generator);
     let first_time = generator.next_emission.departure_time_ns;
     if first_time > image.stop_time_ns {
         return Ok(0);
@@ -3493,6 +4295,8 @@ fn validate_global_time_capacity(
             FlowGeneratorKind::Constant(constant) => constant.packet_size_bytes,
             FlowGeneratorKind::Tcp(tcp) => tcp.mss_bytes,
             FlowGeneratorKind::Rate(rate) => rate.packet_size_bytes,
+            FlowGeneratorKind::Collective(collective) => collective.packet_size_bytes,
+            FlowGeneratorKind::Dcqcn(dcqcn) => dcqcn.rate.packet_size_bytes,
         };
         let remaining = executable_generator_packets(image, generator)?;
         for link_id in &flow.route {
@@ -3515,6 +4319,31 @@ fn validate_global_time_capacity(
         }
     }
     let work = future_work(image)?;
+    for generator in image.host_states.iter().flat_map(|state| &state.generators) {
+        let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind else {
+            continue;
+        };
+        let flow = flow(image, generator.flow).expect("generator validation established the flow");
+        let cnp_count = work.dcqcn_cnp_by_flow[flow.id.0 as usize];
+        for link_id in &flow.reverse_route {
+            let link = link(image, *link_id).expect("flow validation established the route link");
+            let delay = link
+                .delay_ns(dcqcn.cnp_size_bytes)
+                .expect("DCQCN CNP/link delay validation already succeeded");
+            let flow_delay = delay.checked_mul(cnp_count).ok_or_else(|| {
+                ValidationError::new(format!(
+                    "DCQCN CNP reverse-route time bound overflows for flow {:?} on link {:?}",
+                    flow.id, link.id
+                ))
+            })?;
+            service_bound = service_bound.checked_add(flow_delay).ok_or_else(|| {
+                ValidationError::new(format!(
+                    "DCQCN CNP reverse-route time bound overflows while adding flow {:?} on link {:?}",
+                    flow.id, link.id
+                ))
+            })?;
+        }
+    }
     let reserves_pfc_time = work.pfc_by_channel.iter().any(|frames| *frames != 0);
     for (channel_index, frames) in work.pfc_by_channel.iter().copied().enumerate() {
         if frames == 0 {
@@ -3546,7 +4375,17 @@ fn validate_global_time_capacity(
         .filter(|generator| {
             generator.next_emission.status == GeneratorStatus::Scheduled
                 || generator.next_emission.status == GeneratorStatus::Blocked
-                    && matches!(generator.kind, FlowGeneratorKind::Rate(_))
+                    && matches!(
+                        generator.kind,
+                        FlowGeneratorKind::Rate(_)
+                            | FlowGeneratorKind::Collective(_)
+                            | FlowGeneratorKind::Dcqcn(_)
+                    )
+                || matches!(
+                    generator.kind,
+                    FlowGeneratorKind::Dcqcn(dcqcn)
+                        if dcqcn.controller.next_control_time_ns <= image.stop_time_ns
+                )
         })
         .map(|generator| match generator.kind {
             FlowGeneratorKind::Constant(constant) => {
@@ -3570,6 +4409,36 @@ fn validate_global_time_capacity(
             }
             FlowGeneratorKind::Tcp(_) => Ok(image.stop_time_ns),
             FlowGeneratorKind::Rate(_) => latest_rate_pacing_time(image, generator),
+            FlowGeneratorKind::Collective(collective) => {
+                let remaining = executable_generator_packets(image, generator)?;
+                let intervals = remaining.saturating_sub(1);
+                collective
+                    .interval_ns
+                    .checked_mul(intervals)
+                    .and_then(|offset| {
+                        generator
+                            .next_emission
+                            .departure_time_ns
+                            .checked_add(offset)
+                    })
+                    .ok_or_else(|| {
+                        ValidationError::new(format!(
+                            "flow {:?} latest collective departure time exceeds u64",
+                            generator.flow
+                        ))
+                    })
+            }
+            FlowGeneratorKind::Dcqcn(_) => {
+                let pacing = if matches!(
+                    generator.next_emission.status,
+                    GeneratorStatus::Scheduled | GeneratorStatus::Blocked
+                ) {
+                    latest_dcqcn_pacing_time(image, generator)?
+                } else {
+                    0
+                };
+                Ok(pacing.max(latest_dcqcn_control_time(image, generator)?))
+            }
         })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
@@ -3901,8 +4770,59 @@ fn record_mutable_payload(
 struct FutureWork {
     data_by_flow: Vec<u64>,
     feedback_by_flow: Vec<u64>,
+    dcqcn_cnp_by_flow: Vec<u64>,
     pfc_by_node: Vec<u64>,
     pfc_by_channel: Vec<u64>,
+}
+
+fn validate_dcqcn_arithmetic_capacity(
+    image: &SimulationImage,
+    work: &FutureWork,
+) -> Result<(), ValidationError> {
+    let resident_cnp_flows = executable_resident_packets(image)
+        .into_iter()
+        .filter_map(|packet| matches!(packet.kind, PacketKind::DcqcnCnp(_)).then_some(packet.flow))
+        .collect::<BTreeSet<_>>();
+    for generator in image.host_states.iter().flat_map(|state| &state.generators) {
+        let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind else {
+            continue;
+        };
+        let index = generator.flow.0 as usize;
+        let cnp_can_arrive =
+            work.dcqcn_cnp_by_flow[index] != 0 || resident_cnp_flows.contains(&generator.flow);
+        if cnp_can_arrive
+            && dcqcn.controller.last_cnp_time_ns.is_some_and(|last| {
+                last.checked_add(dcqcn.controller.config.cnp_interval_ns)
+                    .is_none()
+            })
+        {
+            return Err(ValidationError::new(format!(
+                "flow {:?} DCQCN CNP interval deadline can exceed u64 while feedback remains executable",
+                generator.flow
+            )));
+        }
+
+        let executable_packets = executable_dcqcn_packets(image, generator)?;
+        let remaining_bytes = dcqcn.rate.total_bytes - generator.bytes_emitted;
+        let executable_bytes = u128::from(executable_packets)
+            .checked_mul(u128::from(dcqcn.rate.packet_size_bytes))
+            .map(|bytes| bytes.min(u128::from(remaining_bytes)))
+            .ok_or_else(|| {
+                ValidationError::new(format!(
+                    "flow {:?} DCQCN executable byte bound exceeds u128",
+                    generator.flow
+                ))
+            })?;
+        if u128::from(dcqcn.controller.bytes_since_increase) + executable_bytes
+            > u128::from(u64::MAX)
+        {
+            return Err(ValidationError::new(format!(
+                "flow {:?} DCQCN byte counter can exceed u64 across {executable_packets} executable packets",
+                generator.flow
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn route_enters_pfc_controller(
@@ -3920,6 +4840,7 @@ fn route_enters_pfc_controller(
 fn future_work(image: &SimulationImage) -> Result<FutureWork, ValidationError> {
     let mut data_by_flow = vec![0_u64; image.flows.len()];
     let mut feedback_by_flow = vec![0_u64; image.flows.len()];
+    let mut dcqcn_cnp_by_flow = vec![0_u64; image.flows.len()];
     let resident_packets = executable_resident_packets(image);
     for packet in &resident_packets {
         let counts = if packet.kind.is_data() {
@@ -3952,6 +4873,18 @@ fn future_work(image: &SimulationImage) -> Result<FutureWork, ValidationError> {
                 &mut data_by_flow[generator.flow.0 as usize],
                 executable_generator_packets(image, generator)?,
             )?,
+            FlowGeneratorKind::Collective(_) => add_packet_count(
+                &mut data_by_flow[generator.flow.0 as usize],
+                executable_generator_packets(image, generator)?,
+            )?,
+            FlowGeneratorKind::Dcqcn(_) => {
+                let count = executable_generator_packets(image, generator)?;
+                let index = generator.flow.0 as usize;
+                add_packet_count(&mut data_by_flow[index], count)?;
+                let cnp_count = data_by_flow[index];
+                dcqcn_cnp_by_flow[index] = cnp_count;
+                add_packet_count(&mut feedback_by_flow[index], cnp_count)?;
+            }
         }
     }
     let mut pfc_by_node = vec![0_u64; image.nodes.len()];
@@ -4041,6 +4974,7 @@ fn future_work(image: &SimulationImage) -> Result<FutureWork, ValidationError> {
     Ok(FutureWork {
         data_by_flow,
         feedback_by_flow,
+        dcqcn_cnp_by_flow,
         pfc_by_node,
         pfc_by_channel,
     })
@@ -4150,6 +5084,37 @@ fn validate_counters(image: &SimulationImage) -> Result<FutureWork, ValidationEr
 fn remaining_generator_packets(
     generator: &crate::FlowGeneratorState,
 ) -> Result<u64, ValidationError> {
+    if let FlowGeneratorKind::Collective(collective) = generator.kind {
+        if collective.packet_size_bytes == 0 || collective.chunk_bytes == 0 {
+            return Err(ValidationError::new(format!(
+                "flow {:?} collective packet and chunk sizes must be positive",
+                generator.flow
+            )));
+        }
+        if generator.bytes_emitted > collective.chunk_bytes {
+            return Err(ValidationError::new(format!(
+                "flow {:?} collective emitted byte state exceeds chunk bytes {}",
+                generator.flow, collective.chunk_bytes
+            )));
+        }
+        let expected_bytes = u128::from(generator.packets_emitted)
+            .checked_mul(u128::from(collective.packet_size_bytes))
+            .map(|bytes| bytes.min(u128::from(collective.chunk_bytes)))
+            .ok_or_else(|| {
+                ValidationError::new(format!(
+                    "flow {:?} collective byte bookkeeping exceeds u128",
+                    generator.flow
+                ))
+            })?;
+        if u128::from(generator.bytes_emitted) != expected_bytes {
+            return Err(ValidationError::new(format!(
+                "flow {:?} collective records {} emitted bytes, expected {expected_bytes}",
+                generator.flow, generator.bytes_emitted
+            )));
+        }
+        return Ok((collective.chunk_bytes - generator.bytes_emitted)
+            .div_ceil(collective.packet_size_bytes));
+    }
     if let FlowGeneratorKind::Rate(rate) = generator.kind {
         if generator.bytes_emitted > rate.total_bytes {
             return Err(ValidationError::new(format!(
@@ -4174,9 +5139,34 @@ fn remaining_generator_packets(
         }
         return Ok((rate.total_bytes - generator.bytes_emitted).div_ceil(rate.packet_size_bytes));
     }
+    if let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind {
+        let rate = dcqcn.rate;
+        if generator.bytes_emitted > rate.total_bytes {
+            return Err(ValidationError::new(format!(
+                "flow {:?} DCQCN emitted byte state exceeds total bytes {}",
+                generator.flow, rate.total_bytes
+            )));
+        }
+        let expected_bytes = u128::from(generator.packets_emitted)
+            .checked_mul(u128::from(rate.packet_size_bytes))
+            .map(|bytes| bytes.min(u128::from(rate.total_bytes)))
+            .ok_or_else(|| {
+                ValidationError::new(format!(
+                    "flow {:?} DCQCN byte bookkeeping exceeds u128",
+                    generator.flow
+                ))
+            })?;
+        if u128::from(generator.bytes_emitted) != expected_bytes {
+            return Err(ValidationError::new(format!(
+                "flow {:?} DCQCN records {} emitted bytes, expected {expected_bytes}",
+                generator.flow, generator.bytes_emitted
+            )));
+        }
+        return Ok((rate.total_bytes - generator.bytes_emitted).div_ceil(rate.packet_size_bytes));
+    }
     let FlowGeneratorKind::Constant(constant) = generator.kind else {
         let FlowGeneratorKind::Tcp(tcp) = generator.kind else {
-            unreachable!("rate generators return above")
+            unreachable!("rate, DCQCN, and collective generators return above")
         };
         if generator.bytes_emitted > tcp.total_bytes || tcp.next_sequence > tcp.total_bytes {
             return Err(ValidationError::new(format!(
@@ -4256,6 +5246,22 @@ fn executable_generator_packets(
     {
         return executable_rate_packets(image, generator);
     }
+    if matches!(generator.kind, FlowGeneratorKind::Dcqcn(_))
+        && matches!(
+            generator.next_emission.status,
+            GeneratorStatus::Scheduled | GeneratorStatus::Blocked
+        )
+    {
+        return executable_dcqcn_packets(image, generator);
+    }
+    if matches!(generator.kind, FlowGeneratorKind::Collective(_))
+        && matches!(
+            generator.next_emission.status,
+            GeneratorStatus::Scheduled | GeneratorStatus::Blocked
+        )
+    {
+        return executable_collective_packets(image, generator);
+    }
     match generator.next_emission.status {
         GeneratorStatus::Scheduled => remaining_generator_packets(generator),
         GeneratorStatus::Blocked if matches!(generator.kind, FlowGeneratorKind::Tcp(_)) => {
@@ -4263,6 +5269,164 @@ fn executable_generator_packets(
         }
         GeneratorStatus::Blocked | GeneratorStatus::Finished | GeneratorStatus::Stopped => Ok(0),
     }
+}
+
+fn collective_generator(
+    image: &SimulationImage,
+    id: crate::FlowId,
+) -> Option<&crate::FlowGeneratorState> {
+    image
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .find(|generator| generator.flow == id)
+}
+
+fn collective_generation_completion_time(
+    image: &SimulationImage,
+    generator: &crate::FlowGeneratorState,
+    visiting: &mut BTreeSet<crate::FlowId>,
+) -> Result<Option<u64>, ValidationError> {
+    let FlowGeneratorKind::Collective(collective) = generator.kind else {
+        return Err(ValidationError::new(format!(
+            "flow {:?} collective dependency names a non-collective generator",
+            generator.flow
+        )));
+    };
+    let remaining = remaining_generator_packets(generator)?;
+    if remaining == 0 {
+        return Ok(Some(0));
+    }
+    if !visiting.insert(generator.flow) {
+        return Err(ValidationError::new(format!(
+            "flow {:?} collective dependency graph contains a cycle",
+            generator.flow
+        )));
+    }
+    let first_time = match generator.next_emission.status {
+        GeneratorStatus::Scheduled => Some(generator.next_emission.departure_time_ns),
+        GeneratorStatus::Blocked => {
+            collective_blocked_activation_time(image, collective, visiting)?
+        }
+        GeneratorStatus::Finished | GeneratorStatus::Stopped => None,
+    };
+    visiting.remove(&generator.flow);
+    let Some(first_time) = first_time else {
+        return Ok(None);
+    };
+    let completion = collective
+        .interval_ns
+        .checked_mul(remaining - 1)
+        .and_then(|offset| first_time.checked_add(offset))
+        .ok_or_else(|| {
+            ValidationError::new(format!(
+                "flow {:?} collective completion time exceeds u64",
+                generator.flow
+            ))
+        })?;
+    Ok((completion <= image.stop_time_ns).then_some(completion))
+}
+
+fn collective_blocked_activation_time(
+    image: &SimulationImage,
+    collective: crate::CollectiveGenerator,
+    visiting: &mut BTreeSet<crate::FlowId>,
+) -> Result<Option<u64>, ValidationError> {
+    let mut activation = 0_u64;
+    if !collective.local_predecessor_complete {
+        let predecessor_id = collective.local_predecessor.ok_or_else(|| {
+            ValidationError::new("collective local completion flag is false without a predecessor")
+        })?;
+        let predecessor = collective_generator(image, predecessor_id).ok_or_else(|| {
+            ValidationError::new(format!(
+                "collective local predecessor {predecessor_id:?} has no generator"
+            ))
+        })?;
+        let Some(completion) = collective_generation_completion_time(image, predecessor, visiting)?
+        else {
+            return Ok(None);
+        };
+        activation = activation.max(completion);
+    }
+    if !collective.inbound_predecessor_complete {
+        let predecessor_id = collective.inbound_predecessor.ok_or_else(|| {
+            ValidationError::new(
+                "collective inbound completion flag is false without a predecessor",
+            )
+        })?;
+        let predecessor = collective_generator(image, predecessor_id).ok_or_else(|| {
+            ValidationError::new(format!(
+                "collective inbound predecessor {predecessor_id:?} has no generator"
+            ))
+        })?;
+        let Some(mut completion) =
+            collective_generation_completion_time(image, predecessor, visiting)?
+        else {
+            return Ok(None);
+        };
+        let predecessor_flow = flow(image, predecessor_id).ok_or_else(|| {
+            ValidationError::new(format!(
+                "collective inbound predecessor {predecessor_id:?} has no flow"
+            ))
+        })?;
+        let FlowGeneratorKind::Collective(predecessor_stage) = predecessor.kind else {
+            unreachable!("collective completion rejected a non-collective predecessor")
+        };
+        let tail = predecessor_stage.chunk_bytes % predecessor_stage.packet_size_bytes;
+        let final_size = if tail == 0 {
+            predecessor_stage.packet_size_bytes
+        } else {
+            tail
+        };
+        for link_id in &predecessor_flow.route {
+            let route_link = link(image, *link_id)
+                .expect("flow validation established collective predecessor links");
+            completion = completion
+                .checked_add(route_link.delay_ns(final_size).map_err(|error| {
+                    ValidationError::new(format!(
+                        "flow {predecessor_id:?} collective final-packet delay overflows: {error}"
+                    ))
+                })?)
+                .ok_or_else(|| {
+                    ValidationError::new(format!(
+                        "flow {predecessor_id:?} collective delivery time exceeds u64"
+                    ))
+                })?;
+        }
+        if completion > image.stop_time_ns {
+            return Ok(None);
+        }
+        activation = activation.max(completion);
+    }
+    Ok(Some(activation))
+}
+
+fn executable_collective_packets(
+    image: &SimulationImage,
+    generator: &crate::FlowGeneratorState,
+) -> Result<u64, ValidationError> {
+    let FlowGeneratorKind::Collective(collective) = generator.kind else {
+        unreachable!("collective executable count requires collective state")
+    };
+    let remaining = remaining_generator_packets(generator)?;
+    if remaining == 0 {
+        return Ok(0);
+    }
+    let first_time = match generator.next_emission.status {
+        GeneratorStatus::Scheduled => Some(generator.next_emission.departure_time_ns),
+        GeneratorStatus::Blocked => {
+            collective_blocked_activation_time(image, collective, &mut BTreeSet::new())?
+        }
+        GeneratorStatus::Finished | GeneratorStatus::Stopped => None,
+    };
+    let Some(first_time) = first_time.filter(|time| *time <= image.stop_time_ns) else {
+        return Ok(0);
+    };
+    // The mathematical count can be u64::MAX + 1 for the full [0, u64::MAX]
+    // horizon. Saturation is exact here because `remaining` is itself a u64.
+    let horizon_count =
+        ((image.stop_time_ns - first_time) / collective.interval_ns).saturating_add(1);
+    Ok(remaining.min(horizon_count))
 }
 
 fn is_preloaded_tcp_ack_arrival(
@@ -4503,6 +5667,42 @@ fn validate_origin_sequences(
                         })?
                     }
                 }
+                FlowGeneratorKind::Collective(_) => {
+                    let remaining = executable_generator_packets(image, generator)?;
+                    remaining.saturating_sub(1)
+                }
+                FlowGeneratorKind::Dcqcn(dcqcn) => {
+                    let pacing_ticks = executable_dcqcn_pacing_ticks(image, generator)?;
+                    let pacing_successors = if pacing_ticks == BigUint::from(0_u8) {
+                        0
+                    } else {
+                        u64::try_from(pacing_ticks - 1_u8).map_err(|_| {
+                            ValidationError::new(format!(
+                                "flow {:?} DCQCN successor pacing-timer count exceeds u64",
+                                generator.flow
+                            ))
+                        })?
+                    };
+                    let control_ticks = executable_dcqcn_control_ticks(image, dcqcn);
+                    let control_successors = if control_ticks == BigUint::from(0_u8) {
+                        0
+                    } else {
+                        u64::try_from(control_ticks - 1_u8).map_err(|_| {
+                            ValidationError::new(format!(
+                                "flow {:?} DCQCN successor control-timer count exceeds u64",
+                                generator.flow
+                            ))
+                        })?
+                    };
+                    pacing_successors
+                        .checked_add(control_successors)
+                        .ok_or_else(|| {
+                            ValidationError::new(format!(
+                                "flow {:?} DCQCN successor timer count exceeds u64",
+                                generator.flow
+                            ))
+                        })?
+                }
             };
             emissions_by_node[owner.id.0 as usize] += u128::from(emissions);
         }
@@ -4633,22 +5833,35 @@ fn validate_payload_sequences(
                 FlowGeneratorKind::Constant(_) => executable_generator_packets(image, generator)?,
                 FlowGeneratorKind::Tcp(_) => tcp_attempt_upper_bound(image, generator)?,
                 FlowGeneratorKind::Rate(_) => rate_payload_allocations(image, generator)?,
+                FlowGeneratorKind::Collective(_) => executable_generator_packets(image, generator)?,
+                FlowGeneratorKind::Dcqcn(_) => dcqcn_payload_allocations(image, generator)?,
             };
             let already_scheduled = u64::from(
                 generator.next_emission.status == GeneratorStatus::Scheduled
-                    || matches!(generator.kind, FlowGeneratorKind::Rate(_))
-                        && generator.next_emission.status == GeneratorStatus::Blocked,
+                    || matches!(
+                        generator.kind,
+                        FlowGeneratorKind::Rate(_) | FlowGeneratorKind::Dcqcn(_)
+                    ) && generator.next_emission.status == GeneratorStatus::Blocked,
             );
             consumed_sequences = consumed_sequences
                 .checked_add(generator.packets_emitted)
                 .and_then(|total| total.checked_add(already_scheduled))
+                .and_then(|total| {
+                    total.checked_add(u64::from(matches!(
+                        generator.kind,
+                        FlowGeneratorKind::Dcqcn(_)
+                    )))
+                })
                 .ok_or_else(|| {
                     ValidationError::new(format!(
                         "node {:?} consumed payload sequence count exceeds u64",
                         owner.id
                     ))
                 })?;
-            let required = if matches!(generator.kind, FlowGeneratorKind::Rate(_)) {
+            let required = if matches!(
+                generator.kind,
+                FlowGeneratorKind::Rate(_) | FlowGeneratorKind::Dcqcn(_)
+            ) {
                 remaining
             } else {
                 remaining.checked_sub(already_scheduled).ok_or_else(|| {
@@ -4671,6 +5884,16 @@ fn validate_payload_sequences(
                 .ok_or_else(|| {
                     ValidationError::new(format!(
                         "node {:?} generated TCP ACK count exceeds u64",
+                        owner.id
+                    ))
+                })?;
+        }
+        for receiver in &state.dcqcn_receivers {
+            allocations = allocations
+                .checked_add(work.dcqcn_cnp_by_flow[receiver.flow.0 as usize])
+                .ok_or_else(|| {
+                    ValidationError::new(format!(
+                        "node {:?} generated DCQCN CNP count exceeds u64",
                         owner.id
                     ))
                 })?;
@@ -4815,14 +6038,22 @@ fn packet_incoming_link_at(
 fn packet_route(flow: &FlowDescriptor, packet_kind: PacketKind) -> &[LinkId] {
     match packet_kind {
         PacketKind::Data | PacketKind::TcpData(_) => &flow.route,
-        PacketKind::Feedback | PacketKind::TcpAck(_) | PacketKind::Pfc(_) => &flow.reverse_route,
+        PacketKind::Feedback
+        | PacketKind::TcpAck(_)
+        | PacketKind::Pfc(_)
+        | PacketKind::DcqcnCnp(_) => &flow.reverse_route,
+        PacketKind::DcqcnControlTimer => &[],
     }
 }
 
 fn packet_terminal(flow: &FlowDescriptor, packet_kind: PacketKind) -> NodeId {
     match packet_kind {
         PacketKind::Data | PacketKind::TcpData(_) => flow.target,
-        PacketKind::Feedback | PacketKind::TcpAck(_) | PacketKind::Pfc(_) => flow.source,
+        PacketKind::Feedback
+        | PacketKind::TcpAck(_)
+        | PacketKind::Pfc(_)
+        | PacketKind::DcqcnCnp(_)
+        | PacketKind::DcqcnControlTimer => flow.source,
     }
 }
 

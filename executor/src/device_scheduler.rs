@@ -10,12 +10,15 @@
 
 use num_bigint::BigUint;
 
-use crate::{ExactRational, NodeKind, SchedulerKind, SimulationImage, SwitchQueueState};
+use crate::{
+    DropMarkPolicy, ExactRational, NodeKind, QueueDepthUnit, SchedulerKind, SimulationImage,
+    SwitchQueueState,
+};
 
 pub(crate) const RATIONAL_LIMBS: usize = 5;
 pub(crate) const RATIONAL_WORDS: usize = RATIONAL_LIMBS * 2;
 
-pub(crate) const SCHEDULER_NODE_WORDS: usize = 25;
+pub(crate) const SCHEDULER_NODE_WORDS: usize = 29;
 pub(crate) const SCHEDULER_KIND: usize = 0;
 pub(crate) const SCHEDULER_CLASS_COUNT: usize = 1;
 pub(crate) const SCHEDULER_CLASS_OFFSET: usize = 2;
@@ -23,6 +26,10 @@ pub(crate) const SCHEDULER_QUEUE_TAG_OFFSET: usize = 3;
 pub(crate) const SCHEDULER_LAST_UPDATED: usize = 4;
 pub(crate) const SCHEDULER_VIRTUAL_TIME: usize = 5;
 pub(crate) const SCHEDULER_IN_SERVICE_TAG: usize = 15;
+pub(crate) const SCHEDULER_AQM_KIND: usize = 25;
+pub(crate) const SCHEDULER_AQM_UNIT: usize = 26;
+pub(crate) const SCHEDULER_AQM_CAPACITY: usize = 27;
+pub(crate) const SCHEDULER_AQM_THRESHOLD: usize = 28;
 
 pub(crate) const SCHEDULER_CLASS_WORDS: usize = 12;
 pub(crate) const SCHEDULER_CLASS_VALUE: usize = 0;
@@ -108,6 +115,21 @@ pub(crate) fn prepare_device_schedulers(
         let Some(queue) = image.switch_states[node.state_slot as usize].queues.first() else {
             continue;
         };
+        match queue.drop_mark {
+            DropMarkPolicy::TailDrop => {}
+            DropMarkPolicy::EcnThreshold(config) => {
+                words[node_base + SCHEDULER_AQM_KIND] = 1;
+                words[node_base + SCHEDULER_AQM_UNIT] = match config.unit {
+                    QueueDepthUnit::Packets => 0,
+                    QueueDepthUnit::Bytes => 1,
+                };
+                words[node_base + SCHEDULER_AQM_CAPACITY] = config.capacity;
+                words[node_base + SCHEDULER_AQM_THRESHOLD] = config.threshold;
+            }
+            DropMarkPolicy::Red(_) => {
+                unreachable!("device validation rejects RED before scheduler packing")
+            }
+        }
         words[node_base + SCHEDULER_KIND] = u64::from(queue.scheduler.code());
         match &queue.scheduler {
             SchedulerKind::Fifo => {}
@@ -172,8 +194,36 @@ pub(crate) fn prepare_device_schedulers(
                     write_rational(&mut words, node_base + SCHEDULER_IN_SERVICE_TAG, finish)?;
                 }
             }
-            SchedulerKind::DeficitRoundRobin(_) | SchedulerKind::WeightedRoundRobin(_) => {
-                unreachable!("device validation rejects DRR and WRR before scheduler packing")
+            SchedulerKind::DeficitRoundRobin(state) => {
+                words[node_base + SCHEDULER_CLASS_COUNT] = state.quanta_bytes.len() as u64;
+                words[node_base + SCHEDULER_CLASS_OFFSET] = words.len() as u64;
+                // DRR and WRR reuse the WFQ-only last-updated word as their class cursor.
+                words[node_base + SCHEDULER_LAST_UPDATED] = state.current_class;
+                for (quantum, deficit) in state
+                    .quanta_bytes
+                    .iter()
+                    .copied()
+                    .zip(state.deficits_bytes.iter().copied())
+                {
+                    let class_base = append_class(&mut words)?;
+                    words[class_base + SCHEDULER_CLASS_VALUE] = quantum;
+                    words[class_base + SCHEDULER_CLASS_ACTIVE] = deficit;
+                }
+            }
+            SchedulerKind::WeightedRoundRobin(state) => {
+                words[node_base + SCHEDULER_CLASS_COUNT] = state.weights.len() as u64;
+                words[node_base + SCHEDULER_CLASS_OFFSET] = words.len() as u64;
+                words[node_base + SCHEDULER_LAST_UPDATED] = state.current_class;
+                for (weight, sent) in state
+                    .weights
+                    .iter()
+                    .copied()
+                    .zip(state.packets_sent_in_round.iter().copied())
+                {
+                    let class_base = append_class(&mut words)?;
+                    words[class_base + SCHEDULER_CLASS_VALUE] = weight;
+                    words[class_base + SCHEDULER_CLASS_ACTIVE] = sent;
+                }
             }
         }
     }
@@ -252,51 +302,118 @@ pub(crate) fn restore_device_scheduler(
             queue.scheduler.code()
         ));
     }
-    let SchedulerKind::WeightedFairQueue(state) = &mut queue.scheduler else {
-        return Ok(());
-    };
-
-    let class_count = usize::try_from(words[node_base + SCHEDULER_CLASS_COUNT])
-        .map_err(|_| "device WFQ class count overflows usize".to_owned())?;
-    if class_count != state.weights.len() {
-        return Err("device WFQ class count changed during execution".to_owned());
-    }
-    let class_offset = usize::try_from(words[node_base + SCHEDULER_CLASS_OFFSET])
-        .map_err(|_| "device WFQ class offset overflows usize".to_owned())?;
-    state.virtual_time = read_rational(words, node_base + SCHEDULER_VIRTUAL_TIME)?;
-    state.last_updated_ns = words[node_base + SCHEDULER_LAST_UPDATED];
-    for class in 0..class_count {
-        let class_base = class_offset
-            .checked_add(class * SCHEDULER_CLASS_WORDS)
-            .ok_or_else(|| "device WFQ class-state offset overflows usize".to_owned())?;
-        if words[class_base + SCHEDULER_CLASS_VALUE] != state.weights[class] {
-            return Err(format!("device WFQ weight for class {class} changed"));
+    match queue.drop_mark {
+        DropMarkPolicy::TailDrop => {
+            if words[node_base + SCHEDULER_AQM_KIND] != 0 {
+                return Err("device queue admission policy changed from TailDrop".to_owned());
+            }
         }
-        state.active_packets[class] = words[class_base + SCHEDULER_CLASS_ACTIVE];
-        state.finish_times[class] = read_rational(words, class_base + SCHEDULER_CLASS_FINISH)?;
+        DropMarkPolicy::EcnThreshold(config) => {
+            let expected_unit = match config.unit {
+                QueueDepthUnit::Packets => 0,
+                QueueDepthUnit::Bytes => 1,
+            };
+            if words[node_base + SCHEDULER_AQM_KIND] != 1
+                || words[node_base + SCHEDULER_AQM_UNIT] != expected_unit
+                || words[node_base + SCHEDULER_AQM_CAPACITY] != config.capacity
+                || words[node_base + SCHEDULER_AQM_THRESHOLD] != config.threshold
+            {
+                return Err(
+                    "device ECN threshold configuration changed during execution".to_owned(),
+                );
+            }
+        }
+        DropMarkPolicy::Red(_) => {
+            return Err("device scheduler restore encountered unsupported RED state".to_owned());
+        }
     }
+    match &mut queue.scheduler {
+        SchedulerKind::Fifo | SchedulerKind::StaticPriority { .. } => {}
+        SchedulerKind::WeightedFairQueue(state) => {
+            let class_count = usize::try_from(words[node_base + SCHEDULER_CLASS_COUNT])
+                .map_err(|_| "device WFQ class count overflows usize".to_owned())?;
+            if class_count != state.weights.len() {
+                return Err("device WFQ class count changed during execution".to_owned());
+            }
+            let class_offset = usize::try_from(words[node_base + SCHEDULER_CLASS_OFFSET])
+                .map_err(|_| "device WFQ class offset overflows usize".to_owned())?;
+            state.virtual_time = read_rational(words, node_base + SCHEDULER_VIRTUAL_TIME)?;
+            state.last_updated_ns = words[node_base + SCHEDULER_LAST_UPDATED];
+            for class in 0..class_count {
+                let class_base = class_offset
+                    .checked_add(class * SCHEDULER_CLASS_WORDS)
+                    .ok_or_else(|| "device WFQ class-state offset overflows usize".to_owned())?;
+                if words[class_base + SCHEDULER_CLASS_VALUE] != state.weights[class] {
+                    return Err(format!("device WFQ weight for class {class} changed"));
+                }
+                state.active_packets[class] = words[class_base + SCHEDULER_CLASS_ACTIVE];
+                state.finish_times[class] =
+                    read_rational(words, class_base + SCHEDULER_CLASS_FINISH)?;
+            }
 
-    state.packet_finish_times.clear();
-    let queue_base = node * META_WORDS;
-    let capacity = usize::try_from(queue_meta[queue_base + 1])
-        .map_err(|_| "device WFQ queue capacity overflows usize".to_owned())?;
-    let head = usize::try_from(queue_meta[queue_base + 2])
-        .map_err(|_| "device WFQ queue head overflows usize".to_owned())?;
-    let tag_offset = usize::try_from(words[node_base + SCHEDULER_QUEUE_TAG_OFFSET])
-        .map_err(|_| "device WFQ tag offset overflows usize".to_owned())?;
-    for (logical, payload) in queue.queue.iter().copied().enumerate() {
-        let physical = (head + logical) % capacity.max(1);
-        let finish = read_rational(
-            words,
-            tag_offset
-                .checked_add(physical * RATIONAL_WORDS)
-                .ok_or_else(|| "device WFQ waiting-tag offset overflows usize".to_owned())?,
-        )?;
-        state.packet_finish_times.insert(payload, finish);
-    }
-    if let Some(payload) = queue.in_service {
-        let finish = read_rational(words, node_base + SCHEDULER_IN_SERVICE_TAG)?;
-        state.packet_finish_times.insert(payload, finish);
+            state.packet_finish_times.clear();
+            let queue_base = node * META_WORDS;
+            let capacity = usize::try_from(queue_meta[queue_base + 1])
+                .map_err(|_| "device WFQ queue capacity overflows usize".to_owned())?;
+            let head = usize::try_from(queue_meta[queue_base + 2])
+                .map_err(|_| "device WFQ queue head overflows usize".to_owned())?;
+            let tag_offset = usize::try_from(words[node_base + SCHEDULER_QUEUE_TAG_OFFSET])
+                .map_err(|_| "device WFQ tag offset overflows usize".to_owned())?;
+            for (logical, payload) in queue.queue.iter().copied().enumerate() {
+                let physical = (head + logical) % capacity.max(1);
+                let finish = read_rational(
+                    words,
+                    tag_offset
+                        .checked_add(physical * RATIONAL_WORDS)
+                        .ok_or_else(|| {
+                            "device WFQ waiting-tag offset overflows usize".to_owned()
+                        })?,
+                )?;
+                state.packet_finish_times.insert(payload, finish);
+            }
+            if let Some(payload) = queue.in_service {
+                let finish = read_rational(words, node_base + SCHEDULER_IN_SERVICE_TAG)?;
+                state.packet_finish_times.insert(payload, finish);
+            }
+        }
+        SchedulerKind::DeficitRoundRobin(state) => {
+            let class_count = usize::try_from(words[node_base + SCHEDULER_CLASS_COUNT])
+                .map_err(|_| "device DRR class count overflows usize".to_owned())?;
+            if class_count != state.quanta_bytes.len() {
+                return Err("device DRR class count changed during execution".to_owned());
+            }
+            let class_offset = usize::try_from(words[node_base + SCHEDULER_CLASS_OFFSET])
+                .map_err(|_| "device DRR class offset overflows usize".to_owned())?;
+            state.current_class = words[node_base + SCHEDULER_LAST_UPDATED];
+            for class in 0..class_count {
+                let class_base = class_offset
+                    .checked_add(class * SCHEDULER_CLASS_WORDS)
+                    .ok_or_else(|| "device DRR class-state offset overflows usize".to_owned())?;
+                if words[class_base + SCHEDULER_CLASS_VALUE] != state.quanta_bytes[class] {
+                    return Err(format!("device DRR quantum for class {class} changed"));
+                }
+                state.deficits_bytes[class] = words[class_base + SCHEDULER_CLASS_ACTIVE];
+            }
+        }
+        SchedulerKind::WeightedRoundRobin(state) => {
+            let class_count = usize::try_from(words[node_base + SCHEDULER_CLASS_COUNT])
+                .map_err(|_| "device WRR class count overflows usize".to_owned())?;
+            if class_count != state.weights.len() {
+                return Err("device WRR class count changed during execution".to_owned());
+            }
+            let class_offset = usize::try_from(words[node_base + SCHEDULER_CLASS_OFFSET])
+                .map_err(|_| "device WRR class offset overflows usize".to_owned())?;
+            state.current_class = words[node_base + SCHEDULER_LAST_UPDATED];
+            for class in 0..class_count {
+                let class_base = class_offset
+                    .checked_add(class * SCHEDULER_CLASS_WORDS)
+                    .ok_or_else(|| "device WRR class-state offset overflows usize".to_owned())?;
+                if words[class_base + SCHEDULER_CLASS_VALUE] != state.weights[class] {
+                    return Err(format!("device WRR weight for class {class} changed"));
+                }
+                state.packets_sent_in_round[class] = words[class_base + SCHEDULER_CLASS_ACTIVE];
+            }
+        }
     }
     Ok(())
 }

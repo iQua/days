@@ -157,6 +157,8 @@ const PROFILE_SAMPLES_PER_ATTEMPT: usize = PROFILE_PHASES * 2;
 const CONTROL_THREADGROUP_BYTES: usize =
     LANES * (std::mem::size_of::<u64>() + std::mem::size_of::<u32>());
 const NONE: u64 = u64::MAX;
+const PACKET_ECN_FLAG: u64 = 1_u64 << 63;
+const PACKET_KIND_MASK: u64 = !PACKET_ECN_FLAG;
 
 const CONTROL_ERROR: usize = 0;
 const CONTROL_ERROR_ARENA: usize = 1;
@@ -1171,6 +1173,7 @@ impl MetalPlan {
                     if let Some(limit) = state
                         .queues
                         .first()
+                        .filter(|queue| matches!(queue.drop_mark, crate::DropMarkPolicy::TailDrop))
                         .map(|queue| queue.queue_capacity_packets)
                         .filter(|limit| *limit != 0)
                     {
@@ -1281,8 +1284,24 @@ impl MetalPlan {
                                     &mut generators[offset..offset + GENERATOR_WORDS],
                                 );
                             }
-                            FlowGeneratorKind::Rate(_) => {
-                                unreachable!("Metal capability validation rejects rate sources")
+                            FlowGeneratorKind::Rate(rate) => {
+                                generators[offset + 11] = 2;
+                                generators[offset + 12] = rate.first_pacing_time_ns;
+                                generators[offset + 13] = rate.pacing_interval_ns;
+                                generators[offset + 14] = rate.packet_size_bytes;
+                                generators[offset + 15] = rate.total_bytes;
+                                generators[offset + 16] = rate.rate_numerator_bits_per_second;
+                                generators[offset + 17] = rate.rate_denominator;
+                                generators[offset + 18] = rate.credit_quanta as u64;
+                                generators[offset + 19] = (rate.credit_quanta >> 64) as u64;
+                            }
+                            FlowGeneratorKind::Collective(_) => {
+                                unreachable!(
+                                    "Metal capability validation rejects collective generators"
+                                )
+                            }
+                            FlowGeneratorKind::Dcqcn(_) => {
+                                unreachable!("Metal capability validation rejects DCQCN generators")
                             }
                         }
                     }
@@ -1413,7 +1432,7 @@ impl MetalPlan {
             &fel_records,
             remote_staging_slots,
         )?;
-        let event_bound = derived_transition_bound(image, &flow_packet_counts);
+        let event_bound = derived_transition_bound(image, &flow_packet_counts)?;
         let observation_capacity = if observation_mode == ObservationMode::Full {
             config.max_observations.unwrap_or(event_bound.max(1))
         } else {
@@ -1532,7 +1551,10 @@ fn tcp_generator(image: &SimulationImage, flow_index: usize) -> Option<crate::Tc
         .find(|generator| generator.flow.0 as usize == flow_index)
         .and_then(|generator| match generator.kind {
             FlowGeneratorKind::Tcp(tcp) => Some(tcp),
-            FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => None,
+            FlowGeneratorKind::Constant(_)
+            | FlowGeneratorKind::Rate(_)
+            | FlowGeneratorKind::Collective(_)
+            | FlowGeneratorKind::Dcqcn(_) => None,
         })
 }
 
@@ -1554,6 +1576,21 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
     for state in &image.host_states {
         for generator in &state.generators {
             let index = generator.flow.0 as usize;
+            if let FlowGeneratorKind::Rate(rate) = generator.kind {
+                let work = crate::device_sizing::rate_device_work(image, generator, rate)
+                    .map_err(|error| MetalError::Validation(error.to_string()))?;
+                let owns_timer_token = image.initial_events.iter().any(|event| {
+                    event.kind == EventKind::PacingTimer
+                        && event.target == image.flows[index].source
+                        && event.payload == generator.next_emission.payload
+                        && event.key.time_ns == generator.next_emission.departure_time_ns
+                });
+                if owns_timer_token {
+                    data_counts[index] = data_counts[index].saturating_sub(1);
+                }
+                data_counts[index] = data_counts[index].saturating_add(work.packets);
+                continue;
+            }
             let FlowGeneratorKind::Constant(constant) = generator.kind else {
                 let FlowGeneratorKind::Tcp(tcp) = generator.kind else {
                     unreachable!()
@@ -1751,15 +1788,20 @@ fn generator_round_burst(
         .flat_map(|state| &state.generators)
         .filter(|generator| {
             generator.flow.0 as usize == flow_index
-                && generator.next_emission.status == GeneratorStatus::Scheduled
+                && matches!(
+                    generator.next_emission.status,
+                    GeneratorStatus::Scheduled | GeneratorStatus::Blocked
+                )
         })
         .map(|generator| {
-            let FlowGeneratorKind::Constant(constant) = generator.kind else {
-                return packet_count;
+            let interval_ns = match generator.kind {
+                FlowGeneratorKind::Constant(constant) => constant.interval_ns,
+                FlowGeneratorKind::Rate(rate) => rate.pacing_interval_ns,
+                _ => return packet_count,
             };
             match lookahead {
                 Some(lookahead) => packet_count.min(
-                    usize::try_from(lookahead / constant.interval_ns)
+                    usize::try_from(lookahead / interval_ns)
                         .unwrap_or(usize::MAX)
                         .saturating_add(1),
                 ),
@@ -1789,6 +1831,10 @@ fn add_flow_route_capacities(
         }
         PacketKind::Pfc(_) => {
             unreachable!("Metal capability validation rejects PFC payloads")
+        }
+        PacketKind::DcqcnCnp(_) => (flow.reverse_route.as_slice(), flow.source),
+        PacketKind::DcqcnControlTimer => {
+            unreachable!("Metal capability validation rejects DCQCN timer payloads")
         }
     };
     for index in 0..route.len() {
@@ -1837,6 +1883,10 @@ fn flow_link_serialization_ns(
                             FlowGeneratorKind::Constant(constant) => constant.packet_size_bytes,
                             FlowGeneratorKind::Tcp(_) => 1,
                             FlowGeneratorKind::Rate(rate) => rate.packet_size_bytes,
+                            FlowGeneratorKind::Collective(collective) => {
+                                collective.packet_size_bytes
+                            }
+                            FlowGeneratorKind::Dcqcn(dcqcn) => dcqcn.rate.packet_size_bytes,
                         })
                 })
                 .into_iter()
@@ -2435,8 +2485,11 @@ fn remote_inbound_producers(image: &SimulationImage) -> (Vec<u64>, Vec<u64>) {
     (meta, producers)
 }
 
-fn derived_transition_bound(image: &SimulationImage, counts: &[usize]) -> usize {
-    image
+fn derived_transition_bound(
+    image: &SimulationImage,
+    counts: &[usize],
+) -> Result<usize, MetalError> {
+    let network = image
         .flows
         .iter()
         .enumerate()
@@ -2448,7 +2501,19 @@ fn derived_transition_bound(image: &SimulationImage, counts: &[usize]) -> usize 
         .fold(
             image.initial_events.len().saturating_add(1),
             usize::saturating_add,
-        )
+        );
+    image
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .try_fold(network, |bound, generator| {
+            let FlowGeneratorKind::Rate(rate) = generator.kind else {
+                return Ok(bound);
+            };
+            let work = crate::device_sizing::rate_device_work(image, generator, rate)
+                .map_err(|error| MetalError::Validation(error.to_string()))?;
+            Ok(bound.saturating_add(work.pacing_ticks))
+        })
 }
 
 fn derived_round_bound(
@@ -2761,7 +2826,7 @@ fn packet_record(packet: PacketDescriptor) -> [u64; EVENT_WORDS] {
     record[7] = packet.id.0;
     record[8] = packet.flow.0;
     record[9] = packet.size_bytes;
-    record[10] = u64::from(packet.kind.code());
+    record[10] = encode_packet_kind_word(packet);
     encode_packet_metadata(packet.kind, &mut record[11..14]);
     record
 }
@@ -2779,10 +2844,19 @@ fn event_record(event: Event, packet: Option<PacketDescriptor>) -> [u64; EVENT_W
         record[7] = packet.id.0;
         record[8] = packet.flow.0;
         record[9] = packet.size_bytes;
-        record[10] = u64::from(packet.kind.code());
+        record[10] = encode_packet_kind_word(packet);
         encode_packet_metadata(packet.kind, &mut record[11..14]);
     }
     record
+}
+
+fn encode_packet_kind_word(packet: PacketDescriptor) -> u64 {
+    u64::from(packet.kind.code())
+        | if packet.ecn_marked {
+            PACKET_ECN_FLAG
+        } else {
+            0
+        }
 }
 
 fn encode_packet_metadata(kind: PacketKind, words: &mut [u64]) {
@@ -2804,6 +2878,8 @@ fn encode_packet_metadata(kind: PacketKind, words: &mut [u64]) {
             words[1] = u64::from(header.priority);
             words[2] = u64::from(header.pause);
         }
+        PacketKind::DcqcnCnp(header) => words[0] = header.trigger_payload.0,
+        PacketKind::DcqcnControlTimer => {}
     }
 }
 
@@ -3189,10 +3265,36 @@ impl MetalBuffers {
                         generator.feedback.arrivals = generators[offset + 8];
                         generator.feedback.outstanding_bytes = generators[offset + 9];
                         generator.feedback.unacknowledged_bytes = generators[offset + 10];
-                        if generators[offset + 11] == 1 {
-                            generator.kind = FlowGeneratorKind::Tcp(decode_tcp_generator(
-                                &generators[offset..offset + GENERATOR_WORDS],
-                            )?);
+                        match generators[offset + 11] {
+                            0 => {}
+                            1 => {
+                                generator.kind = FlowGeneratorKind::Tcp(decode_tcp_generator(
+                                    &generators[offset..offset + GENERATOR_WORDS],
+                                )?);
+                            }
+                            2 => {
+                                let FlowGeneratorKind::Rate(mut rate) = generator.kind else {
+                                    return Err(MetalError::DeviceExecution {
+                                        code: 96,
+                                        node: Some(node.id),
+                                    });
+                                };
+                                rate.first_pacing_time_ns = generators[offset + 12];
+                                rate.pacing_interval_ns = generators[offset + 13];
+                                rate.packet_size_bytes = generators[offset + 14];
+                                rate.total_bytes = generators[offset + 15];
+                                rate.rate_numerator_bits_per_second = generators[offset + 16];
+                                rate.rate_denominator = generators[offset + 17];
+                                rate.credit_quanta = u128::from(generators[offset + 18])
+                                    | (u128::from(generators[offset + 19]) << 64);
+                                generator.kind = FlowGeneratorKind::Rate(rate);
+                            }
+                            _ => {
+                                return Err(MetalError::DeviceExecution {
+                                    code: 96,
+                                    node: Some(node.id),
+                                });
+                            }
                         }
                     }
                     let receiver_base = params[28] as usize;
@@ -3319,7 +3421,12 @@ impl MetalBuffers {
             );
             for words in observed_words.chunks_exact(OBSERVED_WORDS) {
                 let packet = decode_packet_words(words)?;
-                observed_packets.entry(packet.id).or_insert(packet);
+                observed_packets
+                    .entry(packet.id)
+                    .and_modify(|existing: &mut PacketDescriptor| {
+                        existing.ecn_marked |= packet.ecn_marked;
+                    })
+                    .or_insert(packet);
             }
             let mut keyed_departures = Vec::new();
             let mut keyed_arrivals = Vec::new();
@@ -3329,10 +3436,13 @@ impl MetalBuffers {
                     id: PayloadId(words[4]),
                     flow: crate::FlowId(words[6]),
                     size_bytes: words[7],
-                    ecn_marked: false,
+                    ecn_marked: words[8] & PACKET_ECN_FLAG != 0,
                     kind: decode_packet_kind(words[8], &words[9..12])?,
                 };
-                observed_packets.entry(packet.id).or_insert(packet);
+                observed_packets
+                    .entry(packet.id)
+                    .and_modify(|existing| existing.ecn_marked |= packet.ecn_marked)
+                    .or_insert(packet);
                 keyed_departures.push((
                     key,
                     PacketDeparture {
@@ -3347,10 +3457,13 @@ impl MetalBuffers {
                     id: PayloadId(words[4]),
                     flow: crate::FlowId(words[7]),
                     size_bytes: words[8],
-                    ecn_marked: false,
+                    ecn_marked: words[9] & PACKET_ECN_FLAG != 0,
                     kind: decode_packet_kind(words[9], &words[10..13])?,
                 };
-                observed_packets.entry(packet.id).or_insert(packet);
+                observed_packets
+                    .entry(packet.id)
+                    .and_modify(|existing| existing.ecn_marked |= packet.ecn_marked)
+                    .or_insert(packet);
                 keyed_arrivals.push((
                     key,
                     PacketArrivalObservation {
@@ -3506,7 +3619,7 @@ fn read_packet(storage: &[u64], slot: usize) -> PacketDescriptor {
         id: PayloadId(record[7]),
         flow: crate::FlowId(record[8]),
         size_bytes: record[9],
-        ecn_marked: false,
+        ecn_marked: record[10] & PACKET_ECN_FLAG != 0,
         kind: decode_packet_kind(record[10], &record[11..14])
             .expect("device error screening precedes packet readback"),
     }
@@ -3531,7 +3644,7 @@ fn decode_event(record: &[u64]) -> Result<(Event, Option<PacketDescriptor>), Met
                 id: PayloadId(record[7]),
                 flow: crate::FlowId(record[8]),
                 size_bytes: record[9],
-                ecn_marked: false,
+                ecn_marked: record[10] & PACKET_ECN_FLAG != 0,
                 kind: decode_packet_kind(record[10], &record[11..14])?,
             })
         })
@@ -3574,6 +3687,7 @@ fn decode_event_kind(value: u64) -> Result<EventKind, MetalError> {
         2 => Ok(EventKind::TxComplete),
         3 => Ok(EventKind::RemoteArrival),
         4 => Ok(EventKind::RetransmissionTimeout),
+        5 => Ok(EventKind::PacingTimer),
         _ => Err(MetalError::DeviceExecution {
             code: 92,
             node: None,
@@ -3582,7 +3696,7 @@ fn decode_event_kind(value: u64) -> Result<EventKind, MetalError> {
 }
 
 fn decode_packet_kind(value: u64, metadata: &[u64]) -> Result<PacketKind, MetalError> {
-    match value {
+    match value & PACKET_KIND_MASK {
         0 => Ok(PacketKind::Data),
         1 => Ok(PacketKind::Feedback),
         2 => Ok(PacketKind::TcpData(TcpDataHeader {
@@ -3633,7 +3747,7 @@ fn decode_packet_words(words: &[u64]) -> Result<PacketDescriptor, MetalError> {
         id: PayloadId(words[0]),
         flow: crate::FlowId(words[1]),
         size_bytes: words[2],
-        ecn_marked: false,
+        ecn_marked: words[3] & PACKET_ECN_FLAG != 0,
         kind: decode_packet_kind(words[3], &words[4..7])?,
     })
 }

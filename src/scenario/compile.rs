@@ -3,13 +3,15 @@ use std::fs;
 use std::path::Path;
 
 use days_executor::{
-    Backend, ConstantGenerator, DropMarkPolicy, EcnThresholdPolicy, Event, EventKey, EventKind,
-    FlowDescriptor, FlowGeneratorKind, FlowGeneratorState, FlowId, GeneratorFeedbackState,
-    GeneratorStatus, GeneratorTermination, HostState, LinkDescriptor, LinkId, NodeDescriptor,
-    NodeId, NodeKind, PacketDescriptor, PacketKind, PayloadId, PfcIngressState, PfcQueueState,
-    QueueDepthUnit, RedPolicyState, RemoteChannel, ScheduledEmission, SchedulerKind,
-    SimulationImage, SwitchQueueState, SwitchState, TcpCongestionControl, TcpDataHeader,
-    TcpGenerator, TcpReceiverState, event_phase, validate,
+    Backend, CollectiveAlgorithm, CollectiveChannelPolicy, CollectiveChunkPolicy,
+    CollectiveGenerator, CollectivePhase, ConstantGenerator, DcqcnController,
+    DcqcnControllerConfig, DcqcnGenerator, DcqcnReceiverState, DropMarkPolicy, EcnThresholdPolicy,
+    Event, EventKey, EventKind, FlowDescriptor, FlowGeneratorKind, FlowGeneratorState, FlowId,
+    GeneratorFeedbackState, GeneratorStatus, GeneratorTermination, HostState, LinkDescriptor,
+    LinkId, NodeDescriptor, NodeId, NodeKind, PacketDescriptor, PacketKind, PayloadId,
+    PfcIngressState, PfcQueueState, QueueDepthUnit, RateGenerator, RedPolicyState, RemoteChannel,
+    ScheduledEmission, SchedulerKind, SimulationImage, SwitchQueueState, SwitchState,
+    TcpCongestionControl, TcpDataHeader, TcpGenerator, TcpReceiverState, event_phase, validate,
 };
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
@@ -59,8 +61,8 @@ struct SourceConfig {
     time_quantum_ns: Option<u64>,
     flow: Option<Vec<SourceFlow>>,
     flow_set: Option<Vec<SourceFlowSet>>,
-    collective: Option<Vec<toml::Value>>,
-    collective_set: Option<Vec<toml::Value>>,
+    collective: Option<Vec<SourceCollective>>,
+    collective_set: Option<Vec<SourceCollectiveSet>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,6 +119,35 @@ struct SourceFlowSet {
 }
 
 #[derive(Debug, Deserialize)]
+struct SourceCollective {
+    collective_type: String,
+    first_flow_id: Option<u64>,
+    flow_type: String,
+    flow_count: u64,
+    graph: Option<Vec<(u64, u64)>>,
+    paths: Option<Vec<Vec<u64>>>,
+    sources: Option<Vec<u64>>,
+    sinks: Option<Vec<u64>>,
+    priority: Option<u8>,
+    routing: Option<toml::Value>,
+    traffic: SourceTraffic,
+}
+
+#[derive(Debug, Deserialize)]
+struct SourceCollectiveSet {
+    collective_type: String,
+    collective_count: u64,
+    first_flow_id: Option<u64>,
+    flow_type: String,
+    flow_count: u64,
+    sources: Option<Vec<Vec<u64>>>,
+    sinks: Option<Vec<Vec<u64>>>,
+    priority: Option<u8>,
+    routing: Option<toml::Value>,
+    traffic: SourceTraffic,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct SourceTraffic {
     initial_delay: Option<f64>,
     duration: Option<f64>,
@@ -124,10 +155,26 @@ struct SourceTraffic {
     arr_dist: DistributionInfo,
     pkt_size_dist: DistributionInfo,
     tcp: Option<SourceTcp>,
-    dcqcn: Option<toml::Value>,
+    dcqcn: Option<SourceDcqcn>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize)]
+struct SourceDcqcn {
+    rate_gbps: f64,
+    min_rate_gbps: f64,
+    max_rate_gbps: f64,
+    g: f64,
+    ai_rate_gbps: f64,
+    hai_rate_gbps: f64,
+    mi_factor: f64,
+    rtt_ns: Option<f64>,
+    cnp_interval_ns: Option<f64>,
+    pacing_interval_ns: Option<f64>,
+    cnp_priority: Option<u8>,
+    increase_byte_threshold: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct SourceTcp {
     cc_algorithm: String,
     #[serde(default)]
@@ -135,7 +182,7 @@ struct SourceTcp {
     cubic: Option<SourceCubic>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct SourceCubic {
     beta: Option<f64>,
     c: Option<f64>,
@@ -152,6 +199,23 @@ enum Termination {
 enum TrafficKind {
     Constant,
     Tcp(TcpAlgorithm),
+    Dcqcn(DcqcnTrafficKey),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DcqcnTrafficKey {
+    initial_rate_bps: u64,
+    minimum_rate_bps: u64,
+    maximum_rate_bps: u64,
+    additive_rate_bps: u64,
+    hyper_rate_bps: u64,
+    g_ppb: u64,
+    decrease_ppb: u64,
+    cnp_interval_ns: u64,
+    control_interval_ns: u64,
+    pacing_interval_ns: u64,
+    cnp_priority: u8,
+    increase_byte_threshold: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -164,6 +228,7 @@ enum TcpAlgorithm {
 enum SourceFlowKind {
     PacketDistribution,
     Tcp,
+    Dcqcn,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -191,6 +256,23 @@ struct FlowSetKey {
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CollectiveKey {
+    algorithm: CollectiveAlgorithm,
+    flow_count: u64,
+    sources: Vec<u64>,
+    sinks: Vec<u64>,
+    priority: u8,
+    traffic: TrafficKey,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CollectiveStagePosition {
+    phase: CollectivePhase,
+    rank: u32,
+    step: u32,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum FlowKey {
     Explicit {
         semantic: ExplicitFlowKey,
@@ -203,6 +285,22 @@ enum FlowKey {
         source: u64,
         target: u64,
     },
+    CollectiveStage {
+        semantic: CollectiveKey,
+        duplicate_ordinal: u64,
+        stage: CollectiveStagePosition,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct CollectiveStageInput {
+    collective_id: u64,
+    position: CollectiveStagePosition,
+    chunk_offset_bytes: u64,
+    chunk_bytes: u64,
+    local_predecessor: Option<CollectiveStagePosition>,
+    inbound_predecessor: Option<CollectiveStagePosition>,
+    inbound_predecessor_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -212,6 +310,7 @@ struct FlowInput {
     target: u64,
     priority: u8,
     traffic: TrafficKey,
+    collective: Option<CollectiveStageInput>,
 }
 
 /// Lowers one Days configuration file into one heterogeneous semantic image.
@@ -251,6 +350,7 @@ struct SupportedModel {
     propagation_ns: u64,
     explicit_flows: Vec<ExplicitFlowKey>,
     flow_sets: Vec<FlowSetKey>,
+    collectives: Vec<CollectiveKey>,
 }
 
 #[derive(Clone)]
@@ -461,21 +561,6 @@ impl SupportedModel {
                     .to_owned(),
             ));
         }
-        if source
-            .collective
-            .as_ref()
-            .is_some_and(|collectives| !collectives.is_empty())
-            || source
-                .collective_set
-                .as_ref()
-                .is_some_and(|collectives| !collectives.is_empty())
-        {
-            return Err(CompileError::Unsupported(
-                "unsupported collective traffic; Days executor v1 lowering supports only independent open-loop flows"
-                    .to_owned(),
-            ));
-        }
-
         let explicit_flows = source
             .flow
             .unwrap_or_default()
@@ -488,6 +573,15 @@ impl SupportedModel {
             .into_iter()
             .map(validate_flow_set)
             .collect::<Result<Vec<_>, _>>()?;
+        let mut collectives = source
+            .collective
+            .unwrap_or_default()
+            .into_iter()
+            .map(validate_collective)
+            .collect::<Result<Vec<_>, _>>()?;
+        for collective_set in source.collective_set.unwrap_or_default() {
+            collectives.extend(validate_collective_set(collective_set)?);
+        }
 
         Ok(Self {
             seed,
@@ -500,6 +594,7 @@ impl SupportedModel {
             propagation_ns: link.propagation_ns.unwrap_or(0),
             explicit_flows,
             flow_sets,
+            collectives,
         })
     }
 }
@@ -589,12 +684,9 @@ fn validate_flow_type(flow_type: &str) -> Result<SourceFlowKind, CompileError> {
     match flow_type {
         "PacketDistribution" => Ok(SourceFlowKind::PacketDistribution),
         "TCP" => Ok(SourceFlowKind::Tcp),
-        "DCQCN" => Err(CompileError::Unsupported(
-            "unsupported flow type `DCQCN`; Days executor supports PacketDistribution and exact TCP Reno/CUBIC traffic"
-                .to_owned(),
-        )),
+        "DCQCN" => Ok(SourceFlowKind::Dcqcn),
         _ => Err(CompileError::Unsupported(format!(
-            "unsupported flow type `{flow_type}`; Days executor supports PacketDistribution and exact TCP Reno/CUBIC traffic"
+            "unsupported flow type `{flow_type}`; Days executor supports PacketDistribution, exact TCP Reno/CUBIC, and exact DCQCN traffic"
         ))),
     }
 }
@@ -657,11 +749,21 @@ fn validate_explicit_flow(flow: SourceFlow) -> Result<ExplicitFlowKey, CompileEr
             "flow source and target must differ, got {source}"
         )));
     }
+    let priority = flow.priority.unwrap_or(0);
+    let traffic = validate_traffic(flow.traffic, flow_kind)?;
+    if let TrafficKind::Dcqcn(dcqcn) = traffic.kind {
+        if dcqcn.cnp_priority != priority {
+            return Err(CompileError::Unsupported(format!(
+                "DCQCN CNP priority {} must equal flow priority {priority}; the v1 packet record has one priority per flow",
+                dcqcn.cnp_priority
+            )));
+        }
+    }
     Ok(ExplicitFlowKey {
         source,
         target,
-        priority: flow.priority.unwrap_or(0),
-        traffic: validate_traffic(flow.traffic, flow_kind)?,
+        priority,
+        traffic,
     })
 }
 
@@ -675,27 +777,196 @@ fn validate_flow_set(flow_set: SourceFlowSet) -> Result<FlowSetKey, CompileError
         flow_set.routing.as_ref(),
         None,
     )?;
+    let priority = flow_set.priority.unwrap_or(0);
+    let traffic = validate_traffic(flow_set.traffic, flow_kind)?;
+    if let TrafficKind::Dcqcn(dcqcn) = traffic.kind {
+        if dcqcn.cnp_priority != priority {
+            return Err(CompileError::Unsupported(format!(
+                "DCQCN CNP priority {} must equal flow priority {priority}; the v1 packet record has one priority per flow",
+                dcqcn.cnp_priority
+            )));
+        }
+    }
     Ok(FlowSetKey {
         flow_count: flow_set.flow_count,
-        priority: flow_set.priority.unwrap_or(0),
-        traffic: validate_traffic(flow_set.traffic, flow_kind)?,
+        priority,
+        traffic,
     })
+}
+
+fn collective_algorithm(name: &str) -> Result<CollectiveAlgorithm, CompileError> {
+    match name {
+        "RingAllReduce" => Ok(CollectiveAlgorithm::RingAllReduce),
+        "AllGather" => Ok(CollectiveAlgorithm::AllGather),
+        unsupported => Err(CompileError::Unsupported(format!(
+            "unsupported collective algorithm `{unsupported}`; T26 supports RingAllReduce and AllGather"
+        ))),
+    }
+}
+
+fn validate_collective_transport(flow_type: &str) -> Result<(), CompileError> {
+    if flow_type == "PacketDistribution" {
+        Ok(())
+    } else {
+        Err(CompileError::Unsupported(format!(
+            "unsupported collective flow type `{flow_type}`; T26 collectives require deterministic byte-terminated PacketDistribution traffic"
+        )))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collective_key(
+    collective_type: &str,
+    flow_type: &str,
+    flow_count: u64,
+    sources: Vec<u64>,
+    sinks: Vec<u64>,
+    priority: Option<u8>,
+    first_flow_id: Option<u64>,
+    routing: Option<&toml::Value>,
+    paths: Option<&[Vec<u64>]>,
+    graph: Option<&[(u64, u64)]>,
+    traffic: SourceTraffic,
+) -> Result<CollectiveKey, CompileError> {
+    validate_collective_transport(flow_type)?;
+    let algorithm = collective_algorithm(collective_type)?;
+    if first_flow_id.is_some() {
+        return Err(CompileError::Unsupported(
+            "unsupported explicit collective flow IDs; scenario-local flow identity is derived from the collective stage key"
+                .to_owned(),
+        ));
+    }
+    if routing.is_some() || paths.is_some_and(|paths| !paths.is_empty()) {
+        return Err(CompileError::Unsupported(
+            "unsupported collective source routing or explicit paths; executor lowering derives deterministic topology routes"
+                .to_owned(),
+        ));
+    }
+    if graph.is_some_and(|graph| !graph.is_empty()) {
+        return Err(CompileError::Unsupported(
+            "unsupported collective graph; use ordered sources/sinks for the flat T26 topology hierarchy"
+                .to_owned(),
+        ));
+    }
+    if priority.is_some_and(|priority| priority > 7) {
+        return Err(CompileError::Invalid(
+            "collective priority must be in IEEE 802.1Q range 0..=7".to_owned(),
+        ));
+    }
+    if flow_count < 2 {
+        return Err(CompileError::Invalid(
+            "collective flow_count must be at least 2".to_owned(),
+        ));
+    }
+    if sources.is_empty() != sinks.is_empty() {
+        return Err(CompileError::Invalid(
+            "collective sources and sinks must either both be provided or both be omitted"
+                .to_owned(),
+        ));
+    }
+    if !sources.is_empty()
+        && (sources.len() != flow_count as usize || sinks.len() != flow_count as usize)
+    {
+        return Err(CompileError::Invalid(format!(
+            "collective sources and sinks must each contain flow_count={flow_count} entries"
+        )));
+    }
+    if !sources.is_empty() {
+        for rank in 0..sources.len() {
+            if sinks[rank] != sources[(rank + 1) % sources.len()] {
+                return Err(CompileError::Invalid(format!(
+                    "collective ring-next mismatch at rank {rank}: sink {} must equal next source {}",
+                    sinks[rank],
+                    sources[(rank + 1) % sources.len()]
+                )));
+            }
+        }
+    }
+    let traffic = validate_traffic(traffic, SourceFlowKind::PacketDistribution)?;
+    let Termination::Bytes(total_bytes) = traffic.termination else {
+        return Err(CompileError::Unsupported(
+            "unsupported duration-terminated collective traffic; T26 collectives require an exact byte size"
+                .to_owned(),
+        ));
+    };
+    if total_bytes < flow_count {
+        return Err(CompileError::Invalid(format!(
+            "collective byte size {total_bytes} must be at least flow_count {flow_count}"
+        )));
+    }
+    Ok(CollectiveKey {
+        algorithm,
+        flow_count,
+        sources,
+        sinks,
+        priority: priority.unwrap_or(0),
+        traffic,
+    })
+}
+
+fn validate_collective(source: SourceCollective) -> Result<CollectiveKey, CompileError> {
+    collective_key(
+        &source.collective_type,
+        &source.flow_type,
+        source.flow_count,
+        source.sources.unwrap_or_default(),
+        source.sinks.unwrap_or_default(),
+        source.priority,
+        source.first_flow_id,
+        source.routing.as_ref(),
+        source.paths.as_deref(),
+        source.graph.as_deref(),
+        source.traffic,
+    )
+}
+
+fn validate_collective_set(
+    source: SourceCollectiveSet,
+) -> Result<Vec<CollectiveKey>, CompileError> {
+    validate_collective_transport(&source.flow_type)?;
+    let count = usize::try_from(source.collective_count).map_err(|_| {
+        CompileError::Invalid("collective_count exceeds the platform index domain".to_owned())
+    })?;
+    let sources = source.sources.unwrap_or_else(|| vec![Vec::new(); count]);
+    let sinks = source.sinks.unwrap_or_else(|| vec![Vec::new(); count]);
+    if sources.len() != count || sinks.len() != count {
+        return Err(CompileError::Invalid(format!(
+            "collective_set sources and sinks must each contain collective_count={} entries",
+            source.collective_count
+        )));
+    }
+    let mut result = Vec::with_capacity(count);
+    for (collective_sources, collective_sinks) in sources.into_iter().zip(sinks) {
+        result.push(collective_key(
+            &source.collective_type,
+            &source.flow_type,
+            source.flow_count,
+            collective_sources,
+            collective_sinks,
+            source.priority,
+            source.first_flow_id,
+            source.routing.as_ref(),
+            None,
+            None,
+            source.traffic.clone(),
+        )?);
+    }
+    Ok(result)
 }
 
 fn validate_traffic(
     traffic: SourceTraffic,
     flow_kind: SourceFlowKind,
 ) -> Result<TrafficKey, CompileError> {
-    if traffic.dcqcn.is_some() {
-        return Err(CompileError::Unsupported(
-            "unsupported DCQCN source behavior; the executor transport lattice implements exact loss-only TCP Reno/CUBIC"
-                .to_owned(),
-        ));
-    }
-
     let packet_size_bytes = constant_packet_size_bytes(&traffic.pkt_size_dist)?;
     let (kind, interval_ns, termination) = match flow_kind {
         SourceFlowKind::PacketDistribution => {
+            if traffic.dcqcn.is_some() {
+                return Err(CompileError::Unsupported(
+                    "unsupported DCQCN options on PacketDistribution traffic; use `flow_type = \"DCQCN\"`"
+                        .to_owned(),
+                ));
+            }
             if traffic.tcp.is_some() {
                 return Err(CompileError::Unsupported(
                     "unsupported TCP options on PacketDistribution traffic; use `flow_type = \"TCP\"`"
@@ -725,6 +996,12 @@ fn validate_traffic(
             (TrafficKind::Constant, interval_ns, termination)
         }
         SourceFlowKind::Tcp => {
+            if traffic.dcqcn.is_some() {
+                return Err(CompileError::Unsupported(
+                    "unsupported DCQCN options on TCP traffic; use `flow_type = \"DCQCN\"`"
+                        .to_owned(),
+                ));
+            }
             let tcp = traffic.tcp.ok_or_else(|| {
                 CompileError::Invalid(
                     "TCP traffic must provide `[flow.traffic.tcp]` or `[flow_set.traffic.tcp]`"
@@ -770,6 +1047,97 @@ fn validate_traffic(
             // Closed-loop TCP owns all post-start send timing. The legacy `arr_dist` field is
             // accepted for source-file compatibility but has no executor semantic effect.
             (TrafficKind::Tcp(algorithm), 0, Termination::Bytes(size))
+        }
+        SourceFlowKind::Dcqcn => {
+            if traffic.tcp.is_some() {
+                return Err(CompileError::Unsupported(
+                    "unsupported TCP options on DCQCN traffic".to_owned(),
+                ));
+            }
+            let dcqcn = traffic.dcqcn.ok_or_else(|| {
+                CompileError::Invalid(
+                    "DCQCN traffic must provide `[flow.traffic.dcqcn]` or `[flow_set.traffic.dcqcn]`"
+                        .to_owned(),
+                )
+            })?;
+            let size = traffic.size.ok_or_else(|| {
+                CompileError::Unsupported(
+                    "unsupported duration-terminated DCQCN traffic; the executor requires an exact byte `size`"
+                        .to_owned(),
+                )
+            })?;
+            if size == 0 {
+                return Err(CompileError::Invalid(
+                    "DCQCN traffic `size` must be positive".to_owned(),
+                ));
+            }
+            let key = DcqcnTrafficKey {
+                initial_rate_bps: scaled_u64(dcqcn.rate_gbps, 1_000_000_000, "DCQCN rate")?,
+                minimum_rate_bps: scaled_u64(
+                    dcqcn.min_rate_gbps,
+                    1_000_000_000,
+                    "DCQCN minimum rate",
+                )?,
+                maximum_rate_bps: scaled_u64(
+                    dcqcn.max_rate_gbps,
+                    1_000_000_000,
+                    "DCQCN maximum rate",
+                )?,
+                additive_rate_bps: scaled_u64(
+                    dcqcn.ai_rate_gbps,
+                    1_000_000_000,
+                    "DCQCN additive rate",
+                )?,
+                hyper_rate_bps: scaled_u64(dcqcn.hai_rate_gbps, 1_000_000_000, "DCQCN hyper rate")?,
+                g_ppb: scaled_u64(dcqcn.g, 1_000_000_000, "DCQCN g ppb")?,
+                decrease_ppb: scaled_u64(dcqcn.mi_factor, 1_000_000_000, "DCQCN decrease ppb")?,
+                cnp_interval_ns: scaled_u64(
+                    dcqcn.cnp_interval_ns.unwrap_or(50_000.0),
+                    1,
+                    "DCQCN CNP interval ns",
+                )?,
+                control_interval_ns: scaled_u64(
+                    dcqcn.rtt_ns.unwrap_or(100_000.0),
+                    1,
+                    "DCQCN control interval ns",
+                )?,
+                pacing_interval_ns: scaled_u64(
+                    dcqcn.pacing_interval_ns.unwrap_or(1_000.0),
+                    1,
+                    "DCQCN pacing interval ns",
+                )?,
+                cnp_priority: dcqcn.cnp_priority.unwrap_or(0),
+                increase_byte_threshold: dcqcn.increase_byte_threshold.unwrap_or(10_000_000),
+            };
+            if key.pacing_interval_ns == 0 {
+                return Err(CompileError::Invalid(
+                    "DCQCN pacing interval must be positive".to_owned(),
+                ));
+            }
+            if key.cnp_priority > 7 {
+                return Err(CompileError::Invalid(
+                    "DCQCN CNP priority must be in IEEE 802.1Q range 0..=7".to_owned(),
+                ));
+            }
+            DcqcnControllerConfig {
+                initial_rate_bps: key.initial_rate_bps,
+                minimum_rate_bps: key.minimum_rate_bps,
+                maximum_rate_bps: key.maximum_rate_bps,
+                additive_rate_bps: key.additive_rate_bps,
+                hyper_rate_bps: key.hyper_rate_bps,
+                g_ppb: key.g_ppb,
+                decrease_ppb: key.decrease_ppb,
+                cnp_interval_ns: key.cnp_interval_ns,
+                control_interval_ns: key.control_interval_ns,
+                increase_byte_threshold: key.increase_byte_threshold,
+            }
+            .validate()
+            .map_err(|error| CompileError::Invalid(error.to_string()))?;
+            (
+                TrafficKind::Dcqcn(key),
+                key.pacing_interval_ns,
+                Termination::Bytes(size),
+            )
         }
     };
 
@@ -886,6 +1254,26 @@ fn seconds_to_ns(seconds: f64, label: &str) -> Result<u64, CompileError> {
         )));
     }
     Ok(nanoseconds as u64)
+}
+
+fn scaled_u64(value: f64, scale: u64, label: &str) -> Result<u64, CompileError> {
+    if !value.is_finite() || value < 0.0 {
+        return Err(CompileError::Invalid(format!(
+            "{label} must be finite and nonnegative, got {value}"
+        )));
+    }
+    let scaled = value * scale as f64;
+    if !scaled.is_finite() || scaled >= 2_f64.powi(64) {
+        return Err(CompileError::Invalid(format!(
+            "{label} `{value}` exceeds the u64 representation"
+        )));
+    }
+    if scaled.fract() != 0.0 {
+        return Err(CompileError::Unsupported(format!(
+            "unsupported {label} `{value}`; exact representation requires an integer scaled value"
+        )));
+    }
+    Ok(scaled as u64)
 }
 
 fn image_route(
@@ -1032,6 +1420,7 @@ fn lower(
     let flows = canonical_flows(
         model.explicit_flows,
         model.flow_sets,
+        model.collectives,
         &host_topology_ids,
         &hosts,
         model.seed,
@@ -1101,14 +1490,30 @@ fn lower(
     let mut generators_by_source = BTreeMap::<LpKey, Vec<FlowGeneratorState>>::new();
     let mut payload_sequences = BTreeMap::<LpKey, u64>::new();
     let mut initial_packets = Vec::with_capacity(flows.len());
-    let mut initial_event_inputs = Vec::<(LpKey, u64, FlowId, PayloadId)>::new();
+    let mut initial_event_inputs = Vec::<(LpKey, u64, FlowId, PayloadId, EventKind)>::new();
     for (flow, descriptor) in flows.iter().zip(&flow_descriptors) {
         let source = LpKey::Host(flow.source);
         let emission_count = packet_count(&flow.traffic);
+        let mut dcqcn_control_payload = None;
+        let collective_ready = flow.collective.as_ref().is_none_or(|stage| {
+            stage.local_predecessor.is_none() && stage.inbound_predecessor.is_none()
+        });
         let next_emission = if emission_count == 0 {
             ScheduledEmission {
                 status: GeneratorStatus::Finished,
                 departure_time_ns: 0,
+                payload: PayloadId(0),
+            }
+        } else if !collective_ready {
+            ScheduledEmission {
+                status: GeneratorStatus::Blocked,
+                departure_time_ns: 0,
+                payload: PayloadId(0),
+            }
+        } else if flow.collective.is_some() && flow.traffic.initial_delay_ns > model.stop_time_ns {
+            ScheduledEmission {
+                status: GeneratorStatus::Stopped,
+                departure_time_ns: flow.traffic.initial_delay_ns,
                 payload: PayloadId(0),
             }
         } else {
@@ -1123,7 +1528,12 @@ fn lower(
                 CompileError::Invalid(format!("initial payload sequence overflow at {source:?}"))
             })?;
             let initial_size_bytes = match (flow.traffic.kind, &flow.traffic.termination) {
-                (TrafficKind::Tcp(_), Termination::Bytes(total_bytes)) => {
+                (TrafficKind::Tcp(_) | TrafficKind::Dcqcn(_), Termination::Bytes(total_bytes)) => {
+                    flow.traffic.packet_size_bytes.min(*total_bytes)
+                }
+                (TrafficKind::Constant, Termination::Bytes(total_bytes))
+                    if flow.collective.is_some() =>
+                {
                     flow.traffic.packet_size_bytes.min(*total_bytes)
                 }
                 _ => flow.traffic.packet_size_bytes,
@@ -1135,6 +1545,7 @@ fn lower(
                     sent_time_ns: flow.traffic.initial_delay_ns,
                     retransmission: false,
                 }),
+                TrafficKind::Dcqcn(_) => PacketKind::Data,
             };
             initial_packets.push(PacketDescriptor {
                 id: payload,
@@ -1148,7 +1559,52 @@ fn lower(
                 flow.traffic.initial_delay_ns,
                 descriptor.id,
                 payload,
+                if matches!(flow.traffic.kind, TrafficKind::Dcqcn(_)) {
+                    EventKind::PacingTimer
+                } else {
+                    EventKind::PacketArrival
+                },
             ));
+            if let TrafficKind::Dcqcn(config) = flow.traffic.kind {
+                let control_time_ns = flow
+                    .traffic
+                    .initial_delay_ns
+                    .checked_add(config.control_interval_ns)
+                    .ok_or_else(|| {
+                        CompileError::Invalid(format!(
+                            "flow {:?} first DCQCN control deadline exceeds u64",
+                            descriptor.id
+                        ))
+                    })?;
+                let control_payload = allocate_payload_id(
+                    ids.node(source),
+                    node_count,
+                    *sequence,
+                    "DCQCN control payload sequence",
+                )?;
+                *sequence = sequence.checked_add(1).ok_or_else(|| {
+                    CompileError::Invalid(format!(
+                        "DCQCN control payload sequence overflow at {source:?}"
+                    ))
+                })?;
+                initial_packets.push(PacketDescriptor {
+                    id: control_payload,
+                    flow: descriptor.id,
+                    size_bytes: 0,
+                    ecn_marked: false,
+                    kind: PacketKind::DcqcnControlTimer,
+                });
+                if control_time_ns <= model.stop_time_ns {
+                    initial_event_inputs.push((
+                        source,
+                        control_time_ns,
+                        descriptor.id,
+                        control_payload,
+                        EventKind::PacingTimer,
+                    ));
+                }
+                dcqcn_control_payload = Some(control_payload);
+            }
             ScheduledEmission {
                 status: GeneratorStatus::Scheduled,
                 departure_time_ns: flow.traffic.initial_delay_ns,
@@ -1169,36 +1625,118 @@ fn lower(
                     outstanding_bytes: 0,
                     unacknowledged_bytes: 0,
                 },
-                kind: match flow.traffic.kind {
-                    TrafficKind::Constant => FlowGeneratorKind::Constant(ConstantGenerator {
-                        first_departure_ns: flow.traffic.initial_delay_ns,
-                        interval_ns: flow.traffic.interval_ns,
+                kind: if let Some(stage) = &flow.collective {
+                    let FlowKey::CollectiveStage {
+                        semantic,
+                        duplicate_ordinal,
+                        ..
+                    } = &flow.key
+                    else {
+                        unreachable!("collective metadata requires a collective flow key")
+                    };
+                    let stage_flow = |position: CollectiveStagePosition| {
+                        flow_ids[&FlowKey::CollectiveStage {
+                            semantic: semantic.clone(),
+                            duplicate_ordinal: *duplicate_ordinal,
+                            stage: position,
+                        }]
+                    };
+                    FlowGeneratorKind::Collective(CollectiveGenerator {
+                        collective_id: stage.collective_id,
+                        algorithm: semantic.algorithm,
+                        topology_level: 0,
+                        topology_group: 0,
+                        group_size: u32::try_from(semantic.flow_count)
+                            .expect("collective lowering checked group size"),
+                        rank: stage.position.rank,
+                        phase: stage.position.phase,
+                        step: stage.position.step,
+                        chunk_policy: CollectiveChunkPolicy::EqualRemainderLast,
+                        channel_policy: CollectiveChannelPolicy::RingNext,
+                        chunk_offset_bytes: stage.chunk_offset_bytes,
+                        chunk_bytes: stage.chunk_bytes,
                         packet_size_bytes: flow.traffic.packet_size_bytes,
-                        termination: match flow.traffic.termination {
-                            Termination::Bytes(bytes) => GeneratorTermination::Bytes(bytes),
-                            Termination::DurationNs(duration_ns) => {
-                                GeneratorTermination::DurationNs(duration_ns)
-                            }
-                        },
-                    }),
-                    TrafficKind::Tcp(algorithm) => {
-                        let Termination::Bytes(total_bytes) = flow.traffic.termination else {
-                            unreachable!("TCP validation requires byte termination")
-                        };
-                        let control = match algorithm {
-                            TcpAlgorithm::Reno => {
-                                TcpCongestionControl::reno(flow.traffic.packet_size_bytes)
-                            }
-                            TcpAlgorithm::Cubic => {
-                                TcpCongestionControl::cubic(flow.traffic.packet_size_bytes)
-                            }
-                        };
-                        FlowGeneratorKind::Tcp(TcpGenerator::new(
-                            total_bytes,
-                            flow.traffic.packet_size_bytes,
-                            40,
-                            control,
-                        ))
+                        interval_ns: flow.traffic.interval_ns,
+                        local_predecessor: stage.local_predecessor.map(stage_flow).map(FlowId),
+                        inbound_predecessor: stage.inbound_predecessor.map(stage_flow).map(FlowId),
+                        inbound_predecessor_bytes: stage.inbound_predecessor_bytes,
+                        local_predecessor_complete: stage.local_predecessor.is_none(),
+                        inbound_predecessor_complete: stage.inbound_predecessor.is_none(),
+                        inbound_bytes_received: 0,
+                    })
+                } else {
+                    match flow.traffic.kind {
+                        TrafficKind::Constant => FlowGeneratorKind::Constant(ConstantGenerator {
+                            first_departure_ns: flow.traffic.initial_delay_ns,
+                            interval_ns: flow.traffic.interval_ns,
+                            packet_size_bytes: flow.traffic.packet_size_bytes,
+                            termination: match flow.traffic.termination {
+                                Termination::Bytes(bytes) => GeneratorTermination::Bytes(bytes),
+                                Termination::DurationNs(duration_ns) => {
+                                    GeneratorTermination::DurationNs(duration_ns)
+                                }
+                            },
+                        }),
+                        TrafficKind::Tcp(algorithm) => {
+                            let Termination::Bytes(total_bytes) = flow.traffic.termination else {
+                                unreachable!("TCP validation requires byte termination")
+                            };
+                            let control = match algorithm {
+                                TcpAlgorithm::Reno => {
+                                    TcpCongestionControl::reno(flow.traffic.packet_size_bytes)
+                                }
+                                TcpAlgorithm::Cubic => {
+                                    TcpCongestionControl::cubic(flow.traffic.packet_size_bytes)
+                                }
+                            };
+                            FlowGeneratorKind::Tcp(TcpGenerator::new(
+                                total_bytes,
+                                flow.traffic.packet_size_bytes,
+                                40,
+                                control,
+                            ))
+                        }
+                        TrafficKind::Dcqcn(config) => {
+                            let Termination::Bytes(total_bytes) = flow.traffic.termination else {
+                                unreachable!("DCQCN validation requires byte termination")
+                            };
+                            let first_control_time_ns = flow
+                                .traffic
+                                .initial_delay_ns
+                                .checked_add(config.control_interval_ns)
+                                .expect("DCQCN lowering checked first control deadline");
+                            let controller = DcqcnController::new(
+                                DcqcnControllerConfig {
+                                    initial_rate_bps: config.initial_rate_bps,
+                                    minimum_rate_bps: config.minimum_rate_bps,
+                                    maximum_rate_bps: config.maximum_rate_bps,
+                                    additive_rate_bps: config.additive_rate_bps,
+                                    hyper_rate_bps: config.hyper_rate_bps,
+                                    g_ppb: config.g_ppb,
+                                    decrease_ppb: config.decrease_ppb,
+                                    cnp_interval_ns: config.cnp_interval_ns,
+                                    control_interval_ns: config.control_interval_ns,
+                                    increase_byte_threshold: config.increase_byte_threshold,
+                                },
+                                first_control_time_ns,
+                            )
+                            .expect("validated DCQCN controller configuration");
+                            FlowGeneratorKind::Dcqcn(DcqcnGenerator {
+                                rate: RateGenerator {
+                                    first_pacing_time_ns: flow.traffic.initial_delay_ns,
+                                    pacing_interval_ns: config.pacing_interval_ns,
+                                    packet_size_bytes: flow.traffic.packet_size_bytes,
+                                    total_bytes,
+                                    rate_numerator_bits_per_second: config.initial_rate_bps,
+                                    rate_denominator: 1,
+                                    credit_quanta: 0,
+                                },
+                                controller,
+                                control_timer_payload: dcqcn_control_payload
+                                    .expect("nonempty DCQCN lowering allocates a control token"),
+                                cnp_size_bytes: 64,
+                            })
+                        }
                     }
                 },
             });
@@ -1213,7 +1751,7 @@ fn lower(
             .then_with(|| left.2.cmp(&right.2))
     });
     let mut initial_events = Vec::with_capacity(initial_event_inputs.len());
-    for (source, time_ns, _, payload) in initial_event_inputs {
+    for (source, time_ns, _, payload, kind) in initial_event_inputs {
         let sequence = origin_sequences.entry(source).or_default();
         let origin_seq = *sequence;
         *sequence = sequence.checked_add(1).ok_or_else(|| {
@@ -1223,24 +1761,36 @@ fn lower(
         initial_events.push(Event {
             key: EventKey {
                 time_ns,
-                phase: event_phase(EventKind::PacketArrival),
+                phase: event_phase(kind),
                 origin_node,
                 origin_seq,
             },
             target: origin_node,
-            kind: EventKind::PacketArrival,
+            kind,
             payload,
         });
     }
     initial_events.sort_by_key(|event| event.key);
 
     let mut tcp_receivers_by_target = BTreeMap::<LpKey, Vec<TcpReceiverState>>::new();
+    let mut dcqcn_receivers_by_target = BTreeMap::<LpKey, Vec<DcqcnReceiverState>>::new();
     for (flow, descriptor) in flows.iter().zip(&flow_descriptors) {
         if matches!(flow.traffic.kind, TrafficKind::Tcp(_)) {
             tcp_receivers_by_target
                 .entry(LpKey::Host(flow.target))
                 .or_default()
                 .push(TcpReceiverState::new(descriptor.id, 40));
+        }
+        if let TrafficKind::Dcqcn(config) = flow.traffic.kind {
+            dcqcn_receivers_by_target
+                .entry(LpKey::Host(flow.target))
+                .or_default()
+                .push(DcqcnReceiverState {
+                    flow: descriptor.id,
+                    cnp_interval_ns: config.cnp_interval_ns,
+                    cnp_size_bytes: 64,
+                    last_cnp_time_ns: None,
+                });
         }
     }
 
@@ -1260,6 +1810,9 @@ fn lower(
                 tx_ready_pending: false,
                 generators: generators_by_source.remove(&node_key).unwrap_or_default(),
                 tcp_receivers: tcp_receivers_by_target
+                    .remove(&node_key)
+                    .unwrap_or_default(),
+                dcqcn_receivers: dcqcn_receivers_by_target
                     .remove(&node_key)
                     .unwrap_or_default(),
                 next_origin_seq: origin_sequences.get(&node_key).copied().unwrap_or(0),
@@ -1307,25 +1860,36 @@ fn lower(
         .collect::<Vec<_>>();
     let mut channel_keys = BTreeSet::<(LinkId, NodeId)>::new();
     let mut min_packet_size_by_link = BTreeMap::<LinkId, u64>::new();
-    let initial_payload_by_flow = initial_packets
-        .iter()
-        .map(|packet| (packet.flow, packet.id))
-        .collect::<BTreeMap<_, _>>();
     for (flow, input) in flow_descriptors.iter().zip(&flows) {
         if packet_count(&input.traffic) == 0 {
             continue;
         }
-        let payload = initial_payload_by_flow[&flow.id];
-        let data_min_size = if matches!(input.traffic.kind, TrafficKind::Tcp(_)) {
+        let data_min_size = if matches!(
+            input.traffic.kind,
+            TrafficKind::Tcp(_) | TrafficKind::Dcqcn(_)
+        ) {
             // Both controllers may fill the exact remaining congestion-window bytes, so even a
             // byte-aligned total/MSS pair can legally produce a one-byte intermediate segment.
             1
+        } else if input.collective.is_some() {
+            let Termination::Bytes(bytes) = input.traffic.termination else {
+                unreachable!("collective lowering requires byte termination")
+            };
+            let remainder = bytes % input.traffic.packet_size_bytes;
+            if remainder == 0 {
+                input.traffic.packet_size_bytes
+            } else {
+                remainder
+            }
         } else {
             input.traffic.packet_size_bytes
         };
         let mut routed_packets = vec![(flow.route.as_slice(), flow.target, data_min_size, "data")];
         if matches!(input.traffic.kind, TrafficKind::Tcp(_)) {
             routed_packets.push((flow.reverse_route.as_slice(), flow.source, 40, "ACK"));
+        }
+        if matches!(input.traffic.kind, TrafficKind::Dcqcn(_)) {
+            routed_packets.push((flow.reverse_route.as_slice(), flow.source, 64, "CNP"));
         }
         for (route, terminal, packet_size_bytes, direction) in routed_packets {
             for (index, link_id) in route.iter().enumerate() {
@@ -1337,8 +1901,8 @@ fn lower(
                 })?;
                 link.delay_ns(packet_size_bytes).map_err(|error| {
                     CompileError::Invalid(format!(
-                        "link {link_id:?} delay overflows for flow {:?} TCP {direction} packet {:?}: {error}",
-                        flow.id, payload
+                        "link {link_id:?} delay overflows for flow {:?} {direction} packet: {error}",
+                        flow.id
                     ))
                 })?;
                 let target = route
@@ -1379,12 +1943,20 @@ fn lower(
                         })
                         .or_insert(input.traffic.packet_size_bytes);
                 }
-                if matches!(input.traffic.kind, TrafficKind::Tcp(_)) {
+                if matches!(
+                    input.traffic.kind,
+                    TrafficKind::Tcp(_) | TrafficKind::Dcqcn(_)
+                ) {
                     for link_id in &descriptor.reverse_route {
+                        let feedback_size = if matches!(input.traffic.kind, TrafficKind::Tcp(_)) {
+                            40
+                        } else {
+                            64
+                        };
                         max_frame_by_link_priority
                             .entry((*link_id, priority))
-                            .and_modify(|maximum| *maximum = (*maximum).max(40))
-                            .or_insert(40);
+                            .and_modify(|maximum| *maximum = (*maximum).max(feedback_size))
+                            .or_insert(feedback_size);
                     }
                 }
             }
@@ -1398,7 +1970,10 @@ fn lower(
                 }
                 monitored_paths.insert((controlled.id, downstream));
             }
-            if matches!(input.traffic.kind, TrafficKind::Tcp(_)) {
+            if matches!(
+                input.traffic.kind,
+                TrafficKind::Tcp(_) | TrafficKind::Dcqcn(_)
+            ) {
                 for pair in descriptor.reverse_route.windows(2) {
                     let controlled = links[pair[0].0 as usize];
                     let downstream = links[pair[1].0 as usize].source;
@@ -1505,12 +2080,14 @@ fn lower(
 fn canonical_flows(
     mut explicit: Vec<ExplicitFlowKey>,
     mut flow_sets: Vec<FlowSetKey>,
+    mut collectives: Vec<CollectiveKey>,
     hosts: &BTreeSet<u64>,
     host_attachments: &HostAttachments,
     seed: u64,
 ) -> Result<Vec<FlowInput>, CompileError> {
     explicit.sort();
     flow_sets.sort();
+    collectives.sort();
 
     let mut flows = Vec::new();
     flows
@@ -1538,6 +2115,7 @@ fn canonical_flows(
             target: semantic.target,
             priority: semantic.priority,
             traffic: semantic.traffic,
+            collective: None,
         });
     }
 
@@ -1583,12 +2161,190 @@ fn canonical_flows(
                 target,
                 priority: semantic.priority,
                 traffic: semantic.traffic.clone(),
+                collective: None,
             });
         }
     }
 
+    let mut collective_duplicates = BTreeMap::<CollectiveKey, u64>::new();
+    let mut next_collective_id = 0_u64;
+    for mut semantic in collectives {
+        if semantic.sources.is_empty() {
+            let participants = hosts.iter().copied().collect::<Vec<_>>();
+            if participants.len() != semantic.flow_count as usize {
+                return Err(CompileError::Invalid(format!(
+                    "collective flow_count {} must match the {} configured hosts when sources/sinks are omitted",
+                    semantic.flow_count,
+                    participants.len()
+                )));
+            }
+            semantic.sources.clone_from(&participants);
+            semantic.sinks = participants
+                .iter()
+                .cycle()
+                .skip(1)
+                .take(participants.len())
+                .copied()
+                .collect();
+        }
+        for participant in semantic.sources.iter().chain(&semantic.sinks) {
+            if !hosts.contains(participant) {
+                return Err(CompileError::Invalid(format!(
+                    "collective participant {participant} must be a configured host attachment"
+                )));
+            }
+        }
+        let unique = semantic.sources.iter().copied().collect::<BTreeSet<_>>();
+        if unique.len() != semantic.sources.len() {
+            return Err(CompileError::Invalid(
+                "collective ring participants must be unique".to_owned(),
+            ));
+        }
+
+        let duplicate = collective_duplicates.entry(semantic.clone()).or_default();
+        let duplicate_ordinal = *duplicate;
+        *duplicate = duplicate.checked_add(1).ok_or_else(|| {
+            CompileError::Invalid("duplicate collective ordinal overflow".to_owned())
+        })?;
+        let collective_id = next_collective_id;
+        next_collective_id = next_collective_id
+            .checked_add(1)
+            .ok_or_else(|| CompileError::Invalid("collective identity exceeds u64".to_owned()))?;
+        expand_collective(&mut flows, semantic, duplicate_ordinal, collective_id)?;
+    }
+
     flows.sort_by(|left, right| left.key.cmp(&right.key));
     Ok(flows)
+}
+
+fn collective_chunk_bounds(total: u64, group_size: u64, owner: u64) -> (u64, u64) {
+    let base = total / group_size;
+    let offset = owner * base;
+    let bytes = if owner + 1 == group_size {
+        total - offset
+    } else {
+        base
+    };
+    (offset, bytes)
+}
+
+fn expand_collective(
+    flows: &mut Vec<FlowInput>,
+    semantic: CollectiveKey,
+    duplicate_ordinal: u64,
+    collective_id: u64,
+) -> Result<(), CompileError> {
+    let n = semantic.flow_count;
+    let stage_count = match semantic.algorithm {
+        CollectiveAlgorithm::RingAllReduce => {
+            n.checked_mul(n - 1).and_then(|count| count.checked_mul(2))
+        }
+        CollectiveAlgorithm::AllGather => n.checked_mul(n - 1),
+    }
+    .ok_or_else(|| CompileError::Invalid("collective stage count exceeds u64".to_owned()))?;
+    flows
+        .try_reserve_exact(usize::try_from(stage_count).map_err(|_| {
+            CompileError::Invalid(
+                "collective stage count exceeds the platform index domain".to_owned(),
+            )
+        })?)
+        .map_err(|error| {
+            CompileError::Invalid(format!("collective stage table is too large: {error}"))
+        })?;
+    let Termination::Bytes(total_bytes) = semantic.traffic.termination else {
+        unreachable!("collective validation requires byte termination")
+    };
+    u32::try_from(n)
+        .map_err(|_| CompileError::Invalid("collective group size exceeds u32".to_owned()))?;
+    let phases: &[CollectivePhase] = match semantic.algorithm {
+        CollectiveAlgorithm::RingAllReduce => {
+            &[CollectivePhase::ReduceScatter, CollectivePhase::AllGather]
+        }
+        CollectiveAlgorithm::AllGather => &[CollectivePhase::AllGather],
+    };
+    let final_step = u32::try_from(n - 1)
+        .map_err(|_| CompileError::Invalid("collective step exceeds u32".to_owned()))?;
+
+    for &phase in phases {
+        for rank_u64 in 0..n {
+            let rank = u32::try_from(rank_u64)
+                .map_err(|_| CompileError::Invalid("collective rank exceeds u32".to_owned()))?;
+            let previous_rank = u32::try_from((rank_u64 + n - 1) % n)
+                .expect("rank is below validated u32 group size");
+            for step_u64 in 1..n {
+                let step = u32::try_from(step_u64)
+                    .map_err(|_| CompileError::Invalid("collective step exceeds u32".to_owned()))?;
+                let standalone_gather = semantic.algorithm == CollectiveAlgorithm::AllGather;
+                let owner = match phase {
+                    CollectivePhase::ReduceScatter => (rank_u64 + n - step_u64 + 1) % n,
+                    CollectivePhase::AllGather if standalone_gather => {
+                        (rank_u64 + n - step_u64 + 1) % n
+                    }
+                    CollectivePhase::AllGather => (rank_u64 + n - step_u64 + 2) % n,
+                };
+                let (chunk_offset_bytes, chunk_bytes) =
+                    collective_chunk_bounds(total_bytes, n, owner);
+                let position = CollectiveStagePosition { phase, rank, step };
+                let local_predecessor = if step > 1 {
+                    Some(CollectiveStagePosition {
+                        phase,
+                        rank,
+                        step: step - 1,
+                    })
+                } else if semantic.algorithm == CollectiveAlgorithm::RingAllReduce
+                    && phase == CollectivePhase::AllGather
+                {
+                    Some(CollectiveStagePosition {
+                        phase: CollectivePhase::ReduceScatter,
+                        rank,
+                        step: final_step,
+                    })
+                } else {
+                    None
+                };
+                let inbound_predecessor = if step > 1 {
+                    Some(CollectiveStagePosition {
+                        phase,
+                        rank: previous_rank,
+                        step: step - 1,
+                    })
+                } else if semantic.algorithm == CollectiveAlgorithm::RingAllReduce
+                    && phase == CollectivePhase::AllGather
+                {
+                    Some(CollectiveStagePosition {
+                        phase: CollectivePhase::ReduceScatter,
+                        rank: previous_rank,
+                        step: final_step,
+                    })
+                } else {
+                    None
+                };
+                let mut traffic = semantic.traffic.clone();
+                traffic.termination = Termination::Bytes(chunk_bytes);
+                flows.push(FlowInput {
+                    key: FlowKey::CollectiveStage {
+                        semantic: semantic.clone(),
+                        duplicate_ordinal,
+                        stage: position,
+                    },
+                    source: semantic.sources[rank_u64 as usize],
+                    target: semantic.sinks[rank_u64 as usize],
+                    priority: semantic.priority,
+                    traffic,
+                    collective: Some(CollectiveStageInput {
+                        collective_id,
+                        position,
+                        chunk_offset_bytes,
+                        chunk_bytes,
+                        local_predecessor,
+                        inbound_predecessor,
+                        inbound_predecessor_bytes: chunk_bytes,
+                    }),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_input_bounds(flows: &[FlowInput]) -> Result<(), CompileError> {
@@ -1606,17 +2362,17 @@ fn validate_input_bounds(flows: &[FlowInput]) -> Result<(), CompileError> {
         let count = packet_count(&flow.traffic);
         if matches!(flow.traffic.kind, TrafficKind::Tcp(_)) {
             let Termination::Bytes(total_bytes) = flow.traffic.termination else {
-                unreachable!("TCP validation requires byte termination")
+                unreachable!("closed-loop validation requires byte termination")
             };
             flow.traffic
                 .packet_size_bytes
                 .checked_mul(count)
                 .ok_or_else(|| {
-                    CompileError::Invalid("TCP segment input count overflow".to_owned())
+                    CompileError::Invalid("closed-loop segment input count overflow".to_owned())
                 })?;
             if total_bytes == 0 {
                 return Err(CompileError::Invalid(
-                    "TCP traffic `size` must be positive".to_owned(),
+                    "closed-loop traffic `size` must be positive".to_owned(),
                 ));
             }
             continue;
@@ -1654,9 +2410,9 @@ fn validate_input_bounds(flows: &[FlowInput]) -> Result<(), CompileError> {
 }
 
 fn packet_count(traffic: &TrafficKey) -> u64 {
-    if matches!(traffic.kind, TrafficKind::Tcp(_)) {
+    if matches!(traffic.kind, TrafficKind::Tcp(_) | TrafficKind::Dcqcn(_)) {
         let Termination::Bytes(bytes) = traffic.termination else {
-            unreachable!("TCP validation requires byte termination")
+            unreachable!("closed-loop validation requires byte termination")
         };
         return bytes.div_ceil(traffic.packet_size_bytes);
     }
@@ -1717,6 +2473,19 @@ fn generator_seed(image_seed: u64, key: &FlowKey) -> u64 {
             state = mix_seed(state ^ source);
             state = mix_seed(state ^ target);
         }
+        FlowKey::CollectiveStage {
+            semantic,
+            duplicate_ordinal,
+            stage,
+        } => {
+            state = mix_seed(state ^ 0x434f_4c4c_4543_5449);
+            state = mix_seed(state ^ semantic.flow_count);
+            state = mix_seed(state ^ duplicate_ordinal);
+            state = mix_seed(state ^ u64::from(stage.phase as u8));
+            state = mix_seed(state ^ u64::from(stage.rank));
+            state = mix_seed(state ^ u64::from(stage.step));
+            state = mix_traffic_seed(state, &semantic.traffic);
+        }
     }
     state
 }
@@ -1739,6 +2508,26 @@ fn mix_traffic_seed(mut state: u64, traffic: &TrafficKey) -> u64 {
         TrafficKind::Constant => state,
         TrafficKind::Tcp(TcpAlgorithm::Reno) => mix_seed(state ^ 0x5450_435f_5245_4e4f),
         TrafficKind::Tcp(TcpAlgorithm::Cubic) => mix_seed(state ^ 0x5450_435f_4355_4249),
+        TrafficKind::Dcqcn(dcqcn) => {
+            state = mix_seed(state ^ 0x4443_5143_4e00_0000);
+            for value in [
+                dcqcn.initial_rate_bps,
+                dcqcn.minimum_rate_bps,
+                dcqcn.maximum_rate_bps,
+                dcqcn.additive_rate_bps,
+                dcqcn.hyper_rate_bps,
+                dcqcn.g_ppb,
+                dcqcn.decrease_ppb,
+                dcqcn.cnp_interval_ns,
+                dcqcn.control_interval_ns,
+                dcqcn.pacing_interval_ns,
+                u64::from(dcqcn.cnp_priority),
+                dcqcn.increase_byte_threshold,
+            ] {
+                state = mix_seed(state ^ value);
+            }
+            state
+        }
     }
 }
 

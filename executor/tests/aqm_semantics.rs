@@ -8,6 +8,10 @@ use days_executor::{
     SimulationImage, SwitchQueueState, SwitchState, aqm_transitions_csv, event_phase,
     run_cpu_with_observations, run_scalar_with_observations, validate,
 };
+#[cfg(feature = "cuda")]
+use days_executor::{CudaConfig, run_cuda_with_observations};
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+use days_executor::{MetalConfig, run_metal_with_observations};
 
 const SOURCE: NodeId = NodeId(0);
 const SWITCH: NodeId = NodeId(1);
@@ -81,6 +85,7 @@ fn aqm_image(policy: DropMarkPolicy, packet_sizes: &[u64]) -> SimulationImage {
                 tx_ready_pending: false,
                 generators: vec![],
                 tcp_receivers: vec![],
+                dcqcn_receivers: vec![],
                 next_origin_seq: packet_sizes.len() as u64,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -94,6 +99,7 @@ fn aqm_image(policy: DropMarkPolicy, packet_sizes: &[u64]) -> SimulationImage {
                 tx_ready_pending: false,
                 generators: vec![],
                 tcp_receivers: vec![],
+                dcqcn_receivers: vec![],
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -385,9 +391,9 @@ fn aqm_certificate_records_enqueue_mark_and_drop_with_exact_state() {
     assert!(rows[3].ends_with(",mark"));
     assert!(rows[4].ends_with(",drop"));
 
-    let duplicate = result.aqm_transitions[0].clone();
+    let duplicate = result.aqm_transitions[0];
     assert_eq!(
-        aqm_transitions_csv(&[duplicate.clone(), duplicate])
+        aqm_transitions_csv(&[duplicate, duplicate])
             .expect_err("duplicate canonical transition keys must be rejected")
             .duplicate_key,
         result.aqm_transitions[0].key
@@ -632,54 +638,159 @@ fn aqm_checkpoint_and_cpu_worker_matrix_match_scalar() {
 }
 
 #[test]
-fn device_backends_reject_each_aqm_policy_exactly() {
-    let cases = [
-        (
-            DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
-                unit: QueueDepthUnit::Packets,
-                capacity: 4,
-                threshold: 2,
-            }),
-            "ECN threshold marking",
-        ),
-        (
-            DropMarkPolicy::Red(RedPolicyState {
-                unit: QueueDepthUnit::Packets,
-                capacity: 4,
-                min_threshold: 1,
-                max_threshold: 3,
-                max_probability_numerator: 1,
-                max_probability_denominator: 2,
-                average_scaled: 0,
-                counter: 0,
-                mark_ecn: false,
-            }),
-            "RED admission",
-        ),
-    ];
-
-    for (policy, feature) in cases {
-        let image = aqm_image(policy, &[1]);
-        for backend in [Backend::Metal, Backend::Cuda] {
-            assert_eq!(
-                validate(&image, backend)
-                    .expect_err("device backend must reject AQM before packing")
-                    .to_string(),
-                format!("backend {backend} does not support {feature}; use Scalar or Cpu")
-            );
-        }
+fn device_backends_accept_ecn_and_reject_red_exactly() {
+    let ecn = aqm_image(
+        DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
+            unit: QueueDepthUnit::Packets,
+            capacity: 4,
+            threshold: 2,
+        }),
+        &[1],
+    );
+    let red = aqm_image(
+        DropMarkPolicy::Red(RedPolicyState {
+            unit: QueueDepthUnit::Packets,
+            capacity: 4,
+            min_threshold: 1,
+            max_threshold: 3,
+            max_probability_numerator: 1,
+            max_probability_denominator: 2,
+            average_scaled: 0,
+            counter: 0,
+            mark_ecn: false,
+        }),
+        &[1],
+    );
+    for backend in [Backend::Metal, Backend::Cuda] {
+        validate(&ecn, backend)
+            .unwrap_or_else(|error| panic!("{backend} must accept deterministic ECN: {error}"));
+        assert_eq!(
+            validate(&red, backend)
+                .expect_err("device backend must retain the RED capability rejection")
+                .to_string(),
+            format!("backend {backend} does not support RED admission; use Scalar or Cpu")
+        );
     }
 
     let mut marked_packet = aqm_image(DropMarkPolicy::TailDrop, &[1]);
     marked_packet.initial_packets[0].ecn_marked = true;
     for backend in [Backend::Metal, Backend::Cuda] {
-        assert_eq!(
-            validate(&marked_packet, backend)
-                .expect_err("the device packet plane must reject retained ECN marks")
-                .to_string(),
-            format!(
-                "backend {backend} does not support the ECN-marked packet plane; use Scalar or Cpu"
-            )
-        );
+        validate(&marked_packet, backend)
+            .unwrap_or_else(|error| panic!("{backend} must retain ECN packet marks: {error}"));
+    }
+}
+
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn adversarial_device_ecn_images() -> Vec<SimulationImage> {
+    let packet_threshold = aqm_image(
+        DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
+            unit: QueueDepthUnit::Packets,
+            capacity: 2,
+            threshold: 2,
+        }),
+        &[1, 1, 1, 1],
+    );
+    let mut byte_threshold = aqm_image(
+        DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
+            unit: QueueDepthUnit::Bytes,
+            capacity: 8,
+            threshold: 5,
+        }),
+        &[1, 2, 3],
+    );
+    byte_threshold.switch_states[0].queues[0].queue_capacity_packets = 1;
+    let overflow = hidden_byte_overflow_image(DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
+        unit: QueueDepthUnit::Bytes,
+        capacity: u64::MAX,
+        threshold: u64::MAX,
+    }));
+    let mut retained_mark = aqm_image(DropMarkPolicy::TailDrop, &[1, 1]);
+    retained_mark.initial_packets[0].ecn_marked = true;
+    let prefix = run_scalar_with_observations(&byte_threshold, Some(7), ObservationMode::Full)
+        .expect("ECN checkpoint prefix must execute");
+    let checkpoint = checkpoint_image(&byte_threshold, &prefix);
+    vec![
+        packet_threshold,
+        byte_threshold,
+        overflow,
+        retained_mark,
+        checkpoint,
+    ]
+}
+
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn without_mechanism_transitions(mut result: RunResult) -> RunResult {
+    result.aqm_transitions.clear();
+    result.mechanism_transitions.clear();
+    result
+}
+
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[test]
+fn metal_ecn_threshold_and_persistent_marks_match_scalar() {
+    for (image_index, image) in adversarial_device_ecn_images().into_iter().enumerate() {
+        for horizon in [Some(7), None] {
+            let expected = without_mechanism_transitions(
+                run_scalar_with_observations(&image, horizon, ObservationMode::Full).unwrap(),
+            );
+            for streams_enabled in [true, false] {
+                for round_threads_per_threadgroup in [32, 256] {
+                    let actual = run_metal_with_observations(
+                        &image,
+                        horizon,
+                        MetalConfig {
+                            streams_enabled,
+                            round_threads_per_threadgroup,
+                            ..MetalConfig::default()
+                        },
+                        ObservationMode::Full,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "image={image_index} horizon={horizon:?} streams={streams_enabled} geometry={round_threads_per_threadgroup}: {error}"
+                        )
+                    });
+                    assert_eq!(actual.result, expected);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_ecn_threshold_and_persistent_marks_match_scalar() {
+    for image in adversarial_device_ecn_images() {
+        for horizon in [Some(7), None] {
+            let expected = without_mechanism_transitions(
+                run_scalar_with_observations(&image, horizon, ObservationMode::Full).unwrap(),
+            );
+            for streams_enabled in [true, false] {
+                for round_threads_per_block in [32, 256] {
+                    let actual = run_cuda_with_observations(
+                        &image,
+                        horizon,
+                        CudaConfig {
+                            streams_enabled,
+                            round_threads_per_block,
+                            ..CudaConfig::default()
+                        },
+                        ObservationMode::Full,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "horizon={horizon:?} streams={streams_enabled} geometry={round_threads_per_block}: {error}"
+                        )
+                    });
+                    assert_eq!(actual.result, expected);
+                }
+            }
+        }
     }
 }

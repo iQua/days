@@ -7,6 +7,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use num_bigint::BigUint;
+
 use crate::device_scheduler::device_scheduler_word_count;
 use crate::{
     EventKind, FlowGeneratorKind, GeneratorStatus, LinkId, NodeKind, PacketKind, SimulationImage,
@@ -107,6 +109,123 @@ pub struct DeviceSizingReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceSizingError(String);
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RateDeviceWork {
+    pub pacing_ticks: usize,
+    pub packets: usize,
+    pub payload_allocations: usize,
+}
+
+pub(crate) fn rate_device_work(
+    image: &SimulationImage,
+    generator: &crate::FlowGeneratorState,
+    rate: crate::RateGenerator,
+) -> Result<RateDeviceWork, DeviceSizingError> {
+    if !matches!(
+        generator.next_emission.status,
+        GeneratorStatus::Scheduled | GeneratorStatus::Blocked
+    ) || generator.bytes_emitted >= rate.total_bytes
+        || generator.next_emission.departure_time_ns > image.stop_time_ns
+    {
+        return Ok(RateDeviceWork::default());
+    }
+    let available_ticks = BigUint::from(
+        1 + (image.stop_time_ns - generator.next_emission.departure_time_ns)
+            / rate.pacing_interval_ns,
+    );
+    let credit = BigUint::from(rate.credit_quanta);
+    let tick =
+        BigUint::from(rate.rate_numerator_bits_per_second) * BigUint::from(rate.pacing_interval_ns);
+    let scale = BigUint::from(rate.rate_denominator) * BigUint::from(1_000_000_000_u64);
+    let remaining = rate.total_bytes - generator.bytes_emitted;
+    let full_packets = (remaining - 1) / rate.packet_size_bytes;
+    let last_size = remaining - full_packets * rate.packet_size_bytes;
+    let full_cost = BigUint::from(rate.packet_size_bytes) * BigUint::from(8_u8) * &scale;
+    let last_cost = BigUint::from(last_size) * BigUint::from(8_u8) * &scale;
+
+    fn ceil_deficit(deficit: BigUint, tick: &BigUint) -> BigUint {
+        if deficit == BigUint::from(0_u8) {
+            BigUint::from(0_u8)
+        } else {
+            (deficit + tick - BigUint::from(1_u8)) / tick
+        }
+    }
+    fn sub_floor(left: BigUint, right: &BigUint) -> BigUint {
+        if left > *right {
+            left - right
+        } else {
+            BigUint::from(0_u8)
+        }
+    }
+    fn full_by_ticks(
+        ticks: &BigUint,
+        full_packets: u64,
+        credit: &BigUint,
+        tick: &BigUint,
+        cost: &BigUint,
+    ) -> BigUint {
+        let by_credit = (credit + ticks * tick) / cost;
+        by_credit
+            .min(ticks.clone())
+            .min(BigUint::from(full_packets))
+    }
+    fn packet_count(
+        ticks: &BigUint,
+        full_packets: u64,
+        credit: &BigUint,
+        tick: &BigUint,
+        full_cost: &BigUint,
+        last_cost: &BigUint,
+    ) -> BigUint {
+        let full = full_by_ticks(ticks, full_packets, credit, tick, full_cost);
+        if full < BigUint::from(full_packets) {
+            return full;
+        }
+        let full_count = BigUint::from(full_packets);
+        let full_deficit = sub_floor(&full_count * full_cost, credit);
+        let ticks_for_full = full_count.clone().max(ceil_deficit(full_deficit, tick));
+        let credit_after_full = credit + &ticks_for_full * tick - &full_count * full_cost;
+        let last_deficit = sub_floor(last_cost.clone(), &credit_after_full);
+        let extra = BigUint::from(1_u8).max(ceil_deficit(last_deficit, tick));
+        full_count + BigUint::from(u8::from(ticks_for_full + extra <= *ticks))
+    }
+
+    let packets = packet_count(
+        &available_ticks,
+        full_packets,
+        &credit,
+        &tick,
+        &full_cost,
+        &last_cost,
+    );
+    let prior_ticks = sub_floor(available_ticks.clone(), &BigUint::from(1_u8));
+    let payload_allocations = packet_count(
+        &prior_ticks,
+        full_packets,
+        &credit,
+        &tick,
+        &full_cost,
+        &last_cost,
+    )
+    .min(BigUint::from(full_packets));
+    let all_packets = BigUint::from(full_packets + 1);
+    let pacing_ticks = if packets == all_packets {
+        let full_count = BigUint::from(full_packets);
+        let full_deficit = sub_floor(&full_count * &full_cost, &credit);
+        let ticks_for_full = full_count.clone().max(ceil_deficit(full_deficit, &tick));
+        let credit_after_full = &credit + &ticks_for_full * &tick - &full_count * &full_cost;
+        let last_deficit = sub_floor(last_cost, &credit_after_full);
+        ticks_for_full + BigUint::from(1_u8).max(ceil_deficit(last_deficit, &tick))
+    } else {
+        available_ticks
+    };
+    Ok(RateDeviceWork {
+        pacing_ticks: pacing_ticks.try_into().unwrap_or(usize::MAX),
+        packets: packets.try_into().unwrap_or(usize::MAX),
+        payload_allocations: payload_allocations.try_into().unwrap_or(usize::MAX),
+    })
+}
+
 impl fmt::Display for DeviceSizingError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
@@ -183,6 +302,7 @@ pub fn size_default_device_plan(
                 if let Some(limit) = state
                     .queues
                     .first()
+                    .filter(|queue| matches!(queue.drop_mark, crate::DropMarkPolicy::TailDrop))
                     .map(|queue| queue.queue_capacity_packets)
                     .filter(|limit| *limit != 0)
                 {
@@ -378,6 +498,36 @@ impl CapacityContext {
                             generator_intervals[index].push(rate.pacing_interval_ns);
                         }
                     }
+                    FlowGeneratorKind::Collective(collective) => {
+                        let remaining = collective
+                            .chunk_bytes
+                            .saturating_sub(generator.bytes_emitted);
+                        let tail = remaining % collective.packet_size_bytes;
+                        let minimum = if tail == 0 {
+                            collective.packet_size_bytes.min(remaining.max(1))
+                        } else {
+                            tail
+                        };
+                        minimum_data_sizes[index] = minimum_data_sizes[index].min(minimum);
+                        if matches!(
+                            generator.next_emission.status,
+                            GeneratorStatus::Scheduled | GeneratorStatus::Blocked
+                        ) {
+                            generator_intervals[index].push(collective.interval_ns);
+                        }
+                    }
+                    FlowGeneratorKind::Dcqcn(dcqcn) => {
+                        minimum_data_sizes[index] =
+                            minimum_data_sizes[index].min(dcqcn.rate.packet_size_bytes);
+                        minimum_feedback_sizes[index] =
+                            minimum_feedback_sizes[index].min(dcqcn.cnp_size_bytes);
+                        if matches!(
+                            generator.next_emission.status,
+                            GeneratorStatus::Scheduled | GeneratorStatus::Blocked
+                        ) {
+                            generator_intervals[index].push(dcqcn.rate.pacing_interval_ns);
+                        }
+                    }
                 }
             }
         }
@@ -386,9 +536,11 @@ impl CapacityContext {
                 PacketKind::Data | PacketKind::TcpData(_) => {
                     &mut minimum_data_sizes[packet.flow.0 as usize]
                 }
-                PacketKind::Feedback | PacketKind::TcpAck(_) | PacketKind::Pfc(_) => {
-                    &mut minimum_feedback_sizes[packet.flow.0 as usize]
-                }
+                PacketKind::Feedback
+                | PacketKind::TcpAck(_)
+                | PacketKind::Pfc(_)
+                | PacketKind::DcqcnCnp(_) => &mut minimum_feedback_sizes[packet.flow.0 as usize],
+                PacketKind::DcqcnControlTimer => continue,
             };
             *minimum = (*minimum).min(packet.size_bytes);
         }
@@ -477,14 +629,45 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<Vec<usize>, DeviceSizin
                     counts[index] = counts[index].saturating_add(bound.saturating_mul(2));
                 }
                 FlowGeneratorKind::Rate(rate) => {
-                    if !matches!(
+                    let work = rate_device_work(image, generator, rate)?;
+                    let owns_timer_token = image.initial_events.iter().any(|event| {
+                        event.kind == EventKind::PacingTimer
+                            && event.target == image.flows[index].source
+                            && event.payload == generator.next_emission.payload
+                            && event.key.time_ns == generator.next_emission.departure_time_ns
+                    });
+                    if owns_timer_token {
+                        counts[index] = counts[index].saturating_sub(1);
+                    }
+                    counts[index] = counts[index].saturating_add(work.packets);
+                }
+                FlowGeneratorKind::Collective(collective) => {
+                    if matches!(
                         generator.next_emission.status,
                         GeneratorStatus::Finished | GeneratorStatus::Stopped
                     ) {
-                        let remaining = rate.total_bytes.saturating_sub(generator.bytes_emitted);
-                        counts[index] = counts[index]
-                            .saturating_add(remaining.div_ceil(rate.packet_size_bytes) as usize);
+                        continue;
                     }
+                    let remaining = collective
+                        .chunk_bytes
+                        .saturating_sub(generator.bytes_emitted);
+                    let packets = remaining.div_ceil(collective.packet_size_bytes) as usize;
+                    let resident =
+                        usize::from(generator.next_emission.status == GeneratorStatus::Scheduled);
+                    counts[index] = counts[index].saturating_add(packets.saturating_sub(resident));
+                }
+                FlowGeneratorKind::Dcqcn(dcqcn) => {
+                    if !matches!(
+                        generator.next_emission.status,
+                        GeneratorStatus::Scheduled | GeneratorStatus::Blocked
+                    ) || generator.bytes_emitted >= dcqcn.rate.total_bytes
+                    {
+                        continue;
+                    }
+                    let remaining = dcqcn.rate.total_bytes - generator.bytes_emitted;
+                    let count = remaining.div_ceil(dcqcn.rate.packet_size_bytes);
+                    counts[index] =
+                        counts[index].saturating_add(usize::try_from(count).unwrap_or(usize::MAX));
                 }
             }
         }
@@ -706,9 +889,11 @@ fn add_flow_route_capacities(
     let flow = &image.flows[flow_index];
     let (route, terminal) = match packet_kind {
         PacketKind::Data | PacketKind::TcpData(_) => (flow.route.as_slice(), flow.target),
-        PacketKind::Feedback | PacketKind::TcpAck(_) | PacketKind::Pfc(_) => {
-            (flow.reverse_route.as_slice(), flow.source)
-        }
+        PacketKind::Feedback
+        | PacketKind::TcpAck(_)
+        | PacketKind::Pfc(_)
+        | PacketKind::DcqcnCnp(_) => (flow.reverse_route.as_slice(), flow.source),
+        PacketKind::DcqcnControlTimer => return,
     };
     for index in 0..route.len() {
         let target = route
@@ -741,9 +926,11 @@ fn flow_link_serialization_ns(
 ) -> u64 {
     let minimum_size = match packet_kind {
         PacketKind::Data | PacketKind::TcpData(_) => context.minimum_data_sizes[flow_index],
-        PacketKind::Feedback | PacketKind::TcpAck(_) | PacketKind::Pfc(_) => {
-            context.minimum_feedback_sizes[flow_index]
-        }
+        PacketKind::Feedback
+        | PacketKind::TcpAck(_)
+        | PacketKind::Pfc(_)
+        | PacketKind::DcqcnCnp(_) => context.minimum_feedback_sizes[flow_index],
+        PacketKind::DcqcnControlTimer => return 0,
     };
     serialization_time_ns(minimum_size, image.links[link_id.0 as usize].rate_bps)
         .expect("lowered GPU image has positive finite serialization intervals")

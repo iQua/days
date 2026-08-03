@@ -309,7 +309,10 @@ fn smallest_width_via_load_fixture_lowers_and_truncates_pending_tail() {
             .fold(BTreeMap::new(), |mut counts, generator| {
                 let first_departure_ns = match generator.kind {
                     FlowGeneratorKind::Constant(constant) => constant.first_departure_ns,
-                    FlowGeneratorKind::Tcp(_) | FlowGeneratorKind::Rate(_) => {
+                    FlowGeneratorKind::Tcp(_)
+                    | FlowGeneratorKind::Rate(_)
+                    | FlowGeneratorKind::Collective(_)
+                    | FlowGeneratorKind::Dcqcn(_) => {
                         panic!("fixture uses constant generators")
                     }
                 };

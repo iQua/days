@@ -112,6 +112,7 @@ fn image(
                 tx_ready_pending: false,
                 generators: vec![],
                 tcp_receivers: vec![],
+                dcqcn_receivers: vec![],
                 next_origin_seq: packets.len() as u64,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -125,6 +126,7 @@ fn image(
                 tx_ready_pending: false,
                 generators: vec![],
                 tcp_receivers: vec![],
+                dcqcn_receivers: vec![],
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -407,21 +409,16 @@ fn drr_and_wrr_are_byte_identical_on_scalar_and_cpu() {
 }
 
 #[test]
-fn devices_reject_drr_and_wrr_before_packing() {
-    for (scheduler, expected) in [
-        (
-            SchedulerKind::deficit_round_robin(vec![1]),
-            "does not support DRR scheduling",
-        ),
-        (
-            SchedulerKind::weighted_round_robin(vec![1]),
-            "does not support WRR scheduling",
-        ),
+fn devices_accept_valid_drr_and_wrr_state() {
+    for scheduler in [
+        SchedulerKind::deficit_round_robin(vec![1]),
+        SchedulerKind::weighted_round_robin(vec![1]),
     ] {
         let image = image(scheduler, &[(0, 0, 1, 0)], 4);
         for backend in [Backend::Metal, Backend::Cuda] {
-            let error = validate(&image, backend).unwrap_err().to_string();
-            assert!(error.contains(expected), "{backend}: {error}");
+            validate(&image, backend).unwrap_or_else(|error| {
+                panic!("{backend} must accept the device scheduler state: {error}")
+            });
         }
     }
 }
@@ -763,6 +760,86 @@ fn adversarial_scheduler_images() -> [SimulationImage; 3] {
     ]
 }
 
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn adversarial_drr_wrr_images() -> [SimulationImage; 3] {
+    let mut drr_wrap = image(
+        SchedulerKind::deficit_round_robin(vec![2, 7, 2]),
+        &[(0, 2, 5, 0), (1, 0, 2, 0)],
+        16,
+    );
+    let SchedulerKind::DeficitRoundRobin(state) =
+        &mut drr_wrap.switch_states[0].queues[0].scheduler
+    else {
+        unreachable!()
+    };
+    state.deficits_bytes = vec![0, 6, 0];
+    state.current_class = 2;
+
+    let mut drr_skip = image(
+        SchedulerKind::deficit_round_robin(vec![1, 3]),
+        &[(0, 0, 1_000_000, 0), (1, 1, 5, 0)],
+        1_000_016,
+    );
+    let SchedulerKind::DeficitRoundRobin(state) =
+        &mut drr_skip.switch_states[0].queues[0].scheduler
+    else {
+        unreachable!()
+    };
+    state.current_class = 1;
+
+    let mut wrr = image(
+        SchedulerKind::weighted_round_robin(vec![2, 1, 3]),
+        &[(0, 2, 1, 0), (1, 1, 1, 0), (2, 2, 1, 0)],
+        16,
+    );
+    let SchedulerKind::WeightedRoundRobin(state) = &mut wrr.switch_states[0].queues[0].scheduler
+    else {
+        unreachable!()
+    };
+    state.packets_sent_in_round = vec![2, 0, 2];
+    state.current_class = 0;
+
+    [drr_wrap, drr_skip, wrr]
+}
+
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn drr_legal_maximum_image() -> SimulationImage {
+    let mut image = image(
+        SchedulerKind::deficit_round_robin(vec![1]),
+        &[(0, 0, u64::MAX, 0)],
+        1,
+    );
+    image.links[0].rate_bps = u64::MAX;
+    image.links[1].rate_bps = u64::MAX;
+    image.channels[0] = RemoteChannel::for_packet_link(image.links[0], 1).unwrap();
+    image.channels[1] = RemoteChannel::for_packet_link(image.links[1], 1).unwrap();
+    image
+}
+
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn wrr_legal_maximum_image() -> SimulationImage {
+    let mut image = image(
+        SchedulerKind::weighted_round_robin(vec![u64::MAX]),
+        &[(0, 0, 1, 0)],
+        1,
+    );
+    let SchedulerKind::WeightedRoundRobin(state) = &mut image.switch_states[0].queues[0].scheduler
+    else {
+        unreachable!()
+    };
+    state.packets_sent_in_round[0] = u64::MAX - 1;
+    image
+}
+
 #[test]
 fn cpu_is_byte_identical_for_adversarial_sp_wfq_and_in_service_checkpoints() {
     for image in adversarial_scheduler_images() {
@@ -892,6 +969,84 @@ fn metal_is_byte_identical_for_adversarial_sp_wfq_and_in_service_checkpoints() {
 
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 #[test]
+fn metal_drr_wrr_service_start_and_checkpoint_state_match_scalar() {
+    for image in adversarial_drr_wrr_images() {
+        for horizon in [Some(1), None] {
+            let expected =
+                run_scalar_with_observations(&image, horizon, ObservationMode::Summary).unwrap();
+            for streams_enabled in [true, false] {
+                for round_threads_per_threadgroup in [32, 256] {
+                    let actual = run_metal_with_observations(
+                        &image,
+                        horizon,
+                        MetalConfig {
+                            streams_enabled,
+                            round_threads_per_threadgroup,
+                            ..MetalConfig::default()
+                        },
+                        ObservationMode::Summary,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{} horizon={horizon:?} streams={streams_enabled} geometry={round_threads_per_threadgroup}: {error}",
+                            image.switch_states[0].queues[0].scheduler.label()
+                        )
+                    });
+                    assert_eq!(actual.result, expected);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[test]
+fn metal_drr_skips_the_exact_legal_maximum_round_count() {
+    let image = drr_legal_maximum_image();
+    validate(&image, Backend::Metal).expect("the maximum representable DRR round count is legal");
+    let result = run_metal_with_observations(
+        &image,
+        Some(1),
+        MetalConfig::default(),
+        ObservationMode::Summary,
+    )
+    .expect("the exact analytical skip must not iterate once per deficit round")
+    .result;
+    assert_eq!(
+        result.switch_states[0].queues[0].in_service,
+        Some(PayloadId(0))
+    );
+    let SchedulerKind::DeficitRoundRobin(state) = &result.switch_states[0].queues[0].scheduler
+    else {
+        unreachable!()
+    };
+    assert_eq!(state.deficits_bytes, [0]);
+    assert_eq!(state.current_class, 0);
+}
+
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[test]
+fn metal_wrr_restores_the_maximum_legal_counter() {
+    let image = wrr_legal_maximum_image();
+    validate(&image, Backend::Metal).expect("the maximum representable WRR counter is legal");
+    let result = run_metal_with_observations(
+        &image,
+        Some(1),
+        MetalConfig::default(),
+        ObservationMode::Summary,
+    )
+    .expect("the maximum legal WRR counter must not wrap")
+    .result;
+    let SchedulerKind::WeightedRoundRobin(state) = &result.switch_states[0].queues[0].scheduler
+    else {
+        unreachable!()
+    };
+    assert_eq!(state.packets_sent_in_round, [u64::MAX]);
+    assert_eq!(state.current_class, 0);
+}
+
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[test]
 fn metal_wfq_overflow_faults_instead_of_wrapping() {
     let image = wfq_overflow_checkpoint();
     validate(&image, Backend::Metal).expect("320-bit checkpoint must pass Metal pre-screening");
@@ -979,6 +1134,84 @@ fn cuda_is_byte_identical_for_adversarial_sp_wfq_and_in_service_checkpoints() {
             }
         }
     }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_drr_wrr_service_start_and_checkpoint_state_match_scalar() {
+    for image in adversarial_drr_wrr_images() {
+        for horizon in [Some(1), None] {
+            let expected =
+                run_scalar_with_observations(&image, horizon, ObservationMode::Summary).unwrap();
+            for streams_enabled in [true, false] {
+                for round_threads_per_block in [32, 256] {
+                    let actual = run_cuda_with_observations(
+                        &image,
+                        horizon,
+                        CudaConfig {
+                            streams_enabled,
+                            round_threads_per_block,
+                            ..CudaConfig::default()
+                        },
+                        ObservationMode::Summary,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{} horizon={horizon:?} streams={streams_enabled} geometry={round_threads_per_block}: {error}",
+                            image.switch_states[0].queues[0].scheduler.label()
+                        )
+                    });
+                    assert_eq!(actual.result, expected);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_drr_skips_the_exact_legal_maximum_round_count() {
+    let image = drr_legal_maximum_image();
+    validate(&image, Backend::Cuda).expect("the maximum representable DRR round count is legal");
+    let result = run_cuda_with_observations(
+        &image,
+        Some(1),
+        CudaConfig::default(),
+        ObservationMode::Summary,
+    )
+    .expect("the exact analytical skip must not iterate once per deficit round")
+    .result;
+    assert_eq!(
+        result.switch_states[0].queues[0].in_service,
+        Some(PayloadId(0))
+    );
+    let SchedulerKind::DeficitRoundRobin(state) = &result.switch_states[0].queues[0].scheduler
+    else {
+        unreachable!()
+    };
+    assert_eq!(state.deficits_bytes, [0]);
+    assert_eq!(state.current_class, 0);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_wrr_restores_the_maximum_legal_counter() {
+    let image = wrr_legal_maximum_image();
+    validate(&image, Backend::Cuda).expect("the maximum representable WRR counter is legal");
+    let result = run_cuda_with_observations(
+        &image,
+        Some(1),
+        CudaConfig::default(),
+        ObservationMode::Summary,
+    )
+    .expect("the maximum legal WRR counter must not wrap")
+    .result;
+    let SchedulerKind::WeightedRoundRobin(state) = &result.switch_states[0].queues[0].scheduler
+    else {
+        unreachable!()
+    };
+    assert_eq!(state.packets_sent_in_round, [u64::MAX]);
+    assert_eq!(state.current_class, 0);
 }
 
 #[cfg(feature = "cuda")]

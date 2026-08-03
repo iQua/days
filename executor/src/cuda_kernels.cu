@@ -45,7 +45,7 @@ constexpr uint RATIONAL_WORDS = 10;
 constexpr uint BIG_LIMBS = 10;
 constexpr uint WIDE_LIMBS = 16;
 constexpr uint PRODUCT_LIMBS = 20;
-constexpr uint SCHEDULER_NODE_WORDS = 25;
+constexpr uint SCHEDULER_NODE_WORDS = 29;
 constexpr uint SCHEDULER_CLASS_WORDS = 12;
 constexpr ulong NONE = 0xfffffffffffffffful;
 
@@ -119,6 +119,10 @@ constexpr uint S_QUEUE_TAG_OFFSET = 3;
 constexpr uint S_LAST_UPDATED = 4;
 constexpr uint S_VIRTUAL_TIME = 5;
 constexpr uint S_IN_SERVICE_TAG = 15;
+constexpr uint S_AQM_KIND = 25;
+constexpr uint S_AQM_UNIT = 26;
+constexpr uint S_AQM_CAPACITY = 27;
+constexpr uint S_AQM_THRESHOLD = 28;
 
 constexpr uint SC_VALUE = 0;
 constexpr uint SC_ACTIVE = 1;
@@ -138,6 +142,8 @@ constexpr uint PK_KIND = 10;
 constexpr uint PK_META_0 = 11;
 constexpr uint PK_META_1 = 12;
 constexpr uint PK_META_2 = 13;
+constexpr ulong PK_ECN_FLAG = 1ul << 63;
+constexpr ulong PK_KIND_MASK = ~PK_ECN_FLAG;
 
 constexpr ulong HOST = 0;
 constexpr ulong SWITCH = 1;
@@ -146,6 +152,7 @@ constexpr ulong TX_READY = 1;
 constexpr ulong TX_COMPLETE = 2;
 constexpr ulong REMOTE_ARRIVAL = 3;
 constexpr ulong RETRANSMISSION_TIMEOUT = 4;
+constexpr ulong PACING_TIMER = 5;
 constexpr ulong DATA_PACKET = 0;
 constexpr ulong FEEDBACK_PACKET = 1;
 constexpr ulong TCP_DATA_PACKET = 2;
@@ -153,6 +160,12 @@ constexpr ulong TCP_ACK_PACKET = 3;
 constexpr ulong SCHED_FIFO = 0;
 constexpr ulong SCHED_SP = 1;
 constexpr ulong SCHED_WFQ = 2;
+constexpr ulong SCHED_DRR = 3;
+constexpr ulong SCHED_WRR = 4;
+constexpr ulong AQM_TAILDROP = 0;
+constexpr ulong AQM_ECN = 1;
+constexpr ulong AQM_PACKETS = 0;
+constexpr ulong AQM_BYTES = 1;
 
 // Generator row ABI. Common words 0..10 and kind tag 11 are shared with the scalar image;
 // TCP owns words 12..30 and the controller tag/state at 31..42.
@@ -187,6 +200,14 @@ constexpr uint G_TCP_SRTT = 28;
 constexpr uint G_TCP_RTTVAR = 29;
 constexpr uint G_TCP_RTO = 30;
 constexpr uint G_CONTROL = 31;
+constexpr uint G_RATE_FIRST = 12;
+constexpr uint G_RATE_INTERVAL = 13;
+constexpr uint G_RATE_PACKET_SIZE = 14;
+constexpr uint G_RATE_TOTAL = 15;
+constexpr uint G_RATE_NUMERATOR = 16;
+constexpr uint G_RATE_DENOMINATOR = 17;
+constexpr uint G_RATE_CREDIT_LOW = 18;
+constexpr uint G_RATE_CREDIT_HIGH = 19;
 
 constexpr uint CTL_KIND = 0;
 constexpr uint CTL_MSS = 1;
@@ -989,6 +1010,36 @@ __device__ __forceinline__ bool queue_pop(
     return true;
 }
 
+__device__ __forceinline__ bool queue_remove_at(
+    ulong node,
+    ulong logical,
+    ulong *meta,
+    ulong *records,
+    ulong *record,
+    ulong &physical
+) {
+    ulong base = node * META_WORDS;
+    ulong offset = meta[base];
+    ulong capacity = meta[base + 1];
+    ulong head = meta[base + 2];
+    ulong count = meta[base + 3];
+    if (logical >= count) {
+        return false;
+    }
+    if (logical == 0) {
+        return queue_pop(node, meta, records, record, physical);
+    }
+    physical = (head + logical) % max(capacity, 1ul);
+    copy_device_to_thread(records, offset + physical, record);
+    for (ulong cursor = logical; cursor + 1 < count; ++cursor) {
+        ulong source = offset + (head + cursor + 1) % max(capacity, 1ul);
+        ulong target = offset + (head + cursor) % max(capacity, 1ul);
+        copy_device_record(records, source, records, target);
+    }
+    meta[base + 3] = count - 1;
+    return true;
+}
+
 __device__ __forceinline__ bool queue_front(
     ulong node,
     const ulong *meta,
@@ -1004,7 +1055,7 @@ __device__ __forceinline__ bool queue_front(
 }
 
 __device__ __forceinline__ ulong event_phase(ulong kind) {
-    if (kind == TX_COMPLETE || kind == RETRANSMISSION_TIMEOUT) {
+    if (kind == TX_COMPLETE || kind == RETRANSMISSION_TIMEOUT || kind == PACING_TIMER) {
         return 1;
     }
     if (kind == TX_READY) {
@@ -1350,6 +1401,82 @@ __device__ __forceinline__ bool emit_child(
 __device__ __forceinline__ bool checked_add(ulong left, ulong right, ulong &result) {
     result = left + right;
     return result >= left;
+}
+
+__device__ __forceinline__ bool u128_add(
+    ulong left_low, ulong left_high, ulong right_low, ulong right_high,
+    ulong &result_low, ulong &result_high
+) {
+    result_low = left_low + right_low;
+    ulong carry = result_low < left_low ? 1ul : 0ul;
+    result_high = left_high + right_high;
+    if (result_high < left_high || result_high > NONE - carry) {
+        return false;
+    }
+    result_high += carry;
+    return true;
+}
+
+__device__ __forceinline__ bool u128_mul_u64(
+    ulong left_low, ulong left_high, ulong right,
+    ulong &result_low, ulong &result_high
+) {
+    if (left_high != 0 && __umul64hi(left_high, right) != 0) {
+        return false;
+    }
+    result_low = left_low * right;
+    ulong low_high = __umul64hi(left_low, right);
+    ulong high_low = left_high * right;
+    if (low_high > NONE - high_low) {
+        return false;
+    }
+    result_high = low_high + high_low;
+    return true;
+}
+
+__device__ __forceinline__ bool u128_mul(
+    ulong left_low, ulong left_high, ulong right_low, ulong right_high,
+    ulong &result_low, ulong &result_high
+) {
+    if ((left_high != 0 && right_high != 0) ||
+        __umul64hi(left_low, right_high) != 0 || __umul64hi(left_high, right_low) != 0) {
+        return false;
+    }
+    result_low = left_low * right_low;
+    ulong high = __umul64hi(left_low, right_low);
+    ulong cross = left_low * right_high;
+    if (high > NONE - cross) {
+        return false;
+    }
+    high += cross;
+    cross = left_high * right_low;
+    if (high > NONE - cross) {
+        return false;
+    }
+    result_high = high + cross;
+    return true;
+}
+
+__device__ __forceinline__ bool u128_from_mul_u64(
+    ulong left, ulong right, ulong &result_low, ulong &result_high
+) {
+    result_low = left * right;
+    result_high = __umul64hi(left, right);
+    return true;
+}
+
+__device__ __forceinline__ bool u128_at_least(
+    ulong left_low, ulong left_high, ulong right_low, ulong right_high
+) {
+    return left_high > right_high || (left_high == right_high && left_low >= right_low);
+}
+
+__device__ __forceinline__ void u128_sub(
+    ulong left_low, ulong left_high, ulong right_low, ulong right_high,
+    ulong &result_low, ulong &result_high
+) {
+    result_low = left_low - right_low;
+    result_high = left_high - right_high - (left_low < right_low ? 1ul : 0ul);
 }
 
 __device__ __forceinline__ ulong saturating_add_u64(ulong left, ulong right) {
@@ -2057,6 +2184,268 @@ __device__ __forceinline__ bool scheduler_active_weight_sum(
     return true;
 }
 
+__device__ __forceinline__ bool scheduler_first_packet_for_class(
+    ulong node,
+    ulong class_count,
+    ulong class_index,
+    const ulong *queue_meta,
+    const ulong *queue_records,
+    ulong &position,
+    ulong &size
+) {
+    ulong meta_base = node * META_WORDS;
+    ulong offset = queue_meta[meta_base];
+    ulong capacity = queue_meta[meta_base + 1];
+    ulong head = queue_meta[meta_base + 2];
+    ulong count = queue_meta[meta_base + 3];
+    for (ulong logical = 0; logical < count; ++logical) {
+        ulong physical = (head + logical) % max(capacity, 1ul);
+        ulong record_base = (offset + physical) * EVENT_WORDS;
+        if (queue_records[record_base + PK_FLOW] % class_count == class_index) {
+            position = logical;
+            size = queue_records[record_base + PK_SIZE];
+            return true;
+        }
+    }
+    return false;
+}
+
+__device__ __forceinline__ bool drr_select_position(
+    ulong node,
+    ulong *error,
+    const ulong *queue_meta,
+    const ulong *queue_records,
+    ulong *scheduler_state,
+    ulong &position
+) {
+    ulong node_base = node * SCHEDULER_NODE_WORDS;
+    ulong class_count = scheduler_state[node_base + S_CLASS_COUNT];
+    ulong class_offset = scheduler_state[node_base + S_CLASS_OFFSET];
+    ulong current = scheduler_state[node_base + S_LAST_UPDATED];
+    if (class_count == 0 || current >= class_count) {
+        set_semantic_error(error, 33, node);
+        return false;
+    }
+
+    // First finish the scalar cursor's current, possibly partial, scan. No deficit is added
+    // until that scan wraps from the last class back to class zero.
+    for (ulong class_index = current; class_index < class_count; ++class_index) {
+        ulong size = 0;
+        ulong candidate = 0;
+        ulong class_base = class_offset + class_index * SCHEDULER_CLASS_WORDS;
+        ulong deficit = scheduler_state[class_base + SC_ACTIVE];
+        if (
+            scheduler_first_packet_for_class(
+                node,
+                class_count,
+                class_index,
+                queue_meta,
+                queue_records,
+                candidate,
+                size
+            ) &&
+            deficit > 0 &&
+            size <= deficit
+        ) {
+            scheduler_state[class_base + SC_ACTIVE] = deficit - size;
+            scheduler_state[node_base + S_LAST_UPDATED] = class_index;
+            position = candidate;
+            return true;
+        }
+    }
+
+    // After the first wrap, every nonempty class gains its quantum once per complete scan.
+    // Compute the first selectable round directly; this is exact even when it is u64::MAX.
+    ulong selected_class = NONE;
+    ulong selected_position = 0;
+    ulong selected_size = 0;
+    ulong minimum_rounds = NONE;
+    for (ulong class_index = 0; class_index < class_count; ++class_index) {
+        ulong candidate = 0;
+        ulong size = 0;
+        if (!scheduler_first_packet_for_class(
+            node,
+            class_count,
+            class_index,
+            queue_meta,
+            queue_records,
+            candidate,
+            size
+        )) {
+            continue;
+        }
+        ulong class_base = class_offset + class_index * SCHEDULER_CLASS_WORDS;
+        ulong quantum = scheduler_state[class_base + SC_VALUE];
+        ulong deficit = scheduler_state[class_base + SC_ACTIVE];
+        if (quantum == 0) {
+            set_semantic_error(error, 33, node);
+            return false;
+        }
+        ulong rounds = 1;
+        if (size > deficit) {
+            ulong needed = size - deficit;
+            rounds = needed / quantum;
+            if (needed % quantum != 0) {
+                rounds += 1;
+            }
+        }
+        if (selected_class == NONE || rounds < minimum_rounds) {
+            selected_class = class_index;
+            selected_position = candidate;
+            selected_size = size;
+            minimum_rounds = rounds;
+        }
+    }
+    if (selected_class == NONE) {
+        set_semantic_error(error, 33, node);
+        return false;
+    }
+
+    for (ulong class_index = 0; class_index < class_count; ++class_index) {
+        ulong ignored_position = 0;
+        ulong ignored_size = 0;
+        ulong class_base = class_offset + class_index * SCHEDULER_CLASS_WORDS;
+        if (!scheduler_first_packet_for_class(
+            node,
+            class_count,
+            class_index,
+            queue_meta,
+            queue_records,
+            ignored_position,
+            ignored_size
+        )) {
+            scheduler_state[class_base + SC_ACTIVE] = 0;
+            continue;
+        }
+        ulong quantum = scheduler_state[class_base + SC_VALUE];
+        ulong deficit = scheduler_state[class_base + SC_ACTIVE];
+        if (quantum == 0 || minimum_rounds > (NONE - deficit) / quantum) {
+            set_semantic_error(error, 33, node);
+            return false;
+        }
+        scheduler_state[class_base + SC_ACTIVE] = deficit + minimum_rounds * quantum;
+    }
+    ulong selected_base = class_offset + selected_class * SCHEDULER_CLASS_WORDS;
+    ulong selected_deficit = scheduler_state[selected_base + SC_ACTIVE];
+    if (selected_size > selected_deficit) {
+        set_semantic_error(error, 33, node);
+        return false;
+    }
+    scheduler_state[selected_base + SC_ACTIVE] = selected_deficit - selected_size;
+    scheduler_state[node_base + S_LAST_UPDATED] = selected_class;
+    position = selected_position;
+    return true;
+}
+
+__device__ __forceinline__ bool wrr_select_position(
+    ulong node,
+    ulong *error,
+    const ulong *queue_meta,
+    const ulong *queue_records,
+    ulong *scheduler_state,
+    ulong &position
+) {
+    ulong node_base = node * SCHEDULER_NODE_WORDS;
+    ulong class_count = scheduler_state[node_base + S_CLASS_COUNT];
+    ulong class_offset = scheduler_state[node_base + S_CLASS_OFFSET];
+    ulong current = scheduler_state[node_base + S_LAST_UPDATED];
+    if (class_count == 0 || current >= class_count) {
+        set_semantic_error(error, 34, node);
+        return false;
+    }
+    // One scan may reset exhausted nonempty classes; a second scan must then select one.
+    for (uint pass = 0; pass < 2; ++pass) {
+        for (ulong scanned = 0; scanned < class_count; ++scanned) {
+            ulong class_base = class_offset + current * SCHEDULER_CLASS_WORDS;
+            ulong weight = scheduler_state[class_base + SC_VALUE];
+            ulong sent = scheduler_state[class_base + SC_ACTIVE];
+            if (weight == 0 || sent > weight) {
+                set_semantic_error(error, 34, node);
+                return false;
+            }
+            ulong candidate = 0;
+            ulong ignored_size = 0;
+            if (
+                sent < weight &&
+                scheduler_first_packet_for_class(
+                    node,
+                    class_count,
+                    current,
+                    queue_meta,
+                    queue_records,
+                    candidate,
+                    ignored_size
+                )
+            ) {
+                scheduler_state[class_base + SC_ACTIVE] = sent + 1;
+                scheduler_state[node_base + S_LAST_UPDATED] = current;
+                position = candidate;
+                return true;
+            }
+            scheduler_state[class_base + SC_ACTIVE] = 0;
+            current = (current + 1) % class_count;
+            scheduler_state[node_base + S_LAST_UPDATED] = current;
+        }
+    }
+    set_semantic_error(error, 34, node);
+    return false;
+}
+
+__device__ __forceinline__ bool switch_admission_action(
+    ulong node,
+    const ulong *packet,
+    ulong taildrop_capacity,
+    ulong *error,
+    const ulong *queue_meta,
+    const ulong *queue_records,
+    const ulong *scheduler_state,
+    ulong &action
+) {
+    ulong scheduler_base = node * SCHEDULER_NODE_WORDS;
+    ulong policy = scheduler_state[scheduler_base + S_AQM_KIND];
+    ulong meta_base = node * META_WORDS;
+    ulong waiting = queue_meta[meta_base + 3];
+    if (policy == AQM_TAILDROP) {
+        action = taildrop_capacity != 0 && waiting >= taildrop_capacity ? 2 : 0;
+        return true;
+    }
+    if (policy != AQM_ECN) {
+        set_semantic_error(error, 58, node);
+        return false;
+    }
+
+    ulong capacity = scheduler_state[scheduler_base + S_AQM_CAPACITY];
+    ulong threshold = scheduler_state[scheduler_base + S_AQM_THRESHOLD];
+    ulong unit = scheduler_state[scheduler_base + S_AQM_UNIT];
+    if (capacity == 0 || threshold == 0 || threshold > capacity || unit > AQM_BYTES) {
+        set_semantic_error(error, 58, node);
+        return false;
+    }
+    ulong post_depth = waiting + 1;
+    if (unit == AQM_BYTES) {
+        ulong offset = queue_meta[meta_base];
+        ulong queue_capacity = queue_meta[meta_base + 1];
+        ulong head = queue_meta[meta_base + 2];
+        ulong queued_bytes = 0;
+        for (ulong logical = 0; logical < waiting; ++logical) {
+            ulong physical = (head + logical) % max(queue_capacity, 1ul);
+            ulong size = queue_records[(offset + physical) * EVENT_WORDS + PK_SIZE];
+            if (queued_bytes > NONE - size) {
+                action = 2;
+                return true;
+            }
+            queued_bytes += size;
+        }
+        if (queued_bytes > NONE - packet[PK_SIZE]) {
+            action = 2;
+            return true;
+        }
+        post_depth = queued_bytes + packet[PK_SIZE];
+    }
+    action = post_depth > capacity ? 2 : (post_depth >= threshold ? 1 : 0);
+    return true;
+}
+
 __device__ __forceinline__ void local_rational_zero(uint *numerator, uint *denominator) {
     big_clear(numerator, BIG_LIMBS);
     big_clear(denominator, BIG_LIMBS);
@@ -2447,7 +2836,8 @@ __device__ __forceinline__ bool flow_route(
     ulong &terminal
 ) {
     ulong flow_base = packet[PK_FLOW] * FLOW_WORDS;
-    if (packet[PK_KIND] == DATA_PACKET || packet[PK_KIND] == TCP_DATA_PACKET) {
+    ulong kind = packet[PK_KIND] & PK_KIND_MASK;
+    if (kind == DATA_PACKET || kind == TCP_DATA_PACKET) {
         offset = flows[flow_base + 2];
         length = flows[flow_base + 3];
         terminal = flows[flow_base + 1];
@@ -2985,6 +3375,147 @@ __device__ __forceinline__ bool dispatch_event(
     ulong role = node_state[node_base + N_KIND];
     ulong kind = event[E_KIND];
 
+    if (kind == PACING_TIMER && role == HOST) {
+        ulong flow = event[PK_FLOW];
+        ulong generator = flow * GENERATOR_WORDS;
+        if (flow >= params[P_FLOW_COUNT] || generators[generator + G_VALID] == 0 ||
+            generators[generator + G_OWNER] != node || generators[generator + G_KIND] != 2) {
+            return true;
+        }
+        ulong status = generators[generator + G_STATUS];
+        if ((status != 0 && status != 1) ||
+            generators[generator + G_PAYLOAD] != event[E_PAYLOAD] ||
+            generators[generator + G_DEPARTURE] != event[E_TIME]) {
+            return true;
+        }
+
+        ulong scale_low;
+        ulong scale_high;
+        ulong tick_low;
+        ulong tick_high;
+        ulong bits_low = event[PK_SIZE] << 3;
+        ulong bits_high = event[PK_SIZE] >> 61;
+        ulong cost_low;
+        ulong cost_high;
+        if (!u128_from_mul_u64(
+                generators[generator + G_RATE_DENOMINATOR], 1000000000ul,
+                scale_low, scale_high) ||
+            !u128_from_mul_u64(
+                generators[generator + G_RATE_NUMERATOR],
+                generators[generator + G_RATE_INTERVAL], tick_low, tick_high) ||
+            !u128_mul(bits_low, bits_high, scale_low, scale_high, cost_low, cost_high)) {
+            set_semantic_error(error, 59, node);
+            return false;
+        }
+        ulong credit_low;
+        ulong credit_high;
+        if (!u128_add(
+                generators[generator + G_RATE_CREDIT_LOW],
+                generators[generator + G_RATE_CREDIT_HIGH], tick_low, tick_high,
+                credit_low, credit_high)) {
+            set_semantic_error(error, 59, node);
+            return false;
+        }
+        bool emitted = u128_at_least(credit_low, credit_high, cost_low, cost_high);
+        if (emitted) {
+            u128_sub(credit_low, credit_high, cost_low, cost_high, credit_low, credit_high);
+            if (generators[generator + G_PACKETS] == NONE ||
+                generators[generator + G_BYTES] > NONE - event[PK_SIZE] ||
+                node_state[node_base + N_COUNTER_0] == NONE) {
+                set_semantic_error(error, 59, node);
+                return false;
+            }
+            generators[generator + G_PACKETS] += 1;
+            generators[generator + G_BYTES] += event[PK_SIZE];
+            node_state[node_base + N_COUNTER_0] += 1;
+        }
+        generators[generator + G_RATE_CREDIT_LOW] = credit_low;
+        generators[generator + G_RATE_CREDIT_HIGH] = credit_high;
+
+        bool finished = generators[generator + G_BYTES] >= generators[generator + G_RATE_TOTAL];
+        ulong candidate = 0;
+        if (!finished && !checked_add(
+                event[E_TIME], generators[generator + G_RATE_INTERVAL], candidate)) {
+            set_semantic_error(error, 59, node);
+            return false;
+        }
+        if (!finished && candidate <= params[P_STOP_TIME]) {
+            ulong payload = event[PK_ID];
+            ulong size = event[PK_SIZE];
+            if (emitted) {
+                ulong sequence = node_state[node_base + N_NEXT_PAYLOAD];
+                if (sequence == NONE || sequence > (NONE - node) / params[P_NODE_COUNT]) {
+                    set_semantic_error(error, 59, node);
+                    return false;
+                }
+                payload = sequence * params[P_NODE_COUNT] + node;
+                node_state[node_base + N_NEXT_PAYLOAD] = sequence + 1;
+                ulong remaining = generators[generator + G_RATE_TOTAL] -
+                    generators[generator + G_BYTES];
+                size = min(generators[generator + G_RATE_PACKET_SIZE], remaining);
+            }
+            ulong next_bits_low = size << 3;
+            ulong next_bits_high = size >> 61;
+            ulong next_cost_low;
+            ulong next_cost_high;
+            if (!u128_mul(
+                    next_bits_low, next_bits_high, scale_low, scale_high,
+                    next_cost_low, next_cost_high)) {
+                set_semantic_error(error, 59, node);
+                return false;
+            }
+            ulong next_credit_low;
+            ulong next_credit_high;
+            bool next_scheduled = u128_add(
+                    credit_low, credit_high, tick_low, tick_high,
+                    next_credit_low, next_credit_high) &&
+                u128_at_least(next_credit_low, next_credit_high, next_cost_low, next_cost_high);
+            generators[generator + G_STATUS] = next_scheduled ? 0 : 1;
+            generators[generator + G_DEPARTURE] = candidate;
+            generators[generator + G_PAYLOAD] = payload;
+            ulong next_packet[EVENT_WORDS];
+            packet_clear(next_packet);
+            next_packet[PK_ID] = payload;
+            next_packet[PK_FLOW] = flow;
+            next_packet[PK_SIZE] = size;
+            next_packet[PK_KIND] = DATA_PACKET;
+            if (!emit_child(
+                    node, event, node, PACING_TIMER, candidate, next_packet, error, params,
+                    node_state, fel_meta, fel_records, remote_meta, remote_staging,
+                    stream_state, stream_records)) {
+                return false;
+            }
+        } else {
+            generators[generator + G_STATUS] = finished ? 2 : 3;
+            if (!finished) {
+                generators[generator + G_DEPARTURE] = candidate;
+            }
+        }
+
+        if (!emitted) {
+            return true;
+        }
+        ulong sourced_packet[EVENT_WORDS];
+        for (uint word = 0; word < EVENT_WORDS; ++word) {
+            sourced_packet[word] = event[word];
+        }
+        sourced_packet[E_PHASE] = 1;
+        if (!source_queue_insert(node, sourced_packet, error, queue_meta, queue_records) ||
+            !record_sourced(
+                node, event, error, params, summary, observation_meta, observed)) {
+            return false;
+        }
+        if (node_state[node_base + N_SERVICE_VALID] == 0 &&
+            node_state[node_base + N_READY_PENDING] == 0) {
+            node_state[node_base + N_READY_PENDING] = 1;
+            return emit_child(
+                node, event, node, TX_READY, event[E_TIME], event, error, params,
+                node_state, fel_meta, fel_records, remote_meta, remote_staging,
+                stream_state, stream_records);
+        }
+        return true;
+    }
+
     if (kind == PACKET_ARRIVAL) {
         if (role != HOST) {
             set_semantic_error(error, 3, node);
@@ -2999,7 +3530,7 @@ __device__ __forceinline__ bool dispatch_event(
             if (generators[generator_base + G_STATUS] != 0 ||
                 generators[generator_base + G_DEPARTURE] != event[E_TIME] ||
                 generators[generator_base + G_PAYLOAD] != event[PK_ID] ||
-                event[PK_KIND] != TCP_DATA_PACKET ||
+                (event[PK_KIND] & PK_KIND_MASK) != TCP_DATA_PACKET ||
                 event[PK_META_0] != generators[generator_base + G_TCP_NEXT] ||
                 event[PK_META_1] != event[E_TIME] || event[PK_META_2] != 0) {
                 set_semantic_error(error, 52, node);
@@ -3207,11 +3738,52 @@ __device__ __forceinline__ bool dispatch_event(
         }
         ulong selected[EVENT_WORDS];
         ulong selected_physical;
-        if (!queue_pop(node, queue_meta, queue_records, selected, selected_physical)) {
+        ulong scheduler_base = node * SCHEDULER_NODE_WORDS;
+        ulong scheduler_kind = role == SWITCH
+            ? scheduler_state[scheduler_base + S_KIND]
+            : SCHED_FIFO;
+        ulong selected_position = 0;
+        bool selected_position_valid = true;
+        if (scheduler_kind == SCHED_DRR) {
+            selected_position_valid = drr_select_position(
+                node,
+                error,
+                queue_meta,
+                queue_records,
+                scheduler_state,
+                selected_position
+            );
+        } else if (scheduler_kind == SCHED_WRR) {
+            selected_position_valid = wrr_select_position(
+                node,
+                error,
+                queue_meta,
+                queue_records,
+                scheduler_state,
+                selected_position
+            );
+        }
+        if (!selected_position_valid) {
+            return false;
+        }
+        bool removed = scheduler_kind == SCHED_DRR || scheduler_kind == SCHED_WRR
+            ? queue_remove_at(
+                node,
+                selected_position,
+                queue_meta,
+                queue_records,
+                selected,
+                selected_physical
+            )
+            : queue_pop(node, queue_meta, queue_records, selected, selected_physical);
+        if (!removed) {
+            if (scheduler_kind == SCHED_DRR || scheduler_kind == SCHED_WRR) {
+                set_semantic_error(error, 35, node);
+                return false;
+            }
             return true;
         }
-        ulong scheduler_base = node * SCHEDULER_NODE_WORDS;
-        if (role == SWITCH && scheduler_state[scheduler_base + S_KIND] == SCHED_WFQ) {
+        if (role == SWITCH && scheduler_kind == SCHED_WFQ) {
             ulong tag_offset = scheduler_state[scheduler_base + S_QUEUE_TAG_OFFSET];
             rational_copy(
                 scheduler_state,
@@ -3382,9 +3954,22 @@ __device__ __forceinline__ bool dispatch_event(
             set_semantic_error(error, 20, node);
             return false;
         }
-        ulong waiting = queue_meta[node * META_WORDS + 3];
         ulong semantic_capacity = node_state[node_base + N_SEMANTIC_QUEUE_CAPACITY];
-        if (semantic_capacity != 0 && waiting >= semantic_capacity) {
+        ulong scheduler_base = node * SCHEDULER_NODE_WORDS;
+        ulong admission;
+        if (!switch_admission_action(
+            node,
+            event,
+            semantic_capacity,
+            error,
+            queue_meta,
+            queue_records,
+            scheduler_state,
+            admission
+        )) {
+            return false;
+        }
+        if (admission == 2) {
             if (node_state[node_base + N_COUNTER_1] == NONE) {
                 set_semantic_error(error, 21, node);
                 return false;
@@ -3402,7 +3987,9 @@ __device__ __forceinline__ bool dispatch_event(
                 arrivals
             );
         }
-        ulong scheduler_base = node * SCHEDULER_NODE_WORDS;
+        if (admission == 1) {
+            event[PK_KIND] |= PK_ECN_FLAG;
+        }
         ulong scheduler_kind = scheduler_state[scheduler_base + S_KIND];
         bool inserted;
         if (scheduler_kind == SCHED_FIFO) {
@@ -3426,6 +4013,8 @@ __device__ __forceinline__ bool dispatch_event(
                 queue_records,
                 scheduler_state
             );
+        } else if (scheduler_kind == SCHED_DRR || scheduler_kind == SCHED_WRR) {
+            inserted = queue_push(node, event, error, queue_meta, queue_records);
         } else {
             set_semantic_error(error, 32, node);
             return false;
@@ -3473,7 +4062,8 @@ __device__ __forceinline__ bool dispatch_event(
         return true;
     }
 
-    if (kind == REMOTE_ARRIVAL && role == HOST && event[PK_KIND] == TCP_DATA_PACKET) {
+    if (kind == REMOTE_ARRIVAL && role == HOST &&
+        (event[PK_KIND] & PK_KIND_MASK) == TCP_DATA_PACKET) {
         ulong flow = event[PK_FLOW];
         ulong flow_base = flow * FLOW_WORDS;
         ulong receiver = params[P_TCP_RECEIVER_OFFSET] + flow * TCP_RECEIVER_WORDS;
@@ -3528,7 +4118,8 @@ __device__ __forceinline__ bool dispatch_event(
         return true;
     }
 
-    if (kind == REMOTE_ARRIVAL && role == HOST && event[PK_KIND] == TCP_ACK_PACKET) {
+    if (kind == REMOTE_ARRIVAL && role == HOST &&
+        (event[PK_KIND] & PK_KIND_MASK) == TCP_ACK_PACKET) {
         ulong flow = event[PK_FLOW];
         ulong flow_base = flow * FLOW_WORDS;
         ulong generator = flow * GENERATOR_WORDS;
@@ -3682,7 +4273,7 @@ __device__ __forceinline__ bool dispatch_event(
         ulong flow_base = event[PK_FLOW] * FLOW_WORDS;
         ulong disposition = 2;
         if (
-            event[PK_KIND] == FEEDBACK_PACKET &&
+            (event[PK_KIND] & PK_KIND_MASK) == FEEDBACK_PACKET &&
             event[PK_FLOW] < params[P_FLOW_COUNT] &&
             generators[event[PK_FLOW] * GENERATOR_WORDS] != 0 &&
             generators[event[PK_FLOW] * GENERATOR_WORDS + 1] == node
@@ -3696,7 +4287,8 @@ __device__ __forceinline__ bool dispatch_event(
             disposition = 3;
         } else {
             ulong expected =
-                (event[PK_KIND] == DATA_PACKET || event[PK_KIND] == TCP_DATA_PACKET)
+                ((event[PK_KIND] & PK_KIND_MASK) == DATA_PACKET ||
+                 (event[PK_KIND] & PK_KIND_MASK) == TCP_DATA_PACKET)
                     ? flows[flow_base + 1] : flows[flow_base];
             if (expected != node) {
                 set_semantic_error(error, 23, node);

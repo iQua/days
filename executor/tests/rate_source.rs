@@ -9,6 +9,10 @@ use days_executor::{
     rate_transitions_csv, run_cpu_with_observations, run_scalar_rounds,
     run_scalar_with_observations, validate,
 };
+#[cfg(feature = "cuda")]
+use days_executor::{CudaConfig, run_cuda_with_observations};
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+use days_executor::{MetalConfig, run_metal_with_observations};
 
 const SOURCE: NodeId = NodeId(0);
 const SINK: NodeId = NodeId(1);
@@ -72,6 +76,7 @@ fn rate_image(rate: RateGenerator, status: GeneratorStatus, stop_time_ns: u64) -
                     kind: FlowGeneratorKind::Rate(rate),
                 }],
                 tcp_receivers: vec![],
+                dcqcn_receivers: vec![],
                 next_origin_seq: 1,
                 next_payload_seq: 1,
                 sourced_packets: 0,
@@ -85,6 +90,7 @@ fn rate_image(rate: RateGenerator, status: GeneratorStatus, stop_time_ns: u64) -
                 tx_ready_pending: false,
                 generators: vec![],
                 tcp_receivers: vec![],
+                dcqcn_receivers: vec![],
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -454,7 +460,7 @@ fn rate_certificate_is_generated_byte_for_byte_by_the_scalar_oracle() {
 
 #[test]
 fn final_partial_packet_uses_its_exact_smaller_credit_cost() {
-    let image = rate_image(
+    let mut image = rate_image(
         RateGenerator {
             first_pacing_time_ns: 1,
             pacing_interval_ns: 1,
@@ -467,6 +473,7 @@ fn final_partial_packet_uses_its_exact_smaller_credit_cost() {
         GeneratorStatus::Blocked,
         20,
     );
+    image.channels[0] = RemoteChannel::for_packet_link(image.links[0], 1).unwrap();
     validate(&image, Backend::Scalar).expect("partial-final rate image must validate");
 
     let result = run_scalar_with_observations(&image, None, ObservationMode::Full)
@@ -712,6 +719,31 @@ fn time_zero_is_a_legal_rate_source_deadline() {
 }
 
 #[test]
+fn final_partial_packet_rejects_an_unsafe_channel_delay_certificate() {
+    let image = rate_image(
+        RateGenerator {
+            first_pacing_time_ns: 1,
+            pacing_interval_ns: 1,
+            packet_size_bytes: 3,
+            total_bytes: 4,
+            rate_numerator_bits_per_second: 24_000_000_000,
+            rate_denominator: 1,
+            credit_quanta: 8_000_000_000,
+        },
+        GeneratorStatus::Scheduled,
+        10,
+    );
+
+    let error = validate(&image, Backend::Scalar)
+        .expect_err("the one-byte final packet invalidates the nominal three-byte delay bound")
+        .to_string();
+    assert!(
+        error.contains("min_delay_ns 3, exceeding derived bound 1"),
+        "expected exact final-packet channel bound, got: {error}"
+    );
+}
+
+#[test]
 fn finished_rate_source_owns_no_timer_capacity() {
     let mut image = rate_image(
         RateGenerator {
@@ -787,7 +819,7 @@ fn rate_checkpoint_and_cpu_worker_matrix_match_scalar() {
 }
 
 #[test]
-fn device_backends_reject_rate_sources_exactly() {
+fn device_backends_accept_rate_sources() {
     let image = rate_image(
         RateGenerator {
             first_pacing_time_ns: 1,
@@ -803,12 +835,216 @@ fn device_backends_reject_rate_sources_exactly() {
     );
 
     for backend in [Backend::Metal, Backend::Cuda] {
-        assert_eq!(
-            validate(&image, backend)
-                .expect_err("device backend must reject rate source before packing")
-                .to_string(),
-            format!("backend {backend} does not support rate-based sources; use Scalar or Cpu")
-        );
+        validate(&image, backend)
+            .unwrap_or_else(|error| panic!("{backend} must accept rate sources: {error}"));
+    }
+}
+
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn adversarial_device_rate_images() -> Vec<SimulationImage> {
+    let blocked = rate_image(
+        RateGenerator {
+            first_pacing_time_ns: 1,
+            pacing_interval_ns: 1,
+            packet_size_bytes: 1,
+            total_bytes: 5,
+            rate_numerator_bits_per_second: 10_000_000_000,
+            rate_denominator: 3,
+            credit_quanta: 0,
+        },
+        GeneratorStatus::Blocked,
+        30,
+    );
+    let mut partial = rate_image(
+        RateGenerator {
+            first_pacing_time_ns: 1,
+            pacing_interval_ns: 1,
+            packet_size_bytes: 3,
+            total_bytes: 4,
+            rate_numerator_bits_per_second: 24_000_000_000,
+            rate_denominator: 1,
+            credit_quanta: 8_000_000_000,
+        },
+        GeneratorStatus::Scheduled,
+        10,
+    );
+    partial.channels[0] = RemoteChannel::for_packet_link(partial.links[0], 1).unwrap();
+    let time_zero = rate_image(
+        RateGenerator {
+            first_pacing_time_ns: 0,
+            pacing_interval_ns: 2,
+            packet_size_bytes: 2,
+            total_bytes: 4,
+            rate_numerator_bits_per_second: 8_000_000_000,
+            rate_denominator: 1,
+            credit_quanta: 0,
+        },
+        GeneratorStatus::Scheduled,
+        10,
+    );
+    let prefix = run_scalar_with_observations(&blocked, Some(7), ObservationMode::Summary)
+        .expect("rate checkpoint prefix must execute");
+    let checkpoint = checkpoint_image(&blocked, &prefix);
+    vec![blocked, partial, time_zero, checkpoint]
+}
+
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn terminal_device_rate_images() -> [SimulationImage; 3] {
+    let mut finished = rate_image(
+        RateGenerator {
+            first_pacing_time_ns: 1,
+            pacing_interval_ns: 1,
+            packet_size_bytes: 1,
+            total_bytes: 1,
+            rate_numerator_bits_per_second: 8_000_000_000,
+            rate_denominator: 1,
+            credit_quanta: 0,
+        },
+        GeneratorStatus::Scheduled,
+        10,
+    );
+    finished.host_states[0].generators[0].packets_emitted = 1;
+    finished.host_states[0].generators[0].bytes_emitted = 1;
+    finished.host_states[0].generators[0].next_emission.status = GeneratorStatus::Finished;
+    finished.initial_packets.clear();
+    finished.initial_events.clear();
+    finished.host_states[0].next_origin_seq = 0;
+
+    let mut stopped = rate_image(
+        RateGenerator {
+            first_pacing_time_ns: 11,
+            pacing_interval_ns: 1,
+            packet_size_bytes: 1,
+            total_bytes: 1,
+            rate_numerator_bits_per_second: 8_000_000_000,
+            rate_denominator: 1,
+            credit_quanta: 0,
+        },
+        GeneratorStatus::Stopped,
+        10,
+    );
+    stopped.initial_packets.clear();
+    stopped.initial_events.clear();
+    stopped.host_states[0].next_origin_seq = 0;
+    stopped.host_states[0].next_payload_seq = 0;
+
+    let beyond_stop = rate_image(
+        RateGenerator {
+            first_pacing_time_ns: 11,
+            pacing_interval_ns: 1,
+            packet_size_bytes: 1,
+            total_bytes: 1,
+            rate_numerator_bits_per_second: 8_000_000_000,
+            rate_denominator: 1,
+            credit_quanta: 0,
+        },
+        GeneratorStatus::Scheduled,
+        10,
+    );
+    [finished, stopped, beyond_stop]
+}
+
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[test]
+fn metal_rate_pacing_and_checkpoints_match_scalar() {
+    for (image_index, image) in adversarial_device_rate_images().into_iter().enumerate() {
+        for horizon in [Some(2), None] {
+            let expected =
+                run_scalar_with_observations(&image, horizon, ObservationMode::Summary).unwrap();
+            for streams_enabled in [true, false] {
+                for round_threads_per_threadgroup in [32, 256] {
+                    let actual = run_metal_with_observations(
+                        &image,
+                        horizon,
+                        MetalConfig {
+                            streams_enabled,
+                            round_threads_per_threadgroup,
+                            ..MetalConfig::default()
+                        },
+                        ObservationMode::Summary,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "image={image_index} horizon={horizon:?} streams={streams_enabled} geometry={round_threads_per_threadgroup}: {error}"
+                        )
+                    });
+                    assert_eq!(actual.result, expected);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[test]
+fn metal_rate_terminal_and_beyond_stop_states_reserve_no_work() {
+    for image in terminal_device_rate_images() {
+        validate(&image, Backend::Metal).expect("terminal rate state must validate");
+        let expected =
+            run_scalar_with_observations(&image, None, ObservationMode::Summary).unwrap();
+        let actual = run_metal_with_observations(
+            &image,
+            None,
+            MetalConfig::default(),
+            ObservationMode::Summary,
+        )
+        .expect("terminal rate state must execute");
+        assert_eq!(actual.result, expected);
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_rate_pacing_and_checkpoints_match_scalar() {
+    for image in adversarial_device_rate_images() {
+        for horizon in [Some(2), None] {
+            let expected =
+                run_scalar_with_observations(&image, horizon, ObservationMode::Summary).unwrap();
+            for streams_enabled in [true, false] {
+                for round_threads_per_block in [32, 256] {
+                    let actual = run_cuda_with_observations(
+                        &image,
+                        horizon,
+                        CudaConfig {
+                            streams_enabled,
+                            round_threads_per_block,
+                            ..CudaConfig::default()
+                        },
+                        ObservationMode::Summary,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "horizon={horizon:?} streams={streams_enabled} geometry={round_threads_per_block}: {error}"
+                        )
+                    });
+                    assert_eq!(actual.result, expected);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_rate_terminal_and_beyond_stop_states_reserve_no_work() {
+    for image in terminal_device_rate_images() {
+        validate(&image, Backend::Cuda).expect("terminal rate state must validate");
+        let expected =
+            run_scalar_with_observations(&image, None, ObservationMode::Summary).unwrap();
+        let actual = run_cuda_with_observations(
+            &image,
+            None,
+            CudaConfig::default(),
+            ObservationMode::Summary,
+        )
+        .expect("terminal rate state must execute");
+        assert_eq!(actual.result, expected);
     }
 }
 

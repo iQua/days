@@ -7,6 +7,7 @@ mod aqm_trace;
 pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+mod dcqcn;
 mod device_scheduler;
 pub mod device_sizing;
 pub mod event;
@@ -38,6 +39,10 @@ pub use cuda::{
     CudaArena, CudaConfig, CudaError, CudaExecutor, CudaInitializationTimings, CudaMemoryLayout,
     CudaRun, run_cuda, run_cuda_with_observations,
 };
+pub use dcqcn::{
+    DCQCN_FRACTION_SCALE, DCQCN_STAGE_STEPS, DcqcnArithmeticError, DcqcnController,
+    DcqcnControllerConfig, DcqcnIncreaseStage, DcqcnTransitionKind, DcqcnTransitionRecord,
+};
 pub use device_sizing::{
     DeviceEventArenaSizing, DevicePlaneSizing, DeviceSizingError, DeviceSizingReport,
     size_default_device_plan,
@@ -47,18 +52,21 @@ pub use event::{
     event_phase,
 };
 pub use image::{
-    ConstantGenerator, FlowDescriptor, FlowGeneratorKind, FlowGeneratorState,
-    GeneratorFeedbackAction, GeneratorFeedbackState, GeneratorStatus, GeneratorTermination,
-    HostState, LinkDescriptor, NodeDescriptor, PacketDescriptor, PacketKind, PfcHeader,
-    PfcIngressState, PfcQueueState, RateGenerator, RemoteChannel, ScheduledEmission,
-    SimulationImage, SwitchQueueState, SwitchState, TcpAckHeader, TcpDataHeader, TcpGenerator,
-    TcpReceiveRange, TcpReceiverState, TcpTimerState, default_propagation_ns,
+    CollectiveAlgorithm, CollectiveChannelPolicy, CollectiveChunkPolicy, CollectiveGenerator,
+    CollectivePhase, ConstantGenerator, DcqcnCnpHeader, DcqcnGenerator, DcqcnReceiverState,
+    EcnCodepoint, FlowDescriptor, FlowGeneratorKind, FlowGeneratorState, GeneratorFeedbackAction,
+    GeneratorFeedbackState, GeneratorStatus, GeneratorTermination, HostState, LinkDescriptor,
+    NodeDescriptor, PacketDescriptor, PacketKind, PfcHeader, PfcIngressState, PfcQueueState,
+    RateGenerator, RemoteChannel, ScheduledEmission, SimulationImage, SwitchQueueState,
+    SwitchState, TcpAckHeader, TcpDataHeader, TcpGenerator, TcpReceiveRange, TcpReceiverState,
+    TcpTimerState, default_propagation_ns,
 };
 pub use mechanism_trace::{
     DrrTransitionRecord, MechanismTraceError, MechanismTransitionRecord, PfcControlAction,
     PfcControlTransitionRecord, PfcOccupancyAction, PfcThresholdTransitionRecord, RateReplayConfig,
     RateReplayState, RateTransitionRecord, SchedulerPacket, WrrTransitionRecord,
-    drr_transitions_csv, pfc_transitions_csv, rate_transitions_csv, wrr_transitions_csv,
+    dcqcn_transitions_csv, drr_transitions_csv, pfc_transitions_csv, rate_transitions_csv,
+    wrr_transitions_csv,
 };
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub use metal::{

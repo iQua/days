@@ -95,6 +95,7 @@ fn tcp_image(control: TcpCongestionControl, total_bytes: u64) -> SimulationImage
                     )),
                 }],
                 tcp_receivers: vec![],
+                dcqcn_receivers: vec![],
                 next_origin_seq: 1,
                 next_payload_seq: 1,
                 sourced_packets: 0,
@@ -108,6 +109,7 @@ fn tcp_image(control: TcpCongestionControl, total_bytes: u64) -> SimulationImage
                 tx_ready_pending: false,
                 generators: vec![],
                 tcp_receivers: vec![TcpReceiverState::new(FLOW, ACK_BYTES)],
+                dcqcn_receivers: vec![],
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -248,6 +250,7 @@ fn switched_tcp_image(
                     )),
                 }],
                 tcp_receivers: vec![],
+                dcqcn_receivers: vec![],
                 next_origin_seq: 1,
                 next_payload_seq: 1,
                 sourced_packets: 0,
@@ -261,6 +264,7 @@ fn switched_tcp_image(
                 tx_ready_pending: false,
                 generators: vec![],
                 tcp_receivers: vec![TcpReceiverState::new(FLOW, ACK_BYTES)],
+                dcqcn_receivers: vec![],
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -1383,7 +1387,7 @@ fn device_sizing_derives_a_tcp_plan() {
     let report = size_default_device_plan(&image)
         .expect("generic GPU sizing must account for TCP state and exact fallback timers");
     assert!(report.total_device_bytes > 0);
-    assert!(report.event_arenas.fallback_heap_event_slots >= image.nodes.len() + 1);
+    assert!(report.event_arenas.fallback_heap_event_slots > image.nodes.len());
 
     #[cfg(any(
         feature = "cuda",

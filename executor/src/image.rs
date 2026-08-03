@@ -4,8 +4,8 @@ use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 
 use crate::{
-    DropMarkPolicy, Event, EventKind, FlowId, LinkId, NodeId, NodeKind, PayloadId, SchedulerKind,
-    TcpCongestionControl, TimeError, link_arrival_time_ns,
+    DcqcnController, DropMarkPolicy, Event, EventKind, FlowId, LinkId, NodeId, NodeKind, PayloadId,
+    SchedulerKind, TcpCongestionControl, TimeError, link_arrival_time_ns,
 };
 
 /// The plan's default constant propagation delay for a directed link.
@@ -24,7 +24,7 @@ pub struct NodeDescriptor {
 }
 
 /// Host-owned semantic state.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct HostState {
     pub egress_link: LinkId,
     pub queue: VecDeque<PayloadId>,
@@ -34,12 +34,38 @@ pub struct HostState {
     pub generators: Vec<FlowGeneratorState>,
     /// Target-owned TCP cumulative-ACK state in canonical `FlowId` order.
     pub tcp_receivers: Vec<TcpReceiverState>,
+    /// Target-owned DCQCN CNP interval state in canonical `FlowId` order.
+    pub dcqcn_receivers: Vec<DcqcnReceiverState>,
     pub next_origin_seq: u64,
     /// Per-node packet identity cursor. Every generated packet consumes one sequence value.
     pub next_payload_seq: u64,
     pub sourced_packets: u64,
     pub departed_packets: u64,
     pub received_packets: u64,
+}
+
+impl fmt::Debug for HostState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("HostState");
+        debug
+            .field("egress_link", &self.egress_link)
+            .field("queue", &self.queue)
+            .field("in_service", &self.in_service)
+            .field("tx_ready_pending", &self.tx_ready_pending)
+            .field("generators", &self.generators)
+            .field("tcp_receivers", &self.tcp_receivers);
+        // Omitting the empty additive field preserves every frozen pre-T26 image byte.
+        if !self.dcqcn_receivers.is_empty() {
+            debug.field("dcqcn_receivers", &self.dcqcn_receivers);
+        }
+        debug
+            .field("next_origin_seq", &self.next_origin_seq)
+            .field("next_payload_seq", &self.next_payload_seq)
+            .field("sourced_packets", &self.sourced_packets)
+            .field("departed_packets", &self.departed_packets)
+            .field("received_packets", &self.received_packets)
+            .finish()
+    }
 }
 
 /// One switch-port-owned TailDrop egress queue with discipline-owned service state.
@@ -210,6 +236,75 @@ pub struct ConstantGenerator {
     pub termination: GeneratorTermination,
 }
 
+/// Collective algorithm tag retained as image data. Runtime execution is driven by resolved stage
+/// dependencies rather than algorithm-specific branches.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum CollectiveAlgorithm {
+    RingAllReduce = 0,
+    AllGather = 1,
+}
+
+/// Resolved phase tag for one collective stage.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum CollectivePhase {
+    ReduceScatter = 0,
+    AllGather = 1,
+}
+
+/// Chunk partition policy retained explicitly in every stage image.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum CollectiveChunkPolicy {
+    EqualRemainderLast = 0,
+}
+
+/// Logical communication-channel policy retained explicitly in every stage image.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum CollectiveChannelPolicy {
+    RingNext = 0,
+}
+
+/// One fixed-width stage of a parametric collective program.
+///
+/// The lowerer resolves algorithms, topology hierarchy, chunks, channels, and dependencies into
+/// these records. A source LP needs no shared mutable collective object: ordinary packet delivery
+/// satisfies the inbound prerequisite of the next local stage.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CollectiveGenerator {
+    pub collective_id: u64,
+    pub algorithm: CollectiveAlgorithm,
+    pub topology_level: u32,
+    pub topology_group: u32,
+    pub group_size: u32,
+    pub rank: u32,
+    pub phase: CollectivePhase,
+    /// One-based phase step.
+    pub step: u32,
+    pub chunk_policy: CollectiveChunkPolicy,
+    pub channel_policy: CollectiveChannelPolicy,
+    pub chunk_offset_bytes: u64,
+    pub chunk_bytes: u64,
+    pub packet_size_bytes: u64,
+    pub interval_ns: u64,
+    pub local_predecessor: Option<FlowId>,
+    pub inbound_predecessor: Option<FlowId>,
+    pub inbound_predecessor_bytes: u64,
+    pub local_predecessor_complete: bool,
+    pub inbound_predecessor_complete: bool,
+    pub inbound_bytes_received: u64,
+}
+
+impl CollectiveGenerator {
+    pub const fn prerequisites_complete(self) -> bool {
+        (self.local_predecessor.is_none() || self.local_predecessor_complete)
+            && (self.inbound_predecessor.is_none() || self.inbound_predecessor_complete)
+    }
+}
+
 /// Closed generator transition set. New traffic families require an explicit image variant.
 #[repr(C, u8)]
 // Image state is deliberately pointer-free and Copy across every backend boundary.
@@ -219,6 +314,8 @@ pub enum FlowGeneratorKind {
     Constant(ConstantGenerator),
     Tcp(TcpGenerator),
     Rate(RateGenerator),
+    Collective(CollectiveGenerator),
+    Dcqcn(DcqcnGenerator),
 }
 
 /// Exact rational rate source paced by the M3 fallback-heap timer.
@@ -236,6 +333,17 @@ pub struct RateGenerator {
     pub rate_numerator_bits_per_second: u64,
     pub rate_denominator: u64,
     pub credit_quanta: u128,
+}
+
+/// Exact DCQCN reaction-point state over the T25 rate generator.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DcqcnGenerator {
+    pub rate: RateGenerator,
+    pub controller: DcqcnController,
+    /// Stable zero-byte token referenced by the second live `PacingTimer` event.
+    pub control_timer_payload: PayloadId,
+    pub cnp_size_bytes: u64,
 }
 
 /// Fixed-width result of routing an ordinary feedback packet into a source generator.
@@ -349,6 +457,16 @@ impl TcpReceiverState {
     }
 }
 
+/// Target-owned DCQCN notification-point state.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DcqcnReceiverState {
+    pub flow: FlowId,
+    pub cnp_interval_ns: u64,
+    pub cnp_size_bytes: u64,
+    pub last_cnp_time_ns: Option<u64>,
+}
+
 /// Immutable per-packet data referenced by a persistent event payload.
 ///
 /// Lowered images retain only the first scheduled packet for each active flow. Later records are
@@ -387,6 +505,22 @@ pub struct PfcHeader {
     pub pause: bool,
 }
 
+/// Typed CNP feedback metadata carried by an ordinary reverse-channel `RemoteArrival`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DcqcnCnpHeader {
+    pub trigger_payload: PayloadId,
+}
+
+/// Exact ECN codepoint represented by packet kind plus the persistent congestion bit.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EcnCodepoint {
+    NotEct = 0,
+    Ect0 = 1,
+    Ce = 3,
+}
+
 /// TCP data metadata independent of the transmission-attempt `PayloadId`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -414,6 +548,9 @@ pub enum PacketKind {
     TcpData(TcpDataHeader) = 2,
     TcpAck(TcpAckHeader) = 3,
     Pfc(PfcHeader) = 4,
+    DcqcnCnp(DcqcnCnpHeader) = 5,
+    /// A source-local zero-byte token. It is never enqueued or transmitted.
+    DcqcnControlTimer = 6,
 }
 
 impl PacketKind {
@@ -422,7 +559,10 @@ impl PacketKind {
     }
 
     pub const fn is_feedback(self) -> bool {
-        matches!(self, Self::Feedback | Self::TcpAck(_) | Self::Pfc(_))
+        matches!(
+            self,
+            Self::Feedback | Self::TcpAck(_) | Self::Pfc(_) | Self::DcqcnCnp(_)
+        )
     }
 
     pub const fn code(self) -> u8 {
@@ -432,6 +572,30 @@ impl PacketKind {
             Self::TcpData(_) => 2,
             Self::TcpAck(_) => 3,
             Self::Pfc(_) => 4,
+            Self::DcqcnCnp(_) => 5,
+            Self::DcqcnControlTimer => 6,
+        }
+    }
+}
+
+impl PacketDescriptor {
+    pub const fn ecn_codepoint(self) -> EcnCodepoint {
+        if self.ecn_marked {
+            EcnCodepoint::Ce
+        } else if self.kind.is_data() {
+            EcnCodepoint::Ect0
+        } else {
+            EcnCodepoint::NotEct
+        }
+    }
+
+    /// Applies CE only to ECN-capable data. NotEct control/feedback remains unchanged.
+    pub fn mark_ecn(&mut self) -> bool {
+        if self.kind.is_data() {
+            self.ecn_marked = true;
+            true
+        } else {
+            false
         }
     }
 }

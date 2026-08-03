@@ -2,7 +2,7 @@
 
 use std::fmt::{self, Write};
 
-use crate::{EventKey, FlowId, GeneratorStatus, LinkId, NodeId, PayloadId};
+use crate::{DcqcnTransitionRecord, EventKey, FlowId, GeneratorStatus, LinkId, NodeId, PayloadId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RateReplayConfig {
@@ -124,6 +124,7 @@ pub enum MechanismTransitionRecord {
     PfcControl(PfcControlTransitionRecord),
     Drr(DrrTransitionRecord),
     Wrr(WrrTransitionRecord),
+    Dcqcn(DcqcnTransitionRecord),
 }
 
 impl MechanismTransitionRecord {
@@ -134,6 +135,7 @@ impl MechanismTransitionRecord {
             Self::PfcControl(record) => record.key,
             Self::Drr(record) => record.key,
             Self::Wrr(record) => record.key,
+            Self::Dcqcn(record) => record.key,
         }
     }
 
@@ -144,9 +146,79 @@ impl MechanismTransitionRecord {
             Self::PfcControl(_) => 2,
             Self::Drr(_) => 3,
             Self::Wrr(_) => 4,
+            Self::Dcqcn(_) => 5,
         };
         (self.key(), tag)
     }
+}
+
+pub fn dcqcn_transitions_csv(
+    records: &[MechanismTransitionRecord],
+) -> Result<String, MechanismTraceError> {
+    let records = canonical(
+        "DCQCN",
+        records
+            .iter()
+            .filter_map(|record| match record {
+                MechanismTransitionRecord::Dcqcn(record) => Some((record.key, *record)),
+                _ => None,
+            })
+            .collect(),
+    )?;
+    let mut csv = String::from(
+        "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,kind,applied,emitted_bytes,initial_rate_bps,minimum_rate_bps,maximum_rate_bps,additive_rate_bps,hyper_rate_bps,g_ppb,decrease_ppb,cnp_interval_ns,control_interval_ns,increase_byte_threshold,before_alpha_ppb,before_current_rate_bps,before_target_rate_bps,before_cnp_seen,before_last_cnp_time_ns,before_stage,before_stage_steps,before_bytes_since_increase,before_next_control_time_ns,after_alpha_ppb,after_current_rate_bps,after_target_rate_bps,after_cnp_seen,after_last_cnp_time_ns,after_stage,after_stage_steps,after_bytes_since_increase,after_next_control_time_ns\n",
+    );
+    for record in records {
+        let config = record.before.config;
+        debug_assert_eq!(config, record.after.config);
+        writeln!(
+            csv,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            record.key.time_ns,
+            record.key.phase,
+            record.key.origin_node.0,
+            record.key.origin_seq,
+            record.node.0,
+            record.flow.0,
+            record.kind.label(),
+            bit(record.applied),
+            record.emitted_bytes,
+            config.initial_rate_bps,
+            config.minimum_rate_bps,
+            config.maximum_rate_bps,
+            config.additive_rate_bps,
+            config.hyper_rate_bps,
+            config.g_ppb,
+            config.decrease_ppb,
+            config.cnp_interval_ns,
+            config.control_interval_ns,
+            config.increase_byte_threshold,
+            record.before.alpha_ppb,
+            record.before.current_rate_bps,
+            record.before.target_rate_bps,
+            bit(record.before.cnp_seen),
+            optional_u64(record.before.last_cnp_time_ns),
+            record.before.stage.label(),
+            record.before.stage_steps,
+            record.before.bytes_since_increase,
+            record.before.next_control_time_ns,
+            record.after.alpha_ppb,
+            record.after.current_rate_bps,
+            record.after.target_rate_bps,
+            bit(record.after.cnp_seen),
+            optional_u64(record.after.last_cnp_time_ns),
+            record.after.stage.label(),
+            record.after.stage_steps,
+            record.after.bytes_since_increase,
+            record.after.next_control_time_ns,
+        )
+        .expect("writing to String cannot fail");
+    }
+    Ok(csv)
+}
+
+fn optional_u64(value: Option<u64>) -> String {
+    value.map_or_else(String::new, |value| value.to_string())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

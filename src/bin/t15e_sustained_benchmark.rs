@@ -80,7 +80,9 @@ fn benchmark_workload(image: &days_executor::SimulationImage) -> BenchmarkWorklo
         match generator.kind {
             days_executor::FlowGeneratorKind::Tcp(_) => has_tcp = true,
             days_executor::FlowGeneratorKind::Constant(_)
-            | days_executor::FlowGeneratorKind::Rate(_) => has_open_loop = true,
+            | days_executor::FlowGeneratorKind::Rate(_)
+            | days_executor::FlowGeneratorKind::Collective(_)
+            | days_executor::FlowGeneratorKind::Dcqcn(_) => has_open_loop = true,
         }
     }
     classify_workload(has_tcp, has_open_loop)

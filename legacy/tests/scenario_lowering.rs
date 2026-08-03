@@ -1321,7 +1321,7 @@ fn unsupported_source_behaviour_is_rejected_with_specific_diagnostics() {
     let directory = TempDir::new().expect("temporary directory should be available");
     let cases = [
         (
-            "dcqcn",
+            "dcqcn-missing-config",
             r#"
 seed = 1
 edges = [[0, 1]]
@@ -1339,7 +1339,7 @@ size = 1
 arr_dist = { type = "Uniform", low = 1, high = 1 }
 pkt_size_dist = { type = "Uniform", low = 1, high = 1 }
 "#,
-            "unsupported flow type `DCQCN`; Days executor supports PacketDistribution and exact TCP Reno/CUBIC traffic",
+            "invalid scenario: DCQCN traffic must provide `[flow.traffic.dcqcn]` or `[flow_set.traffic.dcqcn]`",
         ),
         (
             "zero-rate",
@@ -1381,8 +1381,18 @@ discipline = "FIFO"
 drop = "TailDrop"
 [[collective_set]]
 collective_type = "Broadcast"
+collective_count = 1
+flow_type = "PacketDistribution"
+flow_count = 2
+sources = [[0, 1]]
+sinks = [[1, 0]]
+[collective_set.traffic]
+initial_delay = 0.0
+size = 2
+arr_dist = { type = "Uniform", low = 0.000000001, high = 0.000000001 }
+pkt_size_dist = { type = "Uniform", low = 1, high = 1 }
 "#,
-            "unsupported collective traffic; Days executor v1 lowering supports only independent open-loop flows",
+            "unsupported collective algorithm `Broadcast`; T26 supports RingAllReduce and AllGather",
         ),
         (
             "legacy-run-batch",
