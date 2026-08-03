@@ -721,24 +721,13 @@ fn adversarial_device_ecn_images() -> Vec<SimulationImage> {
     ]
 }
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
-fn without_mechanism_transitions(mut result: RunResult) -> RunResult {
-    result.aqm_transitions.clear();
-    result.mechanism_transitions.clear();
-    result
-}
-
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 #[test]
 fn metal_ecn_threshold_and_persistent_marks_match_scalar() {
     for (image_index, image) in adversarial_device_ecn_images().into_iter().enumerate() {
         for horizon in [Some(7), None] {
-            let expected = without_mechanism_transitions(
-                run_scalar_with_observations(&image, horizon, ObservationMode::Full).unwrap(),
-            );
+            let expected =
+                run_scalar_with_observations(&image, horizon, ObservationMode::Summary).unwrap();
             for streams_enabled in [true, false] {
                 for round_threads_per_threadgroup in [32, 256] {
                     let actual = run_metal_with_observations(
@@ -749,7 +738,7 @@ fn metal_ecn_threshold_and_persistent_marks_match_scalar() {
                             round_threads_per_threadgroup,
                             ..MetalConfig::default()
                         },
-                        ObservationMode::Full,
+                        ObservationMode::Summary,
                     )
                     .unwrap_or_else(|error| {
                         panic!(
@@ -768,9 +757,8 @@ fn metal_ecn_threshold_and_persistent_marks_match_scalar() {
 fn cuda_ecn_threshold_and_persistent_marks_match_scalar() {
     for image in adversarial_device_ecn_images() {
         for horizon in [Some(7), None] {
-            let expected = without_mechanism_transitions(
-                run_scalar_with_observations(&image, horizon, ObservationMode::Full).unwrap(),
-            );
+            let expected =
+                run_scalar_with_observations(&image, horizon, ObservationMode::Summary).unwrap();
             for streams_enabled in [true, false] {
                 for round_threads_per_block in [32, 256] {
                     let actual = run_cuda_with_observations(
@@ -781,7 +769,7 @@ fn cuda_ecn_threshold_and_persistent_marks_match_scalar() {
                             round_threads_per_block,
                             ..CudaConfig::default()
                         },
-                        ObservationMode::Full,
+                        ObservationMode::Summary,
                     )
                     .unwrap_or_else(|error| {
                         panic!(

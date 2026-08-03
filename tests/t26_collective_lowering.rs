@@ -311,6 +311,50 @@ fn collective_validator_rejects_duplicate_stage_positions() {
 }
 
 #[test]
+fn collective_validator_rejects_overlapping_equal_remainder_last_partition() {
+    let image = compile_collective("AllGather");
+    validate(&image, Backend::Scalar).expect("the canonical [2,2,2,4] partition must validate");
+
+    let mut overlapping = image;
+    let mut changed_stages = 0;
+    let mut root_payload = None;
+    for generator in overlapping
+        .host_states
+        .iter_mut()
+        .flat_map(|state| &mut state.generators)
+    {
+        let FlowGeneratorKind::Collective(mut stage) = generator.kind else {
+            continue;
+        };
+        let owner = (u64::from(stage.rank) + u64::from(stage.group_size) - u64::from(stage.step)
+            + 1)
+            % u64::from(stage.group_size);
+        if owner == 0 {
+            stage.chunk_bytes = 3;
+            stage.inbound_predecessor_bytes = 3;
+            generator.kind = FlowGeneratorKind::Collective(stage);
+            changed_stages += 1;
+            if generator.next_emission.status == GeneratorStatus::Scheduled {
+                root_payload = Some(generator.next_emission.payload);
+            }
+        }
+    }
+    assert_eq!(changed_stages, 3);
+    let root_payload = root_payload.expect("owner zero has one scheduled root stage");
+    overlapping
+        .initial_packets
+        .iter_mut()
+        .find(|packet| packet.id == root_payload)
+        .expect("root packet exists")
+        .size_bytes = 3;
+
+    let error = validate(&overlapping, Backend::Scalar)
+        .expect_err("[0,3), [2,4), [4,6), [6,10) is not a partition")
+        .to_string();
+    assert!(error.contains("collective partition"), "{error}");
+}
+
+#[test]
 fn collective_terminal_closure_is_zero_and_maximum_state_remains_representable() {
     let config = collective_config("RingAllReduce")
         .replace("initial_delay = 0.0", "initial_delay = 0.001")

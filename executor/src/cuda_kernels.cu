@@ -3987,7 +3987,9 @@ __device__ __forceinline__ bool dispatch_event(
                 arrivals
             );
         }
-        if (admission == 1) {
+        ulong packet_kind = event[PK_KIND] & PK_KIND_MASK;
+        if (admission == 1 &&
+            (packet_kind == DATA_PACKET || packet_kind == TCP_DATA_PACKET)) {
             event[PK_KIND] |= PK_ECN_FLAG;
         }
         ulong scheduler_kind = scheduler_state[scheduler_base + S_KIND];

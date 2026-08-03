@@ -580,12 +580,12 @@ impl PacketKind {
 
 impl PacketDescriptor {
     pub const fn ecn_codepoint(self) -> EcnCodepoint {
-        if self.ecn_marked {
-            EcnCodepoint::Ce
-        } else if self.kind.is_data() {
-            EcnCodepoint::Ect0
-        } else {
+        if !self.kind.is_data() {
             EcnCodepoint::NotEct
+        } else if self.ecn_marked {
+            EcnCodepoint::Ce
+        } else {
+            EcnCodepoint::Ect0
         }
     }
 

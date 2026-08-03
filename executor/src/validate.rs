@@ -144,6 +144,21 @@ fn validate_backend_capabilities(
     if !matches!(backend, Backend::Metal | Backend::Cuda) {
         return Ok(());
     }
+    if image
+        .host_states
+        .iter()
+        .any(|state| !state.dcqcn_receivers.is_empty())
+        || image.initial_packets.iter().any(|packet| {
+            matches!(
+                packet.kind,
+                PacketKind::DcqcnCnp(_) | PacketKind::DcqcnControlTimer
+            )
+        })
+    {
+        return Err(ValidationError::new(format!(
+            "backend {backend} does not support DCQCN controller or CNP state planes; use Scalar or Cpu"
+        )));
+    }
     for generator in image.host_states.iter().flat_map(|state| &state.generators) {
         if matches!(generator.kind, FlowGeneratorKind::Collective(_)) {
             return Err(ValidationError::new(format!(
@@ -2132,6 +2147,7 @@ fn validate_generators(image: &SimulationImage) -> Result<(), ValidationError> {
             }
         }
     }
+    validate_collective_partitions(image)?;
     for (receiver_flow, receiver_owner) in receiver_owners {
         match owners.get(&receiver_flow) {
             None => {
@@ -2191,6 +2207,131 @@ fn validate_generators(image: &SimulationImage) -> Result<(), ValidationError> {
                     packet.flow, event.payload, event.target, event.key.time_ns
                 )));
             }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct CollectivePartitionState {
+    algorithm: crate::CollectiveAlgorithm,
+    topology_level: u32,
+    topology_group: u32,
+    group_size: u32,
+    bounds_by_owner: BTreeMap<u32, (u64, u64)>,
+    copies_by_owner: BTreeMap<u32, u64>,
+}
+
+fn validate_collective_partitions(image: &SimulationImage) -> Result<(), ValidationError> {
+    let mut collectives = BTreeMap::<u64, CollectivePartitionState>::new();
+    for generator in image.host_states.iter().flat_map(|state| &state.generators) {
+        let FlowGeneratorKind::Collective(stage) = generator.kind else {
+            continue;
+        };
+        let group_size = u64::from(stage.group_size);
+        let owner_offset = match (stage.algorithm, stage.phase) {
+            (crate::CollectiveAlgorithm::AllGather, crate::CollectivePhase::AllGather)
+            | (crate::CollectiveAlgorithm::RingAllReduce, crate::CollectivePhase::ReduceScatter) => {
+                1
+            }
+            (crate::CollectiveAlgorithm::RingAllReduce, crate::CollectivePhase::AllGather) => 2,
+            (crate::CollectiveAlgorithm::AllGather, crate::CollectivePhase::ReduceScatter) => {
+                return Err(ValidationError::new(format!(
+                    "flow {:?} collective partition has an invalid AllGather phase",
+                    generator.flow
+                )));
+            }
+        };
+        let owner = (u64::from(stage.rank) + group_size - u64::from(stage.step) + owner_offset)
+            % group_size;
+        let owner = u32::try_from(owner).expect("collective owner is bounded by u32 group size");
+        let bounds = (stage.chunk_offset_bytes, stage.chunk_bytes);
+        let state =
+            collectives
+                .entry(stage.collective_id)
+                .or_insert_with(|| CollectivePartitionState {
+                    algorithm: stage.algorithm,
+                    topology_level: stage.topology_level,
+                    topology_group: stage.topology_group,
+                    group_size: stage.group_size,
+                    bounds_by_owner: BTreeMap::new(),
+                    copies_by_owner: BTreeMap::new(),
+                });
+        if state.algorithm != stage.algorithm
+            || state.topology_level != stage.topology_level
+            || state.topology_group != stage.topology_group
+            || state.group_size != stage.group_size
+        {
+            return Err(ValidationError::new(format!(
+                "collective partition {} metadata is inconsistent across propagation stages",
+                stage.collective_id
+            )));
+        }
+        if state
+            .bounds_by_owner
+            .get(&owner)
+            .is_some_and(|expected| *expected != bounds)
+        {
+            return Err(ValidationError::new(format!(
+                "collective partition {} owner {owner} has inconsistent bounds across propagation stages",
+                stage.collective_id
+            )));
+        }
+        state.bounds_by_owner.insert(owner, bounds);
+        let copies = state.copies_by_owner.entry(owner).or_default();
+        *copies = copies.checked_add(1).ok_or_else(|| {
+            ValidationError::new(format!(
+                "collective partition {} propagation count exceeds u32",
+                stage.collective_id
+            ))
+        })?;
+    }
+
+    for (collective_id, state) in collectives {
+        let expected_copies = match state.algorithm {
+            crate::CollectiveAlgorithm::AllGather => u64::from(state.group_size - 1),
+            crate::CollectiveAlgorithm::RingAllReduce => 2 * u64::from(state.group_size - 1),
+        };
+        if state.bounds_by_owner.len() != state.group_size as usize
+            || state.copies_by_owner.len() != state.group_size as usize
+            || state
+                .copies_by_owner
+                .values()
+                .any(|copies| *copies != expected_copies)
+        {
+            return Err(ValidationError::new(format!(
+                "collective partition {collective_id} does not propagate every owner exactly {expected_copies} times"
+            )));
+        }
+        let bounds = state.bounds_by_owner.into_iter().collect::<Vec<_>>();
+        let base = bounds[0].1.1;
+        let mut expected_offset = 0_u64;
+        for (index, (owner, (offset, bytes))) in bounds.iter().copied().enumerate() {
+            if usize::try_from(owner).ok() != Some(index)
+                || offset != expected_offset
+                || index + 1 != bounds.len() && bytes != base
+            {
+                return Err(ValidationError::new(format!(
+                    "collective partition {collective_id} is not contiguous EqualRemainderLast at owner {owner}"
+                )));
+            }
+            expected_offset = expected_offset.checked_add(bytes).ok_or_else(|| {
+                ValidationError::new(format!(
+                    "collective partition {collective_id} endpoint exceeds u64"
+                ))
+            })?;
+        }
+        let total_bytes = expected_offset;
+        let expected_base = total_bytes / u64::from(state.group_size);
+        let expected_last = total_bytes - expected_base * u64::from(state.group_size - 1);
+        if base != expected_base
+            || bounds
+                .last()
+                .is_none_or(|(_, (_, bytes))| *bytes != expected_last)
+        {
+            return Err(ValidationError::new(format!(
+                "collective partition {collective_id} does not place only the division remainder in the last owner chunk"
+            )));
         }
     }
     Ok(())
@@ -2458,14 +2599,47 @@ fn validate_packets_and_derive_delays(
                 packet.id, packet.flow
             ))
         })?;
+        if packet.ecn_marked && !packet.kind.is_data() {
+            return Err(ValidationError::new(format!(
+                "packet {:?} has an ECN mark on non-data kind {:?}; control and feedback are NotECT",
+                packet.id, packet.kind
+            )));
+        }
         if packet.kind == PacketKind::DcqcnControlTimer {
-            if packet.size_bytes != 0 || packet.ecn_marked {
+            let source =
+                node(image, flow.source).expect("flow validation established the source node");
+            let owns_token = image.host_states[source.state_slot as usize]
+                .generators
+                .iter()
+                .any(|generator| {
+                    generator.flow == flow.id
+                        && matches!(generator.kind, FlowGeneratorKind::Dcqcn(dcqcn)
+                            if dcqcn.control_timer_payload == packet.id)
+                });
+            if packet.size_bytes != 0 || !owns_token {
                 return Err(ValidationError::new(format!(
-                    "DCQCN control token {:?} must be zero-byte NotEct state",
+                    "DCQCN control token {:?} must be zero-byte NotECT state owned by its DCQCN generator",
                     packet.id
                 )));
             }
             continue;
+        }
+        if matches!(packet.kind, PacketKind::DcqcnCnp(_)) {
+            let source =
+                node(image, flow.source).expect("flow validation established the source node");
+            let is_dcqcn = image.host_states[source.state_slot as usize]
+                .generators
+                .iter()
+                .any(|generator| {
+                    generator.flow == flow.id
+                        && matches!(generator.kind, FlowGeneratorKind::Dcqcn(_))
+                });
+            if packet.size_bytes != 64 || !is_dcqcn {
+                return Err(ValidationError::new(format!(
+                    "DCQCN CNP packet {:?} must be an exact 64-byte NotECT frame bound to a DCQCN generator",
+                    packet.id
+                )));
+            }
         }
         if let PacketKind::Pfc(header) = packet.kind {
             if packet.size_bytes != 64 {
@@ -4261,7 +4435,10 @@ fn validate_global_time_capacity(
         .filter(|generator| {
             generator.next_emission.status == GeneratorStatus::Scheduled
                 || generator.next_emission.status == GeneratorStatus::Blocked
-                    && matches!(generator.kind, FlowGeneratorKind::Rate(_))
+                    && matches!(
+                        generator.kind,
+                        FlowGeneratorKind::Rate(_) | FlowGeneratorKind::Dcqcn(_)
+                    )
         })
         .map(|generator| generator.next_emission.payload)
         .collect::<BTreeSet<_>>();

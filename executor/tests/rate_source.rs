@@ -10,9 +10,9 @@ use days_executor::{
     run_scalar_with_observations, validate,
 };
 #[cfg(feature = "cuda")]
-use days_executor::{CudaConfig, run_cuda_with_observations};
+use days_executor::{CudaConfig, CudaError, run_cuda_with_observations};
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-use days_executor::{MetalConfig, run_metal_with_observations};
+use days_executor::{MetalConfig, MetalError, run_metal_with_observations};
 
 const SOURCE: NodeId = NodeId(0);
 const SINK: NodeId = NodeId(1);
@@ -838,6 +838,66 @@ fn device_backends_accept_rate_sources() {
         validate(&image, backend)
             .unwrap_or_else(|error| panic!("{backend} must accept rate sources: {error}"));
     }
+}
+
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[test]
+fn metal_rate_full_observation_rejects_the_unported_transition_plane() {
+    let image = rate_image(
+        RateGenerator {
+            first_pacing_time_ns: 1,
+            pacing_interval_ns: 1,
+            packet_size_bytes: 1,
+            total_bytes: 1,
+            rate_numerator_bits_per_second: 8_000_000_000,
+            rate_denominator: 1,
+            credit_quanta: 0,
+        },
+        GeneratorStatus::Scheduled,
+        10,
+    );
+    assert_eq!(
+        run_metal_with_observations(
+            &image,
+            None,
+            MetalConfig::default(),
+            ObservationMode::Full,
+        )
+        .expect_err("Metal Full cannot omit the Rate transition plane"),
+        MetalError::Validation(
+            "Full observation mode is unsupported on Metal for Rate, ECN, DRR, or WRR transition planes; use Summary".to_owned()
+        )
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_rate_full_observation_rejects_the_unported_transition_plane() {
+    let image = rate_image(
+        RateGenerator {
+            first_pacing_time_ns: 1,
+            pacing_interval_ns: 1,
+            packet_size_bytes: 1,
+            total_bytes: 1,
+            rate_numerator_bits_per_second: 8_000_000_000,
+            rate_denominator: 1,
+            credit_quanta: 0,
+        },
+        GeneratorStatus::Scheduled,
+        10,
+    );
+    assert_eq!(
+        run_cuda_with_observations(
+            &image,
+            None,
+            CudaConfig::default(),
+            ObservationMode::Full,
+        )
+        .expect_err("CUDA Full cannot omit the Rate transition plane"),
+        CudaError::Validation(
+            "Full observation mode is unsupported on CUDA for Rate, ECN, DRR, or WRR transition planes; use Summary".to_owned()
+        )
+    );
 }
 
 #[cfg(any(

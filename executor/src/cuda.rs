@@ -756,6 +756,7 @@ impl CudaExecutor {
         observation_mode: ObservationMode,
     ) -> Result<CudaRun, CudaError> {
         validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
+        validate_cuda_observation_mode(image, observation_mode)?;
         validate_config(config)?;
 
         let plan = CudaPlan::new(image, exclusive_horizon_ns, config, observation_mode)?;
@@ -776,6 +777,7 @@ impl CudaExecutor {
         observation_mode: ObservationMode,
     ) -> Result<CudaProfiledRun, CudaError> {
         validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
+        validate_cuda_observation_mode(image, observation_mode)?;
         validate_config(config)?;
 
         let plan = CudaPlan::new(image, exclusive_horizon_ns, config, observation_mode)?;
@@ -786,6 +788,37 @@ impl CudaExecutor {
         panic_after_execution_if_requested();
         let run = buffers.finish(&self.direct.stream, image, observation_mode, timing)?;
         Ok(CudaProfiledRun { run, profile })
+    }
+}
+
+fn validate_cuda_observation_mode(
+    image: &SimulationImage,
+    observation_mode: ObservationMode,
+) -> Result<(), CudaError> {
+    let has_unported_transition_plane = image
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .any(|generator| matches!(generator.kind, FlowGeneratorKind::Rate(_)))
+        || image
+            .switch_states
+            .iter()
+            .flat_map(|state| &state.queues)
+            .any(|queue| {
+                queue.drop_mark != crate::DropMarkPolicy::TailDrop
+                    || matches!(
+                        queue.scheduler,
+                        crate::SchedulerKind::DeficitRoundRobin(_)
+                            | crate::SchedulerKind::WeightedRoundRobin(_)
+                    )
+            });
+    if observation_mode == ObservationMode::Full && has_unported_transition_plane {
+        Err(CudaError::Validation(
+            "Full observation mode is unsupported on CUDA for Rate, ECN, DRR, or WRR transition planes; use Summary"
+                .to_owned(),
+        ))
+    } else {
+        Ok(())
     }
 }
 

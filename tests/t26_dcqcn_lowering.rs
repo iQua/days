@@ -81,6 +81,25 @@ fn dcqcn_image() -> days_executor::SimulationImage {
     compile_config(write_dcqcn_config(&directory)).unwrap()
 }
 
+fn compile_dcqcn_with_rates(
+    initial: &str,
+    minimum: &str,
+    maximum: &str,
+) -> Result<days_executor::SimulationImage, days::scenario::CompileError> {
+    let directory = TempDir::new().unwrap();
+    let path = write_dcqcn_config(&directory);
+    let config = fs::read_to_string(&path)
+        .unwrap()
+        .replace("rate_gbps = 10.0", &format!("rate_gbps = {initial}"))
+        .replace("min_rate_gbps = 1.0", &format!("min_rate_gbps = {minimum}"))
+        .replace(
+            "max_rate_gbps = 20.0",
+            &format!("max_rate_gbps = {maximum}"),
+        );
+    fs::write(&path, config).unwrap();
+    compile_config(path)
+}
+
 fn fix_dcqcn_rate(image: &mut days_executor::SimulationImage) {
     let FlowGeneratorKind::Dcqcn(mut dcqcn) = image.host_states[0].generators[0].kind else {
         unreachable!()
@@ -161,6 +180,54 @@ fn move_control_beyond_stop(image: &mut days_executor::SimulationImage) {
         .retain(|event| event.payload != control_payload);
 }
 
+fn blocked_dcqcn_service_boundary() -> days_executor::SimulationImage {
+    const DUPLICATED_TOKEN_DELAY_NS: u64 = 922_337_203_685_452_262;
+    const NON_PRIMARY_PER_PACKET_DELAY_NS: u64 = 318;
+
+    let mut image = dcqcn_image();
+    let generator = &mut image.host_states[0].generators[0];
+    let FlowGeneratorKind::Dcqcn(mut dcqcn) = generator.kind else {
+        unreachable!()
+    };
+    dcqcn.rate.pacing_interval_ns = 1;
+    generator.next_emission.status = GeneratorStatus::Blocked;
+    generator.kind = FlowGeneratorKind::Dcqcn(dcqcn);
+
+    let flow = image.flows[0].clone();
+    for link in &mut image.links {
+        link.rate_bps = u64::MAX;
+        link.propagation_ns = 0;
+    }
+    let primary = flow.route[0];
+    let primary_serialization = image.links[primary.0 as usize]
+        .delay_ns(dcqcn.rate.packet_size_bytes)
+        .unwrap();
+    image.links[primary.0 as usize].propagation_ns =
+        DUPLICATED_TOKEN_DELAY_NS - primary_serialization;
+
+    let non_primary_links = flow.route.len() - 1 + flow.reverse_route.len();
+    let adjusted_reverse = flow.reverse_route[0];
+    let adjusted_delay =
+        NON_PRIMARY_PER_PACKET_DELAY_NS - u64::try_from(non_primary_links - 1).unwrap();
+    let adjusted_serialization = image.links[adjusted_reverse.0 as usize]
+        .delay_ns(dcqcn.cnp_size_bytes)
+        .unwrap();
+    image.links[adjusted_reverse.0 as usize].propagation_ns =
+        adjusted_delay - adjusted_serialization;
+
+    for channel in &mut image.channels {
+        let minimum_size = if flow.route.contains(&channel.link) {
+            dcqcn.rate.packet_size_bytes
+        } else {
+            dcqcn.cnp_size_bytes
+        };
+        channel.min_delay_ns = image.links[channel.link.0 as usize]
+            .delay_ns(minimum_size)
+            .unwrap();
+    }
+    image
+}
+
 #[test]
 fn dcqcn_lowers_to_rate_controller_receiver_and_two_timer_tokens() {
     let directory = TempDir::new().unwrap();
@@ -190,6 +257,147 @@ fn dcqcn_lowers_to_rate_controller_receiver_and_two_timer_tokens() {
             .count(),
         2
     );
+}
+
+#[test]
+fn dcqcn_decimal_rates_lower_losslessly_through_u64_max() {
+    let above_binary64_integer = compile_dcqcn_with_rates(
+        "9007199.254740993",
+        "9007199.254740993",
+        "9007199.254740993",
+    )
+    .expect("2^53 + 1 bps is exactly representable in the image");
+    let FlowGeneratorKind::Dcqcn(dcqcn) = above_binary64_integer.host_states[0].generators[0].kind
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        dcqcn.rate.rate_numerator_bits_per_second,
+        9_007_199_254_740_993
+    );
+
+    let exact_max = compile_dcqcn_with_rates(
+        "18446744073.709551615",
+        "18446744073.709551615",
+        "18446744073.709551615",
+    )
+    .expect("the exact u64::MAX bps decimal must lower");
+    let FlowGeneratorKind::Dcqcn(dcqcn) = exact_max.host_states[0].generators[0].kind else {
+        unreachable!()
+    };
+    assert_eq!(dcqcn.rate.rate_numerator_bits_per_second, u64::MAX);
+
+    let one_past = compile_dcqcn_with_rates(
+        "18446744073.709551616",
+        "18446744073.709551616",
+        "18446744073.709551616",
+    )
+    .expect_err("one bps past u64::MAX must reject");
+    assert!(one_past.to_string().contains("u64"), "{one_past}");
+
+    let nonrepresentable = compile_dcqcn_with_rates("0.0000000001", "0", "1")
+        .expect_err("a tenth of one bps is not exactly representable");
+    assert!(
+        nonrepresentable
+            .to_string()
+            .contains("exact representation"),
+        "{nonrepresentable}"
+    );
+}
+
+#[test]
+fn blocked_dcqcn_pacing_token_is_counted_once_at_service_boundaries() {
+    let below_max = blocked_dcqcn_service_boundary();
+    validate(&below_max, Backend::Scalar)
+        .expect("the review fixture's logical service bound is exactly 15 ns below u64::MAX");
+
+    let mut exact = below_max;
+    exact.stop_time_ns = 500_015;
+    let FlowGeneratorKind::Dcqcn(mut dcqcn) = exact.host_states[0].generators[0].kind else {
+        unreachable!()
+    };
+    dcqcn.controller.config.control_interval_ns = 100_003;
+    dcqcn.controller.next_control_time_ns = 100_003;
+    let control_payload = dcqcn.control_timer_payload;
+    exact.host_states[0].generators[0].kind = FlowGeneratorKind::Dcqcn(dcqcn);
+    exact
+        .initial_events
+        .iter_mut()
+        .find(|event| event.payload == control_payload)
+        .expect("control event exists")
+        .key
+        .time_ns = 100_003;
+    exact.initial_events.sort_by_key(|event| event.key);
+    validate(&exact, Backend::Scalar).expect("the exact u64 service-time boundary must validate");
+
+    let mut one_past = exact;
+    let reverse = one_past.flows[0].reverse_route[0];
+    one_past.links[reverse.0 as usize].propagation_ns += 1;
+    one_past
+        .channels
+        .iter_mut()
+        .find(|channel| channel.link == reverse)
+        .expect("reverse channel exists")
+        .min_delay_ns += 1;
+    let error = validate(&one_past, Backend::Scalar)
+        .expect_err("one additional nanosecond per CNP is genuinely beyond u64")
+        .to_string();
+    assert!(error.contains("conservative service bound"), "{error}");
+}
+
+#[test]
+fn canonical_dcqcn_cnp_checkpoint_keeps_validating() {
+    let mut image = dcqcn_image();
+    let flow = image.flows[0].clone();
+    let target = image.nodes[flow.target.0 as usize];
+    let node_count = image.nodes.len() as u64;
+    let state = &mut image.host_states[target.state_slot as usize];
+    let cnp_payload = days_executor::PayloadId(target.id.0 + node_count * state.next_payload_seq);
+    state.next_payload_seq += 1;
+    let origin_seq = state.next_origin_seq;
+    state.next_origin_seq += 1;
+    state.sourced_packets += 1;
+    state.received_packets += 1;
+    state.queue.push_back(cnp_payload);
+    state.tx_ready_pending = true;
+    state.dcqcn_receivers[0].last_cnp_time_ns = Some(1);
+    let trigger_payload = image.host_states[0].generators[0].next_emission.payload;
+    image.initial_packets.push(days_executor::PacketDescriptor {
+        id: cnp_payload,
+        flow: flow.id,
+        size_bytes: 64,
+        ecn_marked: false,
+        kind: PacketKind::DcqcnCnp(days_executor::DcqcnCnpHeader { trigger_payload }),
+    });
+    image.initial_packets.sort_by_key(|packet| packet.id);
+    image.initial_events.push(days_executor::Event {
+        key: days_executor::EventKey {
+            time_ns: 1,
+            phase: days_executor::event_phase(EventKind::TxReady),
+            origin_node: target.id,
+            origin_seq,
+        },
+        target: target.id,
+        kind: EventKind::TxReady,
+        payload: cnp_payload,
+    });
+    image.initial_events.sort_by_key(|event| event.key);
+
+    validate(&image, Backend::Scalar).expect("a canonical 64-byte NotECT CNP checkpoint is legal");
+    validate(&image, Backend::Cpu { workers: 2 })
+        .expect("the canonical CNP checkpoint is legal on CPU");
+
+    let mut undersized = image;
+    undersized
+        .initial_packets
+        .iter_mut()
+        .find(|packet| packet.id == cnp_payload)
+        .expect("CNP remains resident")
+        .size_bytes = 63;
+    let error = validate(&undersized, Backend::Scalar)
+        .expect_err("a 63-byte CNP violates the exact wire contract")
+        .to_string();
+    assert!(error.contains("exact 64-byte NotECT"), "{error}");
 }
 
 #[test]

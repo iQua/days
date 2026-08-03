@@ -158,18 +158,33 @@ struct SourceTraffic {
     dcqcn: Option<SourceDcqcn>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Debug)]
+struct ExactDecimal {
+    span: std::ops::Range<usize>,
+}
+
+impl<'de> Deserialize<'de> for ExactDecimal {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = toml::Spanned::<serde::de::IgnoredAny>::deserialize(deserializer)?;
+        Ok(Self { span: value.span() })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct SourceDcqcn {
-    rate_gbps: f64,
-    min_rate_gbps: f64,
-    max_rate_gbps: f64,
-    g: f64,
-    ai_rate_gbps: f64,
-    hai_rate_gbps: f64,
-    mi_factor: f64,
-    rtt_ns: Option<f64>,
-    cnp_interval_ns: Option<f64>,
-    pacing_interval_ns: Option<f64>,
+    rate_gbps: ExactDecimal,
+    min_rate_gbps: ExactDecimal,
+    max_rate_gbps: ExactDecimal,
+    g: ExactDecimal,
+    ai_rate_gbps: ExactDecimal,
+    hai_rate_gbps: ExactDecimal,
+    mi_factor: ExactDecimal,
+    rtt_ns: Option<ExactDecimal>,
+    cnp_interval_ns: Option<ExactDecimal>,
+    pacing_interval_ns: Option<ExactDecimal>,
     cnp_priority: Option<u8>,
     increase_byte_threshold: Option<u64>,
 }
@@ -329,7 +344,7 @@ pub fn compile_config(path: impl AsRef<Path>) -> Result<SimulationImage, Compile
     crate::validate_config(path_str).map_err(CompileError::Unsupported)?;
 
     let source: SourceConfig = toml::from_str(&content)?;
-    let model = SupportedModel::from_source(source)?;
+    let model = SupportedModel::from_source(source, &content)?;
     let (graph, hosts) = build_graph(path_str)?;
 
     let image = lower(model, &graph, hosts)?;
@@ -361,7 +376,7 @@ struct PfcLowering {
 }
 
 impl SupportedModel {
-    fn from_source(source: SourceConfig) -> Result<Self, CompileError> {
+    fn from_source(source: SourceConfig, scenario_text: &str) -> Result<Self, CompileError> {
         let seed = source
             .seed
             .ok_or_else(|| CompileError::Invalid("`seed` is missing".to_owned()))?;
@@ -565,22 +580,22 @@ impl SupportedModel {
             .flow
             .unwrap_or_default()
             .into_iter()
-            .map(validate_explicit_flow)
+            .map(|flow| validate_explicit_flow(flow, scenario_text))
             .collect::<Result<Vec<_>, _>>()?;
         let flow_sets = source
             .flow_set
             .unwrap_or_default()
             .into_iter()
-            .map(validate_flow_set)
+            .map(|flow_set| validate_flow_set(flow_set, scenario_text))
             .collect::<Result<Vec<_>, _>>()?;
         let mut collectives = source
             .collective
             .unwrap_or_default()
             .into_iter()
-            .map(validate_collective)
+            .map(|collective| validate_collective(collective, scenario_text))
             .collect::<Result<Vec<_>, _>>()?;
         for collective_set in source.collective_set.unwrap_or_default() {
-            collectives.extend(validate_collective_set(collective_set)?);
+            collectives.extend(validate_collective_set(collective_set, scenario_text)?);
         }
 
         Ok(Self {
@@ -727,7 +742,10 @@ fn reject_flow_options(
     Ok(())
 }
 
-fn validate_explicit_flow(flow: SourceFlow) -> Result<ExplicitFlowKey, CompileError> {
+fn validate_explicit_flow(
+    flow: SourceFlow,
+    scenario_text: &str,
+) -> Result<ExplicitFlowKey, CompileError> {
     let flow_kind = validate_flow_type(&flow.flow_type)?;
     reject_flow_options(
         flow.flow_id,
@@ -750,7 +768,7 @@ fn validate_explicit_flow(flow: SourceFlow) -> Result<ExplicitFlowKey, CompileEr
         )));
     }
     let priority = flow.priority.unwrap_or(0);
-    let traffic = validate_traffic(flow.traffic, flow_kind)?;
+    let traffic = validate_traffic(flow.traffic, flow_kind, scenario_text)?;
     if let TrafficKind::Dcqcn(dcqcn) = traffic.kind {
         if dcqcn.cnp_priority != priority {
             return Err(CompileError::Unsupported(format!(
@@ -767,7 +785,10 @@ fn validate_explicit_flow(flow: SourceFlow) -> Result<ExplicitFlowKey, CompileEr
     })
 }
 
-fn validate_flow_set(flow_set: SourceFlowSet) -> Result<FlowSetKey, CompileError> {
+fn validate_flow_set(
+    flow_set: SourceFlowSet,
+    scenario_text: &str,
+) -> Result<FlowSetKey, CompileError> {
     let flow_kind = validate_flow_type(&flow_set.flow_type)?;
     reject_flow_options(
         flow_set.first_flow_id,
@@ -778,7 +799,7 @@ fn validate_flow_set(flow_set: SourceFlowSet) -> Result<FlowSetKey, CompileError
         None,
     )?;
     let priority = flow_set.priority.unwrap_or(0);
-    let traffic = validate_traffic(flow_set.traffic, flow_kind)?;
+    let traffic = validate_traffic(flow_set.traffic, flow_kind, scenario_text)?;
     if let TrafficKind::Dcqcn(dcqcn) = traffic.kind {
         if dcqcn.cnp_priority != priority {
             return Err(CompileError::Unsupported(format!(
@@ -827,6 +848,7 @@ fn collective_key(
     paths: Option<&[Vec<u64>]>,
     graph: Option<&[(u64, u64)]>,
     traffic: SourceTraffic,
+    scenario_text: &str,
 ) -> Result<CollectiveKey, CompileError> {
     validate_collective_transport(flow_type)?;
     let algorithm = collective_algorithm(collective_type)?;
@@ -882,7 +904,7 @@ fn collective_key(
             }
         }
     }
-    let traffic = validate_traffic(traffic, SourceFlowKind::PacketDistribution)?;
+    let traffic = validate_traffic(traffic, SourceFlowKind::PacketDistribution, scenario_text)?;
     let Termination::Bytes(total_bytes) = traffic.termination else {
         return Err(CompileError::Unsupported(
             "unsupported duration-terminated collective traffic; T26 collectives require an exact byte size"
@@ -904,7 +926,10 @@ fn collective_key(
     })
 }
 
-fn validate_collective(source: SourceCollective) -> Result<CollectiveKey, CompileError> {
+fn validate_collective(
+    source: SourceCollective,
+    scenario_text: &str,
+) -> Result<CollectiveKey, CompileError> {
     collective_key(
         &source.collective_type,
         &source.flow_type,
@@ -917,11 +942,13 @@ fn validate_collective(source: SourceCollective) -> Result<CollectiveKey, Compil
         source.paths.as_deref(),
         source.graph.as_deref(),
         source.traffic,
+        scenario_text,
     )
 }
 
 fn validate_collective_set(
     source: SourceCollectiveSet,
+    scenario_text: &str,
 ) -> Result<Vec<CollectiveKey>, CompileError> {
     validate_collective_transport(&source.flow_type)?;
     let count = usize::try_from(source.collective_count).map_err(|_| {
@@ -949,6 +976,7 @@ fn validate_collective_set(
             None,
             None,
             source.traffic.clone(),
+            scenario_text,
         )?);
     }
     Ok(result)
@@ -957,6 +985,7 @@ fn validate_collective_set(
 fn validate_traffic(
     traffic: SourceTraffic,
     flow_kind: SourceFlowKind,
+    scenario_text: &str,
 ) -> Result<TrafficKey, CompileError> {
     let packet_size_bytes = constant_packet_size_bytes(&traffic.pkt_size_dist)?;
     let (kind, interval_ns, termination) = match flow_kind {
@@ -1072,37 +1101,61 @@ fn validate_traffic(
                 ));
             }
             let key = DcqcnTrafficKey {
-                initial_rate_bps: scaled_u64(dcqcn.rate_gbps, 1_000_000_000, "DCQCN rate")?,
-                minimum_rate_bps: scaled_u64(
-                    dcqcn.min_rate_gbps,
+                initial_rate_bps: scaled_decimal(
+                    scenario_text,
+                    &dcqcn.rate_gbps,
+                    1_000_000_000,
+                    "DCQCN rate",
+                )?,
+                minimum_rate_bps: scaled_decimal(
+                    scenario_text,
+                    &dcqcn.min_rate_gbps,
                     1_000_000_000,
                     "DCQCN minimum rate",
                 )?,
-                maximum_rate_bps: scaled_u64(
-                    dcqcn.max_rate_gbps,
+                maximum_rate_bps: scaled_decimal(
+                    scenario_text,
+                    &dcqcn.max_rate_gbps,
                     1_000_000_000,
                     "DCQCN maximum rate",
                 )?,
-                additive_rate_bps: scaled_u64(
-                    dcqcn.ai_rate_gbps,
+                additive_rate_bps: scaled_decimal(
+                    scenario_text,
+                    &dcqcn.ai_rate_gbps,
                     1_000_000_000,
                     "DCQCN additive rate",
                 )?,
-                hyper_rate_bps: scaled_u64(dcqcn.hai_rate_gbps, 1_000_000_000, "DCQCN hyper rate")?,
-                g_ppb: scaled_u64(dcqcn.g, 1_000_000_000, "DCQCN g ppb")?,
-                decrease_ppb: scaled_u64(dcqcn.mi_factor, 1_000_000_000, "DCQCN decrease ppb")?,
-                cnp_interval_ns: scaled_u64(
-                    dcqcn.cnp_interval_ns.unwrap_or(50_000.0),
+                hyper_rate_bps: scaled_decimal(
+                    scenario_text,
+                    &dcqcn.hai_rate_gbps,
+                    1_000_000_000,
+                    "DCQCN hyper rate",
+                )?,
+                g_ppb: scaled_decimal(scenario_text, &dcqcn.g, 1_000_000_000, "DCQCN g ppb")?,
+                decrease_ppb: scaled_decimal(
+                    scenario_text,
+                    &dcqcn.mi_factor,
+                    1_000_000_000,
+                    "DCQCN decrease ppb",
+                )?,
+                cnp_interval_ns: optional_scaled_decimal(
+                    scenario_text,
+                    dcqcn.cnp_interval_ns.as_ref(),
+                    "50000",
                     1,
                     "DCQCN CNP interval ns",
                 )?,
-                control_interval_ns: scaled_u64(
-                    dcqcn.rtt_ns.unwrap_or(100_000.0),
+                control_interval_ns: optional_scaled_decimal(
+                    scenario_text,
+                    dcqcn.rtt_ns.as_ref(),
+                    "100000",
                     1,
                     "DCQCN control interval ns",
                 )?,
-                pacing_interval_ns: scaled_u64(
-                    dcqcn.pacing_interval_ns.unwrap_or(1_000.0),
+                pacing_interval_ns: optional_scaled_decimal(
+                    scenario_text,
+                    dcqcn.pacing_interval_ns.as_ref(),
+                    "1000",
                     1,
                     "DCQCN pacing interval ns",
                 )?,
@@ -1256,24 +1309,189 @@ fn seconds_to_ns(seconds: f64, label: &str) -> Result<u64, CompileError> {
     Ok(nanoseconds as u64)
 }
 
-fn scaled_u64(value: f64, scale: u64, label: &str) -> Result<u64, CompileError> {
-    if !value.is_finite() || value < 0.0 {
+fn optional_scaled_decimal(
+    scenario_text: &str,
+    value: Option<&ExactDecimal>,
+    default: &str,
+    scale: u64,
+    label: &str,
+) -> Result<u64, CompileError> {
+    match value {
+        Some(value) => scaled_decimal(scenario_text, value, scale, label),
+        None => scaled_decimal_literal(default, scale, label),
+    }
+}
+
+fn scaled_decimal(
+    scenario_text: &str,
+    value: &ExactDecimal,
+    scale: u64,
+    label: &str,
+) -> Result<u64, CompileError> {
+    let literal = scenario_text.get(value.span.clone()).ok_or_else(|| {
+        CompileError::Invalid(format!("{label} source span is outside the scenario text"))
+    })?;
+    scaled_decimal_literal(literal, scale, label)
+}
+
+fn scaled_decimal_literal(literal: &str, scale: u64, label: &str) -> Result<u64, CompileError> {
+    let literal = literal.trim();
+    let normalized = literal.replace('_', "");
+    let (negative, unsigned) = if let Some(unsigned) = normalized.strip_prefix('-') {
+        (true, unsigned)
+    } else {
+        (false, normalized.strip_prefix('+').unwrap_or(&normalized))
+    };
+    if matches!(unsigned, "inf" | "nan") {
         return Err(CompileError::Invalid(format!(
-            "{label} must be finite and nonnegative, got {value}"
+            "{label} must be finite and nonnegative, got {literal}"
         )));
     }
-    let scaled = value * scale as f64;
-    if !scaled.is_finite() || scaled >= 2_f64.powi(64) {
+
+    if let Some((radix, digits)) = integer_radix(unsigned) {
+        let value = u128::from_str_radix(digits, radix).map_err(|_| {
+            CompileError::Invalid(format!(
+                "{label} `{literal}` exceeds the u64 representation"
+            ))
+        })?;
+        if negative && value != 0 {
+            return Err(CompileError::Invalid(format!(
+                "{label} must be finite and nonnegative, got {literal}"
+            )));
+        }
+        return value
+            .checked_mul(u128::from(scale))
+            .and_then(|scaled| u64::try_from(scaled).ok())
+            .ok_or_else(|| {
+                CompileError::Invalid(format!(
+                    "{label} `{literal}` exceeds the u64 representation"
+                ))
+            });
+    }
+
+    let scale_power = decimal_scale_power(scale).ok_or_else(|| {
+        CompileError::Invalid(format!("{label} uses a non-decimal semantic scale {scale}"))
+    })?;
+    let (mantissa, exponent) = split_decimal_exponent(unsigned, label, literal)?;
+    let mut parts = mantissa.split('.');
+    let whole = parts.next().unwrap_or_default();
+    let fraction = parts.next().unwrap_or_default();
+    if parts.next().is_some()
+        || whole.is_empty() && fraction.is_empty()
+        || !whole
+            .bytes()
+            .chain(fraction.bytes())
+            .all(|byte| byte.is_ascii_digit())
+    {
         return Err(CompileError::Invalid(format!(
-            "{label} `{value}` exceeds the u64 representation"
+            "{label} `{literal}` is not a decimal number"
         )));
     }
-    if scaled.fract() != 0.0 {
-        return Err(CompileError::Unsupported(format!(
-            "unsupported {label} `{value}`; exact representation requires an integer scaled value"
+    let digits = format!("{whole}{fraction}");
+    let significant = digits.trim_start_matches('0');
+    if significant.is_empty() {
+        return Ok(0);
+    }
+    if negative {
+        return Err(CompileError::Invalid(format!(
+            "{label} must be finite and nonnegative, got {literal}"
         )));
     }
-    Ok(scaled as u64)
+
+    let decimal_shift = exponent
+        .checked_sub(i64::try_from(fraction.len()).unwrap_or(i64::MAX))
+        .and_then(|shift| shift.checked_add(scale_power))
+        .ok_or_else(|| decimal_range_error(label, literal, exponent.is_positive()))?;
+    let scaled_digits = if decimal_shift >= 0 {
+        let zero_count = usize::try_from(decimal_shift)
+            .map_err(|_| decimal_range_error(label, literal, true))?;
+        if significant.len().saturating_add(zero_count) > 20 {
+            return Err(decimal_range_error(label, literal, true));
+        }
+        let mut scaled = String::with_capacity(significant.len() + zero_count);
+        scaled.push_str(significant);
+        scaled.extend(std::iter::repeat_n('0', zero_count));
+        scaled
+    } else {
+        let removed = usize::try_from(decimal_shift.unsigned_abs()).map_err(|_| {
+            CompileError::Unsupported(format!(
+                "unsupported {label} `{literal}`; exact representation requires an integer scaled value"
+            ))
+        })?;
+        if removed > significant.len()
+            || significant[significant.len() - removed..]
+                .bytes()
+                .any(|byte| byte != b'0')
+        {
+            return Err(CompileError::Unsupported(format!(
+                "unsupported {label} `{literal}`; exact representation requires an integer scaled value"
+            )));
+        }
+        significant[..significant.len() - removed].to_owned()
+    };
+    let scaled_digits = scaled_digits.trim_start_matches('0');
+    if scaled_digits.is_empty() {
+        return Ok(0);
+    }
+    scaled_digits
+        .parse::<u64>()
+        .map_err(|_| decimal_range_error(label, literal, true))
+}
+
+fn integer_radix(literal: &str) -> Option<(u32, &str)> {
+    literal
+        .strip_prefix("0x")
+        .map(|digits| (16, digits))
+        .or_else(|| literal.strip_prefix("0o").map(|digits| (8, digits)))
+        .or_else(|| literal.strip_prefix("0b").map(|digits| (2, digits)))
+}
+
+fn decimal_scale_power(mut scale: u64) -> Option<i64> {
+    let mut power = 0_i64;
+    while scale > 1 && scale.is_multiple_of(10) {
+        scale /= 10;
+        power += 1;
+    }
+    (scale == 1).then_some(power)
+}
+
+fn split_decimal_exponent<'a>(
+    literal: &'a str,
+    label: &str,
+    original: &str,
+) -> Result<(&'a str, i64), CompileError> {
+    let mut parts = literal.split(['e', 'E']);
+    let mantissa = parts.next().unwrap_or_default();
+    let exponent = match parts.next() {
+        None => 0,
+        Some(value) if !value.is_empty() => value.parse::<i64>().map_err(|_| {
+            let positive = !value.starts_with('-');
+            decimal_range_error(label, original, positive)
+        })?,
+        Some(_) => {
+            return Err(CompileError::Invalid(format!(
+                "{label} `{original}` has an invalid decimal exponent"
+            )));
+        }
+    };
+    if parts.next().is_some() {
+        return Err(CompileError::Invalid(format!(
+            "{label} `{original}` has an invalid decimal exponent"
+        )));
+    }
+    Ok((mantissa, exponent))
+}
+
+fn decimal_range_error(label: &str, literal: &str, positive: bool) -> CompileError {
+    if positive {
+        CompileError::Invalid(format!(
+            "{label} `{literal}` exceeds the u64 representation"
+        ))
+    } else {
+        CompileError::Unsupported(format!(
+            "unsupported {label} `{literal}`; exact representation requires an integer scaled value"
+        ))
+    }
 }
 
 fn image_route(

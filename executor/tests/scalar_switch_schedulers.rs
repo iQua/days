@@ -1001,6 +1001,25 @@ fn metal_drr_wrr_service_start_and_checkpoint_state_match_scalar() {
 
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 #[test]
+fn metal_drr_wrr_full_observation_rejects_unported_transition_planes() {
+    for image in adversarial_drr_wrr_images() {
+        assert_eq!(
+            run_metal_with_observations(
+                &image,
+                None,
+                MetalConfig::default(),
+                ObservationMode::Full,
+            )
+            .expect_err("Metal Full cannot omit DRR/WRR transitions"),
+            MetalError::Validation(
+                "Full observation mode is unsupported on Metal for Rate, ECN, DRR, or WRR transition planes; use Summary".to_owned()
+            )
+        );
+    }
+}
+
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[test]
 fn metal_drr_skips_the_exact_legal_maximum_round_count() {
     let image = drr_legal_maximum_image();
     validate(&image, Backend::Metal).expect("the maximum representable DRR round count is legal");
@@ -1165,6 +1184,25 @@ fn cuda_drr_wrr_service_start_and_checkpoint_state_match_scalar() {
                 }
             }
         }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_drr_wrr_full_observation_rejects_unported_transition_planes() {
+    for image in adversarial_drr_wrr_images() {
+        assert_eq!(
+            run_cuda_with_observations(
+                &image,
+                None,
+                CudaConfig::default(),
+                ObservationMode::Full,
+            )
+            .expect_err("CUDA Full cannot omit DRR/WRR transitions"),
+            CudaError::Validation(
+                "Full observation mode is unsupported on CUDA for Rate, ECN, DRR, or WRR transition planes; use Summary".to_owned()
+            )
+        );
     }
 }
 

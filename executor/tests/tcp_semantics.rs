@@ -1,20 +1,26 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use days_executor::{
-    Backend, CUBIC_WINDOW_SCALE, ChunkGranularity, ConstantGenerator, CpuConfig, Event,
-    EventFelClass, EventKey, EventKind, FlowDescriptor, FlowGeneratorKind, FlowGeneratorState,
-    FlowId, GeneratorFeedbackState, GeneratorStatus, GeneratorTermination, HostState,
-    LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketDescriptor,
-    PacketKind, PayloadId, RemoteChannel, ScheduledEmission, SchedulerKind, SimulationImage,
-    StaticPartitionPolicy, SwitchQueueState, SwitchState, TcpAckHeader, TcpCongestionControl,
-    TcpDataHeader, TcpGenerator, TcpPhase, TcpReceiverState, TcpTimerState, TcpTransitionInput,
-    event_fel_class, event_phase, run_cpu_with_observations, run_scalar_rounds_with_observations,
-    run_scalar_with_observations, size_default_device_plan, validate,
+    Backend, CUBIC_WINDOW_SCALE, ChunkGranularity, ConstantGenerator, CpuConfig, DcqcnCnpHeader,
+    DcqcnReceiverState, EcnCodepoint, Event, EventFelClass, EventKey, EventKind, FlowDescriptor,
+    FlowGeneratorKind, FlowGeneratorState, FlowId, GeneratorFeedbackState, GeneratorStatus,
+    GeneratorTermination, HostState, LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind,
+    ObservationMode, PacketDescriptor, PacketKind, PayloadId, PfcHeader, RemoteChannel,
+    ScheduledEmission, SchedulerKind, SimulationImage, StaticPartitionPolicy, SwitchQueueState,
+    SwitchState, TcpAckHeader, TcpCongestionControl, TcpDataHeader, TcpGenerator, TcpPhase,
+    TcpReceiverState, TcpTimerState, TcpTransitionInput, event_fel_class, event_phase,
+    run_cpu_with_observations, run_scalar_rounds_with_observations, run_scalar_with_observations,
+    size_default_device_plan, validate,
 };
 #[cfg(feature = "cuda")]
-use days_executor::{CudaConfig, run_cuda_with_observations};
+use days_executor::{CudaConfig, CudaError, run_cuda_with_observations};
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+use days_executor::{DropMarkPolicy, EcnThresholdPolicy, QueueDepthUnit};
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-use days_executor::{MetalConfig, run_metal_with_observations};
+use days_executor::{MetalConfig, MetalError, run_metal_with_observations};
 
 const SOURCE: NodeId = NodeId(0);
 const SINK: NodeId = NodeId(1);
@@ -1315,6 +1321,207 @@ fn tcp_images_validate_for_device_backends() {
         validate(&image, backend)
             .unwrap_or_else(|error| panic!("T24 {backend} TCP image must validate: {error}"));
     }
+}
+
+#[test]
+fn dcqcn_cnp_and_non_data_ecn_state_cannot_hide_in_a_tcp_checkpoint() {
+    let image = tcp_ack_burst_image(TcpCongestionControl::reno(MSS), MSS, &[MSS]);
+    let ack_index = image
+        .initial_packets
+        .iter()
+        .position(|packet| matches!(packet.kind, PacketKind::TcpAck(_)))
+        .expect("fixture contains a resident TCP ACK");
+
+    for kind in [
+        PacketKind::Feedback,
+        PacketKind::TcpAck(TcpAckHeader {
+            acknowledgment: 1,
+            acknowledged_bytes: 1,
+            echoed_sent_time_ns: 0,
+        }),
+        PacketKind::Pfc(PfcHeader {
+            controlled_link: REVERSE,
+            priority: 0,
+            pause: true,
+        }),
+        PacketKind::DcqcnCnp(DcqcnCnpHeader {
+            trigger_payload: FIRST,
+        }),
+        PacketKind::DcqcnControlTimer,
+    ] {
+        let packet = PacketDescriptor {
+            id: PayloadId(99),
+            flow: FLOW,
+            size_bytes: 64,
+            ecn_marked: true,
+            kind,
+        };
+        assert_eq!(packet.ecn_codepoint(), EcnCodepoint::NotEct, "{kind:?}");
+    }
+
+    let mut retyped = image.clone();
+    let trigger_payload = retyped.initial_packets[0].id;
+    retyped.initial_packets[ack_index].kind =
+        PacketKind::DcqcnCnp(DcqcnCnpHeader { trigger_payload });
+    for backend in [
+        Backend::Scalar,
+        Backend::Cpu { workers: 2 },
+        Backend::Metal,
+        Backend::Cuda,
+    ] {
+        let error = validate(&retyped, backend)
+            .expect_err("a DCQCN CNP requires a DCQCN generator and the 64-byte contract")
+            .to_string();
+        assert!(error.contains("DCQCN"), "{backend}: {error}");
+    }
+
+    let mut retyped_control = image.clone();
+    retyped_control.initial_packets[ack_index].kind = PacketKind::DcqcnControlTimer;
+    retyped_control.initial_packets[ack_index].size_bytes = 0;
+    for backend in [
+        Backend::Scalar,
+        Backend::Cpu { workers: 2 },
+        Backend::Metal,
+        Backend::Cuda,
+    ] {
+        let error = validate(&retyped_control, backend)
+            .expect_err("a DCQCN control token requires its DCQCN generator")
+            .to_string();
+        assert!(error.contains("DCQCN"), "{backend}: {error}");
+    }
+
+    let mut orphan_receiver = image.clone();
+    orphan_receiver.host_states[1]
+        .dcqcn_receivers
+        .push(DcqcnReceiverState {
+            flow: FLOW,
+            cnp_interval_ns: 1,
+            cnp_size_bytes: 64,
+            last_cnp_time_ns: None,
+        });
+    for backend in [
+        Backend::Scalar,
+        Backend::Cpu { workers: 2 },
+        Backend::Metal,
+        Backend::Cuda,
+    ] {
+        let error = validate(&orphan_receiver, backend)
+            .expect_err("DCQCN receiver state requires its DCQCN generator")
+            .to_string();
+        assert!(error.contains("DCQCN"), "{backend}: {error}");
+    }
+
+    let mut marked_ack = image;
+    marked_ack.initial_packets[ack_index].ecn_marked = true;
+    assert_eq!(
+        marked_ack.initial_packets[ack_index].ecn_codepoint(),
+        EcnCodepoint::NotEct
+    );
+    for backend in [
+        Backend::Scalar,
+        Backend::Cpu { workers: 2 },
+        Backend::Metal,
+        Backend::Cuda,
+    ] {
+        let error = validate(&marked_ack, backend)
+            .expect_err("marked non-data is not a legal checkpoint state")
+            .to_string();
+        assert!(error.contains("non-data"), "{backend}: {error}");
+    }
+}
+
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn reachable_tcp_ack_ecn_image() -> SimulationImage {
+    let mut image = switched_tcp_image(TcpCongestionControl::reno(MSS), SchedulerKind::Fifo, 64);
+    let FlowGeneratorKind::Tcp(ref mut tcp) = image.host_states[0].generators[0].kind else {
+        unreachable!()
+    };
+    tcp.total_bytes = MSS;
+    for queue in image
+        .switch_states
+        .iter_mut()
+        .flat_map(|state| &mut state.queues)
+    {
+        queue.drop_mark = DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
+            unit: QueueDepthUnit::Packets,
+            capacity: 64,
+            threshold: 1,
+        });
+    }
+    image
+}
+
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[test]
+fn metal_reachable_notect_ack_matches_scalar_in_summary_mode() {
+    let image = reachable_tcp_ack_ecn_image();
+    let expected = run_scalar_with_observations(&image, Some(456), ObservationMode::Summary)
+        .expect("scalar ACK checkpoint");
+    assert!(
+        expected
+            .resident_packets
+            .iter()
+            .any(|packet| { matches!(packet.kind, PacketKind::TcpAck(_)) && !packet.ecn_marked })
+    );
+    let actual = run_metal_with_observations(
+        &image,
+        Some(456),
+        MetalConfig::default(),
+        ObservationMode::Summary,
+    )
+    .expect("Metal ACK checkpoint");
+    assert_eq!(actual.result, expected);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_reachable_notect_ack_matches_scalar_in_summary_mode() {
+    let image = reachable_tcp_ack_ecn_image();
+    let expected = run_scalar_with_observations(&image, Some(456), ObservationMode::Summary)
+        .expect("scalar ACK checkpoint");
+    assert!(
+        expected
+            .resident_packets
+            .iter()
+            .any(|packet| { matches!(packet.kind, PacketKind::TcpAck(_)) && !packet.ecn_marked })
+    );
+    let actual = run_cuda_with_observations(
+        &image,
+        Some(456),
+        CudaConfig::default(),
+        ObservationMode::Summary,
+    )
+    .expect("CUDA ACK checkpoint");
+    assert_eq!(actual.result, expected);
+}
+
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[test]
+fn metal_full_observation_mode_is_rejected_precisely() {
+    let image = reachable_tcp_ack_ecn_image();
+    assert_eq!(
+        run_metal_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full,)
+            .expect_err("Metal does not implement every Full transition plane"),
+        MetalError::Validation(
+            "Full observation mode is unsupported on Metal for Rate, ECN, DRR, or WRR transition planes; use Summary".to_owned()
+        )
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_full_observation_mode_is_rejected_precisely() {
+    let image = reachable_tcp_ack_ecn_image();
+    assert_eq!(
+        run_cuda_with_observations(&image, None, CudaConfig::default(), ObservationMode::Full,)
+            .expect_err("CUDA does not implement every Full transition plane"),
+        CudaError::Validation(
+            "Full observation mode is unsupported on CUDA for Rate, ECN, DRR, or WRR transition planes; use Summary".to_owned()
+        )
+    );
 }
 
 #[test]
