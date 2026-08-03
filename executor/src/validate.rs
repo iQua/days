@@ -178,6 +178,141 @@ fn event_can_reach_switch_egress(
 }
 
 #[allow(dead_code)]
+fn tcp_flow_can_emit_after_ack(image: &SimulationImage, flow_id: crate::FlowId) -> bool {
+    image
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .any(|generator| {
+            generator.flow == flow_id
+                && matches!(generator.kind, FlowGeneratorKind::Tcp(tcp)
+                if tcp.highest_ack < tcp.total_bytes)
+                && !matches!(
+                    generator.next_emission.status,
+                    GeneratorStatus::Finished | GeneratorStatus::Stopped
+                )
+        })
+}
+
+#[allow(dead_code)]
+fn tcp_descendant_route_can_reach_switch_egress(
+    image: &SimulationImage,
+    packet: &crate::PacketDescriptor,
+    candidate: LinkId,
+) -> bool {
+    let Some(flow) = flow(image, packet.flow) else {
+        return false;
+    };
+    let can_continue = tcp_flow_can_emit_after_ack(image, flow.id);
+    match packet.kind {
+        PacketKind::TcpData(_) => {
+            flow.reverse_route.contains(&candidate)
+                || can_continue && flow.route.contains(&candidate)
+        }
+        PacketKind::TcpAck(_) => {
+            can_continue
+                && (flow.route.contains(&candidate) || flow.reverse_route.contains(&candidate))
+        }
+        PacketKind::Data
+        | PacketKind::Feedback
+        | PacketKind::Pfc(_)
+        | PacketKind::DcqcnCnp(_)
+        | PacketKind::DcqcnControlTimer => false,
+    }
+}
+
+#[allow(dead_code)]
+fn event_tcp_descendant_can_reach_switch_egress(
+    image: &SimulationImage,
+    event: &crate::Event,
+    candidate: LinkId,
+) -> bool {
+    packet(image, event.payload).is_some_and(|packet| {
+        tcp_descendant_route_can_reach_switch_egress(image, packet, candidate)
+    })
+}
+
+#[allow(dead_code)]
+fn service_trigger_executes_before(
+    image: &SimulationImage,
+    owner: NodeId,
+    egress: LinkId,
+    run_end_exclusive: u128,
+) -> bool {
+    image.initial_events.iter().any(|event| {
+        event.target == owner
+            && matches!(event.kind, EventKind::TxReady | EventKind::TxComplete)
+            && event_egress(image, event) == Some(egress)
+            && event_executes_before(event.key.time_ns, run_end_exclusive)
+    })
+}
+
+#[allow(dead_code)]
+fn waiting_queue_can_reach_switch_egress(
+    image: &SimulationImage,
+    owner: NodeId,
+    queue: &std::collections::VecDeque<PayloadId>,
+    candidate: LinkId,
+) -> bool {
+    queue.iter().copied().any(|payload| {
+        let Some(packet) = packet(image, payload) else {
+            return false;
+        };
+        let Some(flow) = flow(image, packet.flow) else {
+            return false;
+        };
+        let route = packet_route(flow, packet.kind);
+        let route_reaches = route
+            .iter()
+            .position(|link_id| *link_id == candidate)
+            .zip(route_outgoing_index(image, route, owner))
+            .is_some_and(|(candidate_index, outgoing_index)| candidate_index > outgoing_index);
+        route_reaches || tcp_descendant_route_can_reach_switch_egress(image, packet, candidate)
+    })
+}
+
+#[allow(dead_code)]
+fn resident_waiter_can_reach_switch_egress(
+    image: &SimulationImage,
+    candidate: LinkId,
+    run_end_exclusive: u128,
+) -> bool {
+    image.nodes.iter().any(|owner| match owner.kind {
+        NodeKind::Host => {
+            let state = &image.host_states[owner.state_slot as usize];
+            !state.queue.is_empty()
+                && service_trigger_executes_before(
+                    image,
+                    owner.id,
+                    state.egress_link,
+                    run_end_exclusive,
+                )
+                && waiting_queue_can_reach_switch_egress(image, owner.id, &state.queue, candidate)
+        }
+        NodeKind::Switch => image.switch_states[owner.state_slot as usize]
+            .queues
+            .iter()
+            .any(|queue| {
+                queue.egress_link.is_some_and(|egress| {
+                    !queue.queue.is_empty()
+                        && service_trigger_executes_before(
+                            image,
+                            owner.id,
+                            egress,
+                            run_end_exclusive,
+                        )
+                        && waiting_queue_can_reach_switch_egress(
+                            image,
+                            owner.id,
+                            &queue.queue,
+                            candidate,
+                        )
+                })
+            }),
+    })
+}
+
+#[allow(dead_code)]
 fn switch_egress_has_future_arrival(
     image: &SimulationImage,
     egress: LinkId,
@@ -185,15 +320,19 @@ fn switch_egress_has_future_arrival(
 ) -> bool {
     image.initial_events.iter().any(|event| {
         event_executes_before(event.key.time_ns, run_end_exclusive)
-            && event_can_reach_switch_egress(image, event, egress)
-    })
+            && (event_can_reach_switch_egress(image, event, egress)
+                || event_tcp_descendant_can_reach_switch_egress(image, event, egress))
+    }) || resident_waiter_can_reach_switch_egress(image, egress, run_end_exclusive)
 }
 
 /// Conservative validated future-work test for device transition planes omitted from Full mode.
 ///
 /// `false` proves that no Rate, AQM, DRR, or WRR record can be produced before the inclusive
-/// scenario stop and the optional exclusive run horizon. `true` means a plane is reachable under
-/// the static event/route analysis, not that a particular execution must populate it.
+/// scenario stop and the optional exclusive run horizon. The route closure includes executable
+/// event payloads, every resident waiter released by an executable service event, and all
+/// subsequent alternating TCP data/ACK route descendants. `true` means a plane is reachable
+/// under this conservative ancestor-time analysis, not that a particular execution must populate
+/// it.
 #[allow(dead_code)]
 pub(crate) fn device_unported_transition_plane_reachable(
     image: &SimulationImage,

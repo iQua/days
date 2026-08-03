@@ -178,6 +178,40 @@ fn decimal_scaled_classes_accept_u64_max_and_reject_nonintegral_or_one_past_valu
 }
 
 #[test]
+fn exact_zero_accepts_exponents_outside_i64_without_weakening_nonzero_ranges() {
+    const HUGE_NEGATIVE: &str = "-999999999999999999999999999999999999999999999999999999999999";
+    for literal in [
+        "0e9223372036854775807",
+        "0e9223372036854775808",
+        "0e-9223372036854775808",
+        "0e-9223372036854775809",
+        "+0.0E+9223372036854775808",
+        "-0.000e-9223372036854775809",
+        "0.0_0e-9_223_372_036_854_775_809",
+    ] {
+        let image = compile_text(&empty_config(literal, "1", 100, "TailDrop", ""))
+            .unwrap_or_else(|error| panic!("exact zero {literal} must compile: {error}"));
+        assert_eq!(image.stop_time_ns, 0, "{literal}");
+    }
+
+    let reviewer_literal = format!("0e{HUGE_NEGATIVE}");
+    let image = compile_text(&empty_config(&reviewer_literal, "1", 100, "TailDrop", ""))
+        .unwrap_or_else(|error| {
+            panic!("verbatim reviewer exact zero {reviewer_literal} must compile: {error}")
+        });
+    assert_eq!(image.stop_time_ns, 0);
+
+    let nonzero = "1e-9223372036854775809";
+    let error = compile_text(&empty_config(nonzero, "1", 100, "TailDrop", ""))
+        .expect_err("a nonzero mantissa with an exponent below i64 must still reject")
+        .to_string();
+    assert_eq!(
+        error,
+        "unsupported simulation duration `1e-9223372036854775809`; exact representation requires an integer scaled value"
+    );
+}
+
+#[test]
 fn cubic_literals_and_pfc_zero_timer_gates_are_exact() {
     let cubic = |beta: &str, c: &str| {
         format!(
@@ -244,6 +278,13 @@ pause_quanta = [1, 0, 0, 0, 0, 0, 0, 0]
 refresh_interval = 1e-400
 drain_interval = 0
 "#;
+    let exact_zero_pfc = pfc.replace(
+        "refresh_interval = 1e-400\ndrain_interval = 0",
+        "refresh_interval = -0.000e-9223372036854775809\ndrain_interval = +0.0E+9223372036854775808",
+    );
+    compile_text(&exact_zero_pfc)
+        .expect("PFC timer gates must recognize signed fractional zeros before exponent scaling");
+
     let error = compile_text(pfc)
         .expect_err("nonzero underflowed PFC timer must reject")
         .to_string();

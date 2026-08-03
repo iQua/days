@@ -6,6 +6,15 @@ use days_executor::{
     SchedulerKind, SimulationImage, SwitchQueueState, SwitchState, WfqSchedulerState, event_phase,
     run_scalar_with_observations, validate,
 };
+#[cfg(feature = "cuda")]
+use days_executor::{CudaConfig, CudaError, run_cuda_with_observations};
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+use days_executor::{DropMarkPolicy, EcnThresholdPolicy, QueueDepthUnit};
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+use days_executor::{MetalConfig, MetalError, run_metal_with_observations};
 use num_bigint::BigUint;
 use num_rational::Ratio;
 
@@ -200,6 +209,559 @@ fn wfq_in_service_image() -> SimulationImage {
     checkpoint.initial_packets = prefix.resident_packets;
     checkpoint.initial_events = prefix.pending_events;
     checkpoint
+}
+
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn empty_host_state(egress_link: LinkId) -> HostState {
+    HostState {
+        egress_link,
+        queue: VecDeque::new(),
+        in_service: None,
+        tx_ready_pending: false,
+        generators: vec![],
+        tcp_receivers: vec![],
+        dcqcn_receivers: vec![],
+        next_payload_seq: 0,
+        next_origin_seq: 0,
+        sourced_packets: 0,
+        departed_packets: 0,
+        received_packets: 0,
+    }
+}
+
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn switch_state(
+    physical_switch: u64,
+    egress_link: LinkId,
+    scheduler: SchedulerKind,
+    drop_mark: DropMarkPolicy,
+) -> SwitchState {
+    SwitchState {
+        physical_switch,
+        queues: vec![SwitchQueueState {
+            egress_link: Some(egress_link),
+            scheduler,
+            queue_capacity_packets: 64,
+            drop_mark,
+            pfc: None,
+            queue: VecDeque::new(),
+            in_service: None,
+            tx_ready_pending: false,
+        }],
+        next_origin_seq: 0,
+        arrived_packets: 0,
+        dropped_packets: 0,
+        departed_packets: 0,
+    }
+}
+
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn checkpoint_image(source: &SimulationImage, horizon_ns: u64) -> SimulationImage {
+    let prefix = run_scalar_with_observations(source, Some(horizon_ns), ObservationMode::Full)
+        .expect("resident-waiter prefix must execute");
+    let mut checkpoint = source.clone();
+    checkpoint.host_states = prefix.host_states;
+    checkpoint.switch_states = prefix.switch_states;
+    checkpoint.initial_packets = prefix.resident_packets;
+    checkpoint.initial_events = prefix.pending_events;
+    checkpoint
+}
+
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn host_resident_waiter_image(
+    scheduler: SchedulerKind,
+    drop_mark: DropMarkPolicy,
+) -> SimulationImage {
+    let links = [
+        LinkDescriptor {
+            id: LinkId(0),
+            source: NodeId(0),
+            target: NodeId(3),
+            rate_bps: 8_000_000_000,
+            propagation_ns: 0,
+        },
+        LinkDescriptor {
+            id: LinkId(1),
+            source: NodeId(3),
+            target: NodeId(1),
+            rate_bps: 8_000_000_000,
+            propagation_ns: 0,
+        },
+        LinkDescriptor {
+            id: LinkId(2),
+            source: NodeId(4),
+            target: NodeId(2),
+            rate_bps: 8_000_000_000,
+            propagation_ns: 0,
+        },
+        LinkDescriptor {
+            id: LinkId(3),
+            source: NodeId(1),
+            target: NodeId(3),
+            rate_bps: 8_000_000_000,
+            propagation_ns: 0,
+        },
+        LinkDescriptor {
+            id: LinkId(4),
+            source: NodeId(2),
+            target: NodeId(4),
+            rate_bps: 8_000_000_000,
+            propagation_ns: 0,
+        },
+    ];
+    let packets = [
+        PacketDescriptor {
+            id: PayloadId(0),
+            flow: FlowId(0),
+            size_bytes: 8,
+            ecn_marked: false,
+            kind: days_executor::PacketKind::Data,
+        },
+        PacketDescriptor {
+            id: PayloadId(5),
+            flow: FlowId(1),
+            size_bytes: 1,
+            ecn_marked: false,
+            kind: days_executor::PacketKind::Data,
+        },
+    ];
+    let mut source = empty_host_state(LinkId(0));
+    source.next_payload_seq = 2;
+    source.next_origin_seq = 2;
+    let image = SimulationImage {
+        stop_time_ns: 100,
+        nodes: vec![
+            NodeDescriptor {
+                id: NodeId(0),
+                kind: NodeKind::Host,
+                state_slot: 0,
+            },
+            NodeDescriptor {
+                id: NodeId(1),
+                kind: NodeKind::Host,
+                state_slot: 1,
+            },
+            NodeDescriptor {
+                id: NodeId(2),
+                kind: NodeKind::Host,
+                state_slot: 2,
+            },
+            NodeDescriptor {
+                id: NodeId(3),
+                kind: NodeKind::Switch,
+                state_slot: 0,
+            },
+            NodeDescriptor {
+                id: NodeId(4),
+                kind: NodeKind::Switch,
+                state_slot: 1,
+            },
+        ],
+        host_states: vec![
+            source,
+            empty_host_state(LinkId(3)),
+            empty_host_state(LinkId(4)),
+        ],
+        switch_states: vec![
+            switch_state(0, LinkId(1), SchedulerKind::Fifo, DropMarkPolicy::TailDrop),
+            switch_state(0, LinkId(2), scheduler, drop_mark),
+        ],
+        flows: vec![
+            FlowDescriptor {
+                id: FlowId(0),
+                source: NodeId(0),
+                target: NodeId(1),
+                priority: 0,
+                route: vec![LinkId(0), LinkId(1)],
+                reverse_route: vec![],
+            },
+            FlowDescriptor {
+                id: FlowId(1),
+                source: NodeId(0),
+                target: NodeId(2),
+                priority: 0,
+                route: vec![LinkId(0), LinkId(2)],
+                reverse_route: vec![],
+            },
+        ],
+        initial_packets: packets.to_vec(),
+        links: links.to_vec(),
+        channels: vec![
+            RemoteChannel::for_packet_link_to(links[0], NodeId(3), 1).unwrap(),
+            RemoteChannel::for_packet_link_to(links[0], NodeId(4), 1).unwrap(),
+            RemoteChannel::for_packet_link(links[1], 1).unwrap(),
+            RemoteChannel::for_packet_link(links[2], 1).unwrap(),
+        ],
+        initial_events: packets
+            .iter()
+            .enumerate()
+            .map(|(origin_seq, packet)| Event {
+                key: EventKey {
+                    time_ns: 0,
+                    phase: event_phase(EventKind::PacketArrival),
+                    origin_node: NodeId(0),
+                    origin_seq: origin_seq as u64,
+                },
+                target: NodeId(0),
+                kind: EventKind::PacketArrival,
+                payload: packet.id,
+            })
+            .collect(),
+        seed: 26,
+    };
+    let checkpoint = checkpoint_image(&image, 1);
+    assert_eq!(checkpoint.host_states[0].in_service, Some(PayloadId(0)));
+    assert_eq!(
+        checkpoint.host_states[0].queue,
+        VecDeque::from([PayloadId(5)])
+    );
+    assert!(
+        checkpoint
+            .initial_events
+            .iter()
+            .all(|event| { event.key.time_ns == 8 && event.payload == PayloadId(0) })
+    );
+    checkpoint
+}
+
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn idle_host_resident_waiter_image(
+    scheduler: SchedulerKind,
+    drop_mark: DropMarkPolicy,
+) -> SimulationImage {
+    let mut checkpoint = host_resident_waiter_image(scheduler, drop_mark);
+    let state = &mut checkpoint.host_states[0];
+    let in_service = state
+        .in_service
+        .take()
+        .expect("host waiter checkpoint has an in-service packet");
+    state.queue.push_front(in_service);
+    state.tx_ready_pending = true;
+    let origin_seq = state.next_origin_seq;
+    state.next_origin_seq += 1;
+    checkpoint.initial_events = vec![Event {
+        key: EventKey {
+            time_ns: 8,
+            phase: event_phase(EventKind::TxReady),
+            origin_node: NodeId(0),
+            origin_seq,
+        },
+        target: NodeId(0),
+        kind: EventKind::TxReady,
+        payload: in_service,
+    }];
+    validate(&checkpoint, Backend::Scalar)
+        .expect("idle divergent host waiter checkpoint must validate");
+    checkpoint
+}
+
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn switch_resident_waiter_image(
+    scheduler: SchedulerKind,
+    drop_mark: DropMarkPolicy,
+) -> SimulationImage {
+    let links = [
+        LinkDescriptor {
+            id: LinkId(0),
+            source: NodeId(0),
+            target: NodeId(3),
+            rate_bps: 64_000_000_000,
+            propagation_ns: 0,
+        },
+        LinkDescriptor {
+            id: LinkId(1),
+            source: NodeId(3),
+            target: NodeId(4),
+            rate_bps: 8_000_000_000,
+            propagation_ns: 0,
+        },
+        LinkDescriptor {
+            id: LinkId(2),
+            source: NodeId(4),
+            target: NodeId(1),
+            rate_bps: 8_000_000_000,
+            propagation_ns: 0,
+        },
+        LinkDescriptor {
+            id: LinkId(3),
+            source: NodeId(5),
+            target: NodeId(2),
+            rate_bps: 8_000_000_000,
+            propagation_ns: 0,
+        },
+        LinkDescriptor {
+            id: LinkId(4),
+            source: NodeId(1),
+            target: NodeId(4),
+            rate_bps: 8_000_000_000,
+            propagation_ns: 0,
+        },
+        LinkDescriptor {
+            id: LinkId(5),
+            source: NodeId(2),
+            target: NodeId(5),
+            rate_bps: 8_000_000_000,
+            propagation_ns: 0,
+        },
+    ];
+    let packets = [
+        PacketDescriptor {
+            id: PayloadId(0),
+            flow: FlowId(0),
+            size_bytes: 8,
+            ecn_marked: false,
+            kind: days_executor::PacketKind::Data,
+        },
+        PacketDescriptor {
+            id: PayloadId(6),
+            flow: FlowId(1),
+            size_bytes: 1,
+            ecn_marked: false,
+            kind: days_executor::PacketKind::Data,
+        },
+    ];
+    let mut source = empty_host_state(LinkId(0));
+    source.next_payload_seq = 2;
+    source.next_origin_seq = 2;
+    let image = SimulationImage {
+        stop_time_ns: 100,
+        nodes: vec![
+            NodeDescriptor {
+                id: NodeId(0),
+                kind: NodeKind::Host,
+                state_slot: 0,
+            },
+            NodeDescriptor {
+                id: NodeId(1),
+                kind: NodeKind::Host,
+                state_slot: 1,
+            },
+            NodeDescriptor {
+                id: NodeId(2),
+                kind: NodeKind::Host,
+                state_slot: 2,
+            },
+            NodeDescriptor {
+                id: NodeId(3),
+                kind: NodeKind::Switch,
+                state_slot: 0,
+            },
+            NodeDescriptor {
+                id: NodeId(4),
+                kind: NodeKind::Switch,
+                state_slot: 1,
+            },
+            NodeDescriptor {
+                id: NodeId(5),
+                kind: NodeKind::Switch,
+                state_slot: 2,
+            },
+        ],
+        host_states: vec![
+            source,
+            empty_host_state(LinkId(4)),
+            empty_host_state(LinkId(5)),
+        ],
+        switch_states: vec![
+            switch_state(0, LinkId(1), SchedulerKind::Fifo, DropMarkPolicy::TailDrop),
+            switch_state(1, LinkId(2), SchedulerKind::Fifo, DropMarkPolicy::TailDrop),
+            switch_state(1, LinkId(3), scheduler, drop_mark),
+        ],
+        flows: vec![
+            FlowDescriptor {
+                id: FlowId(0),
+                source: NodeId(0),
+                target: NodeId(1),
+                priority: 0,
+                route: vec![LinkId(0), LinkId(1), LinkId(2)],
+                reverse_route: vec![],
+            },
+            FlowDescriptor {
+                id: FlowId(1),
+                source: NodeId(0),
+                target: NodeId(2),
+                priority: 0,
+                route: vec![LinkId(0), LinkId(1), LinkId(3)],
+                reverse_route: vec![],
+            },
+        ],
+        initial_packets: packets.to_vec(),
+        links: links.to_vec(),
+        channels: vec![
+            RemoteChannel::for_packet_link(links[0], 1).unwrap(),
+            RemoteChannel::for_packet_link_to(links[1], NodeId(4), 1).unwrap(),
+            RemoteChannel::for_packet_link_to(links[1], NodeId(5), 1).unwrap(),
+            RemoteChannel::for_packet_link(links[2], 1).unwrap(),
+            RemoteChannel::for_packet_link(links[3], 1).unwrap(),
+        ],
+        initial_events: packets
+            .iter()
+            .enumerate()
+            .map(|(origin_seq, packet)| Event {
+                key: EventKey {
+                    time_ns: 0,
+                    phase: event_phase(EventKind::PacketArrival),
+                    origin_node: NodeId(0),
+                    origin_seq: origin_seq as u64,
+                },
+                target: NodeId(0),
+                kind: EventKind::PacketArrival,
+                payload: packet.id,
+            })
+            .collect(),
+        seed: 26,
+    };
+    let checkpoint = checkpoint_image(&image, 3);
+    assert_eq!(
+        checkpoint.switch_states[0].queues[0].in_service,
+        Some(PayloadId(0))
+    );
+    assert_eq!(
+        checkpoint.switch_states[0].queues[0].queue,
+        VecDeque::from([PayloadId(6)])
+    );
+    assert!(checkpoint.initial_events.iter().any(|event| {
+        event.key.time_ns == 9
+            && event.kind == EventKind::TxComplete
+            && event.target == NodeId(3)
+            && event.payload == PayloadId(0)
+    }));
+    checkpoint
+}
+
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn resident_waiter_cases() -> Vec<(SimulationImage, u64, NodeId, PayloadId, bool)> {
+    let ecn = DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
+        unit: QueueDepthUnit::Packets,
+        capacity: 64,
+        threshold: 1,
+    });
+    let planes = [
+        (SchedulerKind::Fifo, ecn, true),
+        (
+            SchedulerKind::deficit_round_robin(vec![1]),
+            DropMarkPolicy::TailDrop,
+            false,
+        ),
+        (
+            SchedulerKind::weighted_round_robin(vec![1]),
+            DropMarkPolicy::TailDrop,
+            false,
+        ),
+    ];
+    let mut cases = Vec::new();
+    for (scheduler, drop_mark, aqm) in planes {
+        cases.push((
+            host_resident_waiter_image(scheduler.clone(), drop_mark),
+            8,
+            NodeId(4),
+            PayloadId(5),
+            aqm,
+        ));
+        cases.push((
+            idle_host_resident_waiter_image(scheduler.clone(), drop_mark),
+            8,
+            NodeId(4),
+            PayloadId(5),
+            aqm,
+        ));
+        cases.push((
+            switch_resident_waiter_image(scheduler, drop_mark),
+            9,
+            NodeId(5),
+            PayloadId(6),
+            aqm,
+        ));
+    }
+    cases
+}
+
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[test]
+fn metal_full_observation_closes_over_divergent_resident_waiters() {
+    for (image, boundary, node, payload, aqm) in resident_waiter_cases() {
+        let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+            .expect("resident-waiter suffix must execute");
+        if aqm {
+            assert_eq!(scalar.aqm_transitions.len(), 1);
+            assert_eq!(scalar.aqm_transitions[0].node, node);
+            assert_eq!(scalar.aqm_transitions[0].payload, payload);
+        } else {
+            assert_eq!(scalar.mechanism_transitions.len(), 1);
+        }
+        let dormant = run_scalar_with_observations(&image, Some(boundary), ObservationMode::Full)
+            .expect("completion at the exclusive horizon must remain dormant");
+        let metal_dormant = run_metal_with_observations(
+            &image,
+            Some(boundary),
+            MetalConfig::default(),
+            ObservationMode::Full,
+        )
+        .expect("excluded waiter handoff must retain Full support");
+        assert_eq!(metal_dormant.result, dormant);
+        assert_eq!(
+            run_metal_with_observations(
+                &image,
+                None,
+                MetalConfig::default(),
+                ObservationMode::Full,
+            )
+            .expect_err("Metal Full cannot omit a resident-waiter transition"),
+            MetalError::Validation(
+                "Full observation mode is unsupported on Metal for Rate, ECN, DRR, or WRR transition planes; use Summary".to_owned()
+            )
+        );
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_full_observation_closes_over_divergent_resident_waiters() {
+    for (image, boundary, _, _, _) in resident_waiter_cases() {
+        let dormant = run_scalar_with_observations(&image, Some(boundary), ObservationMode::Full)
+            .expect("completion at the exclusive horizon must remain dormant");
+        let cuda_dormant = run_cuda_with_observations(
+            &image,
+            Some(boundary),
+            CudaConfig::default(),
+            ObservationMode::Full,
+        )
+        .expect("excluded waiter handoff must retain Full support");
+        assert_eq!(cuda_dormant.result, dormant);
+        assert_eq!(
+            run_cuda_with_observations(
+                &image,
+                None,
+                CudaConfig::default(),
+                ObservationMode::Full,
+            )
+            .expect_err("CUDA Full cannot omit a resident-waiter transition"),
+            CudaError::Validation(
+                "Full observation mode is unsupported on CUDA for Rate, ECN, DRR, or WRR transition planes; use Summary".to_owned()
+            )
+        );
+    }
 }
 
 #[test]

@@ -1517,6 +1517,12 @@ fn parsed_decimal(literal: &str, label: &str) -> Result<ParsedDecimal, CompileEr
             power: 0,
         });
     }
+    let exponent = exponent.map_or(Ok(0), |value| {
+        value.parse::<i64>().map_err(|_| {
+            let positive = !value.starts_with('-');
+            decimal_range_error(label, literal, positive)
+        })
+    })?;
     let fraction_len = i64::try_from(fraction.len())
         .map_err(|_| decimal_range_error(label, literal, exponent.is_positive()))?;
     let mut power = exponent
@@ -1650,15 +1656,22 @@ fn split_decimal_exponent<'a>(
     literal: &'a str,
     label: &str,
     original: &str,
-) -> Result<(&'a str, i64), CompileError> {
+) -> Result<(&'a str, Option<&'a str>), CompileError> {
     let mut parts = literal.split(['e', 'E']);
     let mantissa = parts.next().unwrap_or_default();
     let exponent = match parts.next() {
-        None => 0,
-        Some(value) if !value.is_empty() => value.parse::<i64>().map_err(|_| {
-            let positive = !value.starts_with('-');
-            decimal_range_error(label, original, positive)
-        })?,
+        None => None,
+        Some(value)
+            if !value.is_empty()
+                && !value.strip_prefix(['+', '-']).unwrap_or(value).is_empty()
+                && value
+                    .strip_prefix(['+', '-'])
+                    .unwrap_or(value)
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit()) =>
+        {
+            Some(value)
+        }
         Some(_) => {
             return Err(CompileError::Invalid(format!(
                 "{label} `{original}` has an invalid decimal exponent"
@@ -2979,4 +2992,28 @@ fn mix_seed(mut value: u64) -> u64 {
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parsed_decimal;
+
+    #[test]
+    fn nonzero_decimal_exponents_outside_i64_keep_directional_errors() {
+        let positive = parsed_decimal("1e9223372036854775808", "probe")
+            .expect_err("positive exponent outside i64 must reject")
+            .to_string();
+        assert_eq!(
+            positive,
+            "invalid scenario: probe `1e9223372036854775808` exceeds the u64 representation"
+        );
+
+        let negative = parsed_decimal("1e-9223372036854775809", "probe")
+            .expect_err("negative exponent outside i64 must reject")
+            .to_string();
+        assert_eq!(
+            negative,
+            "unsupported probe `1e-9223372036854775809`; exact representation requires an integer scaled value"
+        );
+    }
 }

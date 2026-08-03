@@ -1440,18 +1440,112 @@ fn reachable_tcp_ack_ecn_image() -> SimulationImage {
         unreachable!()
     };
     tcp.total_bytes = MSS;
-    for queue in image
-        .switch_states
-        .iter_mut()
-        .flat_map(|state| &mut state.queues)
-    {
-        queue.drop_mark = DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
-            unit: QueueDepthUnit::Packets,
-            capacity: 64,
-            threshold: 1,
-        });
-    }
+    image.switch_states[1].queues[0].drop_mark = DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
+        unit: QueueDepthUnit::Packets,
+        capacity: 64,
+        threshold: 1,
+    });
     image
+}
+
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn reachable_tcp_ack_scheduler_image(scheduler: SchedulerKind) -> SimulationImage {
+    let mut image = reachable_tcp_ack_ecn_image();
+    image.switch_states[1].queues[0].drop_mark = DropMarkPolicy::TailDrop;
+    image.switch_states[1].queues[0].scheduler = scheduler;
+    image
+}
+
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn ack_descendant_forward_ecn_checkpoint() -> SimulationImage {
+    let mut image = switched_tcp_image(TcpCongestionControl::cubic(MSS), SchedulerKind::Fifo, 64);
+    let FlowGeneratorKind::Tcp(ref mut tcp) = image.host_states[0].generators[0].kind else {
+        unreachable!()
+    };
+    tcp.total_bytes = 2 * MSS;
+    image.switch_states[0].queues[0].drop_mark = DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
+        unit: QueueDepthUnit::Packets,
+        capacity: 64,
+        threshold: 1,
+    });
+    let prefix = run_scalar_with_observations(&image, Some(459), ObservationMode::Summary)
+        .expect("prefix must leave the first ACK at the source-arrival boundary");
+    let checkpoint = checkpoint_image(&image, &prefix);
+    assert!(checkpoint.initial_events.iter().any(|event| {
+        event.key.time_ns == 459
+            && event.kind == EventKind::RemoteArrival
+            && event.target == SOURCE
+            && checkpoint.initial_packets.iter().any(|packet| {
+                packet.id == event.payload && matches!(packet.kind, PacketKind::TcpAck(_))
+            })
+    }));
+    checkpoint
+}
+
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn data_descendant_chain_forward_ecn_checkpoint() -> SimulationImage {
+    let mut image = switched_tcp_image(TcpCongestionControl::cubic(MSS), SchedulerKind::Fifo, 64);
+    let FlowGeneratorKind::Tcp(ref mut tcp) = image.host_states[0].generators[0].kind else {
+        unreachable!()
+    };
+    tcp.total_bytes = 2 * MSS;
+    image.switch_states[0].queues[0].drop_mark = DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
+        unit: QueueDepthUnit::Packets,
+        capacity: 64,
+        threshold: 1,
+    });
+    let prefix = run_scalar_with_observations(&image, Some(42), ObservationMode::Summary)
+        .expect("prefix must leave data in flight after its first forward admission");
+    let mut checkpoint = checkpoint_image(&image, &prefix);
+    checkpoint.stop_time_ns = 1_000;
+    assert!(checkpoint.initial_events.iter().any(|event| {
+        event.key.time_ns == 451
+            && event.kind == EventKind::TxComplete
+            && event.target == NodeId(1)
+            && checkpoint.initial_packets.iter().any(|packet| {
+                packet.id == event.payload && matches!(packet.kind, PacketKind::TcpData(_))
+            })
+    }));
+    checkpoint
+}
+
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn ack_descendant_chain_reverse_ecn_checkpoint() -> SimulationImage {
+    let mut image = switched_tcp_image(TcpCongestionControl::cubic(MSS), SchedulerKind::Fifo, 64);
+    let FlowGeneratorKind::Tcp(ref mut tcp) = image.host_states[0].generators[0].kind else {
+        unreachable!()
+    };
+    tcp.total_bytes = 2 * MSS;
+    image.switch_states[1].queues[0].drop_mark = DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
+        unit: QueueDepthUnit::Packets,
+        capacity: 64,
+        threshold: 1,
+    });
+    let prefix = run_scalar_with_observations(&image, Some(459), ObservationMode::Summary)
+        .expect("prefix must leave the first ACK at the source-arrival boundary");
+    let mut checkpoint = checkpoint_image(&image, &prefix);
+    checkpoint.stop_time_ns = 1_000;
+    assert!(checkpoint.initial_events.iter().any(|event| {
+        event.key.time_ns == 459
+            && event.kind == EventKind::RemoteArrival
+            && event.target == SOURCE
+            && checkpoint.initial_packets.iter().any(|packet| {
+                packet.id == event.payload && matches!(packet.kind, PacketKind::TcpAck(_))
+            })
+    }));
+    checkpoint
 }
 
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
@@ -1502,6 +1596,24 @@ fn cuda_reachable_notect_ack_matches_scalar_in_summary_mode() {
 #[test]
 fn metal_full_observation_mode_is_rejected_precisely() {
     let image = reachable_tcp_ack_ecn_image();
+    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("scalar reverse-ACK counterexample must execute");
+    assert_eq!(scalar.aqm_transitions.len(), 1);
+    assert_eq!(scalar.aqm_transitions[0].key.time_ns, 455);
+    assert_eq!(scalar.aqm_transitions[0].node, NodeId(3));
+    assert_eq!(scalar.aqm_transitions[0].payload, PayloadId(2));
+
+    let dormant = run_scalar_with_observations(&image, Some(0), ObservationMode::Full)
+        .expect("the root event is excluded at the exact horizon");
+    let metal_dormant = run_metal_with_observations(
+        &image,
+        Some(0),
+        MetalConfig::default(),
+        ObservationMode::Full,
+    )
+    .expect("an excluded TCP root cannot populate its descendant route");
+    assert_eq!(metal_dormant.result, dormant);
+
     assert_eq!(
         run_metal_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full,)
             .expect_err("Metal does not implement every Full transition plane"),
@@ -1509,6 +1621,99 @@ fn metal_full_observation_mode_is_rejected_precisely() {
             "Full observation mode is unsupported on Metal for Rate, ECN, DRR, or WRR transition planes; use Summary".to_owned()
         )
     );
+
+    for scheduler in [
+        SchedulerKind::deficit_round_robin(vec![1]),
+        SchedulerKind::weighted_round_robin(vec![1]),
+    ] {
+        let image = reachable_tcp_ack_scheduler_image(scheduler);
+        let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+            .expect("scalar reverse-ACK scheduler counterexample must execute");
+        assert_eq!(scalar.mechanism_transitions.len(), 1);
+        let dormant = run_scalar_with_observations(&image, Some(0), ObservationMode::Full)
+            .expect("the TCP root is excluded at the exact horizon");
+        let metal_dormant = run_metal_with_observations(
+            &image,
+            Some(0),
+            MetalConfig::default(),
+            ObservationMode::Full,
+        )
+        .expect("an excluded TCP root cannot populate its descendant scheduler route");
+        assert_eq!(metal_dormant.result, dormant);
+        assert_eq!(
+            run_metal_with_observations(
+                &image,
+                None,
+                MetalConfig::default(),
+                ObservationMode::Full,
+            )
+            .expect_err("Metal Full cannot omit a reverse-ACK scheduler transition"),
+            MetalError::Validation(
+                "Full observation mode is unsupported on Metal for Rate, ECN, DRR, or WRR transition planes; use Summary".to_owned()
+            )
+        );
+    }
+
+    let checkpoint = ack_descendant_forward_ecn_checkpoint();
+    let scalar = run_scalar_with_observations(&checkpoint, None, ObservationMode::Full)
+        .expect("scalar ACK-to-data counterexample must execute");
+    assert_eq!(scalar.aqm_transitions.len(), 1);
+    assert_eq!(scalar.aqm_transitions[0].key.time_ns, 500);
+    let dormant = run_scalar_with_observations(&checkpoint, Some(459), ObservationMode::Full)
+        .expect("the ACK root is excluded at the exact horizon");
+    let metal_dormant = run_metal_with_observations(
+        &checkpoint,
+        Some(459),
+        MetalConfig::default(),
+        ObservationMode::Full,
+    )
+    .expect("an excluded ACK cannot populate the forward route");
+    assert_eq!(metal_dormant.result, dormant);
+    assert_eq!(
+        run_metal_with_observations(
+            &checkpoint,
+            None,
+            MetalConfig::default(),
+            ObservationMode::Full,
+        )
+        .expect_err("Metal Full cannot omit an ACK-created forward AQM transition"),
+        MetalError::Validation(
+            "Full observation mode is unsupported on Metal for Rate, ECN, DRR, or WRR transition planes; use Summary".to_owned()
+        )
+    );
+
+    for (checkpoint, boundary, transition_time) in [
+        (data_descendant_chain_forward_ecn_checkpoint(), 451, 500),
+        (ack_descendant_chain_reverse_ecn_checkpoint(), 459, 914),
+    ] {
+        let scalar = run_scalar_with_observations(&checkpoint, None, ObservationMode::Full)
+            .expect("scalar multi-generation TCP descendant chain must execute");
+        assert_eq!(scalar.aqm_transitions.len(), 1);
+        assert_eq!(scalar.aqm_transitions[0].key.time_ns, transition_time);
+        let dormant =
+            run_scalar_with_observations(&checkpoint, Some(boundary), ObservationMode::Full)
+                .expect("the multi-generation TCP root is excluded at the exact horizon");
+        let metal_dormant = run_metal_with_observations(
+            &checkpoint,
+            Some(boundary),
+            MetalConfig::default(),
+            ObservationMode::Full,
+        )
+        .expect("an excluded root cannot populate a transitive TCP descendant route");
+        assert_eq!(metal_dormant.result, dormant);
+        assert_eq!(
+            run_metal_with_observations(
+                &checkpoint,
+                None,
+                MetalConfig::default(),
+                ObservationMode::Full,
+            )
+            .expect_err("Metal Full cannot omit a transitive TCP descendant AQM transition"),
+            MetalError::Validation(
+                "Full observation mode is unsupported on Metal for Rate, ECN, DRR, or WRR transition planes; use Summary".to_owned()
+            )
+        );
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -1522,6 +1727,99 @@ fn cuda_full_observation_mode_is_rejected_precisely() {
             "Full observation mode is unsupported on CUDA for Rate, ECN, DRR, or WRR transition planes; use Summary".to_owned()
         )
     );
+
+    for scheduler in [
+        SchedulerKind::deficit_round_robin(vec![1]),
+        SchedulerKind::weighted_round_robin(vec![1]),
+    ] {
+        let image = reachable_tcp_ack_scheduler_image(scheduler);
+        let dormant = run_scalar_with_observations(&image, Some(0), ObservationMode::Full)
+            .expect("the TCP root is excluded at the exact horizon");
+        let cuda_dormant = run_cuda_with_observations(
+            &image,
+            Some(0),
+            CudaConfig::default(),
+            ObservationMode::Full,
+        )
+        .expect("an excluded TCP root cannot populate its descendant scheduler route");
+        assert_eq!(cuda_dormant.result, dormant);
+        assert_eq!(
+            run_cuda_with_observations(
+                &image,
+                None,
+                CudaConfig::default(),
+                ObservationMode::Full,
+            )
+            .expect_err("CUDA Full cannot omit a reverse-ACK scheduler transition"),
+            CudaError::Validation(
+                "Full observation mode is unsupported on CUDA for Rate, ECN, DRR, or WRR transition planes; use Summary".to_owned()
+            )
+        );
+    }
+
+    let dormant = run_scalar_with_observations(&image, Some(0), ObservationMode::Full)
+        .expect("the root event is excluded at the exact horizon");
+    let cuda_dormant = run_cuda_with_observations(
+        &image,
+        Some(0),
+        CudaConfig::default(),
+        ObservationMode::Full,
+    )
+    .expect("an excluded TCP root cannot populate its descendant route");
+    assert_eq!(cuda_dormant.result, dormant);
+
+    let checkpoint = ack_descendant_forward_ecn_checkpoint();
+    let dormant = run_scalar_with_observations(&checkpoint, Some(459), ObservationMode::Full)
+        .expect("the ACK root is excluded at the exact horizon");
+    let cuda_dormant = run_cuda_with_observations(
+        &checkpoint,
+        Some(459),
+        CudaConfig::default(),
+        ObservationMode::Full,
+    )
+    .expect("an excluded ACK cannot populate the forward route");
+    assert_eq!(cuda_dormant.result, dormant);
+    assert_eq!(
+        run_cuda_with_observations(
+            &checkpoint,
+            None,
+            CudaConfig::default(),
+            ObservationMode::Full,
+        )
+        .expect_err("CUDA Full cannot omit an ACK-created forward AQM transition"),
+        CudaError::Validation(
+            "Full observation mode is unsupported on CUDA for Rate, ECN, DRR, or WRR transition planes; use Summary".to_owned()
+        )
+    );
+
+    for (checkpoint, boundary) in [
+        (data_descendant_chain_forward_ecn_checkpoint(), 451),
+        (ack_descendant_chain_reverse_ecn_checkpoint(), 459),
+    ] {
+        let dormant =
+            run_scalar_with_observations(&checkpoint, Some(boundary), ObservationMode::Full)
+                .expect("the multi-generation TCP root is excluded at the exact horizon");
+        let cuda_dormant = run_cuda_with_observations(
+            &checkpoint,
+            Some(boundary),
+            CudaConfig::default(),
+            ObservationMode::Full,
+        )
+        .expect("an excluded root cannot populate a transitive TCP descendant route");
+        assert_eq!(cuda_dormant.result, dormant);
+        assert_eq!(
+            run_cuda_with_observations(
+                &checkpoint,
+                None,
+                CudaConfig::default(),
+                ObservationMode::Full,
+            )
+            .expect_err("CUDA Full cannot omit a transitive TCP descendant AQM transition"),
+            CudaError::Validation(
+                "Full observation mode is unsupported on CUDA for Rate, ECN, DRR, or WRR transition planes; use Summary".to_owned()
+            )
+        );
+    }
 }
 
 #[test]
