@@ -266,20 +266,25 @@ struct PendingCollectiveProgress {
     before_inbound_bytes: u64,
 }
 
-fn collective_progress_record(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CollectiveProgressContext {
     key: EventKey,
     ordinal: u64,
     node: NodeId,
     stop_time_ns: u64,
+    activated: bool,
+}
+
+fn collective_progress_record(
+    context: CollectiveProgressContext,
     cause: PendingCollectiveProgress,
     collective: crate::CollectiveGenerator,
     generator: &crate::FlowGeneratorState,
-    activated: bool,
 ) -> crate::CollectiveProgressRecord {
     crate::CollectiveProgressRecord {
-        key,
-        ordinal,
-        node,
+        key: context.key,
+        ordinal: context.ordinal,
+        node: context.node,
         flow: generator.flow,
         cause: cause.cause,
         cause_flow: cause.cause_flow,
@@ -295,14 +300,14 @@ fn collective_progress_record(
         chunk_bytes: collective.chunk_bytes,
         packet_size_bytes: collective.packet_size_bytes,
         interval_ns: collective.interval_ns,
-        stop_time_ns,
+        stop_time_ns: context.stop_time_ns,
         local_predecessor: collective.local_predecessor,
         inbound_predecessor: collective.inbound_predecessor,
         inbound_predecessor_bytes: collective.inbound_predecessor_bytes,
         before_local_complete: cause.before_local_complete,
         before_inbound_complete: cause.before_inbound_complete,
         before_inbound_bytes: cause.before_inbound_bytes,
-        activated,
+        activated: context.activated,
         after_local_complete: collective.local_predecessor_complete,
         after_inbound_complete: collective.inbound_predecessor_complete,
         after_inbound_bytes: collective.inbound_bytes_received,
@@ -1384,14 +1389,16 @@ impl<'image> TransitionState<'image> {
                     unreachable!("collective activation retains its generator kind")
                 };
                 let transition = collective_progress_record(
-                    parent.key,
-                    ordinal,
-                    node.id,
-                    stop_time_ns,
+                    CollectiveProgressContext {
+                        key: parent.key,
+                        ordinal,
+                        node: node.id,
+                        stop_time_ns,
+                        activated: true,
+                    },
                     cause,
                     after_collective,
                     generator,
-                    true,
                 );
                 ordinal = ordinal
                     .checked_add(1)
@@ -1470,14 +1477,16 @@ impl<'image> TransitionState<'image> {
                         });
                     };
                     transitions.push(collective_progress_record(
-                        parent.key,
-                        ordinal,
-                        node.id,
-                        stop_time_ns,
+                        CollectiveProgressContext {
+                            key: parent.key,
+                            ordinal,
+                            node: node.id,
+                            stop_time_ns,
+                            activated: false,
+                        },
                         cause,
                         collective,
                         generator,
-                        false,
                     ));
                     ordinal = ordinal
                         .checked_add(1)
