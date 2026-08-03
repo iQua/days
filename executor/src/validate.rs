@@ -4680,10 +4680,22 @@ fn validate_global_time_capacity(
                     .flat_map(|queue| queue.queue.iter().copied().chain(queue.in_service))
             }))
             .collect::<BTreeSet<_>>();
-        for event in &image.initial_events {
-            let packet =
-                packet(image, event.payload).expect("event validation established the packet");
-            let flow = flow(image, packet.flow).expect("packet validation established the flow");
+        for (index, event) in image.initial_events.iter().enumerate() {
+            if event.kind == EventKind::RetransmissionTimeout {
+                continue;
+            }
+            let packet = packet(image, event.payload).ok_or_else(|| {
+                ValidationError::new(format!(
+                    "initial event {index} references unknown packet {:?}",
+                    event.payload
+                ))
+            })?;
+            let flow = flow(image, packet.flow).ok_or_else(|| {
+                ValidationError::new(format!(
+                    "packet {:?} references unknown flow {:?}",
+                    packet.id, packet.flow
+                ))
+            })?;
             let terminal = packet_terminal(flow, packet.kind);
             if event.kind != EventKind::RemoteArrival || event.target != terminal {
                 payloads.insert(event.payload);
@@ -4733,19 +4745,34 @@ fn validate_global_time_capacity(
     }
     for generator in image.host_states.iter().flat_map(|state| &state.generators) {
         let flow = flow(image, generator.flow).expect("generator validation established the flow");
-        let packet_size_bytes = match generator.kind {
-            FlowGeneratorKind::Constant(constant) => constant.packet_size_bytes,
-            FlowGeneratorKind::Tcp(tcp) => tcp.mss_bytes,
-            FlowGeneratorKind::Rate(rate) => rate.packet_size_bytes,
-            FlowGeneratorKind::Collective(collective) => collective.packet_size_bytes,
-            FlowGeneratorKind::Dcqcn(dcqcn) => dcqcn.rate.packet_size_bytes,
-        };
         let remaining = executable_generator_packets(image, generator)?;
+        if remaining == 0 {
+            continue;
+        }
+        let maximum_packet_size_bytes = match generator.kind {
+            FlowGeneratorKind::Constant(constant) => constant.packet_size_bytes,
+            FlowGeneratorKind::Tcp(tcp) => tcp_future_data_max_frame(image, generator, tcp),
+            FlowGeneratorKind::Rate(rate) => rate
+                .packet_size_bytes
+                .min(rate.total_bytes - generator.bytes_emitted),
+            FlowGeneratorKind::Collective(collective) => collective
+                .packet_size_bytes
+                .min(collective.chunk_bytes - generator.bytes_emitted),
+            FlowGeneratorKind::Dcqcn(dcqcn) => dcqcn
+                .rate
+                .packet_size_bytes
+                .min(dcqcn.rate.total_bytes - generator.bytes_emitted),
+        };
         for link_id in &flow.route {
             let link = link(image, *link_id).expect("flow validation established the route link");
             let delay = link
-                .delay_ns(packet_size_bytes)
-                .expect("generator/link delay validation already succeeded");
+                .delay_ns(maximum_packet_size_bytes)
+                .map_err(|error| {
+                    ValidationError::new(format!(
+                        "link {:?} delay overflows for flow {:?} generator packet size {maximum_packet_size_bytes}: {error}",
+                        link.id, flow.id
+                    ))
+                })?;
             let flow_delay = delay.checked_mul(remaining).ok_or_else(|| {
                 ValidationError::new(format!(
                     "conservative service-time bound overflows for flow {:?} generator on link {:?}",

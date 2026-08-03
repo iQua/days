@@ -1269,6 +1269,252 @@ fn stale_different_timer_checkpoint_is_byte_identical_on_all_available_backends(
     }
 }
 
+fn scalar_checkpoint_with_reclaimed_stale_rto_payload(
+    exclusive_horizon_ns: u64,
+) -> SimulationImage {
+    let image = switched_tcp_image(TcpCongestionControl::reno(MSS), SchedulerKind::Fifo, 1);
+    let prefix =
+        run_scalar_with_observations(&image, Some(exclusive_horizon_ns), ObservationMode::Summary)
+            .expect("reviewer scalar prefix must run");
+    let checkpoint = checkpoint_image(&image, &prefix);
+    let missing_rto_payloads = checkpoint
+        .initial_events
+        .iter()
+        .filter(|event| {
+            event.kind == EventKind::RetransmissionTimeout
+                && !checkpoint
+                    .initial_packets
+                    .iter()
+                    .any(|packet| packet.id == event.payload)
+        })
+        .count();
+    assert_eq!(
+        missing_rto_payloads, 1,
+        "reviewer checkpoint must retain one stale RTO after reclaiming its attempt packet"
+    );
+    validate(&checkpoint, Backend::Scalar).expect("Scalar must accept its own checkpoint");
+
+    checkpoint
+}
+
+fn validate_stale_rto_checkpoint_on_devices(checkpoint: &SimulationImage, case: &str) {
+    for backend in [Backend::Metal, Backend::Cuda] {
+        validate(checkpoint, backend)
+            .unwrap_or_else(|error| panic!("{backend} must accept {case}: {error}"));
+    }
+}
+
+fn reclaimed_stale_rto(checkpoint: &SimulationImage) -> Event {
+    checkpoint
+        .initial_events
+        .iter()
+        .copied()
+        .find(|event| {
+            event.kind == EventKind::RetransmissionTimeout
+                && !checkpoint
+                    .initial_packets
+                    .iter()
+                    .any(|packet| packet.id == event.payload)
+        })
+        .expect("reviewer checkpoint retains its packetless stale RTO")
+}
+
+#[test]
+fn device_validators_accept_scalar_checkpoint_with_reclaimed_stale_rto_payload() {
+    let checkpoint = scalar_checkpoint_with_reclaimed_stale_rto_payload(10_000);
+    validate_stale_rto_checkpoint_on_devices(&checkpoint, "the reviewer stale RTO checkpoint");
+}
+
+#[test]
+fn device_validators_accept_stale_rto_horizon_multiplicity_and_resident_boundaries() {
+    let checkpoint = scalar_checkpoint_with_reclaimed_stale_rto_payload(10_000);
+    let stale_rto = reclaimed_stale_rto(&checkpoint);
+    let forward_resident = scalar_checkpoint_with_reclaimed_stale_rto_payload(911);
+    assert!(
+        forward_resident
+            .initial_packets
+            .iter()
+            .filter(|packet| matches!(packet.kind, PacketKind::TcpData(_)))
+            .any(|packet| {
+                forward_resident.host_states.iter().any(|state| {
+                    state.in_service == Some(packet.id) || state.queue.contains(&packet.id)
+                }) || forward_resident.switch_states.iter().any(|state| {
+                    state.queues.iter().any(|queue| {
+                        queue.in_service == Some(packet.id) || queue.queue.contains(&packet.id)
+                    })
+                }) || forward_resident.initial_events.iter().any(|event| {
+                    event.kind != EventKind::RetransmissionTimeout && event.payload == packet.id
+                })
+            }),
+        "the stale RTO must coexist with positioned forward-route data"
+    );
+    let reverse_resident = scalar_checkpoint_with_reclaimed_stale_rto_payload(1_272);
+    assert!(
+        reverse_resident
+            .initial_packets
+            .iter()
+            .filter(|packet| matches!(packet.kind, PacketKind::TcpAck(_)))
+            .any(|packet| {
+                reverse_resident.host_states.iter().any(|state| {
+                    state.in_service == Some(packet.id) || state.queue.contains(&packet.id)
+                }) || reverse_resident.switch_states.iter().any(|state| {
+                    state.queues.iter().any(|queue| {
+                        queue.in_service == Some(packet.id) || queue.queue.contains(&packet.id)
+                    })
+                }) || reverse_resident.initial_events.iter().any(|event| {
+                    event.kind != EventKind::RetransmissionTimeout && event.payload == packet.id
+                })
+            }),
+        "the stale RTO must coexist with a positioned reverse-route ACK: packets={:?}, events={:?}",
+        reverse_resident.initial_packets,
+        reverse_resident.initial_events
+    );
+
+    let mut at_exclusive_horizon = checkpoint.clone();
+    at_exclusive_horizon.stop_time_ns = stale_rto
+        .key
+        .time_ns
+        .checked_sub(1)
+        .expect("reviewer RTO follows time zero");
+
+    let mut past_exclusive_horizon = checkpoint.clone();
+    past_exclusive_horizon.stop_time_ns = stale_rto
+        .key
+        .time_ns
+        .checked_sub(2)
+        .expect("reviewer RTO follows the past-horizon boundary");
+
+    let mut inside_horizon = checkpoint.clone();
+    inside_horizon.stop_time_ns = stale_rto.key.time_ns;
+
+    let mut multiple_rtos = checkpoint.clone();
+    let source_state = &mut multiple_rtos.host_states[SOURCE.0 as usize];
+    let mut second_stale_rto = stale_rto;
+    second_stale_rto.key.time_ns = second_stale_rto
+        .key
+        .time_ns
+        .checked_add(1)
+        .expect("reviewer RTO leaves room for a second timer");
+    second_stale_rto.key.origin_seq = source_state.next_origin_seq;
+    source_state.next_origin_seq = source_state
+        .next_origin_seq
+        .checked_add(1)
+        .expect("small checkpoint leaves origin-sequence capacity");
+    multiple_rtos.initial_events.push(second_stale_rto);
+    multiple_rtos
+        .initial_events
+        .sort_unstable_by_key(|event| event.key);
+    assert_eq!(
+        multiple_rtos
+            .initial_events
+            .iter()
+            .filter(|event| {
+                event.kind == EventKind::RetransmissionTimeout
+                    && !multiple_rtos
+                        .initial_packets
+                        .iter()
+                        .any(|packet| packet.id == event.payload)
+            })
+            .count(),
+        2
+    );
+
+    for (case, variant) in [
+        ("a stale RTO inside the run horizon", inside_horizon),
+        (
+            "a stale RTO at the exact exclusive run horizon",
+            at_exclusive_horizon,
+        ),
+        (
+            "a stale RTO past the exclusive run horizon",
+            past_exclusive_horizon,
+        ),
+        ("multiple stale RTOs", multiple_rtos),
+        (
+            "a stale RTO alongside positioned forward data",
+            forward_resident,
+        ),
+        (
+            "a stale RTO alongside a resident reverse ACK",
+            reverse_resident,
+        ),
+    ] {
+        validate(&variant, Backend::Scalar)
+            .unwrap_or_else(|error| panic!("Scalar must accept {case}: {error}"));
+        validate_stale_rto_checkpoint_on_devices(&variant, case);
+    }
+}
+
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[test]
+fn metal_executes_reclaimed_stale_rto_as_a_scalar_identical_noop() {
+    let checkpoint = scalar_checkpoint_with_reclaimed_stale_rto_payload(10_000);
+    let stale_rto_time = reclaimed_stale_rto(&checkpoint).key.time_ns;
+    let exclusive_horizon = stale_rto_time
+        .checked_add(1)
+        .expect("reviewer RTO can execute below u64::MAX");
+    let scalar = run_scalar_with_observations(
+        &checkpoint,
+        Some(exclusive_horizon),
+        ObservationMode::Summary,
+    )
+    .expect("Scalar must execute the stale RTO as a no-op");
+    let metal = run_metal_with_observations(
+        &checkpoint,
+        Some(exclusive_horizon),
+        MetalConfig::default(),
+        ObservationMode::Summary,
+    )
+    .expect("Metal must execute the stale RTO as a no-op");
+    assert_eq!(metal.result, scalar);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_executes_reclaimed_stale_rto_as_a_scalar_identical_noop() {
+    let checkpoint = scalar_checkpoint_with_reclaimed_stale_rto_payload(10_000);
+    let stale_rto_time = reclaimed_stale_rto(&checkpoint).key.time_ns;
+    let exclusive_horizon = stale_rto_time
+        .checked_add(1)
+        .expect("reviewer RTO can execute below u64::MAX");
+    let scalar = run_scalar_with_observations(
+        &checkpoint,
+        Some(exclusive_horizon),
+        ObservationMode::Summary,
+    )
+    .expect("Scalar must execute the stale RTO as a no-op");
+    let cuda = run_cuda_with_observations(
+        &checkpoint,
+        Some(exclusive_horizon),
+        CudaConfig::default(),
+        ObservationMode::Summary,
+    )
+    .expect("CUDA must execute the stale RTO as a no-op");
+    assert_eq!(cuda.result, scalar);
+}
+
+#[test]
+fn device_time_capacity_accepts_a_reachable_short_tcp_tail_without_panicking() {
+    let mut image = tcp_image(TcpCongestionControl::reno(u64::MAX), 1);
+    let FlowGeneratorKind::Tcp(ref mut tcp) = image.host_states[0].generators[0].kind else {
+        unreachable!()
+    };
+    tcp.mss_bytes = u64::MAX;
+    image.links[0].rate_bps = 1;
+    image.channels[0] = RemoteChannel::for_packet_link(image.links[0], 1)
+        .expect("one-byte tail has a representable link delay");
+
+    for backend in [
+        Backend::Scalar,
+        Backend::Cpu { workers: 2 },
+        Backend::Metal,
+        Backend::Cuda,
+    ] {
+        validate(&image, backend)
+            .unwrap_or_else(|error| panic!("{backend} must accept the one-byte TCP tail: {error}"));
+    }
+}
+
 #[test]
 fn tcp_lookahead_admits_one_byte_data_segments_and_forty_byte_acks() {
     let image = tcp_image(TcpCongestionControl::reno(MSS), 2 * MSS);
