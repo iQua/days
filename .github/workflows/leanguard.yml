@@ -51,6 +51,9 @@ jobs:
             aqm_check \
             aqm_dcqcn_check
 
+      - name: Audit DaysExecutor axioms and placeholders
+        run: bash lean/scripts/audit-days-executor-axioms.sh
+
       - name: Run AQM fixture checks
         run: bash lean/scripts/run-aqm-fixtures.sh
 
