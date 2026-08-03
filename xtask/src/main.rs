@@ -62,19 +62,43 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     },
 ];
 
+const T13F_FULL_LOAD_TESTS: &[&str] = &[
+    "width_via_load_full_load_10_holds_runtime_contract",
+    "width_via_load_full_load_30_holds_runtime_contract",
+    "width_via_load_full_load_50_holds_runtime_contract",
+    "width_via_load_full_load_70_holds_runtime_contract",
+    "width_via_load_full_load_90_holds_runtime_contract",
+];
+
 fn main() {
     let mut arguments = std::env::args().skip(1);
-    match (arguments.next().as_deref(), arguments.next()) {
-        (Some("audit"), None) => {}
+    let command = match (arguments.next(), arguments.next()) {
+        (Some(command), None) => command,
         _ => {
-            eprintln!("usage: cargo xtask audit");
+            print_usage();
             std::process::exit(2);
         }
-    }
+    };
 
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("xtask must be a direct workspace member");
+
+    match command.as_str() {
+        "audit" => run_audits(workspace),
+        "t13f-full-load" => run_t13f_full_load(workspace),
+        _ => {
+            print_usage();
+            std::process::exit(2);
+        }
+    }
+}
+
+fn print_usage() {
+    eprintln!("usage: cargo xtask <audit|t13f-full-load>");
+}
+
+fn run_audits(workspace: &Path) {
     let output = Command::new("cargo")
         .args(["metadata", "--format-version", "1", "--all-features"])
         .current_dir(workspace)
@@ -105,5 +129,34 @@ fn main() {
     } else {
         eprintln!("{}", failures.join("\n\n"));
         std::process::exit(1);
+    }
+}
+
+fn run_t13f_full_load(workspace: &Path) {
+    let status = Command::new("cargo")
+        .args([
+            "nextest",
+            "run",
+            "--package",
+            "days-validation",
+            "--features",
+            "metal-spike",
+            "--test",
+            "t13f_width_via_load_full",
+            "--test-threads",
+            "5",
+        ])
+        .args(T13F_FULL_LOAD_TESTS)
+        .current_dir(workspace)
+        .status()
+        .unwrap_or_else(|error| {
+            eprintln!(
+                "failed to execute cargo-nextest ({error}); install it with `cargo install cargo-nextest --locked`"
+            );
+            std::process::exit(1);
+        });
+
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
     }
 }

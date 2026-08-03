@@ -15,6 +15,11 @@ const PACKET_SIZE_BYTES: u64 = 256;
 const MIN_EVENTS: u128 = 10_000_000;
 const MAX_EVENTS: u128 = 50_000_000;
 
+// Keep the full-load lane in Cargo's debug test profile: overflow panics and
+// debug assertions are deliberate detection instruments. The checked-in files
+// under FIXTURE_DIRECTORY are read-only inputs; any future generated artifacts
+// must live in a per-test tempfile::TempDir.
+
 #[derive(Clone, Copy)]
 struct Fixture {
     name: &'static str,
@@ -312,43 +317,70 @@ fn smallest_width_via_load_full_fixture_lowers_and_truncates_pending_tail() {
 }
 
 #[cfg(feature = "metal-spike")]
-#[test]
-fn remaining_width_via_load_full_fixtures_hold_the_runtime_contract() {
-    for fixture in FIXTURES.into_iter().skip(1) {
-        let path = fixture_path(fixture.name);
-        let image = compile_config(&path)
-            .unwrap_or_else(|error| panic!("failed to lower {}: {error}", path.display()));
-        let run = run_scalar_rounds(&image, None)
-            .unwrap_or_else(|error| panic!("failed to execute {}: {error}", path.display()));
-        let total_events = run
-            .rounds
-            .iter()
-            .map(|round| u128::from(round.events_processed))
-            .sum::<u128>();
+fn assert_runtime_contract(fixture: Fixture) {
+    let path = fixture_path(fixture.name);
+    let image = compile_config(&path)
+        .unwrap_or_else(|error| panic!("failed to lower {}: {error}", path.display()));
+    let run = run_scalar_rounds(&image, None)
+        .unwrap_or_else(|error| panic!("failed to execute {}: {error}", path.display()));
+    let total_events = run
+        .rounds
+        .iter()
+        .map(|round| u128::from(round.events_processed))
+        .sum::<u128>();
 
-        assert_eq!(
-            run.result.summary.sourced_bytes,
-            sourced_bytes_through_stop(fixture),
-            "{} sourced-byte total changed",
-            fixture.name
-        );
-        assert!(
-            (MIN_EVENTS..=MAX_EVENTS).contains(&total_events),
-            "{} processed {total_events} events, outside [{MIN_EVENTS}, {MAX_EVENTS}]",
-            fixture.name
-        );
-        assert!(
-            !run.result.pending_events.is_empty(),
-            "{} must retain a pending tail",
-            fixture.name
-        );
-        assert!(
-            run.result
-                .pending_events
-                .iter()
-                .all(|event| event.key.time_ns > image.stop_time_ns),
-            "{} retained an event at or before the stop time",
-            fixture.name
-        );
-    }
+    assert_eq!(
+        run.result.summary.sourced_bytes,
+        sourced_bytes_through_stop(fixture),
+        "{} sourced-byte total changed",
+        fixture.name
+    );
+    assert!(
+        (MIN_EVENTS..=MAX_EVENTS).contains(&total_events),
+        "{} processed {total_events} events, outside [{MIN_EVENTS}, {MAX_EVENTS}]",
+        fixture.name
+    );
+    assert!(
+        !run.result.pending_events.is_empty(),
+        "{} must retain a pending tail",
+        fixture.name
+    );
+    assert!(
+        run.result
+            .pending_events
+            .iter()
+            .all(|event| event.key.time_ns > image.stop_time_ns),
+        "{} retained an event at or before the stop time",
+        fixture.name
+    );
+}
+
+#[cfg(feature = "metal-spike")]
+#[test]
+fn width_via_load_full_load_10_holds_runtime_contract() {
+    assert_runtime_contract(FIXTURES[0]);
+}
+
+#[cfg(feature = "metal-spike")]
+#[test]
+fn width_via_load_full_load_30_holds_runtime_contract() {
+    assert_runtime_contract(FIXTURES[1]);
+}
+
+#[cfg(feature = "metal-spike")]
+#[test]
+fn width_via_load_full_load_50_holds_runtime_contract() {
+    assert_runtime_contract(FIXTURES[2]);
+}
+
+#[cfg(feature = "metal-spike")]
+#[test]
+fn width_via_load_full_load_70_holds_runtime_contract() {
+    assert_runtime_contract(FIXTURES[3]);
+}
+
+#[cfg(feature = "metal-spike")]
+#[test]
+fn width_via_load_full_load_90_holds_runtime_contract() {
+    assert_runtime_contract(FIXTURES[4]);
 }

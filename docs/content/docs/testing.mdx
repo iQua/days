@@ -22,6 +22,13 @@ If you have `cargo-nextest` installed:
 cargo nextest run --workspace --all-features --no-capture
 ```
 
+The T13f full-load width lane deliberately uses the debug test profile and runs
+one fixture per nextest process:
+
+```bash
+cargo xtask t13f-full-load
+```
+
 ## Feature-gated test suites
 
 Many tests use `#![cfg(feature = "test")]` to enable additional invariants and helpers (for example, verifying that local time tracking matches the simulation engine clock).
