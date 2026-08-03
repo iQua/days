@@ -137,6 +137,130 @@ pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), Validat
     Ok(())
 }
 
+#[allow(dead_code)]
+fn device_run_end_exclusive(image: &SimulationImage, exclusive_horizon_ns: Option<u64>) -> u128 {
+    let stop_end = u128::from(image.stop_time_ns) + 1;
+    exclusive_horizon_ns.map_or(stop_end, |horizon| stop_end.min(u128::from(horizon)))
+}
+
+#[allow(dead_code)]
+fn event_executes_before(event_time_ns: u64, run_end_exclusive: u128) -> bool {
+    u128::from(event_time_ns) < run_end_exclusive
+}
+
+#[allow(dead_code)]
+fn event_can_reach_switch_egress(
+    image: &SimulationImage,
+    event: &crate::Event,
+    candidate: LinkId,
+) -> bool {
+    let Some(packet) = packet(image, event.payload) else {
+        return false;
+    };
+    let Some(flow) = flow(image, packet.flow) else {
+        return false;
+    };
+    let route = packet_route(flow, packet.kind);
+    let Some(candidate_index) = route.iter().position(|link_id| *link_id == candidate) else {
+        return false;
+    };
+    let Some(outgoing_index) = route_outgoing_index(image, route, event.target) else {
+        return false;
+    };
+    match event.kind {
+        EventKind::PacketArrival
+        | EventKind::RemoteArrival
+        | EventKind::PacingTimer
+        | EventKind::RetransmissionTimeout => candidate_index >= outgoing_index,
+        // The packet has already crossed admission and scheduler selection at the current egress.
+        EventKind::TxReady | EventKind::TxComplete => candidate_index > outgoing_index,
+    }
+}
+
+#[allow(dead_code)]
+fn switch_egress_has_future_arrival(
+    image: &SimulationImage,
+    egress: LinkId,
+    run_end_exclusive: u128,
+) -> bool {
+    image.initial_events.iter().any(|event| {
+        event_executes_before(event.key.time_ns, run_end_exclusive)
+            && event_can_reach_switch_egress(image, event, egress)
+    })
+}
+
+/// Conservative validated future-work test for device transition planes omitted from Full mode.
+///
+/// `false` proves that no Rate, AQM, DRR, or WRR record can be produced before the inclusive
+/// scenario stop and the optional exclusive run horizon. `true` means a plane is reachable under
+/// the static event/route analysis, not that a particular execution must populate it.
+#[allow(dead_code)]
+pub(crate) fn device_unported_transition_plane_reachable(
+    image: &SimulationImage,
+    exclusive_horizon_ns: Option<u64>,
+) -> bool {
+    let run_end_exclusive = device_run_end_exclusive(image, exclusive_horizon_ns);
+    if run_end_exclusive == 0 {
+        return false;
+    }
+    let rate_reachable = image
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .any(|generator| {
+            matches!(generator.kind, FlowGeneratorKind::Rate(_))
+                && matches!(
+                    generator.next_emission.status,
+                    GeneratorStatus::Scheduled | GeneratorStatus::Blocked
+                )
+                && event_executes_before(
+                    generator.next_emission.departure_time_ns,
+                    run_end_exclusive,
+                )
+        });
+    if rate_reachable {
+        return true;
+    }
+
+    for owner in image
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::Switch)
+    {
+        for queue in &image.switch_states[owner.state_slot as usize].queues {
+            let Some(egress) = queue.egress_link else {
+                continue;
+            };
+            let future_arrival = switch_egress_has_future_arrival(image, egress, run_end_exclusive);
+            if queue.drop_mark != crate::DropMarkPolicy::TailDrop && future_arrival {
+                return true;
+            }
+            if matches!(
+                queue.scheduler,
+                SchedulerKind::DeficitRoundRobin(_) | SchedulerKind::WeightedRoundRobin(_)
+            ) {
+                let ready = image.initial_events.iter().any(|event| {
+                    event.kind == EventKind::TxReady
+                        && event.target == owner.id
+                        && event_egress(image, event) == Some(egress)
+                        && event_executes_before(event.key.time_ns, run_end_exclusive)
+                });
+                let completion_with_waiter = !queue.queue.is_empty()
+                    && image.initial_events.iter().any(|event| {
+                        event.kind == EventKind::TxComplete
+                            && event.target == owner.id
+                            && event_egress(image, event) == Some(egress)
+                            && event_executes_before(event.key.time_ns, run_end_exclusive)
+                    });
+                if ready || completion_with_waiter || future_arrival {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn validate_backend_capabilities(
     image: &SimulationImage,
     backend: Backend,
@@ -1525,7 +1649,9 @@ fn validate_generators(image: &SimulationImage) -> Result<(), ValidationError> {
                     || collective.rank >= collective.group_size
                     || collective.step == 0
                     || collective.step >= collective.group_size
+                    || collective.declared_total_bytes == 0
                     || collective.chunk_bytes == 0
+                        && collective.algorithm != crate::CollectiveAlgorithm::AllGather
                     || collective.packet_size_bytes == 0
                     || collective.interval_ns == 0
                 {
@@ -2218,6 +2344,7 @@ struct CollectivePartitionState {
     topology_level: u32,
     topology_group: u32,
     group_size: u32,
+    declared_total_bytes: u64,
     bounds_by_owner: BTreeMap<u32, (u64, u64)>,
     copies_by_owner: BTreeMap<u32, u64>,
 }
@@ -2254,6 +2381,7 @@ fn validate_collective_partitions(image: &SimulationImage) -> Result<(), Validat
                     topology_level: stage.topology_level,
                     topology_group: stage.topology_group,
                     group_size: stage.group_size,
+                    declared_total_bytes: stage.declared_total_bytes,
                     bounds_by_owner: BTreeMap::new(),
                     copies_by_owner: BTreeMap::new(),
                 });
@@ -2261,6 +2389,7 @@ fn validate_collective_partitions(image: &SimulationImage) -> Result<(), Validat
             || state.topology_level != stage.topology_level
             || state.topology_group != stage.topology_group
             || state.group_size != stage.group_size
+            || state.declared_total_bytes != stage.declared_total_bytes
         {
             return Err(ValidationError::new(format!(
                 "collective partition {} metadata is inconsistent across propagation stages",
@@ -2303,35 +2432,28 @@ fn validate_collective_partitions(image: &SimulationImage) -> Result<(), Validat
                 "collective partition {collective_id} does not propagate every owner exactly {expected_copies} times"
             )));
         }
-        let bounds = state.bounds_by_owner.into_iter().collect::<Vec<_>>();
-        let base = bounds[0].1.1;
-        let mut expected_offset = 0_u64;
-        for (index, (owner, (offset, bytes))) in bounds.iter().copied().enumerate() {
-            if usize::try_from(owner).ok() != Some(index)
-                || offset != expected_offset
-                || index + 1 != bounds.len() && bytes != base
-            {
-                return Err(ValidationError::new(format!(
-                    "collective partition {collective_id} is not contiguous EqualRemainderLast at owner {owner}"
-                )));
-            }
-            expected_offset = expected_offset.checked_add(bytes).ok_or_else(|| {
+        let base = state.declared_total_bytes / u64::from(state.group_size);
+        for (index, (owner, (offset, bytes))) in state.bounds_by_owner.into_iter().enumerate() {
+            let owner_u64 = u64::from(owner);
+            let expected_offset = owner_u64.checked_mul(base).ok_or_else(|| {
                 ValidationError::new(format!(
-                    "collective partition {collective_id} endpoint exceeds u64"
+                    "collective partition {collective_id} declared-total offset exceeds u64"
                 ))
             })?;
-        }
-        let total_bytes = expected_offset;
-        let expected_base = total_bytes / u64::from(state.group_size);
-        let expected_last = total_bytes - expected_base * u64::from(state.group_size - 1);
-        if base != expected_base
-            || bounds
-                .last()
-                .is_none_or(|(_, (_, bytes))| *bytes != expected_last)
-        {
-            return Err(ValidationError::new(format!(
-                "collective partition {collective_id} does not place only the division remainder in the last owner chunk"
-            )));
+            let expected_bytes = if owner + 1 == state.group_size {
+                state.declared_total_bytes - expected_offset
+            } else {
+                base
+            };
+            if usize::try_from(owner).ok() != Some(index)
+                || offset != expected_offset
+                || bytes != expected_bytes
+            {
+                return Err(ValidationError::new(format!(
+                    "collective partition {collective_id} does not match declared total {} under EqualRemainderLast at owner {owner}",
+                    state.declared_total_bytes
+                )));
+            }
         }
     }
     Ok(())
@@ -2701,6 +2823,10 @@ fn validate_packets_and_derive_delays(
     }
     for state in &image.host_states {
         for generator in &state.generators {
+            if matches!(generator.kind, FlowGeneratorKind::Collective(collective) if collective.chunk_bytes == 0)
+            {
+                continue;
+            }
             let flow = flow(image, generator.flow).expect("generator validation established flow");
             let generator_can_emit = matches!(
                 generator.next_emission.status,
@@ -5262,9 +5388,21 @@ fn remaining_generator_packets(
     generator: &crate::FlowGeneratorState,
 ) -> Result<u64, ValidationError> {
     if let FlowGeneratorKind::Collective(collective) = generator.kind {
-        if collective.packet_size_bytes == 0 || collective.chunk_bytes == 0 {
+        if collective.packet_size_bytes == 0 {
             return Err(ValidationError::new(format!(
-                "flow {:?} collective packet and chunk sizes must be positive",
+                "flow {:?} collective packet size must be positive",
+                generator.flow
+            )));
+        }
+        if collective.chunk_bytes == 0 {
+            if collective.algorithm == crate::CollectiveAlgorithm::AllGather
+                && generator.packets_emitted == 0
+                && generator.bytes_emitted == 0
+            {
+                return Ok(0);
+            }
+            return Err(ValidationError::new(format!(
+                "flow {:?} collective zero chunk is not a canonical AllGather no-op",
                 generator.flow
             )));
         }

@@ -728,7 +728,7 @@ drop = "TailDrop"
     let error = compile_config(path).expect_err("fractional-nanosecond duration should reject");
     assert_eq!(
         error.to_string(),
-        "unsupported simulation duration `0.0000000015`; Days executor v1 requires an integer number of nanoseconds"
+        "unsupported simulation duration `0.0000000015`; exact representation requires an integer scaled value"
     );
 }
 
@@ -2068,7 +2068,7 @@ size = 1
 arr_dist = { type = "Uniform", low = 0.0000000015, high = 0.0000000015 }
 pkt_size_dist = { type = "Uniform", low = 1, high = 1 }
 "#,
-            "unsupported packet arrival interval `0.0000000015`; Days executor v1 requires an integer number of nanoseconds",
+            "unsupported packet arrival distribution `0.0000000015`; exact representation requires an integer scaled value",
         ),
     ];
 

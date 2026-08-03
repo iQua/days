@@ -16,6 +16,16 @@ Supported `collective_type` values:
 - `AllReduce`
 - `RingAllReduce`
 
+The current executor lowering in `src/scenario/compile.rs` supports `RingAllReduce` and
+`AllGather` with deterministic, byte-terminated `PacketDistribution` traffic. Its edge rules are
+algorithm-specific:
+
+- `RingAllReduce` requires at least two ranks and at least one byte per rank.
+- `AllGather` requires at least one rank. A single-rank group or a zero-byte transfer is a valid
+  no-op and lowers to an empty propagation program.
+- If an `AllGather` byte count is smaller than its rank count, zero-byte partitions are finished
+  initially and the non-zero partitions still propagate normally.
+
 Collectives can be specified individually (`[[collective]]`) or as sets (`[[collective_set]]`).
 
 ## `[[collective]]` schema
@@ -52,7 +62,7 @@ Notes:
 - The optional `graph` field is currently stored but not used to derive endpoints; to control endpoints, use `sources`/`sinks` or `paths`.
 - `RingAllReduce` is expanded internally into per-hop traffic flows for a reduce-scatter-style phase followed by an all-gather-style phase.
 - `RingAllReduce` currently supports byte-sized traffic only. Duration-based ring collectives are rejected.
-- For byte-sized `RingAllReduce`, `traffic.size` must be at least the ring size so every generated hop carries a non-zero chunk.
+- For byte-sized `RingAllReduce`, `traffic.size` must be at least the ring size so every generated hop carries a non-zero chunk. This constraint does not apply to `AllGather`.
 
 ## Endpoint selection rules
 

@@ -28,6 +28,7 @@ days-executor = { path = "executor" }
 env_logger = "0.11"
 clap = { version = "4.5", features = ["derive"] }
 log = "0.4"
+num-bigint = "0.4.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = [ "fmt", "env-filter", "registry" ] }
 parking_lot = "0.12"

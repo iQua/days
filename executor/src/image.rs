@@ -280,6 +280,8 @@ pub struct CollectiveGenerator {
     pub topology_level: u32,
     pub topology_group: u32,
     pub group_size: u32,
+    /// Immutable source-declared byte total from which every owner partition is derived.
+    pub declared_total_bytes: u64,
     pub rank: u32,
     pub phase: CollectivePhase,
     /// One-based phase step.

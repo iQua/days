@@ -968,7 +968,7 @@ impl MetalExecutor {
     ) -> Result<MetalRun, MetalError> {
         validate(image, Backend::Metal)
             .map_err(|error| MetalError::Validation(error.to_string()))?;
-        validate_metal_observation_mode(image, observation_mode)?;
+        validate_metal_observation_mode(image, exclusive_horizon_ns, observation_mode)?;
         validate_config(config)?;
 
         let plan = MetalPlan::new(image, exclusive_horizon_ns, config, observation_mode)?;
@@ -983,25 +983,11 @@ impl MetalExecutor {
 
 fn validate_metal_observation_mode(
     image: &SimulationImage,
+    exclusive_horizon_ns: Option<u64>,
     observation_mode: ObservationMode,
 ) -> Result<(), MetalError> {
-    let has_unported_transition_plane = image
-        .host_states
-        .iter()
-        .flat_map(|state| &state.generators)
-        .any(|generator| matches!(generator.kind, FlowGeneratorKind::Rate(_)))
-        || image
-            .switch_states
-            .iter()
-            .flat_map(|state| &state.queues)
-            .any(|queue| {
-                queue.drop_mark != crate::DropMarkPolicy::TailDrop
-                    || matches!(
-                        queue.scheduler,
-                        crate::SchedulerKind::DeficitRoundRobin(_)
-                            | crate::SchedulerKind::WeightedRoundRobin(_)
-                    )
-            });
+    let has_unported_transition_plane =
+        crate::validate::device_unported_transition_plane_reachable(image, exclusive_horizon_ns);
     if observation_mode == ObservationMode::Full && has_unported_transition_plane {
         Err(MetalError::Validation(
             "Full observation mode is unsupported on Metal for Rate, ECN, DRR, or WRR transition planes; use Summary"

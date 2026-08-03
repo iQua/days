@@ -752,6 +752,29 @@ fn metal_ecn_threshold_and_persistent_marks_match_scalar() {
     }
 }
 
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[test]
+fn metal_dormant_ecn_threshold_retains_full_observation_support() {
+    let image = aqm_image(
+        DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
+            unit: QueueDepthUnit::Packets,
+            capacity: 2,
+            threshold: 1,
+        }),
+        &[1],
+    );
+    let expected = run_scalar_with_observations(&image, Some(0), ObservationMode::Full).unwrap();
+    assert!(expected.mechanism_transitions.is_empty());
+    let actual = run_metal_with_observations(
+        &image,
+        Some(0),
+        MetalConfig::default(),
+        ObservationMode::Full,
+    )
+    .expect("an ECN queue with no reachable arrival must retain Full observation support");
+    assert_eq!(actual.result, expected);
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 fn cuda_ecn_threshold_and_persistent_marks_match_scalar() {
@@ -781,4 +804,27 @@ fn cuda_ecn_threshold_and_persistent_marks_match_scalar() {
             }
         }
     }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_dormant_ecn_threshold_retains_full_observation_support() {
+    let image = aqm_image(
+        DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
+            unit: QueueDepthUnit::Packets,
+            capacity: 2,
+            threshold: 1,
+        }),
+        &[1],
+    );
+    let expected = run_scalar_with_observations(&image, Some(0), ObservationMode::Full).unwrap();
+    assert!(expected.mechanism_transitions.is_empty());
+    let actual = run_cuda_with_observations(
+        &image,
+        Some(0),
+        CudaConfig::default(),
+        ObservationMode::Full,
+    )
+    .expect("an ECN queue with no reachable arrival must retain Full observation support");
+    assert_eq!(actual.result, expected);
 }

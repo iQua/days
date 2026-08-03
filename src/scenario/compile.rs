@@ -13,6 +13,7 @@ use days_executor::{
     ScheduledEmission, SchedulerKind, SimulationImage, SwitchQueueState, SwitchState,
     TcpCongestionControl, TcpDataHeader, TcpGenerator, TcpReceiverState, event_phase, validate,
 };
+use num_bigint::BigUint;
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 use rand::SeedableRng;
@@ -21,7 +22,6 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use super::ids::{IdError, LinkKey, LpKey, PhysicalNodeKey, StableIds, dense_ids};
-use crate::scenario::DistributionInfo;
 use crate::topos::build::{HostAttachments, TopologyError, build_graph};
 use crate::topos::route::{RouteTableError, compute_shortest_path_route_table};
 
@@ -55,7 +55,7 @@ impl From<IdError> for CompileError {
 #[derive(Debug, Deserialize)]
 struct SourceConfig {
     seed: Option<u64>,
-    duration: Option<f64>,
+    duration: Option<ExactDecimal>,
     switch: SourceSwitch,
     link: Option<SourceLink>,
     time_quantum_ns: Option<u64>,
@@ -67,11 +67,11 @@ struct SourceConfig {
 
 #[derive(Debug, Deserialize)]
 struct SourceSwitch {
-    port_rate: Option<toml::Value>,
+    port_rate: Option<ExactDecimal>,
     capacity: u64,
     discipline: Option<String>,
     drop: Option<String>,
-    ecn_threshold: Option<f64>,
+    ecn_threshold: Option<ExactDecimal>,
     weights: Option<Vec<u64>>,
     priorities: Option<Vec<u64>>,
 }
@@ -89,8 +89,8 @@ struct SourcePfc {
     xon: Option<Vec<u64>>,
     buffer_capacity: Option<Vec<u64>>,
     pause_quanta: Option<Vec<u16>>,
-    refresh_interval: Option<f64>,
-    drain_interval: Option<f64>,
+    refresh_interval: Option<ExactDecimal>,
+    drain_interval: Option<ExactDecimal>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,11 +149,11 @@ struct SourceCollectiveSet {
 
 #[derive(Clone, Debug, Deserialize)]
 struct SourceTraffic {
-    initial_delay: Option<f64>,
-    duration: Option<f64>,
+    initial_delay: Option<ExactDecimal>,
+    duration: Option<ExactDecimal>,
     size: Option<u64>,
-    arr_dist: DistributionInfo,
-    pkt_size_dist: DistributionInfo,
+    arr_dist: SourceDistributionInfo,
+    pkt_size_dist: SourceDistributionInfo,
     tcp: Option<SourceTcp>,
     dcqcn: Option<SourceDcqcn>,
 }
@@ -164,6 +164,21 @@ struct ExactDecimal {
 }
 
 impl<'de> Deserialize<'de> for ExactDecimal {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = toml::Spanned::<serde::de::IgnoredAny>::deserialize(deserializer)?;
+        Ok(Self { span: value.span() })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SourceDistributionInfo {
+    span: std::ops::Range<usize>,
+}
+
+impl<'de> Deserialize<'de> for SourceDistributionInfo {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -199,8 +214,8 @@ struct SourceTcp {
 
 #[derive(Clone, Debug, Deserialize)]
 struct SourceCubic {
-    beta: Option<f64>,
-    c: Option<f64>,
+    beta: Option<ExactDecimal>,
+    c: Option<ExactDecimal>,
     fast_convergence: Option<bool>,
 }
 
@@ -310,12 +325,15 @@ enum FlowKey {
 #[derive(Clone, Debug)]
 struct CollectiveStageInput {
     collective_id: u64,
+    declared_total_bytes: u64,
     position: CollectiveStagePosition,
     chunk_offset_bytes: u64,
     chunk_bytes: u64,
     local_predecessor: Option<CollectiveStagePosition>,
     inbound_predecessor: Option<CollectiveStagePosition>,
     inbound_predecessor_bytes: u64,
+    local_predecessor_complete: bool,
+    inbound_predecessor_complete: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -380,8 +398,14 @@ impl SupportedModel {
         let seed = source
             .seed
             .ok_or_else(|| CompileError::Invalid("`seed` is missing".to_owned()))?;
-        let stop_time_ns = seconds_to_ns(source.duration.unwrap_or(1500.0), "simulation duration")?;
-        let rate_bps = parse_rate(source.switch.port_rate.as_ref())?;
+        let stop_time_ns = optional_scaled_decimal(
+            scenario_text,
+            source.duration.as_ref(),
+            "1500",
+            1_000_000_000,
+            "simulation duration",
+        )?;
+        let rate_bps = parse_rate(scenario_text, source.switch.port_rate.as_ref())?;
 
         let discipline = source
             .switch
@@ -490,18 +514,13 @@ impl SupportedModel {
                 })
             }
             "ECN_THRESHOLD" => {
-                let fraction = source.switch.ecn_threshold.unwrap_or(0.8);
-                if source.switch.capacity == 0
-                    || !fraction.is_finite()
-                    || !(0.0..=1.0).contains(&fraction)
-                    || fraction == 0.0
-                {
-                    return Err(CompileError::Invalid(
-                        "ECN threshold requires finite 0 < switch.ecn_threshold <= 1 and positive capacity"
-                            .to_owned(),
-                    ));
-                }
-                let threshold = (fraction * source.switch.capacity as f64).ceil() as u64;
+                let threshold = exact_decimal_product_ceil(
+                    scenario_text,
+                    source.switch.ecn_threshold.as_ref(),
+                    "0.8",
+                    source.switch.capacity,
+                    "switch.ecn_threshold",
+                )?;
                 DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
                     unit: QueueDepthUnit::Packets,
                     capacity: source.switch.capacity,
@@ -522,13 +541,25 @@ impl SupportedModel {
                 let config = link.pfc.as_ref().ok_or_else(|| {
                     CompileError::Invalid("`link.pfc` is required when link mode is Pfc".to_owned())
                 })?;
-                if config
+                let refresh_nonzero = config
                     .refresh_interval
-                    .is_some_and(|interval| interval != 0.0)
-                    || config
-                        .drain_interval
-                        .is_some_and(|interval| interval != 0.0)
-                {
+                    .as_ref()
+                    .map(|interval| {
+                        exact_decimal_is_zero(scenario_text, interval, "PFC refresh interval")
+                            .map(|zero| !zero)
+                    })
+                    .transpose()?
+                    .unwrap_or(false);
+                let drain_nonzero = config
+                    .drain_interval
+                    .as_ref()
+                    .map(|interval| {
+                        exact_decimal_is_zero(scenario_text, interval, "PFC drain interval")
+                            .map(|zero| !zero)
+                    })
+                    .transpose()?
+                    .unwrap_or(false);
+                if refresh_nonzero || drain_nonzero {
                     return Err(CompileError::Unsupported(
                         "PFC refresh/drain timers are outside the T25 executor mechanism; use edge-triggered XOFF/XON"
                             .to_owned(),
@@ -649,7 +680,7 @@ fn validated_weights(
     Ok(weights)
 }
 
-fn parse_rate(value: Option<&toml::Value>) -> Result<u64, CompileError> {
+fn parse_rate(scenario_text: &str, value: Option<&ExactDecimal>) -> Result<u64, CompileError> {
     let Some(value) = value else {
         return Err(CompileError::Unsupported(
             "unsupported link rate: `switch.port_rate` is missing; Days executor v1 requires a positive constant rate"
@@ -657,41 +688,14 @@ fn parse_rate(value: Option<&toml::Value>) -> Result<u64, CompileError> {
         ));
     };
 
-    let rate = match value {
-        toml::Value::Integer(rate) => {
-            if *rate == 0 {
-                return Err(CompileError::Unsupported(
-                    "unsupported link rate: `switch.port_rate` is zero; Days executor v1 requires a positive constant rate"
-                        .to_owned(),
-                ));
-            }
-            u64::try_from(*rate).map_err(|_| {
-                CompileError::Unsupported(format!(
-                    "unsupported link rate `{rate}`; Days executor v1 requires a positive constant rate"
-                ))
-            })?
-        }
-        toml::Value::Float(rate) => {
-            if *rate == 0.0 {
-                return Err(CompileError::Unsupported(
-                    "unsupported link rate: `switch.port_rate` is zero; Days executor v1 requires a positive constant rate"
-                        .to_owned(),
-                ));
-            }
-            if !rate.is_finite() || *rate < 0.0 || rate.fract() != 0.0 || *rate >= 2_f64.powi(64) {
-                return Err(CompileError::Unsupported(format!(
-                    "unsupported link rate `{rate}`; Days executor v1 requires a positive integer constant rate"
-                )));
-            }
-            *rate as u64
-        }
-        other => {
-            return Err(CompileError::Unsupported(format!(
-                "unsupported link rate `{other}`; Days executor v1 requires a positive integer constant rate"
-            )));
-        }
-    };
-
+    let literal = exact_decimal_literal(scenario_text, value, "link rate")?;
+    let rate = scaled_decimal_literal(literal, 1, "link rate")?;
+    if rate == 0 {
+        return Err(CompileError::Unsupported(
+            "unsupported link rate: `switch.port_rate` is zero; Days executor v1 requires a positive constant rate"
+                .to_owned(),
+        ));
+    }
     Ok(rate)
 }
 
@@ -875,10 +879,13 @@ fn collective_key(
             "collective priority must be in IEEE 802.1Q range 0..=7".to_owned(),
         ));
     }
-    if flow_count < 2 {
-        return Err(CompileError::Invalid(
-            "collective flow_count must be at least 2".to_owned(),
-        ));
+    if flow_count == 0 || algorithm == CollectiveAlgorithm::RingAllReduce && flow_count < 2 {
+        return Err(CompileError::Invalid(match algorithm {
+            CollectiveAlgorithm::RingAllReduce => {
+                "RingAllReduce flow_count must be at least 2".to_owned()
+            }
+            CollectiveAlgorithm::AllGather => "AllGather flow_count must be at least 1".to_owned(),
+        }));
     }
     if sources.is_empty() != sinks.is_empty() {
         return Err(CompileError::Invalid(
@@ -911,9 +918,9 @@ fn collective_key(
                 .to_owned(),
         ));
     };
-    if total_bytes < flow_count {
+    if algorithm == CollectiveAlgorithm::RingAllReduce && total_bytes < flow_count {
         return Err(CompileError::Invalid(format!(
-            "collective byte size {total_bytes} must be at least flow_count {flow_count}"
+            "RingAllReduce byte size {total_bytes} must be at least flow_count {flow_count}"
         )));
     }
     Ok(CollectiveKey {
@@ -987,7 +994,7 @@ fn validate_traffic(
     flow_kind: SourceFlowKind,
     scenario_text: &str,
 ) -> Result<TrafficKey, CompileError> {
-    let packet_size_bytes = constant_packet_size_bytes(&traffic.pkt_size_dist)?;
+    let packet_size_bytes = constant_packet_size_bytes(&traffic.pkt_size_dist, scenario_text)?;
     let (kind, interval_ns, termination) = match flow_kind {
         SourceFlowKind::PacketDistribution => {
             if traffic.dcqcn.is_some() {
@@ -1002,9 +1009,12 @@ fn validate_traffic(
                         .to_owned(),
                 ));
             }
-            let interval_seconds =
-                constant_distribution(&traffic.arr_dist, "packet arrival distribution")?;
-            let interval_ns = seconds_to_ns(interval_seconds, "packet arrival interval")?;
+            let interval_ns = constant_distribution_scaled(
+                &traffic.arr_dist,
+                scenario_text,
+                1_000_000_000,
+                "packet arrival distribution",
+            )?;
             if interval_ns == 0 {
                 return Err(CompileError::Unsupported(
                     "unsupported zero packet arrival interval; deterministic precomputation would not advance time"
@@ -1013,9 +1023,12 @@ fn validate_traffic(
             }
             let termination = match (traffic.size, traffic.duration) {
                 (Some(size), _) => Termination::Bytes(size),
-                (None, Some(duration)) => {
-                    Termination::DurationNs(seconds_to_ns(duration, "flow duration")?)
-                }
+                (None, Some(duration)) => Termination::DurationNs(scaled_decimal(
+                    scenario_text,
+                    &duration,
+                    1_000_000_000,
+                    "flow duration",
+                )?),
                 (None, None) => {
                     return Err(CompileError::Invalid(
                         "open-loop traffic must specify `size` or `duration`".to_owned(),
@@ -1053,7 +1066,7 @@ fn validate_traffic(
                     TcpAlgorithm::Reno
                 }
                 "TCPCubic" | "CUBIC" | "Cubic" | "cubic" => {
-                    validate_cubic_profile(tcp.cubic.as_ref())?;
+                    validate_cubic_profile(tcp.cubic.as_ref(), scenario_text)?;
                     TcpAlgorithm::Cubic
                 }
                 unsupported => {
@@ -1195,8 +1208,11 @@ fn validate_traffic(
     };
 
     Ok(TrafficKey {
-        initial_delay_ns: seconds_to_ns(
-            traffic.initial_delay.unwrap_or_default(),
+        initial_delay_ns: optional_scaled_decimal(
+            scenario_text,
+            traffic.initial_delay.as_ref(),
+            "0",
+            1_000_000_000,
             "initial flow delay",
         )?,
         interval_ns,
@@ -1206,13 +1222,18 @@ fn validate_traffic(
     })
 }
 
-fn validate_cubic_profile(cubic: Option<&SourceCubic>) -> Result<(), CompileError> {
+fn validate_cubic_profile(
+    cubic: Option<&SourceCubic>,
+    scenario_text: &str,
+) -> Result<(), CompileError> {
     let supported = cubic.is_none_or(|cubic| {
-        cubic.beta.is_none_or(|beta| beta == 0.7)
-            && cubic.c.is_none_or(|c| c == 0.4)
-            && cubic
-                .fast_convergence
-                .is_none_or(|fast_convergence| fast_convergence)
+        cubic.beta.as_ref().is_none_or(|beta| {
+            scaled_decimal(scenario_text, beta, 10, "TCP CUBIC beta").is_ok_and(|value| value == 7)
+        }) && cubic.c.as_ref().is_none_or(|c| {
+            scaled_decimal(scenario_text, c, 10, "TCP CUBIC c").is_ok_and(|value| value == 4)
+        }) && cubic
+            .fast_convergence
+            .is_none_or(|fast_convergence| fast_convergence)
     });
     if supported {
         Ok(())
@@ -1224,10 +1245,104 @@ fn validate_cubic_profile(cubic: Option<&SourceCubic>) -> Result<(), CompileErro
     }
 }
 
-fn constant_packet_size_bytes(distribution: &DistributionInfo) -> Result<u64, CompileError> {
-    match distribution {
-        DistributionInfo::DiscreteUniform { low, high } if low == high => {
-            u64::try_from(*low).map_err(|_| {
+enum ParsedSourceDistribution<'a> {
+    DiscreteUniform { low: i64, high: i64 },
+    Exp,
+    Uniform { low: &'a str, high: &'a str },
+}
+
+fn source_distribution<'a>(
+    distribution: &SourceDistributionInfo,
+    scenario_text: &'a str,
+) -> Result<ParsedSourceDistribution<'a>, CompileError> {
+    let literal = scenario_text
+        .get(distribution.span.clone())
+        .ok_or_else(|| {
+            CompileError::Invalid(
+                "distribution source span is outside the scenario text".to_owned(),
+            )
+        })?;
+    let body = literal
+        .trim()
+        .strip_prefix('{')
+        .and_then(|body| body.strip_suffix('}'))
+        .ok_or_else(|| {
+            CompileError::Invalid("executor distributions must use an inline TOML table".to_owned())
+        })?;
+    let mut fields = BTreeMap::new();
+    for field in body.split(',') {
+        let (key, value) = field.split_once('=').ok_or_else(|| {
+            CompileError::Invalid(format!("invalid distribution field `{field}`"))
+        })?;
+        fields.insert(key.trim(), value.trim());
+    }
+    let kind = fields
+        .get("type")
+        .and_then(|value| {
+            value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .or_else(|| {
+                    value
+                        .strip_prefix('\'')
+                        .and_then(|value| value.strip_suffix('\''))
+                })
+        })
+        .ok_or_else(|| CompileError::Invalid("distribution `type` must be a string".to_owned()))?;
+    let value = |field: &str| {
+        fields.get(field).copied().ok_or_else(|| {
+            CompileError::Invalid(format!("distribution `{kind}` is missing `{field}`"))
+        })
+    };
+    match kind {
+        "DiscreteUniform" => Ok(ParsedSourceDistribution::DiscreteUniform {
+            low: exact_i64_literal(value("low")?, "DiscreteUniform low")?,
+            high: exact_i64_literal(value("high")?, "DiscreteUniform high")?,
+        }),
+        "Uniform" => {
+            let low = value("low")?;
+            let high = value("high")?;
+            parsed_decimal(low, "Uniform low")?;
+            parsed_decimal(high, "Uniform high")?;
+            Ok(ParsedSourceDistribution::Uniform { low, high })
+        }
+        "Exp" => {
+            parsed_decimal(value("lambda")?, "Exp lambda")?;
+            Ok(ParsedSourceDistribution::Exp)
+        }
+        unsupported => Err(CompileError::Unsupported(format!(
+            "unsupported distribution type `{unsupported}`"
+        ))),
+    }
+}
+
+fn exact_i64_literal(literal: &str, label: &str) -> Result<i64, CompileError> {
+    let normalized = literal.trim().replace('_', "");
+    let (negative, unsigned) = if let Some(unsigned) = normalized.strip_prefix('-') {
+        (true, unsigned)
+    } else {
+        (false, normalized.strip_prefix('+').unwrap_or(&normalized))
+    };
+    let (radix, digits) = integer_radix(unsigned).unwrap_or((10, unsigned));
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Err(CompileError::Invalid(format!(
+            "{label} `{literal}` must be an integer"
+        )));
+    }
+    let magnitude = i128::from_str_radix(digits, radix)
+        .map_err(|_| CompileError::Invalid(format!("{label} `{literal}` exceeds i64")))?;
+    let signed = if negative { -magnitude } else { magnitude };
+    i64::try_from(signed)
+        .map_err(|_| CompileError::Invalid(format!("{label} `{literal}` exceeds i64")))
+}
+
+fn constant_packet_size_bytes(
+    distribution: &SourceDistributionInfo,
+    scenario_text: &str,
+) -> Result<u64, CompileError> {
+    match source_distribution(distribution, scenario_text)? {
+        ParsedSourceDistribution::DiscreteUniform { low, high } if low == high => {
+            u64::try_from(low).map_err(|_| {
                 CompileError::Unsupported(format!(
                     "unsupported constant packet size `{low}`; Days executor v1 requires a positive integer byte size"
                 ))
@@ -1242,71 +1357,69 @@ fn constant_packet_size_bytes(distribution: &DistributionInfo) -> Result<u64, Co
                 }
             })
         }
-        DistributionInfo::Uniform { low, high } if low == high => {
-            if !low.is_finite() || *low <= 0.0 || low.fract() != 0.0 {
-                return Err(CompileError::Unsupported(format!(
-                    "unsupported constant packet size `{low}`; Days executor v1 requires a positive integer byte size"
-                )));
-            }
-            if *low >= 2_f64.powi(64) {
-                return Err(CompileError::Invalid(
-                    "constant packet size exceeds the u64 byte domain".to_owned(),
+        ParsedSourceDistribution::Uniform { low, high }
+            if parsed_decimal(low, "packet size distribution")?
+                == parsed_decimal(high, "packet size distribution")? =>
+        {
+            let size = scaled_decimal_literal(low, 1, "constant packet size")?;
+            if size == 0 {
+                return Err(CompileError::Unsupported(
+                    "unsupported constant packet size `0`; Days executor v1 requires a positive integer byte size"
+                        .to_owned(),
                 ));
             }
-            Ok(*low as u64)
+            Ok(size)
         }
-        DistributionInfo::DiscreteUniform { .. } => Err(CompileError::Unsupported(
+        ParsedSourceDistribution::DiscreteUniform { .. } => Err(CompileError::Unsupported(
             "unsupported nonconstant packet size distribution `DiscreteUniform`; Days executor v1 requires deterministic constant precomputed inputs"
                 .to_owned(),
         )),
-        DistributionInfo::Uniform { .. } => Err(CompileError::Unsupported(
+        ParsedSourceDistribution::Uniform { .. } => Err(CompileError::Unsupported(
             "unsupported nonconstant packet size distribution `Uniform`; Days executor v1 requires deterministic constant precomputed inputs"
                 .to_owned(),
         )),
-        DistributionInfo::Exp { .. } => Err(CompileError::Unsupported(
+        ParsedSourceDistribution::Exp => Err(CompileError::Unsupported(
             "unsupported packet size distribution `Exp`; Days executor v1 requires deterministic constant precomputed inputs"
                 .to_owned(),
         )),
     }
 }
 
-fn constant_distribution(
-    distribution: &DistributionInfo,
+fn constant_distribution_scaled(
+    distribution: &SourceDistributionInfo,
+    scenario_text: &str,
+    scale: u64,
     label: &str,
-) -> Result<f64, CompileError> {
-    match distribution {
-        DistributionInfo::DiscreteUniform { low, high } if low == high => Ok(*low as f64),
-        DistributionInfo::Uniform { low, high } if low == high => Ok(*low),
-        DistributionInfo::DiscreteUniform { .. } => Err(CompileError::Unsupported(format!(
-            "unsupported nonconstant {label} `DiscreteUniform`; Days executor v1 requires deterministic constant precomputed inputs"
-        ))),
-        DistributionInfo::Uniform { .. } => Err(CompileError::Unsupported(format!(
+) -> Result<u64, CompileError> {
+    match source_distribution(distribution, scenario_text)? {
+        ParsedSourceDistribution::DiscreteUniform { low, high } if low == high => {
+            let value = u64::try_from(low).map_err(|_| {
+                CompileError::Invalid(format!("{label} must be finite and nonnegative, got {low}"))
+            })?;
+            u128::from(value)
+                .checked_mul(u128::from(scale))
+                .and_then(|scaled| u64::try_from(scaled).ok())
+                .ok_or_else(|| {
+                    CompileError::Invalid(format!("{label} `{low}` exceeds the u64 representation"))
+                })
+        }
+        ParsedSourceDistribution::Uniform { low, high }
+            if parsed_decimal(low, label)? == parsed_decimal(high, label)? =>
+        {
+            scaled_decimal_literal(low, scale, label)
+        }
+        ParsedSourceDistribution::DiscreteUniform { .. } => {
+            Err(CompileError::Unsupported(format!(
+                "unsupported nonconstant {label} `DiscreteUniform`; Days executor v1 requires deterministic constant precomputed inputs"
+            )))
+        }
+        ParsedSourceDistribution::Uniform { .. } => Err(CompileError::Unsupported(format!(
             "unsupported nonconstant {label} `Uniform`; Days executor v1 requires deterministic constant precomputed inputs"
         ))),
-        DistributionInfo::Exp { .. } => Err(CompileError::Unsupported(format!(
+        ParsedSourceDistribution::Exp => Err(CompileError::Unsupported(format!(
             "unsupported {label} `Exp`; Days executor v1 requires deterministic constant precomputed inputs"
         ))),
     }
-}
-
-fn seconds_to_ns(seconds: f64, label: &str) -> Result<u64, CompileError> {
-    if !seconds.is_finite() || seconds < 0.0 {
-        return Err(CompileError::Invalid(format!(
-            "{label} must be a finite nonnegative duration, got {seconds}"
-        )));
-    }
-    let nanoseconds = seconds * 1_000_000_000.0;
-    if !nanoseconds.is_finite() || nanoseconds >= 2_f64.powi(64) {
-        return Err(CompileError::Invalid(format!(
-            "{label} `{seconds}` exceeds the u64 nanosecond domain"
-        )));
-    }
-    if nanoseconds.fract() != 0.0 {
-        return Err(CompileError::Unsupported(format!(
-            "unsupported {label} `{seconds}`; Days executor v1 requires an integer number of nanoseconds"
-        )));
-    }
-    Ok(nanoseconds as u64)
 }
 
 fn optional_scaled_decimal(
@@ -1328,13 +1441,28 @@ fn scaled_decimal(
     scale: u64,
     label: &str,
 ) -> Result<u64, CompileError> {
-    let literal = scenario_text.get(value.span.clone()).ok_or_else(|| {
-        CompileError::Invalid(format!("{label} source span is outside the scenario text"))
-    })?;
+    let literal = exact_decimal_literal(scenario_text, value, label)?;
     scaled_decimal_literal(literal, scale, label)
 }
 
-fn scaled_decimal_literal(literal: &str, scale: u64, label: &str) -> Result<u64, CompileError> {
+fn exact_decimal_literal<'a>(
+    scenario_text: &'a str,
+    value: &ExactDecimal,
+    label: &str,
+) -> Result<&'a str, CompileError> {
+    scenario_text.get(value.span.clone()).ok_or_else(|| {
+        CompileError::Invalid(format!("{label} source span is outside the scenario text"))
+    })
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ParsedDecimal {
+    negative: bool,
+    digits: String,
+    power: i64,
+}
+
+fn parsed_decimal(literal: &str, label: &str) -> Result<ParsedDecimal, CompileError> {
     let literal = literal.trim();
     let normalized = literal.replace('_', "");
     let (negative, unsigned) = if let Some(unsigned) = normalized.strip_prefix('-') {
@@ -1351,27 +1479,16 @@ fn scaled_decimal_literal(literal: &str, scale: u64, label: &str) -> Result<u64,
     if let Some((radix, digits)) = integer_radix(unsigned) {
         let value = u128::from_str_radix(digits, radix).map_err(|_| {
             CompileError::Invalid(format!(
-                "{label} `{literal}` exceeds the u64 representation"
+                "{label} `{literal}` exceeds the exact integer representation"
             ))
         })?;
-        if negative && value != 0 {
-            return Err(CompileError::Invalid(format!(
-                "{label} must be finite and nonnegative, got {literal}"
-            )));
-        }
-        return value
-            .checked_mul(u128::from(scale))
-            .and_then(|scaled| u64::try_from(scaled).ok())
-            .ok_or_else(|| {
-                CompileError::Invalid(format!(
-                    "{label} `{literal}` exceeds the u64 representation"
-                ))
-            });
+        return Ok(ParsedDecimal {
+            negative: negative && value != 0,
+            digits: value.to_string(),
+            power: 0,
+        });
     }
 
-    let scale_power = decimal_scale_power(scale).ok_or_else(|| {
-        CompileError::Invalid(format!("{label} uses a non-decimal semantic scale {scale}"))
-    })?;
     let (mantissa, exponent) = split_decimal_exponent(unsigned, label, literal)?;
     let mut parts = mantissa.split('.');
     let whole = parts.next().unwrap_or_default();
@@ -1387,55 +1504,129 @@ fn scaled_decimal_literal(literal: &str, scale: u64, label: &str) -> Result<u64,
             "{label} `{literal}` is not a decimal number"
         )));
     }
-    let digits = format!("{whole}{fraction}");
-    let significant = digits.trim_start_matches('0');
-    if significant.is_empty() {
-        return Ok(0);
+    let mut digits = format!("{whole}{fraction}");
+    let significant_start = digits
+        .bytes()
+        .position(|byte| byte != b'0')
+        .unwrap_or(digits.len());
+    digits.drain(..significant_start);
+    if digits.is_empty() {
+        return Ok(ParsedDecimal {
+            negative: false,
+            digits: "0".to_owned(),
+            power: 0,
+        });
     }
-    if negative {
+    let fraction_len = i64::try_from(fraction.len())
+        .map_err(|_| decimal_range_error(label, literal, exponent.is_positive()))?;
+    let mut power = exponent
+        .checked_sub(fraction_len)
+        .ok_or_else(|| decimal_range_error(label, literal, exponent.is_positive()))?;
+    let trailing_zeros = digits
+        .bytes()
+        .rev()
+        .take_while(|byte| *byte == b'0')
+        .count();
+    if trailing_zeros != 0 {
+        digits.truncate(digits.len() - trailing_zeros);
+        power = power
+            .checked_add(i64::try_from(trailing_zeros).unwrap_or(i64::MAX))
+            .ok_or_else(|| decimal_range_error(label, literal, true))?;
+    }
+    Ok(ParsedDecimal {
+        negative,
+        digits,
+        power,
+    })
+}
+
+fn scaled_decimal_literal(literal: &str, scale: u64, label: &str) -> Result<u64, CompileError> {
+    let literal = literal.trim();
+    let parsed = parsed_decimal(literal, label)?;
+    if parsed.negative {
         return Err(CompileError::Invalid(format!(
             "{label} must be finite and nonnegative, got {literal}"
         )));
     }
-
-    let decimal_shift = exponent
-        .checked_sub(i64::try_from(fraction.len()).unwrap_or(i64::MAX))
-        .and_then(|shift| shift.checked_add(scale_power))
-        .ok_or_else(|| decimal_range_error(label, literal, exponent.is_positive()))?;
+    if parsed.digits == "0" {
+        return Ok(0);
+    }
+    let scale_power = decimal_scale_power(scale).ok_or_else(|| {
+        CompileError::Invalid(format!("{label} uses a non-decimal semantic scale {scale}"))
+    })?;
+    let decimal_shift = parsed
+        .power
+        .checked_add(scale_power)
+        .ok_or_else(|| decimal_range_error(label, literal, parsed.power.is_positive()))?;
     let scaled_digits = if decimal_shift >= 0 {
         let zero_count = usize::try_from(decimal_shift)
             .map_err(|_| decimal_range_error(label, literal, true))?;
-        if significant.len().saturating_add(zero_count) > 20 {
+        if parsed.digits.len().saturating_add(zero_count) > 20 {
             return Err(decimal_range_error(label, literal, true));
         }
-        let mut scaled = String::with_capacity(significant.len() + zero_count);
-        scaled.push_str(significant);
+        let mut scaled = String::with_capacity(parsed.digits.len() + zero_count);
+        scaled.push_str(&parsed.digits);
         scaled.extend(std::iter::repeat_n('0', zero_count));
         scaled
     } else {
-        let removed = usize::try_from(decimal_shift.unsigned_abs()).map_err(|_| {
-            CompileError::Unsupported(format!(
-                "unsupported {label} `{literal}`; exact representation requires an integer scaled value"
-            ))
-        })?;
-        if removed > significant.len()
-            || significant[significant.len() - removed..]
-                .bytes()
-                .any(|byte| byte != b'0')
-        {
-            return Err(CompileError::Unsupported(format!(
-                "unsupported {label} `{literal}`; exact representation requires an integer scaled value"
-            )));
-        }
-        significant[..significant.len() - removed].to_owned()
+        return Err(CompileError::Unsupported(format!(
+            "unsupported {label} `{literal}`; exact representation requires an integer scaled value"
+        )));
     };
-    let scaled_digits = scaled_digits.trim_start_matches('0');
-    if scaled_digits.is_empty() {
-        return Ok(0);
-    }
     scaled_digits
         .parse::<u64>()
         .map_err(|_| decimal_range_error(label, literal, true))
+}
+
+fn exact_decimal_is_zero(
+    scenario_text: &str,
+    value: &ExactDecimal,
+    label: &str,
+) -> Result<bool, CompileError> {
+    let value = parsed_decimal(exact_decimal_literal(scenario_text, value, label)?, label)?;
+    Ok(value.digits == "0")
+}
+
+fn exact_decimal_product_ceil(
+    scenario_text: &str,
+    value: Option<&ExactDecimal>,
+    default: &str,
+    capacity: u64,
+    label: &str,
+) -> Result<u64, CompileError> {
+    let literal = match value {
+        Some(value) => exact_decimal_literal(scenario_text, value, label)?,
+        None => default,
+    };
+    let parsed = parsed_decimal(literal, label)?;
+    let invalid = || {
+        CompileError::Invalid(
+            "ECN threshold requires finite 0 < switch.ecn_threshold <= 1 and positive capacity"
+                .to_owned(),
+        )
+    };
+    if capacity == 0 || parsed.negative || parsed.digits == "0" {
+        return Err(invalid());
+    }
+    if parsed.power >= 0 {
+        if parsed.digits == "1" && parsed.power == 0 {
+            return Ok(capacity);
+        }
+        return Err(invalid());
+    }
+    let denominator_power = usize::try_from(parsed.power.unsigned_abs()).map_err(|_| invalid())?;
+    if parsed.digits.len() > denominator_power {
+        return Err(invalid());
+    }
+    if denominator_power > parsed.digits.len().saturating_add(20) {
+        return Ok(1);
+    }
+    let denominator_power = u32::try_from(denominator_power).map_err(|_| invalid())?;
+    let numerator = parsed.digits.parse::<BigUint>().map_err(|_| invalid())?;
+    let denominator = BigUint::from(10_u8).pow(denominator_power);
+    let product = numerator * BigUint::from(capacity);
+    let threshold = (&product + &denominator - BigUint::from(1_u8)) / denominator;
+    u64::try_from(threshold).map_err(|_| invalid())
 }
 
 fn integer_radix(literal: &str) -> Option<(u32, &str)> {
@@ -1714,7 +1905,7 @@ fn lower(
         let emission_count = packet_count(&flow.traffic);
         let mut dcqcn_control_payload = None;
         let collective_ready = flow.collective.as_ref().is_none_or(|stage| {
-            stage.local_predecessor.is_none() && stage.inbound_predecessor.is_none()
+            stage.local_predecessor_complete && stage.inbound_predecessor_complete
         });
         let next_emission = if emission_count == 0 {
             ScheduledEmission {
@@ -1866,6 +2057,7 @@ fn lower(
                         topology_group: 0,
                         group_size: u32::try_from(semantic.flow_count)
                             .expect("collective lowering checked group size"),
+                        declared_total_bytes: stage.declared_total_bytes,
                         rank: stage.position.rank,
                         phase: stage.position.phase,
                         step: stage.position.step,
@@ -1878,8 +2070,8 @@ fn lower(
                         local_predecessor: stage.local_predecessor.map(stage_flow).map(FlowId),
                         inbound_predecessor: stage.inbound_predecessor.map(stage_flow).map(FlowId),
                         inbound_predecessor_bytes: stage.inbound_predecessor_bytes,
-                        local_predecessor_complete: stage.local_predecessor.is_none(),
-                        inbound_predecessor_complete: stage.inbound_predecessor.is_none(),
+                        local_predecessor_complete: stage.local_predecessor_complete,
+                        inbound_predecessor_complete: stage.inbound_predecessor_complete,
                         inbound_bytes_received: 0,
                     })
                 } else {
@@ -2446,6 +2638,27 @@ fn collective_chunk_bounds(total: u64, group_size: u64, owner: u64) -> (u64, u64
     (offset, bytes)
 }
 
+fn collective_stage_owner(
+    algorithm: CollectiveAlgorithm,
+    phase: CollectivePhase,
+    group_size: u64,
+    rank: u64,
+    step: u64,
+) -> u64 {
+    match (algorithm, phase) {
+        (CollectiveAlgorithm::RingAllReduce, CollectivePhase::AllGather) => {
+            (rank + group_size - step + 2) % group_size
+        }
+        (CollectiveAlgorithm::RingAllReduce, CollectivePhase::ReduceScatter)
+        | (CollectiveAlgorithm::AllGather, CollectivePhase::AllGather) => {
+            (rank + group_size - step + 1) % group_size
+        }
+        (CollectiveAlgorithm::AllGather, CollectivePhase::ReduceScatter) => {
+            unreachable!("AllGather has no ReduceScatter phase")
+        }
+    }
+}
+
 fn expand_collective(
     flows: &mut Vec<FlowInput>,
     semantic: CollectiveKey,
@@ -2453,6 +2666,12 @@ fn expand_collective(
     collective_id: u64,
 ) -> Result<(), CompileError> {
     let n = semantic.flow_count;
+    let Termination::Bytes(total_bytes) = semantic.traffic.termination else {
+        unreachable!("collective validation requires byte termination")
+    };
+    if semantic.algorithm == CollectiveAlgorithm::AllGather && (n == 1 || total_bytes == 0) {
+        return Ok(());
+    }
     let stage_count = match semantic.algorithm {
         CollectiveAlgorithm::RingAllReduce => {
             n.checked_mul(n - 1).and_then(|count| count.checked_mul(2))
@@ -2469,9 +2688,6 @@ fn expand_collective(
         .map_err(|error| {
             CompileError::Invalid(format!("collective stage table is too large: {error}"))
         })?;
-    let Termination::Bytes(total_bytes) = semantic.traffic.termination else {
-        unreachable!("collective validation requires byte termination")
-    };
     u32::try_from(n)
         .map_err(|_| CompileError::Invalid("collective group size exceeds u32".to_owned()))?;
     let phases: &[CollectivePhase] = match semantic.algorithm {
@@ -2492,14 +2708,8 @@ fn expand_collective(
             for step_u64 in 1..n {
                 let step = u32::try_from(step_u64)
                     .map_err(|_| CompileError::Invalid("collective step exceeds u32".to_owned()))?;
-                let standalone_gather = semantic.algorithm == CollectiveAlgorithm::AllGather;
-                let owner = match phase {
-                    CollectivePhase::ReduceScatter => (rank_u64 + n - step_u64 + 1) % n,
-                    CollectivePhase::AllGather if standalone_gather => {
-                        (rank_u64 + n - step_u64 + 1) % n
-                    }
-                    CollectivePhase::AllGather => (rank_u64 + n - step_u64 + 2) % n,
-                };
+                let owner =
+                    collective_stage_owner(semantic.algorithm, phase, n, rank_u64, step_u64);
                 let (chunk_offset_bytes, chunk_bytes) =
                     collective_chunk_bounds(total_bytes, n, owner);
                 let position = CollectiveStagePosition { phase, rank, step };
@@ -2537,6 +2747,18 @@ fn expand_collective(
                 } else {
                     None
                 };
+                let local_predecessor_complete = local_predecessor.is_none_or(|predecessor| {
+                    let predecessor_owner = collective_stage_owner(
+                        semantic.algorithm,
+                        predecessor.phase,
+                        n,
+                        u64::from(predecessor.rank),
+                        u64::from(predecessor.step),
+                    );
+                    collective_chunk_bounds(total_bytes, n, predecessor_owner).1 == 0
+                });
+                let inbound_predecessor_complete =
+                    inbound_predecessor.is_none() || chunk_bytes == 0;
                 let mut traffic = semantic.traffic.clone();
                 traffic.termination = Termination::Bytes(chunk_bytes);
                 flows.push(FlowInput {
@@ -2551,12 +2773,15 @@ fn expand_collective(
                     traffic,
                     collective: Some(CollectiveStageInput {
                         collective_id,
+                        declared_total_bytes: total_bytes,
                         position,
                         chunk_offset_bytes,
                         chunk_bytes,
                         local_predecessor,
                         inbound_predecessor,
                         inbound_predecessor_bytes: chunk_bytes,
+                        local_predecessor_complete,
+                        inbound_predecessor_complete,
                     }),
                 });
             }

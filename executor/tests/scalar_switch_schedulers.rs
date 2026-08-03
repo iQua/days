@@ -1020,6 +1020,28 @@ fn metal_drr_wrr_full_observation_rejects_unported_transition_planes() {
 
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 #[test]
+fn metal_dormant_drr_wrr_queues_retain_full_observation_support() {
+    for scheduler in [
+        SchedulerKind::deficit_round_robin(vec![1]),
+        SchedulerKind::weighted_round_robin(vec![1]),
+    ] {
+        let image = image(scheduler, &[(0, 0, 1, 1)], 10);
+        let expected =
+            run_scalar_with_observations(&image, Some(1), ObservationMode::Full).unwrap();
+        assert!(expected.mechanism_transitions.is_empty());
+        let actual = run_metal_with_observations(
+            &image,
+            Some(1),
+            MetalConfig::default(),
+            ObservationMode::Full,
+        )
+        .expect("a scheduler arrival at the exclusive horizon cannot populate its plane");
+        assert_eq!(actual.result, expected);
+    }
+}
+
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[test]
 fn metal_drr_skips_the_exact_legal_maximum_round_count() {
     let image = drr_legal_maximum_image();
     validate(&image, Backend::Metal).expect("the maximum representable DRR round count is legal");
@@ -1203,6 +1225,28 @@ fn cuda_drr_wrr_full_observation_rejects_unported_transition_planes() {
                 "Full observation mode is unsupported on CUDA for Rate, ECN, DRR, or WRR transition planes; use Summary".to_owned()
             )
         );
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_dormant_drr_wrr_queues_retain_full_observation_support() {
+    for scheduler in [
+        SchedulerKind::deficit_round_robin(vec![1]),
+        SchedulerKind::weighted_round_robin(vec![1]),
+    ] {
+        let image = image(scheduler, &[(0, 0, 1, 1)], 10);
+        let expected =
+            run_scalar_with_observations(&image, Some(1), ObservationMode::Full).unwrap();
+        assert!(expected.mechanism_transitions.is_empty());
+        let actual = run_cuda_with_observations(
+            &image,
+            Some(1),
+            CudaConfig::default(),
+            ObservationMode::Full,
+        )
+        .expect("a scheduler arrival at the exclusive horizon cannot populate its plane");
+        assert_eq!(actual.result, expected);
     }
 }
 

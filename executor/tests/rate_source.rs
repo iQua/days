@@ -1046,17 +1046,54 @@ fn metal_rate_pacing_and_checkpoints_match_scalar() {
 fn metal_rate_terminal_and_beyond_stop_states_reserve_no_work() {
     for image in terminal_device_rate_images() {
         validate(&image, Backend::Metal).expect("terminal rate state must validate");
-        let expected =
-            run_scalar_with_observations(&image, None, ObservationMode::Summary).unwrap();
+        let expected = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
+        assert!(expected.mechanism_transitions.is_empty());
         let actual = run_metal_with_observations(
             &image,
             None,
             MetalConfig::default(),
-            ObservationMode::Summary,
+            ObservationMode::Full,
         )
-        .expect("terminal rate state must execute");
+        .expect("provably dormant Rate state must retain Full observation support");
         assert_eq!(actual.result, expected);
     }
+}
+
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[test]
+fn metal_rate_full_observation_respects_the_exclusive_horizon() {
+    let image = rate_image(
+        RateGenerator {
+            first_pacing_time_ns: 1,
+            pacing_interval_ns: 1,
+            packet_size_bytes: 1,
+            total_bytes: 1,
+            rate_numerator_bits_per_second: 8_000_000_000,
+            rate_denominator: 1,
+            credit_quanta: 0,
+        },
+        GeneratorStatus::Scheduled,
+        10,
+    );
+    let expected = run_scalar_with_observations(&image, Some(1), ObservationMode::Full).unwrap();
+    assert!(expected.mechanism_transitions.is_empty());
+    let actual = run_metal_with_observations(
+        &image,
+        Some(1),
+        MetalConfig::default(),
+        ObservationMode::Full,
+    )
+    .expect("a pacing event at the exclusive horizon cannot populate the Rate plane");
+    assert_eq!(actual.result, expected);
+    assert!(
+        run_metal_with_observations(
+            &image,
+            Some(2),
+            MetalConfig::default(),
+            ObservationMode::Full,
+        )
+        .is_err()
+    );
 }
 
 #[cfg(feature = "cuda")]
@@ -1095,17 +1132,50 @@ fn cuda_rate_pacing_and_checkpoints_match_scalar() {
 fn cuda_rate_terminal_and_beyond_stop_states_reserve_no_work() {
     for image in terminal_device_rate_images() {
         validate(&image, Backend::Cuda).expect("terminal rate state must validate");
-        let expected =
-            run_scalar_with_observations(&image, None, ObservationMode::Summary).unwrap();
-        let actual = run_cuda_with_observations(
-            &image,
-            None,
-            CudaConfig::default(),
-            ObservationMode::Summary,
-        )
-        .expect("terminal rate state must execute");
+        let expected = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
+        assert!(expected.mechanism_transitions.is_empty());
+        let actual =
+            run_cuda_with_observations(&image, None, CudaConfig::default(), ObservationMode::Full)
+                .expect("provably dormant Rate state must retain Full observation support");
         assert_eq!(actual.result, expected);
     }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_rate_full_observation_respects_the_exclusive_horizon() {
+    let image = rate_image(
+        RateGenerator {
+            first_pacing_time_ns: 1,
+            pacing_interval_ns: 1,
+            packet_size_bytes: 1,
+            total_bytes: 1,
+            rate_numerator_bits_per_second: 8_000_000_000,
+            rate_denominator: 1,
+            credit_quanta: 0,
+        },
+        GeneratorStatus::Scheduled,
+        10,
+    );
+    let expected = run_scalar_with_observations(&image, Some(1), ObservationMode::Full).unwrap();
+    assert!(expected.mechanism_transitions.is_empty());
+    let actual = run_cuda_with_observations(
+        &image,
+        Some(1),
+        CudaConfig::default(),
+        ObservationMode::Full,
+    )
+    .expect("a pacing event at the exclusive horizon cannot populate the Rate plane");
+    assert_eq!(actual.result, expected);
+    assert!(
+        run_cuda_with_observations(
+            &image,
+            Some(2),
+            CudaConfig::default(),
+            ObservationMode::Full,
+        )
+        .is_err()
+    );
 }
 
 #[test]

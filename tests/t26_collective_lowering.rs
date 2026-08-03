@@ -355,6 +355,190 @@ fn collective_validator_rejects_overlapping_equal_remainder_last_partition() {
 }
 
 #[test]
+fn collective_validator_binds_partition_to_the_declared_total() {
+    let image = compile_collective("AllGather");
+    let mut changed_total = image;
+    for generator in changed_total
+        .host_states
+        .iter_mut()
+        .flat_map(|state| &mut state.generators)
+    {
+        let FlowGeneratorKind::Collective(mut stage) = generator.kind else {
+            continue;
+        };
+        let owner = (u64::from(stage.rank) + u64::from(stage.group_size) - u64::from(stage.step)
+            + 1)
+            % u64::from(stage.group_size);
+        stage.chunk_offset_bytes = owner * 3;
+        stage.chunk_bytes = 3;
+        stage.inbound_predecessor_bytes = 3;
+        generator.kind = FlowGeneratorKind::Collective(stage);
+        if generator.next_emission.status == GeneratorStatus::Scheduled {
+            changed_total
+                .initial_packets
+                .iter_mut()
+                .find(|packet| packet.id == generator.next_emission.payload)
+                .expect("scheduled collective packet")
+                .size_bytes = 3;
+        }
+    }
+
+    let error = validate(&changed_total, Backend::Scalar)
+        .expect_err("declared total 10 cannot be changed to a self-consistent total 12")
+        .to_string();
+    assert!(error.contains("collective partition"), "{error}");
+
+    let config = collective_config("AllGather").replace("size = 10", "size = 12");
+    let path = std::env::temp_dir().join(format!(
+        "days-t26-allgather-declared-twelve-{}.toml",
+        std::process::id()
+    ));
+    fs::write(&path, config).unwrap();
+    let canonical_twelve = compile_config(&path).expect("declared total 12 must lower canonically");
+    fs::remove_file(path).unwrap();
+    assert!(
+        canonical_twelve
+            .host_states
+            .iter()
+            .flat_map(|state| &state.generators)
+            .all(
+                |generator| matches!(generator.kind, FlowGeneratorKind::Collective(stage)
+            if stage.declared_total_bytes == 12 && stage.chunk_bytes == 3)
+            )
+    );
+    let scalar = run_scalar_with_observations(&canonical_twelve, None, ObservationMode::Full)
+        .expect("declared total 12 must execute");
+    assert_eq!(scalar.summary.sourced_bytes, 36);
+
+    let mut inconsistent_total = canonical_twelve;
+    let generator = inconsistent_total
+        .host_states
+        .iter_mut()
+        .flat_map(|state| &mut state.generators)
+        .next()
+        .expect("collective stage");
+    let FlowGeneratorKind::Collective(mut stage) = generator.kind else {
+        unreachable!()
+    };
+    stage.declared_total_bytes = 11;
+    generator.kind = FlowGeneratorKind::Collective(stage);
+    let error = validate(&inconsistent_total, Backend::Scalar)
+        .expect_err("declared total must agree across all stages")
+        .to_string();
+    assert!(error.contains("metadata is inconsistent"), "{error}");
+}
+
+#[test]
+fn collective_algorithm_specific_no_op_boundaries_are_canonical() {
+    for (flow_count, total_bytes) in [(1, 10), (4, 0)] {
+        let config = collective_config("AllGather")
+            .replace("flow_count = 4", &format!("flow_count = {flow_count}"))
+            .replace("size = 10", &format!("size = {total_bytes}"))
+            .replace(
+                "sources = [0, 1, 2, 3]\nsinks = [1, 2, 3, 0]\n",
+                if flow_count == 1 {
+                    "sources = [0]\nsinks = [0]\n"
+                } else {
+                    "sources = [0, 1, 2, 3]\nsinks = [1, 2, 3, 0]\n"
+                },
+            );
+        let path = std::env::temp_dir().join(format!(
+            "days-t26-allgather-noop-{}-{flow_count}-{total_bytes}.toml",
+            std::process::id()
+        ));
+        fs::write(&path, config).unwrap();
+        let image = compile_config(&path).expect("AllGather no-op must lower");
+        fs::remove_file(path).unwrap();
+        assert!(image.flows.is_empty());
+        assert!(image.initial_packets.is_empty());
+        assert!(image.initial_events.is_empty());
+        let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+            .expect("AllGather no-op must execute");
+        assert_eq!(scalar.summary.sourced_bytes, 0);
+        for workers in [1, 2, 4] {
+            let cpu = run_cpu_with_observations(
+                &image,
+                None,
+                CpuConfig {
+                    workers,
+                    ..CpuConfig::default()
+                },
+                ObservationMode::Full,
+            )
+            .expect("AllGather no-op must execute on CPU");
+            assert_eq!(cpu.result, scalar);
+        }
+    }
+
+    for (flow_count, total_bytes) in [(1, 10), (4, 0), (4, 3)] {
+        let config = collective_config("RingAllReduce")
+            .replace("flow_count = 4", &format!("flow_count = {flow_count}"))
+            .replace("size = 10", &format!("size = {total_bytes}"))
+            .replace(
+                "sources = [0, 1, 2, 3]\nsinks = [1, 2, 3, 0]\n",
+                if flow_count == 1 {
+                    "sources = [0]\nsinks = [0]\n"
+                } else {
+                    "sources = [0, 1, 2, 3]\nsinks = [1, 2, 3, 0]\n"
+                },
+            );
+        let path = std::env::temp_dir().join(format!(
+            "days-t26-ring-reject-{}-{flow_count}-{total_bytes}.toml",
+            std::process::id()
+        ));
+        fs::write(&path, config).unwrap();
+        let error = compile_config(&path).expect_err("RingAllReduce traffic boundary must reject");
+        fs::remove_file(path).unwrap();
+        assert!(error.to_string().contains("RingAllReduce"), "{error}");
+    }
+
+    let minimum_ring = collective_config("RingAllReduce")
+        .replace("flow_count = 4", "flow_count = 2")
+        .replace("sources = [0, 1, 2, 3]", "sources = [0, 1]")
+        .replace("sinks = [1, 2, 3, 0]", "sinks = [1, 0]")
+        .replace("size = 10", "size = 2");
+    let path = std::env::temp_dir().join(format!(
+        "days-t26-ring-minimum-active-{}.toml",
+        std::process::id()
+    ));
+    fs::write(&path, minimum_ring).unwrap();
+    let image = compile_config(&path).expect("minimum active RingAllReduce must lower");
+    fs::remove_file(path).unwrap();
+    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("minimum active RingAllReduce must execute");
+    assert_eq!(scalar.summary.sourced_bytes, 4);
+}
+
+#[test]
+fn allgather_partial_zero_partition_executes_only_nonzero_chunks() {
+    let config = collective_config("AllGather").replace("size = 10", "size = 1");
+    let path = std::env::temp_dir().join(format!(
+        "days-t26-allgather-zero-chunks-{}.toml",
+        std::process::id()
+    ));
+    fs::write(&path, config).unwrap();
+    let image = compile_config(&path).expect("[0,0,0,1] AllGather partition must lower");
+    fs::remove_file(path).unwrap();
+    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("partial-zero AllGather must execute");
+    assert_eq!(scalar.summary.sourced_bytes, 3);
+    assert!(scalar.pending_events.is_empty());
+    for workers in [1, 2, 4] {
+        let cpu = run_cpu_with_observations(
+            &image,
+            None,
+            CpuConfig {
+                workers,
+                ..CpuConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .expect("partial-zero AllGather must execute on CPU");
+        assert_eq!(cpu.result, scalar);
+    }
+}
+
+#[test]
 fn collective_terminal_closure_is_zero_and_maximum_state_remains_representable() {
     let config = collective_config("RingAllReduce")
         .replace("initial_delay = 0.0", "initial_delay = 0.001")
