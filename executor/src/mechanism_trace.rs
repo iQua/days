@@ -1,8 +1,11 @@
-//! Stable exact-integer certificates for T25 stateful mechanism replay.
+//! Stable exact-integer certificates for stateful mechanism replay.
 
 use std::fmt::{self, Write};
 
-use crate::{DcqcnTransitionRecord, EventKey, FlowId, GeneratorStatus, LinkId, NodeId, PayloadId};
+use crate::{
+    CollectiveAlgorithm, CollectivePhase, DcqcnTransitionRecord, EventKey, FlowId, GeneratorStatus,
+    LinkId, NodeId, PayloadId,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RateReplayConfig {
@@ -117,6 +120,51 @@ pub struct WrrTransitionRecord {
     pub after_current_class: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CollectiveActivationCause {
+    LocalCompletion,
+    InboundArrival,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CollectiveProgressRecord {
+    pub key: EventKey,
+    /// Distinguishes progress transitions caused by the same executor event.
+    pub ordinal: u64,
+    pub node: NodeId,
+    pub flow: FlowId,
+    pub cause: CollectiveActivationCause,
+    pub cause_flow: FlowId,
+    pub arrival_bytes: u64,
+    pub collective_id: u64,
+    pub algorithm: CollectiveAlgorithm,
+    pub group_size: u32,
+    pub declared_total_bytes: u64,
+    pub rank: u32,
+    pub phase: CollectivePhase,
+    pub step: u32,
+    pub chunk_offset_bytes: u64,
+    pub chunk_bytes: u64,
+    pub packet_size_bytes: u64,
+    pub interval_ns: u64,
+    pub stop_time_ns: u64,
+    pub local_predecessor: Option<FlowId>,
+    pub inbound_predecessor: Option<FlowId>,
+    pub inbound_predecessor_bytes: u64,
+    pub before_local_complete: bool,
+    pub before_inbound_complete: bool,
+    pub before_inbound_bytes: u64,
+    /// Whether this prerequisite transition unblocked the stage and emitted its first packet.
+    pub activated: bool,
+    pub after_local_complete: bool,
+    pub after_inbound_complete: bool,
+    pub after_inbound_bytes: u64,
+    pub after_packets_emitted: u64,
+    pub after_bytes_emitted: u64,
+    pub after_status: GeneratorStatus,
+    pub after_next_time_ns: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MechanismTransitionRecord {
     Rate(RateTransitionRecord),
@@ -125,6 +173,7 @@ pub enum MechanismTransitionRecord {
     Drr(DrrTransitionRecord),
     Wrr(WrrTransitionRecord),
     Dcqcn(DcqcnTransitionRecord),
+    Collective(CollectiveProgressRecord),
 }
 
 impl MechanismTransitionRecord {
@@ -136,20 +185,117 @@ impl MechanismTransitionRecord {
             Self::Drr(record) => record.key,
             Self::Wrr(record) => record.key,
             Self::Dcqcn(record) => record.key,
+            Self::Collective(record) => record.key,
         }
     }
 
-    pub const fn canonical_order_key(&self) -> (EventKey, u8) {
-        let tag = match self {
-            Self::Rate(_) => 0,
-            Self::PfcThreshold(_) => 1,
-            Self::PfcControl(_) => 2,
-            Self::Drr(_) => 3,
-            Self::Wrr(_) => 4,
-            Self::Dcqcn(_) => 5,
+    pub const fn canonical_order_key(&self) -> (EventKey, u8, u64) {
+        let (tag, ordinal) = match self {
+            Self::Rate(_) => (0, 0),
+            Self::PfcThreshold(_) => (1, 0),
+            Self::PfcControl(_) => (2, 0),
+            Self::Drr(_) => (3, 0),
+            Self::Wrr(_) => (4, 0),
+            Self::Dcqcn(_) => (5, 0),
+            Self::Collective(record) => (6, record.ordinal),
         };
-        (self.key(), tag)
+        (self.key(), tag, ordinal)
     }
+}
+
+pub fn collective_transitions_csv(
+    records: &[MechanismTransitionRecord],
+) -> Result<String, MechanismTraceError> {
+    let mut records = records
+        .iter()
+        .filter_map(|record| match record {
+            MechanismTransitionRecord::Collective(record) => Some(*record),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    records.sort_by_key(|record| (record.key, record.ordinal));
+    if let Some(duplicate) = records
+        .windows(2)
+        .find(|pair| (pair[0].key, pair[0].ordinal) == (pair[1].key, pair[1].ordinal))
+    {
+        return Err(MechanismTraceError {
+            mechanism: "collective",
+            duplicate_key: duplicate[0].key,
+        });
+    }
+
+    let mut csv = String::from(
+        "time_ns,event_phase,event_origin_node,event_origin_sequence,ordinal,node_id,flow_id,cause,cause_flow_id,arrival_bytes,collective_id,algorithm,group_size,declared_total_bytes,rank,collective_phase,step,chunk_offset_bytes,chunk_bytes,packet_size_bytes,interval_ns,stop_time_ns,local_predecessor_flow_id,inbound_predecessor_flow_id,inbound_predecessor_bytes,before_local_complete,before_inbound_complete,before_inbound_bytes,activated,after_local_complete,after_inbound_complete,after_inbound_bytes,after_packets_emitted,after_bytes_emitted,after_status,after_next_time_ns\n",
+    );
+    for record in records {
+        writeln!(
+            csv,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            record.key.time_ns,
+            record.key.phase,
+            record.key.origin_node.0,
+            record.key.origin_seq,
+            record.ordinal,
+            record.node.0,
+            record.flow.0,
+            collective_cause(record.cause),
+            record.cause_flow.0,
+            record.arrival_bytes,
+            record.collective_id,
+            collective_algorithm(record.algorithm),
+            record.group_size,
+            record.declared_total_bytes,
+            record.rank,
+            collective_phase(record.phase),
+            record.step,
+            record.chunk_offset_bytes,
+            record.chunk_bytes,
+            record.packet_size_bytes,
+            record.interval_ns,
+            record.stop_time_ns,
+            optional_flow(record.local_predecessor),
+            optional_flow(record.inbound_predecessor),
+            record.inbound_predecessor_bytes,
+            bit(record.before_local_complete),
+            bit(record.before_inbound_complete),
+            record.before_inbound_bytes,
+            bit(record.activated),
+            bit(record.after_local_complete),
+            bit(record.after_inbound_complete),
+            record.after_inbound_bytes,
+            record.after_packets_emitted,
+            record.after_bytes_emitted,
+            status(record.after_status),
+            record.after_next_time_ns,
+        )
+        .expect("writing to String cannot fail");
+    }
+    Ok(csv)
+}
+
+const fn collective_cause(cause: CollectiveActivationCause) -> &'static str {
+    match cause {
+        CollectiveActivationCause::LocalCompletion => "local_completion",
+        CollectiveActivationCause::InboundArrival => "inbound_arrival",
+    }
+}
+
+const fn collective_algorithm(algorithm: CollectiveAlgorithm) -> &'static str {
+    match algorithm {
+        CollectiveAlgorithm::RingAllReduce => "ring_allreduce",
+        CollectiveAlgorithm::AllGather => "allgather",
+    }
+}
+
+const fn collective_phase(phase: CollectivePhase) -> &'static str {
+    match phase {
+        CollectivePhase::ReduceScatter => "reduce_scatter",
+        CollectivePhase::AllGather => "allgather",
+    }
+}
+
+fn optional_flow(flow: Option<FlowId>) -> String {
+    flow.map_or_else(String::new, |flow| flow.0.to_string())
 }
 
 pub fn dcqcn_transitions_csv(

@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use days::scenario::compile_config;
 use days_executor::{
     Backend, CollectiveAlgorithm, CollectivePhase, CpuConfig, FlowGeneratorKind, GeneratorStatus,
-    ObservationMode, run_cpu_with_observations, run_scalar_with_observations, validate,
+    MechanismTransitionRecord, ObservationMode, collective_transitions_csv,
+    run_cpu_with_observations, run_scalar_with_observations, validate,
 };
 
 fn collective_config(algorithm: &str) -> String {
@@ -38,13 +39,31 @@ pkt_size_dist = {{ type = "DiscreteUniform", low = 3, high = 3 }}
 }
 
 fn compile_collective(algorithm: &str) -> days_executor::SimulationImage {
+    compile_collective_with_total(algorithm, 10)
+}
+
+fn compile_collective_with_total(
+    algorithm: &str,
+    total_bytes: u64,
+) -> days_executor::SimulationImage {
+    compile_collective_with_total_and_interval(algorithm, total_bytes, "0.000000001")
+}
+
+fn compile_collective_with_total_and_interval(
+    algorithm: &str,
+    total_bytes: u64,
+    interval_seconds: &str,
+) -> days_executor::SimulationImage {
     static FIXTURE_ID: AtomicU64 = AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!(
         "days-t26-collective-{}-{}-{algorithm}.toml",
         std::process::id(),
         FIXTURE_ID.fetch_add(1, Ordering::Relaxed)
     ));
-    fs::write(&path, collective_config(algorithm)).expect("write collective fixture");
+    let config = collective_config(algorithm)
+        .replace("size = 10", &format!("size = {total_bytes}"))
+        .replace("0.000000001", interval_seconds);
+    fs::write(&path, config).expect("write collective fixture");
     let image = compile_config(&path).expect("collective fixture must lower");
     fs::remove_file(path).expect("remove collective fixture");
     image
@@ -142,6 +161,84 @@ fn collectives_are_scalar_cpu_byte_identical() {
             .unwrap();
             assert_eq!(cpu.result, scalar, "{algorithm}, workers={workers}");
         }
+    }
+}
+
+#[test]
+fn collective_activation_certificates_are_scalar_generated() {
+    for (algorithm, total_bytes, interval, expected_activations, local_activation, fixture) in [
+        (
+            "AllGather",
+            10,
+            "0.000000001",
+            8,
+            false,
+            "collective_allgather_executor_accept.csv",
+        ),
+        (
+            "AllGather",
+            1,
+            "0.000000001",
+            2,
+            false,
+            "collective_allgather_partial_zero_executor_accept.csv",
+        ),
+        (
+            "AllGather",
+            10,
+            "0.000000100",
+            8,
+            true,
+            "collective_allgather_local_activation_executor_accept.csv",
+        ),
+        (
+            "RingAllReduce",
+            10,
+            "0.000000001",
+            20,
+            false,
+            "collective_ring_allreduce_executor_accept.csv",
+        ),
+    ] {
+        let image = compile_collective_with_total_and_interval(algorithm, total_bytes, interval);
+        let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
+        let progress = scalar
+            .mechanism_transitions
+            .iter()
+            .filter_map(|record| match record {
+                MechanismTransitionRecord::Collective(record) => Some(record),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let activation_count = progress.iter().filter(|record| record.activated).count();
+        assert!(
+            progress.len() > activation_count,
+            "{algorithm} must log prerequisite progress before activation"
+        );
+        assert_eq!(activation_count, expected_activations, "{algorithm}");
+        assert!(progress.iter().any(|record| {
+            record.cause == days_executor::CollectiveActivationCause::LocalCompletion
+                && !record.activated
+        }));
+        assert!(progress.iter().any(|record| {
+            record.cause == days_executor::CollectiveActivationCause::InboundArrival
+                && record.activated
+        }));
+        if local_activation {
+            assert!(progress.iter().any(|record| {
+                record.cause == days_executor::CollectiveActivationCause::LocalCompletion
+                    && record.activated
+            }));
+        }
+
+        let csv = collective_transitions_csv(&scalar.mechanism_transitions).unwrap();
+        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("lean/fixtures/p10c")
+            .join(fixture);
+        if std::env::var_os("DAYS_UPDATE_COLLECTIVE_TRACE_FIXTURES").is_some() {
+            fs::write(&fixture_path, &csv).unwrap();
+        }
+        assert_eq!(csv, fs::read_to_string(fixture_path).unwrap());
     }
 }
 
