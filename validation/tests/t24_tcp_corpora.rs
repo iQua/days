@@ -45,6 +45,10 @@ fn assert_result_eq(
         "{label} TCP transition count"
     );
     assert_eq!(
+        actual_diagnostics, expected_diagnostics,
+        "{label} diagnostics"
+    );
+    assert_eq!(
         actual.observed_packets.len(),
         expected.observed_packets.len(),
         "{label} observed-packet count"
