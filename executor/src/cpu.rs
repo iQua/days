@@ -8,9 +8,6 @@ use std::time::{Duration, Instant};
 use crossbeam::channel::{Receiver, RecvError, Select, Sender, TryRecvError, bounded, unbounded};
 
 use crate::event::{EventFelClass, event_fel_class, is_same_time_tx_ready_continuation};
-use crate::p11_probe_sites::P11ProbeSite;
-#[cfg(feature = "p11-profile")]
-use crate::p11_profile::{P11LpProfile, P11RoundProfile};
 use crate::safe_horizon::{LpRoundWork, RoundMetrics};
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 use crate::safe_horizon::{RoundMetricsWindow, WindowedRunTotals};
@@ -753,12 +750,6 @@ impl CpuLp<'_> {
         let mut same_time_continuations = 0_u64;
         let mut fallback_classified_pushes = 0_u64;
         let mut continuation = None;
-        #[cfg(feature = "p11-profile")]
-        let packet_store_before = self.transitions.p11_packet_store_profile();
-        #[cfg(feature = "p11-profile")]
-        let mut p11_profile = P11LpProfile::default();
-        #[cfg(feature = "p11-profile")]
-        let mut previous_time_ns = None;
         while continuation.is_some()
             || self
                 .futures
@@ -779,10 +770,6 @@ impl CpuLp<'_> {
                 }
             }
 
-            #[cfg(feature = "p11-profile")]
-            let direct_continuation = continuation.is_some();
-            #[cfg(feature = "p11-profile")]
-            let fel_pop_started = Instant::now();
             let event = if let Some(event) = continuation.take() {
                 event
             } else {
@@ -791,40 +778,14 @@ impl CpuLp<'_> {
                     .expect("first_key_value established a pending event")
                     .1
             };
-            #[cfg(feature = "p11-profile")]
-            {
-                p11_profile.profiled_events = p11_profile.profiled_events.saturating_add(1);
-                if previous_time_ns == Some(event.key.time_ns) {
-                    p11_profile.consecutive_same_time_events =
-                        p11_profile.consecutive_same_time_events.saturating_add(1);
-                }
-                previous_time_ns = Some(event.key.time_ns);
-                if !direct_continuation {
-                    p11_profile.fel_pop_count = p11_profile.fel_pop_count.saturating_add(1);
-                    p11_profile.fel_pop_ns = p11_profile
-                        .fel_pop_ns
-                        .saturating_add(elapsed_ns(fel_pop_started));
-                }
-            }
-            #[cfg(feature = "p11-profile")]
-            let transition_started = Instant::now();
             let preserved_packet = if self.pinned_packets.contains(&event.payload) {
-                Some(
-                    self.transitions
-                        .packet_descriptor(event.payload, P11ProbeSite::CpuPinnedPreservedPacket)?,
-                )
+                Some(self.transitions.packet_descriptor(event.payload)?)
             } else {
                 None
             };
             self.transitions.dispatch(event, &mut children)?;
             if let Some(packet) = preserved_packet {
                 self.transitions.install_packet(packet)?;
-            }
-            #[cfg(feature = "p11-profile")]
-            {
-                p11_profile.transition_body_ns = p11_profile
-                    .transition_body_ns
-                    .saturating_add(elapsed_ns(transition_started));
             }
             let direct_child = match children.as_slice() {
                 [child]
@@ -840,8 +801,6 @@ impl CpuLp<'_> {
                 _ => None,
             };
             for child in children.drain(..) {
-                #[cfg(feature = "p11-profile")]
-                let child_started = Instant::now();
                 if child.target == self.node.id {
                     if direct_child == Some(child) {
                         continuation = Some(child);
@@ -853,14 +812,6 @@ impl CpuLp<'_> {
                             .checked_add(1)
                             .ok_or(ExecutionError::CounterOverflow(self.node.id))?;
                     }
-                    #[cfg(feature = "p11-profile")]
-                    if direct_child != Some(child) {
-                        p11_profile.fel_insert_count =
-                            p11_profile.fel_insert_count.saturating_add(1);
-                        p11_profile.fel_insert_ns = p11_profile
-                            .fel_insert_ns
-                            .saturating_add(elapsed_ns(child_started));
-                    }
                 } else {
                     if outbox_capacity.is_some_and(|capacity| outbox.len() >= capacity) {
                         return Err(ExecutionError::OutboxCapacityExceeded {
@@ -868,22 +819,10 @@ impl CpuLp<'_> {
                             capacity: outbox_capacity.expect("capacity was checked"),
                         });
                     }
-                    self.transitions
-                        .p11_probe_call(P11ProbeSite::CpuOutboxStagingPacket);
                     outbox.push(RemoteEnvelope {
                         event: child,
-                        packet: self.transitions.packet_descriptor(
-                            child.payload,
-                            P11ProbeSite::CpuOutboxStagingPacket,
-                        )?,
+                        packet: self.transitions.packet_descriptor(child.payload)?,
                     });
-                    #[cfg(feature = "p11-profile")]
-                    {
-                        p11_profile.outbox_events = p11_profile.outbox_events.saturating_add(1);
-                        p11_profile.outbox_staging_ns = p11_profile
-                            .outbox_staging_ns
-                            .saturating_add(elapsed_ns(child_started));
-                    }
                 }
             }
             events_processed = events_processed
@@ -899,41 +838,12 @@ impl CpuLp<'_> {
                 });
             }
         }
-        #[cfg(feature = "p11-profile")]
-        {
-            let packet_store = self
-                .transitions
-                .p11_packet_store_profile()
-                .saturating_sub(packet_store_before);
-            p11_profile.resident_packet_ns = packet_store.ns;
-            p11_profile.resident_packet_lookups = packet_store.lookups;
-            p11_profile.resident_packet_inserts = packet_store.inserts;
-            p11_profile.resident_packet_generator_inserts = packet_store.generator_inserts;
-            p11_profile.resident_packet_removes = packet_store.removes;
-            p11_profile.outbox_key_inversions = outbox
-                .windows(2)
-                .filter(|pair| pair[1].event.key < pair[0].event.key)
-                .count() as u64;
-            let mut previous_by_target = BTreeMap::<NodeId, EventKey>::new();
-            for envelope in &outbox {
-                if previous_by_target
-                    .insert(envelope.event.target, envelope.event.key)
-                    .is_some_and(|previous| envelope.event.key < previous)
-                {
-                    p11_profile.outbox_target_inversions =
-                        p11_profile.outbox_target_inversions.saturating_add(1);
-                }
-            }
-            p11_profile.outbox_distinct_targets = previous_by_target.len() as u64;
-        }
         Ok((
             LpRoundWork {
                 node: self.node.id,
                 events_processed,
                 same_time_continuations,
                 fallback_classified_pushes,
-                #[cfg(feature = "p11-profile")]
-                p11_profile,
             },
             outbox,
         ))
@@ -2283,8 +2193,6 @@ fn run_coordinator<'image>(
             (u128::from(frontier_ns) + u128::from(delay)).min(TIME_AFTER_U64_MAX)
         });
         let exclusive_horizon_ns = run_end.min(lookahead_end);
-        #[cfg(feature = "p11-profile")]
-        let p11_horizon_ns = elapsed_ns(round_start);
         let horizon_advance_ns = exclusive_horizon_ns
             .saturating_sub(previous_horizon.unwrap_or(u128::from(frontier_ns)));
 
@@ -2426,8 +2334,6 @@ fn run_coordinator<'image>(
         );
         let worker_parallel_efficiency = efficiency(worker_busy_ns.iter().copied(), config.workers);
         let round_wall_time_ns = elapsed_ns(round_start);
-        #[cfg(feature = "p11-profile")]
-        let p11_profile = p11_round_profile(&lp_work, round_wall_time_ns, p11_horizon_ns, 0);
         let worker_timings = worker_busy_ns
             .iter()
             .copied()
@@ -2464,8 +2370,6 @@ fn run_coordinator<'image>(
                     frontier_updates,
                     frontier_heap_pops,
                     physical_lp_probes,
-                    #[cfg(feature = "p11-profile")]
-                    p11_profile,
                 },
                 partition,
                 owner_batch_messages,
@@ -2548,8 +2452,6 @@ fn run_owned_static_coordinator<'image>(
             (u128::from(frontier_ns) + u128::from(delay)).min(TIME_AFTER_U64_MAX)
         });
         let exclusive_horizon_ns = run_end.min(lookahead_end);
-        #[cfg(feature = "p11-profile")]
-        let p11_horizon_ns = elapsed_ns(round_start);
         let horizon_advance_ns = exclusive_horizon_ns
             .saturating_sub(previous_horizon.unwrap_or(u128::from(frontier_ns)));
         let partition_started = Instant::now();
@@ -2746,13 +2648,6 @@ fn run_owned_static_coordinator<'image>(
         );
         let worker_parallel_efficiency = efficiency(worker_busy_ns.iter().copied(), config.workers);
         let round_wall_time_ns = elapsed_ns(round_start);
-        #[cfg(feature = "p11-profile")]
-        let p11_profile = p11_round_profile(
-            &lp_work,
-            round_wall_time_ns,
-            p11_horizon_ns,
-            coordinator_exchange_ns,
-        );
         let worker_timings = worker_busy_ns
             .iter()
             .copied()
@@ -2789,8 +2684,6 @@ fn run_owned_static_coordinator<'image>(
                     frontier_updates,
                     frontier_heap_pops,
                     physical_lp_probes,
-                    #[cfg(feature = "p11-profile")]
-                    p11_profile,
                 },
                 partition,
                 owner_batch_messages,
@@ -4014,29 +3907,6 @@ fn elapsed_ns(started: Instant) -> u64 {
     duration_ns(started.elapsed())
 }
 
-#[cfg(feature = "p11-profile")]
-fn p11_round_profile(
-    lp_work: &[LpRoundWork],
-    round_wall_ns: u64,
-    horizon_ns: u64,
-    exchange_merge_ns: u64,
-) -> P11RoundProfile {
-    let lp = lp_work
-        .iter()
-        .fold(P11LpProfile::default(), |profile, work| {
-            profile.saturating_add(work.p11_profile)
-        });
-    let mut profile = P11RoundProfile {
-        round_wall_ns,
-        horizon_ns,
-        exchange_merge_ns,
-        lp,
-        ..P11RoundProfile::default()
-    };
-    profile.close_residual();
-    profile
-}
-
 fn duration_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
@@ -4527,8 +4397,6 @@ fn one_lp_outbox_is_event_key_ordered_not_target_major() {
             events_processed: 9,
             same_time_continuations: 2,
             fallback_classified_pushes: 0,
-            #[cfg(feature = "p11-profile")]
-            p11_profile: P11LpProfile::default(),
         }
     );
     assert_eq!(

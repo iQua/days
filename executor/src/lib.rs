@@ -18,9 +18,6 @@ pub mod metal;
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub mod metal_spike;
 pub mod model;
-pub mod p11_probe_sites;
-#[cfg(feature = "p11-profile")]
-pub mod p11_profile;
 pub mod safe_horizon;
 pub mod scalar;
 pub mod tcp;
@@ -85,18 +82,6 @@ pub use model::{
     RedPolicyState, SchedulerKind, TransitionHandler, WfqSchedulerState, WrrSchedulerState,
     resolve_transition,
 };
-pub use p11_probe_sites::{
-    P11_PROBE_SITE_COUNT, P11_PROBE_SITE_MAPS, P11_PROBE_SITE_NAMES, P11ProbeSite,
-};
-#[cfg(feature = "p11-probe-sites")]
-pub use p11_probe_sites::{P11ProbeSiteTotal, p11_probe_site_totals, reset_p11_probe_sites};
-#[cfg(feature = "p11-profile")]
-pub use p11_profile::{
-    P11AllocationProfile, P11HorizonPolicy, P11LpProfile, P11RoundProfile, allocation_profile,
-    record_scoped_allocation, record_scoped_deallocation, reset_allocation_profile,
-};
-#[cfg(feature = "p11-profile")]
-pub use safe_horizon::run_scalar_rounds_with_p11_horizon_policy;
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub use safe_horizon::run_scalar_rounds_with_replay_trace;
 pub use safe_horizon::{
