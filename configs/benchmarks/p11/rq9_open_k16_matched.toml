@@ -1,6 +1,6 @@
-# P11 T20a RQ9 rung 0: pure forward-only traffic. The 512-byte packet certifies the registered
-# 41 ns channel bound at 100 Gbit/s with zero propagation. Twelve long-lived flows are the
-# calibrated open-loop width control for the sparse-round TCP fixture.
+# P11 T20a RQ9 duration-matched control: one open-loop flow of 512-byte packets certifies the
+# registered 41 ns channel bound at 100 Gbit/s with zero propagation. Its duration matches the
+# sparse-round TCP fixture so their active widths can be compared over the same interval.
 seed = 2416
 duration = 0.001152
 threading = "single"
