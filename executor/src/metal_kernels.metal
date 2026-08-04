@@ -47,6 +47,7 @@ constant uint C_ACTIVE = 15;
 constant uint C_FRONTIER = 16;
 constant uint C_CONTINUATION = 17;
 constant uint C_RELAUNCHES = 18;
+constant uint C_INDIRECT_OFFSET_WORDS = 19;
 
 constant uint P_NODE_COUNT = 0;
 constant uint P_FLOW_COUNT = 1;
@@ -79,6 +80,7 @@ constant uint P_STREAM_ORDER_CHECKS = 27;
 constant uint P_TCP_RECEIVER_OFFSET = 28;
 constant uint P_TCP_LEDGER_META_OFFSET = 29;
 constant uint P_TCP_TRANSITION_META_OFFSET = 30;
+constant uint P_ROUND_THREADS = 31;
 
 constant uint N_KIND = 0;
 constant uint N_EGRESS = 1;
@@ -4805,9 +4807,17 @@ kernel void days_round_prepare(
     }
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     if (lane == 0) {
-        control[C_ACTIVE] = counts[1023];
+        ulong active = counts[1023];
+        device uint *drain_dispatch =
+            reinterpret_cast<device uint *>(control + C_INDIRECT_OFFSET_WORDS);
+        control[C_ACTIVE] = active;
         control[C_OUTBOX] = 0;
         control[C_CONTINUATION] = 1;
+        drain_dispatch[0] = uint(
+            (active + params[P_ROUND_THREADS] - 1) / params[P_ROUND_THREADS]
+        );
+        drain_dispatch[1] = 1;
+        drain_dispatch[2] = 1;
     }
 }
 

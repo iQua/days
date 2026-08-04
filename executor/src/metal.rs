@@ -127,6 +127,7 @@ enum AttemptPhase {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DispatchGeometry {
     FixedControl,
+    ActiveWorklist,
     Parallel,
 }
 
@@ -134,7 +135,7 @@ impl DispatchGeometry {
     const fn threads_per_threadgroup(self, parallel_threads: usize) -> usize {
         match self {
             Self::FixedControl => LANES,
-            Self::Parallel => parallel_threads,
+            Self::ActiveWorklist | Self::Parallel => parallel_threads,
         }
     }
 }
@@ -142,7 +143,7 @@ impl DispatchGeometry {
 const ATTEMPT_PHASES: [(AttemptPhase, DispatchGeometry); 8] = [
     (AttemptPhase::Horizon, DispatchGeometry::FixedControl),
     (AttemptPhase::Compaction, DispatchGeometry::FixedControl),
-    (AttemptPhase::DrainExecute, DispatchGeometry::Parallel),
+    (AttemptPhase::DrainExecute, DispatchGeometry::ActiveWorklist),
     (
         AttemptPhase::ContinuationControl,
         DispatchGeometry::FixedControl,
@@ -159,6 +160,7 @@ const CONTROL_THREADGROUP_BYTES: usize =
 const NONE: u64 = u64::MAX;
 const PACKET_ECN_FLAG: u64 = 1_u64 << 63;
 const PACKET_KIND_MASK: u64 = !PACKET_ECN_FLAG;
+const PARAM_ROUND_THREADS: usize = 31;
 
 const CONTROL_ERROR: usize = 0;
 const CONTROL_ERROR_ARENA: usize = 1;
@@ -171,6 +173,8 @@ const CONTROL_ROUNDS: usize = 9;
 const CONTROL_CONTINUATION: usize = 17;
 const CONTROL_RELAUNCHES: usize = 18;
 const CONTROL_WORDS: usize = 19;
+const CONTROL_INDIRECT_OFFSET_WORDS: usize = CONTROL_WORDS;
+const CONTROL_STORAGE_WORDS: usize = CONTROL_WORDS + 2;
 
 type RawMetalBuffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 type RawCommandBuffer = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
@@ -1485,7 +1489,7 @@ impl MetalPlan {
             .map(u128::from)
             .unwrap_or(1_u128 << 64)
             .min(u128::from(image.stop_time_ns) + 1);
-        let mut control = vec![0_u64; CONTROL_WORDS];
+        let mut control = vec![0_u64; CONTROL_STORAGE_WORDS];
         control[CONTROL_RUN_END_LO] = run_end as u64;
         control[CONTROL_RUN_END_HI] = (run_end >> 64) as u64;
         let params = vec![
@@ -1520,7 +1524,19 @@ impl MetalPlan {
             tcp_state.layout.receiver_offset as u64,
             tcp_state.layout.ledger_meta_offset as u64,
             tcp_state.layout.transition_meta_offset as u64,
+            config.round_threads_per_threadgroup as u64,
         ];
+
+        if node_count.div_ceil(config.round_threads_per_threadgroup) > u32::MAX as usize {
+            return Err(MetalError::Validation(
+                "active-worklist threadgroup count exceeds the Metal indirect-dispatch limit"
+                    .into(),
+            ));
+        }
+        debug_assert_eq!(
+            params[PARAM_ROUND_THREADS],
+            config.round_threads_per_threadgroup as u64
+        );
 
         Ok(Self {
             control,
@@ -4154,6 +4170,7 @@ impl DirectMetal {
                     for _ in captured..encoded {
                         self.encode_attempt(
                             &encoder,
+                            buffers,
                             control_grid,
                             control_group,
                             parallel_grid,
@@ -4244,6 +4261,7 @@ impl DirectMetal {
     fn encode_attempt(
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        buffers: &MetalBuffers,
         control_grid: MTLSize,
         control_group: MTLSize,
         parallel_grid: MTLSize,
@@ -4252,12 +4270,24 @@ impl DirectMetal {
         merge_pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
     ) {
         for (phase, geometry) in ATTEMPT_PHASES {
-            let (grid, group) = match geometry {
-                DispatchGeometry::FixedControl => (control_grid, control_group),
-                DispatchGeometry::Parallel => (parallel_grid, parallel_group),
-            };
             encoder.setComputePipelineState(self.pipeline(phase, round_pipeline, merge_pipeline));
-            encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, group);
+            match geometry {
+                DispatchGeometry::FixedControl => {
+                    encoder.dispatchThreadgroups_threadsPerThreadgroup(control_grid, control_group);
+                }
+                DispatchGeometry::ActiveWorklist => unsafe {
+                    encoder
+                        .dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                            &buffers.planes[0].raw,
+                            CONTROL_INDIRECT_OFFSET_WORDS * std::mem::size_of::<u64>(),
+                            parallel_group,
+                        );
+                },
+                DispatchGeometry::Parallel => {
+                    encoder
+                        .dispatchThreadgroups_threadsPerThreadgroup(parallel_grid, parallel_group);
+                }
+            }
         }
     }
 
@@ -4277,10 +4307,6 @@ impl DirectMetal {
         fel_probe: Option<&FelProbeResources>,
     ) -> Result<(), MetalError> {
         for (phase_index, (phase, geometry)) in ATTEMPT_PHASES.into_iter().enumerate() {
-            let (grid, group) = match geometry {
-                DispatchGeometry::FixedControl => (control_grid, control_group),
-                DispatchGeometry::Parallel => (parallel_grid, parallel_group),
-            };
             let descriptor = MTLComputePassDescriptor::new();
             descriptor.setDispatchType(MTLDispatchType::Serial);
             let attachment = unsafe {
@@ -4304,7 +4330,23 @@ impl DirectMetal {
                 probe.bind(&encoder);
             }
             encoder.setComputePipelineState(self.pipeline(phase, round_pipeline, merge_pipeline));
-            encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, group);
+            match geometry {
+                DispatchGeometry::FixedControl => {
+                    encoder.dispatchThreadgroups_threadsPerThreadgroup(control_grid, control_group);
+                }
+                DispatchGeometry::ActiveWorklist => unsafe {
+                    encoder
+                        .dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                            &buffers.planes[0].raw,
+                            CONTROL_INDIRECT_OFFSET_WORDS * std::mem::size_of::<u64>(),
+                            parallel_group,
+                        );
+                },
+                DispatchGeometry::Parallel => {
+                    encoder
+                        .dispatchThreadgroups_threadsPerThreadgroup(parallel_grid, parallel_group);
+                }
+            }
             encoder.endEncoding();
         }
         Ok(())
@@ -4630,6 +4672,12 @@ mod tests {
             assert_eq!(geometry, DispatchGeometry::FixedControl);
             assert_eq!(geometry.threads_per_threadgroup(256), LANES);
         }
+
+        let (_, drain_geometry) = ATTEMPT_PHASES
+            .into_iter()
+            .find(|(candidate, _)| *candidate == AttemptPhase::DrainExecute)
+            .expect("the drain phase is present");
+        assert_eq!(drain_geometry, DispatchGeometry::ActiveWorklist);
     }
 
     #[test]
