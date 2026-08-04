@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use crossbeam::channel::{Receiver, RecvError, Select, Sender, TryRecvError, bounded, unbounded};
 
 use crate::event::{EventFelClass, event_fel_class, is_same_time_tx_ready_continuation};
+use crate::p11_probe_sites::P11ProbeSite;
 #[cfg(feature = "p11-profile")]
 use crate::p11_profile::{P11LpProfile, P11RoundProfile};
 use crate::safe_horizon::{LpRoundWork, RoundMetrics};
@@ -808,7 +809,10 @@ impl CpuLp<'_> {
             #[cfg(feature = "p11-profile")]
             let transition_started = Instant::now();
             let preserved_packet = if self.pinned_packets.contains(&event.payload) {
-                Some(self.transitions.packet_descriptor(event.payload)?)
+                Some(
+                    self.transitions
+                        .packet_descriptor(event.payload, P11ProbeSite::CpuPinnedPreservedPacket)?,
+                )
             } else {
                 None
             };
@@ -864,9 +868,14 @@ impl CpuLp<'_> {
                             capacity: outbox_capacity.expect("capacity was checked"),
                         });
                     }
+                    self.transitions
+                        .p11_probe_call(P11ProbeSite::CpuOutboxStagingPacket);
                     outbox.push(RemoteEnvelope {
                         event: child,
-                        packet: self.transitions.packet_descriptor(child.payload)?,
+                        packet: self.transitions.packet_descriptor(
+                            child.payload,
+                            P11ProbeSite::CpuOutboxStagingPacket,
+                        )?,
                     });
                     #[cfg(feature = "p11-profile")]
                     {

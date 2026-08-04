@@ -22,6 +22,7 @@ metal-spike = [
 ]
 metal-test-hooks = ["metal-spike"]
 p11-profile = []
+p11-probe-sites = []
 
 [dependencies]
 crossbeam = "0.8.4"

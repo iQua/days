@@ -7,6 +7,7 @@ use std::fmt;
 use num_bigint::BigUint;
 use num_rational::Ratio;
 
+use crate::p11_probe_sites::{P11ProbeSite, P11ProbeSiteCounters};
 #[cfg(feature = "p11-profile")]
 use crate::p11_profile::{P11PacketStoreOperation, P11PacketStoreProfile, P11PacketStoreProfiler};
 
@@ -553,6 +554,7 @@ pub(crate) struct TransitionState<'image> {
     packets: BTreeMap<PayloadId, ResidentPacket>,
     #[cfg(feature = "p11-profile")]
     p11_packet_store: P11PacketStoreProfiler,
+    p11_probe_sites: P11ProbeSiteCounters,
     observation_mode: ObservationMode,
     summary: RunSummary,
     observed_packets: BTreeMap<PayloadId, PacketDescriptor>,
@@ -612,6 +614,10 @@ struct TcpSendPlan {
 }
 
 impl<'image> TransitionState<'image> {
+    #[cfg_attr(
+        not(feature = "p11-probe-sites"),
+        allow(clippy::default_constructed_unit_structs)
+    )]
     pub(crate) fn new(
         image: &'image SimulationImage,
         observation_mode: ObservationMode,
@@ -670,6 +676,7 @@ impl<'image> TransitionState<'image> {
             packets,
             #[cfg(feature = "p11-profile")]
             p11_packet_store: P11PacketStoreProfiler::default(),
+            p11_probe_sites: P11ProbeSiteCounters::default(),
             observation_mode,
             summary: RunSummary::default(),
             observed_packets: BTreeMap::new(),
@@ -682,6 +689,10 @@ impl<'image> TransitionState<'image> {
         })
     }
 
+    #[cfg_attr(
+        not(feature = "p11-probe-sites"),
+        allow(clippy::default_constructed_unit_structs)
+    )]
     pub(crate) fn new_local(
         image: &'image SimulationImage,
         node: NodeDescriptor,
@@ -761,6 +772,7 @@ impl<'image> TransitionState<'image> {
             packets: resident,
             #[cfg(feature = "p11-profile")]
             p11_packet_store: P11PacketStoreProfiler::default(),
+            p11_probe_sites: P11ProbeSiteCounters::default(),
             observation_mode,
             summary: RunSummary::default(),
             observed_packets: BTreeMap::new(),
@@ -781,6 +793,8 @@ impl<'image> TransitionState<'image> {
         let lookup_guard = self
             .p11_packet_store
             .measure(P11PacketStoreOperation::Lookup);
+        self.p11_probe_sites
+            .probe(P11ProbeSite::InstallPacketBoundary);
         let existing = self.packets.get(&descriptor.id);
         #[cfg(feature = "p11-profile")]
         drop(lookup_guard);
@@ -814,11 +828,16 @@ impl<'image> TransitionState<'image> {
         self.p11_packet_store.snapshot()
     }
 
+    pub(crate) fn p11_probe_call(&self, site: P11ProbeSite) {
+        self.p11_probe_sites.call(site);
+    }
+
     pub(crate) fn packet_descriptor(
         &self,
         payload: PayloadId,
+        site: P11ProbeSite,
     ) -> Result<PacketDescriptor, ExecutionError> {
-        self.packet(payload)
+        self.packet(payload, site)
     }
 
     pub(crate) fn finish(mut self, pending_events: Vec<Event>) -> RunResult {
@@ -954,7 +973,9 @@ impl<'image> TransitionState<'image> {
         event: Event,
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
-        let packet = self.packet(event.payload)?;
+        self.p11_probe_sites
+            .call(P11ProbeSite::HostPacketArrivalEventPacket);
+        let packet = self.packet(event.payload, P11ProbeSite::HostPacketArrivalEventPacket)?;
         let owns_generator = self
             .host_state(node)?
             .generators
@@ -975,7 +996,11 @@ impl<'image> TransitionState<'image> {
         {
             return self.host_collective_scheduled_send(node, event, packet, children);
         }
-        self.set_source_time(event.payload, event.key.time_ns)?;
+        self.set_source_time(
+            event.payload,
+            event.key.time_ns,
+            P11ProbeSite::HostPacketArrivalSetSourceTime,
+        )?;
         let (next_packet, next_departure_ns, schedule_ready) = {
             let stop_time_ns = self.image.stop_time_ns;
             let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
@@ -1095,6 +1120,7 @@ impl<'image> TransitionState<'image> {
             self.insert_generated_packet(
                 next_packet,
                 Some(next_departure_ns.expect("produced time")),
+                P11ProbeSite::HostPacketArrivalInsertGenerated,
             )?;
             self.emit_from_host(
                 node,
@@ -1132,7 +1158,11 @@ impl<'image> TransitionState<'image> {
         packet: PacketDescriptor,
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
-        self.set_source_time(packet.id, event.key.time_ns)?;
+        self.set_source_time(
+            packet.id,
+            event.key.time_ns,
+            P11ProbeSite::HostCollectiveSendSetSourceTime,
+        )?;
         let stop_time_ns = self.image.stop_time_ns;
         let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
         let mut progress_causes = Vec::new();
@@ -1258,6 +1288,7 @@ impl<'image> TransitionState<'image> {
             self.insert_generated_packet(
                 next_packet,
                 Some(next_time.expect("next packet has a time")),
+                P11ProbeSite::HostCollectiveSendInsertGenerated,
             )?;
             self.emit_from_host(
                 node,
@@ -1452,13 +1483,18 @@ impl<'image> TransitionState<'image> {
                 self.mechanism_transitions
                     .push(crate::MechanismTransitionRecord::Collective(transition));
             }
-            self.insert_generated_packet(first_packet, Some(parent.key.time_ns))?;
+            self.insert_generated_packet(
+                first_packet,
+                Some(parent.key.time_ns),
+                P11ProbeSite::ActivateCollectivesInsertFirst,
+            )?;
             self.enqueue_source_packet(node, first_packet.id)?;
             self.record_sourced(node.id, first_packet)?;
             if let Some(next_packet) = next_packet {
                 self.insert_generated_packet(
                     next_packet,
                     Some(next_time.expect("next packet has a time")),
+                    P11ProbeSite::ActivateCollectivesInsertNext,
                 )?;
                 self.emit_from_host(
                     node,
@@ -1541,7 +1577,11 @@ impl<'image> TransitionState<'image> {
         header: TcpDataHeader,
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
-        self.set_source_time(event.payload, event.key.time_ns)?;
+        self.set_source_time(
+            event.payload,
+            event.key.time_ns,
+            P11ProbeSite::HostTcpInitialSendSetSourceTime,
+        )?;
         {
             let state = self.host_state_mut(node)?;
             let generator = state
@@ -1598,6 +1638,8 @@ impl<'image> TransitionState<'image> {
                 .checked_add(1)
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
         }
+        self.p11_probe_sites
+            .probe(P11ProbeSite::HostTcpInitialSendSeedSegment);
         seed_tcp_segment(&mut self.tcp_sent_segments, packet)?;
         self.enqueue_source_packet(node, packet.id)?;
         self.record_sourced(node.id, packet)?;
@@ -1612,8 +1654,12 @@ impl<'image> TransitionState<'image> {
         event: Event,
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
-        let packet = self.packet(event.payload)?;
-        self.set_source_time(event.payload, event.key.time_ns)?;
+        let packet = self.packet(event.payload, P11ProbeSite::HostPreloadedArrivalEventPacket)?;
+        self.set_source_time(
+            event.payload,
+            event.key.time_ns,
+            P11ProbeSite::HostPreloadedArrivalSetSourceTime,
+        )?;
         let schedule_ready = {
             let state = self.host_state_mut(node)?;
             state.sourced_packets = state
@@ -1674,9 +1720,11 @@ impl<'image> TransitionState<'image> {
             });
         }
 
-        self.start_transmission(node.id, payload)?;
-        let arrival_time_ns =
-            link.arrival_time_ns(event.key.time_ns, self.packet_size(payload)?)?;
+        self.start_transmission(node.id, payload, P11ProbeSite::HostTxReadyStartTransmission)?;
+        let arrival_time_ns = link.arrival_time_ns(
+            event.key.time_ns,
+            self.packet_size(payload, P11ProbeSite::HostTxReadyPacketSize)?,
+        )?;
         let departure_time_ns = arrival_time_ns
             .checked_sub(link.propagation_ns)
             .ok_or(ExecutionError::Time(TimeError::ArrivalOverflow))?;
@@ -1697,7 +1745,11 @@ impl<'image> TransitionState<'image> {
             node,
             event,
             ChildEmission {
-                target: self.packet_remote_target(payload, link.id)?,
+                target: self.packet_remote_target(
+                    payload,
+                    link.id,
+                    P11ProbeSite::HostTxReadyRemoteTarget,
+                )?,
                 kind: EventKind::RemoteArrival,
                 payload,
                 time_ns: arrival_time_ns,
@@ -1736,9 +1788,15 @@ impl<'image> TransitionState<'image> {
             }
         };
 
-        let packet = self.packet(event.payload)?;
+        self.p11_probe_sites
+            .call(P11ProbeSite::HostTxCompleteEventPacket);
+        let packet = self.packet(event.payload, P11ProbeSite::HostTxCompleteEventPacket)?;
         self.record_departure(node.id, packet, event.key)?;
-        self.finish_transmission(node.id, event.payload)?;
+        self.finish_transmission(
+            node.id,
+            event.payload,
+            P11ProbeSite::HostTxCompleteFinishTransmission,
+        )?;
 
         if schedule_ready {
             self.emit_from_host(
@@ -1763,13 +1821,25 @@ impl<'image> TransitionState<'image> {
         event: Event,
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
-        let mut packet = self.packet(event.payload)?;
+        self.p11_probe_sites
+            .call(P11ProbeSite::SwitchRemoteArrivalEventPacket);
+        let mut packet =
+            self.packet(event.payload, P11ProbeSite::SwitchRemoteArrivalEventPacket)?;
         let packet_ecn_before = packet.ecn_marked;
         if let PacketKind::Pfc(header) = packet.kind {
             return self.switch_pfc_remote_arrival(node, event, header, children);
         }
-        let egress_link = self.packet_egress_at(event.payload, node.id)?;
-        let incoming_link = self.packet_incoming_link_at(event.payload, node.id)?;
+        let egress_link = self.packet_egress_at(
+            event.payload,
+            node.id,
+            P11ProbeSite::SwitchRemoteArrivalEgressAt,
+        )?;
+        let incoming_link = self.packet_incoming_link_at(
+            event.payload,
+            node.id,
+            P11ProbeSite::SwitchRemoteArrivalIncomingLinkSelf,
+            P11ProbeSite::SwitchRemoteArrivalIncomingLinkRouteScan,
+        )?;
         let priority = usize::from(self.flow(packet.flow)?.priority);
         let rate_bps = egress_link
             .map(|link| self.link(link).map(|descriptor| descriptor.rate_bps))
@@ -1786,9 +1856,14 @@ impl<'image> TransitionState<'image> {
                     node: node.id,
                     egress_link,
                 })?;
+            self.p11_probe_sites
+                .call(P11ProbeSite::SwitchRemoteArrivalQueueBytesScan);
             let queue_bytes = queue.queue.iter().try_fold(0_u64, |total, payload| {
                 total
-                    .checked_add(self.packet(*payload)?.size_bytes)
+                    .checked_add(
+                        self.packet(*payload, P11ProbeSite::SwitchRemoteArrivalQueueBytesScan)?
+                            .size_bytes,
+                    )
                     .ok_or(ExecutionError::CounterOverflow(node.id))
             })?;
             (u64::try_from(queue_id).unwrap_or(u64::MAX), queue_bytes)
@@ -1964,7 +2039,10 @@ impl<'image> TransitionState<'image> {
         };
 
         if mark_packet {
-            self.set_packet_marked(event.payload)?;
+            self.set_packet_marked(
+                event.payload,
+                P11ProbeSite::SwitchRemoteArrivalSetPacketMarked,
+            )?;
             packet.ecn_marked = true;
         }
 
@@ -1994,7 +2072,7 @@ impl<'image> TransitionState<'image> {
 
         self.record_arrival(node.id, packet, event.key, disposition)?;
         if disposition == ArrivalDisposition::Dropped {
-            self.mark_terminal(event.payload)?;
+            self.mark_terminal(event.payload, P11ProbeSite::SwitchRemoteArrivalMarkTerminal)?;
         }
 
         if let Some(plan) = pfc_plan {
@@ -2035,11 +2113,14 @@ impl<'image> TransitionState<'image> {
                     node: node.id,
                     egress_link: Some(header.controlled_link),
                 })?;
+            self.p11_probe_sites
+                .call(P11ProbeSite::SwitchPfcArrivalQueuePriorityScan);
             queue
                 .queue
                 .iter()
                 .map(|payload| {
-                    let packet = self.packet(*payload)?;
+                    let packet =
+                        self.packet(*payload, P11ProbeSite::SwitchPfcArrivalQueuePriorityScan)?;
                     Ok((*payload, usize::from(self.flow(packet.flow)?.priority)))
                 })
                 .collect::<Result<Vec<_>, ExecutionError>>()?
@@ -2106,7 +2187,7 @@ impl<'image> TransitionState<'image> {
         if self.observation_mode == ObservationMode::Full {
             self.mechanism_transitions.push(transition);
         }
-        self.mark_terminal(event.payload)?;
+        self.mark_terminal(event.payload, P11ProbeSite::SwitchPfcArrivalMarkTerminal)?;
         if let Some(payload) = schedule_payload {
             self.emit_from_switch(
                 node,
@@ -2129,7 +2210,9 @@ impl<'image> TransitionState<'image> {
         event: Event,
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
-        let packet = self.packet(event.payload)?;
+        self.p11_probe_sites
+            .call(P11ProbeSite::HostRemoteArrivalEventPacket);
+        let packet = self.packet(event.payload, P11ProbeSite::HostRemoteArrivalEventPacket)?;
         let (flow_id, flow_source, flow_target) = {
             let flow = self.flow(packet.flow)?;
             (flow.id, flow.source, flow.target)
@@ -2226,7 +2309,7 @@ impl<'image> TransitionState<'image> {
             }
         };
         self.record_arrival(node.id, packet, event.key, disposition)?;
-        self.mark_terminal(event.payload)?;
+        self.mark_terminal(event.payload, P11ProbeSite::HostRemoteArrivalMarkTerminal)?;
         if !collective_progress_causes.is_empty() {
             self.activate_ready_collectives(node, event, collective_progress_causes, children)?;
         }
@@ -2291,7 +2374,7 @@ impl<'image> TransitionState<'image> {
             }
         };
         self.record_arrival(node.id, packet, event.key, ArrivalDisposition::Delivered)?;
-        self.mark_terminal(packet.id)?;
+        self.mark_terminal(packet.id, P11ProbeSite::HostDcqcnDataArrivalMarkTerminal)?;
         if let Some((payload, size_bytes, schedule_ready)) = cnp_plan {
             let cnp = PacketDescriptor {
                 id: payload,
@@ -2302,7 +2385,11 @@ impl<'image> TransitionState<'image> {
                     trigger_payload: packet.id,
                 }),
             };
-            self.insert_packet(cnp, Some(event.key.time_ns))?;
+            self.insert_packet(
+                cnp,
+                Some(event.key.time_ns),
+                P11ProbeSite::HostDcqcnDataArrivalInsertCnp,
+            )?;
             self.enqueue_source_packet(node, payload)?;
             self.record_sourced(node.id, cnp)?;
             if schedule_ready {
@@ -2381,7 +2468,7 @@ impl<'image> TransitionState<'image> {
                 .push(crate::MechanismTransitionRecord::Dcqcn(transition));
         }
         self.record_arrival(node.id, packet, event.key, ArrivalDisposition::Feedback)?;
-        self.mark_terminal(packet.id)
+        self.mark_terminal(packet.id, P11ProbeSite::HostDcqcnCnpArrivalMarkTerminal)
     }
 
     fn host_tcp_data_arrival(
@@ -2436,7 +2523,7 @@ impl<'image> TransitionState<'image> {
             )
         };
         self.record_arrival(node.id, packet, event.key, ArrivalDisposition::Delivered)?;
-        self.mark_terminal(packet.id)?;
+        self.mark_terminal(packet.id, P11ProbeSite::HostTcpDataArrivalMarkTerminal)?;
         let ack = PacketDescriptor {
             id: ack_payload,
             flow: packet.flow,
@@ -2448,7 +2535,11 @@ impl<'image> TransitionState<'image> {
                 echoed_sent_time_ns: header.sent_time_ns,
             }),
         };
-        self.insert_packet(ack, Some(event.key.time_ns))?;
+        self.insert_packet(
+            ack,
+            Some(event.key.time_ns),
+            P11ProbeSite::HostTcpDataArrivalInsertAck,
+        )?;
         self.enqueue_source_packet(node, ack.id)?;
         self.record_sourced(node.id, ack)?;
         let ready = {
@@ -2492,7 +2583,7 @@ impl<'image> TransitionState<'image> {
             });
         }
         self.record_arrival(node.id, packet, event.key, ArrivalDisposition::Feedback)?;
-        self.mark_terminal(packet.id)?;
+        self.mark_terminal(packet.id, P11ProbeSite::HostTcpAckArrivalMarkTerminal)?;
 
         let (
             retransmit_sequence,
@@ -2602,6 +2693,8 @@ impl<'image> TransitionState<'image> {
             )
         };
         if let Some(acknowledgment) = acknowledged_through {
+            self.p11_probe_sites
+                .probe(P11ProbeSite::HostTcpAckArrivalAcknowledge);
             acknowledge_tcp_segments(&mut self.tcp_sent_segments, packet.flow, acknowledgment)?;
         }
         let sender_transition = transition.is_some();
@@ -2688,7 +2781,7 @@ impl<'image> TransitionState<'image> {
         event: Event,
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
-        let packet = self.packet(event.payload)?;
+        let packet = self.packet(event.payload, P11ProbeSite::HostPacingTimerEventPacket)?;
         if packet.kind == PacketKind::DcqcnControlTimer {
             return self.host_dcqcn_control_timer(node, event, packet, children);
         }
@@ -2859,14 +2952,22 @@ impl<'image> TransitionState<'image> {
         }
 
         if emitted {
-            self.set_source_time(packet.id, event.key.time_ns)?;
+            self.set_source_time(
+                packet.id,
+                event.key.time_ns,
+                P11ProbeSite::HostPacingTimerSetSourceTime,
+            )?;
             self.enqueue_source_packet(node, packet.id)?;
             self.record_sourced(node.id, packet)?;
         } else if terminal_unused_token {
-            self.mark_terminal(packet.id)?;
+            self.mark_terminal(packet.id, P11ProbeSite::HostPacingTimerMarkTerminal)?;
         }
         if let Some(next_packet) = next_packet {
-            self.insert_generated_packet(next_packet, None)?;
+            self.insert_generated_packet(
+                next_packet,
+                None,
+                P11ProbeSite::HostPacingTimerInsertGenerated,
+            )?;
         }
         if let Some((payload, time_ns)) = next_timer {
             self.emit_from_host(
@@ -3066,14 +3167,22 @@ impl<'image> TransitionState<'image> {
                 .extend(byte_transition.map(crate::MechanismTransitionRecord::Dcqcn));
         }
         if emitted {
-            self.set_source_time(packet.id, event.key.time_ns)?;
+            self.set_source_time(
+                packet.id,
+                event.key.time_ns,
+                P11ProbeSite::HostDcqcnPacingSetSourceTime,
+            )?;
             self.enqueue_source_packet(node, packet.id)?;
             self.record_sourced(node.id, packet)?;
         } else if terminal_unused_token {
-            self.mark_terminal(packet.id)?;
+            self.mark_terminal(packet.id, P11ProbeSite::HostDcqcnPacingMarkTerminal)?;
         }
         if let Some(packet) = next_packet {
-            self.insert_generated_packet(packet, None)?;
+            self.insert_generated_packet(
+                packet,
+                None,
+                P11ProbeSite::HostDcqcnPacingInsertGenerated,
+            )?;
         }
         if let Some((payload, time_ns)) = next_timer {
             self.emit_from_host(
@@ -3179,7 +3288,7 @@ impl<'image> TransitionState<'image> {
                 children,
             )?;
         } else {
-            self.mark_terminal(packet.id)?;
+            self.mark_terminal(packet.id, P11ProbeSite::HostDcqcnControlTimerMarkTerminal)?;
         }
         Ok(())
     }
@@ -3190,7 +3299,10 @@ impl<'image> TransitionState<'image> {
         event: Event,
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
-        let egress_link = self.packet_egress_at(event.payload, node.id)?;
+        self.p11_probe_sites
+            .call(P11ProbeSite::SwitchTxReadyEgressAt);
+        let egress_link =
+            self.packet_egress_at(event.payload, node.id, P11ProbeSite::SwitchTxReadyEgressAt)?;
         let Some(egress_link) = egress_link else {
             return Err(ExecutionError::MissingSwitchQueue {
                 node: node.id,
@@ -3212,8 +3324,12 @@ impl<'image> TransitionState<'image> {
             let mut packets = Vec::new();
             let mut priorities = Vec::new();
             let mut incoming_links = Vec::new();
+            self.p11_probe_sites
+                .call(P11ProbeSite::SwitchTxReadyEligibleScan);
+            self.p11_probe_sites
+                .call(P11ProbeSite::SwitchTxReadyEligibleIncomingLinkSelf);
             for (position, payload) in queue.queue.iter().enumerate() {
-                let packet = self.packet(*payload)?;
+                let packet = self.packet(*payload, P11ProbeSite::SwitchTxReadyEligibleScan)?;
                 let priority = usize::from(self.flow(packet.flow)?.priority);
                 let paused = queue
                     .pfc
@@ -3223,7 +3339,12 @@ impl<'image> TransitionState<'image> {
                     positions.push(position);
                     packets.push(packet);
                     priorities.push(priority);
-                    incoming_links.push(self.packet_incoming_link_at(*payload, node.id)?);
+                    incoming_links.push(self.packet_incoming_link_at(
+                        *payload,
+                        node.id,
+                        P11ProbeSite::SwitchTxReadyEligibleIncomingLinkSelf,
+                        P11ProbeSite::SwitchTxReadyEligibleIncomingLinkRouteScan,
+                    )?);
                 }
             }
             (positions, packets, priorities, incoming_links)
@@ -3390,9 +3511,15 @@ impl<'image> TransitionState<'image> {
                 actual_source: link.source,
             });
         }
-        self.start_transmission(node.id, payload)?;
-        let arrival_time_ns =
-            link.arrival_time_ns(event.key.time_ns, self.packet_size(payload)?)?;
+        self.start_transmission(
+            node.id,
+            payload,
+            P11ProbeSite::SwitchTxReadyStartTransmission,
+        )?;
+        let arrival_time_ns = link.arrival_time_ns(
+            event.key.time_ns,
+            self.packet_size(payload, P11ProbeSite::SwitchTxReadyPacketSize)?,
+        )?;
         let departure_time_ns = arrival_time_ns
             .checked_sub(link.propagation_ns)
             .ok_or(ExecutionError::Time(TimeError::ArrivalOverflow))?;
@@ -3416,7 +3543,11 @@ impl<'image> TransitionState<'image> {
             node,
             event,
             ChildEmission {
-                target: self.packet_remote_target(payload, link.id)?,
+                target: self.packet_remote_target(
+                    payload,
+                    link.id,
+                    P11ProbeSite::SwitchTxReadyRemoteTarget,
+                )?,
                 kind: EventKind::RemoteArrival,
                 payload,
                 time_ns: arrival_time_ns,
@@ -3431,7 +3562,11 @@ impl<'image> TransitionState<'image> {
         event: Event,
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
-        let egress_link = self.packet_egress_at(event.payload, node.id)?;
+        let egress_link = self.packet_egress_at(
+            event.payload,
+            node.id,
+            P11ProbeSite::SwitchTxCompleteEgressAt,
+        )?;
         let Some(egress_link) = egress_link else {
             return Err(ExecutionError::MissingSwitchQueue {
                 node: node.id,
@@ -3439,7 +3574,9 @@ impl<'image> TransitionState<'image> {
             });
         };
         let rate_bps = self.link(egress_link)?.rate_bps;
-        let packet = self.packet(event.payload)?;
+        self.p11_probe_sites
+            .call(P11ProbeSite::SwitchTxCompleteEventPacket);
+        let packet = self.packet(event.payload, P11ProbeSite::SwitchTxCompleteEventPacket)?;
 
         let eligible_next_payload = {
             let state = self.switch_state(node)?;
@@ -3451,8 +3588,12 @@ impl<'image> TransitionState<'image> {
                     node: node.id,
                     egress_link: Some(egress_link),
                 })?;
+            self.p11_probe_sites
+                .call(P11ProbeSite::SwitchTxCompleteEligibleNextScan);
             queue.queue.iter().find_map(|payload| {
-                let packet = self.packet(*payload).ok()?;
+                let packet = self
+                    .packet(*payload, P11ProbeSite::SwitchTxCompleteEligibleNextScan)
+                    .ok()?;
                 let priority = usize::from(self.flow(packet.flow).ok()?.priority);
                 let paused = queue
                     .pfc
@@ -3497,7 +3638,11 @@ impl<'image> TransitionState<'image> {
         };
 
         self.record_departure(node.id, packet, event.key)?;
-        self.finish_transmission(node.id, event.payload)?;
+        self.finish_transmission(
+            node.id,
+            event.payload,
+            P11ProbeSite::SwitchTxCompleteFinishTransmission,
+        )?;
 
         if let Some(payload) = next_payload {
             self.emit_from_switch(
@@ -3668,8 +3813,10 @@ impl<'image> TransitionState<'image> {
         let incoming_class = scheduler_class(incoming_flow, priorities.len())
             .ok_or(ExecutionError::InvalidSchedulerState(node.id))?;
         let incoming_priority = priorities[incoming_class];
+        self.p11_probe_sites
+            .call(P11ProbeSite::SwitchSpInsertionPositionScan);
         for (position, payload) in queue.queue.iter().enumerate() {
-            let queued = self.packet(*payload)?;
+            let queued = self.packet(*payload, P11ProbeSite::SwitchSpInsertionPositionScan)?;
             let queued_class = scheduler_class(queued.flow, priorities.len())
                 .ok_or(ExecutionError::InvalidSchedulerState(node.id))?;
             if priorities[queued_class] < incoming_priority {
@@ -3693,15 +3840,20 @@ impl<'image> TransitionState<'image> {
             .ok_or(ExecutionError::UnknownLink(id))
     }
 
-    fn packet_size(&self, id: PayloadId) -> Result<u64, ExecutionError> {
-        Ok(self.packet(id)?.size_bytes)
+    fn packet_size(&self, id: PayloadId, site: P11ProbeSite) -> Result<u64, ExecutionError> {
+        Ok(self.packet(id, site)?.size_bytes)
     }
 
-    fn packet(&self, id: PayloadId) -> Result<PacketDescriptor, ExecutionError> {
+    fn packet(
+        &self,
+        id: PayloadId,
+        site: P11ProbeSite,
+    ) -> Result<PacketDescriptor, ExecutionError> {
         #[cfg(feature = "p11-profile")]
         let lookup_guard = self
             .p11_packet_store
             .measure(P11PacketStoreOperation::Lookup);
+        self.p11_probe_sites.probe(site);
         let packet = self
             .packets
             .get(&id)
@@ -3721,8 +3873,9 @@ impl<'image> TransitionState<'image> {
         &self,
         payload: PayloadId,
         node: NodeId,
+        site: P11ProbeSite,
     ) -> Result<Option<LinkId>, ExecutionError> {
-        let packet = self.packet(payload)?;
+        let packet = self.packet(payload, site)?;
         let flow = self.flow(packet.flow)?;
 
         let route = if packet.kind.is_data() {
@@ -3754,16 +3907,19 @@ impl<'image> TransitionState<'image> {
         &self,
         payload: PayloadId,
         node: NodeId,
+        site: P11ProbeSite,
+        route_site: P11ProbeSite,
     ) -> Result<Option<LinkId>, ExecutionError> {
-        let packet = self.packet(payload)?;
+        let packet = self.packet(payload, site)?;
         let flow = self.flow(packet.flow)?;
         let route = if packet.kind.is_data() {
             &flow.route
         } else {
             &flow.reverse_route
         };
+        self.p11_probe_sites.call(route_site);
         for link_id in route {
-            if self.packet_remote_target(payload, *link_id)? == node {
+            if self.packet_remote_target(payload, *link_id, route_site)? == node {
                 return Ok(Some(*link_id));
             }
         }
@@ -3774,8 +3930,9 @@ impl<'image> TransitionState<'image> {
         &self,
         payload: PayloadId,
         egress: LinkId,
+        site: P11ProbeSite,
     ) -> Result<NodeId, ExecutionError> {
-        let packet = self.packet(payload)?;
+        let packet = self.packet(payload, site)?;
         let flow = self.flow(packet.flow)?;
         let route = if packet.kind.is_data() {
             &flow.route
@@ -3824,6 +3981,7 @@ impl<'image> TransitionState<'image> {
                 kind: PacketKind::Pfc(plan.header),
             },
             Some(parent.key.time_ns),
+            P11ProbeSite::EmitPfcFrameInsert,
         )?;
         let arrival_time_ns = parent
             .key
@@ -3847,16 +4005,18 @@ impl<'image> TransitionState<'image> {
         &mut self,
         packet: PacketDescriptor,
         source_time_ns: Option<u64>,
+        site: P11ProbeSite,
     ) -> Result<(), ExecutionError> {
-        self.insert_packet_profiled(packet, source_time_ns, false)
+        self.insert_packet_profiled(packet, source_time_ns, false, site)
     }
 
     fn insert_generated_packet(
         &mut self,
         packet: PacketDescriptor,
         source_time_ns: Option<u64>,
+        site: P11ProbeSite,
     ) -> Result<(), ExecutionError> {
-        self.insert_packet_profiled(packet, source_time_ns, true)
+        self.insert_packet_profiled(packet, source_time_ns, true, site)
     }
 
     fn insert_packet_profiled(
@@ -3864,6 +4024,7 @@ impl<'image> TransitionState<'image> {
         packet: PacketDescriptor,
         source_time_ns: Option<u64>,
         generator: bool,
+        site: P11ProbeSite,
     ) -> Result<(), ExecutionError> {
         #[cfg(not(feature = "p11-profile"))]
         let _ = generator;
@@ -3871,6 +4032,7 @@ impl<'image> TransitionState<'image> {
         let lookup_guard = self
             .p11_packet_store
             .measure(P11PacketStoreOperation::Lookup);
+        self.p11_probe_sites.probe(site);
         let duplicate = self.packets.contains_key(&packet.id);
         #[cfg(feature = "p11-profile")]
         drop(lookup_guard);
@@ -3895,11 +4057,12 @@ impl<'image> TransitionState<'image> {
         Ok(())
     }
 
-    fn resident_packet(&self, payload: PayloadId) -> Option<ResidentPacket> {
+    fn resident_packet(&self, payload: PayloadId, site: P11ProbeSite) -> Option<ResidentPacket> {
         #[cfg(feature = "p11-profile")]
         let lookup_guard = self
             .p11_packet_store
             .measure(P11PacketStoreOperation::Lookup);
+        self.p11_probe_sites.probe(site);
         let packet = self.packets.get(&payload).copied();
         #[cfg(feature = "p11-profile")]
         drop(lookup_guard);
@@ -3909,11 +4072,13 @@ impl<'image> TransitionState<'image> {
     fn resident_packet_mut(
         &mut self,
         payload: PayloadId,
+        site: P11ProbeSite,
     ) -> Result<&mut ResidentPacket, ExecutionError> {
         #[cfg(feature = "p11-profile")]
         let lookup_guard = self
             .p11_packet_store
             .measure(P11PacketStoreOperation::Lookup);
+        self.p11_probe_sites.probe(site);
         let packet = self
             .packets
             .get_mut(&payload)
@@ -3933,14 +4098,23 @@ impl<'image> TransitionState<'image> {
         drop(remove_guard);
     }
 
-    fn set_source_time(&mut self, payload: PayloadId, time_ns: u64) -> Result<(), ExecutionError> {
-        let packet = self.resident_packet_mut(payload)?;
+    fn set_source_time(
+        &mut self,
+        payload: PayloadId,
+        time_ns: u64,
+        site: P11ProbeSite,
+    ) -> Result<(), ExecutionError> {
+        let packet = self.resident_packet_mut(payload, site)?;
         packet.source_time_ns = Some(time_ns);
         Ok(())
     }
 
-    fn set_packet_marked(&mut self, payload: PayloadId) -> Result<(), ExecutionError> {
-        let packet = self.resident_packet_mut(payload)?;
+    fn set_packet_marked(
+        &mut self,
+        payload: PayloadId,
+        site: P11ProbeSite,
+    ) -> Result<(), ExecutionError> {
+        let packet = self.resident_packet_mut(payload, site)?;
         packet.descriptor.ecn_marked = true;
         Ok(())
     }
@@ -3950,12 +4124,16 @@ impl<'image> TransitionState<'image> {
         node: NodeDescriptor,
         payload: PayloadId,
     ) -> Result<(), ExecutionError> {
-        let packet = self.packet(payload)?;
+        self.p11_probe_sites
+            .call(P11ProbeSite::EnqueueSourcePacketEventPacket);
+        let packet = self.packet(payload, P11ProbeSite::EnqueueSourcePacketEventPacket)?;
         let source_time_ns = self
-            .resident_packet(payload)
+            .resident_packet(payload, P11ProbeSite::EnqueueSourcePacketSourceTime)
             .and_then(|resident| resident.source_time_ns)
             .ok_or(ExecutionError::UnknownPacket(payload))?;
         let slot = self.local_state_slot(node)?;
+        self.p11_probe_sites
+            .call(P11ProbeSite::EnqueueSourcePacketQueueRpositionScan);
         let position = self
             .host_states
             .get(slot)
@@ -3967,14 +4145,15 @@ impl<'image> TransitionState<'image> {
             .queue
             .iter()
             .rposition(|queued| {
-                self.resident_packet(*queued).is_some_and(|resident| {
-                    (
-                        u8::from(resident.source_time_ns.is_some()),
-                        resident.source_time_ns.unwrap_or(0),
-                        resident.descriptor.flow,
-                        resident.descriptor.id,
-                    ) <= (1, source_time_ns, packet.flow, packet.id)
-                })
+                self.resident_packet(*queued, P11ProbeSite::EnqueueSourcePacketQueueRpositionScan)
+                    .is_some_and(|resident| {
+                        (
+                            u8::from(resident.source_time_ns.is_some()),
+                            resident.source_time_ns.unwrap_or(0),
+                            resident.descriptor.flow,
+                            resident.descriptor.id,
+                        ) <= (1, source_time_ns, packet.flow, packet.id)
+                    })
             })
             .map_or(0, |position| position + 1);
         let state = self.host_state_mut(node)?;
@@ -4020,7 +4199,11 @@ impl<'image> TransitionState<'image> {
             ecn_marked: false,
             kind: PacketKind::Data,
         };
-        self.insert_generated_packet(packet, Some(parent.key.time_ns))?;
+        self.insert_generated_packet(
+            packet,
+            Some(parent.key.time_ns),
+            P11ProbeSite::EmitFeedbackDrivenInsert,
+        )?;
         self.enqueue_source_packet(node, payload)?;
         self.record_sourced(node.id, packet)?;
         if schedule_ready {
@@ -4051,6 +4234,8 @@ impl<'image> TransitionState<'image> {
         let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
         let retransmit_segment = retransmit_sequence
             .map(|sequence| {
+                self.p11_probe_sites
+                    .probe(P11ProbeSite::PrepareTcpAttemptsRetransmitSegment);
                 self.tcp_sent_segments
                     .get(&flow)
                     .and_then(|segments| segments.get(&sequence))
@@ -4189,6 +4374,8 @@ impl<'image> TransitionState<'image> {
             .checked_add(u64::try_from(packets.len()).unwrap_or(u64::MAX))
             .ok_or(ExecutionError::CounterOverflow(node.id))?;
         for packet in packets.iter().copied() {
+            self.p11_probe_sites
+                .probe(P11ProbeSite::InstallTcpAttemptsSeedSegment);
             seed_tcp_segment(&mut self.tcp_sent_segments, packet)?;
         }
         Ok(TcpSendPlan { packets, timer })
@@ -4202,7 +4389,11 @@ impl<'image> TransitionState<'image> {
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
         for packet in plan.packets {
-            self.insert_generated_packet(packet, Some(parent.key.time_ns))?;
+            self.insert_generated_packet(
+                packet,
+                Some(parent.key.time_ns),
+                P11ProbeSite::InstallTcpAttemptsInsertGenerated,
+            )?;
             self.enqueue_source_packet(node, packet.id)?;
             self.record_sourced(node.id, packet)?;
         }
@@ -4321,6 +4512,7 @@ impl<'image> TransitionState<'image> {
 
     fn observe_packet(&mut self, packet: PacketDescriptor) {
         if self.observation_mode == ObservationMode::Full {
+            self.p11_probe_sites.probe(P11ProbeSite::ObservePacketEntry);
             self.observed_packets
                 .entry(packet.id)
                 .and_modify(|observed| observed.ecn_marked |= packet.ecn_marked)
@@ -4332,8 +4524,9 @@ impl<'image> TransitionState<'image> {
         &mut self,
         node: NodeId,
         payload: PayloadId,
+        site: P11ProbeSite,
     ) -> Result<(), ExecutionError> {
-        let packet = self.resident_packet_mut(payload)?;
+        let packet = self.resident_packet_mut(payload, site)?;
         packet.transmitters = packet
             .transmitters
             .checked_add(1)
@@ -4345,11 +4538,12 @@ impl<'image> TransitionState<'image> {
         &mut self,
         node: NodeId,
         payload: PayloadId,
+        site: P11ProbeSite,
     ) -> Result<(), ExecutionError> {
         let remove =
             {
                 let local_node = self.local_node;
-                let packet = self.resident_packet_mut(payload)?;
+                let packet = self.resident_packet_mut(payload, site)?;
                 packet.transmitters = packet.transmitters.checked_sub(1).ok_or(
                     ExecutionError::UnexpectedTxComplete {
                         node,
@@ -4365,9 +4559,13 @@ impl<'image> TransitionState<'image> {
         Ok(())
     }
 
-    fn mark_terminal(&mut self, payload: PayloadId) -> Result<(), ExecutionError> {
+    fn mark_terminal(
+        &mut self,
+        payload: PayloadId,
+        site: P11ProbeSite,
+    ) -> Result<(), ExecutionError> {
         let remove = {
-            let packet = self.resident_packet_mut(payload)?;
+            let packet = self.resident_packet_mut(payload, site)?;
             packet.terminal = true;
             packet.transmitters == 0
         };

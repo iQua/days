@@ -22,6 +22,7 @@ lean = []
 metal-spike = ["days-executor/metal-spike"]
 cuda = ["days-executor/cuda"]
 p11-profile = ["days-executor/p11-profile"]
+p11-probe-sites = ["days-executor/p11-probe-sites"]
 
 [dependencies]
 csv = "1.4"
