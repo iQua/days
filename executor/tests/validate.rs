@@ -6,12 +6,7 @@ use days_executor::{
     SchedulerKind, SimulationImage, SwitchQueueState, SwitchState, WfqSchedulerState, event_phase,
     run_scalar_with_observations, validate,
 };
-#[cfg(feature = "cuda")]
-use days_executor::{CudaConfig, run_cuda_with_observations};
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 use days_executor::{DropMarkPolicy, EcnThresholdPolicy, QueueDepthUnit};
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 use days_executor::{MetalConfig, run_metal_with_observations};
@@ -211,10 +206,7 @@ fn wfq_in_service_image() -> SimulationImage {
     checkpoint
 }
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 fn empty_host_state(egress_link: LinkId) -> HostState {
     HostState {
         egress_link,
@@ -232,10 +224,7 @@ fn empty_host_state(egress_link: LinkId) -> HostState {
     }
 }
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 fn switch_state(
     physical_switch: u64,
     egress_link: LinkId,
@@ -261,10 +250,7 @@ fn switch_state(
     }
 }
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 fn checkpoint_image(source: &SimulationImage, horizon_ns: u64) -> SimulationImage {
     let prefix = run_scalar_with_observations(source, Some(horizon_ns), ObservationMode::Full)
         .expect("resident-waiter prefix must execute");
@@ -276,10 +262,7 @@ fn checkpoint_image(source: &SimulationImage, horizon_ns: u64) -> SimulationImag
     checkpoint
 }
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 fn host_resident_waiter_image(
     scheduler: SchedulerKind,
     drop_mark: DropMarkPolicy,
@@ -436,10 +419,7 @@ fn host_resident_waiter_image(
     checkpoint
 }
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 fn idle_host_resident_waiter_image(
     scheduler: SchedulerKind,
     drop_mark: DropMarkPolicy,
@@ -470,10 +450,7 @@ fn idle_host_resident_waiter_image(
     checkpoint
 }
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 fn switch_resident_waiter_image(
     scheduler: SchedulerKind,
     drop_mark: DropMarkPolicy,
@@ -647,10 +624,7 @@ fn switch_resident_waiter_image(
     checkpoint
 }
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 fn resident_waiter_cases() -> Vec<(SimulationImage, u64, NodeId, PayloadId, bool)> {
     let ecn = DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
         unit: QueueDepthUnit::Packets,
