@@ -25,11 +25,11 @@ use cudarc::nvrtc::Ptx;
 use crate::device_scheduler::{prepare_device_schedulers, restore_device_scheduler};
 use crate::tcp::{TcpCubic, TcpReno};
 use crate::{
-    ArrivalDisposition, Backend, Event, EventKey, EventKind, FlowGeneratorKind, FlowId,
-    GeneratorStatus, GeneratorTermination, NodeId, NodeKind, ObservationMode,
-    PacketArrivalObservation, PacketDeparture, PacketDescriptor, PacketKind, PayloadId, RunResult,
-    RunSummary, SimulationImage, TcpAckHeader, TcpCongestionControl, TcpDataHeader, TcpPhase,
-    TcpReceiveRange, TcpTimerState, validate,
+    ArrivalDisposition, Backend, DeviceCapacityCaps, DeviceLanePacking, Event, EventKey, EventKind,
+    FlowGeneratorKind, FlowId, GeneratorStatus, GeneratorTermination, LanePackingCounters, NodeId,
+    NodeKind, ObservationMode, PacketArrivalObservation, PacketDeparture, PacketDescriptor,
+    PacketKind, PayloadId, RunResult, RunSummary, SimulationImage, TcpAckHeader,
+    TcpCongestionControl, TcpDataHeader, TcpPhase, TcpReceiveRange, TcpTimerState, validate,
 };
 
 const LANES: usize = 1_024;
@@ -484,6 +484,11 @@ impl Error for CudaError {}
 pub struct CudaConfig {
     /// Enables the stream-decomposed FEL. `false` retains the exact fallback heap path.
     pub streams_enabled: bool,
+    /// Active-worklist lane packing and issue-order policy.
+    pub lane_packing: DeviceLanePacking,
+    /// Optional caps for large capacities derived from the complete image. Exact legacy
+    /// `max_*` overrides below retain precedence when both forms are specified.
+    pub capacity_caps: DeviceCapacityCaps,
     pub max_fel_events_per_lp: Option<usize>,
     pub max_channel_events_per_stream: Option<usize>,
     pub max_queue_packets_per_lp: Option<usize>,
@@ -507,6 +512,8 @@ impl Default for CudaConfig {
     fn default() -> Self {
         Self {
             streams_enabled: true,
+            lane_packing: DeviceLanePacking::default(),
+            capacity_caps: DeviceCapacityCaps::default(),
             max_fel_events_per_lp: None,
             max_channel_events_per_stream: None,
             max_queue_packets_per_lp: None,
@@ -552,6 +559,9 @@ impl CudaMemoryLayout {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CudaRun {
     pub result: RunResult,
+    pub lane_packing: DeviceLanePacking,
+    /// Counter-only mechanism evidence. Present only in `lane-packing-counters` builds.
+    pub lane_packing_counters: Option<LanePackingCounters>,
     pub rounds: u64,
     pub transitions: u64,
     /// Physical attempts present in launched graph replays, including deterministic no-op tails.
@@ -918,7 +928,10 @@ fn tcp_flow_segment_capacity(image: &SimulationImage, flow: usize) -> usize {
         .max(1)
 }
 
-fn prepare_tcp_state(image: &SimulationImage) -> Result<(Vec<u64>, TcpLayout), CudaError> {
+fn prepare_tcp_state(
+    image: &SimulationImage,
+    capacity_caps: DeviceCapacityCaps,
+) -> Result<(Vec<u64>, TcpLayout), CudaError> {
     let flow_count = image.flows.len().max(1);
     let receiver_offset = 0;
     let ledger_meta_offset = flow_count
@@ -938,7 +951,11 @@ fn prepare_tcp_state(image: &SimulationImage) -> Result<(Vec<u64>, TcpLayout), C
         for receiver in &host.tcp_receivers {
             let flow = receiver.flow.0 as usize;
             let row = receiver_offset + flow * TCP_RECEIVER_WORDS;
-            let capacity = tcp_flow_segment_capacity(image, flow).max(receiver.out_of_order.len());
+            let capacity = crate::device_capacity::cap_derived_capacity(
+                tcp_flow_segment_capacity(image, flow).max(receiver.out_of_order.len()),
+                capacity_caps.tcp_receiver_ranges_per_flow,
+                receiver.out_of_order.len(),
+            );
             let range_offset = next;
             next = next
                 .checked_add(capacity.saturating_mul(2))
@@ -973,7 +990,11 @@ fn prepare_tcp_state(image: &SimulationImage) -> Result<(Vec<u64>, TcpLayout), C
         let packets = ledger
             .get(&crate::FlowId(flow as u64))
             .map_or_else(Vec::new, |segments| segments.values().copied().collect());
-        let capacity = tcp_flow_segment_capacity(image, flow).max(packets.len());
+        let capacity = crate::device_capacity::cap_derived_capacity(
+            tcp_flow_segment_capacity(image, flow).max(packets.len()),
+            capacity_caps.tcp_ledger_segments_per_flow,
+            packets.len(),
+        );
         let row = ledger_meta_offset + flow * TCP_LEDGER_META_WORDS;
         let record_offset = next;
         next = next
@@ -1039,9 +1060,11 @@ impl CudaPlan {
 
         let mut queue_caps = vec![1_usize; node_count];
         let mut legacy_fel_caps = vec![8_usize; node_count];
+        let mut initial_fel_counts = vec![0_usize; node_count];
         for event in &image.initial_events {
-            legacy_fel_caps[event.target.0 as usize] =
-                legacy_fel_caps[event.target.0 as usize].saturating_add(1);
+            let target = event.target.0 as usize;
+            legacy_fel_caps[target] = legacy_fel_caps[target].saturating_add(1);
+            initial_fel_counts[target] = initial_fel_counts[target].saturating_add(1);
         }
         for (flow_index, flow) in image.flows.iter().enumerate() {
             let packet_count = flow_packet_counts[flow_index];
@@ -1102,11 +1125,35 @@ impl CudaPlan {
             }
             if let Some(limit) = config.max_queue_packets_per_lp {
                 queue_caps[slot] = limit;
+            } else {
+                let resident = match node.kind {
+                    NodeKind::Host => image.host_states[node.state_slot as usize].queue.len(),
+                    NodeKind::Switch => image.switch_states[node.state_slot as usize]
+                        .queues
+                        .first()
+                        .map_or(0, |queue| queue.queue.len()),
+                };
+                queue_caps[slot] = crate::device_capacity::cap_derived_capacity(
+                    queue_caps[slot],
+                    config.capacity_caps.queue_packets_per_lp,
+                    resident,
+                );
             }
         }
 
         if let Some(limit) = config.max_fel_events_per_lp {
             legacy_fel_caps.fill(limit);
+        } else {
+            for (capacity, resident) in legacy_fel_caps
+                .iter_mut()
+                .zip(initial_fel_counts.iter().copied())
+            {
+                *capacity = crate::device_capacity::cap_derived_capacity(
+                    *capacity,
+                    config.capacity_caps.fallback_fel_events_per_lp,
+                    resident,
+                );
+            }
         }
         let mut fel_caps = if config.streams_enabled {
             let mut capacities = vec![1_usize; node_count];
@@ -1128,6 +1175,15 @@ impl CudaPlan {
         };
         if let Some(limit) = config.max_fel_events_per_lp {
             fel_caps.fill(limit);
+        } else {
+            for (capacity, resident) in fel_caps.iter_mut().zip(initial_fel_counts.iter().copied())
+            {
+                *capacity = crate::device_capacity::cap_derived_capacity(
+                    *capacity,
+                    config.capacity_caps.fallback_fel_events_per_lp,
+                    resident,
+                );
+            }
         }
 
         let mut fel_meta = vec![0_u64; node_count * ARENA_META_WORDS];
@@ -1325,7 +1381,13 @@ impl CudaPlan {
             &flow_feedback_counts,
             minimum_lookahead_ns,
         );
-        let outbox_capacity = config.max_outbox_events.unwrap_or(remote_bound.max(1));
+        let outbox_capacity = config.max_outbox_events.unwrap_or_else(|| {
+            crate::device_capacity::cap_derived_capacity(
+                remote_bound.max(1),
+                config.capacity_caps.outbox_events_total,
+                0,
+            )
+        });
         let mut remote_capacities = derived_remote_capacities(
             image,
             &flow_packet_counts,
@@ -1334,6 +1396,14 @@ impl CudaPlan {
         );
         if let Some(capacity) = config.max_outbox_events {
             remote_capacities.fill(capacity);
+        } else {
+            for capacity in &mut remote_capacities {
+                *capacity = crate::device_capacity::cap_derived_capacity(
+                    *capacity,
+                    config.capacity_caps.remote_staging_events_per_lp,
+                    0,
+                );
+            }
         }
         let mut remote_meta = vec![0_u64; node_count * ARENA_META_WORDS];
         let remote_staging_slots = assign_arena_offsets(&mut remote_meta, &remote_capacities)?;
@@ -1365,6 +1435,14 @@ impl CudaPlan {
         };
         if let Some(capacity) = config.max_observations {
             observation_capacities.fill(capacity);
+        } else {
+            for capacity in &mut observation_capacities {
+                *capacity = crate::device_capacity::cap_derived_capacity(
+                    *capacity,
+                    config.capacity_caps.observation_events_per_lp,
+                    0,
+                );
+            }
         }
         let mut observation_meta = vec![0_u64; node_count * OBSERVATION_META_WORDS];
         let observation_slots =
@@ -1381,7 +1459,7 @@ impl CudaPlan {
                     arrival_capacity as u64;
             }
         }
-        let (tcp_state, tcp_layout) = prepare_tcp_state(image)?;
+        let (tcp_state, tcp_layout) = prepare_tcp_state(image, config.capacity_caps)?;
         let (inbound_meta, inbound_producers) = remote_inbound_producers(image);
         let round_capacity = config
             .max_rounds
@@ -1427,7 +1505,33 @@ impl CudaPlan {
             u64::from(cfg!(debug_assertions)),
             tcp_layout.receiver_offset as u64,
             tcp_layout.ledger_meta_offset as u64,
+            config.lane_packing.device_code(),
         ];
+
+        let worklist_words =
+            if config.lane_packing.is_packed() || cfg!(feature = "lane-packing-counters") {
+                node_count.checked_mul(4).ok_or_else(|| {
+                    CudaError::Validation("packed active worklist overflows usize".into())
+                })?
+            } else {
+                node_count
+            };
+        #[cfg(feature = "lane-packing-counters")]
+        let worklist_words = {
+            let group_capacity = node_count.div_ceil(32);
+            let round_words = group_capacity
+                .checked_mul(2)
+                .and_then(|words| words.checked_add(1))
+                .ok_or_else(|| {
+                    CudaError::Validation("lane-packing counter stride overflows usize".into())
+                })?;
+            round_capacity
+                .checked_mul(round_words)
+                .and_then(|words| worklist_words.checked_add(words))
+                .ok_or_else(|| {
+                    CudaError::Validation("lane-packing counter plane overflows usize".into())
+                })?
+        };
 
         Ok(Self {
             control,
@@ -1443,7 +1547,7 @@ impl CudaPlan {
             queue_records,
             in_service,
             outbox: zero_words(outbox_capacity, EVENT_WORDS)?,
-            worklist: vec![0_u64; node_count.max(1)],
+            worklist: vec![0_u64; worklist_words.max(1)],
             summary: vec![0_u64; node_count.max(1) * SUMMARY_COUNTERS * 2],
             observed: zero_words(observation_slots, OBSERVED_WORDS)?,
             departures: zero_words(observation_slots, DEPARTURE_WORDS)?,
@@ -2059,6 +2163,14 @@ fn prepare_streams(
         derived_channel_stream_capacities(image, counts, feedback_counts, lookahead)?;
     if let Some(capacity) = config.max_channel_events_per_stream {
         channel_caps.fill(capacity);
+    } else {
+        for capacity in &mut channel_caps {
+            *capacity = crate::device_capacity::cap_derived_capacity(
+                *capacity,
+                config.capacity_caps.channel_events_per_stream,
+                0,
+            );
+        }
     }
     let service_caps = vec![injected_capacity(config, CudaArena::ServiceStream, 2); node_count];
     let generator_caps =
@@ -3109,6 +3221,22 @@ impl CudaBuffers {
                 diagnostics: None,
                 pending_events,
             },
+            lane_packing: match params[30] {
+                0 => DeviceLanePacking::Unpacked,
+                1 => DeviceLanePacking::Descending,
+                2 => DeviceLanePacking::Ascending,
+                code => {
+                    return Err(CudaError::Validation(format!(
+                        "device returned unknown lane-packing code {code}"
+                    )));
+                }
+            },
+            lane_packing_counters: crate::lane_packing::decode_lane_packing_counters(
+                &planes[13],
+                image.nodes.len(),
+                control[CONTROL_ROUNDS],
+            )
+            .map_err(CudaError::Validation)?,
             rounds: control[CONTROL_ROUNDS],
             transitions: lp_state
                 .chunks_exact(LP_STATE_WORDS)

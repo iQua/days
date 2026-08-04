@@ -29,11 +29,11 @@ use objc2_metal::{
 use crate::device_scheduler::{prepare_device_schedulers, restore_device_scheduler};
 use crate::tcp::{TcpCubic, TcpReno};
 use crate::{
-    ArrivalDisposition, Backend, Event, EventKey, EventKind, FlowGeneratorKind, GeneratorStatus,
-    GeneratorTermination, NodeId, NodeKind, ObservationMode, PacketArrivalObservation,
-    PacketDeparture, PacketDescriptor, PacketKind, PayloadId, RunResult, RunSummary,
-    SimulationImage, TcpAckHeader, TcpCongestionControl, TcpDataHeader, TcpPhase, TcpReceiveRange,
-    TcpTimerState, validate,
+    ArrivalDisposition, Backend, DeviceCapacityCaps, DeviceLanePacking, Event, EventKey, EventKind,
+    FlowGeneratorKind, GeneratorStatus, GeneratorTermination, LanePackingCounters, NodeId,
+    NodeKind, ObservationMode, PacketArrivalObservation, PacketDeparture, PacketDescriptor,
+    PacketKind, PayloadId, RunResult, RunSummary, SimulationImage, TcpAckHeader,
+    TcpCongestionControl, TcpDataHeader, TcpPhase, TcpReceiveRange, TcpTimerState, validate,
 };
 
 const LANES: usize = 1_024;
@@ -300,6 +300,11 @@ pub struct MetalConfig {
     /// Enables the stream-decomposed FEL. When false, every event uses the retained exact heap and
     /// the original target-owned exchange merge, providing an identical-binary ablation.
     pub streams_enabled: bool,
+    /// Active-worklist lane packing and issue-order policy.
+    pub lane_packing: DeviceLanePacking,
+    /// Optional caps for large capacities derived from the complete image. Exact legacy
+    /// `max_*` overrides below retain precedence when both forms are specified.
+    pub capacity_caps: DeviceCapacityCaps,
     /// Optional exact per-LP FEL capacity override. Raising the derived default consumes more
     /// device memory; lowering it retains an explicit device capacity fault on overflow.
     pub max_fel_events_per_lp: Option<usize>,
@@ -331,6 +336,8 @@ impl Default for MetalConfig {
     fn default() -> Self {
         Self {
             streams_enabled: true,
+            lane_packing: DeviceLanePacking::default(),
+            capacity_caps: DeviceCapacityCaps::default(),
             max_fel_events_per_lp: None,
             max_channel_events_per_stream: None,
             max_queue_packets_per_lp: None,
@@ -375,6 +382,9 @@ impl MetalMemoryLayout {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetalRun {
     pub result: RunResult,
+    pub lane_packing: DeviceLanePacking,
+    /// Counter-only mechanism evidence. Present only in `lane-packing-counters` builds.
+    pub lane_packing_counters: Option<LanePackingCounters>,
     pub rounds: u64,
     pub transitions: u64,
     /// Physical round attempts encoded into submitted command buffers, including termination and
@@ -1120,9 +1130,11 @@ impl MetalPlan {
 
         let mut queue_caps = vec![1_usize; node_count];
         let mut legacy_fel_caps = vec![8_usize; node_count];
+        let mut initial_fel_counts = vec![0_usize; node_count];
         for event in &image.initial_events {
-            legacy_fel_caps[event.target.0 as usize] =
-                legacy_fel_caps[event.target.0 as usize].saturating_add(1);
+            let target = event.target.0 as usize;
+            legacy_fel_caps[target] = legacy_fel_caps[target].saturating_add(1);
+            initial_fel_counts[target] = initial_fel_counts[target].saturating_add(1);
         }
         for (flow_index, flow) in image.flows.iter().enumerate() {
             let packet_count = flow_packet_counts[flow_index];
@@ -1185,11 +1197,35 @@ impl MetalPlan {
             }
             if let Some(limit) = config.max_queue_packets_per_lp {
                 queue_caps[slot] = limit;
+            } else {
+                let resident = match node.kind {
+                    NodeKind::Host => image.host_states[node.state_slot as usize].queue.len(),
+                    NodeKind::Switch => image.switch_states[node.state_slot as usize]
+                        .queues
+                        .first()
+                        .map_or(0, |queue| queue.queue.len()),
+                };
+                queue_caps[slot] = crate::device_capacity::cap_derived_capacity(
+                    queue_caps[slot],
+                    config.capacity_caps.queue_packets_per_lp,
+                    resident,
+                );
             }
         }
 
         if let Some(limit) = config.max_fel_events_per_lp {
             legacy_fel_caps.fill(limit);
+        } else {
+            for (capacity, resident) in legacy_fel_caps
+                .iter_mut()
+                .zip(initial_fel_counts.iter().copied())
+            {
+                *capacity = crate::device_capacity::cap_derived_capacity(
+                    *capacity,
+                    config.capacity_caps.fallback_fel_events_per_lp,
+                    resident,
+                );
+            }
         }
         let mut fel_caps = if config.streams_enabled {
             let mut capacities = vec![1_usize; node_count];
@@ -1211,6 +1247,15 @@ impl MetalPlan {
         };
         if let Some(limit) = config.max_fel_events_per_lp {
             fel_caps.fill(limit);
+        } else {
+            for (capacity, resident) in fel_caps.iter_mut().zip(initial_fel_counts.iter().copied())
+            {
+                *capacity = crate::device_capacity::cap_derived_capacity(
+                    *capacity,
+                    config.capacity_caps.fallback_fel_events_per_lp,
+                    resident,
+                );
+            }
         }
 
         let mut fel_meta = vec![0_u64; node_count * ARENA_META_WORDS];
@@ -1411,7 +1456,13 @@ impl MetalPlan {
             &flow_feedback_counts,
             minimum_lookahead_ns,
         );
-        let outbox_capacity = config.max_outbox_events.unwrap_or(remote_bound.max(1));
+        let outbox_capacity = config.max_outbox_events.unwrap_or_else(|| {
+            crate::device_capacity::cap_derived_capacity(
+                remote_bound.max(1),
+                config.capacity_caps.outbox_events_total,
+                0,
+            )
+        });
         let mut remote_capacities = derived_remote_capacities(
             image,
             &flow_minimum_packet_sizes,
@@ -1421,6 +1472,14 @@ impl MetalPlan {
         );
         if let Some(capacity) = config.max_outbox_events {
             remote_capacities.fill(capacity);
+        } else {
+            for capacity in &mut remote_capacities {
+                *capacity = crate::device_capacity::cap_derived_capacity(
+                    *capacity,
+                    config.capacity_caps.remote_staging_events_per_lp,
+                    0,
+                );
+            }
         }
         let mut remote_meta = vec![0_u64; node_count * ARENA_META_WORDS];
         let remote_staging_slots = assign_arena_offsets(&mut remote_meta, &remote_capacities)?;
@@ -1450,11 +1509,24 @@ impl MetalPlan {
         };
         if let Some(capacity) = config.max_observations {
             observation_capacities.fill(capacity);
+        } else {
+            for capacity in &mut observation_capacities {
+                *capacity = crate::device_capacity::cap_derived_capacity(
+                    *capacity,
+                    config.capacity_caps.observation_events_per_lp,
+                    0,
+                );
+            }
         }
         let mut observation_meta = vec![0_u64; node_count * OBSERVATION_META_WORDS];
         let observation_slots =
             assign_observation_offsets(&mut observation_meta, &observation_capacities)?;
-        let tcp_state = prepare_tcp_state(image, &flow_packet_counts, &flow_feedback_counts)?;
+        let tcp_state = prepare_tcp_state(
+            image,
+            &flow_packet_counts,
+            &flow_feedback_counts,
+            config.capacity_caps,
+        )?;
         let (inbound_meta, inbound_producers) = remote_inbound_producers(image);
         let round_capacity = config
             .max_rounds
@@ -1501,6 +1573,7 @@ impl MetalPlan {
             tcp_state.layout.receiver_offset as u64,
             tcp_state.layout.ledger_meta_offset as u64,
             config.round_threads_per_threadgroup as u64,
+            config.lane_packing.device_code(),
         ];
 
         if node_count.div_ceil(config.round_threads_per_threadgroup) > u32::MAX as usize {
@@ -1513,6 +1586,31 @@ impl MetalPlan {
             params[PARAM_ROUND_THREADS],
             config.round_threads_per_threadgroup as u64
         );
+
+        let worklist_words =
+            if config.lane_packing.is_packed() || cfg!(feature = "lane-packing-counters") {
+                node_count.checked_mul(4).ok_or_else(|| {
+                    MetalError::Validation("packed active worklist overflows usize".into())
+                })?
+            } else {
+                node_count
+            };
+        #[cfg(feature = "lane-packing-counters")]
+        let worklist_words = {
+            let group_capacity = node_count.div_ceil(32);
+            let round_words = group_capacity
+                .checked_mul(2)
+                .and_then(|words| words.checked_add(1))
+                .ok_or_else(|| {
+                    MetalError::Validation("lane-packing counter stride overflows usize".into())
+                })?;
+            round_capacity
+                .checked_mul(round_words)
+                .and_then(|words| worklist_words.checked_add(words))
+                .ok_or_else(|| {
+                    MetalError::Validation("lane-packing counter plane overflows usize".into())
+                })?
+        };
 
         Ok(Self {
             control,
@@ -1528,7 +1626,7 @@ impl MetalPlan {
             queue_records,
             in_service,
             outbox: zero_words(outbox_capacity, EVENT_WORDS)?,
-            worklist: vec![0_u64; node_count.max(1)],
+            worklist: vec![0_u64; worklist_words.max(1)],
             summary: vec![0_u64; node_count.max(1) * SUMMARY_COUNTERS * 2],
             observed: zero_words(observation_slots, OBSERVED_WORDS)?,
             departures: zero_words(observation_slots, DEPARTURE_WORDS)?,
@@ -2207,6 +2305,14 @@ fn prepare_streams(
     )?;
     if let Some(capacity) = config.max_channel_events_per_stream {
         channel_caps.fill(capacity);
+    } else {
+        for capacity in &mut channel_caps {
+            *capacity = crate::device_capacity::cap_derived_capacity(
+                *capacity,
+                config.capacity_caps.channel_events_per_stream,
+                0,
+            );
+        }
     }
     let service_caps = vec![2_usize; node_count];
     let generator_caps = vec![2_usize; image.flows.len()];
@@ -2730,6 +2836,7 @@ fn prepare_tcp_state(
     image: &SimulationImage,
     packet_counts: &[usize],
     feedback_counts: &[usize],
+    capacity_caps: DeviceCapacityCaps,
 ) -> Result<PreparedTcpState, MetalError> {
     let flow_count = image.flows.len();
     let receiver_offset = 0;
@@ -2752,11 +2859,16 @@ fn prepare_tcp_state(
                 .copied()
                 .unwrap_or(0)
                 .saturating_sub(feedback_counts.get(flow).copied().unwrap_or(0));
-            let capacity = receiver
+            let derived_capacity = receiver
                 .out_of_order
                 .len()
                 .saturating_add(data_count)
                 .max(1);
+            let capacity = crate::device_capacity::cap_derived_capacity(
+                derived_capacity,
+                capacity_caps.tcp_receiver_ranges_per_flow,
+                receiver.out_of_order.len(),
+            );
             let words = capacity.checked_mul(TCP_RANGE_WORDS).ok_or_else(|| {
                 MetalError::Validation("TCP receiver range size overflows".into())
             })?;
@@ -2795,7 +2907,11 @@ fn prepare_tcp_state(
             .copied()
             .unwrap_or(0)
             .saturating_sub(feedback_counts.get(flow).copied().unwrap_or(0));
-        let capacity = current.max(data_count).max(1);
+        let capacity = crate::device_capacity::cap_derived_capacity(
+            current.max(data_count).max(1),
+            capacity_caps.tcp_ledger_segments_per_flow,
+            current,
+        );
         let record_offset = next;
         next = next
             .checked_add(
@@ -3553,6 +3669,22 @@ impl MetalBuffers {
                 diagnostics: None,
                 pending_events,
             },
+            lane_packing: match params[31] {
+                0 => DeviceLanePacking::Unpacked,
+                1 => DeviceLanePacking::Descending,
+                2 => DeviceLanePacking::Ascending,
+                code => {
+                    return Err(MetalError::Validation(format!(
+                        "device returned unknown lane-packing code {code}"
+                    )));
+                }
+            },
+            lane_packing_counters: crate::lane_packing::decode_lane_packing_counters(
+                &planes[13],
+                image.nodes.len(),
+                control[CONTROL_ROUNDS],
+            )
+            .map_err(MetalError::Validation)?,
             rounds: control[CONTROL_ROUNDS],
             transitions: lp_state
                 .chunks_exact(LP_STATE_WORDS)
@@ -3900,16 +4032,23 @@ impl DirectMetal {
         let queue = device
             .newCommandQueue()
             .ok_or_else(|| MetalError::Unavailable("command queue creation failed".into()))?;
-        let source = include_str!("metal_kernels.metal");
+        let source = if cfg!(feature = "lane-packing-counters") {
+            format!(
+                "#define DAYS_T20B2B_COUNTERS 1\n{}",
+                include_str!("metal_kernels.metal")
+            )
+        } else {
+            include_str!("metal_kernels.metal").to_owned()
+        };
         let pipeline_started = Instant::now();
-        let horizon_pipeline = create_pipeline(&device, source, "days_horizon")?;
-        let prepare_pipeline = create_pipeline(&device, source, "days_round_prepare")?;
-        let round_pipeline = create_pipeline(&device, source, "days_round")?;
-        let control_pipeline = create_pipeline(&device, source, "days_round_control")?;
-        let exchange_prefix_pipeline = create_pipeline(&device, source, "days_exchange_prefix")?;
-        let exchange_scatter_pipeline = create_pipeline(&device, source, "days_exchange_scatter")?;
-        let exchange_merge_pipeline = create_pipeline(&device, source, "days_exchange_merge")?;
-        let finalize_pipeline = create_pipeline(&device, source, "days_round_finalize")?;
+        let horizon_pipeline = create_pipeline(&device, &source, "days_horizon")?;
+        let prepare_pipeline = create_pipeline(&device, &source, "days_round_prepare")?;
+        let round_pipeline = create_pipeline(&device, &source, "days_round")?;
+        let control_pipeline = create_pipeline(&device, &source, "days_round_control")?;
+        let exchange_prefix_pipeline = create_pipeline(&device, &source, "days_exchange_prefix")?;
+        let exchange_scatter_pipeline = create_pipeline(&device, &source, "days_exchange_scatter")?;
+        let exchange_merge_pipeline = create_pipeline(&device, &source, "days_exchange_merge")?;
+        let finalize_pipeline = create_pipeline(&device, &source, "days_round_finalize")?;
         let pipeline_creation_ns = duration_ns(pipeline_started.elapsed());
         for (name, pipeline) in [
             ("horizon", &horizon_pipeline),
@@ -3960,8 +4099,13 @@ impl DirectMetal {
         }
 
         let started = Instant::now();
+        let counter_define = if cfg!(feature = "lane-packing-counters") {
+            "#define DAYS_T20B2B_COUNTERS 1\n"
+        } else {
+            ""
+        };
         let source = format!(
-            "#define DAYS_T15E_DIAGNOSTICS 1\n{}",
+            "#define DAYS_T15E_DIAGNOSTICS 1\n{counter_define}{}",
             include_str!("metal_kernels.metal")
         );
         let pipelines = FelProbePipelines {
