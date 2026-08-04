@@ -24,6 +24,68 @@ fn median(values: impl Iterator<Item = u128>) -> u128 {
     all(feature = "metal-spike", target_vendor = "apple")
 ))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ActiveLpStats {
+    rounds: u64,
+    total: u128,
+    minimum: usize,
+    maximum: usize,
+    median_times_two: u128,
+}
+
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+impl ActiveLpStats {
+    fn mean(self) -> f64 {
+        self.total as f64 / self.rounds.max(1) as f64
+    }
+
+    fn median(self) -> f64 {
+        self.median_times_two as f64 / 2.0
+    }
+}
+
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn active_lp_stats(active_lps: impl IntoIterator<Item = usize>) -> ActiveLpStats {
+    let mut active_lps = active_lps.into_iter().collect::<Vec<_>>();
+    active_lps.sort_unstable();
+    let rounds = u64::try_from(active_lps.len()).expect("round count must fit in u64");
+    let total = active_lps
+        .iter()
+        .fold(0_u128, |total, active| total + *active as u128);
+    let (minimum, maximum, median_times_two) = match active_lps.len() {
+        0 => (0, 0, 0),
+        length if length % 2 == 1 => {
+            let middle = active_lps[length / 2];
+            (active_lps[0], active_lps[length - 1], middle as u128 * 2)
+        }
+        length => (
+            active_lps[0],
+            active_lps[length - 1],
+            active_lps[length / 2 - 1] as u128 + active_lps[length / 2] as u128,
+        ),
+    };
+    ActiveLpStats {
+        rounds,
+        total,
+        minimum,
+        maximum,
+        median_times_two,
+    }
+}
+
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BenchmarkWorkload {
     Empty,
     OpenLoop,
@@ -350,6 +412,7 @@ fn main() {
     struct Outcome {
         rounds: u64,
         transitions: u64,
+        active_lps: ActiveLpStats,
         summary: RunSummary,
         resident_packets: usize,
         pending_events: usize,
@@ -427,6 +490,7 @@ fn main() {
         let outcome = Outcome {
             rounds,
             transitions,
+            active_lps: active_lp_stats(run.rounds.iter().map(|round| round.active_lp_count)),
             summary: run.result.summary,
             resident_packets: run.result.resident_packets.len(),
             pending_events: run.result.pending_events.len(),
@@ -492,6 +556,11 @@ fn main() {
         let outcome = Outcome {
             rounds,
             transitions,
+            active_lps: active_lp_stats(
+                run.rounds
+                    .iter()
+                    .map(|round| round.semantic.active_lp_count),
+            ),
             summary: run.result.summary,
             resident_packets: run.result.resident_packets.len(),
             pending_events: run.result.pending_events.len(),
@@ -540,6 +609,7 @@ fn main() {
         pipeline_creation_ns: u128,
         streams_enabled: bool,
         expected_result: &RunResult,
+        active_lps: ActiveLpStats,
     ) -> Measurement {
         let started = Instant::now();
         let run = executor
@@ -562,6 +632,7 @@ fn main() {
         let outcome = Outcome {
             rounds: run.rounds,
             transitions: run.transitions,
+            active_lps,
             summary: run.result.summary,
             resident_packets: run.result.resident_packets.len(),
             pending_events: run.result.pending_events.len(),
@@ -643,6 +714,7 @@ fn main() {
         pipeline_creation_ns: u128,
         streams_enabled: bool,
         expected_result: &RunResult,
+        active_lps: ActiveLpStats,
     ) -> Measurement {
         let _ = metal(
             executor,
@@ -652,6 +724,7 @@ fn main() {
             pipeline_creation_ns,
             streams_enabled,
             expected_result,
+            active_lps,
         );
         let mut measurement = metal(
             executor,
@@ -661,6 +734,7 @@ fn main() {
             pipeline_creation_ns,
             streams_enabled,
             expected_result,
+            active_lps,
         );
         measurement.predecessor = recorded_predecessor_for_engine(measurement.engine);
         measurement
@@ -676,7 +750,9 @@ fn main() {
         println!(
             "record=t15e_{kind} config={fixture} workload={} rq={} sample={} order={} predecessor={} \
              engine={} backend={} stream_mode={} metal_mode_order={} workers={} \
-             threadgroup_width={} rounds={} transitions={} fixed_method={} separation_quality={} \
+             threadgroup_width={} rounds={} transitions={} active_lp_denominator=all_rounds \
+             mean_active_lps={:.6} min_active_lps={} max_active_lps={} median_active_lps={:.6} \
+             fixed_method={} separation_quality={} \
              end_to_end_ns={} \
              cold_end_to_end_ns={} fixed_ns={} warm_fixed_ns={} marginal_ns={} \
              marginal_ns_per_round={} calibration_ns={} backend_wall_ns={} device_ns={} \
@@ -695,6 +771,10 @@ fn main() {
             threadgroup_width,
             measurement.outcome.rounds,
             measurement.outcome.transitions,
+            measurement.outcome.active_lps.mean(),
+            measurement.outcome.active_lps.minimum,
+            measurement.outcome.active_lps.maximum,
+            measurement.outcome.active_lps.median(),
             measurement.fixed_method,
             measurement.separation_quality,
             measurement.end_to_end_ns,
@@ -749,7 +829,9 @@ fn main() {
              aggregation=component_medians_with_derived_fixed_closure config={fixture} workload={} rq={} \
              order={order} predecessor={} engine={} \
              backend={} stream_mode={} workers={} samples={} threadgroup_width={} rounds={} transitions={} \
-             fixed_method={} separation_quality={} end_to_end_ns={} cold_end_to_end_ns={} \
+             active_lp_denominator=all_rounds mean_active_lps={:.6} min_active_lps={} \
+             max_active_lps={} median_active_lps={:.6} fixed_method={} separation_quality={} \
+             end_to_end_ns={} cold_end_to_end_ns={} \
              fixed_ns={} warm_fixed_ns={} marginal_ns={} marginal_ns_per_round={} \
              calibration_ns={} backend_wall_ns={} \
              device_ns={} host_encode_submit_ns={} encoded_attempts={} continuation_relaunches={} \
@@ -765,6 +847,10 @@ fn main() {
             threadgroup_width,
             first.outcome.rounds,
             first.outcome.transitions,
+            first.outcome.active_lps.mean(),
+            first.outcome.active_lps.minimum,
+            first.outcome.active_lps.maximum,
+            first.outcome.active_lps.median(),
             first.fixed_method,
             first.separation_quality,
             end_to_end_ns,
@@ -863,7 +949,7 @@ fn main() {
     let image = compile_config(&path)
         .unwrap_or_else(|error| panic!("failed to lower {}: {error}", path.display()));
     let workload = benchmark_workload(&image);
-    let oracle = run_cpu(
+    let oracle_run = run_cpu(
         &image,
         None,
         CpuConfig {
@@ -871,8 +957,14 @@ fn main() {
             ..CpuConfig::default()
         },
     )
-    .expect("W4 benchmark oracle must succeed")
-    .result;
+    .expect("W4 benchmark oracle must succeed");
+    let oracle_active_lps = active_lp_stats(
+        oracle_run
+            .rounds
+            .iter()
+            .map(|round| round.semantic.active_lp_count),
+    );
+    let oracle = oracle_run.result;
     let executor = MetalExecutor::new().expect("Metal benchmark executor must initialize");
     let initialization = executor.initialization_timings();
     let device_queue_setup_ns = u128::from(initialization.device_queue_setup_ns);
@@ -928,6 +1020,7 @@ fn main() {
             pipeline_creation_ns,
             false,
             &oracle,
+            oracle_active_lps,
         ),
         metal(
             &executor,
@@ -937,6 +1030,7 @@ fn main() {
             pipeline_creation_ns,
             true,
             &oracle,
+            oracle_active_lps,
         ),
     ];
     let expected = warmups[0].outcome;
@@ -966,6 +1060,7 @@ fn main() {
                     pipeline_creation_ns,
                     false,
                     &oracle,
+                    oracle_active_lps,
                 ),
                 metal_after_predecessor(
                     &executor,
@@ -975,6 +1070,7 @@ fn main() {
                     pipeline_creation_ns,
                     true,
                     &oracle,
+                    oracle_active_lps,
                 ),
             ]
         } else {
@@ -987,6 +1083,7 @@ fn main() {
                     pipeline_creation_ns,
                     true,
                     &oracle,
+                    oracle_active_lps,
                 ),
                 metal_after_predecessor(
                     &executor,
@@ -996,6 +1093,7 @@ fn main() {
                     pipeline_creation_ns,
                     false,
                     &oracle,
+                    oracle_active_lps,
                 ),
             ]
         };
@@ -1122,6 +1220,8 @@ fn main() {
         "record=t15e_pooled_summary statistic=median config={relative} workload={} rq={} \
          scalar_samples={scalar_samples} comparison_samples={samples} \
          threadgroup_width={threadgroup_width} rounds={} transitions={} \
+         active_lp_denominator=all_rounds mean_active_lps={:.6} min_active_lps={} \
+         max_active_lps={} median_active_lps={:.6} \
          ratio_definition=metal_marginal_div_cpu_marginal \
          ablation_ratio_definition=metal_streams_marginal_div_metal_heap_marginal \
          speedup_definition=cpu_marginal_div_metal_marginal \
@@ -1141,6 +1241,10 @@ fn main() {
         workload.rq(),
         expected.rounds,
         expected.transitions,
+        expected.active_lps.mean(),
+        expected.active_lps.minimum,
+        expected.active_lps.maximum,
+        expected.active_lps.median(),
         metal_vs_w4.candidate_range_ns,
         metal_vs_w4.reference_range_ns,
         metal_vs_w18.reference_range_ns,
@@ -1184,10 +1288,27 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        BenchmarkWorkload, ComparisonOutcome, SCALAR_SAMPLES, classify_workload,
+        BenchmarkWorkload, ComparisonOutcome, SCALAR_SAMPLES, active_lp_stats, classify_workload,
         compare_retained_samples, cpu_engine_name, crossover_summary, cuda_crossover_summary,
         median, order_for_sample, parse_worker_sweep, recorded_predecessor_for_engine, split_fixed,
     };
+
+    #[test]
+    fn active_lp_statistics_cover_every_round_and_even_median() {
+        let stats = active_lp_stats([5, 1, 7, 3]);
+
+        assert_eq!(stats.rounds, 4);
+        assert_eq!(stats.total, 16);
+        assert_eq!(stats.minimum, 1);
+        assert_eq!(stats.maximum, 7);
+        assert_eq!(stats.median_times_two, 8);
+        assert_eq!(stats.mean(), 4.0);
+        assert_eq!(stats.median(), 4.0);
+
+        let fractional_median = active_lp_stats([1, 2]);
+        assert_eq!(fractional_median.median_times_two, 3);
+        assert_eq!(fractional_median.median(), 1.5);
+    }
 
     #[test]
     fn tcp_workloads_use_the_rq9_record_schema() {

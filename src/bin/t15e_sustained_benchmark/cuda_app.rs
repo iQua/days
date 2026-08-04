@@ -8,9 +8,9 @@ use days_executor::{
 };
 
 use super::{
-    BenchmarkWorkload, SCALAR_SAMPLES, benchmark_workload, compare_retained_samples,
-    cpu_engine_name, cuda_crossover_summary, median, order_for_sample, parse_worker_sweep,
-    recorded_predecessor_for_engine, split_fixed,
+    ActiveLpStats, BenchmarkWorkload, SCALAR_SAMPLES, active_lp_stats, benchmark_workload,
+    compare_retained_samples, cpu_engine_name, cuda_crossover_summary, median, order_for_sample,
+    parse_worker_sweep, recorded_predecessor_for_engine, split_fixed,
 };
 
 const COMPARISON_SAMPLES: usize = 4;
@@ -19,6 +19,7 @@ const COMPARISON_SAMPLES: usize = 4;
 struct Outcome {
     rounds: u64,
     transitions: u64,
+    active_lps: ActiveLpStats,
     summary: RunSummary,
     resident_packets: usize,
     pending_events: usize,
@@ -95,6 +96,7 @@ fn scalar(
     let outcome = Outcome {
         rounds,
         transitions,
+        active_lps: active_lp_stats(run.rounds.iter().map(|round| round.active_lp_count)),
         summary: run.result.summary,
         resident_packets: run.result.resident_packets.len(),
         pending_events: run.result.pending_events.len(),
@@ -165,6 +167,11 @@ fn cpu(
     let outcome = Outcome {
         rounds,
         transitions,
+        active_lps: active_lp_stats(
+            run.rounds
+                .iter()
+                .map(|round| round.semantic.active_lp_count),
+        ),
         summary: run.result.summary,
         resident_packets: run.result.resident_packets.len(),
         pending_events: run.result.pending_events.len(),
@@ -206,6 +213,7 @@ fn cuda(
     round_threads_per_block: usize,
     initialization_ns: u128,
     expected_result: &RunResult,
+    active_lps: ActiveLpStats,
 ) -> Measurement {
     let started = Instant::now();
     let run = executor
@@ -226,6 +234,7 @@ fn cuda(
     let outcome = Outcome {
         rounds: run.rounds,
         transitions: run.transitions,
+        active_lps,
         summary: run.result.summary,
         resident_packets: run.result.resident_packets.len(),
         pending_events: run.result.pending_events.len(),
@@ -301,6 +310,7 @@ fn cuda_after_predecessor(
     round_threads_per_block: usize,
     initialization_ns: u128,
     expected_result: &RunResult,
+    active_lps: ActiveLpStats,
 ) -> Measurement {
     let _ = cuda(
         executor,
@@ -308,6 +318,7 @@ fn cuda_after_predecessor(
         round_threads_per_block,
         initialization_ns,
         expected_result,
+        active_lps,
     );
     let mut measurement = cuda(
         executor,
@@ -315,6 +326,7 @@ fn cuda_after_predecessor(
         round_threads_per_block,
         initialization_ns,
         expected_result,
+        active_lps,
     );
     measurement.predecessor = recorded_predecessor_for_engine(measurement.engine);
     measurement
@@ -330,6 +342,8 @@ fn print_record(
     println!(
         "record=t17b_sustained_{kind} config={fixture} workload={} rq={} sample={} order={} predecessor={} \
          engine={} backend={} workers={} round_threads_per_block={} rounds={} transitions={} \
+         active_lp_denominator=all_rounds mean_active_lps={:.6} min_active_lps={} \
+         max_active_lps={} median_active_lps={:.6} \
          fixed_method={} separation_quality={} end_to_end_ns={} cold_end_to_end_ns={} \
          fixed_ns={} warm_fixed_ns={} marginal_ns={} marginal_ns_per_round={} calibration_ns={} \
          backend_wall_ns={} device_ns={} device_ns_per_round={} host_submit_ns={} \
@@ -346,6 +360,10 @@ fn print_record(
         round_threads_per_block,
         measurement.outcome.rounds,
         measurement.outcome.transitions,
+        measurement.outcome.active_lps.mean(),
+        measurement.outcome.active_lps.minimum,
+        measurement.outcome.active_lps.maximum,
+        measurement.outcome.active_lps.median(),
         measurement.fixed_method,
         measurement.separation_quality,
         measurement.end_to_end_ns,
@@ -402,7 +420,9 @@ fn print_summary(
         "record=t17b_sustained_{kind} statistic=median \
          aggregation=component_medians_with_derived_fixed_closure config={fixture} workload={} rq={} order={order} \
          predecessor={} engine={} backend={} workers={} samples={} round_threads_per_block={} \
-         rounds={} transitions={} fixed_method={} separation_quality={} end_to_end_ns={} \
+         rounds={} transitions={} active_lp_denominator=all_rounds mean_active_lps={:.6} \
+         min_active_lps={} max_active_lps={} median_active_lps={:.6} \
+         fixed_method={} separation_quality={} end_to_end_ns={} \
          cold_end_to_end_ns={} fixed_ns={} warm_fixed_ns={} marginal_ns={} \
          marginal_ns_per_round={} calibration_ns={} backend_wall_ns={} device_ns={} \
          device_ns_per_round={} host_submit_ns={} graph_capture_ns={} graph_replays={} \
@@ -418,6 +438,10 @@ fn print_summary(
         round_threads_per_block,
         first.outcome.rounds,
         first.outcome.transitions,
+        first.outcome.active_lps.mean(),
+        first.outcome.active_lps.minimum,
+        first.outcome.active_lps.maximum,
+        first.outcome.active_lps.median(),
         first.fixed_method,
         first.separation_quality,
         end_to_end_ns,
@@ -522,6 +546,11 @@ fn run_worker_sweep(
         let transitions = run.rounds.iter().fold(0_u64, |total, round| {
             total.saturating_add(round.semantic.events_processed)
         });
+        let active_lps = active_lp_stats(
+            run.rounds
+                .iter()
+                .map(|round| round.semantic.active_lp_count),
+        );
         let marginal_ns = run.rounds.iter().fold(0_u128, |total, round| {
             total.saturating_add(u128::from(round.round_wall_time_ns))
         });
@@ -529,10 +558,16 @@ fn run_worker_sweep(
         println!(
             "record=t17b_worker_sweep config={fixture} workload={} rq={} workers={worker_count} samples=1 \
              predecessor=none rounds={rounds} transitions={transitions} \
+             active_lp_denominator=all_rounds mean_active_lps={:.6} min_active_lps={} \
+             max_active_lps={} median_active_lps={:.6} \
              fixed_ns={fixed_ns} marginal_ns={marginal_ns} \
              marginal_ns_per_round={}",
             workload.workload(),
             workload.rq(),
+            active_lps.mean(),
+            active_lps.minimum,
+            active_lps.maximum,
+            active_lps.median(),
             marginal_ns / u128::from(rounds)
         );
     }
@@ -606,7 +641,7 @@ pub fn main() {
         run_worker_sweep(&image, &fixture, workload, &workers);
         return;
     }
-    let oracle = run_cpu(
+    let oracle_run = run_cpu(
         &image,
         None,
         CpuConfig {
@@ -614,8 +649,14 @@ pub fn main() {
             ..CpuConfig::default()
         },
     )
-    .expect("W4 benchmark oracle must succeed")
-    .result;
+    .expect("W4 benchmark oracle must succeed");
+    let oracle_active_lps = active_lp_stats(
+        oracle_run
+            .rounds
+            .iter()
+            .map(|round| round.semantic.active_lp_count),
+    );
+    let oracle = oracle_run.result;
     let executor = CudaExecutor::new().expect("CUDA benchmark executor must initialize");
     let initialization = executor.initialization_timings();
     let initialization_ns = u128::from(initialization.context_stream_setup_ns)
@@ -654,6 +695,7 @@ pub fn main() {
             round_threads_per_block,
             initialization_ns,
             &oracle,
+            oracle_active_lps,
         ),
     ];
     let expected = warmups[0].outcome;
@@ -687,6 +729,7 @@ pub fn main() {
                     round_threads_per_block,
                     initialization_ns,
                     &oracle,
+                    oracle_active_lps,
                 ),
             ]);
         } else {
@@ -696,6 +739,7 @@ pub fn main() {
                 round_threads_per_block,
                 initialization_ns,
                 &oracle,
+                oracle_active_lps,
             ));
             if include_scalar {
                 ordered.push(scalar(&image, scalar_calibration(&image), &oracle));
@@ -794,6 +838,8 @@ pub fn main() {
         "record=t17b_sustained_pooled_summary statistic=median config={fixture} workload={} rq={} \
          scalar_samples={scalar_samples} comparison_samples={samples} best_workers={best_workers} \
          round_threads_per_block={round_threads_per_block} rounds={} transitions={} \
+         active_lp_denominator=all_rounds mean_active_lps={:.6} min_active_lps={} \
+         max_active_lps={} median_active_lps={:.6} \
          ratio_definition=cuda_marginal_div_cpu_marginal \
          speedup_definition=cpu_marginal_div_cuda_marginal \
          w4_marginal_ns={w4_marginal_ns} wbest_marginal_ns={wbest_marginal_ns} \
@@ -810,6 +856,10 @@ pub fn main() {
         workload.rq(),
         expected.rounds,
         expected.transitions,
+        expected.active_lps.mean(),
+        expected.active_lps.minimum,
+        expected.active_lps.maximum,
+        expected.active_lps.median(),
         cuda_vs_w4.candidate_range_ns,
         cuda_vs_w4.reference_range_ns,
         cuda_vs_wbest.reference_range_ns,
