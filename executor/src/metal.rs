@@ -990,9 +990,12 @@ fn validate_metal_observation_mode(
     exclusive_horizon_ns: Option<u64>,
     observation_mode: ObservationMode,
 ) -> Result<(), MetalError> {
+    if observation_mode != ObservationMode::Full {
+        return Ok(());
+    }
     let has_unported_transition_plane =
         crate::validate::device_unported_transition_plane_reachable(image, exclusive_horizon_ns);
-    if observation_mode == ObservationMode::Full && has_unported_transition_plane {
+    if has_unported_transition_plane {
         Err(MetalError::Validation(
             "Full observation mode is unsupported on Metal for Rate, ECN, DRR, or WRR transition planes; use Summary"
                 .to_owned(),
@@ -1120,6 +1123,7 @@ impl MetalPlan {
     ) -> Result<Self, MetalError> {
         let node_count = image.nodes.len();
         let (flow_packet_counts, flow_feedback_counts) = flow_packet_counts(image)?;
+        let flow_minimum_packet_sizes = flow_minimum_packet_sizes(image);
         let minimum_lookahead_ns = image
             .channels
             .iter()
@@ -1163,6 +1167,7 @@ impl MetalPlan {
 
             add_flow_route_capacities(
                 image,
+                &flow_minimum_packet_sizes,
                 flow_index,
                 data_count,
                 PacketKind::Data,
@@ -1172,6 +1177,7 @@ impl MetalPlan {
             );
             add_flow_route_capacities(
                 image,
+                &flow_minimum_packet_sizes,
                 flow_index,
                 feedback_count,
                 PacketKind::Feedback,
@@ -1426,6 +1432,7 @@ impl MetalPlan {
 
         let remote_bound = derived_remote_capacity(
             image,
+            &flow_minimum_packet_sizes,
             &flow_packet_counts,
             &flow_feedback_counts,
             minimum_lookahead_ns,
@@ -1433,6 +1440,7 @@ impl MetalPlan {
         let outbox_capacity = config.max_outbox_events.unwrap_or(remote_bound.max(1));
         let mut remote_capacities = derived_remote_capacities(
             image,
+            &flow_minimum_packet_sizes,
             &flow_packet_counts,
             &flow_feedback_counts,
             minimum_lookahead_ns,
@@ -1444,6 +1452,7 @@ impl MetalPlan {
         let remote_staging_slots = assign_arena_offsets(&mut remote_meta, &remote_capacities)?;
         let streams = prepare_streams(
             image,
+            &flow_minimum_packet_sizes,
             &flow_packet_counts,
             &flow_feedback_counts,
             minimum_lookahead_ns,
@@ -1847,6 +1856,7 @@ fn generator_round_burst(
 
 fn add_flow_route_capacities(
     image: &SimulationImage,
+    flow_minimum_packet_sizes: &[[u64; 2]],
     flow_index: usize,
     packet_count: usize,
     packet_kind: PacketKind,
@@ -1879,6 +1889,7 @@ fn add_flow_route_capacities(
         let target_slot = target.0 as usize;
         let burst = flow_link_fel_bound(
             image,
+            flow_minimum_packet_sizes,
             flow_index,
             packet_count,
             packet_kind,
@@ -1892,48 +1903,92 @@ fn add_flow_route_capacities(
     }
 }
 
+fn flow_minimum_packet_sizes(image: &SimulationImage) -> Vec<[u64; 2]> {
+    let mut minimums = vec![[u64::MAX; 2]; image.flows.len()];
+    for packet in &image.initial_packets {
+        let class = if packet.kind.is_data() { 0 } else { 1 };
+        minimums[packet.flow.0 as usize][class] =
+            minimums[packet.flow.0 as usize][class].min(packet.size_bytes);
+    }
+    for state in &image.host_states {
+        for generator in &state.generators {
+            let size = match generator.kind {
+                FlowGeneratorKind::Constant(constant) => constant.packet_size_bytes,
+                FlowGeneratorKind::Tcp(_) => 1,
+                FlowGeneratorKind::Rate(rate) => rate.packet_size_bytes,
+                FlowGeneratorKind::Collective(collective) => collective.packet_size_bytes,
+                FlowGeneratorKind::Dcqcn(dcqcn) => dcqcn.rate.packet_size_bytes,
+            };
+            let flow = generator.flow.0 as usize;
+            minimums[flow][0] = minimums[flow][0].min(size);
+        }
+    }
+    for minimum in &mut minimums {
+        for size in minimum {
+            if *size == u64::MAX {
+                *size = 1;
+            }
+        }
+    }
+    #[cfg(debug_assertions)]
+    for (flow, minimum) in minimums.iter().enumerate() {
+        for (class, packet_kind) in [PacketKind::Data, PacketKind::Feedback]
+            .into_iter()
+            .enumerate()
+        {
+            let expected = image
+                .initial_packets
+                .iter()
+                .filter(|packet| {
+                    packet.flow.0 as usize == flow && packet.kind.is_data() == packet_kind.is_data()
+                })
+                .map(|packet| packet.size_bytes)
+                .chain(
+                    (packet_kind == PacketKind::Data)
+                        .then(|| {
+                            image
+                                .host_states
+                                .iter()
+                                .flat_map(|state| &state.generators)
+                                .filter(move |generator| generator.flow.0 as usize == flow)
+                                .map(|generator| match generator.kind {
+                                    FlowGeneratorKind::Constant(constant) => {
+                                        constant.packet_size_bytes
+                                    }
+                                    FlowGeneratorKind::Tcp(_) => 1,
+                                    FlowGeneratorKind::Rate(rate) => rate.packet_size_bytes,
+                                    FlowGeneratorKind::Collective(collective) => {
+                                        collective.packet_size_bytes
+                                    }
+                                    FlowGeneratorKind::Dcqcn(dcqcn) => dcqcn.rate.packet_size_bytes,
+                                })
+                        })
+                        .into_iter()
+                        .flatten(),
+                )
+                .min()
+                .unwrap_or(1);
+            debug_assert_eq!(minimum[class], expected);
+        }
+    }
+    minimums
+}
+
 fn flow_link_serialization_ns(
-    image: &SimulationImage,
+    flow_minimum_packet_sizes: &[[u64; 2]],
     flow_index: usize,
     packet_kind: PacketKind,
     link: crate::LinkDescriptor,
 ) -> u64 {
-    let minimum_size = image
-        .initial_packets
-        .iter()
-        .filter(|packet| {
-            packet.flow.0 as usize == flow_index && packet.kind.is_data() == packet_kind.is_data()
-        })
-        .map(|packet| packet.size_bytes)
-        .chain(
-            (packet_kind == PacketKind::Data)
-                .then(|| {
-                    image
-                        .host_states
-                        .iter()
-                        .flat_map(|state| &state.generators)
-                        .filter(move |generator| generator.flow.0 as usize == flow_index)
-                        .map(|generator| match generator.kind {
-                            FlowGeneratorKind::Constant(constant) => constant.packet_size_bytes,
-                            FlowGeneratorKind::Tcp(_) => 1,
-                            FlowGeneratorKind::Rate(rate) => rate.packet_size_bytes,
-                            FlowGeneratorKind::Collective(collective) => {
-                                collective.packet_size_bytes
-                            }
-                            FlowGeneratorKind::Dcqcn(dcqcn) => dcqcn.rate.packet_size_bytes,
-                        })
-                })
-                .into_iter()
-                .flatten(),
-        )
-        .min()
-        .unwrap_or(1);
+    let class = if packet_kind.is_data() { 0 } else { 1 };
+    let minimum_size = flow_minimum_packet_sizes[flow_index][class];
     crate::time::serialization_time_ns(minimum_size, link.rate_bps)
         .expect("Metal validation established a positive finite serialization interval")
 }
 
 fn flow_link_round_bound(
     image: &SimulationImage,
+    flow_minimum_packet_sizes: &[[u64; 2]],
     flow_index: usize,
     packet_count: usize,
     packet_kind: PacketKind,
@@ -1970,7 +2025,8 @@ fn flow_link_round_bound(
         }
     };
     let queue_bound = current_queue.max(queue_capacity);
-    let serialization = flow_link_serialization_ns(image, flow_index, packet_kind, link);
+    let serialization =
+        flow_link_serialization_ns(flow_minimum_packet_sizes, flow_index, packet_kind, link);
     let service_burst = lookahead.map_or(packet_count, |lookahead| {
         usize::try_from(lookahead.div_ceil(serialization)).unwrap_or(usize::MAX)
     });
@@ -1995,6 +2051,7 @@ fn flow_link_round_bound(
 
 fn flow_link_fel_bound(
     image: &SimulationImage,
+    flow_minimum_packet_sizes: &[[u64; 2]],
     flow_index: usize,
     packet_count: usize,
     packet_kind: PacketKind,
@@ -2005,13 +2062,15 @@ fn flow_link_fel_bound(
         return 0;
     }
     let link = image.links[link_id.0 as usize];
-    let serialization = flow_link_serialization_ns(image, flow_index, packet_kind, link);
+    let serialization =
+        flow_link_serialization_ns(flow_minimum_packet_sizes, flow_index, packet_kind, link);
     let in_flight =
         usize::try_from(link.propagation_ns.div_ceil(serialization)).unwrap_or(usize::MAX);
 
     packet_count.min(
         flow_link_round_bound(
             image,
+            flow_minimum_packet_sizes,
             flow_index,
             packet_count,
             packet_kind,
@@ -2024,6 +2083,7 @@ fn flow_link_fel_bound(
 
 fn derived_remote_capacity(
     image: &SimulationImage,
+    flow_minimum_packet_sizes: &[[u64; 2]],
     counts: &[usize],
     feedback_counts: &[usize],
     lookahead: Option<u64>,
@@ -2040,6 +2100,7 @@ fn derived_remote_capacity(
                 .map(|link| {
                     flow_link_round_bound(
                         image,
+                        flow_minimum_packet_sizes,
                         index,
                         data_count,
                         PacketKind::Data,
@@ -2050,6 +2111,7 @@ fn derived_remote_capacity(
                 .chain(flow.reverse_route.iter().map(|link| {
                     flow_link_round_bound(
                         image,
+                        flow_minimum_packet_sizes,
                         index,
                         feedback_count,
                         PacketKind::Feedback,
@@ -2064,6 +2126,7 @@ fn derived_remote_capacity(
 
 fn derived_remote_capacities(
     image: &SimulationImage,
+    flow_minimum_packet_sizes: &[[u64; 2]],
     counts: &[usize],
     feedback_counts: &[usize],
     lookahead: Option<u64>,
@@ -2084,6 +2147,7 @@ fn derived_remote_capacities(
                 let producer = image.links[link_id.0 as usize].source.0 as usize;
                 capacities[producer] = capacities[producer].saturating_add(flow_link_round_bound(
                     image,
+                    flow_minimum_packet_sizes,
                     index,
                     packet_count,
                     packet_kind,
@@ -2106,6 +2170,7 @@ fn derived_remote_capacities(
 #[allow(clippy::too_many_arguments)] // One prepare-time boundary owns all arena sizing inputs.
 fn prepare_streams(
     image: &SimulationImage,
+    flow_minimum_packet_sizes: &[[u64; 2]],
     counts: &[usize],
     feedback_counts: &[usize],
     lookahead: Option<u64>,
@@ -2152,8 +2217,13 @@ fn prepare_streams(
     let stream_count = generator_stream_base
         .checked_add(image.flows.len())
         .ok_or_else(|| MetalError::Validation("generator stream count overflows usize".into()))?;
-    let mut channel_caps =
-        derived_channel_stream_capacities(image, counts, feedback_counts, lookahead)?;
+    let mut channel_caps = derived_channel_stream_capacities(
+        image,
+        flow_minimum_packet_sizes,
+        counts,
+        feedback_counts,
+        lookahead,
+    )?;
     if let Some(capacity) = config.max_channel_events_per_stream {
         channel_caps.fill(capacity);
     }
@@ -2325,6 +2395,7 @@ fn prepare_streams(
 
 fn derived_channel_stream_capacities(
     image: &SimulationImage,
+    flow_minimum_packet_sizes: &[[u64; 2]],
     counts: &[usize],
     feedback_counts: &[usize],
     lookahead: Option<u64>,
@@ -2372,7 +2443,7 @@ fn derived_channel_stream_capacities(
                 })?;
                 packet_counts[channel] = packet_counts[channel].saturating_add(packet_count);
                 let serialization = flow_link_serialization_ns(
-                    image,
+                    flow_minimum_packet_sizes,
                     flow_index,
                     packet_kind,
                     image.links[link_id.0 as usize],

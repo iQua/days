@@ -735,6 +735,24 @@ fn metal_full_observation_closes_over_divergent_resident_waiters() {
     }
 }
 
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[test]
+fn metal_summary_observation_matches_reachable_unported_planes() {
+    for (image, _, _, _, _) in resident_waiter_cases() {
+        let scalar = run_scalar_with_observations(&image, None, ObservationMode::Summary)
+            .expect("summary scalar suffix must execute");
+        let metal = run_metal_with_observations(
+            &image,
+            None,
+            MetalConfig::default(),
+            ObservationMode::Summary,
+        )
+        .expect("Summary mode must not require unported transition records");
+
+        assert_eq!(metal.result, scalar);
+    }
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 fn cuda_full_observation_closes_over_divergent_resident_waiters() {
