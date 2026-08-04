@@ -550,6 +550,8 @@ pub(crate) struct TransitionState<'image> {
     image: &'image SimulationImage,
     host_states: Vec<HostState>,
     switch_states: Vec<SwitchState>,
+    /// Executor-local redundant state, derived on construction and never serialized.
+    switch_queue_bytes: Vec<Vec<u64>>,
     local_node: Option<NodeDescriptor>,
     packets: BTreeMap<PayloadId, ResidentPacket>,
     #[cfg(feature = "p11-profile")]
@@ -668,10 +670,15 @@ impl<'image> TransitionState<'image> {
                 .ok_or(ExecutionError::CounterOverflow(NodeId(0)))?;
         }
 
+        let host_states = image.host_states.clone();
+        let switch_states = image.switch_states.clone();
+        let switch_queue_bytes = derive_switch_queue_bytes(image, &switch_states, None, &packets)?;
+
         Ok(Self {
             image,
-            host_states: image.host_states.clone(),
-            switch_states: image.switch_states.clone(),
+            host_states,
+            switch_states,
+            switch_queue_bytes,
             local_node: None,
             packets,
             #[cfg(feature = "p11-profile")]
@@ -764,10 +771,14 @@ impl<'image> TransitionState<'image> {
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
         }
 
+        let switch_queue_bytes =
+            derive_switch_queue_bytes(image, &switch_states, Some(node), &resident)?;
+
         Ok(Self {
             image,
             host_states,
             switch_states,
+            switch_queue_bytes,
             local_node: Some(node),
             packets: resident,
             #[cfg(feature = "p11-profile")]
@@ -1845,9 +1856,10 @@ impl<'image> TransitionState<'image> {
             .map(|link| self.link(link).map(|descriptor| descriptor.rate_bps))
             .transpose()?;
         let sp_position = self.switch_sp_insertion_position(node, egress_link, packet.flow)?;
-        let (queue_id, queue_bytes) = {
+        let state_slot = self.local_state_slot(node)?;
+        let (queue_id, queue_slot, queue_bytes) = {
             let state = self.switch_state(node)?;
-            let (queue_id, queue) = state
+            let (queue_slot, _) = state
                 .queues
                 .iter()
                 .enumerate()
@@ -1856,17 +1868,12 @@ impl<'image> TransitionState<'image> {
                     node: node.id,
                     egress_link,
                 })?;
-            self.p11_probe_sites
-                .call(P11ProbeSite::SwitchRemoteArrivalQueueBytesScan);
-            let queue_bytes = queue.queue.iter().try_fold(0_u64, |total, payload| {
-                total
-                    .checked_add(
-                        self.packet(*payload, P11ProbeSite::SwitchRemoteArrivalQueueBytesScan)?
-                            .size_bytes,
-                    )
-                    .ok_or(ExecutionError::CounterOverflow(node.id))
-            })?;
-            (u64::try_from(queue_id).unwrap_or(u64::MAX), queue_bytes)
+            let queue_bytes = self.switch_queue_bytes[state_slot][queue_slot];
+            (
+                u64::try_from(queue_slot).unwrap_or(u64::MAX),
+                queue_slot,
+                queue_bytes,
+            )
         };
 
         let (disposition, schedule_ready, mark_packet, pfc_plan, pfc_transition, aqm_transition) = {
@@ -2037,6 +2044,15 @@ impl<'image> TransitionState<'image> {
                 )
             }
         };
+
+        if disposition == ArrivalDisposition::Admitted {
+            let counter = &mut self.switch_queue_bytes[state_slot][queue_slot];
+            *counter = counter
+                .checked_add(packet.size_bytes)
+                .ok_or(ExecutionError::CounterOverflow(node.id))?;
+            #[cfg(debug_assertions)]
+            self.debug_assert_switch_queue_bytes(node, state_slot, queue_slot);
+        }
 
         if mark_packet {
             self.set_packet_marked(
@@ -3349,9 +3365,17 @@ impl<'image> TransitionState<'image> {
             }
             (positions, packets, priorities, incoming_links)
         };
-        let (payload, pfc_plan, pfc_transition, scheduler_transition) = {
+        let state_slot = self.local_state_slot(node)?;
+        let (
+            payload,
+            dequeued_size_bytes,
+            queue_slot,
+            pfc_plan,
+            pfc_transition,
+            scheduler_transition,
+        ) = {
             let state = self.switch_state_mut(node)?;
-            let (queue_id, queue) = state
+            let (queue_slot, queue) = state
                 .queues
                 .iter_mut()
                 .enumerate()
@@ -3391,7 +3415,7 @@ impl<'image> TransitionState<'image> {
             let packet = eligible_packets[eligible_position];
             let priority = eligible_priorities[eligible_position];
             let incoming_link = eligible_incoming_links[eligible_position];
-            let queue_id = u64::try_from(queue_id).unwrap_or(u64::MAX);
+            let queue_id = u64::try_from(queue_slot).unwrap_or(u64::MAX);
             let ingress = queue.pfc.as_mut().and_then(|pfc| {
                 pfc.ingresses
                     .iter_mut()
@@ -3495,8 +3519,22 @@ impl<'image> TransitionState<'image> {
                 )),
                 _ => None,
             };
-            (payload, pfc_plan, pfc_transition, scheduler_transition)
+            (
+                payload,
+                packet.size_bytes,
+                queue_slot,
+                pfc_plan,
+                pfc_transition,
+                scheduler_transition,
+            )
         };
+
+        let counter = &mut self.switch_queue_bytes[state_slot][queue_slot];
+        *counter = counter
+            .checked_sub(dequeued_size_bytes)
+            .ok_or(ExecutionError::CounterOverflow(node.id))?;
+        #[cfg(debug_assertions)]
+        self.debug_assert_switch_queue_bytes(node, state_slot, queue_slot);
 
         if self.observation_mode == ObservationMode::Full {
             self.mechanism_transitions.extend(pfc_transition);
@@ -3832,6 +3870,25 @@ impl<'image> TransitionState<'image> {
             Some(_) => Err(ExecutionError::UnknownNode(node.id)),
             None => Ok(node.state_slot as usize),
         }
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_assert_switch_queue_bytes(
+        &self,
+        node: NodeDescriptor,
+        state_slot: usize,
+        queue_slot: usize,
+    ) {
+        let queue = &self.switch_states[state_slot].queues[queue_slot];
+        let derived = queue.queue.iter().try_fold(0_u64, |total, payload| {
+            total.checked_add(self.packets.get(payload)?.descriptor.size_bytes)
+        });
+        debug_assert_eq!(
+            derived,
+            Some(self.switch_queue_bytes[state_slot][queue_slot]),
+            "switch {:?} queue {queue_slot} byte counter diverged from its contents",
+            node.id,
+        );
     }
 
     fn link(&self, id: LinkId) -> Result<crate::LinkDescriptor, ExecutionError> {
@@ -4863,6 +4920,50 @@ enum QueueAdmissionAction {
     Enqueue,
     Mark,
     Drop,
+}
+
+fn derive_switch_queue_bytes(
+    image: &SimulationImage,
+    switch_states: &[SwitchState],
+    local_node: Option<NodeDescriptor>,
+    packets: &BTreeMap<PayloadId, ResidentPacket>,
+) -> Result<Vec<Vec<u64>>, ExecutionError> {
+    let mut node_ids = vec![None; switch_states.len()];
+    if let Some(node) = local_node {
+        if node.kind == NodeKind::Switch {
+            node_ids[0] = Some(node.id);
+        }
+    } else {
+        for node in &image.nodes {
+            if node.kind == NodeKind::Switch {
+                if let Some(slot) = node_ids.get_mut(node.state_slot as usize) {
+                    *slot = Some(node.id);
+                }
+            }
+        }
+    }
+    switch_states
+        .iter()
+        .enumerate()
+        .map(|(state_slot, state)| {
+            let node = node_ids[state_slot]
+                .ok_or(ExecutionError::UnknownNode(NodeId(state_slot as u64)))?;
+            state
+                .queues
+                .iter()
+                .map(|queue| {
+                    queue.queue.iter().try_fold(0_u64, |total, payload| {
+                        let packet = packets
+                            .get(payload)
+                            .ok_or(ExecutionError::UnknownPacket(*payload))?;
+                        total
+                            .checked_add(packet.descriptor.size_bytes)
+                            .ok_or(ExecutionError::CounterOverflow(node))
+                    })
+                })
+                .collect()
+        })
+        .collect()
 }
 
 fn drop_mark_decision(

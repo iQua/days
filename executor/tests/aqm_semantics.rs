@@ -290,6 +290,30 @@ fn taildrop_forces_drop_when_post_enqueue_byte_sum_is_unrepresentable() {
 }
 
 #[test]
+fn queue_byte_total_is_rederived_exactly_on_checkpoint_resume() {
+    let image = hidden_byte_overflow_image(DropMarkPolicy::TailDrop);
+    let prefix = hidden_byte_overflow_result(&image);
+    let checkpoint = checkpoint_image(&image, &prefix);
+    let scalar = run_scalar_with_observations(&checkpoint, None, ObservationMode::Full)
+        .expect("checkpoint restore must rederive the executor-local queue byte total");
+
+    assert!(scalar.switch_states[0].queues[0].queue.is_empty());
+    for workers in [1, 2, 4] {
+        let cpu = run_cpu_with_observations(
+            &checkpoint,
+            None,
+            CpuConfig {
+                workers,
+                ..CpuConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .unwrap();
+        assert_eq!(cpu.result, scalar, "worker count {workers}");
+    }
+}
+
+#[test]
 fn packet_ecn_forces_traced_drop_when_post_enqueue_byte_sum_is_unrepresentable() {
     let policy = DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
         unit: QueueDepthUnit::Packets,
