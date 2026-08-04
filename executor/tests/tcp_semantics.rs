@@ -2,13 +2,13 @@ use std::collections::{BTreeMap, VecDeque};
 
 use days_executor::{
     Backend, CUBIC_WINDOW_SCALE, ChunkGranularity, ConstantGenerator, CpuConfig, DcqcnCnpHeader,
-    DcqcnReceiverState, EcnCodepoint, Event, EventFelClass, EventKey, EventKind, FlowDescriptor,
-    FlowGeneratorKind, FlowGeneratorState, FlowId, GeneratorFeedbackState, GeneratorStatus,
-    GeneratorTermination, HostState, LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind,
-    ObservationMode, PacketDescriptor, PacketKind, PayloadId, PfcHeader, RemoteChannel,
-    ScheduledEmission, SchedulerKind, SimulationImage, StaticPartitionPolicy, SwitchQueueState,
-    SwitchState, TcpAckHeader, TcpCongestionControl, TcpDataHeader, TcpGenerator, TcpPhase,
-    TcpReceiverState, TcpTimerState, TcpTransitionInput, event_fel_class, event_phase,
+    DcqcnReceiverState, DiagnosticPlanes, EcnCodepoint, Event, EventFelClass, EventKey, EventKind,
+    FlowDescriptor, FlowGeneratorKind, FlowGeneratorState, FlowId, GeneratorFeedbackState,
+    GeneratorStatus, GeneratorTermination, HostState, LinkDescriptor, LinkId, NodeDescriptor,
+    NodeId, NodeKind, ObservationMode, PacketDescriptor, PacketKind, PayloadId, PfcHeader,
+    RemoteChannel, ScheduledEmission, SchedulerKind, SimulationImage, StaticPartitionPolicy,
+    SwitchQueueState, SwitchState, TcpAckHeader, TcpCongestionControl, TcpDataHeader, TcpGenerator,
+    TcpPhase, TcpReceiverState, TcpTimerState, TcpTransitionInput, event_fel_class, event_phase,
     run_cpu_with_observations, run_scalar_rounds_with_observations, run_scalar_with_observations,
     size_default_device_plan, validate,
 };
@@ -601,6 +601,13 @@ fn checkpoint_image(
     checkpoint
 }
 
+fn diagnostics(result: &days_executor::RunResult) -> &DiagnosticPlanes {
+    result
+        .diagnostics
+        .as_ref()
+        .expect("full reference observation retains diagnostics")
+}
+
 fn stitch_checkpoint_run(
     prefix: &days_executor::RunResult,
     suffix: &days_executor::RunResult,
@@ -637,12 +644,12 @@ fn stitch_checkpoint_run(
     departures.extend_from_slice(&suffix.departures);
     let mut arrivals = prefix.arrivals.clone();
     arrivals.extend_from_slice(&suffix.arrivals);
-    let mut tcp_transitions = prefix.tcp_transitions.clone();
-    tcp_transitions.extend_from_slice(&suffix.tcp_transitions);
-    let mut aqm_transitions = prefix.aqm_transitions.clone();
-    aqm_transitions.extend_from_slice(&suffix.aqm_transitions);
-    let mut mechanism_transitions = prefix.mechanism_transitions.clone();
-    mechanism_transitions.extend_from_slice(&suffix.mechanism_transitions);
+    let mut tcp_transitions = diagnostics(prefix).tcp_transitions.clone();
+    tcp_transitions.extend_from_slice(&diagnostics(suffix).tcp_transitions);
+    let mut aqm_transitions = diagnostics(prefix).aqm_transitions.clone();
+    aqm_transitions.extend_from_slice(&diagnostics(suffix).aqm_transitions);
+    let mut mechanism_transitions = diagnostics(prefix).mechanism_transitions.clone();
+    mechanism_transitions.extend_from_slice(&diagnostics(suffix).mechanism_transitions);
 
     days_executor::RunResult {
         host_states: suffix.host_states.clone(),
@@ -652,9 +659,11 @@ fn stitch_checkpoint_run(
         observed_packets,
         departures,
         arrivals,
-        tcp_transitions,
-        aqm_transitions,
-        mechanism_transitions,
+        diagnostics: Some(DiagnosticPlanes {
+            tcp_transitions,
+            aqm_transitions,
+            mechanism_transitions,
+        }),
         pending_events: suffix.pending_events.clone(),
     }
 }
@@ -735,7 +744,7 @@ fn cubic_wide_magnitude_transition_is_byte_identical_on_all_available_backends()
     validate(&image, Backend::Scalar).expect("wide CUBIC checkpoint should validate");
     let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
         .expect("wide CUBIC scalar checkpoint should run");
-    let TcpCongestionControl::Cubic(after) = scalar.tcp_transitions[0].after else {
+    let TcpCongestionControl::Cubic(after) = diagnostics(&scalar).tcp_transitions[0].after else {
         unreachable!()
     };
     assert_eq!(after.cwnd_scaled, 6_094_816_939);
@@ -883,7 +892,7 @@ fn tcp_cartesian_matrix_is_byte_identical_across_all_available_backends() {
                 .unwrap_or_else(|error| panic!("{discipline} scalar full failed: {error}"));
             if matches!(control, TcpCongestionControl::Cubic(_)) {
                 assert!(
-                    full.tcp_transitions.iter().any(|record| {
+                    diagnostics(&full).tcp_transitions.iter().any(|record| {
                         matches!(record.after, TcpCongestionControl::Cubic(_))
                             && record.after.phase() == TcpPhase::CongestionAvoidance
                     }),
@@ -1844,10 +1853,13 @@ fn metal_full_observation_mode_is_rejected_precisely() {
     let image = reachable_tcp_ack_ecn_image();
     let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
         .expect("scalar reverse-ACK counterexample must execute");
-    assert_eq!(scalar.aqm_transitions.len(), 1);
-    assert_eq!(scalar.aqm_transitions[0].key.time_ns, 455);
-    assert_eq!(scalar.aqm_transitions[0].node, NodeId(3));
-    assert_eq!(scalar.aqm_transitions[0].payload, PayloadId(2));
+    assert_eq!(diagnostics(&scalar).aqm_transitions.len(), 1);
+    assert_eq!(diagnostics(&scalar).aqm_transitions[0].key.time_ns, 455);
+    assert_eq!(diagnostics(&scalar).aqm_transitions[0].node, NodeId(3));
+    assert_eq!(
+        diagnostics(&scalar).aqm_transitions[0].payload,
+        PayloadId(2)
+    );
 
     let dormant = run_scalar_with_observations(&image, Some(0), ObservationMode::Full)
         .expect("the root event is excluded at the exact horizon");
@@ -1875,7 +1887,7 @@ fn metal_full_observation_mode_is_rejected_precisely() {
         let image = reachable_tcp_ack_scheduler_image(scheduler);
         let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
             .expect("scalar reverse-ACK scheduler counterexample must execute");
-        assert_eq!(scalar.mechanism_transitions.len(), 1);
+        assert_eq!(diagnostics(&scalar).mechanism_transitions.len(), 1);
         let dormant = run_scalar_with_observations(&image, Some(0), ObservationMode::Full)
             .expect("the TCP root is excluded at the exact horizon");
         let metal_dormant = run_metal_with_observations(
@@ -1903,8 +1915,8 @@ fn metal_full_observation_mode_is_rejected_precisely() {
     let checkpoint = ack_descendant_forward_ecn_checkpoint();
     let scalar = run_scalar_with_observations(&checkpoint, None, ObservationMode::Full)
         .expect("scalar ACK-to-data counterexample must execute");
-    assert_eq!(scalar.aqm_transitions.len(), 1);
-    assert_eq!(scalar.aqm_transitions[0].key.time_ns, 500);
+    assert_eq!(diagnostics(&scalar).aqm_transitions.len(), 1);
+    assert_eq!(diagnostics(&scalar).aqm_transitions[0].key.time_ns, 500);
     let dormant = run_scalar_with_observations(&checkpoint, Some(459), ObservationMode::Full)
         .expect("the ACK root is excluded at the exact horizon");
     let metal_dormant = run_metal_with_observations(
@@ -1934,8 +1946,11 @@ fn metal_full_observation_mode_is_rejected_precisely() {
     ] {
         let scalar = run_scalar_with_observations(&checkpoint, None, ObservationMode::Full)
             .expect("scalar multi-generation TCP descendant chain must execute");
-        assert_eq!(scalar.aqm_transitions.len(), 1);
-        assert_eq!(scalar.aqm_transitions[0].key.time_ns, transition_time);
+        assert_eq!(diagnostics(&scalar).aqm_transitions.len(), 1);
+        assert_eq!(
+            diagnostics(&scalar).aqm_transitions[0].key.time_ns,
+            transition_time
+        );
         let dormant =
             run_scalar_with_observations(&checkpoint, Some(boundary), ObservationMode::Full)
                 .expect("the multi-generation TCP root is excluded at the exact horizon");
@@ -2526,7 +2541,10 @@ fn scalar_adversarial_trace_covers_tcp_leanguard_transition_classes() {
                     )
             }));
         }
-        let records = run.tcp_transitions;
+        let records = run
+            .diagnostics
+            .expect("full scalar observation retains diagnostics")
+            .tcp_transitions;
         assert!(records.iter().any(|record| {
             matches!(record.input, TcpTransitionInput::DuplicateAck { .. })
                 && record.before.duplicate_acks() == 2
@@ -2567,13 +2585,19 @@ fn scalar_adversarial_trace_covers_tcp_leanguard_transition_classes() {
         .expect("adversarial timeout TailDrop trace should run");
         assert!(
             timeout_run
+                .diagnostics
+                .as_ref()
+                .unwrap()
                 .tcp_transitions
                 .iter()
                 .any(|record| matches!(record.input, TcpTransitionInput::Timeout { .. }))
         );
         traces.push((
             format!("{}-timeout", control.label()),
-            timeout_run.tcp_transitions,
+            timeout_run
+                .diagnostics
+                .expect("full scalar observation retains diagnostics")
+                .tcp_transitions,
         ));
     }
 

@@ -94,9 +94,9 @@ pub use safe_horizon::{
     run_scalar_rounds_with_windowed_replay_trace,
 };
 pub use scalar::{
-    AqmTransitionAction, AqmTransitionRecord, ArrivalDisposition, ExecutionError, ObservationMode,
-    PacketArrivalObservation, PacketDeparture, RunResult, RunSummary, TcpTransitionInput,
-    TcpTransitionRecord, run_scalar, run_scalar_with_observations,
+    AqmTransitionAction, AqmTransitionRecord, ArrivalDisposition, DiagnosticPlanes, ExecutionError,
+    ObservationMode, PacketArrivalObservation, PacketDeparture, RunResult, RunSummary,
+    TcpTransitionInput, TcpTransitionRecord, run_scalar, run_scalar_with_observations,
 };
 pub use tcp::{CUBIC_WINDOW_SCALE, TcpCongestionControl, TcpPhase};
 pub use tcp_trace::{TcpTraceError, tcp_transitions_csv};

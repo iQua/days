@@ -12,7 +12,7 @@ use crate::safe_horizon::{LpRoundWork, RoundMetrics};
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 use crate::safe_horizon::{RoundMetricsWindow, WindowedRunTotals};
 use crate::scalar::{
-    ExecutionError, LocalNodeState, LocalTransitionResult, ObservationMode,
+    DiagnosticPlanes, ExecutionError, LocalNodeState, LocalTransitionResult, ObservationMode,
     PacketArrivalObservation, PacketDeparture, RunResult, RunSummary, TransitionState,
 };
 use crate::{
@@ -459,6 +459,7 @@ fn run_cpu_collecting_metrics(
             &commands,
             &reply_rx,
             &routes,
+            observation_mode,
             retention,
         );
         drop(commands);
@@ -583,6 +584,7 @@ fn run_owned_static_cpu_with_observations(
             minimum_lookahead_ns,
             &commands,
             &reply_rx,
+            observation_mode,
             retention,
         );
         drop(commands);
@@ -702,6 +704,7 @@ fn run_classified_static_cpu_with_observations(
             minimum_lookahead_ns,
             &commands,
             &reply_rx,
+            observation_mode,
             retention,
         );
         drop(commands);
@@ -2164,6 +2167,7 @@ fn run_coordinator<'image>(
     commands: &[Sender<WorkerCommand<'image>>],
     replies: &Receiver<WorkerReply<'image>>,
     routes: &[OwnerRoutes],
+    observation_mode: ObservationMode,
     retention: CpuMetricsRetention,
 ) -> Result<CollectedCpuRun, ExecutionError> {
     let mut previous_horizon = None;
@@ -2413,7 +2417,7 @@ fn run_coordinator<'image>(
             .ok_or(ExecutionError::CounterOverflow(NodeId(0)))?;
     }
 
-    finish_workers(image, commands, replies, metrics)
+    finish_workers(image, commands, replies, observation_mode, metrics)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2424,6 +2428,7 @@ fn run_owned_static_coordinator<'image>(
     minimum_lookahead_ns: Option<u64>,
     commands: &[Sender<OwnedWorkerCommand>],
     replies: &Receiver<OwnedWorkerReply<'image>>,
+    observation_mode: ObservationMode,
     retention: CpuMetricsRetention,
 ) -> Result<CollectedCpuRun, ExecutionError> {
     let mut minima = vec![None; config.workers];
@@ -2808,7 +2813,7 @@ fn run_owned_static_coordinator<'image>(
         }
     }
     Ok(CollectedCpuRun {
-        result: assemble_result(image, lps)?,
+        result: assemble_result(image, lps, observation_mode)?,
         metrics,
     })
 }
@@ -3552,6 +3557,7 @@ fn finish_workers<'image>(
     image: &SimulationImage,
     commands: &[Sender<WorkerCommand<'image>>],
     replies: &Receiver<WorkerReply<'image>>,
+    observation_mode: ObservationMode,
     metrics: CpuMetricsCollector,
 ) -> Result<CollectedCpuRun, ExecutionError> {
     for command in commands {
@@ -3573,7 +3579,7 @@ fn finish_workers<'image>(
         .flatten()
         .collect::<Vec<_>>();
     Ok(CollectedCpuRun {
-        result: assemble_result(image, lps)?,
+        result: assemble_result(image, lps, observation_mode)?,
         metrics,
     })
 }
@@ -3581,6 +3587,7 @@ fn finish_workers<'image>(
 fn assemble_result(
     image: &SimulationImage,
     lps: Vec<CpuLp<'_>>,
+    observation_mode: ObservationMode,
 ) -> Result<RunResult, ExecutionError> {
     let mut host_states = (0..image.host_states.len())
         .map(|_| None)
@@ -3653,9 +3660,11 @@ fn assemble_result(
             .map(|(_, departure)| departure)
             .collect(),
         arrivals: arrivals.into_iter().map(|(_, arrival)| arrival).collect(),
-        tcp_transitions,
-        aqm_transitions,
-        mechanism_transitions,
+        diagnostics: (observation_mode == ObservationMode::Full).then_some(DiagnosticPlanes {
+            tcp_transitions,
+            aqm_transitions,
+            mechanism_transitions,
+        }),
         pending_events,
     })
 }

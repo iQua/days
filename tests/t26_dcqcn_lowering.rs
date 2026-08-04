@@ -417,7 +417,11 @@ fn ecn_marking_generates_cnp_and_exact_scalar_cpu_controller_trajectory() {
             .iter()
             .any(|packet| packet.ecn_marked)
     );
-    let dcqcn_records = scalar
+    let diagnostics = scalar
+        .diagnostics
+        .as_ref()
+        .expect("full scalar observation retains diagnostics");
+    let dcqcn_records = diagnostics
         .mechanism_transitions
         .iter()
         .filter_map(|record| match record {
@@ -425,7 +429,7 @@ fn ecn_marking_generates_cnp_and_exact_scalar_cpu_controller_trajectory() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    let csv = dcqcn_transitions_csv(&scalar.mechanism_transitions).unwrap();
+    let csv = dcqcn_transitions_csv(&diagnostics.mechanism_transitions).unwrap();
     let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("lean/fixtures/p10c/dcqcn_executor_trace_accept.csv");
     if std::env::var_os("DAYS_UPDATE_DCQCN_TRACE_FIXTURE").is_some() {

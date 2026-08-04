@@ -363,7 +363,14 @@ fn drr_and_wrr_certificates_are_generated_by_the_scalar_oracle() {
     );
     let drr_result = run_scalar_with_observations(&drr, None, ObservationMode::Full).unwrap();
     assert_eq!(
-        drr_transitions_csv(&drr_result.mechanism_transitions).unwrap(),
+        drr_transitions_csv(
+            &drr_result
+                .diagnostics
+                .as_ref()
+                .unwrap()
+                .mechanism_transitions,
+        )
+        .unwrap(),
         include_str!("../../lean/fixtures/p10c/drr_executor_accept.csv")
     );
 
@@ -374,7 +381,14 @@ fn drr_and_wrr_certificates_are_generated_by_the_scalar_oracle() {
     );
     let wrr_result = run_scalar_with_observations(&wrr, None, ObservationMode::Full).unwrap();
     assert_eq!(
-        wrr_transitions_csv(&wrr_result.mechanism_transitions).unwrap(),
+        wrr_transitions_csv(
+            &wrr_result
+                .diagnostics
+                .as_ref()
+                .unwrap()
+                .mechanism_transitions,
+        )
+        .unwrap(),
         include_str!("../../lean/fixtures/p10c/wrr_executor_accept.csv")
     );
 }
@@ -1028,7 +1042,14 @@ fn metal_dormant_drr_wrr_queues_retain_full_observation_support() {
         let image = image(scheduler, &[(0, 0, 1, 1)], 10);
         let expected =
             run_scalar_with_observations(&image, Some(1), ObservationMode::Full).unwrap();
-        assert!(expected.mechanism_transitions.is_empty());
+        assert!(
+            expected
+                .diagnostics
+                .as_ref()
+                .unwrap()
+                .mechanism_transitions
+                .is_empty()
+        );
         let actual = run_metal_with_observations(
             &image,
             Some(1),
@@ -1238,7 +1259,14 @@ fn cuda_dormant_drr_wrr_queues_retain_full_observation_support() {
         let image = image(scheduler, &[(0, 0, 1, 1)], 10);
         let expected =
             run_scalar_with_observations(&image, Some(1), ObservationMode::Full).unwrap();
-        assert!(expected.mechanism_transitions.is_empty());
+        assert!(
+            expected
+                .diagnostics
+                .as_ref()
+                .unwrap()
+                .mechanism_transitions
+                .is_empty()
+        );
         let actual = run_cuda_with_observations(
             &image,
             Some(1),

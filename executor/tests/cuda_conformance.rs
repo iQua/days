@@ -565,6 +565,7 @@ fn assert_full_parity(image: &SimulationImage, exclusive_horizon_ns: Option<u64>
     validate(image, Backend::Cuda).expect("production CUDA fixture must validate");
     let scalar = run_scalar_with_observations(image, exclusive_horizon_ns, ObservationMode::Full)
         .expect("scalar oracle must run");
+    assert!(scalar.diagnostics.is_some());
     for streams_enabled in [true, false] {
         let cuda = run_cuda_with_observations(
             image,
@@ -579,8 +580,11 @@ fn assert_full_parity(image: &SimulationImage, exclusive_horizon_ns: Option<u64>
             panic!("production CUDA backend with streams={streams_enabled} failed: {error}")
         });
 
+        assert!(cuda.result.diagnostics.is_none());
+        let mut expected = scalar.clone();
+        expected.diagnostics = None;
         assert_eq!(
-            cuda.result, scalar,
+            cuda.result, expected,
             "CUDA result with streams={streams_enabled} differs from scalar"
         );
     }

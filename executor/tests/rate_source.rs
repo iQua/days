@@ -451,7 +451,14 @@ fn rate_certificate_is_generated_byte_for_byte_by_the_scalar_oracle() {
         20,
     );
     let result = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
-    let csv = rate_transitions_csv(&result.mechanism_transitions).unwrap();
+    let csv = rate_transitions_csv(
+        &result
+            .diagnostics
+            .as_ref()
+            .expect("full scalar observation retains diagnostics")
+            .mechanism_transitions,
+    )
+    .unwrap();
     assert_eq!(
         csv,
         include_str!("../../lean/fixtures/p10c/rate_executor_accept.csv")
@@ -1047,7 +1054,14 @@ fn metal_rate_terminal_and_beyond_stop_states_reserve_no_work() {
     for image in terminal_device_rate_images() {
         validate(&image, Backend::Metal).expect("terminal rate state must validate");
         let expected = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
-        assert!(expected.mechanism_transitions.is_empty());
+        assert!(
+            expected
+                .diagnostics
+                .as_ref()
+                .unwrap()
+                .mechanism_transitions
+                .is_empty()
+        );
         let actual = run_metal_with_observations(
             &image,
             None,
@@ -1076,7 +1090,14 @@ fn metal_rate_full_observation_respects_the_exclusive_horizon() {
         10,
     );
     let expected = run_scalar_with_observations(&image, Some(1), ObservationMode::Full).unwrap();
-    assert!(expected.mechanism_transitions.is_empty());
+    assert!(
+        expected
+            .diagnostics
+            .as_ref()
+            .unwrap()
+            .mechanism_transitions
+            .is_empty()
+    );
     let actual = run_metal_with_observations(
         &image,
         Some(1),
@@ -1133,7 +1154,14 @@ fn cuda_rate_terminal_and_beyond_stop_states_reserve_no_work() {
     for image in terminal_device_rate_images() {
         validate(&image, Backend::Cuda).expect("terminal rate state must validate");
         let expected = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
-        assert!(expected.mechanism_transitions.is_empty());
+        assert!(
+            expected
+                .diagnostics
+                .as_ref()
+                .unwrap()
+                .mechanism_transitions
+                .is_empty()
+        );
         let actual =
             run_cuda_with_observations(&image, None, CudaConfig::default(), ObservationMode::Full)
                 .expect("provably dormant Rate state must retain Full observation support");
@@ -1158,7 +1186,14 @@ fn cuda_rate_full_observation_respects_the_exclusive_horizon() {
         10,
     );
     let expected = run_scalar_with_observations(&image, Some(1), ObservationMode::Full).unwrap();
-    assert!(expected.mechanism_transitions.is_empty());
+    assert!(
+        expected
+            .diagnostics
+            .as_ref()
+            .unwrap()
+            .mechanism_transitions
+            .is_empty()
+    );
     let actual = run_cuda_with_observations(
         &image,
         Some(1),

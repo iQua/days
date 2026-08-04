@@ -23,17 +23,25 @@ fn assert_result_eq(
     actual: &days_executor::RunResult,
     expected: &days_executor::RunResult,
 ) {
-    for (index, (actual, expected)) in actual
+    let actual_diagnostics = actual
+        .diagnostics
+        .as_ref()
+        .expect("full reference observation retains diagnostics");
+    let expected_diagnostics = expected
+        .diagnostics
+        .as_ref()
+        .expect("full reference observation retains diagnostics");
+    for (index, (actual, expected)) in actual_diagnostics
         .tcp_transitions
         .iter()
-        .zip(&expected.tcp_transitions)
+        .zip(&expected_diagnostics.tcp_transitions)
         .enumerate()
     {
         assert_eq!(actual, expected, "{label} TCP transition {index}");
     }
     assert_eq!(
-        actual.tcp_transitions.len(),
-        expected.tcp_transitions.len(),
+        actual_diagnostics.tcp_transitions.len(),
+        expected_diagnostics.tcp_transitions.len(),
         "{label} TCP transition count"
     );
     assert_eq!(

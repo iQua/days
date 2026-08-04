@@ -77,9 +77,15 @@ mod result_gate {
         first_cuda: &RunResult,
         second_cuda: &RunResult,
     ) -> Result<(), ResultMismatch> {
+        let mut expected = scalar.clone();
+        expected.diagnostics = None;
         let mismatch = ResultMismatch {
-            scalar_matches_first_cuda: scalar == first_cuda,
-            scalar_matches_second_cuda: scalar == second_cuda,
+            scalar_matches_first_cuda: scalar.diagnostics.is_some()
+                && first_cuda.diagnostics.is_none()
+                && expected == *first_cuda,
+            scalar_matches_second_cuda: scalar.diagnostics.is_some()
+                && second_cuda.diagnostics.is_none()
+                && expected == *second_cuda,
             cuda_runs_match: first_cuda == second_cuda,
         };
         if mismatch.scalar_matches_first_cuda
@@ -134,19 +140,48 @@ mod app {
             ObservationMode::Full,
         )?;
         let second_end_to_end_wall_ns = elapsed_ns(second_started);
+        let mut expected = scalar.clone();
+        expected.diagnostics = None;
         let scalar_fingerprint = fingerprint_normalized_result(&scalar);
+        let expected_fingerprint = fingerprint_normalized_result(&expected);
         let first_fingerprint = fingerprint_normalized_result(&first.result);
         let second_fingerprint = fingerprint_normalized_result(&second.result);
 
         println!("fixture={}", fixture.display());
-        println!("result_matches_scalar={}", first.result == scalar);
-        println!("second_result_matches_scalar={}", second.result == scalar);
+        println!(
+            "scalar_diagnostics_present={}",
+            scalar.diagnostics.is_some()
+        );
+        println!(
+            "first_cuda_diagnostics_absent={}",
+            first.result.diagnostics.is_none()
+        );
+        println!(
+            "second_cuda_diagnostics_absent={}",
+            second.result.diagnostics.is_none()
+        );
+        println!(
+            "result_matches_scalar_measurements={}",
+            first.result == expected
+        );
+        println!(
+            "second_result_matches_scalar_measurements={}",
+            second.result == expected
+        );
         println!("two_run_deterministic={}", first.result == second.result);
         println!(
             "scalar_result_serialization_bytes={}",
             scalar_fingerprint.serialization_bytes
         );
         println!("scalar_result_fnv1a64={:016x}", scalar_fingerprint.fnv1a64);
+        println!(
+            "scalar_without_diagnostics_serialization_bytes={}",
+            expected_fingerprint.serialization_bytes
+        );
+        println!(
+            "scalar_without_diagnostics_fnv1a64={:016x}",
+            expected_fingerprint.fnv1a64
+        );
         println!(
             "first_cuda_result_serialization_bytes={}",
             first_fingerprint.serialization_bytes
@@ -212,7 +247,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use days_executor::{RunResult, RunSummary};
+    use days_executor::{DiagnosticPlanes, RunResult, RunSummary};
 
     use super::result_gate::{fingerprint_normalized_result, verify_result_equality};
 
@@ -225,9 +260,7 @@ mod tests {
             observed_packets: Vec::new(),
             departures: Vec::new(),
             arrivals: Vec::new(),
-            tcp_transitions: Vec::new(),
-            aqm_transitions: Vec::new(),
-            mechanism_transitions: Vec::new(),
+            diagnostics: Some(DiagnosticPlanes::default()),
             pending_events: Vec::new(),
         }
     }
@@ -243,13 +276,18 @@ mod tests {
         let mut changed = result;
         changed.summary.sourced_packets = 1;
         assert_ne!(fingerprint_normalized_result(&changed), first);
+
+        changed.summary.sourced_packets = 0;
+        changed.diagnostics = None;
+        assert_ne!(fingerprint_normalized_result(&changed), first);
     }
 
     #[test]
     fn result_equality_gate_rejects_each_inequality() {
         let scalar = empty_result();
-        let first_cuda = scalar.clone();
-        let second_cuda = scalar.clone();
+        let mut first_cuda = scalar.clone();
+        first_cuda.diagnostics = None;
+        let second_cuda = first_cuda.clone();
         assert!(verify_result_equality(&scalar, &first_cuda, &second_cuda).is_ok());
 
         let mut unequal_first = first_cuda.clone();

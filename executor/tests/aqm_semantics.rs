@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use days_executor::{
-    AqmTransitionAction, ArrivalDisposition, Backend, CpuConfig, DropMarkPolicy,
+    AqmTransitionAction, ArrivalDisposition, Backend, CpuConfig, DiagnosticPlanes, DropMarkPolicy,
     EcnThresholdPolicy, Event, EventKey, EventKind, FlowDescriptor, FlowId, HostState,
     LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketDescriptor,
     PacketKind, PayloadId, QueueDepthUnit, RedPolicyState, RemoteChannel, RunResult, SchedulerKind,
@@ -281,12 +281,19 @@ fn marked(result: &RunResult, id: PayloadId) -> bool {
         .is_some_and(|packet| packet.ecn_marked)
 }
 
+fn diagnostics(result: &RunResult) -> &DiagnosticPlanes {
+    result
+        .diagnostics
+        .as_ref()
+        .expect("full reference observation retains diagnostics")
+}
+
 #[test]
 fn taildrop_forces_drop_when_post_enqueue_byte_sum_is_unrepresentable() {
     let image = hidden_byte_overflow_image(DropMarkPolicy::TailDrop);
     let result = hidden_byte_overflow_result(&image);
 
-    assert!(result.aqm_transitions.is_empty());
+    assert!(diagnostics(&result).aqm_transitions.is_empty());
 }
 
 #[test]
@@ -323,8 +330,8 @@ fn packet_ecn_forces_traced_drop_when_post_enqueue_byte_sum_is_unrepresentable()
     let image = hidden_byte_overflow_image(policy);
     let result = hidden_byte_overflow_result(&image);
 
-    assert_eq!(result.aqm_transitions.len(), 1);
-    let transition = &result.aqm_transitions[0];
+    assert_eq!(diagnostics(&result).aqm_transitions.len(), 1);
+    let transition = &diagnostics(&result).aqm_transitions[0];
     assert_eq!(transition.queued_packets_before, 1);
     assert_eq!(transition.queued_bytes_before, u64::MAX);
     assert_eq!(transition.packet_size_bytes, 1);
@@ -332,7 +339,7 @@ fn packet_ecn_forces_traced_drop_when_post_enqueue_byte_sum_is_unrepresentable()
     assert_eq!(transition.after, policy);
     assert_eq!(transition.action, AqmTransitionAction::Drop);
 
-    let csv = aqm_transitions_csv(&result.aqm_transitions).unwrap();
+    let csv = aqm_transitions_csv(&diagnostics(&result).aqm_transitions).unwrap();
     assert_eq!(
         csv,
         include_str!(
@@ -359,8 +366,8 @@ fn packet_red_updates_ewma_then_traces_hidden_byte_domain_drop() {
     let image = hidden_byte_overflow_image(policy);
     let result = hidden_byte_overflow_result(&image);
 
-    assert_eq!(result.aqm_transitions.len(), 1);
-    let transition = &result.aqm_transitions[0];
+    assert_eq!(diagnostics(&result).aqm_transitions.len(), 1);
+    let transition = &diagnostics(&result).aqm_transitions[0];
     assert_eq!(transition.queued_packets_before, 1);
     assert_eq!(transition.queued_bytes_before, u64::MAX);
     assert_eq!(transition.packet_size_bytes, 1);
@@ -381,7 +388,7 @@ fn packet_red_updates_ewma_then_traces_hidden_byte_domain_drop() {
     );
     assert_eq!(transition.action, AqmTransitionAction::Drop);
 
-    let csv = aqm_transitions_csv(&result.aqm_transitions).unwrap();
+    let csv = aqm_transitions_csv(&diagnostics(&result).aqm_transitions).unwrap();
     assert_eq!(
         csv,
         include_str!("../../lean/fixtures/p10c/aqm_red_packet_byte_overflow_executor_accept.csv"),
@@ -400,7 +407,7 @@ fn aqm_certificate_records_enqueue_mark_and_drop_with_exact_state() {
         &[1, 1, 1, 1],
     );
     let result = run_scalar_with_observations(&image, Some(5), ObservationMode::Full).unwrap();
-    let csv = aqm_transitions_csv(&result.aqm_transitions).unwrap();
+    let csv = aqm_transitions_csv(&diagnostics(&result).aqm_transitions).unwrap();
     assert_eq!(
         csv,
         include_str!("../../lean/fixtures/p10c/aqm_executor_accept.csv"),
@@ -415,12 +422,12 @@ fn aqm_certificate_records_enqueue_mark_and_drop_with_exact_state() {
     assert!(rows[3].ends_with(",mark"));
     assert!(rows[4].ends_with(",drop"));
 
-    let duplicate = result.aqm_transitions[0];
+    let duplicate = diagnostics(&result).aqm_transitions[0];
     assert_eq!(
         aqm_transitions_csv(&[duplicate, duplicate])
             .expect_err("duplicate canonical transition keys must be rejected")
             .duplicate_key,
-        result.aqm_transitions[0].key
+        diagnostics(&result).aqm_transitions[0].key
     );
 }
 
@@ -441,7 +448,7 @@ fn red_certificate_is_generated_byte_for_byte_by_the_scalar_oracle() {
         &[1],
     );
     let result = run_scalar_with_observations(&image, Some(2), ObservationMode::Full).unwrap();
-    let csv = aqm_transitions_csv(&result.aqm_transitions).unwrap();
+    let csv = aqm_transitions_csv(&diagnostics(&result).aqm_transitions).unwrap();
 
     assert_eq!(
         csv,
@@ -788,7 +795,7 @@ fn metal_dormant_ecn_threshold_retains_full_observation_support() {
         &[1],
     );
     let expected = run_scalar_with_observations(&image, Some(0), ObservationMode::Full).unwrap();
-    assert!(expected.mechanism_transitions.is_empty());
+    assert!(diagnostics(&expected).mechanism_transitions.is_empty());
     let actual = run_metal_with_observations(
         &image,
         Some(0),
@@ -842,7 +849,7 @@ fn cuda_dormant_ecn_threshold_retains_full_observation_support() {
         &[1],
     );
     let expected = run_scalar_with_observations(&image, Some(0), ObservationMode::Full).unwrap();
-    assert!(expected.mechanism_transitions.is_empty());
+    assert!(diagnostics(&expected).mechanism_transitions.is_empty());
     let actual = run_cuda_with_observations(
         &image,
         Some(0),

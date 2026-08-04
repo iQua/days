@@ -202,7 +202,11 @@ fn collective_activation_certificates_are_scalar_generated() {
     ] {
         let image = compile_collective_with_total_and_interval(algorithm, total_bytes, interval);
         let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
-        let progress = scalar
+        let diagnostics = scalar
+            .diagnostics
+            .as_ref()
+            .expect("full scalar observation retains diagnostics");
+        let progress = diagnostics
             .mechanism_transitions
             .iter()
             .filter_map(|record| match record {
@@ -231,7 +235,7 @@ fn collective_activation_certificates_are_scalar_generated() {
             }));
         }
 
-        let csv = collective_transitions_csv(&scalar.mechanism_transitions).unwrap();
+        let csv = collective_transitions_csv(&diagnostics.mechanism_transitions).unwrap();
         let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("lean/fixtures/p10c")
             .join(fixture);

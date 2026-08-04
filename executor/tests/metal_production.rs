@@ -1061,6 +1061,7 @@ fn assert_full_parity(image: &SimulationImage, exclusive_horizon_ns: Option<u64>
     validate(image, Backend::Metal).expect("production Metal fixture must validate");
     let scalar = run_scalar_with_observations(image, exclusive_horizon_ns, ObservationMode::Full)
         .expect("scalar oracle must run");
+    assert!(scalar.diagnostics.is_some());
     for streams_enabled in [true, false] {
         let metal = run_metal_with_observations(
             image,
@@ -1075,8 +1076,11 @@ fn assert_full_parity(image: &SimulationImage, exclusive_horizon_ns: Option<u64>
             panic!("production Metal backend with streams={streams_enabled} failed: {error}")
         });
 
+        assert!(metal.result.diagnostics.is_none());
+        let mut expected = scalar.clone();
+        expected.diagnostics = None;
         assert_eq!(
-            metal.result, scalar,
+            metal.result, expected,
             "Metal result with streams={streams_enabled} differs from scalar"
         );
     }

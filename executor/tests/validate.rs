@@ -703,12 +703,16 @@ fn metal_full_observation_closes_over_divergent_resident_waiters() {
     for (image, boundary, node, payload, aqm) in resident_waiter_cases() {
         let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
             .expect("resident-waiter suffix must execute");
+        let diagnostics = scalar
+            .diagnostics
+            .as_ref()
+            .expect("full scalar observation retains diagnostics");
         if aqm {
-            assert_eq!(scalar.aqm_transitions.len(), 1);
-            assert_eq!(scalar.aqm_transitions[0].node, node);
-            assert_eq!(scalar.aqm_transitions[0].payload, payload);
+            assert_eq!(diagnostics.aqm_transitions.len(), 1);
+            assert_eq!(diagnostics.aqm_transitions[0].node, node);
+            assert_eq!(diagnostics.aqm_transitions[0].payload, payload);
         } else {
-            assert_eq!(scalar.mechanism_transitions.len(), 1);
+            assert_eq!(diagnostics.mechanism_transitions.len(), 1);
         }
         let dormant = run_scalar_with_observations(&image, Some(boundary), ObservationMode::Full)
             .expect("completion at the exclusive horizon must remain dormant");

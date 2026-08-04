@@ -121,6 +121,21 @@ pub struct RunSummary {
     pub feedback_bytes: u128,
 }
 
+/// Exact transition records retained by reference-lane full observation.
+///
+/// Device backends intentionally omit these diagnostic planes while still returning complete
+/// state and measurement planes. [`RunResult::diagnostics`] therefore distinguishes an omitted
+/// diagnostic plane from a present plane containing no records.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DiagnosticPlanes {
+    /// Exact TCP control transitions retained in full observation mode.
+    pub tcp_transitions: Vec<TcpTransitionRecord>,
+    /// Exact RED/ECN enqueue transitions retained in full observation mode.
+    pub aqm_transitions: Vec<AqmTransitionRecord>,
+    /// Exact rate/PFC/DRR/WRR/collective transitions retained in full observation mode.
+    pub mechanism_transitions: Vec<crate::MechanismTransitionRecord>,
+}
+
 /// Complete normalized scalar state after reaching a configured endpoint or execution horizon.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunResult {
@@ -138,12 +153,8 @@ pub struct RunResult {
     pub observed_packets: Vec<PacketDescriptor>,
     pub departures: Vec<PacketDeparture>,
     pub arrivals: Vec<PacketArrivalObservation>,
-    /// Exact TCP control transitions retained in full observation mode.
-    pub tcp_transitions: Vec<TcpTransitionRecord>,
-    /// Exact RED/ECN enqueue transitions retained in full observation mode.
-    pub aqm_transitions: Vec<AqmTransitionRecord>,
-    /// Exact rate/PFC/DRR/WRR/collective transitions retained in full observation mode.
-    pub mechanism_transitions: Vec<crate::MechanismTransitionRecord>,
+    /// Reference-lane diagnostics, present only for scalar/CPU full observation.
+    pub diagnostics: Option<DiagnosticPlanes>,
     /// Unprocessed events in canonical `EventKey` order.
     pub pending_events: Vec<Event>,
 }
@@ -833,9 +844,13 @@ impl<'image> TransitionState<'image> {
                 .into_iter()
                 .map(|(_, arrival)| arrival)
                 .collect(),
-            tcp_transitions: self.tcp_transitions,
-            aqm_transitions: self.aqm_transitions,
-            mechanism_transitions: self.mechanism_transitions,
+            diagnostics: (self.observation_mode == ObservationMode::Full).then_some(
+                DiagnosticPlanes {
+                    tcp_transitions: self.tcp_transitions,
+                    aqm_transitions: self.aqm_transitions,
+                    mechanism_transitions: self.mechanism_transitions,
+                },
+            ),
             pending_events,
         }
     }

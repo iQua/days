@@ -888,14 +888,22 @@ fn pfc_certificate_is_generated_byte_for_byte_by_the_scalar_oracle() {
     let mut threshold_image = path_image();
     threshold_image.stop_time_ns = 1;
     add_xoff_arrival(&mut threshold_image, 1);
-    let mut records = run_scalar_cpu(&threshold_image).mechanism_transitions;
+    let mut records = run_scalar_cpu(&threshold_image)
+        .diagnostics
+        .expect("full reference observation retains diagnostics")
+        .mechanism_transitions;
 
     let mut controller_image = branched_path_image();
     controller_image.stop_time_ns = 3;
     add_control_from(&mut controller_image, DOWNSTREAM, 1, 0, true);
     add_control_from(&mut controller_image, DOWNSTREAM_B, 2, 0, true);
     add_control_from(&mut controller_image, DOWNSTREAM, 3, 1, false);
-    records.extend(run_scalar_cpu_with_external_controls(&controller_image).mechanism_transitions);
+    records.extend(
+        run_scalar_cpu_with_external_controls(&controller_image)
+            .diagnostics
+            .expect("full reference observation retains diagnostics")
+            .mechanism_transitions,
+    );
 
     assert_eq!(
         pfc_transitions_csv(&records).unwrap(),
