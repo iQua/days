@@ -12,6 +12,8 @@ use crate::event::{EventFelClass, event_fel_class, is_same_time_tx_ready_continu
 use crate::metal_spike::{
     RealReplayTrace, RealReplayTraceBuilder, RecordedReplayLp, ReplayStep, ReplayTraceCapture,
 };
+#[cfg(feature = "p11-profile")]
+use crate::p11_profile::{P11HorizonPolicy, P11LpProfile, P11RoundProfile, duration_ns};
 use crate::scalar::{ExecutionError, ObservationMode, RunResult, TransitionState};
 use crate::{Event, EventKey, NodeId, SimulationImage};
 
@@ -31,6 +33,8 @@ pub struct LpRoundWork {
     /// CPU round execution currently store every non-continuation local event in the same ordered
     /// `BTreeMap`.
     pub fallback_classified_pushes: u64,
+    #[cfg(feature = "p11-profile")]
+    pub p11_profile: P11LpProfile,
 }
 
 /// Cheap, deterministic instrumentation retained for one safe-horizon round.
@@ -54,6 +58,8 @@ pub struct RoundMetrics {
     pub frontier_heap_pops: u64,
     /// Physical LP-table slots visited by frontier, dispatch, and merge machinery.
     pub physical_lp_probes: u64,
+    #[cfg(feature = "p11-profile")]
+    pub p11_profile: P11RoundProfile,
 }
 
 impl RoundMetrics {
@@ -181,6 +187,25 @@ pub fn run_scalar_rounds_with_observations(
     observation_mode: ObservationMode,
 ) -> Result<ScalarRoundRun, ExecutionError> {
     RoundExecutor::new(image, observation_mode)?.run(exclusive_horizon_ns)
+}
+
+/// Runs the scalar round executor with an opt-in P11 measurement horizon policy.
+///
+/// `TransitivePerLp` computes `B_j = min(S, min_i(N_i + D+(i, j)))`, where `D+` is the shortest
+/// nonempty directed path over declared remote channels. This is measurement-only and is not
+/// compiled into production builds. For that policy, [`RoundMetrics::exclusive_horizon_ns`] and
+/// `horizon_advance_ns` report the minimum member of the bound family; the profile retains both
+/// the minimum and maximum.
+#[cfg(feature = "p11-profile")]
+pub fn run_scalar_rounds_with_p11_horizon_policy(
+    image: &SimulationImage,
+    exclusive_horizon_ns: Option<u64>,
+    observation_mode: ObservationMode,
+    policy: P11HorizonPolicy,
+) -> Result<ScalarRoundRun, ExecutionError> {
+    let mut executor = RoundExecutor::new(image, observation_mode)?;
+    executor.set_p11_horizon_policy(policy)?;
+    executor.run(exclusive_horizon_ns)
 }
 
 /// Records a bounded real-image window while executing the canonical safe-horizon CPU path.
@@ -332,6 +357,10 @@ struct RoundExecutor<'image> {
     pending_keys: BTreeSet<EventKey>,
     frontier: OwnerFrontierIndex,
     minimum_lookahead_ns: Option<u64>,
+    #[cfg(feature = "p11-profile")]
+    p11_horizon_policy: P11HorizonPolicy,
+    #[cfg(feature = "p11-profile")]
+    p11_outgoing_channels: Option<Vec<Vec<(usize, u64)>>>,
     #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
     replay_trace: Option<RealReplayTraceBuilder>,
 }
@@ -395,9 +424,52 @@ impl<'image> RoundExecutor<'image> {
             pending_keys,
             frontier,
             minimum_lookahead_ns,
+            #[cfg(feature = "p11-profile")]
+            p11_horizon_policy: P11HorizonPolicy::Global,
+            #[cfg(feature = "p11-profile")]
+            p11_outgoing_channels: None,
             #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
             replay_trace: None,
         })
+    }
+
+    #[cfg(feature = "p11-profile")]
+    fn set_p11_horizon_policy(&mut self, policy: P11HorizonPolicy) -> Result<(), ExecutionError> {
+        self.p11_horizon_policy = policy;
+        if policy == P11HorizonPolicy::TransitivePerLp {
+            let mut outgoing = vec![Vec::new(); self.image.nodes.len()];
+            for channel in &self.image.channels {
+                let source = node_slot(self.image, channel.source)
+                    .ok_or(ExecutionError::UnknownNode(channel.source))?;
+                let target = node_slot(self.image, channel.target)
+                    .ok_or(ExecutionError::UnknownNode(channel.target))?;
+                outgoing[source].push((target, channel.min_delay_ns));
+            }
+            self.p11_outgoing_channels = Some(outgoing);
+        }
+        Ok(())
+    }
+
+    /// Computes `min_i(N_i + D+(i, j))` by seeding the queue with the first remote edge.
+    ///
+    /// Seeding by edges rather than by `N_i` itself is what excludes the empty `i -> i` path. A
+    /// target can therefore be constrained by its own frontier only through a real positive cycle.
+    #[cfg(feature = "p11-profile")]
+    fn p11_transitive_per_lp_bounds(&self, run_end: u128) -> Vec<u128> {
+        let outgoing = self
+            .p11_outgoing_channels
+            .as_ref()
+            .expect("the per-LP policy installs its channel graph");
+        let frontiers = self
+            .futures
+            .iter()
+            .map(|future| {
+                future
+                    .first_key_value()
+                    .map(|(key, _)| u128::from(key.time_ns))
+            })
+            .collect::<Vec<_>>();
+        p11_shortest_nonempty_path_bounds(&frontiers, outgoing, run_end)
     }
 
     fn run(mut self, exclusive_horizon_ns: Option<u64>) -> Result<ScalarRoundRun, ExecutionError> {
@@ -473,6 +545,10 @@ impl<'image> RoundExecutor<'image> {
         };
 
         loop {
+            #[cfg(feature = "p11-profile")]
+            let round_started = std::time::Instant::now();
+            #[cfg(feature = "p11-profile")]
+            let horizon_started = std::time::Instant::now();
             let mut frontier_heap_pops = 0;
             let mut physical_lp_probes = 0_u64;
             let Some(frontier_entry) = self
@@ -491,17 +567,62 @@ impl<'image> RoundExecutor<'image> {
                 .map_or(TIME_AFTER_U64_MAX, |delay| {
                     (u128::from(frontier_ns) + u128::from(delay)).min(TIME_AFTER_U64_MAX)
                 });
+            #[cfg(feature = "p11-profile")]
+            let global_horizon = run_end.min(lookahead_end);
+            #[cfg(feature = "p11-profile")]
+            let per_lp_bounds = (self.p11_horizon_policy == P11HorizonPolicy::TransitivePerLp)
+                .then(|| self.p11_transitive_per_lp_bounds(run_end));
+            #[cfg(feature = "p11-profile")]
+            let horizon = per_lp_bounds.as_ref().map_or(global_horizon, |bounds| {
+                bounds.iter().copied().min().unwrap_or(run_end)
+            });
+            #[cfg(not(feature = "p11-profile"))]
             let horizon = run_end.min(lookahead_end);
             let horizon_advance_ns =
                 horizon.saturating_sub(previous_horizon.unwrap_or(u128::from(frontier_ns)));
 
+            #[cfg(feature = "p11-profile")]
+            let mut active = Vec::<(FrontierEntry, u128)>::new();
+            #[cfg(feature = "p11-profile")]
+            if let Some(bounds) = per_lp_bounds.as_ref() {
+                for (lp_slot, future) in self.futures.iter().enumerate() {
+                    physical_lp_probes = physical_lp_probes.saturating_add(1);
+                    let Some((key, _)) = future.first_key_value() else {
+                        continue;
+                    };
+                    if u128::from(key.time_ns) < bounds[lp_slot] {
+                        active.push((
+                            FrontierEntry {
+                                time_ns: key.time_ns,
+                                node: self.image.nodes[lp_slot].id,
+                                generation: self.frontier.generations[lp_slot],
+                                lp_slot,
+                            },
+                            bounds[lp_slot],
+                        ));
+                    }
+                }
+                active.sort_unstable_by_key(|(entry, _)| *entry);
+            } else {
+                while let Some(entry) = self.frontier.pop_before(
+                    horizon,
+                    &mut frontier_heap_pops,
+                    &mut physical_lp_probes,
+                ) {
+                    active.push((entry, horizon));
+                }
+            }
+            #[cfg(not(feature = "p11-profile"))]
             let mut active = Vec::new();
+            #[cfg(not(feature = "p11-profile"))]
             while let Some(entry) =
                 self.frontier
                     .pop_before(horizon, &mut frontier_heap_pops, &mut physical_lp_probes)
             {
                 active.push(entry);
             }
+            #[cfg(feature = "p11-profile")]
+            let horizon_ns = duration_ns(horizon_started.elapsed());
 
             let mut children = Vec::new();
             let mut outboxes = Vec::with_capacity(active.len());
@@ -515,6 +636,35 @@ impl<'image> RoundExecutor<'image> {
             let mut replay_rows = Vec::with_capacity(if capture_replay { active.len() } else { 0 });
             let mut events_processed = 0_u64;
             let mut frontier_updates = 0_u64;
+            #[cfg(feature = "p11-profile")]
+            let mut p11_lp_profile = P11LpProfile::default();
+            #[cfg(feature = "p11-profile")]
+            for (entry, lp_horizon) in active {
+                physical_lp_probes = physical_lp_probes.saturating_add(1);
+                let drained = self.drain_lp(
+                    entry.lp_slot,
+                    lp_horizon,
+                    &mut children,
+                    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+                    capture_replay,
+                )?;
+                events_processed = events_processed.saturating_add(drained.work.events_processed);
+                #[cfg(feature = "p11-profile")]
+                {
+                    p11_lp_profile = p11_lp_profile.saturating_add(drained.work.p11_profile);
+                }
+                lp_work.push(drained.work);
+                if !drained.outbox.is_empty() {
+                    outboxes.push(drained.outbox);
+                }
+                #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+                if let Some(replay) = drained.replay {
+                    replay_rows.push(replay);
+                }
+                self.update_frontier(entry.lp_slot, &mut physical_lp_probes)?;
+                frontier_updates = frontier_updates.saturating_add(1);
+            }
+            #[cfg(not(feature = "p11-profile"))]
             for entry in active {
                 physical_lp_probes = physical_lp_probes.saturating_add(1);
                 let drained = self.drain_lp(
@@ -537,6 +687,35 @@ impl<'image> RoundExecutor<'image> {
                 frontier_updates = frontier_updates.saturating_add(1);
             }
 
+            #[cfg(feature = "p11-profile")]
+            if let Some(bounds) = per_lp_bounds.as_ref() {
+                for (lp_slot, future) in self.futures.iter().enumerate() {
+                    physical_lp_probes = physical_lp_probes.saturating_add(1);
+                    if let Some((key, _)) = future.first_key_value() {
+                        if u128::from(key.time_ns) < bounds[lp_slot] {
+                            return Err(ExecutionError::EventBelowHorizonAfterDrain {
+                                key: *key,
+                                exclusive_horizon_ns: bounds[lp_slot],
+                            });
+                        }
+                    }
+                }
+            } else if let Some(entry) = self
+                .frontier
+                .peek_min(&mut frontier_heap_pops, &mut physical_lp_probes)
+            {
+                if u128::from(entry.time_ns) < horizon {
+                    let key = self.futures[entry.lp_slot]
+                        .first_key_value()
+                        .map(|(key, _)| *key)
+                        .expect("a live frontier entry has a pending event");
+                    return Err(ExecutionError::EventBelowHorizonAfterDrain {
+                        key,
+                        exclusive_horizon_ns: horizon,
+                    });
+                }
+            }
+            #[cfg(not(feature = "p11-profile"))]
             if let Some(entry) = self
                 .frontier
                 .peek_min(&mut frontier_heap_pops, &mut physical_lp_probes)
@@ -553,6 +732,27 @@ impl<'image> RoundExecutor<'image> {
                 }
             }
 
+            #[cfg(feature = "p11-profile")]
+            let exchange_started = std::time::Instant::now();
+            #[cfg(feature = "p11-profile")]
+            let (exchange_targets, exchange_fan_in_sum, exchange_max_fan_in) = {
+                let mut fan_in = BTreeMap::<NodeId, u64>::new();
+                for outbox in &outboxes {
+                    let targets = outbox
+                        .iter()
+                        .map(|event| event.target)
+                        .collect::<BTreeSet<_>>();
+                    for target in targets {
+                        let count = fan_in.entry(target).or_default();
+                        *count = count.saturating_add(1);
+                    }
+                }
+                (
+                    fan_in.len() as u64,
+                    fan_in.values().copied().fold(0_u64, u64::saturating_add),
+                    fan_in.values().copied().max().unwrap_or(0),
+                )
+            };
             let mut remote_events = outboxes.into_iter().flatten().collect::<Vec<Event>>();
             let messages_exchanged = u64::try_from(remote_events.len()).unwrap_or(u64::MAX);
             radix_sort_remote_events(&mut remote_events);
@@ -566,11 +766,17 @@ impl<'image> RoundExecutor<'image> {
                 while end < remote_events.len() && remote_events[end].target == target {
                     end += 1;
                 }
+                #[cfg(feature = "p11-profile")]
+                let target_horizon = per_lp_bounds
+                    .as_ref()
+                    .map_or(horizon, |bounds| bounds[lp_slot]);
+                #[cfg(not(feature = "p11-profile"))]
+                let target_horizon = horizon;
                 for event in &remote_events[offset..end] {
-                    if u128::from(event.key.time_ns) < horizon {
+                    if u128::from(event.key.time_ns) < target_horizon {
                         return Err(ExecutionError::RemoteEventBeforeHorizon {
                             key: event.key,
-                            exclusive_horizon_ns: horizon,
+                            exclusive_horizon_ns: target_horizon,
                         });
                     }
                     if self.futures[lp_slot].insert(event.key, *event).is_some() {
@@ -581,6 +787,8 @@ impl<'image> RoundExecutor<'image> {
                 frontier_updates = frontier_updates.saturating_add(1);
                 offset = end;
             }
+            #[cfg(feature = "p11-profile")]
+            let exchange_merge_ns = duration_ns(exchange_started.elapsed());
 
             let active_lp_count = lp_work.len();
             let max_work = lp_work
@@ -607,6 +815,36 @@ impl<'image> RoundExecutor<'image> {
                         replay_rows,
                     );
             }
+            #[cfg(feature = "p11-profile")]
+            let p11_profile = {
+                let (horizon_bound_min_ns, horizon_bound_max_ns, horizon_distinct_bounds) =
+                    per_lp_bounds
+                        .as_ref()
+                        .map_or((horizon, horizon, 1), |bounds| {
+                            let distinct = bounds.iter().copied().collect::<BTreeSet<_>>();
+                            (
+                                bounds.iter().copied().min().unwrap_or(run_end),
+                                bounds.iter().copied().max().unwrap_or(run_end),
+                                distinct.len() as u64,
+                            )
+                        });
+                let mut profile = P11RoundProfile {
+                    round_wall_ns: duration_ns(round_started.elapsed()),
+                    horizon_ns,
+                    horizon_policy: self.p11_horizon_policy,
+                    horizon_bound_min_ns,
+                    horizon_bound_max_ns,
+                    horizon_distinct_bounds,
+                    exchange_merge_ns,
+                    exchange_targets,
+                    exchange_fan_in_sum,
+                    exchange_max_fan_in,
+                    lp: p11_lp_profile,
+                    ..P11RoundProfile::default()
+                };
+                profile.close_residual();
+                profile
+            };
             let metrics = RoundMetrics {
                 frontier_ns,
                 exclusive_horizon_ns: horizon,
@@ -619,6 +857,8 @@ impl<'image> RoundExecutor<'image> {
                 frontier_updates,
                 frontier_heap_pops,
                 physical_lp_probes,
+                #[cfg(feature = "p11-profile")]
+                p11_profile,
             };
             #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
             if let (RoundRetention::Window(window), Some(totals)) =
@@ -679,6 +919,12 @@ impl<'image> RoundExecutor<'image> {
         let mut fallback_classified_pushes = 0_u64;
         let mut outbox = Vec::new();
         let mut continuation = None;
+        #[cfg(feature = "p11-profile")]
+        let packet_store_before = self.transitions.p11_packet_store_profile();
+        #[cfg(feature = "p11-profile")]
+        let mut p11_profile = P11LpProfile::default();
+        #[cfg(feature = "p11-profile")]
+        let mut previous_time_ns = None;
         #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
         let pending_events_below_horizon = if capture_replay {
             u32::try_from(
@@ -698,8 +944,13 @@ impl<'image> RoundExecutor<'image> {
                 .first_key_value()
                 .is_some_and(|(key, _)| u128::from(key.time_ns) < exclusive_horizon_ns)
         {
-            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+            #[cfg(any(
+                feature = "p11-profile",
+                all(feature = "metal-spike", target_vendor = "apple")
+            ))]
             let direct_continuation = continuation.is_some();
+            #[cfg(feature = "p11-profile")]
+            let fel_pop_started = std::time::Instant::now();
             let event = if let Some(event) = continuation.take() {
                 event
             } else {
@@ -710,6 +961,21 @@ impl<'image> RoundExecutor<'image> {
             };
             let removed = self.pending_keys.remove(&event.key);
             debug_assert!(removed, "executing event must own a pending key");
+            #[cfg(feature = "p11-profile")]
+            {
+                p11_profile.profiled_events = p11_profile.profiled_events.saturating_add(1);
+                if previous_time_ns == Some(event.key.time_ns) {
+                    p11_profile.consecutive_same_time_events =
+                        p11_profile.consecutive_same_time_events.saturating_add(1);
+                }
+                previous_time_ns = Some(event.key.time_ns);
+                if !direct_continuation {
+                    p11_profile.fel_pop_count = p11_profile.fel_pop_count.saturating_add(1);
+                    p11_profile.fel_pop_ns = p11_profile
+                        .fel_pop_ns
+                        .saturating_add(duration_ns(fel_pop_started.elapsed()));
+                }
+            }
 
             #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
             let queue_occupancy = if capture_replay && event.kind == crate::EventKind::TxReady {
@@ -720,7 +986,15 @@ impl<'image> RoundExecutor<'image> {
             } else {
                 None
             };
+            #[cfg(feature = "p11-profile")]
+            let transition_started = std::time::Instant::now();
             self.transitions.dispatch(event, children)?;
+            #[cfg(feature = "p11-profile")]
+            {
+                p11_profile.transition_body_ns = p11_profile
+                    .transition_body_ns
+                    .saturating_add(duration_ns(transition_started.elapsed()));
+            }
             let direct_child = match children.as_slice() {
                 [child]
                     if is_same_time_tx_ready_continuation(
@@ -739,6 +1013,8 @@ impl<'image> RoundExecutor<'image> {
             #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
             let mut remote_outbox_writes = 0_u8;
             for child in children.drain(..) {
+                #[cfg(feature = "p11-profile")]
+                let child_started = std::time::Instant::now();
                 if !self.pending_keys.insert(child.key) {
                     return Err(ExecutionError::DuplicateEventKey(child.key));
                 }
@@ -761,6 +1037,14 @@ impl<'image> RoundExecutor<'image> {
                                 .ok_or(ExecutionError::CounterOverflow(node))?;
                         }
                     }
+                    #[cfg(feature = "p11-profile")]
+                    if direct_child != Some(child) {
+                        p11_profile.fel_insert_count =
+                            p11_profile.fel_insert_count.saturating_add(1);
+                        p11_profile.fel_insert_ns = p11_profile
+                            .fel_insert_ns
+                            .saturating_add(duration_ns(child_started.elapsed()));
+                    }
                 } else {
                     #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
                     if capture_replay {
@@ -769,6 +1053,13 @@ impl<'image> RoundExecutor<'image> {
                             .ok_or(ExecutionError::CounterOverflow(node))?;
                     }
                     outbox.push(child);
+                    #[cfg(feature = "p11-profile")]
+                    {
+                        p11_profile.outbox_events = p11_profile.outbox_events.saturating_add(1);
+                        p11_profile.outbox_staging_ns = p11_profile
+                            .outbox_staging_ns
+                            .saturating_add(duration_ns(child_started.elapsed()));
+                    }
                 }
             }
             #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
@@ -787,12 +1078,42 @@ impl<'image> RoundExecutor<'image> {
             events_processed = events_processed.saturating_add(1);
         }
 
+        #[cfg(feature = "p11-profile")]
+        {
+            let packet_store = self
+                .transitions
+                .p11_packet_store_profile()
+                .saturating_sub(packet_store_before);
+            p11_profile.resident_packet_ns = packet_store.ns;
+            p11_profile.resident_packet_lookups = packet_store.lookups;
+            p11_profile.resident_packet_inserts = packet_store.inserts;
+            p11_profile.resident_packet_generator_inserts = packet_store.generator_inserts;
+            p11_profile.resident_packet_removes = packet_store.removes;
+            p11_profile.outbox_key_inversions = outbox
+                .windows(2)
+                .filter(|pair| pair[0].key > pair[1].key)
+                .count() as u64;
+            let mut targets = BTreeMap::<NodeId, EventKey>::new();
+            for event in &outbox {
+                if targets
+                    .insert(event.target, event.key)
+                    .is_some_and(|previous| previous > event.key)
+                {
+                    p11_profile.outbox_target_inversions =
+                        p11_profile.outbox_target_inversions.saturating_add(1);
+                }
+            }
+            p11_profile.outbox_distinct_targets = targets.len() as u64;
+        }
+
         Ok(DrainedLp {
             work: LpRoundWork {
                 node,
                 events_processed,
                 same_time_continuations,
                 fallback_classified_pushes,
+                #[cfg(feature = "p11-profile")]
+                p11_profile,
             },
             outbox,
             #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
@@ -821,6 +1142,52 @@ impl<'image> RoundExecutor<'image> {
             physical_lp_probes,
         )
     }
+}
+
+#[cfg(feature = "p11-profile")]
+fn p11_shortest_nonempty_path_bounds(
+    frontiers: &[Option<u128>],
+    outgoing: &[Vec<(usize, u64)>],
+    run_end: u128,
+) -> Vec<u128> {
+    debug_assert_eq!(frontiers.len(), outgoing.len());
+    let mut bounds = vec![run_end; outgoing.len()];
+    let mut work = BinaryHeap::<Reverse<(u128, usize)>>::new();
+
+    // Starting with each root's first edge excludes zero-length self paths while retaining every
+    // real cycle back to the root.
+    for (source, edges) in outgoing.iter().enumerate() {
+        let Some(frontier) = frontiers[source] else {
+            continue;
+        };
+        for &(target, delay_ns) in edges {
+            let candidate = frontier
+                .saturating_add(u128::from(delay_ns))
+                .min(TIME_AFTER_U64_MAX)
+                .min(run_end);
+            if candidate < bounds[target] {
+                bounds[target] = candidate;
+                work.push(Reverse((candidate, target)));
+            }
+        }
+    }
+
+    while let Some(Reverse((distance, source))) = work.pop() {
+        if bounds[source] != distance {
+            continue;
+        }
+        for &(target, delay_ns) in &outgoing[source] {
+            let candidate = distance
+                .saturating_add(u128::from(delay_ns))
+                .min(TIME_AFTER_U64_MAX)
+                .min(run_end);
+            if candidate < bounds[target] {
+                bounds[target] = candidate;
+                work.push(Reverse((candidate, target)));
+            }
+        }
+    }
+    bounds
 }
 
 fn node_slot(image: &SimulationImage, node: NodeId) -> Option<usize> {
@@ -931,6 +1298,35 @@ mod tests {
             kind: EventKind::RemoteArrival,
             payload: PayloadId(origin_seq),
         }
+    }
+
+    #[cfg(feature = "p11-profile")]
+    #[test]
+    fn p11_per_lp_bounds_follow_transitive_relays() {
+        let frontiers = [Some(5), None, Some(100)];
+        let outgoing = [vec![(1, 1)], vec![(2, 1)], vec![]];
+
+        assert_eq!(
+            p11_shortest_nonempty_path_bounds(&frontiers, &outgoing, 200),
+            vec![200, 6, 7]
+        );
+    }
+
+    #[cfg(feature = "p11-profile")]
+    #[test]
+    fn p11_per_lp_self_bound_uses_a_positive_cycle_not_zero() {
+        let frontiers = [Some(5), None];
+        let acyclic = [vec![(1, 2)], vec![]];
+        let cyclic = [vec![(1, 2)], vec![(0, 3)]];
+
+        assert_eq!(
+            p11_shortest_nonempty_path_bounds(&frontiers, &acyclic, 100),
+            vec![100, 7]
+        );
+        assert_eq!(
+            p11_shortest_nonempty_path_bounds(&frontiers, &cyclic, 100),
+            vec![10, 7]
+        );
     }
 
     #[test]

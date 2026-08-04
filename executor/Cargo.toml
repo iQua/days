@@ -21,6 +21,7 @@ metal-spike = [
     "dep:objc2-metal",
 ]
 metal-test-hooks = ["metal-spike"]
+p11-profile = []
 
 [dependencies]
 crossbeam = "0.8.4"

@@ -1,0 +1,36 @@
+# P11 T20a RQ9 rung 2: fully closed-loop TCP Reno. Scenario lowering certifies the reachable
+# one-byte forward tail (1 ns) and exact 40-byte ACK reverse channel (4 ns).
+seed = 2416
+duration = 0.001152
+threading = "single"
+log_path = "logs/p11/rq9_closed_k16"
+
+[topology]
+category = "FatTree"
+
+[topology.fat_tree]
+k = 16
+hosts_per_edge = 8
+
+[switch]
+port_rate = 100_000_000_000
+capacity = 64
+weights = [1]
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link]
+propagation_ns = 0
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 1024
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 500_000
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1460, high = 1460 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"

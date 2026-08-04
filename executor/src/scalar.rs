@@ -7,6 +7,9 @@ use std::fmt;
 use num_bigint::BigUint;
 use num_rational::Ratio;
 
+#[cfg(feature = "p11-profile")]
+use crate::p11_profile::{P11PacketStoreOperation, P11PacketStoreProfile, P11PacketStoreProfiler};
+
 use crate::{
     Event, EventKey, EventKind, FlowGeneratorKind, FlowId, GeneratorFeedbackAction,
     GeneratorStatus, GeneratorTermination, HostState, LinkId, NodeDescriptor, NodeId, NodeKind,
@@ -548,6 +551,8 @@ pub(crate) struct TransitionState<'image> {
     switch_states: Vec<SwitchState>,
     local_node: Option<NodeDescriptor>,
     packets: BTreeMap<PayloadId, ResidentPacket>,
+    #[cfg(feature = "p11-profile")]
+    p11_packet_store: P11PacketStoreProfiler,
     observation_mode: ObservationMode,
     summary: RunSummary,
     observed_packets: BTreeMap<PayloadId, PacketDescriptor>,
@@ -663,6 +668,8 @@ impl<'image> TransitionState<'image> {
             switch_states: image.switch_states.clone(),
             local_node: None,
             packets,
+            #[cfg(feature = "p11-profile")]
+            p11_packet_store: P11PacketStoreProfiler::default(),
             observation_mode,
             summary: RunSummary::default(),
             observed_packets: BTreeMap::new(),
@@ -752,6 +759,8 @@ impl<'image> TransitionState<'image> {
             switch_states,
             local_node: Some(node),
             packets: resident,
+            #[cfg(feature = "p11-profile")]
+            p11_packet_store: P11PacketStoreProfiler::default(),
             observation_mode,
             summary: RunSummary::default(),
             observed_packets: BTreeMap::new(),
@@ -768,13 +777,24 @@ impl<'image> TransitionState<'image> {
         &mut self,
         descriptor: PacketDescriptor,
     ) -> Result<(), ExecutionError> {
-        if let Some(existing) = self.packets.get(&descriptor.id) {
+        #[cfg(feature = "p11-profile")]
+        let lookup_guard = self
+            .p11_packet_store
+            .measure(P11PacketStoreOperation::Lookup);
+        let existing = self.packets.get(&descriptor.id);
+        #[cfg(feature = "p11-profile")]
+        drop(lookup_guard);
+        if let Some(existing) = existing {
             return if existing.descriptor == descriptor {
                 Ok(())
             } else {
                 Err(ExecutionError::DuplicatePayload(descriptor.id))
             };
         }
+        #[cfg(feature = "p11-profile")]
+        let insert_guard = self
+            .p11_packet_store
+            .measure(P11PacketStoreOperation::Insert { generator: false });
         self.packets.insert(
             descriptor.id,
             ResidentPacket {
@@ -784,7 +804,14 @@ impl<'image> TransitionState<'image> {
                 terminal: false,
             },
         );
+        #[cfg(feature = "p11-profile")]
+        drop(insert_guard);
         Ok(())
+    }
+
+    #[cfg(feature = "p11-profile")]
+    pub(crate) fn p11_packet_store_profile(&self) -> P11PacketStoreProfile {
+        self.p11_packet_store.snapshot()
     }
 
     pub(crate) fn packet_descriptor(
@@ -1065,7 +1092,10 @@ impl<'image> TransitionState<'image> {
 
         self.record_sourced(node.id, packet)?;
         if let Some(next_packet) = next_packet {
-            self.insert_packet(next_packet, Some(next_departure_ns.expect("produced time")))?;
+            self.insert_generated_packet(
+                next_packet,
+                Some(next_departure_ns.expect("produced time")),
+            )?;
             self.emit_from_host(
                 node,
                 event,
@@ -1225,7 +1255,7 @@ impl<'image> TransitionState<'image> {
         self.enqueue_source_packet(node, packet.id)?;
         self.record_sourced(node.id, packet)?;
         if let Some(next_packet) = next_packet {
-            self.insert_packet(
+            self.insert_generated_packet(
                 next_packet,
                 Some(next_time.expect("next packet has a time")),
             )?;
@@ -1422,11 +1452,11 @@ impl<'image> TransitionState<'image> {
                 self.mechanism_transitions
                     .push(crate::MechanismTransitionRecord::Collective(transition));
             }
-            self.insert_packet(first_packet, Some(parent.key.time_ns))?;
+            self.insert_generated_packet(first_packet, Some(parent.key.time_ns))?;
             self.enqueue_source_packet(node, first_packet.id)?;
             self.record_sourced(node.id, first_packet)?;
             if let Some(next_packet) = next_packet {
-                self.insert_packet(
+                self.insert_generated_packet(
                     next_packet,
                     Some(next_time.expect("next packet has a time")),
                 )?;
@@ -2836,7 +2866,7 @@ impl<'image> TransitionState<'image> {
             self.mark_terminal(packet.id)?;
         }
         if let Some(next_packet) = next_packet {
-            self.insert_packet(next_packet, None)?;
+            self.insert_generated_packet(next_packet, None)?;
         }
         if let Some((payload, time_ns)) = next_timer {
             self.emit_from_host(
@@ -3043,7 +3073,7 @@ impl<'image> TransitionState<'image> {
             self.mark_terminal(packet.id)?;
         }
         if let Some(packet) = next_packet {
-            self.insert_packet(packet, None)?;
+            self.insert_generated_packet(packet, None)?;
         }
         if let Some((payload, time_ns)) = next_timer {
             self.emit_from_host(
@@ -3668,10 +3698,18 @@ impl<'image> TransitionState<'image> {
     }
 
     fn packet(&self, id: PayloadId) -> Result<PacketDescriptor, ExecutionError> {
-        self.packets
+        #[cfg(feature = "p11-profile")]
+        let lookup_guard = self
+            .p11_packet_store
+            .measure(P11PacketStoreOperation::Lookup);
+        let packet = self
+            .packets
             .get(&id)
             .map(|packet| packet.descriptor)
-            .ok_or(ExecutionError::UnknownPacket(id))
+            .ok_or(ExecutionError::UnknownPacket(id));
+        #[cfg(feature = "p11-profile")]
+        drop(lookup_guard);
+        packet
     }
 
     fn flow(&self, id: FlowId) -> Result<&crate::FlowDescriptor, ExecutionError> {
@@ -3810,9 +3848,39 @@ impl<'image> TransitionState<'image> {
         packet: PacketDescriptor,
         source_time_ns: Option<u64>,
     ) -> Result<(), ExecutionError> {
-        if self.packets.contains_key(&packet.id) {
+        self.insert_packet_profiled(packet, source_time_ns, false)
+    }
+
+    fn insert_generated_packet(
+        &mut self,
+        packet: PacketDescriptor,
+        source_time_ns: Option<u64>,
+    ) -> Result<(), ExecutionError> {
+        self.insert_packet_profiled(packet, source_time_ns, true)
+    }
+
+    fn insert_packet_profiled(
+        &mut self,
+        packet: PacketDescriptor,
+        source_time_ns: Option<u64>,
+        generator: bool,
+    ) -> Result<(), ExecutionError> {
+        #[cfg(not(feature = "p11-profile"))]
+        let _ = generator;
+        #[cfg(feature = "p11-profile")]
+        let lookup_guard = self
+            .p11_packet_store
+            .measure(P11PacketStoreOperation::Lookup);
+        let duplicate = self.packets.contains_key(&packet.id);
+        #[cfg(feature = "p11-profile")]
+        drop(lookup_guard);
+        if duplicate {
             return Err(ExecutionError::DuplicatePayload(packet.id));
         }
+        #[cfg(feature = "p11-profile")]
+        let insert_guard = self
+            .p11_packet_store
+            .measure(P11PacketStoreOperation::Insert { generator });
         self.packets.insert(
             packet.id,
             ResidentPacket {
@@ -3822,23 +3890,57 @@ impl<'image> TransitionState<'image> {
                 terminal: false,
             },
         );
+        #[cfg(feature = "p11-profile")]
+        drop(insert_guard);
         Ok(())
     }
 
-    fn set_source_time(&mut self, payload: PayloadId, time_ns: u64) -> Result<(), ExecutionError> {
+    fn resident_packet(&self, payload: PayloadId) -> Option<ResidentPacket> {
+        #[cfg(feature = "p11-profile")]
+        let lookup_guard = self
+            .p11_packet_store
+            .measure(P11PacketStoreOperation::Lookup);
+        let packet = self.packets.get(&payload).copied();
+        #[cfg(feature = "p11-profile")]
+        drop(lookup_guard);
+        packet
+    }
+
+    fn resident_packet_mut(
+        &mut self,
+        payload: PayloadId,
+    ) -> Result<&mut ResidentPacket, ExecutionError> {
+        #[cfg(feature = "p11-profile")]
+        let lookup_guard = self
+            .p11_packet_store
+            .measure(P11PacketStoreOperation::Lookup);
         let packet = self
             .packets
             .get_mut(&payload)
-            .ok_or(ExecutionError::UnknownPacket(payload))?;
+            .ok_or(ExecutionError::UnknownPacket(payload));
+        #[cfg(feature = "p11-profile")]
+        drop(lookup_guard);
+        packet
+    }
+
+    fn remove_resident_packet(&mut self, payload: PayloadId) {
+        #[cfg(feature = "p11-profile")]
+        let remove_guard = self
+            .p11_packet_store
+            .measure(P11PacketStoreOperation::Remove);
+        self.packets.remove(&payload);
+        #[cfg(feature = "p11-profile")]
+        drop(remove_guard);
+    }
+
+    fn set_source_time(&mut self, payload: PayloadId, time_ns: u64) -> Result<(), ExecutionError> {
+        let packet = self.resident_packet_mut(payload)?;
         packet.source_time_ns = Some(time_ns);
         Ok(())
     }
 
     fn set_packet_marked(&mut self, payload: PayloadId) -> Result<(), ExecutionError> {
-        let packet = self
-            .packets
-            .get_mut(&payload)
-            .ok_or(ExecutionError::UnknownPacket(payload))?;
+        let packet = self.resident_packet_mut(payload)?;
         packet.descriptor.ecn_marked = true;
         Ok(())
     }
@@ -3850,8 +3952,7 @@ impl<'image> TransitionState<'image> {
     ) -> Result<(), ExecutionError> {
         let packet = self.packet(payload)?;
         let source_time_ns = self
-            .packets
-            .get(&payload)
+            .resident_packet(payload)
             .and_then(|resident| resident.source_time_ns)
             .ok_or(ExecutionError::UnknownPacket(payload))?;
         let slot = self.local_state_slot(node)?;
@@ -3866,7 +3967,7 @@ impl<'image> TransitionState<'image> {
             .queue
             .iter()
             .rposition(|queued| {
-                self.packets.get(queued).is_some_and(|resident| {
+                self.resident_packet(*queued).is_some_and(|resident| {
                     (
                         u8::from(resident.source_time_ns.is_some()),
                         resident.source_time_ns.unwrap_or(0),
@@ -3919,7 +4020,7 @@ impl<'image> TransitionState<'image> {
             ecn_marked: false,
             kind: PacketKind::Data,
         };
-        self.insert_packet(packet, Some(parent.key.time_ns))?;
+        self.insert_generated_packet(packet, Some(parent.key.time_ns))?;
         self.enqueue_source_packet(node, payload)?;
         self.record_sourced(node.id, packet)?;
         if schedule_ready {
@@ -4101,7 +4202,7 @@ impl<'image> TransitionState<'image> {
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
         for packet in plan.packets {
-            self.insert_packet(packet, Some(parent.key.time_ns))?;
+            self.insert_generated_packet(packet, Some(parent.key.time_ns))?;
             self.enqueue_source_packet(node, packet.id)?;
             self.record_sourced(node.id, packet)?;
         }
@@ -4232,10 +4333,7 @@ impl<'image> TransitionState<'image> {
         node: NodeId,
         payload: PayloadId,
     ) -> Result<(), ExecutionError> {
-        let packet = self
-            .packets
-            .get_mut(&payload)
-            .ok_or(ExecutionError::UnknownPacket(payload))?;
+        let packet = self.resident_packet_mut(payload)?;
         packet.transmitters = packet
             .transmitters
             .checked_add(1)
@@ -4250,10 +4348,8 @@ impl<'image> TransitionState<'image> {
     ) -> Result<(), ExecutionError> {
         let remove =
             {
-                let packet = self
-                    .packets
-                    .get_mut(&payload)
-                    .ok_or(ExecutionError::UnknownPacket(payload))?;
+                let local_node = self.local_node;
+                let packet = self.resident_packet_mut(payload)?;
                 packet.transmitters = packet.transmitters.checked_sub(1).ok_or(
                     ExecutionError::UnexpectedTxComplete {
                         node,
@@ -4261,25 +4357,22 @@ impl<'image> TransitionState<'image> {
                         actual: payload,
                     },
                 )?;
-                packet.transmitters == 0 && (packet.terminal || self.local_node.is_some())
+                packet.transmitters == 0 && (packet.terminal || local_node.is_some())
             };
         if remove {
-            self.packets.remove(&payload);
+            self.remove_resident_packet(payload);
         }
         Ok(())
     }
 
     fn mark_terminal(&mut self, payload: PayloadId) -> Result<(), ExecutionError> {
         let remove = {
-            let packet = self
-                .packets
-                .get_mut(&payload)
-                .ok_or(ExecutionError::UnknownPacket(payload))?;
+            let packet = self.resident_packet_mut(payload)?;
             packet.terminal = true;
             packet.transmitters == 0
         };
         if remove {
-            self.packets.remove(&payload);
+            self.remove_resident_packet(payload);
         }
         Ok(())
     }
