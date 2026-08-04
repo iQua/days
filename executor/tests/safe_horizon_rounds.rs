@@ -5,10 +5,10 @@ use days_executor::{
     Event, EventKey, EventKind, ExecutionError, FlowDescriptor, FlowGeneratorKind,
     FlowGeneratorState, FlowId, GeneratorFeedbackState, GeneratorStatus, GeneratorTermination,
     HostState, LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, ObservationMode,
-    PacketDescriptor, PacketKind, PayloadId, RemoteChannel, ScheduledEmission, SchedulerKind,
-    SimulationImage, StaticPartitionPolicy, SwitchQueueState, SwitchState, WorkClass, event_phase,
-    run_cpu_with_observations, run_scalar_rounds_with_observations, run_scalar_with_observations,
-    validate,
+    PacketDescriptor, PacketKind, PayloadId, RemoteChannel, RunResult, ScheduledEmission,
+    SchedulerKind, SimulationImage, StaticPartitionPolicy, SwitchQueueState, SwitchState,
+    WorkClass, event_phase, run_cpu_with_observations, run_scalar_rounds_with_observations,
+    run_scalar_with_observations, validate,
 };
 #[cfg(feature = "cuda")]
 use days_executor::{CudaConfig, run_cuda_with_observations};
@@ -23,6 +23,24 @@ const SINK: NodeId = NodeId(1);
 const LINK: LinkId = LinkId(0);
 const FLOW: FlowId = FlowId(0);
 const PACKET: PayloadId = PayloadId(0);
+
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn assert_device_full_result_eq(actual: &RunResult, scalar: &RunResult, context: &str) {
+    assert!(
+        scalar.diagnostics.is_some(),
+        "{context}: scalar Full diagnostics must be present"
+    );
+    assert!(
+        actual.diagnostics.is_none(),
+        "{context}: device Full diagnostics must be absent"
+    );
+    let mut expected = scalar.clone();
+    expected.diagnostics = None;
+    assert_eq!(actual, &expected, "{context}");
+}
 
 fn image(stop_time_ns: u64, event_time_ns: u64, channel_delay_ns: u64) -> SimulationImage {
     SimulationImage {
@@ -2639,9 +2657,12 @@ fn production_metal_matches_representative_cartesian_images() {
                             "seed {seed}, scheduler {label}, horizon {horizon:?}, streams={streams_enabled} Metal execution failed: {error}"
                         )
                     });
-                    assert_eq!(
-                        actual.result, expected,
-                        "seed {seed}, scheduler {label}, horizon {horizon:?}, streams={streams_enabled}"
+                    assert_device_full_result_eq(
+                        &actual.result,
+                        &expected,
+                        &format!(
+                            "seed {seed}, scheduler {label}, horizon {horizon:?}, streams={streams_enabled}"
+                        ),
                     );
                 }
             }
@@ -2678,7 +2699,13 @@ fn production_cuda_matches_representative_scheduler_cartesian_images() {
                             "seed {seed}, scheduler {label}, horizon {horizon:?}, streams={streams_enabled} CUDA execution failed: {error}"
                         )
                     });
-                    assert_eq!(actual.result, expected);
+                    assert_device_full_result_eq(
+                        &actual.result,
+                        &expected,
+                        &format!(
+                            "seed {seed}, scheduler {label}, horizon {horizon:?}, streams={streams_enabled}"
+                        ),
+                    );
                 }
             }
         }
@@ -3137,7 +3164,7 @@ fn production_metal_horizon_scans_active_lps_beyond_1024_lanes() {
             ObservationMode::Full,
         )
         .expect("wide Metal image must run");
-        assert_eq!(actual.result, expected);
+        assert_device_full_result_eq(&actual.result, &expected, "wide Metal image");
     }
 }
 
@@ -3170,7 +3197,7 @@ fn production_metal_horizon_scans_multiple_active_lps_beyond_1024_lanes() {
             ObservationMode::Full,
         )
         .expect("wide Metal image must run");
-        assert_eq!(actual.result, expected);
+        assert_device_full_result_eq(&actual.result, &expected, "multiple-wide Metal image");
     }
 }
 

@@ -5,8 +5,8 @@ use days_executor::{
     EventKind, FlowDescriptor, FlowGeneratorKind, FlowGeneratorState, FlowId,
     GeneratorFeedbackState, GeneratorStatus, HostState, LinkDescriptor, LinkId,
     MechanismTransitionRecord, NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketDescriptor,
-    PacketKind, PayloadId, QueueDepthUnit, RemoteChannel, ScheduledEmission, SchedulerKind,
-    SchedulerPacket, SimulationImage, SwitchQueueState, SwitchState, TcpAckHeader,
+    PacketKind, PayloadId, QueueDepthUnit, RemoteChannel, RunResult, ScheduledEmission,
+    SchedulerKind, SchedulerPacket, SimulationImage, SwitchQueueState, SwitchState, TcpAckHeader,
     TcpCongestionControl, TcpDataHeader, TcpGenerator, TcpReceiverState, TcpTimerState,
     drr_transitions_csv, event_phase, run_cpu_with_observations, run_scalar_with_observations,
     validate, wrr_transitions_csv,
@@ -32,6 +32,18 @@ const SINK: NodeId = NodeId(2);
 const SOURCE_LINK: LinkId = LinkId(0);
 const SWITCH_LINK: LinkId = LinkId(1);
 const SINK_EGRESS: LinkId = LinkId(2);
+
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn assert_device_full_result_eq(actual: &RunResult, scalar: &RunResult) {
+    assert!(scalar.diagnostics.is_some());
+    assert!(actual.diagnostics.is_none());
+    let mut expected = scalar.clone();
+    expected.diagnostics = None;
+    assert_eq!(actual, &expected);
+}
 
 fn image(
     scheduler: SchedulerKind,
@@ -974,7 +986,7 @@ fn metal_is_byte_identical_for_adversarial_sp_wfq_and_in_service_checkpoints() {
                             image.switch_states[0].queues[0].scheduler.label()
                         )
                     });
-                    assert_eq!(actual.result, expected);
+                    assert_device_full_result_eq(&actual.result, &expected);
                 }
             }
         }
@@ -1115,7 +1127,7 @@ fn metal_wfq_multilimb_cross_cancel_and_comparison_match_scalar() {
                     ObservationMode::Full,
                 )
                 .unwrap();
-                assert_eq!(actual.result, expected);
+                assert_device_full_result_eq(&actual.result, &expected);
             }
         }
     }
@@ -1146,7 +1158,7 @@ fn cuda_is_byte_identical_for_adversarial_sp_wfq_and_in_service_checkpoints() {
                             image.switch_states[0].queues[0].scheduler.label()
                         )
                     });
-                    assert_eq!(actual.result, expected);
+                    assert_device_full_result_eq(&actual.result, &expected);
                 }
             }
         }
@@ -1287,7 +1299,7 @@ fn cuda_wfq_multilimb_cross_cancel_and_comparison_match_scalar() {
                     ObservationMode::Full,
                 )
                 .unwrap();
-                assert_eq!(actual.result, expected);
+                assert_device_full_result_eq(&actual.result, &expected);
             }
         }
     }

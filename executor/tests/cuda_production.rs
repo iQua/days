@@ -429,6 +429,7 @@ fn assert_full_parity(image: &SimulationImage, exclusive_horizon_ns: Option<u64>
     validate(image, Backend::Cuda).expect("CUDA fixture must validate");
     let scalar = run_scalar_with_observations(image, exclusive_horizon_ns, ObservationMode::Full)
         .expect("scalar oracle must run");
+    assert!(scalar.diagnostics.is_some());
     for streams_enabled in [true, false] {
         let cuda = run_cuda_with_observations(
             image,
@@ -441,7 +442,10 @@ fn assert_full_parity(image: &SimulationImage, exclusive_horizon_ns: Option<u64>
         )
         .expect("CUDA backend must run");
 
-        assert_eq!(cuda.result, scalar);
+        assert!(cuda.result.diagnostics.is_none());
+        let mut expected = scalar.clone();
+        expected.diagnostics = None;
+        assert_eq!(cuda.result, expected);
         assert!(cuda.graph_replays > 0);
         assert_eq!(cuda.graph_replays, cuda.wave_boundary_syncs);
     }
@@ -546,8 +550,13 @@ fn cuda_continuation_state_crosses_graph_waves_exactly() {
     )
     .expect("continuation state must survive graph-wave boundaries");
 
-    assert_eq!(uncapped.result, scalar);
-    assert_eq!(crossed.result, scalar);
+    assert!(scalar.diagnostics.is_some());
+    assert!(uncapped.result.diagnostics.is_none());
+    assert!(crossed.result.diagnostics.is_none());
+    let mut expected = scalar.clone();
+    expected.diagnostics = None;
+    assert_eq!(uncapped.result, expected);
+    assert_eq!(crossed.result, expected);
     assert_eq!(crossed.rounds, uncapped.rounds);
     assert_eq!(crossed.transitions, uncapped.transitions);
     assert!(crossed.continuation_relaunches > 64);
@@ -585,5 +594,9 @@ fn cuda_device_capacity_fault_is_explicit_and_executor_recovers() {
     let recovered = executor
         .run_with_observations(&image, None, CudaConfig::default(), ObservationMode::Full)
         .expect("the executor must recover after a device capacity fault");
-    assert_eq!(recovered.result, expected);
+    assert!(expected.diagnostics.is_some());
+    assert!(recovered.result.diagnostics.is_none());
+    let mut expected_without_diagnostics = expected.clone();
+    expected_without_diagnostics.diagnostics = None;
+    assert_eq!(recovered.result, expected_without_diagnostics);
 }

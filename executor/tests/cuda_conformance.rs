@@ -606,6 +606,9 @@ fn cuda_block_boundaries_and_geometry_match_full_scalar_result() {
         let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
             .expect("wide scalar oracle must run");
         assert_eq!(scalar.summary.received_packets, producers as u128);
+        assert!(scalar.diagnostics.is_some());
+        let mut expected = scalar.clone();
+        expected.diagnostics = None;
 
         for streams_enabled in [true, false] {
             let mut reference = None;
@@ -623,10 +626,11 @@ fn cuda_block_boundaries_and_geometry_match_full_scalar_result() {
                 .unwrap_or_else(|error| {
                     panic!(
                         "CUDA producers={producers} streams={streams_enabled} \
-                         geometry={round_threads_per_block} failed: {error}"
+                        geometry={round_threads_per_block} failed: {error}"
                     )
                 });
-                assert_eq!(cuda.result, scalar);
+                assert!(cuda.result.diagnostics.is_none());
+                assert_eq!(cuda.result, expected);
                 if let Some(reference) = &reference {
                     assert_eq!(&cuda.result, reference);
                 } else {
@@ -657,6 +661,9 @@ fn cuda_fallback_heap_fan_in_tie_order_decides_tail_drop_winner() {
     assert_eq!(scalar.summary.admitted_packets, 1);
     assert_eq!(scalar.summary.dropped_packets, 1);
     assert_eq!(scalar.summary.received_packets, 1);
+    assert!(scalar.diagnostics.is_some());
+    let mut expected = scalar.clone();
+    expected.diagnostics = None;
 
     for streams_enabled in [false, true] {
         let cuda = run_cuda_with_observations(
@@ -682,7 +689,8 @@ fn cuda_fallback_heap_fan_in_tie_order_decides_tail_drop_winner() {
             assert_eq!(cuda.memory_layout.channel_stream_event_slots, 0);
             assert!(cuda.memory_layout.fallback_heap_event_slots >= 2);
         }
-        assert_eq!(cuda.result, scalar);
+        assert!(cuda.result.diagnostics.is_none());
+        assert_eq!(cuda.result, expected);
     }
 }
 
@@ -945,7 +953,11 @@ fn cuda_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
         let recovered = executor
             .run_with_observations(&image, None, CudaConfig::default(), ObservationMode::Full)
             .expect("the same executor must recover after each device capacity fault");
-        assert_eq!(recovered.result, expected);
+        assert!(expected.diagnostics.is_some());
+        assert!(recovered.result.diagnostics.is_none());
+        let mut expected_without_diagnostics = expected.clone();
+        expected_without_diagnostics.diagnostics = None;
+        assert_eq!(recovered.result, expected_without_diagnostics);
     }
 }
 
@@ -977,7 +989,11 @@ fn process_wide_cuda_guard_recovers_after_a_mid_execution_panic() {
     let recovered =
         run_cuda_with_observations(&image, None, CudaConfig::default(), ObservationMode::Full)
             .expect("CUDA execution must recover after the guarded panic");
-    assert_eq!(recovered.result, expected);
+    assert!(expected.diagnostics.is_some());
+    assert!(recovered.result.diagnostics.is_none());
+    let mut expected_without_diagnostics = expected.clone();
+    expected_without_diagnostics.diagnostics = None;
+    assert_eq!(recovered.result, expected_without_diagnostics);
 }
 
 #[test]

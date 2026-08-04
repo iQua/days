@@ -9,9 +9,9 @@ use days_executor::{
     FlowGeneratorKind, FlowGeneratorState, FlowId, GeneratorFeedbackState, GeneratorStatus,
     GeneratorTermination, HostState, LinkDescriptor, LinkId, MetalArena, MetalConfig, MetalError,
     MetalExecutor, NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketDescriptor, PacketKind,
-    PayloadId, RemoteChannel, ScheduledEmission, SchedulerKind, SimulationImage, SwitchQueueState,
-    SwitchState, event_phase, run_metal, run_metal_with_observations, run_scalar_with_observations,
-    validate,
+    PayloadId, RemoteChannel, RunResult, ScheduledEmission, SchedulerKind, SimulationImage,
+    SwitchQueueState, SwitchState, event_phase, run_metal, run_metal_with_observations,
+    run_scalar_with_observations, validate,
 };
 
 const GENERATOR_SOURCE: NodeId = NodeId(0);
@@ -1061,7 +1061,6 @@ fn assert_full_parity(image: &SimulationImage, exclusive_horizon_ns: Option<u64>
     validate(image, Backend::Metal).expect("production Metal fixture must validate");
     let scalar = run_scalar_with_observations(image, exclusive_horizon_ns, ObservationMode::Full)
         .expect("scalar oracle must run");
-    assert!(scalar.diagnostics.is_some());
     for streams_enabled in [true, false] {
         let metal = run_metal_with_observations(
             image,
@@ -1076,14 +1075,26 @@ fn assert_full_parity(image: &SimulationImage, exclusive_horizon_ns: Option<u64>
             panic!("production Metal backend with streams={streams_enabled} failed: {error}")
         });
 
-        assert!(metal.result.diagnostics.is_none());
-        let mut expected = scalar.clone();
-        expected.diagnostics = None;
-        assert_eq!(
-            metal.result, expected,
-            "Metal result with streams={streams_enabled} differs from scalar"
+        assert_metal_full_result_matches_scalar(
+            &metal.result,
+            &scalar,
+            &format!("Metal result with streams={streams_enabled}"),
         );
     }
+}
+
+fn assert_metal_full_result_matches_scalar(metal: &RunResult, scalar: &RunResult, context: &str) {
+    assert!(
+        scalar.diagnostics.is_some(),
+        "{context}: scalar Full result must contain diagnostics"
+    );
+    assert!(
+        metal.diagnostics.is_none(),
+        "{context}: Metal Full result must omit diagnostics"
+    );
+    let mut expected = scalar.clone();
+    expected.diagnostics = None;
+    assert_eq!(metal, &expected, "{context} differs from scalar");
 }
 
 #[test]
@@ -1125,8 +1136,8 @@ fn metal_equal_rate_paced_source_queue_bound_is_tight() {
     assert_eq!(scalar.summary.departed_packets, 63);
     assert!(scalar.host_states[0].queue.is_empty());
     assert!(scalar.host_states[0].in_service.is_some());
-    assert_eq!(derived.result, scalar);
-    assert_eq!(exact.result, scalar);
+    assert_metal_full_result_matches_scalar(&derived.result, &scalar, "derived-capacity Metal run");
+    assert_metal_full_result_matches_scalar(&exact.result, &scalar, "exact-capacity Metal run");
 
     let error = run_metal(
         &image,
@@ -1224,7 +1235,7 @@ fn concurrent_public_api_runs_match_the_scalar_result() {
             .join()
             .expect("concurrent Metal worker must not panic")
             .expect("concurrent Metal run must succeed");
-        assert_eq!(actual.result, expected);
+        assert_metal_full_result_matches_scalar(&actual.result, &expected, "concurrent Metal run");
     }
 }
 
@@ -1257,7 +1268,7 @@ fn process_wide_guard_recovers_after_a_mid_execution_panic() {
     let recovered =
         run_metal_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full)
             .expect("Metal execution must recover after the guarded panic");
-    assert_eq!(recovered.result, expected);
+    assert_metal_full_result_matches_scalar(&recovered.result, &expected, "recovered Metal run");
 }
 
 #[test]
@@ -1431,8 +1442,8 @@ fn metal_global_outbox_capacity_faults_identically_in_both_stream_modes() {
                 capacity: 2,
             }
         );
-        assert_eq!(
-            executor
+        assert_metal_full_result_matches_scalar(
+            &executor
                 .run_with_observations(
                     &image,
                     None,
@@ -1444,7 +1455,8 @@ fn metal_global_outbox_capacity_faults_identically_in_both_stream_modes() {
                 )
                 .expect("the same executor must recover after the global outbox fault")
                 .result,
-            expected
+            &expected,
+            "Metal run recovered after global outbox fault",
         );
     }
 }
@@ -1478,12 +1490,13 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             capacity: 1,
         }
     );
-    assert_eq!(
-        executor
+    assert_metal_full_result_matches_scalar(
+        &executor
             .run_with_observations(&image, None, heap_config, ObservationMode::Full)
             .expect("the same executor must recover after the FEL fault")
             .result,
-        expected
+        &expected,
+        "Metal run recovered after FEL fault",
     );
 
     let channel_stream = executor
@@ -1504,12 +1517,13 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             capacity: 0,
         }
     );
-    assert_eq!(
-        executor
-            .run_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full,)
+    assert_metal_full_result_matches_scalar(
+        &executor
+            .run_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full)
             .expect("the same executor must recover after the channel-stream fault")
             .result,
-        expected
+        &expected,
+        "Metal run recovered after channel-stream fault",
     );
 
     let outbox = executor
@@ -1530,12 +1544,13 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             capacity: 0,
         }
     );
-    assert_eq!(
-        executor
-            .run_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full,)
+    assert_metal_full_result_matches_scalar(
+        &executor
+            .run_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full)
             .expect("the same executor must recover after the outbox fault")
             .result,
-        expected
+        &expected,
+        "Metal run recovered after outbox fault",
     );
 
     let observed = executor
@@ -1557,12 +1572,13 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             capacity: 0,
         }
     );
-    assert_eq!(
-        executor
-            .run_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full,)
+    assert_metal_full_result_matches_scalar(
+        &executor
+            .run_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full)
             .expect("the same executor must recover after the observation fault")
             .result,
-        expected
+        &expected,
+        "Metal run recovered after observation fault",
     );
 }
 
@@ -1637,7 +1653,7 @@ fn metal_default_capacity_handles_a_service_rate_backlog_drain() {
     assert_eq!(scalar.summary.departed_packets, 11);
     assert!(scalar.host_states[0].in_service.is_some());
     assert_eq!(scalar.pending_events.len(), 13);
-    assert_eq!(metal.result, scalar);
+    assert_metal_full_result_matches_scalar(&metal.result, &scalar, "default-capacity Metal run");
 
     let raised = run_metal_with_observations(
         &image,
@@ -1650,7 +1666,7 @@ fn metal_default_capacity_handles_a_service_rate_backlog_drain() {
         ObservationMode::Full,
     )
     .expect("an explicit capacity must be able to raise the old derived FEL/outbox bounds");
-    assert_eq!(raised.result, scalar);
+    assert_metal_full_result_matches_scalar(&raised.result, &scalar, "raised-capacity Metal run");
 }
 
 #[test]
@@ -1665,7 +1681,11 @@ fn metal_default_fel_capacity_covers_packets_resident_on_a_long_link() {
     assert_eq!(scalar.summary.departed_packets, 11);
     assert!(scalar.switch_states[0].queues[0].in_service.is_some());
     assert_eq!(scalar.pending_events.len(), 13);
-    assert_eq!(metal.result, scalar);
+    assert_metal_full_result_matches_scalar(
+        &metal.result,
+        &scalar,
+        "long-flight backlog Metal run",
+    );
 }
 
 #[test]
@@ -1704,12 +1724,16 @@ fn metal_tiny_physical_transition_chunks_relaunch_to_exact_parity() {
 
         assert!(default.transitions > 1);
         assert_eq!(default.continuation_relaunches, 0);
-        assert_eq!(default.result, scalar);
-        assert_eq!(tiny.result, scalar);
+        assert_metal_full_result_matches_scalar(
+            &default.result,
+            &scalar,
+            "default-chunk Metal run",
+        );
+        assert_metal_full_result_matches_scalar(&tiny.result, &scalar, "tiny-chunk Metal run");
         assert!(tiny.continuation_relaunches > 10);
         assert_eq!(tiny.rounds, default.rounds);
         assert_eq!(tiny.transitions, default.transitions);
-        assert_eq!(uncapped.result, scalar);
+        assert_metal_full_result_matches_scalar(&uncapped.result, &scalar, "uncapped Metal run");
         assert_eq!(uncapped.continuation_relaunches, 0);
         assert_eq!(uncapped.rounds, default.rounds);
         assert_eq!(uncapped.transitions, default.transitions);
@@ -1750,8 +1774,8 @@ fn metal_continuations_advance_across_uneven_active_lps() {
         ],
         [3, 7, 39]
     );
-    assert_eq!(uncapped.result, scalar);
-    assert_eq!(capped.result, scalar);
+    assert_metal_full_result_matches_scalar(&uncapped.result, &scalar, "uncapped Metal run");
+    assert_metal_full_result_matches_scalar(&capped.result, &scalar, "capped Metal run");
     assert_eq!(capped.result, uncapped.result);
     assert_eq!(uncapped.continuation_relaunches, 0);
     // The per-LP cap advances all active LPs in the same encoded dispatch, unlike T14's shared
@@ -1796,8 +1820,16 @@ fn metal_continuations_cross_a_bounded_encoding_wave_exactly() {
         )
         .expect("one-pair command buffers must continue across a bounded wave");
 
-        assert_eq!(uncapped.result, scalar);
-        assert_eq!(crossed.result, scalar);
+        assert_metal_full_result_matches_scalar(
+            &uncapped.result,
+            &scalar,
+            "uncapped wave-boundary Metal run",
+        );
+        assert_metal_full_result_matches_scalar(
+            &crossed.result,
+            &scalar,
+            "bounded wave-crossing Metal run",
+        );
         assert_eq!(crossed.result, uncapped.result);
         assert!(crossed.continuation_relaunches > 64);
         assert_eq!(crossed.rounds, uncapped.rounds);
@@ -1912,7 +1944,7 @@ fn metal_executes_a_real_event_at_u64_max_through_the_inclusive_stop() {
             ObservationMode::Full,
         )
         .expect("Metal must execute the endpoint event");
-        assert_eq!(metal.result, scalar);
+        assert_metal_full_result_matches_scalar(&metal.result, &scalar, "endpoint-event Metal run");
     }
 }
 
@@ -1934,7 +1966,11 @@ fn metal_keeps_a_u64_max_event_pending_above_an_earlier_stop() {
             ObservationMode::Full,
         )
         .expect("Metal must stop before the endpoint event");
-        assert_eq!(metal.result, scalar);
+        assert_metal_full_result_matches_scalar(
+            &metal.result,
+            &scalar,
+            "pre-endpoint-stop Metal run",
+        );
     }
 }
 

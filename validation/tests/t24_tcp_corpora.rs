@@ -92,6 +92,28 @@ fn assert_result_eq(
     );
 }
 
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn assert_device_full_result_eq(
+    label: &str,
+    actual: &days_executor::RunResult,
+    scalar: &days_executor::RunResult,
+) {
+    assert!(
+        scalar.diagnostics.is_some(),
+        "{label} scalar Full diagnostics must be present"
+    );
+    assert!(
+        actual.diagnostics.is_none(),
+        "{label} device Full diagnostics must be absent"
+    );
+    let mut expected = scalar.clone();
+    expected.diagnostics = None;
+    assert_eq!(actual, &expected, "{label}");
+}
+
 #[derive(Clone, Copy)]
 struct Corpus {
     file: &'static str,
@@ -343,7 +365,7 @@ fn full_tcp_corpora_are_byte_identical_across_available_backends() {
                 ObservationMode::Full,
             )
             .unwrap_or_else(|error| panic!("{} Metal failed: {error}", corpus.file));
-            assert_result_eq(&format!("{} Metal", corpus.file), &metal.result, &scalar);
+            assert_device_full_result_eq(&format!("{} Metal", corpus.file), &metal.result, &scalar);
         }
 
         #[cfg(feature = "cuda")]
@@ -355,7 +377,7 @@ fn full_tcp_corpora_are_byte_identical_across_available_backends() {
                 ObservationMode::Full,
             )
             .unwrap_or_else(|error| panic!("{} CUDA failed: {error}", corpus.file));
-            assert_result_eq(&format!("{} CUDA", corpus.file), &cuda.result, &scalar);
+            assert_device_full_result_eq(&format!("{} CUDA", corpus.file), &cuda.result, &scalar);
         }
     }
 }

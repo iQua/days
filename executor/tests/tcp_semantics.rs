@@ -33,6 +33,24 @@ const FIRST: PayloadId = PayloadId(0);
 const MSS: u64 = 512;
 const ACK_BYTES: u64 = 40;
 
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn assert_device_full_result_eq(actual: &RunResult, scalar: &RunResult, context: &str) {
+    assert!(
+        scalar.diagnostics.is_some(),
+        "{context}: scalar Full diagnostics must be present"
+    );
+    assert!(
+        actual.diagnostics.is_none(),
+        "{context}: device Full diagnostics must be absent"
+    );
+    let mut expected = scalar.clone();
+    expected.diagnostics = None;
+    assert_eq!(actual, &expected, "{context}");
+}
+
 fn tcp_image(control: TcpCongestionControl, total_bytes: u64) -> SimulationImage {
     let first_size = MSS.min(total_bytes);
     let forward = LinkDescriptor {
@@ -764,7 +782,7 @@ fn cubic_wide_magnitude_transition_is_byte_identical_on_all_available_backends()
             ObservationMode::Full,
         )
         .expect("wide CUBIC Metal checkpoint should run");
-        assert_eq!(metal.result, scalar);
+        assert_device_full_result_eq(&metal.result, &scalar, "wide CUBIC Metal checkpoint");
     }
 
     #[cfg(feature = "cuda")]
@@ -772,7 +790,7 @@ fn cubic_wide_magnitude_transition_is_byte_identical_on_all_available_backends()
         let cuda =
             run_cuda_with_observations(&image, None, CudaConfig::default(), ObservationMode::Full)
                 .expect("wide CUBIC CUDA checkpoint should run");
-        assert_eq!(cuda.result, scalar);
+        assert_device_full_result_eq(&cuda.result, &scalar, "wide CUBIC CUDA checkpoint");
     }
 }
 
@@ -965,11 +983,13 @@ fn tcp_cartesian_matrix_is_byte_identical_across_all_available_backends() {
                                 control.label()
                             )
                         });
-                        assert_eq!(
+                        assert_device_full_result_eq(
                             &actual.result,
                             expected,
-                            "{} {discipline} Metal streams={streams_enabled}/geometry={round_threads_per_threadgroup}/{horizon:?}",
-                            control.label()
+                            &format!(
+                                "{} {discipline} Metal streams={streams_enabled}/geometry={round_threads_per_threadgroup}/{horizon:?}",
+                                control.label()
+                            ),
                         );
                         metal_comparisons += 1;
                     }
@@ -1001,11 +1021,13 @@ fn tcp_cartesian_matrix_is_byte_identical_across_all_available_backends() {
                                 control.label()
                             )
                         });
-                        assert_eq!(
+                        assert_device_full_result_eq(
                             &actual.result,
                             expected,
-                            "{} {discipline} CUDA streams={streams_enabled}/geometry={round_threads_per_block}/{horizon:?}",
-                            control.label()
+                            &format!(
+                                "{} {discipline} CUDA streams={streams_enabled}/geometry={round_threads_per_block}/{horizon:?}",
+                                control.label()
+                            ),
                         );
                         cuda_comparisons += 1;
                     }
@@ -1106,7 +1128,11 @@ fn tcp_device_semantic_gap_probes_are_byte_identical() {
                 ObservationMode::Full,
             )
             .unwrap_or_else(|error| panic!("{name} Metal execution failed: {error}"));
-            assert_eq!(metal.result, scalar, "{name} Scalar/Metal byte identity");
+            assert_device_full_result_eq(
+                &metal.result,
+                &scalar,
+                &format!("{name} Scalar/Metal byte identity"),
+            );
             metal_comparisons += 1;
         }
 
@@ -1121,7 +1147,11 @@ fn tcp_device_semantic_gap_probes_are_byte_identical() {
                 ObservationMode::Full,
             )
             .unwrap_or_else(|error| panic!("{name} CUDA execution failed: {error}"));
-            assert_eq!(cuda.result, scalar, "{name} Scalar/CUDA byte identity");
+            assert_device_full_result_eq(
+                &cuda.result,
+                &scalar,
+                &format!("{name} Scalar/CUDA byte identity"),
+            );
             cuda_comparisons += 1;
         }
     }
@@ -1150,7 +1180,11 @@ fn metal_tcp_reno_and_cubic_literal_smoke_is_byte_identical() {
             ObservationMode::Full,
         )
         .unwrap_or_else(|error| panic!("Metal {} TCP smoke failed: {error}", control.label()));
-        assert_eq!(metal.result, scalar, "Metal {} TCP smoke", control.label());
+        assert_device_full_result_eq(
+            &metal.result,
+            &scalar,
+            &format!("Metal {} TCP smoke", control.label()),
+        );
     }
 }
 
@@ -1170,7 +1204,7 @@ fn metal_tcp_timer_checkpoint_is_byte_identical() {
         ObservationMode::Full,
     )
     .expect("Metal timer checkpoint must resume");
-    assert_eq!(metal.result, scalar);
+    assert_device_full_result_eq(&metal.result, &scalar, "Metal timer checkpoint");
 }
 
 #[cfg(feature = "cuda")]
@@ -1189,7 +1223,7 @@ fn cuda_tcp_timer_checkpoint_is_byte_identical() {
         ObservationMode::Full,
     )
     .expect("CUDA timer checkpoint must resume");
-    assert_eq!(cuda.result, scalar);
+    assert_device_full_result_eq(&cuda.result, &scalar, "CUDA timer checkpoint");
 }
 
 #[test]
@@ -1264,7 +1298,7 @@ fn stale_different_timer_checkpoint_is_byte_identical_on_all_available_backends(
             ObservationMode::Full,
         )
         .expect("Metal stale-timer checkpoint must resume");
-        assert_eq!(metal.result, scalar, "stale-timer Scalar/Metal identity");
+        assert_device_full_result_eq(&metal.result, &scalar, "stale-timer Scalar/Metal identity");
     }
 
     #[cfg(feature = "cuda")]
@@ -1276,7 +1310,7 @@ fn stale_different_timer_checkpoint_is_byte_identical_on_all_available_backends(
             ObservationMode::Full,
         )
         .expect("CUDA stale-timer checkpoint must resume");
-        assert_eq!(cuda.result, scalar, "stale-timer Scalar/CUDA identity");
+        assert_device_full_result_eq(&cuda.result, &scalar, "stale-timer Scalar/CUDA identity");
     }
 }
 

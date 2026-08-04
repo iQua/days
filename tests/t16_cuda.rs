@@ -27,8 +27,13 @@ fn cuda_fattree_k4_is_byte_exact_end_to_end_and_deterministic() {
     let first = run();
     let second = run();
 
-    assert_eq!(first.result, scalar);
-    assert_eq!(second.result, scalar);
+    assert!(scalar.diagnostics.is_some());
+    assert!(first.result.diagnostics.is_none());
+    assert!(second.result.diagnostics.is_none());
+    let mut expected = scalar.clone();
+    expected.diagnostics = None;
+    assert_eq!(first.result, expected);
+    assert_eq!(second.result, expected);
     assert_eq!(first.result, second.result);
     assert_eq!(first.rounds, second.rounds);
     assert_eq!(first.transitions, second.transitions);
