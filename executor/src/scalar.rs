@@ -1840,15 +1840,10 @@ impl<'image> TransitionState<'image> {
         if let PacketKind::Pfc(header) = packet.kind {
             return self.switch_pfc_remote_arrival(node, event, header, children);
         }
-        let egress_link = self.packet_egress_at(
-            event.payload,
-            node.id,
-            P11ProbeSite::SwitchRemoteArrivalEgressAt,
-        )?;
+        let egress_link = self.packet_egress_at(packet, node.id)?;
         let incoming_link = self.packet_incoming_link_at(
-            event.payload,
+            packet,
             node.id,
-            P11ProbeSite::SwitchRemoteArrivalIncomingLinkSelf,
             P11ProbeSite::SwitchRemoteArrivalIncomingLinkRouteScan,
         )?;
         let priority = usize::from(self.flow(packet.flow)?.priority);
@@ -3317,8 +3312,8 @@ impl<'image> TransitionState<'image> {
     ) -> Result<(), ExecutionError> {
         self.p11_probe_sites
             .call(P11ProbeSite::SwitchTxReadyEgressAt);
-        let egress_link =
-            self.packet_egress_at(event.payload, node.id, P11ProbeSite::SwitchTxReadyEgressAt)?;
+        let ready_packet = self.packet(event.payload, P11ProbeSite::SwitchTxReadyEgressAt)?;
+        let egress_link = self.packet_egress_at(ready_packet, node.id)?;
         let Some(egress_link) = egress_link else {
             return Err(ExecutionError::MissingSwitchQueue {
                 node: node.id,
@@ -3356,9 +3351,8 @@ impl<'image> TransitionState<'image> {
                     packets.push(packet);
                     priorities.push(priority);
                     incoming_links.push(self.packet_incoming_link_at(
-                        *payload,
+                        packet,
                         node.id,
-                        P11ProbeSite::SwitchTxReadyEligibleIncomingLinkSelf,
                         P11ProbeSite::SwitchTxReadyEligibleIncomingLinkRouteScan,
                     )?);
                 }
@@ -3366,14 +3360,7 @@ impl<'image> TransitionState<'image> {
             (positions, packets, priorities, incoming_links)
         };
         let state_slot = self.local_state_slot(node)?;
-        let (
-            payload,
-            dequeued_size_bytes,
-            queue_slot,
-            pfc_plan,
-            pfc_transition,
-            scheduler_transition,
-        ) = {
+        let (payload, selected_packet, queue_slot, pfc_plan, pfc_transition, scheduler_transition) = {
             let state = self.switch_state_mut(node)?;
             let (queue_slot, queue) = state
                 .queues
@@ -3521,7 +3508,7 @@ impl<'image> TransitionState<'image> {
             };
             (
                 payload,
-                packet.size_bytes,
+                packet,
                 queue_slot,
                 pfc_plan,
                 pfc_transition,
@@ -3531,7 +3518,7 @@ impl<'image> TransitionState<'image> {
 
         let counter = &mut self.switch_queue_bytes[state_slot][queue_slot];
         *counter = counter
-            .checked_sub(dequeued_size_bytes)
+            .checked_sub(selected_packet.size_bytes)
             .ok_or(ExecutionError::CounterOverflow(node.id))?;
         #[cfg(debug_assertions)]
         self.debug_assert_switch_queue_bytes(node, state_slot, queue_slot);
@@ -3554,10 +3541,8 @@ impl<'image> TransitionState<'image> {
             payload,
             P11ProbeSite::SwitchTxReadyStartTransmission,
         )?;
-        let arrival_time_ns = link.arrival_time_ns(
-            event.key.time_ns,
-            self.packet_size(payload, P11ProbeSite::SwitchTxReadyPacketSize)?,
-        )?;
+        let arrival_time_ns =
+            link.arrival_time_ns(event.key.time_ns, selected_packet.size_bytes)?;
         let departure_time_ns = arrival_time_ns
             .checked_sub(link.propagation_ns)
             .ok_or(ExecutionError::Time(TimeError::ArrivalOverflow))?;
@@ -3581,11 +3566,7 @@ impl<'image> TransitionState<'image> {
             node,
             event,
             ChildEmission {
-                target: self.packet_remote_target(
-                    payload,
-                    link.id,
-                    P11ProbeSite::SwitchTxReadyRemoteTarget,
-                )?,
+                target: self.packet_remote_target_for(selected_packet, link.id)?,
                 kind: EventKind::RemoteArrival,
                 payload,
                 time_ns: arrival_time_ns,
@@ -3600,11 +3581,8 @@ impl<'image> TransitionState<'image> {
         event: Event,
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
-        let egress_link = self.packet_egress_at(
-            event.payload,
-            node.id,
-            P11ProbeSite::SwitchTxCompleteEgressAt,
-        )?;
+        let packet = self.packet(event.payload, P11ProbeSite::SwitchTxCompleteEventPacket)?;
+        let egress_link = self.packet_egress_at(packet, node.id)?;
         let Some(egress_link) = egress_link else {
             return Err(ExecutionError::MissingSwitchQueue {
                 node: node.id,
@@ -3614,7 +3592,6 @@ impl<'image> TransitionState<'image> {
         let rate_bps = self.link(egress_link)?.rate_bps;
         self.p11_probe_sites
             .call(P11ProbeSite::SwitchTxCompleteEventPacket);
-        let packet = self.packet(event.payload, P11ProbeSite::SwitchTxCompleteEventPacket)?;
 
         let eligible_next_payload = {
             let state = self.switch_state(node)?;
@@ -3928,11 +3905,9 @@ impl<'image> TransitionState<'image> {
 
     fn packet_egress_at(
         &self,
-        payload: PayloadId,
+        packet: PacketDescriptor,
         node: NodeId,
-        site: P11ProbeSite,
     ) -> Result<Option<LinkId>, ExecutionError> {
-        let packet = self.packet(payload, site)?;
         let flow = self.flow(packet.flow)?;
 
         let route = if packet.kind.is_data() {
@@ -3962,12 +3937,10 @@ impl<'image> TransitionState<'image> {
 
     fn packet_incoming_link_at(
         &self,
-        payload: PayloadId,
+        packet: PacketDescriptor,
         node: NodeId,
-        site: P11ProbeSite,
         route_site: P11ProbeSite,
     ) -> Result<Option<LinkId>, ExecutionError> {
-        let packet = self.packet(payload, site)?;
         let flow = self.flow(packet.flow)?;
         let route = if packet.kind.is_data() {
             &flow.route
@@ -3975,8 +3948,15 @@ impl<'image> TransitionState<'image> {
             &flow.reverse_route
         };
         self.p11_probe_sites.call(route_site);
-        for link_id in route {
-            if self.packet_remote_target(payload, *link_id, route_site)? == node {
+        for (index, link_id) in route.iter().enumerate() {
+            let remote_target = if let Some(next) = route.get(index + 1) {
+                self.link(*next)?.source
+            } else if packet.kind.is_data() {
+                flow.target
+            } else {
+                flow.source
+            };
+            if remote_target == node {
                 return Ok(Some(*link_id));
             }
         }
@@ -3990,6 +3970,14 @@ impl<'image> TransitionState<'image> {
         site: P11ProbeSite,
     ) -> Result<NodeId, ExecutionError> {
         let packet = self.packet(payload, site)?;
+        self.packet_remote_target_for(packet, egress)
+    }
+
+    fn packet_remote_target_for(
+        &self,
+        packet: PacketDescriptor,
+        egress: LinkId,
+    ) -> Result<NodeId, ExecutionError> {
         let flow = self.flow(packet.flow)?;
         let route = if packet.kind.is_data() {
             &flow.route

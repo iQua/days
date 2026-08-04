@@ -1,11 +1,11 @@
 use std::collections::VecDeque;
 
 use days_executor::{
-    ArrivalDisposition, Event, EventKey, EventKind, FlowDescriptor, FlowId, HostState,
+    ArrivalDisposition, CpuConfig, Event, EventKey, EventKind, FlowDescriptor, FlowId, HostState,
     LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, ObservationMode,
     PacketArrivalObservation, PacketDeparture, PacketDescriptor, PayloadId, RemoteChannel,
     SchedulerKind, SimulationImage, SwitchQueueState, SwitchState, event_phase,
-    run_scalar_with_observations,
+    run_cpu_with_observations, run_scalar_with_observations,
 };
 
 const SOURCE: NodeId = NodeId(0);
@@ -359,4 +359,24 @@ fn switch_fifo_selects_one_packet_per_tx_ready_and_reaches_the_sink() {
             departed_packets: 4,
         }]
     );
+}
+
+#[test]
+fn resolved_switch_routes_keep_complete_cpu_state_identical() {
+    let image = image();
+    let expected = run_scalar_with_observations(&image, Some(27), ObservationMode::Full).unwrap();
+
+    for workers in [1, 2, 4] {
+        let actual = run_cpu_with_observations(
+            &image,
+            Some(27),
+            CpuConfig {
+                workers,
+                ..CpuConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .unwrap();
+        assert_eq!(actual.result, expected, "worker count {workers}");
+    }
 }
