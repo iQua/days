@@ -18,7 +18,9 @@ use days_executor::{CudaConfig, run_cuda_with_observations};
     feature = "cuda",
     all(feature = "metal-spike", target_vendor = "apple")
 ))]
-use days_executor::{DropMarkPolicy, EcnThresholdPolicy, QueueDepthUnit};
+use days_executor::{
+    DropMarkPolicy, EcnThresholdPolicy, MechanismTransitionRecord, QueueDepthUnit, RunResult,
+};
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 use days_executor::{MetalConfig, run_metal_with_observations};
 
@@ -1803,48 +1805,158 @@ fn ack_descendant_chain_reverse_ecn_checkpoint() -> SimulationImage {
     checkpoint
 }
 
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+#[derive(Clone, Copy)]
+enum ReachableDeviceMechanism {
+    Ecn,
+    Drr,
+    Wrr,
+}
+
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn reachable_tcp_measurement_cases() -> Vec<(
+    &'static str,
+    SimulationImage,
+    Option<u64>,
+    ReachableDeviceMechanism,
+)> {
+    vec![
+        (
+            "reverse ACK ECN",
+            reachable_tcp_ack_ecn_image(),
+            Some(456),
+            ReachableDeviceMechanism::Ecn,
+        ),
+        (
+            "reverse ACK DRR",
+            reachable_tcp_ack_scheduler_image(SchedulerKind::deficit_round_robin(vec![1])),
+            None,
+            ReachableDeviceMechanism::Drr,
+        ),
+        (
+            "reverse ACK WRR",
+            reachable_tcp_ack_scheduler_image(SchedulerKind::weighted_round_robin(vec![1])),
+            None,
+            ReachableDeviceMechanism::Wrr,
+        ),
+        (
+            "ACK descendant forward ECN",
+            ack_descendant_forward_ecn_checkpoint(),
+            None,
+            ReachableDeviceMechanism::Ecn,
+        ),
+        (
+            "data descendant chain forward ECN",
+            data_descendant_chain_forward_ecn_checkpoint(),
+            None,
+            ReachableDeviceMechanism::Ecn,
+        ),
+        (
+            "ACK descendant chain reverse ECN",
+            ack_descendant_chain_reverse_ecn_checkpoint(),
+            None,
+            ReachableDeviceMechanism::Ecn,
+        ),
+    ]
+}
+
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn scalar_device_measurement_oracle(
+    case: &str,
+    image: &SimulationImage,
+    horizon: Option<u64>,
+    mechanism: ReachableDeviceMechanism,
+) -> RunResult {
+    let mut scalar = run_scalar_with_observations(image, horizon, ObservationMode::Full)
+        .unwrap_or_else(|error| panic!("scalar {case} fixture failed: {error}"));
+    let diagnostics = scalar
+        .diagnostics
+        .as_ref()
+        .expect("Full scalar oracle must retain diagnostic planes");
+    match mechanism {
+        ReachableDeviceMechanism::Ecn => assert!(
+            !diagnostics.aqm_transitions.is_empty(),
+            "{case} must reach ECN threshold evaluation"
+        ),
+        ReachableDeviceMechanism::Drr => assert!(
+            diagnostics
+                .mechanism_transitions
+                .iter()
+                .any(|record| matches!(record, MechanismTransitionRecord::Drr(_))),
+            "{case} must reach DRR selection"
+        ),
+        ReachableDeviceMechanism::Wrr => assert!(
+            diagnostics
+                .mechanism_transitions
+                .iter()
+                .any(|record| matches!(record, MechanismTransitionRecord::Wrr(_))),
+            "{case} must reach WRR selection"
+        ),
+    }
+    assert!(
+        !scalar.observed_packets.is_empty(),
+        "{case} must populate observed packets"
+    );
+    assert!(
+        !scalar.departures.is_empty(),
+        "{case} must populate departures"
+    );
+    assert!(!scalar.arrivals.is_empty(), "{case} must populate arrivals");
+    scalar.diagnostics = None;
+    scalar
+}
+
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 #[test]
-fn metal_reachable_notect_ack_matches_scalar_in_summary_mode() {
-    let image = reachable_tcp_ack_ecn_image();
-    let expected = run_scalar_with_observations(&image, Some(456), ObservationMode::Summary)
-        .expect("scalar ACK checkpoint");
-    assert!(
-        expected
-            .resident_packets
-            .iter()
-            .any(|packet| { matches!(packet.kind, PacketKind::TcpAck(_)) && !packet.ecn_marked })
-    );
-    let actual = run_metal_with_observations(
-        &image,
-        Some(456),
-        MetalConfig::default(),
-        ObservationMode::Summary,
-    )
-    .expect("Metal ACK checkpoint");
-    assert_eq!(actual.result, expected);
+fn metal_reachable_tcp_ecn_drr_wrr_measurements_match_full_scalar_result() {
+    for (case, image, horizon, mechanism) in reachable_tcp_measurement_cases() {
+        validate(&image, Backend::Metal)
+            .unwrap_or_else(|error| panic!("Metal {case} fixture must validate: {error}"));
+        let expected = scalar_device_measurement_oracle(case, &image, horizon, mechanism);
+        let actual = run_metal_with_observations(
+            &image,
+            horizon,
+            MetalConfig::default(),
+            ObservationMode::Full,
+        )
+        .unwrap_or_else(|error| panic!("Metal {case} fixture failed: {error}"));
+        assert!(
+            actual.result.diagnostics.is_none(),
+            "Metal {case} diagnostics must be absent"
+        );
+        assert_eq!(actual.result, expected, "Metal {case} Full-mode parity");
+    }
 }
 
 #[cfg(feature = "cuda")]
 #[test]
-fn cuda_reachable_notect_ack_matches_scalar_in_summary_mode() {
-    let image = reachable_tcp_ack_ecn_image();
-    let expected = run_scalar_with_observations(&image, Some(456), ObservationMode::Summary)
-        .expect("scalar ACK checkpoint");
-    assert!(
-        expected
-            .resident_packets
-            .iter()
-            .any(|packet| { matches!(packet.kind, PacketKind::TcpAck(_)) && !packet.ecn_marked })
-    );
-    let actual = run_cuda_with_observations(
-        &image,
-        Some(456),
-        CudaConfig::default(),
-        ObservationMode::Summary,
-    )
-    .expect("CUDA ACK checkpoint");
-    assert_eq!(actual.result, expected);
+fn cuda_reachable_tcp_ecn_drr_wrr_measurements_match_full_scalar_result() {
+    for (case, image, horizon, mechanism) in reachable_tcp_measurement_cases() {
+        validate(&image, Backend::Cuda)
+            .unwrap_or_else(|error| panic!("CUDA {case} fixture must validate: {error}"));
+        let expected = scalar_device_measurement_oracle(case, &image, horizon, mechanism);
+        let actual = run_cuda_with_observations(
+            &image,
+            horizon,
+            CudaConfig::default(),
+            ObservationMode::Full,
+        )
+        .unwrap_or_else(|error| panic!("CUDA {case} fixture failed: {error}"));
+        assert!(
+            actual.result.diagnostics.is_none(),
+            "CUDA {case} diagnostics must be absent"
+        );
+        assert_eq!(actual.result, expected, "CUDA {case} Full-mode parity");
+    }
 }
 
 #[test]

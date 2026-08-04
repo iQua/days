@@ -892,7 +892,7 @@ fn adversarial_device_rate_images() -> Vec<SimulationImage> {
         GeneratorStatus::Scheduled,
         10,
     );
-    let prefix = run_scalar_with_observations(&blocked, Some(7), ObservationMode::Summary)
+    let prefix = run_scalar_with_observations(&blocked, Some(7), ObservationMode::Full)
         .expect("rate checkpoint prefix must execute");
     let checkpoint = checkpoint_image(&blocked, &prefix);
     vec![blocked, partial, time_zero, checkpoint]
@@ -904,7 +904,8 @@ fn metal_rate_pacing_and_checkpoints_match_scalar() {
     for (image_index, image) in adversarial_device_rate_images().into_iter().enumerate() {
         for horizon in [Some(2), None] {
             let expected =
-                run_scalar_with_observations(&image, horizon, ObservationMode::Summary).unwrap();
+                run_scalar_with_observations(&image, horizon, ObservationMode::Full).unwrap();
+            assert!(expected.diagnostics.is_some());
             for streams_enabled in [true, false] {
                 for round_threads_per_threadgroup in [32, 256] {
                     let actual = run_metal_with_observations(
@@ -915,14 +916,17 @@ fn metal_rate_pacing_and_checkpoints_match_scalar() {
                             round_threads_per_threadgroup,
                             ..MetalConfig::default()
                         },
-                        ObservationMode::Summary,
+                        ObservationMode::Full,
                     )
                     .unwrap_or_else(|error| {
                         panic!(
                             "image={image_index} horizon={horizon:?} streams={streams_enabled} geometry={round_threads_per_threadgroup}: {error}"
                         )
                     });
-                    assert_eq!(actual.result, expected);
+                    assert!(actual.result.diagnostics.is_none());
+                    let mut expected_without_diagnostics = expected.clone();
+                    expected_without_diagnostics.diagnostics = None;
+                    assert_eq!(actual.result, expected_without_diagnostics);
                 }
             }
         }
@@ -935,7 +939,8 @@ fn cuda_rate_pacing_and_checkpoints_match_scalar() {
     for image in adversarial_device_rate_images() {
         for horizon in [Some(2), None] {
             let expected =
-                run_scalar_with_observations(&image, horizon, ObservationMode::Summary).unwrap();
+                run_scalar_with_observations(&image, horizon, ObservationMode::Full).unwrap();
+            assert!(expected.diagnostics.is_some());
             for streams_enabled in [true, false] {
                 for round_threads_per_block in [32, 256] {
                     let actual = run_cuda_with_observations(
@@ -946,14 +951,17 @@ fn cuda_rate_pacing_and_checkpoints_match_scalar() {
                             round_threads_per_block,
                             ..CudaConfig::default()
                         },
-                        ObservationMode::Summary,
+                        ObservationMode::Full,
                     )
                     .unwrap_or_else(|error| {
                         panic!(
                             "horizon={horizon:?} streams={streams_enabled} geometry={round_threads_per_block}: {error}"
                         )
                     });
-                    assert_eq!(actual.result, expected);
+                    assert!(actual.result.diagnostics.is_none());
+                    let mut expected_without_diagnostics = expected.clone();
+                    expected_without_diagnostics.diagnostics = None;
+                    assert_eq!(actual.result, expected_without_diagnostics);
                 }
             }
         }

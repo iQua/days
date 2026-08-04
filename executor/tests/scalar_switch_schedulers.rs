@@ -983,11 +983,13 @@ fn metal_is_byte_identical_for_adversarial_sp_wfq_and_in_service_checkpoints() {
 
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 #[test]
-fn metal_drr_wrr_service_start_and_checkpoint_state_match_scalar() {
+fn metal_drr_wrr_full_measurements_and_state_match_scalar() {
     for image in adversarial_drr_wrr_images() {
         for horizon in [Some(1), None] {
-            let expected =
-                run_scalar_with_observations(&image, horizon, ObservationMode::Summary).unwrap();
+            let mut expected =
+                run_scalar_with_observations(&image, horizon, ObservationMode::Full).unwrap();
+            assert!(expected.diagnostics.is_some());
+            expected.diagnostics = None;
             for streams_enabled in [true, false] {
                 for round_threads_per_threadgroup in [32, 256] {
                     let actual = run_metal_with_observations(
@@ -998,7 +1000,7 @@ fn metal_drr_wrr_service_start_and_checkpoint_state_match_scalar() {
                             round_threads_per_threadgroup,
                             ..MetalConfig::default()
                         },
-                        ObservationMode::Summary,
+                        ObservationMode::Full,
                     )
                     .unwrap_or_else(|error| {
                         panic!(
@@ -1006,6 +1008,7 @@ fn metal_drr_wrr_service_start_and_checkpoint_state_match_scalar() {
                             image.switch_states[0].queues[0].scheduler.label()
                         )
                     });
+                    assert!(actual.result.diagnostics.is_none());
                     assert_eq!(actual.result, expected);
                 }
             }
@@ -1152,11 +1155,13 @@ fn cuda_is_byte_identical_for_adversarial_sp_wfq_and_in_service_checkpoints() {
 
 #[cfg(feature = "cuda")]
 #[test]
-fn cuda_drr_wrr_service_start_and_checkpoint_state_match_scalar() {
+fn cuda_drr_wrr_full_measurements_and_state_match_scalar() {
     for image in adversarial_drr_wrr_images() {
         for horizon in [Some(1), None] {
-            let expected =
-                run_scalar_with_observations(&image, horizon, ObservationMode::Summary).unwrap();
+            let mut expected =
+                run_scalar_with_observations(&image, horizon, ObservationMode::Full).unwrap();
+            assert!(expected.diagnostics.is_some());
+            expected.diagnostics = None;
             for streams_enabled in [true, false] {
                 for round_threads_per_block in [32, 256] {
                     let actual = run_cuda_with_observations(
@@ -1167,7 +1172,7 @@ fn cuda_drr_wrr_service_start_and_checkpoint_state_match_scalar() {
                             round_threads_per_block,
                             ..CudaConfig::default()
                         },
-                        ObservationMode::Summary,
+                        ObservationMode::Full,
                     )
                     .unwrap_or_else(|error| {
                         panic!(
@@ -1175,6 +1180,7 @@ fn cuda_drr_wrr_service_start_and_checkpoint_state_match_scalar() {
                             image.switch_states[0].queues[0].scheduler.label()
                         )
                     });
+                    assert!(actual.result.diagnostics.is_none());
                     assert_eq!(actual.result, expected);
                 }
             }
