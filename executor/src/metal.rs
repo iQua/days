@@ -1905,11 +1905,13 @@ fn add_flow_route_capacities(
 }
 
 fn flow_minimum_packet_sizes(image: &SimulationImage) -> Vec<[u64; 2]> {
-    let mut minimums = vec![[u64::MAX; 2]; image.flows.len()];
+    let mut minimums = vec![[0; 2]; image.flows.len()];
     for packet in &image.initial_packets {
         let class = if packet.kind.is_data() { 0 } else { 1 };
-        minimums[packet.flow.0 as usize][class] =
-            minimums[packet.flow.0 as usize][class].min(packet.size_bytes);
+        update_minimum_packet_size(
+            &mut minimums[packet.flow.0 as usize][class],
+            packet.size_bytes,
+        );
     }
     for state in &image.host_states {
         for generator in &state.generators {
@@ -1921,16 +1923,10 @@ fn flow_minimum_packet_sizes(image: &SimulationImage) -> Vec<[u64; 2]> {
                 FlowGeneratorKind::Dcqcn(dcqcn) => dcqcn.rate.packet_size_bytes,
             };
             let flow = generator.flow.0 as usize;
-            minimums[flow][0] = minimums[flow][0].min(size);
+            update_minimum_packet_size(&mut minimums[flow][0], size);
         }
     }
-    for minimum in &mut minimums {
-        for size in minimum {
-            if *size == u64::MAX {
-                *size = 1;
-            }
-        }
-    }
+    materialize_flow_minimum_packet_sizes(&mut minimums);
     #[cfg(debug_assertions)]
     for (flow, minimum) in minimums.iter().enumerate() {
         for (class, packet_kind) in [PacketKind::Data, PacketKind::Feedback]
@@ -1973,6 +1969,23 @@ fn flow_minimum_packet_sizes(image: &SimulationImage) -> Vec<[u64; 2]> {
         }
     }
     minimums
+}
+
+fn update_minimum_packet_size(minimum: &mut u64, size: u64) {
+    debug_assert_ne!(size, 0, "Metal validation rejects zero packet sizes");
+    if *minimum == 0 || size < *minimum {
+        *minimum = size;
+    }
+}
+
+fn materialize_flow_minimum_packet_sizes(minimums: &mut [[u64; 2]]) {
+    for minimum in minimums {
+        for size in minimum {
+            if *size == 0 {
+                *size = 1;
+            }
+        }
+    }
 }
 
 fn flow_link_serialization_ns(
@@ -4706,8 +4719,17 @@ mod tests {
         MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER, MAX_ENCODED_PAIRS_PER_WAVE, MetalConfig,
         MetalPhaseTimings, PROFILE_SAMPLES_PER_ATTEMPT, PROFILED_ATTEMPTS,
         accumulate_profile_interval, build_phase_profile, encoding_limits,
-        paced_single_source_queue_bound,
+        materialize_flow_minimum_packet_sizes, paced_single_source_queue_bound,
+        update_minimum_packet_size,
     };
+
+    #[test]
+    fn packet_size_cache_distinguishes_exact_u64_boundary_from_one_past_absence() {
+        let mut minimums = [[0, 0]];
+        update_minimum_packet_size(&mut minimums[0][0], u64::MAX);
+        materialize_flow_minimum_packet_sizes(&mut minimums);
+        assert_eq!(minimums, [[u64::MAX, 1]]);
+    }
 
     #[test]
     fn stream_decomposition_is_enabled_by_default() {
