@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use days::scenario::compile_config;
 use days_executor::{
-    CpuConfig, NodeId, NodeKind, ObservationMode, RoundMetrics, run_cpu,
+    CpuConfig, CpuRoundMetrics, NodeId, NodeKind, ObservationMode, RoundMetrics, run_cpu,
     run_scalar_rounds_with_observations,
 };
 
@@ -225,6 +225,87 @@ struct DistributionSummary {
     median: f64,
     min: f64,
     max: f64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct CpuRoundCounterSample {
+    round_wall_time_ns: u64,
+    owner_merge_ns: u64,
+    early_owner_merge_ns: u64,
+    coordinator_exchange_ns: u64,
+    coordinator_partition_ns: u64,
+    worker_wait_ns: u64,
+    messages_exchanged: u64,
+    owner_batches_merged: u64,
+    early_owner_batches_merged: u64,
+}
+
+impl From<&CpuRoundMetrics> for CpuRoundCounterSample {
+    fn from(round: &CpuRoundMetrics) -> Self {
+        Self {
+            round_wall_time_ns: round.round_wall_time_ns,
+            owner_merge_ns: round.owner_merge_ns,
+            early_owner_merge_ns: round.early_owner_merge_ns,
+            coordinator_exchange_ns: round.coordinator_exchange_ns,
+            coordinator_partition_ns: round.coordinator_partition_ns,
+            worker_wait_ns: round.worker_wait_ns,
+            messages_exchanged: round.semantic.messages_exchanged,
+            owner_batches_merged: round.owner_batches_merged,
+            early_owner_batches_merged: round.early_owner_batches_merged,
+        }
+    }
+}
+
+impl CpuRoundCounterSample {
+    fn scalar(round: &RoundMetrics) -> Self {
+        Self {
+            messages_exchanged: round.messages_exchanged,
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Default)]
+struct CpuRoundCounterSummary {
+    rounds: usize,
+    round_wall_ns_total: u128,
+    owner_merge_ns_total: u128,
+    early_owner_merge_ns_total: u128,
+    coordinator_exchange_ns_total: u128,
+    coordinator_partition_ns_total: u128,
+    worker_wait_ns_total: u128,
+    messages_exchanged_total: u128,
+    owner_batches_merged_total: u128,
+    early_owner_batches_merged_total: u128,
+    owner_merge_ns: DistributionSummary,
+    coordinator_exchange_ns: DistributionSummary,
+}
+
+fn summarize_cpu_round_counters(
+    samples: impl IntoIterator<Item = CpuRoundCounterSample>,
+) -> CpuRoundCounterSummary {
+    let mut summary = CpuRoundCounterSummary::default();
+    let mut owner_merge_ns = Series::default();
+    let mut coordinator_exchange_ns = Series::default();
+
+    for sample in samples {
+        summary.rounds += 1;
+        summary.round_wall_ns_total += u128::from(sample.round_wall_time_ns);
+        summary.owner_merge_ns_total += u128::from(sample.owner_merge_ns);
+        summary.early_owner_merge_ns_total += u128::from(sample.early_owner_merge_ns);
+        summary.coordinator_exchange_ns_total += u128::from(sample.coordinator_exchange_ns);
+        summary.coordinator_partition_ns_total += u128::from(sample.coordinator_partition_ns);
+        summary.worker_wait_ns_total += u128::from(sample.worker_wait_ns);
+        summary.messages_exchanged_total += u128::from(sample.messages_exchanged);
+        summary.owner_batches_merged_total += u128::from(sample.owner_batches_merged);
+        summary.early_owner_batches_merged_total += u128::from(sample.early_owner_batches_merged);
+        owner_merge_ns.push(sample.owner_merge_ns as f64);
+        coordinator_exchange_ns.push(sample.coordinator_exchange_ns as f64);
+    }
+
+    summary.owner_merge_ns = owner_merge_ns.summary();
+    summary.coordinator_exchange_ns = coordinator_exchange_ns.summary();
+    summary
 }
 
 #[cfg(test)]
@@ -647,6 +728,85 @@ fn emit(cli: &Cli, mut analysis: Analysis) {
     );
 }
 
+fn cpu_round_counter_record(cli: &Cli, summary: &CpuRoundCounterSummary) -> String {
+    let rounds = summary.rounds as u128;
+    let owner_merge_ns_per_message = ratio(
+        summary.owner_merge_ns_total,
+        summary.messages_exchanged_total,
+        0.0,
+    );
+    let coordinator_exchange_ns_per_message = ratio(
+        summary.coordinator_exchange_ns_total,
+        summary.messages_exchanged_total,
+        0.0,
+    );
+    // owner_merge_ns sums CPU time across worker threads, while round_wall_time_ns is wall time.
+    // Its share can legitimately exceed 1.0 at high worker counts, so emit it without clamping.
+    let owner_merge_share_of_round_wall = ratio(
+        summary.owner_merge_ns_total,
+        summary.round_wall_ns_total,
+        0.0,
+    );
+    let coordinator_exchange_share_of_round_wall = ratio(
+        summary.coordinator_exchange_ns_total,
+        summary.round_wall_ns_total,
+        0.0,
+    );
+    let backend_note = if cli.backend == "scalar" {
+        " backend_note=scalar_has_no_cpu_pool_counters"
+    } else {
+        ""
+    };
+
+    format!(
+        "record=t20a_cpu_round_counters config={} backend={} workers={} rounds={} \
+         round_wall_ns_total={} round_wall_ns_per_round={:.6} \
+         owner_merge_ns_total={} owner_merge_ns_per_round={:.6} \
+         owner_merge_ns_median={:.6} owner_merge_ns_min={:.0} owner_merge_ns_max={:.0} \
+         early_owner_merge_ns_total={} early_owner_merge_ns_per_round={:.6} \
+         coordinator_exchange_ns_total={} coordinator_exchange_ns_per_round={:.6} \
+         coordinator_exchange_ns_median={:.6} coordinator_exchange_ns_min={:.0} \
+         coordinator_exchange_ns_max={:.0} coordinator_partition_ns_total={} \
+         coordinator_partition_ns_per_round={:.6} worker_wait_ns_total={} \
+         worker_wait_ns_per_round={:.6} messages_exchanged_total={} \
+         messages_exchanged_per_round={:.6} owner_batches_merged_total={} \
+         early_owner_batches_merged_total={} owner_merge_ns_per_message={:.6} \
+         coordinator_exchange_ns_per_message={:.6} owner_merge_share_of_round_wall={:.6} \
+         coordinator_exchange_share_of_round_wall={:.6}{}",
+        cli.config,
+        cli.backend,
+        cli.data_workers(),
+        summary.rounds,
+        summary.round_wall_ns_total,
+        ratio(summary.round_wall_ns_total, rounds, 0.0),
+        summary.owner_merge_ns_total,
+        ratio(summary.owner_merge_ns_total, rounds, 0.0),
+        summary.owner_merge_ns.median,
+        summary.owner_merge_ns.min,
+        summary.owner_merge_ns.max,
+        summary.early_owner_merge_ns_total,
+        ratio(summary.early_owner_merge_ns_total, rounds, 0.0),
+        summary.coordinator_exchange_ns_total,
+        ratio(summary.coordinator_exchange_ns_total, rounds, 0.0),
+        summary.coordinator_exchange_ns.median,
+        summary.coordinator_exchange_ns.min,
+        summary.coordinator_exchange_ns.max,
+        summary.coordinator_partition_ns_total,
+        ratio(summary.coordinator_partition_ns_total, rounds, 0.0),
+        summary.worker_wait_ns_total,
+        ratio(summary.worker_wait_ns_total, rounds, 0.0),
+        summary.messages_exchanged_total,
+        ratio(summary.messages_exchanged_total, rounds, 0.0),
+        summary.owner_batches_merged_total,
+        summary.early_owner_batches_merged_total,
+        owner_merge_ns_per_message,
+        coordinator_exchange_ns_per_message,
+        owner_merge_share_of_round_wall,
+        coordinator_exchange_share_of_round_wall,
+        backend_note,
+    )
+}
+
 fn main() {
     let cli = Cli::parse();
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&cli.config);
@@ -671,18 +831,21 @@ fn main() {
         )
     });
 
-    let analysis = match cli.backend.as_str() {
+    let (analysis, cpu_round_counters) = match cli.backend.as_str() {
         "scalar" => {
             let run = run_scalar_rounds_with_observations(&image, None, ObservationMode::Summary)
                 .expect("scalar round run must succeed");
-            analyze_rounds(
+            let analysis = analyze_rounds(
                 run.rounds.iter(),
                 run.rounds.len(),
                 &node_slots,
                 &node_kinds,
                 &cli.lane_widths,
                 csv.as_mut(),
-            )
+            );
+            let counters =
+                summarize_cpu_round_counters(run.rounds.iter().map(CpuRoundCounterSample::scalar));
+            analysis.map(|analysis| (analysis, counters))
         }
         "cpu" => {
             let run = run_cpu(
@@ -694,14 +857,17 @@ fn main() {
                 },
             )
             .expect("CPU round run must succeed");
-            analyze_rounds(
+            let analysis = analyze_rounds(
                 run.rounds.iter().map(|round| &round.semantic),
                 run.rounds.len(),
                 &node_slots,
                 &node_kinds,
                 &cli.lane_widths,
                 csv.as_mut(),
-            )
+            );
+            let counters =
+                summarize_cpu_round_counters(run.rounds.iter().map(CpuRoundCounterSample::from));
+            analysis.map(|analysis| (analysis, counters))
         }
         _ => unreachable!(),
     }
@@ -711,13 +877,18 @@ fn main() {
         writer.flush().expect("failed to flush per-round CSV");
     }
     emit(&cli, analysis);
+    let counter_record = cpu_round_counter_record(&cli, &cpu_round_counters);
+    println!("{counter_record}");
 }
 
 #[cfg(test)]
 mod tests {
     use days_executor::NodeKind;
 
-    use super::{ActiveEntry, median, summarize_lane};
+    use super::{
+        ActiveEntry, Cli, CpuRoundCounterSample, cpu_round_counter_record, median,
+        summarize_cpu_round_counters, summarize_lane,
+    };
 
     #[test]
     fn lane_summary_uses_actual_short_group_length() {
@@ -770,5 +941,77 @@ mod tests {
         let mut values = vec![9.0, 1.0, 7.0, 3.0];
 
         assert_eq!(median(&mut values), 5.0);
+    }
+
+    #[test]
+    fn cpu_round_counter_summary_aggregates_totals_means_and_medians() {
+        let summary = summarize_cpu_round_counters([
+            CpuRoundCounterSample {
+                round_wall_time_ns: 100,
+                owner_merge_ns: 30,
+                early_owner_merge_ns: 5,
+                coordinator_exchange_ns: 2,
+                coordinator_partition_ns: 7,
+                worker_wait_ns: 20,
+                messages_exchanged: 3,
+                owner_batches_merged: 2,
+                early_owner_batches_merged: 1,
+            },
+            CpuRoundCounterSample {
+                round_wall_time_ns: 200,
+                owner_merge_ns: 50,
+                early_owner_merge_ns: 7,
+                coordinator_exchange_ns: 6,
+                coordinator_partition_ns: 9,
+                worker_wait_ns: 40,
+                messages_exchanged: 5,
+                owner_batches_merged: 3,
+                early_owner_batches_merged: 2,
+            },
+        ]);
+
+        assert_eq!(summary.rounds, 2);
+        assert_eq!(summary.round_wall_ns_total, 300);
+        assert_eq!(summary.owner_merge_ns_total, 80);
+        assert_eq!(summary.early_owner_merge_ns_total, 12);
+        assert_eq!(summary.coordinator_exchange_ns_total, 8);
+        assert_eq!(summary.coordinator_partition_ns_total, 16);
+        assert_eq!(summary.worker_wait_ns_total, 60);
+        assert_eq!(summary.messages_exchanged_total, 8);
+        assert_eq!(summary.owner_batches_merged_total, 5);
+        assert_eq!(summary.early_owner_batches_merged_total, 3);
+        assert_eq!(summary.owner_merge_ns.median, 40.0);
+        assert_eq!(summary.owner_merge_ns.min, 30.0);
+        assert_eq!(summary.owner_merge_ns.max, 50.0);
+        assert_eq!(summary.coordinator_exchange_ns.median, 4.0);
+        assert_eq!(summary.coordinator_exchange_ns.min, 2.0);
+        assert_eq!(summary.coordinator_exchange_ns.max, 6.0);
+    }
+
+    #[test]
+    fn scalar_round_counter_record_zeroes_cpu_pool_fields() {
+        let cli = Cli {
+            config: "example.toml".to_owned(),
+            backend: "scalar".to_owned(),
+            workers: 18,
+            lane_widths: vec![8],
+            per_round_csv: None,
+        };
+        let summary = summarize_cpu_round_counters([CpuRoundCounterSample {
+            messages_exchanged: 7,
+            ..CpuRoundCounterSample::default()
+        }]);
+
+        let record = cpu_round_counter_record(&cli, &summary);
+
+        assert!(record.starts_with(
+            "record=t20a_cpu_round_counters config=example.toml backend=scalar workers=1 rounds=1"
+        ));
+        assert!(record.contains("owner_merge_ns_total=0 owner_merge_ns_per_round=0.000000"));
+        assert!(
+            record.contains("messages_exchanged_total=7 messages_exchanged_per_round=7.000000")
+        );
+        assert!(record.contains("owner_merge_ns_per_message=0.000000"));
+        assert!(record.ends_with("backend_note=scalar_has_no_cpu_pool_counters"));
     }
 }
