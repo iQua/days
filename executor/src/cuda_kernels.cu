@@ -39,8 +39,6 @@ constexpr uint ACTIVE_STREAM_ENTRY_WORDS = 5;
 constexpr uint TCP_RECEIVER_WORDS = 7;
 constexpr uint TCP_LEDGER_META_WORDS = 4;
 constexpr uint TCP_LEDGER_RECORD_WORDS = 5;
-constexpr uint TCP_TRANSITION_META_WORDS = 4;
-constexpr uint TCP_TRANSITION_WORDS = 36;
 constexpr uint RATIONAL_WORDS = 10;
 constexpr uint BIG_LIMBS = 10;
 constexpr uint WIDE_LIMBS = 16;
@@ -99,7 +97,6 @@ constexpr uint P_CHANNEL_TARGET_OFFSET = 26;
 constexpr uint P_STREAM_ORDER_CHECKS = 27;
 constexpr uint P_TCP_RECEIVER_OFFSET = 28;
 constexpr uint P_TCP_LEDGER_META_OFFSET = 29;
-constexpr uint P_TCP_TRANSITION_META_OFFSET = 30;
 
 constexpr uint N_KIND = 0;
 constexpr uint N_EGRESS = 1;
@@ -3109,52 +3106,6 @@ __device__ __forceinline__ bool tcp_receive_range(
     return true;
 }
 
-__device__ __forceinline__ bool record_tcp_transition(
-    ulong node,
-    ulong flow,
-    const ulong *event,
-    ulong input_kind,
-    ulong input_0,
-    ulong input_1,
-    ulong input_2,
-    ulong input_3,
-    const ulong *before,
-    const ulong *after,
-    ulong *error,
-    const ulong *params,
-    ulong *tcp_state
-) {
-    if (params[P_FULL_OBSERVATIONS] == 0) {
-        return true;
-    }
-    ulong meta = params[P_TCP_TRANSITION_META_OFFSET] + node * TCP_TRANSITION_META_WORDS;
-    ulong count = tcp_state[meta + 3];
-    ulong capacity = tcp_state[meta + 1];
-    if (count >= capacity) {
-        set_capacity_error(error, ARENA_OBSERVED, node, capacity);
-        return false;
-    }
-    ulong record = tcp_state[meta] + count * TCP_TRANSITION_WORDS;
-    tcp_state[record] = event[E_TIME];
-    tcp_state[record + 1] = event[E_PHASE];
-    tcp_state[record + 2] = event[E_ORIGIN];
-    tcp_state[record + 3] = event[E_SEQUENCE];
-    tcp_state[record + 4] = node;
-    tcp_state[record + 5] = flow;
-    tcp_state[record + 6] = before[CTL_MSS];
-    tcp_state[record + 7] = input_kind;
-    tcp_state[record + 8] = input_0;
-    tcp_state[record + 9] = input_1;
-    tcp_state[record + 10] = input_2;
-    tcp_state[record + 11] = input_3;
-    for (uint word = 0; word < 12; ++word) {
-        tcp_state[record + 12 + word] = before[word];
-        tcp_state[record + 24 + word] = after[word];
-    }
-    tcp_state[meta + 3] = count + 1;
-    return true;
-}
-
 __device__ __forceinline__ bool tcp_enqueue_attempt(
     ulong node,
     ulong flow,
@@ -4139,21 +4090,12 @@ __device__ __forceinline__ bool dispatch_event(
         }
         generators[generator + G_FEEDBACK] += 1;
         ulong acknowledgment = min(event[PK_META_0], generators[generator + G_TCP_NEXT]);
-        ulong before[12];
-        for (uint word = 0; word < 12; ++word) {
-            before[word] = generators[generator + G_CONTROL + word];
-        }
-        bool has_transition = false;
+        bool handled_ack = false;
         bool retransmit = false;
         ulong retransmit_sequence = 0;
         bool fill = false;
         bool acknowledged_new = false;
         ulong flight_before = generators[generator + G_TCP_FLIGHT];
-        ulong input_kind = 0;
-        ulong input_0 = 0;
-        ulong input_1 = 0;
-        ulong input_2 = 0;
-        ulong input_3 = 0;
 
         if (acknowledgment > generators[generator + G_TCP_HIGHEST_ACK]) {
             ulong acknowledged_bytes =
@@ -4180,12 +4122,7 @@ __device__ __forceinline__ bool dispatch_event(
             }
             fill = acknowledgment < generators[generator + G_TCP_TOTAL];
             acknowledged_new = true;
-            has_transition = true;
-            input_kind = 0;
-            input_0 = acknowledged_bytes;
-            input_1 = rtt_sample;
-            input_2 = flight_before;
-            input_3 = acknowledgment;
+            handled_ack = true;
         } else if (acknowledgment == generators[generator + G_TCP_HIGHEST_ACK] &&
             acknowledgment < generators[generator + G_TCP_TOTAL] && flight_before != 0) {
             ulong recovery_high = generators[generator + G_TCP_NEXT];
@@ -4203,10 +4140,7 @@ __device__ __forceinline__ bool dispatch_event(
             } else if (generators[generator + G_TCP_DUP_ACKS] > 3) {
                 fill = true;
             }
-            has_transition = true;
-            input_kind = 1;
-            input_0 = flight_before;
-            input_1 = recovery_high;
+            handled_ack = true;
         }
 
         generators[generator + G_OUTSTANDING] = generators[generator + G_TCP_FLIGHT];
@@ -4216,14 +4150,8 @@ __device__ __forceinline__ bool dispatch_event(
         )) {
             return false;
         }
-        if (!has_transition) {
+        if (!handled_ack) {
             return true;
-        }
-        if (!record_tcp_transition(
-            node, flow, event, input_kind, input_0, input_1, input_2, input_3, before,
-            generators + generator + G_CONTROL, error, params, tcp_state
-        )) {
-            return false;
         }
         bool scheduled = generators[generator + G_STATUS] == 0;
         if (scheduled && !retransmit) {
@@ -4248,21 +4176,11 @@ __device__ __forceinline__ bool dispatch_event(
             return true;
         }
         generators[generator + G_TCP_TIMER_ACTIVE] = 0;
-        ulong before[12];
-        for (uint word = 0; word < 12; ++word) {
-            before[word] = generators[generator + G_CONTROL + word];
-        }
         ulong flight = generators[generator + G_TCP_FLIGHT];
         controller_timeout(generators + generator + G_CONTROL, flight);
         generators[generator + G_TCP_RTO] = min(
             saturating_mul_u64(generators[generator + G_TCP_TIMER_RTO], 2), TCP_MAX_RTO
         );
-        if (!record_tcp_transition(
-            node, flow, event, 2, flight, 0, 0, 0, before,
-            generators + generator + G_CONTROL, error, params, tcp_state
-        )) {
-            return false;
-        }
         return prepare_tcp_attempts(
             node, flow, event, true, generators[generator + G_TCP_HIGHEST_ACK], false, false,
             error, params, node_state, generators, fel_meta, fel_records, queue_meta,

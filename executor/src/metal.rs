@@ -33,7 +33,7 @@ use crate::{
     GeneratorTermination, NodeId, NodeKind, ObservationMode, PacketArrivalObservation,
     PacketDeparture, PacketDescriptor, PacketKind, PayloadId, RunResult, RunSummary,
     SimulationImage, TcpAckHeader, TcpCongestionControl, TcpDataHeader, TcpPhase, TcpReceiveRange,
-    TcpTimerState, TcpTransitionInput, TcpTransitionRecord, validate,
+    TcpTimerState, validate,
 };
 
 const LANES: usize = 1_024;
@@ -59,8 +59,6 @@ const TCP_RECEIVER_WORDS: usize = 7;
 const TCP_RANGE_WORDS: usize = 2;
 const TCP_LEDGER_META_WORDS: usize = 4;
 const TCP_LEDGER_RECORD_WORDS: usize = 5;
-const TCP_TRANSITION_META_WORDS: usize = 4;
-const TCP_TRANSITION_WORDS: usize = 36;
 // The retained k32 profile averages about 1,300 transitions per round. 4,096 keeps ordinary
 // LP drains single-launch while putting a finite ceiling on pathological device work per lane.
 const DEFAULT_TRANSITIONS_PER_DISPATCH: usize = 4_096;
@@ -160,7 +158,7 @@ const CONTROL_THREADGROUP_BYTES: usize =
 const NONE: u64 = u64::MAX;
 const PACKET_ECN_FLAG: u64 = 1_u64 << 63;
 const PACKET_KIND_MASK: u64 = !PACKET_ECN_FLAG;
-const PARAM_ROUND_THREADS: usize = 31;
+const PARAM_ROUND_THREADS: usize = 30;
 
 const CONTROL_ERROR: usize = 0;
 const CONTROL_ERROR_ARENA: usize = 1;
@@ -197,7 +195,6 @@ pub enum MetalArena {
     Arrivals,
     TcpReceiverRanges,
     TcpSegmentLedger,
-    TcpTransitions,
 }
 
 impl fmt::Display for MetalArena {
@@ -215,7 +212,6 @@ impl fmt::Display for MetalArena {
             Self::Arrivals => "arrival log",
             Self::TcpReceiverRanges => "TCP receiver range arena",
             Self::TcpSegmentLedger => "TCP segment ledger",
-            Self::TcpTransitions => "TCP transition log",
         })
     }
 }
@@ -1106,7 +1102,6 @@ struct PreparedStreams {
 struct TcpStateLayout {
     receiver_offset: usize,
     ledger_meta_offset: usize,
-    transition_meta_offset: usize,
 }
 
 struct PreparedTcpState {
@@ -1480,13 +1475,7 @@ impl MetalPlan {
         let mut observation_meta = vec![0_u64; node_count * OBSERVATION_META_WORDS];
         let observation_slots =
             assign_observation_offsets(&mut observation_meta, &observation_capacities)?;
-        let tcp_state = prepare_tcp_state(
-            image,
-            &flow_packet_counts,
-            &flow_feedback_counts,
-            &observation_capacities,
-            observation_mode,
-        )?;
+        let tcp_state = prepare_tcp_state(image, &flow_packet_counts, &flow_feedback_counts)?;
         let (inbound_meta, inbound_producers) = remote_inbound_producers(image);
         let round_capacity = config
             .max_rounds
@@ -1532,7 +1521,6 @@ impl MetalPlan {
             u64::from(cfg!(debug_assertions)),
             tcp_state.layout.receiver_offset as u64,
             tcp_state.layout.ledger_meta_offset as u64,
-            tcp_state.layout.transition_meta_offset as u64,
             config.round_threads_per_threadgroup as u64,
         ];
 
@@ -2763,11 +2751,8 @@ fn prepare_tcp_state(
     image: &SimulationImage,
     packet_counts: &[usize],
     feedback_counts: &[usize],
-    observation_capacities: &[usize],
-    observation_mode: ObservationMode,
 ) -> Result<PreparedTcpState, MetalError> {
     let flow_count = image.flows.len();
-    let node_count = image.nodes.len();
     let receiver_offset = 0;
     let mut next = flow_count
         .checked_mul(TCP_RECEIVER_WORDS)
@@ -2845,36 +2830,6 @@ fn prepare_tcp_state(
         *layout = (record_offset, capacity);
     }
 
-    let transition_meta_offset = next;
-    next = next
-        .checked_add(
-            node_count
-                .checked_mul(TCP_TRANSITION_META_WORDS)
-                .ok_or_else(|| {
-                    MetalError::Validation("TCP transition metadata overflows".into())
-                })?,
-        )
-        .ok_or_else(|| MetalError::Validation("TCP transition metadata arena overflows".into()))?;
-    let mut transition_layout = vec![(0_usize, 0_usize); node_count];
-    for (node, layout) in transition_layout.iter_mut().enumerate() {
-        let capacity = if observation_mode == ObservationMode::Full {
-            observation_capacities
-                .get(node)
-                .copied()
-                .unwrap_or(0)
-                .max(1)
-        } else {
-            0
-        };
-        let record_offset = next;
-        next = next
-            .checked_add(capacity.checked_mul(TCP_TRANSITION_WORDS).ok_or_else(|| {
-                MetalError::Validation("TCP transition record size overflows".into())
-            })?)
-            .ok_or_else(|| MetalError::Validation("TCP transition arena overflows".into()))?;
-        *layout = (record_offset, capacity);
-    }
-
     let mut words = vec![0_u64; next.max(1)];
     for (flow, entry) in receiver_ranges.into_iter().enumerate() {
         let Some((owner, receiver, range_offset, capacity)) = entry else {
@@ -2914,18 +2869,11 @@ fn prepare_tcp_state(
             }
         }
     }
-    for (node, (record_offset, capacity)) in transition_layout.into_iter().enumerate() {
-        let base = transition_meta_offset + node * TCP_TRANSITION_META_WORDS;
-        words[base] = record_offset as u64;
-        words[base + 1] = capacity as u64;
-    }
-
     Ok(PreparedTcpState {
         words,
         layout: TcpStateLayout {
             receiver_offset,
             ledger_meta_offset,
-            transition_meta_offset,
         },
     })
 }
@@ -3515,7 +3463,6 @@ impl MetalBuffers {
         let mut observed_packets = BTreeMap::new();
         let mut departures = Vec::new();
         let mut arrivals = Vec::new();
-        let mut tcp_transitions = Vec::new();
         if observation_mode == ObservationMode::Full {
             let observed_words = compact_lp_log(
                 observed_words,
@@ -3602,19 +3549,6 @@ impl MetalBuffers {
                 .into_iter()
                 .map(|(_, arrival)| arrival)
                 .collect();
-            let transition_meta_offset = params[30] as usize;
-            for node in 0..image.nodes.len() {
-                let base = transition_meta_offset + node * TCP_TRANSITION_META_WORDS;
-                let offset = tcp_state[base] as usize;
-                let count = tcp_state[base + 3] as usize;
-                for index in 0..count {
-                    let start = offset + index * TCP_TRANSITION_WORDS;
-                    tcp_transitions.push(decode_tcp_transition(
-                        &tcp_state[start..start + TCP_TRANSITION_WORDS],
-                    )?);
-                }
-            }
-            tcp_transitions.sort_unstable_by_key(|record| record.key);
         }
 
         let phase_profile = (!timing.profiled_attempts.is_empty()).then(|| {
@@ -3693,7 +3627,6 @@ fn decode_arena(value: u64) -> MetalArena {
         10 => MetalArena::GeneratorStream,
         11 => MetalArena::TcpReceiverRanges,
         12 => MetalArena::TcpSegmentLedger,
-        13 => MetalArena::TcpTransitions,
         _ => MetalArena::Fel,
     }
 }
@@ -3936,39 +3869,6 @@ fn decode_tcp_generator(row: &[u64]) -> Result<crate::TcpGenerator, MetalError> 
         rtt_var_ns: row[29],
         rto_ns: row[30],
         control: decode_tcp_control(&row[31..43])?,
-    })
-}
-
-fn decode_tcp_transition(words: &[u64]) -> Result<TcpTransitionRecord, MetalError> {
-    let input = match words[7] {
-        0 => TcpTransitionInput::NewAck {
-            acknowledged_bytes: words[8],
-            rtt_sample_ns: words[9],
-            flight_size_bytes: words[10],
-            acknowledgment: words[11],
-        },
-        1 => TcpTransitionInput::DuplicateAck {
-            flight_size_bytes: words[8],
-            recovery_high_sequence: words[9],
-        },
-        2 => TcpTransitionInput::Timeout {
-            flight_size_bytes: words[8],
-        },
-        _ => {
-            return Err(MetalError::DeviceExecution {
-                code: 99,
-                node: None,
-            });
-        }
-    };
-    Ok(TcpTransitionRecord {
-        key: decode_key(words)?,
-        node: NodeId(words[4]),
-        flow: crate::FlowId(words[5]),
-        mss_bytes: words[6],
-        input,
-        before: decode_tcp_control(&words[12..24])?,
-        after: decode_tcp_control(&words[24..36])?,
     })
 }
 

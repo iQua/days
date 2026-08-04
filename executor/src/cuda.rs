@@ -29,7 +29,7 @@ use crate::{
     GeneratorStatus, GeneratorTermination, NodeId, NodeKind, ObservationMode,
     PacketArrivalObservation, PacketDeparture, PacketDescriptor, PacketKind, PayloadId, RunResult,
     RunSummary, SimulationImage, TcpAckHeader, TcpCongestionControl, TcpDataHeader, TcpPhase,
-    TcpReceiveRange, TcpTimerState, TcpTransitionInput, TcpTransitionRecord, validate,
+    TcpReceiveRange, TcpTimerState, validate,
 };
 
 const LANES: usize = 1_024;
@@ -54,8 +54,6 @@ const ACTIVE_STREAM_ENTRY_WORDS: usize = 5;
 const TCP_RECEIVER_WORDS: usize = 7;
 const TCP_LEDGER_META_WORDS: usize = 4;
 const TCP_LEDGER_RECORD_WORDS: usize = 5;
-const TCP_TRANSITION_META_WORDS: usize = 4;
-const TCP_TRANSITION_WORDS: usize = 36;
 const DEFAULT_TRANSITIONS_PER_DISPATCH: usize = 4_096;
 const DEFAULT_ROUND_THREADS_PER_BLOCK: usize = 256;
 const DEFAULT_ATTEMPTS_PER_GRAPH_WAVE: usize = 64;
@@ -349,39 +347,6 @@ fn decode_control(words: &[u64]) -> Result<TcpCongestionControl, CudaError> {
             node: None,
         }),
     }
-}
-
-fn decode_tcp_transition(words: &[u64]) -> Result<TcpTransitionRecord, CudaError> {
-    let input = match words[7] {
-        0 => TcpTransitionInput::NewAck {
-            acknowledged_bytes: words[8],
-            rtt_sample_ns: words[9],
-            flight_size_bytes: words[10],
-            acknowledgment: words[11],
-        },
-        1 => TcpTransitionInput::DuplicateAck {
-            flight_size_bytes: words[8],
-            recovery_high_sequence: words[9],
-        },
-        2 => TcpTransitionInput::Timeout {
-            flight_size_bytes: words[8],
-        },
-        _ => {
-            return Err(CudaError::DeviceExecution {
-                code: 98,
-                node: None,
-            });
-        }
-    };
-    Ok(TcpTransitionRecord {
-        key: decode_key(words)?,
-        node: NodeId(words[4]),
-        flow: crate::FlowId(words[5]),
-        mss_bytes: words[6],
-        input,
-        before: decode_control(&words[12..24])?,
-        after: decode_control(&words[24..36])?,
-    })
 }
 
 fn decode_disposition(value: u64) -> Result<ArrivalDisposition, CudaError> {
@@ -921,7 +886,6 @@ struct PreparedStreams {
 struct TcpLayout {
     receiver_offset: usize,
     ledger_meta_offset: usize,
-    transition_meta_offset: usize,
 }
 
 fn encode_control(control: TcpCongestionControl, words: &mut [u64]) {
@@ -973,23 +937,15 @@ fn tcp_flow_segment_capacity(image: &SimulationImage, flow: usize) -> usize {
         .max(1)
 }
 
-fn prepare_tcp_state(
-    image: &SimulationImage,
-    transition_capacities: &[usize],
-) -> Result<(Vec<u64>, TcpLayout), CudaError> {
+fn prepare_tcp_state(image: &SimulationImage) -> Result<(Vec<u64>, TcpLayout), CudaError> {
     let flow_count = image.flows.len().max(1);
     let receiver_offset = 0;
     let ledger_meta_offset = flow_count
         .checked_mul(TCP_RECEIVER_WORDS)
         .ok_or_else(|| CudaError::Validation("TCP receiver plane size overflows usize".into()))?;
-    let transition_meta_offset = ledger_meta_offset
+    let mut next = ledger_meta_offset
         .checked_add(flow_count * TCP_LEDGER_META_WORDS)
         .ok_or_else(|| CudaError::Validation("TCP ledger metadata size overflows usize".into()))?;
-    let mut next = transition_meta_offset
-        .checked_add(image.nodes.len() * TCP_TRANSITION_META_WORDS)
-        .ok_or_else(|| {
-            CudaError::Validation("TCP transition metadata size overflows usize".into())
-        })?;
     let mut state = vec![0_u64; next.max(1)];
 
     for (owner_slot, host) in image.host_states.iter().enumerate() {
@@ -1062,22 +1018,11 @@ fn prepare_tcp_state(
         }
     }
 
-    for node in 0..image.nodes.len() {
-        let capacity = transition_capacities.get(node).copied().unwrap_or(0);
-        let row = transition_meta_offset + node * TCP_TRANSITION_META_WORDS;
-        state[row] = next as u64;
-        state[row + 1] = capacity as u64;
-        next = next
-            .checked_add(capacity.saturating_mul(TCP_TRANSITION_WORDS))
-            .ok_or_else(|| CudaError::Validation("TCP transition arena overflows usize".into()))?;
-        state.resize(next.max(1), 0);
-    }
     Ok((
         state,
         TcpLayout {
             receiver_offset,
             ledger_meta_offset,
-            transition_meta_offset,
         },
     ))
 }
@@ -1455,12 +1400,7 @@ impl CudaPlan {
                     arrival_capacity as u64;
             }
         }
-        let tcp_transition_capacities = if observation_mode == ObservationMode::Full {
-            observation_capacities.clone()
-        } else {
-            vec![0; node_count]
-        };
-        let (tcp_state, tcp_layout) = prepare_tcp_state(image, &tcp_transition_capacities)?;
+        let (tcp_state, tcp_layout) = prepare_tcp_state(image)?;
         let (inbound_meta, inbound_producers) = remote_inbound_producers(image);
         let round_capacity = config
             .max_rounds
@@ -1506,7 +1446,6 @@ impl CudaPlan {
             u64::from(cfg!(debug_assertions)),
             tcp_layout.receiver_offset as u64,
             tcp_layout.ledger_meta_offset as u64,
-            tcp_layout.transition_meta_offset as u64,
         ];
 
         Ok(Self {
@@ -3089,7 +3028,6 @@ impl CudaBuffers {
         let mut observed_packets = BTreeMap::new();
         let mut departures = Vec::new();
         let mut arrivals = Vec::new();
-        let mut tcp_transitions = Vec::new();
         if observation_mode == ObservationMode::Full {
             let observed_words = compact_lp_log(
                 observed_words,
@@ -3175,24 +3113,6 @@ impl CudaBuffers {
             arrivals = keyed_arrivals
                 .into_iter()
                 .map(|(_, arrival)| arrival)
-                .collect();
-            let transition_meta = params[30] as usize;
-            let mut keyed_transitions = Vec::new();
-            for node in 0..image.nodes.len() {
-                let row = transition_meta + node * TCP_TRANSITION_META_WORDS;
-                let offset = tcp_state[row] as usize;
-                let count = tcp_state[row + 3] as usize;
-                for index in 0..count {
-                    let record = offset + index * TCP_TRANSITION_WORDS;
-                    let transition =
-                        decode_tcp_transition(&tcp_state[record..record + TCP_TRANSITION_WORDS])?;
-                    keyed_transitions.push((transition.key, transition));
-                }
-            }
-            keyed_transitions.sort_unstable_by_key(|(key, _)| *key);
-            tcp_transitions = keyed_transitions
-                .into_iter()
-                .map(|(_, transition)| transition)
                 .collect();
         }
 
