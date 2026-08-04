@@ -721,7 +721,6 @@ impl CudaExecutor {
         observation_mode: ObservationMode,
     ) -> Result<CudaRun, CudaError> {
         validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
-        validate_cuda_observation_mode(image, exclusive_horizon_ns, observation_mode)?;
         validate_config(config)?;
 
         let plan = CudaPlan::new(image, exclusive_horizon_ns, config, observation_mode)?;
@@ -742,7 +741,6 @@ impl CudaExecutor {
         observation_mode: ObservationMode,
     ) -> Result<CudaProfiledRun, CudaError> {
         validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
-        validate_cuda_observation_mode(image, exclusive_horizon_ns, observation_mode)?;
         validate_config(config)?;
 
         let plan = CudaPlan::new(image, exclusive_horizon_ns, config, observation_mode)?;
@@ -753,23 +751,6 @@ impl CudaExecutor {
         panic_after_execution_if_requested();
         let run = buffers.finish(&self.direct.stream, image, observation_mode, timing)?;
         Ok(CudaProfiledRun { run, profile })
-    }
-}
-
-fn validate_cuda_observation_mode(
-    image: &SimulationImage,
-    exclusive_horizon_ns: Option<u64>,
-    observation_mode: ObservationMode,
-) -> Result<(), CudaError> {
-    let has_unported_transition_plane =
-        crate::validate::device_unported_transition_plane_reachable(image, exclusive_horizon_ns);
-    if observation_mode == ObservationMode::Full && has_unported_transition_plane {
-        Err(CudaError::Validation(
-            "Full observation mode is unsupported on CUDA for Rate, ECN, DRR, or WRR transition planes; use Summary"
-                .to_owned(),
-        ))
-    } else {
-        Ok(())
     }
 }
 

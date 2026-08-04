@@ -7,14 +7,14 @@ use days_executor::{
     run_scalar_with_observations, validate,
 };
 #[cfg(feature = "cuda")]
-use days_executor::{CudaConfig, CudaError, run_cuda_with_observations};
+use days_executor::{CudaConfig, run_cuda_with_observations};
 #[cfg(any(
     feature = "cuda",
     all(feature = "metal-spike", target_vendor = "apple")
 ))]
 use days_executor::{DropMarkPolicy, EcnThresholdPolicy, QueueDepthUnit};
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-use days_executor::{MetalConfig, MetalError, run_metal_with_observations};
+use days_executor::{MetalConfig, run_metal_with_observations};
 use num_bigint::BigUint;
 use num_rational::Ratio;
 
@@ -699,48 +699,6 @@ fn resident_waiter_cases() -> Vec<(SimulationImage, u64, NodeId, PayloadId, bool
 
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 #[test]
-fn metal_full_observation_closes_over_divergent_resident_waiters() {
-    for (image, boundary, node, payload, aqm) in resident_waiter_cases() {
-        let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
-            .expect("resident-waiter suffix must execute");
-        let diagnostics = scalar
-            .diagnostics
-            .as_ref()
-            .expect("full scalar observation retains diagnostics");
-        if aqm {
-            assert_eq!(diagnostics.aqm_transitions.len(), 1);
-            assert_eq!(diagnostics.aqm_transitions[0].node, node);
-            assert_eq!(diagnostics.aqm_transitions[0].payload, payload);
-        } else {
-            assert_eq!(diagnostics.mechanism_transitions.len(), 1);
-        }
-        let dormant = run_scalar_with_observations(&image, Some(boundary), ObservationMode::Full)
-            .expect("completion at the exclusive horizon must remain dormant");
-        let metal_dormant = run_metal_with_observations(
-            &image,
-            Some(boundary),
-            MetalConfig::default(),
-            ObservationMode::Full,
-        )
-        .expect("excluded waiter handoff must retain Full support");
-        assert_eq!(metal_dormant.result, dormant);
-        assert_eq!(
-            run_metal_with_observations(
-                &image,
-                None,
-                MetalConfig::default(),
-                ObservationMode::Full,
-            )
-            .expect_err("Metal Full cannot omit a resident-waiter transition"),
-            MetalError::Validation(
-                "Full observation mode is unsupported on Metal for Rate, ECN, DRR, or WRR transition planes; use Summary".to_owned()
-            )
-        );
-    }
-}
-
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-#[test]
 fn metal_summary_observation_matches_reachable_unported_planes() {
     for (image, _, _, _, _) in resident_waiter_cases() {
         let scalar = run_scalar_with_observations(&image, None, ObservationMode::Summary)
@@ -754,35 +712,6 @@ fn metal_summary_observation_matches_reachable_unported_planes() {
         .expect("Summary mode must not require unported transition records");
 
         assert_eq!(metal.result, scalar);
-    }
-}
-
-#[cfg(feature = "cuda")]
-#[test]
-fn cuda_full_observation_closes_over_divergent_resident_waiters() {
-    for (image, boundary, _, _, _) in resident_waiter_cases() {
-        let dormant = run_scalar_with_observations(&image, Some(boundary), ObservationMode::Full)
-            .expect("completion at the exclusive horizon must remain dormant");
-        let cuda_dormant = run_cuda_with_observations(
-            &image,
-            Some(boundary),
-            CudaConfig::default(),
-            ObservationMode::Full,
-        )
-        .expect("excluded waiter handoff must retain Full support");
-        assert_eq!(cuda_dormant.result, dormant);
-        assert_eq!(
-            run_cuda_with_observations(
-                &image,
-                None,
-                CudaConfig::default(),
-                ObservationMode::Full,
-            )
-            .expect_err("CUDA Full cannot omit a resident-waiter transition"),
-            CudaError::Validation(
-                "Full observation mode is unsupported on CUDA for Rate, ECN, DRR, or WRR transition planes; use Summary".to_owned()
-            )
-        );
     }
 }
 

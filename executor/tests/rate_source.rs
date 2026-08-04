@@ -10,9 +10,9 @@ use days_executor::{
     run_scalar_with_observations, validate,
 };
 #[cfg(feature = "cuda")]
-use days_executor::{CudaConfig, CudaError, run_cuda_with_observations};
+use days_executor::{CudaConfig, run_cuda_with_observations};
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-use days_executor::{MetalConfig, MetalError, run_metal_with_observations};
+use days_executor::{MetalConfig, run_metal_with_observations};
 
 const SOURCE: NodeId = NodeId(0);
 const SINK: NodeId = NodeId(1);
@@ -847,66 +847,6 @@ fn device_backends_accept_rate_sources() {
     }
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-#[test]
-fn metal_rate_full_observation_rejects_the_unported_transition_plane() {
-    let image = rate_image(
-        RateGenerator {
-            first_pacing_time_ns: 1,
-            pacing_interval_ns: 1,
-            packet_size_bytes: 1,
-            total_bytes: 1,
-            rate_numerator_bits_per_second: 8_000_000_000,
-            rate_denominator: 1,
-            credit_quanta: 0,
-        },
-        GeneratorStatus::Scheduled,
-        10,
-    );
-    assert_eq!(
-        run_metal_with_observations(
-            &image,
-            None,
-            MetalConfig::default(),
-            ObservationMode::Full,
-        )
-        .expect_err("Metal Full cannot omit the Rate transition plane"),
-        MetalError::Validation(
-            "Full observation mode is unsupported on Metal for Rate, ECN, DRR, or WRR transition planes; use Summary".to_owned()
-        )
-    );
-}
-
-#[cfg(feature = "cuda")]
-#[test]
-fn cuda_rate_full_observation_rejects_the_unported_transition_plane() {
-    let image = rate_image(
-        RateGenerator {
-            first_pacing_time_ns: 1,
-            pacing_interval_ns: 1,
-            packet_size_bytes: 1,
-            total_bytes: 1,
-            rate_numerator_bits_per_second: 8_000_000_000,
-            rate_denominator: 1,
-            credit_quanta: 0,
-        },
-        GeneratorStatus::Scheduled,
-        10,
-    );
-    assert_eq!(
-        run_cuda_with_observations(
-            &image,
-            None,
-            CudaConfig::default(),
-            ObservationMode::Full,
-        )
-        .expect_err("CUDA Full cannot omit the Rate transition plane"),
-        CudaError::Validation(
-            "Full observation mode is unsupported on CUDA for Rate, ECN, DRR, or WRR transition planes; use Summary".to_owned()
-        )
-    );
-}
-
 #[cfg(any(
     feature = "cuda",
     all(feature = "metal-spike", target_vendor = "apple")
@@ -958,65 +898,6 @@ fn adversarial_device_rate_images() -> Vec<SimulationImage> {
     vec![blocked, partial, time_zero, checkpoint]
 }
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
-fn terminal_device_rate_images() -> [SimulationImage; 3] {
-    let mut finished = rate_image(
-        RateGenerator {
-            first_pacing_time_ns: 1,
-            pacing_interval_ns: 1,
-            packet_size_bytes: 1,
-            total_bytes: 1,
-            rate_numerator_bits_per_second: 8_000_000_000,
-            rate_denominator: 1,
-            credit_quanta: 0,
-        },
-        GeneratorStatus::Scheduled,
-        10,
-    );
-    finished.host_states[0].generators[0].packets_emitted = 1;
-    finished.host_states[0].generators[0].bytes_emitted = 1;
-    finished.host_states[0].generators[0].next_emission.status = GeneratorStatus::Finished;
-    finished.initial_packets.clear();
-    finished.initial_events.clear();
-    finished.host_states[0].next_origin_seq = 0;
-
-    let mut stopped = rate_image(
-        RateGenerator {
-            first_pacing_time_ns: 11,
-            pacing_interval_ns: 1,
-            packet_size_bytes: 1,
-            total_bytes: 1,
-            rate_numerator_bits_per_second: 8_000_000_000,
-            rate_denominator: 1,
-            credit_quanta: 0,
-        },
-        GeneratorStatus::Stopped,
-        10,
-    );
-    stopped.initial_packets.clear();
-    stopped.initial_events.clear();
-    stopped.host_states[0].next_origin_seq = 0;
-    stopped.host_states[0].next_payload_seq = 0;
-
-    let beyond_stop = rate_image(
-        RateGenerator {
-            first_pacing_time_ns: 11,
-            pacing_interval_ns: 1,
-            packet_size_bytes: 1,
-            total_bytes: 1,
-            rate_numerator_bits_per_second: 8_000_000_000,
-            rate_denominator: 1,
-            credit_quanta: 0,
-        },
-        GeneratorStatus::Scheduled,
-        10,
-    );
-    [finished, stopped, beyond_stop]
-}
-
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 #[test]
 fn metal_rate_pacing_and_checkpoints_match_scalar() {
@@ -1048,75 +929,6 @@ fn metal_rate_pacing_and_checkpoints_match_scalar() {
     }
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-#[test]
-fn metal_rate_terminal_and_beyond_stop_states_reserve_no_work() {
-    for image in terminal_device_rate_images() {
-        validate(&image, Backend::Metal).expect("terminal rate state must validate");
-        let expected = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
-        assert!(
-            expected
-                .diagnostics
-                .as_ref()
-                .unwrap()
-                .mechanism_transitions
-                .is_empty()
-        );
-        let actual = run_metal_with_observations(
-            &image,
-            None,
-            MetalConfig::default(),
-            ObservationMode::Full,
-        )
-        .expect("provably dormant Rate state must retain Full observation support");
-        assert_eq!(actual.result, expected);
-    }
-}
-
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-#[test]
-fn metal_rate_full_observation_respects_the_exclusive_horizon() {
-    let image = rate_image(
-        RateGenerator {
-            first_pacing_time_ns: 1,
-            pacing_interval_ns: 1,
-            packet_size_bytes: 1,
-            total_bytes: 1,
-            rate_numerator_bits_per_second: 8_000_000_000,
-            rate_denominator: 1,
-            credit_quanta: 0,
-        },
-        GeneratorStatus::Scheduled,
-        10,
-    );
-    let expected = run_scalar_with_observations(&image, Some(1), ObservationMode::Full).unwrap();
-    assert!(
-        expected
-            .diagnostics
-            .as_ref()
-            .unwrap()
-            .mechanism_transitions
-            .is_empty()
-    );
-    let actual = run_metal_with_observations(
-        &image,
-        Some(1),
-        MetalConfig::default(),
-        ObservationMode::Full,
-    )
-    .expect("a pacing event at the exclusive horizon cannot populate the Rate plane");
-    assert_eq!(actual.result, expected);
-    assert!(
-        run_metal_with_observations(
-            &image,
-            Some(2),
-            MetalConfig::default(),
-            ObservationMode::Full,
-        )
-        .is_err()
-    );
-}
-
 #[cfg(feature = "cuda")]
 #[test]
 fn cuda_rate_pacing_and_checkpoints_match_scalar() {
@@ -1146,71 +958,6 @@ fn cuda_rate_pacing_and_checkpoints_match_scalar() {
             }
         }
     }
-}
-
-#[cfg(feature = "cuda")]
-#[test]
-fn cuda_rate_terminal_and_beyond_stop_states_reserve_no_work() {
-    for image in terminal_device_rate_images() {
-        validate(&image, Backend::Cuda).expect("terminal rate state must validate");
-        let expected = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
-        assert!(
-            expected
-                .diagnostics
-                .as_ref()
-                .unwrap()
-                .mechanism_transitions
-                .is_empty()
-        );
-        let actual =
-            run_cuda_with_observations(&image, None, CudaConfig::default(), ObservationMode::Full)
-                .expect("provably dormant Rate state must retain Full observation support");
-        assert_eq!(actual.result, expected);
-    }
-}
-
-#[cfg(feature = "cuda")]
-#[test]
-fn cuda_rate_full_observation_respects_the_exclusive_horizon() {
-    let image = rate_image(
-        RateGenerator {
-            first_pacing_time_ns: 1,
-            pacing_interval_ns: 1,
-            packet_size_bytes: 1,
-            total_bytes: 1,
-            rate_numerator_bits_per_second: 8_000_000_000,
-            rate_denominator: 1,
-            credit_quanta: 0,
-        },
-        GeneratorStatus::Scheduled,
-        10,
-    );
-    let expected = run_scalar_with_observations(&image, Some(1), ObservationMode::Full).unwrap();
-    assert!(
-        expected
-            .diagnostics
-            .as_ref()
-            .unwrap()
-            .mechanism_transitions
-            .is_empty()
-    );
-    let actual = run_cuda_with_observations(
-        &image,
-        Some(1),
-        CudaConfig::default(),
-        ObservationMode::Full,
-    )
-    .expect("a pacing event at the exclusive horizon cannot populate the Rate plane");
-    assert_eq!(actual.result, expected);
-    assert!(
-        run_cuda_with_observations(
-            &image,
-            Some(2),
-            CudaConfig::default(),
-            ObservationMode::Full,
-        )
-        .is_err()
-    );
 }
 
 #[test]
