@@ -1854,6 +1854,7 @@ fn generator_round_burst(
         .fold(0, usize::saturating_add)
 }
 
+#[allow(clippy::too_many_arguments)] // One prepare-time boundary owns all flow sizing inputs.
 fn add_flow_route_capacities(
     image: &SimulationImage,
     flow_minimum_packet_sizes: &[[u64; 2]],

@@ -601,6 +601,7 @@ fn main() {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // The benchmark record keeps each timing input explicit.
     fn metal(
         executor: &MetalExecutor,
         image: &SimulationImage,
@@ -706,6 +707,7 @@ fn main() {
         measurement
     }
 
+    #[allow(clippy::too_many_arguments)] // Matches `metal` plus the predecessor protocol.
     fn metal_after_predecessor(
         executor: &MetalExecutor,
         image: &SimulationImage,
