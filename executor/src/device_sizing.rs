@@ -109,6 +109,47 @@ pub struct DeviceSizingReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceSizingError(String);
 
+#[cfg(any(
+    test,
+    feature = "cuda-test-hooks",
+    all(feature = "metal-test-hooks", target_vendor = "apple")
+))]
+pub(crate) fn exact_plan_report(
+    words: [usize; 28],
+    tcp_words: usize,
+    event_arenas: DeviceEventArenaSizing,
+) -> Result<DeviceSizingReport, DeviceSizingError> {
+    let mut planes = PLANE_NAMES
+        .into_iter()
+        .zip(words)
+        .enumerate()
+        .map(|(index, (name, words))| {
+            Ok(DevicePlaneSizing {
+                index,
+                name,
+                words,
+                bytes: checked_product(words, WORD_BYTES, "device plane bytes")?,
+            })
+        })
+        .collect::<Result<Vec<_>, DeviceSizingError>>()?;
+    planes.push(DevicePlaneSizing {
+        index: planes.len(),
+        name: "tcp_state",
+        words: tcp_words,
+        bytes: checked_product(tcp_words, WORD_BYTES, "TCP state plane bytes")?,
+    });
+    let total_device_bytes = planes.iter().try_fold(0_usize, |total, plane| {
+        total
+            .checked_add(plane.bytes)
+            .ok_or_else(|| sizing_error("total device bytes overflow usize"))
+    })?;
+    Ok(DeviceSizingReport {
+        planes,
+        total_device_bytes,
+        event_arenas,
+    })
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct RateDeviceWork {
     pub pacing_ticks: usize,
@@ -1503,10 +1544,23 @@ fn sizing_error(message: impl Into<String>) -> DeviceSizingError {
 #[cfg(test)]
 mod tests {
     use super::{
-        horizon_queue_packet_bound, paced_single_source_queue_bound,
+        exact_plan_report, horizon_queue_packet_bound, paced_single_source_queue_bound,
         tcp_fallback_timer_packet_bound, tcp_ledger_segment_bound, tcp_receiver_range_bound,
     };
-    use crate::{TcpCongestionControl, TcpGenerator};
+    use crate::{DeviceEventArenaSizing, TcpCongestionControl, TcpGenerator};
+
+    #[test]
+    fn exact_plan_report_sums_production_plane_words() {
+        let mut words = [0_usize; 28];
+        words[0] = 20;
+        words[12] = 40;
+        let report = exact_plan_report(words, 10, DeviceEventArenaSizing::default()).unwrap();
+
+        assert_eq!(report.planes.len(), 29);
+        assert_eq!(report.planes[12].name, "outbox");
+        assert_eq!(report.planes[28].name, "tcp_state");
+        assert_eq!(report.total_device_bytes, 70 * size_of::<u64>());
+    }
 
     #[test]
     fn paced_single_source_queue_bound_pins_service_rate_contract() {

@@ -1056,6 +1056,65 @@ pub fn measure_cuda_planner_for_testing(
     Ok(planning_ns)
 }
 
+/// Returns the exact production-plan plane lengths without creating a CUDA device.
+#[cfg(feature = "cuda-test-hooks")]
+#[doc(hidden)]
+pub fn size_cuda_plan_for_testing(
+    image: &SimulationImage,
+    exclusive_horizon_ns: Option<u64>,
+    config: CudaConfig,
+    observation_mode: ObservationMode,
+) -> Result<crate::DeviceSizingReport, CudaError> {
+    validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
+    validate_config(config)?;
+    let plan = CudaPlan::new(image, exclusive_horizon_ns, config, observation_mode)?;
+    let words = [
+        plan.control.len(),
+        plan.params.len(),
+        plan.node_state.len(),
+        plan.generators.len(),
+        plan.flows.len(),
+        plan.routes.len(),
+        plan.links.len(),
+        plan.fel_meta.len(),
+        plan.fel_records.len(),
+        plan.queue_meta.len(),
+        plan.queue_records.len(),
+        plan.in_service.len(),
+        plan.outbox.len(),
+        plan.worklist.len(),
+        plan.summary.len(),
+        plan.observed.len(),
+        plan.departures.len(),
+        plan.arrivals.len(),
+        plan.lp_state.len(),
+        plan.remote_meta.len(),
+        plan.remote_staging.len(),
+        plan.observation_meta.len(),
+        plan.inbound_meta.len(),
+        plan.inbound_producers.len(),
+        plan.merge_cursors.len(),
+        plan.stream_state.len(),
+        plan.stream_records.len(),
+        plan.scheduler_state.len(),
+    ];
+    crate::device_sizing::exact_plan_report(
+        words,
+        plan.tcp_state.len(),
+        crate::DeviceEventArenaSizing {
+            legacy_heap_event_slots: plan.memory_layout.legacy_heap_event_slots,
+            fallback_heap_event_slots: plan.memory_layout.fallback_heap_event_slots,
+            channel_stream_event_slots: plan.memory_layout.channel_stream_event_slots,
+            service_stream_event_slots: plan.memory_layout.service_stream_event_slots,
+            generator_stream_event_slots: plan.memory_layout.generator_stream_event_slots,
+            heap_arena_bytes: plan.memory_layout.heap_arena_bytes,
+            stream_arena_bytes: plan.memory_layout.stream_arena_bytes,
+            legacy_heap_arena_bytes: plan.memory_layout.legacy_heap_arena_bytes,
+        },
+    )
+    .map_err(|error| CudaError::Validation(error.to_string()))
+}
+
 fn validate_config(config: CudaConfig) -> Result<(), CudaError> {
     if config.attempts_per_graph_wave == 0 {
         return Err(CudaError::Validation(

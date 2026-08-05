@@ -43,14 +43,14 @@ pub use cpu::{WindowedCpuRun, run_cpu_with_metrics_window};
 #[cfg(all(feature = "cuda", feature = "planner-test-hooks"))]
 #[doc(hidden)]
 pub use cuda::assert_cuda_planner_bit_equal_for_testing;
-#[cfg(feature = "cuda-test-hooks")]
-#[doc(hidden)]
-pub use cuda::measure_cuda_planner_for_testing;
 #[cfg(feature = "cuda")]
 pub use cuda::{
     CudaArena, CudaConfig, CudaError, CudaExecutor, CudaInitializationTimings, CudaMemoryLayout,
     CudaRun, run_cuda, run_cuda_with_observations,
 };
+#[cfg(feature = "cuda-test-hooks")]
+#[doc(hidden)]
+pub use cuda::{measure_cuda_planner_for_testing, size_cuda_plan_for_testing};
 pub use dcqcn::{
     DCQCN_FRACTION_SCALE, DCQCN_STAGE_STEPS, DcqcnArithmeticError, DcqcnController,
     DcqcnControllerConfig, DcqcnIncreaseStage, DcqcnTransitionKind, DcqcnTransitionRecord,
@@ -88,9 +88,6 @@ pub use mechanism_trace::{
 ))]
 #[doc(hidden)]
 pub use metal::assert_metal_planner_bit_equal_for_testing;
-#[cfg(all(feature = "metal-test-hooks", target_vendor = "apple"))]
-#[doc(hidden)]
-pub use metal::measure_metal_planner_for_testing;
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub use metal::{
     MetalArena, MetalConfig, MetalDrainDecomposition, MetalError, MetalExecutor,
@@ -98,6 +95,9 @@ pub use metal::{
     MetalMergeFanIn, MetalMergeFanInRun, MetalPhaseProfile, MetalPhaseTimings, MetalRun, run_metal,
     run_metal_with_observations,
 };
+#[cfg(all(feature = "metal-test-hooks", target_vendor = "apple"))]
+#[doc(hidden)]
+pub use metal::{measure_metal_planner_for_testing, size_metal_plan_for_testing};
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub use metal_spike::{RealReplayTrace, ReplayStep, ReplayTraceCapture};
 pub use model::{

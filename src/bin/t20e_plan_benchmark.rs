@@ -8,10 +8,12 @@ mod app {
     use clap::{Parser, ValueEnum};
     use days::scenario::compile_config;
     #[cfg(feature = "cuda-test-hooks")]
-    use days_executor::{CudaConfig, measure_cuda_planner_for_testing};
-    use days_executor::{DeviceCapacityCaps, ObservationMode};
+    use days_executor::{CudaConfig, measure_cuda_planner_for_testing, size_cuda_plan_for_testing};
+    use days_executor::{DeviceCapacityCaps, DeviceSizingReport, ObservationMode};
     #[cfg(all(feature = "metal-test-hooks", target_vendor = "apple"))]
-    use days_executor::{MetalConfig, measure_metal_planner_for_testing};
+    use days_executor::{
+        MetalConfig, measure_metal_planner_for_testing, size_metal_plan_for_testing,
+    };
 
     const CAPACITY_CAPS: DeviceCapacityCaps = DeviceCapacityCaps {
         fallback_fel_events_per_lp: Some(16_384),
@@ -48,6 +50,45 @@ mod app {
         planner: Planner,
         #[arg(long, default_value_t = 1)]
         samples: usize,
+        /// Print the exact uncapped production-plan layout instead of timing the capped planner.
+        #[arg(long)]
+        default_layout: bool,
+        /// Print the exact production layout under the retained P11 arena-cap policy.
+        #[arg(long, conflicts_with = "default_layout")]
+        capped_layout: bool,
+    }
+
+    fn print_layout(fixture: &std::path::Path, backend: Backend, report: &DeviceSizingReport) {
+        for plane in &report.planes {
+            println!(
+                "record=t20f_plan_plane backend={backend:?} fixture={} index={} name={} words={} bytes={}",
+                fixture.display(),
+                plane.index,
+                plane.name,
+                plane.words,
+                plane.bytes
+            );
+        }
+        let arenas = report.event_arenas;
+        println!(
+            "record=t20f_plan_arenas backend={backend:?} fixture={} legacy_heap_event_slots={} fallback_heap_event_slots={} channel_stream_event_slots={} service_stream_event_slots={} generator_stream_event_slots={} heap_arena_bytes={} stream_arena_bytes={} legacy_heap_arena_bytes={}",
+            fixture.display(),
+            arenas.legacy_heap_event_slots,
+            arenas.fallback_heap_event_slots,
+            arenas.channel_stream_event_slots,
+            arenas.service_stream_event_slots,
+            arenas.generator_stream_event_slots,
+            arenas.heap_arena_bytes,
+            arenas.stream_arena_bytes,
+            arenas.legacy_heap_arena_bytes
+        );
+        println!(
+            "record=t20f_plan_total backend={backend:?} fixture={} plane_count={} total_device_bytes={} total_device_gib={:.9}",
+            fixture.display(),
+            report.planes.len(),
+            report.total_device_bytes,
+            report.total_device_bytes as f64 / 1_073_741_824.0
+        );
     }
 
     pub fn run() -> Result<(), String> {
@@ -57,6 +98,43 @@ mod app {
         }
         let image = compile_config(&cli.fixture)
             .map_err(|error| format!("failed to lower {}: {error}", cli.fixture.display()))?;
+        if cli.default_layout || cli.capped_layout {
+            let capacity_caps = cli.capped_layout.then_some(CAPACITY_CAPS);
+            let report = match cli.backend {
+                #[cfg(all(feature = "metal-test-hooks", target_vendor = "apple"))]
+                Backend::Metal => size_metal_plan_for_testing(
+                    &image,
+                    None,
+                    MetalConfig {
+                        capacity_caps: capacity_caps.unwrap_or_default(),
+                        ..MetalConfig::default()
+                    },
+                    ObservationMode::Summary,
+                )
+                .map_err(|error| error.to_string())?,
+                #[cfg(feature = "cuda-test-hooks")]
+                Backend::Cuda => size_cuda_plan_for_testing(
+                    &image,
+                    None,
+                    CudaConfig {
+                        capacity_caps: capacity_caps.unwrap_or_default(),
+                        ..CudaConfig::default()
+                    },
+                    ObservationMode::Summary,
+                )
+                .map_err(|error| error.to_string())?,
+            };
+            println!(
+                "record=t20f_plan_policy policy={}",
+                if cli.capped_layout {
+                    "p11_capacity_caps"
+                } else {
+                    "uncapped_default"
+                }
+            );
+            print_layout(&cli.fixture, cli.backend, &report);
+            return Ok(());
+        }
         let legacy = cli.planner == Planner::Legacy;
         for sample in 1..=cli.samples {
             let planning_ns = match cli.backend {
