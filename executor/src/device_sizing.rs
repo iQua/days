@@ -955,7 +955,8 @@ pub(crate) fn tcp_fallback_timer_packet_bound(whole_flow_attempts: usize) -> usi
 }
 
 /// `ceil(L/S)+1` horizon emissions, `ceil(P/S)` propagation residency, and two records of
-/// outward slack, with the finite whole-flow count as the final absolute cap.
+/// outward slack, with the finite whole-flow count as the final absolute cap. Capacity overflow
+/// remains fail-stop and adaptive re-planning grows any execution-specific underestimate.
 pub(crate) fn horizon_queue_packet_bound(
     whole_flow_packets: usize,
     lookahead_ns: Option<u64>,

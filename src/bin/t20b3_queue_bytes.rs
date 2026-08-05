@@ -91,6 +91,9 @@ struct Cli {
     /// Optional exact per-LP FEL capacity override.
     #[arg(long)]
     max_fel_events_per_lp: Option<usize>,
+    /// Capacity retry budget; zero proves that the selected sizing is single-shot sufficient.
+    #[arg(long, default_value_t = 4)]
+    max_capacity_retries: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -218,7 +221,7 @@ fn print_protocol(backend: &str, cli: &Cli, transform: BytePolicyTransform) {
          observation_mode={:?} source_policy=TailDrop source_unit=packets \
          policy=EcnThreshold policy_unit=bytes policy_packet_bytes={} queues={} \
          capacity_bytes={} threshold_bytes={} capacity_caps={:?} max_fel_events_per_lp={:?} \
-         production_uninstrumented=1",
+         max_capacity_retries={} production_uninstrumented=1",
         cli.fixture.display(),
         cli.kind.label(),
         cli.sample_label,
@@ -229,6 +232,7 @@ fn print_protocol(backend: &str, cli: &Cli, transform: BytePolicyTransform) {
         transform.capacity_bytes,
         capacity_caps(cli.kind),
         cli.max_fel_events_per_lp,
+        cli.max_capacity_retries,
     );
 }
 
@@ -290,6 +294,7 @@ fn main() {
     let config = MetalConfig {
         capacity_caps: capacity_caps(cli.kind),
         max_fel_events_per_lp: cli.max_fel_events_per_lp,
+        max_capacity_retries: cli.max_capacity_retries,
         ..MetalConfig::default()
     };
 
@@ -353,6 +358,7 @@ fn main() {
     let config = CudaConfig {
         capacity_caps: capacity_caps(cli.kind),
         max_fel_events_per_lp: cli.max_fel_events_per_lp,
+        max_capacity_retries: cli.max_capacity_retries,
         ..CudaConfig::default()
     };
 
