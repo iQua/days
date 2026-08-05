@@ -10,6 +10,12 @@ categories = ["simulation", "science"]
 license = "AGPL-3.0-only"
 edition = "2021"
 
+[[bin]]
+name = "t20b2b_lane_packing"
+path = "src/bin/t20b2b_lane_packing.rs"
+test = false
+bench = false
+
 [workspace]
 members = ["executor", "legacy", "validation", "xtask"]
 resolver = "2"
