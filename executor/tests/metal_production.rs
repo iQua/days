@@ -1617,7 +1617,10 @@ fn metal_device_queue_capacity_fault_is_explicit() {
         &image,
         None,
         MetalConfig {
-            max_queue_packets_per_lp: Some(0),
+            capacity_caps: days_executor::DeviceCapacityCaps {
+                queue_packets_per_lp: Some(0),
+                ..days_executor::DeviceCapacityCaps::default()
+            },
             ..MetalConfig::default()
         },
         ObservationMode::Full,
@@ -1638,7 +1641,10 @@ fn metal_device_queue_capacity_fault_is_explicit() {
         &image,
         None,
         MetalConfig {
-            max_queue_packets_per_lp: Some(0),
+            capacity_caps: days_executor::DeviceCapacityCaps {
+                queue_packets_per_lp: Some(0),
+                ..days_executor::DeviceCapacityCaps::default()
+            },
             max_capacity_retries: 0,
             ..MetalConfig::default()
         },

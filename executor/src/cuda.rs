@@ -556,20 +556,20 @@ impl CudaConfig {
     fn raise_capacity(&mut self, arena: CudaArena, grown: usize) {
         match arena {
             CudaArena::Fel => {
-                if let Some(capacity) = &mut self.max_fel_events_per_lp {
-                    *capacity = (*capacity).max(grown);
-                } else {
-                    self.capacity_floors.fallback_fel_events_per_lp =
-                        self.capacity_floors.fallback_fel_events_per_lp.max(grown);
-                }
+                crate::device_capacity::raise_override_cap_or_floor(
+                    &mut self.max_fel_events_per_lp,
+                    &mut self.capacity_caps.fallback_fel_events_per_lp,
+                    &mut self.capacity_floors.fallback_fel_events_per_lp,
+                    grown,
+                );
             }
             CudaArena::ChannelInbox => {
-                if let Some(capacity) = &mut self.max_channel_events_per_stream {
-                    *capacity = (*capacity).max(grown);
-                } else {
-                    self.capacity_floors.channel_events_per_stream =
-                        self.capacity_floors.channel_events_per_stream.max(grown);
-                }
+                crate::device_capacity::raise_override_cap_or_floor(
+                    &mut self.max_channel_events_per_stream,
+                    &mut self.capacity_caps.channel_events_per_stream,
+                    &mut self.capacity_floors.channel_events_per_stream,
+                    grown,
+                );
             }
             CudaArena::ServiceStream => {
                 self.capacity_floors.service_events_per_stream =
@@ -580,48 +580,54 @@ impl CudaConfig {
                     self.capacity_floors.generator_events_per_stream.max(grown);
             }
             CudaArena::Queue => {
-                if let Some(capacity) = &mut self.max_queue_packets_per_lp {
-                    *capacity = (*capacity).max(grown);
-                } else {
-                    self.capacity_floors.queue_packets_per_lp =
-                        self.capacity_floors.queue_packets_per_lp.max(grown);
-                }
+                crate::device_capacity::raise_override_cap_or_floor(
+                    &mut self.max_queue_packets_per_lp,
+                    &mut self.capacity_caps.queue_packets_per_lp,
+                    &mut self.capacity_floors.queue_packets_per_lp,
+                    grown,
+                );
             }
             CudaArena::Outbox => {
-                if let Some(capacity) = &mut self.max_outbox_events {
-                    *capacity = (*capacity).max(grown);
-                } else {
-                    self.capacity_floors.outbox_events_total =
-                        self.capacity_floors.outbox_events_total.max(grown);
-                }
+                crate::device_capacity::raise_override_cap_or_floor(
+                    &mut self.max_outbox_events,
+                    &mut self.capacity_caps.outbox_events_total,
+                    &mut self.capacity_floors.outbox_events_total,
+                    grown,
+                );
             }
             CudaArena::Worklist => {
                 self.capacity_floors.worklist_entries_total =
                     self.capacity_floors.worklist_entries_total.max(grown);
             }
             CudaArena::ObservedPackets | CudaArena::Departures | CudaArena::Arrivals => {
-                if let Some(capacity) = &mut self.max_observations {
-                    *capacity = (*capacity).max(grown);
-                } else {
-                    self.capacity_floors.observation_events =
-                        self.capacity_floors.observation_events.max(grown);
-                }
+                crate::device_capacity::raise_override_cap_or_floor(
+                    &mut self.max_observations,
+                    &mut self.capacity_caps.observation_events_per_lp,
+                    &mut self.capacity_floors.observation_events,
+                    grown,
+                );
             }
             CudaArena::TcpReceiverRanges => {
-                self.capacity_floors.tcp_receiver_ranges_per_flow =
-                    self.capacity_floors.tcp_receiver_ranges_per_flow.max(grown);
+                crate::device_capacity::raise_cap_or_floor(
+                    &mut self.capacity_caps.tcp_receiver_ranges_per_flow,
+                    &mut self.capacity_floors.tcp_receiver_ranges_per_flow,
+                    grown,
+                );
             }
             CudaArena::TcpSegmentLedger => {
-                self.capacity_floors.tcp_ledger_segments_per_flow =
-                    self.capacity_floors.tcp_ledger_segments_per_flow.max(grown);
+                crate::device_capacity::raise_cap_or_floor(
+                    &mut self.capacity_caps.tcp_ledger_segments_per_flow,
+                    &mut self.capacity_floors.tcp_ledger_segments_per_flow,
+                    grown,
+                );
             }
             CudaArena::RemoteStaging => {
-                if let Some(capacity) = &mut self.max_outbox_events {
-                    *capacity = (*capacity).max(grown);
-                } else {
-                    self.capacity_floors.remote_staging_events_per_lp =
-                        self.capacity_floors.remote_staging_events_per_lp.max(grown);
-                }
+                crate::device_capacity::raise_override_cap_or_floor(
+                    &mut self.max_outbox_events,
+                    &mut self.capacity_caps.remote_staging_events_per_lp,
+                    &mut self.capacity_floors.remote_staging_events_per_lp,
+                    grown,
+                );
             }
         }
     }

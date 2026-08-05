@@ -51,7 +51,7 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "device_capacity.rs",
         predicate: r#"any(test, feature = "cuda", all(feature = "metal-spike", target_vendor = "apple"))"#,
-        count: 3,
+        count: 5,
         purpose: "shared device-arena cap and retry helpers compile only for tests and device backends",
     },
     AllowedFeatureGate {
