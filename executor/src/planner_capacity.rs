@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crate::{
     EventKind, FlowGeneratorKind, GeneratorStatus, NodeId, NodeKind, PacketKind, SimulationImage,
-    TcpGenerator,
+    TcpGenerator, device_sizing::paced_single_source_queue_bound,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -482,18 +482,6 @@ fn precompute_minimum_packet_sizes(
     minimums
 }
 
-pub(crate) fn paced_single_source_queue_bound(
-    packet_count: usize,
-    emission_interval_ns: u64,
-    serialization_ns: u64,
-) -> usize {
-    if emission_interval_ns >= serialization_ns {
-        packet_count.min(1)
-    } else {
-        packet_count
-    }
-}
-
 fn update_minimum_packet_size(minimum: &mut u64, size: u64) {
     debug_assert_ne!(size, 0, "device validation rejects zero packet sizes");
     if *minimum == 0 || size < *minimum {
@@ -717,10 +705,7 @@ fn legacy_source_queue_packet_bound(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        materialize_minimum_packet_sizes, paced_single_source_queue_bound,
-        update_minimum_packet_size,
-    };
+    use super::{materialize_minimum_packet_sizes, update_minimum_packet_size};
 
     #[test]
     fn packet_size_cache_distinguishes_exact_u64_boundary_from_absence() {
@@ -728,12 +713,5 @@ mod tests {
         update_minimum_packet_size(&mut minimums[0][0], u64::MAX);
         materialize_minimum_packet_sizes(&mut minimums);
         assert_eq!(minimums, [[u64::MAX, 1]]);
-    }
-
-    #[test]
-    fn paced_single_source_queue_bound_pins_service_rate_contract() {
-        assert_eq!(paced_single_source_queue_bound(65_536, 21, 21), 1);
-        assert_eq!(paced_single_source_queue_bound(65_536, 22, 21), 1);
-        assert_eq!(paced_single_source_queue_bound(65_536, 20, 21), 65_536);
     }
 }

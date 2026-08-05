@@ -42,11 +42,12 @@ The device-planner equality gate also runs in the standard backend test surfaces
 # Apple Metal toolchain
 cargo test -p days --features test,metal-spike --test t20e_planner_bit_equal -- --show-output
 
-# CUDA toolchain; constructs and compares host plans without executing a GPU
-cargo test -p days --features test,cuda --test t20e_planner_bit_equal -- --show-output
+# Host-only CUDA planner; does not require nvcc or execute a GPU
+cargo test -p days --features cuda-planner-test --test t20e_planner_bit_equal -- --show-output
 ```
 
-The CUDA surface still requires the normal CUDA build toolchain because the backend is compiled.
+The normal `test,cuda` CUDA-toolchain surface registers the same gate. The host-only surface writes
+an empty kernel placeholder because these tests never initialize or execute the CUDA backend.
 
 ## Feature flags
 
@@ -54,3 +55,4 @@ The CUDA surface still requires the normal CUDA build toolchain because the back
 - `dcqcn`: DCQCN flow type and models
 - `lean`: additional DCQCN event logging for the Lean checker
 - `test`: extra assertions and test helpers
+- `cuda-planner-test`: host-only CUDA plan equality tests without kernel compilation

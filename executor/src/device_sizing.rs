@@ -771,6 +771,18 @@ fn packed_tcp_state_words(
     })
 }
 
+pub(crate) fn paced_single_source_queue_bound(
+    packet_count: usize,
+    emission_interval_ns: u64,
+    serialization_ns: u64,
+) -> usize {
+    if emission_interval_ns >= serialization_ns {
+        packet_count.min(1)
+    } else {
+        packet_count
+    }
+}
+
 fn source_queue_bounds(
     image: &SimulationImage,
     packet_counts: &[usize],
@@ -865,11 +877,8 @@ fn source_queue_bounds(
             let link = image.links[first_link.0 as usize];
             let serialization = serialization_time_ns(constant.packet_size_bytes, link.rate_bps)
                 .map_err(|error| sizing_error(format!("source serialization failed: {error}")))?;
-            let paced = if constant.interval_ns >= serialization {
-                packet_count.min(1)
-            } else {
-                packet_count
-            };
+            let paced =
+                paced_single_source_queue_bound(packet_count, constant.interval_ns, serialization);
             Ok(if paced == packet_count {
                 packet_count
             } else {
@@ -1311,4 +1320,16 @@ fn checked_product(left: usize, right: usize, label: &str) -> Result<usize, Devi
 
 fn sizing_error(message: impl Into<String>) -> DeviceSizingError {
     DeviceSizingError(message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::paced_single_source_queue_bound;
+
+    #[test]
+    fn paced_single_source_queue_bound_pins_service_rate_contract() {
+        assert_eq!(paced_single_source_queue_bound(65_536, 21, 21), 1);
+        assert_eq!(paced_single_source_queue_bound(65_536, 22, 21), 1);
+        assert_eq!(paced_single_source_queue_bound(65_536, 20, 21), 65_536);
+    }
 }

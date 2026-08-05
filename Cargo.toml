@@ -21,6 +21,7 @@ dcqcn = []
 lean = []
 metal-spike = ["days-executor/metal-spike"]
 cuda = ["days-executor/cuda"]
+cuda-planner-test = ["test", "days-executor/cuda-planner-test"]
 metal-test-hooks = ["metal-spike", "days-executor/metal-test-hooks"]
 cuda-test-hooks = ["cuda", "days-executor/cuda-test-hooks"]
 

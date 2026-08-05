@@ -10,6 +10,7 @@ name = "days_executor"
 [features]
 default = []
 cuda = ["dep:cudarc"]
+cuda-planner-test = ["cuda", "planner-test-hooks"]
 planner-test-hooks = []
 cuda-test-hooks = ["cuda", "planner-test-hooks"]
 metal-spike = [

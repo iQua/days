@@ -5,6 +5,7 @@
     feature = "test",
     any(
         feature = "cuda",
+        feature = "cuda-planner-test",
         all(feature = "metal-spike", target_vendor = "apple")
     )
 ))]
@@ -14,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use days::scenario::compile_config;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
 use days_executor::{CudaConfig, assert_cuda_planner_bit_equal_for_testing};
 use days_executor::{
     DeviceCapacityCaps, Event, EventKey, EventKind, FlowDescriptor, FlowGeneratorKind,
@@ -228,7 +229,7 @@ fn metal_config(streams_enabled: bool, capped: bool) -> MetalConfig {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
 fn cuda_config(streams_enabled: bool, capped: bool) -> CudaConfig {
     if !capped {
         return CudaConfig {
@@ -264,7 +265,7 @@ fn assert_planners_equal(
     )
     .unwrap_or_else(|error| panic!("Metal planner differs for {label}: {error}"));
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
     assert_cuda_planner_bit_equal_for_testing(
         image,
         None,
@@ -382,7 +383,7 @@ fn unsupported_device_families_are_rejected_before_planning() {
             path.display()
         );
 
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
         assert!(
             assert_cuda_planner_bit_equal_for_testing(
                 &image,
@@ -411,7 +412,7 @@ fn unsupported_device_families_are_rejected_before_planning() {
         "Metal must reject DCQCN before planning"
     );
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
     assert!(
         assert_cuda_planner_bit_equal_for_testing(
             &dcqcn,
