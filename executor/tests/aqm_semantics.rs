@@ -733,11 +733,19 @@ fn adversarial_device_ecn_images() -> Vec<SimulationImage> {
         &[1, 2, 3],
     );
     byte_threshold.switch_states[0].queues[0].queue_capacity_packets = 1;
-    let overflow = hidden_byte_overflow_image(DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
-        unit: QueueDepthUnit::Bytes,
-        capacity: u64::MAX,
-        threshold: u64::MAX,
-    }));
+    let byte_threshold_overflow =
+        hidden_byte_overflow_image(DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
+            unit: QueueDepthUnit::Bytes,
+            capacity: u64::MAX,
+            threshold: u64::MAX,
+        }));
+    let packet_threshold_overflow =
+        hidden_byte_overflow_image(DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
+            unit: QueueDepthUnit::Packets,
+            capacity: 2,
+            threshold: 2,
+        }));
+    let taildrop_overflow = hidden_byte_overflow_image(DropMarkPolicy::TailDrop);
     let mut retained_mark = aqm_image(DropMarkPolicy::TailDrop, &[1, 1]);
     retained_mark.initial_packets[0].ecn_marked = true;
     let prefix = run_scalar_with_observations(&byte_threshold, Some(7), ObservationMode::Full)
@@ -746,7 +754,9 @@ fn adversarial_device_ecn_images() -> Vec<SimulationImage> {
     vec![
         packet_threshold,
         byte_threshold,
-        overflow,
+        byte_threshold_overflow,
+        packet_threshold_overflow,
+        taildrop_overflow,
         retained_mark,
         checkpoint,
     ]
