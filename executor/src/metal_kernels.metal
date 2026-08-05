@@ -78,7 +78,6 @@ constant uint P_STREAM_ORDER_CHECKS = 27;
 constant uint P_TCP_RECEIVER_OFFSET = 28;
 constant uint P_TCP_LEDGER_META_OFFSET = 29;
 constant uint P_ROUND_THREADS = 30;
-constant uint P_LANE_PACKING = 31;
 
 constant uint N_KIND = 0;
 constant uint N_EGRESS = 1;
@@ -793,38 +792,6 @@ inline bool fel_root_time(
     }
     time = record[E_TIME];
     return true;
-}
-
-inline ulong fel_pending_count(
-    ulong node,
-    const device ulong *params,
-    const device ulong *fel_meta,
-    const device ulong *stream_state
-) {
-    ulong pending = fel_meta[node * META_WORDS + 3];
-    if (params[P_STREAMS_ENABLED] == 0) {
-        return pending;
-    }
-    ulong meta = params[P_LP_STREAM_META_OFFSET] + node * LP_STREAM_META_WORDS;
-    ulong declared = stream_state[meta];
-    ulong declared_count = stream_state[meta + 1];
-    for (ulong index = 0; index < declared_count; ++index) {
-        ulong stream = stream_state[declared + index];
-        pending += stream_state[stream * META_WORDS + 3];
-    }
-    return pending;
-}
-
-inline bool packed_before(
-    ulong left,
-    ulong right,
-    ulong worklist_capacity,
-    const device ulong *worklist
-) {
-    ulong keys = worklist_capacity * 3;
-    ulong left_key = worklist[keys + left];
-    ulong right_key = worklist[keys + right];
-    return left_key != right_key ? left_key > right_key : left < right;
 }
 
 inline bool fel_pop_selected(
@@ -4684,7 +4651,7 @@ kernel void days_round_prepare(
         lp_state[state + L_ERROR_CAPACITY] = 0;
         remote_meta[node * META_WORDS + 3] = 0;
         ulong time;
-        bool active =
+        if (
             fel_root_time(
                 node,
                 params,
@@ -4693,26 +4660,9 @@ kernel void days_round_prepare(
                 stream_state,
                 stream_records,
                 time
-            ) && before_horizon(time, control);
-        bool retain_round_work = params[P_LANE_PACKING] != 0;
-#if defined(DAYS_T20B2B_COUNTERS)
-        retain_round_work = true;
-#endif
-        if (retain_round_work) {
-            ulong transitions = lp_state[state + L_TRANSITIONS];
-            ulong baseline_slot = params[P_WORKLIST_CAPACITY] * 2 + node;
-            ulong baseline = worklist[baseline_slot];
-            if (transitions < baseline) {
-                set_semantic_error(lp_state + state, 46, node);
-            } else if (active && params[P_LANE_PACKING] != 0) {
-                ulong realized = transitions - baseline;
-                worklist[params[P_WORKLIST_CAPACITY] * 3 + node] = realized != 0
-                    ? realized
-                    : fel_pending_count(node, params, fel_meta, stream_state);
-            }
-            worklist[baseline_slot] = transitions;
-        }
-        if (active) {
+            ) &&
+            before_horizon(time, control)
+        ) {
             local_count += 1;
         }
     }
@@ -4755,67 +4705,8 @@ kernel void days_round_prepare(
         }
     }
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-    ulong active = counts[1023];
-    if (params[P_LANE_PACKING] != 0) {
-        ulong capacity = params[P_WORKLIST_CAPACITY];
-        bool source_is_primary = true;
-        for (ulong width = 1; width < active; width *= 2) {
-            ulong span = width * 2;
-            ulong source = source_is_primary ? 0 : capacity;
-            ulong destination = source_is_primary ? capacity : 0;
-            for (ulong first = ulong(lane) * span; first < active; first += 1024 * span) {
-                ulong middle = min(first + width, active);
-                ulong last = min(first + span, active);
-                ulong left = first;
-                ulong right = middle;
-                ulong output = first;
-                while (left < middle && right < last) {
-                    ulong left_node = worklist[source + left];
-                    ulong right_node = worklist[source + right];
-                    if (packed_before(left_node, right_node, capacity, worklist)) {
-                        worklist[destination + output++] = left_node;
-                        left += 1;
-                    } else {
-                        worklist[destination + output++] = right_node;
-                        right += 1;
-                    }
-                }
-                while (left < middle) {
-                    worklist[destination + output++] = worklist[source + left++];
-                }
-                while (right < last) {
-                    worklist[destination + output++] = worklist[source + right++];
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-            source_is_primary = !source_is_primary;
-        }
-        if (!source_is_primary) {
-            for (ulong index = lane; index < active; index += 1024) {
-                worklist[index] = worklist[capacity + index];
-            }
-            threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-        }
-        if (params[P_LANE_PACKING] == 2) {
-            ulong full_lanes = (active / 32) * 32;
-            ulong full_groups = full_lanes / 32;
-            for (ulong index = lane; index < full_lanes; index += 1024) {
-                ulong group = index / 32;
-                ulong group_lane = index % 32;
-                ulong destination_group = full_groups - group - 1;
-                worklist[capacity + destination_group * 32 + group_lane] = worklist[index];
-            }
-            for (ulong index = full_lanes + lane; index < active; index += 1024) {
-                worklist[capacity + index] = worklist[index];
-            }
-            threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-            for (ulong index = lane; index < active; index += 1024) {
-                worklist[index] = worklist[capacity + index];
-            }
-            threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-        }
-    }
     if (lane == 0) {
+        ulong active = counts[1023];
         device uint *drain_dispatch =
             reinterpret_cast<device uint *>(control + C_INDIRECT_OFFSET_WORDS);
         control[C_ACTIVE] = active;
@@ -5709,9 +5600,6 @@ kernel void days_exchange_merge_fan_in_probe(
 kernel void days_round_finalize(
     device ulong *control [[buffer(0)]],
     const device ulong *params [[buffer(1)]],
-#if defined(DAYS_T20B2B_COUNTERS)
-    device ulong *worklist [[buffer(13)]],
-#endif
     const device ulong *lp_state [[buffer(18)]],
     const device ulong *observation_meta [[buffer(21)]],
     uint lane [[thread_index_in_threadgroup]]
@@ -5778,36 +5666,6 @@ kernel void days_round_finalize(
     if (values[0] != NONE) {
         return;
     }
-#if defined(DAYS_T20B2B_COUNTERS)
-    ulong worklist_capacity = params[P_WORKLIST_CAPACITY];
-    ulong group_capacity = (worklist_capacity + 31) / 32;
-    ulong counter_stride = 1 + group_capacity * 2;
-    ulong counter_base =
-        worklist_capacity * 4 + control[C_ROUNDS] * counter_stride;
-    ulong active = control[C_ACTIVE];
-    if (lane == 0) {
-        worklist[counter_base] = active;
-    }
-    ulong group_count = (active + 31) / 32;
-    for (ulong group = lane; group < group_count; group += 1024) {
-        ulong first = group * 32;
-        ulong last = min(first + 32, active);
-        ulong work = 0;
-        ulong maximum = 0;
-        for (ulong index = first; index < last; ++index) {
-            ulong node = worklist[index];
-            ulong transitions = lp_state[node * LP_STATE_WORDS + L_TRANSITIONS];
-            ulong baseline = worklist[worklist_capacity * 2 + node];
-            ulong realized = transitions - baseline;
-            work += realized;
-            maximum = max(maximum, realized);
-        }
-        ulong record = counter_base + 1 + group * 2;
-        worklist[record] = work;
-        worklist[record + 1] = maximum;
-    }
-    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-#endif
     // Complete the reduction-result read before reusing the threadgroup scratch planes.
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (params[P_FULL_OBSERVATIONS] == 0) {

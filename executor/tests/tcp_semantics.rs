@@ -19,8 +19,7 @@ use days_executor::{CudaConfig, run_cuda_with_observations};
     all(feature = "metal-spike", target_vendor = "apple")
 ))]
 use days_executor::{
-    DeviceLanePacking, DropMarkPolicy, EcnThresholdPolicy, MechanismTransitionRecord,
-    QueueDepthUnit, RunResult,
+    DropMarkPolicy, EcnThresholdPolicy, MechanismTransitionRecord, QueueDepthUnit, RunResult,
 };
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 use days_executor::{MetalConfig, run_metal_with_observations};
@@ -1191,61 +1190,6 @@ fn metal_tcp_reno_and_cubic_literal_smoke_is_byte_identical() {
 
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 #[test]
-fn metal_tcp_lane_packing_arms_match_unpacked_and_scalar() {
-    let image = tcp_image(TcpCongestionControl::reno(MSS), 4 * MSS);
-    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
-        .expect("scalar TCP packing oracle must run");
-    let mut unpacked = None;
-    for lane_packing in [
-        DeviceLanePacking::Unpacked,
-        DeviceLanePacking::Descending,
-        DeviceLanePacking::Ascending,
-    ] {
-        let run = run_metal_with_observations(
-            &image,
-            None,
-            MetalConfig {
-                lane_packing,
-                ..MetalConfig::default()
-            },
-            ObservationMode::Full,
-        )
-        .unwrap_or_else(|error| panic!("Metal TCP {} arm failed: {error}", lane_packing.label()));
-        assert_eq!(run.lane_packing, lane_packing);
-        #[cfg(feature = "lane-packing-counters")]
-        {
-            let counters = run
-                .lane_packing_counters
-                .as_ref()
-                .expect("instrumented Metal run must return lane-packing counters");
-            assert_eq!(counters.rounds.len() as u64, run.rounds);
-            assert_eq!(
-                counters
-                    .rounds
-                    .iter()
-                    .flatten()
-                    .map(|group| group.work)
-                    .sum::<u64>(),
-                run.transitions
-            );
-        }
-        #[cfg(not(feature = "lane-packing-counters"))]
-        assert!(run.lane_packing_counters.is_none());
-        assert_device_full_result_eq(
-            &run.result,
-            &scalar,
-            &format!("Metal TCP {} arm", lane_packing.label()),
-        );
-        if let Some(expected) = &unpacked {
-            assert_eq!(&run.result, expected, "Metal TCP packed/unpacked identity");
-        } else {
-            unpacked = Some(run.result);
-        }
-    }
-}
-
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-#[test]
 fn metal_tcp_timer_checkpoint_is_byte_identical() {
     let image = tcp_image(TcpCongestionControl::reno(MSS), 2 * MSS);
     let prefix = run_scalar_with_observations(&image, Some(1), ObservationMode::Full)
@@ -1280,61 +1224,6 @@ fn cuda_tcp_timer_checkpoint_is_byte_identical() {
     )
     .expect("CUDA timer checkpoint must resume");
     assert_device_full_result_eq(&cuda.result, &scalar, "CUDA timer checkpoint");
-}
-
-#[cfg(feature = "cuda")]
-#[test]
-fn cuda_tcp_lane_packing_arms_match_unpacked_and_scalar() {
-    let image = tcp_image(TcpCongestionControl::reno(MSS), 4 * MSS);
-    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
-        .expect("scalar TCP packing oracle must run");
-    let mut unpacked = None;
-    for lane_packing in [
-        DeviceLanePacking::Unpacked,
-        DeviceLanePacking::Descending,
-        DeviceLanePacking::Ascending,
-    ] {
-        let run = run_cuda_with_observations(
-            &image,
-            None,
-            CudaConfig {
-                lane_packing,
-                ..CudaConfig::default()
-            },
-            ObservationMode::Full,
-        )
-        .unwrap_or_else(|error| panic!("CUDA TCP {} arm failed: {error}", lane_packing.label()));
-        assert_eq!(run.lane_packing, lane_packing);
-        #[cfg(feature = "lane-packing-counters")]
-        {
-            let counters = run
-                .lane_packing_counters
-                .as_ref()
-                .expect("instrumented CUDA run must return lane-packing counters");
-            assert_eq!(counters.rounds.len() as u64, run.rounds);
-            assert_eq!(
-                counters
-                    .rounds
-                    .iter()
-                    .flatten()
-                    .map(|group| group.work)
-                    .sum::<u64>(),
-                run.transitions
-            );
-        }
-        #[cfg(not(feature = "lane-packing-counters"))]
-        assert!(run.lane_packing_counters.is_none());
-        assert_device_full_result_eq(
-            &run.result,
-            &scalar,
-            &format!("CUDA TCP {} arm", lane_packing.label()),
-        );
-        if let Some(expected) = &unpacked {
-            assert_eq!(&run.result, expected, "CUDA TCP packed/unpacked identity");
-        } else {
-            unpacked = Some(run.result);
-        }
-    }
 }
 
 #[test]

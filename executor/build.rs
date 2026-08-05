@@ -5,7 +5,6 @@ use std::process::{Command, Output};
 
 fn main() {
     println!("cargo:rerun-if-env-changed=NVCC");
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_LANE_PACKING_COUNTERS");
     println!("cargo:rerun-if-changed=src/cuda_kernels.cu");
 
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
@@ -32,12 +31,8 @@ fn main() {
     let source = manifest_dir.join("src/cuda_kernels.cu");
     let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo provides OUT_DIR"))
         .join("days_cuda_kernels.fatbin");
-    let mut command = Command::new(&nvcc);
-    command.arg("-std=c++17");
-    if env::var_os("CARGO_FEATURE_LANE_PACKING_COUNTERS").is_some() {
-        command.arg("-DDAYS_T20B2B_COUNTERS=1");
-    }
-    let compiled = command
+    let compiled = Command::new(&nvcc)
+        .arg("-std=c++17")
         .arg("-O3")
         .arg("-fatbin")
         .arg("-lineinfo")

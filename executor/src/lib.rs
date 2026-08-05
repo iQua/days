@@ -13,7 +13,6 @@ mod device_scheduler;
 pub mod device_sizing;
 pub mod event;
 pub mod image;
-mod lane_packing;
 mod mechanism_trace;
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub mod metal;
@@ -64,7 +63,6 @@ pub use image::{
     SwitchState, TcpAckHeader, TcpDataHeader, TcpGenerator, TcpReceiveRange, TcpReceiverState,
     TcpTimerState, default_propagation_ns,
 };
-pub use lane_packing::{DeviceLanePacking, LanePackingCounters, LanePackingGroupCounters};
 pub use mechanism_trace::{
     CollectiveActivationCause, CollectiveProgressRecord, DrrTransitionRecord, MechanismTraceError,
     MechanismTransitionRecord, PfcControlAction, PfcControlTransitionRecord, PfcOccupancyAction,

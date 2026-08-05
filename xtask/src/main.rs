@@ -31,52 +31,16 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
         purpose: "CUDA-only fault injection and capacity test hooks; no protocol selection",
     },
     AllowedFeatureGate {
-        path: "cuda.rs",
-        predicate: r#"feature = "lane-packing-counters""#,
-        count: 2,
-        purpose: "counter-only CUDA lane-utilization evidence; no timers or protocol selection",
-    },
-    AllowedFeatureGate {
         path: "metal.rs",
         predicate: r#"feature = "metal-test-hooks""#,
         count: 4,
         purpose: "Metal-only panic and fault-injection test hooks; no protocol selection",
     },
     AllowedFeatureGate {
-        path: "metal.rs",
-        predicate: r#"feature = "lane-packing-counters""#,
-        count: 4,
-        purpose: "counter-only Metal lane-utilization evidence; no timers or protocol selection",
-    },
-    AllowedFeatureGate {
         path: "device_capacity.rs",
         predicate: r#"any(test, feature = "cuda", all(feature = "metal-spike", target_vendor = "apple"))"#,
         count: 1,
         purpose: "shared device-arena cap helper is compiled only for tests and device backends",
-    },
-    AllowedFeatureGate {
-        path: "lane_packing.rs",
-        predicate: r#"any(feature = "cuda", all(feature = "metal-spike", target_vendor = "apple"))"#,
-        count: 1,
-        purpose: "device lane-packing encoding is compiled only when a device backend consumes it",
-    },
-    AllowedFeatureGate {
-        path: "lane_packing.rs",
-        predicate: r#"any(test, feature = "cuda", all(feature = "metal-spike", target_vendor = "apple"))"#,
-        count: 2,
-        purpose: "shared device counter decoding is compiled only for tests and device backends",
-    },
-    AllowedFeatureGate {
-        path: "lane_packing.rs",
-        predicate: r#"feature = "lane-packing-counters""#,
-        count: 1,
-        purpose: "decode counter-only lane-utilization evidence in instrumented builds",
-    },
-    AllowedFeatureGate {
-        path: "lane_packing.rs",
-        predicate: r#"not(feature = "lane-packing-counters")"#,
-        count: 1,
-        purpose: "return no counter evidence in ordinary production builds",
     },
     AllowedFeatureGate {
         path: "cpu.rs",

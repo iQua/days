@@ -5,19 +5,14 @@ use days_executor::{
     EventKind, FlowDescriptor, FlowGeneratorKind, FlowGeneratorState, FlowId,
     GeneratorFeedbackState, GeneratorStatus, HostState, LinkDescriptor, LinkId,
     MechanismTransitionRecord, NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketDescriptor,
-    PacketKind, PayloadId, QueueDepthUnit, RemoteChannel, ScheduledEmission, SchedulerKind,
-    SchedulerPacket, SimulationImage, SwitchQueueState, SwitchState, TcpAckHeader,
+    PacketKind, PayloadId, QueueDepthUnit, RemoteChannel, RunResult, ScheduledEmission,
+    SchedulerKind, SchedulerPacket, SimulationImage, SwitchQueueState, SwitchState, TcpAckHeader,
     TcpCongestionControl, TcpDataHeader, TcpGenerator, TcpReceiverState, TcpTimerState,
     drr_transitions_csv, event_phase, run_cpu_with_observations, run_scalar_with_observations,
     validate, wrr_transitions_csv,
 };
 #[cfg(feature = "cuda")]
 use days_executor::{CudaConfig, CudaError, run_cuda_with_observations};
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
-use days_executor::{DeviceLanePacking, RunResult};
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 use days_executor::{MetalConfig, MetalError, run_metal_with_observations};
 #[cfg(any(
@@ -1035,48 +1030,6 @@ fn metal_drr_wrr_full_measurements_and_state_match_scalar() {
 
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 #[test]
-fn metal_scheduler_lane_packing_arms_match_unpacked_and_scalar() {
-    let image = adversarial_drr_wrr_images()
-        .into_iter()
-        .next()
-        .expect("scheduler packing fixture");
-    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
-    let mut unpacked = None;
-    for lane_packing in [
-        DeviceLanePacking::Unpacked,
-        DeviceLanePacking::Descending,
-        DeviceLanePacking::Ascending,
-    ] {
-        let run = run_metal_with_observations(
-            &image,
-            None,
-            MetalConfig {
-                lane_packing,
-                ..MetalConfig::default()
-            },
-            ObservationMode::Full,
-        )
-        .unwrap_or_else(|error| {
-            panic!(
-                "Metal scheduler {} arm failed: {error}",
-                lane_packing.label()
-            )
-        });
-        assert_eq!(run.lane_packing, lane_packing);
-        assert_device_full_result_eq(&run.result, &scalar);
-        if let Some(expected) = &unpacked {
-            assert_eq!(
-                &run.result, expected,
-                "Metal scheduler packed/unpacked identity"
-            );
-        } else {
-            unpacked = Some(run.result);
-        }
-    }
-}
-
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-#[test]
 fn metal_drr_skips_the_exact_legal_maximum_round_count() {
     let image = drr_legal_maximum_image();
     validate(&image, Backend::Metal).expect("the maximum representable DRR round count is legal");
@@ -1243,48 +1196,6 @@ fn cuda_drr_wrr_full_measurements_and_state_match_scalar() {
                     assert_eq!(actual.result, expected);
                 }
             }
-        }
-    }
-}
-
-#[cfg(feature = "cuda")]
-#[test]
-fn cuda_scheduler_lane_packing_arms_match_unpacked_and_scalar() {
-    let image = adversarial_drr_wrr_images()
-        .into_iter()
-        .next()
-        .expect("scheduler packing fixture");
-    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full).unwrap();
-    let mut unpacked = None;
-    for lane_packing in [
-        DeviceLanePacking::Unpacked,
-        DeviceLanePacking::Descending,
-        DeviceLanePacking::Ascending,
-    ] {
-        let run = run_cuda_with_observations(
-            &image,
-            None,
-            CudaConfig {
-                lane_packing,
-                ..CudaConfig::default()
-            },
-            ObservationMode::Full,
-        )
-        .unwrap_or_else(|error| {
-            panic!(
-                "CUDA scheduler {} arm failed: {error}",
-                lane_packing.label()
-            )
-        });
-        assert_eq!(run.lane_packing, lane_packing);
-        assert_device_full_result_eq(&run.result, &scalar);
-        if let Some(expected) = &unpacked {
-            assert_eq!(
-                &run.result, expected,
-                "CUDA scheduler packed/unpacked identity"
-            );
-        } else {
-            unpacked = Some(run.result);
         }
     }
 }

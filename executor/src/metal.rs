@@ -29,11 +29,11 @@ use objc2_metal::{
 use crate::device_scheduler::{prepare_device_schedulers, restore_device_scheduler};
 use crate::tcp::{TcpCubic, TcpReno};
 use crate::{
-    ArrivalDisposition, Backend, DeviceCapacityCaps, DeviceLanePacking, Event, EventKey, EventKind,
-    FlowGeneratorKind, GeneratorStatus, GeneratorTermination, LanePackingCounters, NodeId,
-    NodeKind, ObservationMode, PacketArrivalObservation, PacketDeparture, PacketDescriptor,
-    PacketKind, PayloadId, RunResult, RunSummary, SimulationImage, TcpAckHeader,
-    TcpCongestionControl, TcpDataHeader, TcpPhase, TcpReceiveRange, TcpTimerState, validate,
+    ArrivalDisposition, Backend, DeviceCapacityCaps, Event, EventKey, EventKind, FlowGeneratorKind,
+    GeneratorStatus, GeneratorTermination, NodeId, NodeKind, ObservationMode,
+    PacketArrivalObservation, PacketDeparture, PacketDescriptor, PacketKind, PayloadId, RunResult,
+    RunSummary, SimulationImage, TcpAckHeader, TcpCongestionControl, TcpDataHeader, TcpPhase,
+    TcpReceiveRange, TcpTimerState, validate,
 };
 
 const LANES: usize = 1_024;
@@ -300,8 +300,6 @@ pub struct MetalConfig {
     /// Enables the stream-decomposed FEL. When false, every event uses the retained exact heap and
     /// the original target-owned exchange merge, providing an identical-binary ablation.
     pub streams_enabled: bool,
-    /// Active-worklist lane packing and issue-order policy.
-    pub lane_packing: DeviceLanePacking,
     /// Optional caps for large capacities derived from the complete image. Exact legacy
     /// `max_*` overrides below retain precedence when both forms are specified.
     pub capacity_caps: DeviceCapacityCaps,
@@ -336,7 +334,6 @@ impl Default for MetalConfig {
     fn default() -> Self {
         Self {
             streams_enabled: true,
-            lane_packing: DeviceLanePacking::default(),
             capacity_caps: DeviceCapacityCaps::default(),
             max_fel_events_per_lp: None,
             max_channel_events_per_stream: None,
@@ -382,9 +379,6 @@ impl MetalMemoryLayout {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetalRun {
     pub result: RunResult,
-    pub lane_packing: DeviceLanePacking,
-    /// Counter-only mechanism evidence. Present only in `lane-packing-counters` builds.
-    pub lane_packing_counters: Option<LanePackingCounters>,
     pub rounds: u64,
     pub transitions: u64,
     /// Physical round attempts encoded into submitted command buffers, including termination and
@@ -1573,7 +1567,6 @@ impl MetalPlan {
             tcp_state.layout.receiver_offset as u64,
             tcp_state.layout.ledger_meta_offset as u64,
             config.round_threads_per_threadgroup as u64,
-            config.lane_packing.device_code(),
         ];
 
         if node_count.div_ceil(config.round_threads_per_threadgroup) > u32::MAX as usize {
@@ -1586,31 +1579,6 @@ impl MetalPlan {
             params[PARAM_ROUND_THREADS],
             config.round_threads_per_threadgroup as u64
         );
-
-        let worklist_words =
-            if config.lane_packing.is_packed() || cfg!(feature = "lane-packing-counters") {
-                node_count.checked_mul(4).ok_or_else(|| {
-                    MetalError::Validation("packed active worklist overflows usize".into())
-                })?
-            } else {
-                node_count
-            };
-        #[cfg(feature = "lane-packing-counters")]
-        let worklist_words = {
-            let group_capacity = node_count.div_ceil(32);
-            let round_words = group_capacity
-                .checked_mul(2)
-                .and_then(|words| words.checked_add(1))
-                .ok_or_else(|| {
-                    MetalError::Validation("lane-packing counter stride overflows usize".into())
-                })?;
-            round_capacity
-                .checked_mul(round_words)
-                .and_then(|words| worklist_words.checked_add(words))
-                .ok_or_else(|| {
-                    MetalError::Validation("lane-packing counter plane overflows usize".into())
-                })?
-        };
 
         Ok(Self {
             control,
@@ -1626,7 +1594,7 @@ impl MetalPlan {
             queue_records,
             in_service,
             outbox: zero_words(outbox_capacity, EVENT_WORDS)?,
-            worklist: vec![0_u64; worklist_words.max(1)],
+            worklist: vec![0_u64; node_count.max(1)],
             summary: vec![0_u64; node_count.max(1) * SUMMARY_COUNTERS * 2],
             observed: zero_words(observation_slots, OBSERVED_WORDS)?,
             departures: zero_words(observation_slots, DEPARTURE_WORDS)?,
@@ -3669,22 +3637,6 @@ impl MetalBuffers {
                 diagnostics: None,
                 pending_events,
             },
-            lane_packing: match params[31] {
-                0 => DeviceLanePacking::Unpacked,
-                1 => DeviceLanePacking::Descending,
-                2 => DeviceLanePacking::Ascending,
-                code => {
-                    return Err(MetalError::Validation(format!(
-                        "device returned unknown lane-packing code {code}"
-                    )));
-                }
-            },
-            lane_packing_counters: crate::lane_packing::decode_lane_packing_counters(
-                &planes[13],
-                image.nodes.len(),
-                control[CONTROL_ROUNDS],
-            )
-            .map_err(MetalError::Validation)?,
             rounds: control[CONTROL_ROUNDS],
             transitions: lp_state
                 .chunks_exact(LP_STATE_WORDS)
@@ -4032,23 +3984,16 @@ impl DirectMetal {
         let queue = device
             .newCommandQueue()
             .ok_or_else(|| MetalError::Unavailable("command queue creation failed".into()))?;
-        let source = if cfg!(feature = "lane-packing-counters") {
-            format!(
-                "#define DAYS_T20B2B_COUNTERS 1\n{}",
-                include_str!("metal_kernels.metal")
-            )
-        } else {
-            include_str!("metal_kernels.metal").to_owned()
-        };
+        let source = include_str!("metal_kernels.metal");
         let pipeline_started = Instant::now();
-        let horizon_pipeline = create_pipeline(&device, &source, "days_horizon")?;
-        let prepare_pipeline = create_pipeline(&device, &source, "days_round_prepare")?;
-        let round_pipeline = create_pipeline(&device, &source, "days_round")?;
-        let control_pipeline = create_pipeline(&device, &source, "days_round_control")?;
-        let exchange_prefix_pipeline = create_pipeline(&device, &source, "days_exchange_prefix")?;
-        let exchange_scatter_pipeline = create_pipeline(&device, &source, "days_exchange_scatter")?;
-        let exchange_merge_pipeline = create_pipeline(&device, &source, "days_exchange_merge")?;
-        let finalize_pipeline = create_pipeline(&device, &source, "days_round_finalize")?;
+        let horizon_pipeline = create_pipeline(&device, source, "days_horizon")?;
+        let prepare_pipeline = create_pipeline(&device, source, "days_round_prepare")?;
+        let round_pipeline = create_pipeline(&device, source, "days_round")?;
+        let control_pipeline = create_pipeline(&device, source, "days_round_control")?;
+        let exchange_prefix_pipeline = create_pipeline(&device, source, "days_exchange_prefix")?;
+        let exchange_scatter_pipeline = create_pipeline(&device, source, "days_exchange_scatter")?;
+        let exchange_merge_pipeline = create_pipeline(&device, source, "days_exchange_merge")?;
+        let finalize_pipeline = create_pipeline(&device, source, "days_round_finalize")?;
         let pipeline_creation_ns = duration_ns(pipeline_started.elapsed());
         for (name, pipeline) in [
             ("horizon", &horizon_pipeline),
@@ -4099,13 +4044,8 @@ impl DirectMetal {
         }
 
         let started = Instant::now();
-        let counter_define = if cfg!(feature = "lane-packing-counters") {
-            "#define DAYS_T20B2B_COUNTERS 1\n"
-        } else {
-            ""
-        };
         let source = format!(
-            "#define DAYS_T15E_DIAGNOSTICS 1\n{counter_define}{}",
+            "#define DAYS_T15E_DIAGNOSTICS 1\n{}",
             include_str!("metal_kernels.metal")
         );
         let pipelines = FelProbePipelines {
