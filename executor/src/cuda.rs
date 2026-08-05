@@ -1009,6 +1009,7 @@ fn encode_control(control: TcpCongestionControl, words: &mut [u64]) {
 fn prepare_tcp_state(
     image: &SimulationImage,
     capacity_context: &PlannerCapacityContext,
+    data_counts: &[usize],
     capacity_caps: DeviceCapacityCaps,
 ) -> Result<(Vec<u64>, TcpLayout), CudaError> {
     let flow_count = image.flows.len().max(1);
@@ -1033,7 +1034,7 @@ fn prepare_tcp_state(
             let row = receiver_offset + flow * TCP_RECEIVER_WORDS;
             let capacity = crate::device_capacity::cap_derived_capacity(
                 capacity_context
-                    .tcp_flow_segment_capacity(image, flow)
+                    .tcp_receiver_range_bound(image, flow, data_counts[flow])
                     .max(receiver.out_of_order.len()),
                 capacity_caps.tcp_receiver_ranges_per_flow,
                 receiver.out_of_order.len(),
@@ -1068,13 +1069,13 @@ fn prepare_tcp_state(
             conflict.replacement_size_bytes
         ))
     })?;
-    for flow in 0..image.flows.len() {
+    for (flow, data_count) in data_counts.iter().copied().enumerate() {
         let packets = ledger
             .get(&crate::FlowId(flow as u64))
             .map_or_else(Vec::new, |segments| segments.values().copied().collect());
         let capacity = crate::device_capacity::cap_derived_capacity(
             capacity_context
-                .tcp_flow_segment_capacity(image, flow)
+                .tcp_ledger_segment_bound(image, flow, data_count)
                 .max(packets.len()),
             capacity_caps.tcp_ledger_segments_per_flow,
             packets.len(),
@@ -1190,8 +1191,9 @@ impl CudaPlan {
             if capacity_context.tcp_generator(image, flow_index).is_some() {
                 // Timeout events are intentionally heap-class. Stale timers can coexist with the
                 // active timer, so reserve one slot per bounded sender attempt.
-                legacy_fel_caps[source_slot] =
-                    legacy_fel_caps[source_slot].saturating_add(data_count);
+                legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(
+                    capacity_context.tcp_fallback_timer_bound(image, flow_index, data_count),
+                );
             }
 
             add_flow_route_capacities(
@@ -1227,12 +1229,22 @@ impl CudaPlan {
                     let state = &image.switch_states[node.state_slot as usize];
                     let initial = state.queues.first().map_or(0, |queue| queue.queue.len());
                     queue_caps[slot] = queue_caps[slot].max(initial);
-                    if let Some(limit) = state
-                        .queues
-                        .first()
-                        .filter(|queue| matches!(queue.drop_mark, crate::DropMarkPolicy::TailDrop))
-                        .map(|queue| queue.queue_capacity_packets)
-                        .filter(|limit| *limit != 0)
+                    if let Some(limit) =
+                        state
+                            .queues
+                            .first()
+                            .and_then(|queue| match queue.drop_mark {
+                                crate::DropMarkPolicy::TailDrop => (queue.queue_capacity_packets
+                                    != 0)
+                                    .then_some(queue.queue_capacity_packets),
+                                crate::DropMarkPolicy::EcnThreshold(policy)
+                                    if policy.unit == crate::QueueDepthUnit::Packets =>
+                                {
+                                    (policy.capacity != 0).then_some(policy.capacity)
+                                }
+                                crate::DropMarkPolicy::EcnThreshold(_)
+                                | crate::DropMarkPolicy::Red(_) => None,
+                            })
                     {
                         queue_caps[slot] = queue_caps[slot].min(limit as usize);
                     }
@@ -1279,7 +1291,11 @@ impl CudaPlan {
             for (flow, descriptor) in image.flows.iter().enumerate() {
                 if capacity_context.tcp_generator(image, flow).is_some() {
                     let feedback = flow_feedback_counts[flow];
-                    let attempts = flow_packet_counts[flow].saturating_sub(feedback);
+                    let attempts = capacity_context.tcp_fallback_timer_bound(
+                        image,
+                        flow,
+                        flow_packet_counts[flow].saturating_sub(feedback),
+                    );
                     let source = descriptor.source.0 as usize;
                     capacities[source] = capacities[source].saturating_add(attempts);
                 }
@@ -1579,8 +1595,12 @@ impl CudaPlan {
                     arrival_capacity as u64;
             }
         }
-        let (tcp_state, tcp_layout) =
-            prepare_tcp_state(image, &capacity_context, config.capacity_caps)?;
+        let (tcp_state, tcp_layout) = prepare_tcp_state(
+            image,
+            &capacity_context,
+            &flow_data_counts,
+            config.capacity_caps,
+        )?;
         let (inbound_meta, inbound_producers) = remote_inbound_producers(image);
         let round_capacity = config
             .max_rounds
@@ -1827,7 +1847,24 @@ fn add_flow_route_capacities(
         );
         fel_caps[target_slot] = fel_caps[target_slot].saturating_add(burst);
         if image.nodes[target_slot].kind == NodeKind::Switch {
-            queue_caps[target_slot] = queue_caps[target_slot].saturating_add(packet_count);
+            let queue = image.switch_states[image.nodes[target_slot].state_slot as usize]
+                .queues
+                .first();
+            let contribution = if queue.is_some_and(|queue| {
+                matches!(queue.drop_mark, crate::DropMarkPolicy::EcnThreshold(_))
+            }) {
+                capacity_context.horizon_queue_packet_bound(
+                    image,
+                    flow_index,
+                    packet_count,
+                    packet_kind,
+                    image.links[route[index].0 as usize],
+                    lookahead,
+                )
+            } else {
+                packet_count
+            };
+            queue_caps[target_slot] = queue_caps[target_slot].saturating_add(contribution);
         }
     }
 }

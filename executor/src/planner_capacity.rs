@@ -46,8 +46,13 @@ pub(crate) struct PlannerCapacityContext {
     source_queue_bounds: Vec<usize>,
     generator_round_bursts: Vec<usize>,
     minimum_packet_sizes: Vec<[u64; 2]>,
+    tcp_ledger_segment_bounds: Vec<usize>,
+    tcp_receiver_range_bounds: Vec<usize>,
+    tcp_fallback_timer_bounds: Vec<usize>,
     flow_to_generator: Vec<Option<GeneratorLocation>>,
     host_to_lp: Vec<Option<NodeId>>,
+    #[cfg(any(test, feature = "planner-test-hooks"))]
+    lookahead: Option<u64>,
 }
 
 impl PlannerCapacityContext {
@@ -70,8 +75,12 @@ impl PlannerCapacityContext {
                 } else {
                     Vec::new()
                 },
+                tcp_ledger_segment_bounds: Vec::new(),
+                tcp_receiver_range_bounds: Vec::new(),
+                tcp_fallback_timer_bounds: Vec::new(),
                 flow_to_generator: Vec::new(),
                 host_to_lp: Vec::new(),
+                lookahead,
             };
         }
 
@@ -148,6 +157,26 @@ impl PlannerCapacityContext {
         }
         materialize_minimum_packet_sizes(&mut minimum_packet_sizes);
 
+        let mut tcp_ledger_segment_bounds = vec![1_usize; flow_count];
+        let mut tcp_receiver_range_bounds = vec![1_usize; flow_count];
+        let mut tcp_fallback_timer_bounds = vec![0_usize; flow_count];
+        for (flow, location) in flow_to_generator.iter().copied().enumerate() {
+            let Some(location) = location else {
+                continue;
+            };
+            let FlowGeneratorKind::Tcp(tcp) =
+                image.host_states[location.host].generators[location.generator].kind
+            else {
+                continue;
+            };
+            tcp_ledger_segment_bounds[flow] =
+                crate::device_sizing::tcp_ledger_segment_bound(tcp, data_counts[flow]);
+            tcp_receiver_range_bounds[flow] =
+                crate::device_sizing::tcp_receiver_range_bound(tcp, data_counts[flow]);
+            tcp_fallback_timer_bounds[flow] =
+                crate::device_sizing::tcp_fallback_timer_packet_bound(data_counts[flow]);
+        }
+
         let mut matching_arrivals = vec![0_usize; flow_count];
         for event in &image.initial_events {
             let Some(&flow_index) = payload_to_flow.get(&event.payload) else {
@@ -177,8 +206,26 @@ impl PlannerCapacityContext {
             .enumerate()
             .map(|(flow_index, flow)| {
                 let packet_count = data_counts[flow_index];
-                if packet_count == 0 || flows_per_source[flow.source.0 as usize] != 1 {
+                if packet_count == 0 {
+                    return 0;
+                }
+                let Some(first_link) = flow.route.first().copied() else {
                     return packet_count;
+                };
+                let link = image.links[first_link.0 as usize];
+                let serialization = crate::time::serialization_time_ns(
+                    minimum_packet_sizes[flow_index][0],
+                    link.rate_bps,
+                )
+                .expect("device validation established a positive finite serialization interval");
+                let horizon_bound = crate::device_sizing::horizon_queue_packet_bound(
+                    packet_count,
+                    lookahead,
+                    serialization,
+                    link.propagation_ns,
+                );
+                if flows_per_source[flow.source.0 as usize] != 1 {
+                    return horizon_bound;
                 }
                 let source = &image.nodes[flow.source.0 as usize];
                 if source.kind != NodeKind::Host {
@@ -201,9 +248,6 @@ impl PlannerCapacityContext {
                 {
                     return packet_count;
                 }
-                let Some(first_link) = flow.route.first().copied() else {
-                    return packet_count;
-                };
                 if first_link != state.egress_link {
                     return packet_count;
                 }
@@ -213,7 +257,6 @@ impl PlannerCapacityContext {
                 if initial_data_size[flow_index] != constant.packet_size_bytes {
                     return packet_count;
                 }
-                let link = image.links[first_link.0 as usize];
                 let serialization = crate::time::serialization_time_ns(
                     constant.packet_size_bytes,
                     link.rate_bps,
@@ -247,8 +290,13 @@ impl PlannerCapacityContext {
             source_queue_bounds,
             generator_round_bursts,
             minimum_packet_sizes,
+            tcp_ledger_segment_bounds,
+            tcp_receiver_range_bounds,
+            tcp_fallback_timer_bounds,
             flow_to_generator,
             host_to_lp,
+            #[cfg(any(test, feature = "planner-test-hooks"))]
+            lookahead,
         };
         context.debug_assert_sampled_minimum_packet_sizes(image);
         context
@@ -262,7 +310,28 @@ impl PlannerCapacityContext {
     ) -> usize {
         #[cfg(any(test, feature = "planner-test-hooks"))]
         if self.mode == PlannerCapacityMode::Legacy {
-            return legacy_source_queue_packet_bound(image, flow, packet_count);
+            let legacy = legacy_source_queue_packet_bound(image, flow, packet_count);
+            if image
+                .flows
+                .iter()
+                .filter(|candidate| candidate.source == image.flows[flow].source)
+                .count()
+                == 1
+            {
+                return legacy;
+            }
+            let Some(first_link) = image.flows[flow].route.first().copied() else {
+                return legacy;
+            };
+            let link = image.links[first_link.0 as usize];
+            return self.horizon_queue_packet_bound(
+                image,
+                flow,
+                packet_count,
+                PacketKind::Data,
+                link,
+                self.lookahead,
+            );
         }
         let _ = (image, packet_count, self.mode);
         self.source_queue_bounds[flow]
@@ -324,16 +393,74 @@ impl PlannerCapacityContext {
         }
     }
 
-    #[cfg(feature = "cuda")]
-    pub(crate) fn tcp_flow_segment_capacity(&self, image: &SimulationImage, flow: usize) -> usize {
-        self.tcp_generator(image, flow)
-            .and_then(|tcp| {
-                usize::try_from(tcp.total_bytes.div_ceil(tcp.mss_bytes))
-                    .ok()
-                    .map(|segments| segments.saturating_mul(4).saturating_add(8))
-            })
-            .unwrap_or(1)
-            .max(1)
+    pub(crate) fn tcp_ledger_segment_bound(
+        &self,
+        image: &SimulationImage,
+        flow: usize,
+        whole_flow_segments: usize,
+    ) -> usize {
+        #[cfg(any(test, feature = "planner-test-hooks"))]
+        if self.mode == PlannerCapacityMode::Legacy {
+            return self.tcp_generator(image, flow).map_or(1, |tcp| {
+                crate::device_sizing::tcp_ledger_segment_bound(tcp, whole_flow_segments)
+            });
+        }
+        let _ = (image, whole_flow_segments);
+        self.tcp_ledger_segment_bounds[flow]
+    }
+
+    pub(crate) fn tcp_receiver_range_bound(
+        &self,
+        image: &SimulationImage,
+        flow: usize,
+        whole_flow_segments: usize,
+    ) -> usize {
+        #[cfg(any(test, feature = "planner-test-hooks"))]
+        if self.mode == PlannerCapacityMode::Legacy {
+            return self.tcp_generator(image, flow).map_or(1, |tcp| {
+                crate::device_sizing::tcp_receiver_range_bound(tcp, whole_flow_segments)
+            });
+        }
+        let _ = (image, whole_flow_segments);
+        self.tcp_receiver_range_bounds[flow]
+    }
+
+    pub(crate) fn tcp_fallback_timer_bound(
+        &self,
+        image: &SimulationImage,
+        flow: usize,
+        whole_flow_attempts: usize,
+    ) -> usize {
+        #[cfg(any(test, feature = "planner-test-hooks"))]
+        if self.mode == PlannerCapacityMode::Legacy {
+            return usize::from(self.tcp_generator(image, flow).is_some()).saturating_mul(
+                crate::device_sizing::tcp_fallback_timer_packet_bound(whole_flow_attempts),
+            );
+        }
+        let _ = (image, whole_flow_attempts);
+        self.tcp_fallback_timer_bounds[flow]
+    }
+
+    pub(crate) fn horizon_queue_packet_bound(
+        &self,
+        image: &SimulationImage,
+        flow: usize,
+        whole_flow_packets: usize,
+        packet_kind: PacketKind,
+        link: crate::LinkDescriptor,
+        lookahead: Option<u64>,
+    ) -> usize {
+        let serialization = crate::time::serialization_time_ns(
+            self.minimum_packet_size(image, flow, packet_kind),
+            link.rate_bps,
+        )
+        .expect("device validation established a positive finite serialization interval");
+        crate::device_sizing::horizon_queue_packet_bound(
+            whole_flow_packets,
+            lookahead,
+            serialization,
+            link.propagation_ns,
+        )
     }
 
     pub(crate) fn host_lp(&self, image: &SimulationImage, host_slot: usize) -> Option<NodeId> {
@@ -383,7 +510,12 @@ impl PlannerCapacityContext {
                             == legacy.minimum_packet_size(image, flow, kind)
                     })
                 && precomputed.tcp_generator(image, flow) == legacy.tcp_generator(image, flow)
-                && tcp_segment_capacities_match(&precomputed, &legacy, image, flow)
+                && precomputed.tcp_ledger_segment_bound(image, flow, packet_count)
+                    == legacy.tcp_ledger_segment_bound(image, flow, packet_count)
+                && precomputed.tcp_receiver_range_bound(image, flow, packet_count)
+                    == legacy.tcp_receiver_range_bound(image, flow, packet_count)
+                && precomputed.tcp_fallback_timer_bound(image, flow, packet_count)
+                    == legacy.tcp_fallback_timer_bound(image, flow, packet_count)
         });
         flow_values_equal
             && image
@@ -415,27 +547,6 @@ impl PlannerCapacityContext {
 
     #[cfg(not(debug_assertions))]
     fn debug_assert_sampled_minimum_packet_sizes(&self, _image: &SimulationImage) {}
-}
-
-#[cfg(all(feature = "cuda", any(test, feature = "planner-test-hooks")))]
-fn tcp_segment_capacities_match(
-    precomputed: &PlannerCapacityContext,
-    legacy: &PlannerCapacityContext,
-    image: &SimulationImage,
-    flow: usize,
-) -> bool {
-    precomputed.tcp_flow_segment_capacity(image, flow)
-        == legacy.tcp_flow_segment_capacity(image, flow)
-}
-
-#[cfg(all(not(feature = "cuda"), any(test, feature = "planner-test-hooks")))]
-fn tcp_segment_capacities_match(
-    _precomputed: &PlannerCapacityContext,
-    _legacy: &PlannerCapacityContext,
-    _image: &SimulationImage,
-    _flow: usize,
-) -> bool {
-    true
 }
 
 fn interval_burst(packet_count: usize, interval_ns: u64, lookahead: Option<u64>) -> usize {

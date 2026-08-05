@@ -22,7 +22,7 @@ const FLOW_WORDS: usize = 6;
 const LINK_WORDS: usize = 4;
 const ARENA_META_WORDS: usize = 4;
 const SUMMARY_COUNTERS: usize = 12;
-const LP_STATE_WORDS: usize = 6;
+const LP_STATE_WORDS: usize = 7;
 const OBSERVATION_META_WORDS: usize = ARENA_META_WORDS * 3;
 const INBOUND_META_WORDS: usize = 2;
 const LP_STREAM_META_WORDS: usize = 4;
@@ -30,7 +30,7 @@ const OUTBOUND_META_WORDS: usize = 2;
 const OUTBOUND_ENTRY_WORDS: usize = 2;
 const CHANNEL_BATCH_WORDS: usize = 4;
 const ACTIVE_STREAM_ENTRY_WORDS: usize = 5;
-const CONTROL_WORDS: usize = 19;
+const CONTROL_WORDS: usize = 20;
 const PARAM_WORDS: usize = 35;
 const WORD_BYTES: usize = std::mem::size_of::<u64>();
 
@@ -243,6 +243,11 @@ pub fn size_default_device_plan(
     let link_count = image.links.len();
     let flow_packet_counts = flow_packet_counts(image)?;
     let flow_feedback_counts = feedback_packet_counts(image, &flow_packet_counts);
+    let flow_data_counts = flow_packet_counts
+        .iter()
+        .zip(&flow_feedback_counts)
+        .map(|(total, feedback)| total.saturating_sub(*feedback))
+        .collect::<Vec<_>>();
     let minimum_lookahead_ns = image
         .channels
         .iter()
@@ -269,6 +274,10 @@ pub fn size_default_device_plan(
         queue_capacities[source_slot] =
             queue_capacities[source_slot].saturating_add(context.source_queue_bounds[flow_index]);
         legacy_fel_capacities[source_slot] = legacy_fel_capacities[source_slot].saturating_add(4);
+        if context.tcp_generators[flow_index].is_some() {
+            legacy_fel_capacities[source_slot] = legacy_fel_capacities[source_slot]
+                .saturating_add(tcp_fallback_timer_packet_bound(data_count));
+        }
         add_flow_route_capacities(
             image,
             &context,
@@ -302,9 +311,18 @@ pub fn size_default_device_plan(
                 if let Some(limit) = state
                     .queues
                     .first()
-                    .filter(|queue| matches!(queue.drop_mark, crate::DropMarkPolicy::TailDrop))
-                    .map(|queue| queue.queue_capacity_packets)
-                    .filter(|limit| *limit != 0)
+                    .and_then(|queue| match queue.drop_mark {
+                        crate::DropMarkPolicy::TailDrop => (queue.queue_capacity_packets != 0)
+                            .then_some(queue.queue_capacity_packets),
+                        crate::DropMarkPolicy::EcnThreshold(policy)
+                            if policy.unit == crate::QueueDepthUnit::Packets =>
+                        {
+                            (policy.capacity != 0).then_some(policy.capacity)
+                        }
+                        crate::DropMarkPolicy::EcnThreshold(_) | crate::DropMarkPolicy::Red(_) => {
+                            None
+                        }
+                    })
                 {
                     queue_capacities[slot] = queue_capacities[slot].min(limit as usize);
                 }
@@ -319,7 +337,10 @@ pub fn size_default_device_plan(
         .filter(|generator| matches!(generator.kind, FlowGeneratorKind::Tcp(_)))
         .try_fold(0_usize, |total, generator| {
             total
-                .checked_add(flow_packet_counts[generator.flow.0 as usize].max(1))
+                .checked_add(tcp_fallback_timer_packet_bound(
+                    flow_packet_counts[generator.flow.0 as usize]
+                        .saturating_sub(flow_feedback_counts[generator.flow.0 as usize]),
+                ))
                 .ok_or_else(|| sizing_error("TCP fallback FEL slots overflow usize"))
         })?;
     let fallback_fel_event_slots = node_count
@@ -411,7 +432,7 @@ pub fn size_default_device_plan(
                 .iter()
                 .any(|generator| matches!(generator.kind, FlowGeneratorKind::Tcp(_)))
     }) {
-        let tcp_words = packed_tcp_state_words(image, &flow_packet_counts)?;
+        let tcp_words = packed_tcp_state_words(image, &flow_data_counts, &context)?;
         planes.push(DevicePlaneSizing {
             index: planes.len(),
             name: "tcp_state",
@@ -458,6 +479,7 @@ struct CapacityContext {
     generator_intervals: Vec<Vec<u64>>,
     minimum_data_sizes: Vec<u64>,
     minimum_feedback_sizes: Vec<u64>,
+    tcp_generators: Vec<Option<crate::TcpGenerator>>,
     lookahead: Option<u64>,
 }
 
@@ -472,6 +494,7 @@ impl CapacityContext {
         let mut generator_intervals = vec![Vec::new(); flow_count];
         let mut minimum_data_sizes = vec![u64::MAX; flow_count];
         let mut minimum_feedback_sizes = vec![u64::MAX; flow_count];
+        let mut tcp_generators = vec![None; flow_count];
         for state in &image.host_states {
             for generator in &state.generators {
                 let index = generator.flow.0 as usize;
@@ -484,6 +507,7 @@ impl CapacityContext {
                         }
                     }
                     FlowGeneratorKind::Tcp(tcp) => {
+                        tcp_generators[index].get_or_insert(tcp);
                         minimum_data_sizes[index] = minimum_data_sizes[index].min(tcp.mss_bytes);
                         minimum_feedback_sizes[index] =
                             minimum_feedback_sizes[index].min(tcp.ack_size_bytes);
@@ -552,7 +576,13 @@ impl CapacityContext {
                 *minimum = 1;
             }
         }
-        let source_queue_bounds = source_queue_bounds(image, packet_counts)?;
+        let data_counts = packet_counts
+            .iter()
+            .zip(feedback_counts)
+            .map(|(total, feedback)| total.saturating_sub(*feedback))
+            .collect::<Vec<_>>();
+        let source_queue_bounds =
+            source_queue_bounds(image, &data_counts, &minimum_data_sizes, lookahead)?;
         Ok(Self {
             packet_counts: packet_counts.to_vec(),
             feedback_counts: feedback_counts.to_vec(),
@@ -560,6 +590,7 @@ impl CapacityContext {
             generator_intervals,
             minimum_data_sizes,
             minimum_feedback_sizes,
+            tcp_generators,
             lookahead,
         })
     }
@@ -735,32 +766,54 @@ fn tcp_data_attempt_bound(
 
 fn packed_tcp_state_words(
     image: &SimulationImage,
-    packet_counts: &[usize],
+    data_counts: &[usize],
+    context: &CapacityContext,
 ) -> Result<usize, DeviceSizingError> {
-    const RECEIVER_WORDS: usize = 4;
+    const RECEIVER_WORDS: usize = 7;
     const RANGE_WORDS: usize = 2;
+    const LEDGER_META_WORDS: usize = 4;
+    const LEDGER_RECORD_WORDS: usize = 5;
     let flow_count = image.flows.len().max(1);
-    let tcp_record_slots = image
+    let receiver_range_slots = image
         .host_states
         .iter()
-        .flat_map(|state| &state.generators)
-        .filter(|generator| matches!(generator.kind, FlowGeneratorKind::Tcp(_)))
-        .try_fold(0_usize, |total, generator| {
+        .flat_map(|state| &state.tcp_receivers)
+        .try_fold(0_usize, |total, receiver| {
+            let flow = receiver.flow.0 as usize;
+            let bound = context.tcp_generators[flow]
+                .map_or(1, |tcp| tcp_receiver_range_bound(tcp, data_counts[flow]));
             total
-                .checked_add(packet_counts[generator.flow.0 as usize])
-                .ok_or_else(|| sizing_error("TCP auxiliary record slots overflow usize"))
+                .checked_add(bound.max(receiver.out_of_order.len()))
+                .ok_or_else(|| sizing_error("TCP receiver range slots overflow usize"))
         })?
         .max(1);
+    let ledger = crate::tcp_ledger::seed_image(image).map_err(|conflict| {
+        sizing_error(format!(
+            "TCP flow {:?} sequence {} changed segment size from {} to {} bytes",
+            conflict.flow,
+            conflict.sequence,
+            conflict.original_size_bytes,
+            conflict.replacement_size_bytes
+        ))
+    })?;
+    let ledger_record_slots = (0..image.flows.len()).try_fold(0_usize, |total, flow| {
+        let resident = ledger
+            .get(&crate::FlowId(flow as u64))
+            .map_or(0, BTreeMap::len);
+        let bound = context.tcp_generators[flow]
+            .map_or(1, |tcp| tcp_ledger_segment_bound(tcp, data_counts[flow]));
+        total
+            .checked_add(bound.max(resident))
+            .ok_or_else(|| sizing_error("TCP ledger record slots overflow usize"))
+    })?;
     [
         checked_product(flow_count, RECEIVER_WORDS, "TCP receiver rows")?,
-        checked_product(flow_count, ARENA_META_WORDS, "TCP range metadata")?,
-        checked_product(tcp_record_slots, RANGE_WORDS, "TCP receive ranges")?,
-        checked_product(flow_count, ARENA_META_WORDS, "TCP ledger metadata")?,
-        checked_product(tcp_record_slots, EVENT_WORDS, "TCP ledger records")?,
+        checked_product(receiver_range_slots, RANGE_WORDS, "TCP receive ranges")?,
+        checked_product(flow_count, LEDGER_META_WORDS, "TCP ledger metadata")?,
         checked_product(
-            image.nodes.len().max(1),
-            ARENA_META_WORDS,
-            "TCP transition metadata",
+            ledger_record_slots.max(1),
+            LEDGER_RECORD_WORDS,
+            "TCP ledger records",
         )?,
     ]
     .into_iter()
@@ -783,9 +836,92 @@ pub(crate) fn paced_single_source_queue_bound(
     }
 }
 
+/// Multiplier covering Reno fast-recovery inflation and transient reordering beyond the encoded
+/// congestion window. Device overflow remains fail-stop and adaptive re-planning can grow it.
+pub(crate) const TCP_WINDOW_SLACK_FACTOR: usize = 2;
+/// Extra ledger records for a partial cumulative ACK boundary and recovery retransmissions.
+pub(crate) const TCP_LEDGER_RECOVERY_ALLOWANCE: usize = 8;
+/// Extra receiver gaps for the head-truncation/coalescing boundary during recovery.
+pub(crate) const TCP_RECEIVER_RECOVERY_ALLOWANCE: usize = 4;
+/// Twice the measured frontier failure average of 512 retained RTO installs per flow.
+pub(crate) const TCP_STALE_TIMER_ALLOWANCE_PER_FLOW: usize = 1_024;
+
+fn u64_segments(bytes: u64, mss_bytes: u64) -> usize {
+    usize::try_from(bytes.div_ceil(mss_bytes.max(1))).unwrap_or(usize::MAX)
+}
+
+fn tcp_encoded_window_segments(tcp: crate::TcpGenerator) -> usize {
+    let outstanding = u64_segments(tcp.bytes_in_flight, tcp.mss_bytes);
+    let (cwnd, slow_start_ceiling) = match tcp.control {
+        crate::TcpCongestionControl::Reno(state) => (
+            u64_segments(state.cwnd_bytes, state.mss_bytes),
+            u64_segments(state.ssthresh_bytes, state.mss_bytes),
+        ),
+        crate::TcpCongestionControl::Cubic(state) => (
+            usize::try_from(state.cwnd_scaled.div_ceil(crate::CUBIC_WINDOW_SCALE))
+                .unwrap_or(usize::MAX),
+            usize::try_from(state.ssthresh_scaled.div_ceil(crate::CUBIC_WINDOW_SCALE))
+                .unwrap_or(usize::MAX),
+        ),
+    };
+    outstanding.max(cwnd).max(slow_start_ceiling).max(1)
+}
+
+fn tcp_window_plane_bound(
+    tcp: crate::TcpGenerator,
+    whole_flow_segments: usize,
+    recovery_allowance: usize,
+) -> usize {
+    let outstanding = u64_segments(tcp.bytes_in_flight, tcp.mss_bytes);
+    let absolute_cap = whole_flow_segments.max(outstanding).max(1);
+    tcp_encoded_window_segments(tcp)
+        .saturating_mul(TCP_WINDOW_SLACK_FACTOR)
+        .saturating_add(recovery_allowance)
+        .min(absolute_cap)
+}
+
+pub(crate) fn tcp_ledger_segment_bound(
+    tcp: crate::TcpGenerator,
+    whole_flow_segments: usize,
+) -> usize {
+    tcp_window_plane_bound(tcp, whole_flow_segments, TCP_LEDGER_RECOVERY_ALLOWANCE)
+}
+
+pub(crate) fn tcp_receiver_range_bound(
+    tcp: crate::TcpGenerator,
+    whole_flow_segments: usize,
+) -> usize {
+    tcp_window_plane_bound(tcp, whole_flow_segments, TCP_RECEIVER_RECOVERY_ALLOWANCE)
+}
+
+pub(crate) fn tcp_fallback_timer_packet_bound(whole_flow_attempts: usize) -> usize {
+    whole_flow_attempts.min(TCP_STALE_TIMER_ALLOWANCE_PER_FLOW)
+}
+
+/// `ceil(L/S)+1` horizon emissions, `ceil(P/S)` propagation residency, and two records of
+/// outward slack, with the finite whole-flow count as the final absolute cap.
+pub(crate) fn horizon_queue_packet_bound(
+    whole_flow_packets: usize,
+    lookahead_ns: Option<u64>,
+    serialization_ns: u64,
+    propagation_ns: u64,
+) -> usize {
+    let serialization_ns = serialization_ns.max(1);
+    let emissions = lookahead_ns.map_or(whole_flow_packets, |lookahead| {
+        usize::try_from(lookahead.div_ceil(serialization_ns))
+            .unwrap_or(usize::MAX)
+            .saturating_add(1)
+    });
+    let residency =
+        usize::try_from(propagation_ns.div_ceil(serialization_ns)).unwrap_or(usize::MAX);
+    whole_flow_packets.min(emissions.saturating_add(residency).saturating_add(2))
+}
+
 fn source_queue_bounds(
     image: &SimulationImage,
     packet_counts: &[usize],
+    minimum_data_sizes: &[u64],
+    lookahead: Option<u64>,
 ) -> Result<Vec<usize>, DeviceSizingError> {
     let flow_count = image.flows.len();
     let mut flows_per_source = vec![0_usize; image.nodes.len()];
@@ -835,8 +971,25 @@ fn source_queue_bounds(
         .enumerate()
         .map(|(flow_index, flow)| {
             let packet_count = packet_counts[flow_index];
-            if packet_count == 0 || flows_per_source[flow.source.0 as usize] != 1 {
+            if packet_count == 0 {
+                return Ok(0);
+            }
+            let Some(first_link) = flow.route.first().copied() else {
                 return Ok(packet_count);
+            };
+            let link = image.links[first_link.0 as usize];
+            let serialization =
+                serialization_time_ns(minimum_data_sizes[flow_index], link.rate_bps).map_err(
+                    |error| sizing_error(format!("source serialization failed: {error}")),
+                )?;
+            let horizon_bound = horizon_queue_packet_bound(
+                packet_count,
+                lookahead,
+                serialization,
+                link.propagation_ns,
+            );
+            if flows_per_source[flow.source.0 as usize] != 1 {
+                return Ok(horizon_bound);
             }
             let source = &image.nodes[flow.source.0 as usize];
             if source.kind != NodeKind::Host {
@@ -846,9 +999,6 @@ fn source_queue_bounds(
             let [generator] = state.generators.as_slice() else {
                 return Ok(packet_count);
             };
-            if matches!(generator.kind, FlowGeneratorKind::Tcp(_)) {
-                return Ok(packet_count);
-            }
             if generator.flow.0 as usize != flow_index
                 || generator.next_emission.status != GeneratorStatus::Scheduled
                 || generator.packets_emitted != 0
@@ -861,9 +1011,6 @@ fn source_queue_bounds(
                 || matching_arrivals[flow_index] != 1
             {
                 return Ok(packet_count);
-            }
-            let Some(first_link) = flow.route.first().copied() else {
-                return Ok(packet_count);
             };
             if first_link != state.egress_link {
                 return Ok(packet_count);
@@ -874,7 +1021,6 @@ fn source_queue_bounds(
             if initial_data_size[flow_index] != constant.packet_size_bytes {
                 return Ok(packet_count);
             }
-            let link = image.links[first_link.0 as usize];
             let serialization = serialization_time_ns(constant.packet_size_bytes, link.rate_bps)
                 .map_err(|error| sizing_error(format!("source serialization failed: {error}")))?;
             let paced =
@@ -925,8 +1071,30 @@ fn add_flow_route_capacities(
         );
         fel_capacities[target_slot] = fel_capacities[target_slot].saturating_add(burst);
         if image.nodes[target_slot].kind == NodeKind::Switch {
+            let queue = image.switch_states[image.nodes[target_slot].state_slot as usize]
+                .queues
+                .first();
+            let contribution = if queue.is_some_and(|queue| {
+                matches!(queue.drop_mark, crate::DropMarkPolicy::EcnThreshold(_))
+            }) {
+                let link = image.links[route[index].0 as usize];
+                horizon_queue_packet_bound(
+                    packet_count,
+                    context.lookahead,
+                    flow_link_serialization_ns(
+                        image,
+                        context,
+                        flow_index,
+                        packet_kind,
+                        route[index],
+                    ),
+                    link.propagation_ns,
+                )
+            } else {
+                packet_count
+            };
             queue_capacities[target_slot] =
-                queue_capacities[target_slot].saturating_add(packet_count);
+                queue_capacities[target_slot].saturating_add(contribution);
         }
     }
 }
@@ -1324,12 +1492,36 @@ fn sizing_error(message: impl Into<String>) -> DeviceSizingError {
 
 #[cfg(test)]
 mod tests {
-    use super::paced_single_source_queue_bound;
+    use super::{
+        horizon_queue_packet_bound, paced_single_source_queue_bound,
+        tcp_fallback_timer_packet_bound, tcp_ledger_segment_bound, tcp_receiver_range_bound,
+    };
+    use crate::{TcpCongestionControl, TcpGenerator};
 
     #[test]
     fn paced_single_source_queue_bound_pins_service_rate_contract() {
         assert_eq!(paced_single_source_queue_bound(65_536, 21, 21), 1);
         assert_eq!(paced_single_source_queue_bound(65_536, 22, 21), 1);
         assert_eq!(paced_single_source_queue_bound(65_536, 20, 21), 65_536);
+    }
+
+    #[test]
+    fn window_sized_tcp_planes_cover_encoded_flight_and_recovery() {
+        let mut tcp = TcpGenerator::new(1 << 20, 1_024, 64, TcpCongestionControl::reno(1_024));
+        tcp.bytes_in_flight = 3_073;
+
+        assert_eq!(tcp_ledger_segment_bound(tcp, 1_024), 136);
+        assert_eq!(tcp_receiver_range_bound(tcp, 1_024), 132);
+        assert_eq!(tcp_ledger_segment_bound(tcp, 16), 16);
+        assert_eq!(tcp_receiver_range_bound(tcp, 16), 16);
+    }
+
+    #[test]
+    fn stale_timer_and_horizon_queue_bounds_are_outward_and_whole_flow_capped() {
+        assert_eq!(tcp_fallback_timer_packet_bound(65_536), 1_024);
+        assert_eq!(tcp_fallback_timer_packet_bound(512), 512);
+        assert_eq!(horizon_queue_packet_bound(100, Some(1_000), 100, 250), 16);
+        assert_eq!(horizon_queue_packet_bound(10, Some(1_000), 100, 250), 10);
+        assert_eq!(horizon_queue_packet_bound(100, None, 100, 250), 100);
     }
 }

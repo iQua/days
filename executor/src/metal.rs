@@ -1284,8 +1284,9 @@ impl MetalPlan {
             if capacity_context.tcp_generator(image, flow_index).is_some() {
                 // TCP timers remain fallback-heap events. ACK-driven replacement leaves stale
                 // timers resident until their deadlines, so reserve one slot per bounded attempt.
-                legacy_fel_caps[source_slot] =
-                    legacy_fel_caps[source_slot].saturating_add(data_count);
+                legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(
+                    capacity_context.tcp_fallback_timer_bound(image, flow_index, data_count),
+                );
             }
 
             add_flow_route_capacities(
@@ -1321,12 +1322,22 @@ impl MetalPlan {
                     let state = &image.switch_states[node.state_slot as usize];
                     let initial = state.queues.first().map_or(0, |queue| queue.queue.len());
                     queue_caps[slot] = queue_caps[slot].max(initial);
-                    if let Some(limit) = state
-                        .queues
-                        .first()
-                        .filter(|queue| matches!(queue.drop_mark, crate::DropMarkPolicy::TailDrop))
-                        .map(|queue| queue.queue_capacity_packets)
-                        .filter(|limit| *limit != 0)
+                    if let Some(limit) =
+                        state
+                            .queues
+                            .first()
+                            .and_then(|queue| match queue.drop_mark {
+                                crate::DropMarkPolicy::TailDrop => (queue.queue_capacity_packets
+                                    != 0)
+                                    .then_some(queue.queue_capacity_packets),
+                                crate::DropMarkPolicy::EcnThreshold(policy)
+                                    if policy.unit == crate::QueueDepthUnit::Packets =>
+                                {
+                                    (policy.capacity != 0).then_some(policy.capacity)
+                                }
+                                crate::DropMarkPolicy::EcnThreshold(_)
+                                | crate::DropMarkPolicy::Red(_) => None,
+                            })
                     {
                         queue_caps[slot] = queue_caps[slot].min(limit as usize);
                     }
@@ -1372,8 +1383,11 @@ impl MetalPlan {
             }
             for (flow, descriptor) in image.flows.iter().enumerate() {
                 if capacity_context.tcp_generator(image, flow).is_some() {
-                    let attempts =
-                        flow_packet_counts[flow].saturating_sub(flow_feedback_counts[flow]);
+                    let attempts = capacity_context.tcp_fallback_timer_bound(
+                        image,
+                        flow,
+                        flow_packet_counts[flow].saturating_sub(flow_feedback_counts[flow]),
+                    );
                     let source = descriptor.source.0 as usize;
                     capacities[source] = capacities[source].saturating_add(attempts);
                 }
@@ -1925,7 +1939,24 @@ fn add_flow_route_capacities(
         );
         fel_caps[target_slot] = fel_caps[target_slot].saturating_add(burst);
         if image.nodes[target_slot].kind == NodeKind::Switch {
-            queue_caps[target_slot] = queue_caps[target_slot].saturating_add(packet_count);
+            let queue = image.switch_states[image.nodes[target_slot].state_slot as usize]
+                .queues
+                .first();
+            let contribution = if queue.is_some_and(|queue| {
+                matches!(queue.drop_mark, crate::DropMarkPolicy::EcnThreshold(_))
+            }) {
+                capacity_context.horizon_queue_packet_bound(
+                    image,
+                    flow_index,
+                    packet_count,
+                    packet_kind,
+                    image.links[route[index].0 as usize],
+                    lookahead,
+                )
+            } else {
+                packet_count
+            };
+            queue_caps[target_slot] = queue_caps[target_slot].saturating_add(contribution);
         }
     }
 }
@@ -2751,11 +2782,9 @@ fn prepare_tcp_state(
                 .copied()
                 .unwrap_or(0)
                 .saturating_sub(feedback_counts.get(flow).copied().unwrap_or(0));
-            let derived_capacity = receiver
-                .out_of_order
-                .len()
-                .saturating_add(data_count)
-                .max(1);
+            let derived_capacity = capacity_context
+                .tcp_receiver_range_bound(image, flow, data_count)
+                .max(receiver.out_of_order.len());
             let capacity = crate::device_capacity::cap_derived_capacity(
                 derived_capacity,
                 capacity_caps.tcp_receiver_ranges_per_flow,
@@ -2800,7 +2829,9 @@ fn prepare_tcp_state(
             .unwrap_or(0)
             .saturating_sub(feedback_counts.get(flow).copied().unwrap_or(0));
         let capacity = crate::device_capacity::cap_derived_capacity(
-            current.max(data_count).max(1),
+            capacity_context
+                .tcp_ledger_segment_bound(image, flow, data_count)
+                .max(current),
             capacity_caps.tcp_ledger_segments_per_flow,
             current,
         );
