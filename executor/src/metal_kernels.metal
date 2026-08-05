@@ -8,7 +8,7 @@ constant uint FLOW_WORDS = 6;
 constant uint LINK_WORDS = 4;
 constant uint META_WORDS = 4;
 constant uint QUEUE_META_WORDS = 5;
-constant uint LP_STATE_WORDS = 6;
+constant uint LP_STATE_WORDS = 7;
 constant uint OBSERVATION_META_WORDS = 12;
 constant uint INBOUND_META_WORDS = 2;
 constant uint LP_STREAM_META_WORDS = 4;
@@ -46,7 +46,8 @@ constant uint C_ACTIVE = 15;
 constant uint C_FRONTIER = 16;
 constant uint C_CONTINUATION = 17;
 constant uint C_RELAUNCHES = 18;
-constant uint C_INDIRECT_OFFSET_WORDS = 19;
+constant uint C_ERROR_DEMAND = 19;
+constant uint C_INDIRECT_OFFSET_WORDS = 20;
 
 constant uint P_NODE_COUNT = 0;
 constant uint P_FLOW_COUNT = 1;
@@ -234,6 +235,7 @@ constant uint L_ERROR = 2;
 constant uint L_ERROR_ARENA = 3;
 constant uint L_ERROR_NODE = 4;
 constant uint L_ERROR_CAPACITY = 5;
+constant uint L_ERROR_DEMAND = 6;
 
 inline bool key_less(const thread ulong *left, const thread ulong *right) {
     if (left[E_TIME] != right[E_TIME]) {
@@ -350,17 +352,23 @@ inline void swap_records(device ulong *records, ulong left_slot, ulong right_slo
     }
 }
 
+inline ulong saturating_add_ulong(ulong left, ulong right) {
+    return right > NONE - left ? NONE : left + right;
+}
+
 inline void set_capacity_error(
     device ulong *error,
     ulong arena,
     ulong node,
-    ulong capacity
+    ulong capacity,
+    ulong demand
 ) {
     if (error[L_ERROR] == 0) {
         error[L_ERROR] = ERROR_CAPACITY;
         error[L_ERROR_ARENA] = arena;
         error[L_ERROR_NODE] = node;
         error[L_ERROR_CAPACITY] = capacity;
+        error[L_ERROR_DEMAND] = demand;
     }
 }
 
@@ -390,7 +398,7 @@ inline bool heap_push(
     ulong capacity = meta[base + 1];
     ulong count = meta[base + 3];
     if (count >= capacity) {
-        set_capacity_error(error, ARENA_FEL, node, capacity);
+        set_capacity_error(error, ARENA_FEL, node, capacity, count + 1);
         return false;
     }
     ulong child = count;
@@ -586,7 +594,8 @@ inline bool stream_push(
             error,
             stream_arena(stream, params),
             node,
-            capacity
+            capacity,
+            count + 1
         );
         return false;
     }
@@ -907,7 +916,7 @@ inline bool queue_push(
     ulong head = meta[base + 2];
     ulong count = meta[base + 3];
     if (count >= capacity) {
-        set_capacity_error(error, ARENA_QUEUE, node, capacity);
+        set_capacity_error(error, ARENA_QUEUE, node, capacity, count + 1);
         return false;
     }
     ulong physical = (head + count) % max(capacity, 1ul);
@@ -947,7 +956,7 @@ inline bool source_queue_insert(
     ulong head = meta[base + 2];
     ulong count = meta[base + 3];
     if (count >= capacity) {
-        set_capacity_error(error, ARENA_QUEUE, node, capacity);
+        set_capacity_error(error, ARENA_QUEUE, node, capacity, count + 1);
         return false;
     }
     ulong insertion = count;
@@ -1076,7 +1085,7 @@ inline bool append_observed(
     ulong index = observation_meta[meta + 3];
     ulong capacity = observation_meta[meta + 1];
     if (index >= capacity) {
-        set_capacity_error(error, ARENA_OBSERVED, NONE, params[P_OBSERVED_CAPACITY]);
+        set_capacity_error(error, ARENA_OBSERVED, node, capacity, index + 1);
         return false;
     }
     ulong offset = (observation_meta[meta] + index) * 7;
@@ -1137,7 +1146,7 @@ inline bool record_departure(
     ulong index = observation_meta[meta + 3];
     ulong capacity = observation_meta[meta + 1];
     if (index >= capacity) {
-        set_capacity_error(error, ARENA_DEPARTURES, NONE, params[P_DEPARTURE_CAPACITY]);
+        set_capacity_error(error, ARENA_DEPARTURES, node, capacity, index + 1);
         return false;
     }
     ulong offset = (observation_meta[meta] + index) * 12;
@@ -1195,7 +1204,7 @@ inline bool record_arrival(
     ulong index = observation_meta[meta + 3];
     ulong capacity = observation_meta[meta + 1];
     if (index >= capacity) {
-        set_capacity_error(error, ARENA_ARRIVALS, NONE, params[P_ARRIVAL_CAPACITY]);
+        set_capacity_error(error, ARENA_ARRIVALS, node, capacity, index + 1);
         return false;
     }
     ulong offset = (observation_meta[meta] + index) * 13;
@@ -1230,7 +1239,7 @@ inline bool append_remote(
     ulong capacity = remote_meta[base + 1];
     ulong index = remote_meta[base + 3];
     if (index >= capacity) {
-        set_capacity_error(error, ARENA_REMOTE_STAGING, node, capacity);
+        set_capacity_error(error, ARENA_REMOTE_STAGING, node, capacity, index + 1);
         return false;
     }
     copy_thread_to_device(record, remote_staging, offset + index);
@@ -2561,7 +2570,7 @@ inline bool sp_queue_insert(
     ulong head = queue_meta[meta_base + 2];
     ulong count = queue_meta[meta_base + 3];
     if (count >= capacity) {
-        set_capacity_error(error, ARENA_QUEUE, node, capacity);
+        set_capacity_error(error, ARENA_QUEUE, node, capacity, count + 1);
         return false;
     }
     ulong node_base = node * SCHEDULER_NODE_WORDS;
@@ -2620,7 +2629,7 @@ inline bool wfq_queue_insert(
     ulong head = queue_meta[meta_base + 2];
     ulong count = queue_meta[meta_base + 3];
     if (count >= capacity) {
-        set_capacity_error(error, ARENA_QUEUE, node, capacity);
+        set_capacity_error(error, ARENA_QUEUE, node, capacity, count + 1);
         return false;
     }
     ulong node_base = node * SCHEDULER_NODE_WORDS;
@@ -3021,7 +3030,7 @@ inline bool tcp_ledger_insert(
         return true;
     }
     if (count >= capacity) {
-        set_capacity_error(error, ARENA_TCP_SEGMENT_LEDGER, flow, capacity);
+        set_capacity_error(error, ARENA_TCP_SEGMENT_LEDGER, flow, capacity, count + 1);
         return false;
     }
     for (ulong index = count; index > insertion; --index) {
@@ -3100,7 +3109,7 @@ inline bool tcp_receive_range(
     ulong capacity = tcp_state[row + 5];
     ulong count = tcp_state[row + 6];
     if (count >= capacity) {
-        set_capacity_error(error, ARENA_TCP_RECEIVER, flow, capacity);
+        set_capacity_error(error, ARENA_TCP_RECEIVER, flow, capacity, count + 1);
         return false;
     }
     ulong insertion = count;
@@ -4654,6 +4663,7 @@ kernel void days_round_prepare(
         lp_state[state + L_ERROR_ARENA] = 0;
         lp_state[state + L_ERROR_NODE] = NONE;
         lp_state[state + L_ERROR_CAPACITY] = 0;
+        lp_state[state + L_ERROR_DEMAND] = 0;
         remote_meta[node * META_WORDS + 3] = 0;
         ulong time;
         if (
@@ -4702,6 +4712,7 @@ kernel void days_round_prepare(
                     control[C_ERROR_ARENA] = ARENA_WORKLIST;
                     control[C_ERROR_NODE] = NONE;
                     control[C_ERROR_CAPACITY] = params[P_WORKLIST_CAPACITY];
+                    control[C_ERROR_DEMAND] = write + 1;
                 }
                 return;
             }
@@ -5076,6 +5087,7 @@ kernel void days_round_control(
         control[C_ERROR_ARENA] = lp_state[state + L_ERROR_ARENA];
         control[C_ERROR_NODE] = lp_state[state + L_ERROR_NODE];
         control[C_ERROR_CAPACITY] = lp_state[state + L_ERROR_CAPACITY];
+        control[C_ERROR_DEMAND] = lp_state[state + L_ERROR_DEMAND];
     } else if (unfinished_lanes[0] != 0) {
         control[C_RELAUNCHES] += 1;
     } else {
@@ -5117,15 +5129,8 @@ kernel void days_exchange_prefix(
                 params[P_CHANNEL_BATCH_OFFSET] +
                 channel * CHANNEL_BATCH_WORDS;
             ulong batch_count = stream_state[batch];
-            if (
-                local_exceeded == 0 &&
-                (local_sum > capacity || batch_count > capacity - local_sum)
-            ) {
-                local_sum = capacity;
-                local_exceeded = 1;
-            } else if (local_exceeded == 0) {
-                local_sum += batch_count;
-            }
+            local_sum = saturating_add_ulong(local_sum, batch_count);
+            local_exceeded |= uint(local_sum > capacity);
             stream_state[batch + 3] = 0;
             ulong stream_base = channel * META_WORDS;
             ulong capacity = stream_state[stream_base + 1];
@@ -5167,14 +5172,9 @@ kernel void days_exchange_prefix(
                 ulong right_sum = sums[lane + stride];
                 uint combined_exceeded =
                     exceeded[lane] | exceeded[lane + stride];
-                if (
-                    combined_exceeded == 0 &&
-                    (sums[lane] > capacity || right_sum > capacity - sums[lane])
-                ) {
-                    combined_exceeded = 1;
-                }
-                sums[lane] =
-                    combined_exceeded != 0 ? capacity : sums[lane] + right_sum;
+                ulong combined_sum = saturating_add_ulong(sums[lane], right_sum);
+                combined_exceeded |= uint(combined_sum > capacity);
+                sums[lane] = combined_sum;
                 exceeded[lane] = combined_exceeded;
                 failures[lane] = min(failures[lane], failures[lane + stride]);
             }
@@ -5188,6 +5188,7 @@ kernel void days_exchange_prefix(
                 control[C_ERROR_ARENA] = ARENA_OUTBOX;
                 control[C_ERROR_NODE] = NONE;
                 control[C_ERROR_CAPACITY] = capacity;
+                control[C_ERROR_DEMAND] = sums[0];
             } else if (failure != NONE) {
                 ulong batch =
                     params[P_CHANNEL_BATCH_OFFSET] +
@@ -5205,6 +5206,7 @@ kernel void days_exchange_prefix(
                     control[C_ERROR] = ERROR_CAPACITY;
                     control[C_ERROR_ARENA] = ARENA_CHANNEL_INBOX;
                     control[C_ERROR_CAPACITY] = capacity;
+                    control[C_ERROR_DEMAND] = saturating_add_ulong(count, batch_count);
                 } else {
                     control[C_ERROR] = ERROR_SEMANTIC + 42;
                 }
@@ -5224,15 +5226,8 @@ kernel void days_exchange_prefix(
     for (ulong producer = start; producer < end; ++producer) {
         ulong base = producer * META_WORDS;
         ulong count = remote_meta[base + 3];
-        if (
-            local_exceeded == 0 &&
-            (local_sum > capacity || count > capacity - local_sum)
-        ) {
-            local_sum = capacity;
-            local_exceeded = 1;
-        } else if (local_exceeded == 0) {
-            local_sum += count;
-        }
+        local_sum = saturating_add_ulong(local_sum, count);
+        local_exceeded |= uint(local_sum > capacity);
     }
 
     sums[lane] = local_sum;
@@ -5246,14 +5241,9 @@ kernel void days_exchange_prefix(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (lane >= offset) {
             uint combined_exceeded = left_exceeded | own_exceeded;
-            if (
-                combined_exceeded == 0 &&
-                (left_sum > capacity || own_sum > capacity - left_sum)
-            ) {
-                combined_exceeded = 1;
-            }
-            sums[lane] =
-                combined_exceeded != 0 ? capacity : left_sum + own_sum;
+            ulong combined_sum = saturating_add_ulong(left_sum, own_sum);
+            combined_exceeded |= uint(combined_sum > capacity);
+            sums[lane] = combined_sum;
             exceeded[lane] = combined_exceeded;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -5264,6 +5254,7 @@ kernel void days_exchange_prefix(
         control[C_ERROR_ARENA] = ARENA_OUTBOX;
         control[C_ERROR_NODE] = NONE;
         control[C_ERROR_CAPACITY] = capacity;
+        control[C_ERROR_DEMAND] = sums[1023];
     }
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     if (exceeded[1023] != 0) {
@@ -5636,18 +5627,8 @@ kernel void days_round_finalize(
             ulong base = node * OBSERVATION_META_WORDS;
             for (uint log = 0; log < 3; ++log) {
                 ulong count = observation_meta[base + log * META_WORDS + 3];
-                if (
-                    local_exceeded[log] == 0 &&
-                    (
-                        local_totals[log] > capacities[log] ||
-                        count > capacities[log] - local_totals[log]
-                    )
-                ) {
-                    local_totals[log] = capacities[log];
-                    local_exceeded[log] = 1;
-                } else if (local_exceeded[log] == 0) {
-                    local_totals[log] += count;
-                }
+                local_totals[log] = saturating_add_ulong(local_totals[log], count);
+                local_exceeded[log] |= uint(local_totals[log] > capacities[log]);
             }
         }
     }
@@ -5666,6 +5647,7 @@ kernel void days_round_finalize(
         control[C_ERROR_ARENA] = lp_state[state + L_ERROR_ARENA];
         control[C_ERROR_NODE] = lp_state[state + L_ERROR_NODE];
         control[C_ERROR_CAPACITY] = lp_state[state + L_ERROR_CAPACITY];
+        control[C_ERROR_DEMAND] = lp_state[state + L_ERROR_DEMAND];
     }
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     if (values[0] != NONE) {
@@ -5691,14 +5673,9 @@ kernel void days_round_finalize(
                 ulong left = values[lane];
                 ulong right = values[lane + stride];
                 uint combined_exceeded = exceeded[lane] | exceeded[lane + stride];
-                if (
-                    combined_exceeded == 0 &&
-                    (left > capacities[log] || right > capacities[log] - left)
-                ) {
-                    combined_exceeded = 1;
-                }
-                values[lane] =
-                    combined_exceeded != 0 ? capacities[log] : left + right;
+                ulong combined_total = saturating_add_ulong(left, right);
+                combined_exceeded |= uint(combined_total > capacities[log]);
+                values[lane] = combined_total;
                 exceeded[lane] = combined_exceeded;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -5708,6 +5685,7 @@ kernel void days_round_finalize(
             control[C_ERROR_ARENA] = arenas[log];
             control[C_ERROR_NODE] = NONE;
             control[C_ERROR_CAPACITY] = capacities[log];
+            control[C_ERROR_DEMAND] = values[0];
         }
         threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     }

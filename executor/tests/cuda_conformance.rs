@@ -865,6 +865,7 @@ fn cuda_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             CudaArena::Fel,
             Some(SOURCE),
             1,
+            2,
         ),
         (
             CudaConfig {
@@ -875,6 +876,7 @@ fn cuda_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             CudaArena::ChannelInbox,
             Some(SINK),
             0,
+            1,
         ),
         (
             CudaConfig {
@@ -885,6 +887,7 @@ fn cuda_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             CudaArena::ServiceStream,
             Some(SOURCE),
             0,
+            1,
         ),
         (
             CudaConfig {
@@ -895,6 +898,7 @@ fn cuda_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             CudaArena::GeneratorStream,
             Some(SOURCE),
             0,
+            1,
         ),
         (
             CudaConfig {
@@ -905,6 +909,7 @@ fn cuda_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             CudaArena::Outbox,
             None,
             0,
+            1,
         ),
         (
             CudaConfig {
@@ -913,8 +918,9 @@ fn cuda_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             },
             ObservationMode::Full,
             CudaArena::ObservedPackets,
-            None,
+            Some(SOURCE),
             0,
+            1,
         ),
         (
             CudaConfig {
@@ -923,8 +929,9 @@ fn cuda_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             },
             ObservationMode::Full,
             CudaArena::Departures,
-            None,
+            Some(SOURCE),
             0,
+            1,
         ),
         (
             CudaConfig {
@@ -933,12 +940,13 @@ fn cuda_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             },
             ObservationMode::Full,
             CudaArena::Arrivals,
-            None,
+            Some(SINK),
             0,
+            1,
         ),
     ];
 
-    for (config, observation_mode, arena, node, capacity) in cases {
+    for (config, observation_mode, arena, node, capacity, demand) in cases {
         let error = executor
             .run_with_observations(&image, None, config, observation_mode)
             .unwrap_err();
@@ -948,6 +956,7 @@ fn cuda_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
                 arena,
                 node,
                 capacity,
+                demand,
             }
         );
         let recovered = executor

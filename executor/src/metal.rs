@@ -50,7 +50,7 @@ const SUMMARY_COUNTERS: usize = 12;
 const OBSERVED_WORDS: usize = 7;
 const DEPARTURE_WORDS: usize = 12;
 const ARRIVAL_WORDS: usize = 13;
-const LP_STATE_WORDS: usize = 6;
+const LP_STATE_WORDS: usize = 7;
 const OBSERVATION_META_WORDS: usize = ARENA_META_WORDS * 3;
 const INBOUND_META_WORDS: usize = 2;
 const LP_STREAM_META_WORDS: usize = 4;
@@ -168,13 +168,14 @@ const CONTROL_ERROR: usize = 0;
 const CONTROL_ERROR_ARENA: usize = 1;
 const CONTROL_ERROR_NODE: usize = 2;
 const CONTROL_ERROR_CAPACITY: usize = 3;
+const CONTROL_ERROR_DEMAND: usize = 19;
 const CONTROL_DONE: usize = 4;
 const CONTROL_RUN_END_LO: usize = 7;
 const CONTROL_RUN_END_HI: usize = 8;
 const CONTROL_ROUNDS: usize = 9;
 const CONTROL_CONTINUATION: usize = 17;
 const CONTROL_RELAUNCHES: usize = 18;
-const CONTROL_WORDS: usize = 19;
+const CONTROL_WORDS: usize = 20;
 const CONTROL_INDIRECT_OFFSET_WORDS: usize = CONTROL_WORDS;
 const CONTROL_STORAGE_WORDS: usize = CONTROL_WORDS + 2;
 
@@ -231,6 +232,7 @@ pub enum MetalError {
         arena: MetalArena,
         node: Option<NodeId>,
         capacity: usize,
+        demand: usize,
     },
     TransitionLimitExceeded {
         node: NodeId,
@@ -257,16 +259,17 @@ impl fmt::Display for MetalError {
                 arena,
                 node,
                 capacity,
+                demand,
             } => {
                 if let Some(node) = node {
                     write!(
                         formatter,
-                        "Metal {arena} capacity of {capacity} records exceeded at LP {node:?}"
+                        "Metal {arena} capacity of {capacity} records exceeded at LP {node:?}; observed demand {demand}"
                     )
                 } else {
                     write!(
                         formatter,
-                        "Metal {arena} capacity of {capacity} records exceeded"
+                        "Metal {arena} capacity of {capacity} records exceeded; observed demand {demand}"
                     )
                 }
             }
@@ -2958,6 +2961,7 @@ fn heap_push_host(
             arena: MetalArena::Fel,
             node: Some(NodeId(lp as u64)),
             capacity,
+            demand: count.saturating_add(1),
         });
     }
     write_record(storage, offset + count, record);
@@ -2999,6 +3003,7 @@ fn queue_push_host(
             arena: MetalArena::Queue,
             node: Some(NodeId(lp as u64)),
             capacity,
+            demand: count.saturating_add(1),
         });
     }
     if track_bytes {
@@ -3601,11 +3606,13 @@ impl MetalBuffers {
 fn decode_device_error(control: &[u64]) -> MetalError {
     let node = (control[CONTROL_ERROR_NODE] != NONE).then(|| NodeId(control[CONTROL_ERROR_NODE]));
     let capacity = control[CONTROL_ERROR_CAPACITY] as usize;
+    let demand = control[CONTROL_ERROR_DEMAND] as usize;
     match control[CONTROL_ERROR] {
         1 => MetalError::CapacityExceeded {
             arena: decode_arena(control[CONTROL_ERROR_ARENA]),
             node,
             capacity,
+            demand,
         },
         2 => MetalError::TransitionLimitExceeded {
             node: node.unwrap_or(NodeId(0)),

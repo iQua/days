@@ -1154,6 +1154,7 @@ fn metal_equal_rate_paced_source_queue_bound_is_tight() {
             arena: MetalArena::Queue,
             node: Some(GENERATOR_SOURCE),
             capacity: 0,
+            demand: 1,
         }
     );
 }
@@ -1451,6 +1452,7 @@ fn metal_global_outbox_capacity_faults_identically_in_both_stream_modes() {
                 arena: MetalArena::Outbox,
                 node: None,
                 capacity: 2,
+                demand: 3,
             }
         );
         assert_metal_full_result_matches_scalar(
@@ -1499,6 +1501,7 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             arena: MetalArena::Fel,
             node: Some(GENERATOR_SOURCE),
             capacity: 1,
+            demand: 2,
         }
     );
     assert_metal_full_result_matches_scalar(
@@ -1526,6 +1529,7 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             arena: MetalArena::ChannelInbox,
             node: Some(GENERATOR_SINK),
             capacity: 0,
+            demand: 1,
         }
     );
     assert_metal_full_result_matches_scalar(
@@ -1542,7 +1546,10 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             &image,
             None,
             MetalConfig {
-                max_outbox_events: Some(0),
+                capacity_caps: days_executor::DeviceCapacityCaps {
+                    outbox_events_total: Some(0),
+                    ..days_executor::DeviceCapacityCaps::default()
+                },
                 ..MetalConfig::default()
             },
         )
@@ -1553,6 +1560,7 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             arena: MetalArena::Outbox,
             node: None,
             capacity: 0,
+            demand: 1,
         }
     );
     assert_metal_full_result_matches_scalar(
@@ -1579,8 +1587,9 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
         observed,
         MetalError::CapacityExceeded {
             arena: MetalArena::ObservedPackets,
-            node: None,
+            node: Some(GENERATOR_SOURCE),
             capacity: 0,
+            demand: 1,
         }
     );
     assert_metal_full_result_matches_scalar(
@@ -1612,6 +1621,7 @@ fn metal_device_queue_capacity_fault_is_explicit() {
             arena: MetalArena::Queue,
             node: Some(GENERATOR_SOURCE),
             capacity: 0,
+            demand: 1,
         }
     );
 }

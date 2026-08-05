@@ -588,6 +588,7 @@ fn cuda_device_capacity_fault_is_explicit_and_executor_recovers() {
             arena: CudaArena::Queue,
             node: Some(SOURCE),
             capacity: 0,
+            demand: 1,
         }
     );
 
