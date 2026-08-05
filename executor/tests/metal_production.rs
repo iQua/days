@@ -1144,6 +1144,7 @@ fn metal_equal_rate_paced_source_queue_bound_is_tight() {
         None,
         MetalConfig {
             max_queue_packets_per_lp: Some(0),
+            max_capacity_retries: 0,
             ..MetalConfig::default()
         },
     )
@@ -1442,6 +1443,7 @@ fn metal_global_outbox_capacity_faults_identically_in_both_stream_modes() {
                 MetalConfig {
                     streams_enabled,
                     max_outbox_events: Some(2),
+                    max_capacity_retries: 0,
                     ..MetalConfig::default()
                 },
             )
@@ -1482,6 +1484,7 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
     let executor = MetalExecutor::new().expect("Metal executor must initialize");
     let heap_config = MetalConfig {
         streams_enabled: false,
+        max_capacity_retries: 0,
         ..MetalConfig::default()
     };
 
@@ -1519,6 +1522,7 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             None,
             MetalConfig {
                 max_channel_events_per_stream: Some(0),
+                max_capacity_retries: 0,
                 ..MetalConfig::default()
             },
         )
@@ -1550,6 +1554,7 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
                     outbox_events_total: Some(0),
                     ..days_executor::DeviceCapacityCaps::default()
                 },
+                max_capacity_retries: 0,
                 ..MetalConfig::default()
             },
         )
@@ -1578,6 +1583,7 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             None,
             MetalConfig {
                 max_observations: Some(0),
+                max_capacity_retries: 0,
                 ..MetalConfig::default()
             },
             ObservationMode::Full,
@@ -1605,11 +1611,35 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
 #[test]
 fn metal_device_queue_capacity_fault_is_explicit() {
     let image = generator_image(GeneratorTermination::Bytes(2));
+    let expected = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("scalar retry oracle must run");
+    let recovered = run_metal_with_observations(
+        &image,
+        None,
+        MetalConfig {
+            max_queue_packets_per_lp: Some(0),
+            ..MetalConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("adaptive arena growth must restart from the immutable image");
+    assert_metal_full_result_matches_scalar(
+        &recovered.result,
+        &expected,
+        "capacity-retried Metal run",
+    );
+    assert_eq!(recovered.capacity_retry_trace.len(), 1);
+    assert_eq!(recovered.capacity_retry_trace[0].arena, MetalArena::Queue);
+    assert_eq!(recovered.capacity_retry_trace[0].capacity, 0);
+    assert_eq!(recovered.capacity_retry_trace[0].demand, 1);
+    assert_eq!(recovered.capacity_retry_trace[0].grown_capacity, 2);
+
     let error = run_metal(
         &image,
         None,
         MetalConfig {
             max_queue_packets_per_lp: Some(0),
+            max_capacity_retries: 0,
             ..MetalConfig::default()
         },
     )

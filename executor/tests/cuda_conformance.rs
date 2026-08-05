@@ -859,6 +859,7 @@ fn cuda_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             CudaConfig {
                 streams_enabled: false,
                 max_fel_events_per_lp: Some(1),
+                max_capacity_retries: 0,
                 ..CudaConfig::default()
             },
             ObservationMode::Full,
@@ -870,6 +871,7 @@ fn cuda_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
         (
             CudaConfig {
                 max_channel_events_per_stream: Some(0),
+                max_capacity_retries: 0,
                 ..CudaConfig::default()
             },
             ObservationMode::Full,
@@ -881,6 +883,7 @@ fn cuda_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
         (
             CudaConfig {
                 fault_injection: Some(CudaArena::ServiceStream),
+                max_capacity_retries: 0,
                 ..CudaConfig::default()
             },
             ObservationMode::Full,
@@ -892,6 +895,7 @@ fn cuda_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
         (
             CudaConfig {
                 fault_injection: Some(CudaArena::GeneratorStream),
+                max_capacity_retries: 0,
                 ..CudaConfig::default()
             },
             ObservationMode::Full,
@@ -903,6 +907,7 @@ fn cuda_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
         (
             CudaConfig {
                 max_outbox_events: Some(0),
+                max_capacity_retries: 0,
                 ..CudaConfig::default()
             },
             ObservationMode::Full,
@@ -914,6 +919,7 @@ fn cuda_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
         (
             CudaConfig {
                 max_observations: Some(0),
+                max_capacity_retries: 0,
                 ..CudaConfig::default()
             },
             ObservationMode::Full,
@@ -925,6 +931,7 @@ fn cuda_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
         (
             CudaConfig {
                 fault_injection: Some(CudaArena::Departures),
+                max_capacity_retries: 0,
                 ..CudaConfig::default()
             },
             ObservationMode::Full,
@@ -936,6 +943,7 @@ fn cuda_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
         (
             CudaConfig {
                 fault_injection: Some(CudaArena::Arrivals),
+                max_capacity_retries: 0,
                 ..CudaConfig::default()
             },
             ObservationMode::Full,

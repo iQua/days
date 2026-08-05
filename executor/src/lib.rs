@@ -55,7 +55,7 @@ pub use dcqcn::{
     DCQCN_FRACTION_SCALE, DCQCN_STAGE_STEPS, DcqcnArithmeticError, DcqcnController,
     DcqcnControllerConfig, DcqcnIncreaseStage, DcqcnTransitionKind, DcqcnTransitionRecord,
 };
-pub use device_capacity::DeviceCapacityCaps;
+pub use device_capacity::{CapacityRetryRecord, DeviceCapacityCaps, DeviceCapacityFloors};
 pub use device_sizing::{
     DeviceEventArenaSizing, DevicePlaneSizing, DeviceSizingError, DeviceSizingReport,
     size_default_device_plan,

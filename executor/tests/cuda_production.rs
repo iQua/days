@@ -578,6 +578,7 @@ fn cuda_device_capacity_fault_is_explicit_and_executor_recovers() {
             None,
             CudaConfig {
                 max_queue_packets_per_lp: Some(0),
+                max_capacity_retries: 0,
                 ..CudaConfig::default()
             },
         )

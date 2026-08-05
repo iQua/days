@@ -32,11 +32,11 @@ use crate::device_scheduler::{
 use crate::planner_capacity::{PlannerCapacityContext, PlannerCapacityMode, TcpMinimumPacketSize};
 use crate::tcp::{TcpCubic, TcpReno};
 use crate::{
-    ArrivalDisposition, Backend, DeviceCapacityCaps, Event, EventKey, EventKind, FlowGeneratorKind,
-    GeneratorStatus, GeneratorTermination, NodeId, NodeKind, ObservationMode,
-    PacketArrivalObservation, PacketDeparture, PacketDescriptor, PacketKind, PayloadId, RunResult,
-    RunSummary, SimulationImage, TcpAckHeader, TcpCongestionControl, TcpDataHeader, TcpPhase,
-    TcpReceiveRange, TcpTimerState, validate,
+    ArrivalDisposition, Backend, CapacityRetryRecord, DeviceCapacityCaps, DeviceCapacityFloors,
+    Event, EventKey, EventKind, FlowGeneratorKind, GeneratorStatus, GeneratorTermination, NodeId,
+    NodeKind, ObservationMode, PacketArrivalObservation, PacketDeparture, PacketDescriptor,
+    PacketKind, PayloadId, RunResult, RunSummary, SimulationImage, TcpAckHeader,
+    TcpCongestionControl, TcpDataHeader, TcpPhase, TcpReceiveRange, TcpTimerState, validate,
 };
 
 const LANES: usize = 1_024;
@@ -312,6 +312,13 @@ pub struct MetalConfig {
     /// Optional caps for large capacities derived from the complete image. Exact legacy
     /// `max_*` overrides below retain precedence when both forms are specified.
     pub capacity_caps: DeviceCapacityCaps,
+    /// Internal lower bounds raised by deterministic capacity retries. Callers normally leave
+    /// these zeroed.
+    #[doc(hidden)]
+    pub capacity_floors: DeviceCapacityFloors,
+    /// Maximum number of all-or-nothing replacement attempts after capacity faults. Zero selects
+    /// strict single-shot execution.
+    pub max_capacity_retries: usize,
     /// Optional exact per-LP FEL capacity override. Raising the derived default consumes more
     /// device memory; lowering it retains an explicit device capacity fault on overflow.
     pub max_fel_events_per_lp: Option<usize>,
@@ -344,6 +351,8 @@ impl Default for MetalConfig {
         Self {
             streams_enabled: true,
             capacity_caps: DeviceCapacityCaps::default(),
+            capacity_floors: DeviceCapacityFloors::default(),
+            max_capacity_retries: 4,
             max_fel_events_per_lp: None,
             max_channel_events_per_stream: None,
             max_queue_packets_per_lp: None,
@@ -353,6 +362,81 @@ impl Default for MetalConfig {
             round_threads_per_threadgroup: DEFAULT_ROUND_THREADS_PER_THREADGROUP,
             rounds_per_command_buffer: DEFAULT_ROUNDS_PER_COMMAND_BUFFER,
             max_rounds: None,
+        }
+    }
+}
+
+impl MetalConfig {
+    fn raise_capacity(&mut self, arena: MetalArena, grown: usize) {
+        match arena {
+            MetalArena::Fel => {
+                if let Some(capacity) = &mut self.max_fel_events_per_lp {
+                    *capacity = (*capacity).max(grown);
+                } else {
+                    self.capacity_floors.fallback_fel_events_per_lp =
+                        self.capacity_floors.fallback_fel_events_per_lp.max(grown);
+                }
+            }
+            MetalArena::ChannelInbox => {
+                if let Some(capacity) = &mut self.max_channel_events_per_stream {
+                    *capacity = (*capacity).max(grown);
+                } else {
+                    self.capacity_floors.channel_events_per_stream =
+                        self.capacity_floors.channel_events_per_stream.max(grown);
+                }
+            }
+            MetalArena::ServiceStream => {
+                self.capacity_floors.service_events_per_stream =
+                    self.capacity_floors.service_events_per_stream.max(grown);
+            }
+            MetalArena::GeneratorStream => {
+                self.capacity_floors.generator_events_per_stream =
+                    self.capacity_floors.generator_events_per_stream.max(grown);
+            }
+            MetalArena::Queue => {
+                if let Some(capacity) = &mut self.max_queue_packets_per_lp {
+                    *capacity = (*capacity).max(grown);
+                } else {
+                    self.capacity_floors.queue_packets_per_lp =
+                        self.capacity_floors.queue_packets_per_lp.max(grown);
+                }
+            }
+            MetalArena::Outbox => {
+                if let Some(capacity) = &mut self.max_outbox_events {
+                    *capacity = (*capacity).max(grown);
+                } else {
+                    self.capacity_floors.outbox_events_total =
+                        self.capacity_floors.outbox_events_total.max(grown);
+                }
+            }
+            MetalArena::Worklist => {
+                self.capacity_floors.worklist_entries_total =
+                    self.capacity_floors.worklist_entries_total.max(grown);
+            }
+            MetalArena::ObservedPackets | MetalArena::Departures | MetalArena::Arrivals => {
+                if let Some(capacity) = &mut self.max_observations {
+                    *capacity = (*capacity).max(grown);
+                } else {
+                    self.capacity_floors.observation_events =
+                        self.capacity_floors.observation_events.max(grown);
+                }
+            }
+            MetalArena::TcpReceiverRanges => {
+                self.capacity_floors.tcp_receiver_ranges_per_flow =
+                    self.capacity_floors.tcp_receiver_ranges_per_flow.max(grown);
+            }
+            MetalArena::TcpSegmentLedger => {
+                self.capacity_floors.tcp_ledger_segments_per_flow =
+                    self.capacity_floors.tcp_ledger_segments_per_flow.max(grown);
+            }
+            MetalArena::RemoteStaging => {
+                if let Some(capacity) = &mut self.max_outbox_events {
+                    *capacity = (*capacity).max(grown);
+                } else {
+                    self.capacity_floors.remote_staging_events_per_lp =
+                        self.capacity_floors.remote_staging_events_per_lp.max(grown);
+                }
+            }
         }
     }
 }
@@ -388,6 +472,8 @@ impl MetalMemoryLayout {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetalRun {
     pub result: RunResult,
+    /// Capacity faults from discarded attempts, in deterministic retry order.
+    pub capacity_retry_trace: Vec<CapacityRetryRecord<MetalArena>>,
     pub rounds: u64,
     pub transitions: u64,
     /// Physical round attempts encoded into submitted command buffers, including termination and
@@ -1003,13 +1089,68 @@ impl MetalExecutor {
             .map_err(|error| MetalError::Validation(error.to_string()))?;
         validate_config(config)?;
 
-        let plan = MetalPlan::new(image, exclusive_horizon_ns, config, observation_mode)?;
-        let buffers = MetalBuffers::new(&self.direct.device, plan)?;
-        let _execution_guard = metal_device_execution_guard();
-        let timing = self.direct.run(&buffers, config, profile)?;
-        #[cfg(feature = "metal-test-hooks")]
-        panic_after_execution_if_requested();
-        buffers.finish(image, observation_mode, timing)
+        let retry_budget = config.max_capacity_retries;
+        let mut attempt_config = config;
+        let mut retry_trace = Vec::new();
+        loop {
+            let attempt = (|| {
+                let plan = MetalPlan::new(
+                    image,
+                    exclusive_horizon_ns,
+                    attempt_config,
+                    observation_mode,
+                )?;
+                let buffers = MetalBuffers::new(&self.direct.device, plan)?;
+                let _execution_guard = metal_device_execution_guard();
+                let timing = self.direct.run(&buffers, attempt_config, profile)?;
+                #[cfg(feature = "metal-test-hooks")]
+                panic_after_execution_if_requested();
+                buffers.finish(image, observation_mode, timing)
+            })();
+            match attempt {
+                Ok(mut run) => {
+                    run.capacity_retry_trace = retry_trace;
+                    return Ok(run);
+                }
+                Err(error) => {
+                    let MetalError::CapacityExceeded {
+                        arena,
+                        node,
+                        capacity,
+                        demand,
+                    } = error
+                    else {
+                        return Err(error);
+                    };
+                    if retry_trace.len() == retry_budget {
+                        return Err(MetalError::CapacityExceeded {
+                            arena,
+                            node,
+                            capacity,
+                            demand,
+                        });
+                    }
+                    let grown_capacity = crate::device_capacity::grown_capacity(capacity, demand);
+                    if grown_capacity <= capacity {
+                        return Err(MetalError::CapacityExceeded {
+                            arena,
+                            node,
+                            capacity,
+                            demand,
+                        });
+                    }
+                    attempt_config.raise_capacity(arena, grown_capacity);
+                    retry_trace.push(CapacityRetryRecord {
+                        retry: retry_trace.len() + 1,
+                        arena,
+                        node,
+                        capacity,
+                        demand,
+                        grown_capacity,
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -1344,7 +1485,7 @@ impl MetalPlan {
                 }
             }
             if let Some(limit) = config.max_queue_packets_per_lp {
-                queue_caps[slot] = limit;
+                queue_caps[slot] = limit.max(config.capacity_floors.queue_packets_per_lp);
             } else {
                 let resident = match node.kind {
                     NodeKind::Host => image.host_states[node.state_slot as usize].queue.len(),
@@ -1353,24 +1494,26 @@ impl MetalPlan {
                         .first()
                         .map_or(0, |queue| queue.queue.len()),
                 };
-                queue_caps[slot] = crate::device_capacity::cap_derived_capacity(
+                queue_caps[slot] = crate::device_capacity::bound_derived_capacity(
                     queue_caps[slot],
                     config.capacity_caps.queue_packets_per_lp,
+                    config.capacity_floors.queue_packets_per_lp,
                     resident,
                 );
             }
         }
 
         if let Some(limit) = config.max_fel_events_per_lp {
-            legacy_fel_caps.fill(limit);
+            legacy_fel_caps.fill(limit.max(config.capacity_floors.fallback_fel_events_per_lp));
         } else {
             for (capacity, resident) in legacy_fel_caps
                 .iter_mut()
                 .zip(initial_fel_counts.iter().copied())
             {
-                *capacity = crate::device_capacity::cap_derived_capacity(
+                *capacity = crate::device_capacity::bound_derived_capacity(
                     *capacity,
                     config.capacity_caps.fallback_fel_events_per_lp,
+                    config.capacity_floors.fallback_fel_events_per_lp,
                     resident,
                 );
             }
@@ -1397,13 +1540,14 @@ impl MetalPlan {
             legacy_fel_caps.clone()
         };
         if let Some(limit) = config.max_fel_events_per_lp {
-            fel_caps.fill(limit);
+            fel_caps.fill(limit.max(config.capacity_floors.fallback_fel_events_per_lp));
         } else {
             for (capacity, resident) in fel_caps.iter_mut().zip(initial_fel_counts.iter().copied())
             {
-                *capacity = crate::device_capacity::cap_derived_capacity(
+                *capacity = crate::device_capacity::bound_derived_capacity(
                     *capacity,
                     config.capacity_caps.fallback_fel_events_per_lp,
+                    config.capacity_floors.fallback_fel_events_per_lp,
                     resident,
                 );
             }
@@ -1609,13 +1753,17 @@ impl MetalPlan {
             &flow_feedback_counts,
             minimum_lookahead_ns,
         );
-        let outbox_capacity = config.max_outbox_events.unwrap_or_else(|| {
-            crate::device_capacity::cap_derived_capacity(
-                remote_bound.max(1),
-                config.capacity_caps.outbox_events_total,
-                0,
-            )
-        });
+        let outbox_capacity = config.max_outbox_events.map_or_else(
+            || {
+                crate::device_capacity::bound_derived_capacity(
+                    remote_bound.max(1),
+                    config.capacity_caps.outbox_events_total,
+                    config.capacity_floors.outbox_events_total,
+                    0,
+                )
+            },
+            |capacity| capacity.max(config.capacity_floors.outbox_events_total),
+        );
         let mut remote_capacities = derived_remote_capacities(
             image,
             &capacity_context,
@@ -1624,12 +1772,14 @@ impl MetalPlan {
             minimum_lookahead_ns,
         );
         if let Some(capacity) = config.max_outbox_events {
-            remote_capacities.fill(capacity);
+            remote_capacities
+                .fill(capacity.max(config.capacity_floors.remote_staging_events_per_lp));
         } else {
             for capacity in &mut remote_capacities {
-                *capacity = crate::device_capacity::cap_derived_capacity(
+                *capacity = crate::device_capacity::bound_derived_capacity(
                     *capacity,
                     config.capacity_caps.remote_staging_events_per_lp,
+                    config.capacity_floors.remote_staging_events_per_lp,
                     0,
                 );
             }
@@ -1651,7 +1801,10 @@ impl MetalPlan {
         )?;
         let event_bound = derived_transition_bound(image, &flow_packet_counts)?;
         let observation_capacity = if observation_mode == ObservationMode::Full {
-            config.max_observations.unwrap_or(event_bound.max(1))
+            config
+                .max_observations
+                .unwrap_or(event_bound.max(1))
+                .max(config.capacity_floors.observation_events)
         } else {
             0
         };
@@ -1661,12 +1814,13 @@ impl MetalPlan {
             vec![0; node_count]
         };
         if let Some(capacity) = config.max_observations {
-            observation_capacities.fill(capacity);
+            observation_capacities.fill(capacity.max(config.capacity_floors.observation_events));
         } else {
             for capacity in &mut observation_capacities {
-                *capacity = crate::device_capacity::cap_derived_capacity(
+                *capacity = crate::device_capacity::bound_derived_capacity(
                     *capacity,
                     config.capacity_caps.observation_events_per_lp,
+                    config.capacity_floors.observation_events,
                     0,
                 );
             }
@@ -1680,6 +1834,7 @@ impl MetalPlan {
             &flow_packet_counts,
             &flow_feedback_counts,
             config.capacity_caps,
+            config.capacity_floors,
         )?;
         let (inbound_meta, inbound_producers) = remote_inbound_producers(image);
         let round_capacity = config
@@ -1695,12 +1850,15 @@ impl MetalPlan {
         let mut control = vec![0_u64; CONTROL_STORAGE_WORDS];
         control[CONTROL_RUN_END_LO] = run_end as u64;
         control[CONTROL_RUN_END_HI] = (run_end >> 64) as u64;
+        let worklist_capacity = node_count
+            .max(1)
+            .max(config.capacity_floors.worklist_entries_total);
         let params = vec![
             node_count as u64,
             image.flows.len() as u64,
             image.links.len() as u64,
             outbox_capacity as u64,
-            node_count as u64,
+            worklist_capacity as u64,
             observation_capacity as u64,
             observation_capacity as u64,
             observation_capacity as u64,
@@ -1754,7 +1912,7 @@ impl MetalPlan {
             queue_records,
             in_service,
             outbox: zero_words(outbox_capacity, EVENT_WORDS)?,
-            worklist: vec![0_u64; node_count.max(1)],
+            worklist: vec![0_u64; worklist_capacity],
             summary: vec![0_u64; node_count.max(1) * SUMMARY_COUNTERS * 2],
             observed: zero_words(observation_slots, OBSERVED_WORDS)?,
             departures: zero_words(observation_slots, DEPARTURE_WORDS)?,
@@ -2212,18 +2370,21 @@ fn prepare_streams(
         lookahead,
     )?;
     if let Some(capacity) = config.max_channel_events_per_stream {
-        channel_caps.fill(capacity);
+        channel_caps.fill(capacity.max(config.capacity_floors.channel_events_per_stream));
     } else {
         for capacity in &mut channel_caps {
-            *capacity = crate::device_capacity::cap_derived_capacity(
+            *capacity = crate::device_capacity::bound_derived_capacity(
                 *capacity,
                 config.capacity_caps.channel_events_per_stream,
+                config.capacity_floors.channel_events_per_stream,
                 0,
             );
         }
     }
-    let service_caps = vec![2_usize; node_count];
-    let generator_caps = vec![2_usize; image.flows.len()];
+    let service_caps =
+        vec![2_usize.max(config.capacity_floors.service_events_per_stream); node_count];
+    let generator_caps =
+        vec![2_usize.max(config.capacity_floors.generator_events_per_stream); image.flows.len()];
     let mut stream_caps = Vec::with_capacity(stream_count);
     stream_caps.extend_from_slice(&channel_caps);
     stream_caps.extend_from_slice(&service_caps);
@@ -2760,6 +2921,7 @@ fn prepare_tcp_state(
     packet_counts: &[usize],
     feedback_counts: &[usize],
     capacity_caps: DeviceCapacityCaps,
+    capacity_floors: DeviceCapacityFloors,
 ) -> Result<PreparedTcpState, MetalError> {
     let flow_count = image.flows.len();
     let receiver_offset = 0;
@@ -2785,9 +2947,10 @@ fn prepare_tcp_state(
             let derived_capacity = capacity_context
                 .tcp_receiver_range_bound(image, flow, data_count)
                 .max(receiver.out_of_order.len());
-            let capacity = crate::device_capacity::cap_derived_capacity(
+            let capacity = crate::device_capacity::bound_derived_capacity(
                 derived_capacity,
                 capacity_caps.tcp_receiver_ranges_per_flow,
+                capacity_floors.tcp_receiver_ranges_per_flow,
                 receiver.out_of_order.len(),
             );
             let words = capacity.checked_mul(TCP_RANGE_WORDS).ok_or_else(|| {
@@ -2828,11 +2991,12 @@ fn prepare_tcp_state(
             .copied()
             .unwrap_or(0)
             .saturating_sub(feedback_counts.get(flow).copied().unwrap_or(0));
-        let capacity = crate::device_capacity::cap_derived_capacity(
+        let capacity = crate::device_capacity::bound_derived_capacity(
             capacity_context
                 .tcp_ledger_segment_bound(image, flow, data_count)
                 .max(current),
             capacity_caps.tcp_ledger_segments_per_flow,
+            capacity_floors.tcp_ledger_segments_per_flow,
             current,
         );
         let record_offset = next;
@@ -3615,6 +3779,7 @@ impl MetalBuffers {
                 diagnostics: None,
                 pending_events,
             },
+            capacity_retry_trace: Vec::new(),
             rounds: control[CONTROL_ROUNDS],
             transitions: lp_state
                 .chunks_exact(LP_STATE_WORDS)
@@ -4670,6 +4835,7 @@ mod tests {
 
         assert!(config.streams_enabled);
         assert_eq!(config.max_channel_events_per_stream, None);
+        assert_eq!(config.max_capacity_retries, 4);
     }
 
     #[test]
