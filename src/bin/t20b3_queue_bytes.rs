@@ -42,6 +42,14 @@ const fn sustained_capacity_caps() -> DeviceCapacityCaps {
     }
 }
 
+fn capacity_caps(kind: RunKind) -> DeviceCapacityCaps {
+    let mut caps = sustained_capacity_caps();
+    if kind == RunKind::FullParity {
+        caps.observation_events_per_lp = None;
+    }
+    caps
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum RunKind {
     Warmup,
@@ -219,7 +227,7 @@ fn print_protocol(backend: &str, cli: &Cli, transform: BytePolicyTransform) {
         transform.queues,
         transform.capacity_bytes,
         transform.capacity_bytes,
-        sustained_capacity_caps(),
+        capacity_caps(cli.kind),
         cli.max_fel_events_per_lp,
     );
 }
@@ -280,7 +288,7 @@ fn main() {
     let executor = MetalExecutor::new().expect("Metal executor must initialize");
     print_protocol("metal", &cli, transform);
     let config = MetalConfig {
-        capacity_caps: sustained_capacity_caps(),
+        capacity_caps: capacity_caps(cli.kind),
         max_fel_events_per_lp: cli.max_fel_events_per_lp,
         ..MetalConfig::default()
     };
@@ -343,7 +351,7 @@ fn main() {
     let executor = CudaExecutor::new().expect("CUDA executor must initialize");
     print_protocol("cuda", &cli, transform);
     let config = CudaConfig {
-        capacity_caps: sustained_capacity_caps(),
+        capacity_caps: capacity_caps(cli.kind),
         max_fel_events_per_lp: cli.max_fel_events_per_lp,
         ..CudaConfig::default()
     };
@@ -409,7 +417,21 @@ mod tests {
     use days::scenario::compile_config;
     use days_executor::{DropMarkPolicy, QueueDepthUnit};
 
-    use super::{FNV1A64_OFFSET_BASIS, apply_probe_byte_policy, fingerprint};
+    use super::{
+        FNV1A64_OFFSET_BASIS, RunKind, apply_probe_byte_policy, capacity_caps, fingerprint,
+    };
+
+    #[test]
+    fn full_parity_derives_observation_capacity_without_changing_timing_caps() {
+        assert_eq!(
+            capacity_caps(RunKind::Sample).observation_events_per_lp,
+            Some(512)
+        );
+        assert_eq!(
+            capacity_caps(RunKind::FullParity).observation_events_per_lp,
+            None
+        );
+    }
 
     #[test]
     fn k16_probe_policy_is_derived_exactly() {
