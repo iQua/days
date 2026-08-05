@@ -9,7 +9,7 @@ use std::fmt;
 
 use num_bigint::BigUint;
 
-use crate::device_scheduler::device_scheduler_word_count;
+use crate::device_scheduler::{QUEUE_META_WORDS, device_scheduler_word_count};
 use crate::{
     EventKind, FlowGeneratorKind, GeneratorStatus, LinkId, NodeKind, PacketKind, SimulationImage,
     serialization_time_ns,
@@ -366,7 +366,7 @@ pub fn size_default_device_plan(
         checked_product(link_count.max(1), LINK_WORDS, "link plane")?,
         checked_product(node_count, ARENA_META_WORDS, "FEL metadata plane")?,
         checked_product(fallback_fel_event_slots, EVENT_WORDS, "FEL record plane")?.max(1),
-        checked_product(node_count, ARENA_META_WORDS, "queue metadata plane")?,
+        checked_product(node_count, QUEUE_META_WORDS, "queue metadata plane")?,
         checked_product(queue_slots, EVENT_WORDS, "queue record plane")?.max(1),
         checked_product(node_count, EVENT_WORDS, "in-service plane")?.max(1),
         checked_product(remote_bound.max(1), EVENT_WORDS, "outbox plane")?,
