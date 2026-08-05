@@ -226,6 +226,7 @@ constant ulong ARENA_SERVICE_STREAM = 9;
 constant ulong ARENA_GENERATOR_STREAM = 10;
 constant ulong ARENA_TCP_RECEIVER = 11;
 constant ulong ARENA_TCP_SEGMENT_LEDGER = 12;
+constant ulong ARENA_REMOTE_STAGING = 13;
 
 constant uint L_FINISHED = 0;
 constant uint L_TRANSITIONS = 1;
@@ -1229,7 +1230,7 @@ inline bool append_remote(
     ulong capacity = remote_meta[base + 1];
     ulong index = remote_meta[base + 3];
     if (index >= capacity) {
-        set_capacity_error(error, ARENA_OUTBOX, NONE, params[P_OUTBOX_CAPACITY]);
+        set_capacity_error(error, ARENA_REMOTE_STAGING, node, capacity);
         return false;
     }
     copy_thread_to_device(record, remote_staging, offset + index);

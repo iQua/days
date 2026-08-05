@@ -124,6 +124,9 @@ pub enum CudaArena {
     ObservedPackets,
     Departures,
     Arrivals,
+    TcpReceiverRanges,
+    TcpSegmentLedger,
+    RemoteStaging,
 }
 
 impl fmt::Display for CudaArena {
@@ -139,6 +142,9 @@ impl fmt::Display for CudaArena {
             Self::ObservedPackets => "observed-packet log",
             Self::Departures => "departure log",
             Self::Arrivals => "arrival log",
+            Self::TcpReceiverRanges => "TCP receiver range arena",
+            Self::TcpSegmentLedger => "TCP segment ledger",
+            Self::RemoteStaging => "per-LP remote staging",
         })
     }
 }
@@ -174,6 +180,9 @@ fn decode_arena(value: u64) -> CudaArena {
         8 => CudaArena::ChannelInbox,
         9 => CudaArena::ServiceStream,
         10 => CudaArena::GeneratorStream,
+        11 => CudaArena::TcpReceiverRanges,
+        12 => CudaArena::TcpSegmentLedger,
+        13 => CudaArena::RemoteStaging,
         _ => CudaArena::Fel,
     }
 }
@@ -3633,4 +3642,16 @@ fn driver_error(context: impl fmt::Display, error: cudarc::driver::DriverError) 
 
 fn duration_ns(duration: Duration) -> u64 {
     duration.as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CudaArena, decode_arena};
+
+    #[test]
+    fn cuda_decodes_tcp_capacity_arenas_with_metal_parity() {
+        assert_eq!(decode_arena(11), CudaArena::TcpReceiverRanges);
+        assert_eq!(decode_arena(12), CudaArena::TcpSegmentLedger);
+        assert_eq!(decode_arena(13), CudaArena::RemoteStaging);
+    }
 }

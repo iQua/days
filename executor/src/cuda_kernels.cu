@@ -243,6 +243,9 @@ constexpr ulong ARENA_ARRIVALS = 7;
 constexpr ulong ARENA_CHANNEL_INBOX = 8;
 constexpr ulong ARENA_SERVICE_STREAM = 9;
 constexpr ulong ARENA_GENERATOR_STREAM = 10;
+constexpr ulong ARENA_TCP_RECEIVER = 11;
+constexpr ulong ARENA_TCP_SEGMENT_LEDGER = 12;
+constexpr ulong ARENA_REMOTE_STAGING = 13;
 
 constexpr uint L_FINISHED = 0;
 constexpr uint L_TRANSITIONS = 1;
@@ -1246,7 +1249,7 @@ __device__ __forceinline__ bool append_remote(
     ulong capacity = remote_meta[base + 1];
     ulong index = remote_meta[base + 3];
     if (index >= capacity) {
-        set_capacity_error(error, ARENA_OUTBOX, NONE, params[P_OUTBOX_CAPACITY]);
+        set_capacity_error(error, ARENA_REMOTE_STAGING, node, capacity);
         return false;
     }
     copy_thread_to_device(record, remote_staging, offset + index);
@@ -2967,7 +2970,7 @@ __device__ __forceinline__ bool tcp_ledger_insert(
         return true;
     }
     if (count >= capacity) {
-        set_semantic_error(error, 41, NONE);
+        set_capacity_error(error, ARENA_TCP_SEGMENT_LEDGER, flow, capacity);
         return false;
     }
     for (ulong index = count; index > insertion; --index) {
@@ -3046,7 +3049,7 @@ __device__ __forceinline__ bool tcp_receive_range(
     ulong capacity = tcp_state[row + 5];
     ulong count = tcp_state[row + 6];
     if (count >= capacity) {
-        set_semantic_error(error, 43, NONE);
+        set_capacity_error(error, ARENA_TCP_RECEIVER, flow, capacity);
         return false;
     }
     ulong insertion = count;

@@ -199,6 +199,7 @@ pub enum MetalArena {
     Arrivals,
     TcpReceiverRanges,
     TcpSegmentLedger,
+    RemoteStaging,
 }
 
 impl fmt::Display for MetalArena {
@@ -216,6 +217,7 @@ impl fmt::Display for MetalArena {
             Self::Arrivals => "arrival log",
             Self::TcpReceiverRanges => "TCP receiver range arena",
             Self::TcpSegmentLedger => "TCP segment ledger",
+            Self::RemoteStaging => "per-LP remote staging",
         })
     }
 }
@@ -3630,6 +3632,7 @@ fn decode_arena(value: u64) -> MetalArena {
         10 => MetalArena::GeneratorStream,
         11 => MetalArena::TcpReceiverRanges,
         12 => MetalArena::TcpSegmentLedger,
+        13 => MetalArena::RemoteStaging,
         _ => MetalArena::Fel,
     }
 }
