@@ -71,11 +71,15 @@ pub(crate) fn grown_capacity(capacity: usize, demand: usize) -> usize {
     feature = "cuda",
     all(feature = "metal-spike", target_vendor = "apple")
 ))]
-pub(crate) fn raise_cap_or_floor(cap: &mut Option<usize>, floor: &mut usize, grown: usize) {
-    if let Some(cap) = cap {
-        *cap = (*cap).max(grown);
-    } else {
-        *floor = (*floor).max(grown);
+pub(crate) fn raise_cap_or_floor(
+    cap: &mut Option<usize>,
+    floor: &mut usize,
+    capacity: usize,
+    grown: usize,
+) {
+    match cap {
+        Some(cap) if *cap == capacity => *cap = (*cap).max(grown),
+        Some(_) | None => *floor = (*floor).max(grown),
     }
 }
 
@@ -88,12 +92,14 @@ pub(crate) fn raise_override_cap_or_floor(
     override_capacity: &mut Option<usize>,
     cap: &mut Option<usize>,
     floor: &mut usize,
+    capacity: usize,
     grown: usize,
 ) {
-    if let Some(override_capacity) = override_capacity {
-        *override_capacity = (*override_capacity).max(grown);
-    } else {
-        raise_cap_or_floor(cap, floor, grown);
+    match override_capacity {
+        Some(override_capacity) if *override_capacity == capacity => {
+            *override_capacity = (*override_capacity).max(grown);
+        }
+        Some(_) | None => raise_cap_or_floor(cap, floor, capacity, grown),
     }
 }
 
@@ -153,21 +159,28 @@ mod tests {
         let mut override_capacity = None;
         let mut cap = Some(8);
         let mut floor = 0;
-        raise_override_cap_or_floor(&mut override_capacity, &mut cap, &mut floor, 18);
+        raise_override_cap_or_floor(&mut override_capacity, &mut cap, &mut floor, 8, 18);
         assert_eq!(override_capacity, None);
         assert_eq!(cap, Some(18));
         assert_eq!(floor, 0);
 
         cap = None;
-        raise_cap_or_floor(&mut cap, &mut floor, 24);
+        raise_cap_or_floor(&mut cap, &mut floor, 8, 24);
         assert_eq!(cap, None);
         assert_eq!(floor, 24);
 
         override_capacity = Some(4);
         cap = Some(8);
-        raise_override_cap_or_floor(&mut override_capacity, &mut cap, &mut floor, 32);
+        raise_override_cap_or_floor(&mut override_capacity, &mut cap, &mut floor, 4, 32);
         assert_eq!(override_capacity, Some(32));
         assert_eq!(cap, Some(8));
         assert_eq!(floor, 24);
+
+        override_capacity = None;
+        cap = Some(2_048);
+        floor = 0;
+        raise_override_cap_or_floor(&mut override_capacity, &mut cap, &mut floor, 49, 100);
+        assert_eq!(cap, Some(2_048));
+        assert_eq!(floor, 100);
     }
 }

@@ -367,13 +367,14 @@ impl Default for MetalConfig {
 }
 
 impl MetalConfig {
-    fn raise_capacity(&mut self, arena: MetalArena, grown: usize) {
+    fn raise_capacity(&mut self, arena: MetalArena, capacity: usize, grown: usize) {
         match arena {
             MetalArena::Fel => {
                 crate::device_capacity::raise_override_cap_or_floor(
                     &mut self.max_fel_events_per_lp,
                     &mut self.capacity_caps.fallback_fel_events_per_lp,
                     &mut self.capacity_floors.fallback_fel_events_per_lp,
+                    capacity,
                     grown,
                 );
             }
@@ -382,6 +383,7 @@ impl MetalConfig {
                     &mut self.max_channel_events_per_stream,
                     &mut self.capacity_caps.channel_events_per_stream,
                     &mut self.capacity_floors.channel_events_per_stream,
+                    capacity,
                     grown,
                 );
             }
@@ -398,6 +400,7 @@ impl MetalConfig {
                     &mut self.max_queue_packets_per_lp,
                     &mut self.capacity_caps.queue_packets_per_lp,
                     &mut self.capacity_floors.queue_packets_per_lp,
+                    capacity,
                     grown,
                 );
             }
@@ -406,6 +409,7 @@ impl MetalConfig {
                     &mut self.max_outbox_events,
                     &mut self.capacity_caps.outbox_events_total,
                     &mut self.capacity_floors.outbox_events_total,
+                    capacity,
                     grown,
                 );
             }
@@ -418,6 +422,7 @@ impl MetalConfig {
                     &mut self.max_observations,
                     &mut self.capacity_caps.observation_events_per_lp,
                     &mut self.capacity_floors.observation_events,
+                    capacity,
                     grown,
                 );
             }
@@ -425,6 +430,7 @@ impl MetalConfig {
                 crate::device_capacity::raise_cap_or_floor(
                     &mut self.capacity_caps.tcp_receiver_ranges_per_flow,
                     &mut self.capacity_floors.tcp_receiver_ranges_per_flow,
+                    capacity,
                     grown,
                 );
             }
@@ -432,6 +438,7 @@ impl MetalConfig {
                 crate::device_capacity::raise_cap_or_floor(
                     &mut self.capacity_caps.tcp_ledger_segments_per_flow,
                     &mut self.capacity_floors.tcp_ledger_segments_per_flow,
+                    capacity,
                     grown,
                 );
             }
@@ -440,6 +447,7 @@ impl MetalConfig {
                     &mut self.max_outbox_events,
                     &mut self.capacity_caps.remote_staging_events_per_lp,
                     &mut self.capacity_floors.remote_staging_events_per_lp,
+                    capacity,
                     grown,
                 );
             }
@@ -1145,7 +1153,7 @@ impl MetalExecutor {
                             demand,
                         });
                     }
-                    attempt_config.raise_capacity(arena, grown_capacity);
+                    attempt_config.raise_capacity(arena, capacity, grown_capacity);
                     retry_trace.push(CapacityRetryRecord {
                         retry: retry_trace.len() + 1,
                         arena,
