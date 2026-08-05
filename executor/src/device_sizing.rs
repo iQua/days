@@ -241,8 +241,10 @@ pub fn size_default_device_plan(
     let node_count = image.nodes.len();
     let flow_count = image.flows.len();
     let link_count = image.links.len();
-    let flow_packet_counts = flow_packet_counts(image)?;
-    let flow_feedback_counts = feedback_packet_counts(image, &flow_packet_counts);
+    let initial_tcp_ack_counts = initial_tcp_ack_counts(image);
+    let flow_packet_counts = flow_packet_counts(image, &initial_tcp_ack_counts)?;
+    let flow_feedback_counts =
+        feedback_packet_counts(image, &flow_packet_counts, &initial_tcp_ack_counts);
     let flow_data_counts = flow_packet_counts
         .iter()
         .zip(&flow_feedback_counts)
@@ -596,7 +598,21 @@ impl CapacityContext {
     }
 }
 
-fn flow_packet_counts(image: &SimulationImage) -> Result<Vec<usize>, DeviceSizingError> {
+fn initial_tcp_ack_counts(image: &SimulationImage) -> Vec<u64> {
+    let mut counts = vec![0_u64; image.flows.len()];
+    for packet in &image.initial_packets {
+        if matches!(packet.kind, PacketKind::TcpAck(_)) {
+            let flow = packet.flow.0 as usize;
+            counts[flow] = counts[flow].saturating_add(1);
+        }
+    }
+    counts
+}
+
+fn flow_packet_counts(
+    image: &SimulationImage,
+    initial_tcp_ack_counts: &[u64],
+) -> Result<Vec<usize>, DeviceSizingError> {
     let mut counts = vec![0_usize; image.flows.len()];
     for packet in &image.initial_packets {
         counts[packet.flow.0 as usize] = counts[packet.flow.0 as usize].saturating_add(1);
@@ -661,7 +677,8 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<Vec<usize>, DeviceSizin
                     // boundary and can retransmit. Twice the remaining nominal segment count plus
                     // preloaded ACK triggers is the practical bounded device arena reservation;
                     // a valid trajectory that exceeds it reports an exact capacity error.
-                    let bound = tcp_data_attempt_bound(image, generator, tcp);
+                    let bound =
+                        tcp_data_attempt_bound(generator, tcp, initial_tcp_ack_counts[index]);
                     // Every delivered data attempt creates one cumulative ACK attempt.
                     counts[index] = counts[index].saturating_add(bound.saturating_mul(2));
                 }
@@ -711,7 +728,11 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<Vec<usize>, DeviceSizin
     Ok(counts)
 }
 
-fn feedback_packet_counts(image: &SimulationImage, packet_counts: &[usize]) -> Vec<usize> {
+fn feedback_packet_counts(
+    image: &SimulationImage,
+    packet_counts: &[usize],
+    initial_tcp_ack_counts: &[u64],
+) -> Vec<usize> {
     let mut counts = image.initial_packets.iter().fold(
         vec![0_usize; image.flows.len()],
         |mut counts, packet| {
@@ -725,7 +746,8 @@ fn feedback_packet_counts(image: &SimulationImage, packet_counts: &[usize]) -> V
         for generator in &state.generators {
             if let FlowGeneratorKind::Tcp(tcp) = generator.kind {
                 let index = generator.flow.0 as usize;
-                let attempts = tcp_data_attempt_bound(image, generator, tcp);
+                let attempts =
+                    tcp_data_attempt_bound(generator, tcp, initial_tcp_ack_counts[index]);
                 counts[index] = counts[index].saturating_add(attempts);
                 counts[index] = counts[index].min(packet_counts[index]);
             }
@@ -735,9 +757,9 @@ fn feedback_packet_counts(image: &SimulationImage, packet_counts: &[usize]) -> V
 }
 
 fn tcp_data_attempt_bound(
-    image: &SimulationImage,
     generator: &crate::FlowGeneratorState,
     tcp: crate::TcpGenerator,
+    preloaded_acks: u64,
 ) -> usize {
     if matches!(
         generator.next_emission.status,
@@ -748,13 +770,6 @@ fn tcp_data_attempt_bound(
     }
     let remaining = tcp.total_bytes - tcp.highest_ack;
     let nominal = remaining.div_ceil(tcp.mss_bytes.max(1));
-    let preloaded_acks = image
-        .initial_packets
-        .iter()
-        .filter(|packet| {
-            packet.flow == generator.flow && matches!(packet.kind, PacketKind::TcpAck(_))
-        })
-        .count() as u64;
     usize::try_from(
         nominal
             .saturating_mul(2)
@@ -1163,12 +1178,7 @@ fn flow_link_round_bound(
     });
     let generator_burst =
         if packet_kind == PacketKind::Data && link.source == image.flows[flow_index].source {
-            let closed_loop = image.host_states.iter().any(|state| {
-                state.generators.iter().any(|generator| {
-                    generator.flow.0 as usize == flow_index
-                        && matches!(generator.kind, FlowGeneratorKind::Tcp(_))
-                })
-            });
+            let closed_loop = context.tcp_generators[flow_index].is_some();
             if closed_loop {
                 packet_count
             } else {
