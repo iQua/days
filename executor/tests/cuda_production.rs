@@ -4,11 +4,12 @@ use std::collections::VecDeque;
 
 use days_executor::{
     ArrivalDisposition, Backend, ConstantGenerator, CudaArena, CudaConfig, CudaError, CudaExecutor,
-    Event, EventKey, EventKind, FlowDescriptor, FlowGeneratorKind, FlowGeneratorState, FlowId,
-    GeneratorFeedbackState, GeneratorStatus, GeneratorTermination, HostState, LinkDescriptor,
-    LinkId, NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketDescriptor, PacketKind,
-    PayloadId, RemoteChannel, ScheduledEmission, SchedulerKind, SimulationImage, SwitchQueueState,
-    SwitchState, event_phase, run_cuda_with_observations, run_scalar_with_observations, validate,
+    DeviceLanePacking, Event, EventKey, EventKind, FlowDescriptor, FlowGeneratorKind,
+    FlowGeneratorState, FlowId, GeneratorFeedbackState, GeneratorStatus, GeneratorTermination,
+    HostState, LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, ObservationMode,
+    PacketDescriptor, PacketKind, PayloadId, RemoteChannel, ScheduledEmission, SchedulerKind,
+    SimulationImage, SwitchQueueState, SwitchState, event_phase, run_cuda_with_observations,
+    run_scalar_with_observations, validate,
 };
 
 const SOURCE: NodeId = NodeId(0);
@@ -17,6 +18,20 @@ const FORWARD: LinkId = LinkId(0);
 const REVERSE: LinkId = LinkId(1);
 const FLOW: FlowId = FlowId(0);
 const FIRST_PACKET: PayloadId = PayloadId(0);
+
+fn production_cuda_config() -> CudaConfig {
+    let lane_packing = match std::env::var("DAYS_CUDA_PRODUCTION_LANE_PACKING") {
+        Err(std::env::VarError::NotPresent) => DeviceLanePacking::Unpacked,
+        Ok(value) if value == "unpacked" => DeviceLanePacking::Unpacked,
+        Ok(value) if value == "descending" => DeviceLanePacking::Descending,
+        Ok(value) => panic!("unsupported CUDA production lane-packing arm {value}"),
+        Err(error) => panic!("invalid CUDA production lane-packing environment: {error}"),
+    };
+    CudaConfig {
+        lane_packing,
+        ..CudaConfig::default()
+    }
+}
 
 fn generator_image(termination: GeneratorTermination) -> SimulationImage {
     let first_packet = PacketDescriptor {
@@ -436,7 +451,7 @@ fn assert_full_parity(image: &SimulationImage, exclusive_horizon_ns: Option<u64>
             exclusive_horizon_ns,
             CudaConfig {
                 streams_enabled,
-                ..CudaConfig::default()
+                ..production_cuda_config()
             },
             ObservationMode::Full,
         )
@@ -473,7 +488,7 @@ fn cuda_two_runs_are_byte_exact() {
         .run_with_observations(
             &image,
             Some(27),
-            CudaConfig::default(),
+            production_cuda_config(),
             ObservationMode::Full,
         )
         .expect("first CUDA run must succeed");
@@ -481,7 +496,7 @@ fn cuda_two_runs_are_byte_exact() {
         .run_with_observations(
             &image,
             Some(27),
-            CudaConfig::default(),
+            production_cuda_config(),
             ObservationMode::Full,
         )
         .expect("second CUDA run must succeed");
@@ -499,7 +514,7 @@ fn cuda_phase_profile_uses_device_timestamps_without_changing_the_result() {
         .run_with_observations(
             &image,
             Some(27),
-            CudaConfig::default(),
+            production_cuda_config(),
             ObservationMode::Full,
         )
         .expect("unprofiled CUDA run must succeed");
@@ -507,7 +522,7 @@ fn cuda_phase_profile_uses_device_timestamps_without_changing_the_result() {
         .run_profiled_with_observations(
             &image,
             Some(27),
-            CudaConfig::default(),
+            production_cuda_config(),
             ObservationMode::Full,
         )
         .expect("profiled CUDA run must succeed");
@@ -533,7 +548,7 @@ fn cuda_continuation_state_crosses_graph_waves_exactly() {
         None,
         CudaConfig {
             max_transitions_per_lp_per_round: usize::MAX,
-            ..CudaConfig::default()
+            ..production_cuda_config()
         },
         ObservationMode::Full,
     )
@@ -544,7 +559,7 @@ fn cuda_continuation_state_crosses_graph_waves_exactly() {
         CudaConfig {
             max_transitions_per_lp_per_round: 1,
             attempts_per_graph_wave: 8,
-            ..CudaConfig::default()
+            ..production_cuda_config()
         },
         ObservationMode::Full,
     )
@@ -578,7 +593,7 @@ fn cuda_device_capacity_fault_is_explicit_and_executor_recovers() {
             None,
             CudaConfig {
                 max_queue_packets_per_lp: Some(0),
-                ..CudaConfig::default()
+                ..production_cuda_config()
             },
         )
         .expect_err("zero queue capacity must fault in the transition kernel");
@@ -592,7 +607,12 @@ fn cuda_device_capacity_fault_is_explicit_and_executor_recovers() {
     );
 
     let recovered = executor
-        .run_with_observations(&image, None, CudaConfig::default(), ObservationMode::Full)
+        .run_with_observations(
+            &image,
+            None,
+            production_cuda_config(),
+            ObservationMode::Full,
+        )
         .expect("the executor must recover after a device capacity fault");
     assert!(expected.diagnostics.is_some());
     assert!(recovered.result.diagnostics.is_none());
