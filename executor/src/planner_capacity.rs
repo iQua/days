@@ -16,7 +16,7 @@ pub(crate) enum TcpMinimumPacketSize {
 }
 
 impl TcpMinimumPacketSize {
-    #[cfg(any(test, feature = "cuda-test-hooks", feature = "metal-test-hooks"))]
+    #[cfg(any(test, feature = "planner-test-hooks"))]
     fn legacy_uses_precomputed_table(self) -> bool {
         match self {
             #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
@@ -30,7 +30,7 @@ impl TcpMinimumPacketSize {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PlannerCapacityMode {
     Precomputed,
-    #[cfg(any(test, feature = "cuda-test-hooks", feature = "metal-test-hooks"))]
+    #[cfg(any(test, feature = "planner-test-hooks"))]
     Legacy,
 }
 
@@ -58,7 +58,7 @@ impl PlannerCapacityContext {
         tcp_minimum_packet_size: TcpMinimumPacketSize,
         mode: PlannerCapacityMode,
     ) -> Self {
-        #[cfg(any(test, feature = "cuda-test-hooks", feature = "metal-test-hooks"))]
+        #[cfg(any(test, feature = "planner-test-hooks"))]
         if mode == PlannerCapacityMode::Legacy {
             return Self {
                 mode,
@@ -260,7 +260,7 @@ impl PlannerCapacityContext {
         flow: usize,
         packet_count: usize,
     ) -> usize {
-        #[cfg(any(test, feature = "cuda-test-hooks", feature = "metal-test-hooks"))]
+        #[cfg(any(test, feature = "planner-test-hooks"))]
         if self.mode == PlannerCapacityMode::Legacy {
             return legacy_source_queue_packet_bound(image, flow, packet_count);
         }
@@ -275,7 +275,7 @@ impl PlannerCapacityContext {
         packet_count: usize,
         lookahead: Option<u64>,
     ) -> usize {
-        #[cfg(any(test, feature = "cuda-test-hooks", feature = "metal-test-hooks"))]
+        #[cfg(any(test, feature = "planner-test-hooks"))]
         if self.mode == PlannerCapacityMode::Legacy {
             return legacy_generator_round_burst(image, flow, packet_count, lookahead);
         }
@@ -289,7 +289,7 @@ impl PlannerCapacityContext {
         flow: usize,
         packet_kind: PacketKind,
     ) -> u64 {
-        #[cfg(any(test, feature = "cuda-test-hooks", feature = "metal-test-hooks"))]
+        #[cfg(any(test, feature = "planner-test-hooks"))]
         if self.mode == PlannerCapacityMode::Legacy {
             if self.tcp_minimum_packet_size.legacy_uses_precomputed_table() {
                 return self.minimum_packet_sizes[flow][usize::from(!packet_kind.is_data())];
@@ -310,7 +310,7 @@ impl PlannerCapacityContext {
         image: &SimulationImage,
         flow: usize,
     ) -> Option<TcpGenerator> {
-        #[cfg(any(test, feature = "cuda-test-hooks", feature = "metal-test-hooks"))]
+        #[cfg(any(test, feature = "planner-test-hooks"))]
         if self.mode == PlannerCapacityMode::Legacy {
             return legacy_tcp_generator(image, flow);
         }
@@ -337,7 +337,7 @@ impl PlannerCapacityContext {
     }
 
     pub(crate) fn host_lp(&self, image: &SimulationImage, host_slot: usize) -> Option<NodeId> {
-        #[cfg(any(test, feature = "cuda-test-hooks", feature = "metal-test-hooks"))]
+        #[cfg(any(test, feature = "planner-test-hooks"))]
         if self.mode == PlannerCapacityMode::Legacy {
             return image
                 .nodes
@@ -349,7 +349,7 @@ impl PlannerCapacityContext {
         self.host_to_lp[host_slot]
     }
 
-    #[cfg(any(test, feature = "cuda-test-hooks", feature = "metal-test-hooks"))]
+    #[cfg(any(test, feature = "planner-test-hooks"))]
     pub(crate) fn matches_legacy(
         image: &SimulationImage,
         data_counts: &[usize],
@@ -417,10 +417,7 @@ impl PlannerCapacityContext {
     fn debug_assert_sampled_minimum_packet_sizes(&self, _image: &SimulationImage) {}
 }
 
-#[cfg(all(
-    feature = "cuda",
-    any(test, feature = "cuda-test-hooks", feature = "metal-test-hooks")
-))]
+#[cfg(all(feature = "cuda", any(test, feature = "planner-test-hooks")))]
 fn tcp_segment_capacities_match(
     precomputed: &PlannerCapacityContext,
     legacy: &PlannerCapacityContext,
@@ -431,10 +428,7 @@ fn tcp_segment_capacities_match(
         == legacy.tcp_flow_segment_capacity(image, flow)
 }
 
-#[cfg(all(
-    not(feature = "cuda"),
-    any(test, feature = "cuda-test-hooks", feature = "metal-test-hooks")
-))]
+#[cfg(all(not(feature = "cuda"), any(test, feature = "planner-test-hooks")))]
 fn tcp_segment_capacities_match(
     _precomputed: &PlannerCapacityContext,
     _legacy: &PlannerCapacityContext,
@@ -454,7 +448,7 @@ fn interval_burst(packet_count: usize, interval_ns: u64, lookahead: Option<u64>)
     })
 }
 
-#[cfg(any(test, feature = "cuda-test-hooks", feature = "metal-test-hooks"))]
+#[cfg(any(test, feature = "planner-test-hooks"))]
 fn precompute_minimum_packet_sizes(
     image: &SimulationImage,
     tcp_minimum_packet_size: TcpMinimumPacketSize,
@@ -539,12 +533,7 @@ fn sampled_flow_indices(flow_count: usize) -> Vec<usize> {
     sampled
 }
 
-#[cfg(any(
-    debug_assertions,
-    test,
-    feature = "cuda-test-hooks",
-    feature = "metal-test-hooks"
-))]
+#[cfg(any(debug_assertions, test, feature = "planner-test-hooks"))]
 fn legacy_minimum_packet_size(
     image: &SimulationImage,
     flow: usize,
@@ -592,7 +581,7 @@ fn legacy_minimum_packet_size(
         .unwrap_or(1)
 }
 
-#[cfg(any(test, feature = "cuda-test-hooks", feature = "metal-test-hooks"))]
+#[cfg(any(test, feature = "planner-test-hooks"))]
 fn legacy_tcp_generator(image: &SimulationImage, flow: usize) -> Option<TcpGenerator> {
     image
         .host_states
@@ -608,7 +597,7 @@ fn legacy_tcp_generator(image: &SimulationImage, flow: usize) -> Option<TcpGener
         })
 }
 
-#[cfg(any(test, feature = "cuda-test-hooks", feature = "metal-test-hooks"))]
+#[cfg(any(test, feature = "planner-test-hooks"))]
 fn legacy_generator_round_burst(
     image: &SimulationImage,
     flow: usize,
@@ -640,7 +629,7 @@ fn legacy_generator_round_burst(
         .fold(0, usize::saturating_add)
 }
 
-#[cfg(any(test, feature = "cuda-test-hooks", feature = "metal-test-hooks"))]
+#[cfg(any(test, feature = "planner-test-hooks"))]
 fn legacy_source_queue_packet_bound(
     image: &SimulationImage,
     flow_index: usize,
@@ -728,7 +717,10 @@ fn legacy_source_queue_packet_bound(
 
 #[cfg(test)]
 mod tests {
-    use super::{materialize_minimum_packet_sizes, update_minimum_packet_size};
+    use super::{
+        materialize_minimum_packet_sizes, paced_single_source_queue_bound,
+        update_minimum_packet_size,
+    };
 
     #[test]
     fn packet_size_cache_distinguishes_exact_u64_boundary_from_absence() {
@@ -736,5 +728,12 @@ mod tests {
         update_minimum_packet_size(&mut minimums[0][0], u64::MAX);
         materialize_minimum_packet_sizes(&mut minimums);
         assert_eq!(minimums, [[u64::MAX, 1]]);
+    }
+
+    #[test]
+    fn paced_single_source_queue_bound_pins_service_rate_contract() {
+        assert_eq!(paced_single_source_queue_bound(65_536, 21, 21), 1);
+        assert_eq!(paced_single_source_queue_bound(65_536, 22, 21), 1);
+        assert_eq!(paced_single_source_queue_bound(65_536, 20, 21), 65_536);
     }
 }

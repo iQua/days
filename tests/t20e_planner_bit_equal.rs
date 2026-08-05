@@ -1,6 +1,12 @@
-#![cfg(any(
-    feature = "cuda-test-hooks",
-    all(feature = "metal-test-hooks", target_vendor = "apple")
+//! The equality gate proves that the retained legacy planner and the precomputed planner produce
+//! the same values. It is not a specification oracle: primitives shared by both paths can drift
+//! without making this gate fail, so those primitives require focused independent tests.
+#![cfg(all(
+    feature = "test",
+    any(
+        feature = "cuda",
+        all(feature = "metal-spike", target_vendor = "apple")
+    )
 ))]
 
 use std::collections::VecDeque;
@@ -8,7 +14,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use days::scenario::compile_config;
-#[cfg(feature = "cuda-test-hooks")]
+#[cfg(feature = "cuda")]
 use days_executor::{CudaConfig, assert_cuda_planner_bit_equal_for_testing};
 use days_executor::{
     DeviceCapacityCaps, Event, EventKey, EventKind, FlowDescriptor, FlowGeneratorKind,
@@ -16,7 +22,7 @@ use days_executor::{
     LinkId, NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketDescriptor, PacketKind,
     PayloadId, RateGenerator, RemoteChannel, ScheduledEmission, SimulationImage, event_phase,
 };
-#[cfg(all(feature = "metal-test-hooks", target_vendor = "apple"))]
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 use days_executor::{MetalConfig, assert_metal_planner_bit_equal_for_testing};
 use tempfile::NamedTempFile;
 
@@ -202,7 +208,7 @@ fn compile_dcqcn_rejection_fixture() -> SimulationImage {
         .unwrap_or_else(|error| panic!("failed to lower DCQCN rejection fixture: {error}"))
 }
 
-#[cfg(all(feature = "metal-test-hooks", target_vendor = "apple"))]
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 fn metal_config(streams_enabled: bool, capped: bool) -> MetalConfig {
     if !capped {
         return MetalConfig {
@@ -222,7 +228,7 @@ fn metal_config(streams_enabled: bool, capped: bool) -> MetalConfig {
     }
 }
 
-#[cfg(feature = "cuda-test-hooks")]
+#[cfg(feature = "cuda")]
 fn cuda_config(streams_enabled: bool, capped: bool) -> CudaConfig {
     if !capped {
         return CudaConfig {
@@ -249,7 +255,7 @@ fn assert_planners_equal(
     observation_mode: ObservationMode,
     capped: bool,
 ) {
-    #[cfg(all(feature = "metal-test-hooks", target_vendor = "apple"))]
+    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
     assert_metal_planner_bit_equal_for_testing(
         image,
         None,
@@ -258,7 +264,7 @@ fn assert_planners_equal(
     )
     .unwrap_or_else(|error| panic!("Metal planner differs for {label}: {error}"));
 
-    #[cfg(feature = "cuda-test-hooks")]
+    #[cfg(feature = "cuda")]
     assert_cuda_planner_bit_equal_for_testing(
         image,
         None,
@@ -363,7 +369,7 @@ fn unsupported_device_families_are_rejected_before_planning() {
         };
         planner_rejections += 1;
 
-        #[cfg(all(feature = "metal-test-hooks", target_vendor = "apple"))]
+        #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
         assert!(
             assert_metal_planner_bit_equal_for_testing(
                 &image,
@@ -376,7 +382,7 @@ fn unsupported_device_families_are_rejected_before_planning() {
             path.display()
         );
 
-        #[cfg(feature = "cuda-test-hooks")]
+        #[cfg(feature = "cuda")]
         assert!(
             assert_cuda_planner_bit_equal_for_testing(
                 &image,
@@ -393,7 +399,7 @@ fn unsupported_device_families_are_rejected_before_planning() {
     let dcqcn = compile_dcqcn_rejection_fixture();
     planner_rejections += 1;
 
-    #[cfg(all(feature = "metal-test-hooks", target_vendor = "apple"))]
+    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
     assert!(
         assert_metal_planner_bit_equal_for_testing(
             &dcqcn,
@@ -405,7 +411,7 @@ fn unsupported_device_families_are_rejected_before_planning() {
         "Metal must reject DCQCN before planning"
     );
 
-    #[cfg(feature = "cuda-test-hooks")]
+    #[cfg(feature = "cuda")]
     assert!(
         assert_cuda_planner_bit_equal_for_testing(
             &dcqcn,

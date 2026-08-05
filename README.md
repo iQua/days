@@ -36,6 +36,18 @@ cargo test -p days-legacy --features test -- --show-output
 cargo test -p days-validation --features test -- --show-output
 ```
 
+The device-planner equality gate also runs in the standard backend test surfaces:
+
+```bash
+# Apple Metal toolchain
+cargo test -p days --features test,metal-spike --test t20e_planner_bit_equal -- --show-output
+
+# CUDA toolchain; constructs and compares host plans without executing a GPU
+cargo test -p days --features test,cuda --test t20e_planner_bit_equal -- --show-output
+```
+
+The CUDA surface still requires the normal CUDA build toolchain because the backend is compiled.
+
 ## Feature flags
 
 - `l2` / `l2_pfc`: optional legacy L2/PFC pipeline

@@ -1007,7 +1007,7 @@ impl MetalExecutor {
 }
 
 /// Asserts that the linear-table planner produces the complete legacy host plan bit-for-bit.
-#[cfg(feature = "metal-test-hooks")]
+#[cfg(feature = "planner-test-hooks")]
 #[doc(hidden)]
 pub fn assert_metal_planner_bit_equal_for_testing(
     image: &SimulationImage,
@@ -4578,8 +4578,6 @@ fn seconds_ns(seconds: f64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::planner_capacity::paced_single_source_queue_bound;
-
     use super::{
         ATTEMPT_PHASES, AttemptPhase, DispatchGeometry, LANES,
         MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER, MAX_ENCODED_PAIRS_PER_WAVE, MetalConfig,
@@ -4699,17 +4697,6 @@ mod tests {
         assert_eq!(timing.continuation_control_ns, 4);
         assert_eq!(timing.exchange_prefix_ns, 5);
         assert_eq!(timing.final_control_ns, 8);
-    }
-
-    #[test]
-    fn paced_single_source_queue_bound_stays_constant_when_service_keeps_up() {
-        assert_eq!(paced_single_source_queue_bound(65_536, 21, 21), 1);
-        assert_eq!(paced_single_source_queue_bound(65_536, 22, 21), 1);
-    }
-
-    #[test]
-    fn paced_single_source_queue_bound_retains_full_backlog_when_service_is_slower() {
-        assert_eq!(paced_single_source_queue_bound(65_536, 20, 21), 65_536);
     }
 
     #[test]

@@ -760,7 +760,7 @@ impl CudaExecutor {
 }
 
 /// Asserts that the linear-table planner produces the complete legacy host plan bit-for-bit.
-#[cfg(feature = "cuda-test-hooks")]
+#[cfg(feature = "planner-test-hooks")]
 #[doc(hidden)]
 pub fn assert_cuda_planner_bit_equal_for_testing(
     image: &SimulationImage,

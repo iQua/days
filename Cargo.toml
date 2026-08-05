@@ -15,7 +15,7 @@ members = ["executor", "legacy", "validation", "xtask"]
 resolver = "2"
 
 [features]
-test = []
+test = ["days-executor/planner-test-hooks"]
 l2_pfc = []
 dcqcn = []
 lean = []
