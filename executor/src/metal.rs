@@ -26,7 +26,9 @@ use objc2_metal::{
     MTLResourceOptions, MTLSize, MTLStorageMode,
 };
 
-use crate::device_scheduler::{prepare_device_schedulers, restore_device_scheduler};
+use crate::device_scheduler::{
+    QUEUE_META_WORDS, prepare_device_schedulers, restore_device_scheduler,
+};
 use crate::tcp::{TcpCubic, TcpReno};
 use crate::{
     ArrivalDisposition, Backend, DeviceCapacityCaps, Event, EventKey, EventKind, FlowGeneratorKind,
@@ -1253,9 +1255,9 @@ impl MetalPlan {
         }
 
         let mut fel_meta = vec![0_u64; node_count * ARENA_META_WORDS];
-        let mut queue_meta = vec![0_u64; node_count * ARENA_META_WORDS];
+        let mut queue_meta = vec![0_u64; node_count * QUEUE_META_WORDS];
         let fel_slots = assign_arena_offsets(&mut fel_meta, &fel_caps)?;
-        let queue_slots = assign_arena_offsets(&mut queue_meta, &queue_caps)?;
+        let queue_slots = assign_queue_offsets(&mut queue_meta, &queue_caps)?;
         let mut fel_records = zero_words(fel_slots, EVENT_WORDS)?;
         let mut queue_records = zero_words(queue_slots, EVENT_WORDS)?;
         let mut in_service = zero_words(node_count, EVENT_WORDS)?;
@@ -1283,6 +1285,7 @@ impl MetalPlan {
                         queue_push_host(
                             slot,
                             packet_record(packet),
+                            false,
                             &mut queue_meta,
                             &mut queue_records,
                         )?;
@@ -1369,6 +1372,7 @@ impl MetalPlan {
                             queue_push_host(
                                 slot,
                                 packet_record(packet),
+                                true,
                                 &mut queue_meta,
                                 &mut queue_records,
                             )?;
@@ -2722,6 +2726,19 @@ fn assign_arena_offsets(meta: &mut [u64], capacities: &[usize]) -> Result<usize,
     Ok(offset)
 }
 
+fn assign_queue_offsets(meta: &mut [u64], capacities: &[usize]) -> Result<usize, MetalError> {
+    let mut offset = 0_usize;
+    for (slot, capacity) in capacities.iter().copied().enumerate() {
+        let base = slot * QUEUE_META_WORDS;
+        meta[base] = offset as u64;
+        meta[base + 1] = capacity as u64;
+        offset = offset.checked_add(capacity).ok_or_else(|| {
+            MetalError::Validation("device queue arena size overflows usize".into())
+        })?;
+    }
+    Ok(offset)
+}
+
 fn assign_observation_offsets(meta: &mut [u64], capacities: &[usize]) -> Result<usize, MetalError> {
     let mut offset = 0_usize;
     for (slot, capacity) in capacities.iter().copied().enumerate() {
@@ -3064,10 +3081,11 @@ fn heap_push_host(
 fn queue_push_host(
     lp: usize,
     record: [u64; EVENT_WORDS],
+    track_bytes: bool,
     meta: &mut [u64],
     storage: &mut [u64],
 ) -> Result<(), MetalError> {
-    let base = lp * ARENA_META_WORDS;
+    let base = lp * QUEUE_META_WORDS;
     let offset = meta[base] as usize;
     let capacity = meta[base + 1] as usize;
     let head = meta[base + 2] as usize;
@@ -3078,6 +3096,14 @@ fn queue_push_host(
             node: Some(NodeId(lp as u64)),
             capacity,
         });
+    }
+    if track_bytes {
+        meta[base + 4] = meta[base + 4].checked_add(record[9]).ok_or_else(|| {
+            MetalError::Validation(format!(
+                "Metal queue byte total overflows u64 at LP {:?}",
+                NodeId(lp as u64)
+            ))
+        })?;
     }
     let physical = (head + count) % capacity.max(1);
     write_record(storage, offset + physical, record);
@@ -3365,6 +3391,18 @@ impl MetalBuffers {
             let lp = node.id.0 as usize;
             let base = lp * NODE_WORDS;
             let queue = read_queue(lp, queue_meta, queue_records);
+            #[cfg(debug_assertions)]
+            if node.kind == NodeKind::Switch {
+                let derived_bytes = queue
+                    .iter()
+                    .try_fold(0_u64, |total, packet| total.checked_add(packet.size_bytes));
+                debug_assert_eq!(
+                    derived_bytes,
+                    Some(queue_meta[lp * QUEUE_META_WORDS + 4]),
+                    "Metal switch {:?} queue byte counter diverged from its contents",
+                    node.id,
+                );
+            }
             for packet in &queue {
                 resident.insert(packet.id, *packet);
             }
@@ -3739,7 +3777,7 @@ fn read_packet(storage: &[u64], slot: usize) -> PacketDescriptor {
 }
 
 fn read_queue(lp: usize, meta: &[u64], records: &[u64]) -> Vec<PacketDescriptor> {
-    let base = lp * ARENA_META_WORDS;
+    let base = lp * QUEUE_META_WORDS;
     let offset = meta[base] as usize;
     let capacity = meta[base + 1] as usize;
     let head = meta[base + 2] as usize;

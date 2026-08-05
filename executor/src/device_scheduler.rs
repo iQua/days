@@ -17,6 +17,7 @@ use crate::{
 
 pub(crate) const RATIONAL_LIMBS: usize = 5;
 pub(crate) const RATIONAL_WORDS: usize = RATIONAL_LIMBS * 2;
+pub(crate) const QUEUE_META_WORDS: usize = 5;
 
 pub(crate) const SCHEDULER_NODE_WORDS: usize = 29;
 pub(crate) const SCHEDULER_KIND: usize = 0;
@@ -92,8 +93,6 @@ pub(crate) fn prepare_device_schedulers(
     image: &SimulationImage,
     queue_meta: &[u64],
 ) -> Result<Vec<u64>, String> {
-    const META_WORDS: usize = 4;
-
     let fixed_words = image
         .nodes
         .len()
@@ -161,7 +160,7 @@ pub(crate) fn prepare_device_schedulers(
                     )?;
                 }
 
-                let queue_base = slot * META_WORDS;
+                let queue_base = slot * QUEUE_META_WORDS;
                 let capacity = usize::try_from(queue_meta[queue_base + 1])
                     .map_err(|_| "device scheduler queue capacity overflows usize".to_owned())?;
                 let head = usize::try_from(queue_meta[queue_base + 2])
@@ -288,8 +287,6 @@ pub(crate) fn restore_device_scheduler(
     words: &[u64],
     queue: &mut SwitchQueueState,
 ) -> Result<(), String> {
-    const META_WORDS: usize = 4;
-
     let node_base = node
         .checked_mul(SCHEDULER_NODE_WORDS)
         .ok_or_else(|| "device scheduler node offset overflows usize".to_owned())?;
@@ -352,7 +349,7 @@ pub(crate) fn restore_device_scheduler(
             }
 
             state.packet_finish_times.clear();
-            let queue_base = node * META_WORDS;
+            let queue_base = node * QUEUE_META_WORDS;
             let capacity = usize::try_from(queue_meta[queue_base + 1])
                 .map_err(|_| "device WFQ queue capacity overflows usize".to_owned())?;
             let head = usize::try_from(queue_meta[queue_base + 2])

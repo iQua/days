@@ -7,6 +7,7 @@ constant uint GENERATOR_WORDS = 43;
 constant uint FLOW_WORDS = 6;
 constant uint LINK_WORDS = 4;
 constant uint META_WORDS = 4;
+constant uint QUEUE_META_WORDS = 5;
 constant uint LP_STATE_WORDS = 6;
 constant uint OBSERVATION_META_WORDS = 12;
 constant uint INBOUND_META_WORDS = 2;
@@ -899,7 +900,7 @@ inline bool queue_push(
     device ulong *meta,
     device ulong *records
 ) {
-    ulong base = node * META_WORDS;
+    ulong base = node * QUEUE_META_WORDS;
     ulong offset = meta[base];
     ulong capacity = meta[base + 1];
     ulong head = meta[base + 2];
@@ -939,7 +940,7 @@ inline bool source_queue_insert(
     device ulong *meta,
     device ulong *records
 ) {
-    ulong base = node * META_WORDS;
+    ulong base = node * QUEUE_META_WORDS;
     ulong offset = meta[base];
     ulong capacity = meta[base + 1];
     ulong head = meta[base + 2];
@@ -975,7 +976,7 @@ inline bool queue_pop(
     thread ulong *record,
     thread ulong &physical
 ) {
-    ulong base = node * META_WORDS;
+    ulong base = node * QUEUE_META_WORDS;
     ulong offset = meta[base];
     ulong capacity = meta[base + 1];
     ulong head = meta[base + 2];
@@ -998,7 +999,7 @@ inline bool queue_remove_at(
     thread ulong *record,
     thread ulong &physical
 ) {
-    ulong base = node * META_WORDS;
+    ulong base = node * QUEUE_META_WORDS;
     ulong offset = meta[base];
     ulong capacity = meta[base + 1];
     ulong head = meta[base + 2];
@@ -1026,7 +1027,7 @@ inline bool queue_front(
     const device ulong *records,
     thread ulong *record
 ) {
-    ulong base = node * META_WORDS;
+    ulong base = node * QUEUE_META_WORDS;
     if (meta[base + 3] == 0) {
         return false;
     }
@@ -2242,7 +2243,7 @@ inline bool scheduler_first_packet_for_class(
     thread ulong &position,
     thread ulong &size
 ) {
-    ulong meta_base = node * META_WORDS;
+    ulong meta_base = node * QUEUE_META_WORDS;
     ulong offset = queue_meta[meta_base];
     ulong capacity = queue_meta[meta_base + 1];
     ulong head = queue_meta[meta_base + 2];
@@ -2446,14 +2447,19 @@ inline bool switch_admission_action(
     ulong taildrop_capacity,
     device ulong *error,
     const device ulong *queue_meta,
-    const device ulong *queue_records,
     const device ulong *scheduler_state,
     thread ulong &action
 ) {
     ulong scheduler_base = node * SCHEDULER_NODE_WORDS;
     ulong policy = scheduler_state[scheduler_base + S_AQM_KIND];
-    ulong meta_base = node * META_WORDS;
+    ulong meta_base = node * QUEUE_META_WORDS;
     ulong waiting = queue_meta[meta_base + 3];
+    ulong queued_bytes = queue_meta[meta_base + 4];
+    if (queued_bytes > NONE - packet[PK_SIZE]) {
+        action = 2;
+        return true;
+    }
+    ulong post_bytes = queued_bytes + packet[PK_SIZE];
     if (policy == AQM_TAILDROP) {
         action = taildrop_capacity != 0 && waiting >= taildrop_capacity ? 2 : 0;
         return true;
@@ -2472,24 +2478,7 @@ inline bool switch_admission_action(
     }
     ulong post_depth = waiting + 1;
     if (unit == AQM_BYTES) {
-        ulong offset = queue_meta[meta_base];
-        ulong queue_capacity = queue_meta[meta_base + 1];
-        ulong head = queue_meta[meta_base + 2];
-        ulong queued_bytes = 0;
-        for (ulong logical = 0; logical < waiting; ++logical) {
-            ulong physical = (head + logical) % max(queue_capacity, 1ul);
-            ulong size = queue_records[(offset + physical) * EVENT_WORDS + PK_SIZE];
-            if (queued_bytes > NONE - size) {
-                action = 2;
-                return true;
-            }
-            queued_bytes += size;
-        }
-        if (queued_bytes > NONE - packet[PK_SIZE]) {
-            action = 2;
-            return true;
-        }
-        post_depth = queued_bytes + packet[PK_SIZE];
+        post_depth = post_bytes;
     }
     action = post_depth > capacity ? 2 : (post_depth >= threshold ? 1 : 0);
     return true;
@@ -2565,7 +2554,7 @@ inline bool sp_queue_insert(
     device ulong *queue_records,
     const device ulong *scheduler_state
 ) {
-    ulong meta_base = node * META_WORDS;
+    ulong meta_base = node * QUEUE_META_WORDS;
     ulong offset = queue_meta[meta_base];
     ulong capacity = queue_meta[meta_base + 1];
     ulong head = queue_meta[meta_base + 2];
@@ -2624,7 +2613,7 @@ inline bool wfq_queue_insert(
     device ulong *queue_records,
     device ulong *scheduler_state
 ) {
-    ulong meta_base = node * META_WORDS;
+    ulong meta_base = node * QUEUE_META_WORDS;
     ulong offset = queue_meta[meta_base];
     ulong capacity = queue_meta[meta_base + 1];
     ulong head = queue_meta[meta_base + 2];
@@ -3385,7 +3374,7 @@ inline bool prepare_tcp_attempts(
 
     ulong node_base = node * NODE_WORDS;
     if (
-        queue_meta[node * META_WORDS + 3] != 0 &&
+        queue_meta[node * QUEUE_META_WORDS + 3] != 0 &&
         node_state[node_base + N_SERVICE_VALID] == 0 &&
         node_state[node_base + N_READY_PENDING] == 0
     ) {
@@ -3889,6 +3878,15 @@ inline bool dispatch_event(
             }
             return true;
         }
+        if (role == SWITCH) {
+            ulong queue_base = node * QUEUE_META_WORDS;
+            ulong queued_bytes = queue_meta[queue_base + 4];
+            if (queued_bytes < selected[PK_SIZE]) {
+                set_semantic_error(error, 60, node);
+                return false;
+            }
+            queue_meta[queue_base + 4] = queued_bytes - selected[PK_SIZE];
+        }
         if (role == SWITCH && scheduler_kind == SCHED_WFQ) {
             ulong tag_offset = scheduler_state[scheduler_base + S_QUEUE_TAG_OFFSET];
             rational_copy(
@@ -4015,7 +4013,7 @@ inline bool dispatch_event(
             return false;
         }
         if (
-            queue_meta[node * META_WORDS + 3] != 0 &&
+            queue_meta[node * QUEUE_META_WORDS + 3] != 0 &&
             node_state[node_base + N_READY_PENDING] == 0
         ) {
             ulong next[EVENT_WORDS];
@@ -4069,7 +4067,6 @@ inline bool dispatch_event(
             semantic_capacity,
             error,
             queue_meta,
-            queue_records,
             scheduler_state,
             admission
         )) {
@@ -4130,6 +4127,13 @@ inline bool dispatch_event(
         if (!inserted) {
             return false;
         }
+        ulong queue_base = node * QUEUE_META_WORDS;
+        ulong queued_bytes = queue_meta[queue_base + 4];
+        if (queued_bytes > NONE - event[PK_SIZE]) {
+            set_semantic_error(error, 60, node);
+            return false;
+        }
+        queue_meta[queue_base + 4] = queued_bytes + event[PK_SIZE];
         if (!record_arrival(
             node,
             event,
