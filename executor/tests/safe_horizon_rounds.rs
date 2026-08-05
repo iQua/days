@@ -1,14 +1,19 @@
 use std::collections::{BTreeMap, VecDeque};
 
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+use days_executor::RunResult;
 use days_executor::{
     Backend, ChunkGranularity, ConstantGenerator, CpuConfig, CpuFaultInjection, CpuFaultKind,
     Event, EventKey, EventKind, ExecutionError, FlowDescriptor, FlowGeneratorKind,
     FlowGeneratorState, FlowId, GeneratorFeedbackState, GeneratorStatus, GeneratorTermination,
     HostState, LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, ObservationMode,
-    PacketDescriptor, PacketKind, PayloadId, RemoteChannel, RunResult, ScheduledEmission,
-    SchedulerKind, SimulationImage, StaticPartitionPolicy, SwitchQueueState, SwitchState,
-    WorkClass, event_phase, run_cpu_with_observations, run_scalar_rounds_with_observations,
-    run_scalar_with_observations, validate,
+    PacketDescriptor, PacketKind, PayloadId, RemoteChannel, ScheduledEmission, SchedulerKind,
+    SimulationImage, StaticPartitionPolicy, SwitchQueueState, SwitchState, WorkClass, event_phase,
+    run_cpu_with_observations, run_scalar_rounds_with_observations, run_scalar_with_observations,
+    validate,
 };
 #[cfg(feature = "cuda")]
 use days_executor::{CudaConfig, run_cuda_with_observations};

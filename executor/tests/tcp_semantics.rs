@@ -2,15 +2,15 @@ use std::collections::{BTreeMap, VecDeque};
 
 use days_executor::{
     Backend, CUBIC_WINDOW_SCALE, ChunkGranularity, ConstantGenerator, CpuConfig, DcqcnCnpHeader,
-    DcqcnReceiverState, DeviceLanePacking, DiagnosticPlanes, EcnCodepoint, Event, EventFelClass,
-    EventKey, EventKind, FlowDescriptor, FlowGeneratorKind, FlowGeneratorState, FlowId,
-    GeneratorFeedbackState, GeneratorStatus, GeneratorTermination, HostState, LinkDescriptor,
-    LinkId, NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketDescriptor, PacketKind,
-    PayloadId, PfcHeader, RemoteChannel, ScheduledEmission, SchedulerKind, SimulationImage,
-    StaticPartitionPolicy, SwitchQueueState, SwitchState, TcpAckHeader, TcpCongestionControl,
-    TcpDataHeader, TcpGenerator, TcpPhase, TcpReceiverState, TcpTimerState, TcpTransitionInput,
-    event_fel_class, event_phase, run_cpu_with_observations, run_scalar_rounds_with_observations,
-    run_scalar_with_observations, size_default_device_plan, validate,
+    DcqcnReceiverState, DiagnosticPlanes, EcnCodepoint, Event, EventFelClass, EventKey, EventKind,
+    FlowDescriptor, FlowGeneratorKind, FlowGeneratorState, FlowId, GeneratorFeedbackState,
+    GeneratorStatus, GeneratorTermination, HostState, LinkDescriptor, LinkId, NodeDescriptor,
+    NodeId, NodeKind, ObservationMode, PacketDescriptor, PacketKind, PayloadId, PfcHeader,
+    RemoteChannel, ScheduledEmission, SchedulerKind, SimulationImage, StaticPartitionPolicy,
+    SwitchQueueState, SwitchState, TcpAckHeader, TcpCongestionControl, TcpDataHeader, TcpGenerator,
+    TcpPhase, TcpReceiverState, TcpTimerState, TcpTransitionInput, event_fel_class, event_phase,
+    run_cpu_with_observations, run_scalar_rounds_with_observations, run_scalar_with_observations,
+    size_default_device_plan, validate,
 };
 #[cfg(feature = "cuda")]
 use days_executor::{CudaConfig, run_cuda_with_observations};
@@ -19,7 +19,8 @@ use days_executor::{CudaConfig, run_cuda_with_observations};
     all(feature = "metal-spike", target_vendor = "apple")
 ))]
 use days_executor::{
-    DropMarkPolicy, EcnThresholdPolicy, MechanismTransitionRecord, QueueDepthUnit, RunResult,
+    DeviceLanePacking, DropMarkPolicy, EcnThresholdPolicy, MechanismTransitionRecord,
+    QueueDepthUnit, RunResult,
 };
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 use days_executor::{MetalConfig, run_metal_with_observations};

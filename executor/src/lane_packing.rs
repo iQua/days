@@ -39,6 +39,7 @@ impl DeviceLanePacking {
         feature = "cuda",
         all(feature = "metal-spike", target_vendor = "apple")
     ))]
+    #[allow(dead_code)] // Consumed only when a device backend is enabled.
     pub(crate) const fn is_packed(self) -> bool {
         !matches!(self, Self::Unpacked)
     }
