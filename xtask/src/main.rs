@@ -27,13 +27,13 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "cuda.rs",
         predicate: r#"feature = "cuda-test-hooks""#,
-        count: 11,
+        count: 12,
         purpose: "CUDA-only fault injection, capacity, and planner measurement hooks",
     },
     AllowedFeatureGate {
         path: "metal.rs",
         predicate: r#"feature = "metal-test-hooks""#,
-        count: 5,
+        count: 6,
         purpose: "Metal-only panic, fault-injection, and planner measurement hooks",
     },
     AllowedFeatureGate {
@@ -51,8 +51,14 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "device_capacity.rs",
         predicate: r#"any(test, feature = "cuda", all(feature = "metal-spike", target_vendor = "apple"))"#,
+        count: 3,
+        purpose: "shared device-arena cap and retry helpers compile only for tests and device backends",
+    },
+    AllowedFeatureGate {
+        path: "device_sizing.rs",
+        predicate: r#"any(test, feature = "cuda-test-hooks", all(feature = "metal-test-hooks", target_vendor = "apple"))"#,
         count: 1,
-        purpose: "shared device-arena cap helper is compiled only for tests and device backends",
+        purpose: "exact production-layout reports exist only for tests and dedicated backend probes",
     },
     AllowedFeatureGate {
         path: "cpu.rs",
@@ -111,7 +117,7 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "planner_capacity.rs",
         predicate: r#"feature = "cuda""#,
-        count: 6,
+        count: 5,
         purpose: "CUDA-only MSS and TCP segment-capacity lookup behavior",
     },
     AllowedFeatureGate {
@@ -123,7 +129,7 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "planner_capacity.rs",
         predicate: r#"any(test, feature = "planner-test-hooks")"#,
-        count: 13,
+        count: 18,
         purpose: "legacy quadratic helpers exist only for unit and standard full-plan equality tests",
     },
     AllowedFeatureGate {
@@ -131,18 +137,6 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
         predicate: r#"any(debug_assertions, test, feature = "planner-test-hooks")"#,
         count: 1,
         purpose: "legacy minimum scan supports sampled debug checks and equality tests",
-    },
-    AllowedFeatureGate {
-        path: "planner_capacity.rs",
-        predicate: r#"all(feature = "cuda", any(test, feature = "planner-test-hooks"))"#,
-        count: 1,
-        purpose: "CUDA equality tests compare TCP segment-capacity lookup values",
-    },
-    AllowedFeatureGate {
-        path: "planner_capacity.rs",
-        predicate: r#"all(not(feature = "cuda"), any(test, feature = "planner-test-hooks"))"#,
-        count: 1,
-        purpose: "non-CUDA equality tests omit CUDA-only TCP segment capacity",
     },
 ];
 
