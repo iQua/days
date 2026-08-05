@@ -19,6 +19,11 @@ pub mod metal;
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub mod metal_spike;
 pub mod model;
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+mod planner_capacity;
 pub mod safe_horizon;
 pub mod scalar;
 pub mod tcp;
@@ -35,6 +40,12 @@ pub use cpu::{
 };
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub use cpu::{WindowedCpuRun, run_cpu_with_metrics_window};
+#[cfg(feature = "cuda-test-hooks")]
+#[doc(hidden)]
+pub use cuda::assert_cuda_planner_bit_equal_for_testing;
+#[cfg(feature = "cuda-test-hooks")]
+#[doc(hidden)]
+pub use cuda::measure_cuda_planner_for_testing;
 #[cfg(feature = "cuda")]
 pub use cuda::{
     CudaArena, CudaConfig, CudaError, CudaExecutor, CudaInitializationTimings, CudaMemoryLayout,
@@ -70,6 +81,12 @@ pub use mechanism_trace::{
     SchedulerPacket, WrrTransitionRecord, collective_transitions_csv, dcqcn_transitions_csv,
     drr_transitions_csv, pfc_transitions_csv, rate_transitions_csv, wrr_transitions_csv,
 };
+#[cfg(all(feature = "metal-test-hooks", target_vendor = "apple"))]
+#[doc(hidden)]
+pub use metal::assert_metal_planner_bit_equal_for_testing;
+#[cfg(all(feature = "metal-test-hooks", target_vendor = "apple"))]
+#[doc(hidden)]
+pub use metal::measure_metal_planner_for_testing;
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub use metal::{
     MetalArena, MetalConfig, MetalDrainDecomposition, MetalError, MetalExecutor,

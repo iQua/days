@@ -4,7 +4,7 @@
 //! only small host-side capacity vectors. It never materializes event planes or initializes a
 //! device backend.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 
 use num_bigint::BigUint;
@@ -570,6 +570,12 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<Vec<usize>, DeviceSizin
     for packet in &image.initial_packets {
         counts[packet.flow.0 as usize] = counts[packet.flow.0 as usize].saturating_add(1);
     }
+    let pacing_timer_tokens = image
+        .initial_events
+        .iter()
+        .filter(|event| event.kind == EventKind::PacingTimer)
+        .map(|event| (event.target, event.payload, event.key.time_ns))
+        .collect::<HashSet<_>>();
     for state in &image.host_states {
         for generator in &state.generators {
             let index = generator.flow.0 as usize;
@@ -630,12 +636,11 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<Vec<usize>, DeviceSizin
                 }
                 FlowGeneratorKind::Rate(rate) => {
                     let work = rate_device_work(image, generator, rate)?;
-                    let owns_timer_token = image.initial_events.iter().any(|event| {
-                        event.kind == EventKind::PacingTimer
-                            && event.target == image.flows[index].source
-                            && event.payload == generator.next_emission.payload
-                            && event.key.time_ns == generator.next_emission.departure_time_ns
-                    });
+                    let owns_timer_token = pacing_timer_tokens.contains(&(
+                        image.flows[index].source,
+                        generator.next_emission.payload,
+                        generator.next_emission.departure_time_ns,
+                    ));
                     if owns_timer_token {
                         counts[index] = counts[index].saturating_sub(1);
                     }

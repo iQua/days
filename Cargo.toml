@@ -21,6 +21,8 @@ dcqcn = []
 lean = []
 metal-spike = ["days-executor/metal-spike"]
 cuda = ["days-executor/cuda"]
+metal-test-hooks = ["metal-spike", "days-executor/metal-test-hooks"]
+cuda-test-hooks = ["cuda", "days-executor/cuda-test-hooks"]
 
 [dependencies]
 csv = "1.4"
