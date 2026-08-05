@@ -8,10 +8,10 @@
 //! reported in [`MetalRun`]. Role-split transition kernels are intentionally deferred to a later
 //! optimization milestone.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::error::Error;
 use std::fmt;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use objc2::rc::Retained;
@@ -29,6 +29,7 @@ use objc2_metal::{
 use crate::device_scheduler::{
     QUEUE_META_WORDS, prepare_device_schedulers, restore_device_scheduler,
 };
+use crate::planner_capacity::{PlannerCapacityContext, PlannerCapacityMode, TcpMinimumPacketSize};
 use crate::tcp::{TcpCubic, TcpReno};
 use crate::{
     ArrivalDisposition, Backend, DeviceCapacityCaps, Event, EventKey, EventKind, FlowGeneratorKind,
@@ -79,6 +80,7 @@ const MAX_COMMAND_BUFFERS: usize = 64;
 const PROFILED_ATTEMPTS: usize = 128;
 
 static METAL_DEVICE_EXECUTION: Mutex<()> = Mutex::new(());
+static METAL_DIRECT: Mutex<Option<Arc<DirectMetal>>> = Mutex::new(None);
 
 #[cfg(feature = "metal-test-hooks")]
 std::thread_local! {
@@ -694,8 +696,8 @@ pub struct MetalPhaseProfile {
 /// Runs the production Metal executor through the inclusive scenario stop.
 ///
 /// Metal execution is serialized process-wide: one executor executes at a time, and concurrent
-/// callers queue until execution and readback complete. Executor construction may proceed
-/// concurrently.
+/// callers queue until execution and readback complete. The compiled executor is cached
+/// process-wide.
 pub fn run_metal(
     image: &SimulationImage,
     exclusive_horizon_ns: Option<u64>,
@@ -733,9 +735,10 @@ pub fn run_metal_with_observations(
 /// Each run allocates fresh state buffers, so an explicit device fault cannot contaminate a
 /// subsequent run through the same executor. Metal execution is serialized process-wide: one
 /// executor executes at a time, and concurrent callers queue until execution and readback
-/// complete. Executor construction may proceed concurrently.
+/// complete. All wrappers share one process-wide compiled executor.
 pub struct MetalExecutor {
-    direct: DirectMetal,
+    direct: Arc<DirectMetal>,
+    initialization_timings: MetalInitializationTimings,
 }
 
 /// One-time costs paid while constructing a reusable [`MetalExecutor`].
@@ -745,16 +748,35 @@ pub struct MetalInitializationTimings {
     pub device_queue_setup_ns: u64,
     /// Runtime MSL library compilation and compute-pipeline creation for all production phases.
     pub pipeline_creation_ns: u64,
+    /// Whether this wrapper reused the process-wide compiled executor.
+    pub reused_cached_executor: bool,
 }
 
 impl MetalExecutor {
-    /// Constructs an executor without acquiring the process-wide execution guard.
+    /// Returns a wrapper around the process-wide compiled executor.
     ///
-    /// Multiple executors may be constructed concurrently. Their runs are serialized
-    /// process-wide.
+    /// The first successful call pays device and pipeline initialization. Later calls report a
+    /// cache hit with zero initialization durations. Runs remain serialized process-wide.
     pub fn new() -> Result<Self, MetalError> {
+        let mut cached = METAL_DIRECT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(direct) = cached.as_ref() {
+            return Ok(Self {
+                direct: Arc::clone(direct),
+                initialization_timings: MetalInitializationTimings {
+                    device_queue_setup_ns: 0,
+                    pipeline_creation_ns: 0,
+                    reused_cached_executor: true,
+                },
+            });
+        }
+        let direct = Arc::new(DirectMetal::new()?);
+        let initialization_timings = direct.initialization_timings;
+        *cached = Some(Arc::clone(&direct));
         Ok(Self {
-            direct: DirectMetal::new()?,
+            direct,
+            initialization_timings,
         })
     }
 
@@ -775,7 +797,7 @@ impl MetalExecutor {
 
     /// Returns the one-time initialization split measured when this reusable executor was built.
     pub const fn initialization_timings(&self) -> MetalInitializationTimings {
-        self.direct.initialization_timings
+        self.initialization_timings
     }
 
     /// Runs the production backend with diagnostic stage-boundary phase timestamps enabled.
@@ -986,6 +1008,91 @@ impl MetalExecutor {
     }
 }
 
+/// Asserts that the linear-table planner produces the complete legacy host plan bit-for-bit.
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+pub fn assert_metal_planner_bit_equal_for_testing(
+    image: &SimulationImage,
+    exclusive_horizon_ns: Option<u64>,
+    config: MetalConfig,
+    observation_mode: ObservationMode,
+) -> Result<(), MetalError> {
+    validate(image, Backend::Metal).map_err(|error| MetalError::Validation(error.to_string()))?;
+    validate_config(config)?;
+    let (packet_counts, feedback_counts) = flow_packet_counts(image)?;
+    let data_counts = packet_counts
+        .iter()
+        .zip(&feedback_counts)
+        .map(|(total, feedback)| total.saturating_sub(*feedback))
+        .collect::<Vec<_>>();
+    let lookahead = image
+        .channels
+        .iter()
+        .map(|channel| channel.min_delay_ns)
+        .min();
+    if !PlannerCapacityContext::matches_legacy(
+        image,
+        &data_counts,
+        lookahead,
+        TcpMinimumPacketSize::One,
+    ) {
+        return Err(MetalError::Validation(
+            "linear lookup tables differ from the legacy helpers".into(),
+        ));
+    }
+    let precomputed = MetalPlan::new_with_capacity_mode(
+        image,
+        exclusive_horizon_ns,
+        config,
+        observation_mode,
+        PlannerCapacityMode::Precomputed,
+    )?;
+    let legacy = MetalPlan::new_with_capacity_mode(
+        image,
+        exclusive_horizon_ns,
+        config,
+        observation_mode,
+        PlannerCapacityMode::Legacy,
+    )?;
+    if precomputed != legacy {
+        return Err(MetalError::Validation(
+            "linear-table planner differs from the legacy planner".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Measures host plan construction only; device initialization and execution are excluded.
+#[cfg(feature = "metal-test-hooks")]
+#[doc(hidden)]
+pub fn measure_metal_planner_for_testing(
+    image: &SimulationImage,
+    exclusive_horizon_ns: Option<u64>,
+    config: MetalConfig,
+    observation_mode: ObservationMode,
+    legacy: bool,
+) -> Result<u64, MetalError> {
+    validate(image, Backend::Metal).map_err(|error| MetalError::Validation(error.to_string()))?;
+    validate_config(config)?;
+    let mode = if legacy {
+        PlannerCapacityMode::Legacy
+    } else {
+        PlannerCapacityMode::Precomputed
+    };
+    let started = Instant::now();
+    let plan = MetalPlan::new_with_capacity_mode(
+        image,
+        exclusive_horizon_ns,
+        config,
+        observation_mode,
+        mode,
+    )?;
+    let planning_ns = duration_ns(started.elapsed());
+    std::hint::black_box(&plan.params);
+    drop(plan);
+    Ok(planning_ns)
+}
+
 fn validate_config(config: MetalConfig) -> Result<(), MetalError> {
     if config.rounds_per_command_buffer == 0 {
         return Err(MetalError::Validation(
@@ -1023,6 +1130,7 @@ fn encoding_limits(rounds_per_command_buffer: usize) -> (usize, usize) {
     (pairs_per_command_buffer, pairs_per_wave)
 }
 
+#[derive(Eq, PartialEq)]
 struct MetalPlan {
     control: Vec<u64>,
     params: Vec<u64>,
@@ -1060,7 +1168,7 @@ struct MetalPlan {
     dispatch_capacity: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct StreamLayout {
     stream_count: usize,
     channel_count: usize,
@@ -1101,14 +1209,41 @@ impl MetalPlan {
         config: MetalConfig,
         observation_mode: ObservationMode,
     ) -> Result<Self, MetalError> {
+        Self::new_with_capacity_mode(
+            image,
+            exclusive_horizon_ns,
+            config,
+            observation_mode,
+            PlannerCapacityMode::Precomputed,
+        )
+    }
+
+    fn new_with_capacity_mode(
+        image: &SimulationImage,
+        exclusive_horizon_ns: Option<u64>,
+        config: MetalConfig,
+        observation_mode: ObservationMode,
+        capacity_mode: PlannerCapacityMode,
+    ) -> Result<Self, MetalError> {
         let node_count = image.nodes.len();
         let (flow_packet_counts, flow_feedback_counts) = flow_packet_counts(image)?;
-        let flow_minimum_packet_sizes = flow_minimum_packet_sizes(image);
         let minimum_lookahead_ns = image
             .channels
             .iter()
             .map(|channel| channel.min_delay_ns)
             .min();
+        let flow_data_counts = flow_packet_counts
+            .iter()
+            .zip(&flow_feedback_counts)
+            .map(|(total, feedback)| total.saturating_sub(*feedback))
+            .collect::<Vec<_>>();
+        let capacity_context = PlannerCapacityContext::new(
+            image,
+            &flow_data_counts,
+            minimum_lookahead_ns,
+            TcpMinimumPacketSize::One,
+            capacity_mode,
+        );
         let initial_by_payload = image
             .initial_packets
             .iter()
@@ -1137,10 +1272,11 @@ impl MetalPlan {
             let feedback_count = flow_feedback_counts[flow_index];
             let data_count = packet_count.saturating_sub(feedback_count);
             let source_slot = flow.source.0 as usize;
-            queue_caps[source_slot] = queue_caps[source_slot]
-                .saturating_add(source_queue_packet_bound(image, flow_index, data_count));
+            queue_caps[source_slot] = queue_caps[source_slot].saturating_add(
+                capacity_context.source_queue_packet_bound(image, flow_index, data_count),
+            );
             legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(4);
-            if tcp_generator(image, flow_index).is_some() {
+            if capacity_context.tcp_generator(image, flow_index).is_some() {
                 // TCP timers remain fallback-heap events. ACK-driven replacement leaves stale
                 // timers resident until their deadlines, so reserve one slot per bounded attempt.
                 legacy_fel_caps[source_slot] =
@@ -1149,7 +1285,7 @@ impl MetalPlan {
 
             add_flow_route_capacities(
                 image,
-                &flow_minimum_packet_sizes,
+                &capacity_context,
                 flow_index,
                 data_count,
                 PacketKind::Data,
@@ -1159,7 +1295,7 @@ impl MetalPlan {
             );
             add_flow_route_capacities(
                 image,
-                &flow_minimum_packet_sizes,
+                &capacity_context,
                 flow_index,
                 feedback_count,
                 PacketKind::Feedback,
@@ -1230,7 +1366,7 @@ impl MetalPlan {
                 capacities[target] = capacities[target].saturating_add(1);
             }
             for (flow, descriptor) in image.flows.iter().enumerate() {
-                if tcp_generator(image, flow).is_some() {
+                if capacity_context.tcp_generator(image, flow).is_some() {
                     let attempts =
                         flow_packet_counts[flow].saturating_sub(flow_feedback_counts[flow]);
                     let source = descriptor.source.0 as usize;
@@ -1449,7 +1585,7 @@ impl MetalPlan {
 
         let remote_bound = derived_remote_capacity(
             image,
-            &flow_minimum_packet_sizes,
+            &capacity_context,
             &flow_packet_counts,
             &flow_feedback_counts,
             minimum_lookahead_ns,
@@ -1463,7 +1599,7 @@ impl MetalPlan {
         });
         let mut remote_capacities = derived_remote_capacities(
             image,
-            &flow_minimum_packet_sizes,
+            &capacity_context,
             &flow_packet_counts,
             &flow_feedback_counts,
             minimum_lookahead_ns,
@@ -1483,7 +1619,7 @@ impl MetalPlan {
         let remote_staging_slots = assign_arena_offsets(&mut remote_meta, &remote_capacities)?;
         let streams = prepare_streams(
             image,
-            &flow_minimum_packet_sizes,
+            &capacity_context,
             &flow_packet_counts,
             &flow_feedback_counts,
             minimum_lookahead_ns,
@@ -1521,6 +1657,7 @@ impl MetalPlan {
             assign_observation_offsets(&mut observation_meta, &observation_capacities)?;
         let tcp_state = prepare_tcp_state(
             image,
+            &capacity_context,
             &flow_packet_counts,
             &flow_feedback_counts,
             config.capacity_caps,
@@ -1623,21 +1760,6 @@ impl MetalPlan {
     }
 }
 
-fn tcp_generator(image: &SimulationImage, flow_index: usize) -> Option<crate::TcpGenerator> {
-    image
-        .host_states
-        .iter()
-        .flat_map(|state| &state.generators)
-        .find(|generator| generator.flow.0 as usize == flow_index)
-        .and_then(|generator| match generator.kind {
-            FlowGeneratorKind::Tcp(tcp) => Some(tcp),
-            FlowGeneratorKind::Constant(_)
-            | FlowGeneratorKind::Rate(_)
-            | FlowGeneratorKind::Collective(_)
-            | FlowGeneratorKind::Dcqcn(_) => None,
-        })
-}
-
 fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>), MetalError> {
     let live_payloads = crate::tcp_ledger::initial_live_payloads(image);
     let mut data_counts = vec![0_usize; image.flows.len()];
@@ -1653,18 +1775,23 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
         };
         counts[packet.flow.0 as usize] = counts[packet.flow.0 as usize].saturating_add(1);
     }
+    let pacing_timer_tokens = image
+        .initial_events
+        .iter()
+        .filter(|event| event.kind == EventKind::PacingTimer)
+        .map(|event| (event.target, event.payload, event.key.time_ns))
+        .collect::<HashSet<_>>();
     for state in &image.host_states {
         for generator in &state.generators {
             let index = generator.flow.0 as usize;
             if let FlowGeneratorKind::Rate(rate) = generator.kind {
                 let work = crate::device_sizing::rate_device_work(image, generator, rate)
                     .map_err(|error| MetalError::Validation(error.to_string()))?;
-                let owns_timer_token = image.initial_events.iter().any(|event| {
-                    event.kind == EventKind::PacingTimer
-                        && event.target == image.flows[index].source
-                        && event.payload == generator.next_emission.payload
-                        && event.key.time_ns == generator.next_emission.departure_time_ns
-                });
+                let owns_timer_token = pacing_timer_tokens.contains(&(
+                    image.flows[index].source,
+                    generator.next_emission.payload,
+                    generator.next_emission.departure_time_ns,
+                ));
                 if owns_timer_token {
                     data_counts[index] = data_counts[index].saturating_sub(1);
                 }
@@ -1748,153 +1875,10 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
     Ok((totals, feedback_counts))
 }
 
-fn paced_single_source_queue_bound(
-    packet_count: usize,
-    emission_interval_ns: u64,
-    serialization_ns: u64,
-) -> usize {
-    // This is the exact worst-case queued occupancy for the clean single-source state accepted by
-    // `source_queue_packet_bound`. Let arrivals be a_n = a_0 + nI and link service take S. The
-    // source begins idle and empty. If I >= S, packet n completes no later than a_(n+1). At I = S,
-    // canonical phases process the next PacketArrival before TxComplete and TxReady, so the queued
-    // population briefly reaches exactly one and then drains; the in-service packet is stored
-    // separately. Thus q(t) <= 1 across every timestamp and safe-horizon cut, and equality makes
-    // the bound tight. When service is slower, retaining the whole remaining flow is the only
-    // workload-independent bound used here.
-    if emission_interval_ns >= serialization_ns {
-        packet_count.min(1)
-    } else {
-        packet_count
-    }
-}
-
-fn source_queue_packet_bound(
-    image: &SimulationImage,
-    flow_index: usize,
-    packet_count: usize,
-) -> usize {
-    if packet_count == 0 {
-        return 0;
-    }
-    // Apply the service-rate proof only to a pristine source with one flow, one constant
-    // generator, one matching scheduled first packet, and no queued or in-service work. Every
-    // checkpoint, preloaded, multi-flow, or otherwise ambiguous state falls back to the whole
-    // remaining flow below.
-    let flow = &image.flows[flow_index];
-    if image
-        .flows
-        .iter()
-        .filter(|candidate| candidate.source == flow.source)
-        .count()
-        != 1
-    {
-        return packet_count;
-    }
-    let source = &image.nodes[flow.source.0 as usize];
-    if source.kind != NodeKind::Host {
-        return packet_count;
-    }
-    let state = &image.host_states[source.state_slot as usize];
-    let [generator] = state.generators.as_slice() else {
-        return packet_count;
-    };
-    if generator.flow.0 as usize != flow_index
-        || generator.next_emission.status != GeneratorStatus::Scheduled
-        || generator.packets_emitted != 0
-        || generator.bytes_emitted != 0
-        || !state.queue.is_empty()
-        || state.in_service.is_some()
-        || state.tx_ready_pending
-    {
-        return packet_count;
-    }
-    let mut initial_data_packets = image
-        .initial_packets
-        .iter()
-        .filter(|packet| packet.flow.0 as usize == flow_index && packet.kind == PacketKind::Data);
-    let Some(initial_packet) = initial_data_packets.next() else {
-        return packet_count;
-    };
-    if initial_data_packets.next().is_some() || initial_packet.id != generator.next_emission.payload
-    {
-        return packet_count;
-    }
-    let scheduled_arrivals = image
-        .initial_events
-        .iter()
-        .filter(|event| {
-            event.target == flow.source
-                && event.kind == EventKind::PacketArrival
-                && event.payload == generator.next_emission.payload
-                && event.key.time_ns == generator.next_emission.departure_time_ns
-        })
-        .count();
-    if scheduled_arrivals != 1 {
-        return packet_count;
-    }
-    let Some(first_link) = flow.route.first().copied() else {
-        return packet_count;
-    };
-    if first_link != state.egress_link {
-        return packet_count;
-    }
-    let FlowGeneratorKind::Constant(constant) = generator.kind else {
-        return packet_count;
-    };
-    if initial_packet.size_bytes != constant.packet_size_bytes {
-        return packet_count;
-    }
-    let link = image.links[first_link.0 as usize];
-    let serialization =
-        crate::time::serialization_time_ns(constant.packet_size_bytes, link.rate_bps)
-            .expect("Metal validation established a positive finite serialization interval");
-    let paced = paced_single_source_queue_bound(packet_count, constant.interval_ns, serialization);
-    if paced == packet_count {
-        packet_count
-    } else {
-        state.queue.len().saturating_add(paced).min(packet_count)
-    }
-}
-
-fn generator_round_burst(
-    image: &SimulationImage,
-    flow_index: usize,
-    packet_count: usize,
-    lookahead: Option<u64>,
-) -> usize {
-    image
-        .host_states
-        .iter()
-        .flat_map(|state| &state.generators)
-        .filter(|generator| {
-            generator.flow.0 as usize == flow_index
-                && matches!(
-                    generator.next_emission.status,
-                    GeneratorStatus::Scheduled | GeneratorStatus::Blocked
-                )
-        })
-        .map(|generator| {
-            let interval_ns = match generator.kind {
-                FlowGeneratorKind::Constant(constant) => constant.interval_ns,
-                FlowGeneratorKind::Rate(rate) => rate.pacing_interval_ns,
-                _ => return packet_count,
-            };
-            match lookahead {
-                Some(lookahead) => packet_count.min(
-                    usize::try_from(lookahead / interval_ns)
-                        .unwrap_or(usize::MAX)
-                        .saturating_add(1),
-                ),
-                None => packet_count,
-            }
-        })
-        .fold(0, usize::saturating_add)
-}
-
 #[allow(clippy::too_many_arguments)] // One prepare-time boundary owns all flow sizing inputs.
 fn add_flow_route_capacities(
     image: &SimulationImage,
-    flow_minimum_packet_sizes: &[[u64; 2]],
+    capacity_context: &PlannerCapacityContext,
     flow_index: usize,
     packet_count: usize,
     packet_kind: PacketKind,
@@ -1927,7 +1911,7 @@ fn add_flow_route_capacities(
         let target_slot = target.0 as usize;
         let burst = flow_link_fel_bound(
             image,
-            flow_minimum_packet_sizes,
+            capacity_context,
             flow_index,
             packet_count,
             packet_kind,
@@ -1941,105 +1925,21 @@ fn add_flow_route_capacities(
     }
 }
 
-fn flow_minimum_packet_sizes(image: &SimulationImage) -> Vec<[u64; 2]> {
-    let mut minimums = vec![[0; 2]; image.flows.len()];
-    for packet in &image.initial_packets {
-        let class = if packet.kind.is_data() { 0 } else { 1 };
-        update_minimum_packet_size(
-            &mut minimums[packet.flow.0 as usize][class],
-            packet.size_bytes,
-        );
-    }
-    for state in &image.host_states {
-        for generator in &state.generators {
-            let size = match generator.kind {
-                FlowGeneratorKind::Constant(constant) => constant.packet_size_bytes,
-                FlowGeneratorKind::Tcp(_) => 1,
-                FlowGeneratorKind::Rate(rate) => rate.packet_size_bytes,
-                FlowGeneratorKind::Collective(collective) => collective.packet_size_bytes,
-                FlowGeneratorKind::Dcqcn(dcqcn) => dcqcn.rate.packet_size_bytes,
-            };
-            let flow = generator.flow.0 as usize;
-            update_minimum_packet_size(&mut minimums[flow][0], size);
-        }
-    }
-    materialize_flow_minimum_packet_sizes(&mut minimums);
-    #[cfg(debug_assertions)]
-    for (flow, minimum) in minimums.iter().enumerate() {
-        for (class, packet_kind) in [PacketKind::Data, PacketKind::Feedback]
-            .into_iter()
-            .enumerate()
-        {
-            let expected = image
-                .initial_packets
-                .iter()
-                .filter(|packet| {
-                    packet.flow.0 as usize == flow && packet.kind.is_data() == packet_kind.is_data()
-                })
-                .map(|packet| packet.size_bytes)
-                .chain(
-                    (packet_kind == PacketKind::Data)
-                        .then(|| {
-                            image
-                                .host_states
-                                .iter()
-                                .flat_map(|state| &state.generators)
-                                .filter(move |generator| generator.flow.0 as usize == flow)
-                                .map(|generator| match generator.kind {
-                                    FlowGeneratorKind::Constant(constant) => {
-                                        constant.packet_size_bytes
-                                    }
-                                    FlowGeneratorKind::Tcp(_) => 1,
-                                    FlowGeneratorKind::Rate(rate) => rate.packet_size_bytes,
-                                    FlowGeneratorKind::Collective(collective) => {
-                                        collective.packet_size_bytes
-                                    }
-                                    FlowGeneratorKind::Dcqcn(dcqcn) => dcqcn.rate.packet_size_bytes,
-                                })
-                        })
-                        .into_iter()
-                        .flatten(),
-                )
-                .min()
-                .unwrap_or(1);
-            debug_assert_eq!(minimum[class], expected);
-        }
-    }
-    minimums
-}
-
-fn update_minimum_packet_size(minimum: &mut u64, size: u64) {
-    debug_assert_ne!(size, 0, "Metal validation rejects zero packet sizes");
-    if *minimum == 0 || size < *minimum {
-        *minimum = size;
-    }
-}
-
-fn materialize_flow_minimum_packet_sizes(minimums: &mut [[u64; 2]]) {
-    for minimum in minimums {
-        for size in minimum {
-            if *size == 0 {
-                *size = 1;
-            }
-        }
-    }
-}
-
 fn flow_link_serialization_ns(
-    flow_minimum_packet_sizes: &[[u64; 2]],
+    image: &SimulationImage,
+    capacity_context: &PlannerCapacityContext,
     flow_index: usize,
     packet_kind: PacketKind,
     link: crate::LinkDescriptor,
 ) -> u64 {
-    let class = if packet_kind.is_data() { 0 } else { 1 };
-    let minimum_size = flow_minimum_packet_sizes[flow_index][class];
+    let minimum_size = capacity_context.minimum_packet_size(image, flow_index, packet_kind);
     crate::time::serialization_time_ns(minimum_size, link.rate_bps)
         .expect("Metal validation established a positive finite serialization interval")
 }
 
 fn flow_link_round_bound(
     image: &SimulationImage,
-    flow_minimum_packet_sizes: &[[u64; 2]],
+    capacity_context: &PlannerCapacityContext,
     flow_index: usize,
     packet_count: usize,
     packet_kind: PacketKind,
@@ -2056,7 +1956,7 @@ fn flow_link_round_bound(
             let state = &image.host_states[source.state_slot as usize];
             let capacity =
                 if packet_kind == PacketKind::Data && source.id == image.flows[flow_index].source {
-                    source_queue_packet_bound(image, flow_index, packet_count)
+                    capacity_context.source_queue_packet_bound(image, flow_index, packet_count)
                 } else {
                     packet_count
                 };
@@ -2077,13 +1977,13 @@ fn flow_link_round_bound(
     };
     let queue_bound = current_queue.max(queue_capacity);
     let serialization =
-        flow_link_serialization_ns(flow_minimum_packet_sizes, flow_index, packet_kind, link);
+        flow_link_serialization_ns(image, capacity_context, flow_index, packet_kind, link);
     let service_burst = lookahead.map_or(packet_count, |lookahead| {
         usize::try_from(lookahead.div_ceil(serialization)).unwrap_or(usize::MAX)
     });
     let generator_burst =
         if packet_kind == PacketKind::Data && link.source == image.flows[flow_index].source {
-            generator_round_burst(image, flow_index, packet_count, lookahead)
+            capacity_context.generator_round_burst(image, flow_index, packet_count, lookahead)
         } else {
             0
         };
@@ -2102,7 +2002,7 @@ fn flow_link_round_bound(
 
 fn flow_link_fel_bound(
     image: &SimulationImage,
-    flow_minimum_packet_sizes: &[[u64; 2]],
+    capacity_context: &PlannerCapacityContext,
     flow_index: usize,
     packet_count: usize,
     packet_kind: PacketKind,
@@ -2114,14 +2014,14 @@ fn flow_link_fel_bound(
     }
     let link = image.links[link_id.0 as usize];
     let serialization =
-        flow_link_serialization_ns(flow_minimum_packet_sizes, flow_index, packet_kind, link);
+        flow_link_serialization_ns(image, capacity_context, flow_index, packet_kind, link);
     let in_flight =
         usize::try_from(link.propagation_ns.div_ceil(serialization)).unwrap_or(usize::MAX);
 
     packet_count.min(
         flow_link_round_bound(
             image,
-            flow_minimum_packet_sizes,
+            capacity_context,
             flow_index,
             packet_count,
             packet_kind,
@@ -2134,7 +2034,7 @@ fn flow_link_fel_bound(
 
 fn derived_remote_capacity(
     image: &SimulationImage,
-    flow_minimum_packet_sizes: &[[u64; 2]],
+    capacity_context: &PlannerCapacityContext,
     counts: &[usize],
     feedback_counts: &[usize],
     lookahead: Option<u64>,
@@ -2151,7 +2051,7 @@ fn derived_remote_capacity(
                 .map(|link| {
                     flow_link_round_bound(
                         image,
-                        flow_minimum_packet_sizes,
+                        capacity_context,
                         index,
                         data_count,
                         PacketKind::Data,
@@ -2162,7 +2062,7 @@ fn derived_remote_capacity(
                 .chain(flow.reverse_route.iter().map(|link| {
                     flow_link_round_bound(
                         image,
-                        flow_minimum_packet_sizes,
+                        capacity_context,
                         index,
                         feedback_count,
                         PacketKind::Feedback,
@@ -2177,7 +2077,7 @@ fn derived_remote_capacity(
 
 fn derived_remote_capacities(
     image: &SimulationImage,
-    flow_minimum_packet_sizes: &[[u64; 2]],
+    capacity_context: &PlannerCapacityContext,
     counts: &[usize],
     feedback_counts: &[usize],
     lookahead: Option<u64>,
@@ -2198,7 +2098,7 @@ fn derived_remote_capacities(
                 let producer = image.links[link_id.0 as usize].source.0 as usize;
                 capacities[producer] = capacities[producer].saturating_add(flow_link_round_bound(
                     image,
-                    flow_minimum_packet_sizes,
+                    capacity_context,
                     index,
                     packet_count,
                     packet_kind,
@@ -2221,7 +2121,7 @@ fn derived_remote_capacities(
 #[allow(clippy::too_many_arguments)] // One prepare-time boundary owns all arena sizing inputs.
 fn prepare_streams(
     image: &SimulationImage,
-    flow_minimum_packet_sizes: &[[u64; 2]],
+    capacity_context: &PlannerCapacityContext,
     counts: &[usize],
     feedback_counts: &[usize],
     lookahead: Option<u64>,
@@ -2270,7 +2170,7 @@ fn prepare_streams(
         .ok_or_else(|| MetalError::Validation("generator stream count overflows usize".into()))?;
     let mut channel_caps = derived_channel_stream_capacities(
         image,
-        flow_minimum_packet_sizes,
+        capacity_context,
         counts,
         feedback_counts,
         lookahead,
@@ -2454,7 +2354,7 @@ fn prepare_streams(
 
 fn derived_channel_stream_capacities(
     image: &SimulationImage,
-    flow_minimum_packet_sizes: &[[u64; 2]],
+    capacity_context: &PlannerCapacityContext,
     counts: &[usize],
     feedback_counts: &[usize],
     lookahead: Option<u64>,
@@ -2502,7 +2402,8 @@ fn derived_channel_stream_capacities(
                 })?;
                 packet_counts[channel] = packet_counts[channel].saturating_add(packet_count);
                 let serialization = flow_link_serialization_ns(
-                    flow_minimum_packet_sizes,
+                    image,
+                    capacity_context,
                     flow_index,
                     packet_kind,
                     image.links[link_id.0 as usize],
@@ -2819,6 +2720,7 @@ fn encode_tcp_control(control: TcpCongestionControl, words: &mut [u64]) {
 
 fn prepare_tcp_state(
     image: &SimulationImage,
+    capacity_context: &PlannerCapacityContext,
     packet_counts: &[usize],
     feedback_counts: &[usize],
     capacity_caps: DeviceCapacityCaps,
@@ -2831,11 +2733,11 @@ fn prepare_tcp_state(
 
     let mut receiver_ranges = vec![None; flow_count];
     for (host_slot, state) in image.host_states.iter().enumerate() {
-        let owner = image
-            .nodes
-            .iter()
-            .find(|node| node.kind == NodeKind::Host && node.state_slot as usize == host_slot)
-            .map(|node| node.id)
+        if state.tcp_receivers.is_empty() {
+            continue;
+        }
+        let owner = capacity_context
+            .host_lp(image, host_slot)
             .ok_or_else(|| MetalError::Validation("TCP receiver owner is missing".into()))?;
         for receiver in &state.tcp_receivers {
             let flow = receiver.flow.0 as usize;
@@ -4060,6 +3962,7 @@ impl DirectMetal {
             initialization_timings: MetalInitializationTimings {
                 device_queue_setup_ns: initialization_ns.saturating_sub(pipeline_creation_ns),
                 pipeline_creation_ns,
+                reused_cached_executor: false,
             },
             horizon_pipeline,
             prepare_pipeline,
@@ -4718,17 +4621,7 @@ mod tests {
         MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER, MAX_ENCODED_PAIRS_PER_WAVE, MetalConfig,
         MetalPhaseTimings, PROFILE_SAMPLES_PER_ATTEMPT, PROFILED_ATTEMPTS,
         accumulate_profile_interval, build_phase_profile, encoding_limits,
-        materialize_flow_minimum_packet_sizes, paced_single_source_queue_bound,
-        update_minimum_packet_size,
     };
-
-    #[test]
-    fn packet_size_cache_distinguishes_exact_u64_boundary_from_one_past_absence() {
-        let mut minimums = [[0, 0]];
-        update_minimum_packet_size(&mut minimums[0][0], u64::MAX);
-        materialize_flow_minimum_packet_sizes(&mut minimums);
-        assert_eq!(minimums, [[u64::MAX, 1]]);
-    }
 
     #[test]
     fn stream_decomposition_is_enabled_by_default() {
@@ -4842,17 +4735,6 @@ mod tests {
         assert_eq!(timing.continuation_control_ns, 4);
         assert_eq!(timing.exchange_prefix_ns, 5);
         assert_eq!(timing.final_control_ns, 8);
-    }
-
-    #[test]
-    fn paced_single_source_queue_bound_stays_constant_when_service_keeps_up() {
-        assert_eq!(paced_single_source_queue_bound(65_536, 21, 21), 1);
-        assert_eq!(paced_single_source_queue_bound(65_536, 22, 21), 1);
-    }
-
-    #[test]
-    fn paced_single_source_queue_bound_retains_full_backlog_when_service_is_slower() {
-        assert_eq!(paced_single_source_queue_bound(65_536, 20, 21), 65_536);
     }
 
     #[test]

@@ -10,7 +10,7 @@
 
 #[cfg(feature = "cuda-test-hooks")]
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -25,6 +25,7 @@ use cudarc::nvrtc::Ptx;
 use crate::device_scheduler::{
     QUEUE_META_WORDS, prepare_device_schedulers, restore_device_scheduler,
 };
+use crate::planner_capacity::{PlannerCapacityContext, PlannerCapacityMode, TcpMinimumPacketSize};
 use crate::tcp::{TcpCubic, TcpReno};
 use crate::{
     ArrivalDisposition, Backend, DeviceCapacityCaps, Event, EventKey, EventKind, FlowGeneratorKind,
@@ -760,6 +761,91 @@ impl CudaExecutor {
     }
 }
 
+/// Asserts that the linear-table planner produces the complete legacy host plan bit-for-bit.
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+pub fn assert_cuda_planner_bit_equal_for_testing(
+    image: &SimulationImage,
+    exclusive_horizon_ns: Option<u64>,
+    config: CudaConfig,
+    observation_mode: ObservationMode,
+) -> Result<(), CudaError> {
+    validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
+    validate_config(config)?;
+    let (packet_counts, feedback_counts) = flow_packet_counts(image)?;
+    let data_counts = packet_counts
+        .iter()
+        .zip(&feedback_counts)
+        .map(|(total, feedback)| total.saturating_sub(*feedback))
+        .collect::<Vec<_>>();
+    let lookahead = image
+        .channels
+        .iter()
+        .map(|channel| channel.min_delay_ns)
+        .min();
+    if !PlannerCapacityContext::matches_legacy(
+        image,
+        &data_counts,
+        lookahead,
+        TcpMinimumPacketSize::MaximumSegmentSize,
+    ) {
+        return Err(CudaError::Validation(
+            "linear lookup tables differ from the legacy helpers".into(),
+        ));
+    }
+    let precomputed = CudaPlan::new_with_capacity_mode(
+        image,
+        exclusive_horizon_ns,
+        config,
+        observation_mode,
+        PlannerCapacityMode::Precomputed,
+    )?;
+    let legacy = CudaPlan::new_with_capacity_mode(
+        image,
+        exclusive_horizon_ns,
+        config,
+        observation_mode,
+        PlannerCapacityMode::Legacy,
+    )?;
+    if precomputed != legacy {
+        return Err(CudaError::Validation(
+            "linear-table planner differs from the legacy planner".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Measures host plan construction only; CUDA initialization and execution are excluded.
+#[cfg(feature = "cuda-test-hooks")]
+#[doc(hidden)]
+pub fn measure_cuda_planner_for_testing(
+    image: &SimulationImage,
+    exclusive_horizon_ns: Option<u64>,
+    config: CudaConfig,
+    observation_mode: ObservationMode,
+    legacy: bool,
+) -> Result<u64, CudaError> {
+    validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
+    validate_config(config)?;
+    let mode = if legacy {
+        PlannerCapacityMode::Legacy
+    } else {
+        PlannerCapacityMode::Precomputed
+    };
+    let started = Instant::now();
+    let plan = CudaPlan::new_with_capacity_mode(
+        image,
+        exclusive_horizon_ns,
+        config,
+        observation_mode,
+        mode,
+    )?;
+    let planning_ns = duration_ns(started.elapsed());
+    std::hint::black_box(&plan.params);
+    drop(plan);
+    Ok(planning_ns)
+}
+
 fn validate_config(config: CudaConfig) -> Result<(), CudaError> {
     if config.attempts_per_graph_wave == 0 {
         return Err(CudaError::Validation(
@@ -809,6 +895,7 @@ fn injected_capacity(config: CudaConfig, arena: CudaArena, default: usize) -> us
     default
 }
 
+#[derive(Eq, PartialEq)]
 struct CudaPlan {
     control: Vec<u64>,
     params: Vec<u64>,
@@ -846,7 +933,7 @@ struct CudaPlan {
     dispatch_capacity: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct StreamLayout {
     stream_count: usize,
     channel_count: usize,
@@ -905,27 +992,9 @@ fn encode_control(control: TcpCongestionControl, words: &mut [u64]) {
     }
 }
 
-fn tcp_flow_segment_capacity(image: &SimulationImage, flow: usize) -> usize {
-    image
-        .host_states
-        .iter()
-        .flat_map(|state| &state.generators)
-        .find(|generator| generator.flow.0 as usize == flow)
-        .and_then(|generator| match generator.kind {
-            FlowGeneratorKind::Tcp(tcp) => usize::try_from(tcp.total_bytes.div_ceil(tcp.mss_bytes))
-                .ok()
-                .map(|segments| segments.saturating_mul(4).saturating_add(8)),
-            FlowGeneratorKind::Constant(_)
-            | FlowGeneratorKind::Rate(_)
-            | FlowGeneratorKind::Collective(_)
-            | FlowGeneratorKind::Dcqcn(_) => None,
-        })
-        .unwrap_or(1)
-        .max(1)
-}
-
 fn prepare_tcp_state(
     image: &SimulationImage,
+    capacity_context: &PlannerCapacityContext,
     capacity_caps: DeviceCapacityCaps,
 ) -> Result<(Vec<u64>, TcpLayout), CudaError> {
     let flow_count = image.flows.len().max(1);
@@ -939,16 +1008,19 @@ fn prepare_tcp_state(
     let mut state = vec![0_u64; next.max(1)];
 
     for (owner_slot, host) in image.host_states.iter().enumerate() {
-        let owner = image
-            .nodes
-            .iter()
-            .find(|node| node.kind == NodeKind::Host && node.state_slot as usize == owner_slot)
-            .map_or(NONE, |node| node.id.0);
+        if host.tcp_receivers.is_empty() {
+            continue;
+        }
+        let owner = capacity_context
+            .host_lp(image, owner_slot)
+            .map_or(NONE, |node| node.0);
         for receiver in &host.tcp_receivers {
             let flow = receiver.flow.0 as usize;
             let row = receiver_offset + flow * TCP_RECEIVER_WORDS;
             let capacity = crate::device_capacity::cap_derived_capacity(
-                tcp_flow_segment_capacity(image, flow).max(receiver.out_of_order.len()),
+                capacity_context
+                    .tcp_flow_segment_capacity(image, flow)
+                    .max(receiver.out_of_order.len()),
                 capacity_caps.tcp_receiver_ranges_per_flow,
                 receiver.out_of_order.len(),
             );
@@ -987,7 +1059,9 @@ fn prepare_tcp_state(
             .get(&crate::FlowId(flow as u64))
             .map_or_else(Vec::new, |segments| segments.values().copied().collect());
         let capacity = crate::device_capacity::cap_derived_capacity(
-            tcp_flow_segment_capacity(image, flow).max(packets.len()),
+            capacity_context
+                .tcp_flow_segment_capacity(image, flow)
+                .max(packets.len()),
             capacity_caps.tcp_ledger_segments_per_flow,
             packets.len(),
         );
@@ -1032,6 +1106,22 @@ impl CudaPlan {
         config: CudaConfig,
         observation_mode: ObservationMode,
     ) -> Result<Self, CudaError> {
+        Self::new_with_capacity_mode(
+            image,
+            exclusive_horizon_ns,
+            config,
+            observation_mode,
+            PlannerCapacityMode::Precomputed,
+        )
+    }
+
+    fn new_with_capacity_mode(
+        image: &SimulationImage,
+        exclusive_horizon_ns: Option<u64>,
+        config: CudaConfig,
+        observation_mode: ObservationMode,
+        capacity_mode: PlannerCapacityMode,
+    ) -> Result<Self, CudaError> {
         let node_count = image.nodes.len();
         let (flow_packet_counts, flow_feedback_counts) = flow_packet_counts(image)?;
         let minimum_lookahead_ns = image
@@ -1039,6 +1129,18 @@ impl CudaPlan {
             .iter()
             .map(|channel| channel.min_delay_ns)
             .min();
+        let flow_data_counts = flow_packet_counts
+            .iter()
+            .zip(&flow_feedback_counts)
+            .map(|(total, feedback)| total.saturating_sub(*feedback))
+            .collect::<Vec<_>>();
+        let capacity_context = PlannerCapacityContext::new(
+            image,
+            &flow_data_counts,
+            minimum_lookahead_ns,
+            TcpMinimumPacketSize::MaximumSegmentSize,
+            capacity_mode,
+        );
         let initial_by_payload = image
             .initial_packets
             .iter()
@@ -1067,10 +1169,11 @@ impl CudaPlan {
             let feedback_count = flow_feedback_counts[flow_index];
             let data_count = packet_count.saturating_sub(feedback_count);
             let source_slot = flow.source.0 as usize;
-            queue_caps[source_slot] = queue_caps[source_slot]
-                .saturating_add(source_queue_packet_bound(image, flow_index, data_count));
+            queue_caps[source_slot] = queue_caps[source_slot].saturating_add(
+                capacity_context.source_queue_packet_bound(image, flow_index, data_count),
+            );
             legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(4);
-            if tcp_generator(image, flow_index).is_some() {
+            if capacity_context.tcp_generator(image, flow_index).is_some() {
                 // Timeout events are intentionally heap-class. Stale timers can coexist with the
                 // active timer, so reserve one slot per bounded sender attempt.
                 legacy_fel_caps[source_slot] =
@@ -1079,6 +1182,7 @@ impl CudaPlan {
 
             add_flow_route_capacities(
                 image,
+                &capacity_context,
                 flow_index,
                 data_count,
                 PacketKind::Data,
@@ -1088,6 +1192,7 @@ impl CudaPlan {
             );
             add_flow_route_capacities(
                 image,
+                &capacity_context,
                 flow_index,
                 feedback_count,
                 PacketKind::Feedback,
@@ -1158,7 +1263,7 @@ impl CudaPlan {
                 capacities[target] = capacities[target].saturating_add(1);
             }
             for (flow, descriptor) in image.flows.iter().enumerate() {
-                if tcp_generator(image, flow).is_some() {
+                if capacity_context.tcp_generator(image, flow).is_some() {
                     let feedback = flow_feedback_counts[flow];
                     let attempts = flow_packet_counts[flow].saturating_sub(feedback);
                     let source = descriptor.source.0 as usize;
@@ -1375,6 +1480,7 @@ impl CudaPlan {
 
         let remote_bound = derived_remote_capacity(
             image,
+            &capacity_context,
             &flow_packet_counts,
             &flow_feedback_counts,
             minimum_lookahead_ns,
@@ -1388,6 +1494,7 @@ impl CudaPlan {
         });
         let mut remote_capacities = derived_remote_capacities(
             image,
+            &capacity_context,
             &flow_packet_counts,
             &flow_feedback_counts,
             minimum_lookahead_ns,
@@ -1407,6 +1514,7 @@ impl CudaPlan {
         let remote_staging_slots = assign_arena_offsets(&mut remote_meta, &remote_capacities)?;
         let streams = prepare_streams(
             image,
+            &capacity_context,
             &flow_packet_counts,
             &flow_feedback_counts,
             minimum_lookahead_ns,
@@ -1457,7 +1565,8 @@ impl CudaPlan {
                     arrival_capacity as u64;
             }
         }
-        let (tcp_state, tcp_layout) = prepare_tcp_state(image, config.capacity_caps)?;
+        let (tcp_state, tcp_layout) =
+            prepare_tcp_state(image, &capacity_context, config.capacity_caps)?;
         let (inbound_meta, inbound_producers) = remote_inbound_producers(image);
         let round_capacity = config
             .max_rounds
@@ -1559,18 +1668,23 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
         };
         counts[packet.flow.0 as usize] = counts[packet.flow.0 as usize].saturating_add(1);
     }
+    let pacing_timer_tokens = image
+        .initial_events
+        .iter()
+        .filter(|event| event.kind == EventKind::PacingTimer)
+        .map(|event| (event.target, event.payload, event.key.time_ns))
+        .collect::<HashSet<_>>();
     for state in &image.host_states {
         for generator in &state.generators {
             let index = generator.flow.0 as usize;
             if let FlowGeneratorKind::Rate(rate) = generator.kind {
                 let work = crate::device_sizing::rate_device_work(image, generator, rate)
                     .map_err(|error| CudaError::Validation(error.to_string()))?;
-                let owns_timer_token = image.initial_events.iter().any(|event| {
-                    event.kind == EventKind::PacingTimer
-                        && event.target == image.flows[index].source
-                        && event.payload == generator.next_emission.payload
-                        && event.key.time_ns == generator.next_emission.departure_time_ns
-                });
+                let owns_timer_token = pacing_timer_tokens.contains(&(
+                    image.flows[index].source,
+                    generator.next_emission.payload,
+                    generator.next_emission.departure_time_ns,
+                ));
                 if owns_timer_token {
                     data_counts[index] = data_counts[index].saturating_sub(1);
                 }
@@ -1654,166 +1768,10 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
     Ok((totals, feedback_counts))
 }
 
-fn tcp_generator(image: &SimulationImage, flow_index: usize) -> Option<crate::TcpGenerator> {
-    image
-        .host_states
-        .iter()
-        .flat_map(|state| &state.generators)
-        .find(|generator| generator.flow.0 as usize == flow_index)
-        .and_then(|generator| match generator.kind {
-            FlowGeneratorKind::Tcp(tcp) => Some(tcp),
-            FlowGeneratorKind::Constant(_)
-            | FlowGeneratorKind::Rate(_)
-            | FlowGeneratorKind::Collective(_)
-            | FlowGeneratorKind::Dcqcn(_) => None,
-        })
-}
-
-fn paced_single_source_queue_bound(
-    packet_count: usize,
-    emission_interval_ns: u64,
-    serialization_ns: u64,
-) -> usize {
-    // This is the exact worst-case queued occupancy for the clean single-source state accepted by
-    // `source_queue_packet_bound`. Let arrivals be a_n = a_0 + nI and link service take S. The
-    // source begins idle and empty. If I >= S, packet n completes no later than a_(n+1). At I = S,
-    // canonical phases process the next PacketArrival before TxComplete and TxReady, so the queued
-    // population briefly reaches exactly one and then drains; the in-service packet is stored
-    // separately. Thus q(t) <= 1 across every timestamp and safe-horizon cut, and equality makes
-    // the bound tight. When service is slower, retaining the whole remaining flow is the only
-    // workload-independent bound used here.
-    if emission_interval_ns >= serialization_ns {
-        packet_count.min(1)
-    } else {
-        packet_count
-    }
-}
-
-fn source_queue_packet_bound(
-    image: &SimulationImage,
-    flow_index: usize,
-    packet_count: usize,
-) -> usize {
-    if packet_count == 0 {
-        return 0;
-    }
-    // Apply the service-rate proof only to a pristine source with one flow, one constant
-    // generator, one matching scheduled first packet, and no queued or in-service work. Every
-    // checkpoint, preloaded, multi-flow, or otherwise ambiguous state falls back to the whole
-    // remaining flow below.
-    let flow = &image.flows[flow_index];
-    if image
-        .flows
-        .iter()
-        .filter(|candidate| candidate.source == flow.source)
-        .count()
-        != 1
-    {
-        return packet_count;
-    }
-    let source = &image.nodes[flow.source.0 as usize];
-    if source.kind != NodeKind::Host {
-        return packet_count;
-    }
-    let state = &image.host_states[source.state_slot as usize];
-    let [generator] = state.generators.as_slice() else {
-        return packet_count;
-    };
-    if generator.flow.0 as usize != flow_index
-        || generator.next_emission.status != GeneratorStatus::Scheduled
-        || generator.packets_emitted != 0
-        || generator.bytes_emitted != 0
-        || !state.queue.is_empty()
-        || state.in_service.is_some()
-        || state.tx_ready_pending
-    {
-        return packet_count;
-    }
-    let mut initial_data_packets = image
-        .initial_packets
-        .iter()
-        .filter(|packet| packet.flow.0 as usize == flow_index && packet.kind == PacketKind::Data);
-    let Some(initial_packet) = initial_data_packets.next() else {
-        return packet_count;
-    };
-    if initial_data_packets.next().is_some() || initial_packet.id != generator.next_emission.payload
-    {
-        return packet_count;
-    }
-    let scheduled_arrivals = image
-        .initial_events
-        .iter()
-        .filter(|event| {
-            event.target == flow.source
-                && event.kind == EventKind::PacketArrival
-                && event.payload == generator.next_emission.payload
-                && event.key.time_ns == generator.next_emission.departure_time_ns
-        })
-        .count();
-    if scheduled_arrivals != 1 {
-        return packet_count;
-    }
-    let Some(first_link) = flow.route.first().copied() else {
-        return packet_count;
-    };
-    if first_link != state.egress_link {
-        return packet_count;
-    }
-    let FlowGeneratorKind::Constant(constant) = generator.kind else {
-        return packet_count;
-    };
-    if initial_packet.size_bytes != constant.packet_size_bytes {
-        return packet_count;
-    }
-    let link = image.links[first_link.0 as usize];
-    let serialization =
-        crate::time::serialization_time_ns(constant.packet_size_bytes, link.rate_bps)
-            .expect("CUDA validation established a positive finite serialization interval");
-    let paced = paced_single_source_queue_bound(packet_count, constant.interval_ns, serialization);
-    if paced == packet_count {
-        packet_count
-    } else {
-        state.queue.len().saturating_add(paced).min(packet_count)
-    }
-}
-
-fn generator_round_burst(
-    image: &SimulationImage,
-    flow_index: usize,
-    packet_count: usize,
-    lookahead: Option<u64>,
-) -> usize {
-    image
-        .host_states
-        .iter()
-        .flat_map(|state| &state.generators)
-        .filter(|generator| {
-            generator.flow.0 as usize == flow_index
-                && matches!(
-                    generator.next_emission.status,
-                    GeneratorStatus::Scheduled | GeneratorStatus::Blocked
-                )
-        })
-        .map(|generator| {
-            let interval_ns = match generator.kind {
-                FlowGeneratorKind::Constant(constant) => constant.interval_ns,
-                FlowGeneratorKind::Rate(rate) => rate.pacing_interval_ns,
-                _ => return packet_count,
-            };
-            match lookahead {
-                Some(lookahead) => packet_count.min(
-                    usize::try_from(lookahead / interval_ns)
-                        .unwrap_or(usize::MAX)
-                        .saturating_add(1),
-                ),
-                None => packet_count,
-            }
-        })
-        .fold(0, usize::saturating_add)
-}
-
+#[allow(clippy::too_many_arguments)] // One prepare-time boundary owns all flow sizing inputs.
 fn add_flow_route_capacities(
     image: &SimulationImage,
+    capacity_context: &PlannerCapacityContext,
     flow_index: usize,
     packet_count: usize,
     packet_kind: PacketKind,
@@ -1846,6 +1804,7 @@ fn add_flow_route_capacities(
         let target_slot = target.0 as usize;
         let burst = flow_link_fel_bound(
             image,
+            capacity_context,
             flow_index,
             packet_count,
             packet_kind,
@@ -1861,58 +1820,19 @@ fn add_flow_route_capacities(
 
 fn flow_link_serialization_ns(
     image: &SimulationImage,
+    capacity_context: &PlannerCapacityContext,
     flow_index: usize,
     packet_kind: PacketKind,
     link: crate::LinkDescriptor,
 ) -> u64 {
-    let minimum_size = image
-        .initial_packets
-        .iter()
-        .filter(|packet| {
-            packet.flow.0 as usize == flow_index
-                && packet_direction(packet.kind) == packet_direction(packet_kind)
-        })
-        .map(|packet| packet.size_bytes)
-        .chain(
-            (packet_kind == PacketKind::Data)
-                .then(|| {
-                    image
-                        .host_states
-                        .iter()
-                        .flat_map(|state| &state.generators)
-                        .filter(move |generator| generator.flow.0 as usize == flow_index)
-                        .map(|generator| match generator.kind {
-                            FlowGeneratorKind::Constant(constant) => constant.packet_size_bytes,
-                            FlowGeneratorKind::Tcp(tcp) => tcp.mss_bytes,
-                            FlowGeneratorKind::Rate(rate) => rate.packet_size_bytes,
-                            FlowGeneratorKind::Collective(collective) => {
-                                collective.packet_size_bytes
-                            }
-                            FlowGeneratorKind::Dcqcn(dcqcn) => dcqcn.rate.packet_size_bytes,
-                        })
-                })
-                .into_iter()
-                .flatten(),
-        )
-        .min()
-        .unwrap_or(1);
+    let minimum_size = capacity_context.minimum_packet_size(image, flow_index, packet_kind);
     crate::time::serialization_time_ns(minimum_size, link.rate_bps)
         .expect("CUDA validation established a positive finite serialization interval")
 }
 
-fn packet_direction(kind: PacketKind) -> u8 {
-    match kind {
-        PacketKind::Data | PacketKind::TcpData(_) => 0,
-        PacketKind::Feedback
-        | PacketKind::TcpAck(_)
-        | PacketKind::Pfc(_)
-        | PacketKind::DcqcnCnp(_)
-        | PacketKind::DcqcnControlTimer => 1,
-    }
-}
-
 fn flow_link_round_bound(
     image: &SimulationImage,
+    capacity_context: &PlannerCapacityContext,
     flow_index: usize,
     packet_count: usize,
     packet_kind: PacketKind,
@@ -1929,7 +1849,7 @@ fn flow_link_round_bound(
             let state = &image.host_states[source.state_slot as usize];
             let capacity =
                 if packet_kind == PacketKind::Data && source.id == image.flows[flow_index].source {
-                    source_queue_packet_bound(image, flow_index, packet_count)
+                    capacity_context.source_queue_packet_bound(image, flow_index, packet_count)
                 } else {
                     packet_count
                 };
@@ -1949,13 +1869,14 @@ fn flow_link_round_bound(
         }
     };
     let queue_bound = current_queue.max(queue_capacity);
-    let serialization = flow_link_serialization_ns(image, flow_index, packet_kind, link);
+    let serialization =
+        flow_link_serialization_ns(image, capacity_context, flow_index, packet_kind, link);
     let service_burst = lookahead.map_or(packet_count, |lookahead| {
         usize::try_from(lookahead.div_ceil(serialization)).unwrap_or(usize::MAX)
     });
     let generator_burst =
         if packet_kind == PacketKind::Data && link.source == image.flows[flow_index].source {
-            generator_round_burst(image, flow_index, packet_count, lookahead)
+            capacity_context.generator_round_burst(image, flow_index, packet_count, lookahead)
         } else {
             0
         };
@@ -1974,6 +1895,7 @@ fn flow_link_round_bound(
 
 fn flow_link_fel_bound(
     image: &SimulationImage,
+    capacity_context: &PlannerCapacityContext,
     flow_index: usize,
     packet_count: usize,
     packet_kind: PacketKind,
@@ -1984,13 +1906,15 @@ fn flow_link_fel_bound(
         return 0;
     }
     let link = image.links[link_id.0 as usize];
-    let serialization = flow_link_serialization_ns(image, flow_index, packet_kind, link);
+    let serialization =
+        flow_link_serialization_ns(image, capacity_context, flow_index, packet_kind, link);
     let in_flight =
         usize::try_from(link.propagation_ns.div_ceil(serialization)).unwrap_or(usize::MAX);
 
     packet_count.min(
         flow_link_round_bound(
             image,
+            capacity_context,
             flow_index,
             packet_count,
             packet_kind,
@@ -2003,6 +1927,7 @@ fn flow_link_fel_bound(
 
 fn derived_remote_capacity(
     image: &SimulationImage,
+    capacity_context: &PlannerCapacityContext,
     counts: &[usize],
     feedback_counts: &[usize],
     lookahead: Option<u64>,
@@ -2019,6 +1944,7 @@ fn derived_remote_capacity(
                 .map(|link| {
                     flow_link_round_bound(
                         image,
+                        capacity_context,
                         index,
                         data_count,
                         PacketKind::Data,
@@ -2029,6 +1955,7 @@ fn derived_remote_capacity(
                 .chain(flow.reverse_route.iter().map(|link| {
                     flow_link_round_bound(
                         image,
+                        capacity_context,
                         index,
                         feedback_count,
                         PacketKind::Feedback,
@@ -2043,6 +1970,7 @@ fn derived_remote_capacity(
 
 fn derived_remote_capacities(
     image: &SimulationImage,
+    capacity_context: &PlannerCapacityContext,
     counts: &[usize],
     feedback_counts: &[usize],
     lookahead: Option<u64>,
@@ -2063,6 +1991,7 @@ fn derived_remote_capacities(
                 let producer = image.links[link_id.0 as usize].source.0 as usize;
                 capacities[producer] = capacities[producer].saturating_add(flow_link_round_bound(
                     image,
+                    capacity_context,
                     index,
                     packet_count,
                     packet_kind,
@@ -2085,6 +2014,7 @@ fn derived_remote_capacities(
 #[allow(clippy::too_many_arguments)] // One prepare-time boundary owns all arena sizing inputs.
 fn prepare_streams(
     image: &SimulationImage,
+    capacity_context: &PlannerCapacityContext,
     counts: &[usize],
     feedback_counts: &[usize],
     lookahead: Option<u64>,
@@ -2131,8 +2061,13 @@ fn prepare_streams(
     let stream_count = generator_stream_base
         .checked_add(image.flows.len())
         .ok_or_else(|| CudaError::Validation("generator stream count overflows usize".into()))?;
-    let mut channel_caps =
-        derived_channel_stream_capacities(image, counts, feedback_counts, lookahead)?;
+    let mut channel_caps = derived_channel_stream_capacities(
+        image,
+        capacity_context,
+        counts,
+        feedback_counts,
+        lookahead,
+    )?;
     if let Some(capacity) = config.max_channel_events_per_stream {
         channel_caps.fill(capacity);
     } else {
@@ -2313,6 +2248,7 @@ fn prepare_streams(
 
 fn derived_channel_stream_capacities(
     image: &SimulationImage,
+    capacity_context: &PlannerCapacityContext,
     counts: &[usize],
     feedback_counts: &[usize],
     lookahead: Option<u64>,
@@ -2361,6 +2297,7 @@ fn derived_channel_stream_capacities(
                 packet_counts[channel] = packet_counts[channel].saturating_add(packet_count);
                 let serialization = flow_link_serialization_ns(
                     image,
+                    capacity_context,
                     flow_index,
                     packet_kind,
                     image.links[link_id.0 as usize],

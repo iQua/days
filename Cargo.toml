@@ -21,12 +21,15 @@ members = ["executor", "legacy", "validation", "xtask"]
 resolver = "2"
 
 [features]
-test = []
+test = ["days-executor/planner-test-hooks"]
 l2_pfc = []
 dcqcn = []
 lean = []
 metal-spike = ["days-executor/metal-spike"]
 cuda = ["days-executor/cuda"]
+cuda-planner-test = ["test", "days-executor/cuda-planner-test"]
+metal-test-hooks = ["metal-spike", "days-executor/metal-test-hooks"]
+cuda-test-hooks = ["cuda", "days-executor/cuda-test-hooks"]
 
 [dependencies]
 csv = "1.4"

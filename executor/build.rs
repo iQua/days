@@ -1,5 +1,6 @@
 use std::env;
 use std::ffi::OsString;
+use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
@@ -8,6 +9,17 @@ fn main() {
     println!("cargo:rerun-if-changed=src/cuda_kernels.cu");
 
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
+        return;
+    }
+
+    let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo provides OUT_DIR"))
+        .join("days_cuda_kernels.fatbin");
+    if env::var_os("CARGO_FEATURE_CUDA_PLANNER_TEST").is_some()
+        && env::var_os("CARGO_FEATURE_CUDA_TEST_HOOKS").is_none()
+    {
+        // The planner equality surface constructs host plans only. Keep it runnable on hosts
+        // without nvcc while ensuring full CUDA test-hook and all-feature builds compile kernels.
+        fs::write(&output, []).expect("host-only CUDA planner placeholder must be written");
         return;
     }
 
@@ -29,8 +41,6 @@ fn main() {
         env::var_os("CARGO_MANIFEST_DIR").expect("Cargo provides CARGO_MANIFEST_DIR"),
     );
     let source = manifest_dir.join("src/cuda_kernels.cu");
-    let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo provides OUT_DIR"))
-        .join("days_cuda_kernels.fatbin");
     let compiled = Command::new(&nvcc)
         .arg("-std=c++17")
         .arg("-O3")

@@ -1239,6 +1239,17 @@ fn concurrent_public_api_runs_match_the_scalar_result() {
     }
 }
 
+#[test]
+fn executor_construction_reports_cached_pipeline_reuse_truthfully() {
+    let _first = MetalExecutor::new().expect("first Metal executor must initialize");
+    let second = MetalExecutor::new().expect("cached Metal executor must initialize");
+    let timings = second.initialization_timings();
+
+    assert!(timings.reused_cached_executor);
+    assert_eq!(timings.device_queue_setup_ns, 0);
+    assert_eq!(timings.pipeline_creation_ns, 0);
+}
+
 #[cfg(feature = "metal-test-hooks")]
 #[test]
 fn process_wide_guard_recovers_after_a_mid_execution_panic() {

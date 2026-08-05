@@ -4,7 +4,7 @@
 //! only small host-side capacity vectors. It never materializes event planes or initializes a
 //! device backend.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 
 use num_bigint::BigUint;
@@ -570,6 +570,12 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<Vec<usize>, DeviceSizin
     for packet in &image.initial_packets {
         counts[packet.flow.0 as usize] = counts[packet.flow.0 as usize].saturating_add(1);
     }
+    let pacing_timer_tokens = image
+        .initial_events
+        .iter()
+        .filter(|event| event.kind == EventKind::PacingTimer)
+        .map(|event| (event.target, event.payload, event.key.time_ns))
+        .collect::<HashSet<_>>();
     for state in &image.host_states {
         for generator in &state.generators {
             let index = generator.flow.0 as usize;
@@ -630,12 +636,11 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<Vec<usize>, DeviceSizin
                 }
                 FlowGeneratorKind::Rate(rate) => {
                     let work = rate_device_work(image, generator, rate)?;
-                    let owns_timer_token = image.initial_events.iter().any(|event| {
-                        event.kind == EventKind::PacingTimer
-                            && event.target == image.flows[index].source
-                            && event.payload == generator.next_emission.payload
-                            && event.key.time_ns == generator.next_emission.departure_time_ns
-                    });
+                    let owns_timer_token = pacing_timer_tokens.contains(&(
+                        image.flows[index].source,
+                        generator.next_emission.payload,
+                        generator.next_emission.departure_time_ns,
+                    ));
                     if owns_timer_token {
                         counts[index] = counts[index].saturating_sub(1);
                     }
@@ -766,6 +771,18 @@ fn packed_tcp_state_words(
     })
 }
 
+pub(crate) fn paced_single_source_queue_bound(
+    packet_count: usize,
+    emission_interval_ns: u64,
+    serialization_ns: u64,
+) -> usize {
+    if emission_interval_ns >= serialization_ns {
+        packet_count.min(1)
+    } else {
+        packet_count
+    }
+}
+
 fn source_queue_bounds(
     image: &SimulationImage,
     packet_counts: &[usize],
@@ -860,11 +877,8 @@ fn source_queue_bounds(
             let link = image.links[first_link.0 as usize];
             let serialization = serialization_time_ns(constant.packet_size_bytes, link.rate_bps)
                 .map_err(|error| sizing_error(format!("source serialization failed: {error}")))?;
-            let paced = if constant.interval_ns >= serialization {
-                packet_count.min(1)
-            } else {
-                packet_count
-            };
+            let paced =
+                paced_single_source_queue_bound(packet_count, constant.interval_ns, serialization);
             Ok(if paced == packet_count {
                 packet_count
             } else {
@@ -1306,4 +1320,16 @@ fn checked_product(left: usize, right: usize, label: &str) -> Result<usize, Devi
 
 fn sizing_error(message: impl Into<String>) -> DeviceSizingError {
     DeviceSizingError(message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::paced_single_source_queue_bound;
+
+    #[test]
+    fn paced_single_source_queue_bound_pins_service_rate_contract() {
+        assert_eq!(paced_single_source_queue_bound(65_536, 21, 21), 1);
+        assert_eq!(paced_single_source_queue_bound(65_536, 22, 21), 1);
+        assert_eq!(paced_single_source_queue_bound(65_536, 20, 21), 65_536);
+    }
 }

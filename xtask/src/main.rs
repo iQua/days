@@ -27,14 +27,26 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "cuda.rs",
         predicate: r#"feature = "cuda-test-hooks""#,
-        count: 10,
-        purpose: "CUDA-only fault injection and capacity test hooks; no protocol selection",
+        count: 11,
+        purpose: "CUDA-only fault injection, capacity, and planner measurement hooks",
     },
     AllowedFeatureGate {
         path: "metal.rs",
         predicate: r#"feature = "metal-test-hooks""#,
-        count: 4,
-        purpose: "Metal-only panic and fault-injection test hooks; no protocol selection",
+        count: 5,
+        purpose: "Metal-only panic, fault-injection, and planner measurement hooks",
+    },
+    AllowedFeatureGate {
+        path: "cuda.rs",
+        predicate: r#"feature = "planner-test-hooks""#,
+        count: 1,
+        purpose: "CUDA host-plan equality hook is enabled by the standard test feature",
+    },
+    AllowedFeatureGate {
+        path: "metal.rs",
+        predicate: r#"feature = "planner-test-hooks""#,
+        count: 1,
+        purpose: "Metal host-plan equality hook is enabled by the standard test feature",
     },
     AllowedFeatureGate {
         path: "device_capacity.rs",
@@ -65,6 +77,72 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
         predicate: r#"not(any(feature = "cuda", all(feature = "metal-spike", target_vendor = "apple")))"#,
         count: 1,
         purpose: "suppress dead-code warnings when neither device toolchain backend is built",
+    },
+    AllowedFeatureGate {
+        path: "lib.rs",
+        predicate: r#"any(feature = "cuda", all(feature = "metal-spike", target_vendor = "apple"))"#,
+        count: 1,
+        purpose: "shared planner lookup tables exist only when a device planner is built",
+    },
+    AllowedFeatureGate {
+        path: "lib.rs",
+        predicate: r#"feature = "cuda-test-hooks""#,
+        count: 1,
+        purpose: "CUDA planner measurement hook is exported only for dedicated test tools",
+    },
+    AllowedFeatureGate {
+        path: "lib.rs",
+        predicate: r#"all(feature = "metal-test-hooks", target_vendor = "apple")"#,
+        count: 1,
+        purpose: "Metal planner measurement hook requires dedicated test tools and Apple Metal",
+    },
+    AllowedFeatureGate {
+        path: "lib.rs",
+        predicate: r#"all(feature = "cuda", feature = "planner-test-hooks")"#,
+        count: 1,
+        purpose: "CUDA full-plan equality hook requires the backend and standard test helpers",
+    },
+    AllowedFeatureGate {
+        path: "lib.rs",
+        predicate: r#"all(feature = "metal-spike", feature = "planner-test-hooks", target_vendor = "apple")"#,
+        count: 1,
+        purpose: "Metal full-plan equality hook requires standard test helpers and Apple Metal",
+    },
+    AllowedFeatureGate {
+        path: "planner_capacity.rs",
+        predicate: r#"feature = "cuda""#,
+        count: 6,
+        purpose: "CUDA-only MSS and TCP segment-capacity lookup behavior",
+    },
+    AllowedFeatureGate {
+        path: "planner_capacity.rs",
+        predicate: r#"all(feature = "metal-spike", target_vendor = "apple")"#,
+        count: 5,
+        purpose: "Metal-only one-byte TCP minimum behavior",
+    },
+    AllowedFeatureGate {
+        path: "planner_capacity.rs",
+        predicate: r#"any(test, feature = "planner-test-hooks")"#,
+        count: 13,
+        purpose: "legacy quadratic helpers exist only for unit and standard full-plan equality tests",
+    },
+    AllowedFeatureGate {
+        path: "planner_capacity.rs",
+        predicate: r#"any(debug_assertions, test, feature = "planner-test-hooks")"#,
+        count: 1,
+        purpose: "legacy minimum scan supports sampled debug checks and equality tests",
+    },
+    AllowedFeatureGate {
+        path: "planner_capacity.rs",
+        predicate: r#"all(feature = "cuda", any(test, feature = "planner-test-hooks"))"#,
+        count: 1,
+        purpose: "CUDA equality tests compare TCP segment-capacity lookup values",
+    },
+    AllowedFeatureGate {
+        path: "planner_capacity.rs",
+        predicate: r#"all(not(feature = "cuda"), any(test, feature = "planner-test-hooks"))"#,
+        count: 1,
+        purpose: "non-CUDA equality tests omit CUDA-only TCP segment capacity",
     },
 ];
 
