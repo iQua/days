@@ -10,6 +10,12 @@ categories = ["simulation", "science"]
 license = "AGPL-3.0-only"
 edition = "2021"
 
+[[bin]]
+name = "t20b3_queue_bytes"
+path = "src/bin/t20b3_queue_bytes.rs"
+test = false
+bench = false
+
 [workspace]
 members = ["executor", "legacy", "validation", "xtask"]
 resolver = "2"
