@@ -536,7 +536,7 @@ impl Default for CudaConfig {
             streams_enabled: true,
             capacity_caps: DeviceCapacityCaps::default(),
             capacity_floors: DeviceCapacityFloors::default(),
-            max_capacity_retries: 8,
+            max_capacity_retries: 16,
             max_fel_events_per_lp: None,
             max_channel_events_per_stream: None,
             max_queue_packets_per_lp: None,
@@ -887,7 +887,23 @@ impl CudaExecutor {
                             demand,
                         });
                     }
-                    let grown_capacity = crate::device_capacity::grown_capacity(capacity, demand);
+                    let grown_capacity = match arena {
+                        CudaArena::TcpReceiverRanges => {
+                            crate::device_capacity::grown_capacity_with_slack(
+                                capacity,
+                                demand,
+                                crate::device_capacity::TCP_RECEIVER_RETRY_SLACK,
+                            )
+                        }
+                        CudaArena::TcpSegmentLedger => {
+                            crate::device_capacity::grown_capacity_with_slack(
+                                capacity,
+                                demand,
+                                crate::device_capacity::TCP_LEDGER_RETRY_SLACK,
+                            )
+                        }
+                        _ => crate::device_capacity::grown_capacity(capacity, demand),
+                    };
                     if grown_capacity <= capacity {
                         return Err(CudaError::CapacityExceeded {
                             arena,
@@ -963,7 +979,23 @@ impl CudaExecutor {
                             demand,
                         });
                     }
-                    let grown_capacity = crate::device_capacity::grown_capacity(capacity, demand);
+                    let grown_capacity = match arena {
+                        CudaArena::TcpReceiverRanges => {
+                            crate::device_capacity::grown_capacity_with_slack(
+                                capacity,
+                                demand,
+                                crate::device_capacity::TCP_RECEIVER_RETRY_SLACK,
+                            )
+                        }
+                        CudaArena::TcpSegmentLedger => {
+                            crate::device_capacity::grown_capacity_with_slack(
+                                capacity,
+                                demand,
+                                crate::device_capacity::TCP_LEDGER_RETRY_SLACK,
+                            )
+                        }
+                        _ => crate::device_capacity::grown_capacity(capacity, demand),
+                    };
                     if grown_capacity <= capacity {
                         return Err(CudaError::CapacityExceeded {
                             arena,

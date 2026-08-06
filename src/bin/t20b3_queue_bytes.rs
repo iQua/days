@@ -92,7 +92,7 @@ struct Cli {
     #[arg(long)]
     max_fel_events_per_lp: Option<usize>,
     /// Capacity retry budget; zero proves that the selected sizing is single-shot sufficient.
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 16)]
     max_capacity_retries: usize,
 }
 

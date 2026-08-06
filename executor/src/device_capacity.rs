@@ -63,6 +63,17 @@ pub struct CapacityRetryRecord<A> {
 }
 
 #[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+pub(crate) const TCP_RECEIVER_RETRY_SLACK: usize = 64;
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+pub(crate) const TCP_LEDGER_RETRY_SLACK: usize = 256;
+
+#[cfg(any(
     test,
     feature = "cuda",
     all(feature = "metal-spike", target_vendor = "apple")
@@ -70,6 +81,15 @@ pub struct CapacityRetryRecord<A> {
 pub(crate) fn grown_capacity(capacity: usize, demand: usize) -> usize {
     let basis = demand.max(capacity.saturating_add(1));
     basis.saturating_mul(2).max(basis)
+}
+
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+pub(crate) fn grown_capacity_with_slack(capacity: usize, demand: usize, slack: usize) -> usize {
+    demand.max(capacity.saturating_add(1)).saturating_add(slack)
 }
 
 #[cfg(any(
@@ -177,7 +197,8 @@ pub(crate) fn bound_derived_capacity_for_class(
 mod tests {
     use super::{
         bound_derived_capacity, bound_derived_capacity_for_class, cap_derived_capacity,
-        grown_capacity, raise_cap_or_class_floor, raise_cap_or_floor, raise_override_cap_or_floor,
+        grown_capacity, grown_capacity_with_slack, raise_cap_or_class_floor, raise_cap_or_floor,
+        raise_override_cap_or_floor,
     };
 
     #[test]
@@ -215,6 +236,15 @@ mod tests {
         assert_eq!(grown_capacity(8, 9), 18);
         assert_eq!(grown_capacity(8, 12), 24);
         assert_eq!(grown_capacity(usize::MAX, usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn reported_demand_supports_tight_additive_retry_slack() {
+        assert_eq!(grown_capacity_with_slack(4_096, 4_097, 256), 4_353);
+        assert_eq!(
+            grown_capacity_with_slack(usize::MAX, usize::MAX, 256),
+            usize::MAX
+        );
     }
 
     #[test]
