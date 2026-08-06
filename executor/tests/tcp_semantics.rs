@@ -14,6 +14,10 @@ use days_executor::{
 };
 #[cfg(feature = "cuda")]
 use days_executor::{CudaConfig, run_cuda_with_observations};
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+use days_executor::{
+    DeviceCapacityCaps, MetalArena, MetalConfig, MetalError, run_metal_with_observations,
+};
 #[cfg(any(
     feature = "cuda",
     all(feature = "metal-spike", target_vendor = "apple")
@@ -21,8 +25,6 @@ use days_executor::{CudaConfig, run_cuda_with_observations};
 use days_executor::{
     DropMarkPolicy, EcnThresholdPolicy, MechanismTransitionRecord, QueueDepthUnit, RunResult,
 };
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-use days_executor::{MetalConfig, run_metal_with_observations};
 
 const SOURCE: NodeId = NodeId(0);
 const SINK: NodeId = NodeId(1);
@@ -1186,6 +1188,71 @@ fn metal_tcp_reno_and_cubic_literal_smoke_is_byte_identical() {
             &format!("Metal {} TCP smoke", control.label()),
         );
     }
+}
+
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[test]
+fn metal_tcp_ledger_capacity_retry_is_typed_and_byte_identical() {
+    let image = tcp_image(TcpCongestionControl::reno(MSS), 2 * MSS);
+    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("scalar TCP ledger retry oracle must run");
+    let capacity_caps = DeviceCapacityCaps {
+        tcp_ledger_segments_per_flow: Some(0),
+        ..DeviceCapacityCaps::default()
+    };
+
+    let strict_error = run_metal_with_observations(
+        &image,
+        None,
+        MetalConfig {
+            capacity_caps,
+            max_capacity_retries: 0,
+            ..MetalConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect_err("under-capped TCP ledger must fail in strict mode");
+    assert_eq!(
+        strict_error,
+        MetalError::CapacityExceeded {
+            arena: MetalArena::TcpSegmentLedger,
+            node: None,
+            flow: Some(FLOW),
+            // The zero cap retains the one segment already resident in the image.
+            capacity: 1,
+            demand: 2,
+        }
+    );
+
+    let recovered = run_metal_with_observations(
+        &image,
+        None,
+        MetalConfig {
+            capacity_caps,
+            ..MetalConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("adaptive TCP ledger growth must restart from the immutable image");
+    assert_device_full_result_eq(
+        &recovered.result,
+        &scalar,
+        "capacity-retried Metal TCP ledger run",
+    );
+
+    let [retry] = recovered.capacity_retry_trace.as_slice() else {
+        panic!(
+            "expected one TCP ledger retry, got {:?}",
+            recovered.capacity_retry_trace
+        );
+    };
+    assert_eq!(retry.retry, 1);
+    assert_eq!(retry.arena, MetalArena::TcpSegmentLedger);
+    assert_eq!(retry.node, None);
+    assert_eq!(retry.flow, Some(FLOW));
+    assert_eq!(retry.capacity, 1);
+    assert_eq!(retry.demand, 2);
+    assert_eq!(retry.grown_capacity, 258);
 }
 
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
