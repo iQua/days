@@ -263,6 +263,15 @@ pub enum ExecutionError {
         parent: EventKey,
         child: EventKey,
     },
+    /// A superseded retransmission timer had no scheduled event to remove.
+    ///
+    /// The live-state contract requires every armed timer to own exactly one pending event, so
+    /// this reports a corrupted future-event index rather than a modelling condition.
+    SupersededTimerMissing {
+        node: NodeId,
+        payload: PayloadId,
+        deadline_ns: u64,
+    },
     Time(TimeError),
 }
 
@@ -493,6 +502,14 @@ impl fmt::Display for ExecutionError {
                     "child key {child:?} does not advance parent {parent:?}"
                 )
             }
+            Self::SupersededTimerMissing {
+                node,
+                payload,
+                deadline_ns,
+            } => write!(
+                formatter,
+                "node {node:?} has no pending retransmission timeout for attempt {payload:?} at {deadline_ns} ns"
+            ),
             Self::Time(error) => error.fmt(formatter),
         }
     }
@@ -534,6 +551,7 @@ pub fn run_scalar_with_observations(
     let mut transitions = TransitionState::new(image, observation_mode)?;
     let mut events = initial_event_queue(image)?;
     let mut children = Vec::new();
+    let mut superseded = Vec::new();
 
     while events.first_key_value().is_some_and(|(key, _)| {
         key.time_ns <= image.stop_time_ns
@@ -543,6 +561,10 @@ pub fn run_scalar_with_observations(
             .pop_first()
             .expect("first_key_value established a pending event");
         transitions.dispatch(event, &mut children)?;
+        transitions.take_superseded_timers(&mut superseded);
+        for timer in superseded.drain(..) {
+            remove_superseded_timer(&mut events, timer)?;
+        }
         for child in children.drain(..) {
             if events.insert(child.key, child).is_some() {
                 return Err(ExecutionError::DuplicateEventKey(child.key));
@@ -570,6 +592,72 @@ pub(crate) struct TransitionState<'image> {
     aqm_transitions: Vec<AqmTransitionRecord>,
     mechanism_transitions: Vec<crate::MechanismTransitionRecord>,
     tcp_sent_segments: crate::tcp_ledger::TcpSegmentLedger,
+    /// Retransmission timers superseded by the transition currently in flight.
+    ///
+    /// The transition owns sender state; the event queue is owned by the driving backend. This
+    /// buffer carries the eager-removal obligation across that boundary and is drained by the
+    /// queue owner immediately after every dispatch.
+    superseded_timers: Vec<SupersededTimer>,
+}
+
+/// Identity of a retransmission-timeout event that stopped being a flow's armed timer.
+///
+/// The identity is exactly the tuple the lazy pop-skip used to compare, so eager removal and the
+/// retired recognition classify the same events. `origin_node` equals `target` for every
+/// retransmission timeout, which bounds the ordered-map search to one canonical key range.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SupersededTimer {
+    pub target: NodeId,
+    pub payload: PayloadId,
+    pub deadline_ns: u64,
+}
+
+impl SupersededTimer {
+    /// Returns the inclusive `EventKey` bounds that can hold this timer's event.
+    fn key_bounds(self) -> (EventKey, EventKey) {
+        let lower = EventKey {
+            time_ns: self.deadline_ns,
+            phase: event_phase(EventKind::RetransmissionTimeout),
+            origin_node: self.target,
+            origin_seq: 0,
+        };
+        let upper = EventKey {
+            origin_seq: u64::MAX,
+            ..lower
+        };
+        (lower, upper)
+    }
+
+    /// Returns whether `event` is a candidate carrier of this timer identity.
+    fn matches(self, event: Event) -> bool {
+        event.kind == EventKind::RetransmissionTimeout
+            && event.target == self.target
+            && event.payload == self.payload
+    }
+}
+
+/// Removes the event carrying a superseded timer identity from one ordered future-event map.
+///
+/// The canonical owner of a timer identity is the minimum-`EventKey` event carrying it, which is
+/// also the event the lazy recognition would have consumed first. Removal is therefore exact even
+/// when a legacy image supplied indistinguishable duplicates.
+pub(crate) fn remove_superseded_timer(
+    events: &mut BTreeMap<EventKey, Event>,
+    timer: SupersededTimer,
+) -> Result<Event, ExecutionError> {
+    let (lower, upper) = timer.key_bounds();
+    let key = events
+        .range(lower..=upper)
+        .find(|(_, event)| timer.matches(**event))
+        .map(|(key, _)| *key)
+        .ok_or(ExecutionError::SupersededTimerMissing {
+            node: timer.target,
+            payload: timer.payload,
+            deadline_ns: timer.deadline_ns,
+        })?;
+    Ok(events
+        .remove(&key)
+        .expect("range search established the key"))
 }
 
 #[derive(Clone, Copy)]
@@ -690,6 +778,7 @@ impl<'image> TransitionState<'image> {
             aqm_transitions: Vec::new(),
             mechanism_transitions: Vec::new(),
             tcp_sent_segments,
+            superseded_timers: Vec::new(),
         })
     }
 
@@ -783,7 +872,39 @@ impl<'image> TransitionState<'image> {
             aqm_transitions: Vec::new(),
             mechanism_transitions: Vec::new(),
             tcp_sent_segments,
+            superseded_timers: Vec::new(),
         })
+    }
+
+    /// Records that `timer` stopped being the armed timer of a flow owned by `node`.
+    ///
+    /// Called at every `active_timer` `Some -> None` transition except the one performed by the
+    /// timer's own firing event, which the queue already removed by popping it.
+    fn cancel_superseded_timer(&mut self, node: NodeId, timer: TcpTimerState) {
+        self.superseded_timers.push(SupersededTimer {
+            target: node,
+            payload: timer.attempt,
+            deadline_ns: timer.deadline_ns,
+        });
+    }
+
+    /// Drains the eager-removal obligations produced by the last dispatch.
+    ///
+    /// Queue owners apply these before indexing the transition's children so a re-arm at the same
+    /// deadline cannot collide with the identity it replaced.
+    pub(crate) fn take_superseded_timers(&mut self, sink: &mut Vec<SupersededTimer>) {
+        sink.append(&mut self.superseded_timers);
+    }
+
+    /// Returns whether `key` names an event supplied by the image rather than armed by this run.
+    ///
+    /// Only used by debug assertions guarding the retired lazy timer recognition.
+    #[cfg(debug_assertions)]
+    fn imported_event(&self, key: EventKey) -> bool {
+        self.image
+            .initial_events
+            .iter()
+            .any(|initial| initial.key == key)
     }
 
     pub(crate) fn install_packet(
@@ -2506,6 +2627,7 @@ impl<'image> TransitionState<'image> {
             acknowledged_through,
             transition,
             scheduled_send_pending,
+            superseded_timer,
         ) = {
             let state = self.host_state_mut(node)?;
             let generator = state
@@ -2529,6 +2651,10 @@ impl<'image> TransitionState<'image> {
             let mut retransmit = None;
             let mut fill = false;
             let mut acknowledged_through = None;
+            // Live-state contract (T20g item 2): a timer that stops being the flow's armed timer
+            // stops being pending state. Every `Some -> None` transition below reports the
+            // superseded identity so the queue owner removes its event in this same transition.
+            let mut superseded = None;
             if acknowledgment > tcp.highest_ack {
                 let acknowledged_bytes = acknowledgment - tcp.highest_ack;
                 let flight_before = tcp.bytes_in_flight;
@@ -2556,7 +2682,7 @@ impl<'image> TransitionState<'image> {
                 tcp.highest_ack = acknowledgment;
                 acknowledged_through = Some(acknowledgment);
                 tcp.duplicate_acks = 0;
-                tcp.active_timer = None;
+                superseded = tcp.active_timer.take();
                 if tcp.control.phase() == crate::TcpPhase::FastRecovery
                     && acknowledgment < tcp.recovery_high_sequence
                 {
@@ -2579,7 +2705,7 @@ impl<'image> TransitionState<'image> {
                     tcp.recovery_high_sequence = tcp.next_sequence;
                     tcp.control
                         .set_recovery_high_sequence(tcp.recovery_high_sequence);
-                    tcp.active_timer = None;
+                    superseded = tcp.active_timer.take();
                     retransmit = Some(tcp.highest_ack);
                 } else if tcp.duplicate_acks > 3 {
                     fill = true;
@@ -2605,8 +2731,12 @@ impl<'image> TransitionState<'image> {
                 acknowledged_through,
                 transition,
                 scheduled_send_pending,
+                superseded,
             )
         };
+        if let Some(timer) = superseded_timer {
+            self.cancel_superseded_timer(node.id, timer);
+        }
         if let Some(acknowledgment) = acknowledged_through {
             acknowledge_tcp_segments(&mut self.tcp_sent_segments, packet.flow, acknowledgment)?;
         }
@@ -2678,6 +2808,14 @@ impl<'image> TransitionState<'image> {
             }
         }
         let Some((flow, sequence, transition)) = timed_out else {
+            // Live-state contract (T20g item 2): execution removes a superseded timer event at
+            // the transition that supersedes it, so this lazy recognition is unreachable for any
+            // event this run armed. Only legacy residue imported by the image can reach it.
+            debug_assert!(
+                self.imported_event(event.key),
+                "superseded retransmission timeout {:?} survived its disarm transition",
+                event.key
+            );
             return Ok(());
         };
         if self.observation_mode == ObservationMode::Full {

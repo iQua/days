@@ -749,6 +749,7 @@ impl CpuLp<'_> {
     ) -> Result<(LpRoundWork, Vec<RemoteEnvelope>), ExecutionError> {
         let mut children = Vec::new();
         let mut outbox = Vec::new();
+        let mut superseded = Vec::new();
         let mut events_processed = 0_u64;
         let mut same_time_continuations = 0_u64;
         let mut fallback_classified_pushes = 0_u64;
@@ -789,6 +790,14 @@ impl CpuLp<'_> {
             self.transitions.dispatch(event, &mut children)?;
             if let Some(packet) = preserved_packet {
                 self.transitions.install_packet(packet)?;
+            }
+            // Live-state contract (T20g item 2): a source-owned retransmission timeout targets its
+            // own host, so every superseded timer belongs to this LP's future map and needs no
+            // cross-worker cancellation protocol.
+            self.transitions.take_superseded_timers(&mut superseded);
+            for timer in superseded.drain(..) {
+                debug_assert_eq!(timer.target, self.node.id);
+                crate::scalar::remove_superseded_timer(&mut self.futures, timer)?;
             }
             let direct_child = match children.as_slice() {
                 [child]

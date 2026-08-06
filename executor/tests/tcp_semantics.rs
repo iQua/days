@@ -1382,6 +1382,11 @@ fn stale_different_timer_checkpoint_is_byte_identical_on_all_available_backends(
     }
 }
 
+/// Builds a checkpoint carrying one legacy-residue retransmission timeout.
+///
+/// Execution no longer produces a superseded timer, so the residue is injected the way a legacy
+/// image supplies it: an unowned event whose attempt packet was already reclaimed. Validators must
+/// keep accepting that shape because imported images are not re-derived.
 fn scalar_checkpoint_with_reclaimed_stale_rto_payload(
     exclusive_horizon_ns: u64,
 ) -> SimulationImage {
@@ -1389,25 +1394,66 @@ fn scalar_checkpoint_with_reclaimed_stale_rto_payload(
     let prefix =
         run_scalar_with_observations(&image, Some(exclusive_horizon_ns), ObservationMode::Summary)
             .expect("reviewer scalar prefix must run");
-    let checkpoint = checkpoint_image(&image, &prefix);
-    let missing_rto_payloads = checkpoint
+    let mut checkpoint = checkpoint_image(&image, &prefix);
+    // Live-state contract (T20g item 2): execution leaves no packetless retransmission timeout.
+    assert_eq!(
+        packetless_rto_count(&checkpoint),
+        0,
+        "execution must not retain a superseded RTO after reclaiming its attempt packet"
+    );
+    let live = checkpoint
         .initial_events
         .iter()
-        .filter(|event| {
-            event.kind == EventKind::RetransmissionTimeout
-                && !checkpoint
-                    .initial_packets
-                    .iter()
-                    .any(|packet| packet.id == event.payload)
-        })
-        .count();
+        .copied()
+        .find(|event| event.kind == EventKind::RetransmissionTimeout)
+        .expect("the reviewer prefix checkpoint arms one timer");
+    let state = &mut checkpoint.host_states[SOURCE.0 as usize];
+    let mut residue = live;
+    residue.key.time_ns = live
+        .key
+        .time_ns
+        .checked_sub(1)
+        .expect("the reviewer timer deadline follows time zero");
+    residue.key.origin_seq = state.next_origin_seq;
+    residue.payload = PayloadId(
+        checkpoint
+            .initial_packets
+            .iter()
+            .map(|packet| packet.id.0)
+            .max()
+            .unwrap_or_default()
+            + 1,
+    );
+    state.next_origin_seq = state
+        .next_origin_seq
+        .checked_add(1)
+        .expect("the reviewer checkpoint leaves origin-sequence capacity");
+    checkpoint.initial_events.push(residue);
+    checkpoint
+        .initial_events
+        .sort_unstable_by_key(|event| event.key);
     assert_eq!(
-        missing_rto_payloads, 1,
-        "reviewer checkpoint must retain one stale RTO after reclaiming its attempt packet"
+        packetless_rto_count(&checkpoint),
+        1,
+        "the reviewer checkpoint must carry one packetless legacy residue"
     );
     validate(&checkpoint, Backend::Scalar).expect("Scalar must accept its own checkpoint");
 
     checkpoint
+}
+
+fn packetless_rto_count(image: &SimulationImage) -> usize {
+    image
+        .initial_events
+        .iter()
+        .filter(|event| {
+            event.kind == EventKind::RetransmissionTimeout
+                && !image
+                    .initial_packets
+                    .iter()
+                    .any(|packet| packet.id == event.payload)
+        })
+        .count()
 }
 
 fn validate_stale_rto_checkpoint_on_devices(checkpoint: &SimulationImage, case: &str) {
@@ -2436,7 +2482,7 @@ fn validator_reserves_tcp_rto_deadline_headroom_before_execution() {
 }
 
 #[test]
-fn stale_same_attempt_timers_preserve_checkpoint_closure() {
+fn rearm_trace_checkpoint_keeps_only_the_live_timer_event() {
     let acknowledgments = [0, 0, 0, MSS, 2 * MSS, 2 * MSS, 3 * MSS];
     let mut image = tcp_ack_burst_image(TcpCongestionControl::reno(MSS), 4 * MSS, &acknowledgments);
     let FlowGeneratorKind::Tcp(ref mut tcp) = image.host_states[0].generators[0].kind else {
@@ -2444,11 +2490,10 @@ fn stale_same_attempt_timers_preserve_checkpoint_closure() {
     };
     tcp.timer_generation = u64::MAX - 8;
 
-    validate(&image, Backend::Scalar).expect("reviewer stale-timer probe must validate for Scalar");
-    validate(&image, Backend::Cpu { workers: 2 })
-        .expect("reviewer stale-timer probe must validate for CPU");
+    validate(&image, Backend::Scalar).expect("re-arm trace must validate for Scalar");
+    validate(&image, Backend::Cpu { workers: 2 }).expect("re-arm trace must validate for CPU");
     let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
-        .expect("reviewer stale-timer Scalar run must execute");
+        .expect("re-arm trace Scalar run must execute");
     let cpu = run_cpu_with_observations(
         &image,
         None,
@@ -2458,9 +2503,15 @@ fn stale_same_attempt_timers_preserve_checkpoint_closure() {
         },
         ObservationMode::Full,
     )
-    .expect("reviewer stale-timer CPU run must execute")
+    .expect("re-arm trace CPU run must execute")
     .result;
-    assert_eq!(cpu, scalar, "reviewer stale-timer byte identity");
+    assert_eq!(cpu, scalar, "re-arm trace byte identity");
+    assert_live_timer_closure(
+        &image,
+        &scalar.host_states,
+        &scalar.pending_events,
+        "re-arm trace Scalar result",
+    );
 
     let checkpoint = checkpoint_image(&image, &scalar);
     let FlowGeneratorKind::Tcp(tcp) = checkpoint.host_states[0].generators[0].kind else {
@@ -2468,7 +2519,9 @@ fn stale_same_attempt_timers_preserve_checkpoint_closure() {
     };
     let timer = tcp
         .active_timer
-        .expect("reviewer checkpoint has a live timer");
+        .expect("re-arm checkpoint has a live timer");
+    // The retired retention contract kept the live timer plus one event per superseded
+    // generation. Under the live-state contract the same trace closes on exactly one.
     assert_eq!(
         checkpoint
             .initial_events
@@ -2480,13 +2533,123 @@ fn stale_same_attempt_timers_preserve_checkpoint_closure() {
                     && event.key.time_ns == timer.deadline_ns
             })
             .count(),
-        3,
-        "reviewer checkpoint must retain the live timer and two stale generations"
+        1,
+        "the re-arm checkpoint must retain only the live timer"
     );
-    validate(&checkpoint, Backend::Scalar)
-        .expect("reviewer stale-timer checkpoint must validate for Scalar");
+    assert_eq!(
+        checkpoint
+            .initial_events
+            .iter()
+            .filter(|event| event.kind == EventKind::RetransmissionTimeout)
+            .count(),
+        1,
+        "the re-arm checkpoint must carry no superseded generation"
+    );
+    validate(&checkpoint, Backend::Scalar).expect("re-arm checkpoint must validate for Scalar");
     validate(&checkpoint, Backend::Cpu { workers: 2 })
-        .expect("reviewer stale-timer checkpoint must validate for CPU");
+        .expect("re-arm checkpoint must validate for CPU");
+}
+
+/// Asserts the T20g live-state contract on one run result.
+///
+/// Every pending `RetransmissionTimeout` must be the currently armed timer of exactly one source
+/// generator, and every armed timer must own exactly one pending event. This is the replacement
+/// for the retired retention assertions: it fails both on a leaked superseded generation and on an
+/// over-eager removal that drops a live timer.
+fn assert_live_timer_closure(
+    image: &SimulationImage,
+    host_states: &[HostState],
+    pending_events: &[Event],
+    context: &str,
+) {
+    let mut armed = BTreeMap::new();
+    for node in image
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::Host)
+    {
+        for generator in &host_states[node.state_slot as usize].generators {
+            let FlowGeneratorKind::Tcp(tcp) = generator.kind else {
+                continue;
+            };
+            if let Some(timer) = tcp.active_timer {
+                assert!(
+                    armed.insert((node.id, generator.flow), timer).is_none(),
+                    "{context}: flow {:?} is armed twice",
+                    generator.flow
+                );
+            }
+        }
+    }
+    let mut owned = BTreeMap::new();
+    for event in pending_events
+        .iter()
+        .filter(|event| event.kind == EventKind::RetransmissionTimeout)
+    {
+        let Some((owner, _)) = armed.iter().find(|((node, _), timer)| {
+            *node == event.target
+                && timer.attempt == event.payload
+                && timer.deadline_ns == event.key.time_ns
+        }) else {
+            panic!(
+                "{context}: pending timeout {:?} is not the armed timer of any flow",
+                event.key
+            );
+        };
+        assert!(
+            owned.insert(*owner, event.key).is_none(),
+            "{context}: {owner:?} owns more than one pending retransmission timeout"
+        );
+    }
+    assert_eq!(
+        owned.len(),
+        armed.len(),
+        "{context}: every armed timer must own exactly one pending event"
+    );
+}
+
+#[test]
+fn armed_timers_own_exactly_one_pending_event_on_every_host_backend() {
+    let mut checked = 0_usize;
+    for control in [
+        TcpCongestionControl::reno(MSS),
+        TcpCongestionControl::cubic(MSS),
+    ] {
+        let burst = tcp_ack_burst_image(control, 4 * MSS, &[0, 0, 0, MSS, 2 * MSS, 2 * MSS]);
+        let switched = switched_tcp_image(control, SchedulerKind::Fifo, 1);
+        for (label, image) in [("ack burst", burst), ("switched", switched)] {
+            for horizon_ns in [None, Some(911), Some(1_272), Some(10_000), Some(4_000_000)] {
+                let scalar =
+                    run_scalar_with_observations(&image, horizon_ns, ObservationMode::Full)
+                        .expect("live-timer closure Scalar run must execute");
+                let context = format!("{label} at horizon {horizon_ns:?}");
+                assert_live_timer_closure(
+                    &image,
+                    &scalar.host_states,
+                    &scalar.pending_events,
+                    &context,
+                );
+                let rounds =
+                    run_scalar_rounds_with_observations(&image, horizon_ns, ObservationMode::Full)
+                        .expect("live-timer closure round run must execute");
+                assert_eq!(rounds.result, scalar, "{context}: safe-horizon identity");
+                let cpu = run_cpu_with_observations(
+                    &image,
+                    horizon_ns,
+                    CpuConfig {
+                        workers: 2,
+                        ..CpuConfig::default()
+                    },
+                    ObservationMode::Full,
+                )
+                .expect("live-timer closure CPU run must execute")
+                .result;
+                assert_eq!(cpu, scalar, "{context}: CPU identity");
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, 20, "the closure matrix must stay complete");
 }
 
 #[test]

@@ -678,6 +678,7 @@ impl<'image> RoundExecutor<'image> {
         let mut same_time_continuations = 0_u64;
         let mut fallback_classified_pushes = 0_u64;
         let mut outbox = Vec::new();
+        let mut superseded = Vec::new();
         let mut continuation = None;
         #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
         let pending_events_below_horizon = if capture_replay {
@@ -721,6 +722,17 @@ impl<'image> RoundExecutor<'image> {
                 None
             };
             self.transitions.dispatch(event, children)?;
+            // Live-state contract (T20g item 2): a source-owned retransmission timeout targets its
+            // own host, so eager removal stays inside this LP's future map and its pending-key
+            // index. `update_frontier` after the drain republishes the LP minimum.
+            self.transitions.take_superseded_timers(&mut superseded);
+            for timer in superseded.drain(..) {
+                debug_assert_eq!(timer.target, node);
+                let removed =
+                    crate::scalar::remove_superseded_timer(&mut self.futures[lp_slot], timer)?;
+                let tracked = self.pending_keys.remove(&removed.key);
+                debug_assert!(tracked, "a pending event must own a pending key");
+            }
             let direct_child = match children.as_slice() {
                 [child]
                     if is_same_time_tx_ready_continuation(
