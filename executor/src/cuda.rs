@@ -1710,8 +1710,12 @@ impl CudaPlan {
             );
             legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(4);
             if capacity_context.tcp_generator(image, flow_index).is_some() {
-                // Timeout events are intentionally heap-class. Stale timers can coexist with the
-                // active timer, so reserve one slot per bounded sender attempt.
+                // Timeout events are intentionally heap-class. Under the live-state contract
+                // (Mechanism API errata E5) a superseded timeout is removed at the invalidating
+                // edge and disarm precedes re-arm inside one transition, so a source-owned flow
+                // holds at most one live timer record. Do not restore a per-attempt reservation:
+                // imported timeouts that no armed timer owns are covered by the separate
+                // initial-event floor in `device_sizing`.
                 legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(
                     capacity_context.tcp_fallback_timer_bound(image, flow_index, data_count),
                 );

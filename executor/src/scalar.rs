@@ -155,7 +155,14 @@ pub struct RunResult {
     pub arrivals: Vec<PacketArrivalObservation>,
     /// Reference-lane diagnostics, present only for scalar/CPU full observation.
     pub diagnostics: Option<DiagnosticPlanes>,
-    /// Unprocessed events in canonical `EventKey` order.
+    /// Live unprocessed events in canonical `EventKey` order.
+    ///
+    /// Live, not retained: a retransmission timeout that stops being its flow's armed timer stops
+    /// being pending state and is removed from the future-event list inside the transition that
+    /// supersedes it, on every backend, so it is absent here even though its historical deadline
+    /// has not passed. Imported timeouts that no armed timer owns are the exception — validation
+    /// accepts them and they stay schedulable until they fire. Mechanism API errata E5
+    /// (`days-gpu/plans/mechanism-api-v1.md`).
     pub pending_events: Vec<Event>,
 }
 
