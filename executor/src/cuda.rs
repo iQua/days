@@ -1043,7 +1043,7 @@ pub fn assert_cuda_planner_bit_equal_for_testing(
         image,
         &data_counts,
         lookahead,
-        TcpMinimumPacketSize::MaximumSegmentSize,
+        TcpMinimumPacketSize::One,
     ) {
         return Err(CudaError::Validation(
             "linear lookup tables differ from the legacy helpers".into(),
@@ -1457,7 +1457,7 @@ impl CudaPlan {
             image,
             &flow_data_counts,
             minimum_lookahead_ns,
-            TcpMinimumPacketSize::MaximumSegmentSize,
+            TcpMinimumPacketSize::One,
             capacity_mode,
         );
         let initial_by_payload = image

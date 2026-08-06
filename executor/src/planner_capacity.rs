@@ -9,20 +9,22 @@ use crate::{
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TcpMinimumPacketSize {
-    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    #[cfg(any(
+        feature = "cuda",
+        all(feature = "metal-spike", target_vendor = "apple")
+    ))]
     One,
-    #[cfg(feature = "cuda")]
-    MaximumSegmentSize,
 }
 
 impl TcpMinimumPacketSize {
     #[cfg(any(test, feature = "planner-test-hooks"))]
     fn legacy_uses_precomputed_table(self) -> bool {
         match self {
-            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+            #[cfg(any(
+                feature = "cuda",
+                all(feature = "metal-spike", target_vendor = "apple")
+            ))]
             Self::One => true,
-            #[cfg(feature = "cuda")]
-            Self::MaximumSegmentSize => false,
         }
     }
 }
@@ -120,13 +122,14 @@ impl PlannerCapacityContext {
                 let size = match generator.kind {
                     FlowGeneratorKind::Constant(constant) => constant.packet_size_bytes,
                     FlowGeneratorKind::Tcp(tcp) => match tcp_minimum_packet_size {
-                        #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+                        #[cfg(any(
+                            feature = "cuda",
+                            all(feature = "metal-spike", target_vendor = "apple")
+                        ))]
                         TcpMinimumPacketSize::One => {
                             let _ = tcp;
                             1
                         }
-                        #[cfg(feature = "cuda")]
-                        TcpMinimumPacketSize::MaximumSegmentSize => tcp.mss_bytes,
                     },
                     FlowGeneratorKind::Rate(rate) => rate.packet_size_bytes,
                     FlowGeneratorKind::Collective(collective) => collective.packet_size_bytes,
@@ -575,13 +578,14 @@ fn precompute_minimum_packet_sizes(
         let size = match generator.kind {
             FlowGeneratorKind::Constant(constant) => constant.packet_size_bytes,
             FlowGeneratorKind::Tcp(tcp) => match tcp_minimum_packet_size {
-                #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+                #[cfg(any(
+                    feature = "cuda",
+                    all(feature = "metal-spike", target_vendor = "apple")
+                ))]
                 TcpMinimumPacketSize::One => {
                     let _ = tcp;
                     1
                 }
-                #[cfg(feature = "cuda")]
-                TcpMinimumPacketSize::MaximumSegmentSize => tcp.mss_bytes,
             },
             FlowGeneratorKind::Rate(rate) => rate.packet_size_bytes,
             FlowGeneratorKind::Collective(collective) => collective.packet_size_bytes,
@@ -658,13 +662,14 @@ fn legacy_minimum_packet_size(
                         .map(move |generator| match generator.kind {
                             FlowGeneratorKind::Constant(constant) => constant.packet_size_bytes,
                             FlowGeneratorKind::Tcp(tcp) => match tcp_minimum_packet_size {
-                                #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+                                #[cfg(any(
+                                    feature = "cuda",
+                                    all(feature = "metal-spike", target_vendor = "apple")
+                                ))]
                                 TcpMinimumPacketSize::One => {
                                     let _ = tcp;
                                     1
                                 }
-                                #[cfg(feature = "cuda")]
-                                TcpMinimumPacketSize::MaximumSegmentSize => tcp.mss_bytes,
                             },
                             FlowGeneratorKind::Rate(rate) => rate.packet_size_bytes,
                             FlowGeneratorKind::Collective(collective) => {
@@ -818,11 +823,143 @@ fn legacy_source_queue_packet_bound(
 mod tests {
     use super::{materialize_minimum_packet_sizes, update_minimum_packet_size};
 
+    #[cfg(feature = "cuda")]
+    use std::collections::VecDeque;
+
+    #[cfg(feature = "cuda")]
+    use super::{PlannerCapacityContext, PlannerCapacityMode, TcpMinimumPacketSize};
+    #[cfg(feature = "cuda")]
+    use crate::{
+        FlowDescriptor, FlowGeneratorKind, FlowGeneratorState, FlowId, GeneratorFeedbackState,
+        GeneratorStatus, HostState, LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind,
+        PacketKind, PayloadId, ScheduledEmission, SimulationImage, TcpCongestionControl,
+        TcpGenerator,
+    };
+
     #[test]
     fn packet_size_cache_distinguishes_exact_u64_boundary_from_absence() {
         let mut minimums = [[0, 0]];
         update_minimum_packet_size(&mut minimums[0][0], u64::MAX);
         materialize_minimum_packet_sizes(&mut minimums);
         assert_eq!(minimums, [[u64::MAX, 1]]);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn tcp_generator_uses_one_byte_minimum_for_horizon_queue_sizing() {
+        const MSS_BYTES: u64 = 1_000;
+        const PACKET_COUNT: usize = 100;
+        const LOOKAHEAD_NS: u64 = 64;
+
+        let link = LinkDescriptor {
+            id: LinkId(0),
+            source: NodeId(0),
+            target: NodeId(1),
+            rate_bps: 8_000_000_000,
+            propagation_ns: 0,
+        };
+        let empty_host = || HostState {
+            egress_link: link.id,
+            queue: VecDeque::new(),
+            in_service: None,
+            tx_ready_pending: false,
+            generators: vec![],
+            tcp_receivers: vec![],
+            dcqcn_receivers: vec![],
+            next_origin_seq: 0,
+            next_payload_seq: 0,
+            sourced_packets: 0,
+            departed_packets: 0,
+            received_packets: 0,
+        };
+        let mut source = empty_host();
+        source.generators.push(FlowGeneratorState {
+            flow: FlowId(0),
+            packets_emitted: 0,
+            bytes_emitted: 0,
+            next_emission: ScheduledEmission {
+                status: GeneratorStatus::Scheduled,
+                departure_time_ns: 0,
+                payload: PayloadId(0),
+            },
+            rng_state: 1,
+            feedback: GeneratorFeedbackState {
+                arrivals: 0,
+                outstanding_bytes: 0,
+                unacknowledged_bytes: 0,
+            },
+            kind: FlowGeneratorKind::Tcp(TcpGenerator::new(
+                99 * MSS_BYTES + 1,
+                MSS_BYTES,
+                40,
+                TcpCongestionControl::reno(MSS_BYTES),
+            )),
+        });
+        let image = SimulationImage {
+            stop_time_ns: 1_000,
+            nodes: vec![
+                NodeDescriptor {
+                    id: NodeId(0),
+                    kind: NodeKind::Host,
+                    state_slot: 0,
+                },
+                NodeDescriptor {
+                    id: NodeId(1),
+                    kind: NodeKind::Host,
+                    state_slot: 1,
+                },
+            ],
+            host_states: vec![source, empty_host()],
+            switch_states: vec![],
+            flows: vec![FlowDescriptor {
+                id: FlowId(0),
+                source: NodeId(0),
+                target: NodeId(1),
+                priority: 0,
+                route: vec![link.id],
+                reverse_route: vec![],
+            }],
+            initial_packets: vec![],
+            links: vec![link],
+            channels: vec![],
+            initial_events: vec![],
+            seed: 1,
+        };
+        let context = PlannerCapacityContext::new(
+            &image,
+            &[PACKET_COUNT],
+            Some(LOOKAHEAD_NS),
+            TcpMinimumPacketSize::One,
+            PlannerCapacityMode::Precomputed,
+        );
+
+        assert_eq!(context.minimum_packet_size(&image, 0, PacketKind::Data), 1);
+        let one_byte_serialization = crate::time::serialization_time_ns(1, link.rate_bps).unwrap();
+        let mss_serialization =
+            crate::time::serialization_time_ns(MSS_BYTES, link.rate_bps).unwrap();
+        let expected = crate::device_sizing::horizon_queue_packet_bound(
+            PACKET_COUNT,
+            Some(LOOKAHEAD_NS),
+            one_byte_serialization,
+            link.propagation_ns,
+        );
+        let unsafe_mss_bound = crate::device_sizing::horizon_queue_packet_bound(
+            PACKET_COUNT,
+            Some(LOOKAHEAD_NS),
+            mss_serialization,
+            link.propagation_ns,
+        );
+        assert_ne!(expected, unsafe_mss_bound);
+        assert_eq!(
+            context.horizon_queue_packet_bound(
+                &image,
+                0,
+                PACKET_COUNT,
+                PacketKind::Data,
+                link,
+                Some(LOOKAHEAD_NS),
+            ),
+            expected
+        );
     }
 }
