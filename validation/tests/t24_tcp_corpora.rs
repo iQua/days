@@ -126,6 +126,8 @@ struct Corpus {
     algorithm: &'static str,
 }
 
+/// Formal k16/k32 ladder points, whose manifests are pinned by
+/// `canonical_tcp_corpus_manifests_are_one_flow_per_host_at_k16_and_k32`.
 const CORPORA: [Corpus; 4] = [
     Corpus {
         file: "fattree_k16_tcp_reno_f1024.toml",
@@ -152,6 +154,49 @@ const CORPORA: [Corpus; 4] = [
         algorithm: "CUBIC",
     },
 ];
+
+/// The k4 harness smoke fixture.
+///
+/// It is deliberately not a ladder point (`configs/benchmarks/tcp/t24-corpus-manifest.md`), which
+/// is why it stays out of `CORPORA` and out of the k16/k32 manifest assertions. It is still a real
+/// canonical TCP image, so it is a full member of the lowering and four-backend execution
+/// campaigns below.
+const SMOKE: Corpus = Corpus {
+    file: "fattree_k4_tcp_cubic_f16_smoke.toml",
+    k: 4,
+    hosts: 16,
+    algorithm: "CUBIC",
+};
+
+/// Every corpus the lowering and four-backend byte-identity campaigns execute: the smoke fixture
+/// first, then the ladder. `T24_CORPUS` selects one member of this list by file name.
+const CAMPAIGN_CORPORA: [Corpus; 5] = [SMOKE, CORPORA[0], CORPORA[1], CORPORA[2], CORPORA[3]];
+
+/// Campaign members selected by an optional `T24_CORPUS` file-name filter.
+///
+/// Pure so the selection semantics are testable without mutating process environment.
+fn select_campaign_corpora(filter: Option<&str>) -> Vec<Corpus> {
+    CAMPAIGN_CORPORA
+        .into_iter()
+        .filter(|corpus| filter.is_none_or(|filter| filter == corpus.file))
+        .collect()
+}
+
+/// Campaign members selected by the ambient `T24_CORPUS` filter, guaranteed non-empty.
+///
+/// A filter that matches no campaign member is a harness error, never an empty pass: a campaign
+/// that compares nothing must not be able to report a green row (T20g review round 1, M1).
+fn selected_campaign_corpora() -> Vec<Corpus> {
+    let filter = std::env::var("T24_CORPUS").ok();
+    let selected = select_campaign_corpora(filter.as_deref());
+    assert!(
+        !selected.is_empty(),
+        "T24_CORPUS={} matched no campaign corpus; valid names: {}",
+        filter.as_deref().unwrap_or("<unset>"),
+        CAMPAIGN_CORPORA.map(|corpus| corpus.file).join(", ")
+    );
+    selected
+}
 
 fn path(file: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -296,9 +341,64 @@ fn tcp_smoke_fixture_lowers_and_is_scalar_cpu_byte_identical() {
 }
 
 #[test]
-#[ignore = "explicit T24 k16/k32 corpus lowering; run before device conformance campaigns"]
-fn full_tcp_corpora_lower_to_exact_tcp_images() {
+fn campaign_corpora_cover_the_ladder_and_the_smoke_fixture() {
+    assert_eq!(CAMPAIGN_CORPORA.len(), CORPORA.len() + 1);
     for corpus in CORPORA {
+        assert!(
+            CAMPAIGN_CORPORA
+                .iter()
+                .any(|member| member.file == corpus.file),
+            "ladder corpus {} must be a campaign member",
+            corpus.file
+        );
+    }
+    assert!(
+        CAMPAIGN_CORPORA
+            .iter()
+            .any(|member| member.file == SMOKE.file),
+        "the smoke fixture must be a campaign member"
+    );
+    for corpus in CAMPAIGN_CORPORA {
+        assert!(
+            path(corpus.file).is_file(),
+            "campaign corpus {} must exist on disk",
+            corpus.file
+        );
+    }
+}
+
+#[test]
+fn a_campaign_filter_matching_no_corpus_selects_nothing() {
+    assert_eq!(
+        select_campaign_corpora(None).len(),
+        CAMPAIGN_CORPORA.len(),
+        "an absent filter runs the whole campaign"
+    );
+    assert_eq!(
+        select_campaign_corpora(Some(SMOKE.file))
+            .into_iter()
+            .map(|corpus| corpus.file)
+            .collect::<Vec<_>>(),
+        vec![SMOKE.file],
+        "an exact file name selects exactly that corpus"
+    );
+    for miss in [
+        "fattree_k4_tcp_cubic_f16_smoke",
+        "configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml",
+        "fattree_k8_tcp_reno_f128.toml",
+    ] {
+        assert!(
+            select_campaign_corpora(Some(miss)).is_empty(),
+            "{miss} must not select any corpus"
+        );
+    }
+}
+
+#[test]
+#[ignore = "explicit T24 corpus lowering; run before device conformance campaigns"]
+fn full_tcp_corpora_lower_to_exact_tcp_images() {
+    let mut lowered = Vec::new();
+    for corpus in CAMPAIGN_CORPORA {
         let image = compile_config(path(corpus.file))
             .unwrap_or_else(|error| panic!("{} should lower: {error}", corpus.file));
         assert_eq!(image.flows.len(), corpus.hosts);
@@ -334,16 +434,25 @@ fn full_tcp_corpora_lower_to_exact_tcp_images() {
                 .count(),
             corpus.hosts
         );
+        lowered.push(corpus.file);
     }
+    assert_eq!(
+        lowered,
+        CAMPAIGN_CORPORA
+            .iter()
+            .map(|corpus| corpus.file)
+            .collect::<Vec<_>>(),
+        "every campaign corpus must have lowered"
+    );
 }
 
 #[test]
-#[ignore = "explicit T24 k16/k32 four-backend execution campaign"]
+#[ignore = "explicit T24 four-backend execution campaign"]
 fn full_tcp_corpora_are_byte_identical_across_available_backends() {
-    for corpus in CORPORA {
-        if std::env::var("T24_CORPUS").is_ok_and(|filter| filter != corpus.file) {
-            continue;
-        }
+    let corpora = selected_campaign_corpora();
+    let mut compared = Vec::new();
+    for corpus in corpora.iter().copied() {
+        let mut backends = vec!["scalar"];
         let image = compile_config(path(corpus.file))
             .unwrap_or_else(|error| panic!("{} should lower: {error}", corpus.file));
         let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
@@ -359,6 +468,7 @@ fn full_tcp_corpora_are_byte_identical_across_available_backends() {
         )
         .unwrap_or_else(|error| panic!("{} CPU failed: {error}", corpus.file));
         assert_result_eq(&format!("{} CPU", corpus.file), &cpu.result, &scalar);
+        backends.push("CPU");
 
         #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
         {
@@ -370,6 +480,7 @@ fn full_tcp_corpora_are_byte_identical_across_available_backends() {
             )
             .unwrap_or_else(|error| panic!("{} Metal failed: {error}", corpus.file));
             assert_device_full_result_eq(&format!("{} Metal", corpus.file), &metal.result, &scalar);
+            backends.push("Metal");
         }
 
         #[cfg(feature = "cuda")]
@@ -382,6 +493,36 @@ fn full_tcp_corpora_are_byte_identical_across_available_backends() {
             )
             .unwrap_or_else(|error| panic!("{} CUDA failed: {error}", corpus.file));
             assert_device_full_result_eq(&format!("{} CUDA", corpus.file), &cuda.result, &scalar);
+            backends.push("CUDA");
         }
+
+        // Positive evidence of executed work, so a campaign log can never be read as a green row
+        // for a comparison that did not happen (T20g review round 1, M1).
+        eprintln!(
+            "T24 campaign: {} byte-identical across {} \
+             (flows={} observed_packets={} departures={} arrivals={} pending_events={})",
+            corpus.file,
+            backends.join("/"),
+            image.flows.len(),
+            scalar.observed_packets.len(),
+            scalar.departures.len(),
+            scalar.arrivals.len(),
+            scalar.pending_events.len(),
+        );
+        compared.push(corpus.file);
     }
+    assert_eq!(
+        compared,
+        corpora.iter().map(|corpus| corpus.file).collect::<Vec<_>>(),
+        "every selected corpus must have completed its cross-backend comparison"
+    );
+    assert!(
+        !compared.is_empty(),
+        "the campaign must compare at least one corpus"
+    );
+    eprintln!(
+        "T24 campaign: compared {} corpora: {}",
+        compared.len(),
+        compared.join(", ")
+    );
 }
