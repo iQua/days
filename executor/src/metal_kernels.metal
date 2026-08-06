@@ -468,12 +468,24 @@ inline bool heap_push(
         return false;
     }
     ulong child = count;
+    // A kernel-side timeout push is always the arming transition's new live timer, so it claims
+    // the flow's slot before the sift-up starts repairing positions. The slot must be empty first:
+    // firing clears it and an eager disarm clears it, so a live slot here is a removal the
+    // live-state contract required and some transition did not perform.
+    bool arming_timer =
+        record[E_KIND] == RETRANSMISSION_TIMEOUT && record[PK_FLOW] < params[P_FLOW_COUNT];
+    ulong slot_word = 0;
+    if (arming_timer) {
+        slot_word = tcp_timer_slot_word(record[PK_FLOW], params);
+        if (tcp_state[slot_word] != 0) {
+            set_semantic_error(error, 61, node);
+            return false;
+        }
+    }
     copy_thread_to_device(record, records, offset + child);
     meta[base + 3] = count + 1;
-    // A kernel-side timeout push is always the arming transition's new live timer, so it claims
-    // the flow's slot before the sift-up starts repairing positions.
-    if (record[E_KIND] == RETRANSMISSION_TIMEOUT && record[PK_FLOW] < params[P_FLOW_COUNT]) {
-        tcp_state[tcp_timer_slot_word(record[PK_FLOW], params)] = offset + child + 1;
+    if (arming_timer) {
+        tcp_state[slot_word] = offset + child + 1;
     }
     while (child != 0) {
         ulong parent = (child - 1) / 2;
