@@ -810,6 +810,173 @@ mod tests {
         });
     }
 
+    /// Five nodes in two components, and not a canonical k=2 fat tree, so route selection takes
+    /// the A* fallback and `0 -> 3` has no path at all.
+    fn split_fallback_graph() -> UnGraph<usize, ()> {
+        let mut graph = UnGraph::<usize, ()>::new_undirected();
+        for node in 0..5 {
+            graph.add_node(node);
+        }
+        graph.add_edge(NodeIndex::new(0), NodeIndex::new(1), ());
+        graph.add_edge(NodeIndex::new(1), NodeIndex::new(2), ());
+        graph.add_edge(NodeIndex::new(3), NodeIndex::new(4), ());
+        graph
+    }
+
+    const BUDGETS: [RouteWorkers; 5] = [
+        RouteWorkers::serial(),
+        RouteWorkers::new(2),
+        RouteWorkers::new(3),
+        RouteWorkers::new(7),
+        RouteWorkers::new(MAX_ROUTE_WORKERS),
+    ];
+
+    #[test]
+    fn every_route_worker_budget_selects_the_same_fat_tree_paths() {
+        let graph = canonical_k4_fat_tree();
+        let flows = (0..8_usize)
+            .flat_map(|source| {
+                (0..8_usize)
+                    .filter(move |target| *target != source)
+                    .map(move |target| {
+                        (
+                            source * 8 + target,
+                            NodeIndex::new(source),
+                            NodeIndex::new(target),
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        let serial =
+            compute_shortest_path_route_table_with(&graph, flows.iter().copied(), BUDGETS[0])
+                .expect("canonical fat-tree routes should exist");
+        assert_eq!(serial.len(), flows.len());
+        for workers in BUDGETS {
+            let parallel =
+                compute_shortest_path_route_table_with(&graph, flows.iter().copied(), workers)
+                    .expect("canonical fat-tree routes should exist");
+            assert_eq!(
+                parallel,
+                serial,
+                "a {}-worker scatter must select the same path for every flow",
+                workers.get()
+            );
+        }
+    }
+
+    #[test]
+    fn every_route_worker_budget_selects_the_same_astar_fallback_paths() {
+        let graph = split_fallback_graph();
+        let flows = [
+            (0_usize, NodeIndex::new(0), NodeIndex::new(2)),
+            (1, NodeIndex::new(2), NodeIndex::new(0)),
+            (2, NodeIndex::new(1), NodeIndex::new(2)),
+            (3, NodeIndex::new(3), NodeIndex::new(4)),
+            (4, NodeIndex::new(0), NodeIndex::new(1)),
+        ];
+
+        let serial = compute_shortest_path_route_table_with(&graph, flows, BUDGETS[0])
+            .expect("both components are internally connected");
+        for workers in BUDGETS {
+            let parallel = compute_shortest_path_route_table_with(&graph, flows, workers)
+                .expect("both components are internally connected");
+            assert_eq!(
+                parallel,
+                serial,
+                "a {}-worker scatter must not change the A* fallback selection",
+                workers.get()
+            );
+        }
+    }
+
+    #[test]
+    fn route_table_reports_the_first_failing_submission_position() {
+        let graph = split_fallback_graph();
+        let reachable = (NodeIndex::new(0), NodeIndex::new(2));
+        let unreachable = (NodeIndex::new(0), NodeIndex::new(3));
+
+        // An unreachable flow submitted before a repeated key outranks that key.
+        let unreachable_first = [
+            (10_usize, reachable.0, reachable.1),
+            (11, unreachable.0, unreachable.1),
+            (12, reachable.0, reachable.1),
+            (10, reachable.0, reachable.1),
+        ];
+        // A repeated key submitted before an unreachable flow outranks that flow, and the route
+        // for the repeated position is never requested.
+        let duplicate_first = [
+            (20_usize, reachable.0, reachable.1),
+            (20, reachable.0, reachable.1),
+            (21, unreachable.0, unreachable.1),
+        ];
+        // A position that is both a repeat and unreachable is still reported as a repeat.
+        let duplicate_and_unreachable = [
+            (30_usize, reachable.0, reachable.1),
+            (30, unreachable.0, unreachable.1),
+        ];
+
+        for workers in BUDGETS {
+            assert_eq!(
+                compute_shortest_path_route_table_with(&graph, unreachable_first, workers),
+                Err(RouteTableError::Unreachable(11)),
+                "budget {} must report the earlier unreachable flow",
+                workers.get()
+            );
+            assert_eq!(
+                compute_shortest_path_route_table_with(&graph, duplicate_first, workers),
+                Err(RouteTableError::DuplicateKey(20)),
+                "budget {} must report the earlier repeated key",
+                workers.get()
+            );
+            assert_eq!(
+                compute_shortest_path_route_table_with(&graph, duplicate_and_unreachable, workers),
+                Err(RouteTableError::DuplicateKey(30)),
+                "budget {} must prefer the repeat diagnosis at a shared position",
+                workers.get()
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_flow_list_needs_no_route_worker() {
+        for workers in BUDGETS {
+            let routes = compute_shortest_path_route_table_with(
+                &canonical_k4_fat_tree(),
+                std::iter::empty::<(usize, NodeIndex, NodeIndex)>(),
+                workers,
+            )
+            .expect("an empty submission cannot fail");
+            assert!(routes.is_empty());
+            assert_eq!(route_chunk_count(0, workers), 0);
+        }
+    }
+
+    #[test]
+    fn a_wide_budget_still_classifies_the_topology_once() {
+        let graph = canonical_k4_fat_tree();
+        let flows = (0..8_usize)
+            .map(|target| (target, NodeIndex::new(0), NodeIndex::new(target)))
+            .collect::<Vec<_>>();
+        FAT_TREE_LAYOUT_CHECKS.with(|checks| checks.set(0));
+
+        let routes = compute_shortest_path_route_table_with(
+            &graph,
+            flows,
+            RouteWorkers::new(MAX_ROUTE_WORKERS),
+        )
+        .expect("canonical fat-tree routes should exist");
+
+        assert_eq!(routes.len(), 8);
+        FAT_TREE_LAYOUT_CHECKS.with(|checks| {
+            assert_eq!(
+                checks.get(),
+                1,
+                "the scatter must reuse the one classification taken on the submitting thread"
+            );
+        });
+    }
+
     #[test]
     fn classified_fat_tree_route_table_preserves_one_off_route_selection() {
         let graph = canonical_k4_fat_tree();
