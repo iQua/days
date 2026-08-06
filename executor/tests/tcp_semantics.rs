@@ -1218,6 +1218,7 @@ fn metal_tcp_ledger_capacity_retry_is_typed_and_byte_identical() {
             arena: MetalArena::TcpSegmentLedger,
             node: None,
             flow: Some(FLOW),
+            stream: None,
             // The zero cap retains the one segment already resident in the image.
             capacity: 1,
             demand: 2,

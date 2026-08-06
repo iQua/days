@@ -954,7 +954,7 @@ fn cuda_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
         ),
     ];
 
-    for (config, observation_mode, arena, node, capacity, demand) in cases {
+    for (config, observation_mode, arena, expected_node, capacity, demand) in cases {
         let error = executor
             .run_with_observations(&image, None, config, observation_mode)
             .unwrap_err();
@@ -962,8 +962,11 @@ fn cuda_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             error,
             CudaError::CapacityExceeded {
                 arena,
-                node,
+                node: (arena != CudaArena::ChannelInbox)
+                    .then_some(expected_node)
+                    .flatten(),
                 flow: None,
+                stream: (arena == CudaArena::ChannelInbox).then_some(0),
                 capacity,
                 demand,
             }

@@ -5,13 +5,13 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use days_executor::{
-    ArrivalDisposition, Backend, ConstantGenerator, Event, EventKey, EventKind, FlowDescriptor,
-    FlowGeneratorKind, FlowGeneratorState, FlowId, GeneratorFeedbackState, GeneratorStatus,
-    GeneratorTermination, HostState, LinkDescriptor, LinkId, MetalArena, MetalConfig, MetalError,
-    MetalExecutor, NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketDescriptor, PacketKind,
-    PayloadId, RemoteChannel, RunResult, ScheduledEmission, SchedulerKind, SimulationImage,
-    SwitchQueueState, SwitchState, event_phase, run_metal, run_metal_with_observations,
-    run_scalar_with_observations, validate,
+    ArrivalDisposition, Backend, ChannelStreamCapacityLevel, ConstantGenerator, Event, EventKey,
+    EventKind, FlowDescriptor, FlowGeneratorKind, FlowGeneratorState, FlowId,
+    GeneratorFeedbackState, GeneratorStatus, GeneratorTermination, HostState, LinkDescriptor,
+    LinkId, MetalArena, MetalConfig, MetalError, MetalExecutor, NodeDescriptor, NodeId, NodeKind,
+    ObservationMode, PacketDescriptor, PacketKind, PayloadId, RemoteChannel, RunResult,
+    ScheduledEmission, SchedulerKind, SimulationImage, SwitchQueueState, SwitchState, event_phase,
+    run_metal, run_metal_with_observations, run_scalar_with_observations, validate,
 };
 
 const GENERATOR_SOURCE: NodeId = NodeId(0);
@@ -1155,6 +1155,7 @@ fn metal_equal_rate_paced_source_queue_bound_is_tight() {
             arena: MetalArena::Queue,
             node: Some(GENERATOR_SOURCE),
             flow: None,
+            stream: None,
             capacity: 0,
             demand: 1,
         }
@@ -1455,6 +1456,7 @@ fn metal_global_outbox_capacity_faults_identically_in_both_stream_modes() {
                 arena: MetalArena::Outbox,
                 node: None,
                 flow: None,
+                stream: None,
                 capacity: 2,
                 demand: 3,
             }
@@ -1506,6 +1508,7 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             arena: MetalArena::Fel,
             node: Some(GENERATOR_SOURCE),
             flow: None,
+            stream: None,
             capacity: 1,
             demand: 2,
         }
@@ -1534,8 +1537,9 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
         channel_stream,
         MetalError::CapacityExceeded {
             arena: MetalArena::ChannelInbox,
-            node: Some(GENERATOR_SINK),
+            node: None,
             flow: None,
+            stream: Some(0),
             capacity: 0,
             demand: 1,
         }
@@ -1569,6 +1573,7 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             arena: MetalArena::Outbox,
             node: None,
             flow: None,
+            stream: None,
             capacity: 0,
             demand: 1,
         }
@@ -1600,6 +1605,7 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             arena: MetalArena::ObservedPackets,
             node: Some(GENERATOR_SOURCE),
             flow: None,
+            stream: None,
             capacity: 0,
             demand: 1,
         }
@@ -1611,6 +1617,100 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             .result,
         &expected,
         "Metal run recovered after observation fault",
+    );
+}
+
+#[test]
+fn metal_channel_retry_grows_only_the_faulting_stream() {
+    let mut image = generator_image(GeneratorTermination::Bytes(4));
+    let reverse = image.links[GENERATOR_REVERSE.0 as usize];
+    image.flows.push(FlowDescriptor {
+        id: FlowId(1),
+        source: GENERATOR_SINK,
+        target: GENERATOR_SOURCE,
+        priority: 0,
+        route: vec![GENERATOR_REVERSE],
+        reverse_route: vec![GENERATOR_FORWARD],
+    });
+    image.initial_packets.push(PacketDescriptor {
+        id: PayloadId(1),
+        flow: FlowId(1),
+        size_bytes: 2,
+        ecn_marked: false,
+        kind: PacketKind::Data,
+    });
+    image.channels.push(
+        RemoteChannel::for_packet_link(reverse, 2).expect("unused reverse channel delay must fit"),
+    );
+    validate(&image, Backend::Metal).expect("two-channel retry fixture must validate");
+    let expected = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("scalar retry oracle must run");
+    let executor = MetalExecutor::new().expect("Metal executor must initialize");
+
+    let strict = executor
+        .run_with_observations(
+            &image,
+            None,
+            MetalConfig {
+                max_channel_events_per_stream: Some(0),
+                max_capacity_retries: 0,
+                ..MetalConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .expect_err("strict mode must retain the exact channel-stream fault");
+    assert_eq!(
+        strict,
+        MetalError::CapacityExceeded {
+            arena: MetalArena::ChannelInbox,
+            node: None,
+            flow: None,
+            stream: Some(0),
+            capacity: 0,
+            demand: 1,
+        }
+    );
+
+    let recovered = executor
+        .run_with_observations(
+            &image,
+            None,
+            MetalConfig {
+                max_channel_events_per_stream: Some(0),
+                max_capacity_retries: 1,
+                ..MetalConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .expect("one targeted channel retry must recover");
+    assert_metal_full_result_matches_scalar(
+        &recovered.result,
+        &expected,
+        "targeted Metal channel retry",
+    );
+    assert_eq!(recovered.capacity_retry_trace.len(), 1);
+    let retry = recovered.capacity_retry_trace[0];
+    assert_eq!(retry.arena, MetalArena::ChannelInbox);
+    assert_eq!(retry.node, None);
+    assert_eq!(retry.flow, None);
+    assert_eq!(retry.stream, Some(0));
+    assert_eq!(
+        (retry.capacity, retry.demand, retry.grown_capacity),
+        (0, 1, 2)
+    );
+    assert_eq!(
+        recovered.channel_stream_capacity_distribution,
+        vec![
+            ChannelStreamCapacityLevel {
+                capacity: 0,
+                stream_count: 1,
+            },
+            ChannelStreamCapacityLevel {
+                capacity: 2,
+                stream_count: 1,
+            },
+        ],
+        "the unused stream must remain byte-unchanged at the zero starting cap",
     );
 }
 
@@ -1668,6 +1768,7 @@ fn metal_device_queue_capacity_fault_is_explicit() {
             arena: MetalArena::Queue,
             node: Some(GENERATOR_SOURCE),
             flow: None,
+            stream: None,
             capacity: 0,
             demand: 1,
         }

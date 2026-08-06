@@ -15,16 +15,21 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use days::scenario::compile_config;
-#[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
-use days_executor::{CudaConfig, assert_cuda_planner_bit_equal_for_testing};
 use days_executor::{
-    DeviceCapacityCaps, Event, EventKey, EventKind, FlowDescriptor, FlowGeneratorKind,
-    FlowGeneratorState, FlowId, GeneratorFeedbackState, GeneratorStatus, HostState, LinkDescriptor,
-    LinkId, NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketDescriptor, PacketKind,
-    PayloadId, RateGenerator, RemoteChannel, ScheduledEmission, SimulationImage, event_phase,
+    ChannelStreamCapacityLevel, DeviceCapacityCaps, DeviceSizingReport, Event, EventKey, EventKind,
+    FlowDescriptor, FlowGeneratorKind, FlowGeneratorState, FlowId, GeneratorFeedbackState,
+    GeneratorStatus, HostState, LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind,
+    ObservationMode, PacketDescriptor, PacketKind, PayloadId, RateGenerator, RemoteChannel,
+    ScheduledEmission, SimulationImage, event_phase,
+};
+#[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
+use days_executor::{
+    CudaConfig, assert_cuda_planner_bit_equal_for_testing, size_cuda_plan_for_testing,
 };
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-use days_executor::{MetalConfig, assert_metal_planner_bit_equal_for_testing};
+use days_executor::{
+    MetalConfig, assert_metal_planner_bit_equal_for_testing, size_metal_plan_for_testing,
+};
 use tempfile::NamedTempFile;
 
 const FIXTURES: &[&str] = &[
@@ -333,6 +338,106 @@ fn device_planners_are_bit_equal_to_legacy_planning_across_fixture_families() {
         true,
         ObservationMode::Full,
         false,
+    );
+}
+
+fn assert_0695_initial_plan(
+    backend: &str,
+    image: &SimulationImage,
+    strict: DeviceSizingReport,
+    retry_enabled: DeviceSizingReport,
+    expected_total_device_bytes: usize,
+) {
+    const EVENT_WORDS_AT_0695F02: usize = 14;
+
+    assert_eq!(
+        retry_enabled, strict,
+        "{backend} retry state must be inert before a fault"
+    );
+    assert_eq!(
+        strict.channel_stream_capacity_distribution,
+        vec![ChannelStreamCapacityLevel {
+            capacity: 2,
+            stream_count: image.channels.len(),
+        }],
+        "the plane-wide cap remains the starting capacity for every stream",
+    );
+    let stream_slots = strict.event_arenas.channel_stream_event_slots
+        + strict.event_arenas.service_stream_event_slots
+        + strict.event_arenas.generator_stream_event_slots;
+    let stream_records = strict
+        .planes
+        .iter()
+        .find(|plane| plane.name == "stream_records")
+        .expect("stream-record plane must exist");
+    assert_eq!(stream_records.words, stream_slots * EVENT_WORDS_AT_0695F02);
+    assert_eq!(strict.total_device_bytes, expected_total_device_bytes);
+}
+
+#[test]
+fn channel_starting_cap_preserves_the_0695f02_initial_plan_bytes() {
+    let image = compile_fixture("configs/benchmarks/baseline/fattree_k4_f8_st.toml");
+    let capacity_caps = DeviceCapacityCaps {
+        channel_events_per_stream: Some(2),
+        ..DeviceCapacityCaps::default()
+    };
+
+    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    assert_0695_initial_plan(
+        "Metal",
+        &image,
+        size_metal_plan_for_testing(
+            &image,
+            None,
+            MetalConfig {
+                capacity_caps,
+                max_capacity_retries: 0,
+                ..MetalConfig::default()
+            },
+            ObservationMode::Summary,
+        )
+        .expect("strict Metal initial capped plan must size"),
+        size_metal_plan_for_testing(
+            &image,
+            None,
+            MetalConfig {
+                capacity_caps,
+                max_capacity_retries: 16,
+                ..MetalConfig::default()
+            },
+            ObservationMode::Summary,
+        )
+        .expect("retry-enabled Metal initial capped plan must size"),
+        1_269_928,
+    );
+
+    #[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
+    assert_0695_initial_plan(
+        "CUDA",
+        &image,
+        size_cuda_plan_for_testing(
+            &image,
+            None,
+            CudaConfig {
+                capacity_caps,
+                max_capacity_retries: 0,
+                ..CudaConfig::default()
+            },
+            ObservationMode::Summary,
+        )
+        .expect("strict CUDA initial capped plan must size"),
+        size_cuda_plan_for_testing(
+            &image,
+            None,
+            CudaConfig {
+                capacity_caps,
+                max_capacity_retries: 16,
+                ..CudaConfig::default()
+            },
+            ObservationMode::Summary,
+        )
+        .expect("retry-enabled CUDA initial capped plan must size"),
+        1_269_904,
     );
 }
 

@@ -1,11 +1,32 @@
 use crate::{FlowId, NodeId};
 
-#[cfg(any(
-    test,
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
 use std::collections::BTreeMap;
+
+/// One level in a deterministic channel-stream capacity histogram.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChannelStreamCapacityLevel {
+    pub capacity: usize,
+    pub stream_count: usize,
+}
+
+pub(crate) fn channel_capacity_distribution(
+    capacities: &[usize],
+) -> Vec<ChannelStreamCapacityLevel> {
+    let mut counts = BTreeMap::<usize, usize>::new();
+    for capacity in capacities {
+        counts
+            .entry(*capacity)
+            .and_modify(|count| *count = count.saturating_add(1))
+            .or_insert(1);
+    }
+    counts
+        .into_iter()
+        .map(|(capacity, stream_count)| ChannelStreamCapacityLevel {
+            capacity,
+            stream_count,
+        })
+        .collect()
+}
 
 /// Optional upper bounds for device arenas whose production defaults are derived from the full
 /// simulation image.
@@ -20,7 +41,8 @@ pub struct DeviceCapacityCaps {
     pub fallback_fel_events_per_lp: Option<usize>,
     /// Maximum queued packet records assigned to one LP.
     pub queue_packets_per_lp: Option<usize>,
-    /// Maximum records assigned to one declared incoming-channel stream.
+    /// Plane-wide starting cap applied independently to each incoming-channel stream. Targeted
+    /// retry floors may raise individual streams after a fault; `None` remains uncapped.
     pub channel_events_per_stream: Option<usize>,
     /// Maximum remote staging records assigned independently to one destination LP.
     pub remote_staging_events_per_lp: Option<usize>,
@@ -49,6 +71,58 @@ pub struct DeviceCapacityFloors {
     pub tcp_ledger_segments_per_flow: usize,
     pub observation_events: usize,
     pub worklist_entries_total: usize,
+}
+
+/// Retry-time channel floors keyed by the immutable channel-stream index in the image.
+///
+/// Channel streams deliberately do not grow by starting-cap class: a capped frontier image puts
+/// almost every stream in the same class, which would recreate the plane-wide allocation this
+/// retry state exists to avoid. The device reports one deterministic stream per failed attempt,
+/// and only that stream receives a higher floor for its replacement plan.
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ChannelCapacityFloors {
+    base_by_stream: Vec<Option<usize>>,
+    capacity_by_stream: BTreeMap<usize, usize>,
+}
+
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+impl ChannelCapacityFloors {
+    pub(crate) fn channel(&mut self, stream: usize, base: usize) -> Option<usize> {
+        if self.base_by_stream.len() <= stream {
+            self.base_by_stream.resize(stream.saturating_add(1), None);
+        }
+        match &mut self.base_by_stream[stream] {
+            Some(recorded) if *recorded != base => None,
+            Some(_) => Some(base.max(self.capacity_by_stream.get(&stream).copied().unwrap_or(0))),
+            slot @ None => {
+                *slot = Some(base);
+                Some(base.max(self.capacity_by_stream.get(&stream).copied().unwrap_or(0)))
+            }
+        }
+    }
+
+    pub(crate) fn raise(&mut self, stream: usize, capacity: usize, grown: usize) -> bool {
+        let Some(base) = self.base_by_stream.get(stream).copied().flatten() else {
+            return false;
+        };
+        if base.max(self.capacity_by_stream.get(&stream).copied().unwrap_or(0)) != capacity {
+            return false;
+        }
+        self.capacity_by_stream
+            .entry(stream)
+            .and_modify(|floor| *floor = (*floor).max(grown))
+            .or_insert(grown);
+        true
+    }
 }
 
 /// Retry-time TCP floors keyed by each row's immutable planned-capacity class.
@@ -142,6 +216,8 @@ pub struct CapacityRetryRecord<A> {
     pub node: Option<NodeId>,
     /// Flow identity for per-flow TCP arenas.
     pub flow: Option<FlowId>,
+    /// Immutable `SimulationImage::channels` index for a channel-inbox stream.
+    pub stream: Option<usize>,
     pub capacity: usize,
     pub demand: usize,
     pub grown_capacity: usize,
@@ -254,9 +330,9 @@ pub(crate) fn bound_derived_capacity(
 #[cfg(test)]
 mod tests {
     use super::{
-        TCP_LEDGER_RETRY_SLACK, TCP_RECEIVER_RETRY_SLACK, TcpCapacityClassFloors,
-        bound_derived_capacity, cap_derived_capacity, grown_capacity, grown_capacity_with_slack,
-        raise_cap_or_floor, raise_override_cap_or_floor,
+        ChannelCapacityFloors, TCP_LEDGER_RETRY_SLACK, TCP_RECEIVER_RETRY_SLACK,
+        TcpCapacityClassFloors, bound_derived_capacity, cap_derived_capacity, grown_capacity,
+        grown_capacity_with_slack, raise_cap_or_floor, raise_override_cap_or_floor,
     };
     use crate::FlowId;
 
@@ -330,6 +406,59 @@ mod tests {
         assert_eq!(floors.receiver(FlowId(9), 64), Some(64));
         assert!(floors.raise_receiver(FlowId(9), 64, 129));
         assert_eq!(floors.receiver(FlowId(9), 64), Some(129));
+    }
+
+    #[test]
+    fn channel_retry_floor_is_deterministic_for_the_fault_sequence() {
+        fn replay(faults: &[(usize, usize)]) -> ChannelCapacityFloors {
+            let bases = [8, 8, 12, 8];
+            let mut floors = ChannelCapacityFloors::default();
+            for &(stream, demand) in faults {
+                let capacity = floors
+                    .channel(stream, bases[stream])
+                    .expect("the stream base must remain stable");
+                let grown = grown_capacity(capacity, demand);
+                assert!(floors.raise(stream, capacity, grown));
+            }
+            floors
+        }
+
+        let faults = [(2, 13), (0, 9), (2, 27), (3, 10)];
+        assert_eq!(replay(&faults), replay(&faults));
+    }
+
+    #[test]
+    fn channel_retry_grows_only_the_faulting_stream() {
+        let bases = [8, 8, 12, 8];
+        let mut floors = ChannelCapacityFloors::default();
+        let before = bases
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(stream, base)| floors.channel(stream, base).unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(floors.raise(1, before[1], 18));
+        let after = bases
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(stream, base)| floors.channel(stream, base).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(before, vec![8, 8, 12, 8]);
+        assert_eq!(after, vec![8, 18, 12, 8]);
+        assert_eq!(&after[..1], &before[..1]);
+        assert_eq!(&after[2..], &before[2..]);
+    }
+
+    #[test]
+    fn channel_retry_rejects_unknown_or_changed_stream_state() {
+        let mut floors = ChannelCapacityFloors::default();
+        assert_eq!(floors.channel(4, 8), Some(8));
+        assert!(!floors.raise(3, 8, 18));
+        assert!(!floors.raise(4, 9, 18));
+        assert_eq!(floors.channel(4, 9), None);
     }
 
     #[test]

@@ -103,21 +103,20 @@ pub struct DeviceSizingReport {
     pub planes: Vec<DevicePlaneSizing>,
     pub total_device_bytes: usize,
     pub event_arenas: DeviceEventArenaSizing,
+    /// Ascending capacity levels for the channel streams represented by this exact plan.
+    pub channel_stream_capacity_distribution: Vec<crate::ChannelStreamCapacityLevel>,
 }
 
 /// Failure to derive an exact device plan size.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceSizingError(String);
 
-#[cfg(any(
-    test,
-    feature = "cuda-test-hooks",
-    all(feature = "metal-test-hooks", target_vendor = "apple")
-))]
+#[cfg(any(test, feature = "planner-test-hooks"))]
 pub(crate) fn exact_plan_report(
     words: [usize; 28],
     tcp_words: usize,
     event_arenas: DeviceEventArenaSizing,
+    channel_stream_capacity_distribution: Vec<crate::ChannelStreamCapacityLevel>,
 ) -> Result<DeviceSizingReport, DeviceSizingError> {
     let mut planes = PLANE_NAMES
         .into_iter()
@@ -147,6 +146,7 @@ pub(crate) fn exact_plan_report(
         planes,
         total_device_bytes,
         event_arenas,
+        channel_stream_capacity_distribution,
     })
 }
 
@@ -558,6 +558,9 @@ pub fn size_default_device_plan(
             stream_arena_bytes,
             legacy_heap_arena_bytes,
         },
+        channel_stream_capacity_distribution: crate::device_capacity::channel_capacity_distribution(
+            &channel_capacities,
+        ),
     })
 }
 
@@ -1655,7 +1658,8 @@ mod tests {
         let mut words = [0_usize; 28];
         words[0] = 20;
         words[12] = 40;
-        let report = exact_plan_report(words, 10, DeviceEventArenaSizing::default()).unwrap();
+        let report =
+            exact_plan_report(words, 10, DeviceEventArenaSizing::default(), Vec::new()).unwrap();
 
         assert_eq!(report.planes.len(), 29);
         assert_eq!(report.planes[12].name, "outbox");

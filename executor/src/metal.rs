@@ -232,6 +232,7 @@ pub enum MetalError {
         arena: MetalArena,
         node: Option<NodeId>,
         flow: Option<FlowId>,
+        stream: Option<usize>,
         capacity: usize,
         demand: usize,
     },
@@ -264,10 +265,16 @@ impl fmt::Display for MetalError {
                 arena,
                 node,
                 flow,
+                stream,
                 capacity,
                 demand,
             } => {
-                if let Some(flow) = flow {
+                if let Some(stream) = stream {
+                    write!(
+                        formatter,
+                        "Metal {arena} capacity of {capacity} records exceeded at stream {stream}; observed demand {demand}"
+                    )
+                } else if let Some(flow) = flow {
                     write!(
                         formatter,
                         "Metal {arena} capacity of {capacity} records exceeded at flow {flow:?}; observed demand {demand}"
@@ -356,13 +363,15 @@ pub struct MetalConfig {
     #[doc(hidden)]
     pub capacity_floors: DeviceCapacityFloors,
     /// Maximum number of all-or-nothing replacement attempts after capacity faults. Zero selects
-    /// strict single-shot execution.
+    /// strict single-shot execution. The deterministic first-writer latch reports one entity per
+    /// failed attempt, so this also bounds how many targeted stream growths can be learned.
     pub max_capacity_retries: usize,
     /// Optional exact per-LP FEL capacity override. Raising the derived default consumes more
     /// device memory; lowering it retains an explicit device capacity fault on overflow.
     pub max_fel_events_per_lp: Option<usize>,
-    /// Optional exact capacity applied independently to every incoming-channel stream. Lowering
-    /// it retains an explicit device capacity fault; it has no effect when streams are disabled.
+    /// Optional exact starting capacity applied independently to every incoming-channel stream.
+    /// Lowering it retains an explicit device capacity fault; targeted retries may raise one
+    /// stream, and it has no effect when streams are disabled.
     pub max_channel_events_per_stream: Option<usize>,
     /// Optional exact per-LP packet-queue capacity override, with the same memory/fault tradeoff.
     pub max_queue_packets_per_lp: Option<usize>,
@@ -418,13 +427,7 @@ impl MetalConfig {
                 );
             }
             MetalArena::ChannelInbox => {
-                crate::device_capacity::raise_override_cap_or_floor(
-                    &mut self.max_channel_events_per_stream,
-                    &mut self.capacity_caps.channel_events_per_stream,
-                    &mut self.capacity_floors.channel_events_per_stream,
-                    capacity,
-                    grown,
-                );
+                unreachable!("channel capacity retries use per-stream floors")
             }
             MetalArena::ServiceStream => {
                 self.capacity_floors.service_events_per_stream =
@@ -514,6 +517,8 @@ pub struct MetalRun {
     pub result: RunResult,
     /// Capacity faults from discarded attempts, in deterministic retry order.
     pub capacity_retry_trace: Vec<CapacityRetryRecord<MetalArena>>,
+    /// Ascending final-plan channel capacity levels after all targeted retries.
+    pub channel_stream_capacity_distribution: Vec<crate::ChannelStreamCapacityLevel>,
     pub rounds: u64,
     pub transitions: u64,
     /// Physical round attempts encoded into submitted command buffers, including termination and
@@ -1131,15 +1136,17 @@ impl MetalExecutor {
 
         let retry_budget = config.max_capacity_retries;
         let mut attempt_config = config;
+        let mut channel_capacity_floors = crate::device_capacity::ChannelCapacityFloors::default();
         let mut tcp_capacity_floors = crate::device_capacity::TcpCapacityClassFloors::default();
         let mut retry_trace = Vec::new();
         loop {
             let attempt = (|| {
-                let plan = MetalPlan::new_with_tcp_capacity_floors(
+                let plan = MetalPlan::new_with_entity_capacity_floors(
                     image,
                     exclusive_horizon_ns,
                     attempt_config,
                     observation_mode,
+                    &mut channel_capacity_floors,
                     &mut tcp_capacity_floors,
                 )?;
                 let buffers = MetalBuffers::new(&self.direct.device, plan)?;
@@ -1155,14 +1162,15 @@ impl MetalExecutor {
                     return Ok(run);
                 }
                 Err(error) => {
-                    let (arena, node, flow, capacity, demand) = match error {
+                    let (arena, node, flow, stream, capacity, demand) = match error {
                         MetalError::CapacityExceeded {
                             arena,
                             node,
                             flow,
+                            stream,
                             capacity,
                             demand,
-                        } => (arena, node, flow, capacity, demand),
+                        } => (arena, node, flow, stream, capacity, demand),
                         error => return Err(error.with_retry_trace(&retry_trace)),
                     };
                     if retry_trace.len() == retry_budget {
@@ -1170,6 +1178,7 @@ impl MetalExecutor {
                             arena,
                             node,
                             flow,
+                            stream,
                             capacity,
                             demand,
                         }
@@ -1197,19 +1206,29 @@ impl MetalExecutor {
                             arena,
                             node,
                             flow,
+                            stream,
                             capacity,
                             demand,
                         }
                         .with_retry_trace(&retry_trace));
                     }
-                    let tcp_class_raised = match (arena, flow) {
-                        (MetalArena::TcpReceiverRanges, Some(flow)) => {
+                    let entity_floor_raised = match (arena, flow, stream) {
+                        (MetalArena::ChannelInbox, None, Some(stream)) => {
+                            channel_capacity_floors.raise(stream, capacity, grown_capacity)
+                        }
+                        (MetalArena::ChannelInbox, _, None) => {
+                            return Err(MetalError::Validation(
+                                "channel capacity fault omitted its stream identity".into(),
+                            )
+                            .with_retry_trace(&retry_trace));
+                        }
+                        (MetalArena::TcpReceiverRanges, Some(flow), None) => {
                             tcp_capacity_floors.raise_receiver(flow, capacity, grown_capacity)
                         }
-                        (MetalArena::TcpSegmentLedger, Some(flow)) => {
+                        (MetalArena::TcpSegmentLedger, Some(flow), None) => {
                             tcp_capacity_floors.raise_ledger(flow, capacity, grown_capacity)
                         }
-                        (MetalArena::TcpReceiverRanges | MetalArena::TcpSegmentLedger, None) => {
+                        (MetalArena::TcpReceiverRanges | MetalArena::TcpSegmentLedger, None, _) => {
                             return Err(MetalError::Validation(
                                 "TCP capacity fault omitted its flow identity".into(),
                             )
@@ -1220,9 +1239,9 @@ impl MetalExecutor {
                             true
                         }
                     };
-                    if !tcp_class_raised {
+                    if !entity_floor_raised {
                         return Err(MetalError::Validation(
-                            "TCP capacity fault did not match its immutable planned class".into(),
+                            "capacity fault did not match its immutable planned entity".into(),
                         )
                         .with_retry_trace(&retry_trace));
                     }
@@ -1231,6 +1250,7 @@ impl MetalExecutor {
                         arena,
                         node,
                         flow,
+                        stream,
                         capacity,
                         demand,
                         grown_capacity,
@@ -1327,7 +1347,7 @@ pub fn measure_metal_planner_for_testing(
 }
 
 /// Returns the exact production-plan plane lengths without creating a Metal device.
-#[cfg(feature = "metal-test-hooks")]
+#[cfg(feature = "planner-test-hooks")]
 #[doc(hidden)]
 pub fn size_metal_plan_for_testing(
     image: &SimulationImage,
@@ -1381,6 +1401,7 @@ pub fn size_metal_plan_for_testing(
             stream_arena_bytes: plan.memory_layout.stream_arena_bytes,
             legacy_heap_arena_bytes: plan.memory_layout.legacy_heap_arena_bytes,
         },
+        plan.channel_stream_capacity_distribution,
     )
     .map_err(|error| MetalError::Validation(error.to_string()))
 }
@@ -1455,6 +1476,7 @@ struct MetalPlan {
     tcp_state: Vec<u64>,
     stream_layout: StreamLayout,
     memory_layout: MetalMemoryLayout,
+    channel_stream_capacity_distribution: Vec<crate::ChannelStreamCapacityLevel>,
     orphan_packets: Vec<PacketDescriptor>,
     round_capacity: usize,
     dispatch_capacity: usize,
@@ -1481,6 +1503,7 @@ struct PreparedStreams {
     records: Vec<u64>,
     layout: StreamLayout,
     memory_layout: MetalMemoryLayout,
+    channel_stream_capacity_distribution: Vec<crate::ChannelStreamCapacityLevel>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1501,21 +1524,24 @@ impl MetalPlan {
         config: MetalConfig,
         observation_mode: ObservationMode,
     ) -> Result<Self, MetalError> {
+        let mut channel_capacity_floors = crate::device_capacity::ChannelCapacityFloors::default();
         let mut tcp_capacity_floors = crate::device_capacity::TcpCapacityClassFloors::default();
-        Self::new_with_tcp_capacity_floors(
+        Self::new_with_entity_capacity_floors(
             image,
             exclusive_horizon_ns,
             config,
             observation_mode,
+            &mut channel_capacity_floors,
             &mut tcp_capacity_floors,
         )
     }
 
-    fn new_with_tcp_capacity_floors(
+    fn new_with_entity_capacity_floors(
         image: &SimulationImage,
         exclusive_horizon_ns: Option<u64>,
         config: MetalConfig,
         observation_mode: ObservationMode,
+        channel_capacity_floors: &mut crate::device_capacity::ChannelCapacityFloors,
         tcp_capacity_floors: &mut crate::device_capacity::TcpCapacityClassFloors,
     ) -> Result<Self, MetalError> {
         Self::new_with_capacity_mode_and_tcp_floors(
@@ -1524,6 +1550,7 @@ impl MetalPlan {
             config,
             observation_mode,
             PlannerCapacityMode::Precomputed,
+            channel_capacity_floors,
             tcp_capacity_floors,
         )
     }
@@ -1536,6 +1563,7 @@ impl MetalPlan {
         observation_mode: ObservationMode,
         capacity_mode: PlannerCapacityMode,
     ) -> Result<Self, MetalError> {
+        let mut channel_capacity_floors = crate::device_capacity::ChannelCapacityFloors::default();
         let mut tcp_capacity_floors = crate::device_capacity::TcpCapacityClassFloors::default();
         Self::new_with_capacity_mode_and_tcp_floors(
             image,
@@ -1543,6 +1571,7 @@ impl MetalPlan {
             config,
             observation_mode,
             capacity_mode,
+            &mut channel_capacity_floors,
             &mut tcp_capacity_floors,
         )
     }
@@ -1553,6 +1582,7 @@ impl MetalPlan {
         config: MetalConfig,
         observation_mode: ObservationMode,
         capacity_mode: PlannerCapacityMode,
+        channel_capacity_floors: &mut crate::device_capacity::ChannelCapacityFloors,
         tcp_capacity_floors: &mut crate::device_capacity::TcpCapacityClassFloors,
     ) -> Result<Self, MetalError> {
         let node_count = image.nodes.len();
@@ -1998,6 +2028,7 @@ impl MetalPlan {
             &fel_meta,
             &fel_records,
             remote_staging_slots,
+            channel_capacity_floors,
         )?;
         let event_bound = derived_transition_bound(image, &flow_packet_counts)?;
         let observation_capacity = if observation_mode == ObservationMode::Full {
@@ -2131,6 +2162,7 @@ impl MetalPlan {
             tcp_state: tcp_state.words,
             stream_layout: streams.layout,
             memory_layout: streams.memory_layout,
+            channel_stream_capacity_distribution: streams.channel_stream_capacity_distribution,
             orphan_packets,
             round_capacity,
             dispatch_capacity,
@@ -2537,6 +2569,7 @@ fn prepare_streams(
     fel_meta: &[u64],
     fel_records: &[u64],
     remote_staging_slots: usize,
+    channel_capacity_floors: &mut crate::device_capacity::ChannelCapacityFloors,
 ) -> Result<PreparedStreams, MetalError> {
     let legacy_heap_event_slots = checked_sum_usize(legacy_fel_caps, "legacy FEL slots")?;
     let fallback_heap_event_slots = checked_sum_usize(fallback_fel_caps, "fallback FEL slots")?;
@@ -2562,6 +2595,7 @@ fn prepare_streams(
                 legacy_heap_arena_bytes,
                 ..MetalMemoryLayout::default()
             },
+            channel_stream_capacity_distribution: Vec::new(),
         });
     }
 
@@ -2593,6 +2627,17 @@ fn prepare_streams(
             );
         }
     }
+    for (stream, capacity) in channel_caps.iter_mut().enumerate() {
+        *capacity = channel_capacity_floors
+            .channel(stream, *capacity)
+            .ok_or_else(|| {
+                MetalError::Validation(format!(
+                    "channel stream {stream} starting capacity changed between retry attempts"
+                ))
+            })?;
+    }
+    let channel_stream_capacity_distribution =
+        crate::device_capacity::channel_capacity_distribution(&channel_caps);
     let service_caps =
         vec![2_usize.max(config.capacity_floors.service_events_per_stream); node_count];
     let generator_caps =
@@ -2710,7 +2755,10 @@ fn prepare_streams(
         let batch = channel_batch_offset + channel * CHANNEL_BATCH_WORDS;
         state[batch + 1] = NONE;
         state[batch + 2] = NONE;
-        state[channel_target_offset + channel] = image.channels[channel].target.0;
+        // The kernel's legacy `P_CHANNEL_TARGET_OFFSET` name is retained for ABI stability. This
+        // diagnostic-only word carries the immutable channel-stream index so host retry can grow
+        // precisely the ring selected by the deterministic exchange-prefix reduction.
+        state[channel_target_offset + channel] = channel as u64;
     }
     state[staging_channel_offset..staging_channel_offset + remote_staging_slots].fill(NONE);
 
@@ -2758,6 +2806,7 @@ fn prepare_streams(
             stream_arena_bytes,
             legacy_heap_arena_bytes,
         },
+        channel_stream_capacity_distribution,
     })
 }
 
@@ -3383,6 +3432,7 @@ fn heap_push_host(
             arena: MetalArena::Fel,
             node: Some(NodeId(lp as u64)),
             flow: None,
+            stream: None,
             capacity,
             demand: count.saturating_add(1),
         });
@@ -3426,6 +3476,7 @@ fn queue_push_host(
             arena: MetalArena::Queue,
             node: Some(NodeId(lp as u64)),
             flow: None,
+            stream: None,
             capacity,
             demand: count.saturating_add(1),
         });
@@ -3603,6 +3654,7 @@ struct MetalBuffers {
     node_count: usize,
     stream_layout: StreamLayout,
     memory_layout: MetalMemoryLayout,
+    channel_stream_capacity_distribution: Vec<crate::ChannelStreamCapacityLevel>,
     round_capacity: usize,
     dispatch_capacity: usize,
 }
@@ -3614,6 +3666,7 @@ impl MetalBuffers {
         let orphan_packets = plan.orphan_packets;
         let stream_layout = plan.stream_layout;
         let memory_layout = plan.memory_layout;
+        let channel_stream_capacity_distribution = plan.channel_stream_capacity_distribution;
         let node_count = plan.params[0] as usize;
         let tcp_state = SharedBuffer::new(device, plan.tcp_state)?;
         let planes = vec![
@@ -3656,6 +3709,7 @@ impl MetalBuffers {
             node_count,
             stream_layout,
             memory_layout,
+            channel_stream_capacity_distribution,
             round_capacity,
             dispatch_capacity,
         })
@@ -4009,6 +4063,7 @@ impl MetalBuffers {
                 pending_events,
             },
             capacity_retry_trace: Vec::new(),
+            channel_stream_capacity_distribution: self.channel_stream_capacity_distribution.clone(),
             rounds: control[CONTROL_ROUNDS],
             transitions: lp_state
                 .chunks_exact(LP_STATE_WORDS)
@@ -4039,10 +4094,20 @@ fn decode_device_error(control: &[u64]) -> MetalError {
                 arena,
                 MetalArena::TcpReceiverRanges | MetalArena::TcpSegmentLedger
             );
+            let channel = arena == MetalArena::ChannelInbox;
             MetalError::CapacityExceeded {
                 arena,
-                node: if tcp { None } else { identity.map(NodeId) },
+                node: if tcp || channel {
+                    None
+                } else {
+                    identity.map(NodeId)
+                },
                 flow: if tcp { identity.map(FlowId) } else { None },
+                stream: if channel {
+                    identity.map(|stream| stream as usize)
+                } else {
+                    None
+                },
                 capacity,
                 demand,
             }
@@ -4053,6 +4118,12 @@ fn decode_device_error(control: &[u64]) -> MetalError {
         },
         100 => MetalError::WfqArithmeticOverflow {
             node: identity.map(NodeId).unwrap_or(NodeId(0)),
+        },
+        // The channel-order diagnostic shares the channel capacity identity slot, which carries
+        // an immutable stream index rather than an LP after targeted retry plumbing.
+        142 => MetalError::DeviceExecution {
+            code: 142,
+            node: None,
         },
         code => MetalError::DeviceExecution {
             code,
@@ -5085,9 +5156,42 @@ mod tests {
                 arena: super::MetalArena::TcpReceiverRanges,
                 node: None,
                 flow: Some(crate::FlowId(9)),
+                stream: None,
                 capacity: 64,
                 demand: 65,
             }
+        );
+    }
+
+    #[test]
+    fn channel_capacity_fault_identity_decodes_as_a_stream() {
+        let mut control = vec![0_u64; 20];
+        control[0] = 1;
+        control[1] = 8;
+        control[2] = 73;
+        control[3] = 8;
+        control[19] = 9;
+
+        assert_eq!(
+            decode_device_error(&control),
+            MetalError::CapacityExceeded {
+                arena: super::MetalArena::ChannelInbox,
+                node: None,
+                flow: None,
+                stream: Some(73),
+                capacity: 8,
+                demand: 9,
+            }
+        );
+
+        control[0] = 142;
+        assert_eq!(
+            decode_device_error(&control),
+            MetalError::DeviceExecution {
+                code: 142,
+                node: None,
+            },
+            "a channel index must not be displayed as an LP for the order diagnostic",
         );
     }
 
@@ -5098,6 +5202,7 @@ mod tests {
             arena: super::MetalArena::Queue,
             node: Some(crate::NodeId(3)),
             flow: None,
+            stream: None,
             capacity: 0,
             demand: 1,
             grown_capacity: 2,

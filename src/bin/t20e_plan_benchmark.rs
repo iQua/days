@@ -82,6 +82,14 @@ mod app {
             arenas.stream_arena_bytes,
             arenas.legacy_heap_arena_bytes
         );
+        for level in &report.channel_stream_capacity_distribution {
+            println!(
+                "record=t20g_channel_capacity_level backend={backend:?} fixture={} capacity={} stream_count={}",
+                fixture.display(),
+                level.capacity,
+                level.stream_count,
+            );
+        }
         println!(
             "record=t20f_plan_total backend={backend:?} fixture={} plane_count={} total_device_bytes={} total_device_gib={:.9}",
             fixture.display(),

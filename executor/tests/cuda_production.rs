@@ -589,6 +589,7 @@ fn cuda_device_capacity_fault_is_explicit_and_executor_recovers() {
             arena: CudaArena::Queue,
             node: Some(SOURCE),
             flow: None,
+            stream: None,
             capacity: 0,
             demand: 1,
         }
@@ -617,6 +618,7 @@ fn cuda_device_capacity_fault_is_explicit_and_executor_recovers() {
     assert_eq!(recovered.capacity_retry_trace[0].arena, CudaArena::Queue);
     assert_eq!(recovered.capacity_retry_trace[0].node, Some(SOURCE));
     assert_eq!(recovered.capacity_retry_trace[0].flow, None);
+    assert_eq!(recovered.capacity_retry_trace[0].stream, None);
     assert_eq!(recovered.capacity_retry_trace[0].capacity, 0);
     assert_eq!(recovered.capacity_retry_trace[0].demand, 1);
     assert_eq!(recovered.capacity_retry_trace[0].grown_capacity, 2);
