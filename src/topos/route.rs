@@ -1,8 +1,16 @@
 //! The routing protocols that are used to compute the path that each flow
 //! takes. Currently, three routing protocols have been implemented:
 //!
-//! - Shortest path routing: Selects a random candidate from a set of shortest
-//!   paths, which are computed by the `petgraph` crate using the A* algorithm.
+//! - Shortest path routing: Selects one shortest path per endpoint pair, deterministically.
+//!   The graph is first canonicalized (`canonical_routing_graph`) so that selection cannot
+//!   depend on the order edges were inserted. A canonical fat tree then takes a uniform-cost
+//!   best-first search whose neighbours are enumerated by index arithmetic in a fixed order, and
+//!   every other topology falls back to the `petgraph` A* implementation at uniform edge cost.
+//!   Equal-cost alternatives are broken by that fixed enumeration order, not by choice: no
+//!   randomness, no hash-map iteration, and no shared state is involved, so the same graph and
+//!   endpoints always yield the same path on any thread. (A `RandomSimplePath` protocol, which did
+//!   draw uniformly from `all_simple_paths`, existed until 2023; it was deleted, and nothing in
+//!   the tree selects a random route today.)
 //! - Path from configuration: Uses the path that is specified in the configuration.
 //! - ECMP: Implements the Equal-Cost Multi-Path algorithm (RFC 2992) optimized with A*.
 //!
