@@ -159,7 +159,7 @@ fn test_weighted_round_robin() {
                 // We allow some tolerance because the schedule is stochastic.
                 // A broad range around 2.0 is acceptable.
                 assert!(
-                    ratio >= 1.5 && ratio <= 2.5,
+                    (1.5..=2.5).contains(&ratio),
                     "Flow 1 expected ~2x throughput of flow 0, but ratio = {:.2}",
                     ratio
                 );

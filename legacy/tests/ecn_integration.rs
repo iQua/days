@@ -107,13 +107,7 @@ fn test_red_ecn_marks_ce_in_simulation() {
 
     let _ = sim.step_until(Duration::from_secs_f64(2.0));
 
-    let mut saw_ce = false;
-    while let Some(pkt) = sink_slot.next() {
-        if pkt.ecn == EcnField::Ce {
-            saw_ce = true;
-            break;
-        }
-    }
+    let saw_ce = sink_slot.any(|pkt| pkt.ecn == EcnField::Ce);
 
     assert!(saw_ce, "expected at least one CE-marked packet");
 }

@@ -141,7 +141,7 @@ fn test_deficit_round_robin() {
                 let ratio = flow1_traffic as f64 / flow0_traffic as f64;
 
                 assert!(
-                    ratio >= 1.5 && ratio <= 2.5,
+                    (1.5..=2.5).contains(&ratio),
                     "Expected ratio ~2:1, got {}:1",
                     ratio
                 );

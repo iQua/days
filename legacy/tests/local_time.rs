@@ -16,24 +16,24 @@ fn test_local_time() {
         .try_init();
 
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/local_time.toml");
-    let _ = seed_from_config(&path);
+    let _ = seed_from_config(path);
 
-    let Ok((graph, hosts)) = build_graph(&path) else {
+    let Ok((graph, hosts)) = build_graph(path) else {
         panic!("Failed to build the network graph.");
     };
     info!("The network graph has been initialized.");
 
-    let flows = Flow::flows_from_config_with_attachments(&path, &hosts);
+    let flows = Flow::flows_from_config_with_attachments(path, &hosts);
     info!("A total of {} flows has been initialized.", flows.len());
 
-    let collectives = Collective::collectives_from_config(&path, hosts.host_ids());
+    let collectives = Collective::collectives_from_config(path, hosts.host_ids());
     info!(
         "A total of {} collective communication operations has been initialized.",
         collectives.len()
     );
 
     // initializes the topology
-    let topology = Topology::new(&path, graph.clone(), hosts, flows, collectives);
+    let topology = Topology::new(path, graph.clone(), hosts, flows, collectives);
 
     // runs the topology
     topology.run(graph);

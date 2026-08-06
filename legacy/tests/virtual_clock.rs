@@ -143,7 +143,7 @@ fn test_virtual_clock_scheduler() {
                 println!("{ratio}");
 
                 assert!(
-                    ratio >= 1.3 && ratio <= 2.8,
+                    (1.3..=2.8).contains(&ratio),
                     "Expected ratio ~2:1, got {}:1",
                     ratio
                 );

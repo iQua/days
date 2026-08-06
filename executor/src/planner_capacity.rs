@@ -497,7 +497,17 @@ impl PlannerCapacityContext {
         self.host_to_lp[host_slot]
     }
 
-    #[cfg(any(test, feature = "planner-test-hooks"))]
+    /// Same gating story as `device_sizing::exact_plan_report`: the only callers are
+    /// `cuda::assert_cuda_planner_bit_equal_for_testing` and
+    /// `metal::assert_metal_planner_bit_equal_for_testing`, both `planner-test-hooks` functions in
+    /// modules that only exist under `cuda` / `metal-spike`.
+    #[cfg(all(
+        feature = "planner-test-hooks",
+        any(
+            feature = "cuda",
+            all(feature = "metal-spike", target_vendor = "apple")
+        )
+    ))]
     pub(crate) fn matches_legacy(
         image: &SimulationImage,
         data_counts: &[usize],

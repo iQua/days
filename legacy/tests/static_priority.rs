@@ -159,7 +159,6 @@ fn test_static_priority_scheduler() {
                 "Simulation completed at time {:.3}.",
                 sim.time().duration_since(t0).as_secs_f64()
             );
-            assert!(true);
 
             // generates three CSV files containing statistics of this simulation run
             CsvLogger::get_instance().flush_reports();

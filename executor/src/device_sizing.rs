@@ -111,7 +111,19 @@ pub struct DeviceSizingReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceSizingError(String);
 
-#[cfg(any(test, feature = "planner-test-hooks"))]
+/// Every consumer of this helper is device-side: `cuda::exact_plan_report_for` and
+/// `metal::exact_plan_report_for` are both `#[cfg(feature = "planner-test-hooks")]` inside modules
+/// that only exist under `cuda` / `metal-spike`. Gating on `planner-test-hooks` alone therefore
+/// compiled it dead on a host build with that feature and no device backend.
+#[cfg(any(
+    test,
+    all(feature = "planner-test-hooks", feature = "cuda"),
+    all(
+        feature = "planner-test-hooks",
+        feature = "metal-spike",
+        target_vendor = "apple"
+    )
+))]
 pub(crate) fn exact_plan_report(
     words: [usize; 28],
     tcp_words: usize,

@@ -5,12 +5,18 @@ use days_executor::{
     EventKind, FlowDescriptor, FlowGeneratorKind, FlowGeneratorState, FlowId,
     GeneratorFeedbackState, GeneratorStatus, HostState, LinkDescriptor, LinkId,
     MechanismTransitionRecord, NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketDescriptor,
-    PacketKind, PayloadId, QueueDepthUnit, RemoteChannel, RunResult, ScheduledEmission,
-    SchedulerKind, SchedulerPacket, SimulationImage, SwitchQueueState, SwitchState, TcpAckHeader,
+    PacketKind, PayloadId, QueueDepthUnit, RemoteChannel, ScheduledEmission, SchedulerKind,
+    SchedulerPacket, SimulationImage, SwitchQueueState, SwitchState, TcpAckHeader,
     TcpCongestionControl, TcpDataHeader, TcpGenerator, TcpReceiverState, TcpTimerState,
     drr_transitions_csv, event_phase, run_cpu_with_observations, run_scalar_with_observations,
     validate, wrr_transitions_csv,
 };
+// Only `assert_device_full_result_eq` names this type, and that helper is device-gated.
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+use days_executor::RunResult;
 #[cfg(feature = "cuda")]
 use days_executor::{CudaConfig, CudaError, run_cuda_with_observations};
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]

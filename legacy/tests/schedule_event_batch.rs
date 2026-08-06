@@ -84,7 +84,7 @@ fn schedule_event_batch_preserves_order() {
     let t3 = 0.003;
     for (value, time) in got {
         let expected = match value {
-            0 | 1 | 2 => t1,
+            0..=2 => t1,
             3 => t3,
             _ => unreachable!(),
         };
