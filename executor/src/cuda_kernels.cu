@@ -4395,7 +4395,23 @@ __device__ __forceinline__ bool dispatch_event(
             if (fast) {
                 generators[generator + G_TCP_RECOVERY_HIGH] = recovery_high;
                 generators[generator + G_CONTROL + CTL_RECOVERY_HIGH] = recovery_high;
-                generators[generator + G_TCP_TIMER_ACTIVE] = 0;
+                if (generators[generator + G_TCP_TIMER_ACTIVE] != 0) {
+                    if (!heap_remove_timer(
+                        node,
+                        flow,
+                        generators[generator + G_TCP_TIMER_ATTEMPT],
+                        generators[generator + G_TCP_TIMER_DEADLINE],
+                        error,
+                        params,
+                        fel_meta,
+                        fel_records,
+                        stream_state,
+                        tcp_state
+                    )) {
+                        return false;
+                    }
+                    generators[generator + G_TCP_TIMER_ACTIVE] = 0;
+                }
                 retransmit = true;
                 retransmit_sequence = acknowledgment;
             } else if (generators[generator + G_TCP_DUP_ACKS] > 3) {
@@ -4429,11 +4445,21 @@ __device__ __forceinline__ bool dispatch_event(
     if (kind == RETRANSMISSION_TIMEOUT && role == HOST) {
         ulong flow = event[PK_FLOW];
         ulong generator = flow * GENERATOR_WORDS;
-        if (flow >= params[P_FLOW_COUNT] || generators[generator + G_VALID] == 0 ||
-            generators[generator + G_OWNER] != node || generators[generator + G_KIND] != 1 ||
-            generators[generator + G_TCP_TIMER_ACTIVE] == 0 ||
-            generators[generator + G_TCP_TIMER_ATTEMPT] != event[E_PAYLOAD] ||
-            generators[generator + G_TCP_TIMER_DEADLINE] != event[E_TIME]) {
+        bool armed = flow < params[P_FLOW_COUNT] && generators[generator + G_VALID] != 0 &&
+            generators[generator + G_OWNER] == node && generators[generator + G_KIND] == 1 &&
+            generators[generator + G_TCP_TIMER_ACTIVE] != 0 &&
+            generators[generator + G_TCP_TIMER_ATTEMPT] == event[E_PAYLOAD] &&
+            generators[generator + G_TCP_TIMER_DEADLINE] == event[E_TIME];
+        // Live-state contract (T20g item 2): the flow's owned heap record is live exactly when it
+        // matches the armed timer. Eager removal makes the two conditions equivalent, so any
+        // disagreement is a corrupted slot index rather than a modelling condition. A record owned
+        // by no flow is legacy import residue, which stays lazily recognized.
+        bool owned = popped_timer_owner != NONE && popped_timer_owner == flow;
+        if (armed != owned) {
+            set_semantic_error(error, 61, node);
+            return false;
+        }
+        if (!armed) {
             return true;
         }
         generators[generator + G_TCP_TIMER_ACTIVE] = 0;
