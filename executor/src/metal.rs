@@ -427,18 +427,16 @@ impl MetalConfig {
                 );
             }
             MetalArena::TcpReceiverRanges => {
-                crate::device_capacity::raise_cap_or_class_floor(
+                crate::device_capacity::raise_cap_or_floor(
                     &mut self.capacity_caps.tcp_receiver_ranges_per_flow,
-                    &mut self.capacity_floors.tcp_receiver_ranges_floor_trigger,
                     &mut self.capacity_floors.tcp_receiver_ranges_per_flow,
                     capacity,
                     grown,
                 );
             }
             MetalArena::TcpSegmentLedger => {
-                crate::device_capacity::raise_cap_or_class_floor(
+                crate::device_capacity::raise_cap_or_floor(
                     &mut self.capacity_caps.tcp_ledger_segments_per_flow,
-                    &mut self.capacity_floors.tcp_ledger_segments_floor_trigger,
                     &mut self.capacity_floors.tcp_ledger_segments_per_flow,
                     capacity,
                     grown,
@@ -3038,10 +3036,9 @@ fn prepare_tcp_state(
             let derived_capacity = capacity_context
                 .tcp_receiver_range_bound(image, flow, data_count)
                 .max(receiver.out_of_order.len());
-            let capacity = crate::device_capacity::bound_derived_capacity_for_class(
+            let capacity = crate::device_capacity::bound_derived_capacity(
                 derived_capacity,
                 capacity_caps.tcp_receiver_ranges_per_flow,
-                capacity_floors.tcp_receiver_ranges_floor_trigger,
                 capacity_floors.tcp_receiver_ranges_per_flow,
                 receiver.out_of_order.len(),
             );
@@ -3083,12 +3080,11 @@ fn prepare_tcp_state(
             .copied()
             .unwrap_or(0)
             .saturating_sub(feedback_counts.get(flow).copied().unwrap_or(0));
-        let capacity = crate::device_capacity::bound_derived_capacity_for_class(
+        let capacity = crate::device_capacity::bound_derived_capacity(
             capacity_context
                 .tcp_ledger_segment_bound(image, flow, data_count)
                 .max(current),
             capacity_caps.tcp_ledger_segments_per_flow,
-            capacity_floors.tcp_ledger_segments_floor_trigger,
             capacity_floors.tcp_ledger_segments_per_flow,
             current,
         );

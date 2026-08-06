@@ -39,13 +39,7 @@ pub struct DeviceCapacityFloors {
     pub remote_staging_events_per_lp: usize,
     pub outbox_events_total: usize,
     pub tcp_receiver_ranges_per_flow: usize,
-    /// Retry-only lower-bound class. `Some(capacity)` applies the receiver floor only to flows
-    /// whose capped derived capacity is at least this value.
-    pub tcp_receiver_ranges_floor_trigger: Option<usize>,
     pub tcp_ledger_segments_per_flow: usize,
-    /// Retry-only lower-bound class. `Some(capacity)` applies the ledger floor only to flows whose
-    /// capped derived capacity is at least this value.
-    pub tcp_ledger_segments_floor_trigger: Option<usize>,
     pub observation_events: usize,
     pub worklist_entries_total: usize,
 }
@@ -114,27 +108,6 @@ pub(crate) fn raise_cap_or_floor(
     feature = "cuda",
     all(feature = "metal-spike", target_vendor = "apple")
 ))]
-pub(crate) fn raise_cap_or_class_floor(
-    cap: &mut Option<usize>,
-    floor_trigger: &mut Option<usize>,
-    floor: &mut usize,
-    capacity: usize,
-    grown: usize,
-) {
-    match cap {
-        Some(cap) if *cap == capacity => *cap = (*cap).max(grown),
-        Some(_) | None => {
-            *floor_trigger = Some(floor_trigger.map_or(capacity, |trigger| trigger.min(capacity)));
-            *floor = (*floor).max(grown);
-        }
-    }
-}
-
-#[cfg(any(
-    test,
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
 pub(crate) fn raise_override_cap_or_floor(
     override_capacity: &mut Option<usize>,
     cap: &mut Option<usize>,
@@ -173,32 +146,11 @@ pub(crate) fn bound_derived_capacity(
     cap_derived_capacity(derived, cap, resident).max(floor)
 }
 
-#[cfg(any(
-    test,
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
-pub(crate) fn bound_derived_capacity_for_class(
-    derived: usize,
-    cap: Option<usize>,
-    floor_trigger: Option<usize>,
-    floor: usize,
-    resident: usize,
-) -> usize {
-    let capacity = cap_derived_capacity(derived, cap, resident);
-    match floor_trigger {
-        Some(trigger) if capacity >= trigger => capacity.max(floor),
-        Some(_) => capacity,
-        None => capacity.max(floor),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        bound_derived_capacity, bound_derived_capacity_for_class, cap_derived_capacity,
-        grown_capacity, grown_capacity_with_slack, raise_cap_or_class_floor, raise_cap_or_floor,
-        raise_override_cap_or_floor,
+        bound_derived_capacity, cap_derived_capacity, grown_capacity, grown_capacity_with_slack,
+        raise_cap_or_floor, raise_override_cap_or_floor,
     };
 
     #[test]
@@ -212,22 +164,6 @@ mod tests {
     #[test]
     fn retry_floor_can_raise_a_capped_derived_capacity() {
         assert_eq!(bound_derived_capacity(100, Some(3), 12, 7), 12);
-    }
-
-    #[test]
-    fn retry_class_floor_does_not_inflate_smaller_flows() {
-        assert_eq!(
-            bound_derived_capacity_for_class(100, Some(200), Some(100), 240, 0),
-            240
-        );
-        assert_eq!(
-            bound_derived_capacity_for_class(99, Some(200), Some(100), 240, 0),
-            99
-        );
-        assert_eq!(
-            bound_derived_capacity_for_class(50, Some(40), Some(40), 80, 0),
-            80
-        );
     }
 
     #[test]
@@ -275,22 +211,5 @@ mod tests {
         raise_override_cap_or_floor(&mut override_capacity, &mut cap, &mut floor, 49, 100);
         assert_eq!(cap, Some(2_048));
         assert_eq!(floor, 100);
-    }
-
-    #[test]
-    fn tcp_retry_raises_a_cap_then_scopes_a_formula_floor() {
-        let mut cap = Some(4_096);
-        let mut trigger = None;
-        let mut floor = 0;
-
-        raise_cap_or_class_floor(&mut cap, &mut trigger, &mut floor, 4_096, 8_194);
-        assert_eq!(cap, Some(8_194));
-        assert_eq!(trigger, None);
-        assert_eq!(floor, 0);
-
-        raise_cap_or_class_floor(&mut cap, &mut trigger, &mut floor, 4_174, 8_350);
-        assert_eq!(cap, Some(8_194));
-        assert_eq!(trigger, Some(4_174));
-        assert_eq!(floor, 8_350);
     }
 }

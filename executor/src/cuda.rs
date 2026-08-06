@@ -613,18 +613,16 @@ impl CudaConfig {
                 );
             }
             CudaArena::TcpReceiverRanges => {
-                crate::device_capacity::raise_cap_or_class_floor(
+                crate::device_capacity::raise_cap_or_floor(
                     &mut self.capacity_caps.tcp_receiver_ranges_per_flow,
-                    &mut self.capacity_floors.tcp_receiver_ranges_floor_trigger,
                     &mut self.capacity_floors.tcp_receiver_ranges_per_flow,
                     capacity,
                     grown,
                 );
             }
             CudaArena::TcpSegmentLedger => {
-                crate::device_capacity::raise_cap_or_class_floor(
+                crate::device_capacity::raise_cap_or_floor(
                     &mut self.capacity_caps.tcp_ledger_segments_per_flow,
-                    &mut self.capacity_floors.tcp_ledger_segments_floor_trigger,
                     &mut self.capacity_floors.tcp_ledger_segments_per_flow,
                     capacity,
                     grown,
@@ -1336,12 +1334,11 @@ fn prepare_tcp_state(
         for receiver in &host.tcp_receivers {
             let flow = receiver.flow.0 as usize;
             let row = receiver_offset + flow * TCP_RECEIVER_WORDS;
-            let capacity = crate::device_capacity::bound_derived_capacity_for_class(
+            let capacity = crate::device_capacity::bound_derived_capacity(
                 capacity_context
                     .tcp_receiver_range_bound(image, flow, data_counts[flow])
                     .max(receiver.out_of_order.len()),
                 capacity_caps.tcp_receiver_ranges_per_flow,
-                capacity_floors.tcp_receiver_ranges_floor_trigger,
                 capacity_floors.tcp_receiver_ranges_per_flow,
                 receiver.out_of_order.len(),
             );
@@ -1379,12 +1376,11 @@ fn prepare_tcp_state(
         let packets = ledger
             .get(&crate::FlowId(flow as u64))
             .map_or_else(Vec::new, |segments| segments.values().copied().collect());
-        let capacity = crate::device_capacity::bound_derived_capacity_for_class(
+        let capacity = crate::device_capacity::bound_derived_capacity(
             capacity_context
                 .tcp_ledger_segment_bound(image, flow, data_count)
                 .max(packets.len()),
             capacity_caps.tcp_ledger_segments_per_flow,
-            capacity_floors.tcp_ledger_segments_floor_trigger,
             capacity_floors.tcp_ledger_segments_per_flow,
             packets.len(),
         );
