@@ -2811,6 +2811,7 @@ impl<'image> TransitionState<'image> {
             // Live-state contract (T20g item 2): execution removes a superseded timer event at
             // the transition that supersedes it, so this lazy recognition is unreachable for any
             // event this run armed. Only legacy residue imported by the image can reach it.
+            #[cfg(debug_assertions)]
             debug_assert!(
                 self.imported_event(event.key),
                 "superseded retransmission timeout {:?} survived its disarm transition",

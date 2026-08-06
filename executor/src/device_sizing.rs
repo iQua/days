@@ -432,6 +432,21 @@ pub fn size_default_device_plan(
                 ))
                 .ok_or_else(|| sizing_error("TCP fallback FEL slots overflow usize"))
         })?;
+    // Stream-enabled fallback-heap residency, mirroring the per-LP composition both device
+    // planners derive:
+    //
+    //   derived_lp  = 1 + initial_events_targeting_lp + SUM_f tcp_fallback_timer_bound(f)
+    //   capacity_lp = max(floor, max(initial_events_targeting_lp, min(derived_lp, cap)))
+    //
+    // Outward safety of each term, at live-timer scale:
+    //   * the `1` covers one pacing chain, which pops its predecessor before pushing its
+    //     successor. The general semantic bound is `rate + 2*dcqcn` and device validation still
+    //     rejects DCQCN images; restoring them must raise this term with them.
+    //   * each source-owned TCP flow contributes at most one record, because the T20g live-state
+    //     contract removes a superseded timeout at the transition that supersedes it and disarm
+    //     always precedes re-arm inside a single transition.
+    //   * imported events stay a hard floor: an image may supply legacy residue that no armed
+    //     timer owns, and that residue is resident until its deadline.
     let fallback_fel_event_slots = node_count
         .checked_add(image.initial_events.len())
         .and_then(|slots| slots.checked_add(runtime_tcp_timer_slots))
@@ -955,8 +970,14 @@ pub(crate) const TCP_WINDOW_SLACK_FACTOR: usize = 2;
 pub(crate) const TCP_LEDGER_RECOVERY_ALLOWANCE: usize = 8;
 /// Extra receiver gaps for the head-truncation/coalescing boundary during recovery.
 pub(crate) const TCP_RECEIVER_RECOVERY_ALLOWANCE: usize = 4;
-/// Twice the measured frontier failure average of 512 retained RTO installs per flow.
-pub(crate) const TCP_STALE_TIMER_ALLOWANCE_PER_FLOW: usize = 1_024;
+/// Fallback-heap records one source-owned TCP flow can occupy at once.
+///
+/// The T20g live-state contract removes a superseded retransmission timeout at the transition that
+/// supersedes it, on every backend, so a flow's physical residency equals its armed timer. Disarm
+/// precedes re-arm inside one transition, so the peak never reaches two. The retired allowance
+/// instead paid for every retained installation and was twice the measured frontier failure
+/// average of 512 retained installs per flow.
+pub(crate) const TCP_LIVE_TIMER_RECORDS_PER_FLOW: usize = 1;
 
 fn u64_segments(bytes: u64, mss_bytes: u64) -> usize {
     usize::try_from(bytes.div_ceil(mss_bytes.max(1))).unwrap_or(usize::MAX)
@@ -1006,8 +1027,12 @@ pub(crate) fn tcp_receiver_range_bound(
     tcp_window_plane_bound(tcp, whole_flow_segments, TCP_RECEIVER_RECOVERY_ALLOWANCE)
 }
 
+/// Outward-safe fallback-heap residency of one source-owned TCP flow.
+///
+/// `min` with the whole-flow attempt count keeps the bound exact for a flow that can never arm a
+/// timer, so an image with no sendable bytes still plans zero records for it.
 pub(crate) fn tcp_fallback_timer_packet_bound(whole_flow_attempts: usize) -> usize {
-    whole_flow_attempts.min(TCP_STALE_TIMER_ALLOWANCE_PER_FLOW)
+    whole_flow_attempts.min(TCP_LIVE_TIMER_RECORDS_PER_FLOW)
 }
 
 /// `ceil(L/S)+1` horizon emissions, `ceil(P/S)` propagation residency, and two records of
@@ -1686,9 +1711,11 @@ mod tests {
     }
 
     #[test]
-    fn stale_timer_and_horizon_queue_bounds_are_outward_and_whole_flow_capped() {
-        assert_eq!(tcp_fallback_timer_packet_bound(65_536), 1_024);
-        assert_eq!(tcp_fallback_timer_packet_bound(512), 512);
+    fn live_timer_and_horizon_queue_bounds_are_outward_and_whole_flow_capped() {
+        assert_eq!(tcp_fallback_timer_packet_bound(65_536), 1);
+        assert_eq!(tcp_fallback_timer_packet_bound(512), 1);
+        assert_eq!(tcp_fallback_timer_packet_bound(1), 1);
+        assert_eq!(tcp_fallback_timer_packet_bound(0), 0);
         assert_eq!(horizon_queue_packet_bound(100, Some(1_000), 100, 250), 16);
         assert_eq!(horizon_queue_packet_bound(10, Some(1_000), 100, 250), 10);
         assert_eq!(horizon_queue_packet_bound(100, None, 100, 250), 100);
