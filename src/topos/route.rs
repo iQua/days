@@ -20,7 +20,44 @@ use serde::Deserialize;
 
 #[cfg(test)]
 std::thread_local! {
+    /// Fat-tree classifications taken on this thread *outside* per-flow route filling.
     static FAT_TREE_LAYOUT_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Set while this thread is inside [`fill_route_chunk`], on a worker or on the submitter.
+    static FILLING_ROUTE_CHUNK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Fat-tree classifications taken *while per-flow routes are being filled*, on any thread.
+///
+/// The scatter moves per-flow work onto worker threads, and every worker thread gets its own
+/// copy of a `thread_local!`. A per-thread counter therefore cannot see a classification made by
+/// a worker: the submitting thread would read its own untouched cell and report success. This
+/// counter is process-wide, so it sees every thread.
+///
+/// It is only ever incremented, never reset. Unrelated tests routing concurrently in the same
+/// test binary must not be able to zero it between a regression and the assertion that catches
+/// it; and since the correct value is zero for every caller, concurrent traffic cannot inflate it
+/// either. `Relaxed` suffices because each reader is ordered after its own workers by the
+/// `thread::scope` join.
+#[cfg(test)]
+static ROUTE_FILL_LAYOUT_CHECKS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Marks its enclosing scope as per-flow route filling for the classification counter.
+#[cfg(test)]
+struct RouteFillScope(bool);
+
+#[cfg(test)]
+impl RouteFillScope {
+    fn enter() -> Self {
+        RouteFillScope(FILLING_ROUTE_CHUNK.with(|filling| filling.replace(true)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for RouteFillScope {
+    fn drop(&mut self) {
+        FILLING_ROUTE_CHUNK.with(|filling| filling.set(self.0));
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -165,7 +202,11 @@ impl ShortestPath {
 
     fn fat_tree_params(graph: &UnGraph<usize, ()>) -> Option<(usize, usize, usize)> {
         #[cfg(test)]
-        FAT_TREE_LAYOUT_CHECKS.with(|checks| checks.set(checks.get() + 1));
+        if FILLING_ROUTE_CHUNK.with(std::cell::Cell::get) {
+            ROUTE_FILL_LAYOUT_CHECKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            FAT_TREE_LAYOUT_CHECKS.with(|checks| checks.set(checks.get() + 1));
+        }
 
         let total_nodes = graph.node_count();
         if total_nodes == 0 || !total_nodes.is_multiple_of(5) {
@@ -453,6 +494,9 @@ fn fill_route_chunk(
     endpoints: &[(NodeIndex, NodeIndex)],
     routes: &mut [Option<Vec<NodeIndex>>],
 ) {
+    #[cfg(test)]
+    let _route_fill_scope = RouteFillScope::enter();
+
     for (&(source, target), slot) in endpoints.iter().zip(routes.iter_mut()) {
         *slot = ShortestPath::try_compute_route_in_classified_canonical_graph(
             graph,
@@ -484,7 +528,12 @@ fn scatter_routes(
             .chunks(chunk_len)
             .zip(routes.chunks_mut(chunk_len))
         {
-            scope.spawn(move || fill_route_chunk(graph, fat_tree_params, endpoints, routes));
+            scope.spawn(move || {
+                #[cfg(test)]
+                let _route_fill_scope = RouteFillScope::enter();
+
+                fill_route_chunk(graph, fat_tree_params, endpoints, routes)
+            });
         }
     });
     routes
@@ -808,6 +857,11 @@ mod tests {
                 "route-table lowering must classify the immutable topology once"
             );
         });
+        assert_eq!(
+            ROUTE_FILL_LAYOUT_CHECKS.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "no route fill, on any thread, may re-classify the topology"
+        );
     }
 
     /// Five nodes in two components, and not a canonical k=2 fat tree, so route selection takes
@@ -958,14 +1012,17 @@ mod tests {
         let flows = (0..8_usize)
             .map(|target| (target, NodeIndex::new(0), NodeIndex::new(target)))
             .collect::<Vec<_>>();
+        let workers = RouteWorkers::new(MAX_ROUTE_WORKERS);
+        // Without this the assertions below could hold vacuously on a serial partition.
+        assert_eq!(
+            route_chunk_count(flows.len(), workers),
+            8,
+            "this budget must actually spread the eight flows over eight worker threads"
+        );
         FAT_TREE_LAYOUT_CHECKS.with(|checks| checks.set(0));
 
-        let routes = compute_shortest_path_route_table_with(
-            &graph,
-            flows,
-            RouteWorkers::new(MAX_ROUTE_WORKERS),
-        )
-        .expect("canonical fat-tree routes should exist");
+        let routes = compute_shortest_path_route_table_with(&graph, flows, workers)
+            .expect("canonical fat-tree routes should exist");
 
         assert_eq!(routes.len(), 8);
         FAT_TREE_LAYOUT_CHECKS.with(|checks| {
@@ -975,6 +1032,14 @@ mod tests {
                 "the scatter must reuse the one classification taken on the submitting thread"
             );
         });
+        // The submitting thread cannot see a worker's `thread_local!`, so the per-thread count
+        // above is blind to a re-classification inside the scatter. This process-wide counter is
+        // the half of the invariant that the worker threads are actually in.
+        assert_eq!(
+            ROUTE_FILL_LAYOUT_CHECKS.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "no route worker may re-classify the topology"
+        );
     }
 
     #[test]
