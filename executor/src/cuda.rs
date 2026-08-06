@@ -1629,6 +1629,8 @@ impl CudaPlan {
             .collect();
 
         let mut queue_caps = vec![1_usize; node_count];
+        let mut aggregate_queue_packets = vec![0_usize; node_count];
+        let mut minimum_queue_packet_bytes = vec![u64::MAX; node_count];
         let mut legacy_fel_caps = vec![8_usize; node_count];
         let mut initial_fel_counts = vec![0_usize; node_count];
         for event in &image.initial_events {
@@ -1653,15 +1655,20 @@ impl CudaPlan {
                 );
             }
 
+            let mut route_capacities = FlowRouteCapacities {
+                lookahead: minimum_lookahead_ns,
+                fel: &mut legacy_fel_caps,
+                queue: &mut queue_caps,
+                aggregate_queue_packets: &mut aggregate_queue_packets,
+                minimum_queue_packet_bytes: &mut minimum_queue_packet_bytes,
+            };
             add_flow_route_capacities(
                 image,
                 &capacity_context,
                 flow_index,
                 data_count,
                 PacketKind::Data,
-                minimum_lookahead_ns,
-                &mut legacy_fel_caps,
-                &mut queue_caps,
+                &mut route_capacities,
             );
             add_flow_route_capacities(
                 image,
@@ -1669,9 +1676,7 @@ impl CudaPlan {
                 flow_index,
                 feedback_count,
                 PacketKind::Feedback,
-                minimum_lookahead_ns,
-                &mut legacy_fel_caps,
-                &mut queue_caps,
+                &mut route_capacities,
             );
         }
 
@@ -1684,26 +1689,37 @@ impl CudaPlan {
                 }
                 NodeKind::Switch => {
                     let state = &image.switch_states[node.state_slot as usize];
-                    let initial = state.queues.first().map_or(0, |queue| queue.queue.len());
+                    let queue = state.queues.first();
+                    let initial = queue.map_or(0, |queue| queue.queue.len());
+                    aggregate_queue_packets[slot] = aggregate_queue_packets[slot].max(initial);
+                    if let Some(queue) = queue {
+                        for payload in &queue.queue {
+                            minimum_queue_packet_bytes[slot] = minimum_queue_packet_bytes[slot]
+                                .min(packet_for(&initial_by_payload, *payload)?.size_bytes);
+                        }
+                    }
                     queue_caps[slot] = queue_caps[slot].max(initial);
-                    if let Some(limit) =
-                        state
-                            .queues
-                            .first()
-                            .and_then(|queue| match queue.drop_mark {
-                                crate::DropMarkPolicy::TailDrop => (queue.queue_capacity_packets
-                                    != 0)
-                                    .then_some(queue.queue_capacity_packets),
-                                crate::DropMarkPolicy::EcnThreshold(policy)
-                                    if policy.unit == crate::QueueDepthUnit::Packets =>
-                                {
-                                    (policy.capacity != 0).then_some(policy.capacity)
-                                }
-                                crate::DropMarkPolicy::EcnThreshold(_)
-                                | crate::DropMarkPolicy::Red(_) => None,
-                            })
-                    {
-                        queue_caps[slot] = queue_caps[slot].min(limit as usize);
+                    if let Some(queue) = queue {
+                        match queue.drop_mark {
+                            crate::DropMarkPolicy::TailDrop
+                                if queue.queue_capacity_packets != 0 =>
+                            {
+                                queue_caps[slot] = queue_caps[slot].min(
+                                    usize::try_from(queue.queue_capacity_packets)
+                                        .unwrap_or(usize::MAX),
+                                );
+                            }
+                            crate::DropMarkPolicy::EcnThreshold(policy) => {
+                                queue_caps[slot] = crate::device_sizing::ecn_queue_packet_bound(
+                                    aggregate_queue_packets[slot],
+                                    policy,
+                                    minimum_queue_packet_bytes[slot],
+                                )
+                                .max(initial)
+                                .max(1);
+                            }
+                            crate::DropMarkPolicy::TailDrop | crate::DropMarkPolicy::Red(_) => {}
+                        }
                     }
                 }
             }
@@ -2277,16 +2293,21 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
     Ok((totals, feedback_counts))
 }
 
-#[allow(clippy::too_many_arguments)] // One prepare-time boundary owns all flow sizing inputs.
+struct FlowRouteCapacities<'a> {
+    lookahead: Option<u64>,
+    fel: &'a mut [usize],
+    queue: &'a mut [usize],
+    aggregate_queue_packets: &'a mut [usize],
+    minimum_queue_packet_bytes: &'a mut [u64],
+}
+
 fn add_flow_route_capacities(
     image: &SimulationImage,
     capacity_context: &PlannerCapacityContext,
     flow_index: usize,
     packet_count: usize,
     packet_kind: PacketKind,
-    lookahead: Option<u64>,
-    fel_caps: &mut [usize],
-    queue_caps: &mut [usize],
+    capacities: &mut FlowRouteCapacities<'_>,
 ) {
     if packet_count == 0 {
         return;
@@ -2318,10 +2339,15 @@ fn add_flow_route_capacities(
             packet_count,
             packet_kind,
             route[index],
-            lookahead,
+            capacities.lookahead,
         );
-        fel_caps[target_slot] = fel_caps[target_slot].saturating_add(burst);
+        capacities.fel[target_slot] = capacities.fel[target_slot].saturating_add(burst);
         if image.nodes[target_slot].kind == NodeKind::Switch {
+            capacities.aggregate_queue_packets[target_slot] =
+                capacities.aggregate_queue_packets[target_slot].saturating_add(packet_count);
+            capacities.minimum_queue_packet_bytes[target_slot] = capacities
+                .minimum_queue_packet_bytes[target_slot]
+                .min(capacity_context.minimum_packet_size(image, flow_index, packet_kind));
             let queue = image.switch_states[image.nodes[target_slot].state_slot as usize]
                 .queues
                 .first();
@@ -2334,12 +2360,13 @@ fn add_flow_route_capacities(
                     packet_count,
                     packet_kind,
                     image.links[route[index].0 as usize],
-                    lookahead,
+                    capacities.lookahead,
                 )
             } else {
                 packet_count
             };
-            queue_caps[target_slot] = queue_caps[target_slot].saturating_add(contribution);
+            capacities.queue[target_slot] =
+                capacities.queue[target_slot].saturating_add(contribution);
         }
     }
 }

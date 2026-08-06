@@ -465,4 +465,34 @@ mod tests {
         assert_ne!(hash.fnv1a64, FNV1A64_OFFSET_BASIS);
         assert_eq!(hash, fingerprint(&vec![1_u64, 2, 3]));
     }
+
+    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    #[test]
+    #[ignore = "allocates the 10 GiB standard K32 production plan; run as the T20f acceptance gate"]
+    fn k32_byte_policy_strict_run_is_retry_free() {
+        use days_executor::{MetalConfig, MetalExecutor, ObservationMode};
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("configs/benchmarks/width_via_load_full/fattree_k32_load_90_sustained.toml");
+        let mut image = compile_config(&path).expect("K32 byte-policy fixture must lower");
+        apply_probe_byte_policy(&mut image, 256).expect("byte policy must derive exactly");
+        let run = MetalExecutor::new()
+            .expect("Metal executor must initialize")
+            .run_with_observations(
+                &image,
+                None,
+                MetalConfig {
+                    capacity_caps: capacity_caps(RunKind::Sample),
+                    max_capacity_retries: 0,
+                    ..MetalConfig::default()
+                },
+                ObservationMode::Summary,
+            )
+            .expect("strict K32 production plan must complete without replacement");
+
+        assert!(
+            run.capacity_retry_trace.is_empty(),
+            "strict K32 production plan must not consume a retry"
+        );
+    }
 }

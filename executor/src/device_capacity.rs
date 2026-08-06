@@ -152,6 +152,10 @@ pub struct CapacityRetryRecord<A> {
     feature = "cuda",
     all(feature = "metal-spike", target_vendor = "apple")
 ))]
+// TCP retries deliberately use tight additive growth (+64 receiver ranges, +256 ledger
+// segments), rather than the design's arena-wide geometric 2x policy. The 2x policy was measured
+// and rejected after it produced an 87.8 GB shared-buffer allocation; additive class growth
+// preserves deterministic progress without repeating that allocation.
 pub(crate) const TCP_RECEIVER_RETRY_SLACK: usize = 64;
 #[cfg(any(
     test,
@@ -190,10 +194,18 @@ pub(crate) fn raise_cap_or_floor(
     capacity: usize,
     grown: usize,
 ) {
-    match cap {
-        Some(cap) if *cap == capacity => *cap = (*cap).max(grown),
-        Some(_) | None => *floor = (*floor).max(grown),
+    if let Some(cap) = cap {
+        if *cap == capacity {
+            *cap = (*cap).max(grown);
+        }
     }
+
+    // `capacity = max(min(derived, cap), resident, floor)`. Equality with `cap` does not prove
+    // that the cap alone is binding: `derived` or `resident` may tie it, in which case raising
+    // only the cap leaves the effective capacity unchanged. Raise the floor as well; because the
+    // retry loop admits only `grown > capacity`, the next effective capacity is at least `grown`
+    // while every cap and resident lower bound remains intact (records are never truncated).
+    *floor = (*floor).max(grown);
 }
 
 #[cfg(any(
@@ -247,6 +259,20 @@ mod tests {
         raise_cap_or_floor, raise_override_cap_or_floor,
     };
     use crate::FlowId;
+
+    fn retry_capacity_sequence(derived: usize, initial_cap: usize, resident: usize) -> Vec<usize> {
+        let mut cap = Some(initial_cap);
+        let mut floor = 0;
+        (0..5)
+            .map(|_| {
+                let capacity = bound_derived_capacity(derived, cap, floor, resident);
+                let demand = capacity.saturating_add(1);
+                let grown = grown_capacity(capacity, demand);
+                raise_cap_or_floor(&mut cap, &mut floor, capacity, grown);
+                capacity
+            })
+            .collect()
+    }
 
     #[test]
     fn derived_capacity_cap_never_excludes_resident_records() {
@@ -307,14 +333,14 @@ mod tests {
     }
 
     #[test]
-    fn retry_raises_the_active_capacity_layer_without_globalizing_a_cap() {
+    fn retry_raises_the_effective_capacity_without_discarding_caps() {
         let mut override_capacity = None;
         let mut cap = Some(8);
         let mut floor = 0;
         raise_override_cap_or_floor(&mut override_capacity, &mut cap, &mut floor, 8, 18);
         assert_eq!(override_capacity, None);
         assert_eq!(cap, Some(18));
-        assert_eq!(floor, 0);
+        assert_eq!(floor, 18);
 
         cap = None;
         raise_cap_or_floor(&mut cap, &mut floor, 8, 24);
@@ -334,5 +360,21 @@ mod tests {
         raise_override_cap_or_floor(&mut override_capacity, &mut cap, &mut floor, 49, 100);
         assert_eq!(cap, Some(2_048));
         assert_eq!(floor, 100);
+    }
+
+    #[test]
+    fn retry_strictly_grows_when_the_derived_capacity_ties_the_cap() {
+        assert_eq!(
+            retry_capacity_sequence(2_048, 2_048, 0),
+            vec![2_048, 4_098, 8_198, 16_398, 32_798]
+        );
+    }
+
+    #[test]
+    fn retry_strictly_grows_when_the_resident_capacity_ties_the_cap() {
+        assert_eq!(
+            retry_capacity_sequence(100, 512, 512),
+            vec![512, 1_026, 2_054, 4_110, 8_222]
+        );
     }
 }

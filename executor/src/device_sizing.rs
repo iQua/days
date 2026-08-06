@@ -267,6 +267,27 @@ pub(crate) fn rate_device_work(
     })
 }
 
+/// Smallest packet that can still be emitted by a finite, fixed-MTU generator.
+///
+/// Rate-based and collective generators truncate their final packet to the remaining byte count,
+/// so a non-divisible transfer has a tail smaller than the nominal packet size. A finished
+/// generator returns one byte, which is conservative and keeps zero out of serialization and
+/// byte-capacity divisors.
+pub(crate) fn finite_generator_minimum_packet_size(
+    total_bytes: u64,
+    bytes_emitted: u64,
+    packet_size_bytes: u64,
+) -> u64 {
+    let packet_size_bytes = packet_size_bytes.max(1);
+    let remaining = total_bytes.saturating_sub(bytes_emitted);
+    let tail = remaining % packet_size_bytes;
+    if tail == 0 {
+        packet_size_bytes.min(remaining.max(1))
+    } else {
+        tail
+    }
+}
+
 impl fmt::Display for DeviceSizingError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
@@ -302,8 +323,15 @@ pub fn size_default_device_plan(
         &flow_feedback_counts,
         minimum_lookahead_ns,
     )?;
+    let initial_by_payload = image
+        .initial_packets
+        .iter()
+        .map(|packet| (packet.id, packet))
+        .collect::<BTreeMap<_, _>>();
 
     let mut queue_capacities = vec![1_usize; node_count];
+    let mut aggregate_queue_packets = vec![0_usize; node_count];
+    let mut minimum_queue_packet_bytes = vec![u64::MAX; node_count];
     let mut legacy_fel_capacities = vec![8_usize; node_count];
     for event in &image.initial_events {
         legacy_fel_capacities[event.target.0 as usize] =
@@ -321,14 +349,19 @@ pub fn size_default_device_plan(
             legacy_fel_capacities[source_slot] = legacy_fel_capacities[source_slot]
                 .saturating_add(tcp_fallback_timer_packet_bound(data_count));
         }
+        let mut route_capacities = FlowRouteCapacities {
+            fel: &mut legacy_fel_capacities,
+            queue: &mut queue_capacities,
+            aggregate_queue_packets: &mut aggregate_queue_packets,
+            minimum_queue_packet_bytes: &mut minimum_queue_packet_bytes,
+        };
         add_flow_route_capacities(
             image,
             &context,
             flow_index,
             data_count,
             PacketKind::Data,
-            &mut legacy_fel_capacities,
-            &mut queue_capacities,
+            &mut route_capacities,
         );
         add_flow_route_capacities(
             image,
@@ -336,8 +369,7 @@ pub fn size_default_device_plan(
             flow_index,
             feedback_count,
             PacketKind::Feedback,
-            &mut legacy_fel_capacities,
-            &mut queue_capacities,
+            &mut route_capacities,
         );
     }
     for node in &image.nodes {
@@ -349,25 +381,39 @@ pub fn size_default_device_plan(
             }
             NodeKind::Switch => {
                 let state = &image.switch_states[node.state_slot as usize];
-                let initial = state.queues.first().map_or(0, |queue| queue.queue.len());
+                let queue = state.queues.first();
+                let initial = queue.map_or(0, |queue| queue.queue.len());
+                aggregate_queue_packets[slot] = aggregate_queue_packets[slot].max(initial);
+                if let Some(queue) = queue {
+                    for payload in &queue.queue {
+                        let packet = initial_by_payload.get(payload).ok_or_else(|| {
+                            sizing_error(format!(
+                                "switch queue references missing initial packet {payload:?}"
+                            ))
+                        })?;
+                        minimum_queue_packet_bytes[slot] =
+                            minimum_queue_packet_bytes[slot].min(packet.size_bytes);
+                    }
+                }
                 queue_capacities[slot] = queue_capacities[slot].max(initial);
-                if let Some(limit) = state
-                    .queues
-                    .first()
-                    .and_then(|queue| match queue.drop_mark {
-                        crate::DropMarkPolicy::TailDrop => (queue.queue_capacity_packets != 0)
-                            .then_some(queue.queue_capacity_packets),
-                        crate::DropMarkPolicy::EcnThreshold(policy)
-                            if policy.unit == crate::QueueDepthUnit::Packets =>
-                        {
-                            (policy.capacity != 0).then_some(policy.capacity)
+                if let Some(queue) = queue {
+                    match queue.drop_mark {
+                        crate::DropMarkPolicy::TailDrop if queue.queue_capacity_packets != 0 => {
+                            queue_capacities[slot] = queue_capacities[slot].min(
+                                usize::try_from(queue.queue_capacity_packets).unwrap_or(usize::MAX),
+                            );
                         }
-                        crate::DropMarkPolicy::EcnThreshold(_) | crate::DropMarkPolicy::Red(_) => {
-                            None
+                        crate::DropMarkPolicy::EcnThreshold(policy) => {
+                            queue_capacities[slot] = ecn_queue_packet_bound(
+                                aggregate_queue_packets[slot],
+                                policy,
+                                minimum_queue_packet_bytes[slot],
+                            )
+                            .max(initial)
+                            .max(1);
                         }
-                    })
-                {
-                    queue_capacities[slot] = queue_capacities[slot].min(limit as usize);
+                        crate::DropMarkPolicy::TailDrop | crate::DropMarkPolicy::Red(_) => {}
+                    }
                 }
             }
         }
@@ -551,13 +597,20 @@ impl CapacityContext {
                     }
                     FlowGeneratorKind::Tcp(tcp) => {
                         tcp_generators[index].get_or_insert(tcp);
-                        minimum_data_sizes[index] = minimum_data_sizes[index].min(tcp.mss_bytes);
+                        // A finite TCP flow may end in a one-byte tail segment. Match the
+                        // production planners so byte-policy queue composition cannot divide by
+                        // MSS and undercount the maximum admitted packet population.
+                        minimum_data_sizes[index] = 1;
                         minimum_feedback_sizes[index] =
                             minimum_feedback_sizes[index].min(tcp.ack_size_bytes);
                     }
                     FlowGeneratorKind::Rate(rate) => {
                         minimum_data_sizes[index] =
-                            minimum_data_sizes[index].min(rate.packet_size_bytes);
+                            minimum_data_sizes[index].min(finite_generator_minimum_packet_size(
+                                rate.total_bytes,
+                                generator.bytes_emitted,
+                                rate.packet_size_bytes,
+                            ));
                         if matches!(
                             generator.next_emission.status,
                             GeneratorStatus::Scheduled | GeneratorStatus::Blocked
@@ -566,16 +619,12 @@ impl CapacityContext {
                         }
                     }
                     FlowGeneratorKind::Collective(collective) => {
-                        let remaining = collective
-                            .chunk_bytes
-                            .saturating_sub(generator.bytes_emitted);
-                        let tail = remaining % collective.packet_size_bytes;
-                        let minimum = if tail == 0 {
-                            collective.packet_size_bytes.min(remaining.max(1))
-                        } else {
-                            tail
-                        };
-                        minimum_data_sizes[index] = minimum_data_sizes[index].min(minimum);
+                        minimum_data_sizes[index] =
+                            minimum_data_sizes[index].min(finite_generator_minimum_packet_size(
+                                collective.chunk_bytes,
+                                generator.bytes_emitted,
+                                collective.packet_size_bytes,
+                            ));
                         if matches!(
                             generator.next_emission.status,
                             GeneratorStatus::Scheduled | GeneratorStatus::Blocked
@@ -585,7 +634,11 @@ impl CapacityContext {
                     }
                     FlowGeneratorKind::Dcqcn(dcqcn) => {
                         minimum_data_sizes[index] =
-                            minimum_data_sizes[index].min(dcqcn.rate.packet_size_bytes);
+                            minimum_data_sizes[index].min(finite_generator_minimum_packet_size(
+                                dcqcn.rate.total_bytes,
+                                generator.bytes_emitted,
+                                dcqcn.rate.packet_size_bytes,
+                            ));
                         minimum_feedback_sizes[index] =
                             minimum_feedback_sizes[index].min(dcqcn.cnp_size_bytes);
                         if matches!(
@@ -974,6 +1027,30 @@ pub(crate) fn horizon_queue_packet_bound(
     whole_flow_packets.min(emissions.saturating_add(residency).saturating_add(2))
 }
 
+/// Converts a finite ECN admission limit into an outward-safe queue-record bound.
+///
+/// The admission decision reads the waiting queue before enqueue and accepts only when the
+/// post-enqueue depth is at most `C`. For a byte policy, if every routed or resident packet is at
+/// least `m` bytes, `waiting * m <= queued_bytes <= C`, hence
+/// `waiting <= floor(C / m)`. The packet policy gives `waiting <= C` directly. Intersecting that
+/// queue-level invariant with the aggregate finite-flow packet count is safe across horizons;
+/// summing per-flow horizon arrivals is not, because waiting packets persist between horizons.
+/// The in-service packet is stored in its own plane and therefore is not part of this bound.
+pub(crate) fn ecn_queue_packet_bound(
+    aggregate_flow_packets: usize,
+    policy: crate::EcnThresholdPolicy,
+    minimum_packet_bytes: u64,
+) -> usize {
+    if policy.capacity == 0 {
+        return aggregate_flow_packets;
+    }
+    let semantic_packet_limit = match policy.unit {
+        crate::QueueDepthUnit::Packets => policy.capacity,
+        crate::QueueDepthUnit::Bytes => policy.capacity / minimum_packet_bytes.max(1),
+    };
+    aggregate_flow_packets.min(usize::try_from(semantic_packet_limit).unwrap_or(usize::MAX))
+}
+
 fn source_queue_bounds(
     image: &SimulationImage,
     packet_counts: &[usize],
@@ -1091,14 +1168,20 @@ fn source_queue_bounds(
         .collect()
 }
 
+struct FlowRouteCapacities<'a> {
+    fel: &'a mut [usize],
+    queue: &'a mut [usize],
+    aggregate_queue_packets: &'a mut [usize],
+    minimum_queue_packet_bytes: &'a mut [u64],
+}
+
 fn add_flow_route_capacities(
     image: &SimulationImage,
     context: &CapacityContext,
     flow_index: usize,
     packet_count: usize,
     packet_kind: PacketKind,
-    fel_capacities: &mut [usize],
-    queue_capacities: &mut [usize],
+    capacities: &mut FlowRouteCapacities<'_>,
 ) {
     if packet_count == 0 {
         return;
@@ -1126,8 +1209,21 @@ fn add_flow_route_capacities(
             packet_kind,
             route[index],
         );
-        fel_capacities[target_slot] = fel_capacities[target_slot].saturating_add(burst);
+        capacities.fel[target_slot] = capacities.fel[target_slot].saturating_add(burst);
         if image.nodes[target_slot].kind == NodeKind::Switch {
+            capacities.aggregate_queue_packets[target_slot] =
+                capacities.aggregate_queue_packets[target_slot].saturating_add(packet_count);
+            capacities.minimum_queue_packet_bytes[target_slot] =
+                capacities.minimum_queue_packet_bytes[target_slot].min(match packet_kind {
+                    PacketKind::Data | PacketKind::TcpData(_) => {
+                        context.minimum_data_sizes[flow_index]
+                    }
+                    PacketKind::Feedback
+                    | PacketKind::TcpAck(_)
+                    | PacketKind::Pfc(_)
+                    | PacketKind::DcqcnCnp(_) => context.minimum_feedback_sizes[flow_index],
+                    PacketKind::DcqcnControlTimer => unreachable!(),
+                });
             let queue = image.switch_states[image.nodes[target_slot].state_slot as usize]
                 .queues
                 .first();
@@ -1150,8 +1246,8 @@ fn add_flow_route_capacities(
             } else {
                 packet_count
             };
-            queue_capacities[target_slot] =
-                queue_capacities[target_slot].saturating_add(contribution);
+            capacities.queue[target_slot] =
+                capacities.queue[target_slot].saturating_add(contribution);
         }
     }
 }
@@ -1545,10 +1641,14 @@ fn sizing_error(message: impl Into<String>) -> DeviceSizingError {
 #[cfg(test)]
 mod tests {
     use super::{
-        exact_plan_report, horizon_queue_packet_bound, paced_single_source_queue_bound,
+        ecn_queue_packet_bound, exact_plan_report, finite_generator_minimum_packet_size,
+        horizon_queue_packet_bound, paced_single_source_queue_bound,
         tcp_fallback_timer_packet_bound, tcp_ledger_segment_bound, tcp_receiver_range_bound,
     };
-    use crate::{DeviceEventArenaSizing, TcpCongestionControl, TcpGenerator};
+    use crate::{
+        DeviceEventArenaSizing, EcnThresholdPolicy, QueueDepthUnit, TcpCongestionControl,
+        TcpGenerator,
+    };
 
     #[test]
     fn exact_plan_report_sums_production_plane_words() {
@@ -1588,5 +1688,71 @@ mod tests {
         assert_eq!(horizon_queue_packet_bound(100, Some(1_000), 100, 250), 16);
         assert_eq!(horizon_queue_packet_bound(10, Some(1_000), 100, 250), 10);
         assert_eq!(horizon_queue_packet_bound(100, None, 100, 250), 100);
+    }
+
+    #[test]
+    fn semantic_ecn_bound_covers_cross_horizon_k32_queue_residency() {
+        let per_flow_horizon = horizon_queue_packet_bound(65_536, Some(1_021), 21, 1_000);
+        assert_eq!(per_flow_horizon, 100);
+        assert_eq!(1 + 8 * per_flow_horizon, 801);
+
+        let whole_flow_packets = 8 * 65_536;
+        let byte_policy = EcnThresholdPolicy {
+            unit: QueueDepthUnit::Bytes,
+            capacity: 262_144,
+            threshold: 262_144,
+        };
+        assert_eq!(
+            ecn_queue_packet_bound(whole_flow_packets, byte_policy, 256),
+            1_024
+        );
+        assert_eq!(
+            ecn_queue_packet_bound(800, byte_policy, 256),
+            800,
+            "the semantic bound remains capped by the aggregate finite-flow count"
+        );
+
+        let packet_policy = EcnThresholdPolicy {
+            unit: QueueDepthUnit::Packets,
+            capacity: 777,
+            threshold: 700,
+        };
+        assert_eq!(
+            ecn_queue_packet_bound(whole_flow_packets, packet_policy, 1),
+            777
+        );
+        assert_eq!(
+            ecn_queue_packet_bound(
+                whole_flow_packets,
+                EcnThresholdPolicy {
+                    capacity: 0,
+                    ..byte_policy
+                },
+                256,
+            ),
+            whole_flow_packets,
+            "zero capacity is the unbounded semantic policy"
+        );
+    }
+
+    #[test]
+    fn finite_rate_tail_is_included_in_the_byte_queue_minimum() {
+        let minimum = finite_generator_minimum_packet_size(1_025, 0, 256);
+        assert_eq!(minimum, 1);
+        assert_eq!(finite_generator_minimum_packet_size(1_024, 0, 256), 256);
+        assert_eq!(finite_generator_minimum_packet_size(1_025, 256, 256), 1);
+        assert_eq!(
+            ecn_queue_packet_bound(
+                2_000,
+                EcnThresholdPolicy {
+                    unit: QueueDepthUnit::Bytes,
+                    capacity: 1_024,
+                    threshold: 1_024,
+                },
+                minimum,
+            ),
+            1_024,
+            "the reachable one-byte tail must control byte-capacity composition"
+        );
     }
 }

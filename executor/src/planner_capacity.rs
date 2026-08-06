@@ -131,9 +131,27 @@ impl PlannerCapacityContext {
                             1
                         }
                     },
-                    FlowGeneratorKind::Rate(rate) => rate.packet_size_bytes,
-                    FlowGeneratorKind::Collective(collective) => collective.packet_size_bytes,
-                    FlowGeneratorKind::Dcqcn(dcqcn) => dcqcn.rate.packet_size_bytes,
+                    FlowGeneratorKind::Rate(rate) => {
+                        crate::device_sizing::finite_generator_minimum_packet_size(
+                            rate.total_bytes,
+                            generator.bytes_emitted,
+                            rate.packet_size_bytes,
+                        )
+                    }
+                    FlowGeneratorKind::Collective(collective) => {
+                        crate::device_sizing::finite_generator_minimum_packet_size(
+                            collective.chunk_bytes,
+                            generator.bytes_emitted,
+                            collective.packet_size_bytes,
+                        )
+                    }
+                    FlowGeneratorKind::Dcqcn(dcqcn) => {
+                        crate::device_sizing::finite_generator_minimum_packet_size(
+                            dcqcn.rate.total_bytes,
+                            generator.bytes_emitted,
+                            dcqcn.rate.packet_size_bytes,
+                        )
+                    }
                 };
                 update_minimum_packet_size(&mut minimum_packet_sizes[flow][0], size);
 
@@ -587,9 +605,27 @@ fn precompute_minimum_packet_sizes(
                     1
                 }
             },
-            FlowGeneratorKind::Rate(rate) => rate.packet_size_bytes,
-            FlowGeneratorKind::Collective(collective) => collective.packet_size_bytes,
-            FlowGeneratorKind::Dcqcn(dcqcn) => dcqcn.rate.packet_size_bytes,
+            FlowGeneratorKind::Rate(rate) => {
+                crate::device_sizing::finite_generator_minimum_packet_size(
+                    rate.total_bytes,
+                    generator.bytes_emitted,
+                    rate.packet_size_bytes,
+                )
+            }
+            FlowGeneratorKind::Collective(collective) => {
+                crate::device_sizing::finite_generator_minimum_packet_size(
+                    collective.chunk_bytes,
+                    generator.bytes_emitted,
+                    collective.packet_size_bytes,
+                )
+            }
+            FlowGeneratorKind::Dcqcn(dcqcn) => {
+                crate::device_sizing::finite_generator_minimum_packet_size(
+                    dcqcn.rate.total_bytes,
+                    generator.bytes_emitted,
+                    dcqcn.rate.packet_size_bytes,
+                )
+            }
         };
         update_minimum_packet_size(&mut minimums[flow][0], size);
     }
@@ -671,11 +707,27 @@ fn legacy_minimum_packet_size(
                                     1
                                 }
                             },
-                            FlowGeneratorKind::Rate(rate) => rate.packet_size_bytes,
-                            FlowGeneratorKind::Collective(collective) => {
-                                collective.packet_size_bytes
+                            FlowGeneratorKind::Rate(rate) => {
+                                crate::device_sizing::finite_generator_minimum_packet_size(
+                                    rate.total_bytes,
+                                    generator.bytes_emitted,
+                                    rate.packet_size_bytes,
+                                )
                             }
-                            FlowGeneratorKind::Dcqcn(dcqcn) => dcqcn.rate.packet_size_bytes,
+                            FlowGeneratorKind::Collective(collective) => {
+                                crate::device_sizing::finite_generator_minimum_packet_size(
+                                    collective.chunk_bytes,
+                                    generator.bytes_emitted,
+                                    collective.packet_size_bytes,
+                                )
+                            }
+                            FlowGeneratorKind::Dcqcn(dcqcn) => {
+                                crate::device_sizing::finite_generator_minimum_packet_size(
+                                    dcqcn.rate.total_bytes,
+                                    generator.bytes_emitted,
+                                    dcqcn.rate.packet_size_bytes,
+                                )
+                            }
                         })
                 })
                 .into_iter()
