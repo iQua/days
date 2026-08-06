@@ -386,12 +386,78 @@ inline void set_wfq_arithmetic_error(device ulong *error, ulong node) {
     }
 }
 
+// T20g item 2 live-state contract.
+//
+// `pending_events` denotes LIVE events, so a superseded retransmission timeout is removed from the
+// fallback heap at the transition that supersedes it. Interior removal needs the record's position,
+// which the per-flow TCP ledger metadata word +3 carries as `absolute record slot + 1`; zero means
+// the flow owns no heap record. Every heap movement below repairs that word, and the repair is
+// conditioned on the moved record already being the flow's recorded owner, so legacy-import residue
+// carrying the same flow can never steal ownership.
+inline ulong tcp_timer_slot_word(ulong flow, const device ulong *params) {
+    return params[P_TCP_LEDGER_META_OFFSET] + flow * TCP_LEDGER_META_WORDS + 3;
+}
+
+inline ulong heap_timer_owner(
+    const device ulong *params,
+    const device ulong *tcp_state,
+    const device ulong *records,
+    ulong slot
+) {
+    ulong record = slot * EVENT_WORDS;
+    if (records[record + E_KIND] != RETRANSMISSION_TIMEOUT) {
+        return NONE;
+    }
+    ulong flow = records[record + PK_FLOW];
+    if (flow >= params[P_FLOW_COUNT]) {
+        return NONE;
+    }
+    if (tcp_state[tcp_timer_slot_word(flow, params)] != slot + 1) {
+        return NONE;
+    }
+    return flow;
+}
+
+inline void heap_swap(
+    const device ulong *params,
+    device ulong *tcp_state,
+    device ulong *records,
+    ulong left_slot,
+    ulong right_slot
+) {
+    ulong left_owner = heap_timer_owner(params, tcp_state, records, left_slot);
+    ulong right_owner = heap_timer_owner(params, tcp_state, records, right_slot);
+    swap_records(records, left_slot, right_slot);
+    if (left_owner != NONE) {
+        tcp_state[tcp_timer_slot_word(left_owner, params)] = right_slot + 1;
+    }
+    if (right_owner != NONE) {
+        tcp_state[tcp_timer_slot_word(right_owner, params)] = left_slot + 1;
+    }
+}
+
+inline void heap_move(
+    const device ulong *params,
+    device ulong *tcp_state,
+    device ulong *records,
+    ulong source_slot,
+    ulong target_slot
+) {
+    ulong owner = heap_timer_owner(params, tcp_state, records, source_slot);
+    copy_device_record(records, source_slot, records, target_slot);
+    if (owner != NONE) {
+        tcp_state[tcp_timer_slot_word(owner, params)] = target_slot + 1;
+    }
+}
+
 inline bool heap_push(
     ulong node,
     const thread ulong *record,
     device ulong *error,
+    const device ulong *params,
     device ulong *meta,
-    device ulong *records
+    device ulong *records,
+    device ulong *tcp_state
 ) {
     ulong base = node * META_WORDS;
     ulong offset = meta[base];
@@ -404,12 +470,17 @@ inline bool heap_push(
     ulong child = count;
     copy_thread_to_device(record, records, offset + child);
     meta[base + 3] = count + 1;
+    // A kernel-side timeout push is always the arming transition's new live timer, so it claims
+    // the flow's slot before the sift-up starts repairing positions.
+    if (record[E_KIND] == RETRANSMISSION_TIMEOUT && record[PK_FLOW] < params[P_FLOW_COUNT]) {
+        tcp_state[tcp_timer_slot_word(record[PK_FLOW], params)] = offset + child + 1;
+    }
     while (child != 0) {
         ulong parent = (child - 1) / 2;
         if (!stored_key_less(records, offset + child, offset + parent)) {
             break;
         }
-        swap_records(records, offset + child, offset + parent);
+        heap_swap(params, tcp_state, records, offset + child, offset + parent);
         child = parent;
     }
     return true;
@@ -417,15 +488,25 @@ inline bool heap_push(
 
 inline bool heap_pop(
     ulong node,
+    const device ulong *params,
     device ulong *meta,
     device ulong *records,
-    thread ulong *record
+    device ulong *tcp_state,
+    thread ulong *record,
+    thread ulong &timer_owner
 ) {
     ulong base = node * META_WORDS;
     ulong offset = meta[base];
     ulong count = meta[base + 3];
+    timer_owner = NONE;
     if (count == 0) {
         return false;
+    }
+    // Ownership is resolved before the restructure: sifting can move a different live timer into
+    // the vacated root, and the caller must classify the record it actually received.
+    timer_owner = heap_timer_owner(params, tcp_state, records, offset);
+    if (timer_owner != NONE) {
+        tcp_state[tcp_timer_slot_word(timer_owner, params)] = 0;
     }
     copy_device_to_thread(records, offset, record);
     count -= 1;
@@ -433,7 +514,7 @@ inline bool heap_pop(
     if (count == 0) {
         return true;
     }
-    copy_device_record(records, offset + count, records, offset);
+    heap_move(params, tcp_state, records, offset + count, offset);
     ulong parent = 0;
     while (true) {
         ulong left = parent * 2 + 1;
@@ -448,7 +529,7 @@ inline bool heap_pop(
         if (!stored_key_less(records, offset + child, offset + parent)) {
             break;
         }
-        swap_records(records, offset + child, offset + parent);
+        heap_swap(params, tcp_state, records, offset + child, offset + parent);
         parent = child;
     }
     return true;
@@ -523,6 +604,24 @@ inline void active_update_key(
     }
 }
 
+inline ulong active_find(
+    ulong node,
+    ulong stream,
+    const device ulong *params,
+    const device ulong *stream_state
+) {
+    ulong meta =
+        params[P_LP_STREAM_META_OFFSET] + node * LP_STREAM_META_WORDS;
+    ulong offset = stream_state[meta + 2];
+    ulong count = stream_state[meta + 3];
+    for (ulong index = 0; index < count; ++index) {
+        if (stream_state[offset + index * ACTIVE_STREAM_ENTRY_WORDS] == stream) {
+            return index;
+        }
+    }
+    return NONE;
+}
+
 inline bool active_refresh_source(
     ulong node,
     ulong stream,
@@ -532,26 +631,20 @@ inline bool active_refresh_source(
     const device ulong *records,
     ulong slot
 ) {
-    ulong meta =
-        params[P_LP_STREAM_META_OFFSET] + node * LP_STREAM_META_WORDS;
-    ulong offset = stream_state[meta + 2];
-    ulong count = stream_state[meta + 3];
-    for (ulong index = 0; index < count; ++index) {
-        ulong entry = offset + index * ACTIVE_STREAM_ENTRY_WORDS;
-        if (stream_state[entry] == stream) {
-            active_update_key(
-                node,
-                index,
-                params,
-                stream_state,
-                records,
-                slot
-            );
-            return true;
-        }
+    ulong index = active_find(node, stream, params, stream_state);
+    if (index == NONE) {
+        set_semantic_error(error, 43, node);
+        return false;
     }
-    set_semantic_error(error, 43, node);
-    return false;
+    active_update_key(
+        node,
+        index,
+        params,
+        stream_state,
+        records,
+        slot
+    );
+    return true;
 }
 
 inline void active_remove(
@@ -572,6 +665,102 @@ inline void active_remove(
         }
     }
     stream_state[meta + 3] = count - 1;
+}
+
+// Removes one flow's live retransmission-timeout record from `node`'s fallback heap.
+//
+// The per-flow slot word makes this O(log n): validate the identity at the recorded slot, fill the
+// hole with the last record, and repair in whichever direction the fill violates. Semantic code 61
+// reports a slot that does not carry the flow's armed timer, which the live-state contract forbids.
+inline bool heap_remove_timer(
+    ulong node,
+    ulong flow,
+    ulong attempt,
+    ulong deadline,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *meta,
+    device ulong *records,
+    device ulong *stream_state,
+    device ulong *tcp_state
+) {
+    ulong slot_word = tcp_timer_slot_word(flow, params);
+    ulong stored = tcp_state[slot_word];
+    ulong base = node * META_WORDS;
+    ulong offset = meta[base];
+    ulong count = meta[base + 3];
+    if (stored == 0 || stored - 1 < offset || stored - 1 >= offset + count) {
+        set_semantic_error(error, 61, node);
+        return false;
+    }
+    ulong slot = stored - 1;
+    ulong record = slot * EVENT_WORDS;
+    if (records[record + E_KIND] != RETRANSMISSION_TIMEOUT ||
+        records[record + E_TARGET] != node ||
+        records[record + PK_FLOW] != flow ||
+        records[record + E_PAYLOAD] != attempt ||
+        records[record + E_TIME] != deadline) {
+        set_semantic_error(error, 61, node);
+        return false;
+    }
+    tcp_state[slot_word] = 0;
+    ulong index = slot - offset;
+    ulong last = count - 1;
+    count = last;
+    meta[base + 3] = count;
+    if (index != last) {
+        heap_move(params, tcp_state, records, offset + last, offset + index);
+        ulong child = index;
+        while (child != 0) {
+            ulong parent = (child - 1) / 2;
+            if (!stored_key_less(records, offset + child, offset + parent)) {
+                break;
+            }
+            heap_swap(params, tcp_state, records, offset + child, offset + parent);
+            child = parent;
+        }
+        if (child == index) {
+            ulong parent = index;
+            while (true) {
+                ulong left = parent * 2 + 1;
+                if (left >= count) {
+                    break;
+                }
+                ulong right = left + 1;
+                ulong pick = left;
+                if (right < count &&
+                    stored_key_less(records, offset + right, offset + left)) {
+                    pick = right;
+                }
+                if (!stored_key_less(records, offset + pick, offset + parent)) {
+                    break;
+                }
+                heap_swap(params, tcp_state, records, offset + pick, offset + parent);
+                parent = pick;
+            }
+        }
+    }
+    if (params[P_STREAMS_ENABLED] == 0) {
+        return true;
+    }
+    if (count == 0) {
+        ulong active_index = active_find(node, NONE, params, stream_state);
+        if (active_index == NONE) {
+            set_semantic_error(error, 43, node);
+            return false;
+        }
+        active_remove(node, active_index, params, stream_state);
+        return true;
+    }
+    return active_refresh_source(
+        node,
+        NONE,
+        params,
+        error,
+        stream_state,
+        records,
+        offset
+    );
 }
 
 inline bool stream_push(
@@ -620,10 +809,11 @@ inline bool fallback_push(
     device ulong *error,
     device ulong *fel_meta,
     device ulong *fel_records,
-    device ulong *stream_state
+    device ulong *stream_state,
+    device ulong *tcp_state
 ) {
     bool was_empty = fel_meta[node * META_WORDS + 3] == 0;
-    if (!heap_push(node, record, error, fel_meta, fel_records)) {
+    if (!heap_push(node, record, error, params, fel_meta, fel_records, tcp_state)) {
         return false;
     }
     if (params[P_STREAMS_ENABLED] == 0) {
@@ -658,10 +848,11 @@ inline bool classified_push(
     device ulong *fel_meta,
     device ulong *fel_records,
     device ulong *stream_state,
-    device ulong *stream_records
+    device ulong *stream_records,
+    device ulong *tcp_state
 ) {
     if (params[P_STREAMS_ENABLED] == 0) {
-        return heap_push(node, record, error, fel_meta, fel_records);
+        return heap_push(node, record, error, params, fel_meta, fel_records, tcp_state);
     }
     ulong kind = record[E_KIND];
     if (kind == PACKET_ARRIVAL && record[PK_FLOW] < params[P_FLOW_COUNT]) {
@@ -695,7 +886,8 @@ inline bool classified_push(
         error,
         fel_meta,
         fel_records,
-        stream_state
+        stream_state,
+        tcp_state
     );
 }
 
@@ -814,13 +1006,32 @@ inline bool fel_pop_selected(
     device ulong *fel_records,
     device ulong *stream_state,
     device ulong *stream_records,
-    thread ulong *record
+    device ulong *tcp_state,
+    thread ulong *record,
+    thread ulong &timer_owner
 ) {
+    timer_owner = NONE;
     if (params[P_STREAMS_ENABLED] == 0 || selected_active == NONE) {
-        return heap_pop(node, fel_meta, fel_records, record);
+        return heap_pop(
+            node,
+            params,
+            fel_meta,
+            fel_records,
+            tcp_state,
+            record,
+            timer_owner
+        );
     }
     if (selected_stream == NONE) {
-        if (!heap_pop(node, fel_meta, fel_records, record)) {
+        if (!heap_pop(
+            node,
+            params,
+            fel_meta,
+            fel_records,
+            tcp_state,
+            record,
+            timer_owner
+        )) {
             return false;
         }
         if (fel_meta[node * META_WORDS + 3] == 0) {
@@ -866,10 +1077,21 @@ inline bool fel_pop(
     device ulong *fel_records,
     device ulong *stream_state,
     device ulong *stream_records,
-    thread ulong *record
+    device ulong *tcp_state,
+    thread ulong *record,
+    thread ulong &timer_owner
 ) {
+    timer_owner = NONE;
     if (params[P_STREAMS_ENABLED] == 0) {
-        return heap_pop(node, fel_meta, fel_records, record);
+        return heap_pop(
+            node,
+            params,
+            fel_meta,
+            fel_records,
+            tcp_state,
+            record,
+            timer_owner
+        );
     }
     ulong selected_active;
     ulong selected_stream;
@@ -895,7 +1117,9 @@ inline bool fel_pop(
         fel_records,
         stream_state,
         stream_records,
-        record
+        tcp_state,
+        record,
+        timer_owner
     );
 }
 
@@ -1338,7 +1562,8 @@ inline bool emit_child(
     device ulong *remote_meta,
     device ulong *remote_staging,
     device ulong *stream_state,
-    device ulong *stream_records
+    device ulong *stream_records,
+    device ulong *tcp_state
 ) {
     ulong node_base = node * NODE_WORDS;
     ulong sequence = node_state[node_base + N_NEXT_ORIGIN];
@@ -1375,7 +1600,8 @@ inline bool emit_child(
             fel_meta,
             fel_records,
             stream_state,
-            stream_records
+            stream_records,
+            tcp_state
         );
     }
     return append_remote(
@@ -3376,7 +3602,8 @@ inline bool prepare_tcp_attempts(
             remote_meta,
             remote_staging,
             stream_state,
-            stream_records
+            stream_records,
+            tcp_state
         )) {
             return false;
         }
@@ -3409,7 +3636,8 @@ inline bool prepare_tcp_attempts(
             remote_meta,
             remote_staging,
             stream_state,
-            stream_records
+            stream_records,
+            tcp_state
         );
     }
     return true;
@@ -3418,6 +3646,7 @@ inline bool prepare_tcp_attempts(
 inline bool dispatch_event(
     ulong node,
     thread ulong *event,
+    ulong popped_timer_owner,
     device ulong *error,
     const device ulong *params,
     device ulong *node_state,
@@ -3553,7 +3782,8 @@ inline bool dispatch_event(
             if (!emit_child(
                     node, event, node, PACING_TIMER, candidate, next_packet, error, params,
                     node_state, fel_meta, fel_records, remote_meta, remote_staging,
-                    stream_state, stream_records)) {
+                    stream_state, stream_records,
+                    tcp_state)) {
                 return false;
             }
         } else {
@@ -3582,7 +3812,8 @@ inline bool dispatch_event(
             return emit_child(
                 node, event, node, TX_READY, event[E_TIME], event, error, params,
                 node_state, fel_meta, fel_records, remote_meta, remote_staging,
-                stream_state, stream_records);
+                stream_state, stream_records,
+                tcp_state);
         }
         return true;
     }
@@ -3766,7 +3997,8 @@ inline bool dispatch_event(
                     remote_meta,
                     remote_staging,
                     stream_state,
-                    stream_records
+                    stream_records,
+                    tcp_state
                 )) {
                     return false;
                 }
@@ -3827,7 +4059,8 @@ inline bool dispatch_event(
                 remote_meta,
                 remote_staging,
                 stream_state,
-                stream_records
+                stream_records,
+                tcp_state
             )) {
                 return false;
             }
@@ -3955,7 +4188,8 @@ inline bool dispatch_event(
             remote_meta,
             remote_staging,
             stream_state,
-            stream_records
+            stream_records,
+            tcp_state
         )) {
             return false;
         }
@@ -3974,7 +4208,8 @@ inline bool dispatch_event(
             remote_meta,
             remote_staging,
             stream_state,
-            stream_records
+            stream_records,
+            tcp_state
         );
     }
 
@@ -4047,7 +4282,8 @@ inline bool dispatch_event(
                 remote_meta,
                 remote_staging,
                 stream_state,
-                stream_records
+                stream_records,
+                tcp_state
             );
         }
         return true;
@@ -4178,7 +4414,8 @@ inline bool dispatch_event(
                 remote_meta,
                 remote_staging,
                 stream_state,
-                stream_records
+                stream_records,
+                tcp_state
             );
         }
         return true;
@@ -4273,7 +4510,8 @@ inline bool dispatch_event(
                 remote_meta,
                 remote_staging,
                 stream_state,
-                stream_records
+                stream_records,
+                tcp_state
             );
         }
         return true;
@@ -4349,7 +4587,23 @@ inline bool dispatch_event(
                 flight_before > acknowledged_bytes ? flight_before - acknowledged_bytes : 0;
             generators[generator + G_TCP_HIGHEST_ACK] = acknowledgment;
             generators[generator + G_TCP_DUP_ACKS] = 0;
-            generators[generator + G_TCP_TIMER_ACTIVE] = 0;
+            if (generators[generator + G_TCP_TIMER_ACTIVE] != 0) {
+                if (!heap_remove_timer(
+                    node,
+                    flow,
+                    generators[generator + G_TCP_TIMER_ATTEMPT],
+                    generators[generator + G_TCP_TIMER_DEADLINE],
+                    error,
+                    params,
+                    fel_meta,
+                    fel_records,
+                    stream_state,
+                    tcp_state
+                )) {
+                    return false;
+                }
+                generators[generator + G_TCP_TIMER_ACTIVE] = 0;
+            }
             if (
                 control[CTL_PHASE] == TCP_FAST_RECOVERY &&
                 acknowledgment < generators[generator + G_TCP_RECOVERY_HIGH]
@@ -4371,7 +4625,23 @@ inline bool dispatch_event(
             if (fast) {
                 generators[generator + G_TCP_RECOVERY_HIGH] = recovery_high;
                 control[CTL_RECOVERY_HIGH] = recovery_high;
-                generators[generator + G_TCP_TIMER_ACTIVE] = 0;
+                if (generators[generator + G_TCP_TIMER_ACTIVE] != 0) {
+                    if (!heap_remove_timer(
+                        node,
+                        flow,
+                        generators[generator + G_TCP_TIMER_ATTEMPT],
+                        generators[generator + G_TCP_TIMER_DEADLINE],
+                        error,
+                        params,
+                        fel_meta,
+                        fel_records,
+                        stream_state,
+                        tcp_state
+                    )) {
+                        return false;
+                    }
+                    generators[generator + G_TCP_TIMER_ACTIVE] = 0;
+                }
                 retransmit = true;
                 retransmit_sequence = acknowledgment;
             } else if (generators[generator + G_TCP_DUP_ACKS] > 3) {
@@ -4427,15 +4697,24 @@ inline bool dispatch_event(
     if (kind == RETRANSMISSION_TIMEOUT && role == HOST) {
         ulong flow = event[PK_FLOW];
         ulong generator = flow * GENERATOR_WORDS;
-        if (
-            flow >= params[P_FLOW_COUNT] ||
-            generators[generator + G_VALID] == 0 ||
-            generators[generator + G_OWNER] != node ||
-            generators[generator + G_KIND] != 1 ||
-            generators[generator + G_TCP_TIMER_ACTIVE] == 0 ||
-            generators[generator + G_TCP_TIMER_ATTEMPT] != event[E_PAYLOAD] ||
-            generators[generator + G_TCP_TIMER_DEADLINE] != event[E_TIME]
-        ) {
+        bool armed =
+            flow < params[P_FLOW_COUNT] &&
+            generators[generator + G_VALID] != 0 &&
+            generators[generator + G_OWNER] == node &&
+            generators[generator + G_KIND] == 1 &&
+            generators[generator + G_TCP_TIMER_ACTIVE] != 0 &&
+            generators[generator + G_TCP_TIMER_ATTEMPT] == event[E_PAYLOAD] &&
+            generators[generator + G_TCP_TIMER_DEADLINE] == event[E_TIME];
+        // Live-state contract (T20g item 2): the flow's owned heap record is live exactly when it
+        // matches the armed timer. Eager removal makes the two conditions equivalent, so any
+        // disagreement is a corrupted slot index rather than a modelling condition. A record owned
+        // by no flow is legacy import residue, which stays lazily recognized.
+        bool owned = popped_timer_owner != NONE && popped_timer_owner == flow;
+        if (armed != owned) {
+            set_semantic_error(error, 61, node);
+            return false;
+        }
+        if (!armed) {
             return true;
         }
         generators[generator + G_TCP_TIMER_ACTIVE] = 0;
@@ -4797,6 +5076,7 @@ kernel void days_round(
             state[L_FINISHED] = 1;
             return;
         }
+        ulong popped_timer_owner;
         if (!fel_pop_selected(
             node,
             selected_active,
@@ -4806,7 +5086,9 @@ kernel void days_round(
             fel_records,
             stream_state,
             stream_records,
-            event
+            tcp_state,
+            event,
+            popped_timer_owner
         )) {
             set_semantic_error(state, 26, node);
             return;
@@ -4814,6 +5096,7 @@ kernel void days_round(
         if (!dispatch_event(
             node,
             event,
+            popped_timer_owner,
             state,
             params,
             node_state,
@@ -4952,15 +5235,40 @@ kernel void days_round_fel_probe(
         }
 
         ulong event[EVENT_WORDS];
-        if (!heap_pop(node, fel_meta, fel_records, event)) {
+        ulong popped_timer_owner;
+        if (!heap_pop(
+            node,
+            params,
+            fel_meta,
+            fel_records,
+            tcp_state,
+            event,
+            popped_timer_owner
+        )) {
             set_semantic_error(state, 29, node);
             return;
         }
         if (inject_round_trip) {
-            if (!heap_push(node, event, state, fel_meta, fel_records)) {
+            if (!heap_push(
+                node,
+                event,
+                state,
+                params,
+                fel_meta,
+                fel_records,
+                tcp_state
+            )) {
                 return;
             }
-            if (!heap_pop(node, fel_meta, fel_records, event)) {
+            if (!heap_pop(
+                node,
+                params,
+                fel_meta,
+                fel_records,
+                tcp_state,
+                event,
+                popped_timer_owner
+            )) {
                 set_semantic_error(state, 30, node);
                 return;
             }
@@ -4976,6 +5284,7 @@ kernel void days_round_fel_probe(
         if (!dispatch_event(
             node,
             event,
+            popped_timer_owner,
             state,
             params,
             node_state,
@@ -5357,6 +5666,7 @@ kernel void days_exchange_merge(
     device ulong *merge_cursors [[buffer(24)]],
     device ulong *stream_state [[buffer(25)]],
     const device ulong *stream_records [[buffer(26)]],
+    device ulong *tcp_state [[buffer(30)]],
     uint target [[thread_position_in_grid]]
 ) {
     if (
@@ -5452,7 +5762,15 @@ kernel void days_exchange_merge(
             set_semantic_error(error, 28, target);
             return;
         }
-        if (!heap_push(target, event, error, fel_meta, fel_records)) {
+        if (!heap_push(
+            target,
+            event,
+            error,
+            params,
+            fel_meta,
+            fel_records,
+            tcp_state
+        )) {
             return;
         }
         merge_cursors[best_edge] += 1;
@@ -5474,6 +5792,7 @@ kernel void days_exchange_merge_fan_in_probe(
     const device ulong *inbound_producers [[buffer(23)]],
     device ulong *merge_cursors [[buffer(24)]],
     device ulong *diagnostic_fan_in [[buffer(29)]],
+    device ulong *tcp_state [[buffer(30)]],
     uint target [[thread_position_in_grid]]
 ) {
     if (
@@ -5585,7 +5904,15 @@ kernel void days_exchange_merge_fan_in_probe(
             set_semantic_error(error, 28, target);
             return;
         }
-        if (!heap_push(target, event, error, fel_meta, fel_records)) {
+        if (!heap_push(
+            target,
+            event,
+            error,
+            params,
+            fel_meta,
+            fel_records,
+            tcp_state
+        )) {
             return;
         }
         merge_cursors[best_edge] += 1;

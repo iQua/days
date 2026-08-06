@@ -2144,7 +2144,7 @@ impl CudaPlan {
                     arrival_capacity as u64;
             }
         }
-        let (tcp_state, tcp_layout) = prepare_tcp_state(
+        let (mut tcp_state, tcp_layout) = prepare_tcp_state(
             image,
             &capacity_context,
             &flow_data_counts,
@@ -2152,6 +2152,13 @@ impl CudaPlan {
             config.capacity_floors,
             tcp_capacity_floors,
         )?;
+        publish_live_timer_slots(
+            &fel_meta,
+            &fel_records,
+            node_count,
+            tcp_layout.ledger_meta_offset,
+            &mut tcp_state,
+        );
         let (inbound_meta, inbound_producers) = remote_inbound_producers(image);
         let round_capacity = config
             .max_rounds
@@ -3322,6 +3329,55 @@ fn write_record(storage: &mut [u64], slot: usize, record: [u64; EVENT_WORDS]) {
 
 fn record_less(left: &[u64], right: &[u64]) -> bool {
     (left[0], left[1], left[2], left[3]) < (right[0], right[1], right[2], right[3])
+}
+
+/// Publishes each armed retransmission timer's fallback-heap slot into TCP ledger metadata word +3.
+///
+/// The kernel removes a superseded timer through this slot, so the import must apply the same
+/// ownership rule the runtime does: a flow owns the canonically first heap record carrying its
+/// armed identity. Later duplicates and records the heap build could not attribute to an armed
+/// timer are legacy residue, which keeps the lazy pop recognition as its only consumer. The stored
+/// value is `slot + 1` so that zero means "this flow owns no heap record".
+fn publish_live_timer_slots(
+    fel_meta: &[u64],
+    fel_records: &[u64],
+    node_count: usize,
+    ledger_meta_offset: usize,
+    tcp_words: &mut [u64],
+) {
+    let mut owners: BTreeMap<u64, ([u64; 4], usize)> = BTreeMap::new();
+    for node in 0..node_count {
+        let base = node * ARENA_META_WORDS;
+        let offset = fel_meta[base] as usize;
+        let count = fel_meta[base + 3] as usize;
+        for index in 0..count {
+            let slot = offset + index;
+            let record = slot * EVENT_WORDS;
+            if fel_records[record + 5] != EventKind::RetransmissionTimeout as u64 {
+                continue;
+            }
+            let flow = fel_records[record + 8];
+            if flow == NONE {
+                continue;
+            }
+            let key = [
+                fel_records[record],
+                fel_records[record + 1],
+                fel_records[record + 2],
+                fel_records[record + 3],
+            ];
+            match owners.get(&flow) {
+                Some((owned, _)) if *owned <= key => {}
+                _ => {
+                    owners.insert(flow, (key, slot));
+                }
+            }
+        }
+    }
+    for (flow, (_, slot)) in owners {
+        let base = ledger_meta_offset + flow as usize * TCP_LEDGER_META_WORDS;
+        tcp_words[base + 3] = slot as u64 + 1;
+    }
 }
 
 fn heap_push_host(

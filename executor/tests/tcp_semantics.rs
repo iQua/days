@@ -2548,6 +2548,38 @@ fn rearm_trace_checkpoint_keeps_only_the_live_timer_event() {
     validate(&checkpoint, Backend::Scalar).expect("re-arm checkpoint must validate for Scalar");
     validate(&checkpoint, Backend::Cpu { workers: 2 })
         .expect("re-arm checkpoint must validate for CPU");
+
+    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    {
+        let metal = run_metal_with_observations(
+            &image,
+            None,
+            MetalConfig::default(),
+            ObservationMode::Full,
+        )
+        .expect("re-arm trace Metal run must execute");
+        assert_device_full_result_eq(&metal.result, &scalar, "re-arm trace Scalar/Metal identity");
+        assert_live_timer_closure(
+            &image,
+            &metal.result.host_states,
+            &metal.result.pending_events,
+            "re-arm trace Metal result",
+        );
+    }
+
+    #[cfg(feature = "cuda")]
+    {
+        let cuda =
+            run_cuda_with_observations(&image, None, CudaConfig::default(), ObservationMode::Full)
+                .expect("re-arm trace CUDA run must execute");
+        assert_device_full_result_eq(&cuda.result, &scalar, "re-arm trace Scalar/CUDA identity");
+        assert_live_timer_closure(
+            &image,
+            &cuda.result.host_states,
+            &cuda.result.pending_events,
+            "re-arm trace CUDA result",
+        );
+    }
 }
 
 /// Asserts the T20g live-state contract on one run result.
