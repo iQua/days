@@ -23,7 +23,7 @@ use thiserror::Error;
 
 use super::ids::{IdError, LinkKey, LpKey, PhysicalNodeKey, StableIds, dense_ids};
 use crate::topos::build::{HostAttachments, TopologyError, build_graph};
-use crate::topos::route::{RouteTableError, compute_shortest_path_route_table};
+use crate::topos::route::{RouteTableError, RouteWorkers, compute_shortest_path_route_table_with};
 
 /// Failure while lowering supported Days source configuration.
 #[derive(Debug, Error)]
@@ -351,6 +351,18 @@ struct FlowInput {
 /// This is a separate construction path from Nexosim. It never instantiates legacy actors and
 /// therefore never observes or mutates their process-global ID counters.
 pub fn compile_config(path: impl AsRef<Path>) -> Result<SimulationImage, CompileError> {
+    compile_config_with_route_workers(path, RouteWorkers::available())
+}
+
+/// [`compile_config`] with an explicit host-thread budget for per-flow route computation.
+///
+/// Routes are pure functions of the canonical topology graph and the flow endpoints and scatter
+/// into index-addressed slots, so every budget lowers the same image bytes. Equality gates use
+/// `RouteWorkers::serial()` as the single-threaded reference.
+pub fn compile_config_with_route_workers(
+    path: impl AsRef<Path>,
+    route_workers: RouteWorkers,
+) -> Result<SimulationImage, CompileError> {
     let path = path.as_ref();
     let content = fs::read_to_string(path).map_err(|source| CompileError::Read {
         path: path.display().to_string(),
@@ -365,7 +377,7 @@ pub fn compile_config(path: impl AsRef<Path>) -> Result<SimulationImage, Compile
     let model = SupportedModel::from_source(source, &content)?;
     let (graph, hosts) = build_graph(path_str)?;
 
-    let image = lower(model, &graph, hosts)?;
+    let image = lower(model, &graph, hosts, route_workers)?;
     validate(&image, Backend::Scalar).map_err(|error| {
         CompileError::Invalid(format!("lowered image failed validation: {error}"))
     })?;
@@ -1744,6 +1756,7 @@ fn lower(
     model: SupportedModel,
     graph: &petgraph::graph::UnGraph<usize, ()>,
     hosts: HostAttachments,
+    route_workers: RouteWorkers,
 ) -> Result<SimulationImage, CompileError> {
     let switch_topology_ids = graph
         .node_indices()
@@ -1848,7 +1861,7 @@ fn lower(
         model.seed,
     )?;
     let flow_ids = dense_ids(flows.iter().map(|flow| flow.key.clone()))?;
-    let route_table = compute_shortest_path_route_table(
+    let route_table = compute_shortest_path_route_table_with(
         graph,
         flows.iter().enumerate().map(|(index, flow)| {
             (
@@ -1857,6 +1870,7 @@ fn lower(
                 NodeIndex::new(host_attachment_switches[&flow.target] as usize),
             )
         }),
+        route_workers,
     )
     .map_err(|error| match error {
         RouteTableError::Unreachable(index) => {

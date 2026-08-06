@@ -7,8 +7,10 @@
 //! - ECMP: Implements the Equal-Cost Multi-Path algorithm (RFC 2992) optimized with A*.
 //!
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
+use std::thread;
 
 use petgraph::algo;
 use petgraph::algo::astar;
@@ -371,11 +373,140 @@ pub enum RouteTableError<K> {
     Unreachable(K),
 }
 
+/// Largest host-thread budget the per-flow route scatter will use.
+///
+/// Every worker owns one disjoint index range, so a budget wider than this only adds thread
+/// creation to a phase that is already bounded by memory bandwidth.
+pub const MAX_ROUTE_WORKERS: usize = 64;
+
+/// Host-thread budget for per-flow route computation.
+///
+/// A route is a pure function of the canonical topology graph and the flow endpoints: the
+/// pathfinder reads an immutable graph, allocates its own search state, consults no cache, draws
+/// no randomness, and never iterates a hash map. The budget therefore changes only how much wall
+/// clock the route table costs, never which path a flow receives. `RouteWorkers::serial()` keeps
+/// the single-threaded reference available so equality gates can pin the parallel scatter against
+/// it.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct RouteWorkers(NonZeroUsize);
+
+impl RouteWorkers {
+    /// The single-threaded reference budget.
+    pub const fn serial() -> Self {
+        Self(NonZeroUsize::MIN)
+    }
+
+    /// Clamps an arbitrary request into `1..=MAX_ROUTE_WORKERS`.
+    pub const fn new(workers: usize) -> Self {
+        let clamped = if workers < 1 {
+            1
+        } else if workers > MAX_ROUTE_WORKERS {
+            MAX_ROUTE_WORKERS
+        } else {
+            workers
+        };
+        match NonZeroUsize::new(clamped) {
+            Some(workers) => Self(workers),
+            None => Self::serial(),
+        }
+    }
+
+    /// The budget lowering uses by default: the host's reported parallelism, clamped.
+    pub fn available() -> Self {
+        Self::new(thread::available_parallelism().map_or(1, NonZeroUsize::get))
+    }
+
+    /// The clamped worker count.
+    pub const fn get(self) -> usize {
+        self.0.get()
+    }
+}
+
+/// Number of flows in each contiguous index chunk handed to one route worker.
+///
+/// The partition is a pure function of the flow count and the budget, so the same flow index
+/// always lands in the same chunk at the same offset regardless of thread scheduling.
+pub const fn route_chunk_len(flow_count: usize, workers: RouteWorkers) -> usize {
+    if flow_count == 0 {
+        return 1;
+    }
+    let chunks = if workers.get() < flow_count {
+        workers.get()
+    } else {
+        flow_count
+    };
+    flow_count.div_ceil(chunks)
+}
+
+/// Number of contiguous index chunks the flow list is partitioned into.
+pub const fn route_chunk_count(flow_count: usize, workers: RouteWorkers) -> usize {
+    flow_count.div_ceil(route_chunk_len(flow_count, workers))
+}
+
+/// Fills one worker's disjoint result slice from its disjoint endpoint slice.
+///
+/// The two slices are the same contiguous index range of the flow list, so this is an
+/// index-addressed scatter: no worker can observe or reach another worker's slot.
+fn fill_route_chunk(
+    graph: &UnGraph<usize, ()>,
+    fat_tree_params: Option<(usize, usize, usize)>,
+    endpoints: &[(NodeIndex, NodeIndex)],
+    routes: &mut [Option<Vec<NodeIndex>>],
+) {
+    for (&(source, target), slot) in endpoints.iter().zip(routes.iter_mut()) {
+        *slot = ShortestPath::try_compute_route_in_classified_canonical_graph(
+            graph,
+            source,
+            target,
+            fat_tree_params,
+        );
+    }
+}
+
+/// Computes one route per endpoint pair into an index-addressed buffer.
+///
+/// `None` marks an unreachable pair; the caller decides which position becomes the reported error.
+fn scatter_routes(
+    graph: &UnGraph<usize, ()>,
+    fat_tree_params: Option<(usize, usize, usize)>,
+    endpoints: &[(NodeIndex, NodeIndex)],
+    workers: RouteWorkers,
+) -> Vec<Option<Vec<NodeIndex>>> {
+    let mut routes = vec![None; endpoints.len()];
+    let chunk_len = route_chunk_len(endpoints.len(), workers);
+    if route_chunk_count(endpoints.len(), workers) < 2 {
+        fill_route_chunk(graph, fat_tree_params, endpoints, &mut routes);
+        return routes;
+    }
+
+    thread::scope(|scope| {
+        for (endpoints, routes) in endpoints
+            .chunks(chunk_len)
+            .zip(routes.chunks_mut(chunk_len))
+        {
+            scope.spawn(move || fill_route_chunk(graph, fat_tree_params, endpoints, routes));
+        }
+    });
+    routes
+}
+
+/// Position of the first key that repeats an earlier key, in submission order.
+fn first_repeated_key<K>(keys: &[K]) -> Option<usize>
+where
+    K: Ord,
+{
+    let mut seen = BTreeSet::new();
+    keys.iter().position(|key| !seen.insert(key))
+}
+
 /// Selects one deterministic physical switch path per flow.
 ///
 /// Legacy Days consumes this table when installing forwarding entries, and exact lowering consumes
 /// the same table when materializing `FlowDescriptor` routes. Keeping selection here prevents the
 /// two engines from acquiring independent equal-cost-path policies.
+///
+/// Route computation runs on `RouteWorkers::available()` host threads. Use
+/// [`compute_shortest_path_route_table_with`] to pin a budget.
 pub fn compute_shortest_path_route_table<K>(
     graph: &UnGraph<usize, ()>,
     flows: impl IntoIterator<Item = (K, NodeIndex, NodeIndex)>,
@@ -383,24 +514,59 @@ pub fn compute_shortest_path_route_table<K>(
 where
     K: Ord,
 {
+    compute_shortest_path_route_table_with(graph, flows, RouteWorkers::available())
+}
+
+/// [`compute_shortest_path_route_table`] with an explicit host-thread budget.
+///
+/// The budget is invisible in the result. Flows are partitioned by submission index into at most
+/// `workers` contiguous chunks, each worker writes only its own disjoint slice, and the reported
+/// error is still the first failing submission position rather than the first one a thread happens
+/// to reach.
+pub fn compute_shortest_path_route_table_with<K>(
+    graph: &UnGraph<usize, ()>,
+    flows: impl IntoIterator<Item = (K, NodeIndex, NodeIndex)>,
+    workers: RouteWorkers,
+) -> Result<BTreeMap<K, Vec<NodeIndex>>, RouteTableError<K>>
+where
+    K: Ord,
+{
     let graph = canonical_routing_graph(graph);
     let fat_tree_params = ShortestPath::fat_tree_params(&graph);
-    let mut routes = BTreeMap::new();
+
+    let flows = flows.into_iter();
+    let (lower_bound, _) = flows.size_hint();
+    let mut keys = Vec::with_capacity(lower_bound);
+    let mut endpoints = Vec::with_capacity(lower_bound);
     for (key, source, target) in flows {
-        if routes.contains_key(&key) {
-            return Err(RouteTableError::DuplicateKey(key));
-        }
-        let Some(route) = ShortestPath::try_compute_route_in_classified_canonical_graph(
-            &graph,
-            source,
-            target,
-            fat_tree_params,
-        ) else {
-            return Err(RouteTableError::Unreachable(key));
-        };
-        routes.insert(key, route);
+        keys.push(key);
+        endpoints.push((source, target));
     }
-    Ok(routes)
+
+    // The serial table returned at the first repeated key without asking for its route, so no
+    // position at or beyond that key was ever routed. Keeping the same horizon keeps the reported
+    // error identical and stops the scatter from routing flows the caller never sees.
+    let first_duplicate = first_repeated_key(&keys);
+    let routed = first_duplicate.unwrap_or(keys.len());
+    let routes = scatter_routes(&graph, fat_tree_params, &endpoints[..routed], workers);
+
+    if let Some(index) = routes.iter().position(Option::is_none) {
+        return Err(RouteTableError::Unreachable(keys.swap_remove(index)));
+    }
+    if let Some(index) = first_duplicate {
+        return Err(RouteTableError::DuplicateKey(keys.swap_remove(index)));
+    }
+
+    Ok(keys
+        .into_iter()
+        .zip(routes)
+        .map(|(key, route)| {
+            (
+                key,
+                route.expect("unreachable routes were rejected before the table was built"),
+            )
+        })
+        .collect())
 }
 
 impl RoutingProtocol for ShortestPath {

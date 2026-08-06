@@ -5,7 +5,7 @@ mod ids;
 
 use serde::Deserialize;
 
-pub use compile::{CompileError, compile_config};
+pub use compile::{CompileError, compile_config, compile_config_with_route_workers};
 
 /// Distribution configuration shared by legacy traffic models and exact lowering.
 #[derive(Deserialize, Debug, Clone, PartialEq)]

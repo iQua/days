@@ -149,7 +149,8 @@ fn assert_budget_invariant_lowering(
         let parallel_print = fingerprint(&parallel);
         report(fixture, "parallel", workers, parallel_print);
         assert_eq!(
-            parallel, serial,
+            parallel,
+            serial,
             "T20h fixture {fixture} lowered under {} route workers must be byte-identical to serial",
             workers.get()
         );
@@ -184,7 +185,10 @@ fn route_partitions_cover_every_flow_index_exactly_once() {
             for chunk in 0..chunks {
                 let start = chunk * chunk_len;
                 let end = ((chunk + 1) * chunk_len).min(flow_count);
-                assert_eq!(start, covered, "chunk {chunk} must start where the previous ended");
+                assert_eq!(
+                    start, covered,
+                    "chunk {chunk} must start where the previous ended"
+                );
                 assert!(start < end, "chunk {chunk} must be non-empty");
                 covered = end;
             }
@@ -199,7 +203,11 @@ fn route_partitions_cover_every_flow_index_exactly_once() {
 #[test]
 fn route_worker_budget_is_clamped_to_a_usable_range() {
     assert_eq!(RouteWorkers::serial().get(), 1);
-    assert_eq!(RouteWorkers::new(0).get(), 1, "a zero budget must still lower");
+    assert_eq!(
+        RouteWorkers::new(0).get(),
+        1,
+        "a zero budget must still lower"
+    );
     assert_eq!(RouteWorkers::new(7).get(), 7);
     assert_eq!(
         RouteWorkers::new(usize::MAX).get(),
