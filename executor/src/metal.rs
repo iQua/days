@@ -1131,7 +1131,7 @@ impl MetalExecutor {
 
         let retry_budget = config.max_capacity_retries;
         let mut attempt_config = config;
-        let mut tcp_capacity_floors = crate::device_capacity::TcpPerFlowCapacityFloors::default();
+        let mut tcp_capacity_floors = crate::device_capacity::TcpCapacityClassFloors::default();
         let mut retry_trace = Vec::new();
         loop {
             let attempt = (|| {
@@ -1140,7 +1140,7 @@ impl MetalExecutor {
                     exclusive_horizon_ns,
                     attempt_config,
                     observation_mode,
-                    &tcp_capacity_floors,
+                    &mut tcp_capacity_floors,
                 )?;
                 let buffers = MetalBuffers::new(&self.direct.device, plan)?;
                 let _execution_guard = metal_device_execution_guard();
@@ -1202,12 +1202,12 @@ impl MetalExecutor {
                         }
                         .with_retry_trace(&retry_trace));
                     }
-                    match (arena, flow) {
+                    let tcp_class_raised = match (arena, flow) {
                         (MetalArena::TcpReceiverRanges, Some(flow)) => {
-                            tcp_capacity_floors.raise_receiver(flow, grown_capacity);
+                            tcp_capacity_floors.raise_receiver(flow, capacity, grown_capacity)
                         }
                         (MetalArena::TcpSegmentLedger, Some(flow)) => {
-                            tcp_capacity_floors.raise_ledger(flow, grown_capacity);
+                            tcp_capacity_floors.raise_ledger(flow, capacity, grown_capacity)
                         }
                         (MetalArena::TcpReceiverRanges | MetalArena::TcpSegmentLedger, None) => {
                             return Err(MetalError::Validation(
@@ -1215,7 +1215,16 @@ impl MetalExecutor {
                             )
                             .with_retry_trace(&retry_trace));
                         }
-                        _ => attempt_config.raise_capacity(arena, capacity, grown_capacity),
+                        _ => {
+                            attempt_config.raise_capacity(arena, capacity, grown_capacity);
+                            true
+                        }
+                    };
+                    if !tcp_class_raised {
+                        return Err(MetalError::Validation(
+                            "TCP capacity fault did not match its immutable planned class".into(),
+                        )
+                        .with_retry_trace(&retry_trace));
                     }
                     retry_trace.push(CapacityRetryRecord {
                         retry: retry_trace.len() + 1,
@@ -1492,12 +1501,13 @@ impl MetalPlan {
         config: MetalConfig,
         observation_mode: ObservationMode,
     ) -> Result<Self, MetalError> {
+        let mut tcp_capacity_floors = crate::device_capacity::TcpCapacityClassFloors::default();
         Self::new_with_tcp_capacity_floors(
             image,
             exclusive_horizon_ns,
             config,
             observation_mode,
-            &crate::device_capacity::TcpPerFlowCapacityFloors::default(),
+            &mut tcp_capacity_floors,
         )
     }
 
@@ -1506,7 +1516,7 @@ impl MetalPlan {
         exclusive_horizon_ns: Option<u64>,
         config: MetalConfig,
         observation_mode: ObservationMode,
-        tcp_capacity_floors: &crate::device_capacity::TcpPerFlowCapacityFloors,
+        tcp_capacity_floors: &mut crate::device_capacity::TcpCapacityClassFloors,
     ) -> Result<Self, MetalError> {
         Self::new_with_capacity_mode_and_tcp_floors(
             image,
@@ -1526,13 +1536,14 @@ impl MetalPlan {
         observation_mode: ObservationMode,
         capacity_mode: PlannerCapacityMode,
     ) -> Result<Self, MetalError> {
+        let mut tcp_capacity_floors = crate::device_capacity::TcpCapacityClassFloors::default();
         Self::new_with_capacity_mode_and_tcp_floors(
             image,
             exclusive_horizon_ns,
             config,
             observation_mode,
             capacity_mode,
-            &crate::device_capacity::TcpPerFlowCapacityFloors::default(),
+            &mut tcp_capacity_floors,
         )
     }
 
@@ -1542,7 +1553,7 @@ impl MetalPlan {
         config: MetalConfig,
         observation_mode: ObservationMode,
         capacity_mode: PlannerCapacityMode,
-        tcp_capacity_floors: &crate::device_capacity::TcpPerFlowCapacityFloors,
+        tcp_capacity_floors: &mut crate::device_capacity::TcpCapacityClassFloors,
     ) -> Result<Self, MetalError> {
         let node_count = image.nodes.len();
         let (flow_packet_counts, flow_feedback_counts) = flow_packet_counts(image)?;
@@ -3096,7 +3107,7 @@ fn prepare_tcp_state(
     feedback_counts: &[usize],
     capacity_caps: DeviceCapacityCaps,
     capacity_floors: DeviceCapacityFloors,
-    tcp_capacity_floors: &crate::device_capacity::TcpPerFlowCapacityFloors,
+    tcp_capacity_floors: &mut crate::device_capacity::TcpCapacityClassFloors,
 ) -> Result<PreparedTcpState, MetalError> {
     let flow_count = image.flows.len();
     let receiver_offset = 0;
@@ -3122,14 +3133,19 @@ fn prepare_tcp_state(
             let derived_capacity = capacity_context
                 .tcp_receiver_range_bound(image, flow, data_count)
                 .max(receiver.out_of_order.len());
-            let capacity = crate::device_capacity::bound_derived_capacity(
+            let base_capacity = crate::device_capacity::bound_derived_capacity(
                 derived_capacity,
                 capacity_caps.tcp_receiver_ranges_per_flow,
-                capacity_floors
-                    .tcp_receiver_ranges_per_flow
-                    .max(tcp_capacity_floors.receiver(receiver.flow)),
+                capacity_floors.tcp_receiver_ranges_per_flow,
                 receiver.out_of_order.len(),
             );
+            let capacity = tcp_capacity_floors
+                .receiver(receiver.flow, base_capacity)
+                .ok_or_else(|| {
+                    MetalError::Validation(
+                        "TCP receiver capacity class changed between retry attempts".into(),
+                    )
+                })?;
             let words = capacity.checked_mul(TCP_RANGE_WORDS).ok_or_else(|| {
                 MetalError::Validation("TCP receiver range size overflows".into())
             })?;
@@ -3168,16 +3184,21 @@ fn prepare_tcp_state(
             .copied()
             .unwrap_or(0)
             .saturating_sub(feedback_counts.get(flow).copied().unwrap_or(0));
-        let capacity = crate::device_capacity::bound_derived_capacity(
+        let base_capacity = crate::device_capacity::bound_derived_capacity(
             capacity_context
                 .tcp_ledger_segment_bound(image, flow, data_count)
                 .max(current),
             capacity_caps.tcp_ledger_segments_per_flow,
-            capacity_floors
-                .tcp_ledger_segments_per_flow
-                .max(tcp_capacity_floors.ledger(FlowId(flow as u64))),
+            capacity_floors.tcp_ledger_segments_per_flow,
             current,
         );
+        let capacity = tcp_capacity_floors
+            .ledger(FlowId(flow as u64), base_capacity)
+            .ok_or_else(|| {
+                MetalError::Validation(
+                    "TCP ledger capacity class changed between retry attempts".into(),
+                )
+            })?;
         let record_offset = next;
         next = next
             .checked_add(

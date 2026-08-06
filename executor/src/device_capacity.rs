@@ -51,17 +51,22 @@ pub struct DeviceCapacityFloors {
     pub worklist_entries_total: usize,
 }
 
-/// Retry-time TCP floors keyed by the device row that actually overflowed. Keeping these separate
-/// from [`DeviceCapacityFloors`] prevents one flow from inflating every per-flow TCP arena.
+/// Retry-time TCP floors keyed by each row's immutable planned-capacity class.
+///
+/// Equivalent flows grow together after one representative row overflows. Adjacent capacity
+/// classes remain independent, and retaining each flow's original class prevents a grown row from
+/// migrating into another class on a later retry.
 #[cfg(any(
     test,
     feature = "cuda",
     all(feature = "metal-spike", target_vendor = "apple")
 ))]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct TcpPerFlowCapacityFloors {
-    receiver_ranges: BTreeMap<FlowId, usize>,
-    ledger_segments: BTreeMap<FlowId, usize>,
+pub(crate) struct TcpCapacityClassFloors {
+    receiver_base_by_flow: Vec<Option<usize>>,
+    ledger_base_by_flow: Vec<Option<usize>>,
+    receiver_ranges: BTreeMap<usize, usize>,
+    ledger_segments: BTreeMap<usize, usize>,
 }
 
 #[cfg(any(
@@ -69,27 +74,61 @@ pub(crate) struct TcpPerFlowCapacityFloors {
     feature = "cuda",
     all(feature = "metal-spike", target_vendor = "apple")
 ))]
-impl TcpPerFlowCapacityFloors {
-    pub(crate) fn receiver(&self, flow: FlowId) -> usize {
-        self.receiver_ranges.get(&flow).copied().unwrap_or(0)
+impl TcpCapacityClassFloors {
+    fn record_base(bases: &mut Vec<Option<usize>>, flow: FlowId, base: usize) -> bool {
+        let flow = flow.0 as usize;
+        if bases.len() <= flow {
+            bases.resize(flow.saturating_add(1), None);
+        }
+        match &mut bases[flow] {
+            Some(recorded) => *recorded == base,
+            slot @ None => {
+                *slot = Some(base);
+                true
+            }
+        }
     }
 
-    pub(crate) fn ledger(&self, flow: FlowId) -> usize {
-        self.ledger_segments.get(&flow).copied().unwrap_or(0)
+    fn recorded_base(bases: &[Option<usize>], flow: FlowId) -> Option<usize> {
+        bases.get(flow.0 as usize).copied().flatten()
     }
 
-    pub(crate) fn raise_receiver(&mut self, flow: FlowId, capacity: usize) {
+    pub(crate) fn receiver(&mut self, flow: FlowId, base: usize) -> Option<usize> {
+        Self::record_base(&mut self.receiver_base_by_flow, flow, base)
+            .then(|| base.max(self.receiver_ranges.get(&base).copied().unwrap_or(0)))
+    }
+
+    pub(crate) fn ledger(&mut self, flow: FlowId, base: usize) -> Option<usize> {
+        Self::record_base(&mut self.ledger_base_by_flow, flow, base)
+            .then(|| base.max(self.ledger_segments.get(&base).copied().unwrap_or(0)))
+    }
+
+    pub(crate) fn raise_receiver(&mut self, flow: FlowId, capacity: usize, grown: usize) -> bool {
+        let Some(base) = Self::recorded_base(&self.receiver_base_by_flow, flow) else {
+            return false;
+        };
+        if base.max(self.receiver_ranges.get(&base).copied().unwrap_or(0)) != capacity {
+            return false;
+        }
         self.receiver_ranges
-            .entry(flow)
-            .and_modify(|floor| *floor = (*floor).max(capacity))
-            .or_insert(capacity);
+            .entry(base)
+            .and_modify(|floor| *floor = (*floor).max(grown))
+            .or_insert(grown);
+        true
     }
 
-    pub(crate) fn raise_ledger(&mut self, flow: FlowId, capacity: usize) {
+    pub(crate) fn raise_ledger(&mut self, flow: FlowId, capacity: usize, grown: usize) -> bool {
+        let Some(base) = Self::recorded_base(&self.ledger_base_by_flow, flow) else {
+            return false;
+        };
+        if base.max(self.ledger_segments.get(&base).copied().unwrap_or(0)) != capacity {
+            return false;
+        }
         self.ledger_segments
-            .entry(flow)
-            .and_modify(|floor| *floor = (*floor).max(capacity))
-            .or_insert(capacity);
+            .entry(base)
+            .and_modify(|floor| *floor = (*floor).max(grown))
+            .or_insert(grown);
+        true
     }
 }
 
@@ -203,7 +242,7 @@ pub(crate) fn bound_derived_capacity(
 #[cfg(test)]
 mod tests {
     use super::{
-        TCP_LEDGER_RETRY_SLACK, TCP_RECEIVER_RETRY_SLACK, TcpPerFlowCapacityFloors,
+        TCP_LEDGER_RETRY_SLACK, TCP_RECEIVER_RETRY_SLACK, TcpCapacityClassFloors,
         bound_derived_capacity, cap_derived_capacity, grown_capacity, grown_capacity_with_slack,
         raise_cap_or_floor, raise_override_cap_or_floor,
     };
@@ -244,16 +283,27 @@ mod tests {
     }
 
     #[test]
-    fn tcp_retry_floor_only_grows_the_faulting_flow() {
-        let mut floors = TcpPerFlowCapacityFloors::default();
+    fn tcp_retry_grows_only_the_immutable_capacity_class() {
+        let mut floors = TcpCapacityClassFloors::default();
 
-        floors.raise_ledger(FlowId(7), 4_353);
-        floors.raise_receiver(FlowId(9), 129);
+        assert_eq!(floors.ledger(FlowId(7), 520), Some(520));
+        assert_eq!(floors.ledger(FlowId(8), 520), Some(520));
+        assert_eq!(floors.ledger(FlowId(9), 521), Some(521));
+        assert!(floors.raise_ledger(FlowId(7), 520, 777));
+        assert_eq!(floors.ledger(FlowId(7), 520), Some(777));
+        assert_eq!(floors.ledger(FlowId(8), 520), Some(777));
+        assert_eq!(floors.ledger(FlowId(9), 521), Some(521));
 
-        assert_eq!(floors.ledger(FlowId(7)), 4_353);
-        assert_eq!(floors.ledger(FlowId(8)), 0);
-        assert_eq!(floors.receiver(FlowId(9)), 129);
-        assert_eq!(floors.receiver(FlowId(7)), 0);
+        assert!(floors.raise_ledger(FlowId(8), 777, 1_034));
+        assert_eq!(floors.ledger(FlowId(7), 520), Some(1_034));
+        assert_eq!(floors.ledger(FlowId(8), 520), Some(1_034));
+        assert_eq!(floors.ledger(FlowId(9), 521), Some(521));
+        assert_eq!(floors.ledger(FlowId(7), 521), None);
+        assert!(!floors.raise_ledger(FlowId(10), 520, 777));
+
+        assert_eq!(floors.receiver(FlowId(9), 64), Some(64));
+        assert!(floors.raise_receiver(FlowId(9), 64, 129));
+        assert_eq!(floors.receiver(FlowId(9), 64), Some(129));
     }
 
     #[test]

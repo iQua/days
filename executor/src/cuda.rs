@@ -883,7 +883,7 @@ impl CudaExecutor {
 
         let retry_budget = config.max_capacity_retries;
         let mut attempt_config = config;
-        let mut tcp_capacity_floors = crate::device_capacity::TcpPerFlowCapacityFloors::default();
+        let mut tcp_capacity_floors = crate::device_capacity::TcpCapacityClassFloors::default();
         let mut retry_trace = Vec::new();
         loop {
             let attempt = (|| {
@@ -892,7 +892,7 @@ impl CudaExecutor {
                     exclusive_horizon_ns,
                     attempt_config,
                     observation_mode,
-                    &tcp_capacity_floors,
+                    &mut tcp_capacity_floors,
                 )?;
                 let _execution_guard = cuda_device_execution_guard();
                 let buffers = CudaBuffers::new(&self.direct.stream, plan)?;
@@ -954,12 +954,12 @@ impl CudaExecutor {
                         }
                         .with_retry_trace(&retry_trace));
                     }
-                    match (arena, flow) {
+                    let tcp_class_raised = match (arena, flow) {
                         (CudaArena::TcpReceiverRanges, Some(flow)) => {
-                            tcp_capacity_floors.raise_receiver(flow, grown_capacity);
+                            tcp_capacity_floors.raise_receiver(flow, capacity, grown_capacity)
                         }
                         (CudaArena::TcpSegmentLedger, Some(flow)) => {
-                            tcp_capacity_floors.raise_ledger(flow, grown_capacity);
+                            tcp_capacity_floors.raise_ledger(flow, capacity, grown_capacity)
                         }
                         (CudaArena::TcpReceiverRanges | CudaArena::TcpSegmentLedger, None) => {
                             return Err(CudaError::Validation(
@@ -967,7 +967,16 @@ impl CudaExecutor {
                             )
                             .with_retry_trace(&retry_trace));
                         }
-                        _ => attempt_config.raise_capacity(arena, capacity, grown_capacity),
+                        _ => {
+                            attempt_config.raise_capacity(arena, capacity, grown_capacity);
+                            true
+                        }
+                    };
+                    if !tcp_class_raised {
+                        return Err(CudaError::Validation(
+                            "TCP capacity fault did not match its immutable planned class".into(),
+                        )
+                        .with_retry_trace(&retry_trace));
                     }
                     retry_trace.push(CapacityRetryRecord {
                         retry: retry_trace.len() + 1,
@@ -996,7 +1005,7 @@ impl CudaExecutor {
 
         let retry_budget = config.max_capacity_retries;
         let mut attempt_config = config;
-        let mut tcp_capacity_floors = crate::device_capacity::TcpPerFlowCapacityFloors::default();
+        let mut tcp_capacity_floors = crate::device_capacity::TcpCapacityClassFloors::default();
         let mut retry_trace = Vec::new();
         loop {
             let attempt = (|| {
@@ -1005,7 +1014,7 @@ impl CudaExecutor {
                     exclusive_horizon_ns,
                     attempt_config,
                     observation_mode,
-                    &tcp_capacity_floors,
+                    &mut tcp_capacity_floors,
                 )?;
                 let _execution_guard = cuda_device_execution_guard();
                 let buffers = CudaBuffers::new(&self.direct.stream, plan)?;
@@ -1068,12 +1077,12 @@ impl CudaExecutor {
                         }
                         .with_retry_trace(&retry_trace));
                     }
-                    match (arena, flow) {
+                    let tcp_class_raised = match (arena, flow) {
                         (CudaArena::TcpReceiverRanges, Some(flow)) => {
-                            tcp_capacity_floors.raise_receiver(flow, grown_capacity);
+                            tcp_capacity_floors.raise_receiver(flow, capacity, grown_capacity)
                         }
                         (CudaArena::TcpSegmentLedger, Some(flow)) => {
-                            tcp_capacity_floors.raise_ledger(flow, grown_capacity);
+                            tcp_capacity_floors.raise_ledger(flow, capacity, grown_capacity)
                         }
                         (CudaArena::TcpReceiverRanges | CudaArena::TcpSegmentLedger, None) => {
                             return Err(CudaError::Validation(
@@ -1081,7 +1090,16 @@ impl CudaExecutor {
                             )
                             .with_retry_trace(&retry_trace));
                         }
-                        _ => attempt_config.raise_capacity(arena, capacity, grown_capacity),
+                        _ => {
+                            attempt_config.raise_capacity(arena, capacity, grown_capacity);
+                            true
+                        }
+                    };
+                    if !tcp_class_raised {
+                        return Err(CudaError::Validation(
+                            "TCP capacity fault did not match its immutable planned class".into(),
+                        )
+                        .with_retry_trace(&retry_trace));
                     }
                     retry_trace.push(CapacityRetryRecord {
                         retry: retry_trace.len() + 1,
@@ -1394,7 +1412,7 @@ fn prepare_tcp_state(
     data_counts: &[usize],
     capacity_caps: DeviceCapacityCaps,
     capacity_floors: DeviceCapacityFloors,
-    tcp_capacity_floors: &crate::device_capacity::TcpPerFlowCapacityFloors,
+    tcp_capacity_floors: &mut crate::device_capacity::TcpCapacityClassFloors,
 ) -> Result<(Vec<u64>, TcpLayout), CudaError> {
     let flow_count = image.flows.len().max(1);
     let receiver_offset = 0;
@@ -1416,16 +1434,21 @@ fn prepare_tcp_state(
         for receiver in &host.tcp_receivers {
             let flow = receiver.flow.0 as usize;
             let row = receiver_offset + flow * TCP_RECEIVER_WORDS;
-            let capacity = crate::device_capacity::bound_derived_capacity(
+            let base_capacity = crate::device_capacity::bound_derived_capacity(
                 capacity_context
                     .tcp_receiver_range_bound(image, flow, data_counts[flow])
                     .max(receiver.out_of_order.len()),
                 capacity_caps.tcp_receiver_ranges_per_flow,
-                capacity_floors
-                    .tcp_receiver_ranges_per_flow
-                    .max(tcp_capacity_floors.receiver(receiver.flow)),
+                capacity_floors.tcp_receiver_ranges_per_flow,
                 receiver.out_of_order.len(),
             );
+            let capacity = tcp_capacity_floors
+                .receiver(receiver.flow, base_capacity)
+                .ok_or_else(|| {
+                    CudaError::Validation(
+                        "TCP receiver capacity class changed between retry attempts".into(),
+                    )
+                })?;
             let range_offset = next;
             next = next
                 .checked_add(capacity.saturating_mul(2))
@@ -1460,16 +1483,21 @@ fn prepare_tcp_state(
         let packets = ledger
             .get(&crate::FlowId(flow as u64))
             .map_or_else(Vec::new, |segments| segments.values().copied().collect());
-        let capacity = crate::device_capacity::bound_derived_capacity(
+        let base_capacity = crate::device_capacity::bound_derived_capacity(
             capacity_context
                 .tcp_ledger_segment_bound(image, flow, data_count)
                 .max(packets.len()),
             capacity_caps.tcp_ledger_segments_per_flow,
-            capacity_floors
-                .tcp_ledger_segments_per_flow
-                .max(tcp_capacity_floors.ledger(FlowId(flow as u64))),
+            capacity_floors.tcp_ledger_segments_per_flow,
             packets.len(),
         );
+        let capacity = tcp_capacity_floors
+            .ledger(FlowId(flow as u64), base_capacity)
+            .ok_or_else(|| {
+                CudaError::Validation(
+                    "TCP ledger capacity class changed between retry attempts".into(),
+                )
+            })?;
         let row = ledger_meta_offset + flow * TCP_LEDGER_META_WORDS;
         let record_offset = next;
         next = next
@@ -1512,12 +1540,13 @@ impl CudaPlan {
         config: CudaConfig,
         observation_mode: ObservationMode,
     ) -> Result<Self, CudaError> {
+        let mut tcp_capacity_floors = crate::device_capacity::TcpCapacityClassFloors::default();
         Self::new_with_tcp_capacity_floors(
             image,
             exclusive_horizon_ns,
             config,
             observation_mode,
-            &crate::device_capacity::TcpPerFlowCapacityFloors::default(),
+            &mut tcp_capacity_floors,
         )
     }
 
@@ -1526,7 +1555,7 @@ impl CudaPlan {
         exclusive_horizon_ns: Option<u64>,
         config: CudaConfig,
         observation_mode: ObservationMode,
-        tcp_capacity_floors: &crate::device_capacity::TcpPerFlowCapacityFloors,
+        tcp_capacity_floors: &mut crate::device_capacity::TcpCapacityClassFloors,
     ) -> Result<Self, CudaError> {
         Self::new_with_capacity_mode_and_tcp_floors(
             image,
@@ -1546,13 +1575,14 @@ impl CudaPlan {
         observation_mode: ObservationMode,
         capacity_mode: PlannerCapacityMode,
     ) -> Result<Self, CudaError> {
+        let mut tcp_capacity_floors = crate::device_capacity::TcpCapacityClassFloors::default();
         Self::new_with_capacity_mode_and_tcp_floors(
             image,
             exclusive_horizon_ns,
             config,
             observation_mode,
             capacity_mode,
-            &crate::device_capacity::TcpPerFlowCapacityFloors::default(),
+            &mut tcp_capacity_floors,
         )
     }
 
@@ -1562,7 +1592,7 @@ impl CudaPlan {
         config: CudaConfig,
         observation_mode: ObservationMode,
         capacity_mode: PlannerCapacityMode,
-        tcp_capacity_floors: &crate::device_capacity::TcpPerFlowCapacityFloors,
+        tcp_capacity_floors: &mut crate::device_capacity::TcpCapacityClassFloors,
     ) -> Result<Self, CudaError> {
         let node_count = image.nodes.len();
         let (flow_packet_counts, flow_feedback_counts) = flow_packet_counts(image)?;
