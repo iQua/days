@@ -36,7 +36,7 @@ struct Cli {
     #[arg(long)]
     exclusive_horizon_ns: Option<u64>,
     /// Zero selects strict single-shot execution.
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = 8)]
     max_capacity_retries: usize,
 }
 

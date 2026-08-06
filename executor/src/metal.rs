@@ -352,7 +352,7 @@ impl Default for MetalConfig {
             streams_enabled: true,
             capacity_caps: DeviceCapacityCaps::default(),
             capacity_floors: DeviceCapacityFloors::default(),
-            max_capacity_retries: 4,
+            max_capacity_retries: 8,
             max_fel_events_per_lp: None,
             max_channel_events_per_stream: None,
             max_queue_packets_per_lp: None,
@@ -4912,7 +4912,7 @@ mod tests {
 
         assert!(config.streams_enabled);
         assert_eq!(config.max_channel_events_per_stream, None);
-        assert_eq!(config.max_capacity_retries, 4);
+        assert_eq!(config.max_capacity_retries, 8);
     }
 
     #[test]
