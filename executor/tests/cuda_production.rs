@@ -588,17 +588,36 @@ fn cuda_device_capacity_fault_is_explicit_and_executor_recovers() {
         CudaError::CapacityExceeded {
             arena: CudaArena::Queue,
             node: Some(SOURCE),
+            flow: None,
             capacity: 0,
             demand: 1,
         }
     );
 
     let recovered = executor
-        .run_with_observations(&image, None, CudaConfig::default(), ObservationMode::Full)
-        .expect("the executor must recover after a device capacity fault");
+        .run_with_observations(
+            &image,
+            None,
+            CudaConfig {
+                capacity_caps: days_executor::DeviceCapacityCaps {
+                    queue_packets_per_lp: Some(0),
+                    ..days_executor::DeviceCapacityCaps::default()
+                },
+                ..CudaConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .expect("adaptive CUDA execution must recover from a zero queue cap");
     assert!(expected.diagnostics.is_some());
     assert!(recovered.result.diagnostics.is_none());
     let mut expected_without_diagnostics = expected.clone();
     expected_without_diagnostics.diagnostics = None;
     assert_eq!(recovered.result, expected_without_diagnostics);
+    assert_eq!(recovered.capacity_retry_trace.len(), 1);
+    assert_eq!(recovered.capacity_retry_trace[0].arena, CudaArena::Queue);
+    assert_eq!(recovered.capacity_retry_trace[0].node, Some(SOURCE));
+    assert_eq!(recovered.capacity_retry_trace[0].flow, None);
+    assert_eq!(recovered.capacity_retry_trace[0].capacity, 0);
+    assert_eq!(recovered.capacity_retry_trace[0].demand, 1);
+    assert_eq!(recovered.capacity_retry_trace[0].grown_capacity, 2);
 }

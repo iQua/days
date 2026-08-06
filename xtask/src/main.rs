@@ -27,7 +27,7 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "cuda.rs",
         predicate: r#"feature = "cuda-test-hooks""#,
-        count: 12,
+        count: 13,
         purpose: "CUDA-only fault injection, capacity, and planner measurement hooks",
     },
     AllowedFeatureGate {
@@ -39,20 +39,20 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "cuda.rs",
         predicate: r#"feature = "planner-test-hooks""#,
-        count: 1,
+        count: 2,
         purpose: "CUDA host-plan equality hook is enabled by the standard test feature",
     },
     AllowedFeatureGate {
         path: "metal.rs",
         predicate: r#"feature = "planner-test-hooks""#,
-        count: 1,
+        count: 2,
         purpose: "Metal host-plan equality hook is enabled by the standard test feature",
     },
     AllowedFeatureGate {
         path: "device_capacity.rs",
         predicate: r#"any(test, feature = "cuda", all(feature = "metal-spike", target_vendor = "apple"))"#,
-        count: 8,
-        purpose: "shared device-arena cap and retry helpers compile only for tests and device backends",
+        count: 11,
+        purpose: "shared device-arena cap and per-flow retry helpers compile only for tests and device backends",
     },
     AllowedFeatureGate {
         path: "device_sizing.rs",
@@ -116,15 +116,15 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     },
     AllowedFeatureGate {
         path: "planner_capacity.rs",
-        predicate: r#"feature = "cuda""#,
+        predicate: r#"any(feature = "cuda", all(feature = "metal-spike", target_vendor = "apple"))"#,
         count: 5,
-        purpose: "CUDA-only MSS and TCP segment-capacity lookup behavior",
+        purpose: "both device planners use the one-byte minimum possible TCP tail segment",
     },
     AllowedFeatureGate {
         path: "planner_capacity.rs",
-        predicate: r#"all(feature = "metal-spike", target_vendor = "apple")"#,
-        count: 5,
-        purpose: "Metal-only one-byte TCP minimum behavior",
+        predicate: r#"feature = "cuda""#,
+        count: 4,
+        purpose: "CUDA-only synthetic one-byte TCP planner regression",
     },
     AllowedFeatureGate {
         path: "planner_capacity.rs",

@@ -1154,6 +1154,7 @@ fn metal_equal_rate_paced_source_queue_bound_is_tight() {
         MetalError::CapacityExceeded {
             arena: MetalArena::Queue,
             node: Some(GENERATOR_SOURCE),
+            flow: None,
             capacity: 0,
             demand: 1,
         }
@@ -1453,6 +1454,7 @@ fn metal_global_outbox_capacity_faults_identically_in_both_stream_modes() {
             MetalError::CapacityExceeded {
                 arena: MetalArena::Outbox,
                 node: None,
+                flow: None,
                 capacity: 2,
                 demand: 3,
             }
@@ -1503,6 +1505,7 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
         MetalError::CapacityExceeded {
             arena: MetalArena::Fel,
             node: Some(GENERATOR_SOURCE),
+            flow: None,
             capacity: 1,
             demand: 2,
         }
@@ -1532,6 +1535,7 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
         MetalError::CapacityExceeded {
             arena: MetalArena::ChannelInbox,
             node: Some(GENERATOR_SINK),
+            flow: None,
             capacity: 0,
             demand: 1,
         }
@@ -1564,6 +1568,7 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
         MetalError::CapacityExceeded {
             arena: MetalArena::Outbox,
             node: None,
+            flow: None,
             capacity: 0,
             demand: 1,
         }
@@ -1594,6 +1599,7 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
         MetalError::CapacityExceeded {
             arena: MetalArena::ObservedPackets,
             node: Some(GENERATOR_SOURCE),
+            flow: None,
             capacity: 0,
             demand: 1,
         }
@@ -1633,6 +1639,11 @@ fn metal_device_queue_capacity_fault_is_explicit() {
     );
     assert_eq!(recovered.capacity_retry_trace.len(), 1);
     assert_eq!(recovered.capacity_retry_trace[0].arena, MetalArena::Queue);
+    assert_eq!(
+        recovered.capacity_retry_trace[0].node,
+        Some(GENERATOR_SOURCE)
+    );
+    assert_eq!(recovered.capacity_retry_trace[0].flow, None);
     assert_eq!(recovered.capacity_retry_trace[0].capacity, 0);
     assert_eq!(recovered.capacity_retry_trace[0].demand, 1);
     assert_eq!(recovered.capacity_retry_trace[0].grown_capacity, 2);
@@ -1656,6 +1667,7 @@ fn metal_device_queue_capacity_fault_is_explicit() {
         MetalError::CapacityExceeded {
             arena: MetalArena::Queue,
             node: Some(GENERATOR_SOURCE),
+            flow: None,
             capacity: 0,
             demand: 1,
         }

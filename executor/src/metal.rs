@@ -33,8 +33,8 @@ use crate::planner_capacity::{PlannerCapacityContext, PlannerCapacityMode, TcpMi
 use crate::tcp::{TcpCubic, TcpReno};
 use crate::{
     ArrivalDisposition, Backend, CapacityRetryRecord, DeviceCapacityCaps, DeviceCapacityFloors,
-    Event, EventKey, EventKind, FlowGeneratorKind, GeneratorStatus, GeneratorTermination, NodeId,
-    NodeKind, ObservationMode, PacketArrivalObservation, PacketDeparture, PacketDescriptor,
+    Event, EventKey, EventKind, FlowGeneratorKind, FlowId, GeneratorStatus, GeneratorTermination,
+    NodeId, NodeKind, ObservationMode, PacketArrivalObservation, PacketDeparture, PacketDescriptor,
     PacketKind, PayloadId, RunResult, RunSummary, SimulationImage, TcpAckHeader,
     TcpCongestionControl, TcpDataHeader, TcpPhase, TcpReceiveRange, TcpTimerState, validate,
 };
@@ -231,8 +231,13 @@ pub enum MetalError {
     CapacityExceeded {
         arena: MetalArena,
         node: Option<NodeId>,
+        flow: Option<FlowId>,
         capacity: usize,
         demand: usize,
+    },
+    RetryFailed {
+        error: Box<MetalError>,
+        capacity_retry_trace: Vec<CapacityRetryRecord<MetalArena>>,
     },
     TransitionLimitExceeded {
         node: NodeId,
@@ -258,10 +263,16 @@ impl fmt::Display for MetalError {
             Self::CapacityExceeded {
                 arena,
                 node,
+                flow,
                 capacity,
                 demand,
             } => {
-                if let Some(node) = node {
+                if let Some(flow) = flow {
+                    write!(
+                        formatter,
+                        "Metal {arena} capacity of {capacity} records exceeded at flow {flow:?}; observed demand {demand}"
+                    )
+                } else if let Some(node) = node {
                     write!(
                         formatter,
                         "Metal {arena} capacity of {capacity} records exceeded at LP {node:?}; observed demand {demand}"
@@ -273,6 +284,14 @@ impl fmt::Display for MetalError {
                     )
                 }
             }
+            Self::RetryFailed {
+                error,
+                capacity_retry_trace,
+            } => write!(
+                formatter,
+                "Metal execution failed after {} capacity retries: {error}",
+                capacity_retry_trace.len()
+            ),
             Self::TransitionLimitExceeded { node, capacity } => write!(
                 formatter,
                 "Metal LP {node:?} exceeded the per-round transition continuation capacity of \
@@ -301,7 +320,27 @@ impl fmt::Display for MetalError {
     }
 }
 
-impl Error for MetalError {}
+impl Error for MetalError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::RetryFailed { error, .. } => Some(error.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+impl MetalError {
+    fn with_retry_trace(self, capacity_retry_trace: &[CapacityRetryRecord<MetalArena>]) -> Self {
+        if capacity_retry_trace.is_empty() {
+            self
+        } else {
+            Self::RetryFailed {
+                error: Box::new(self),
+                capacity_retry_trace: capacity_retry_trace.to_vec(),
+            }
+        }
+    }
+}
 
 /// Physical capacity and bounded-wave encoding policy for one Metal run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -426,21 +465,8 @@ impl MetalConfig {
                     grown,
                 );
             }
-            MetalArena::TcpReceiverRanges => {
-                crate::device_capacity::raise_cap_or_floor(
-                    &mut self.capacity_caps.tcp_receiver_ranges_per_flow,
-                    &mut self.capacity_floors.tcp_receiver_ranges_per_flow,
-                    capacity,
-                    grown,
-                );
-            }
-            MetalArena::TcpSegmentLedger => {
-                crate::device_capacity::raise_cap_or_floor(
-                    &mut self.capacity_caps.tcp_ledger_segments_per_flow,
-                    &mut self.capacity_floors.tcp_ledger_segments_per_flow,
-                    capacity,
-                    grown,
-                );
+            MetalArena::TcpReceiverRanges | MetalArena::TcpSegmentLedger => {
+                unreachable!("TCP capacity retries use per-flow floors")
             }
             MetalArena::RemoteStaging => {
                 crate::device_capacity::raise_override_cap_or_floor(
@@ -1105,14 +1131,16 @@ impl MetalExecutor {
 
         let retry_budget = config.max_capacity_retries;
         let mut attempt_config = config;
+        let mut tcp_capacity_floors = crate::device_capacity::TcpPerFlowCapacityFloors::default();
         let mut retry_trace = Vec::new();
         loop {
             let attempt = (|| {
-                let plan = MetalPlan::new(
+                let plan = MetalPlan::new_with_tcp_capacity_floors(
                     image,
                     exclusive_horizon_ns,
                     attempt_config,
                     observation_mode,
+                    &tcp_capacity_floors,
                 )?;
                 let buffers = MetalBuffers::new(&self.direct.device, plan)?;
                 let _execution_guard = metal_device_execution_guard();
@@ -1127,22 +1155,25 @@ impl MetalExecutor {
                     return Ok(run);
                 }
                 Err(error) => {
-                    let MetalError::CapacityExceeded {
-                        arena,
-                        node,
-                        capacity,
-                        demand,
-                    } = error
-                    else {
-                        return Err(error);
+                    let (arena, node, flow, capacity, demand) = match error {
+                        MetalError::CapacityExceeded {
+                            arena,
+                            node,
+                            flow,
+                            capacity,
+                            demand,
+                        } => (arena, node, flow, capacity, demand),
+                        error => return Err(error.with_retry_trace(&retry_trace)),
                     };
                     if retry_trace.len() == retry_budget {
                         return Err(MetalError::CapacityExceeded {
                             arena,
                             node,
+                            flow,
                             capacity,
                             demand,
-                        });
+                        }
+                        .with_retry_trace(&retry_trace));
                     }
                     let grown_capacity = match arena {
                         MetalArena::TcpReceiverRanges => {
@@ -1165,15 +1196,32 @@ impl MetalExecutor {
                         return Err(MetalError::CapacityExceeded {
                             arena,
                             node,
+                            flow,
                             capacity,
                             demand,
-                        });
+                        }
+                        .with_retry_trace(&retry_trace));
                     }
-                    attempt_config.raise_capacity(arena, capacity, grown_capacity);
+                    match (arena, flow) {
+                        (MetalArena::TcpReceiverRanges, Some(flow)) => {
+                            tcp_capacity_floors.raise_receiver(flow, grown_capacity);
+                        }
+                        (MetalArena::TcpSegmentLedger, Some(flow)) => {
+                            tcp_capacity_floors.raise_ledger(flow, grown_capacity);
+                        }
+                        (MetalArena::TcpReceiverRanges | MetalArena::TcpSegmentLedger, None) => {
+                            return Err(MetalError::Validation(
+                                "TCP capacity fault omitted its flow identity".into(),
+                            )
+                            .with_retry_trace(&retry_trace));
+                        }
+                        _ => attempt_config.raise_capacity(arena, capacity, grown_capacity),
+                    }
                     retry_trace.push(CapacityRetryRecord {
                         retry: retry_trace.len() + 1,
                         arena,
                         node,
+                        flow,
                         capacity,
                         demand,
                         grown_capacity,
@@ -1444,21 +1492,57 @@ impl MetalPlan {
         config: MetalConfig,
         observation_mode: ObservationMode,
     ) -> Result<Self, MetalError> {
-        Self::new_with_capacity_mode(
+        Self::new_with_tcp_capacity_floors(
+            image,
+            exclusive_horizon_ns,
+            config,
+            observation_mode,
+            &crate::device_capacity::TcpPerFlowCapacityFloors::default(),
+        )
+    }
+
+    fn new_with_tcp_capacity_floors(
+        image: &SimulationImage,
+        exclusive_horizon_ns: Option<u64>,
+        config: MetalConfig,
+        observation_mode: ObservationMode,
+        tcp_capacity_floors: &crate::device_capacity::TcpPerFlowCapacityFloors,
+    ) -> Result<Self, MetalError> {
+        Self::new_with_capacity_mode_and_tcp_floors(
             image,
             exclusive_horizon_ns,
             config,
             observation_mode,
             PlannerCapacityMode::Precomputed,
+            tcp_capacity_floors,
         )
     }
 
+    #[cfg(feature = "planner-test-hooks")]
     fn new_with_capacity_mode(
         image: &SimulationImage,
         exclusive_horizon_ns: Option<u64>,
         config: MetalConfig,
         observation_mode: ObservationMode,
         capacity_mode: PlannerCapacityMode,
+    ) -> Result<Self, MetalError> {
+        Self::new_with_capacity_mode_and_tcp_floors(
+            image,
+            exclusive_horizon_ns,
+            config,
+            observation_mode,
+            capacity_mode,
+            &crate::device_capacity::TcpPerFlowCapacityFloors::default(),
+        )
+    }
+
+    fn new_with_capacity_mode_and_tcp_floors(
+        image: &SimulationImage,
+        exclusive_horizon_ns: Option<u64>,
+        config: MetalConfig,
+        observation_mode: ObservationMode,
+        capacity_mode: PlannerCapacityMode,
+        tcp_capacity_floors: &crate::device_capacity::TcpPerFlowCapacityFloors,
     ) -> Result<Self, MetalError> {
         let node_count = image.nodes.len();
         let (flow_packet_counts, flow_feedback_counts) = flow_packet_counts(image)?;
@@ -1924,6 +2008,7 @@ impl MetalPlan {
             &flow_feedback_counts,
             config.capacity_caps,
             config.capacity_floors,
+            tcp_capacity_floors,
         )?;
         let (inbound_meta, inbound_producers) = remote_inbound_producers(image);
         let round_capacity = config
@@ -3011,6 +3096,7 @@ fn prepare_tcp_state(
     feedback_counts: &[usize],
     capacity_caps: DeviceCapacityCaps,
     capacity_floors: DeviceCapacityFloors,
+    tcp_capacity_floors: &crate::device_capacity::TcpPerFlowCapacityFloors,
 ) -> Result<PreparedTcpState, MetalError> {
     let flow_count = image.flows.len();
     let receiver_offset = 0;
@@ -3039,7 +3125,9 @@ fn prepare_tcp_state(
             let capacity = crate::device_capacity::bound_derived_capacity(
                 derived_capacity,
                 capacity_caps.tcp_receiver_ranges_per_flow,
-                capacity_floors.tcp_receiver_ranges_per_flow,
+                capacity_floors
+                    .tcp_receiver_ranges_per_flow
+                    .max(tcp_capacity_floors.receiver(receiver.flow)),
                 receiver.out_of_order.len(),
             );
             let words = capacity.checked_mul(TCP_RANGE_WORDS).ok_or_else(|| {
@@ -3085,7 +3173,9 @@ fn prepare_tcp_state(
                 .tcp_ledger_segment_bound(image, flow, data_count)
                 .max(current),
             capacity_caps.tcp_ledger_segments_per_flow,
-            capacity_floors.tcp_ledger_segments_per_flow,
+            capacity_floors
+                .tcp_ledger_segments_per_flow
+                .max(tcp_capacity_floors.ledger(FlowId(flow as u64))),
             current,
         );
         let record_offset = next;
@@ -3244,6 +3334,7 @@ fn heap_push_host(
         return Err(MetalError::CapacityExceeded {
             arena: MetalArena::Fel,
             node: Some(NodeId(lp as u64)),
+            flow: None,
             capacity,
             demand: count.saturating_add(1),
         });
@@ -3286,6 +3377,7 @@ fn queue_push_host(
         return Err(MetalError::CapacityExceeded {
             arena: MetalArena::Queue,
             node: Some(NodeId(lp as u64)),
+            flow: None,
             capacity,
             demand: count.saturating_add(1),
         });
@@ -3889,24 +3981,35 @@ impl MetalBuffers {
 }
 
 fn decode_device_error(control: &[u64]) -> MetalError {
-    let node = (control[CONTROL_ERROR_NODE] != NONE).then(|| NodeId(control[CONTROL_ERROR_NODE]));
+    let identity = (control[CONTROL_ERROR_NODE] != NONE).then_some(control[CONTROL_ERROR_NODE]);
     let capacity = control[CONTROL_ERROR_CAPACITY] as usize;
     let demand = control[CONTROL_ERROR_DEMAND] as usize;
     match control[CONTROL_ERROR] {
-        1 => MetalError::CapacityExceeded {
-            arena: decode_arena(control[CONTROL_ERROR_ARENA]),
-            node,
-            capacity,
-            demand,
-        },
+        1 => {
+            let arena = decode_arena(control[CONTROL_ERROR_ARENA]);
+            let tcp = matches!(
+                arena,
+                MetalArena::TcpReceiverRanges | MetalArena::TcpSegmentLedger
+            );
+            MetalError::CapacityExceeded {
+                arena,
+                node: if tcp { None } else { identity.map(NodeId) },
+                flow: if tcp { identity.map(FlowId) } else { None },
+                capacity,
+                demand,
+            }
+        }
         2 => MetalError::TransitionLimitExceeded {
-            node: node.unwrap_or(NodeId(0)),
+            node: identity.map(NodeId).unwrap_or(NodeId(0)),
             capacity,
         },
         100 => MetalError::WfqArithmeticOverflow {
-            node: node.unwrap_or(NodeId(0)),
+            node: identity.map(NodeId).unwrap_or(NodeId(0)),
         },
-        code => MetalError::DeviceExecution { code, node },
+        code => MetalError::DeviceExecution {
+            code,
+            node: identity.map(NodeId),
+        },
     }
 }
 
@@ -4913,10 +5016,55 @@ fn seconds_ns(seconds: f64) -> u64 {
 mod tests {
     use super::{
         ATTEMPT_PHASES, AttemptPhase, DispatchGeometry, LANES,
-        MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER, MAX_ENCODED_PAIRS_PER_WAVE, MetalConfig,
+        MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER, MAX_ENCODED_PAIRS_PER_WAVE, MetalConfig, MetalError,
         MetalPhaseTimings, PROFILE_SAMPLES_PER_ATTEMPT, PROFILED_ATTEMPTS,
-        accumulate_profile_interval, build_phase_profile, encoding_limits,
+        accumulate_profile_interval, build_phase_profile, decode_device_error, encoding_limits,
     };
+    use crate::CapacityRetryRecord;
+
+    #[test]
+    fn tcp_capacity_fault_identity_decodes_as_a_flow() {
+        let mut control = vec![0_u64; 20];
+        control[0] = 1;
+        control[1] = 11;
+        control[2] = 9;
+        control[3] = 64;
+        control[19] = 65;
+
+        assert_eq!(
+            decode_device_error(&control),
+            MetalError::CapacityExceeded {
+                arena: super::MetalArena::TcpReceiverRanges,
+                node: None,
+                flow: Some(crate::FlowId(9)),
+                capacity: 64,
+                demand: 65,
+            }
+        );
+    }
+
+    #[test]
+    fn terminal_failure_retains_every_capacity_retry() {
+        let retry = CapacityRetryRecord {
+            retry: 1,
+            arena: super::MetalArena::Queue,
+            node: Some(crate::NodeId(3)),
+            flow: None,
+            capacity: 0,
+            demand: 1,
+            grown_capacity: 2,
+        };
+        let error =
+            MetalError::Unavailable("injected terminal failure".into()).with_retry_trace(&[retry]);
+
+        assert_eq!(
+            error,
+            MetalError::RetryFailed {
+                error: Box::new(MetalError::Unavailable("injected terminal failure".into())),
+                capacity_retry_trace: vec![retry],
+            }
+        );
+    }
 
     #[test]
     fn stream_decomposition_is_enabled_by_default() {

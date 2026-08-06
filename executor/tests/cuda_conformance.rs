@@ -963,6 +963,7 @@ fn cuda_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             CudaError::CapacityExceeded {
                 arena,
                 node,
+                flow: None,
                 capacity,
                 demand,
             }

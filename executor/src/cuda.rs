@@ -150,24 +150,35 @@ impl fmt::Display for CudaArena {
     }
 }
 fn decode_device_error(control: &[u64]) -> CudaError {
-    let node = (control[CONTROL_ERROR_NODE] != NONE).then(|| NodeId(control[CONTROL_ERROR_NODE]));
+    let identity = (control[CONTROL_ERROR_NODE] != NONE).then_some(control[CONTROL_ERROR_NODE]);
     let capacity = control[CONTROL_ERROR_CAPACITY] as usize;
     let demand = control[CONTROL_ERROR_DEMAND] as usize;
     match control[CONTROL_ERROR] {
-        1 => CudaError::CapacityExceeded {
-            arena: decode_arena(control[CONTROL_ERROR_ARENA]),
-            node,
-            capacity,
-            demand,
-        },
+        1 => {
+            let arena = decode_arena(control[CONTROL_ERROR_ARENA]);
+            let tcp = matches!(
+                arena,
+                CudaArena::TcpReceiverRanges | CudaArena::TcpSegmentLedger
+            );
+            CudaError::CapacityExceeded {
+                arena,
+                node: if tcp { None } else { identity.map(NodeId) },
+                flow: if tcp { identity.map(FlowId) } else { None },
+                capacity,
+                demand,
+            }
+        }
         2 => CudaError::TransitionLimitExceeded {
-            node: node.unwrap_or(NodeId(0)),
+            node: identity.map(NodeId).unwrap_or(NodeId(0)),
             capacity,
         },
         100 => CudaError::WfqArithmeticOverflow {
-            node: node.unwrap_or(NodeId(0)),
+            node: identity.map(NodeId).unwrap_or(NodeId(0)),
         },
-        code => CudaError::DeviceExecution { code, node },
+        code => CudaError::DeviceExecution {
+            code,
+            node: identity.map(NodeId),
+        },
     }
 }
 
@@ -424,8 +435,13 @@ pub enum CudaError {
     CapacityExceeded {
         arena: CudaArena,
         node: Option<NodeId>,
+        flow: Option<FlowId>,
         capacity: usize,
         demand: usize,
+    },
+    RetryFailed {
+        error: Box<CudaError>,
+        capacity_retry_trace: Vec<CapacityRetryRecord<CudaArena>>,
     },
     TransitionLimitExceeded {
         node: NodeId,
@@ -451,10 +467,16 @@ impl fmt::Display for CudaError {
             Self::CapacityExceeded {
                 arena,
                 node,
+                flow,
                 capacity,
                 demand,
             } => {
-                if let Some(node) = node {
+                if let Some(flow) = flow {
+                    write!(
+                        formatter,
+                        "CUDA {arena} capacity of {capacity} records exceeded at flow {flow:?}; observed demand {demand}"
+                    )
+                } else if let Some(node) = node {
                     write!(
                         formatter,
                         "CUDA {arena} capacity of {capacity} records exceeded at LP {node:?}; observed demand {demand}"
@@ -466,6 +488,14 @@ impl fmt::Display for CudaError {
                     )
                 }
             }
+            Self::RetryFailed {
+                error,
+                capacity_retry_trace,
+            } => write!(
+                formatter,
+                "CUDA execution failed after {} capacity retries: {error}",
+                capacity_retry_trace.len()
+            ),
             Self::TransitionLimitExceeded { node, capacity } => write!(
                 formatter,
                 "CUDA LP {node:?} exceeded the per-round transition continuation capacity of \
@@ -494,7 +524,27 @@ impl fmt::Display for CudaError {
     }
 }
 
-impl Error for CudaError {}
+impl Error for CudaError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::RetryFailed { error, .. } => Some(error.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+impl CudaError {
+    fn with_retry_trace(self, capacity_retry_trace: &[CapacityRetryRecord<CudaArena>]) -> Self {
+        if capacity_retry_trace.is_empty() {
+            self
+        } else {
+            Self::RetryFailed {
+                error: Box::new(self),
+                capacity_retry_trace: capacity_retry_trace.to_vec(),
+            }
+        }
+    }
+}
 
 /// Physical capacity and bounded CUDA Graph wave policy for one run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -612,21 +662,8 @@ impl CudaConfig {
                     grown,
                 );
             }
-            CudaArena::TcpReceiverRanges => {
-                crate::device_capacity::raise_cap_or_floor(
-                    &mut self.capacity_caps.tcp_receiver_ranges_per_flow,
-                    &mut self.capacity_floors.tcp_receiver_ranges_per_flow,
-                    capacity,
-                    grown,
-                );
-            }
-            CudaArena::TcpSegmentLedger => {
-                crate::device_capacity::raise_cap_or_floor(
-                    &mut self.capacity_caps.tcp_ledger_segments_per_flow,
-                    &mut self.capacity_floors.tcp_ledger_segments_per_flow,
-                    capacity,
-                    grown,
-                );
+            CudaArena::TcpReceiverRanges | CudaArena::TcpSegmentLedger => {
+                unreachable!("TCP capacity retries use per-flow floors")
             }
             CudaArena::RemoteStaging => {
                 crate::device_capacity::raise_override_cap_or_floor(
@@ -846,14 +883,16 @@ impl CudaExecutor {
 
         let retry_budget = config.max_capacity_retries;
         let mut attempt_config = config;
+        let mut tcp_capacity_floors = crate::device_capacity::TcpPerFlowCapacityFloors::default();
         let mut retry_trace = Vec::new();
         loop {
             let attempt = (|| {
-                let plan = CudaPlan::new(
+                let plan = CudaPlan::new_with_tcp_capacity_floors(
                     image,
                     exclusive_horizon_ns,
                     attempt_config,
                     observation_mode,
+                    &tcp_capacity_floors,
                 )?;
                 let _execution_guard = cuda_device_execution_guard();
                 let buffers = CudaBuffers::new(&self.direct.stream, plan)?;
@@ -868,22 +907,25 @@ impl CudaExecutor {
                     return Ok(run);
                 }
                 Err(error) => {
-                    let CudaError::CapacityExceeded {
-                        arena,
-                        node,
-                        capacity,
-                        demand,
-                    } = error
-                    else {
-                        return Err(error);
+                    let (arena, node, flow, capacity, demand) = match error {
+                        CudaError::CapacityExceeded {
+                            arena,
+                            node,
+                            flow,
+                            capacity,
+                            demand,
+                        } => (arena, node, flow, capacity, demand),
+                        error => return Err(error.with_retry_trace(&retry_trace)),
                     };
                     if retry_trace.len() == retry_budget {
                         return Err(CudaError::CapacityExceeded {
                             arena,
                             node,
+                            flow,
                             capacity,
                             demand,
-                        });
+                        }
+                        .with_retry_trace(&retry_trace));
                     }
                     let grown_capacity = match arena {
                         CudaArena::TcpReceiverRanges => {
@@ -906,15 +948,32 @@ impl CudaExecutor {
                         return Err(CudaError::CapacityExceeded {
                             arena,
                             node,
+                            flow,
                             capacity,
                             demand,
-                        });
+                        }
+                        .with_retry_trace(&retry_trace));
                     }
-                    attempt_config.raise_capacity(arena, capacity, grown_capacity);
+                    match (arena, flow) {
+                        (CudaArena::TcpReceiverRanges, Some(flow)) => {
+                            tcp_capacity_floors.raise_receiver(flow, grown_capacity);
+                        }
+                        (CudaArena::TcpSegmentLedger, Some(flow)) => {
+                            tcp_capacity_floors.raise_ledger(flow, grown_capacity);
+                        }
+                        (CudaArena::TcpReceiverRanges | CudaArena::TcpSegmentLedger, None) => {
+                            return Err(CudaError::Validation(
+                                "TCP capacity fault omitted its flow identity".into(),
+                            )
+                            .with_retry_trace(&retry_trace));
+                        }
+                        _ => attempt_config.raise_capacity(arena, capacity, grown_capacity),
+                    }
                     retry_trace.push(CapacityRetryRecord {
                         retry: retry_trace.len() + 1,
                         arena,
                         node,
+                        flow,
                         capacity,
                         demand,
                         grown_capacity,
@@ -937,14 +996,16 @@ impl CudaExecutor {
 
         let retry_budget = config.max_capacity_retries;
         let mut attempt_config = config;
+        let mut tcp_capacity_floors = crate::device_capacity::TcpPerFlowCapacityFloors::default();
         let mut retry_trace = Vec::new();
         loop {
             let attempt = (|| {
-                let plan = CudaPlan::new(
+                let plan = CudaPlan::new_with_tcp_capacity_floors(
                     image,
                     exclusive_horizon_ns,
                     attempt_config,
                     observation_mode,
+                    &tcp_capacity_floors,
                 )?;
                 let _execution_guard = cuda_device_execution_guard();
                 let buffers = CudaBuffers::new(&self.direct.stream, plan)?;
@@ -960,22 +1021,25 @@ impl CudaExecutor {
                     return Ok(profiled);
                 }
                 Err(error) => {
-                    let CudaError::CapacityExceeded {
-                        arena,
-                        node,
-                        capacity,
-                        demand,
-                    } = error
-                    else {
-                        return Err(error);
+                    let (arena, node, flow, capacity, demand) = match error {
+                        CudaError::CapacityExceeded {
+                            arena,
+                            node,
+                            flow,
+                            capacity,
+                            demand,
+                        } => (arena, node, flow, capacity, demand),
+                        error => return Err(error.with_retry_trace(&retry_trace)),
                     };
                     if retry_trace.len() == retry_budget {
                         return Err(CudaError::CapacityExceeded {
                             arena,
                             node,
+                            flow,
                             capacity,
                             demand,
-                        });
+                        }
+                        .with_retry_trace(&retry_trace));
                     }
                     let grown_capacity = match arena {
                         CudaArena::TcpReceiverRanges => {
@@ -998,15 +1062,32 @@ impl CudaExecutor {
                         return Err(CudaError::CapacityExceeded {
                             arena,
                             node,
+                            flow,
                             capacity,
                             demand,
-                        });
+                        }
+                        .with_retry_trace(&retry_trace));
                     }
-                    attempt_config.raise_capacity(arena, capacity, grown_capacity);
+                    match (arena, flow) {
+                        (CudaArena::TcpReceiverRanges, Some(flow)) => {
+                            tcp_capacity_floors.raise_receiver(flow, grown_capacity);
+                        }
+                        (CudaArena::TcpSegmentLedger, Some(flow)) => {
+                            tcp_capacity_floors.raise_ledger(flow, grown_capacity);
+                        }
+                        (CudaArena::TcpReceiverRanges | CudaArena::TcpSegmentLedger, None) => {
+                            return Err(CudaError::Validation(
+                                "TCP capacity fault omitted its flow identity".into(),
+                            )
+                            .with_retry_trace(&retry_trace));
+                        }
+                        _ => attempt_config.raise_capacity(arena, capacity, grown_capacity),
+                    }
                     retry_trace.push(CapacityRetryRecord {
                         retry: retry_trace.len() + 1,
                         arena,
                         node,
+                        flow,
                         capacity,
                         demand,
                         grown_capacity,
@@ -1313,6 +1394,7 @@ fn prepare_tcp_state(
     data_counts: &[usize],
     capacity_caps: DeviceCapacityCaps,
     capacity_floors: DeviceCapacityFloors,
+    tcp_capacity_floors: &crate::device_capacity::TcpPerFlowCapacityFloors,
 ) -> Result<(Vec<u64>, TcpLayout), CudaError> {
     let flow_count = image.flows.len().max(1);
     let receiver_offset = 0;
@@ -1339,7 +1421,9 @@ fn prepare_tcp_state(
                     .tcp_receiver_range_bound(image, flow, data_counts[flow])
                     .max(receiver.out_of_order.len()),
                 capacity_caps.tcp_receiver_ranges_per_flow,
-                capacity_floors.tcp_receiver_ranges_per_flow,
+                capacity_floors
+                    .tcp_receiver_ranges_per_flow
+                    .max(tcp_capacity_floors.receiver(receiver.flow)),
                 receiver.out_of_order.len(),
             );
             let range_offset = next;
@@ -1381,7 +1465,9 @@ fn prepare_tcp_state(
                 .tcp_ledger_segment_bound(image, flow, data_count)
                 .max(packets.len()),
             capacity_caps.tcp_ledger_segments_per_flow,
-            capacity_floors.tcp_ledger_segments_per_flow,
+            capacity_floors
+                .tcp_ledger_segments_per_flow
+                .max(tcp_capacity_floors.ledger(FlowId(flow as u64))),
             packets.len(),
         );
         let row = ledger_meta_offset + flow * TCP_LEDGER_META_WORDS;
@@ -1419,27 +1505,64 @@ fn prepare_tcp_state(
 }
 
 impl CudaPlan {
+    #[cfg(feature = "cuda-test-hooks")]
     fn new(
         image: &SimulationImage,
         exclusive_horizon_ns: Option<u64>,
         config: CudaConfig,
         observation_mode: ObservationMode,
     ) -> Result<Self, CudaError> {
-        Self::new_with_capacity_mode(
+        Self::new_with_tcp_capacity_floors(
+            image,
+            exclusive_horizon_ns,
+            config,
+            observation_mode,
+            &crate::device_capacity::TcpPerFlowCapacityFloors::default(),
+        )
+    }
+
+    fn new_with_tcp_capacity_floors(
+        image: &SimulationImage,
+        exclusive_horizon_ns: Option<u64>,
+        config: CudaConfig,
+        observation_mode: ObservationMode,
+        tcp_capacity_floors: &crate::device_capacity::TcpPerFlowCapacityFloors,
+    ) -> Result<Self, CudaError> {
+        Self::new_with_capacity_mode_and_tcp_floors(
             image,
             exclusive_horizon_ns,
             config,
             observation_mode,
             PlannerCapacityMode::Precomputed,
+            tcp_capacity_floors,
         )
     }
 
+    #[cfg(feature = "planner-test-hooks")]
     fn new_with_capacity_mode(
         image: &SimulationImage,
         exclusive_horizon_ns: Option<u64>,
         config: CudaConfig,
         observation_mode: ObservationMode,
         capacity_mode: PlannerCapacityMode,
+    ) -> Result<Self, CudaError> {
+        Self::new_with_capacity_mode_and_tcp_floors(
+            image,
+            exclusive_horizon_ns,
+            config,
+            observation_mode,
+            capacity_mode,
+            &crate::device_capacity::TcpPerFlowCapacityFloors::default(),
+        )
+    }
+
+    fn new_with_capacity_mode_and_tcp_floors(
+        image: &SimulationImage,
+        exclusive_horizon_ns: Option<u64>,
+        config: CudaConfig,
+        observation_mode: ObservationMode,
+        capacity_mode: PlannerCapacityMode,
+        tcp_capacity_floors: &crate::device_capacity::TcpPerFlowCapacityFloors,
     ) -> Result<Self, CudaError> {
         let node_count = image.nodes.len();
         let (flow_packet_counts, flow_feedback_counts) = flow_packet_counts(image)?;
@@ -1918,6 +2041,7 @@ impl CudaPlan {
             &flow_data_counts,
             config.capacity_caps,
             config.capacity_floors,
+            tcp_capacity_floors,
         )?;
         let (inbound_meta, inbound_producers) = remote_inbound_producers(image);
         let round_capacity = config
@@ -3076,6 +3200,7 @@ fn heap_push_host(
         return Err(CudaError::CapacityExceeded {
             arena: CudaArena::Fel,
             node: Some(NodeId(lp as u64)),
+            flow: None,
             capacity,
             demand: count.saturating_add(1),
         });
@@ -3118,6 +3243,7 @@ fn queue_push_host(
         return Err(CudaError::CapacityExceeded {
             arena: CudaArena::Queue,
             node: Some(NodeId(lp as u64)),
+            flow: None,
             capacity,
             demand: count.saturating_add(1),
         });
@@ -4023,6 +4149,7 @@ fn duration_ns(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{CudaArena, CudaError, decode_arena, decode_device_error};
+    use crate::CapacityRetryRecord;
 
     #[test]
     fn cuda_decodes_tcp_capacity_arenas_with_metal_parity() {
@@ -4044,9 +4171,33 @@ mod tests {
             decode_device_error(&control),
             CudaError::CapacityExceeded {
                 arena: CudaArena::TcpSegmentLedger,
-                node: Some(crate::NodeId(7)),
+                node: None,
+                flow: Some(crate::FlowId(7)),
                 capacity: 8,
                 demand: 9,
+            }
+        );
+    }
+
+    #[test]
+    fn cuda_terminal_failure_retains_every_capacity_retry() {
+        let retry = CapacityRetryRecord {
+            retry: 1,
+            arena: CudaArena::Queue,
+            node: Some(crate::NodeId(3)),
+            flow: None,
+            capacity: 0,
+            demand: 1,
+            grown_capacity: 2,
+        };
+        let error =
+            CudaError::Unavailable("injected terminal failure".into()).with_retry_trace(&[retry]);
+
+        assert_eq!(
+            error,
+            CudaError::RetryFailed {
+                error: Box::new(CudaError::Unavailable("injected terminal failure".into())),
+                capacity_retry_trace: vec![retry],
             }
         );
     }

@@ -1,4 +1,11 @@
-use crate::NodeId;
+use crate::{FlowId, NodeId};
+
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+use std::collections::BTreeMap;
 
 /// Optional upper bounds for device arenas whose production defaults are derived from the full
 /// simulation image.
@@ -44,13 +51,58 @@ pub struct DeviceCapacityFloors {
     pub worklist_entries_total: usize,
 }
 
+/// Retry-time TCP floors keyed by the device row that actually overflowed. Keeping these separate
+/// from [`DeviceCapacityFloors`] prevents one flow from inflating every per-flow TCP arena.
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TcpPerFlowCapacityFloors {
+    receiver_ranges: BTreeMap<FlowId, usize>,
+    ledger_segments: BTreeMap<FlowId, usize>,
+}
+
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+impl TcpPerFlowCapacityFloors {
+    pub(crate) fn receiver(&self, flow: FlowId) -> usize {
+        self.receiver_ranges.get(&flow).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn ledger(&self, flow: FlowId) -> usize {
+        self.ledger_segments.get(&flow).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn raise_receiver(&mut self, flow: FlowId, capacity: usize) {
+        self.receiver_ranges
+            .entry(flow)
+            .and_modify(|floor| *floor = (*floor).max(capacity))
+            .or_insert(capacity);
+    }
+
+    pub(crate) fn raise_ledger(&mut self, flow: FlowId, capacity: usize) {
+        self.ledger_segments
+            .entry(flow)
+            .and_modify(|floor| *floor = (*floor).max(capacity))
+            .or_insert(capacity);
+    }
+}
+
 /// One failed attempt and the capacity selected for its deterministic replacement attempt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CapacityRetryRecord<A> {
     /// One-based replacement-attempt number.
     pub retry: usize,
     pub arena: A,
+    /// LP identity for per-LP and aggregate arenas.
     pub node: Option<NodeId>,
+    /// Flow identity for per-flow TCP arenas.
+    pub flow: Option<FlowId>,
     pub capacity: usize,
     pub demand: usize,
     pub grown_capacity: usize,
@@ -151,10 +203,11 @@ pub(crate) fn bound_derived_capacity(
 #[cfg(test)]
 mod tests {
     use super::{
-        TCP_LEDGER_RETRY_SLACK, TCP_RECEIVER_RETRY_SLACK, bound_derived_capacity,
-        cap_derived_capacity, grown_capacity, grown_capacity_with_slack, raise_cap_or_floor,
-        raise_override_cap_or_floor,
+        TCP_LEDGER_RETRY_SLACK, TCP_RECEIVER_RETRY_SLACK, TcpPerFlowCapacityFloors,
+        bound_derived_capacity, cap_derived_capacity, grown_capacity, grown_capacity_with_slack,
+        raise_cap_or_floor, raise_override_cap_or_floor,
     };
+    use crate::FlowId;
 
     #[test]
     fn derived_capacity_cap_never_excludes_resident_records() {
@@ -188,6 +241,19 @@ mod tests {
             grown_capacity_with_slack(usize::MAX, usize::MAX, 256),
             usize::MAX
         );
+    }
+
+    #[test]
+    fn tcp_retry_floor_only_grows_the_faulting_flow() {
+        let mut floors = TcpPerFlowCapacityFloors::default();
+
+        floors.raise_ledger(FlowId(7), 4_353);
+        floors.raise_receiver(FlowId(9), 129);
+
+        assert_eq!(floors.ledger(FlowId(7)), 4_353);
+        assert_eq!(floors.ledger(FlowId(8)), 0);
+        assert_eq!(floors.receiver(FlowId(9)), 129);
+        assert_eq!(floors.receiver(FlowId(7)), 0);
     }
 
     #[test]
