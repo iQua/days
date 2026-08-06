@@ -49,6 +49,14 @@ cargo test -p days --features cuda-planner-test --test t20e_planner_bit_equal --
 The normal `test,cuda` CUDA-toolchain surface registers the same gate. The host-only surface writes
 an empty kernel placeholder because these tests never initialize or execute the CUDA backend.
 
+The Apple Metal surface also registers the strict K32 byte-policy regression. It allocates the
+standard 10 GiB production plan, so run this long gate in release mode:
+
+```bash
+cargo test --release -p days --features test,metal-spike --test t20b3_queue_bytes \
+  k32_byte_policy_strict_run_is_retry_free -- --show-output
+```
+
 ## Feature flags
 
 - `l2` / `l2_pfc`: optional legacy L2/PFC pipeline

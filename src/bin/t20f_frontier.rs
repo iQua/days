@@ -4,6 +4,12 @@ use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
 use days::scenario::compile_config;
+#[cfg(any(
+    test,
+    all(feature = "metal-spike", target_vendor = "apple"),
+    feature = "cuda"
+))]
+use days_executor::CapacityRetryRecord;
 use days_executor::{DeviceCapacityCaps, ObservationMode, RunResult, run_scalar_with_observations};
 
 const FNV1A64_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
@@ -69,6 +75,32 @@ fn fingerprint(value: &impl Debug) -> Fingerprint {
     });
     write!(&mut writer, "{value:#?}").expect("debug serialization length must fit in u64");
     writer.0
+}
+
+#[cfg(any(
+    test,
+    all(feature = "metal-spike", target_vendor = "apple"),
+    feature = "cuda"
+))]
+fn capacity_retry_counts<A>(trace: &[CapacityRetryRecord<A>]) -> (usize, usize) {
+    let grown_stream_count = trace
+        .iter()
+        .filter_map(|record| record.stream)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    (trace.len(), grown_stream_count)
+}
+
+#[cfg(any(
+    all(feature = "metal-spike", target_vendor = "apple"),
+    feature = "cuda"
+))]
+fn channel_capacity_distribution(levels: &[days_executor::ChannelStreamCapacityLevel]) -> String {
+    levels
+        .iter()
+        .map(|level| format!("{}:{}", level.capacity, level.stream_count))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn print_result(engine: &str, result: &RunResult, lowering_ns: u128, run_ns: u128) {
@@ -139,9 +171,13 @@ fn run_device(cli: &Cli, image: &days_executor::SimulationImage, lowering_ns: u1
         )
         .expect("Metal frontier run must succeed");
     let run_ns = started.elapsed().as_nanos();
+    let (retry_count, grown_stream_count) = capacity_retry_counts(&run.capacity_retry_trace);
+    let channel_capacity_distribution =
+        channel_capacity_distribution(&run.channel_stream_capacity_distribution);
     println!(
         "record=p11_t20f_frontier_device engine=metal wall_ns={} device_ns={} rounds={} \
-         transitions={} retry_trace={:?}",
+         transitions={} retry_count={retry_count} grown_stream_count={grown_stream_count} \
+         channel_capacity_distribution={channel_capacity_distribution} retry_trace={:?}",
         run.wall_ns, run.device_ns, run.rounds, run.transitions, run.capacity_retry_trace,
     );
     print_result("metal", &run.result, lowering_ns, run_ns);
@@ -169,9 +205,13 @@ fn run_device(cli: &Cli, image: &days_executor::SimulationImage, lowering_ns: u1
         )
         .expect("CUDA frontier run must succeed");
     let run_ns = started.elapsed().as_nanos();
+    let (retry_count, grown_stream_count) = capacity_retry_counts(&run.capacity_retry_trace);
+    let channel_capacity_distribution =
+        channel_capacity_distribution(&run.channel_stream_capacity_distribution);
     println!(
         "record=p11_t20f_frontier_device engine=cuda wall_ns={} device_ns={} rounds={} \
-         transitions={} retry_trace={:?}",
+         transitions={} retry_count={retry_count} grown_stream_count={grown_stream_count} \
+         channel_capacity_distribution={channel_capacity_distribution} retry_trace={:?}",
         run.wall_ns, run.device_ns, run.rounds, run.transitions, run.capacity_retry_trace,
     );
     print_result("cuda", &run.result, lowering_ns, run_ns);
@@ -190,12 +230,40 @@ fn run_device(_cli: &Cli, _image: &days_executor::SimulationImage, _lowering_ns:
 
 #[cfg(test)]
 mod tests {
-    use super::fingerprint;
+    use days_executor::CapacityRetryRecord;
+
+    use super::{capacity_retry_counts, fingerprint};
+
+    fn retry_record(retry: usize, stream: Option<usize>) -> CapacityRetryRecord<&'static str> {
+        CapacityRetryRecord {
+            retry,
+            arena: "test",
+            node: None,
+            flow: None,
+            stream,
+            capacity: 1,
+            demand: 2,
+            grown_capacity: 4,
+        }
+    }
 
     #[test]
     fn streaming_fingerprint_is_deterministic() {
         let value = vec![1_u64, 2, 3];
         assert_eq!(fingerprint(&value), fingerprint(&value));
         assert_ne!(fingerprint(&value), fingerprint(&vec![3_u64, 2, 1]));
+    }
+
+    #[test]
+    fn retry_counts_distinguish_attempts_from_distinct_grown_streams() {
+        let trace = [
+            retry_record(1, Some(7)),
+            retry_record(2, None),
+            retry_record(3, Some(7)),
+            retry_record(4, Some(9)),
+        ];
+
+        assert_eq!(capacity_retry_counts(&trace), (4, 2));
+        assert_eq!(capacity_retry_counts::<&str>(&[]), (0, 0));
     }
 }

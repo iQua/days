@@ -1,8 +1,11 @@
 #![cfg_attr(
-    not(any(
-        all(feature = "metal-spike", target_vendor = "apple"),
-        feature = "cuda"
-    )),
+    any(
+        test,
+        not(any(
+            all(feature = "metal-spike", target_vendor = "apple"),
+            feature = "cuda"
+        ))
+    ),
     allow(dead_code)
 )]
 
@@ -22,8 +25,8 @@ use days::scenario::compile_config;
 ))]
 use days_executor::run_scalar_with_observations;
 use days_executor::{
-    DeviceCapacityCaps, DropMarkPolicy, EcnThresholdPolicy, ObservationMode, QueueDepthUnit,
-    RunResult, SimulationImage,
+    CapacityRetryRecord, DeviceCapacityCaps, DropMarkPolicy, EcnThresholdPolicy, ObservationMode,
+    QueueDepthUnit, RunResult, SimulationImage,
 };
 
 const FNV1A64_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
@@ -143,6 +146,15 @@ fn result_fingerprints(result: &RunResult) -> ResultFingerprints {
     }
 }
 
+fn capacity_retry_counts<A>(trace: &[CapacityRetryRecord<A>]) -> (usize, usize) {
+    let grown_stream_count = trace
+        .iter()
+        .filter_map(|record| record.stream)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    (trace.len(), grown_stream_count)
+}
+
 fn apply_probe_byte_policy(
     image: &mut SimulationImage,
     policy_packet_bytes: u64,
@@ -236,19 +248,32 @@ fn print_protocol(backend: &str, cli: &Cli, transform: BytePolicyTransform) {
     );
 }
 
-fn print_timing(
-    backend: &str,
-    cli: &Cli,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TimingRecord {
     api_ns: u128,
     backend_wall_ns: u64,
     device_ns: u64,
     rounds: u64,
     transitions: u64,
-) {
+    retry_count: usize,
+    grown_stream_count: usize,
+}
+
+fn print_timing(backend: &str, cli: &Cli, timing: TimingRecord) {
+    let TimingRecord {
+        api_ns,
+        backend_wall_ns,
+        device_ns,
+        rounds,
+        transitions,
+        retry_count,
+        grown_stream_count,
+    } = timing;
     println!(
         "record=p11_t20b3_timing backend={backend} fixture={} kind={} sample_label={} \
          observation_mode=Summary api_ns={api_ns} backend_wall_ns={backend_wall_ns} \
          device_ns={device_ns} rounds={rounds} transitions={transitions} \
+         retry_count={retry_count} grown_stream_count={grown_stream_count} \
          production_uninstrumented=1",
         cli.fixture.display(),
         cli.kind.label(),
@@ -305,14 +330,20 @@ fn main() {
                 .run_with_observations(&image, None, config, ObservationMode::Summary)
                 .expect("Metal production run must succeed");
             let api_ns = started.elapsed().as_nanos();
+            let (retry_count, grown_stream_count) =
+                capacity_retry_counts(&run.capacity_retry_trace);
             print_timing(
                 "metal",
                 &cli,
-                api_ns,
-                run.wall_ns,
-                run.device_ns,
-                run.rounds,
-                run.transitions,
+                TimingRecord {
+                    api_ns,
+                    backend_wall_ns: run.wall_ns,
+                    device_ns: run.device_ns,
+                    rounds: run.rounds,
+                    transitions: run.transitions,
+                    retry_count,
+                    grown_stream_count,
+                },
             );
             print_identity("metal", &cli, &run.result, "N/A", "fingerprint");
         }
@@ -369,14 +400,20 @@ fn main() {
                 .run_with_observations(&image, None, config, ObservationMode::Summary)
                 .expect("CUDA production run must succeed");
             let api_ns = started.elapsed().as_nanos();
+            let (retry_count, grown_stream_count) =
+                capacity_retry_counts(&run.capacity_retry_trace);
             print_timing(
                 "cuda",
                 &cli,
-                api_ns,
-                run.wall_ns,
-                run.device_ns,
-                run.rounds,
-                run.transitions,
+                TimingRecord {
+                    api_ns,
+                    backend_wall_ns: run.wall_ns,
+                    device_ns: run.device_ns,
+                    rounds: run.rounds,
+                    transitions: run.transitions,
+                    retry_count,
+                    grown_stream_count,
+                },
             );
             print_identity("cuda", &cli, &run.result, "N/A", "fingerprint");
         }
@@ -421,11 +458,38 @@ mod tests {
     use std::path::PathBuf;
 
     use days::scenario::compile_config;
-    use days_executor::{DropMarkPolicy, QueueDepthUnit};
+    use days_executor::{CapacityRetryRecord, DropMarkPolicy, QueueDepthUnit};
 
     use super::{
-        FNV1A64_OFFSET_BASIS, RunKind, apply_probe_byte_policy, capacity_caps, fingerprint,
+        FNV1A64_OFFSET_BASIS, RunKind, apply_probe_byte_policy, capacity_caps,
+        capacity_retry_counts, fingerprint,
     };
+
+    fn retry_record(retry: usize, stream: Option<usize>) -> CapacityRetryRecord<&'static str> {
+        CapacityRetryRecord {
+            retry,
+            arena: "test",
+            node: None,
+            flow: None,
+            stream,
+            capacity: 1,
+            demand: 2,
+            grown_capacity: 4,
+        }
+    }
+
+    #[test]
+    fn retry_counts_distinguish_attempts_from_distinct_grown_streams() {
+        let trace = [
+            retry_record(1, Some(7)),
+            retry_record(2, None),
+            retry_record(3, Some(7)),
+            retry_record(4, Some(9)),
+        ];
+
+        assert_eq!(capacity_retry_counts(&trace), (4, 2));
+        assert_eq!(capacity_retry_counts::<&str>(&[]), (0, 0));
+    }
 
     #[test]
     fn full_parity_derives_observation_capacity_without_changing_timing_caps() {
@@ -466,9 +530,8 @@ mod tests {
         assert_eq!(hash, fingerprint(&vec![1_u64, 2, 3]));
     }
 
-    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    #[cfg(all(feature = "test", feature = "metal-spike", target_vendor = "apple"))]
     #[test]
-    #[ignore = "allocates the 10 GiB standard K32 production plan; run as the T20f acceptance gate"]
     fn k32_byte_policy_strict_run_is_retry_free() {
         use days_executor::{MetalConfig, MetalExecutor, ObservationMode};
 
