@@ -895,9 +895,8 @@ pub(crate) fn paced_single_source_queue_bound(
 /// Multiplier covering Reno fast-recovery inflation and transient reordering beyond the encoded
 /// congestion window. Device overflow remains fail-stop and adaptive re-planning can grow it.
 pub(crate) const TCP_WINDOW_SLACK_FACTOR: usize = 2;
-/// Extra ledger records for a partial cumulative ACK boundary and recovery retransmissions. The
-/// frontier reaches exactly one record beyond an eight-record allowance before its safe horizon.
-pub(crate) const TCP_LEDGER_RECOVERY_ALLOWANCE: usize = 9;
+/// Extra ledger records for a partial cumulative ACK boundary and recovery retransmissions.
+pub(crate) const TCP_LEDGER_RECOVERY_ALLOWANCE: usize = 8;
 /// Extra receiver gaps for the head-truncation/coalescing boundary during recovery.
 pub(crate) const TCP_RECEIVER_RECOVERY_ALLOWANCE: usize = 4;
 /// Twice the measured frontier failure average of 512 retained RTO installs per flow.
@@ -1576,7 +1575,7 @@ mod tests {
         let mut tcp = TcpGenerator::new(1 << 20, 1_024, 64, TcpCongestionControl::reno(1_024));
         tcp.bytes_in_flight = 3_073;
 
-        assert_eq!(tcp_ledger_segment_bound(tcp, 1_024), 137);
+        assert_eq!(tcp_ledger_segment_bound(tcp, 1_024), 136);
         assert_eq!(tcp_receiver_range_bound(tcp, 1_024), 132);
         assert_eq!(tcp_ledger_segment_bound(tcp, 16), 16);
         assert_eq!(tcp_receiver_range_bound(tcp, 16), 16);
