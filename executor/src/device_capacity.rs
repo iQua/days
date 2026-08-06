@@ -57,11 +57,13 @@ pub struct CapacityRetryRecord<A> {
 }
 
 #[cfg(any(
+    test,
     feature = "cuda",
     all(feature = "metal-spike", target_vendor = "apple")
 ))]
 pub(crate) const TCP_RECEIVER_RETRY_SLACK: usize = 64;
 #[cfg(any(
+    test,
     feature = "cuda",
     all(feature = "metal-spike", target_vendor = "apple")
 ))]
@@ -149,8 +151,9 @@ pub(crate) fn bound_derived_capacity(
 #[cfg(test)]
 mod tests {
     use super::{
-        bound_derived_capacity, cap_derived_capacity, grown_capacity, grown_capacity_with_slack,
-        raise_cap_or_floor, raise_override_cap_or_floor,
+        TCP_LEDGER_RETRY_SLACK, TCP_RECEIVER_RETRY_SLACK, bound_derived_capacity,
+        cap_derived_capacity, grown_capacity, grown_capacity_with_slack, raise_cap_or_floor,
+        raise_override_cap_or_floor,
     };
 
     #[test]
@@ -176,7 +179,11 @@ mod tests {
 
     #[test]
     fn reported_demand_supports_tight_additive_retry_slack() {
-        assert_eq!(grown_capacity_with_slack(4_096, 4_097, 256), 4_353);
+        assert_eq!(TCP_RECEIVER_RETRY_SLACK, 64);
+        assert_eq!(
+            grown_capacity_with_slack(4_096, 4_097, TCP_LEDGER_RETRY_SLACK),
+            4_353
+        );
         assert_eq!(
             grown_capacity_with_slack(usize::MAX, usize::MAX, 256),
             usize::MAX
