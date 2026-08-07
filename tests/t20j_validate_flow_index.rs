@@ -21,9 +21,9 @@ use std::path::PathBuf;
 use days::scenario::compile_config;
 use days_executor::{
     Backend, Event, EventKey, EventKind, FlowGeneratorKind, FlowId, GeneratorStatus,
-    ObservationMode, PacketDescriptor, PacketKind, PayloadId, SimulationImage, TcpAckHeader,
-    assert_validate_flow_index_equivalent_for_testing, event_phase, run_scalar_with_observations,
-    validate,
+    ObservationMode, PacketDescriptor, PacketKind, PayloadId, SchedulerKind, SimulationImage,
+    TcpAckHeader, assert_validate_flow_index_equivalent_for_testing, event_phase,
+    run_scalar_with_observations, validate,
 };
 
 /// Every fixture family under `configs/` that the executor scenario lowering accepts, biased to
@@ -249,6 +249,77 @@ fn truncated_stop_times_separate_the_two_preloaded_ack_counts() {
         assert_validate_flow_index_equivalent_for_testing(&truncated)
             .unwrap_or_else(|mismatch| panic!("horizon {horizon}: {mismatch}"));
     }
+}
+
+/// Rewrites every switch queue's scheduler as single-class deficit round robin with `quantum`.
+///
+/// Every fixture in `FIXTURES` declares FIFO, and every `configs/**` fixture that declares DRR is
+/// rejected by `compile_config` for an unrelated reason (`configs/benchmarks/scheduling/*` selects
+/// `routing`, `configs/ci/leanguard_drr.toml` uses explicit flow identifiers and an explicit
+/// graph). So the DRR image the ninth site needs is built here, from a lowered TCP fixture.
+fn with_single_class_drr_scheduling(source: &SimulationImage, quantum: u64) -> SimulationImage {
+    let mut image = source.clone();
+    for state in &mut image.switch_states {
+        for queue in &mut state.queues {
+            queue.scheduler = SchedulerKind::deficit_round_robin(vec![quantum]);
+        }
+    }
+    image
+}
+
+/// The ninth indexed site, `maximum_drr_frame_bytes`, calls the same `tcp_future_data_max_frame`
+/// helper as the eighth and is reached only from the `SchedulerKind::DeficitRoundRobin` arm of
+/// `validate_scheduler_state`. No fixture in `FIXTURES` reaches it, so this test builds a DRR
+/// image and pins the helper's value **through the validator's own verdict**: the DRR arm rejects
+/// exactly when `quantum + (maximum_frame - 1)` overflows `u64`, so the largest accepted quantum
+/// is `u64::MAX - (maximum_frame - 1)` and the verdict is a step function of the value the ninth
+/// site computes. A frame bound that changed by one in either direction would move that step.
+#[test]
+fn deficit_round_robin_scheduling_pins_the_ninth_sites_frame_bound() {
+    let source = compile_fixture("configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml");
+
+    // The reachability precondition of the site: DRR queues that have an egress link, and TCP
+    // generators to evaluate the frame bound for.
+    let drr_egress_queues = source
+        .switch_states
+        .iter()
+        .flat_map(|state| &state.queues)
+        .filter(|queue| queue.egress_link.is_some())
+        .count();
+    let tcp_generators = source
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .filter(|generator| matches!(generator.kind, FlowGeneratorKind::Tcp(_)))
+        .count();
+    assert!(
+        drr_egress_queues > 0 && tcp_generators > 0,
+        "the DRR image must reach maximum_drr_frame_bytes at all"
+    );
+
+    // 1460 = the CUBIC MSS of this fixture's fresh segments, which dominates the 40-byte ACKs and
+    // the (empty) initial packet table. Frozen: it is the value the ninth site returns.
+    const MAXIMUM_FRAME_BYTES: u64 = 1460;
+    let largest_accepted_quantum = u64::MAX - (MAXIMUM_FRAME_BYTES - 1);
+
+    let accepted = with_single_class_drr_scheduling(&source, largest_accepted_quantum);
+    assert_validate_flow_index_equivalent_for_testing(&accepted)
+        .expect("the DRR image's indexed walks must match the scanned walks");
+    for backend in [Backend::Scalar, Backend::Cpu { workers: 2 }] {
+        validate(&accepted, backend).unwrap_or_else(|error| {
+            panic!("DRR quantum {largest_accepted_quantum} on {backend:?}: {error}")
+        });
+    }
+
+    let rejected = with_single_class_drr_scheduling(&source, largest_accepted_quantum + 1);
+    let error = validate(&rejected, Backend::Scalar)
+        .expect_err("one byte more of quantum must overflow the DRR deficit bound");
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("cannot accumulate enough deficit for a {MAXIMUM_FRAME_BYTES}-byte packet without overflowing")),
+        "the rejection must name the frame bound the ninth site computed: {error}"
+    );
 }
 
 /// A packet whose flow identifier falls outside the dense flow table cannot be grouped, so the
