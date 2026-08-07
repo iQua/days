@@ -44,6 +44,195 @@ struct Cli {
     /// Zero selects strict single-shot execution.
     #[arg(long, default_value_t = 16)]
     max_capacity_retries: usize,
+    /// T20l fix 3, opt-in and OFF by default: plan the first device attempt from a capacity
+    /// snapshot a previous successful run of the SAME fixture emitted with
+    /// `--dump-capacity-warm-start`. Omitting it reproduces stock behaviour exactly, including
+    /// every discarded attempt.
+    ///
+    /// This is a host sizing hint, not an image or kernel cache: it changes how large the planned
+    /// arenas are, and device capacity is refuse-or-run and never semantics (the T20g invariant),
+    /// so the complete-state fingerprint is identical with and without it.
+    #[arg(long)]
+    capacity_warm_start: Option<PathBuf>,
+    /// Write the capacity this run converged on, after a successful device run, so a later run of
+    /// the same fixture can pass it back through `--capacity-warm-start`.
+    #[arg(long)]
+    dump_capacity_warm_start: Option<PathBuf>,
+}
+
+/// The `--capacity-warm-start` / `--dump-capacity-warm-start` snapshot file format (T20l fix 3).
+///
+/// The executor owns the semantics; this module owns exactly one canonical textual form for them,
+/// so a snapshot round-trips and two runs of the same fixture write the same bytes.
+#[cfg(any(
+    test,
+    all(feature = "metal-spike", target_vendor = "apple"),
+    feature = "cuda"
+))]
+mod warm_start {
+    use days_executor::{CapacityWarmStart, DeviceCapacityFloors};
+
+    /// The eleven plane-wide floor lanes, in the fixed order the format writes them.
+    pub(super) const FLOOR_LANES: [&str; 11] = [
+        "fallback_fel_events_per_lp",
+        "queue_packets_per_lp",
+        "channel_events_per_stream",
+        "service_events_per_stream",
+        "generator_events_per_stream",
+        "remote_staging_events_per_lp",
+        "outbox_events_total",
+        "tcp_receiver_ranges_per_flow",
+        "tcp_ledger_segments_per_flow",
+        "observation_events",
+        "worklist_entries_total",
+    ];
+
+    pub(super) const HEADER: &str = "days-capacity-warm-start v1";
+
+    fn floor_values(floors: DeviceCapacityFloors) -> [usize; FLOOR_LANES.len()] {
+        [
+            floors.fallback_fel_events_per_lp,
+            floors.queue_packets_per_lp,
+            floors.channel_events_per_stream,
+            floors.service_events_per_stream,
+            floors.generator_events_per_stream,
+            floors.remote_staging_events_per_lp,
+            floors.outbox_events_total,
+            floors.tcp_receiver_ranges_per_flow,
+            floors.tcp_ledger_segments_per_flow,
+            floors.observation_events,
+            floors.worklist_entries_total,
+        ]
+    }
+
+    fn floors_from(values: [usize; FLOOR_LANES.len()]) -> DeviceCapacityFloors {
+        DeviceCapacityFloors {
+            fallback_fel_events_per_lp: values[0],
+            queue_packets_per_lp: values[1],
+            channel_events_per_stream: values[2],
+            service_events_per_stream: values[3],
+            generator_events_per_stream: values[4],
+            remote_staging_events_per_lp: values[5],
+            outbox_events_total: values[6],
+            tcp_receiver_ranges_per_flow: values[7],
+            tcp_ledger_segments_per_flow: values[8],
+            observation_events: values[9],
+            worklist_entries_total: values[10],
+        }
+    }
+
+    /// Renders a snapshot in the one canonical textual form.
+    ///
+    /// Every floor lane is written, in a fixed order, even at zero, so a snapshot's meaning does
+    /// not depend on which lanes happen to be present. The three association lists arrive already
+    /// sorted and deduplicated from the executor, so the same run always writes the same bytes.
+    pub(super) fn encode(warm_start: &CapacityWarmStart) -> String {
+        let mut text = String::from(HEADER);
+        text.push('\n');
+        for (lane, value) in FLOOR_LANES.iter().zip(floor_values(warm_start.floors)) {
+            text.push_str(&format!("floor {lane} {value}\n"));
+        }
+        for (key, records) in [
+            ("channel", &warm_start.channel_events_by_stream),
+            ("tcp-receiver", &warm_start.tcp_receiver_ranges_by_base),
+            ("tcp-ledger", &warm_start.tcp_ledger_segments_by_flow),
+        ] {
+            for (entity, capacity) in records {
+                text.push_str(&format!("{key} {entity} {capacity}\n"));
+            }
+        }
+        text
+    }
+
+    /// Parses the canonical form, strictly.
+    ///
+    /// A snapshot that cannot be read exactly is refused rather than silently downgraded to a
+    /// partial hint, because a partial hint would quietly reintroduce the discarded attempts the
+    /// flag exists to remove. Each floor lane must appear exactly once.
+    pub(super) fn decode(text: &str) -> Result<CapacityWarmStart, String> {
+        let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+        match lines.next() {
+            Some(header) if header.trim() == HEADER => {}
+            other => return Err(format!("expected the header `{HEADER}`, found {other:?}")),
+        }
+
+        let mut floors = [0_usize; FLOOR_LANES.len()];
+        let mut seen = [false; FLOOR_LANES.len()];
+        let mut channel_events_by_stream = Vec::new();
+        let mut tcp_receiver_ranges_by_base = Vec::new();
+        let mut tcp_ledger_segments_by_flow = Vec::new();
+        for line in lines {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            let [key, entity, value] = fields.as_slice() else {
+                return Err(format!(
+                    "expected three whitespace-separated fields, got `{line}`"
+                ));
+            };
+            let value = value
+                .parse::<usize>()
+                .map_err(|error| format!("`{line}` has an unreadable capacity: {error}"))?;
+            match *key {
+                "floor" => {
+                    let lane = FLOOR_LANES
+                        .iter()
+                        .position(|lane| lane == entity)
+                        .ok_or_else(|| format!("`{line}` names an unknown floor lane"))?;
+                    if std::mem::replace(&mut seen[lane], true) {
+                        return Err(format!("`{line}` repeats a floor lane"));
+                    }
+                    floors[lane] = value;
+                }
+                "channel" | "tcp-receiver" | "tcp-ledger" => {
+                    let entity = entity
+                        .parse::<usize>()
+                        .map_err(|error| format!("`{line}` has an unreadable entity: {error}"))?;
+                    match *key {
+                        "channel" => channel_events_by_stream.push((entity, value)),
+                        "tcp-receiver" => tcp_receiver_ranges_by_base.push((entity, value)),
+                        _ => tcp_ledger_segments_by_flow.push((entity, value)),
+                    }
+                }
+                _ => return Err(format!("`{line}` names an unknown record kind")),
+            }
+        }
+        if let Some(lane) = seen.iter().position(|seen| !seen) {
+            return Err(format!("the floor lane `{}` is missing", FLOOR_LANES[lane]));
+        }
+
+        Ok(CapacityWarmStart {
+            floors: floors_from(floors),
+            channel_events_by_stream,
+            tcp_receiver_ranges_by_base,
+            tcp_ledger_segments_by_flow,
+        })
+    }
+
+    #[cfg(any(
+        all(feature = "metal-spike", target_vendor = "apple"),
+        feature = "cuda"
+    ))]
+    pub(super) fn load(path: &std::path::Path) -> CapacityWarmStart {
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        decode(&text).unwrap_or_else(|error| panic!("failed to parse {}: {error}", path.display()))
+    }
+
+    #[cfg(any(
+        all(feature = "metal-spike", target_vendor = "apple"),
+        feature = "cuda"
+    ))]
+    pub(super) fn dump(path: &std::path::Path, warm_start: &CapacityWarmStart) {
+        std::fs::write(path, encode(warm_start))
+            .unwrap_or_else(|error| panic!("failed to write {}: {error}", path.display()));
+        println!(
+            "record=p11_t20f_frontier_capacity_warm_start path={} channels={} \
+             tcp_receiver_classes={} tcp_ledger_flows={}",
+            path.display(),
+            warm_start.channel_events_by_stream.len(),
+            warm_start.tcp_receiver_ranges_by_base.len(),
+            warm_start.tcp_ledger_segments_by_flow.len(),
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -130,11 +319,17 @@ fn main() {
     println!(
         "record=p11_t20f_frontier_protocol fixture={} engine={:?} \
          exclusive_horizon_ns={:?} observation_mode=Summary capacity_caps={CAPACITY_CAPS:?} \
-         max_capacity_retries={}",
+         max_capacity_retries={} capacity_warm_start={} dump_capacity_warm_start={}",
         cli.fixture.display(),
         cli.engine,
         cli.exclusive_horizon_ns,
         cli.max_capacity_retries,
+        cli.capacity_warm_start
+            .as_ref()
+            .map_or_else(|| "none".to_owned(), |path| path.display().to_string()),
+        cli.dump_capacity_warm_start
+            .as_ref()
+            .map_or_else(|| "none".to_owned(), |path| path.display().to_string()),
     );
 
     match cli.engine {
@@ -157,20 +352,34 @@ fn run_device(cli: &Cli, image: &days_executor::SimulationImage, lowering_ns: u1
     use days_executor::{MetalConfig, MetalExecutor};
 
     let executor = MetalExecutor::new().expect("Metal executor must initialize");
+    let warm_start = cli.capacity_warm_start.as_deref().map(warm_start::load);
+    let config = MetalConfig {
+        capacity_caps: CAPACITY_CAPS,
+        max_capacity_retries: cli.max_capacity_retries,
+        ..MetalConfig::default()
+    };
     let started = Instant::now();
-    let run = executor
-        .run_with_observations(
+    // Default OFF: with no `--capacity-warm-start` this is the stock entry point, unchanged.
+    let run = match &warm_start {
+        Some(warm_start) => executor.run_with_observations_warm_started(
             image,
             cli.exclusive_horizon_ns,
-            MetalConfig {
-                capacity_caps: CAPACITY_CAPS,
-                max_capacity_retries: cli.max_capacity_retries,
-                ..MetalConfig::default()
-            },
+            config,
             ObservationMode::Summary,
-        )
-        .expect("Metal frontier run must succeed");
+            warm_start,
+        ),
+        None => executor.run_with_observations(
+            image,
+            cli.exclusive_horizon_ns,
+            config,
+            ObservationMode::Summary,
+        ),
+    }
+    .expect("Metal frontier run must succeed");
     let run_ns = started.elapsed().as_nanos();
+    if let Some(path) = cli.dump_capacity_warm_start.as_deref() {
+        warm_start::dump(path, &run.capacity_warm_start);
+    }
     let (retry_count, grown_stream_count) = capacity_retry_counts(&run.capacity_retry_trace);
     let channel_capacity_distribution =
         channel_capacity_distribution(&run.channel_stream_capacity_distribution);
@@ -191,20 +400,34 @@ fn run_device(cli: &Cli, image: &days_executor::SimulationImage, lowering_ns: u1
     use days_executor::{CudaConfig, CudaExecutor};
 
     let executor = CudaExecutor::new().expect("CUDA executor must initialize");
+    let warm_start = cli.capacity_warm_start.as_deref().map(warm_start::load);
+    let config = CudaConfig {
+        capacity_caps: CAPACITY_CAPS,
+        max_capacity_retries: cli.max_capacity_retries,
+        ..CudaConfig::default()
+    };
     let started = Instant::now();
-    let run = executor
-        .run_with_observations(
+    // Default OFF: with no `--capacity-warm-start` this is the stock entry point, unchanged.
+    let run = match &warm_start {
+        Some(warm_start) => executor.run_with_observations_warm_started(
             image,
             cli.exclusive_horizon_ns,
-            CudaConfig {
-                capacity_caps: CAPACITY_CAPS,
-                max_capacity_retries: cli.max_capacity_retries,
-                ..CudaConfig::default()
-            },
+            config,
             ObservationMode::Summary,
-        )
-        .expect("CUDA frontier run must succeed");
+            warm_start,
+        ),
+        None => executor.run_with_observations(
+            image,
+            cli.exclusive_horizon_ns,
+            config,
+            ObservationMode::Summary,
+        ),
+    }
+    .expect("CUDA frontier run must succeed");
     let run_ns = started.elapsed().as_nanos();
+    if let Some(path) = cli.dump_capacity_warm_start.as_deref() {
+        warm_start::dump(path, &run.capacity_warm_start);
+    }
     let (retry_count, grown_stream_count) = capacity_retry_counts(&run.capacity_retry_trace);
     let channel_capacity_distribution =
         channel_capacity_distribution(&run.channel_stream_capacity_distribution);
@@ -230,9 +453,9 @@ fn run_device(_cli: &Cli, _image: &days_executor::SimulationImage, _lowering_ns:
 
 #[cfg(test)]
 mod tests {
-    use days_executor::CapacityRetryRecord;
+    use days_executor::{CapacityRetryRecord, CapacityWarmStart, DeviceCapacityFloors};
 
-    use super::{capacity_retry_counts, fingerprint};
+    use super::{capacity_retry_counts, fingerprint, warm_start};
 
     fn retry_record(retry: usize, stream: Option<usize>) -> CapacityRetryRecord<&'static str> {
         CapacityRetryRecord {
@@ -252,6 +475,68 @@ mod tests {
         let value = vec![1_u64, 2, 3];
         assert_eq!(fingerprint(&value), fingerprint(&value));
         assert_ne!(fingerprint(&value), fingerprint(&vec![3_u64, 2, 1]));
+    }
+
+    fn sample_warm_start() -> CapacityWarmStart {
+        CapacityWarmStart {
+            floors: DeviceCapacityFloors {
+                queue_packets_per_lp: 2_048,
+                worklist_entries_total: 90_001,
+                ..DeviceCapacityFloors::default()
+            },
+            channel_events_by_stream: vec![(3, 512), (11, 4_096)],
+            tcp_receiver_ranges_by_base: vec![(64, 129)],
+            tcp_ledger_segments_by_flow: vec![(0, 24), (1, 88_472), (262_143, 4_168)],
+        }
+    }
+
+    #[test]
+    fn the_capacity_warm_start_snapshot_round_trips_through_its_text_form() {
+        let warm_start = sample_warm_start();
+        let text = warm_start::encode(&warm_start);
+        assert_eq!(
+            warm_start::decode(&text).expect("the canonical form must parse"),
+            warm_start
+        );
+        // One canonical form: the same snapshot always renders the same bytes.
+        assert_eq!(warm_start::encode(&warm_start), text);
+        assert!(text.starts_with("days-capacity-warm-start v1\n"));
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("floor "))
+                .count(),
+            warm_start::FLOOR_LANES.len(),
+            "every floor lane is written even at zero, so a snapshot's meaning never depends on \
+             which lanes happen to be present"
+        );
+
+        let empty = CapacityWarmStart::default();
+        assert_eq!(
+            warm_start::decode(&warm_start::encode(&empty)).expect("an empty snapshot must parse"),
+            empty
+        );
+    }
+
+    /// A snapshot that cannot be read exactly is refused, never silently downgraded: a partial
+    /// hint would quietly reintroduce the discarded attempts the flag exists to remove.
+    #[test]
+    fn a_malformed_capacity_warm_start_is_refused_rather_than_downgraded() {
+        let text = warm_start::encode(&sample_warm_start());
+        assert!(warm_start::decode("").is_err());
+        assert!(warm_start::decode("days-capacity-warm-start v2").is_err());
+        assert!(
+            warm_start::decode(&text.replace("floor queue_packets_per_lp 2048\n", "")).is_err()
+        );
+        assert!(
+            warm_start::decode(&text.replace("queue_packets_per_lp", "queue_packets")).is_err()
+        );
+        assert!(warm_start::decode(&format!("{text}channel 4\n")).is_err());
+        assert!(warm_start::decode(&format!("{text}channel 4 nine\n")).is_err());
+        assert!(warm_start::decode(&format!("{text}sockets 4 9\n")).is_err());
+        assert!(
+            warm_start::decode(&format!("{text}floor queue_packets_per_lp 5\n")).is_err(),
+            "a repeated floor lane is ambiguous and must be refused, not last-write-wins"
+        );
     }
 
     #[test]

@@ -12,18 +12,20 @@ use days_executor::{
     run_cpu_with_observations, run_scalar_rounds_with_observations, run_scalar_with_observations,
     size_default_device_plan, validate,
 };
-#[cfg(feature = "cuda")]
-use days_executor::{CudaArena, CudaConfig, CudaError, run_cuda_with_observations};
 #[cfg(any(
     feature = "cuda",
     all(feature = "metal-spike", target_vendor = "apple")
 ))]
 use days_executor::{
-    DeviceCapacityCaps, DropMarkPolicy, EcnThresholdPolicy, MechanismTransitionRecord,
-    QueueDepthUnit, RunResult,
+    CapacityWarmStart, DeviceCapacityCaps, DropMarkPolicy, EcnThresholdPolicy,
+    MechanismTransitionRecord, QueueDepthUnit, RunResult,
 };
+#[cfg(feature = "cuda")]
+use days_executor::{CudaArena, CudaConfig, CudaError, CudaExecutor, run_cuda_with_observations};
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-use days_executor::{MetalArena, MetalConfig, MetalError, run_metal_with_observations};
+use days_executor::{
+    MetalArena, MetalConfig, MetalError, MetalExecutor, run_metal_with_observations,
+};
 
 const SOURCE: NodeId = NodeId(0);
 const SINK: NodeId = NodeId(1);
@@ -1663,6 +1665,174 @@ fn cuda_tcp_ledger_occupancy_vector_sizes_every_flow_in_one_replan() {
     assert_eq!(retry.capacity, 1);
     assert_eq!(retry.demand, 2);
     assert_eq!(retry.grown_capacity, 16);
+}
+
+/// T20l fix 3: replaying a converged capacity vector removes the retry chain and changes nothing.
+///
+/// The two-flow ledger fixture is the one that needs a real chain: both flows overflow the same
+/// under-capped arena, the fault's occupancy vector sizes both, and the replan succeeds. This test
+/// takes that run's own [`CapacityWarmStart`], hands it back as the *starting* capacity of a second
+/// run whose retry budget is **zero**, and asserts three things:
+///
+/// 1. the warm run succeeds under a budget that forbids any replacement attempt at all, which is
+///    the operational claim — one plan, one upload, one readback;
+/// 2. its complete state is byte-identical to the cold run's and to the scalar oracle's, which is
+///    the determinism claim: capacity is refuse-or-run and never semantics (the T20g invariant),
+///    so the hint can only move a run between refusing once and running immediately;
+/// 3. the warm run re-derives the same snapshot, so the mechanism has a fixed point and the hint's
+///    provenance really is the retry chain's own output.
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[test]
+fn metal_capacity_warm_start_plans_the_converged_capacity_in_one_attempt() {
+    let image = tcp_two_flow_image(TcpCongestionControl::reno(MSS), 2 * MSS);
+    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("scalar two-flow ledger oracle must run");
+    let config = MetalConfig {
+        capacity_caps: DeviceCapacityCaps {
+            tcp_ledger_segments_per_flow: Some(0),
+            ..DeviceCapacityCaps::default()
+        },
+        ..MetalConfig::default()
+    };
+    let executor = MetalExecutor::new().expect("Metal executor must initialize");
+
+    let cold = executor
+        .run_with_observations(&image, None, config, ObservationMode::Full)
+        .expect("the cold run must converge through its retry chain");
+    assert!(
+        !cold.capacity_retry_trace.is_empty(),
+        "the fixture must actually discard an attempt, otherwise the test proves nothing"
+    );
+    assert!(
+        !cold.capacity_warm_start.is_empty(),
+        "a converged run must emit the capacity it converged on"
+    );
+
+    let warm = executor
+        .run_with_observations_warm_started(
+            &image,
+            None,
+            MetalConfig {
+                max_capacity_retries: 0,
+                ..config
+            },
+            ObservationMode::Full,
+            &cold.capacity_warm_start,
+        )
+        .expect("the warm start must plan right on the FIRST attempt, under a zero retry budget");
+
+    assert!(warm.capacity_retry_trace.is_empty());
+    assert_eq!(
+        warm.result, cold.result,
+        "the warm-started run must reproduce the cold run's complete state byte for byte"
+    );
+    assert_device_full_result_eq(
+        &warm.result,
+        &scalar,
+        "warm-started Metal two-flow TCP ledger",
+    );
+    assert_eq!(
+        warm.channel_stream_capacity_distribution,
+        cold.channel_stream_capacity_distribution
+    );
+    assert_eq!(
+        (warm.rounds, warm.transitions),
+        (cold.rounds, cold.transitions)
+    );
+    assert_eq!(
+        warm.capacity_warm_start, cold.capacity_warm_start,
+        "the snapshot must be a fixed point: replaying it re-derives it"
+    );
+    // And the default hint is exactly the stock path: same result, same chain, same snapshot.
+    let stock = executor
+        .run_with_observations_warm_started(
+            &image,
+            None,
+            config,
+            ObservationMode::Full,
+            &CapacityWarmStart::default(),
+        )
+        .expect("an empty warm start must behave exactly like the stock entry point");
+    assert_eq!(stock.result, cold.result);
+    assert_eq!(stock.capacity_retry_trace, cold.capacity_retry_trace);
+    assert_eq!(stock.capacity_warm_start, cold.capacity_warm_start);
+}
+
+/// The CUDA sibling of [`metal_capacity_warm_start_plans_the_converged_capacity_in_one_attempt`].
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_capacity_warm_start_plans_the_converged_capacity_in_one_attempt() {
+    let image = tcp_two_flow_image(TcpCongestionControl::reno(MSS), 2 * MSS);
+    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("scalar two-flow ledger oracle must run");
+    let config = CudaConfig {
+        capacity_caps: DeviceCapacityCaps {
+            tcp_ledger_segments_per_flow: Some(0),
+            ..DeviceCapacityCaps::default()
+        },
+        ..CudaConfig::default()
+    };
+    let executor = CudaExecutor::new().expect("CUDA executor must initialize");
+
+    let cold = executor
+        .run_with_observations(&image, None, config, ObservationMode::Full)
+        .expect("the cold run must converge through its retry chain");
+    assert!(
+        !cold.capacity_retry_trace.is_empty(),
+        "the fixture must actually discard an attempt, otherwise the test proves nothing"
+    );
+    assert!(
+        !cold.capacity_warm_start.is_empty(),
+        "a converged run must emit the capacity it converged on"
+    );
+
+    let warm = executor
+        .run_with_observations_warm_started(
+            &image,
+            None,
+            CudaConfig {
+                max_capacity_retries: 0,
+                ..config
+            },
+            ObservationMode::Full,
+            &cold.capacity_warm_start,
+        )
+        .expect("the warm start must plan right on the FIRST attempt, under a zero retry budget");
+
+    assert!(warm.capacity_retry_trace.is_empty());
+    assert_eq!(
+        warm.result, cold.result,
+        "the warm-started run must reproduce the cold run's complete state byte for byte"
+    );
+    assert_device_full_result_eq(
+        &warm.result,
+        &scalar,
+        "warm-started CUDA two-flow TCP ledger",
+    );
+    assert_eq!(
+        warm.channel_stream_capacity_distribution,
+        cold.channel_stream_capacity_distribution
+    );
+    assert_eq!(
+        (warm.rounds, warm.transitions),
+        (cold.rounds, cold.transitions)
+    );
+    assert_eq!(
+        warm.capacity_warm_start, cold.capacity_warm_start,
+        "the snapshot must be a fixed point: replaying it re-derives it"
+    );
+    let stock = executor
+        .run_with_observations_warm_started(
+            &image,
+            None,
+            config,
+            ObservationMode::Full,
+            &CapacityWarmStart::default(),
+        )
+        .expect("an empty warm start must behave exactly like the stock entry point");
+    assert_eq!(stock.result, cold.result);
+    assert_eq!(stock.capacity_retry_trace, cold.capacity_retry_trace);
+    assert_eq!(stock.capacity_warm_start, cold.capacity_warm_start);
 }
 
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]

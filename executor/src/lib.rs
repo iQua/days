@@ -60,7 +60,8 @@ pub use dcqcn::{
     DcqcnControllerConfig, DcqcnIncreaseStage, DcqcnTransitionKind, DcqcnTransitionRecord,
 };
 pub use device_capacity::{
-    CapacityRetryRecord, ChannelStreamCapacityLevel, DeviceCapacityCaps, DeviceCapacityFloors,
+    CapacityRetryRecord, CapacityWarmStart, ChannelStreamCapacityLevel, DeviceCapacityCaps,
+    DeviceCapacityFloors,
 };
 pub use device_sizing::{
     DeviceEventArenaSizing, DevicePlaneSizing, DeviceSizingError, DeviceSizingReport,

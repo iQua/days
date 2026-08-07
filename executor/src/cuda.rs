@@ -28,11 +28,12 @@ use crate::device_scheduler::{
 use crate::planner_capacity::{PlannerCapacityContext, PlannerCapacityMode, TcpMinimumPacketSize};
 use crate::tcp::{TcpCubic, TcpReno};
 use crate::{
-    ArrivalDisposition, Backend, CapacityRetryRecord, DeviceCapacityCaps, DeviceCapacityFloors,
-    Event, EventKey, EventKind, FlowGeneratorKind, FlowId, GeneratorStatus, GeneratorTermination,
-    NodeId, NodeKind, ObservationMode, PacketArrivalObservation, PacketDeparture, PacketDescriptor,
-    PacketKind, PayloadId, RunResult, RunSummary, SimulationImage, TcpAckHeader,
-    TcpCongestionControl, TcpDataHeader, TcpPhase, TcpReceiveRange, TcpTimerState, validate,
+    ArrivalDisposition, Backend, CapacityRetryRecord, CapacityWarmStart, DeviceCapacityCaps,
+    DeviceCapacityFloors, Event, EventKey, EventKind, FlowGeneratorKind, FlowId, GeneratorStatus,
+    GeneratorTermination, NodeId, NodeKind, ObservationMode, PacketArrivalObservation,
+    PacketDeparture, PacketDescriptor, PacketKind, PayloadId, RunResult, RunSummary,
+    SimulationImage, TcpAckHeader, TcpCongestionControl, TcpDataHeader, TcpPhase, TcpReceiveRange,
+    TcpTimerState, validate,
 };
 
 const LANES: usize = 1_024;
@@ -742,6 +743,33 @@ impl CudaConfig {
     }
 }
 
+/// Records a plane-wide arena's converged capacity in a [`CapacityWarmStart`]'s floor lanes.
+///
+/// [`CudaConfig::raise_capacity`] may satisfy a fault by raising an explicit `max_*` override
+/// rather than the matching floor, so `capacity_floors` alone does not always describe what the
+/// successful attempt planned. Every planner site takes the maximum of its bound and the floor, so
+/// recording the grown capacity here reproduces that attempt's sizing from the floor lane alone.
+/// The three entity-keyed arenas are excluded: their converged capacity lives in the per-stream
+/// and per-flow vectors instead.
+fn record_warm_start_floor(floors: &mut DeviceCapacityFloors, arena: CudaArena, grown: usize) {
+    let lane = match arena {
+        CudaArena::Fel => &mut floors.fallback_fel_events_per_lp,
+        CudaArena::ServiceStream => &mut floors.service_events_per_stream,
+        CudaArena::GeneratorStream => &mut floors.generator_events_per_stream,
+        CudaArena::Queue => &mut floors.queue_packets_per_lp,
+        CudaArena::Outbox => &mut floors.outbox_events_total,
+        CudaArena::Worklist => &mut floors.worklist_entries_total,
+        CudaArena::ObservedPackets | CudaArena::Departures | CudaArena::Arrivals => {
+            &mut floors.observation_events
+        }
+        CudaArena::RemoteStaging => &mut floors.remote_staging_events_per_lp,
+        CudaArena::ChannelInbox | CudaArena::TcpReceiverRanges | CudaArena::TcpSegmentLedger => {
+            return;
+        }
+    };
+    *lane = (*lane).max(grown);
+}
+
 /// Exact planned CUDA event-arena footprint for one run.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CudaMemoryLayout {
@@ -774,6 +802,13 @@ pub struct CudaRun {
     pub result: RunResult,
     /// Capacity faults from discarded attempts, in deterministic retry order.
     pub capacity_retry_trace: Vec<CapacityRetryRecord<CudaArena>>,
+    /// The capacity this run converged on, replayable as a later run's starting capacity.
+    ///
+    /// T20l fix 3: handing this back to
+    /// [`CudaExecutor::run_with_observations_warm_started`] makes the same image plan right on its
+    /// first attempt. It is a sizing hint for host planning, derived output of this run's own
+    /// retry chain, and unrelated to any compiled-image or pipeline cache.
+    pub capacity_warm_start: CapacityWarmStart,
     /// Ascending final-plan channel capacity levels after all targeted retries.
     pub channel_stream_capacity_distribution: Vec<crate::ChannelStreamCapacityLevel>,
     pub rounds: u64,
@@ -944,13 +979,56 @@ impl CudaExecutor {
         config: CudaConfig,
         observation_mode: ObservationMode,
     ) -> Result<CudaRun, CudaError> {
+        self.run_with_observations_warm_started(
+            image,
+            exclusive_horizon_ns,
+            config,
+            observation_mode,
+            &CapacityWarmStart::default(),
+        )
+    }
+
+    /// Runs from an explicit starting capacity instead of from the derived one (T20l fix 3).
+    ///
+    /// `warm_start` is a [`CapacityWarmStart`] a previous successful run of the same image emitted
+    /// on [`CudaRun::capacity_warm_start`]. Supplying it lets the first attempt plan the capacity
+    /// the retry chain would have converged on, so a known fixture builds one plan, uploads once
+    /// and reads back once instead of discarding three attempts. [`CapacityWarmStart::default()`]
+    /// is exactly [`Self::run_with_observations`], which is what every existing caller keeps doing.
+    ///
+    /// The result cannot depend on the hint: capacity on this path is refuse-or-run, never
+    /// semantics (the T20g invariant), so a warm start moves a run between "refuses once, then
+    /// runs" and "runs immediately" and never between two answers. See [`CapacityWarmStart`] for
+    /// the argument in full.
+    pub fn run_with_observations_warm_started(
+        &self,
+        image: &SimulationImage,
+        exclusive_horizon_ns: Option<u64>,
+        config: CudaConfig,
+        observation_mode: ObservationMode,
+        warm_start: &CapacityWarmStart,
+    ) -> Result<CudaRun, CudaError> {
         validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
         validate_config(config)?;
 
         let retry_budget = config.max_capacity_retries;
         let mut attempt_config = config;
-        let mut channel_capacity_floors = crate::device_capacity::ChannelCapacityFloors::default();
-        let mut tcp_capacity_floors = crate::device_capacity::TcpCapacityFloors::default();
+        attempt_config.capacity_floors = config.capacity_floors.merged_with(warm_start.floors);
+        // The warm start's own learned floors, carried separately from `attempt_config` because
+        // `CudaConfig::raise_capacity` may satisfy a fault by raising an explicit `max_*` override
+        // instead of the floor lane. Every planner site honours the floor under both forms
+        // (`limit.max(floor)` with an override, `bound_derived_capacity` without one), so
+        // recording the effective capacity here makes the emitted snapshot exact.
+        let mut warm_start_floors = warm_start.floors;
+        let mut channel_capacity_floors =
+            crate::device_capacity::ChannelCapacityFloors::warm_started(
+                &warm_start.channel_events_by_stream,
+            );
+        let mut tcp_capacity_floors = crate::device_capacity::TcpCapacityFloors::warm_started(
+            &warm_start.tcp_receiver_ranges_by_base,
+            &warm_start.tcp_ledger_segments_by_flow,
+            image.flows.len(),
+        );
         let mut retry_trace = Vec::new();
         loop {
             let attempt = (|| {
@@ -972,6 +1050,14 @@ impl CudaExecutor {
             match attempt {
                 Ok(mut run) => {
                     run.capacity_retry_trace = retry_trace;
+                    run.capacity_warm_start = CapacityWarmStart {
+                        floors: warm_start_floors,
+                        channel_events_by_stream: channel_capacity_floors.converged_capacities(),
+                        tcp_receiver_ranges_by_base: tcp_capacity_floors
+                            .converged_receiver_ranges(),
+                        tcp_ledger_segments_by_flow: tcp_capacity_floors
+                            .converged_ledger_segments(),
+                    };
                     return Ok(run);
                 }
                 Err(failure) => {
@@ -1065,6 +1151,7 @@ impl CudaExecutor {
                         }
                         _ => {
                             attempt_config.raise_capacity(arena, capacity, grown_capacity);
+                            record_warm_start_floor(&mut warm_start_floors, arena, grown_capacity);
                             true
                         }
                     };
@@ -1102,6 +1189,9 @@ impl CudaExecutor {
 
         let retry_budget = config.max_capacity_retries;
         let mut attempt_config = config;
+        // The profiled path takes no warm start; it still emits the one it converged on, so a
+        // profiling run and a production run report the same derived capacity.
+        let mut warm_start_floors = DeviceCapacityFloors::default();
         let mut channel_capacity_floors = crate::device_capacity::ChannelCapacityFloors::default();
         let mut tcp_capacity_floors = crate::device_capacity::TcpCapacityFloors::default();
         let mut retry_trace = Vec::new();
@@ -1126,6 +1216,14 @@ impl CudaExecutor {
             match attempt {
                 Ok(mut profiled) => {
                     profiled.run.capacity_retry_trace = retry_trace;
+                    profiled.run.capacity_warm_start = CapacityWarmStart {
+                        floors: warm_start_floors,
+                        channel_events_by_stream: channel_capacity_floors.converged_capacities(),
+                        tcp_receiver_ranges_by_base: tcp_capacity_floors
+                            .converged_receiver_ranges(),
+                        tcp_ledger_segments_by_flow: tcp_capacity_floors
+                            .converged_ledger_segments(),
+                    };
                     return Ok(profiled);
                 }
                 Err(failure) => {
@@ -1219,6 +1317,7 @@ impl CudaExecutor {
                         }
                         _ => {
                             attempt_config.raise_capacity(arena, capacity, grown_capacity);
+                            record_warm_start_floor(&mut warm_start_floors, arena, grown_capacity);
                             true
                         }
                     };
@@ -4013,6 +4112,7 @@ impl CudaBuffers {
                 pending_events,
             },
             capacity_retry_trace: Vec::new(),
+            capacity_warm_start: CapacityWarmStart::default(),
             channel_stream_capacity_distribution: self.channel_stream_capacity_distribution.clone(),
             rounds: control[CONTROL_ROUNDS],
             transitions: lp_state

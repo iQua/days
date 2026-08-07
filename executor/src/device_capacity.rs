@@ -73,6 +73,119 @@ pub struct DeviceCapacityFloors {
     pub worklist_entries_total: usize,
 }
 
+impl DeviceCapacityFloors {
+    /// Field-wise maximum of two floor sets.
+    ///
+    /// Floors are lower bounds, so combining two of them is a maximum in every lane. This is how a
+    /// [`CapacityWarmStart`] is applied on top of caller-supplied floors without discarding either.
+    #[must_use]
+    pub fn merged_with(self, other: Self) -> Self {
+        Self {
+            fallback_fel_events_per_lp: self
+                .fallback_fel_events_per_lp
+                .max(other.fallback_fel_events_per_lp),
+            queue_packets_per_lp: self.queue_packets_per_lp.max(other.queue_packets_per_lp),
+            channel_events_per_stream: self
+                .channel_events_per_stream
+                .max(other.channel_events_per_stream),
+            service_events_per_stream: self
+                .service_events_per_stream
+                .max(other.service_events_per_stream),
+            generator_events_per_stream: self
+                .generator_events_per_stream
+                .max(other.generator_events_per_stream),
+            remote_staging_events_per_lp: self
+                .remote_staging_events_per_lp
+                .max(other.remote_staging_events_per_lp),
+            outbox_events_total: self.outbox_events_total.max(other.outbox_events_total),
+            tcp_receiver_ranges_per_flow: self
+                .tcp_receiver_ranges_per_flow
+                .max(other.tcp_receiver_ranges_per_flow),
+            tcp_ledger_segments_per_flow: self
+                .tcp_ledger_segments_per_flow
+                .max(other.tcp_ledger_segments_per_flow),
+            observation_events: self.observation_events.max(other.observation_events),
+            worklist_entries_total: self
+                .worklist_entries_total
+                .max(other.worklist_entries_total),
+        }
+    }
+}
+
+/// The capacity a converged device attempt planned with, replayable as the *starting* capacity of
+/// a later run of the same image (T20l fix 3).
+///
+/// # Why this exists
+///
+/// The capacity-retry loop converges by discarding attempts. T20l phase 1 §4.1 measured the RQ9
+/// frontier running four attempts, three of them discarded, at 90-103% of the successful attempt's
+/// device time — the frontier device arm runs the simulation twice over and reports half of it —
+/// on top of four plan builds and four uploads. Yet the capacity the fourth attempt planned with
+/// is **deterministic derived output** of the first three: same image, same config, same faults,
+/// same growth law, same vector. Handing that answer back as the *first* attempt's starting point
+/// removes the discarded attempts without changing what is computed.
+///
+/// # Why it cannot change a result
+///
+/// Capacity on this path is **refuse-or-run, never semantics** (the T20g invariant): a device arena
+/// is either large enough, in which case the run proceeds and produces the complete state the
+/// scalar oracle produces, or it is too small, in which case the attempt aborts with a typed
+/// [`CapacityRetryRecord`] fault and nothing is emitted. Records are never truncated and no
+/// capacity value is readable by the simulation. A warm start therefore moves a run between
+/// "refuses once, then runs" and "runs immediately"; it cannot move it between two different
+/// answers. The executor tests assert that byte-identity in both directions.
+///
+/// # Provenance
+///
+/// The only supported source is a successful run's own [`Self`] snapshot. It is not a compiled
+/// image cache and has nothing to do with kernel or pipeline caching: it is a **sizing hint** for
+/// host planning, orthogonal to the compiled device image, and it is re-derived by the run that
+/// emits it.
+///
+/// # Shape
+///
+/// Every vector is a sparse, ascending, key-deduplicated association list, so a snapshot has one
+/// canonical form and two runs of the same image emit the same bytes. Entries whose key the
+/// replaying image does not plan are simply never consulted; entries below the derived capacity do
+/// not bind, because every consumer takes a maximum.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CapacityWarmStart {
+    /// Converged lower bounds for the arenas that are sized plane-wide rather than per entity.
+    pub floors: DeviceCapacityFloors,
+    /// `(immutable channel index, capacity)` for every channel-inbox stream a retry grew.
+    pub channel_events_by_stream: Vec<(usize, usize)>,
+    /// `(planned base capacity, capacity)` for every TCP receiver-range class a retry grew.
+    pub tcp_receiver_ranges_by_base: Vec<(usize, usize)>,
+    /// `(flow, capacity)` for every TCP segment-ledger row a retry grew. This is the per-flow
+    /// capacity vector the T20i occupancy readback produces.
+    pub tcp_ledger_segments_by_flow: Vec<(usize, usize)>,
+}
+
+impl CapacityWarmStart {
+    /// True when the snapshot constrains nothing, which is exactly the stock starting point.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// Collapses an arbitrary association list into the canonical ascending, max-merged form.
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn warm_start_map(pairs: &[(usize, usize)]) -> BTreeMap<usize, usize> {
+    let mut merged = BTreeMap::new();
+    for (key, capacity) in pairs {
+        merged
+            .entry(*key)
+            .and_modify(|current: &mut usize| *current = (*current).max(*capacity))
+            .or_insert(*capacity);
+    }
+    merged
+}
+
 /// Retry-time channel floors keyed by the immutable channel-stream index in the image.
 ///
 /// Channel streams deliberately do not grow by starting-cap class: a capped frontier image puts
@@ -96,6 +209,27 @@ pub(crate) struct ChannelCapacityFloors {
     all(feature = "metal-spike", target_vendor = "apple")
 ))]
 impl ChannelCapacityFloors {
+    /// Starts from a warm start's per-stream capacities instead of from nothing.
+    ///
+    /// Seeding `capacity_by_stream` is exactly the state a retry chain would have reached: both
+    /// [`Self::channel`] and [`Self::raise`] read the same `base.max(floor)` expression, so a
+    /// seeded floor is indistinguishable from a learned one and the base-stability check the retry
+    /// loop depends on is untouched.
+    pub(crate) fn warm_started(capacities: &[(usize, usize)]) -> Self {
+        Self {
+            base_by_stream: Vec::new(),
+            capacity_by_stream: warm_start_map(capacities),
+        }
+    }
+
+    /// The per-stream capacities this run converged on, in canonical ascending order.
+    pub(crate) fn converged_capacities(&self) -> Vec<(usize, usize)> {
+        self.capacity_by_stream
+            .iter()
+            .map(|(stream, capacity)| (*stream, *capacity))
+            .collect()
+    }
+
     pub(crate) fn channel(&mut self, stream: usize, base: usize) -> Option<usize> {
         if self.base_by_stream.len() <= stream {
             self.base_by_stream.resize(stream.saturating_add(1), None);
@@ -165,6 +299,63 @@ pub(crate) struct TcpCapacityFloors {
     all(feature = "metal-spike", target_vendor = "apple")
 ))]
 impl TcpCapacityFloors {
+    /// Starts from a warm start's receiver classes and per-flow ledger capacities.
+    ///
+    /// As in [`ChannelCapacityFloors::warm_started`], the seeded lanes are the same lanes the
+    /// retry chain writes and are read through the same `base.max(floor)` expression, so the
+    /// base-stability checks in [`Self::raise_receiver`] and [`Self::raise_ledger`] keep holding.
+    ///
+    /// `flows` bounds the per-flow lane at the replaying image's own flow count. Entries beyond it
+    /// are inert — [`Self::ledger`] is only ever called for flows the plan sizes — and dropping
+    /// them keeps a corrupt or foreign snapshot from demanding an arbitrarily large allocation.
+    pub(crate) fn warm_started(
+        receiver_ranges: &[(usize, usize)],
+        ledger_segments: &[(usize, usize)],
+        flows: usize,
+    ) -> Self {
+        let ledger_segments = warm_start_map(ledger_segments);
+        let mut ledger_segments_by_flow = vec![
+            0;
+            ledger_segments
+                .keys()
+                .last()
+                .map_or(0, |flow| flow.saturating_add(1))
+                .min(flows)
+        ];
+        for (flow, capacity) in ledger_segments {
+            if flow < ledger_segments_by_flow.len() {
+                ledger_segments_by_flow[flow] = capacity;
+            }
+        }
+        Self {
+            receiver_base_by_flow: Vec::new(),
+            ledger_base_by_flow: Vec::new(),
+            receiver_ranges: warm_start_map(receiver_ranges),
+            ledger_segments_by_flow,
+        }
+    }
+
+    /// The receiver-range classes this run converged on, in canonical ascending order.
+    pub(crate) fn converged_receiver_ranges(&self) -> Vec<(usize, usize)> {
+        self.receiver_ranges
+            .iter()
+            .map(|(base, capacity)| (*base, *capacity))
+            .collect()
+    }
+
+    /// The per-flow ledger capacities this run converged on, in canonical ascending order.
+    ///
+    /// Flows still at zero are omitted: a zero floor binds nothing, and the frontier's snapshot is
+    /// smaller for it.
+    pub(crate) fn converged_ledger_segments(&self) -> Vec<(usize, usize)> {
+        self.ledger_segments_by_flow
+            .iter()
+            .enumerate()
+            .filter(|(_, capacity)| **capacity != 0)
+            .map(|(flow, capacity)| (flow, *capacity))
+            .collect()
+    }
+
     fn record_base(bases: &mut Vec<Option<usize>>, flow: FlowId, base: usize) -> bool {
         let flow = flow.0 as usize;
         if bases.len() <= flow {
@@ -485,11 +676,12 @@ pub(crate) fn bound_derived_capacity(
 #[cfg(test)]
 mod tests {
     use super::{
-        ChannelCapacityFloors, TCP_LEDGER_OCCUPANCY_SLACK_FACTOR,
-        TCP_LEDGER_OCCUPANCY_SLACK_RECORDS, TCP_LEDGER_RETRY_SLACK, TCP_RECEIVER_RETRY_SLACK,
-        TcpCapacityFloors, bound_derived_capacity, cap_derived_capacity, grown_capacity,
-        grown_capacity_with_slack, grown_ledger_capacity, ledger_capacity_from_high_water,
-        observed_ledger_high_water, raise_cap_or_floor, raise_override_cap_or_floor,
+        CapacityWarmStart, ChannelCapacityFloors, DeviceCapacityFloors,
+        TCP_LEDGER_OCCUPANCY_SLACK_FACTOR, TCP_LEDGER_OCCUPANCY_SLACK_RECORDS,
+        TCP_LEDGER_RETRY_SLACK, TCP_RECEIVER_RETRY_SLACK, TcpCapacityFloors,
+        bound_derived_capacity, cap_derived_capacity, grown_capacity, grown_capacity_with_slack,
+        grown_ledger_capacity, ledger_capacity_from_high_water, observed_ledger_high_water,
+        raise_cap_or_floor, raise_override_cap_or_floor,
     };
     use crate::FlowId;
 
@@ -697,6 +889,139 @@ mod tests {
         assert!(!floors.raise(3, 8, 18));
         assert!(!floors.raise(4, 9, 18));
         assert_eq!(floors.channel(4, 9), None);
+    }
+
+    /// T20l fix 3: a converged snapshot, replayed, reproduces the retry chain's own capacities.
+    ///
+    /// The chain here is the shape the RQ9 frontier runs: a channel stream grows once, a receiver
+    /// class grows once, and the ledger's occupancy vector sizes every flow at once. Replaying the
+    /// snapshot must put every entity at the capacity the last attempt planned, on the first call,
+    /// without any fault having occurred — and it must be a fixed point, because a hint that drifts
+    /// on replay would not be derived output.
+    #[test]
+    fn a_converged_snapshot_replays_the_capacity_the_chain_ended_on() {
+        let mut channels = ChannelCapacityFloors::default();
+        let mut tcp = TcpCapacityFloors::default();
+
+        for (stream, base) in [(0, 8), (1, 8), (2, 12)] {
+            assert_eq!(channels.channel(stream, base), Some(base));
+        }
+        for flow in 0..3 {
+            assert_eq!(tcp.receiver(FlowId(flow), 64), Some(64));
+            assert_eq!(tcp.ledger(FlowId(flow), 520), Some(520));
+        }
+
+        assert!(channels.raise(1, 8, 18));
+        assert!(tcp.raise_receiver(FlowId(0), 64, 129));
+        assert!(tcp.raise_ledger(FlowId(2), 520, 4_168));
+        assert_eq!(tcp.raise_ledger_from_occupancy(&[2, 11_058, 520]), 2);
+
+        let snapshot = CapacityWarmStart {
+            floors: DeviceCapacityFloors {
+                queue_packets_per_lp: 96,
+                ..DeviceCapacityFloors::default()
+            },
+            channel_events_by_stream: channels.converged_capacities(),
+            tcp_receiver_ranges_by_base: tcp.converged_receiver_ranges(),
+            tcp_ledger_segments_by_flow: tcp.converged_ledger_segments(),
+        };
+        assert!(!snapshot.is_empty());
+        assert_eq!(snapshot.channel_events_by_stream, vec![(1, 18)]);
+        assert_eq!(snapshot.tcp_receiver_ranges_by_base, vec![(64, 129)]);
+        // Flow 1's 11,058-record high-water is sized by the vector, flow 2 keeps its own fault's
+        // growth, and flow 0's `8 * 2 + 8 = 24` is recorded but does not bind: every consumer takes
+        // a maximum against the derived capacity, so a snapshot entry below it is inert.
+        assert_eq!(
+            snapshot.tcp_ledger_segments_by_flow,
+            vec![(0, 24), (1, 88_472), (2, 4_168)]
+        );
+
+        // Replay: every entity starts where the chain ended, with no fault in between.
+        let mut replayed_channels =
+            ChannelCapacityFloors::warm_started(&snapshot.channel_events_by_stream);
+        let mut replayed_tcp = TcpCapacityFloors::warm_started(
+            &snapshot.tcp_receiver_ranges_by_base,
+            &snapshot.tcp_ledger_segments_by_flow,
+            3,
+        );
+        assert_eq!(replayed_channels.channel(0, 8), Some(8));
+        assert_eq!(replayed_channels.channel(1, 8), Some(18));
+        assert_eq!(replayed_channels.channel(2, 12), Some(12));
+        assert_eq!(replayed_tcp.receiver(FlowId(0), 64), Some(129));
+        assert_eq!(replayed_tcp.receiver(FlowId(2), 64), Some(129));
+        assert_eq!(replayed_tcp.ledger(FlowId(0), 520), Some(520));
+        assert_eq!(replayed_tcp.ledger(FlowId(1), 520), Some(88_472));
+        assert_eq!(replayed_tcp.ledger(FlowId(2), 520), Some(4_168));
+
+        // Fixed point: the replay emits the snapshot it was given.
+        assert_eq!(
+            replayed_channels.converged_capacities(),
+            snapshot.channel_events_by_stream
+        );
+        assert_eq!(
+            replayed_tcp.converged_receiver_ranges(),
+            snapshot.tcp_receiver_ranges_by_base
+        );
+        assert_eq!(
+            replayed_tcp.converged_ledger_segments(),
+            snapshot.tcp_ledger_segments_by_flow
+        );
+
+        // The base-stability checks the retry loop depends on still hold against seeded floors.
+        assert!(replayed_channels.raise(1, 18, 40));
+        assert!(!replayed_channels.raise(1, 18, 40));
+        assert!(replayed_tcp.raise_ledger(FlowId(1), 88_472, 90_000));
+        assert!(!replayed_tcp.raise_ledger(FlowId(1), 88_472, 90_000));
+    }
+
+    /// Floors are lower bounds, so combining a caller's with a warm start's is a maximum.
+    #[test]
+    fn warm_start_floors_merge_lane_by_lane_and_never_shrink() {
+        let caller = DeviceCapacityFloors {
+            queue_packets_per_lp: 40,
+            observation_events: 7,
+            ..DeviceCapacityFloors::default()
+        };
+        let hint = DeviceCapacityFloors {
+            queue_packets_per_lp: 12,
+            worklist_entries_total: 900,
+            ..DeviceCapacityFloors::default()
+        };
+        let merged = caller.merged_with(hint);
+        assert_eq!(merged.queue_packets_per_lp, 40);
+        assert_eq!(merged.observation_events, 7);
+        assert_eq!(merged.worklist_entries_total, 900);
+        assert_eq!(merged, hint.merged_with(caller));
+        assert_eq!(
+            DeviceCapacityFloors::default().merged_with(DeviceCapacityFloors::default()),
+            DeviceCapacityFloors::default()
+        );
+    }
+
+    /// A hand-written or duplicated association list collapses to one canonical form.
+    #[test]
+    fn warm_start_lists_are_canonicalized_by_key_and_maximum() {
+        let mut floors = ChannelCapacityFloors::warm_started(&[(5, 12), (1, 3), (5, 40), (1, 2)]);
+        assert_eq!(floors.converged_capacities(), vec![(1, 3), (5, 40)]);
+        assert_eq!(floors.channel(1, 2), Some(3));
+        assert_eq!(floors.channel(5, 64), Some(64));
+
+        let mut tcp = TcpCapacityFloors::warm_started(&[], &[(3, 8), (0, 5), (3, 9)], 4);
+        assert_eq!(tcp.converged_ledger_segments(), vec![(0, 5), (3, 9)]);
+        assert_eq!(tcp.ledger(FlowId(3), 1), Some(9));
+        assert_eq!(tcp.ledger(FlowId(2), 1), Some(1));
+        assert!(
+            TcpCapacityFloors::warm_started(&[], &[], 8)
+                .converged_ledger_segments()
+                .is_empty()
+        );
+        assert!(CapacityWarmStart::default().is_empty());
+
+        // A snapshot naming more flows than the replaying image plans keeps only the flows the
+        // image has, and cannot ask for an allocation the image does not justify.
+        let mut narrow = TcpCapacityFloors::warm_started(&[], &[(0, 5), (usize::MAX, 9)], 2);
+        assert_eq!(narrow.converged_ledger_segments(), vec![(0, 5)]);
+        assert_eq!(narrow.ledger(FlowId(1), 3), Some(3));
     }
 
     #[test]
