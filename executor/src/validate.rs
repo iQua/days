@@ -271,6 +271,77 @@ impl FlowIndex {
     }
 }
 
+/// CSR grouping of the executable resident packets by dense flow slot, in resident-table order.
+///
+/// `future_work`'s PFC reservation asks "which executable residents belong to this flow?" twice
+/// per `(PFC ingress, flow)` pair — an `O(ingresses x F x P)` per-flow filter with the same shape
+/// as the ones `FlowIndex` removed. `FlowIndex` cannot answer it: the resident table is *derived*
+/// by `executable_resident_packets`, not stored on the image, so it is grouped separately, by the
+/// same construction and with the same guarantees.
+struct ResidentFlowGroups {
+    /// CSR offsets into `items`; one entry per dense flow slot plus a terminator.
+    offsets: Vec<usize>,
+    /// Resident-table indices grouped by flow slot, ascending inside every group.
+    items: Vec<usize>,
+    /// Resident-table indices whose flow falls outside the dense flow table.
+    unindexed: Vec<usize>,
+}
+
+impl ResidentFlowGroups {
+    fn build(image: &SimulationImage, residents: &[&crate::PacketDescriptor]) -> Self {
+        let flow_count = image.flows.len();
+        let mut offsets = vec![0_usize; flow_count + 1];
+        let mut unindexed = Vec::new();
+        for (index, packet) in residents.iter().enumerate() {
+            match dense_flow_slot(image, packet.flow) {
+                Some(slot) => offsets[slot + 1] += 1,
+                None => unindexed.push(index),
+            }
+        }
+        for slot in 0..flow_count {
+            offsets[slot + 1] += offsets[slot];
+        }
+        let mut cursors = offsets.clone();
+        let mut items = vec![0_usize; offsets[flow_count]];
+        for (index, packet) in residents.iter().enumerate() {
+            if let Some(slot) = dense_flow_slot(image, packet.flow) {
+                items[cursors[slot]] = index;
+                cursors[slot] += 1;
+            }
+        }
+        Self {
+            offsets,
+            items,
+            unindexed,
+        }
+    }
+
+    /// Yields the residents of `id`, in resident-table order.
+    ///
+    /// Exactly equivalent to `residents.iter().filter(|packet| packet.flow == id)`, by the same
+    /// argument as [`FlowIndex::packets_for_flow`]: a dense group holds precisely the residents
+    /// whose flow resolves to that slot, and an identifier outside the dense table falls back to
+    /// an equality filter over the shared unindexed group.
+    fn group<'a>(
+        &'a self,
+        image: &SimulationImage,
+        residents: &'a [&'a crate::PacketDescriptor],
+        id: crate::FlowId,
+    ) -> impl Iterator<Item = &'a crate::PacketDescriptor> + 'a {
+        let (group, unindexed) = match dense_flow_slot(image, id) {
+            Some(slot) => (
+                &self.items[self.offsets[slot]..self.offsets[slot + 1]],
+                false,
+            ),
+            None => (self.unindexed.as_slice(), true),
+        };
+        group
+            .iter()
+            .map(|index| residents[*index])
+            .filter(move |packet| !unindexed || packet.flow == id)
+    }
+}
+
 /// Groups initial payload sequences by their node-strided owner, in `initial_packets` order.
 ///
 /// The owner of `PayloadId(value)` is `value % node_count` and its sequence is
@@ -5308,6 +5379,9 @@ fn future_work(
             }
         }
     }
+    // Grouped after the counting loop above so that a resident whose flow is outside the dense
+    // table still reaches that loop's direct index first, exactly as before.
+    let resident_groups = ResidentFlowGroups::build(image, &resident_packets);
     let mut pfc_by_node = vec![0_u64; image.nodes.len()];
     let mut pfc_by_channel = vec![0_u64; image.channels.len()];
     for owner in image
@@ -5340,9 +5414,9 @@ fn future_work(
                     owner.id,
                 ) {
                     let past_resident = u64::try_from(
-                        resident_packets
-                            .iter()
-                            .filter(|packet| packet.flow == flow.id && packet.kind.is_data())
+                        resident_groups
+                            .group(image, &resident_packets, flow.id)
+                            .filter(|packet| packet.kind.is_data())
                             .filter(|packet| {
                                 !packet_can_still_cross_link(image, packet, ingress.controlled_link)
                             })
@@ -5361,9 +5435,9 @@ fn future_work(
                     owner.id,
                 ) {
                     let past_resident = u64::try_from(
-                        resident_packets
-                            .iter()
-                            .filter(|packet| packet.flow == flow.id && packet.kind.is_feedback())
+                        resident_groups
+                            .group(image, &resident_packets, flow.id)
+                            .filter(|packet| packet.kind.is_feedback())
                             .filter(|packet| {
                                 !packet_can_still_cross_link(image, packet, ingress.controlled_link)
                             })
@@ -6591,6 +6665,21 @@ mod legacy_scans {
         fresh.max(retransmission)
     }
 
+    /// `validate.rs:5316` and `validate.rs:5337` before the fix — the flow's executable residents.
+    ///
+    /// The two sites differ only in the data/feedback lane filter they apply afterwards, which is
+    /// unchanged; what the grouping replaced is the `packet.flow == flow.id` clause.
+    pub(super) fn resident_packets_for_flow(
+        residents: &[&crate::PacketDescriptor],
+        generator_flow: crate::FlowId,
+    ) -> Vec<PayloadId> {
+        residents
+            .iter()
+            .filter(|packet| packet.flow == generator_flow)
+            .map(|packet| packet.id)
+            .collect()
+    }
+
     /// `validate.rs:2653` before the fix — one full event rescan per Blocked TCP generator.
     pub(super) fn matching_retransmission_timeout_events(
         image: &SimulationImage,
@@ -6714,9 +6803,38 @@ pub fn assert_validate_flow_index_equivalent_for_testing(
         ));
     }
 
+    // `future_work`'s PFC reservation groups the *derived* resident table, so it is compared the
+    // same way: element sequence per flow, plus the partition property.
+    let residents = executable_resident_packets(image);
+    let resident_groups = ResidentFlowGroups::build(image, &residents);
+    let mut grouped_residents = 0_usize;
+    for descriptor in &image.flows {
+        let indexed = resident_groups
+            .group(image, &residents, descriptor.id)
+            .map(|packet| packet.id)
+            .collect::<Vec<_>>();
+        let scanned = legacy_scans::resident_packets_for_flow(&residents, descriptor.id);
+        if indexed != scanned {
+            return Err(format!(
+                "flow {:?} indexed resident walk {indexed:?} differs from the scanned walk {scanned:?}",
+                descriptor.id
+            ));
+        }
+        grouped_residents += indexed.len();
+    }
+    let resident_resolved = residents
+        .iter()
+        .filter(|packet| dense_flow_slot(image, packet.flow).is_some())
+        .count();
+    if grouped_residents != resident_resolved {
+        return Err(format!(
+            "flow-keyed resident groups cover {grouped_residents} packets, but {resident_resolved} resolve to a flow"
+        ));
+    }
+
     // Every identifier that labels a packet but resolves to no dense slot. No query derived from
-    // `image.flows` can reach one, so without this loop `packets_for_flow`'s unindexed fallback —
-    // the shared group plus its equality filter — would never be evaluated by the gate at all.
+    // `image.flows` can reach one, so without this loop the unindexed fallbacks — the shared group
+    // plus its equality filter — would never be evaluated by the gate at all.
     let mut unindexed_queries = image
         .initial_packets
         .iter()
@@ -6734,6 +6852,16 @@ pub fn assert_validate_flow_index_equivalent_for_testing(
         if indexed != scanned {
             return Err(format!(
                 "unindexed flow {id:?} indexed packet walk {indexed:?} differs from the scanned walk {scanned:?}"
+            ));
+        }
+        let indexed_residents = resident_groups
+            .group(image, &residents, id)
+            .map(|packet| packet.id)
+            .collect::<Vec<_>>();
+        let scanned_residents = legacy_scans::resident_packets_for_flow(&residents, id);
+        if indexed_residents != scanned_residents {
+            return Err(format!(
+                "unindexed flow {id:?} indexed resident walk {indexed_residents:?} differs from the scanned walk {scanned_residents:?}"
             ));
         }
     }
