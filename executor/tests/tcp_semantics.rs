@@ -13,18 +13,17 @@ use days_executor::{
     size_default_device_plan, validate,
 };
 #[cfg(feature = "cuda")]
-use days_executor::{CudaConfig, run_cuda_with_observations};
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-use days_executor::{
-    DeviceCapacityCaps, MetalArena, MetalConfig, MetalError, run_metal_with_observations,
-};
+use days_executor::{CudaArena, CudaConfig, CudaError, run_cuda_with_observations};
 #[cfg(any(
     feature = "cuda",
     all(feature = "metal-spike", target_vendor = "apple")
 ))]
 use days_executor::{
-    DropMarkPolicy, EcnThresholdPolicy, MechanismTransitionRecord, QueueDepthUnit, RunResult,
+    DeviceCapacityCaps, DropMarkPolicy, EcnThresholdPolicy, MechanismTransitionRecord,
+    QueueDepthUnit, RunResult,
 };
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+use days_executor::{MetalArena, MetalConfig, MetalError, run_metal_with_observations};
 
 const SOURCE: NodeId = NodeId(0);
 const SINK: NodeId = NodeId(1);
@@ -40,7 +39,10 @@ const ACK_BYTES: u64 = 40;
 /// Two flows are the smallest fixture that can distinguish first-offender growth from
 /// vector-informed growth: both flows overflow the same under-capped arena, so a policy that
 /// repairs only the flow named by the fault needs one retry per flow.
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
 fn tcp_two_flow_image(control: TcpCongestionControl, total_bytes: u64) -> SimulationImage {
     let mut image = tcp_image(control, total_bytes);
     let second_flow = FlowId(1);
@@ -1305,6 +1307,75 @@ fn metal_tcp_ledger_capacity_retry_is_typed_and_byte_identical() {
     assert_eq!(retry.grown_capacity, 16);
 }
 
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_tcp_ledger_capacity_retry_is_typed_and_byte_identical() {
+    let image = tcp_image(TcpCongestionControl::reno(MSS), 2 * MSS);
+    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("scalar TCP ledger retry oracle must run");
+    let capacity_caps = DeviceCapacityCaps {
+        tcp_ledger_segments_per_flow: Some(0),
+        ..DeviceCapacityCaps::default()
+    };
+
+    let strict_error = run_cuda_with_observations(
+        &image,
+        None,
+        CudaConfig {
+            capacity_caps,
+            max_capacity_retries: 0,
+            ..CudaConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect_err("under-capped TCP ledger must fail in strict mode");
+    assert_eq!(
+        strict_error,
+        CudaError::CapacityExceeded {
+            arena: CudaArena::TcpSegmentLedger,
+            node: None,
+            flow: Some(FLOW),
+            stream: None,
+            // The zero cap retains the one segment already resident in the image.
+            capacity: 1,
+            demand: 2,
+        }
+    );
+
+    let recovered = run_cuda_with_observations(
+        &image,
+        None,
+        CudaConfig {
+            capacity_caps,
+            ..CudaConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("adaptive TCP ledger growth must restart from the immutable image");
+    assert_device_full_result_eq(
+        &recovered.result,
+        &scalar,
+        "capacity-retried CUDA TCP ledger run",
+    );
+
+    let [retry] = recovered.capacity_retry_trace.as_slice() else {
+        panic!(
+            "expected one TCP ledger retry, got {:?}",
+            recovered.capacity_retry_trace
+        );
+    };
+    assert_eq!(retry.retry, 1);
+    assert_eq!(retry.arena, CudaArena::TcpSegmentLedger);
+    assert_eq!(retry.node, None);
+    assert_eq!(retry.flow, Some(FLOW));
+    assert_eq!(retry.capacity, 1);
+    assert_eq!(retry.demand, 2);
+    // T20i: the ledger's additive +256 class retreat is retired. The fault now reports the flow's
+    // observed occupancy high-water (1 record, the seeded segment) and the replacement capacity is
+    // `8 * high_water + 8`.
+    assert_eq!(retry.grown_capacity, 16);
+}
+
 /// Two flows, both under-capped, and a retry budget of exactly ONE.
 ///
 /// This is the shape T20i layer 2 exists to fix. Under first-offender growth the fault names one
@@ -1368,6 +1439,72 @@ fn metal_tcp_ledger_occupancy_vector_sizes_every_flow_in_one_replan() {
     };
     assert_eq!(retry.retry, 1);
     assert_eq!(retry.arena, MetalArena::TcpSegmentLedger);
+    assert_eq!(retry.capacity, 1);
+    assert_eq!(retry.demand, 2);
+    assert_eq!(retry.grown_capacity, 16);
+}
+
+/// The CUDA sibling of [`metal_tcp_ledger_occupancy_vector_sizes_every_flow_in_one_replan`].
+///
+/// Same fixture, same budget of one, same claim: the ledger fault carries the whole per-flow
+/// occupancy vector, so the single replacement plan sizes BOTH flows and the chain never reaches a
+/// second retry.
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_tcp_ledger_occupancy_vector_sizes_every_flow_in_one_replan() {
+    let image = tcp_two_flow_image(TcpCongestionControl::reno(MSS), 2 * MSS);
+    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("scalar two-flow ledger oracle must run");
+    let capacity_caps = DeviceCapacityCaps {
+        tcp_ledger_segments_per_flow: Some(0),
+        ..DeviceCapacityCaps::default()
+    };
+
+    let strict_error = run_cuda_with_observations(
+        &image,
+        None,
+        CudaConfig {
+            capacity_caps,
+            max_capacity_retries: 0,
+            ..CudaConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect_err("under-capped TCP ledgers must fail in strict mode");
+    let CudaError::CapacityExceeded { arena, flow, .. } = strict_error else {
+        panic!("expected a typed ledger capacity fault, got {strict_error:?}");
+    };
+    assert_eq!(arena, CudaArena::TcpSegmentLedger);
+    assert!(
+        matches!(flow, Some(FlowId(0)) | Some(FlowId(1))),
+        "the fault must still name a flow, got {flow:?}"
+    );
+
+    let recovered = run_cuda_with_observations(
+        &image,
+        None,
+        CudaConfig {
+            capacity_caps,
+            max_capacity_retries: 1,
+            ..CudaConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("one vector-informed replan must size BOTH flows");
+    assert_device_full_result_eq(
+        &recovered.result,
+        &scalar,
+        "vector-retried CUDA two-flow TCP ledger run",
+    );
+
+    let [retry] = recovered.capacity_retry_trace.as_slice() else {
+        panic!(
+            "the vector must collapse the chain to one retry, got {:?}",
+            recovered.capacity_retry_trace
+        );
+    };
+    assert_eq!(retry.retry, 1);
+    assert_eq!(retry.arena, CudaArena::TcpSegmentLedger);
     assert_eq!(retry.capacity, 1);
     assert_eq!(retry.demand, 2);
     assert_eq!(retry.grown_capacity, 16);
