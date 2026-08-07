@@ -3,8 +3,8 @@ use std::collections::VecDeque;
 use days_executor::{
     ArrivalDisposition, CpuConfig, Event, EventKey, EventKind, FlowDescriptor, FlowId, HostState,
     LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, ObservationMode,
-    PacketArrivalObservation, PacketDeparture, PacketDescriptor, PayloadId, RemoteChannel,
-    SchedulerKind, SimulationImage, SwitchQueueState, SwitchState, event_phase,
+    PacketArrivalObservation, PacketDeparture, PacketDescriptor, PayloadId, PfcQueueState,
+    RemoteChannel, SchedulerKind, SimulationImage, SwitchQueueState, SwitchState, event_phase,
     run_cpu_with_observations, run_scalar_with_observations,
 };
 
@@ -379,4 +379,34 @@ fn resolved_switch_routes_keep_complete_cpu_state_identical() {
         .unwrap();
         assert_eq!(actual.result, expected, "worker count {workers}");
     }
+}
+
+#[test]
+fn an_ingress_free_pfc_monitor_serves_exactly_what_no_monitor_serves() {
+    // A switch egress queue without a PFC monitor is served from its head, because nothing can
+    // report a paused priority; a queue with a monitor is served from an eligible-packet scan.
+    // The two must agree whenever no priority is paused, and an ingress-free monitor can never
+    // pause one. This pins that agreement on the complete `RunResult`: the only field the two
+    // runs may differ in is the monitor the reference image does not carry.
+    let reference =
+        run_scalar_with_observations(&image(), Some(27), ObservationMode::Full).unwrap();
+
+    let mut monitored = image();
+    for state in &mut monitored.switch_states {
+        for queue in &mut state.queues {
+            queue.pfc = Some(PfcQueueState::default());
+        }
+    }
+    let mut observed =
+        run_scalar_with_observations(&monitored, Some(27), ObservationMode::Full).unwrap();
+    for state in &mut observed.switch_states {
+        for queue in &mut state.queues {
+            assert_eq!(
+                queue.pfc.take(),
+                Some(PfcQueueState::default()),
+                "an ingress-free monitor has no state to change"
+            );
+        }
+    }
+    assert_eq!(observed, reference);
 }

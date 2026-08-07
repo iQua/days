@@ -709,6 +709,56 @@ struct PfcFramePlan {
     header: crate::PfcHeader,
 }
 
+/// Which packet a switch egress queue may serve on one `TxReady`.
+///
+/// `Head` is the FIFO-order plan: every queued packet is eligible and the discipline always
+/// selects position zero, so the plan is the queue head and nothing else has to be inspected.
+/// `Eligible` is the per-packet scan that only the mechanisms which can reorder service or hold a
+/// packet back need — PFC pausing and the round-robin disciplines. The two are equivalent
+/// whenever `queue_serves_head` holds, so the fast plan is a cost reduction, not a behavior
+/// change.
+enum SwitchServicePlan {
+    Head(Option<PacketDescriptor>),
+    Eligible {
+        positions: Vec<usize>,
+        packets: Vec<PacketDescriptor>,
+        priorities: Vec<usize>,
+        incoming_links: Vec<Option<LinkId>>,
+    },
+}
+
+/// Projects an eligible-packet list onto the record shape the round-robin certificates carry.
+fn scheduler_packets(packets: &[PacketDescriptor]) -> Vec<crate::SchedulerPacket> {
+    packets
+        .iter()
+        .map(|packet| crate::SchedulerPacket {
+            payload: packet.id,
+            flow: packet.flow,
+            size_bytes: packet.size_bytes,
+        })
+        .collect()
+}
+
+/// Whether one queue's mechanisms always select the queue head with no per-packet inspection.
+///
+/// A queue without a PFC monitor cannot report a paused priority, so every queued packet is
+/// eligible. FIFO, static priority and weighted fair queueing all maintain their service order in
+/// the queue itself, which is exactly why `scheduler_select_position` answers position zero for
+/// all three; deficit and weighted round robin choose by class and need the eligible-packet list.
+/// The match is deliberately exhaustive: a new discipline must be classified here before it can
+/// compile, rather than silently inheriting the head-only plan.
+fn queue_serves_head(queue: &crate::SwitchQueueState) -> bool {
+    if queue.pfc.is_some() {
+        return false;
+    }
+    match queue.scheduler {
+        SchedulerKind::Fifo
+        | SchedulerKind::StaticPriority { .. }
+        | SchedulerKind::WeightedFairQueue(_) => true,
+        SchedulerKind::DeficitRoundRobin(_) | SchedulerKind::WeightedRoundRobin(_) => false,
+    }
+}
+
 struct TcpSendPlan {
     packets: Vec<PacketDescriptor>,
     timer: Option<TcpTimerState>,
@@ -1893,16 +1943,15 @@ impl<'image> TransitionState<'image> {
             return self.switch_pfc_remote_arrival(node, event, header, children);
         }
         let egress_link = self.packet_egress_at(packet, node.id)?;
-        let incoming_link = self.packet_incoming_link_at(packet, node.id)?;
         let priority = usize::from(self.flow(packet.flow)?.priority);
         let rate_bps = egress_link
             .map(|link| self.link(link).map(|descriptor| descriptor.rate_bps))
             .transpose()?;
         let sp_position = self.switch_sp_insertion_position(node, egress_link, packet.flow)?;
         let state_slot = self.local_state_slot(node)?;
-        let (queue_id, queue_slot, queue_bytes) = {
+        let (queue_id, queue_slot, queue_bytes, queue_has_pfc) = {
             let state = self.switch_state(node)?;
-            let (queue_slot, _) = state
+            let (queue_slot, queue) = state
                 .queues
                 .iter()
                 .enumerate()
@@ -1916,7 +1965,15 @@ impl<'image> TransitionState<'image> {
                 u64::try_from(queue_slot).unwrap_or(u64::MAX),
                 queue_slot,
                 queue_bytes,
+                queue.pfc.is_some(),
             )
+        };
+        // Only a PFC monitor consults the incoming link, and the route walk that derives it is
+        // per-arrival work. A queue without a monitor never reads this value.
+        let incoming_link = if queue_has_pfc {
+            self.packet_incoming_link_at(packet, node.id)?
+        } else {
+            None
         };
 
         let (disposition, schedule_ready, mark_packet, pfc_plan, pfc_transition, aqm_transition) = {
@@ -3351,7 +3408,7 @@ impl<'image> TransitionState<'image> {
             });
         };
 
-        let (eligible_positions, eligible_packets, eligible_priorities, eligible_incoming_links) = {
+        let plan = {
             let state = self.switch_state(node)?;
             let queue = state
                 .queues
@@ -3361,28 +3418,43 @@ impl<'image> TransitionState<'image> {
                     node: node.id,
                     egress_link: Some(egress_link),
                 })?;
-            let mut positions = Vec::new();
-            let mut packets = Vec::new();
-            let mut priorities = Vec::new();
-            let mut incoming_links = Vec::new();
-            for (position, payload) in queue.queue.iter().enumerate() {
-                let packet = self.packet(*payload)?;
-                let priority = usize::from(self.flow(packet.flow)?.priority);
-                let paused = queue
-                    .pfc
-                    .as_ref()
-                    .is_some_and(|pfc| pfc.is_paused(priority));
-                if !paused {
-                    positions.push(position);
-                    packets.push(packet);
-                    priorities.push(priority);
-                    incoming_links.push(self.packet_incoming_link_at(packet, node.id)?);
+            if queue_serves_head(queue) {
+                SwitchServicePlan::Head(
+                    queue
+                        .queue
+                        .front()
+                        .map(|payload| self.packet(*payload))
+                        .transpose()?,
+                )
+            } else {
+                let mut positions = Vec::new();
+                let mut packets = Vec::new();
+                let mut priorities = Vec::new();
+                let mut incoming_links = Vec::new();
+                for (position, payload) in queue.queue.iter().enumerate() {
+                    let packet = self.packet(*payload)?;
+                    let priority = usize::from(self.flow(packet.flow)?.priority);
+                    let paused = queue
+                        .pfc
+                        .as_ref()
+                        .is_some_and(|pfc| pfc.is_paused(priority));
+                    if !paused {
+                        positions.push(position);
+                        packets.push(packet);
+                        priorities.push(priority);
+                        incoming_links.push(self.packet_incoming_link_at(packet, node.id)?);
+                    }
+                }
+                SwitchServicePlan::Eligible {
+                    positions,
+                    packets,
+                    priorities,
+                    incoming_links,
                 }
             }
-            (positions, packets, priorities, incoming_links)
         };
         let state_slot = self.local_state_slot(node)?;
-        let (payload, selected_packet, queue_slot, pfc_plan, pfc_transition, scheduler_transition) = {
+        let (payload, selected_packet, queue_slot, pfc_plan, pfc_transition, scheduler_transition) = 'service: {
             let state = self.switch_state_mut(node)?;
             let (queue_slot, queue) = state
                 .queues
@@ -3401,9 +3473,49 @@ impl<'image> TransitionState<'image> {
                 });
             }
 
-            let scheduler_before = queue.scheduler.clone();
+            let (
+                eligible_packets,
+                eligible_positions,
+                eligible_priorities,
+                eligible_incoming_links,
+            ) = match &plan {
+                SwitchServicePlan::Head(head) => {
+                    // Position zero of a queue whose every packet is eligible. The selection,
+                    // the removal and the state updates here are exactly what the
+                    // eligible-packet path computes; no PFC monitor and no round-robin
+                    // discipline is present, so both transition records are `None`.
+                    let Some(packet) = *head else {
+                        return Ok(());
+                    };
+                    let payload = queue
+                        .queue
+                        .pop_front()
+                        .ok_or(ExecutionError::InvalidSchedulerState(node.id))?;
+                    if let SchedulerKind::WeightedFairQueue(wfq) = &mut queue.scheduler {
+                        wfq.packet_finish_times.get(&payload).ok_or(
+                            ExecutionError::MissingWfqFinishTag {
+                                node: node.id,
+                                payload,
+                            },
+                        )?;
+                    }
+                    queue.in_service = Some(payload);
+                    break 'service (payload, packet, queue_slot, None, None, None);
+                }
+                SwitchServicePlan::Eligible {
+                    positions,
+                    packets,
+                    priorities,
+                    incoming_links,
+                } => (packets, positions, priorities, incoming_links),
+            };
+            let scheduler_before = matches!(
+                queue.scheduler,
+                SchedulerKind::DeficitRoundRobin(_) | SchedulerKind::WeightedRoundRobin(_)
+            )
+            .then(|| queue.scheduler.clone());
             let Some((eligible_position, scan_steps)) =
-                scheduler_select_position(&mut queue.scheduler, &eligible_packets, node.id)?
+                scheduler_select_position(&mut queue.scheduler, eligible_packets, node.id)?
             else {
                 return Ok(());
             };
@@ -3480,17 +3592,9 @@ impl<'image> TransitionState<'image> {
             } else {
                 (None, None)
             };
-            let scheduler_packets = eligible_packets
-                .iter()
-                .map(|packet| crate::SchedulerPacket {
-                    payload: packet.id,
-                    flow: packet.flow,
-                    size_bytes: packet.size_bytes,
-                })
-                .collect::<Vec<_>>();
             let scheduler_transition = match (&scheduler_before, &queue.scheduler) {
                 (
-                    SchedulerKind::DeficitRoundRobin(before),
+                    Some(SchedulerKind::DeficitRoundRobin(before)),
                     SchedulerKind::DeficitRoundRobin(after),
                 ) => Some(crate::MechanismTransitionRecord::Drr(
                     crate::DrrTransitionRecord {
@@ -3502,14 +3606,14 @@ impl<'image> TransitionState<'image> {
                         before_deficits_bytes: before.deficits_bytes.clone(),
                         before_current_class: before.current_class,
                         scan_steps,
-                        eligible_packets: scheduler_packets,
+                        eligible_packets: scheduler_packets(eligible_packets),
                         selected_payload: payload,
                         after_deficits_bytes: after.deficits_bytes.clone(),
                         after_current_class: after.current_class,
                     },
                 )),
                 (
-                    SchedulerKind::WeightedRoundRobin(before),
+                    Some(SchedulerKind::WeightedRoundRobin(before)),
                     SchedulerKind::WeightedRoundRobin(after),
                 ) => Some(crate::MechanismTransitionRecord::Wrr(
                     crate::WrrTransitionRecord {
@@ -3520,7 +3624,7 @@ impl<'image> TransitionState<'image> {
                         weights: before.weights.clone(),
                         before_packets_sent: before.packets_sent_in_round.clone(),
                         before_current_class: before.current_class,
-                        eligible_packets: scheduler_packets,
+                        eligible_packets: scheduler_packets(eligible_packets),
                         selected_payload: payload,
                         after_packets_sent: after.packets_sent_in_round.clone(),
                         after_current_class: after.current_class,
@@ -3619,15 +3723,16 @@ impl<'image> TransitionState<'image> {
                     node: node.id,
                     egress_link: Some(egress_link),
                 })?;
-            queue.queue.iter().find_map(|payload| {
-                let packet = self.packet(*payload).ok()?;
-                let priority = usize::from(self.flow(packet.flow).ok()?.priority);
-                let paused = queue
-                    .pfc
-                    .as_ref()
-                    .is_some_and(|pfc| pfc.is_paused(priority));
-                (!paused).then_some(*payload)
-            })
+            // Without a PFC monitor no priority can be paused, so the first eligible packet is
+            // the queue head and no per-packet inspection is observable.
+            match &queue.pfc {
+                None => queue.queue.front().copied(),
+                Some(pfc) => queue.queue.iter().find_map(|payload| {
+                    let packet = self.packet(*payload).ok()?;
+                    let priority = usize::from(self.flow(packet.flow).ok()?.priority);
+                    (!pfc.is_paused(priority)).then_some(*payload)
+                }),
+            }
         };
         let next_payload = {
             let state = self.switch_state_mut(node)?;
@@ -4717,6 +4822,8 @@ fn scheduler_select_position(
         return Ok(None);
     }
     match scheduler {
+        // The three head-serving disciplines. `queue_serves_head` classifies exactly this set, and
+        // the two must be changed together.
         SchedulerKind::Fifo
         | SchedulerKind::StaticPriority { .. }
         | SchedulerKind::WeightedFairQueue(_) => Ok(Some((0, 0))),
