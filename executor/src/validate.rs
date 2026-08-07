@@ -102,6 +102,160 @@ impl fmt::Display for ValidationError {
 
 impl Error for ValidationError {}
 
+/// Per-flow counts of preloaded TCP acknowledgment arrivals.
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+struct PreloadedTcpAcks {
+    /// Every initial event that is a preloaded TCP ACK arrival for the flow.
+    total: u64,
+    /// The subset of `total` keyed at or below `image.stop_time_ns`.
+    within_stop_time: u64,
+}
+
+/// Flow-keyed views of the initial packet and event tables, built once per `validate` call.
+///
+/// The validator asks "which initial packets, or preloaded ACK arrivals, belong to this flow?"
+/// once per generator at eight sites. Answering that with a linear filter makes the whole pass
+/// quadratic in the flow count, so each table is indexed once instead: a CSR grouping over
+/// `initial_packets` keyed by dense flow slot, and a per-flow count of preloaded TCP ACK
+/// arrivals. Both are built by a single forward pass, so every group lists its members in
+/// initial-table order and an indexed walk visits exactly the elements the filter visited, in
+/// exactly the same order — the diagnostics that name the first offending element are unchanged.
+struct FlowIndex {
+    /// CSR offsets into `packet_items`; one entry per dense flow slot plus a terminator.
+    packet_offsets: Vec<usize>,
+    /// `initial_packets` indices grouped by flow slot, ascending inside every group.
+    packet_items: Vec<usize>,
+    /// `initial_packets` indices whose flow falls outside the dense flow table.
+    unindexed_packets: Vec<usize>,
+    /// Preloaded TCP ACK arrival counts per dense flow slot.
+    preloaded_tcp_acks: Vec<PreloadedTcpAcks>,
+    /// Smallest initial event time at or below the stop time; invariant across generators.
+    first_admissible_event_time_ns: Option<u64>,
+}
+
+/// Returns the dense flow-table slot of `id`, exactly when `flow(image, id)` resolves.
+fn dense_flow_slot(image: &SimulationImage, id: crate::FlowId) -> Option<usize> {
+    let slot = usize::try_from(id.0).ok()?;
+    image.flows.get(slot).filter(|flow| flow.id == id)?;
+    Some(slot)
+}
+
+impl FlowIndex {
+    fn build(image: &SimulationImage) -> Self {
+        let flow_count = image.flows.len();
+        let mut packet_offsets = vec![0_usize; flow_count + 1];
+        let mut unindexed_packets = Vec::new();
+        for (index, packet) in image.initial_packets.iter().enumerate() {
+            match dense_flow_slot(image, packet.flow) {
+                Some(slot) => packet_offsets[slot + 1] += 1,
+                None => unindexed_packets.push(index),
+            }
+        }
+        for slot in 0..flow_count {
+            packet_offsets[slot + 1] += packet_offsets[slot];
+        }
+        let mut cursors = packet_offsets.clone();
+        let mut packet_items = vec![0_usize; packet_offsets[flow_count]];
+        for (index, packet) in image.initial_packets.iter().enumerate() {
+            if let Some(slot) = dense_flow_slot(image, packet.flow) {
+                packet_items[cursors[slot]] = index;
+                cursors[slot] += 1;
+            }
+        }
+
+        let mut preloaded_tcp_acks = vec![PreloadedTcpAcks::default(); flow_count];
+        let mut first_admissible_event_time_ns: Option<u64> = None;
+        for event in &image.initial_events {
+            let admissible = event.key.time_ns <= image.stop_time_ns;
+            if admissible {
+                first_admissible_event_time_ns = Some(
+                    first_admissible_event_time_ns.map_or(event.key.time_ns, |earliest| {
+                        earliest.min(event.key.time_ns)
+                    }),
+                );
+            }
+            if event.kind != EventKind::RemoteArrival {
+                continue;
+            }
+            let Some(packet) = packet(image, event.payload) else {
+                continue;
+            };
+            if !matches!(packet.kind, PacketKind::TcpAck(_)) {
+                continue;
+            }
+            let Some(slot) = dense_flow_slot(image, packet.flow) else {
+                continue;
+            };
+            if event.target != image.flows[slot].source {
+                continue;
+            }
+            // Both counts are bounded by `initial_events.len()`, so neither can leave `u64`.
+            let counts = &mut preloaded_tcp_acks[slot];
+            counts.total += 1;
+            if admissible {
+                counts.within_stop_time += 1;
+            }
+        }
+
+        Self {
+            packet_offsets,
+            packet_items,
+            unindexed_packets,
+            preloaded_tcp_acks,
+            first_admissible_event_time_ns,
+        }
+    }
+
+    /// Yields the initial packets of `id`, in `initial_packets` order.
+    ///
+    /// Exactly equivalent to `initial_packets.iter().filter(|packet| packet.flow == id)`: a dense
+    /// group holds precisely the packets whose flow resolves to that slot, and an identifier
+    /// outside the dense table falls back to an equality filter over the unindexed group.
+    fn packets_for_flow<'a>(
+        &'a self,
+        image: &'a SimulationImage,
+        id: crate::FlowId,
+    ) -> impl Iterator<Item = &'a crate::PacketDescriptor> + 'a {
+        let (group, unindexed) = match dense_flow_slot(image, id) {
+            Some(slot) => (
+                &self.packet_items[self.packet_offsets[slot]..self.packet_offsets[slot + 1]],
+                false,
+            ),
+            None => (self.unindexed_packets.as_slice(), true),
+        };
+        group
+            .iter()
+            .map(|index| &image.initial_packets[*index])
+            .filter(move |packet| !unindexed || packet.flow == id)
+    }
+
+    /// Returns the preloaded TCP ACK arrival counts of `id`.
+    fn preloaded_tcp_acks(&self, image: &SimulationImage, id: crate::FlowId) -> PreloadedTcpAcks {
+        dense_flow_slot(image, id)
+            .and_then(|slot| self.preloaded_tcp_acks.get(slot).copied())
+            .unwrap_or_default()
+    }
+}
+
+/// Groups initial payload sequences by their node-strided owner, in `initial_packets` order.
+///
+/// The owner of `PayloadId(value)` is `value % node_count` and its sequence is
+/// `value / node_count`. Recovering that per node with a full packet rescan costs one scan per
+/// LP; one bucketing pass answers it for every node at once, and because `initial_packets` is
+/// strictly ascending in `PayloadId` each bucket is ascending in sequence — so the first bucket
+/// entry meeting a predicate is the same packet the rescan would have reported first.
+fn payload_sequences_by_owner(image: &SimulationImage) -> Vec<Vec<u64>> {
+    let mut sequences = vec![Vec::<u64>::new(); image.nodes.len()];
+    let node_count = image.nodes.len() as u64;
+    if node_count == 0 {
+        return sequences;
+    }
+    for packet in &image.initial_packets {
+        sequences[(packet.id.0 % node_count) as usize].push(packet.id.0 / node_count);
+    }
+    sequences
+}
+
 /// Validates all scenario-dependent assumptions required by the selected backend.
 pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), ValidationError> {
     if matches!(backend, Backend::Cpu { workers: 0 }) {
@@ -117,21 +271,27 @@ pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), Validat
     validate_state_ownership(image)?;
     validate_links(image)?;
     validate_flows(image)?;
-    validate_generators(image)?;
+    // Dense flow identifiers and strictly ascending payload identifiers are established above,
+    // which is everything the flow index needs; it reads the image and cannot itself reject.
+    let flow_index = FlowIndex::build(image);
+    validate_generators(image, &flow_index)?;
     validate_backend_capabilities(image, backend)?;
     let derived_delays = validate_packets_and_derive_delays(image)?;
-    validate_tcp_segment_ledger(image)?;
-    validate_owned_service_state(image, backend)?;
+    validate_tcp_segment_ledger(image, &flow_index)?;
+    validate_owned_service_state(image, &flow_index, backend)?;
     let pfc_channels = validate_pfc(image)?;
     validate_channels(image, backend, &derived_delays, &pfc_channels)?;
     validate_events(image, &pfc_channels)?;
     validate_pfc_causal_consistency(image)?;
-    validate_global_time_capacity(image, backend)?;
+    // `future_work` is a pure function of the image and was previously recomputed by
+    // `validate_counters`. It is computed at its first consumer so that a rejection raised while
+    // deriving it still surfaces from `validate_global_time_capacity`, exactly as before.
+    let future_work = validate_global_time_capacity(image, &flow_index, backend)?;
     validate_service_event_consistency(image)?;
-    let future_work = validate_counters(image)?;
+    validate_counters(image, &future_work)?;
     validate_dcqcn_arithmetic_capacity(image, &future_work)?;
-    validate_origin_sequences(image, &future_work)?;
-    validate_payload_sequences(image, &future_work)?;
+    validate_origin_sequences(image, &flow_index, &future_work)?;
+    validate_payload_sequences(image, &flow_index, &future_work)?;
     validate_preloaded_arrival_capacity(image)?;
     validate_initial_payload_positions(image)?;
     Ok(())
@@ -1013,7 +1173,10 @@ fn route_target(
         .or_else(|| (index + 1 == route.len()).then_some(terminal))
 }
 
-fn validate_generators(image: &SimulationImage) -> Result<(), ValidationError> {
+fn validate_generators(
+    image: &SimulationImage,
+    flow_index: &FlowIndex,
+) -> Result<(), ValidationError> {
     let mut arrival_counts = BTreeMap::<(NodeId, PayloadId, u64), usize>::new();
     let mut pacing_counts = BTreeMap::<(NodeId, PayloadId, u64), usize>::new();
     for event in image
@@ -1171,7 +1334,7 @@ fn validate_generators(image: &SimulationImage) -> Result<(), ValidationError> {
                     )));
                 }
                 let remaining = remaining_generator_packets(generator)?;
-                validate_tcp_timer_capacity(image, generator, tcp)?;
+                validate_tcp_timer_capacity(image, flow_index, generator, tcp)?;
                 if tcp.highest_ack > tcp.next_sequence
                     || tcp.bytes_in_flight != tcp.next_sequence - tcp.highest_ack
                     || generator.feedback.outstanding_bytes != tcp.bytes_in_flight
@@ -2364,7 +2527,10 @@ fn validate_preloaded_arrival_capacity(image: &SimulationImage) -> Result<(), Va
     Ok(())
 }
 
-fn validate_tcp_segment_ledger(image: &SimulationImage) -> Result<(), ValidationError> {
+fn validate_tcp_segment_ledger(
+    image: &SimulationImage,
+    flow_index: &FlowIndex,
+) -> Result<(), ValidationError> {
     let ledger = crate::tcp_ledger::seed_image(image).map_err(|conflict| {
         ValidationError::new(format!(
             "TCP flow {:?} sequence {} changed segment size from {} to {} bytes",
@@ -2378,11 +2544,7 @@ fn validate_tcp_segment_ledger(image: &SimulationImage) -> Result<(), Validation
         let FlowGeneratorKind::Tcp(tcp) = generator.kind else {
             continue;
         };
-        for packet in image
-            .initial_packets
-            .iter()
-            .filter(|packet| packet.flow == generator.flow)
-        {
+        for packet in flow_index.packets_for_flow(image, generator.flow) {
             let PacketKind::TcpData(header) = packet.kind else {
                 continue;
             };
@@ -2826,6 +2988,7 @@ fn validate_packets_and_derive_delays(
 
 fn validate_owned_service_state(
     image: &SimulationImage,
+    flow_index: &FlowIndex,
     backend: Backend,
 ) -> Result<(), ValidationError> {
     let pending_event_frontier = image
@@ -2969,7 +3132,14 @@ fn validate_owned_service_state(
                     [payload],
                 )?;
             }
-            validate_scheduler_state(image, owner.id, queue_index, queue, pending_event_frontier)?;
+            validate_scheduler_state(
+                image,
+                flow_index,
+                owner.id,
+                queue_index,
+                queue,
+                pending_event_frontier,
+            )?;
             validate_device_scheduler_capability(owner.id, queue_index, queue, backend)?;
             if queue.in_service.is_some() && queue.tx_ready_pending {
                 return Err(ValidationError::new(format!(
@@ -3325,6 +3495,7 @@ fn packet_can_still_cross_link(
 
 fn tcp_future_data_max_frame(
     image: &SimulationImage,
+    flow_index: &FlowIndex,
     generator: &crate::FlowGeneratorState,
     tcp: crate::TcpGenerator,
 ) -> u64 {
@@ -3335,10 +3506,8 @@ fn tcp_future_data_max_frame(
         return 0;
     }
     let fresh = tcp.mss_bytes.min(tcp.total_bytes - tcp.next_sequence);
-    let retransmission = image
-        .initial_packets
-        .iter()
-        .filter(|packet| packet.flow == generator.flow)
+    let retransmission = flow_index
+        .packets_for_flow(image, generator.flow)
         .filter_map(|packet| {
             let PacketKind::TcpData(header) = packet.kind else {
                 return None;
@@ -3354,6 +3523,7 @@ fn tcp_future_data_max_frame(
 
 fn maximum_drr_frame_bytes(
     image: &SimulationImage,
+    flow_index: &FlowIndex,
     egress: LinkId,
     class_count: usize,
     class: usize,
@@ -3396,7 +3566,7 @@ fn maximum_drr_frame_bytes(
                 }
             }
             FlowGeneratorKind::Tcp(tcp) => {
-                let future_data = tcp_future_data_max_frame(image, generator, tcp);
+                let future_data = tcp_future_data_max_frame(image, flow_index, generator, tcp);
                 if forward_reaches {
                     maximum = maximum.max(future_data);
                 }
@@ -3433,6 +3603,7 @@ fn maximum_drr_frame_bytes(
 
 fn validate_scheduler_state(
     image: &SimulationImage,
+    flow_index: &FlowIndex,
     owner: NodeId,
     queue_index: usize,
     queue: &crate::SwitchQueueState,
@@ -3621,7 +3792,13 @@ fn validate_scheduler_state(
                 let maximum_frame = queue
                     .egress_link
                     .map(|egress| {
-                        maximum_drr_frame_bytes(image, egress, state.quanta_bytes.len(), class)
+                        maximum_drr_frame_bytes(
+                            image,
+                            flow_index,
+                            egress,
+                            state.quanta_bytes.len(),
+                            class,
+                        )
                     })
                     .transpose()?
                     .unwrap_or(0);
@@ -4399,10 +4576,16 @@ fn latest_rate_pacing_time(
     })
 }
 
+/// Bounds the reachable simulation time, and returns the future-work reservation it derives.
+///
+/// The reservation is a pure function of the image and is consumed again by `validate_counters`,
+/// `validate_origin_sequences` and `validate_payload_sequences`; it is derived here, at its first
+/// consumer, so that a rejection raised while deriving it keeps this validator's identity.
 fn validate_global_time_capacity(
     image: &SimulationImage,
+    flow_index: &FlowIndex,
     backend: Backend,
-) -> Result<(), ValidationError> {
+) -> Result<FutureWork, ValidationError> {
     let mut service_bound = 0_u64;
     let live_payloads = crate::tcp_ledger::initial_live_payloads(image);
     let service_payloads = if matches!(backend, Backend::Metal | Backend::Cuda) {
@@ -4488,7 +4671,9 @@ fn validate_global_time_capacity(
         }
         let maximum_packet_size_bytes = match generator.kind {
             FlowGeneratorKind::Constant(constant) => constant.packet_size_bytes,
-            FlowGeneratorKind::Tcp(tcp) => tcp_future_data_max_frame(image, generator, tcp),
+            FlowGeneratorKind::Tcp(tcp) => {
+                tcp_future_data_max_frame(image, flow_index, generator, tcp)
+            }
             FlowGeneratorKind::Rate(rate) => rate
                 .packet_size_bytes
                 .min(rate.total_bytes - generator.bytes_emitted),
@@ -4524,7 +4709,7 @@ fn validate_global_time_capacity(
             })?;
         }
     }
-    let work = future_work(image)?;
+    let work = future_work(image, flow_index)?;
     for generator in image.host_states.iter().flat_map(|state| &state.generators) {
         let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind else {
             continue;
@@ -4667,7 +4852,7 @@ fn validate_global_time_capacity(
             ))
         }
     })?;
-    Ok(())
+    Ok(work)
 }
 
 fn validate_service_event_consistency(image: &SimulationImage) -> Result<(), ValidationError> {
@@ -5043,7 +5228,10 @@ fn route_enters_pfc_controller(
     })
 }
 
-fn future_work(image: &SimulationImage) -> Result<FutureWork, ValidationError> {
+fn future_work(
+    image: &SimulationImage,
+    flow_index: &FlowIndex,
+) -> Result<FutureWork, ValidationError> {
     let mut data_by_flow = vec![0_u64; image.flows.len()];
     let mut feedback_by_flow = vec![0_u64; image.flows.len()];
     let mut dcqcn_cnp_by_flow = vec![0_u64; image.flows.len()];
@@ -5067,7 +5255,7 @@ fn future_work(image: &SimulationImage) -> Result<FutureWork, ValidationError> {
             )?,
             FlowGeneratorKind::Tcp(_) => {
                 let preloaded_data = data_by_flow[generator.flow.0 as usize];
-                let attempts = tcp_attempt_upper_bound(image, generator)?;
+                let attempts = tcp_attempt_upper_bound(image, flow_index, generator)?;
                 add_packet_count(&mut data_by_flow[generator.flow.0 as usize], attempts)?;
                 add_packet_count(
                     &mut feedback_by_flow[generator.flow.0 as usize],
@@ -5186,8 +5374,7 @@ fn future_work(image: &SimulationImage) -> Result<FutureWork, ValidationError> {
     })
 }
 
-fn validate_counters(image: &SimulationImage) -> Result<FutureWork, ValidationError> {
-    let work = future_work(image)?;
+fn validate_counters(image: &SimulationImage, work: &FutureWork) -> Result<(), ValidationError> {
     let mut sourced_by_node = vec![0_u64; image.nodes.len()];
     let mut departed_by_node = vec![0_u64; image.nodes.len()];
     let mut received_by_node = vec![0_u64; image.nodes.len()];
@@ -5284,7 +5471,7 @@ fn validate_counters(image: &SimulationImage) -> Result<FutureWork, ValidationEr
             }
         }
     }
-    Ok(work)
+    Ok(())
 }
 
 fn remaining_generator_packets(
@@ -5647,21 +5834,6 @@ fn executable_collective_packets(
     Ok(remaining.min(horizon_count))
 }
 
-fn is_preloaded_tcp_ack_arrival(
-    image: &SimulationImage,
-    event: &crate::Event,
-    generator_flow: crate::FlowId,
-) -> bool {
-    let Some(flow) = flow(image, generator_flow) else {
-        return false;
-    };
-    event.kind == EventKind::RemoteArrival
-        && event.target == flow.source
-        && packet(image, event.payload).is_some_and(|packet| {
-            packet.flow == generator_flow && matches!(packet.kind, PacketKind::TcpAck(_))
-        })
-}
-
 /// Conservative bound on timer installations reachable during the configured run.
 ///
 /// Runtime TCP feedback is serialized by a positive-delay reverse route. A phase-0 ACK cancels
@@ -5670,6 +5842,7 @@ fn is_preloaded_tcp_ack_arrival(
 /// A Scheduled emission beyond the stop time cannot install a timer in this run.
 fn tcp_timer_install_upper_bound(
     image: &SimulationImage,
+    flow_index: &FlowIndex,
     generator: &crate::FlowGeneratorState,
 ) -> Result<u64, ValidationError> {
     if matches!(
@@ -5687,31 +5860,12 @@ fn tcp_timer_install_upper_bound(
     {
         return Ok(0);
     }
-    let Some(first_event_time) = image
-        .initial_events
-        .iter()
-        .map(|event| event.key.time_ns)
-        .filter(|time_ns| *time_ns <= image.stop_time_ns)
-        .min()
-    else {
+    let Some(first_event_time) = flow_index.first_admissible_event_time_ns else {
         return Ok(0);
     };
-    let preloaded_ack_events = u64::try_from(
-        image
-            .initial_events
-            .iter()
-            .filter(|event| {
-                event.key.time_ns <= image.stop_time_ns
-                    && is_preloaded_tcp_ack_arrival(image, event, generator.flow)
-            })
-            .count(),
-    )
-    .map_err(|_| {
-        ValidationError::new(format!(
-            "flow {:?} TCP finite-run timer installation bound exceeds u64",
-            generator.flow
-        ))
-    })?;
+    let preloaded_ack_events = flow_index
+        .preloaded_tcp_acks(image, generator.flow)
+        .within_stop_time;
     image
         .stop_time_ns
         .checked_sub(first_event_time)
@@ -5727,10 +5881,11 @@ fn tcp_timer_install_upper_bound(
 
 fn validate_tcp_timer_capacity(
     image: &SimulationImage,
+    flow_index: &FlowIndex,
     generator: &crate::FlowGeneratorState,
     tcp: crate::TcpGenerator,
 ) -> Result<(), ValidationError> {
-    let installations = tcp_timer_install_upper_bound(image, generator)?;
+    let installations = tcp_timer_install_upper_bound(image, flow_index, generator)?;
     if tcp.timer_generation.checked_add(installations).is_none() {
         return Err(ValidationError::new(format!(
             "flow {:?} TCP timer generation {} overflows with remaining upper bound {installations}",
@@ -5759,6 +5914,7 @@ fn validate_tcp_timer_capacity(
 /// events bypass that serialization and are therefore counted individually.
 fn tcp_attempt_upper_bound(
     image: &SimulationImage,
+    flow_index: &FlowIndex,
     generator: &crate::FlowGeneratorState,
 ) -> Result<u64, ValidationError> {
     if matches!(
@@ -5773,19 +5929,7 @@ fn tcp_attempt_upper_bound(
     if tcp.highest_ack >= tcp.total_bytes {
         return Ok(0);
     }
-    let preloaded_ack_events = u64::try_from(
-        image
-            .initial_events
-            .iter()
-            .filter(|event| is_preloaded_tcp_ack_arrival(image, event, generator.flow))
-            .count(),
-    )
-    .map_err(|_| {
-        ValidationError::new(format!(
-            "flow {:?} TCP finite-run attempt bound exceeds u64",
-            generator.flow
-        ))
-    })?;
+    let preloaded_ack_events = flow_index.preloaded_tcp_acks(image, generator.flow).total;
     let triggers = image
         .stop_time_ns
         .checked_add(1)
@@ -5832,6 +5976,7 @@ fn check_counter(
 
 fn validate_origin_sequences(
     image: &SimulationImage,
+    flow_index: &FlowIndex,
     work: &FutureWork,
 ) -> Result<(), ValidationError> {
     let mut maximum = BTreeMap::<NodeId, u64>::new();
@@ -5871,7 +6016,7 @@ fn validate_origin_sequences(
                         u64::from(generator.next_emission.status == GeneratorStatus::Scheduled);
                     remaining.saturating_sub(scheduled)
                 }
-                FlowGeneratorKind::Tcp(_) => tcp_attempt_upper_bound(image, generator)?,
+                FlowGeneratorKind::Tcp(_) => tcp_attempt_upper_bound(image, flow_index, generator)?,
                 FlowGeneratorKind::Rate(_) => {
                     let ticks = executable_rate_pacing_ticks(image, generator)?;
                     if ticks == BigUint::from(0_u8) {
@@ -5928,6 +6073,7 @@ fn validate_origin_sequences(
     for (node_index, pfc_frames) in work.pfc_by_node.iter().copied().enumerate() {
         emissions_by_node[node_index] += u128::from(pfc_frames);
     }
+    let owned_sequences = payload_sequences_by_owner(image);
     for node in &image.nodes {
         let next = match node.kind {
             NodeKind::Host => image.host_states[node.state_slot as usize].next_origin_seq,
@@ -5942,16 +6088,12 @@ fn validate_origin_sequences(
             }
         }
         if node.kind == NodeKind::Switch {
-            let node_count = image.nodes.len() as u64;
-            for packet in &image.initial_packets {
-                if node_count != 0 && packet.id.0 % node_count == node.id.0 {
-                    let sequence = packet.id.0 / node_count;
-                    if sequence >= next {
-                        return Err(ValidationError::new(format!(
-                            "switch node {:?} PFC payload sequence {sequence} is not below next origin sequence {next}",
-                            node.id
-                        )));
-                    }
+            for sequence in owned_sequences[node.id.0 as usize].iter().copied() {
+                if sequence >= next {
+                    return Err(ValidationError::new(format!(
+                        "switch node {:?} PFC payload sequence {sequence} is not below next origin sequence {next}",
+                        node.id
+                    )));
                 }
             }
         }
@@ -5999,6 +6141,7 @@ fn validate_origin_sequences(
 
 fn validate_payload_sequences(
     image: &SimulationImage,
+    flow_index: &FlowIndex,
     work: &FutureWork,
 ) -> Result<(), ValidationError> {
     let node_count = u64::try_from(image.nodes.len()).unwrap_or(u64::MAX);
@@ -6049,7 +6192,7 @@ fn validate_payload_sequences(
         for generator in &state.generators {
             let remaining = match generator.kind {
                 FlowGeneratorKind::Constant(_) => executable_generator_packets(image, generator)?,
-                FlowGeneratorKind::Tcp(_) => tcp_attempt_upper_bound(image, generator)?,
+                FlowGeneratorKind::Tcp(_) => tcp_attempt_upper_bound(image, flow_index, generator)?,
                 FlowGeneratorKind::Rate(_) => rate_payload_allocations(image, generator)?,
                 FlowGeneratorKind::Collective(_) => executable_generator_packets(image, generator)?,
                 FlowGeneratorKind::Dcqcn(_) => dcqcn_payload_allocations(image, generator)?,
@@ -6311,4 +6454,260 @@ fn packet(image: &SimulationImage, id: PayloadId) -> Option<&crate::PacketDescri
         .binary_search_by_key(&id, |packet| packet.id)
         .ok()
         .map(|index| &image.initial_packets[index])
+}
+
+/// Pre-index reference scans, retained as the oracle of the T20j equality gate.
+///
+/// Every function below is the exact expression the flow-indexed path replaced. They are
+/// compiled only for the test-hook surface and exist so that
+/// [`assert_validate_flow_index_equivalent_for_testing`] can prove, on real images, that an
+/// indexed walk visits the same elements in the same order and folds to the same values as the
+/// linear filter it replaced.
+#[cfg(feature = "planner-test-hooks")]
+mod legacy_scans {
+    use super::{
+        EventKind, FlowIndex, GeneratorStatus, PacketKind, PayloadId, SimulationImage, flow, packet,
+    };
+
+    pub(super) fn is_preloaded_tcp_ack_arrival(
+        image: &SimulationImage,
+        event: &crate::Event,
+        generator_flow: crate::FlowId,
+    ) -> bool {
+        let Some(flow) = flow(image, generator_flow) else {
+            return false;
+        };
+        event.kind == EventKind::RemoteArrival
+            && event.target == flow.source
+            && packet(image, event.payload).is_some_and(|packet| {
+                packet.flow == generator_flow && matches!(packet.kind, PacketKind::TcpAck(_))
+            })
+    }
+
+    /// `validate.rs:5691` before the fix — the generator-invariant admissible-time minimum.
+    pub(super) fn first_admissible_event_time_ns(image: &SimulationImage) -> Option<u64> {
+        image
+            .initial_events
+            .iter()
+            .map(|event| event.key.time_ns)
+            .filter(|time_ns| *time_ns <= image.stop_time_ns)
+            .min()
+    }
+
+    /// `validate.rs:5701` before the fix — preloaded ACK arrivals inside the run horizon.
+    pub(super) fn preloaded_ack_events_within_stop_time(
+        image: &SimulationImage,
+        generator_flow: crate::FlowId,
+    ) -> usize {
+        image
+            .initial_events
+            .iter()
+            .filter(|event| {
+                event.key.time_ns <= image.stop_time_ns
+                    && is_preloaded_tcp_ack_arrival(image, event, generator_flow)
+            })
+            .count()
+    }
+
+    /// `validate.rs:5778` before the fix — every preloaded ACK arrival of the flow.
+    pub(super) fn preloaded_ack_events(
+        image: &SimulationImage,
+        generator_flow: crate::FlowId,
+    ) -> usize {
+        image
+            .initial_events
+            .iter()
+            .filter(|event| is_preloaded_tcp_ack_arrival(image, event, generator_flow))
+            .count()
+    }
+
+    /// `validate.rs:2381` and `validate.rs:3341` before the fix — the flow's initial packets.
+    pub(super) fn packets_for_flow(
+        image: &SimulationImage,
+        generator_flow: crate::FlowId,
+    ) -> Vec<PayloadId> {
+        image
+            .initial_packets
+            .iter()
+            .filter(|packet| packet.flow == generator_flow)
+            .map(|packet| packet.id)
+            .collect()
+    }
+
+    /// `validate.rs:3338` before the fix — the retransmission half of the future frame bound.
+    pub(super) fn tcp_future_data_max_frame(
+        image: &SimulationImage,
+        generator: &crate::FlowGeneratorState,
+        tcp: crate::TcpGenerator,
+    ) -> u64 {
+        if matches!(
+            generator.next_emission.status,
+            GeneratorStatus::Finished | GeneratorStatus::Stopped
+        ) {
+            return 0;
+        }
+        let fresh = tcp.mss_bytes.min(tcp.total_bytes - tcp.next_sequence);
+        let retransmission = image
+            .initial_packets
+            .iter()
+            .filter(|packet| packet.flow == generator.flow)
+            .filter_map(|packet| {
+                let PacketKind::TcpData(header) = packet.kind else {
+                    return None;
+                };
+                let end = header.sequence.checked_add(packet.size_bytes)?;
+                (header.sequence < tcp.next_sequence && end > tcp.highest_ack)
+                    .then_some(end - header.sequence.max(tcp.highest_ack))
+            })
+            .max()
+            .unwrap_or(0);
+        fresh.max(retransmission)
+    }
+
+    /// `validate.rs:5946` before the fix — one full packet rescan per switch LP.
+    pub(super) fn owned_payload_sequences(
+        image: &SimulationImage,
+        node: &crate::NodeDescriptor,
+    ) -> Vec<u64> {
+        let node_count = image.nodes.len() as u64;
+        let mut sequences = Vec::new();
+        for packet in &image.initial_packets {
+            if node_count != 0 && packet.id.0 % node_count == node.id.0 {
+                sequences.push(packet.id.0 / node_count);
+            }
+        }
+        sequences
+    }
+
+    /// `validate.rs:4527` and `validate.rs:5190` before the fix — two independent derivations.
+    ///
+    /// The fix keeps only the first. That is sound exactly when the derivation is a pure function
+    /// of the image, which is what this compares: two derivations must agree on the reservation,
+    /// or agree on rejecting the image with the same diagnostic.
+    pub(super) fn future_work_is_stable(
+        image: &SimulationImage,
+        flow_index: &FlowIndex,
+    ) -> Result<(), String> {
+        let first = super::future_work(image, flow_index);
+        let second = super::future_work(image, flow_index);
+        match (first, second) {
+            (Ok(left), Ok(right)) => {
+                let matches = left.data_by_flow == right.data_by_flow
+                    && left.feedback_by_flow == right.feedback_by_flow
+                    && left.dcqcn_cnp_by_flow == right.dcqcn_cnp_by_flow
+                    && left.pfc_by_node == right.pfc_by_node
+                    && left.pfc_by_channel == right.pfc_by_channel;
+                if matches {
+                    Ok(())
+                } else {
+                    Err("future work reservations differ across two derivations".to_string())
+                }
+            }
+            (Err(left), Err(right)) if left.to_string() == right.to_string() => Ok(()),
+            (left, right) => Err(format!(
+                "future work derivations disagree: {} then {}",
+                if left.is_ok() { "accepted" } else { "rejected" },
+                if right.is_ok() {
+                    "accepted"
+                } else {
+                    "rejected"
+                }
+            )),
+        }
+    }
+}
+
+/// Proves that the flow-indexed validator answers every per-generator query exactly as the
+/// pre-index linear scans did, on `image`.
+///
+/// This is the T20j verdict-equality gate. It compares, site by site, the value the shipped path
+/// derives against the value the retained scan derives: identical element *sequences* where a
+/// diagnostic names the first offender, and identical folds everywhere else. It reports the first
+/// disagreement instead of panicking so the caller can name the fixture.
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+pub fn assert_validate_flow_index_equivalent_for_testing(
+    image: &SimulationImage,
+) -> Result<(), String> {
+    let flow_index = FlowIndex::build(image);
+
+    if flow_index.first_admissible_event_time_ns
+        != legacy_scans::first_admissible_event_time_ns(image)
+    {
+        return Err(format!(
+            "hoisted first admissible event time {:?} differs from the scanned minimum {:?}",
+            flow_index.first_admissible_event_time_ns,
+            legacy_scans::first_admissible_event_time_ns(image)
+        ));
+    }
+
+    // Every flow, not only the generator-owning ones: the grouping must partition the table.
+    let mut indexed_total = 0_usize;
+    for descriptor in &image.flows {
+        let indexed = flow_index
+            .packets_for_flow(image, descriptor.id)
+            .map(|packet| packet.id)
+            .collect::<Vec<_>>();
+        let scanned = legacy_scans::packets_for_flow(image, descriptor.id);
+        if indexed != scanned {
+            return Err(format!(
+                "flow {:?} indexed packet walk {indexed:?} differs from the scanned walk {scanned:?}",
+                descriptor.id
+            ));
+        }
+        indexed_total += indexed.len();
+    }
+    let flow_resolved = image
+        .initial_packets
+        .iter()
+        .filter(|packet| dense_flow_slot(image, packet.flow).is_some())
+        .count();
+    if indexed_total != flow_resolved {
+        return Err(format!(
+            "flow-keyed packet groups cover {indexed_total} packets, but {flow_resolved} resolve to a flow"
+        ));
+    }
+
+    for generator in image.host_states.iter().flat_map(|state| &state.generators) {
+        let acks = flow_index.preloaded_tcp_acks(image, generator.flow);
+        let scanned_total = legacy_scans::preloaded_ack_events(image, generator.flow) as u64;
+        let scanned_within =
+            legacy_scans::preloaded_ack_events_within_stop_time(image, generator.flow) as u64;
+        if acks.total != scanned_total || acks.within_stop_time != scanned_within {
+            return Err(format!(
+                "flow {:?} indexed preloaded ACK counts ({}, {}) differ from the scanned counts ({scanned_total}, {scanned_within})",
+                generator.flow, acks.total, acks.within_stop_time
+            ));
+        }
+        // `validate_global_time_capacity` reaches the future-frame bound only for a generator
+        // with executable packets left, and the helper's arithmetic assumes that guard. The
+        // comparison keeps it so that the gate evaluates the helper exactly where the validator
+        // does, on images whose generators have already retired included.
+        let executable = executable_generator_packets(image, generator).unwrap_or(0);
+        if let (FlowGeneratorKind::Tcp(tcp), true) = (generator.kind, executable != 0) {
+            let indexed = tcp_future_data_max_frame(image, &flow_index, generator, tcp);
+            let scanned = legacy_scans::tcp_future_data_max_frame(image, generator, tcp);
+            if indexed != scanned {
+                return Err(format!(
+                    "flow {:?} indexed future data frame {indexed} differs from the scanned frame {scanned}",
+                    generator.flow
+                ));
+            }
+        }
+    }
+
+    let owned_sequences = payload_sequences_by_owner(image);
+    for node in &image.nodes {
+        let scanned = legacy_scans::owned_payload_sequences(image, node);
+        if owned_sequences[node.id.0 as usize] != scanned {
+            return Err(format!(
+                "node {:?} bucketed payload sequences {:?} differ from the scanned sequences {scanned:?}",
+                node.id, owned_sequences[node.id.0 as usize]
+            ));
+        }
+    }
+
+    legacy_scans::future_work_is_stable(image, &flow_index)?;
+
+    Ok(())
 }

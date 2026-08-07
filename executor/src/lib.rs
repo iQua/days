@@ -136,6 +136,9 @@ pub use scalar::{
 pub use tcp::{CUBIC_WINDOW_SCALE, TcpCongestionControl, TcpPhase};
 pub use tcp_trace::{TcpTraceError, tcp_transitions_csv};
 pub use time::{TimeError, link_arrival_time_ns, serialization_time_ns};
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+pub use validate::assert_validate_flow_index_equivalent_for_testing;
 pub use validate::{
     Backend, RateSourceLookahead, ValidationError, rate_source_lookahead, validate,
 };
