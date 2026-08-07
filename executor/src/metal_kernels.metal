@@ -3227,7 +3227,12 @@ inline void tcp_record_copy(const thread ulong *packet, device ulong *target) {
 // readback decodes and the frozen hashes cover — is unchanged by the ring; only the physical slot
 // moves. `head + logical <= 2 * capacity - 1` at every call site, so one conditional subtraction
 // is a complete modulo.
-inline ulong tcp_ledger_slot(ulong offset, ulong capacity, ulong head, ulong logical) {
+inline ulong tcp_ledger_slot(
+    ulong offset,
+    ulong capacity,
+    ulong head,
+    ulong logical
+) {
     ulong span = capacity == 0 ? 1 : capacity;
     ulong physical = head + logical;
     if (physical >= span) {
