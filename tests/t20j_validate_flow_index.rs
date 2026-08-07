@@ -1,8 +1,9 @@
 //! T20j verdict-equality gate for the flow-indexed load-time validator.
 //!
 //! `days_executor::validate` used to answer "which initial packets, or preloaded ACK arrivals,
-//! belong to this flow?" with a full linear scan of `initial_packets`/`initial_events`, once per
-//! TCP generator, at eight sites. Those scans are now flow-keyed index walks. This gate proves
+//! belong to this flow?" — and "how many initial timeout events carry this timer's executable
+//! identity?" — with a full linear scan of `initial_packets`/`initial_events`, once per TCP
+//! generator, at ten call sites. Those scans are now index lookups. This gate proves
 //! the replacement changes scan mechanics only: on every executor-lowerable fixture family in
 //! `configs/`, and on running checkpoints of them, the indexed walk visits exactly the elements
 //! the filter visited, in exactly the same order, and every fold over them produces the same
@@ -19,9 +20,10 @@ use std::path::PathBuf;
 
 use days::scenario::compile_config;
 use days_executor::{
-    Backend, Event, EventKey, EventKind, FlowId, ObservationMode, PacketDescriptor, PacketKind,
-    PayloadId, SimulationImage, TcpAckHeader, assert_validate_flow_index_equivalent_for_testing,
-    event_phase, run_scalar_with_observations, validate,
+    Backend, Event, EventKey, EventKind, FlowGeneratorKind, FlowId, GeneratorStatus,
+    ObservationMode, PacketDescriptor, PacketKind, PayloadId, SimulationImage, TcpAckHeader,
+    assert_validate_flow_index_equivalent_for_testing, event_phase, run_scalar_with_observations,
+    validate,
 };
 
 /// Every fixture family under `configs/` that the executor scenario lowering accepts, biased to
@@ -127,9 +129,25 @@ fn every_fixture_family_still_validates_on_the_scalar_and_cpu_backends() {
     }
 }
 
+/// The number of TCP generators whose active retransmission timer the validator will look up in
+/// the initial event table — the query domain of `validate_blocked_tcp_timer`.
+fn blocked_tcp_timer_queries(image: &SimulationImage) -> usize {
+    image
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .filter(|generator| generator.next_emission.status == GeneratorStatus::Blocked)
+        .filter(|generator| match generator.kind {
+            FlowGeneratorKind::Tcp(tcp) => tcp.active_timer.is_some(),
+            _ => false,
+        })
+        .count()
+}
+
 #[test]
 fn flow_indexed_validate_matches_the_pre_index_scans_on_running_checkpoints() {
     let mut with_preloaded_acks = 0_usize;
+    let mut blocked_timer_queries = 0_usize;
     for fixture in CHECKPOINT_FIXTURES {
         let source = compile_fixture(fixture);
         // 4,096 events is the deepest prefix the current validator survives on every fixture:
@@ -143,6 +161,7 @@ fn flow_indexed_validate_matches_the_pre_index_scans_on_running_checkpoints() {
             if !preloaded_tcp_ack_arrival_times(&checkpoint).is_empty() {
                 with_preloaded_acks += 1;
             }
+            blocked_timer_queries += blocked_tcp_timer_queries(&checkpoint);
             assert_validate_flow_index_equivalent_for_testing(&checkpoint)
                 .unwrap_or_else(|mismatch| panic!("{fixture} after {events} events: {mismatch}"));
             validate(&checkpoint, Backend::Scalar)
@@ -154,6 +173,13 @@ fn flow_indexed_validate_matches_the_pre_index_scans_on_running_checkpoints() {
     assert!(
         with_preloaded_acks > 0,
         "the checkpoint corpus must reach the preloaded TCP ACK arrival sites at all"
+    );
+    // A freshly lowered image has every generator Scheduled, so the timeout-event count is only
+    // ever queried on checkpoints. Without a Blocked TCP generator holding an active timer the
+    // gate's timer comparison would run zero times.
+    assert!(
+        blocked_timer_queries > 0,
+        "the checkpoint corpus must reach the Blocked TCP timer event-count site at all"
     );
 }
 

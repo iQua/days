@@ -111,13 +111,15 @@ struct PreloadedTcpAcks {
     within_stop_time: u64,
 }
 
-/// Flow-keyed views of the initial packet and event tables, built once per `validate` call.
+/// Generator-keyed views of the initial packet and event tables, built once per `validate` call.
 ///
-/// The validator asks "which initial packets, or preloaded ACK arrivals, belong to this flow?"
-/// once per generator at nine call sites. Answering that with a linear filter makes the whole pass
+/// The validator asks "which initial packets, or preloaded ACK arrivals, belong to this flow?" —
+/// and "how many initial timeout events carry this timer's executable identity?" — once per
+/// generator at ten call sites. Answering those with a linear filter makes the whole pass
 /// quadratic in the flow count, so each table is indexed once instead: a CSR grouping over
-/// `initial_packets` keyed by dense flow slot, and a per-flow count of preloaded TCP ACK
-/// arrivals. Both are built by a single forward pass, so every group lists its members in
+/// `initial_packets` keyed by dense flow slot, a per-flow count of preloaded TCP ACK arrivals, and
+/// a count of retransmission-timeout events keyed by their `(target, payload, deadline)` identity.
+/// All are built by a single forward pass over each table, so every group lists its members in
 /// initial-table order and an indexed walk visits exactly the elements the filter visited, in
 /// exactly the same order — the diagnostics that name the first offending element are unchanged.
 struct FlowIndex {
@@ -129,6 +131,12 @@ struct FlowIndex {
     unindexed_packets: Vec<usize>,
     /// Preloaded TCP ACK arrival counts per dense flow slot.
     preloaded_tcp_acks: Vec<PreloadedTcpAcks>,
+    /// Retransmission-timeout event counts per `(target, payload, deadline_ns)` identity.
+    ///
+    /// A `BTreeMap` rather than a flow-slot vector because the query key is a timer's executable
+    /// identity, not a flow: the same key is what `validate_generators` uses to reject two flows
+    /// whose active timers would consume the same event.
+    retransmission_timeouts: BTreeMap<(NodeId, PayloadId, u64), u64>,
     /// Smallest initial event time at or below the stop time; invariant across generators.
     first_admissible_event_time_ns: Option<u64>,
 }
@@ -164,6 +172,7 @@ impl FlowIndex {
         }
 
         let mut preloaded_tcp_acks = vec![PreloadedTcpAcks::default(); flow_count];
+        let mut retransmission_timeouts = BTreeMap::<(NodeId, PayloadId, u64), u64>::new();
         let mut first_admissible_event_time_ns: Option<u64> = None;
         for event in &image.initial_events {
             let admissible = event.key.time_ns <= image.stop_time_ns;
@@ -173,6 +182,12 @@ impl FlowIndex {
                         earliest.min(event.key.time_ns)
                     }),
                 );
+            }
+            if event.kind == EventKind::RetransmissionTimeout {
+                // Bounded by `initial_events.len()`, so the count cannot leave `u64`.
+                *retransmission_timeouts
+                    .entry((event.target, event.payload, event.key.time_ns))
+                    .or_insert(0) += 1;
             }
             if event.kind != EventKind::RemoteArrival {
                 continue;
@@ -202,6 +217,7 @@ impl FlowIndex {
             packet_items,
             unindexed_packets,
             preloaded_tcp_acks,
+            retransmission_timeouts,
             first_admissible_event_time_ns,
         }
     }
@@ -234,6 +250,24 @@ impl FlowIndex {
         dense_flow_slot(image, id)
             .and_then(|slot| self.preloaded_tcp_acks.get(slot).copied())
             .unwrap_or_default()
+    }
+
+    /// Returns how many initial retransmission-timeout events carry this executable identity.
+    ///
+    /// Exactly equivalent to counting `initial_events` with `kind == RetransmissionTimeout &&
+    /// target == owner && payload == attempt && key.time_ns == deadline_ns`: the build pass keys
+    /// each such event by that same quadruple and increments its bucket, and `count` is
+    /// order-insensitive.
+    fn retransmission_timeout_events(
+        &self,
+        owner: NodeId,
+        attempt: PayloadId,
+        deadline_ns: u64,
+    ) -> u64 {
+        self.retransmission_timeouts
+            .get(&(owner, attempt, deadline_ns))
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -1393,7 +1427,7 @@ fn validate_generators(
                         )));
                     }
                     GeneratorStatus::Blocked => {
-                        validate_blocked_tcp_timer(image, owner.id, flow.id, tcp)?;
+                        validate_blocked_tcp_timer(image, flow_index, owner.id, flow.id, tcp)?;
                         let timer = tcp
                             .active_timer
                             .expect("blocked timer validation established an active timer");
@@ -2612,6 +2646,7 @@ fn incomplete_tcp_segment_ledger(
 
 fn validate_blocked_tcp_timer(
     image: &SimulationImage,
+    flow_index: &FlowIndex,
     owner: NodeId,
     flow: crate::FlowId,
     tcp: crate::TcpGenerator,
@@ -2650,16 +2685,8 @@ fn validate_blocked_tcp_timer(
             timer.attempt
         )));
     }
-    let matching_events = image
-        .initial_events
-        .iter()
-        .filter(|event| {
-            event.kind == EventKind::RetransmissionTimeout
-                && event.target == owner
-                && event.payload == timer.attempt
-                && event.key.time_ns == timer.deadline_ns
-        })
-        .count();
+    let matching_events =
+        flow_index.retransmission_timeout_events(owner, timer.attempt, timer.deadline_ns);
     // Timeout events do not encode a generation. When an ACK replaces a timer with the same
     // attempt and deadline, the first indistinguishable event consumes the current timer and the
     // remaining events are stale runtime no-ops. The state-generation check above identifies the
@@ -6564,6 +6591,25 @@ mod legacy_scans {
         fresh.max(retransmission)
     }
 
+    /// `validate.rs:2653` before the fix — one full event rescan per Blocked TCP generator.
+    pub(super) fn matching_retransmission_timeout_events(
+        image: &SimulationImage,
+        owner: crate::NodeId,
+        attempt: PayloadId,
+        deadline_ns: u64,
+    ) -> usize {
+        image
+            .initial_events
+            .iter()
+            .filter(|event| {
+                event.kind == EventKind::RetransmissionTimeout
+                    && event.target == owner
+                    && event.payload == attempt
+                    && event.key.time_ns == deadline_ns
+            })
+            .count()
+    }
+
     /// `validate.rs:5946` before the fix — one full packet rescan per switch LP.
     pub(super) fn owned_payload_sequences(
         image: &SimulationImage,
@@ -6716,6 +6762,69 @@ pub fn assert_validate_flow_index_equivalent_for_testing(
                     "flow {:?} indexed future data frame {indexed} differs from the scanned frame {scanned}",
                     generator.flow
                 ));
+            }
+        }
+    }
+
+    // The timeout buckets must partition exactly the timeout events, the same way the flow-keyed
+    // packet groups must partition the resolvable packets. Without this an index that admitted
+    // events of other kinds would agree at every key the corpus happens to query.
+    let indexed_timeout_total = flow_index.retransmission_timeouts.values().sum::<u64>();
+    let scanned_timeout_total = image
+        .initial_events
+        .iter()
+        .filter(|event| event.kind == EventKind::RetransmissionTimeout)
+        .count() as u64;
+    if indexed_timeout_total != scanned_timeout_total {
+        return Err(format!(
+            "timeout-identity buckets cover {indexed_timeout_total} events, but {scanned_timeout_total} are retransmission timeouts"
+        ));
+    }
+
+    // The timeout-event count is keyed by a timer's executable identity, so it is compared where
+    // the validator asks for it: at every TCP generator that owns an active timer, on the host
+    // node that owns the generator. Three neighbouring keys are probed as well, so an index keyed
+    // more coarsely than the scan's four-way match cannot agree with it.
+    for owner in image
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::Host)
+    {
+        let Some(state) = image.host_states.get(owner.state_slot as usize) else {
+            continue;
+        };
+        for generator in &state.generators {
+            let FlowGeneratorKind::Tcp(tcp) = generator.kind else {
+                continue;
+            };
+            let Some(timer) = tcp.active_timer else {
+                continue;
+            };
+            let attempt = timer.attempt;
+            let deadline = timer.deadline_ns;
+            let probes = [
+                (owner.id, attempt, deadline),
+                // One perturbed component each: an index keyed more coarsely than the scan's
+                // four-way match answers a perturbed key with the unperturbed key's count, while
+                // the scan answers 0.
+                (NodeId(owner.id.0.wrapping_add(1)), attempt, deadline),
+                (owner.id, PayloadId(attempt.0.wrapping_add(1)), deadline),
+                (owner.id, attempt, deadline.wrapping_add(1)),
+            ];
+            for (node_id, payload, deadline_ns) in probes {
+                let indexed =
+                    flow_index.retransmission_timeout_events(node_id, payload, deadline_ns);
+                let scanned = legacy_scans::matching_retransmission_timeout_events(
+                    image,
+                    node_id,
+                    payload,
+                    deadline_ns,
+                ) as u64;
+                if indexed != scanned {
+                    return Err(format!(
+                        "node {node_id:?} payload {payload:?} deadline {deadline_ns} has {indexed} indexed timeout events but {scanned} scanned ones"
+                    ));
+                }
             }
         }
     }
