@@ -297,8 +297,13 @@ fn deficit_round_robin_scheduling_pins_the_ninth_sites_frame_bound() {
         "the DRR image must reach maximum_drr_frame_bytes at all"
     );
 
-    // 1460 = the CUBIC MSS of this fixture's fresh segments, which dominates the 40-byte ACKs and
-    // the (empty) initial packet table. Frozen: it is the value the ninth site returns.
+    // 1460 = the CUBIC MSS of this fixture's fresh segments, which dominates the 40-byte
+    // preloaded ACK arrivals. The initial packet table is NOT empty — it holds one 1,460-byte
+    // `TcpData` packet per flow, all 16 at sequence 0 — so the site's `initial_packets` term is
+    // also 1,460 and agrees rather than being absent. The *indexed* retransmission term
+    // contributes 0 for a different reason: every generator is still at `next_sequence = 0`, so
+    // `header.sequence < tcp.next_sequence` is `0 < 0` for every packet the index yields.
+    // Frozen: it is the value the ninth site returns.
     const MAXIMUM_FRAME_BYTES: u64 = 1460;
     let largest_accepted_quantum = u64::MAX - (MAXIMUM_FRAME_BYTES - 1);
 
