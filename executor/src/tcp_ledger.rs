@@ -60,6 +60,12 @@ fn normalize_image(
     segments: &mut TcpSegmentLedger,
     image: &SimulationImage,
 ) -> Result<(), TcpSegmentConflict> {
+    // `acknowledge_segments` is a total no-op on a flow the ledger does not carry, so an empty
+    // ledger cannot be changed by any generator. Skipping the whole-image generator walk in that
+    // case keeps the per-LP seeding of a TCP-free image out of `O(nodes x generators)`.
+    if segments.is_empty() {
+        return Ok(());
+    }
     for generator in image.host_states.iter().flat_map(|state| &state.generators) {
         if let FlowGeneratorKind::Tcp(tcp) = generator.kind {
             acknowledge_segments(segments, generator.flow, tcp.highest_ack)?;
