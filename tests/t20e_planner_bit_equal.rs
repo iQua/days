@@ -408,7 +408,10 @@ fn channel_starting_cap_preserves_the_0695f02_initial_plan_bytes() {
             ObservationMode::Summary,
         )
         .expect("retry-enabled Metal initial capped plan must size"),
-        1_269_928,
+        // T20i widened the per-flow TCP ledger metadata row from 4 words to 6 (ring head +
+        // occupancy high-water). This fixture has 8 TCP flows, so the anchor moves by exactly
+        // 8 * 2 * 8 = 128 B. Nothing else in the plan changed.
+        1_269_928 + 128,
     );
 
     #[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
@@ -437,7 +440,8 @@ fn channel_starting_cap_preserves_the_0695f02_initial_plan_bytes() {
             ObservationMode::Summary,
         )
         .expect("retry-enabled CUDA initial capped plan must size"),
-        1_269_904,
+        // T20i ledger-metadata widening: 8 flows * 2 words * 8 B = 128 B. See the Metal anchor.
+        1_269_904 + 128,
     );
 }
 

@@ -51,8 +51,14 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "device_capacity.rs",
         predicate: r#"any(test, feature = "cuda", all(feature = "metal-spike", target_vendor = "apple"))"#,
-        count: 12,
+        count: 17,
         purpose: "shared device-arena cap and per-entity retry helpers compile only for tests and device backends",
+    },
+    AllowedFeatureGate {
+        path: "tcp_ledger_ring.rs",
+        predicate: r#"any(test, feature = "cuda", all(feature = "metal-spike", target_vendor = "apple"))"#,
+        count: 4,
+        purpose: "T20i ledger-ring slot arithmetic and occupancy readback exist only for tests and device backends",
     },
     AllowedFeatureGate {
         path: "device_sizing.rs",

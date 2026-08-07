@@ -910,8 +910,11 @@ fn packed_tcp_state_words(
 ) -> Result<usize, DeviceSizingError> {
     const RECEIVER_WORDS: usize = 7;
     const RANGE_WORDS: usize = 2;
-    const LEDGER_META_WORDS: usize = 4;
-    const LEDGER_RECORD_WORDS: usize = 5;
+    // T20i widened the per-flow ledger metadata row from 4 words to 6: a ring head and an
+    // occupancy high-water mark. The whole addition is 2 words per flow — 4.19 MB at the 262,144
+    // -flow frontier, against a 5.74 GB record arena.
+    const LEDGER_META_WORDS: usize = crate::tcp_ledger_ring::TCP_LEDGER_META_WORDS;
+    const LEDGER_RECORD_WORDS: usize = crate::tcp_ledger_ring::TCP_LEDGER_RECORD_WORDS;
     let flow_count = image.flows.len().max(1);
     let receiver_range_slots = image
         .host_states

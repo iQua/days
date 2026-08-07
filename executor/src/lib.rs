@@ -28,6 +28,7 @@ pub mod safe_horizon;
 pub mod scalar;
 pub mod tcp;
 mod tcp_ledger;
+mod tcp_ledger_ring;
 pub mod tcp_trace;
 pub mod time;
 pub mod validate;

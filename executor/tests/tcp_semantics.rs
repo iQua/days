@@ -35,6 +35,52 @@ const FIRST: PayloadId = PayloadId(0);
 const MSS: u64 = 512;
 const ACK_BYTES: u64 = 40;
 
+/// [`tcp_image`] with a second, identically shaped TCP flow between the same host pair.
+///
+/// Two flows are the smallest fixture that can distinguish first-offender growth from
+/// vector-informed growth: both flows overflow the same under-capped arena, so a policy that
+/// repairs only the flow named by the fault needs one retry per flow.
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+fn tcp_two_flow_image(control: TcpCongestionControl, total_bytes: u64) -> SimulationImage {
+    let mut image = tcp_image(control, total_bytes);
+    let second_flow = FlowId(1);
+    let second_payload = PayloadId(2);
+
+    let mut flow = image.flows[0].clone();
+    flow.id = second_flow;
+    image.flows.push(flow);
+
+    let mut generator = image.host_states[0].generators[0];
+    generator.flow = second_flow;
+    generator.next_emission.payload = second_payload;
+    image.host_states[0].generators.push(generator);
+    image.host_states[0].next_payload_seq = 2;
+    image.host_states[0].next_origin_seq = 2;
+
+    let mut receiver = image.host_states[1].tcp_receivers[0].clone();
+    receiver.flow = second_flow;
+    image.host_states[1].tcp_receivers.push(receiver);
+
+    let first = image.initial_packets[0];
+    image.initial_packets.push(PacketDescriptor {
+        id: second_payload,
+        flow: second_flow,
+        ..first
+    });
+    image.initial_events.push(Event {
+        key: EventKey {
+            time_ns: 0,
+            phase: event_phase(EventKind::PacketArrival),
+            origin_node: SOURCE,
+            origin_seq: 1,
+        },
+        target: SOURCE,
+        kind: EventKind::PacketArrival,
+        payload: second_payload,
+    });
+    image
+}
+
 #[cfg(any(
     feature = "cuda",
     all(feature = "metal-spike", target_vendor = "apple")
@@ -1253,7 +1299,78 @@ fn metal_tcp_ledger_capacity_retry_is_typed_and_byte_identical() {
     assert_eq!(retry.flow, Some(FLOW));
     assert_eq!(retry.capacity, 1);
     assert_eq!(retry.demand, 2);
-    assert_eq!(retry.grown_capacity, 258);
+    // T20i: the ledger's additive +256 class retreat is retired. The fault now reports the flow's
+    // observed occupancy high-water (1 record, the seeded segment) and the replacement capacity is
+    // `8 * high_water + 8`.
+    assert_eq!(retry.grown_capacity, 16);
+}
+
+/// Two flows, both under-capped, and a retry budget of exactly ONE.
+///
+/// This is the shape T20i layer 2 exists to fix. Under first-offender growth the fault names one
+/// flow, the replan repairs only that flow, and the second flow faults on the next attempt — so
+/// this fixture needs two retries, and at frontier scale the same argument needs 377. The
+/// occupancy vector turns it into one replan: the fault reports every flow's high-water, so the
+/// single replacement plan sizes both flows at once and the budget of one suffices.
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[test]
+fn metal_tcp_ledger_occupancy_vector_sizes_every_flow_in_one_replan() {
+    let image = tcp_two_flow_image(TcpCongestionControl::reno(MSS), 2 * MSS);
+    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("scalar two-flow ledger oracle must run");
+    let capacity_caps = DeviceCapacityCaps {
+        tcp_ledger_segments_per_flow: Some(0),
+        ..DeviceCapacityCaps::default()
+    };
+
+    let strict_error = run_metal_with_observations(
+        &image,
+        None,
+        MetalConfig {
+            capacity_caps,
+            max_capacity_retries: 0,
+            ..MetalConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect_err("under-capped TCP ledgers must fail in strict mode");
+    let MetalError::CapacityExceeded { arena, flow, .. } = strict_error else {
+        panic!("expected a typed ledger capacity fault, got {strict_error:?}");
+    };
+    assert_eq!(arena, MetalArena::TcpSegmentLedger);
+    assert!(
+        matches!(flow, Some(FlowId(0)) | Some(FlowId(1))),
+        "the fault must still name a flow, got {flow:?}"
+    );
+
+    let recovered = run_metal_with_observations(
+        &image,
+        None,
+        MetalConfig {
+            capacity_caps,
+            max_capacity_retries: 1,
+            ..MetalConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("one vector-informed replan must size BOTH flows");
+    assert_device_full_result_eq(
+        &recovered.result,
+        &scalar,
+        "vector-retried Metal two-flow TCP ledger run",
+    );
+
+    let [retry] = recovered.capacity_retry_trace.as_slice() else {
+        panic!(
+            "the vector must collapse the chain to one retry, got {:?}",
+            recovered.capacity_retry_trace
+        );
+    };
+    assert_eq!(retry.retry, 1);
+    assert_eq!(retry.arena, MetalArena::TcpSegmentLedger);
+    assert_eq!(retry.capacity, 1);
+    assert_eq!(retry.demand, 2);
+    assert_eq!(retry.grown_capacity, 16);
 }
 
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]

@@ -60,8 +60,29 @@ const CHANNEL_BATCH_WORDS: usize = 4;
 const ACTIVE_STREAM_ENTRY_WORDS: usize = 5;
 const TCP_RECEIVER_WORDS: usize = 7;
 const TCP_RANGE_WORDS: usize = 2;
-const TCP_LEDGER_META_WORDS: usize = 4;
-const TCP_LEDGER_RECORD_WORDS: usize = 5;
+use crate::tcp_ledger_ring::{
+    LEDGER_META_HEAD, LEDGER_META_HIGH_WATER, TCP_LEDGER_META_WORDS, TCP_LEDGER_RECORD_WORDS,
+    ledger_high_water_vector, ledger_record_slot,
+};
+
+/// One failed device attempt, carrying the retry-sizing evidence the failure produced.
+///
+/// A TCP segment-ledger capacity fault attaches the per-flow occupancy high-water vector read back
+/// from the same plane the fault aborted on. Every other failure carries `None`, so the retry loop
+/// falls back to the first-offender growth it always used.
+struct AttemptFailure {
+    error: MetalError,
+    ledger_high_water: Option<Vec<u32>>,
+}
+
+impl From<MetalError> for AttemptFailure {
+    fn from(error: MetalError) -> Self {
+        Self {
+            error,
+            ledger_high_water: None,
+        }
+    }
+}
 // The retained k32 profile averages about 1,300 transitions per round. 4,096 keeps ordinary
 // LP drains single-launch while putting a finite ceiling on pathological device work per lane.
 const DEFAULT_TRANSITIONS_PER_DISPATCH: usize = 4_096;
@@ -1042,7 +1063,9 @@ impl MetalExecutor {
         let timing = self
             .direct
             .run_with_fel_probe(&buffers, config, true, Some(&probe))?;
-        let run = buffers.finish(image, ObservationMode::Summary, timing)?;
+        let run = buffers
+            .finish(image, ObservationMode::Summary, timing)
+            .map_err(|failure| failure.error)?;
         let fan_in = probe.merge_fan_in()?;
         Ok(MetalMergeFanInRun {
             run,
@@ -1082,7 +1105,9 @@ impl MetalExecutor {
         let timing = self
             .direct
             .run_with_fel_probe(&buffers, config, true, Some(&probe))?;
-        let run = buffers.finish(image, ObservationMode::Summary, timing)?;
+        let run = buffers
+            .finish(image, ObservationMode::Summary, timing)
+            .map_err(|failure| failure.error)?;
         let (local_fel_pushes, injected_fel_round_trips) = probe.fel_counts()?;
         Ok((
             run,
@@ -1137,7 +1162,7 @@ impl MetalExecutor {
         let retry_budget = config.max_capacity_retries;
         let mut attempt_config = config;
         let mut channel_capacity_floors = crate::device_capacity::ChannelCapacityFloors::default();
-        let mut tcp_capacity_floors = crate::device_capacity::TcpCapacityClassFloors::default();
+        let mut tcp_capacity_floors = crate::device_capacity::TcpCapacityFloors::default();
         let mut retry_trace = Vec::new();
         loop {
             let attempt = (|| {
@@ -1161,7 +1186,11 @@ impl MetalExecutor {
                     run.capacity_retry_trace = retry_trace;
                     return Ok(run);
                 }
-                Err(error) => {
+                Err(failure) => {
+                    let AttemptFailure {
+                        error,
+                        ledger_high_water,
+                    } = failure;
                     let (arena, node, flow, stream, capacity, demand) = match error {
                         MetalError::CapacityExceeded {
                             arena,
@@ -1193,10 +1222,13 @@ impl MetalExecutor {
                             )
                         }
                         MetalArena::TcpSegmentLedger => {
-                            crate::device_capacity::grown_capacity_with_slack(
+                            crate::device_capacity::grown_ledger_capacity(
                                 capacity,
                                 demand,
-                                crate::device_capacity::TCP_LEDGER_RETRY_SLACK,
+                                crate::device_capacity::observed_ledger_high_water(
+                                    ledger_high_water.as_deref(),
+                                    flow,
+                                ),
                             )
                         }
                         _ => crate::device_capacity::grown_capacity(capacity, demand),
@@ -1226,7 +1258,16 @@ impl MetalExecutor {
                             tcp_capacity_floors.raise_receiver(flow, capacity, grown_capacity)
                         }
                         (MetalArena::TcpSegmentLedger, Some(flow), None) => {
-                            tcp_capacity_floors.raise_ledger(flow, capacity, grown_capacity)
+                            // The faulting flow's own floor first, so its base/floor equality
+                            // check still sees the capacity the attempt actually planned; then
+                            // the vector, which sizes every other flow in the same replan.
+                            let raised =
+                                tcp_capacity_floors.raise_ledger(flow, capacity, grown_capacity);
+                            if let (true, Some(high_water)) = (raised, ledger_high_water.as_deref())
+                            {
+                                tcp_capacity_floors.raise_ledger_from_occupancy(high_water);
+                            }
+                            raised
                         }
                         (MetalArena::TcpReceiverRanges | MetalArena::TcpSegmentLedger, None, _) => {
                             return Err(MetalError::Validation(
@@ -1525,7 +1566,7 @@ impl MetalPlan {
         observation_mode: ObservationMode,
     ) -> Result<Self, MetalError> {
         let mut channel_capacity_floors = crate::device_capacity::ChannelCapacityFloors::default();
-        let mut tcp_capacity_floors = crate::device_capacity::TcpCapacityClassFloors::default();
+        let mut tcp_capacity_floors = crate::device_capacity::TcpCapacityFloors::default();
         Self::new_with_entity_capacity_floors(
             image,
             exclusive_horizon_ns,
@@ -1542,7 +1583,7 @@ impl MetalPlan {
         config: MetalConfig,
         observation_mode: ObservationMode,
         channel_capacity_floors: &mut crate::device_capacity::ChannelCapacityFloors,
-        tcp_capacity_floors: &mut crate::device_capacity::TcpCapacityClassFloors,
+        tcp_capacity_floors: &mut crate::device_capacity::TcpCapacityFloors,
     ) -> Result<Self, MetalError> {
         Self::new_with_capacity_mode_and_tcp_floors(
             image,
@@ -1564,7 +1605,7 @@ impl MetalPlan {
         capacity_mode: PlannerCapacityMode,
     ) -> Result<Self, MetalError> {
         let mut channel_capacity_floors = crate::device_capacity::ChannelCapacityFloors::default();
-        let mut tcp_capacity_floors = crate::device_capacity::TcpCapacityClassFloors::default();
+        let mut tcp_capacity_floors = crate::device_capacity::TcpCapacityFloors::default();
         Self::new_with_capacity_mode_and_tcp_floors(
             image,
             exclusive_horizon_ns,
@@ -1583,7 +1624,7 @@ impl MetalPlan {
         observation_mode: ObservationMode,
         capacity_mode: PlannerCapacityMode,
         channel_capacity_floors: &mut crate::device_capacity::ChannelCapacityFloors,
-        tcp_capacity_floors: &mut crate::device_capacity::TcpCapacityClassFloors,
+        tcp_capacity_floors: &mut crate::device_capacity::TcpCapacityFloors,
     ) -> Result<Self, MetalError> {
         let node_count = image.nodes.len();
         let (flow_packet_counts, flow_feedback_counts) = flow_packet_counts(image)?;
@@ -3194,7 +3235,7 @@ fn prepare_tcp_state(
     feedback_counts: &[usize],
     capacity_caps: DeviceCapacityCaps,
     capacity_floors: DeviceCapacityFloors,
-    tcp_capacity_floors: &mut crate::device_capacity::TcpCapacityClassFloors,
+    tcp_capacity_floors: &mut crate::device_capacity::TcpCapacityFloors,
 ) -> Result<PreparedTcpState, MetalError> {
     let flow_count = image.flows.len();
     let receiver_offset = 0;
@@ -3323,7 +3364,12 @@ fn prepare_tcp_state(
         words[base] = record_offset as u64;
         words[base + 1] = capacity as u64;
         let segments = ledger.get(&crate::FlowId(flow as u64));
-        words[base + 2] = segments.map_or(0, BTreeMap::len) as u64;
+        let resident = segments.map_or(0, BTreeMap::len) as u64;
+        words[base + 2] = resident;
+        // Mutation site H1: a seeded ring starts unrotated, and its high-water starts at the
+        // resident count so a flow that never inserts still reports its true peak.
+        words[base + LEDGER_META_HEAD] = 0;
+        words[base + LEDGER_META_HIGH_WATER] = resident;
         if let Some(segments) = segments {
             for (index, packet) in segments.values().enumerate() {
                 let PacketKind::TcpData(header) = packet.kind else {
@@ -3791,7 +3837,7 @@ impl MetalBuffers {
         image: &SimulationImage,
         observation_mode: ObservationMode,
         timing: MetalTiming,
-    ) -> Result<MetalRun, MetalError> {
+    ) -> Result<MetalRun, AttemptFailure> {
         let planes = self
             .planes
             .iter()
@@ -3800,12 +3846,32 @@ impl MetalBuffers {
         let tcp_state = self.tcp_state.read();
         let control = &planes[0];
         if control[CONTROL_ERROR] != 0 {
-            return Err(decode_device_error(control));
+            let error = decode_device_error(control);
+            // T20i layer 2: a ledger fault reports the WHOLE per-flow occupancy vector, not just
+            // the first offender. Layer 1 measured 377 of 262,144 frontier flows above the derived
+            // floor, so first-offender keying would need up to 377 sequential replans; one vector
+            // sizes every flow in a single replan. The plane is already resident here, so the
+            // payload costs one pass over 6 words per flow.
+            let ledger_high_water = matches!(
+                error,
+                MetalError::CapacityExceeded {
+                    arena: MetalArena::TcpSegmentLedger,
+                    ..
+                }
+            )
+            .then(|| {
+                ledger_high_water_vector(&tcp_state, planes[1][29] as usize, image.flows.len())
+            });
+            return Err(AttemptFailure {
+                error,
+                ledger_high_water,
+            });
         }
         if control[CONTROL_DONE] == 0 {
             return Err(MetalError::RoundLimitExceeded {
                 capacity: self.round_capacity,
-            });
+            }
+            .into());
         }
 
         let params = &planes[1];
@@ -3892,7 +3958,8 @@ impl MetalBuffers {
                                     return Err(MetalError::DeviceExecution {
                                         code: 96,
                                         node: Some(node.id),
-                                    });
+                                    }
+                                    .into());
                                 };
                                 rate.first_pacing_time_ns = generators[offset + 12];
                                 rate.pacing_interval_ns = generators[offset + 13];
@@ -3908,7 +3975,8 @@ impl MetalBuffers {
                                 return Err(MetalError::DeviceExecution {
                                     code: 96,
                                     node: Some(node.id),
-                                });
+                                }
+                                .into());
                             }
                         }
                     }
@@ -3919,7 +3987,8 @@ impl MetalBuffers {
                             return Err(MetalError::DeviceExecution {
                                 code: 96,
                                 node: Some(node.id),
-                            });
+                            }
+                            .into());
                         }
                         receiver.ack_size_bytes = tcp_state[base + 2];
                         receiver.next_expected_sequence = tcp_state[base + 3];
@@ -3989,9 +4058,12 @@ impl MetalBuffers {
         for flow in 0..image.flows.len() {
             let base = ledger_meta_offset + flow * TCP_LEDGER_META_WORDS;
             let offset = tcp_state[base] as usize;
+            let capacity = tcp_state[base + 1] as usize;
             let count = tcp_state[base + 2] as usize;
+            let head = tcp_state[base + LEDGER_META_HEAD] as usize;
             for index in 0..count {
-                let record = offset + index * TCP_LEDGER_RECORD_WORDS;
+                // Canonical decode: logical order, not physical. The ring is invisible here.
+                let record = ledger_record_slot(offset, capacity, head, index);
                 let packet = PacketDescriptor {
                     id: PayloadId(tcp_state[record]),
                     flow: crate::FlowId(flow as u64),

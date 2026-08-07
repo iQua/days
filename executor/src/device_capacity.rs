@@ -125,22 +125,31 @@ impl ChannelCapacityFloors {
     }
 }
 
-/// Retry-time TCP floors keyed by each row's immutable planned-capacity class.
+/// Retry-time TCP floors: receiver ranges by planned-capacity class, segment ledgers per flow.
 ///
-/// Equivalent flows grow together after one representative row overflows. Adjacent capacity
-/// classes remain independent, and retaining each flow's original class prevents a grown row from
-/// migrating into another class on a later retry.
+/// **Receiver ranges** keep class keying. Equivalent flows grow together after one representative
+/// row overflows, adjacent capacity classes stay independent, and retaining each flow's original
+/// class prevents a grown row from migrating into another class on a later retry.
+///
+/// **Segment ledgers do not** — T20i retired class-together growth for this arena. T20g proved a
+/// class-uniform ledger at the measured demand is arithmetically impossible (48.9 GB for one plane
+/// = 1.90x boston's whole device; 129.1 GB for the whole plan = beyond madrid's entire unified
+/// pool), and T20i layer 1 supplied the missing premise: the demand is carried by **377 of 262,144
+/// flows (0.144%)**, and 261,767 flows never leave the derived floor. Per-flow keying therefore
+/// costs 24.6 MiB over the plan that already fits, and class keying costs 4.66x boston. The class
+/// mechanism is retained where it is still correct — receiver ranges here, and per-stream keying in
+/// [`ChannelCapacityFloors`] — but the ledger is keyed by [`FlowId`].
 #[cfg(any(
     test,
     feature = "cuda",
     all(feature = "metal-spike", target_vendor = "apple")
 ))]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct TcpCapacityClassFloors {
+pub(crate) struct TcpCapacityFloors {
     receiver_base_by_flow: Vec<Option<usize>>,
     ledger_base_by_flow: Vec<Option<usize>>,
     receiver_ranges: BTreeMap<usize, usize>,
-    ledger_segments: BTreeMap<usize, usize>,
+    ledger_segments_by_flow: Vec<usize>,
 }
 
 #[cfg(any(
@@ -148,7 +157,7 @@ pub(crate) struct TcpCapacityClassFloors {
     feature = "cuda",
     all(feature = "metal-spike", target_vendor = "apple")
 ))]
-impl TcpCapacityClassFloors {
+impl TcpCapacityFloors {
     fn record_base(bases: &mut Vec<Option<usize>>, flow: FlowId, base: usize) -> bool {
         let flow = flow.0 as usize;
         if bases.len() <= flow {
@@ -172,9 +181,16 @@ impl TcpCapacityClassFloors {
             .then(|| base.max(self.receiver_ranges.get(&base).copied().unwrap_or(0)))
     }
 
+    fn ledger_floor(&self, flow: FlowId) -> usize {
+        self.ledger_segments_by_flow
+            .get(flow.0 as usize)
+            .copied()
+            .unwrap_or(0)
+    }
+
     pub(crate) fn ledger(&mut self, flow: FlowId, base: usize) -> Option<usize> {
         Self::record_base(&mut self.ledger_base_by_flow, flow, base)
-            .then(|| base.max(self.ledger_segments.get(&base).copied().unwrap_or(0)))
+            .then(|| base.max(self.ledger_floor(flow)))
     }
 
     pub(crate) fn raise_receiver(&mut self, flow: FlowId, capacity: usize, grown: usize) -> bool {
@@ -191,18 +207,55 @@ impl TcpCapacityClassFloors {
         true
     }
 
+    fn raise_ledger_floor(&mut self, flow: FlowId, grown: usize) {
+        let flow = flow.0 as usize;
+        if self.ledger_segments_by_flow.len() <= flow {
+            self.ledger_segments_by_flow
+                .resize(flow.saturating_add(1), 0);
+        }
+        self.ledger_segments_by_flow[flow] = self.ledger_segments_by_flow[flow].max(grown);
+    }
+
+    /// Raises one flow's ledger floor after its own row overflowed.
+    ///
+    /// This is the vector-less fallback: it is exactly the pre-T20i behaviour with class keying
+    /// replaced by flow keying, and it is what runs when a fault carries no occupancy vector.
     pub(crate) fn raise_ledger(&mut self, flow: FlowId, capacity: usize, grown: usize) -> bool {
         let Some(base) = Self::recorded_base(&self.ledger_base_by_flow, flow) else {
             return false;
         };
-        if base.max(self.ledger_segments.get(&base).copied().unwrap_or(0)) != capacity {
+        if base.max(self.ledger_floor(flow)) != capacity {
             return false;
         }
-        self.ledger_segments
-            .entry(base)
-            .and_modify(|floor| *floor = (*floor).max(grown))
-            .or_insert(grown);
+        self.raise_ledger_floor(flow, grown);
         true
+    }
+
+    /// Sizes **every** planned flow from one fault's per-flow occupancy high-water vector.
+    ///
+    /// Returns the number of flows whose floor moved. `false` from [`Self::raise_ledger`] still
+    /// aborts the retry, so the faulting flow's own progress guarantee is unchanged; this call
+    /// only adds the other flows the vector exposed.
+    ///
+    /// Layer 1's first-crossing census is the reason this exists: the deep set accretes
+    /// monotonically (6 flows above the derived floor by 200 us, 183 by 300 us, 377 by 1,140 us)
+    /// and never sheds a member, so a first-offender chain repairs one flow per attempt on an image
+    /// where one attempt costs tens of minutes.
+    pub(crate) fn raise_ledger_from_occupancy(&mut self, high_water: &[u32]) -> usize {
+        let mut raised = 0;
+        for flow in 0..self.ledger_base_by_flow.len() {
+            if self.ledger_base_by_flow[flow].is_none() {
+                continue;
+            }
+            let observed = high_water.get(flow).copied().unwrap_or(0) as usize;
+            let target = ledger_capacity_from_high_water(observed);
+            let flow = FlowId(flow as u64);
+            if target > self.ledger_floor(flow) {
+                self.raise_ledger_floor(flow, target);
+                raised += 1;
+            }
+        }
+        raised
     }
 }
 
@@ -239,6 +292,97 @@ pub(crate) const TCP_RECEIVER_RETRY_SLACK: usize = 64;
     all(feature = "metal-spike", target_vendor = "apple")
 ))]
 pub(crate) const TCP_LEDGER_RETRY_SLACK: usize = 256;
+
+/// Multiplier applied to a flow's **observed** ledger high-water when a fault reports the whole
+/// per-flow occupancy vector.
+///
+/// T20i layer 1 measured the growth law exactly: a flow whose cumulative ACK stalls behind a hole
+/// whose retransmission was also lost holds `occupancy = ssthresh_seg + duplicate_acks`, gaining
+/// **one record per duplicate ACK, which is one record per admitted segment**, and no
+/// retransmission timeout can end the episode (minimum RTO 1 s against a 1.152 ms horizon,
+/// measured `rto_fires=0`). Growth is therefore linear in simulated time from the stall instant
+/// `s`: `occupancy(t) = m * (t - s)`. A vector read at fault time `t_f` sizes the next attempt at
+/// `k * occupancy(t_f)`, which the same flow does not exhaust until `s + k * (t_f - s)` — so the
+/// horizon each attempt reaches grows **geometrically in `k`**, and the attempts a deep flow needs
+/// are `ceil(log_k((T - s) / (t_f - s)))`.
+///
+/// For the RQ9 frontier that ratio is `(1,152 - 110) / (160 - 110) ~= 21`, giving 5 retries at
+/// `k = 2`, 3 at `k = 4`, and **2 at `k = 8`**. Past `k = 8` the deep flows stop being the binding
+/// constraint — a flow that stalls *after* the vector was read still starts at the derived floor —
+/// so `k = 8` is the knee, and larger factors buy nothing.
+///
+/// The cost is negligible because the demand is carried by 0.144% of flows. Projected whole-plan
+/// bytes at the measured per-flow peaks, against boston's 25,757,220,864 B: `k = 1` 17.312 GiB,
+/// `k = 2` 17.359 GiB, **`k = 8` 17.957 GiB**, `k = 16` 18.813 GiB. Every one of them fits; the
+/// class-uniform alternative at the same demand is 120.195 GiB.
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+pub(crate) const TCP_LEDGER_OCCUPANCY_SLACK_FACTOR: usize = 8;
+
+/// Constant record allowance added on top of the scaled high-water.
+///
+/// It matches `TCP_LEDGER_RECOVERY_ALLOWANCE`: one partial cumulative-ACK boundary record plus
+/// recovery retransmissions. At the frontier it costs 3,025 records in total — 121 kB.
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+pub(crate) const TCP_LEDGER_OCCUPANCY_SLACK_RECORDS: usize = 8;
+
+/// Per-flow ledger capacity implied by one observed occupancy high-water mark.
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+pub(crate) fn ledger_capacity_from_high_water(high_water: usize) -> usize {
+    high_water
+        .saturating_mul(TCP_LEDGER_OCCUPANCY_SLACK_FACTOR)
+        .saturating_add(TCP_LEDGER_OCCUPANCY_SLACK_RECORDS)
+}
+
+/// The faulting flow's own entry in a ledger fault's occupancy vector, when both are present.
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+pub(crate) fn observed_ledger_high_water(
+    high_water: Option<&[u32]>,
+    flow: Option<FlowId>,
+) -> Option<usize> {
+    let (high_water, flow) = (high_water?, flow?);
+    Some(high_water.get(flow.0 as usize).copied().unwrap_or(0) as usize)
+}
+
+/// The replacement capacity for the flow a ledger fault named.
+///
+/// With a vector the fault's own flow is sized by the same law as every other flow, and the
+/// additive `TCP_LEDGER_RETRY_SLACK` retreat is retired: that constant existed to stop *class*
+/// growth from reproducing the 87.8 GB shared-buffer allocation, and per-flow keying removes the
+/// blow-up it was defending against. `max(demand, capacity + 1)` keeps the retry loop's strict
+/// progress guarantee intact even if a vector were ever short or stale.
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+pub(crate) fn grown_ledger_capacity(
+    capacity: usize,
+    demand: usize,
+    high_water: Option<usize>,
+) -> usize {
+    match high_water {
+        Some(high_water) => ledger_capacity_from_high_water(high_water)
+            .max(demand)
+            .max(capacity.saturating_add(1)),
+        None => grown_capacity_with_slack(capacity, demand, TCP_LEDGER_RETRY_SLACK),
+    }
+}
 
 #[cfg(any(
     test,
@@ -330,9 +474,11 @@ pub(crate) fn bound_derived_capacity(
 #[cfg(test)]
 mod tests {
     use super::{
-        ChannelCapacityFloors, TCP_LEDGER_RETRY_SLACK, TCP_RECEIVER_RETRY_SLACK,
-        TcpCapacityClassFloors, bound_derived_capacity, cap_derived_capacity, grown_capacity,
-        grown_capacity_with_slack, raise_cap_or_floor, raise_override_cap_or_floor,
+        ChannelCapacityFloors, TCP_LEDGER_OCCUPANCY_SLACK_FACTOR,
+        TCP_LEDGER_OCCUPANCY_SLACK_RECORDS, TCP_LEDGER_RETRY_SLACK, TCP_RECEIVER_RETRY_SLACK,
+        TcpCapacityFloors, bound_derived_capacity, cap_derived_capacity, grown_capacity,
+        grown_capacity_with_slack, grown_ledger_capacity, ledger_capacity_from_high_water,
+        observed_ledger_high_water, raise_cap_or_floor, raise_override_cap_or_floor,
     };
     use crate::FlowId;
 
@@ -384,28 +530,109 @@ mod tests {
         );
     }
 
+    /// T20i retirement gate: the ledger no longer grows by capacity class.
+    ///
+    /// Under the retired policy `raise_ledger(FlowId(7), 520, 777)` also raised flow 8 — and, at
+    /// the frontier, all 262,144 flows sharing the derived base of 520, which is the 4.66x-boston
+    /// plane T20g proved impossible. Receiver ranges keep class keying and are pinned here too, so
+    /// the retirement is visibly scoped to the one arena it applies to.
     #[test]
-    fn tcp_retry_grows_only_the_immutable_capacity_class() {
-        let mut floors = TcpCapacityClassFloors::default();
+    fn tcp_ledger_retry_grows_only_the_faulting_flow() {
+        let mut floors = TcpCapacityFloors::default();
 
         assert_eq!(floors.ledger(FlowId(7), 520), Some(520));
         assert_eq!(floors.ledger(FlowId(8), 520), Some(520));
         assert_eq!(floors.ledger(FlowId(9), 521), Some(521));
         assert!(floors.raise_ledger(FlowId(7), 520, 777));
         assert_eq!(floors.ledger(FlowId(7), 520), Some(777));
-        assert_eq!(floors.ledger(FlowId(8), 520), Some(777));
+        assert_eq!(
+            floors.ledger(FlowId(8), 520),
+            Some(520),
+            "an equivalent flow must NOT inherit the faulting flow's growth"
+        );
         assert_eq!(floors.ledger(FlowId(9), 521), Some(521));
 
-        assert!(floors.raise_ledger(FlowId(8), 777, 1_034));
-        assert_eq!(floors.ledger(FlowId(7), 520), Some(1_034));
+        assert!(floors.raise_ledger(FlowId(8), 520, 1_034));
+        assert_eq!(floors.ledger(FlowId(7), 520), Some(777));
         assert_eq!(floors.ledger(FlowId(8), 520), Some(1_034));
         assert_eq!(floors.ledger(FlowId(9), 521), Some(521));
         assert_eq!(floors.ledger(FlowId(7), 521), None);
         assert!(!floors.raise_ledger(FlowId(10), 520, 777));
+        // A stale capacity — one that is neither the base nor the current floor — is rejected.
+        assert!(!floors.raise_ledger(FlowId(7), 520, 900));
 
         assert_eq!(floors.receiver(FlowId(9), 64), Some(64));
         assert!(floors.raise_receiver(FlowId(9), 64, 129));
         assert_eq!(floors.receiver(FlowId(9), 64), Some(129));
+    }
+
+    #[test]
+    fn the_occupancy_vector_sizes_every_flow_in_one_replan() {
+        let mut floors = TcpCapacityFloors::default();
+        for flow in 0..6 {
+            assert_eq!(floors.ledger(FlowId(flow), 520), Some(520));
+        }
+        // The vector's seventh entry belongs to a flow this plan never sized, so the count of
+        // raised floors must stay at six: a fault must not invent capacity for an absent flow.
+        let high_water = [2_u32, 11_058, 520, 0, 63, 4_474, 9_999];
+        assert_eq!(floors.raise_ledger_from_occupancy(&high_water), 6);
+
+        // Every flow is sized from its OWN observation, in one pass.
+        assert_eq!(floors.ledger(FlowId(0), 520), Some(520)); // 8*2+8 = 24 < the derived floor
+        assert_eq!(floors.ledger(FlowId(1), 520), Some(88_472));
+        assert_eq!(floors.ledger(FlowId(2), 520), Some(4_168));
+        assert_eq!(floors.ledger(FlowId(3), 520), Some(520));
+        assert_eq!(floors.ledger(FlowId(4), 520), Some(520)); // 8*63+8 = 512 < 520
+        assert_eq!(floors.ledger(FlowId(5), 520), Some(35_800));
+
+        // Floors only ever rise: a second, smaller vector cannot shrink a plan.
+        assert_eq!(floors.raise_ledger_from_occupancy(&[0; 6]), 0);
+        assert_eq!(floors.ledger(FlowId(1), 520), Some(88_472));
+        assert_eq!(floors.ledger(FlowId(5), 520), Some(35_800));
+
+        // A short vector reads as zero rather than panicking.
+        assert_eq!(floors.raise_ledger_from_occupancy(&[]), 0);
+    }
+
+    #[test]
+    fn ledger_growth_uses_the_vector_and_keeps_strict_progress() {
+        assert_eq!(TCP_LEDGER_OCCUPANCY_SLACK_FACTOR, 8);
+        assert_eq!(TCP_LEDGER_OCCUPANCY_SLACK_RECORDS, 8);
+        assert_eq!(ledger_capacity_from_high_water(0), 8);
+        assert_eq!(ledger_capacity_from_high_water(11_058), 88_472);
+        assert_eq!(ledger_capacity_from_high_water(usize::MAX), usize::MAX);
+
+        // The faulting flow's own high-water is at least its capacity, so the vector alone already
+        // clears the capacity. The additive +256 retreat is retired for this arena.
+        assert_eq!(grown_ledger_capacity(520, 521, Some(520)), 4_168);
+        assert_eq!(grown_ledger_capacity(4_632, 4_633, Some(4_632)), 37_064);
+        // Progress is guaranteed even against a stale or short vector.
+        assert_eq!(grown_ledger_capacity(520, 521, Some(0)), 521);
+        assert_eq!(grown_ledger_capacity(520, 521, Some(60)), 521);
+        // Without a vector the pre-T20i additive growth remains the fallback.
+        assert_eq!(grown_ledger_capacity(520, 521, None), 777);
+        assert_eq!(
+            grown_ledger_capacity(usize::MAX, usize::MAX, Some(usize::MAX)),
+            usize::MAX
+        );
+    }
+
+    #[test]
+    fn the_faulting_flows_own_observation_is_read_out_of_the_vector() {
+        let vector = [3_u32, 11_058, 7];
+        assert_eq!(
+            observed_ledger_high_water(Some(&vector), Some(FlowId(1))),
+            Some(11_058)
+        );
+        // A fault that named no flow, or carried no vector, falls back to additive growth.
+        assert_eq!(observed_ledger_high_water(Some(&vector), None), None);
+        assert_eq!(observed_ledger_high_water(None, Some(FlowId(1))), None);
+        // A flow past the end of the vector reads as zero rather than panicking; the retry loop's
+        // `max(demand, capacity + 1)` still guarantees strict progress.
+        assert_eq!(
+            observed_ledger_high_water(Some(&vector), Some(FlowId(9))),
+            Some(0)
+        );
     }
 
     #[test]

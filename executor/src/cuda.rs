@@ -55,8 +55,29 @@ const OUTBOUND_ENTRY_WORDS: usize = 2;
 const CHANNEL_BATCH_WORDS: usize = 4;
 const ACTIVE_STREAM_ENTRY_WORDS: usize = 5;
 const TCP_RECEIVER_WORDS: usize = 7;
-const TCP_LEDGER_META_WORDS: usize = 4;
-const TCP_LEDGER_RECORD_WORDS: usize = 5;
+use crate::tcp_ledger_ring::{
+    LEDGER_META_HEAD, LEDGER_META_HIGH_WATER, TCP_LEDGER_META_WORDS, TCP_LEDGER_RECORD_WORDS,
+    ledger_high_water_vector, ledger_record_slot,
+};
+
+/// One failed device attempt, carrying the retry-sizing evidence the failure produced.
+///
+/// A TCP segment-ledger capacity fault attaches the per-flow occupancy high-water vector read back
+/// from the same plane the fault aborted on. Every other failure carries `None`, so the retry loop
+/// falls back to the first-offender growth it always used.
+struct AttemptFailure {
+    error: CudaError,
+    ledger_high_water: Option<Vec<u32>>,
+}
+
+impl From<CudaError> for AttemptFailure {
+    fn from(error: CudaError) -> Self {
+        Self {
+            error,
+            ledger_high_water: None,
+        }
+    }
+}
 const DEFAULT_TRANSITIONS_PER_DISPATCH: usize = 4_096;
 const DEFAULT_ROUND_THREADS_PER_BLOCK: usize = 256;
 const DEFAULT_ATTEMPTS_PER_GRAPH_WAVE: usize = 64;
@@ -906,7 +927,7 @@ impl CudaExecutor {
         let retry_budget = config.max_capacity_retries;
         let mut attempt_config = config;
         let mut channel_capacity_floors = crate::device_capacity::ChannelCapacityFloors::default();
-        let mut tcp_capacity_floors = crate::device_capacity::TcpCapacityClassFloors::default();
+        let mut tcp_capacity_floors = crate::device_capacity::TcpCapacityFloors::default();
         let mut retry_trace = Vec::new();
         loop {
             let attempt = (|| {
@@ -930,7 +951,11 @@ impl CudaExecutor {
                     run.capacity_retry_trace = retry_trace;
                     return Ok(run);
                 }
-                Err(error) => {
+                Err(failure) => {
+                    let AttemptFailure {
+                        error,
+                        ledger_high_water,
+                    } = failure;
                     let (arena, node, flow, stream, capacity, demand) = match error {
                         CudaError::CapacityExceeded {
                             arena,
@@ -962,10 +987,13 @@ impl CudaExecutor {
                             )
                         }
                         CudaArena::TcpSegmentLedger => {
-                            crate::device_capacity::grown_capacity_with_slack(
+                            crate::device_capacity::grown_ledger_capacity(
                                 capacity,
                                 demand,
-                                crate::device_capacity::TCP_LEDGER_RETRY_SLACK,
+                                crate::device_capacity::observed_ledger_high_water(
+                                    ledger_high_water.as_deref(),
+                                    flow,
+                                ),
                             )
                         }
                         _ => crate::device_capacity::grown_capacity(capacity, demand),
@@ -995,7 +1023,16 @@ impl CudaExecutor {
                             tcp_capacity_floors.raise_receiver(flow, capacity, grown_capacity)
                         }
                         (CudaArena::TcpSegmentLedger, Some(flow), None) => {
-                            tcp_capacity_floors.raise_ledger(flow, capacity, grown_capacity)
+                            // The faulting flow's own floor first, so its base/floor equality
+                            // check still sees the capacity the attempt actually planned; then
+                            // the vector, which sizes every other flow in the same replan.
+                            let raised =
+                                tcp_capacity_floors.raise_ledger(flow, capacity, grown_capacity);
+                            if let (true, Some(high_water)) = (raised, ledger_high_water.as_deref())
+                            {
+                                tcp_capacity_floors.raise_ledger_from_occupancy(high_water);
+                            }
+                            raised
                         }
                         (CudaArena::TcpReceiverRanges | CudaArena::TcpSegmentLedger, None, _) => {
                             return Err(CudaError::Validation(
@@ -1043,7 +1080,7 @@ impl CudaExecutor {
         let retry_budget = config.max_capacity_retries;
         let mut attempt_config = config;
         let mut channel_capacity_floors = crate::device_capacity::ChannelCapacityFloors::default();
-        let mut tcp_capacity_floors = crate::device_capacity::TcpCapacityClassFloors::default();
+        let mut tcp_capacity_floors = crate::device_capacity::TcpCapacityFloors::default();
         let mut retry_trace = Vec::new();
         loop {
             let attempt = (|| {
@@ -1068,7 +1105,11 @@ impl CudaExecutor {
                     profiled.run.capacity_retry_trace = retry_trace;
                     return Ok(profiled);
                 }
-                Err(error) => {
+                Err(failure) => {
+                    let AttemptFailure {
+                        error,
+                        ledger_high_water,
+                    } = failure;
                     let (arena, node, flow, stream, capacity, demand) = match error {
                         CudaError::CapacityExceeded {
                             arena,
@@ -1100,10 +1141,13 @@ impl CudaExecutor {
                             )
                         }
                         CudaArena::TcpSegmentLedger => {
-                            crate::device_capacity::grown_capacity_with_slack(
+                            crate::device_capacity::grown_ledger_capacity(
                                 capacity,
                                 demand,
-                                crate::device_capacity::TCP_LEDGER_RETRY_SLACK,
+                                crate::device_capacity::observed_ledger_high_water(
+                                    ledger_high_water.as_deref(),
+                                    flow,
+                                ),
                             )
                         }
                         _ => crate::device_capacity::grown_capacity(capacity, demand),
@@ -1133,7 +1177,16 @@ impl CudaExecutor {
                             tcp_capacity_floors.raise_receiver(flow, capacity, grown_capacity)
                         }
                         (CudaArena::TcpSegmentLedger, Some(flow), None) => {
-                            tcp_capacity_floors.raise_ledger(flow, capacity, grown_capacity)
+                            // The faulting flow's own floor first, so its base/floor equality
+                            // check still sees the capacity the attempt actually planned; then
+                            // the vector, which sizes every other flow in the same replan.
+                            let raised =
+                                tcp_capacity_floors.raise_ledger(flow, capacity, grown_capacity);
+                            if let (true, Some(high_water)) = (raised, ledger_high_water.as_deref())
+                            {
+                                tcp_capacity_floors.raise_ledger_from_occupancy(high_water);
+                            }
+                            raised
                         }
                         (CudaArena::TcpReceiverRanges | CudaArena::TcpSegmentLedger, None, _) => {
                             return Err(CudaError::Validation(
@@ -1467,7 +1520,7 @@ fn prepare_tcp_state(
     data_counts: &[usize],
     capacity_caps: DeviceCapacityCaps,
     capacity_floors: DeviceCapacityFloors,
-    tcp_capacity_floors: &mut crate::device_capacity::TcpCapacityClassFloors,
+    tcp_capacity_floors: &mut crate::device_capacity::TcpCapacityFloors,
 ) -> Result<(Vec<u64>, TcpLayout), CudaError> {
     let flow_count = image.flows.len().max(1);
     let receiver_offset = 0;
@@ -1565,6 +1618,10 @@ fn prepare_tcp_state(
         state[row + 1] = capacity as u64;
         state[row + 2] = packets.len() as u64;
         state[row + 3] = 0;
+        // Mutation site H1: a seeded ring starts unrotated, and its high-water starts at the
+        // resident count so a flow that never inserts still reports its true peak.
+        state[row + LEDGER_META_HEAD] = 0;
+        state[row + LEDGER_META_HIGH_WATER] = packets.len() as u64;
         for (index, packet) in packets.into_iter().enumerate() {
             let PacketKind::TcpData(header) = packet.kind else {
                 unreachable!("TCP ledgers contain only TCP data")
@@ -1596,7 +1653,7 @@ impl CudaPlan {
         observation_mode: ObservationMode,
     ) -> Result<Self, CudaError> {
         let mut channel_capacity_floors = crate::device_capacity::ChannelCapacityFloors::default();
-        let mut tcp_capacity_floors = crate::device_capacity::TcpCapacityClassFloors::default();
+        let mut tcp_capacity_floors = crate::device_capacity::TcpCapacityFloors::default();
         Self::new_with_entity_capacity_floors(
             image,
             exclusive_horizon_ns,
@@ -1613,7 +1670,7 @@ impl CudaPlan {
         config: CudaConfig,
         observation_mode: ObservationMode,
         channel_capacity_floors: &mut crate::device_capacity::ChannelCapacityFloors,
-        tcp_capacity_floors: &mut crate::device_capacity::TcpCapacityClassFloors,
+        tcp_capacity_floors: &mut crate::device_capacity::TcpCapacityFloors,
     ) -> Result<Self, CudaError> {
         Self::new_with_capacity_mode_and_tcp_floors(
             image,
@@ -1635,7 +1692,7 @@ impl CudaPlan {
         capacity_mode: PlannerCapacityMode,
     ) -> Result<Self, CudaError> {
         let mut channel_capacity_floors = crate::device_capacity::ChannelCapacityFloors::default();
-        let mut tcp_capacity_floors = crate::device_capacity::TcpCapacityClassFloors::default();
+        let mut tcp_capacity_floors = crate::device_capacity::TcpCapacityFloors::default();
         Self::new_with_capacity_mode_and_tcp_floors(
             image,
             exclusive_horizon_ns,
@@ -1654,7 +1711,7 @@ impl CudaPlan {
         observation_mode: ObservationMode,
         capacity_mode: PlannerCapacityMode,
         channel_capacity_floors: &mut crate::device_capacity::ChannelCapacityFloors,
-        tcp_capacity_floors: &mut crate::device_capacity::TcpCapacityClassFloors,
+        tcp_capacity_floors: &mut crate::device_capacity::TcpCapacityFloors,
     ) -> Result<Self, CudaError> {
         let node_count = image.nodes.len();
         let (flow_packet_counts, flow_feedback_counts) = flow_packet_counts(image)?;
@@ -3539,7 +3596,7 @@ impl CudaBuffers {
         image: &SimulationImage,
         observation_mode: ObservationMode,
         timing: CudaTiming,
-    ) -> Result<CudaRun, CudaError> {
+    ) -> Result<CudaRun, AttemptFailure> {
         let mut planes = Vec::with_capacity(self.planes.len());
         let mut readback_error = None;
         for (index, plane) in self.planes.iter().enumerate() {
@@ -3558,17 +3615,35 @@ impl CudaBuffers {
             .synchronize()
             .map_err(|error| driver_error("result-plane readback synchronization", error))?;
         if let Some(error) = readback_error {
-            return Err(error);
+            return Err(error.into());
         }
         let control = &planes[0];
         let params = &planes[1];
         if control[CONTROL_ERROR] != 0 {
-            return Err(decode_device_error(control));
+            let error = decode_device_error(control);
+            // T20i layer 2: a ledger fault reports the WHOLE per-flow occupancy vector, not just
+            // the first offender. Layer 1 measured 377 of 262,144 frontier flows above the derived
+            // floor, so first-offender keying would need up to 377 sequential replans; one vector
+            // sizes every flow in a single replan. Plane 28 is already resident here, so the
+            // payload costs one pass over 6 words per flow.
+            let ledger_high_water = matches!(
+                error,
+                CudaError::CapacityExceeded {
+                    arena: CudaArena::TcpSegmentLedger,
+                    ..
+                }
+            )
+            .then(|| ledger_high_water_vector(&planes[28], params[29] as usize, image.flows.len()));
+            return Err(AttemptFailure {
+                error,
+                ledger_high_water,
+            });
         }
         if control[CONTROL_DONE] == 0 {
             return Err(CudaError::RoundLimitExceeded {
                 capacity: self.round_capacity,
-            });
+            }
+            .into());
         }
 
         let node_state = &planes[2];
@@ -3684,7 +3759,8 @@ impl CudaBuffers {
                                 return Err(CudaError::DeviceExecution {
                                     code: 96,
                                     node: Some(node.id),
-                                });
+                                }
+                                .into());
                             }
                         }
                     }
@@ -3755,9 +3831,12 @@ impl CudaBuffers {
         for flow in 0..image.flows.len() {
             let row = ledger_meta + flow * TCP_LEDGER_META_WORDS;
             let offset = tcp_state[row] as usize;
+            let capacity = tcp_state[row + 1] as usize;
             let count = tcp_state[row + 2] as usize;
+            let head = tcp_state[row + LEDGER_META_HEAD] as usize;
             for index in 0..count {
-                let record = offset + index * TCP_LEDGER_RECORD_WORDS;
+                // Canonical decode: logical order, not physical. The ring is invisible here.
+                let record = ledger_record_slot(offset, capacity, head, index);
                 let packet = PacketDescriptor {
                     id: PayloadId(tcp_state[record]),
                     flow: crate::FlowId(flow as u64),

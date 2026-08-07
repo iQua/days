@@ -17,8 +17,14 @@ constant uint OUTBOUND_ENTRY_WORDS = 2;
 constant uint CHANNEL_BATCH_WORDS = 4;
 constant uint ACTIVE_STREAM_ENTRY_WORDS = 5;
 constant uint TCP_RECEIVER_WORDS = 7;
-constant uint TCP_LEDGER_META_WORDS = 4;
+// T20i ledger-ring metadata layout, mirrored word-for-word by `executor/src/tcp_ledger_ring.rs`:
+//   +0 record-arena offset  +1 capacity  +2 count
+//   +3 armed fallback-heap slot + 1 (T20g live-state contract)
+//   +4 ring head            +5 occupancy high-water mark
+constant uint TCP_LEDGER_META_WORDS = 6;
 constant uint TCP_LEDGER_RECORD_WORDS = 5;
+constant uint TCP_LEDGER_META_HEAD = 4;
+constant uint TCP_LEDGER_META_HIGH_WATER = 5;
 constant uint RATIONAL_WORDS = 10;
 constant uint BIG_LIMBS = 10;
 constant uint WIDE_LIMBS = 16;
@@ -3217,6 +3223,45 @@ inline void tcp_record_copy(const thread ulong *packet, device ulong *target) {
     target[4] = packet[PK_META_2];
 }
 
+// Absolute word index of logical ledger record `logical`. Logical order — the canonical order the
+// readback decodes and the frozen hashes cover — is unchanged by the ring; only the physical slot
+// moves. `head + logical <= 2 * capacity - 1` at every call site, so one conditional subtraction
+// is a complete modulo.
+inline ulong tcp_ledger_slot(ulong offset, ulong capacity, ulong head, ulong logical) {
+    ulong span = capacity == 0 ? 1 : capacity;
+    ulong physical = head + logical;
+    if (physical >= span) {
+        physical -= span;
+    }
+    return offset + physical * TCP_LEDGER_RECORD_WORDS;
+}
+
+// First logical index whose sequence is >= `sequence`, by binary search over the ring window.
+//
+// Equivalent to the pre-ring linear scan: the ledger is strictly ascending in sequence and
+// duplicate-free, because inserts replace on an exact sequence match and a partial cumulative ACK
+// re-keys the head record to an acknowledgement that stays below the next record's start.
+inline ulong tcp_ledger_lower_bound(
+    ulong offset,
+    ulong capacity,
+    ulong head,
+    ulong count,
+    ulong sequence,
+    const device ulong *tcp_state
+) {
+    ulong low = 0;
+    ulong high = count;
+    while (low < high) {
+        ulong mid = low + (high - low) / 2;
+        if (tcp_state[tcp_ledger_slot(offset, capacity, head, mid) + 2] < sequence) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return low;
+}
+
 inline bool tcp_ledger_find(
     ulong flow,
     ulong sequence,
@@ -3226,9 +3271,12 @@ inline bool tcp_ledger_find(
 ) {
     ulong meta = params[P_TCP_LEDGER_META_OFFSET] + flow * TCP_LEDGER_META_WORDS;
     ulong offset = tcp_state[meta];
+    ulong capacity = tcp_state[meta + 1];
     ulong count = tcp_state[meta + 2];
-    for (ulong index = 0; index < count; ++index) {
-        ulong candidate = offset + index * TCP_LEDGER_RECORD_WORDS;
+    ulong head = tcp_state[meta + TCP_LEDGER_META_HEAD];
+    ulong index = tcp_ledger_lower_bound(offset, capacity, head, count, sequence, tcp_state);
+    if (index < count) {
+        ulong candidate = tcp_ledger_slot(offset, capacity, head, index);
         if (tcp_state[candidate + 2] == sequence) {
             record = candidate;
             return true;
@@ -3248,37 +3296,53 @@ inline bool tcp_ledger_insert(
     ulong offset = tcp_state[meta];
     ulong capacity = tcp_state[meta + 1];
     ulong count = tcp_state[meta + 2];
+    ulong head = tcp_state[meta + TCP_LEDGER_META_HEAD];
     ulong sequence = packet[PK_META_0];
-    ulong insertion = 0;
-    while (
-        insertion < count &&
-        tcp_state[offset + insertion * TCP_LEDGER_RECORD_WORDS + 2] < sequence
-    ) {
-        insertion += 1;
-    }
-    if (
-        insertion < count &&
-        tcp_state[offset + insertion * TCP_LEDGER_RECORD_WORDS + 2] == sequence
-    ) {
-        if (tcp_state[offset + insertion * TCP_LEDGER_RECORD_WORDS + 1] != packet[PK_SIZE]) {
-            set_semantic_error(error, 40, NONE);
-            return false;
+    ulong insertion = tcp_ledger_lower_bound(offset, capacity, head, count, sequence, tcp_state);
+    if (insertion < count) {
+        ulong existing = tcp_ledger_slot(offset, capacity, head, insertion);
+        if (tcp_state[existing + 2] == sequence) {
+            if (tcp_state[existing + 1] != packet[PK_SIZE]) {
+                set_semantic_error(error, 40, NONE);
+                return false;
+            }
+            // Mutation site R1: in-place replace. Count, head and high-water are unchanged.
+            tcp_record_copy(packet, tcp_state + existing);
+            return true;
         }
-        tcp_record_copy(packet, tcp_state + offset + insertion * TCP_LEDGER_RECORD_WORDS);
-        return true;
     }
     if (count >= capacity) {
         set_capacity_error(error, ARENA_TCP_SEGMENT_LEDGER, flow, capacity, count + 1);
         return false;
     }
-    for (ulong index = count; index > insertion; --index) {
-        for (uint word = 0; word < TCP_LEDGER_RECORD_WORDS; ++word) {
-            tcp_state[offset + index * TCP_LEDGER_RECORD_WORDS + word] =
-                tcp_state[offset + (index - 1) * TCP_LEDGER_RECORD_WORDS + word];
+    ulong target;
+    if (insertion == count) {
+        // Mutation site R2: monotone append, O(1). This is the frontier's hot path.
+        target = tcp_ledger_slot(offset, capacity, head, count);
+    } else if (insertion == 0) {
+        // Mutation site R3: prefix insert retreats the head, O(1).
+        ulong retreated = (head == 0 ? capacity : head) - 1;
+        tcp_state[meta + TCP_LEDGER_META_HEAD] = retreated;
+        target = offset + retreated * TCP_LEDGER_RECORD_WORDS;
+    } else {
+        // Mutation site R4: interior insert still shifts, but inside the ring window.
+        for (ulong index = count; index > insertion; --index) {
+            ulong destination = tcp_ledger_slot(offset, capacity, head, index);
+            ulong source = tcp_ledger_slot(offset, capacity, head, index - 1);
+            for (uint word = 0; word < TCP_LEDGER_RECORD_WORDS; ++word) {
+                tcp_state[destination + word] = tcp_state[source + word];
+            }
         }
+        target = tcp_ledger_slot(offset, capacity, head, insertion);
     }
-    tcp_record_copy(packet, tcp_state + offset + insertion * TCP_LEDGER_RECORD_WORDS);
-    tcp_state[meta + 2] = count + 1;
+    tcp_record_copy(packet, tcp_state + target);
+    // Mutation site R5: the only site that raises `count`, hence the only site that can raise the
+    // high-water word. High-water is a max over a deterministic execution, so it is pure state.
+    ulong grown = count + 1;
+    tcp_state[meta + 2] = grown;
+    if (grown > tcp_state[meta + TCP_LEDGER_META_HIGH_WATER]) {
+        tcp_state[meta + TCP_LEDGER_META_HIGH_WATER] = grown;
+    }
     return true;
 }
 
@@ -3291,10 +3355,12 @@ inline bool tcp_ledger_acknowledge(
 ) {
     ulong meta = params[P_TCP_LEDGER_META_OFFSET] + flow * TCP_LEDGER_META_WORDS;
     ulong offset = tcp_state[meta];
+    ulong capacity = tcp_state[meta + 1];
     ulong count = tcp_state[meta + 2];
+    ulong head = tcp_state[meta + TCP_LEDGER_META_HEAD];
     ulong keep = 0;
     while (keep < count) {
-        ulong record = offset + keep * TCP_LEDGER_RECORD_WORDS;
+        ulong record = tcp_ledger_slot(offset, capacity, head, keep);
         ulong sequence = tcp_state[record + 2];
         ulong size = tcp_state[record + 1];
         if (sequence > NONE - size) {
@@ -3307,11 +3373,12 @@ inline bool tcp_ledger_acknowledge(
         keep += 1;
     }
     if (keep < count) {
-        ulong first = offset + keep * TCP_LEDGER_RECORD_WORDS;
+        ulong first = tcp_ledger_slot(offset, capacity, head, keep);
         ulong sequence = tcp_state[first + 2];
         if (sequence < acknowledgment) {
             ulong acknowledged = acknowledgment - sequence;
             if (acknowledged < tcp_state[first + 1]) {
+                // Mutation site R6: partial cumulative ACK re-keys the head record in place.
                 tcp_state[first + 1] -= acknowledged;
                 tcp_state[first + 2] = acknowledgment;
             } else {
@@ -3319,14 +3386,15 @@ inline bool tcp_ledger_acknowledge(
             }
         }
     }
-    ulong remaining = count - keep;
-    for (ulong index = 0; index < remaining; ++index) {
-        for (uint word = 0; word < TCP_LEDGER_RECORD_WORDS; ++word) {
-            tcp_state[offset + index * TCP_LEDGER_RECORD_WORDS + word] =
-                tcp_state[offset + (keep + index) * TCP_LEDGER_RECORD_WORDS + word];
-        }
+    // Mutation site R7: prefix removal advances the head. The O(n) compaction this replaces was
+    // the whole reason the ring conversion was folded into T20i.
+    ulong span = capacity == 0 ? 1 : capacity;
+    ulong advanced = head + keep;
+    if (advanced >= span) {
+        advanced -= span;
     }
-    tcp_state[meta + 2] = remaining;
+    tcp_state[meta + TCP_LEDGER_META_HEAD] = advanced;
+    tcp_state[meta + 2] = count - keep;
     return true;
 }
 
