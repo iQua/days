@@ -149,6 +149,59 @@ fn the_high_water_word_has_exactly_one_writer_in_each_kernel() {
 }
 
 #[test]
+fn the_ring_head_word_has_exactly_two_writers_in_each_kernel() {
+    // The head is the ring's only reordering degree of freedom: it decides which physical slot
+    // logical index 0 lives in, and every canonical decode walks `0..count` from it. The design
+    // allows exactly two writers — R3, where a prefix insert retreats the head by one, and R7,
+    // where prefix removal advances it past the acknowledged records. A stray third writer would
+    // rotate the decoded record order without changing `count`, `high_water` or any record byte,
+    // so nothing else in the suite would see it: `the_acknowledge_compaction_loop_is_deleted_not_gated`
+    // only checks that R7 exists, and the byte-identity gates compare a kernel against a mirror
+    // that would have to acquire the same stray write to stay equal.
+    for (backend, kernel) in [("Metal", METAL), ("CUDA", CUDA)] {
+        let writes = kernel
+            .matches("tcp_state[meta + TCP_LEDGER_META_HEAD] =")
+            .count();
+        assert_eq!(
+            writes, 2,
+            "{backend} must move the ledger ring head at exactly two sites (R3 and R7)"
+        );
+        let insert = extract(
+            kernel,
+            &["inline bool ", "__device__ __forceinline__ bool "],
+            "tcp_ledger_insert",
+        );
+        assert_eq!(
+            insert
+                .matches("tcp_state[meta + TCP_LEDGER_META_HEAD] =")
+                .count(),
+            1,
+            "{backend}'s insert path must move the head only at R3, the prefix insert"
+        );
+        assert!(
+            insert.contains("TCP_LEDGER_META_HEAD] = retreated"),
+            "{backend}'s R3 must retreat the head rather than shift the ring window"
+        );
+        let acknowledge = extract(
+            kernel,
+            &["inline bool ", "__device__ __forceinline__ bool "],
+            "tcp_ledger_acknowledge",
+        );
+        assert_eq!(
+            acknowledge
+                .matches("tcp_state[meta + TCP_LEDGER_META_HEAD] =")
+                .count(),
+            1,
+            "{backend}'s acknowledge path must move the head only at R7, the prefix removal"
+        );
+        assert!(
+            acknowledge.contains("TCP_LEDGER_META_HEAD] = advanced"),
+            "{backend}'s R7 must advance the head rather than compact the survivors"
+        );
+    }
+}
+
+#[test]
 fn neither_kernel_retains_a_linear_ledger_scan() {
     // Both the find scan and the insert-position scan became a binary search over the ring window.
     for (backend, kernel) in [("Metal", METAL), ("CUDA", CUDA)] {

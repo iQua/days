@@ -75,6 +75,29 @@ pub(crate) const LEDGER_META_HIGH_WATER: usize = 5;
 ///
 /// This is the single source of truth for the host lowering; `tcp_ledger_slot` in
 /// `metal_kernels.metal` and `cuda_kernels.cu` are line-for-line transliterations of it.
+///
+/// # Precondition, and why it is asserted rather than assumed
+///
+/// The `%` below is **total**; the kernels' transliteration is not. Both kernels reduce
+/// `head + logical` with a *single conditional subtraction*, which is a complete modulo only while
+///
+/// ```text
+/// head + logical <= 2 * max(capacity, 1) - 1
+/// ```
+///
+/// Every current call site satisfies that — the tightest is R7's `head + keep`, which is exactly
+/// `2 * capacity - 1` when a full ring is fully acknowledged from `head = capacity - 1`. But a
+/// future call site that violated it would be **correct here and wrong on the device**, and the
+/// byte-identity gates would stay green, because they compare a kernel against this mirror only
+/// through call sites that both of them make. The `debug_assert!` turns that blind spot into a
+/// test failure at the offending call site — in the mirror traces, in the Metal `tcp_semantics`
+/// suite, and in the host readback itself, all of which run with debug assertions on. It is
+/// deliberately not a hard `assert!`: this runs once per resident record per flow in the frontier
+/// readback, and `%` keeps the host answer right even where the device answer would be wrong.
+///
+/// The residual limitation, stated: a release build does not check the bound, and no static gate
+/// can. `the_kernels_single_conditional_subtraction_matches_this_modulo` pins the two forms equal
+/// across the whole precondition domain and shows exactly where they part company outside it.
 #[cfg(any(
     test,
     feature = "cuda",
@@ -88,6 +111,12 @@ pub(crate) fn ledger_record_slot(
     logical: usize,
 ) -> usize {
     let span = capacity.max(1);
+    debug_assert!(
+        head + logical < 2 * span,
+        "ledger ring slot head {head} + logical {logical} exceeds the kernels' \
+         single-conditional-subtraction bound {} at capacity {capacity}",
+        2 * span - 1
+    );
     offset + ((head + logical) % span) * TCP_LEDGER_RECORD_WORDS
 }
 
@@ -409,7 +438,18 @@ pub(crate) mod mirror {
                     }
                 }
                 // Mutation site R7: prefix removal advances the head. No compaction.
+                //
+                // This is the tightest consumer of the kernels' reduction precondition: `head` is
+                // at most `capacity - 1` and `keep` at most `count <= capacity`, so `head + keep`
+                // reaches exactly `2 * capacity - 1` when a full ring is fully acknowledged from
+                // the last slot — the largest sum one conditional subtraction still reduces.
                 let span = capacity.max(1);
+                debug_assert!(
+                    head + keep < 2 * span,
+                    "R7 head {head} + keep {keep} exceeds the kernels' \
+                     single-conditional-subtraction bound {} at capacity {capacity}",
+                    2 * span - 1
+                );
                 words[LEDGER_META_HEAD] = ((head + keep) % span) as u64;
                 words[LEDGER_META_COUNT] = (count - keep) as u64;
                 LedgerOutcome::Applied
@@ -471,6 +511,50 @@ mod tests {
         assert_eq!(ledger_record_slot(100, 4, 3, 3), 110);
         // A zero-capacity ring is never indexed, but the arithmetic must not divide by zero.
         assert_eq!(ledger_record_slot(100, 0, 0, 0), 100);
+    }
+
+    /// The kernels' `tcp_ledger_slot`, transliterated back: one conditional subtraction, no `%`.
+    fn kernel_slot(offset: usize, capacity: usize, head: usize, logical: usize) -> usize {
+        let span = if capacity == 0 { 1 } else { capacity };
+        let mut physical = head + logical;
+        if physical >= span {
+            physical -= span;
+        }
+        offset + physical * TCP_LEDGER_RECORD_WORDS
+    }
+
+    #[test]
+    fn the_kernels_single_conditional_subtraction_matches_this_modulo() {
+        // Exhaustive over the precondition domain: every capacity up to 12, every head inside the
+        // ring, and every logical index up to the `2 * span - 1` bound R7 makes tight. Inside the
+        // domain the kernels' cheaper form is the mirror's `%`, which is what lets one host mirror
+        // gate two device kernels.
+        for capacity in 0..=12_usize {
+            let span = capacity.max(1);
+            for head in 0..span {
+                for logical in 0..=(2 * span - 1 - head) {
+                    assert_eq!(
+                        kernel_slot(64, capacity, head, logical),
+                        ledger_record_slot(64, capacity, head, logical),
+                        "capacity {capacity} head {head} logical {logical}"
+                    );
+                }
+            }
+        }
+        // And immediately outside it they part company: capacity 4 with head 3 and logical 5 sums
+        // to 8, one past `2 * 4 - 1`, where one subtraction leaves 4 — a slot outside the ring —
+        // while the modulo wraps to 0. This is the blind spot the precondition assertion covers.
+        assert_eq!(kernel_slot(64, 4, 3, 5), 64 + 4 * TCP_LEDGER_RECORD_WORDS);
+        assert_ne!(kernel_slot(64, 4, 3, 5), 64);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "single-conditional-subtraction bound")]
+    fn a_slot_past_the_kernels_reduction_bound_is_rejected_by_the_mirror() {
+        // Non-vacuity for the precondition assertion itself: the one input the kernels would get
+        // wrong is the one input the mirror refuses to answer.
+        let _ = ledger_record_slot(64, 4, 3, 5);
     }
 
     #[test]
