@@ -62,9 +62,9 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     },
     AllowedFeatureGate {
         path: "device_sizing.rs",
-        predicate: r#"any(test, feature = "planner-test-hooks")"#,
+        predicate: r#"any(test, all(feature = "planner-test-hooks", feature = "cuda"), all(feature = "planner-test-hooks", feature = "metal-spike", target_vendor = "apple"))"#,
         count: 1,
-        purpose: "exact production-layout reports exist only for tests and host planner probes",
+        purpose: "exact production-layout reports exist only for the crate's own unit test and the two device planner probes (`cuda::size_cuda_plan_for_testing`, `metal::size_metal_plan_for_testing`), which are `planner-test-hooks` items inside `cuda` / `metal-spike` modules",
     },
     AllowedFeatureGate {
         path: "cpu.rs",
@@ -135,8 +135,14 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "planner_capacity.rs",
         predicate: r#"any(test, feature = "planner-test-hooks")"#,
-        count: 18,
+        count: 17,
         purpose: "legacy quadratic helpers exist only for unit and standard full-plan equality tests",
+    },
+    AllowedFeatureGate {
+        path: "planner_capacity.rs",
+        predicate: r#"all(feature = "planner-test-hooks", any(feature = "cuda", all(feature = "metal-spike", target_vendor = "apple")))"#,
+        count: 1,
+        purpose: "the precomputed-versus-legacy planner equality check has no host consumer: its only callers are `cuda::assert_cuda_planner_bit_equal_for_testing` and `metal::assert_metal_planner_bit_equal_for_testing`, so it carries no `test` arm",
     },
     AllowedFeatureGate {
         path: "planner_capacity.rs",
