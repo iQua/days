@@ -114,7 +114,7 @@ struct PreloadedTcpAcks {
 /// Flow-keyed views of the initial packet and event tables, built once per `validate` call.
 ///
 /// The validator asks "which initial packets, or preloaded ACK arrivals, belong to this flow?"
-/// once per generator at eight sites. Answering that with a linear filter makes the whole pass
+/// once per generator at nine call sites. Answering that with a linear filter makes the whole pass
 /// quadratic in the flow count, so each table is indexed once instead: a CSR grouping over
 /// `initial_packets` keyed by dense flow slot, and a per-flow count of preloaded TCP ACK
 /// arrivals. Both are built by a single forward pass, so every group lists its members in
@@ -6699,10 +6699,13 @@ pub fn assert_validate_flow_index_equivalent_for_testing(
     let owned_sequences = payload_sequences_by_owner(image);
     for node in &image.nodes {
         let scanned = legacy_scans::owned_payload_sequences(image, node);
-        if owned_sequences[node.id.0 as usize] != scanned {
+        // `.get` rather than indexing: the gate must report a mismatch, never panic, if it is
+        // ever pointed at an image whose node identifiers are not dense.
+        let bucketed = owned_sequences.get(node.id.0 as usize);
+        if bucketed != Some(&scanned) {
             return Err(format!(
-                "node {:?} bucketed payload sequences {:?} differ from the scanned sequences {scanned:?}",
-                node.id, owned_sequences[node.id.0 as usize]
+                "node {:?} bucketed payload sequences {bucketed:?} differ from the scanned sequences {scanned:?}",
+                node.id
             ));
         }
     }

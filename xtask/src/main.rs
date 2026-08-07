@@ -138,6 +138,18 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
         count: 1,
         purpose: "legacy minimum scan supports sampled debug checks and equality tests",
     },
+    AllowedFeatureGate {
+        path: "validate.rs",
+        predicate: r#"feature = "planner-test-hooks""#,
+        count: 2,
+        purpose: "pre-index validator scans and their equality hook exist only for standard tests",
+    },
+    AllowedFeatureGate {
+        path: "lib.rs",
+        predicate: r#"feature = "planner-test-hooks""#,
+        count: 1,
+        purpose: "validator flow-index equality hook is exported only for standard tests",
+    },
 ];
 
 const T13F_FULL_LOAD_TESTS: &[&str] = &[
