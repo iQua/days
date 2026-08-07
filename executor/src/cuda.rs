@@ -83,6 +83,8 @@ const DEFAULT_ROUND_THREADS_PER_BLOCK: usize = 256;
 const DEFAULT_ATTEMPTS_PER_GRAPH_WAVE: usize = 64;
 const MAX_ATTEMPTS_PER_GRAPH_WAVE: usize = 16_384;
 const NONE: u64 = u64::MAX;
+/// Params word holding the absolute word offset of the per-flow ledger metadata in the TCP plane.
+const PARAM_LEDGER_META_OFFSET: usize = 29;
 const PACKET_ECN_FLAG: u64 = 1_u64 << 63;
 const PACKET_KIND_MASK: u64 = !PACKET_ECN_FLAG;
 
@@ -105,6 +107,11 @@ static CUDA_DIRECT: OnceLock<Result<Arc<DirectCuda>, String>> = OnceLock::new();
 #[cfg(feature = "cuda-test-hooks")]
 std::thread_local! {
     static PANIC_AFTER_NEXT_EXECUTION: Cell<bool> = const { Cell::new(false) };
+    /// Words this thread has copied out of device buffers since the last reset.
+    ///
+    /// Thread-local like the panic hook above: the retry loop, the readback and the test all run
+    /// on the caller's thread, so no shared mutable state is introduced.
+    static READBACK_WORDS: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Acquires the supported process-wide CUDA execution envelope.
@@ -131,6 +138,22 @@ fn panic_after_execution_if_requested() {
     if PANIC_AFTER_NEXT_EXECUTION.replace(false) {
         panic!("injected panic after CUDA execution");
     }
+}
+
+/// Returns and clears this thread's device-to-host readback word count.
+///
+/// T20l fix 1 is an ordering property — *when* the result arena crosses the bus — and this is the
+/// quantity that makes it testable: a screened faulting attempt copies the control plane (and, on
+/// a ledger fault, the per-flow occupancy metadata) instead of every plane.
+#[cfg(feature = "cuda-test-hooks")]
+#[doc(hidden)]
+pub fn take_readback_words_for_testing() -> u64 {
+    READBACK_WORDS.replace(0)
+}
+
+#[cfg(feature = "cuda-test-hooks")]
+fn account_readback_words(words: usize) {
+    READBACK_WORDS.set(READBACK_WORDS.get().saturating_add(words as u64));
 }
 
 /// Bounded device arena reported by a production CUDA capacity fault.
@@ -3597,9 +3620,68 @@ impl CudaBuffers {
         observation_mode: ObservationMode,
         timing: CudaTiming,
     ) -> Result<CudaRun, AttemptFailure> {
+        // T20l fix 1: screen the attempt BEFORE the result arena crosses the bus.
+        //
+        // The control plane is a few dozen words; the result arena is 18.6-19.2 GB at the RQ9
+        // frontier. T20l phase 1 §4.3 measured every one of the four attempts paying that copy in
+        // full, three of which are discarded unread, at 5.08 s/attempt on an RTX 4090. A capacity
+        // fault needs the control plane and — for a ledger fault only — the per-flow occupancy
+        // metadata carrying the T20i vector, so those are fetched here and everything else is
+        // fetched only once the attempt is known to have succeeded.
+        //
+        // This changes WHEN bytes cross the bus and nothing else. On the success path the same
+        // planes are read, in the same order, into the same `planes` vector; on the failure path
+        // the same `AttemptFailure` is produced from the same words. Complete state, retry traces
+        // and fault payloads are byte-identical either way.
+        let control = screen_plane_words(stream, self.planes[0].slice(..), "control plane screen")?;
+        if control[CONTROL_ERROR] != 0 {
+            let error = decode_device_error(&control);
+            // T20i layer 2: a ledger fault reports the WHOLE per-flow occupancy vector, not just
+            // the first offender. Layer 1 measured 377 of 262,144 frontier flows above the derived
+            // floor, so first-offender keying would need up to 377 sequential replans; one vector
+            // sizes every flow in a single replan. The payload is one pass over 6 words per flow,
+            // and under the screen those 6 words per flow are also all that is copied back.
+            let ledger_high_water = matches!(
+                error,
+                CudaError::CapacityExceeded {
+                    arena: CudaArena::TcpSegmentLedger,
+                    ..
+                }
+            )
+            .then(|| {
+                let params =
+                    screen_plane_words(stream, self.planes[1].slice(..), "params plane screen")?;
+                let ledger = &self.planes[28];
+                let start = (params[PARAM_LEDGER_META_OFFSET] as usize).min(ledger.len());
+                let end = start
+                    .saturating_add(image.flows.len().saturating_mul(TCP_LEDGER_META_WORDS))
+                    .min(ledger.len());
+                let meta = screen_plane_words(
+                    stream,
+                    ledger.slice(start..end),
+                    "ledger occupancy screen",
+                )?;
+                Ok::<_, CudaError>(ledger_high_water_vector(&meta, 0, image.flows.len()))
+            })
+            .transpose()?;
+            return Err(AttemptFailure {
+                error,
+                ledger_high_water,
+            });
+        }
+        if control[CONTROL_DONE] == 0 {
+            return Err(CudaError::RoundLimitExceeded {
+                capacity: self.round_capacity,
+            }
+            .into());
+        }
+
         let mut planes = Vec::with_capacity(self.planes.len());
+        planes.push(control);
         let mut readback_error = None;
-        for (index, plane) in self.planes.iter().enumerate() {
+        for (index, plane) in self.planes.iter().enumerate().skip(1) {
+            #[cfg(feature = "cuda-test-hooks")]
+            account_readback_words(plane.len());
             match stream.clone_dtoh(plane) {
                 Ok(words) => planes.push(words),
                 Err(error) => {
@@ -3619,32 +3701,6 @@ impl CudaBuffers {
         }
         let control = &planes[0];
         let params = &planes[1];
-        if control[CONTROL_ERROR] != 0 {
-            let error = decode_device_error(control);
-            // T20i layer 2: a ledger fault reports the WHOLE per-flow occupancy vector, not just
-            // the first offender. Layer 1 measured 377 of 262,144 frontier flows above the derived
-            // floor, so first-offender keying would need up to 377 sequential replans; one vector
-            // sizes every flow in a single replan. Plane 28 is already resident here, so the
-            // payload costs one pass over 6 words per flow.
-            let ledger_high_water = matches!(
-                error,
-                CudaError::CapacityExceeded {
-                    arena: CudaArena::TcpSegmentLedger,
-                    ..
-                }
-            )
-            .then(|| ledger_high_water_vector(&planes[28], params[29] as usize, image.flows.len()));
-            return Err(AttemptFailure {
-                error,
-                ledger_high_water,
-            });
-        }
-        if control[CONTROL_DONE] == 0 {
-            return Err(CudaError::RoundLimitExceeded {
-                capacity: self.round_capacity,
-            }
-            .into());
-        }
 
         let node_state = &planes[2];
         let generators = &planes[3];
@@ -3827,7 +3883,7 @@ impl CudaBuffers {
             }
         }
         pending_events.sort_unstable_by_key(|event| event.key);
-        let ledger_meta = params[29] as usize;
+        let ledger_meta = params[PARAM_LEDGER_META_OFFSET] as usize;
         for flow in 0..image.flows.len() {
             let row = ledger_meta + flow * TCP_LEDGER_META_WORDS;
             let offset = tcp_state[row] as usize;
@@ -4419,6 +4475,26 @@ struct CudaTiming {
     host_submit_ns: u64,
     device_ns: u64,
     wall_ns: u64,
+}
+
+/// Copies one bounded device word range to the host and waits for it.
+///
+/// T20l fix 1's screen needs a handful of words before the result arena is transferred, so each
+/// screen copy synchronizes on its own rather than joining the batched result readback.
+fn screen_plane_words(
+    stream: &std::sync::Arc<CudaStream>,
+    view: cudarc::driver::CudaView<'_, u64>,
+    context: &str,
+) -> Result<Vec<u64>, CudaError> {
+    #[cfg(feature = "cuda-test-hooks")]
+    account_readback_words(view.len());
+    let words = stream
+        .clone_dtoh(&view)
+        .map_err(|error| driver_error(format!("{context} readback"), error));
+    stream
+        .synchronize()
+        .map_err(|error| driver_error(format!("{context} readback synchronization"), error))?;
+    words
 }
 
 fn driver_error(context: impl fmt::Display, error: cudarc::driver::DriverError) -> CudaError {

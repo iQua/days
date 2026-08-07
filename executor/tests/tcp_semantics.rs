@@ -1307,6 +1307,161 @@ fn metal_tcp_ledger_capacity_retry_is_typed_and_byte_identical() {
     assert_eq!(retry.grown_capacity, 16);
 }
 
+/// T20l fix 1: a *failed* attempt must not pull the result arena across the bus.
+///
+/// Before the fix, `MetalBuffers::finish` read every plane and only then tested
+/// `control[CONTROL_ERROR]`, so each discarded attempt paid a full arena copy. T20l phase 1 §4.3
+/// measured that as 5.08 s per attempt on an RTX 4090 and 1.14 s on Apple unified memory, times
+/// the three attempts the RQ9 frontier discards. The screened order copies the control plane and,
+/// for a ledger fault, the per-flow occupancy metadata the T20i vector is decoded from — nothing
+/// else.
+///
+/// The assertion is a ratio rather than an absolute word count so it states the property and not
+/// the fixture's plane sizes: the strict run performs exactly one failed attempt, the recovered run
+/// performs that same failed attempt plus one successful one, and only the successful attempt may
+/// carry an arena-sized readback. Under the old order both attempts copied the arena and the ratio
+/// is about 1:2, which fails this bound.
+#[cfg(all(feature = "metal-test-hooks", target_vendor = "apple"))]
+#[test]
+fn metal_capacity_fault_is_screened_before_the_arena_readback() {
+    let image = tcp_image(TcpCongestionControl::reno(MSS), 2 * MSS);
+    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("scalar TCP ledger retry oracle must run");
+    let capacity_caps = DeviceCapacityCaps {
+        tcp_ledger_segments_per_flow: Some(0),
+        ..DeviceCapacityCaps::default()
+    };
+
+    let _ = days_executor::metal::take_readback_words_for_testing();
+    let strict_error = run_metal_with_observations(
+        &image,
+        None,
+        MetalConfig {
+            capacity_caps,
+            max_capacity_retries: 0,
+            ..MetalConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect_err("under-capped TCP ledger must fail in strict mode");
+    let strict_words = days_executor::metal::take_readback_words_for_testing();
+    assert!(
+        matches!(
+            strict_error,
+            MetalError::CapacityExceeded {
+                arena: MetalArena::TcpSegmentLedger,
+                ..
+            }
+        ),
+        "the screen must still produce the typed ledger fault, got {strict_error:?}"
+    );
+
+    let recovered = run_metal_with_observations(
+        &image,
+        None,
+        MetalConfig {
+            capacity_caps,
+            ..MetalConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("adaptive TCP ledger growth must restart from the immutable image");
+    let recovered_words = days_executor::metal::take_readback_words_for_testing();
+
+    assert!(
+        strict_words.saturating_mul(16) < recovered_words,
+        "a screened failed attempt must copy back a small fraction of an arena readback: the \
+         strict single-attempt run copied {strict_words} words while the one-fault-plus-one-success \
+         run copied {recovered_words}"
+    );
+    // The reordering carries no semantic content: the fault payload still sizes the flow the same
+    // way, and the recovered complete state is still the scalar oracle's, byte for byte.
+    assert_device_full_result_eq(
+        &recovered.result,
+        &scalar,
+        "screened Metal TCP ledger retry run",
+    );
+    let [retry] = recovered.capacity_retry_trace.as_slice() else {
+        panic!(
+            "expected one TCP ledger retry, got {:?}",
+            recovered.capacity_retry_trace
+        );
+    };
+    assert_eq!(retry.arena, MetalArena::TcpSegmentLedger);
+    assert_eq!(retry.flow, Some(FLOW));
+    assert_eq!(retry.grown_capacity, 16);
+}
+
+/// The CUDA sibling of [`metal_capacity_fault_is_screened_before_the_arena_readback`].
+#[cfg(feature = "cuda-test-hooks")]
+#[test]
+fn cuda_capacity_fault_is_screened_before_the_arena_readback() {
+    let image = tcp_image(TcpCongestionControl::reno(MSS), 2 * MSS);
+    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("scalar TCP ledger retry oracle must run");
+    let capacity_caps = DeviceCapacityCaps {
+        tcp_ledger_segments_per_flow: Some(0),
+        ..DeviceCapacityCaps::default()
+    };
+
+    let _ = days_executor::cuda::take_readback_words_for_testing();
+    let strict_error = run_cuda_with_observations(
+        &image,
+        None,
+        CudaConfig {
+            capacity_caps,
+            max_capacity_retries: 0,
+            ..CudaConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect_err("under-capped TCP ledger must fail in strict mode");
+    let strict_words = days_executor::cuda::take_readback_words_for_testing();
+    assert!(
+        matches!(
+            strict_error,
+            CudaError::CapacityExceeded {
+                arena: CudaArena::TcpSegmentLedger,
+                ..
+            }
+        ),
+        "the screen must still produce the typed ledger fault, got {strict_error:?}"
+    );
+
+    let recovered = run_cuda_with_observations(
+        &image,
+        None,
+        CudaConfig {
+            capacity_caps,
+            ..CudaConfig::default()
+        },
+        ObservationMode::Full,
+    )
+    .expect("adaptive TCP ledger growth must restart from the immutable image");
+    let recovered_words = days_executor::cuda::take_readback_words_for_testing();
+
+    assert!(
+        strict_words.saturating_mul(16) < recovered_words,
+        "a screened failed attempt must copy back a small fraction of an arena readback: the \
+         strict single-attempt run copied {strict_words} words while the one-fault-plus-one-success \
+         run copied {recovered_words}"
+    );
+    assert_device_full_result_eq(
+        &recovered.result,
+        &scalar,
+        "screened CUDA TCP ledger retry run",
+    );
+    let [retry] = recovered.capacity_retry_trace.as_slice() else {
+        panic!(
+            "expected one TCP ledger retry, got {:?}",
+            recovered.capacity_retry_trace
+        );
+    };
+    assert_eq!(retry.arena, CudaArena::TcpSegmentLedger);
+    assert_eq!(retry.flow, Some(FLOW));
+    assert_eq!(retry.grown_capacity, 16);
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 fn cuda_tcp_ledger_capacity_retry_is_typed_and_byte_identical() {
