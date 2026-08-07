@@ -4148,3 +4148,34 @@ fn loss_acks_before_a_scheduled_send_still_retransmit() {
     validate(&checkpoint, Backend::Scalar).expect("Scalar continuation must validate");
     validate(&checkpoint, Backend::Cpu { workers: 2 }).expect("CPU continuation must validate");
 }
+
+/// The TCP segment-ledger scan reports the *first* offending initial segment of the generator's
+/// flow, in `initial_packets` order. Two future segments pin that order: a walk that visited the
+/// flow's packets in any other order would name sequence 1024 instead of 512.
+#[test]
+fn future_initial_tcp_segments_report_the_first_offender_in_initial_packet_order() {
+    let mut image = tcp_image(TcpCongestionControl::reno(MSS), 4 * MSS);
+    // SOURCE is node 0 of 2, so it owns the even PayloadIds at sequences 1 and 2.
+    for (id, sequence) in [(2_u64, MSS), (4, 2 * MSS)] {
+        image.initial_packets.push(PacketDescriptor {
+            id: PayloadId(id),
+            flow: FLOW,
+            size_bytes: MSS - 1,
+            ecn_marked: false,
+            kind: PacketKind::TcpData(TcpDataHeader {
+                sequence,
+                sent_time_ns: 0,
+                retransmission: false,
+            }),
+        });
+    }
+    image.host_states[0].next_payload_seq = 3;
+    image.initial_packets.sort_by_key(|packet| packet.id);
+
+    let expected = "flow FlowId(0) TCP segment ledger has unexpected initial segment at sequence 512 at or beyond next sequence 0";
+    for backend in [Backend::Scalar, Backend::Cpu { workers: 2 }] {
+        let error = validate(&image, backend)
+            .expect_err("future TCP ledger entries must reject before construction");
+        assert_eq!(error.to_string(), expected);
+    }
+}

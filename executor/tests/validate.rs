@@ -1477,3 +1477,29 @@ fn aggregate_packet_counts_retain_counter_and_sequence_diagnostics() {
         "node NodeId(0) origin sequence space overflows while reserving 3 generated events"
     );
 }
+
+/// The switch-owner PFC payload-sequence scan reports the *first* owned sequence at or above the
+/// switch's next origin sequence, in `initial_packets` order. Three switch-owned packets pin both
+/// halves of that contract: sequence 1 is below the bound and must be skipped, and sequences 2 and
+/// 3 both violate it, so any scan that does not visit the owner's packets in initial-table order
+/// would name 3 instead of 2.
+#[test]
+fn switch_payload_sequences_report_the_first_offender_in_initial_packet_order() {
+    let mut image = valid_image();
+    image.switch_states[0].next_origin_seq = 2;
+    // node_count is 3, so PayloadIds 4, 7 and 10 are owned by NodeId(1) at sequences 1, 2 and 3.
+    for id in [4_u64, 7, 10] {
+        image.initial_packets.push(PacketDescriptor {
+            id: PayloadId(id),
+            flow: FLOW,
+            size_bytes: 2,
+            ecn_marked: false,
+            kind: days_executor::PacketKind::Data,
+        });
+    }
+
+    assert_eq!(
+        rejection(&image, Backend::Scalar),
+        "switch node NodeId(1) PFC payload sequence 2 is not below next origin sequence 2"
+    );
+}
