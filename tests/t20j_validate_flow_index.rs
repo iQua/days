@@ -14,6 +14,7 @@
 //! primitives shared by both paths can drift without failing it.
 #![cfg(feature = "test")]
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use days::scenario::compile_config;
@@ -225,14 +226,41 @@ fn truncated_stop_times_separate_the_two_preloaded_ack_counts() {
 }
 
 /// A packet whose flow identifier falls outside the dense flow table cannot be grouped, so the
-/// index keeps it in an unindexed group that a query filters by equality. Nothing the validator
-/// accepts reaches that path, but the equality it relies on must hold there too.
+/// index keeps it in one shared unindexed group that a query filters by equality. Nothing the
+/// validator accepts reaches that path, but the equality it relies on must hold there too.
+///
+/// Two *different* outside identifiers share that group deliberately: with only one, the group is
+/// already the answer and the fallback's equality filter is inert, so the branch would be
+/// exercised without being tested. With two, a query for either must reject the other's packets.
 #[test]
 fn flow_indexed_walks_match_the_scans_for_flows_outside_the_dense_table() {
     let mut image = compile_fixture("configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml");
-    let outside = FlowId(image.flows.len() as u64 + 5);
-    image.initial_packets[0].flow = outside;
-    image.initial_packets[3].flow = outside;
+    let first_outside = FlowId(image.flows.len() as u64 + 5);
+    let second_outside = FlowId(image.flows.len() as u64 + 9);
+    image.initial_packets[0].flow = first_outside;
+    image.initial_packets[3].flow = first_outside;
+    image.initial_packets[5].flow = second_outside;
+
+    // The gate queries exactly the identifiers that label a packet without resolving to a dense
+    // slot. Recomputing that set here is what keeps the unindexed branch from being gated
+    // vacuously: if it were empty, the gate below would issue no unindexed query at all.
+    let outside_queries = image
+        .initial_packets
+        .iter()
+        .map(|packet| packet.flow)
+        .filter(|id| {
+            image
+                .flows
+                .get(id.0 as usize)
+                .is_none_or(|flow| flow.id != *id)
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        outside_queries,
+        BTreeSet::from([first_outside, second_outside]),
+        "the gate must issue an unindexed query for each of the two outside identifiers"
+    );
+
     assert_validate_flow_index_equivalent_for_testing(&image)
         .expect("unindexed flow groups must match the scanned walks");
     validate(&image, Backend::Scalar).expect_err("an unknown packet flow must still reject");

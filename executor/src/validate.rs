@@ -6668,6 +6668,30 @@ pub fn assert_validate_flow_index_equivalent_for_testing(
         ));
     }
 
+    // Every identifier that labels a packet but resolves to no dense slot. No query derived from
+    // `image.flows` can reach one, so without this loop `packets_for_flow`'s unindexed fallback —
+    // the shared group plus its equality filter — would never be evaluated by the gate at all.
+    let mut unindexed_queries = image
+        .initial_packets
+        .iter()
+        .map(|packet| packet.flow)
+        .filter(|id| dense_flow_slot(image, *id).is_none())
+        .collect::<Vec<_>>();
+    unindexed_queries.sort_unstable();
+    unindexed_queries.dedup();
+    for id in unindexed_queries {
+        let indexed = flow_index
+            .packets_for_flow(image, id)
+            .map(|packet| packet.id)
+            .collect::<Vec<_>>();
+        let scanned = legacy_scans::packets_for_flow(image, id);
+        if indexed != scanned {
+            return Err(format!(
+                "unindexed flow {id:?} indexed packet walk {indexed:?} differs from the scanned walk {scanned:?}"
+            ));
+        }
+    }
+
     for generator in image.host_states.iter().flat_map(|state| &state.generators) {
         let acks = flow_index.preloaded_tcp_acks(image, generator.flow);
         let scanned_total = legacy_scans::preloaded_ack_events(image, generator.flow) as u64;
