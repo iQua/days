@@ -131,13 +131,20 @@ impl ChannelCapacityFloors {
 /// row overflows, adjacent capacity classes stay independent, and retaining each flow's original
 /// class prevents a grown row from migrating into another class on a later retry.
 ///
-/// **Segment ledgers do not** — T20i retired class-together growth for this arena. T20g proved a
-/// class-uniform ledger at the measured demand is arithmetically impossible (48.9 GB for one plane
-/// = 1.90x boston's whole device; 129.1 GB for the whole plan = beyond madrid's entire unified
-/// pool), and T20i layer 1 supplied the missing premise: the demand is carried by **377 of 262,144
-/// flows (0.144%)**, and 261,767 flows never leave the derived floor. Per-flow keying therefore
-/// costs 24.6 MiB over the plan that already fits, and class keying costs 4.66x boston. The class
-/// mechanism is retained where it is still correct — receiver ranges here, and per-stream keying in
+/// **Segment ledgers do not** — T20i retired class-together growth for this arena. A class-uniform
+/// ledger is arithmetically impossible at *both* measured demands, which are two separate figures
+/// and not one computation:
+///
+/// - at T20g's device-measured demand **4,633**, the `tcp_state` plane alone is 48.9 GB —
+///   **1.90x boston's whole device** — and the whole plan is 61.7 GB;
+/// - at layer 1's whole-run demand **11,058**, the whole plan is 129.1 GB (120.198 GiB), which is
+///   **5.01x boston** and 10.06 GB beyond madrid's entire unified pool.
+///
+/// T20i layer 1 supplied the missing premise: the demand is carried by **377 of 262,144 flows
+/// (0.144%)**, and 261,767 flows never leave the derived floor. Per-flow keying at the exact
+/// measured peaks therefore costs 24.6 MiB over the plan that already fits, and 0.669 GiB once the
+/// `k = 8` factor below is applied — against that 5.01x for class keying. The class mechanism is
+/// retained where it is still correct — receiver ranges here, and per-stream keying in
 /// [`ChannelCapacityFloors`] — but the ledger is keyed by [`FlowId`].
 #[cfg(any(
     test,
@@ -314,7 +321,7 @@ pub(crate) const TCP_LEDGER_RETRY_SLACK: usize = 256;
 /// The cost is negligible because the demand is carried by 0.144% of flows. Projected whole-plan
 /// bytes at the measured per-flow peaks, against boston's 25,757,220,864 B: `k = 1` 17.312 GiB,
 /// `k = 2` 17.359 GiB, **`k = 8` 17.957 GiB**, `k = 16` 18.813 GiB. Every one of them fits; the
-/// class-uniform alternative at the same demand is 120.195 GiB.
+/// class-uniform alternative at the same demand is 120.198 GiB.
 #[cfg(any(
     test,
     feature = "cuda",
@@ -325,7 +332,11 @@ pub(crate) const TCP_LEDGER_OCCUPANCY_SLACK_FACTOR: usize = 8;
 /// Constant record allowance added on top of the scaled high-water.
 ///
 /// It matches `TCP_LEDGER_RECOVERY_ALLOWANCE`: one partial cumulative-ACK boundary record plus
-/// recovery retransmissions. At the frontier it costs 3,025 records in total — 121 kB.
+/// recovery retransmissions. At the frontier it costs 8 records on each of the 9,298 flows the
+/// `k = 8` factor lifts off the derived floor — the flows whose peak is at least 65, since below
+/// that `8 * peak + 8` stays under 520 — for **74,384 records = 2,975,360 B (2.98 MB)** in total.
+/// That is 0.015% of the 19.28 GB plan, but it is 24.6x the figure this constant originally
+/// carried.
 #[cfg(any(
     test,
     feature = "cuda",
@@ -533,9 +544,9 @@ mod tests {
     /// T20i retirement gate: the ledger no longer grows by capacity class.
     ///
     /// Under the retired policy `raise_ledger(FlowId(7), 520, 777)` also raised flow 8 — and, at
-    /// the frontier, all 262,144 flows sharing the derived base of 520, which is the 4.66x-boston
-    /// plane T20g proved impossible. Receiver ranges keep class keying and are pinned here too, so
-    /// the retirement is visibly scoped to the one arena it applies to.
+    /// the frontier, all 262,144 flows sharing the derived base of 520, which at layer 1's measured
+    /// demand is the 5.01x-boston plan T20g proved impossible. Receiver ranges keep class keying and
+    /// are pinned here too, so the retirement is visibly scoped to the one arena it applies to.
     #[test]
     fn tcp_ledger_retry_grows_only_the_faulting_flow() {
         let mut floors = TcpCapacityFloors::default();
