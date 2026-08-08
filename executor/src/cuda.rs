@@ -22,7 +22,9 @@ use cudarc::driver::{
 };
 use cudarc::nvrtc::Ptx;
 
-use crate::device_compaction::{CompactionEntity, CompactionPlan, CompactionShape};
+use crate::device_compaction::{
+    CompactionEntity, CompactionPlan, CompactionShape, metadata_region,
+};
 use crate::device_scheduler::{
     QUEUE_META_WORDS, prepare_device_schedulers, restore_device_scheduler,
 };
@@ -267,39 +269,28 @@ fn arena_compaction_plan(
 /// range is clamped to its plane the way Metal's `SharedBuffer::read_range` clamps it.
 fn bounded_plane_words<const N: usize>(
     stream: &std::sync::Arc<CudaStream>,
-    ranges: [(&CudaSlice<u64>, usize, usize); N],
-    context: &str,
+    ranges: [(&CudaSlice<u64>, usize, usize, &'static str); N],
 ) -> Result<[Vec<u64>; N], AttemptFailure> {
     let mut regions = Vec::with_capacity(N);
     let mut readback_error = None;
-    for (plane, requested_start, len) in ranges {
-        let start = requested_start.min(plane.len());
-        let end = start.saturating_add(len).min(plane.len());
-        // The clamp exists because `CudaSlice::slice` panics on an out-of-range range, not because
-        // a short region is acceptable: the decode indexes these regions by entity, so a short one
-        // would panic or silently drop complete state. Every plan the planner builds sizes them
-        // exactly; refuse rather than truncate if one ever does not.
-        if start != requested_start || end - start != len {
-            return Err(CudaError::Validation(format!(
-                "device readback compaction refused: {context} asked for {len} words at \
-                 {requested_start} but the plane holds {}",
-                plane.len()
-            ))
-            .into());
-        }
+    for (plane, start, len, region) in ranges {
+        // `CudaSlice::slice` panics on an out-of-range range, so the extent is validated before it
+        // is built — by the same shared function Metal validates its clamped `read_range` with, so
+        // the two backends refuse identically and one unit test covers both.
+        let range = metadata_region(plane.len(), start, len, region).map_err(compaction_error)?;
         #[cfg(feature = "cuda-test-hooks")]
-        account_readback_words(end - start);
-        match stream.clone_dtoh(&plane.slice(start..end)) {
+        account_readback_words(range.len());
+        match stream.clone_dtoh(&plane.slice(range)) {
             Ok(words) => regions.push(words),
             Err(error) => {
-                readback_error = Some(driver_error(format!("{context} copy"), error));
+                readback_error = Some(driver_error(format!("{region} readback copy"), error));
                 break;
             }
         }
     }
     stream
         .synchronize()
-        .map_err(|error| driver_error(format!("{context} synchronization"), error))?;
+        .map_err(|error| driver_error("bounded metadata region readback synchronization", error))?;
     if let Some(error) = readback_error {
         return Err(error.into());
     }
@@ -3923,11 +3914,13 @@ impl CudaBuffers {
                     tcp_plane,
                     params[PARAM_RECEIVER_OFFSET] as usize,
                     flow_count.saturating_mul(TCP_RECEIVER_WORDS),
+                    "per-flow TCP receiver state",
                 ),
                 (
                     tcp_plane,
                     params[PARAM_LEDGER_META_OFFSET] as usize,
                     flow_count.saturating_mul(TCP_LEDGER_META_WORDS),
+                    "per-flow TCP ledger metadata",
                 ),
                 (
                     &self.planes[25],
@@ -3935,9 +3928,9 @@ impl CudaBuffers {
                     self.stream_layout
                         .stream_count
                         .saturating_mul(ARENA_META_WORDS),
+                    "per-stream ring metadata",
                 ),
             ],
-            "bounded metadata region readback",
         )?;
 
         let fel_plan = arena_compaction_plan(

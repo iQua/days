@@ -26,7 +26,9 @@ use objc2_metal::{
     MTLResourceOptions, MTLSize, MTLStorageMode,
 };
 
-use crate::device_compaction::{CompactionEntity, CompactionPlan, CompactionShape};
+use crate::device_compaction::{
+    CompactionEntity, CompactionPlan, CompactionShape, metadata_region,
+};
 use crate::device_scheduler::{
     QUEUE_META_WORDS, prepare_device_schedulers, restore_device_scheduler,
 };
@@ -4125,34 +4127,43 @@ impl MetalBuffers {
         // follow it are device scratch. At the frontier that prefix is 1,667,976 of the plane's
         // 52,426,754 words. The extent is the planner's own `stream_count` — the same bound the
         // decode loop below already walks — not an inferred one.
-        let stream_meta_words = self
-            .stream_layout
-            .stream_count
-            .saturating_mul(ARENA_META_WORDS);
-        let stream_state = whole_region(
-            self.planes[25].read_range(0, stream_meta_words),
-            stream_meta_words,
+        let stream_meta_range = metadata_region(
+            self.planes[25].words,
+            0,
+            self.stream_layout
+                .stream_count
+                .saturating_mul(ARENA_META_WORDS),
             "per-stream ring metadata",
-        )?;
+        )
+        .map_err(compaction_error)?;
+        let stream_state =
+            self.planes[25].read_range(stream_meta_range.start, stream_meta_range.len());
         let scheduler_state = self.planes[27].read();
 
         let node_count = image.nodes.len();
         let flow_count = image.flows.len();
         let receiver_base = params[PARAM_RECEIVER_OFFSET] as usize;
         let ledger_meta_offset = params[PARAM_LEDGER_META_OFFSET] as usize;
-        let receiver_words = flow_count.saturating_mul(TCP_RECEIVER_WORDS);
-        let ledger_meta_words = flow_count.saturating_mul(TCP_LEDGER_META_WORDS);
-        let receiver_state = whole_region(
-            self.tcp_state.read_range(receiver_base, receiver_words),
-            receiver_words,
+        let receiver_range = metadata_region(
+            self.tcp_state.words,
+            receiver_base,
+            flow_count.saturating_mul(TCP_RECEIVER_WORDS),
             "per-flow TCP receiver state",
-        )?;
-        let ledger_meta = whole_region(
-            self.tcp_state
-                .read_range(ledger_meta_offset, ledger_meta_words),
-            ledger_meta_words,
+        )
+        .map_err(compaction_error)?;
+        let receiver_state = self
+            .tcp_state
+            .read_range(receiver_range.start, receiver_range.len());
+        let ledger_meta_range = metadata_region(
+            self.tcp_state.words,
+            ledger_meta_offset,
+            flow_count.saturating_mul(TCP_LEDGER_META_WORDS),
             "per-flow TCP ledger metadata",
-        )?;
+        )
+        .map_err(compaction_error)?;
+        let ledger_meta = self
+            .tcp_state
+            .read_range(ledger_meta_range.start, ledger_meta_range.len());
 
         let fel_plan = arena_compaction_plan(
             "FEL record",
@@ -4588,29 +4599,6 @@ impl MetalBuffers {
             memory_layout: self.memory_layout,
         })
     }
-}
-
-/// Refuses a metadata region its plane could not supply in full.
-///
-/// `SharedBuffer::read_range` clamps, which is right for fix 1's fault screen — a short read there
-/// decodes as zero occupancy — and wrong here: the decode indexes these regions by entity, so a
-/// short one would panic or silently drop complete state. Every plan the planner builds sizes them
-/// exactly; this turns a future planner change that did not into a typed refusal instead of a
-/// readback that is quietly missing entities.
-fn whole_region(
-    words: Vec<u64>,
-    expected: usize,
-    region: &str,
-) -> Result<Vec<u64>, AttemptFailure> {
-    if words.len() != expected {
-        return Err(MetalError::Validation(format!(
-            "device readback compaction refused: the {region} region supplied {} of {expected} \
-             words",
-            words.len()
-        ))
-        .into());
-    }
-    Ok(words)
 }
 
 /// Wraps a T20l fix-2 sizing refusal as an attempt failure.

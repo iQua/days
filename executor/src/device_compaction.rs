@@ -14,12 +14,22 @@
 //!
 //! # The determinism contract
 //!
-//! Every number in a [`CompactionPlan`] is a function of words the **device** wrote — an arena
-//! offset, a ring capacity, a ring head, a live count — plus the record width the planner fixed.
-//! There is no host guess, no high-water estimate, and no threshold: a plan for a given device
-//! state is unique, so two runs of the same image compact identically and decode identically.
-//! The destination offsets are the exclusive prefix sum of the live counts, taken in the same
-//! entity order the decode walks, which is what makes the gathered buffer directly indexable.
+//! Every number in a [`CompactionPlan`] comes from a word that is already on the device before the
+//! readback starts, and the two provenances are worth keeping apart:
+//!
+//! * **Device-written**, i.e. assigned by a kernel during the run: the **ring head** (`meta[+2]`)
+//!   and the **live count** (`meta[+3]`, `ledger_meta[+2]`, `receiver_state[+6]`).
+//! * **Planner-authored**, i.e. written by the host before upload and never reassigned on the
+//!   device: the **arena offset** (`meta[+0]`) and the **ring capacity** (`meta[+1]`), laid down by
+//!   `assign_arena_offsets` / `prepare_tcp_state`, plus the record widths.
+//!
+//! Neither is a host *guess* — that is the property that matters — but only the first pair carries
+//! run-dependent occupancy, and the refusals below are written against the first pair because it is
+//! the one a device defect could corrupt. There is no high-water estimate and no threshold: a plan
+//! for a given device state is unique, so two runs of the same image compact identically and decode
+//! identically. The destination offsets are the exclusive prefix sum of the live counts, taken in
+//! the same entity order the decode walks, which is what makes the gathered buffer directly
+//! indexable.
 //!
 //! # Byte-identity
 //!
@@ -65,8 +75,11 @@ pub(crate) struct CompactionEntity {
 impl CompactionEntity {
     /// The absolute source **word** offsets of this entity's live records, in decode order.
     ///
-    /// The host mirror of the gather kernel's inner loop; used by the unit tests and by the
-    /// backends' debug assertions rather than on the readback path itself.
+    /// The host mirror of the gather kernel's inner loop. It is `cfg(test)` and has no
+    /// non-test caller: the readback path never enumerates slots, because the gather resolves them
+    /// on the device. Its job is to be the thing
+    /// `tcp_ledger_ring::the_readback_compaction_ring_matches_the_canonical_ledger_slot` pins the
+    /// kernel's ring expression against.
     #[cfg(test)]
     pub(crate) fn live_record_slots(
         &self,
@@ -97,6 +110,39 @@ impl std::fmt::Display for CompactionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.0)
     }
+}
+
+/// Validates the extent of a contiguous metadata region before it is copied off the device.
+///
+/// Both backends clamp a bounded read to its plane — Metal because `SharedBuffer::read_range`
+/// clamps, CUDA because `CudaSlice::slice` panics on an out-of-range range. That clamp is right for
+/// T20l fix 1's fault screen, where a short read decodes as zero occupancy, and wrong here: the
+/// decode indexes these regions by entity, so a short one would panic or silently drop complete
+/// state.
+///
+/// Every plan the planner builds sizes the three regions exactly — `prepare_tcp_state` allocates
+/// `flow_count * TCP_RECEIVER_WORDS` before anything else and `flow_count * TCP_LEDGER_META_WORDS`
+/// after the range arena, and `stream_state` opens with `stream_count * ARENA_META_WORDS` — so this
+/// cannot refuse today. It exists so a future planner change that broke one of those invariants
+/// produces a typed refusal naming the region rather than a truncated readback, and it is one
+/// function rather than one per backend so both are covered by the same test.
+pub(crate) fn metadata_region(
+    plane_words: usize,
+    start: usize,
+    len: usize,
+    region: &str,
+) -> Result<std::ops::Range<usize>, CompactionError> {
+    let end = start.checked_add(len).ok_or_else(|| {
+        CompactionError(format!(
+            "the {region} region starts at word {start} and overflows a usize extent"
+        ))
+    })?;
+    if end > plane_words {
+        return Err(CompactionError(format!(
+            "the {region} region spans words {start}..{end} of a {plane_words}-word plane"
+        )));
+    }
+    Ok(start..end)
 }
 
 /// A gather request for one striped record arena.
@@ -135,6 +181,22 @@ impl CompactionPlan {
                 return Err(CompactionError(format!(
                     "{arena} ring reports {} live records in a {}-record ring",
                     entity.count, entity.capacity
+                )));
+            }
+            // T20l fix-2 review F2-L4: the ring head is checked here because nothing else on the
+            // readback path checks it any more. Before this fix the decode called
+            // `tcp_ledger_ring::ledger_record_slot` once per resident ledger record, and its
+            // `debug_assert!` on `head + logical` was the only readback-path check of the head the
+            // device wrote; the gather resolves the ring on the device, so that call is gone.
+            //
+            // This is stronger than what it replaces in two ways: it is on in release builds, and
+            // it covers all three ring arenas rather than the ledger alone. `max(capacity, 1)` is
+            // the span the kernel, the decode and `ledger_record_slot` all reduce by, so an empty
+            // ring legitimately has head 0 and nothing else.
+            if shape == CompactionShape::Ring && entity.head >= entity.capacity.max(1) {
+                return Err(CompactionError(format!(
+                    "{arena} ring head {} is outside its {}-record ring",
+                    entity.head, entity.capacity
                 )));
             }
             // The gather reads `source_words + physical * record_words + w` for
@@ -355,6 +417,69 @@ mod tests {
         )
         .expect_err("out-of-range plan");
         assert!(error.0.contains("past the 12-word source plane"), "{error}");
+    }
+
+    #[test]
+    fn a_ring_head_outside_its_own_ring_is_refused() {
+        // T20l fix-2 review F2-L4. Before this fix the readback called
+        // `tcp_ledger_ring::ledger_record_slot` once per resident ledger record, whose
+        // `debug_assert!` checked the ring head against real device state on every debug-build
+        // readback. The gather resolves the ring on the device, so that call is gone; this
+        // refusal restores the check and, unlike the assertion, it is on in release too.
+        let error =
+            CompactionPlan::new("test", CompactionShape::Ring, 2, vec![ring(0, 4, 4, 1)], 64)
+                .expect_err("head at capacity");
+        assert!(
+            error.0.contains("ring head 4 is outside its 4-record ring"),
+            "{error}"
+        );
+        // Capacity 0 rings still admit head 0, because `max(capacity, 1)` is the span the kernel
+        // and the decode both reduce by.
+        assert!(
+            CompactionPlan::new("test", CompactionShape::Ring, 2, vec![ring(0, 0, 0, 0)], 64)
+                .is_ok()
+        );
+        assert!(
+            CompactionPlan::new("test", CompactionShape::Ring, 2, vec![ring(0, 0, 1, 0)], 64)
+                .is_err()
+        );
+        // A Linear arena ignores the head word entirely, so a nonzero one is not a defect there.
+        assert!(
+            CompactionPlan::new(
+                "test",
+                CompactionShape::Linear,
+                2,
+                vec![ring(0, 0, 9, 1)],
+                64
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_metadata_region_past_its_plane_is_refused_rather_than_clamped() {
+        // T20l fix-2 review F2-L6: the guard both backends apply to the contiguous metadata
+        // regions, which used to be two separate untested branches.
+        assert_eq!(
+            metadata_region(64, 8, 16, "per-flow TCP receiver state").expect("in-range region"),
+            8..24
+        );
+        assert_eq!(
+            metadata_region(64, 0, 64, "per-stream ring metadata").expect("exact-fit region"),
+            0..64
+        );
+        let error = metadata_region(64, 60, 8, "per-flow TCP ledger metadata")
+            .expect_err("region past the plane");
+        assert!(
+            error.0.contains(
+                "per-flow TCP ledger metadata region spans words 60..68 of a 64-word plane"
+            ),
+            "{error}"
+        );
+        // A start past the plane is refused rather than silently yielding an empty region.
+        assert!(metadata_region(64, 96, 0, "per-stream ring metadata").is_err());
+        // And an extent that overflows `usize` is refused rather than wrapping.
+        assert!(metadata_region(64, usize::MAX, 1, "per-stream ring metadata").is_err());
     }
 
     #[test]
