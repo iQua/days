@@ -10,7 +10,45 @@ use rand::rngs::SmallRng;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::topos::config::{Config, FatTreeConfig, TopoCategory, TorusConfig};
+use crate::topos::config::{Config, DragonflyConfig, FatTreeConfig, TopoCategory, TorusConfig};
+
+/// Structural identity of a built topology.
+///
+/// Lowering needs more than the bare graph to answer structural questions — which layer a link
+/// belongs to, how many groups a dragonfly has. The builder is the only place that knows, so it
+/// says so rather than letting later stages re-derive it from node numbering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TopologyProfile {
+    FatTree {
+        edge_switches: u64,
+        aggregation_switches: u64,
+        core_switches: u64,
+    },
+    Torus,
+    Dragonfly {
+        groups: u64,
+        routers_per_group: u64,
+    },
+    Custom,
+}
+
+/// Deterministic endpoint-pairing policy for a flow set (T21/P12).
+///
+/// `Random` is the standing behaviour: endpoints are drawn from the scenario's endpoint RNG. The
+/// structural policies draw nothing — they are pure functions of the host attachment grid — and so
+/// leave the RNG stream of any later `Random` flow set exactly where they found it.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub enum PairingPolicy {
+    #[default]
+    Random,
+    /// Host at rack ordinal *o* of attachment switch *s* sends to ordinal *o* of switch
+    /// *(s + S/2) mod S*. On a fat tree this is the cross-pod permutation matrix GeDES's
+    /// `BuildTCPConnections` builds (host *i* to host *i + N/2* under its switch-major numbering).
+    SwitchOffsetHalf,
+    /// Host at rack ordinal *o* of attachment switch *s* sends to ordinal *(o + 1) mod H* of the
+    /// same switch: a rack-local permutation that never leaves the top-of-rack switch.
+    SameSwitchNext,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct HostAttachment {
@@ -96,6 +134,110 @@ impl HostAttachments {
         Self::sample_flow_pairs_from(&host_ids, false, rng, count)
     }
 
+    /// Deterministic structural endpoint pairs, drawn from the attachment grid rather than the RNG.
+    ///
+    /// Members are enumerated in ascending host topology identity, so member *m* sources at the
+    /// *m*-th host. Both policies are permutations, so a flow set may not request more members
+    /// than there are hosts.
+    pub fn structural_flow_pairs(
+        &self,
+        policy: PairingPolicy,
+        count: usize,
+    ) -> std::result::Result<Vec<(usize, usize)>, String> {
+        let grid = self.attachment_grid()?;
+        let switches = grid.len();
+        let ordinals = grid[0].len();
+        if count > switches * ordinals {
+            return Err(format!(
+                "structural flow-set count {count} exceeds the {} configured host attachments",
+                switches * ordinals
+            ));
+        }
+        match policy {
+            PairingPolicy::Random => {
+                return Err("random pairing is not a structural policy".to_owned());
+            }
+            PairingPolicy::SwitchOffsetHalf if !switches.is_multiple_of(2) => {
+                return Err(format!(
+                    "SwitchOffsetHalf pairing requires an even attachment-switch count, got {switches}"
+                ));
+            }
+            PairingPolicy::SameSwitchNext if ordinals < 2 => {
+                return Err(
+                    "SameSwitchNext pairing requires at least two hosts per attachment switch"
+                        .to_owned(),
+                );
+            }
+            _ => {}
+        }
+
+        let mut sources = self.host_ids.clone();
+        sources.sort_unstable();
+        sources.truncate(count);
+        let position = self.grid_positions(&grid);
+        sources
+            .into_iter()
+            .map(|source| {
+                let (switch, ordinal) = position[&source];
+                let target = match policy {
+                    PairingPolicy::Random => unreachable!("refused above"),
+                    PairingPolicy::SwitchOffsetHalf => {
+                        grid[(switch + switches / 2) % switches][ordinal]
+                    }
+                    PairingPolicy::SameSwitchNext => grid[switch][(ordinal + 1) % ordinals],
+                };
+                Ok((source, target))
+            })
+            .collect()
+    }
+
+    /// Hosts arranged as `[attachment switch rank][rack ordinal]`, both in ascending identity.
+    ///
+    /// Structural pairings are only well defined on a uniform grid, so a ragged attachment map is
+    /// refused here rather than silently pairing across differently populated racks.
+    fn attachment_grid(&self) -> std::result::Result<Vec<Vec<usize>>, String> {
+        let mut by_switch = std::collections::BTreeMap::<usize, Vec<usize>>::new();
+        for entry in &self.entries {
+            by_switch
+                .entry(entry.switch_id)
+                .or_default()
+                .push(entry.host_id);
+        }
+        if by_switch.is_empty() {
+            return Err("structural pairing requires at least one host attachment".to_owned());
+        }
+        let grid = by_switch
+            .into_values()
+            .map(|mut hosts| {
+                hosts.sort_unstable();
+                hosts
+            })
+            .collect::<Vec<_>>();
+        let ordinals = grid[0].len();
+        if grid.iter().any(|hosts| hosts.len() != ordinals) {
+            return Err(
+                "structural pairing requires the same host count on every attachment switch"
+                    .to_owned(),
+            );
+        }
+        Ok(grid)
+    }
+
+    fn grid_positions(
+        &self,
+        grid: &[Vec<usize>],
+    ) -> std::collections::BTreeMap<usize, (usize, usize)> {
+        grid.iter()
+            .enumerate()
+            .flat_map(|(switch, hosts)| {
+                hosts
+                    .iter()
+                    .enumerate()
+                    .map(move |(ordinal, host)| (*host, (switch, ordinal)))
+            })
+            .collect()
+    }
+
     fn sample_flow_pairs_from(
         host_ids: &[usize],
         distinct_source_sampling: bool,
@@ -175,11 +317,11 @@ impl NetworkGraph {
 }
 
 trait TopologyBuilder {
-    fn build(&self) -> Result<(UnGraph<usize, ()>, HostAttachments)>;
+    fn build(&self) -> Result<(UnGraph<usize, ()>, HostAttachments, TopologyProfile)>;
 }
 
 impl TopologyBuilder for FatTreeConfig {
-    fn build(&self) -> Result<(UnGraph<usize, ()>, HostAttachments)> {
+    fn build(&self) -> Result<(UnGraph<usize, ()>, HostAttachments, TopologyProfile)> {
         let k = u32::try_from(self.k)
             .map_err(|_| TopologyError::NumericOverflow("FatTree k parameter overflow".into()))?;
 
@@ -203,12 +345,100 @@ impl TopologyBuilder for FatTreeConfig {
         let graph = UnGraph::<usize, ()>::from_edges(&edges);
         let hosts = create_fattree_host_list(num_layer_switches, hosts_per_edge)?;
 
-        Ok((graph, hosts))
+        Ok((
+            graph,
+            hosts,
+            TopologyProfile::FatTree {
+                edge_switches: u64::from(num_layer_switches),
+                aggregation_switches: u64::from(num_layer_switches),
+                core_switches: u64::from(k.pow(2) / 4),
+            },
+        ))
+    }
+}
+
+impl TopologyBuilder for DragonflyConfig {
+    fn build(&self) -> Result<(UnGraph<usize, ()>, HostAttachments, TopologyProfile)> {
+        let routers_per_group = self.routers_per_group;
+        let global_ports = self.global_ports_per_router;
+        let hosts_per_router = self.hosts_per_router.unwrap_or(1);
+        if routers_per_group < 2 {
+            return Err(TopologyError::InvalidConfig(
+                "dragonfly routers_per_group must be at least 2".into(),
+            ));
+        }
+        if global_ports == 0 {
+            return Err(TopologyError::InvalidConfig(
+                "dragonfly global_ports_per_router must be positive".into(),
+            ));
+        }
+        if hosts_per_router == 0 {
+            return Err(TopologyError::InvalidConfig(
+                "dragonfly hosts_per_router must be positive".into(),
+            ));
+        }
+        // Balanced group count: with g = a*h + 1 every pair of groups is joined by exactly one
+        // global link, so the global-port budget is exactly consumed and no group pair is
+        // multiply connected (parallel physical links are refused by lowering).
+        let groups = routers_per_group
+            .checked_mul(global_ports)
+            .and_then(|ports| ports.checked_add(1))
+            .ok_or_else(|| {
+                TopologyError::NumericOverflow("dragonfly group count overflow".into())
+            })?;
+        let router_count = groups.checked_mul(routers_per_group).ok_or_else(|| {
+            TopologyError::NumericOverflow("dragonfly router count overflow".into())
+        })?;
+        u32::try_from(router_count).map_err(|_| {
+            TopologyError::NumericOverflow("dragonfly router identity overflow".into())
+        })?;
+        info!(
+            "Building a Dragonfly topology with {groups} group(s), {routers_per_group} router(s) \
+             per group, {global_ports} global port(s) per router, and {hosts_per_router} \
+             host(s) per router."
+        );
+
+        let router = |group: usize, index: usize| (group * routers_per_group + index) as u32;
+        let mut edges = Vec::new();
+        for group in 0..groups {
+            for left in 0..routers_per_group {
+                for right in (left + 1)..routers_per_group {
+                    edges.push((router(group, left), router(group, right)));
+                }
+            }
+        }
+        // Absolute (circulant) global arrangement: global port `port` of group `group` reaches
+        // group `(group + port + 1) mod groups`, and the partner's matching port is
+        // `groups - port - 2`. Emitting only the `group < partner` half writes each group pair once.
+        for group in 0..groups {
+            for port in 0..(groups - 1) {
+                let partner = (group + port + 1) % groups;
+                if group >= partner {
+                    continue;
+                }
+                let partner_port = groups - port - 2;
+                edges.push((
+                    router(group, port / global_ports),
+                    router(partner, partner_port / global_ports),
+                ));
+            }
+        }
+
+        let graph = UnGraph::<usize, ()>::from_edges(&edges);
+        let hosts = create_uniform_host_list(router_count, hosts_per_router)?;
+        Ok((
+            graph,
+            hosts,
+            TopologyProfile::Dragonfly {
+                groups: groups as u64,
+                routers_per_group: routers_per_group as u64,
+            },
+        ))
     }
 }
 
 impl TopologyBuilder for TorusConfig {
-    fn build(&self) -> Result<(UnGraph<usize, ()>, HostAttachments)> {
+    fn build(&self) -> Result<(UnGraph<usize, ()>, HostAttachments, TopologyProfile)> {
         let dimension = self.dim as u32;
         let nodes_per_dim = self.n as u32;
 
@@ -224,11 +454,19 @@ impl TopologyBuilder for TorusConfig {
         let graph = UnGraph::<usize, ()>::from_edges(&edges);
         let hosts = HostAttachments::identity((0..total_nodes).collect())?;
 
-        Ok((graph, hosts))
+        Ok((graph, hosts, TopologyProfile::Torus))
     }
 }
 
 pub fn build_graph(file_path: &str) -> Result<(UnGraph<usize, ()>, HostAttachments)> {
+    let (graph, hosts, _) = build_graph_with_profile(file_path)?;
+    Ok((graph, hosts))
+}
+
+/// [`build_graph`] with the structural profile lowering needs for layer-keyed questions.
+pub fn build_graph_with_profile(
+    file_path: &str,
+) -> Result<(UnGraph<usize, ()>, HostAttachments, TopologyProfile)> {
     let content = fs::read_to_string(file_path)?;
 
     let config: Config = match toml::from_str::<Config>(&content) {
@@ -255,17 +493,27 @@ pub fn build_graph(file_path: &str) -> Result<(UnGraph<usize, ()>, HostAttachmen
                     .ok_or_else(|| TopologyError::InvalidConfig("Missing Torus config".into()))?
                     .build()
             }
+            TopoCategory::Dragonfly => {
+                debug!("Initializing Dragonfly graph");
+                topo_config
+                    .dragonfly
+                    .ok_or_else(|| TopologyError::InvalidConfig("Missing Dragonfly config".into()))?
+                    .build()
+            }
         },
         None => build_custom_graph(&content),
     }
 }
 
-fn build_custom_graph(content: &str) -> Result<(UnGraph<usize, ()>, HostAttachments)> {
+fn build_custom_graph(
+    content: &str,
+) -> Result<(UnGraph<usize, ()>, HostAttachments, TopologyProfile)> {
     let graph_config: NetworkGraph = toml::from_str(content)?;
     graph_config.validate()?;
     Ok((
         UnGraph::<usize, ()>::from_edges(&graph_config.edges),
         HostAttachments::identity(graph_config.hosts)?,
+        TopologyProfile::Custom,
     ))
 }
 
@@ -376,25 +624,37 @@ fn create_fattree_host_list(
 ) -> Result<HostAttachments> {
     let edge_switch_count = usize::try_from(edge_switch_count)
         .map_err(|_| TopologyError::NumericOverflow("Edge switch count overflow".into()))?;
-    let host_count = edge_switch_count
-        .checked_mul(hosts_per_edge)
+    create_uniform_host_list(edge_switch_count, hosts_per_edge)
+}
+
+/// Ordinal-major host attachment: `host = ordinal * switch_count + switch`.
+///
+/// Shared by every builder that attaches a uniform number of hosts to a set of leaf switches, so
+/// the fat tree and the dragonfly number their hosts by the same rule and a structural pairing
+/// means the same thing on both.
+fn create_uniform_host_list(
+    switch_count: usize,
+    hosts_per_switch: usize,
+) -> Result<HostAttachments> {
+    let host_count = switch_count
+        .checked_mul(hosts_per_switch)
         .ok_or_else(|| TopologyError::NumericOverflow("Host count overflow".into()))?;
     let mut hosts = Vec::new();
     hosts.try_reserve_exact(host_count).map_err(|error| {
         TopologyError::NumericOverflow(format!("Host list allocation: {error}"))
     })?;
-    for host_ordinal in 0..hosts_per_edge {
+    for host_ordinal in 0..hosts_per_switch {
         let host_base = host_ordinal
-            .checked_mul(edge_switch_count)
+            .checked_mul(switch_count)
             .ok_or_else(|| TopologyError::NumericOverflow("Host identity overflow".into()))?;
-        for switch_id in 0..edge_switch_count {
+        for switch_id in 0..switch_count {
             let host_id = host_base
                 .checked_add(switch_id)
                 .ok_or_else(|| TopologyError::NumericOverflow("Host identity overflow".into()))?;
             hosts.push(HostAttachment { host_id, switch_id });
         }
     }
-    HostAttachments::new(hosts, hosts_per_edge > 1)
+    HostAttachments::new(hosts, hosts_per_switch > 1)
 }
 
 fn build_torus_edges(dimension: u32, nodes_per_dim: u32) -> Result<Vec<(u32, u32)>> {
@@ -499,12 +759,14 @@ mod tests {
         hosts_per_edge: Option<usize>,
     ) -> (UnGraph<usize, ()>, HostAttachments) {
         let config = FatTreeConfig { k, hosts_per_edge };
-        config.build().unwrap()
+        let (graph, hosts, _) = config.build().unwrap();
+        (graph, hosts)
     }
 
     fn create_torus(dim: usize, n: usize) -> (UnGraph<usize, ()>, HostAttachments) {
         let config = TorusConfig { dim, n };
-        config.build().unwrap()
+        let (graph, hosts, _) = config.build().unwrap();
+        (graph, hosts)
     }
 
     // FatTree Tests

@@ -22,8 +22,13 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use super::ids::{IdError, LinkKey, LpKey, PhysicalNodeKey, StableIds, dense_ids};
-use crate::topos::build::{HostAttachments, TopologyError, build_graph};
-use crate::topos::route::{RouteTableError, RouteWorkers, compute_shortest_path_route_table_with};
+use crate::topos::build::{
+    HostAttachments, PairingPolicy, TopologyError, TopologyProfile, build_graph_with_profile,
+};
+use crate::topos::route::{
+    EcmpFlow, RouteTableError, RouteWorkers, compute_fat_tree_ecmp_route_table,
+    compute_shortest_path_route_table_with,
+};
 
 /// Failure while lowering supported Days source configuration.
 #[derive(Debug, Error)]
@@ -59,6 +64,7 @@ struct SourceConfig {
     switch: SourceSwitch,
     link: Option<SourceLink>,
     time_quantum_ns: Option<u64>,
+    routing: Option<SourceRouting>,
     flow: Option<Vec<SourceFlow>>,
     flow_set: Option<Vec<SourceFlowSet>>,
     collective: Option<Vec<SourceCollective>>,
@@ -76,11 +82,35 @@ struct SourceSwitch {
     priorities: Option<Vec<u64>>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SourceRouting {
+    policy: String,
+}
+
+/// Which equal-cost path a flow takes through the fabric.
+///
+/// `ShortestPath` is the standing single-path policy and stays the default, so every scenario
+/// authored before T21 lowers to the bytes it was measured with.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum RoutingPolicy {
+    #[default]
+    ShortestPath,
+    FatTreeEcmp,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct SourceLink {
     mode: Option<String>,
     pfc: Option<SourcePfc>,
     propagation_ns: Option<u64>,
+    propagation_tiers: Option<SourcePropagationTiers>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+struct SourcePropagationTiers {
+    host_to_edge_ns: u64,
+    edge_to_aggregation_ns: u64,
+    aggregation_to_core_ns: u64,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -115,6 +145,7 @@ struct SourceFlowSet {
     flow_count: u64,
     priority: Option<u8>,
     routing: Option<toml::Value>,
+    pairing: Option<String>,
     traffic: SourceTraffic,
 }
 
@@ -278,11 +309,17 @@ struct ExplicitFlowKey {
     traffic: TrafficKey,
 }
 
+/// Semantic identity of one flow set.
+///
+/// `pairing` is declared last so that ordering, and therefore lowered flow identity, is unchanged
+/// for every scenario that does not name a structural policy: two `Random` keys compare on the
+/// earlier fields exactly as they did before T21.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct FlowSetKey {
     flow_count: u64,
     priority: u8,
     traffic: TrafficKey,
+    pairing: PairingPolicy,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -375,9 +412,9 @@ pub fn compile_config_with_route_workers(
 
     let source: SourceConfig = toml::from_str(&content)?;
     let model = SupportedModel::from_source(source, &content)?;
-    let (graph, hosts) = build_graph(path_str)?;
+    let (graph, hosts, profile) = build_graph_with_profile(path_str)?;
 
-    let image = lower(model, &graph, hosts, route_workers)?;
+    let image = lower(model, &graph, hosts, profile, route_workers)?;
     validate(&image, Backend::Scalar).map_err(|error| {
         CompileError::Invalid(format!("lowered image failed validation: {error}"))
     })?;
@@ -392,10 +429,21 @@ struct SupportedModel {
     scheduler: SchedulerKind,
     drop_mark: DropMarkPolicy,
     pfc: Option<PfcLowering>,
-    propagation_ns: u64,
+    routing: RoutingPolicy,
+    propagation: PropagationModel,
     explicit_flows: Vec<ExplicitFlowKey>,
     flow_sets: Vec<FlowSetKey>,
     collectives: Vec<CollectiveKey>,
+}
+
+/// How lowering stamps `LinkDescriptor::propagation_ns`.
+///
+/// `Uniform` is the standing model. `FatTreeTiers` (T21/P12 F-HET) keys the delay on the fabric
+/// layer a link belongs to: host attachment, edge-to-aggregation, aggregation-to-core.
+#[derive(Clone, Copy, Debug)]
+enum PropagationModel {
+    Uniform(u64),
+    FatTreeTiers(SourcePropagationTiers),
 }
 
 #[derive(Clone)]
@@ -641,6 +689,33 @@ impl SupportedModel {
             collectives.extend(validate_collective_set(collective_set, scenario_text)?);
         }
 
+        let routing = match source
+            .routing
+            .as_ref()
+            .map(|routing| routing.policy.as_str())
+        {
+            None | Some("ShortestPath") => RoutingPolicy::ShortestPath,
+            Some("FatTreeEcmp") => RoutingPolicy::FatTreeEcmp,
+            Some(unsupported) => {
+                return Err(CompileError::Unsupported(format!(
+                    "unsupported `routing.policy` `{unsupported}`; Days lowering supports \
+                     ShortestPath and FatTreeEcmp"
+                )));
+            }
+        };
+
+        let propagation = match (link.propagation_ns, link.propagation_tiers) {
+            (Some(_), Some(_)) => {
+                return Err(CompileError::Invalid(
+                    "`link.propagation_ns` and `link.propagation_tiers` are mutually exclusive; \
+                     a link carries exactly one delay"
+                        .to_owned(),
+                ));
+            }
+            (_, Some(tiers)) => PropagationModel::FatTreeTiers(tiers),
+            (propagation_ns, None) => PropagationModel::Uniform(propagation_ns.unwrap_or(0)),
+        };
+
         Ok(Self {
             seed,
             stop_time_ns,
@@ -649,7 +724,8 @@ impl SupportedModel {
             scheduler,
             drop_mark,
             pfc,
-            propagation_ns: link.propagation_ns.unwrap_or(0),
+            routing,
+            propagation,
             explicit_flows,
             flow_sets,
             collectives,
@@ -828,7 +904,20 @@ fn validate_flow_set(
         flow_count: flow_set.flow_count,
         priority,
         traffic,
+        pairing: validate_pairing(flow_set.pairing.as_deref())?,
     })
+}
+
+fn validate_pairing(pairing: Option<&str>) -> Result<PairingPolicy, CompileError> {
+    match pairing {
+        None | Some("Random") => Ok(PairingPolicy::Random),
+        Some("SwitchOffsetHalf") => Ok(PairingPolicy::SwitchOffsetHalf),
+        Some("SameSwitchNext") => Ok(PairingPolicy::SameSwitchNext),
+        Some(unsupported) => Err(CompileError::Unsupported(format!(
+            "unsupported flow-set pairing `{unsupported}`; Days lowering supports Random, \
+             SwitchOffsetHalf, and SameSwitchNext"
+        ))),
+    }
 }
 
 fn collective_algorithm(name: &str) -> Result<CollectiveAlgorithm, CompileError> {
@@ -1752,12 +1841,82 @@ fn image_route(
     route
 }
 
+/// Resolves the configured propagation model against the built topology into a per-link delay.
+///
+/// Tiering is fat-tree-only on purpose: the tier names *are* fat-tree layer names, and inventing a
+/// mapping for a topology whose layers are not those layers would be improvisation, not lowering.
+fn link_delay_model(
+    propagation: PropagationModel,
+    profile: TopologyProfile,
+) -> Result<LinkDelay, CompileError> {
+    let tiers = match propagation {
+        PropagationModel::Uniform(propagation_ns) => {
+            return Ok(LinkDelay::Uniform(propagation_ns));
+        }
+        PropagationModel::FatTreeTiers(tiers) => tiers,
+    };
+    let TopologyProfile::FatTree {
+        edge_switches,
+        aggregation_switches,
+        ..
+    } = profile
+    else {
+        return Err(CompileError::Unsupported(format!(
+            "unsupported `link.propagation_tiers` on a {profile:?} topology; per-tier link delay \
+             is defined only for the FatTree profile"
+        )));
+    };
+    let core_boundary = edge_switches
+        .checked_add(aggregation_switches)
+        .ok_or_else(|| CompileError::Invalid("fat-tree layer boundary exceeds u64".to_owned()))?;
+    Ok(LinkDelay::FatTreeTiers {
+        tiers,
+        core_boundary,
+    })
+}
+
+/// Propagation model resolved against one built topology.
+#[derive(Clone, Copy, Debug)]
+enum LinkDelay {
+    Uniform(u64),
+    FatTreeTiers {
+        tiers: SourcePropagationTiers,
+        /// First aggregation-to-core switch identity: `edge_switches + aggregation_switches`.
+        core_boundary: u64,
+    },
+}
+
+impl LinkDelay {
+    fn of(self, key: LinkKey) -> u64 {
+        match self {
+            Self::Uniform(propagation_ns) => propagation_ns,
+            Self::FatTreeTiers {
+                tiers,
+                core_boundary,
+            } => match (key.source, key.target) {
+                (PhysicalNodeKey::Host(_), _) | (_, PhysicalNodeKey::Host(_)) => {
+                    tiers.host_to_edge_ns
+                }
+                (PhysicalNodeKey::Switch(left), PhysicalNodeKey::Switch(right)) => {
+                    if left.max(right) < core_boundary {
+                        tiers.edge_to_aggregation_ns
+                    } else {
+                        tiers.aggregation_to_core_ns
+                    }
+                }
+            },
+        }
+    }
+}
+
 fn lower(
     model: SupportedModel,
     graph: &petgraph::graph::UnGraph<usize, ()>,
     hosts: HostAttachments,
+    profile: TopologyProfile,
     route_workers: RouteWorkers,
 ) -> Result<SimulationImage, CompileError> {
+    let link_delay = link_delay_model(model.propagation, profile)?;
     let switch_topology_ids = graph
         .node_indices()
         .map(|node| u64::try_from(node.index()))
@@ -1861,17 +2020,30 @@ fn lower(
         model.seed,
     )?;
     let flow_ids = dense_ids(flows.iter().map(|flow| flow.key.clone()))?;
-    let route_table = compute_shortest_path_route_table_with(
-        graph,
-        flows.iter().enumerate().map(|(index, flow)| {
-            (
-                index,
-                NodeIndex::new(host_attachment_switches[&flow.source] as usize),
-                NodeIndex::new(host_attachment_switches[&flow.target] as usize),
-            )
-        }),
-        route_workers,
-    )
+    let route_table = match model.routing {
+        RoutingPolicy::ShortestPath => compute_shortest_path_route_table_with(
+            graph,
+            flows.iter().enumerate().map(|(index, flow)| {
+                (
+                    index,
+                    NodeIndex::new(host_attachment_switches[&flow.source] as usize),
+                    NodeIndex::new(host_attachment_switches[&flow.target] as usize),
+                )
+            }),
+            route_workers,
+        ),
+        RoutingPolicy::FatTreeEcmp => compute_fat_tree_ecmp_route_table(
+            graph,
+            flows.iter().enumerate().map(|(index, flow)| EcmpFlow {
+                key: index,
+                source_switch: NodeIndex::new(host_attachment_switches[&flow.source] as usize),
+                target_switch: NodeIndex::new(host_attachment_switches[&flow.target] as usize),
+                // The hash stands in for a switch's header hash. It is taken from the flow's own
+                // semantic key, so it is a pure function of the scenario text.
+                flow_hash: generator_seed(model.seed ^ 0x4543_4d50_5f48_4153, &flow.key),
+            }),
+        ),
+    }
     .map_err(|error| match error {
         RouteTableError::Unreachable(index) => {
             let flow = &flows[index];
@@ -1883,6 +2055,11 @@ fn lower(
         RouteTableError::DuplicateKey(_) => {
             CompileError::Invalid("duplicate internal flow route key".to_string())
         }
+        RouteTableError::UnsupportedTopology => CompileError::Unsupported(
+            "unsupported `routing.policy = \"FatTreeEcmp\"` on a topology that is not a canonical \
+             fat tree; equal-cost multipath selection is defined only for the FatTree profile"
+                .to_owned(),
+        ),
     })?;
     let flow_descriptors = flows
         .iter()
@@ -2292,7 +2469,7 @@ fn lower(
             source: ids.node(LpKey::for_link_source(key)),
             target: ids.node(LpKey::for_link_target(key)),
             rate_bps: model.rate_bps,
-            propagation_ns: model.propagation_ns,
+            propagation_ns: link_delay.of(key),
         })
         .collect::<Vec<_>>();
     let mut channel_keys = BTreeSet::<(LinkId, NodeId)>::new();
@@ -2576,9 +2753,16 @@ fn canonical_flows(
         flows.try_reserve_exact(member_count).map_err(|error| {
             CompileError::Invalid(format!("flow-set expansion is too large: {error}"))
         })?;
-        let pairs = host_attachments
-            .sample_canonical_flow_pairs(&mut rng, member_count)
-            .map_err(CompileError::Invalid)?;
+        // A structural pairing is a pure function of the attachment grid and never touches `rng`,
+        // so a later `Random` flow set draws exactly the endpoints it would have drawn alone.
+        let pairs = match semantic.pairing {
+            PairingPolicy::Random => host_attachments
+                .sample_canonical_flow_pairs(&mut rng, member_count)
+                .map_err(CompileError::Invalid)?,
+            policy => host_attachments
+                .structural_flow_pairs(policy, member_count)
+                .map_err(CompileError::Invalid)?,
+        };
         for (member_ordinal, (source, target)) in (0..semantic.flow_count).zip(pairs) {
             let source = u64::try_from(source).map_err(|_| {
                 CompileError::Invalid("source host identity exceeds u64".to_owned())
@@ -2936,6 +3120,17 @@ fn generator_seed(image_seed: u64, key: &FlowKey) -> u64 {
             state = mix_seed(state ^ semantic.flow_count);
             if semantic.priority != 0 {
                 state = mix_seed(state ^ u64::from(semantic.priority));
+            }
+            // Mixed only when a structural policy is named, so every pre-T21 scenario keeps the
+            // generator seeds it was measured with.
+            match semantic.pairing {
+                PairingPolicy::Random => {}
+                PairingPolicy::SwitchOffsetHalf => {
+                    state = mix_seed(state ^ 0x5041_4952_5f4f_4646);
+                }
+                PairingPolicy::SameSwitchNext => {
+                    state = mix_seed(state ^ 0x5041_4952_5f52_4143);
+                }
             }
             state = mix_traffic_seed(state, &semantic.traffic);
             state = mix_seed(state ^ duplicate_ordinal);

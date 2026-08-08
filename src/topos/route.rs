@@ -420,6 +420,8 @@ fn canonical_routing_graph(graph: &UnGraph<usize, ()>) -> UnGraph<usize, ()> {
 pub enum RouteTableError<K> {
     DuplicateKey(K),
     Unreachable(K),
+    /// A policy that is defined only for one topology family was asked for on another.
+    UnsupportedTopology,
 }
 
 /// Largest host-thread budget the per-flow route scatter will use.
@@ -545,6 +547,109 @@ fn scatter_routes(
         }
     });
     routes
+}
+
+/// One flow's routing request under [`compute_fat_tree_ecmp_route_table`].
+///
+/// `flow_hash` stands in for the header fields a real switch hashes. Lowering derives it from the
+/// flow's own semantic identity, so the selection is a pure function of the scenario and is
+/// reproduced bit-for-bit by every backend and every host-thread budget.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EcmpFlow<K> {
+    pub key: K,
+    pub source_switch: NodeIndex,
+    pub target_switch: NodeIndex,
+    pub flow_hash: u64,
+}
+
+/// Equal-cost multipath selection over a canonical fat tree (T21/P12).
+///
+/// WHY THIS EXISTS. [`compute_shortest_path_route_table`] returns ONE shortest path per switch
+/// pair, and its tie-break is the lowest neighbour identity, so every inter-pod route in a
+/// canonical fat tree leaves through aggregation group 0 and crosses core switch 0. That is a
+/// single-path fabric: a cross-pod permutation at k = 32 puts all 8,192 flows through one core
+/// switch. Every external arm in the P12 roster spreads that traffic (Unison exposes `--ecmp`;
+/// GeDES reports no queue overflow at 90% on the same matrix), so a cross-arm fixture routed
+/// single-path would not be expressing the same fabric as the arms it is compared against.
+///
+/// THE SELECTION. An inter-pod path is
+/// `edge_s -> agg(pod_s, a) -> core(a, c) -> agg(pod_t, a) -> edge_t`, with aggregation group `a`
+/// and core offset `c` taken from disjoint halves of the flow hash. The aggregation group has to
+/// be the SAME on both sides, because core switch `core(a, c)` is wired only to the group-`a`
+/// aggregation switch of each pod. An intra-pod path is `edge_s -> agg(pod, a) -> edge_t`, and
+/// endpoints sharing an edge switch give the same one-hop path the shortest-path table gives.
+///
+/// Selection is O(1) per flow and searches nothing, so it runs serially: the host-thread budget is
+/// irrelevant to it and cannot perturb it.
+pub fn compute_fat_tree_ecmp_route_table<K>(
+    graph: &UnGraph<usize, ()>,
+    flows: impl IntoIterator<Item = EcmpFlow<K>>,
+) -> Result<BTreeMap<K, Vec<NodeIndex>>, RouteTableError<K>>
+where
+    K: Ord,
+{
+    let graph = canonical_routing_graph(graph);
+    let Some((num_layer_switches, switches_per_pod, _)) = ShortestPath::fat_tree_params(&graph)
+    else {
+        return Err(RouteTableError::UnsupportedTopology);
+    };
+    let core_start = 2 * num_layer_switches;
+    let groups = switches_per_pod as u64;
+
+    let mut ordered = Vec::new();
+    for flow in flows {
+        let source = flow.source_switch.index();
+        let target = flow.target_switch.index();
+        if source >= num_layer_switches || target >= num_layer_switches {
+            ordered.push((flow.key, None));
+            continue;
+        }
+        let route = if source == target {
+            vec![NodeIndex::new(source)]
+        } else {
+            let group = (flow.flow_hash % groups) as usize;
+            let source_pod = source / switches_per_pod;
+            let target_pod = target / switches_per_pod;
+            let source_aggregation = num_layer_switches + source_pod * switches_per_pod + group;
+            if source_pod == target_pod {
+                vec![
+                    NodeIndex::new(source),
+                    NodeIndex::new(source_aggregation),
+                    NodeIndex::new(target),
+                ]
+            } else {
+                let core = ((flow.flow_hash >> 32) % groups) as usize;
+                vec![
+                    NodeIndex::new(source),
+                    NodeIndex::new(source_aggregation),
+                    NodeIndex::new(core_start + group * switches_per_pod + core),
+                    NodeIndex::new(num_layer_switches + target_pod * switches_per_pod + group),
+                    NodeIndex::new(target),
+                ]
+            }
+        };
+        ordered.push((flow.key, Some(route)));
+    }
+
+    let first_duplicate = {
+        let keys = ordered.iter().map(|(key, _)| key).collect::<Vec<_>>();
+        first_repeated_key(&keys)
+    };
+    if let Some(index) = ordered.iter().position(|(_, route)| route.is_none()) {
+        return Err(RouteTableError::Unreachable(ordered.swap_remove(index).0));
+    }
+    if let Some(index) = first_duplicate {
+        return Err(RouteTableError::DuplicateKey(ordered.swap_remove(index).0));
+    }
+    Ok(ordered
+        .into_iter()
+        .map(|(key, route)| {
+            (
+                key,
+                route.expect("unreachable routes were rejected before the table was built"),
+            )
+        })
+        .collect())
 }
 
 /// Position of the first key that repeats an earlier key, in submission order.

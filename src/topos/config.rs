@@ -88,18 +88,33 @@ pub struct PfcLinkConfig {
     pub drain_interval: Option<f64>,
 }
 
+/// Per-tier propagation delays for a layered fabric (T21/P12 F-HET).
+///
+/// The lowered image has always carried a per-link `propagation_ns`; only configuration was
+/// restricted to one global value. A tier table names the three fat-tree layers explicitly rather
+/// than inferring them, so a fixture states its delay heterogeneity in the same place it states
+/// its topology.
+#[derive(Clone, Copy, Debug, Deserialize, Default, PartialEq, Eq)]
+pub struct PropagationTierConfig {
+    pub host_to_edge_ns: u64,
+    pub edge_to_aggregation_ns: u64,
+    pub aggregation_to_core_ns: u64,
+}
+
 #[cfg_attr(not(feature = "l2_pfc"), allow(dead_code))]
 #[derive(Clone, Debug, Deserialize, Default)]
 pub struct LinkConfig {
     pub mode: Option<LinkMode>,
     pub pfc: Option<PfcLinkConfig>,
     pub propagation_ns: Option<u64>,
+    pub propagation_tiers: Option<PropagationTierConfig>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 pub enum TopoCategory {
     FatTree,
     Torus,
+    Dragonfly,
 }
 
 #[derive(Deserialize)]
@@ -115,11 +130,25 @@ pub struct TorusConfig {
     pub n: usize,
 }
 
+/// Canonical Kim-style dragonfly (T21/P12 F-TOPO).
+///
+/// `routers_per_group` (a) routers form an all-to-all group; each router carries
+/// `global_ports_per_router` (h) global ports; the group count is the balanced `g = a*h + 1`, so
+/// every pair of groups is joined by exactly one global link. `hosts_per_router` (p) defaults to 1.
+#[derive(Deserialize)]
+pub struct DragonflyConfig {
+    pub routers_per_group: usize,
+    pub global_ports_per_router: usize,
+    #[serde(default)]
+    pub hosts_per_router: Option<usize>,
+}
+
 #[derive(Deserialize)]
 pub struct TopoConfig {
     pub category: TopoCategory,
     pub fat_tree: Option<FatTreeConfig>,
     pub torus: Option<TorusConfig>,
+    pub dragonfly: Option<DragonflyConfig>,
 }
 
 #[derive(Deserialize)]
