@@ -1587,6 +1587,42 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
         "Metal run recovered after outbox fault",
     );
 
+    // T20lm F-A: `max_outbox_events` is the *override* for BOTH producer arenas, and the one that
+    // faults first under a zero override is per-LP remote staging, not the plane-wide outbox. The
+    // arena-specific `outbox_events_total` cap above is what selects the outbox. The CUDA sibling
+    // asserted the outbox for this config and had never been executed; it is corrected against this
+    // case, which runs locally on every gate.
+    let remote_staging = executor
+        .run(
+            &image,
+            None,
+            MetalConfig {
+                max_outbox_events: Some(0),
+                max_capacity_retries: 0,
+                ..MetalConfig::default()
+            },
+        )
+        .expect_err("a zero producer-arena override must fault per-LP remote staging first");
+    assert_eq!(
+        remote_staging,
+        MetalError::CapacityExceeded {
+            arena: MetalArena::RemoteStaging,
+            node: Some(GENERATOR_SOURCE),
+            flow: None,
+            stream: None,
+            capacity: 0,
+            demand: 1,
+        }
+    );
+    assert_metal_full_result_matches_scalar(
+        &executor
+            .run_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full)
+            .expect("the same executor must recover after the remote-staging fault")
+            .result,
+        &expected,
+        "Metal run recovered after remote-staging fault",
+    );
+
     let observed = executor
         .run_with_observations(
             &image,

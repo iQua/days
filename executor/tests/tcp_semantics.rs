@@ -1309,20 +1309,56 @@ fn metal_tcp_ledger_capacity_retry_is_typed_and_byte_identical() {
     assert_eq!(retry.grown_capacity, 16);
 }
 
-/// T20l fix 1: a *failed* attempt must not pull the result arena across the bus.
+/// The screened readback ceiling, in words, for the *fixed* planes a capacity fault reads.
 ///
-/// Before the fix, `MetalBuffers::finish` read every plane and only then tested
-/// `control[CONTROL_ERROR]`, so each discarded attempt paid a full arena copy. T20l phase 1 §4.3
-/// measured that as 5.08 s per attempt on an RTX 4090 and 1.14 s on Apple unified memory, times
-/// the three attempts the RQ9 frontier discards. The screened order copies the control plane and,
-/// for a ledger fault, the per-flow occupancy metadata the T20i vector is decoded from — nothing
-/// else.
+/// The screen reads the control plane and (on CUDA) the params plane, both a few dozen words, plus
+/// [`SCREEN_LEDGER_META_WORDS`] per flow for a ledger fault's T20i occupancy vector, plus a wave
+/// boundary probe or two. 64 bounds the fixed part on either backend with headroom.
 ///
-/// The assertion is a ratio rather than an absolute word count so it states the property and not
-/// the fixture's plane sizes: the strict run performs exactly one failed attempt, the recovered run
-/// performs that same failed attempt plus one successful one, and only the successful attempt may
-/// carry an arena-sized readback. Under the old order both attempts copied the arena and the ratio
-/// is about 1:2, which fails this bound.
+/// **The point of this constant is what it does NOT contain: any term in the plan size.** A screen
+/// that read one extra arena would blow it by orders of magnitude on any real fixture.
+#[cfg(any(
+    all(feature = "metal-test-hooks", target_vendor = "apple"),
+    feature = "cuda-test-hooks"
+))]
+const SCREEN_FIXED_PLANE_WORDS_CEILING: u64 = 64;
+/// Metadata words per flow the T20i occupancy vector is decoded from — the one part of the screen
+/// that legitimately grows, and it grows with the image's flows, never with the arenas.
+#[cfg(any(
+    all(feature = "metal-test-hooks", target_vendor = "apple"),
+    feature = "cuda-test-hooks"
+))]
+const SCREEN_LEDGER_META_WORDS: u64 = 6;
+
+/// T20l fixes 1 and 2: **neither** readback path may scale with the plan.
+///
+/// Fix 1 made a *failed* attempt screen `control[CONTROL_ERROR]` before the ~19 GB result arena
+/// crosses the bus; fix 2 made a *successful* attempt copy the live regions instead of the arena.
+/// Both are the same claim about the same quantity — how many words `finish` asks for — so this
+/// test states it as one property and measures it the only way that cannot be gamed: it runs the
+/// same fixture at two plan sizes and requires **both** readbacks to be *identical*.
+///
+/// The arms differ only in `max_fel_events_per_lp` / `max_queue_packets_per_lp`, which are
+/// refuse-or-run capacity overrides with no semantic content, so the second arm plans a ~109x
+/// larger arena for the same simulation: same events, same packets, same fault, same result.
+///
+/// ```text
+///                plan words   fault-path readback   success-path readback
+///   small             4,238                    31                     558
+///   large           462,766                    31                     558
+/// ```
+///
+/// # Why this replaces a ratio, and why the ratio had to go
+///
+/// The original fix-1 assertion was `strict * 16 < recovered`. That was a *ratio between two
+/// measurements this fix changes*, and fix 2 duly invalidated it by shrinking the denominator:
+/// the T20l measurer's CUDA validation caught it at 56 vs 578 (needs 896), and Metal survived only
+/// on a 12.5% margin at 31 vs 558. A bound that a later improvement to the same code path can
+/// break is not a bound on the property; it is a bound on the arithmetic of one revision.
+///
+/// The equalities above have no such coupling. Under the pre-fix-1 order `strict` would equal the
+/// plan (4,238 and 462,766), so the first equality breaks by two orders of magnitude; under a
+/// fix-2 regression `recovered` would do the same. Neither can be satisfied by tuning a constant.
 #[cfg(all(feature = "metal-test-hooks", target_vendor = "apple"))]
 #[test]
 fn metal_capacity_fault_is_screened_before_the_arena_readback() {
@@ -1334,19 +1370,51 @@ fn metal_capacity_fault_is_screened_before_the_arena_readback() {
         ..DeviceCapacityCaps::default()
     };
 
-    let _ = days_executor::metal::take_readback_words_for_testing();
-    let strict_error = run_metal_with_observations(
-        &image,
-        None,
-        MetalConfig {
-            capacity_caps,
-            max_capacity_retries: 0,
-            ..MetalConfig::default()
-        },
-        ObservationMode::Full,
-    )
-    .expect_err("under-capped TCP ledger must fail in strict mode");
-    let strict_words = days_executor::metal::take_readback_words_for_testing();
+    // One arm: the same simulation planned at `inflate` arena capacity. Returns the fault-path and
+    // success-path readback word counts and the plan size each was measured against.
+    let arm = |inflate: Option<usize>| {
+        let _ = days_executor::metal::take_readback_words_for_testing();
+        let strict_error = run_metal_with_observations(
+            &image,
+            None,
+            MetalConfig {
+                capacity_caps,
+                max_capacity_retries: 0,
+                max_fel_events_per_lp: inflate,
+                max_queue_packets_per_lp: inflate,
+                ..MetalConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .expect_err("under-capped TCP ledger must fail in strict mode");
+        let strict_words = days_executor::metal::take_readback_words_for_testing();
+        let plane_words = days_executor::metal::last_plane_words_for_testing();
+
+        let recovered = run_metal_with_observations(
+            &image,
+            None,
+            MetalConfig {
+                capacity_caps,
+                max_fel_events_per_lp: inflate,
+                max_queue_packets_per_lp: inflate,
+                ..MetalConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .expect("adaptive TCP ledger growth must restart from the immutable image");
+        let recovered_words = days_executor::metal::take_readback_words_for_testing();
+        (
+            strict_error,
+            strict_words,
+            plane_words,
+            recovered,
+            recovered_words,
+        )
+    };
+
+    let (strict_error, small_strict, small_plane, recovered, small_recovered) = arm(None);
+    let (_, large_strict, large_plane, large_run, large_recovered) = arm(Some(8_192));
+
     assert!(
         matches!(
             strict_error,
@@ -1357,31 +1425,54 @@ fn metal_capacity_fault_is_screened_before_the_arena_readback() {
         ),
         "the screen must still produce the typed ledger fault, got {strict_error:?}"
     );
-
-    let recovered = run_metal_with_observations(
-        &image,
-        None,
-        MetalConfig {
-            capacity_caps,
-            ..MetalConfig::default()
-        },
-        ObservationMode::Full,
-    )
-    .expect("adaptive TCP ledger growth must restart from the immutable image");
-    let recovered_words = days_executor::metal::take_readback_words_for_testing();
-
+    // Non-vacuity: the second arm must really plan a much larger arena, or the equalities below
+    // would hold for the trivial reason that nothing changed.
     assert!(
-        strict_words.saturating_mul(16) < recovered_words,
-        "a screened failed attempt must copy back a small fraction of an arena readback: the \
-         strict single-attempt run copied {strict_words} words while the one-fault-plus-one-success \
-         run copied {recovered_words}"
+        large_plane > small_plane.saturating_mul(100),
+        "the inflated arm must plan a far larger arena for the equalities to mean anything: \
+         {small_plane} -> {large_plane} words"
     );
-    // The reordering carries no semantic content: the fault payload still sizes the flow the same
-    // way, and the recovered complete state is still the scalar oracle's, byte for byte.
+
+    // Fix 1: the fault path does not read the arena, so its cost is the same on a 109x plan.
+    assert_eq!(
+        small_strict, large_strict,
+        "a screened failed attempt must copy the same words regardless of plan size: {small_strict} \
+         words against a {small_plane}-word plan, {large_strict} against a {large_plane}-word plan"
+    );
+    // Fix 2: the success path copies live content, and the live content is identical in both arms,
+    // so its cost is the same too.
+    assert_eq!(
+        small_recovered, large_recovered,
+        "a compacted successful readback must copy live content, not arena: {small_recovered} words \
+         against a {small_plane}-word plan, {large_recovered} against a {large_plane}-word plan"
+    );
+    // The fault path is the cheaper of the two, which is fix 1's ordering property.
+    assert!(
+        small_strict < small_recovered,
+        "the screened fault path must copy less than the successful readback: {small_strict} vs \
+         {small_recovered}"
+    );
+    // And an absolute ceiling with no plan term in it, so "constant" cannot mean "constantly huge".
+    let ceiling =
+        SCREEN_FIXED_PLANE_WORDS_CEILING + SCREEN_LEDGER_META_WORDS * image.flows.len() as u64;
+    assert!(
+        small_strict <= ceiling,
+        "the screen must read the control plane and the per-flow ledger metadata and nothing else: \
+         {small_strict} words against a {ceiling}-word ceiling"
+    );
+
+    // The reordering and the compaction carry no semantic content: the fault payload still sizes the
+    // flow the same way, and the recovered complete state is still the scalar oracle's, byte for
+    // byte, at either plan size.
     assert_device_full_result_eq(
         &recovered.result,
         &scalar,
         "screened Metal TCP ledger retry run",
+    );
+    assert_device_full_result_eq(
+        &large_run.result,
+        &scalar,
+        "screened Metal TCP ledger retry run at the inflated plan size",
     );
     let [retry] = recovered.capacity_retry_trace.as_slice() else {
         panic!(
@@ -1394,7 +1485,19 @@ fn metal_capacity_fault_is_screened_before_the_arena_readback() {
     assert_eq!(retry.grown_capacity, 16);
 }
 
-/// The CUDA sibling of [`metal_capacity_fault_is_screened_before_the_arena_readback`].
+/// The CUDA sibling of [`metal_capacity_fault_is_screened_before_the_arena_readback`], with that
+/// test's doc comment as its argument.
+///
+/// **This is the test the T20l measurer's CUDA validation caught.** Its previous form asserted
+/// `strict * 16 < recovered`, and fix 2 shrank `recovered` until the ratio no longer held: 56 vs
+/// 578 on both an RTX 4090 and a GB10, needing 896. Metal's identical assertion survived on a
+/// 12.5% margin (31 vs 558), which is why local gates never saw it — a margin that thin is a
+/// coin-flip, not a bound. Both backends now assert the plan-size invariance instead, which has no
+/// ratio in it at all.
+///
+/// CUDA's fixed screen is larger than Metal's — it reads the whole params plane where Metal reads
+/// the single word it needs (`t20l-fix-report.md` §2.2) — so its absolute count differs while the
+/// invariance does not. That is exactly why the shared ceiling is a bound rather than an equality.
 #[cfg(feature = "cuda-test-hooks")]
 #[test]
 fn cuda_capacity_fault_is_screened_before_the_arena_readback() {
@@ -1406,19 +1509,49 @@ fn cuda_capacity_fault_is_screened_before_the_arena_readback() {
         ..DeviceCapacityCaps::default()
     };
 
-    let _ = days_executor::cuda::take_readback_words_for_testing();
-    let strict_error = run_cuda_with_observations(
-        &image,
-        None,
-        CudaConfig {
-            capacity_caps,
-            max_capacity_retries: 0,
-            ..CudaConfig::default()
-        },
-        ObservationMode::Full,
-    )
-    .expect_err("under-capped TCP ledger must fail in strict mode");
-    let strict_words = days_executor::cuda::take_readback_words_for_testing();
+    let arm = |inflate: Option<usize>| {
+        let _ = days_executor::cuda::take_readback_words_for_testing();
+        let strict_error = run_cuda_with_observations(
+            &image,
+            None,
+            CudaConfig {
+                capacity_caps,
+                max_capacity_retries: 0,
+                max_fel_events_per_lp: inflate,
+                max_queue_packets_per_lp: inflate,
+                ..CudaConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .expect_err("under-capped TCP ledger must fail in strict mode");
+        let strict_words = days_executor::cuda::take_readback_words_for_testing();
+        let plane_words = days_executor::cuda::last_plane_words_for_testing();
+
+        let recovered = run_cuda_with_observations(
+            &image,
+            None,
+            CudaConfig {
+                capacity_caps,
+                max_fel_events_per_lp: inflate,
+                max_queue_packets_per_lp: inflate,
+                ..CudaConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .expect("adaptive TCP ledger growth must restart from the immutable image");
+        let recovered_words = days_executor::cuda::take_readback_words_for_testing();
+        (
+            strict_error,
+            strict_words,
+            plane_words,
+            recovered,
+            recovered_words,
+        )
+    };
+
+    let (strict_error, small_strict, small_plane, recovered, small_recovered) = arm(None);
+    let (_, large_strict, large_plane, large_run, large_recovered) = arm(Some(8_192));
+
     assert!(
         matches!(
             strict_error,
@@ -1429,29 +1562,43 @@ fn cuda_capacity_fault_is_screened_before_the_arena_readback() {
         ),
         "the screen must still produce the typed ledger fault, got {strict_error:?}"
     );
-
-    let recovered = run_cuda_with_observations(
-        &image,
-        None,
-        CudaConfig {
-            capacity_caps,
-            ..CudaConfig::default()
-        },
-        ObservationMode::Full,
-    )
-    .expect("adaptive TCP ledger growth must restart from the immutable image");
-    let recovered_words = days_executor::cuda::take_readback_words_for_testing();
-
     assert!(
-        strict_words.saturating_mul(16) < recovered_words,
-        "a screened failed attempt must copy back a small fraction of an arena readback: the \
-         strict single-attempt run copied {strict_words} words while the one-fault-plus-one-success \
-         run copied {recovered_words}"
+        large_plane > small_plane.saturating_mul(100),
+        "the inflated arm must plan a far larger arena for the equalities to mean anything: \
+         {small_plane} -> {large_plane} words"
     );
+    assert_eq!(
+        small_strict, large_strict,
+        "a screened failed attempt must copy the same words regardless of plan size: {small_strict} \
+         words against a {small_plane}-word plan, {large_strict} against a {large_plane}-word plan"
+    );
+    assert_eq!(
+        small_recovered, large_recovered,
+        "a compacted successful readback must copy live content, not arena: {small_recovered} words \
+         against a {small_plane}-word plan, {large_recovered} against a {large_plane}-word plan"
+    );
+    assert!(
+        small_strict < small_recovered,
+        "the screened fault path must copy less than the successful readback: {small_strict} vs \
+         {small_recovered}"
+    );
+    let ceiling =
+        SCREEN_FIXED_PLANE_WORDS_CEILING + SCREEN_LEDGER_META_WORDS * image.flows.len() as u64;
+    assert!(
+        small_strict <= ceiling,
+        "the screen must read the control and params planes and the per-flow ledger metadata and \
+         nothing else: {small_strict} words against a {ceiling}-word ceiling"
+    );
+
     assert_device_full_result_eq(
         &recovered.result,
         &scalar,
         "screened CUDA TCP ledger retry run",
+    );
+    assert_device_full_result_eq(
+        &large_run.result,
+        &scalar,
+        "screened CUDA TCP ledger retry run at the inflated plan size",
     );
     let [retry] = recovered.capacity_retry_trace.as_slice() else {
         panic!(

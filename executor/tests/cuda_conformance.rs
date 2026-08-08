@@ -904,9 +904,35 @@ fn cuda_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             0,
             1,
         ),
+        // T20lm F-A. `max_outbox_events` is the *override* that serves BOTH producer arenas, and
+        // under a zero override the arena that faults first is per-LP remote staging, not the
+        // plane-wide outbox. This case asserted `Outbox` from the day it was written and had never
+        // run, because every retained CUDA validate script built `--features cuda` only, which
+        // compiles out every `cfg(feature = "cuda-test-hooks")` test in this file. Metal returns
+        // `RemoteStaging { node: 0 }` for the same config, byte-identically, and
+        // `metal_production::metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor`
+        // now pins that locally.
         (
             CudaConfig {
                 max_outbox_events: Some(0),
+                max_capacity_retries: 0,
+                ..CudaConfig::default()
+            },
+            ObservationMode::Full,
+            CudaArena::RemoteStaging,
+            Some(SOURCE),
+            0,
+            1,
+        ),
+        // ...and the arena-specific cap, which is what actually selects the outbox. Without this
+        // case, correcting the one above would have left the CUDA suite with no outbox coverage at
+        // all; the Metal sibling has used this form since it was written.
+        (
+            CudaConfig {
+                capacity_caps: days_executor::DeviceCapacityCaps {
+                    outbox_events_total: Some(0),
+                    ..days_executor::DeviceCapacityCaps::default()
+                },
                 max_capacity_retries: 0,
                 ..CudaConfig::default()
             },
