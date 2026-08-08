@@ -266,7 +266,8 @@ fn arena_compaction_plan(
 /// T20l fix 2 uses this for the contiguous metadata regions the decode needs in full but the
 /// planes carry alongside device scratch: the two `tcp_state` regions and the per-stream ring
 /// metadata prefix of `stream_state`. `CudaSlice::slice` panics on an out-of-range range, so each
-/// range is clamped to its plane the way Metal's `SharedBuffer::read_range` clamps it.
+/// extent is validated by `device_compaction::metadata_region` before the range is built —
+/// a typed refusal, never a clamp.
 fn bounded_plane_words<const N: usize>(
     stream: &std::sync::Arc<CudaStream>,
     ranges: [(&CudaSlice<u64>, usize, usize, &'static str); N],
