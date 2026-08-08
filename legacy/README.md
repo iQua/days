@@ -40,14 +40,35 @@ Frozen **by reference**, not copied here:
   therefore does not by itself freeze legacy's *observable behaviour*: a change to shared
   routing or logging code can move what this engine outputs without any diff under `legacy/`.
   That is also why change class **(a)** below has to exist.
-- The guard is the `days-validation` differential suite (`validation/tests/`: 24 tests — 22
-  executed, 2 `#[ignore]`d — across `service_start_selection` (7), `t24_tcp_corpora` (6),
-  `t17c_wide_corpus` (4), `t13f_width_via_load_full` (3), `tcp_executor_legacy` (3),
-  `t15e_sustained` (1)), which runs legacy against the executor
-  and is the only allow-listed dependant of this crate (`xtask/src/main.rs`). It is a **standing
-  gate**, listed in [§5](#standing-gates), not an optional extra. Anyone changing shared `days`
-  code that legacy consumes runs it, and re-checks the E3 counts in
-  [§6.6](#66-mt-count-nondeterminism-disclosure-protocol) before republishing a legacy number.
+Where each shared surface is actually covered — read this before assuming a green gate means a
+stable baseline:
+
+| shared surface | covered by | not covered by |
+|---|---|---|
+| configuration parsing | `days-validation` (`days::scenario::compile_config`, 5 of 6 binaries; incl. a TOML-key-ordering differential test) | — |
+| topology construction | `days-validation` (`days::topos::build::build_graph`, 4 binaries, consumed by legacy via `Flow::flows_from_config_with_attachments`) | — |
+| routing tables | this crate's own suite — `tests/scenario_lowering.rs::assert_legacy_physical_routes` walks the routes legacy installs against the lowered image on real fat trees | **`days-validation` — zero references to `days::topos::route`** |
+| CSV logger | this crate's own suite — `tests/{scenario_lowering,host_attachment,ring_allreduce_coverage,dcqcn_event_id,pfc_event_id}.rs` read the CSVs back; root crate `tests/trace_manifest.rs` | **`days-validation` — zero references to the logger or its CSVs** |
+
+`days-validation` (`validation/tests/`: 24 tests — 22 executed, 2 `#[ignore]`d — across
+`service_start_selection` (7), `t24_tcp_corpora` (6), `t17c_wide_corpus` (4),
+`t13f_width_via_load_full` (3), `tcp_executor_legacy` (3), `t15e_sustained` (1)) is the only
+allow-listed dependant of this crate (`xtask/src/main.rs`) and is a **standing gate**, listed in
+[§5](#standing-gates). What it guards is **legacy↔executor agreement** — that and no more.
+
+**No automated check catches common-mode drift, and none can be differential.** Legacy's
+`physical_flow_paths` (`src/topos/topo.rs:68`) and executor lowering both call
+`compute_shortest_path_route_table`. A change under `days`'s `src/topos/` therefore moves **both
+sides together**, so every assertion of the form "legacy agrees with the executor" stays green
+through precisely the change that moves a published legacy baseline. Only an *absolute* anchor — a
+pin of this fixture's counts against the frozen 41,932,800 — would catch it, and **no such pin
+exists in CI today**.
+
+The mitigation is therefore not a test. It is the freeze policy in [§3](#3-freeze-policy), its
+changelog in [§8](#8-freeze-changelog), review, and one manual step: anyone changing shared `days`
+code that legacy consumes runs the gates in [§5](#standing-gates) **and re-runs the E3 count check
+of [§6.6](#66-mt-count-nondeterminism-disclosure-protocol) against the frozen anchor** before any
+legacy number is republished. Automating that check is an open recommendation, not a shipped one.
 
 ## 2. Why it is frozen
 
@@ -84,6 +105,13 @@ Frozen **by reference**, not copied here:
 commit. A change to `legacy/` without a changelog row is a policy violation regardless of how
 small it is.
 
+**This rule is enforced by review, not by CI.** Nothing mechanically checks that a diff touching
+`legacy/` also touches the changelog table — `cargo xtask audit` enforces the dependency
+*direction* only and never reads this file. Treat the requirement as a reviewer's checklist item on
+every diff that touches `legacy/`. A CI check that would mechanise it is specified as an open
+recommendation in `days-gpu/evidence/P12/t22-legacy-freeze.md` §7; until it lands, a green gate set
+is **not** evidence that the changelog was updated.
+
 ## 4. Dependency pinning and the lockfile
 
 Every dependency and external dev-dependency in `legacy/Cargo.toml` is an **exact** pin
@@ -101,18 +129,27 @@ Two mechanisms, deliberately redundant:
    anywhere under `legacy/`.
 
 **Known consequence — the pins are workspace-visible.** Cargo unifies a dependency to one
-version per semver-compatible range across the workspace. Most of legacy's pins are on crates
-the live root crate also uses (`csv`, `env_logger`, `log`, `tracing`, `tracing-subscriber`,
-`parking_lot`, `petgraph`, `rand`, `serde`, `serde_json`, `thiserror`, `toml`, `tempfile`,
-`assert_cmd`, `predicates`). While the live crate stays inside the same range, legacy's pin is
-the version everyone gets. This is intended: it makes silent movement of a baseline dependency
-impossible. When the live crate crosses a semver-major boundary (e.g. `rand` 0.10 → 0.11), the
-two versions coexist and legacy simply keeps its frozen one. When a live-side bump *inside* the
-range is genuinely needed, use change class **(c)** and re-run [§5](#standing-gates).
+version per semver-compatible range across the workspace. Most of legacy's pins are on crates a
+live crate also uses. **Consult this split before touching any pin:**
 
-Legacy-exclusive pins — no live crate is affected by these: `indicatif`,
-`indicatif-log-bridge`, `nexosim`, `rand_distr`, `tachyonix`, `futures`, `futures-executor`,
-`once_cell`, `num_cpus`.
+- **Shared — a live crate depends on these, so legacy's pin is the version the whole workspace
+  gets:** `csv`, `env_logger`, `log`, `tracing`, `tracing-subscriber`, `parking_lot`, `petgraph`,
+  `rand`, `serde`, `serde_json`, `thiserror`, `toml`, `tempfile`, `assert_cmd`, `predicates`, and
+  **`nexosim`** — `days-validation` carries `nexosim = { version = "1.0.0", … }`
+  (`validation/Cargo.toml:18`). The `[patch.crates-io]` entry in the root manifest redirects every
+  consumer to the vendored `crates/nexosim` at 1.0.0, so the effect is muted today, but it is not
+  nil: legacy's `=1.0.0` would **block** a vendored-kernel version bump that validation's `^1.0.0`
+  would accept. That is the freeze working as intended, and it is why `nexosim` belongs here rather
+  than on the list below.
+- **Legacy-exclusive — no other crate is affected by these:** `indicatif`,
+  `indicatif-log-bridge`, `rand_distr`, `tachyonix`, `futures`, `futures-executor`, `once_cell`,
+  `num_cpus`.
+
+While the live crate stays inside the same range, legacy's pin is the version everyone gets. This
+is intended: it makes silent movement of a baseline dependency impossible. When the live crate
+crosses a semver-major boundary (e.g. `rand` 0.10 → 0.11), the two versions coexist and legacy
+simply keeps its frozen one. When a live-side bump *inside* the range is genuinely needed, use
+change class **(c)** and re-run [§5](#standing-gates).
 
 ## 5. Standing gates
 
@@ -222,8 +259,11 @@ Timed samples, per arm, under the standing quiet-machine gate:
 Four requirements on the invocation, each with a reason:
 
 - **`RUST_LOG=info`, not `error`.** The legacy binary reports its own in-process clocks and its
-  effective concurrency configuration at `info`; `error` throws both away. The whole log for
-  this fixture is 14 lines / ~1.4 KB, constant in fixture size. Keep the level identical across
+  effective concurrency configuration at `info`; `error` throws both away and leaves a 0-byte log.
+  The whole log is small and fixed: measured **ST 12 lines / 1,294 B, MT 14 lines / 1,470 B** (the
+  MT arm's two extra lines are its `hot_workers` and `concurrency_level` reports). The line set is
+  startup-and-shutdown only — no per-event logging, because this fixture sets no `report_interval` —
+  so it does not grow with fixture size. Keep the level identical across
   every arm, sample, and machine so it cannot bias a comparison, and **record the log's byte
   size per sample as a guard** — if it grows past a few KB the assumption above has broken and
   the round should stop and re-brief. (Note: P01 and the P11 slide preview used `RUST_LOG=error`.
@@ -254,9 +294,9 @@ Per **sample** — not per arm, not per median:
 | `elapsed_wall_s` | `Elapsed wall-clock time: X seconds.` in the run log |
 | `nexosim_total_wall_s` | `Nexosim total wall-clock time: X seconds.` |
 | `nexosim_step_until_wall_s` | `Nexosim step_until wall-clock time: X seconds.` |
-| `threading`, `effective_num_threads` | `Starting simulation with <mode> threading (N thread(s)).` |
-| `hot_workers` | `Using N hot standby worker(s).` |
-| `concurrency_level` | `Using <default\|accelerated> concurrency level.` |
+| `threading`, `effective_num_threads` | `Starting simulation with <mode> threading (N thread(s)).` — both arms |
+| `hot_workers` | `Using N hot standby worker(s).` — **MT only**; the line is absent on ST, record `n/a` |
+| `concurrency_level` | `Using <default\|accelerated> concurrency level.` — **MT only**; absent on ST, record `n/a` |
 | `sent_packets`, `sent_bytes` | **sum** of `sent_packets` / `packet_sizes` over `sources.csv` |
 | `received_packets`, `received_bytes` | **sum** of `received_packets` / `received_sizes` over `sinks.csv` |
 | `derived_dropped_packets` | `sent_packets − received_packets` (see below) |
@@ -280,6 +320,10 @@ Notes that will otherwise be got wrong:
   process start, topology construction, and the final CSV flush.
 - **Never publish a median without its range**, and never emit a statistic whose sample count
   disagrees with the arm's declared `n`.
+- **The count-agreement claim covers integer counts only.** The log's `Average one-way delay` is an
+  `f64` aggregate and is *not* part of it: on the freeze smoke, ST and MT reported 0.001517 s and
+  0.001519 s while every integer count agreed exactly. That is `f64` accumulation order under MT,
+  not a count divergence. Do not treat the delay mean as a count-like invariant.
 
 ### 6.5 The MT configuration is machine-dependent — disclose it
 
