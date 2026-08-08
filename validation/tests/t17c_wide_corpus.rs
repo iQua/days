@@ -309,3 +309,43 @@ fn k48_wide_load60_sizing_reproduces_retained_arenas_and_plane_total() {
             .sum::<usize>()
     );
 }
+
+/// `nvidia-smi --query-gpu=memory.total` on boston's RTX 4090, in bytes.
+const RTX_4090_TOTAL_BYTES: usize = 24_564 * 1_048_576;
+
+/// What the plan must leave free on that card.
+///
+/// P12 wave 2 §2.3 measured the k48/h16 load-90 CUDA arm dying in the allocator on boston twice,
+/// with a 23,983 MiB of 24,564 MiB device high-water 19 s before the panic. The dry run is a
+/// *plan*, not an allocation trace (P12 wave 2 limitation 3): the CUDA context, the module image,
+/// the driver reserve and the transient compaction destination buffer that actually failed are all
+/// outside it. A plan that merely "fits" is therefore not a plan that runs, and this gate demands a
+/// quarter of the card be left over rather than the 4.06% the plan left at `89ec7c4`.
+const REQUIRED_FREE_BYTES: usize = RTX_4090_TOTAL_BYTES / 4;
+
+#[test]
+fn k48_wide_load90_default_plan_leaves_a_quarter_of_a_4090_free() {
+    let image = compile_config(fixture_path(FIXTURES[2].name)).unwrap();
+    let report = size_default_device_plan(&image).unwrap();
+
+    assert!(
+        report.total_device_bytes + REQUIRED_FREE_BYTES <= RTX_4090_TOTAL_BYTES,
+        "k48/h16 load-90 default plan is {} B of a {RTX_4090_TOTAL_BYTES} B card, leaving \
+         {} B free; the gate requires {REQUIRED_FREE_BYTES} B",
+        report.total_device_bytes,
+        RTX_4090_TOTAL_BYTES.saturating_sub(report.total_device_bytes),
+    );
+
+    // The mechanism the margin rests on: `size_default_device_plan` documents itself as sizing the
+    // *streams-enabled* plan, and that plan never addresses an outbox slot, so the plane is one
+    // record. Every outbox access on both device backends sits behind `P_STREAMS_ENABLED == 0`.
+    let outbox = report
+        .planes
+        .iter()
+        .find(|plane| plane.name == "outbox")
+        .expect("outbox plane must exist");
+    assert_eq!(
+        outbox.bytes, 112,
+        "the streams-enabled plan must carry one outbox record, not the legacy exchange arena"
+    );
+}

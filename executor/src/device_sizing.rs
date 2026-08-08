@@ -34,6 +34,29 @@ const CONTROL_WORDS: usize = 20;
 const PARAM_WORDS: usize = 35;
 const WORD_BYTES: usize = std::mem::size_of::<u64>();
 
+/// Outbox record slots a **streams-enabled** plan allocates.
+///
+/// The outbox is the *legacy* exchange path's compaction destination, and nothing else. On both
+/// device backends every access to it is inside a branch that has already tested
+/// `params[P_STREAMS_ENABLED] == 0`: `days_exchange_prefix` computes the per-producer compaction
+/// offsets, `days_exchange_scatter` copies `remote_staging` into it, and `days_exchange_merge`
+/// drains it into the target heaps. The stream-decomposed path stages a producer's remote events
+/// in `remote_staging` and scatters them straight into the per-channel `stream_records` rings, so
+/// it never forms an outbox address. (The Metal readback already classifies plane 12 as elided
+/// device scratch for the same reason: no decode reads it.) Sizing the plane to the legacy path's
+/// arena in a plan that cannot address it is pure overshoot — on the k48/h16 load-90 fixture it was
+/// 10,111,432,352 B, 40.92% of the whole plan.
+///
+/// What the streams path *does* still consult is the outbox **capacity number**:
+/// `days_exchange_prefix` sums the per-channel batch counts against `params[P_OUTBOX_CAPACITY]` and
+/// raises an `ARENA_OUTBOX` capacity fault when a round's remote production exceeds it. That number
+/// is still derived from the image exactly as before and still uploaded unchanged, so capacity
+/// faults, the retry growth law and `CapacityWarmStart` snapshots are all bit-identical. Only the
+/// unaddressable storage goes away. `streams_enabled = false` still gets the full arena.
+///
+/// One slot rather than zero keeps every backend's buffer non-empty.
+pub(crate) const STREAMS_OUTBOX_RECORD_SLOTS: usize = 1;
+
 const PLANE_NAMES: [&str; 28] = [
     "control",
     "params",
@@ -465,7 +488,6 @@ pub fn size_default_device_plan(
         .ok_or_else(|| sizing_error("fallback FEL slots overflow usize"))?;
     let legacy_heap_event_slots = checked_sum(&legacy_fel_capacities, "legacy FEL slots")?;
     let queue_slots = checked_sum(&queue_capacities, "queue slots")?;
-    let remote_bound = derived_remote_capacity(image, &context);
     let remote_capacities = derived_remote_capacities(image, &context);
     let remote_staging_slots = checked_sum(&remote_capacities, "remote staging slots")?;
     let channel_capacities = derived_channel_stream_capacities(image, &context)?;
@@ -506,7 +528,7 @@ pub fn size_default_device_plan(
         checked_product(node_count, QUEUE_META_WORDS, "queue metadata plane")?,
         checked_product(queue_slots, EVENT_WORDS, "queue record plane")?.max(1),
         checked_product(node_count, EVENT_WORDS, "in-service plane")?.max(1),
-        checked_product(remote_bound.max(1), EVENT_WORDS, "outbox plane")?,
+        checked_product(STREAMS_OUTBOX_RECORD_SLOTS, EVENT_WORDS, "outbox plane")?,
         node_count.max(1),
         checked_product(node_count.max(1), SUMMARY_COUNTERS * 2, "summary plane")?,
         1,
@@ -1416,41 +1438,13 @@ fn flow_link_fel_bound(
     )
 }
 
-fn derived_remote_capacity(image: &SimulationImage, context: &CapacityContext) -> usize {
-    image
-        .flows
-        .iter()
-        .enumerate()
-        .map(|(index, flow)| {
-            let feedback_count = context.feedback_counts[index];
-            let data_count = context.packet_counts[index].saturating_sub(feedback_count);
-            flow.route
-                .iter()
-                .map(|link| {
-                    flow_link_round_bound(
-                        image,
-                        context,
-                        index,
-                        data_count,
-                        PacketKind::Data,
-                        *link,
-                    )
-                })
-                .chain(flow.reverse_route.iter().map(|link| {
-                    flow_link_round_bound(
-                        image,
-                        context,
-                        index,
-                        feedback_count,
-                        PacketKind::Feedback,
-                        *link,
-                    )
-                }))
-                .fold(0_usize, usize::saturating_add)
-        })
-        .fold(image.nodes.len().saturating_mul(2), usize::saturating_add)
-}
-
+/// Per-producer remote staging capacities.
+///
+/// The device planners keep a matching whole-plan `derived_remote_capacity` — the same sum with the
+/// same `2` per node folded in as the seed — because it is what they upload as
+/// `params[P_OUTBOX_CAPACITY]`. This module no longer needs that scalar: the streams-enabled plan
+/// it sizes carries [`STREAMS_OUTBOX_RECORD_SLOTS`] outbox records, and the capacity number is not
+/// a plane. Uncapped, `capacities.iter().sum()` reproduces it exactly.
 fn derived_remote_capacities(image: &SimulationImage, context: &CapacityContext) -> Vec<usize> {
     let mut capacities = vec![2_usize; image.nodes.len()];
     for (index, flow) in image.flows.iter().enumerate() {

@@ -2319,6 +2319,15 @@ impl CudaPlan {
             },
             |capacity| capacity.max(config.capacity_floors.outbox_events_total),
         );
+        // `outbox_capacity` stays the uploaded `P_OUTBOX_CAPACITY` on both paths, so the round-wide
+        // remote-production check in `days_exchange_prefix`, its `ARENA_OUTBOX` fault, the retry
+        // growth law and every `CapacityWarmStart` entry are unchanged. Only the *storage* is
+        // conditional: the streams path never forms an outbox address.
+        let outbox_records = if config.streams_enabled {
+            crate::device_sizing::STREAMS_OUTBOX_RECORD_SLOTS
+        } else {
+            outbox_capacity
+        };
         let mut remote_capacities = derived_remote_capacities(
             image,
             &capacity_context,
@@ -2477,7 +2486,7 @@ impl CudaPlan {
             queue_meta,
             queue_records,
             in_service,
-            outbox: zero_words(outbox_capacity, EVENT_WORDS)?,
+            outbox: zero_words(outbox_records, EVENT_WORDS)?,
             worklist: vec![0_u64; worklist_capacity],
             summary: vec![0_u64; node_count.max(1) * SUMMARY_COUNTERS * 2],
             observed: zero_words(observation_slots, OBSERVED_WORDS)?,

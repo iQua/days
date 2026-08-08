@@ -411,7 +411,13 @@ fn channel_starting_cap_preserves_the_0695f02_initial_plan_bytes() {
         // T20i widened the per-flow TCP ledger metadata row from 4 words to 6 (ring head +
         // occupancy high-water). This fixture has 8 TCP flows, so the anchor moves by exactly
         // 8 * 2 * 8 = 128 B. Nothing else in the plan changed.
-        1_269_928 + 128,
+        //
+        // T21 stopped allocating the legacy exchange outbox in a streams-enabled plan, which is
+        // what `MetalConfig::default()` selects here. The plane held 54,432 words (435,456 B) and
+        // now holds one record (112 B), so the anchor moves by exactly -435,344 B. No capacity
+        // number moved with it: `P_OUTBOX_CAPACITY` is still the derived 54,432, so this plan
+        // faults and grows exactly where it did before. Nothing else in the plan changed.
+        1_269_928 + 128 - 435_344,
     );
 
     #[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
@@ -440,8 +446,113 @@ fn channel_starting_cap_preserves_the_0695f02_initial_plan_bytes() {
             ObservationMode::Summary,
         )
         .expect("retry-enabled CUDA initial capped plan must size"),
-        // T20i ledger-metadata widening: 8 flows * 2 words * 8 B = 128 B. See the Metal anchor.
-        1_269_904 + 128,
+        // T20i ledger-metadata widening: 8 flows * 2 words * 8 B = 128 B. T21 streams-path outbox
+        // elision: -435,344 B. See the Metal anchor for both.
+        1_269_904 + 128 - 435_344,
+    );
+}
+
+/// T21: the legacy exchange outbox is storage only the legacy exchange path can address.
+///
+/// `days_exchange_prefix` (compaction offsets), `days_exchange_scatter` (the copy in) and
+/// `days_exchange_merge` (the drain out) are the only kernels that index the plane, and on both
+/// backends each of those accesses is inside a branch that has already tested
+/// `params[P_STREAMS_ENABLED] == 0`. A streams-enabled plan therefore allocates one record; a
+/// streams-disabled plan still allocates the whole derived arena. `P_OUTBOX_CAPACITY` — which the
+/// streams path *does* read, to bound a round's remote production — is derived and uploaded
+/// identically in both cases, so this is a storage change and not a capacity change.
+#[test]
+fn streams_enabled_plans_carry_one_outbox_record_and_legacy_plans_carry_the_arena() {
+    const ONE_RECORD_WORDS: usize = 14;
+
+    for relative in FIXTURES {
+        let image = compile_fixture(relative);
+
+        #[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
+        {
+            let streams = size_cuda_plan_for_testing(
+                &image,
+                None,
+                cuda_config(true, false),
+                ObservationMode::Summary,
+            )
+            .expect("streams-enabled CUDA plan must size");
+            let legacy = size_cuda_plan_for_testing(
+                &image,
+                None,
+                cuda_config(false, false),
+                ObservationMode::Summary,
+            )
+            .expect("legacy-exchange CUDA plan must size");
+            assert_outbox_partition("CUDA", relative, &streams, &legacy, ONE_RECORD_WORDS);
+        }
+
+        #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+        {
+            let streams = size_metal_plan_for_testing(
+                &image,
+                None,
+                metal_config(true, false),
+                ObservationMode::Summary,
+            )
+            .expect("streams-enabled Metal plan must size");
+            let legacy = size_metal_plan_for_testing(
+                &image,
+                None,
+                metal_config(false, false),
+                ObservationMode::Summary,
+            )
+            .expect("legacy-exchange Metal plan must size");
+            assert_outbox_partition("Metal", relative, &streams, &legacy, ONE_RECORD_WORDS);
+        }
+    }
+}
+
+#[cfg(any(
+    feature = "cuda",
+    feature = "cuda-planner-test",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+fn assert_outbox_partition(
+    backend: &str,
+    fixture: &str,
+    streams: &DeviceSizingReport,
+    legacy: &DeviceSizingReport,
+    one_record_words: usize,
+) {
+    let plane = |report: &DeviceSizingReport, name: &str| {
+        report
+            .planes
+            .iter()
+            .find(|plane| plane.name == name)
+            .unwrap_or_else(|| panic!("{name} plane must exist"))
+            .words
+    };
+    let streams_outbox = plane(streams, "outbox");
+    let legacy_outbox = plane(legacy, "outbox");
+
+    assert_eq!(
+        streams_outbox, one_record_words,
+        "{backend} {fixture}: a streams-enabled plan must carry one outbox record"
+    );
+    assert!(
+        legacy_outbox > streams_outbox,
+        "{backend} {fixture}: the legacy exchange path must keep its whole outbox arena \
+         (streams {streams_outbox} words, legacy {legacy_outbox} words)"
+    );
+    // The derived outbox capacity — what both paths upload as `P_OUTBOX_CAPACITY` — is the sum of
+    // the per-producer remote-staging capacities, so uncapped the legacy arena is exactly the
+    // `remote_staging` plane. Both plans size `remote_staging` identically, which is the visible
+    // consequence of the capacity number being untouched: only the storage moved.
+    assert_eq!(
+        legacy_outbox,
+        plane(legacy, "remote_staging"),
+        "{backend} {fixture}: the uncapped legacy outbox arena is the remote-staging arena"
+    );
+    assert_eq!(
+        plane(streams, "remote_staging"),
+        plane(legacy, "remote_staging"),
+        "{backend} {fixture}: the derived remote capacity must not depend on the exchange path"
     );
 }
 

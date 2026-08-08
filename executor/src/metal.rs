@@ -2186,6 +2186,15 @@ impl MetalPlan {
             },
             |capacity| capacity.max(config.capacity_floors.outbox_events_total),
         );
+        // `outbox_capacity` stays the uploaded `P_OUTBOX_CAPACITY` on both paths, so the round-wide
+        // remote-production check in `days_exchange_prefix`, its `ARENA_OUTBOX` fault, the retry
+        // growth law and every `CapacityWarmStart` entry are unchanged. Only the *storage* is
+        // conditional: the streams path never forms an outbox address.
+        let outbox_records = if config.streams_enabled {
+            crate::device_sizing::STREAMS_OUTBOX_RECORD_SLOTS
+        } else {
+            outbox_capacity
+        };
         let mut remote_capacities = derived_remote_capacities(
             image,
             &capacity_context,
@@ -2342,7 +2351,7 @@ impl MetalPlan {
             queue_meta,
             queue_records,
             in_service,
-            outbox: zero_words(outbox_capacity, EVENT_WORDS)?,
+            outbox: zero_words(outbox_records, EVENT_WORDS)?,
             worklist: vec![0_u64; worklist_capacity],
             summary: vec![0_u64; node_count.max(1) * SUMMARY_COUNTERS * 2],
             observed: zero_words(observation_slots, OBSERVED_WORDS)?,
@@ -4100,8 +4109,11 @@ impl MetalBuffers {
         //     rather than by any device word: `flows`(4), `routes`(5), `links`(6) are planner
         //     inputs; `outbox`(12), `worklist`(13), `remote_meta`(19), `remote_staging`(20),
         //     `inbound_meta`(22), `inbound_producers`(23) and `merge_cursors`(24) are device
-        //     scratch. At the frontier that is 691,104,103 words, 28.86% of the plan, of which
-        //     `remote_staging` alone is 657,667,584.
+        //     scratch. At the frontier that was 691,104,103 words, 28.86% of the plan, of which
+        //     `remote_staging` alone is 657,667,584. (T21 acted on the same observation one step
+        //     earlier for `outbox`: a streams-enabled plan no longer *allocates* the plane, so the
+        //     word count this elision skips is smaller than the T20l measurement above. The
+        //     classification is unchanged and so is every other plane's.)
         //   * READ WHOLE — fixed words per entity, and the decode consumes all of them: control,
         //     params, node_state, generators, fel_meta, queue_meta, in_service, summary, lp_state,
         //     observation_meta, stream_state, scheduler_state, plus the two contiguous `tcp_state`
