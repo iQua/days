@@ -11,7 +11,21 @@
 #     `BuildTCPConnections` pairs host i with host i + N/2 under a switch-major host numbering;
 #     Days numbers hosts ordinal-major, so the same FABRIC-level permutation has to be stated on
 #     the (switch, ordinal) grid. Both are the cross-pod permutation (pod p -> pod p+16 mod 32).
-#   * horizon 20 us, matching GeDES's 20,000 x 1,000 ns timeslot smoke run.
+#   * horizon 20 us = 20 quanta of GeDES's 1,000 ns timeslot. This is a SHORT-SPAN probe of
+#     GeDES's fabric, NOT a match to GeDES's 20,000-timeslot runs; see the correction below.
+#
+# CORRECTION (2026-08-08), quoting what this header said before it:
+#     "horizon 20 us, matching GeDES's 20,000 x 1,000 ns timeslot smoke run."
+# That is WRONG, and the error is OURS: 20,000 x 1,000 ns is 20,000,000 ns = 20 ms, not 20 us. We
+# mis-multiplied by 1000. GeDES did not misprint anything -- `paced_udp.cu:155` computes
+# `executed_timeslots * timeslot_ns / 1e9` and a live 2,000-slot run prints
+# `simulated_seconds 0.002000000`, i.e. 2 ms, correctly. Any reading of this file that treated
+# GeDES's `simulated_seconds` or `Simulated Span` output as untrustworthy should be discarded.
+# This fixture's own horizon of 20 us is unchanged and correct; what was wrong was the claim that
+# it matches GeDES's span. It does not -- it is 1/1000 of it. The fixture family that DOES span
+# GeDES's 20 ms is `e1long_open_k32_load_*.toml`, which also re-authors the per-flow byte budget,
+# because raising `duration` alone would only add an empty fabric: at 205 ns this file's
+# 1,000-packet budget stops emitting at 0.205 ms.
 #
 # OFFERED LOAD, disclosed. Days requires an exact integer nanosecond inter-packet interval, and
 # 1540 B at 100 Gbit/s is 123.2 ns of serialisation, so only the 10% point is exactly expressible.

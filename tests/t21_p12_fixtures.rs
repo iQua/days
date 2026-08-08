@@ -170,7 +170,13 @@ fn e1_points_differ_only_in_the_inter_packet_interval() {
         assert_eq!(
             config["duration"].as_float(),
             Some(0.000_020),
-            "{name} horizon must be GeDES's 20,000 x 1,000 ns timeslot window"
+            // CORRECTED (2026-08-08). This message used to read "must be GeDES's 20,000 x 1,000 ns
+            // timeslot window", which is wrong by 1000x and wrong in OUR arithmetic, not GeDES's:
+            // 20,000 x 1,000 ns is 20 ms. GeDES prints its span correctly (`paced_udp.cu:155`;
+            // a live 2,000-slot run prints `simulated_seconds 0.002000000`). E1's horizon is 20 us,
+            // which is 20 of those quanta; `e1long_open_k32_load_*.toml` is the family that spans
+            // GeDES's 20,000.
+            "{name} horizon must be 20 us, i.e. 20 quanta of GeDES's 1,000 ns timeslot"
         );
         assert_eq!(config["topology"]["fat_tree"]["k"].as_integer(), Some(32));
         assert_eq!(
