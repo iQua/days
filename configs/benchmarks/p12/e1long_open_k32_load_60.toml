@@ -1,0 +1,97 @@
+# P12 E1-LONG open-loop k=32 fat tree, nominal 60% offered host load.
+#
+# E1-LONG IS E1 AT GeDES'S ACTUAL SPAN. It shares E1's fabric, wire format, traffic matrix, routing
+# policy, seed and inter-packet interval exactly; it differs from `e1_open_k32_load_60.toml` in
+# exactly two parameters -- `duration` and the per-flow byte budget `size` -- and those two move
+# together, because moving one without the other does not produce a longer run of traffic.
+#
+# WHY THE BYTE BUDGET HAD TO BE RE-AUTHORED, not just the duration. E1 gives each flow
+# `size = 1_540_000` B = 1,000 packets. At this point's interval of 205 ns the thousandth packet
+# leaves at 999 x 205 ns = 204,795 ns, so an E1 file run to a 20 ms horizon is 0.205 ms of
+# traffic followed by ~19.8 ms of an empty, fully drained fabric -- byte-identical to the short
+# run plus a drain, not a longer workload. E1-LONG therefore restates the budget from the pacing
+# arithmetic below.
+#
+# THE BUDGET, exactly. A flow emits at t = 0, I, 2I, ..., so a horizon H admits floor(H/I) + 1
+# emissions. At H = 20,000,000 ns and I = 205 ns that is 97,561 packets per flow, hence
+# `size` = 97,561 x 1,540 B = 150,243,940 B. This budget is MINIMAL AND SUFFICIENT and is pinned as such:
+#   (N-1) x I = 19,999,800 ns <= 20,000,000  -- every emission the horizon admits is funded;
+#       N x I = 20,000,005 ns >  20,000,000  -- and not one packet more is funded.
+# Traffic therefore persists to 19,999,800 ns of the 20,000,000 ns span (99.995%), rather than
+# stopping at 204,795 ns as the frozen E1 file does. Total sourced: 8,192 x 97,561 = 799,219,712.
+# The same formula reproduces E1's four frozen `sourced_packets` anchors at H = 20,000 ns
+# (17/49/98/146 per flow -> 139,264 / 401,408 / 802,816 / 1,196,032), which is why it is trusted here.
+#
+# CROSS-ARM CONTRACT (arms 5-8 of the P12 roster), inherited from E1 unchanged:
+#   * on-wire packet 1540 B = 1460 B payload + 80 B header. This is the quantity that drives link
+#     occupancy in every arm, so it is matched EXACTLY rather than rounded to "1500 B".
+#   * per-host NIC line rate 100 Gbit/s; fabric k = 32, 16 hosts per edge switch = 8,192 hosts.
+#   * traffic matrix: EVERY host is a source, paired with the host at the same rack ordinal on the
+#     attachment switch half the fabric away (`pairing = "SwitchOffsetHalf"`). GeDES's
+#     `BuildTCPConnections` pairs host i with host i + N/2 under a switch-major host numbering;
+#     Days numbers hosts ordinal-major, so the same FABRIC-level permutation has to be stated on
+#     the (switch, ordinal) grid. Both are the cross-pod permutation (pod p -> pod p+16 mod 32).
+#   * horizon 20 ms = 20,000,000 ns, matching GeDES's 20,000-timeslot runs: one GeDES timeslot is
+#     TIMESLOT_LENGTH = 1,000 ns (`code/c++/include/conf.h:26`), so 20,000 x 1,000 ns = 20 ms, and
+#     GeDES prints that span correctly (`paced_udp.cu:155`, verified live: 2,000 slots ->
+#     `simulated_seconds 0.002000000`). The frozen `e1_open_k32_load_*.toml` headers call the same
+#     20,000 slots "20 us"; that is OUR arithmetic error, corrected in place there, and E1-LONG is
+#     the fixture family that actually spans what GeDES spans.
+#
+# OFFERED LOAD, disclosed -- identical to E1, since the interval is identical. Days requires an
+# exact integer nanosecond inter-packet interval, and 1540 B at 100 Gbit/s is 123.2 ns of
+# serialisation, so only the 10% point is exactly expressible. Each point uses the nearest integer
+# interval and states what it achieves:
+#   nominal 10% -> 1232 ns -> 10.0000000%   nominal 30% -> 411 ns -> 29.9756691%
+#   nominal 60% ->  205 ns -> 60.0975610%   nominal 90% -> 137 ns -> 89.9270073%
+# Worst-case deviation is 0.098 percentage points, at the 60% point (0.163% relative). GeDES's own
+# token bucket lands within 0.005% relative of nominal, so the residual difference is a
+# fixture-comparability caveat that belongs in every E1-LONG table -- not a defect.
+# THIS POINT: interval 205 ns, achieved offered host load 60.0975610%.
+#
+# The same deviation is what separates this point's per-flow packet count from GeDES F4's own. F4
+# emits tx/8,192 = 97,402 packets per sender at this load over the same 20 ms; E1-LONG emits
+# 97,561, i.e. +0.163% -- the disclosed interval rounding and nothing else.
+seed = 21032
+duration = 0.020000
+threading = "single"
+log_path = "logs/p12/e1long_open_k32_load_60"
+
+[topology]
+category = "FatTree"
+
+[topology.fat_tree]
+k = 32
+hosts_per_edge = 16
+
+[switch]
+port_rate = 100_000_000_000
+capacity = 1024
+weights = [1]
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link]
+propagation_ns = 1000
+
+# Equal-cost multipath. MANDATORY for this family, exactly as in E1. Days' single-path table returns
+# one path per switch pair, and equal-cost successors tie on score -- `MinScoredNode::cmp` returns
+# Equal and never looks at node identity -- so the winner is BinaryHeap sift order, an
+# implementation artifact rather than a stated rule. ON THIS MATRIX, the offset permutation
+# s -> (s+256) mod 512 collapses each source pod onto ONE aggregation group and ONE core switch.
+# Fabric-wide it is a minority, not a single switch: 6 distinct cores of 256, per-pair histogram
+# {1025: 144, 1121: 32, 1152: 272, 1217: 16, 1233: 16, 1264: 32}, the busiest core taking 272 of
+# 512 pairs (53%, roughly 4,352 of the 8,192 flows). Enough to wreck the fixture -- measured at the
+# nominal 10% point before the policy existed: 36,384 drops out of 139,264 sourced packets, 26.1%.
+# Zero drops with the policy at all four E1 points. GeDES reports NO queue overflow at 90% on the
+# same matrix and Unison exposes `--ecmp`, so a single-path Days row would not be the same fabric
+# as the arms it is compared with. At the 20 ms span the fabric is additionally in steady state
+# rather than filling, so a concentrated single-path matrix would saturate rather than merely skew.
+[routing]
+policy = "FatTreeEcmp"
+
+[[flow_set]]
+flow_type = "PacketDistribution"
+flow_count = 8192
+pairing = "SwitchOffsetHalf"
+traffic = { initial_delay = 0.0, size = 150_243_940, arr_dist = { type = "Uniform", low = 0.000000205, high = 0.000000205 }, pkt_size_dist = { type = "DiscreteUniform", low = 1540, high = 1540 } }
