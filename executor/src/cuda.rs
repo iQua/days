@@ -272,9 +272,21 @@ fn bounded_plane_words<const N: usize>(
 ) -> Result<[Vec<u64>; N], AttemptFailure> {
     let mut regions = Vec::with_capacity(N);
     let mut readback_error = None;
-    for (plane, start, len) in ranges {
-        let start = start.min(plane.len());
+    for (plane, requested_start, len) in ranges {
+        let start = requested_start.min(plane.len());
         let end = start.saturating_add(len).min(plane.len());
+        // The clamp exists because `CudaSlice::slice` panics on an out-of-range range, not because
+        // a short region is acceptable: the decode indexes these regions by entity, so a short one
+        // would panic or silently drop complete state. Every plan the planner builds sizes them
+        // exactly; refuse rather than truncate if one ever does not.
+        if start != requested_start || end - start != len {
+            return Err(CudaError::Validation(format!(
+                "device readback compaction refused: {context} asked for {len} words at \
+                 {requested_start} but the plane holds {}",
+                plane.len()
+            ))
+            .into());
+        }
         #[cfg(feature = "cuda-test-hooks")]
         account_readback_words(end - start);
         match stream.clone_dtoh(&plane.slice(start..end)) {
