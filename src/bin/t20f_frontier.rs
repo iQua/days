@@ -87,7 +87,45 @@ mod warm_start {
         "worklist_entries_total",
     ];
 
-    pub(super) const HEADER: &str = "days-capacity-warm-start v1";
+    /// Format version.
+    ///
+    /// `v1` had no terminator, so a truncated snapshot parsed as a silently downgraded partial
+    /// hint, and no capacity ceiling, so an in-format magnitude aborted the allocator inside the
+    /// planner. Both are fixed by shape changes to the file, so the version is bumped rather than
+    /// mutated in place: every `v1` snapshot on disk — including the one whose md5
+    /// `eee955c8816e7c745570f7c6e88f204e` this round's earlier commits quote — is now refused by
+    /// its header, which is the correct outcome for a file that cannot be validated.
+    pub(super) const HEADER: &str = "days-capacity-warm-start v2";
+
+    /// Terminator keyword: the number of association records the snapshot carries.
+    ///
+    /// The three association lists have no declared length, and the floor block is written first,
+    /// so without this a snapshot truncated anywhere after the floors parses *successfully* as a
+    /// partial hint — exactly the silent downgrade this format claims to refuse. Reproduced before
+    /// it existed: a 1,036-line snapshot cut to 400 lines was accepted and the run then took the
+    /// very retry the hint was supposed to remove.
+    const RECORD_COUNT: &str = "records";
+
+    /// The largest capacity, in records, a snapshot file may name.
+    ///
+    /// A capacity is a record count that the planner multiplies by a record width — the narrowest
+    /// is `TCP_RANGE_WORDS = 2` u64 words — and sums into one plan. At this ceiling a **single**
+    /// entity already claims `2 * 8 * 2^32 = 68.7 GB`: more than boston's entire 25.76 GB device
+    /// and more than half madrid's unified pool. No value at or above it can be a capacity any
+    /// device attempt converged on, so a file naming one is corrupt and is refused **here**,
+    /// before anything is allocated.
+    ///
+    /// Without this the refusal was an allocator abort inside the planner rather than a typed
+    /// error: one in-format line of a real k16 snapshot changed to `tcp-ledger 0 9999999999999`
+    /// produced `memory allocation of 400000006240632 bytes failed`, and
+    /// `floor worklist_entries_total 18446744073709551615` produced `capacity overflow` in
+    /// `alloc::raw_vec`.
+    ///
+    /// This bounds the **file**, which is the untrusted surface this flag adds. A
+    /// `CapacityWarmStart` constructed in process has exactly the standing `DeviceCapacityFloors`
+    /// and the `max_*` overrides already have — its magnitudes are the caller's responsibility,
+    /// unchanged by this round.
+    const MAX_CAPACITY: u64 = 1 << 32;
 
     fn floor_values(floors: DeviceCapacityFloors) -> [usize; FLOOR_LANES.len()] {
         [
@@ -126,21 +164,25 @@ mod warm_start {
     /// Every floor lane is written, in a fixed order, even at zero, so a snapshot's meaning does
     /// not depend on which lanes happen to be present. The three association lists arrive already
     /// sorted and deduplicated from the executor, so the same run always writes the same bytes.
+    /// The trailing [`RECORD_COUNT`] line closes the file: without it truncation is undetectable.
     pub(super) fn encode(warm_start: &CapacityWarmStart) -> String {
         let mut text = String::from(HEADER);
         text.push('\n');
         for (lane, value) in FLOOR_LANES.iter().zip(floor_values(warm_start.floors)) {
             text.push_str(&format!("floor {lane} {value}\n"));
         }
-        for (key, records) in [
+        let mut records = 0_usize;
+        for (key, list) in [
             ("channel", &warm_start.channel_events_by_stream),
             ("tcp-receiver", &warm_start.tcp_receiver_ranges_by_base),
             ("tcp-ledger", &warm_start.tcp_ledger_segments_by_flow),
         ] {
-            for (entity, capacity) in records {
+            for (entity, capacity) in list {
                 text.push_str(&format!("{key} {entity} {capacity}\n"));
+                records += 1;
             }
         }
+        text.push_str(&format!("{RECORD_COUNT} {records}\n"));
         text
     }
 
@@ -148,7 +190,11 @@ mod warm_start {
     ///
     /// A snapshot that cannot be read exactly is refused rather than silently downgraded to a
     /// partial hint, because a partial hint would quietly reintroduce the discarded attempts the
-    /// flag exists to remove. Each floor lane must appear exactly once.
+    /// flag exists to remove. Concretely: every floor lane must appear exactly once, the
+    /// [`RECORD_COUNT`] terminator must be present and must match the association records actually
+    /// read (which is what makes truncation detectable), and no capacity may exceed
+    /// [`MAX_CAPACITY`] (which is what turns a corrupt magnitude into a typed refusal here instead
+    /// of an allocator abort later, inside the planner).
     pub(super) fn decode(text: &str) -> Result<CapacityWarmStart, String> {
         let mut lines = text.lines().filter(|line| !line.trim().is_empty());
         match lines.next() {
@@ -161,16 +207,24 @@ mod warm_start {
         let mut channel_events_by_stream = Vec::new();
         let mut tcp_receiver_ranges_by_base = Vec::new();
         let mut tcp_ledger_segments_by_flow = Vec::new();
+        let mut declared_records = None;
         for line in lines {
             let fields = line.split_whitespace().collect::<Vec<_>>();
+            if let [RECORD_COUNT, declared] = fields.as_slice() {
+                let declared = declared
+                    .parse::<usize>()
+                    .map_err(|error| format!("`{line}` has an unreadable record count: {error}"))?;
+                if declared_records.replace(declared).is_some() {
+                    return Err(format!("`{line}` repeats the record count"));
+                }
+                continue;
+            }
             let [key, entity, value] = fields.as_slice() else {
                 return Err(format!(
                     "expected three whitespace-separated fields, got `{line}`"
                 ));
             };
-            let value = value
-                .parse::<usize>()
-                .map_err(|error| format!("`{line}` has an unreadable capacity: {error}"))?;
+            let value = bounded_capacity(value, line)?;
             match *key {
                 "floor" => {
                     let lane = FLOOR_LANES
@@ -198,6 +252,24 @@ mod warm_start {
         if let Some(lane) = seen.iter().position(|seen| !seen) {
             return Err(format!("the floor lane `{}` is missing", FLOOR_LANES[lane]));
         }
+        let records = channel_events_by_stream.len()
+            + tcp_receiver_ranges_by_base.len()
+            + tcp_ledger_segments_by_flow.len();
+        match declared_records {
+            None => {
+                return Err(format!(
+                    "the `{RECORD_COUNT}` terminator is missing; the snapshot is truncated or was \
+                     not written by this tool"
+                ));
+            }
+            Some(declared) if declared != records => {
+                return Err(format!(
+                    "the snapshot declares {declared} records but carries {records}; it is \
+                     truncated or corrupt"
+                ));
+            }
+            Some(_) => {}
+        }
 
         Ok(CapacityWarmStart {
             floors: floors_from(floors),
@@ -205,6 +277,22 @@ mod warm_start {
             tcp_receiver_ranges_by_base,
             tcp_ledger_segments_by_flow,
         })
+    }
+
+    /// Reads one capacity and refuses it if no device in the fleet could hold it.
+    fn bounded_capacity(value: &str, line: &str) -> Result<usize, String> {
+        let value = value
+            .parse::<u64>()
+            .map_err(|error| format!("`{line}` has an unreadable capacity: {error}"))?;
+        if value > MAX_CAPACITY {
+            return Err(format!(
+                "`{line}` names {value} records, above the {MAX_CAPACITY}-record ceiling: a single \
+                 entity at that capacity claims more device memory than any machine in the fleet \
+                 has, so the snapshot is corrupt"
+            ));
+        }
+        usize::try_from(value)
+            .map_err(|_| format!("`{line}` names a capacity that does not fit this target's usize"))
     }
 
     #[cfg(any(
@@ -500,7 +588,7 @@ mod tests {
         );
         // One canonical form: the same snapshot always renders the same bytes.
         assert_eq!(warm_start::encode(&warm_start), text);
-        assert!(text.starts_with("days-capacity-warm-start v1\n"));
+        assert!(text.starts_with("days-capacity-warm-start v2\n"));
         assert_eq!(
             text.lines()
                 .filter(|line| line.starts_with("floor "))
@@ -523,7 +611,10 @@ mod tests {
     fn a_malformed_capacity_warm_start_is_refused_rather_than_downgraded() {
         let text = warm_start::encode(&sample_warm_start());
         assert!(warm_start::decode("").is_err());
-        assert!(warm_start::decode("days-capacity-warm-start v2").is_err());
+        // A `v1` snapshot — the shape written before the terminator and the ceiling existed —
+        // is refused by its header rather than read as if it had been validated.
+        assert!(warm_start::decode("days-capacity-warm-start v1").is_err());
+        assert!(warm_start::decode("days-capacity-warm-start v3").is_err());
         assert!(
             warm_start::decode(&text.replace("floor queue_packets_per_lp 2048\n", "")).is_err()
         );
@@ -537,6 +628,66 @@ mod tests {
             warm_start::decode(&format!("{text}floor queue_packets_per_lp 5\n")).is_err(),
             "a repeated floor lane is ambiguous and must be refused, not last-write-wins"
         );
+        // A two-field line whose keyword is not the terminator is not a record count.
+        assert!(warm_start::decode(&format!("{text}sockets 9\n")).is_err());
+        assert!(warm_start::decode(&format!("{text}records 3\n")).is_err());
+    }
+
+    /// Truncation, which the format could not detect until it grew a terminator.
+    ///
+    /// The three association lists have no declared length and the floor block is written first, so
+    /// a snapshot cut anywhere after the floors used to parse **successfully** as a partial hint —
+    /// exactly the silent downgrade the format claims to refuse. Reproduced on the real 1,036-line
+    /// k16 snapshot: cut to 400 lines it was accepted, and the run then took the very retry the
+    /// hint existed to remove.
+    #[test]
+    fn a_truncated_capacity_warm_start_is_refused_rather_than_read_as_a_partial_hint() {
+        let text = warm_start::encode(&sample_warm_start());
+        let lines = text.lines().collect::<Vec<_>>();
+        for cut in 1..lines.len() {
+            let truncated = format!("{}\n", lines[..cut].join("\n"));
+            assert!(
+                warm_start::decode(&truncated).is_err(),
+                "a snapshot cut to {cut} of {} lines must be refused, not read as a partial hint",
+                lines.len()
+            );
+        }
+        assert!(warm_start::decode(&text).is_ok());
+        // A terminator that disagrees with the body is corruption, not truncation, and is refused
+        // by the same check.
+        assert!(warm_start::decode(&text.replace("records 6", "records 7")).is_err());
+    }
+
+    /// A capacity no device in the fleet could hold is refused BEFORE anything is allocated.
+    ///
+    /// Both cases are the review's own reproducing snapshots, run against the real binary on the
+    /// real k16 hint file. Before this bound the first produced
+    /// `memory allocation of 400000006240632 bytes failed` and the second `capacity overflow` in
+    /// `alloc::raw_vec` — an allocator abort inside the planner rather than a typed refusal here.
+    #[test]
+    fn a_capacity_beyond_the_fleet_ceiling_is_refused_before_anything_is_allocated() {
+        let text = warm_start::encode(&sample_warm_start());
+        assert!(
+            warm_start::decode(&text.replace("tcp-ledger 0 24", "tcp-ledger 0 9999999999999"))
+                .is_err()
+        );
+        assert!(
+            warm_start::decode(&text.replace(
+                "floor worklist_entries_total 90001",
+                "floor worklist_entries_total 18446744073709551615"
+            ))
+            .is_err()
+        );
+        assert!(
+            warm_start::decode(&text.replace("channel 3 512", "channel 3 4294967297")).is_err(),
+            "the ceiling applies to every lane, not only the per-flow one the clamp names"
+        );
+        assert!(
+            warm_start::decode(&text.replace("tcp-receiver 64 129", "tcp-receiver 64 4294967297"))
+                .is_err()
+        );
+        // The ceiling itself is accepted: the refusal is a bound, not a smaller cap in disguise.
+        assert!(warm_start::decode(&text.replace("channel 3 512", "channel 3 4294967296")).is_ok());
     }
 
     #[test]

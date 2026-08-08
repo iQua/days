@@ -305,9 +305,19 @@ impl TcpCapacityFloors {
     /// retry chain writes and are read through the same `base.max(floor)` expression, so the
     /// base-stability checks in [`Self::raise_receiver`] and [`Self::raise_ledger`] keep holding.
     ///
-    /// `flows` bounds the per-flow lane at the replaying image's own flow count. Entries beyond it
-    /// are inert — [`Self::ledger`] is only ever called for flows the plan sizes — and dropping
-    /// them keeps a corrupt or foreign snapshot from demanding an arbitrarily large allocation.
+    /// `flows` bounds the per-flow lane at the replaying image's own flow count, so this vector is
+    /// never longer than the image justifies. Entries beyond it are inert anyway — [`Self::ledger`]
+    /// is only ever called for flows the plan sizes.
+    ///
+    /// **That clamp bounds the number of keys, not the magnitude of any capacity, and it is not a
+    /// safety bound.** A single seeded value is still whatever the caller supplies, and the planner
+    /// will size an arena from it; one 13-digit entry priced a 400 TB plan and aborted the
+    /// allocator. Magnitudes are bounded where the untrusted input is — at the point a snapshot
+    /// **file** is parsed, in `t20f_frontier`'s `warm_start::decode`, which refuses any capacity
+    /// larger than a device in the fleet could hold before anything is allocated. A
+    /// [`CapacityWarmStart`] built in process has exactly the standing [`DeviceCapacityFloors`] and
+    /// the backends' `max_*` overrides already have: its magnitudes are the caller's
+    /// responsibility, as they were before this type existed.
     pub(crate) fn warm_started(
         receiver_ranges: &[(usize, usize)],
         ledger_segments: &[(usize, usize)],
