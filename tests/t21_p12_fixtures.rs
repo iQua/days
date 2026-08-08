@@ -387,6 +387,11 @@ fn f_het_carries_three_delay_tiers_a_hundred_fold_apart_in_one_image() {
         "rack phase must end ({rack_end}) before the inter-pod phase ({inter_pod_end}) and both \
          before the horizon ({horizon})"
     );
+
+    // The sparsity sentence in the fixture header is load-bearing for the wave-4 honesty
+    // constraint, so the number in it is pinned rather than asserted by eye. 128 x 25 + 32 x 20.
+    let result = scalar_run(&image, None);
+    assert_eq!(result.summary.sourced_packets, 3_840);
 }
 
 #[test]
@@ -449,6 +454,23 @@ fn f_topo_is_a_balanced_dragonfly_no_fat_tree_arithmetic_can_address() {
     let fabric_links = 33 * 28 + 33 * 32 / 2;
     assert_eq!(image.links.len(), 2 * fabric_links + 2 * 1_056);
     assert_eq!(image.flows.len(), 1_056);
+
+    // With more than one host per router the endpoint sampler shuffles and pairs index i with
+    // (i + n/2) mod n; at n = 1,056 that offset IS n/2, so the matrix is a fixed-point-free
+    // involution, not a draw from the full symmetric group. The header says so; this pins it.
+    let mut partner = std::collections::BTreeMap::<u64, u64>::new();
+    for flow in &image.flows {
+        assert_ne!(flow.source, flow.target, "no host may send to itself");
+        assert!(partner.insert(flow.source.0, flow.target.0).is_none());
+    }
+    assert_eq!(partner.len(), 1_056);
+    for (source, target) in &partner {
+        assert_eq!(
+            partner.get(target),
+            Some(source),
+            "host {source} pairs with {target}, but {target} does not pair back"
+        );
+    }
 }
 
 #[test]

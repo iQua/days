@@ -24,7 +24,8 @@
 #   mod 8: every one of those routes crosses two 10,000 ns aggregation-core links. 20 packets at
 #   10,000 ns spacing, last emission at 190 us.
 #
-# HONESTY. This is a sparse fixture on purpose (13,440 sourced packets over 200 us). Per the wave-4
+# HONESTY. This is a sparse fixture on purpose (3,840 sourced packets over 200 us: 128 rack flows
+# x 25 packets plus 32 inter-pod flows x 20, both byte-terminated). Per the wave-4
 # honesty constraint, per-round device cost carries width-fixed terms, so a sparse fixture
 # demonstrates the FEWER-ROUNDS mechanism; it is not a wall-clock claim and must not be reported as
 # one. The first-class metric here is rounds versus equivalent slots at equal simulated time, which

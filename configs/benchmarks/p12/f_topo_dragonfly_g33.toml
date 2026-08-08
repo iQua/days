@@ -27,8 +27,13 @@
 # it is essentially forced, so there is no equal-cost set to spread over and `FatTreeEcmp` (which
 # is fat-tree-only by definition) is neither applicable nor needed.
 #
-# TRAFFIC. Uniform-random permutation over all 1,056 hosts -- the textbook dragonfly workload, and
-# the one that exercises global links rather than staying inside a group. 1,540-byte packets at
+# TRAFFIC. A uniform-random FIXED-POINT-FREE INVOLUTION over all 1,056 hosts, not a draw from the
+# full symmetric group: with more than one host per router the endpoint sampler shuffles the host
+# list and pairs index i with index (i + n/2) mod n, and at n = 1,056 that offset is exactly n/2, so
+# the permutation is its own inverse -- 528 mutually exchanging host pairs. It is a permutation, it
+# is uniformly drawn from that family, and it exercises global links rather than staying inside a
+# group, which is what this row needs; it is simply less random than "uniform-random permutation"
+# would imply. 1,540-byte packets at
 # 1,232 ns give 10 Gbit/s per host, i.e. 10% of line rate: a group offers 320 Gbit/s spread over
 # its 32 global links, well clear of saturation, so this row reports the fabric and not a
 # congestion artefact.
