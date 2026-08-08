@@ -81,6 +81,13 @@ fn physical_flow_paths(graph: &UnGraph<usize, ()>, flows: &[Flow]) -> Vec<Vec<No
         RouteTableError::DuplicateKey(_) => {
             panic!("Duplicate flow ID in shortest-path route table.")
         }
+        // Only a topology-restricted policy can raise this, and legacy Days calls exactly one
+        // route table -- the topology-agnostic shortest path. Reaching it would mean the shared
+        // routing layer had grown a policy legacy does not select, which is a defect in the
+        // caller, not a scenario the frozen crate is expected to handle.
+        RouteTableError::UnsupportedTopology => {
+            panic!("Legacy Days selects only topology-agnostic shortest-path routing.")
+        }
     });
 
     flows
