@@ -40,6 +40,7 @@ Frozen **by reference**, not copied here:
   therefore does not by itself freeze legacy's *observable behaviour*: a change to shared
   routing or logging code can move what this engine outputs without any diff under `legacy/`.
   That is also why change class **(a)** below has to exist.
+
 Where each shared surface is actually covered — read this before assuming a green gate means a
 stable baseline:
 
@@ -67,7 +68,7 @@ exists in CI today**.
 The mitigation is therefore not a test. It is the freeze policy in [§3](#3-freeze-policy), its
 changelog in [§8](#8-freeze-changelog), review, and one manual step: anyone changing shared `days`
 code that legacy consumes runs the gates in [§5](#standing-gates) **and re-runs the E3 count check
-of [§6.6](#66-mt-count-nondeterminism-disclosure-protocol) against the frozen anchor** before any
+of [§6.6](#66-mt-nondeterminism-disclosure-protocol-counts-and-delays) against the frozen anchor** before any
 legacy number is republished. Automating that check is an open recommendation, not a shipped one.
 
 ## 2. Why it is frozen
@@ -274,7 +275,7 @@ Four requirements on the invocation, each with a reason:
   `logs/p12/e3_legacy_rack_local_{st,mt}` and the logger **truncates** `sources.csv`,
   `switches.csv`, and `sinks.csv` at startup (`fs::File::create` in `CsvLogger::init_output_files`).
   Sample *n*'s counts are destroyed the moment sample *n+1* starts, and the per-sample counts are
-  exactly what [§6.6](#66-mt-count-nondeterminism-disclosure-protocol) requires. `logs/` is
+  exactly what [§6.6](#66-mt-nondeterminism-disclosure-protocol-counts-and-delays) requires. `logs/` is
   gitignored, so archive the extracted fields, not the raw CSVs (1.1 MB + 1.7 MB per sample).
 - **One warmup, untimed, per arm per machine**, then the timed samples (the P01 protocol).
 
@@ -302,6 +303,7 @@ Per **sample** — not per arm, not per median:
 | `derived_dropped_packets` | `sent_packets − received_packets` (see below) |
 | `max_source_end_time`, `duration` | max `end_time` over `sources.csv`; `duration` from the fixture |
 | `sink_rows`, `source_rows` | row counts of each CSV |
+| `global_one_way_delay_mean_s` | `Average one-way delay: X seconds.` — **observe-only, NOT citable** (see [§6.6](#66-mt-nondeterminism-disclosure-protocol-counts-and-delays)); retained so the MT delay nondeterminism is visible per sample rather than merely warned about |
 | `log_bytes` | size of the run log (the guard above) |
 | machine, commit, `rustc`/`cargo` versions, quiet-gate record | the standing protocol |
 
@@ -320,10 +322,10 @@ Notes that will otherwise be got wrong:
   process start, topology construction, and the final CSV flush.
 - **Never publish a median without its range**, and never emit a statistic whose sample count
   disagrees with the arm's declared `n`.
-- **The count-agreement claim covers integer counts only.** The log's `Average one-way delay` is an
-  `f64` aggregate and is *not* part of it: on the freeze smoke, ST and MT reported 0.001517 s and
-  0.001519 s while every integer count agreed exactly. That is `f64` accumulation order under MT,
-  not a count divergence. Do not treat the delay mean as a count-like invariant.
+- **Every agreement claim on this fixture covers integer counts ONLY.** The delay columns do not
+  agree — not between ST and MT, and not between two MT runs. This is a real reordering effect, not
+  a rounding residue; see [§6.6](#66-mt-nondeterminism-disclosure-protocol-counts-and-delays).
+  **No delay quantity from a legacy MT run may be cited.**
 
 ### 6.5 The MT configuration is machine-dependent — disclose it
 
@@ -339,9 +341,16 @@ prints its `effective_num_threads`. Do not compare MT wall times across machines
 column, and do not silently pin `num_threads` — pinning changes the arm's meaning and would
 need its own recorded decision.
 
-### 6.6 MT count-nondeterminism disclosure protocol
+### 6.6 MT nondeterminism disclosure protocol (counts and delays)
 
-Legacy MT is **not** a semantic oracle. Two facts are on record:
+Legacy MT is **not** a semantic oracle. It is nondeterministic on this fixture in the delay columns
+and deterministic in the integer counts, and the two halves need different rules. Read
+[§6.6.2](#662-delays-mt-is-nondeterministic-and-no-mt-delay-is-citable) before reporting anything
+that is not an integer.
+
+#### 6.6.1 Counts
+
+Two facts are on record:
 
 - **P01** (`days-gpu/evidence/P01/nexosim-baseline.md`): on duration-terminated fixtures, MT
   received-packet counts varied between samples (2 packets at k8/k16, 145 at k32), attributed to
@@ -349,11 +358,17 @@ Legacy MT is **not** a semantic oracle. Two facts are on record:
 - **P11 slide preview** (`days-gpu/evidence/P11/slide-preview/slide-fourarm-preview.md`): the
   count nondeterminism did not manifest on the drop-free E3-class workload; the drop-heavy
   negative control is where legacy and Days AGO diverged (9.4%, from TailDrop packet-vs-byte
-  admission semantics).
+  admission semantics). **Refined here:** that observation is true of *counts* and false of
+  *delays* — see [§6.6.2](#662-delays-mt-is-nondeterministic-and-no-mt-delay-is-citable). Drops are
+  not required to observe legacy MT nondeterminism; they are only required to observe it *in the
+  counts*.
 
-E3 is built so the boundary mechanism cannot fire: every flow is byte-terminated and completes
-by ~16.0 s, two seconds before the 18 s horizon, so no packet is in flight when the simulation
-stops. **This is an expectation to be tested per machine, not an assumption to be asserted.**
+E3 is built so the **count** boundary mechanism cannot fire: every flow is byte-terminated and
+completes by ~16.0 s, two seconds before the 18 s horizon, so no packet is in flight when the
+simulation stops and no count can be truncated. Note precisely what this does and does not say —
+the MT interleaving still reorders execution extensively (§6.6.2); what the drained horizon buys is
+that the reordering cannot change a *total*. **This is an expectation to be tested per machine, not
+an assumption to be asserted.**
 
 The protocol:
 
@@ -372,10 +387,51 @@ The protocol:
 5. The ST arm's counts are the legacy-side reference. If ST itself varies between samples, stop:
    that is a new finding, not a disclosure item.
 
+#### 6.6.2 Delays: MT is nondeterministic, and no MT delay is citable
+
+<a id="662-delays-mt-is-nondeterministic-and-no-mt-delay-is-citable"></a>
+The count invariance above does **not** extend to the delay columns. Measured at the freeze on this
+fixture, by diffing `sinks.csv` per flow (one ST run, three MT runs):
+
+| comparison | `queueing_delay_mean` differing | `one_way_delay_mean` differing | integer counts / bytes / ids / times differing |
+|---|---:|---:|---:|
+| ST vs MT | **8,704 of 16,896** | **8,704** | **0** |
+| MT vs MT (three pairs) | **8,704** every time | 8,683 – 8,693 | **0** |
+
+Three things follow, and none of them is summation order:
+
+1. **The per-flow delays genuinely differ, at large magnitude.** Over the 8,704 differing sinks
+   (ST vs MT): ratio median **2.08×**, p90 **5.15×**, max **8.45×**; 99.8% differ by more than 1%
+   and 53% differ by more than 2×. Example, sink `id 17665` (flow 8192): ST `one_way_delay_mean`
+   0.047499999999985 vs one MT run's 0.013141666666652. This is not a last-bits residue.
+2. **The divergence is exactly the non-rack-local traffic.** 8,704 = 8,192 intra-pod cross-rack
+   + 512 cross-pod — i.e. **every flow that leaves its top-of-rack switch diverges, and all 8,192
+   rack-local flows agree exactly.** That is execution-order contention at the aggregation and core
+   switches, which is precisely what MT changes. `queueing_delay_mean` hits all 8,704 in *every*
+   comparison; `one_way_delay_mean` falls a few short between MT runs only because a handful of
+   flows coincidentally land on the same value.
+3. **The logged aggregate is a faithful summary, not an artifact.** Recomputing the global mean
+   from the per-sink means and counts gives ST 0.001517160 and MT 0.001518399 / 0.001518479,
+   reproducing the logged `0.001517` / `0.001518` exactly. The four samples logged ST 0.001517 and
+   MT 0.001518, 0.001518, 0.001519 — the MT arm is nondeterministic run to run.
+
+**Protocol consequence, and it is absolute: no delay quantity from a legacy MT run may be cited,
+compared, plotted, or averaged.** That covers `one_way_delay_mean`, `queueing_delay_mean`, and the
+logged `Average one-way delay`. **The ST arm is the only delay-bearing legacy arm.** Retain
+`global_one_way_delay_mean_s` per sample anyway ([§6.4](#64-fields-the-measurer-round-must-retain))
+so the nondeterminism is *observable* in the record rather than merely warned about; label the
+column observe-only wherever it appears. If a future fixture needs legacy MT delays, that is a new
+scoping decision with its own evidence, not something this contract permits.
+
 ### 6.7 Comparability statement to carry into every legacy/AGO table
 
 - TCP scenarios are comparable **modulo the documented `f64` divergences**; legacy timing uses
   `f64`, the executor uses exact integer arithmetic.
+- **Legacy MT delay quantities are not comparable to anything** — not to legacy ST, not to the
+  Days AGO anchor, not to another legacy MT sample
+  ([§6.6.2](#662-delays-mt-is-nondeterministic-and-no-mt-delay-is-citable)). Legacy/AGO agreement on
+  this fixture is an **integer-count** statement. Any table with a delay column sourced from legacy
+  must take it from the ST arm and say so.
 - Legacy emits **one extra packet per duration-terminated flow**. E3 avoids this by construction;
   any other fixture must state how it does.
 - The parity table's intentional exclusions (virtual clock, BBR) keep their recorded rationale.
@@ -393,8 +449,10 @@ The legacy side of E3 was smoke-run once per arm on the freeze machine to prove 
 | ST | completed; 16,896 sink rows; 41,932,800 packets / 41,932,800,000 bytes; sent = received; max source `end_time` 16.0000000000015 < 18 | completed in ~46 s — **not a measurement** |
 | MT | completed; identical counts and identical max source `end_time`; 18 effective threads | completed in ~11 s — **not a measurement** |
 
-Both arms reproduced the frozen Days AGO anchor exactly. No number in this table may be cited,
-compared, or plotted.
+Both arms reproduced the frozen Days AGO anchor's **integer counts** exactly. They did **not** agree
+on the delay columns — 8,704 of 16,896 sinks differ, and MT differs run to run
+([§6.6.2](#662-delays-mt-is-nondeterministic-and-no-mt-delay-is-citable)). No number in this table
+may be cited, compared, or plotted.
 
 ## 7. Provenance
 
