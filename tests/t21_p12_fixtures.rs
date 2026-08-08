@@ -186,7 +186,7 @@ fn e1_points_differ_only_in_the_inter_packet_interval() {
         assert_eq!(
             config["routing"]["policy"].as_str(),
             Some("FatTreeEcmp"),
-            "{name}: single-path routing funnels every cross-pod flow through one core switch"
+            "{name}: single-path routing concentrates cross-pod flows onto few cores (E1 k=32: 6 of 256, busiest 53%) — ECMP required for comparability"
         );
 
         let flow_set = &config["flow_set"][0];
