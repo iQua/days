@@ -565,12 +565,26 @@ pub struct EcmpFlow<K> {
 /// Equal-cost multipath selection over a canonical fat tree (T21/P12).
 ///
 /// WHY THIS EXISTS. [`compute_shortest_path_route_table`] returns ONE shortest path per switch
-/// pair, and its tie-break is the lowest neighbour identity, so every inter-pod route in a
-/// canonical fat tree leaves through aggregation group 0 and crosses core switch 0. That is a
-/// single-path fabric: a cross-pod permutation at k = 32 puts all 8,192 flows through one core
-/// switch. Every external arm in the P12 roster spreads that traffic (Unison exposes `--ecmp`;
-/// GeDES reports no queue overflow at 90% on the same matrix), so a cross-arm fixture routed
-/// single-path would not be expressing the same fabric as the arms it is compared against.
+/// pair. Equal-cost successors tie on the score tuple and [`MinScoredNode`]'s `cmp` returns
+/// `Ordering::Equal` on a tie — node identity is never consulted — so which equal-cost successor
+/// wins is `BinaryHeap` sift order over a reversed push sequence: an implementation artifact, not
+/// a stated policy.
+///
+/// The consequence is severe concentration, and how severe depends on the traffic matrix — a
+/// distinction worth keeping, because collapsing the two is how this was first written down wrong.
+/// Over the full cross-pod pair set at k = 8 each pod still reaches three of four aggregation
+/// groups. Under an OFFSET PERMUTATION — which is exactly what E1 and E2 use — it collapses: every
+/// cross-pod route leaving a given pod takes one aggregation group and one core switch.
+///
+/// Fabric-wide it is never one switch. Measured over E1's matrix (k = 32, 512 edge switches,
+/// `s -> (s + 256) mod 512`): 6 distinct core switches of 256 carry the traffic, per-pair histogram
+/// `{1025: 144, 1121: 32, 1152: 272, 1217: 16, 1233: 16, 1264: 32}` — the busiest core takes 272
+/// of 512 edge-switch pairs, 53%, i.e. roughly 4,352 of the 8,192 flows; six of sixteen
+/// aggregation groups are used. Still a bottleneck no real fabric has: at a nominal 10% offered
+/// load E1 dropped 36,384 of 139,264 sourced packets (26.1%), and drops zero under this policy.
+/// Every external arm in the P12 roster spreads that traffic (Unison exposes `--ecmp`; GeDES
+/// reports no queue overflow at 90% on the same matrix), so a cross-arm fixture routed single-path
+/// would not be expressing the same fabric as the arms it is compared against.
 ///
 /// THE SELECTION. An inter-pod path is
 /// `edge_s -> agg(pod_s, a) -> core(a, c) -> agg(pod_t, a) -> edge_t`, with aggregation group `a`

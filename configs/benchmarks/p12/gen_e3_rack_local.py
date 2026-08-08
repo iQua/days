@@ -16,16 +16,21 @@ as structural findings:
 
 2. THE TRAFFIC MATRIX MUST BE EXPLICIT AND RACK-LOCAL-DOMINANT. The executor rejects non-constant
    arrival distributions, so de-synchronisation has to come from the matrix rather than from an
-   RNG; and the shared canonical fat-tree route table funnels all inter-pod traffic through one
-   aggregation switch per pod and a single core switch, capping active width at roughly hops x k
-   (~192) whatever the rates are. A rack-local-dominant matrix is what produces width on this
-   topology family.
+   RNG; and the shared canonical fat-tree route table concentrates inter-pod traffic hard, because
+   its equal-cost tie-break is enumeration/heap order rather than a spreading policy. How hard
+   depends on the matrix: over the full cross-pod pair set at k = 8 each pod still reaches three of
+   four aggregation groups, while under an offset permutation each pod collapses onto exactly one
+   aggregation group and one core switch. Fabric-wide it is a small minority rather than one switch
+   -- on the E1 permutation at k = 32, 6 distinct cores of 256 with the busiest carrying 53% of the
+   flows. Either way active width is capped at roughly hops x k (~192) whatever the rates are, and
+   that CAP -- not a literal single core switch -- is what the matrix has to work around. A
+   rack-local-dominant matrix is what produces width on this topology family.
 
 3. E3 KEEPS THE DEFAULT SHORTEST-PATH ROUTING. T21 added `[routing] policy = "FatTreeEcmp"`, which
-   removes exactly the funnel that finding 2 describes, and E1/E2 use it. E3 must NOT: legacy Days
-   has no equal-cost multipath and is frozen against new features (PLAN:605), so an ECMP Days AGO
-   row would no longer be running legacy's fabric. The funnel is why the matrix is rack-local, and
-   both halves of that pairing have to stay.
+   removes exactly the concentration finding 2 describes, and E1/E2 use it. E3 must NOT: legacy
+   Days has no equal-cost multipath and is frozen against new features (PLAN:605), so an ECMP Days
+   AGO row would no longer be running legacy's fabric. The concentration is why the matrix is
+   rack-local, and both halves of that pairing have to stay.
 
 The matrix has three permutation components on the k = 32, 16-hosts-per-edge fat tree
 (host(o, s) = o * 512 + s, the ordinal-major numbering the builder produces):
@@ -61,8 +66,9 @@ HEADER = '''# P12 E3 legacy-comparability fixture, %(arm)s arm. GENERATED -- do 
 # The generator carries the full rationale; the three load-bearing facts are:
 #   * every flow is BYTE-terminated (legacy emits one extra packet per duration-terminated flow);
 #   * the traffic matrix is explicit and rack-local-dominant (the executor rejects non-constant
-#     arrival distributions, and the shared canonical fat-tree route table funnels all inter-pod
-#     traffic through one core switch);
+#     arrival distributions, and the shared canonical fat-tree route table concentrates cross-pod
+#     traffic onto a small minority of aggregation and core switches -- under an offset permutation
+#     onto exactly one of each per source pod -- capping active width at roughly hops x k);
 #   * routing is left at the DEFAULT shortest path. E1 and E2 use `FatTreeEcmp`; E3 must not,
 #     because legacy Days has no equal-cost multipath and is frozen against new features, so an
 #     ECMP row here would not be running legacy's fabric.

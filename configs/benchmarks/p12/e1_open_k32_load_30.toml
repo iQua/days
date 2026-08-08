@@ -47,13 +47,18 @@ drop = "TailDrop"
 [link]
 propagation_ns = 1000
 
-# Equal-cost multipath. MANDATORY for this family: Days' single-path table breaks ties on the
-# lowest neighbour identity, so every inter-pod route in a canonical fat tree would leave through
-# aggregation group 0 and cross core switch 0 -- all 8,192 cross-pod flows through one core switch.
-# Measured on this exact fixture at the nominal 10% point before the policy existed: 36,384 drops
-# out of 139,264 sourced packets. GeDES reports NO queue overflow at 90% on the same matrix and
-# Unison exposes `--ecmp`, so a single-path Days row would not be the same fabric as the arms it is
-# compared with.
+# Equal-cost multipath. MANDATORY for this family. Days' single-path table returns one path per
+# switch pair, and equal-cost successors tie on score -- `MinScoredNode::cmp` returns Equal and
+# never looks at node identity -- so the winner is BinaryHeap sift order, an implementation
+# artifact rather than a stated rule. ON THIS MATRIX, the offset permutation s -> (s+256) mod 512,
+# that collapses each source pod onto ONE aggregation group and ONE core switch. Fabric-wide it is
+# a minority, not a single switch: 6 distinct cores of 256, per-pair histogram
+# {1025: 144, 1121: 32, 1152: 272, 1217: 16, 1233: 16, 1264: 32}, the busiest core taking 272 of
+# 512 pairs (53%, roughly 4,352 of the 8,192 flows). Enough to wreck the fixture -- measured at the
+# nominal 10% point before the policy existed: 36,384 drops out of 139,264 sourced packets, 26.1%.
+# Zero drops with the policy, at all four points. GeDES reports NO queue overflow at 90% on the
+# same matrix and Unison exposes `--ecmp`, so a single-path Days row would not be the same fabric
+# as the arms it is compared with.
 [routing]
 policy = "FatTreeEcmp"
 

@@ -4,8 +4,9 @@
 # The generator carries the full rationale; the three load-bearing facts are:
 #   * every flow is BYTE-terminated (legacy emits one extra packet per duration-terminated flow);
 #   * the traffic matrix is explicit and rack-local-dominant (the executor rejects non-constant
-#     arrival distributions, and the shared canonical fat-tree route table funnels all inter-pod
-#     traffic through one core switch);
+#     arrival distributions, and the shared canonical fat-tree route table concentrates cross-pod
+#     traffic onto a small minority of aggregation and core switches -- under an offset permutation
+#     onto exactly one of each per source pod -- capping active width at roughly hops x k);
 #   * routing is left at the DEFAULT shortest path. E1 and E2 use `FatTreeEcmp`; E3 must not,
 #     because legacy Days has no equal-cost multipath and is frozen against new features, so an
 #     ECMP row here would not be running legacy's fabric.

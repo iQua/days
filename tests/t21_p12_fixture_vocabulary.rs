@@ -282,6 +282,12 @@ fn unknown_pairing_policies_are_refused_by_name() {
 fn default_pairing_is_random_and_structural_pairings_do_not_draw_from_the_endpoint_rng() {
     assert_eq!(PairingPolicy::default(), PairingPolicy::Random);
 
+    // The structural set carries flow_count = 2 and the random set flow_count = 4 SO THAT THE
+    // STRUCTURAL SET IS EXPANDED FIRST. `canonical_flows` sorts flow sets before expanding them
+    // and `flow_count` is `FlowSetKey`'s leading field, so a structural set with the LARGER count
+    // would be expanded after the random one and could not perturb it -- the test would have no
+    // red capability at all. Verified red: injecting one `rng.random()` draw into the structural
+    // branch of `canonical_flows` fails this assertion.
     let mixed = r#"
 seed = 21
 duration = 0.00001
@@ -304,7 +310,7 @@ propagation_ns = 100
 
 [[flow_set]]
 flow_type = "PacketDistribution"
-flow_count = 8
+flow_count = 2
 pairing = "SwitchOffsetHalf"
 traffic = { initial_delay = 0.0, size = 15400, arr_dist = { type = "Uniform", low = 0.000001232, high = 0.000001232 }, pkt_size_dist = { type = "DiscreteUniform", low = 1540, high = 1540 } }
 
@@ -343,13 +349,16 @@ traffic = { initial_delay = 0.0, size = 3080, arr_dist = { type = "Uniform", low
     let random_image =
         compile_config(scenario_path(random_only, "pairing-random")).expect("must lower");
 
-    // Flow identity is dense over sorted flow keys, and `flow_count` is the leading field, so the
-    // four-member random set occupies the first four flow ids in both images.
-    let mixed_random_pairs = endpoint_pairs(&mixed_image)
-        .into_iter()
-        .take(4)
-        .collect::<Vec<_>>();
-    assert_eq!(mixed_random_pairs, endpoint_pairs(&random_image));
+    // Flow identity is dense over sorted flow keys and `flow_count` leads, so the two structural
+    // members take flow ids 0..2 and the four random members follow at 2..6.
+    let mixed_pairs = endpoint_pairs(&mixed_image);
+    assert_eq!(mixed_pairs.len(), 6);
+    assert_eq!(
+        mixed_pairs[..2].to_vec(),
+        vec![(0, 4), (1, 5)],
+        "the structural set must expand first, or this test cannot go red"
+    );
+    assert_eq!(mixed_pairs[2..].to_vec(), endpoint_pairs(&random_image));
 }
 
 fn pairing_scenario(policy: &str, flow_count: u64) -> String {
@@ -415,9 +424,11 @@ fn host_topology_identities(
 }
 
 // ---------------------------------------------------------------------------------------------
-// Equal-cost multipath (T21/P12). The single-path table breaks ties on the lowest neighbour
-// identity, so every inter-pod route in a canonical fat tree crosses core switch 0. That is a
-// single-path fabric and it is not what any external P12 arm runs.
+// Equal-cost multipath (T21/P12). The single-path table returns one path per switch pair, and its
+// equal-cost tie-break is `BinaryHeap` sift order rather than any stated rule -- `MinScoredNode`'s
+// `cmp` returns `Ordering::Equal` on a score tie and never consults node identity. The result is
+// severe concentration PER SOURCE POD: one aggregation group and one core switch for every
+// cross-pod route leaving a pod. That is not what any external P12 arm runs.
 // ---------------------------------------------------------------------------------------------
 
 use days::topos::route::{
@@ -448,13 +459,21 @@ drop = "TailDrop"
 
 /// The defect the policy exists to remove, stated as a test so it cannot silently come back.
 ///
-/// Over EVERY cross-pod edge-switch pair of a k = 8 fat tree the single-path table reaches only a
-/// small minority of the sixteen core switches, because its tie-break is the lowest neighbour
-/// identity. Equal-cost multipath reaches all sixteen on the same pair set.
+/// Two different statements, measured separately, because conflating them is how this became an
+/// overclaim once already:
+///
+/// * Over the FULL cross-pod pair set the concentration is partial — each pod reaches three of
+///   four aggregation groups, and the fabric reaches 3 of 16 cores.
+/// * Under E1's OWN matrix, the offset permutation `s -> (s + S/2) mod S`, it is total per source
+///   pod: exactly one aggregation group and exactly one core switch per pod. That is the claim
+///   the E1 and E2 fixture headers make, so it is pinned in the shape those fixtures use.
+///
+/// Fabric-wide it is never a single switch. On E1's k = 32 matrix the single-path table reaches
+/// 6 distinct cores of 256, the busiest carrying 272 of 512 edge-switch pairs (53%).
 #[test]
-fn single_path_routing_concentrates_cross_pod_flows_on_a_few_core_switches() {
+fn single_path_routing_concentrates_every_pod_on_one_aggregation_group_and_one_core() {
     let graph = k8_fat_tree();
-    // k = 8: edge switches 0..=31 in eight pods of four; cores are identities 64..=79.
+    // k = 8: edge switches 0..=31 in eight pods of four; aggregation 32..=63; cores 64..=79.
     let pairs = (0..32_usize)
         .flat_map(|source| (0..32_usize).map(move |target| (source, target)))
         .filter(|(source, target)| source / 4 != target / 4)
@@ -487,9 +506,89 @@ fn single_path_routing_concentrates_cross_pod_flows_on_a_few_core_switches() {
             .filter(|node| *node >= 64)
             .collect::<std::collections::BTreeSet<_>>()
     };
-    let single_path_cores = cores(&single_path);
     let ecmp_cores = cores(&ecmp);
     assert_eq!(ecmp_cores.len(), 16, "ECMP must reach every core switch");
+
+    // Per source pod, the single-path table collapses to one aggregation group and one core.
+    let mut by_pod = std::collections::BTreeMap::<
+        usize,
+        (
+            std::collections::BTreeSet<usize>,
+            std::collections::BTreeSet<usize>,
+        ),
+    >::new();
+    for (index, route) in &single_path {
+        let entry = by_pod.entry(pairs[*index].0 / 4).or_default();
+        for node in route {
+            let identity = node.index();
+            if identity >= 64 {
+                entry.1.insert(identity);
+            } else if identity >= 32 {
+                entry.0.insert((identity - 32) % 4);
+            }
+        }
+    }
+    // Over the FULL cross-pod pair set the collapse is partial, not total: each pod reaches three
+    // of four aggregation groups. Asserting "one" here would be the overclaim this test exists to
+    // prevent.
+    assert_eq!(by_pod.len(), 8, "every pod must source cross-pod traffic");
+    for (pod, (aggregation_groups, pod_cores)) in &by_pod {
+        assert!(
+            aggregation_groups.len() < 4 && pod_cores.len() * 4 <= 16,
+            "pod {pod} spread over {aggregation_groups:?} / {pod_cores:?}"
+        );
+    }
+
+    // E1's own matrix shape -- the offset permutation s -> (s + S/2) mod S -- is where the
+    // collapse becomes total, and that is the claim the E1 and E2 headers make.
+    let offset_pairs = (0..32_usize)
+        .map(|s| (s, (s + 16) % 32))
+        .collect::<Vec<_>>();
+    let offset = compute_shortest_path_route_table(
+        &graph,
+        offset_pairs
+            .iter()
+            .enumerate()
+            .map(|(index, (source, target))| {
+                (index, NodeIndex::new(*source), NodeIndex::new(*target))
+            }),
+    )
+    .expect("offset permutation must route");
+    let mut offset_by_pod = std::collections::BTreeMap::<
+        usize,
+        (
+            std::collections::BTreeSet<usize>,
+            std::collections::BTreeSet<usize>,
+        ),
+    >::new();
+    for (index, route) in &offset {
+        let entry = offset_by_pod.entry(offset_pairs[*index].0 / 4).or_default();
+        for node in route {
+            let identity = node.index();
+            if identity >= 64 {
+                entry.1.insert(identity);
+            } else if identity >= 32 {
+                entry.0.insert((identity - 32) % 4);
+            }
+        }
+    }
+    assert_eq!(offset_by_pod.len(), 8);
+    for (pod, (aggregation_groups, pod_cores)) in &offset_by_pod {
+        assert_eq!(
+            (aggregation_groups.len(), pod_cores.len()),
+            (1, 1),
+            "under E1's permutation pod {pod} must collapse onto exactly one aggregation group \
+             and one core switch, got {aggregation_groups:?} / {pod_cores:?}"
+        );
+    }
+    assert_eq!(
+        cores(&offset).len(),
+        3,
+        "fabric-wide the offset permutation reaches a small minority of the sixteen cores"
+    );
+
+    // Fabric-wide the single-path table reaches only a minority of the cores ECMP reaches.
+    let single_path_cores = cores(&single_path);
     assert!(
         single_path_cores.len() * 2 <= ecmp_cores.len(),
         "single-path routing reached {} of 16 core switches; the concentration this policy exists \
