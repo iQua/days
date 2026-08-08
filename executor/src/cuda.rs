@@ -259,25 +259,41 @@ fn arena_compaction_plan(
     .map_err(compaction_error)
 }
 
-/// Reads one bounded word range out of a result plane, clamped to the plane.
+/// Reads `N` bounded word ranges out of result planes behind ONE synchronization.
 ///
-/// T20l fix 2 uses this for the two contiguous `tcp_state` metadata regions the decode needs in
-/// full; `CudaSlice::slice` panics on an out-of-range range, so the bounds are clamped the way
-/// Metal's `SharedBuffer::read_range` clamps them.
-fn bounded_plane_words(
+/// T20l fix 2 uses this for the contiguous metadata regions the decode needs in full but the
+/// planes carry alongside device scratch: the two `tcp_state` regions and the per-stream ring
+/// metadata prefix of `stream_state`. `CudaSlice::slice` panics on an out-of-range range, so each
+/// range is clamped to its plane the way Metal's `SharedBuffer::read_range` clamps it.
+fn bounded_plane_words<const N: usize>(
     stream: &std::sync::Arc<CudaStream>,
-    plane: &CudaSlice<u64>,
-    start: usize,
-    len: usize,
+    ranges: [(&CudaSlice<u64>, usize, usize); N],
     context: &str,
-) -> Result<Vec<u64>, AttemptFailure> {
-    let start = start.min(plane.len());
-    let end = start.saturating_add(len).min(plane.len());
-    Ok(screen_plane_words(
-        stream,
-        plane.slice(start..end),
-        context,
-    )?)
+) -> Result<[Vec<u64>; N], AttemptFailure> {
+    let mut regions = Vec::with_capacity(N);
+    let mut readback_error = None;
+    for (plane, start, len) in ranges {
+        let start = start.min(plane.len());
+        let end = start.saturating_add(len).min(plane.len());
+        #[cfg(feature = "cuda-test-hooks")]
+        account_readback_words(end - start);
+        match stream.clone_dtoh(&plane.slice(start..end)) {
+            Ok(words) => regions.push(words),
+            Err(error) => {
+                readback_error = Some(driver_error(format!("{context} copy"), error));
+                break;
+            }
+        }
+    }
+    stream
+        .synchronize()
+        .map_err(|error| driver_error(format!("{context} synchronization"), error))?;
+    if let Some(error) = readback_error {
+        return Err(error.into());
+    }
+    Ok(regions
+        .try_into()
+        .expect("one readback per requested bounded range"))
 }
 
 fn decode_device_error(control: &[u64]) -> CudaError {
@@ -3838,67 +3854,78 @@ impl CudaBuffers {
         // plane classes (elided, read whole, compacted) and their justification. At the RQ9
         // frontier the elided planes alone are 691,104,103 of 2,394,309,899 words, of which
         // `remote_staging` is 657,667,584.
-        let read_plane = |index: usize| -> Result<Vec<u64>, AttemptFailure> {
+        // The copies are batched behind one synchronization each, exactly as the pre-fix readback
+        // batched its 29 planes: three waves — the fixed-width planes, the three bounded metadata
+        // regions that need `params` first, then the gathered arenas inside `DirectCuda::compact`.
+        const WHOLE_PLANES: [usize; 10] = [1, 2, 3, 7, 9, 11, 14, 18, 21, 27];
+        let mut whole = Vec::with_capacity(WHOLE_PLANES.len());
+        let mut readback_error = None;
+        for index in WHOLE_PLANES {
             let plane = &self.planes[index];
             #[cfg(feature = "cuda-test-hooks")]
             account_readback_words(plane.len());
-            let words = stream.clone_dtoh(plane).map_err(|error| {
-                AttemptFailure::from(driver_error(
-                    format!("result plane {index} readback"),
-                    error,
-                ))
-            })?;
-            stream.synchronize().map_err(|error| {
-                AttemptFailure::from(driver_error(
-                    format!("result plane {index} readback synchronization"),
-                    error,
-                ))
-            })?;
-            Ok(words)
-        };
-        let params = read_plane(1)?;
-        let node_state = read_plane(2)?;
-        let generators = read_plane(3)?;
-        let fel_meta = read_plane(7)?;
-        let queue_meta = read_plane(9)?;
-        let in_service = read_plane(11)?;
-        let summary_words = read_plane(14)?;
-        let lp_state = read_plane(18)?;
-        let observation_meta = read_plane(21)?;
-        let scheduler_state = read_plane(27)?;
+            match stream.clone_dtoh(plane) {
+                Ok(words) => whole.push(words),
+                Err(error) => {
+                    readback_error = Some(driver_error(
+                        format!("result plane {index} readback"),
+                        error,
+                    ));
+                    break;
+                }
+            }
+        }
+        stream
+            .synchronize()
+            .map_err(|error| driver_error("result-plane readback synchronization", error))?;
+        if let Some(error) = readback_error {
+            return Err(error.into());
+        }
+        let [
+            params,
+            node_state,
+            generators,
+            fel_meta,
+            queue_meta,
+            in_service,
+            summary_words,
+            lp_state,
+            observation_meta,
+            scheduler_state,
+        ]: [Vec<u64>; 10] = whole
+            .try_into()
+            .expect("one readback per decoded fixed-width plane");
 
         let node_count = image.nodes.len();
         let flow_count = image.flows.len();
         let tcp_plane = &self.planes[28];
-        let receiver_base = params[PARAM_RECEIVER_OFFSET] as usize;
-        let ledger_meta_offset = params[PARAM_LEDGER_META_OFFSET] as usize;
-        let receiver_state = bounded_plane_words(
-            stream,
-            tcp_plane,
-            receiver_base,
-            flow_count.saturating_mul(TCP_RECEIVER_WORDS),
-            "TCP receiver state readback",
-        )?;
-        let ledger_meta = bounded_plane_words(
-            stream,
-            tcp_plane,
-            ledger_meta_offset,
-            flow_count.saturating_mul(TCP_LEDGER_META_WORDS),
-            "TCP ledger metadata readback",
-        )?;
         // Only the per-stream ring metadata prefix of `stream_state` is decoded; the LP stream
         // lists, outbound metadata, channel batches, staging channels and channel targets that
         // follow it are device scratch. At the frontier that prefix is 1,667,976 of the plane's
         // 52,426,754 words. The extent is the planner's own `stream_count` — the same bound the
         // decode loop below already walks — not an inferred one.
-        let stream_state = bounded_plane_words(
+        let [receiver_state, ledger_meta, stream_state] = bounded_plane_words(
             stream,
-            &self.planes[25],
-            0,
-            self.stream_layout
-                .stream_count
-                .saturating_mul(ARENA_META_WORDS),
-            "stream ring metadata readback",
+            [
+                (
+                    tcp_plane,
+                    params[PARAM_RECEIVER_OFFSET] as usize,
+                    flow_count.saturating_mul(TCP_RECEIVER_WORDS),
+                ),
+                (
+                    tcp_plane,
+                    params[PARAM_LEDGER_META_OFFSET] as usize,
+                    flow_count.saturating_mul(TCP_LEDGER_META_WORDS),
+                ),
+                (
+                    &self.planes[25],
+                    0,
+                    self.stream_layout
+                        .stream_count
+                        .saturating_mul(ARENA_META_WORDS),
+                ),
+            ],
+            "bounded metadata region readback",
         )?;
 
         let fel_plan = arena_compaction_plan(

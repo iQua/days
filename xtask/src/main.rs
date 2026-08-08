@@ -27,7 +27,7 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "cuda.rs",
         predicate: r#"feature = "cuda-test-hooks""#,
-        count: 19,
+        count: 20,
         purpose: "CUDA-only fault injection, capacity, planner measurement, and T20l readback- and plane-word-accounting hooks",
     },
     AllowedFeatureGate {
