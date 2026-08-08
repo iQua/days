@@ -1,0 +1,67 @@
+# P12 E2: closed-loop k=32 TCP Reno, E1's twin fabric and traffic matrix.
+#
+# CROSS-ARM CONTRACT (arms 5-8 plus every Days AGO lane). E2 differs from E1 in exactly one axis --
+# the traffic model -- so a reader can attribute any difference between the two rows to the closed
+# loop and to nothing else:
+#   * identical fabric: k = 32, 16 hosts per edge switch, 8,192 hosts, 100 Gbit/s ports,
+#     1,024-packet queues, FIFO/TailDrop, 1,000 ns propagation.
+#   * identical traffic matrix: the GeDES-matched cross-pod permutation
+#     (`pairing = "SwitchOffsetHalf"`, pod p -> pod p+16 mod 32), one flow per host.
+#   * 1,460-byte segments: GeDES's as-shipped TCP payload, and E1's 1,540-byte on-wire packet minus
+#     the same 80-byte header, so the two arms put the same bytes on the wire per segment.
+#
+# HORIZON. 1.152 ms, the standing k=32 closed-loop horizon (`rq9_frontier_closed_k32`,
+# `fattree_k32_tcp_reno_f8192`). E1's 20 us horizon is not usable here: six 1,000 ns hops give a
+# ~12 us minimum RTT, so 20 us is under two round trips and no congestion controller has moved.
+#
+# RESIDENCY. 16 MiB per flow. A 100 Gbit/s host can place at most 14.4 MB in 1.152 ms, so no flow
+# can complete inside the horizon and the closed-loop population stays resident for the whole
+# measured window -- the same sizing rule `rq9_frontier_closed_k32` states.
+#
+# NOT the same fixture as `configs/benchmarks/tcp/fattree_k32_tcp_reno_f8192.toml` (T24 corpus):
+# that one draws random endpoint pairs, uses 64-packet queues, and terminates its flows at 23,360
+# bytes. It stays where it is; E2 is the cross-arm row.
+seed = 21032
+duration = 0.001152
+threading = "single"
+log_path = "logs/p12/e2_closed_k32_tcp_reno"
+
+[topology]
+category = "FatTree"
+
+[topology.fat_tree]
+k = 32
+hosts_per_edge = 16
+
+[switch]
+port_rate = 100_000_000_000
+capacity = 1024
+weights = [1]
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link]
+propagation_ns = 1000
+
+# Equal-cost multipath, the same policy E1 uses and for the same reason: Days' single-path table
+# breaks ties on the lowest neighbour identity, so every inter-pod route in a canonical fat tree
+# would leave through aggregation group 0 and cross core switch 0 -- all 8,192 cross-pod flows
+# through one core switch. (Measured on E1's nominal 10% point before the policy existed: 36,384
+# drops out of 139,264 sourced packets.) GeDES reports no queue overflow at 90% on this matrix and
+# Unison exposes `--ecmp`, so a single-path Days row would not be the same fabric as its arms.
+[routing]
+policy = "FatTreeEcmp"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+pairing = "SwitchOffsetHalf"
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1460, high = 1460 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"

@@ -1,0 +1,68 @@
+# P12 F-HET: delay heterogeneity in ONE image (wave-4 amendment).
+#
+# WHAT IT SHOWS. A slot pipeline has to quantise at the SHORTEST delay present anywhere in the
+# fabric -- here 100 ns -- for the whole run, whatever the traffic is doing. Days' safe horizon is
+# a function of the channels that can actually deliver an event, so it stretches toward the
+# 10,000 ns inter-pod scale as soon as the 100 ns rack-local traffic goes quiet. Both regimes are
+# in this single image, in sequence, so the contrast is internal to one fixture and needs no
+# second image to compare against.
+#
+# THE FABRIC. k = 8, 4 hosts per edge switch: 32 edge, 32 aggregation, 16 core switches, 128 hosts.
+# Three delay tiers, stated as fabric layers rather than inferred:
+#   host <-> edge switch          100 ns   (intra-rack)
+#   edge <-> aggregation switch  1,000 ns  (intra-pod spine)
+#   aggregation <-> core switch 10,000 ns  (inter-pod)
+# A 100x spread across one image. `link.propagation_tiers` is refused on any topology other than a
+# fat tree, because these are fat-tree layer names.
+#
+# THE TWO PHASES.
+#   RACK PHASE, 0 to ~48 us. `SameSwitchNext` pairs every host with the next host on its own
+#   top-of-rack switch, so all 128 flows ride host -> edge -> host: two 100 ns links and nothing
+#   else. 25 packets at 2,000 ns spacing, byte-terminated, last emission at 48 us.
+#   INTER-POD PHASE, throughout, and ALONE after ~48 us. `SwitchOffsetHalf` pairs the ordinal-0
+#   host of each of the 32 racks with the same ordinal on the rack 16 away, i.e. pod p -> pod p+4
+#   mod 8: every one of those routes crosses two 10,000 ns aggregation-core links. 20 packets at
+#   10,000 ns spacing, last emission at 190 us.
+#
+# HONESTY. This is a sparse fixture on purpose (13,440 sourced packets over 200 us). Per the wave-4
+# honesty constraint, per-round device cost carries width-fixed terms, so a sparse fixture
+# demonstrates the FEWER-ROUNDS mechanism; it is not a wall-clock claim and must not be reported as
+# one. The first-class metric here is rounds versus equivalent slots at equal simulated time, which
+# is hardware-independent.
+seed = 21008
+duration = 0.000200
+threading = "single"
+log_path = "logs/p12/f_het_k8_tiered_delays"
+
+[topology]
+category = "FatTree"
+
+[topology.fat_tree]
+k = 8
+hosts_per_edge = 4
+
+[switch]
+port_rate = 100_000_000_000
+capacity = 1024
+weights = [1]
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link.propagation_tiers]
+host_to_edge_ns = 100
+edge_to_aggregation_ns = 1000
+aggregation_to_core_ns = 10000
+
+# Rack-local phase: 128 flows, two 100 ns hops, silent after 48 us.
+[[flow_set]]
+flow_type = "PacketDistribution"
+flow_count = 128
+pairing = "SameSwitchNext"
+traffic = { initial_delay = 0.0, size = 38_500, arr_dist = { type = "Uniform", low = 0.000002, high = 0.000002 }, pkt_size_dist = { type = "DiscreteUniform", low = 1540, high = 1540 } }
+
+# Inter-pod phase: 32 flows, two 10,000 ns hops, the only traffic left after 48 us.
+[[flow_set]]
+flow_type = "PacketDistribution"
+flow_count = 32
+pairing = "SwitchOffsetHalf"
+traffic = { initial_delay = 0.0, size = 30_800, arr_dist = { type = "Uniform", low = 0.00001, high = 0.00001 }, pkt_size_dist = { type = "DiscreteUniform", low = 1540, high = 1540 } }
