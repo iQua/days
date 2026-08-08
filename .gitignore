@@ -2,6 +2,10 @@
 **/.vscode/
 **/target/
 **/Cargo.lock
+# The workspace-root lockfile is TRACKED: it is the reproducibility record for the
+# frozen `days-legacy` baseline crate (legacy/README.md). Nested/worktree lockfiles
+# stay ignored.
+!/Cargo.lock
 **/uv.lock
 **/.lake/
 
