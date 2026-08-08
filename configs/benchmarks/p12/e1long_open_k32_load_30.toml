@@ -17,7 +17,7 @@
 # `size` = 48,662 x 1,540 B = 74,939,480 B. This budget is MINIMAL AND SUFFICIENT and is pinned as such:
 #   (N-1) x I = 19,999,671 ns <= 20,000,000  -- every emission the horizon admits is funded;
 #       N x I = 20,000,082 ns >  20,000,000  -- and not one packet more is funded.
-# Traffic therefore persists to 19,999,671 ns of the 20,000,000 ns span (99.995%), rather than
+# Traffic therefore persists to 19,999,671 ns of the 20,000,000 ns span (99.9984%), rather than
 # stopping at 410,589 ns as the frozen E1 file does. Total sourced: 8,192 x 48,662 = 398,639,104.
 # The same formula reproduces E1's four frozen `sourced_packets` anchors at H = 20,000 ns
 # (17/49/98/146 per flow -> 139,264 / 401,408 / 802,816 / 1,196,032), which is why it is trusted here.
@@ -52,6 +52,23 @@
 # The same deviation is what separates this point's per-flow packet count from GeDES F4's own. F4
 # emits tx/8,192 = 48,701 packets per sender at this load over the same 20 ms; E1-LONG emits
 # 48,662, i.e. -0.080% -- the disclosed interval rounding and nothing else.
+#
+# THIS POINT IS NOT DROP-FREE, AND CANNOT BE MADE SO BY ANY QUEUE DEPTH. READ THIS BEFORE CITING IT.
+# `FatTreeEcmp` picks one aggregation group and one core offset per flow from disjoint halves of the
+# flow hash, so the 16 flows leaving an edge switch land on its 16 uplinks as BALLS IN BINS, not one
+# per uplink. Computed exactly from the lowered image, the busiest link carries 7 flows. A 100
+# Gbit/s link serialises 1,540 B in 123.2 ns, so at this point's 411 ns interval it sustains
+# floor(411/123.2) = THREE flows -- and 592 links carry four or more. That is persistent overload,
+# not a transient: such a link queues without bound and drops once `switch.capacity` fills, whatever
+# the capacity is. Measured (scalar, 200 us prefix): 2,506 of 3,989,504 sourced packets dropped,
+# 0.06%, still climbing. GeDES F4 delivers 0.999651 at this load over the same 20 ms with the whole
+# shortfall being pipeline occupancy rather than loss, so ABOVE LOAD 0.10 THIS FAMILY AND GeDES ARE
+# NOT RUNNING THE SAME WORKLOAD. Only `e1long_open_k32_load_10.toml` (0 overloaded links) is a
+# drop-free long-span cross-arm row today. Closing this point needs a BALANCED fat-tree path
+# assignment -- one uplink per source ordinal instead of a hash -- which is a routing-policy change,
+# not a fixture change. Gated by `static_ecmp_cannot_sustain_this_matrix_above_the_ten_percent_point`
+# in `tests/t21_p12_e1long.rs`. E1's four frozen 20 us anchors are drop-free only because the fabric
+# has not finished filling at 20 us; the property belongs to the horizon, not to the fabric.
 seed = 21032
 duration = 0.020000
 threading = "single"

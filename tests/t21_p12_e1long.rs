@@ -44,10 +44,22 @@ const FLOW_COUNT: u64 = 8_192;
 
 /// The four points, as `(load, fixture, inter-packet interval ns, per-flow packets, size bytes)`.
 const POINTS: [(u32, &str, u64, u64, i64); 4] = [
-    (10, "e1long_open_k32_load_10.toml", 1_232, 16_234, 25_000_360),
+    (
+        10,
+        "e1long_open_k32_load_10.toml",
+        1_232,
+        16_234,
+        25_000_360,
+    ),
     (30, "e1long_open_k32_load_30.toml", 411, 48_662, 74_939_480),
     (60, "e1long_open_k32_load_60.toml", 205, 97_561, 150_243_940),
-    (90, "e1long_open_k32_load_90.toml", 137, 145_986, 224_818_440),
+    (
+        90,
+        "e1long_open_k32_load_90.toml",
+        137,
+        145_986,
+        224_818_440,
+    ),
 ];
 
 /// The frozen E1 (20 us) counterpart of each E1-LONG point, and its frozen `sourced_packets`.
@@ -312,7 +324,11 @@ fn e1long_budgets_are_minimal_and_sufficient_for_the_twenty_millisecond_horizon(
         // The budget must be a whole number of wire packets, or the last packet is a runt and the
         // offered-load arithmetic stops holding.
         let budget = size as u64;
-        assert_eq!(budget % WIRE_BYTES, 0, "{name}: budget must be whole packets");
+        assert_eq!(
+            budget % WIRE_BYTES,
+            0,
+            "{name}: budget must be whole packets"
+        );
         assert_eq!(budget / WIRE_BYTES, per_flow, "{name}: packets per flow");
 
         assert_eq!(
@@ -384,19 +400,9 @@ fn e1long_achieved_offered_load_matches_e1s_disclosed_values() {
 /// pinned here and re-asserted against the actual run in the anchors below.
 #[test]
 fn e1long_sourced_packet_totals_are_the_pinned_cross_arm_quantities() {
-    const EXPECTED: [u128; 4] = [
-        132_988_928,
-        398_639_104,
-        799_219_712,
-        1_195_917_312,
-    ];
+    const EXPECTED: [u128; 4] = [132_988_928, 398_639_104, 799_219_712, 1_195_917_312];
     // GeDES F4's own tx_packets at the same four loads and the same 20 ms span.
-    const GEDES_TX: [u128; 4] = [
-        132_980_736,
-        398_958_592,
-        797_917_184,
-        1_196_875_776,
-    ];
+    const GEDES_TX: [u128; 4] = [132_980_736, 398_958_592, 797_917_184, 1_196_875_776];
     for (((_, name, _, per_flow, _), expected), gedes) in
         POINTS.into_iter().zip(EXPECTED).zip(GEDES_TX)
     {
@@ -412,6 +418,97 @@ fn e1long_sourced_packet_totals_are_the_pinned_cross_arm_quantities() {
 }
 
 // -------------------------------------------------------------------------------------------
+// Static ECMP feasibility — why three of the four points cannot be drop-free at any long span.
+// -------------------------------------------------------------------------------------------
+
+/// Number of flows sharing the busiest link, and how many links carry more than they can serve.
+///
+/// A pure function of the lowered image, so it is exact rather than statistical.
+fn ecmp_link_pressure(name: &str, interval_ns: u64) -> (u64, u64, usize) {
+    let image = lower(name);
+    let mut per_link = std::collections::BTreeMap::<u64, u64>::new();
+    for flow in &image.flows {
+        for link in &flow.route {
+            *per_link.entry(link.0).or_default() += 1;
+        }
+    }
+    // A 100 Gbit/s link serialises a 1,540 B packet in 123.2 ns, and each flow offers one packet
+    // per `interval_ns`, so a link sustains `floor(interval_ns / 123.2)` flows. The comparison is
+    // done in integers -- 10 x interval against 1,232 x flows -- because the fixture's own
+    // arithmetic is integer and a float here would decide the 60% point by rounding.
+    let sustainable = (10 * interval_ns) / 1_232;
+    let overloaded = per_link
+        .values()
+        .filter(|count| **count > sustainable)
+        .count();
+    let busiest = *per_link
+        .values()
+        .max()
+        .unwrap_or_else(|| panic!("{name}: no routed links"));
+    (busiest, sustainable, overloaded)
+}
+
+/// **E1's drop-freeness is a property of its 20 us horizon, not of its fabric.** FINDING, pinned.
+///
+/// `FatTreeEcmp` selects one aggregation group and one core offset per flow from disjoint halves
+/// of the flow hash (`src/topos/route.rs`), so the 16 flows leaving an edge switch land on its 16
+/// uplinks as balls in bins, not one per uplink. The busiest link on this matrix carries **6 or 7**
+/// flows at every load. A 100 Gbit/s link serialises a 1,540 B packet in 123.2 ns, so it sustains
+/// `floor(I / 123.2)` flows -- 10 at load 0.10, but only 3 at 0.30 and **1** at 0.60 and 0.90.
+///
+/// The consequence is not a transient: a link offered more than it can serve queues without bound
+/// and drops once `switch.capacity` fills, at any queue depth, for as long as traffic lasts. At
+/// E1's 20 us horizon the fabric is still filling and the 1,024-packet queues have not yet
+/// overflowed, which is why all four frozen E1 anchors are drop-free. Extend the span and the
+/// overload becomes visible: measured on E1-LONG at a 200 us prefix, scalar drops
+/// **0 / 2,506 / 440,564 / 2,200,132** packets at loads 0.10 / 0.30 / 0.60 / 0.90 -- exactly the
+/// pattern this test predicts from the image alone, with no run at all.
+///
+/// This matters for the cross-arm claim, which is why it is a gate and not a comment. GeDES F4
+/// delivers **0.999692 / 0.999651 / 0.999641 / 0.999630** over the same 20 ms span at the same
+/// four loads, with the whole shortfall pipeline occupancy at the horizon rather than loss. So at
+/// loads 0.30 and above E1-LONG and GeDES are no longer running the same workload, and only the
+/// load-0.10 point is a drop-free long-span row today. Closing the other three needs a
+/// **balanced** fat-tree path assignment (one uplink per source ordinal rather than a hash), which
+/// is a routing-policy change in `src/topos/route.rs` with its own gates -- out of scope for a
+/// fixture-authoring round, and recorded rather than attempted.
+#[test]
+fn static_ecmp_cannot_sustain_this_matrix_above_the_ten_percent_point() {
+    const EXPECTED: [(u64, u64, usize); 4] = [
+        // (busiest link, flows it can sustain, links offered more than they can serve)
+        (6, 10, 0),
+        (7, 3, 592),
+        (7, 1, 8_608),
+        (7, 1, 8_640),
+    ];
+    for ((load, name, interval_ns, _, _), expected) in POINTS.into_iter().zip(EXPECTED) {
+        let actual = ecmp_link_pressure(name, interval_ns);
+        assert_eq!(
+            actual, expected,
+            "{name}: hash-ECMP link pressure moved (busiest, sustainable, overloaded) = {actual:?}"
+        );
+        let (busiest, sustainable, overloaded) = actual;
+        assert_eq!(
+            overloaded == 0,
+            busiest <= sustainable,
+            "{name}: the busiest link and the overloaded-link count must agree"
+        );
+        if load == 10 {
+            assert_eq!(
+                overloaded, 0,
+                "{name}: the 10% point is the one long-span row whose fabric is not the bottleneck"
+            );
+        } else {
+            assert!(
+                overloaded > 0,
+                "{name}: this point is EXPECTED to overload under hash ECMP; if it no longer does, \
+                 the routing policy changed and the E1-LONG drop disclosure must be revisited"
+            );
+        }
+    }
+}
+
+// -------------------------------------------------------------------------------------------
 // Anchors.
 // -------------------------------------------------------------------------------------------
 
@@ -419,23 +516,28 @@ fn e1long_sourced_packet_totals_are_the_pinned_cross_arm_quantities() {
 ///
 /// One test per point rather than a loop over four, because these are the most expensive gates in
 /// the repository and a failure at one load must not hide the state of the other three.
+///
+/// `$dropped` is asserted rather than assumed zero. Three of the four points DO drop, for the
+/// structural reason the feasibility gate above states, and an anchor that pretended otherwise
+/// would be the wrong shape of gate: what has to be frozen is the drop count, so that a change in
+/// routing, queueing or pacing moves it and is seen.
 macro_rules! e1long_anchor {
-    ($test:ident, $fixture:literal, $horizon:expr, $sourced:literal, $bytes:literal, $fnv:literal) => {
+    (
+        $test:ident, $fixture:literal, $horizon:expr,
+        $sourced:literal, $dropped:literal, $bytes:literal, $fnv:literal
+    ) => {
         #[test]
-        #[ignore = "explicit P12 E1-LONG anchor: see ANCHOR HORIZONS at the bottom of this file"]
+        #[ignore = "explicit P12 E1-LONG anchor: see ANCHOR HORIZONS below"]
         fn $test() {
             let image = lower($fixture);
             let horizon: Option<u64> = $horizon;
             let scalar = scalar_run(&image, horizon);
+            assert_eq!(scalar.summary.sourced_packets, $sourced, "{} sourced", $fixture);
             assert_eq!(
-                scalar.summary.sourced_packets, $sourced,
-                "{} sourced",
-                $fixture
-            );
-            assert_eq!(
-                scalar.summary.dropped_packets, 0,
-                "{}: E1-LONG must be drop-free; GeDES reports no queue overflow on this matrix, \
-                 and a drop here means the arms are no longer running the same workload",
+                scalar.summary.dropped_packets, $dropped,
+                "{}: frozen drop count moved -- E1-LONG's loss is a structural property of static \
+                 ECMP on this matrix (see static_ecmp_cannot_sustain_this_matrix_above_the_ten_\
+                 percent_point), so a move here is a semantics change, not noise",
                 $fixture
             );
             assert_anchor(
@@ -448,44 +550,65 @@ macro_rules! e1long_anchor {
     };
 }
 
-// ANCHOR HORIZONS. Loads 0.10 and 0.90 are anchored at the fixture's OWN 20 ms horizon: they are
-// the two ends of the sweep, so between them they pin the budget arithmetic at its cheapest and
-// its most expensive point. Loads 0.30 and 0.60 are anchored at a 200 us PREFIX horizon instead.
-// This is a disclosed cost decision, not an oversight: a full-horizon scalar anchor at those two
-// points costs more wall time than the authoring round has, and a prefix anchor still exercises
-// everything an anchor is for -- lowering, the re-authored budget (the generator is nowhere near
-// exhausted at 200 us), steady-state fabric occupancy, and scalar/CPU/Metal byte-identity. What a
-// prefix anchor does NOT pin is the state at 20 ms, so the two middle points' 20 ms images are
-// pinned only by the budget contract above until a measurer round freezes them.
+// ANCHOR HORIZONS, and why they are not all the same.
+//
+// Load 0.10 is anchored at the fixture's OWN 20 ms horizon. It is the one point whose fabric is
+// not the bottleneck at a long span (0 overloaded links), so its 20 ms image is the E1-LONG row a
+// cross-arm table can actually use, and it is frozen in full.
+//
+// Loads 0.30, 0.60 and 0.90 are anchored at a 200 us PREFIX horizon. This is a disclosed decision
+// with two independent reasons, and neither is "it was slow":
+//
+//   1. SEMANTICS. Those three points overload 592 / 8,608 / 8,640 links under static ECMP and
+//      lose 0.06 % / 5.5 % / 18.4 % of sourced packets by 200 us alone, with the loss still
+//      growing. A frozen 20 ms image of a saturated fabric would pin a workload that is NOT the
+//      one GeDES runs (delivery 0.99963 at load 0.90) and that no cross-arm row should cite.
+//      Freezing it would give that image an authority it must not have.
+//   2. COST, stated because it is real: at 200 us the load-0.90 scalar run already carries
+//      3.64 M resident packets and renders a 1.3 GB complete state; the 20 ms image would be a
+//      queue-saturated fabric an order of magnitude larger, on every backend at once.
+//
+// 200 us is not an arbitrary prefix. It is 10x E1's whole horizon and ~23x this fabric's 8.6 us
+// round trip, so the filling transient is over and the overload is already the dominant behaviour
+// -- the prefix anchors DO carry the loss (2,506 / 440,564 / 2,200,132), they simply do not claim
+// to be the 20 ms end state. What they pin is what an anchor is for: lowering, the re-authored
+// budget (no generator is within 47x of exhaustion at 200 us), and scalar/CPU/Metal byte-identity.
+//
+// CUDA is not reachable from this machine and is deferred, exactly as for the frozen E1 family.
+
 e1long_anchor!(
     e1long_load10_anchor_is_drop_free_and_identical_across_local_backends,
     "e1long_open_k32_load_10.toml",
     None,
     132_988_928,
     0,
-    0
+    70_900_544,
+    0x9f9e_8d13_e311_1ff2
 );
 e1long_anchor!(
-    e1long_load30_prefix_anchor_is_drop_free_and_identical_across_local_backends,
+    e1long_load30_prefix_anchor_is_identical_across_local_backends,
     "e1long_open_k32_load_30.toml",
     Some(200_000),
-    0,
-    0,
-    0
+    3_989_504,
+    2_506,
+    172_686_274,
+    0x642e_36cd_58f8_f5bb
 );
 e1long_anchor!(
-    e1long_load60_prefix_anchor_is_drop_free_and_identical_across_local_backends,
+    e1long_load60_prefix_anchor_is_identical_across_local_backends,
     "e1long_open_k32_load_60.toml",
     Some(200_000),
-    0,
-    0,
-    0
+    7_995_392,
+    440_564,
+    776_891_569,
+    0xa605_defe_7f00_8d65
 );
 e1long_anchor!(
-    e1long_load90_anchor_is_drop_free_and_identical_across_local_backends,
+    e1long_load90_prefix_anchor_is_identical_across_local_backends,
     "e1long_open_k32_load_90.toml",
-    None,
-    1_195_917_312,
-    0,
-    0
+    Some(200_000),
+    11_960_320,
+    2_200_132,
+    1_313_022_440,
+    0xa3cf_8acc_e34c_0780
 );

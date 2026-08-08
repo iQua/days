@@ -17,7 +17,7 @@
 # `size` = 16,234 x 1,540 B = 25,000,360 B. This budget is MINIMAL AND SUFFICIENT and is pinned as such:
 #   (N-1) x I = 19,999,056 ns <= 20,000,000  -- every emission the horizon admits is funded;
 #       N x I = 20,000,288 ns >  20,000,000  -- and not one packet more is funded.
-# Traffic therefore persists to 19,999,056 ns of the 20,000,000 ns span (99.995%), rather than
+# Traffic therefore persists to 19,999,056 ns of the 20,000,000 ns span (99.9953%), rather than
 # stopping at 1,230,768 ns as the frozen E1 file does. Total sourced: 8,192 x 16,234 = 132,988,928.
 # The same formula reproduces E1's four frozen `sourced_packets` anchors at H = 20,000 ns
 # (17/49/98/146 per flow -> 139,264 / 401,408 / 802,816 / 1,196,032), which is why it is trusted here.
@@ -52,6 +52,21 @@
 # The same deviation is what separates this point's per-flow packet count from GeDES F4's own. F4
 # emits tx/8,192 = 16,233 packets per sender at this load over the same 20 ms; E1-LONG emits
 # 16,234, i.e. +0.006% -- the disclosed interval rounding and nothing else.
+#
+# THIS IS THE ONE E1-LONG POINT WHOSE FABRIC IS NOT THE BOTTLENECK, and that is a property of the
+# load, not of the family. `FatTreeEcmp` picks one aggregation group and one core offset per flow
+# from disjoint halves of the flow hash, so the 16 flows leaving an edge switch land on its 16
+# uplinks as BALLS IN BINS, not one per uplink; computed exactly from the lowered image, the busiest
+# link carries 6 flows. A 100 Gbit/s link serialises 1,540 B in 123.2 ns, so at this point's 1232 ns
+# interval it sustains floor(1232/123.2) = TEN flows. Six is under ten, so ZERO links are offered
+# more than they can serve and the 20 ms run is drop-free: measured 0 drops on 132,988,928 sourced,
+# delivery 0.9996877 against GeDES F4's 0.999692, with the shortfall exactly equal to the 41,533
+# packets still in the fabric at the horizon. That headroom is gone by load 0.30 (sustains 3, 592
+# links overloaded) and by 0.60/0.90 a link sustains only ONE flow while ~8,600 carry two or more,
+# so those three points DO drop, structurally -- see their headers and
+# `static_ecmp_cannot_sustain_this_matrix_above_the_ten_percent_point` in `tests/t21_p12_e1long.rs`.
+# Until a BALANCED fat-tree path assignment exists, this file is the only drop-free long-span
+# cross-arm row in the family.
 seed = 21032
 duration = 0.020000
 threading = "single"
