@@ -230,8 +230,8 @@ fn e1_achieved_offered_load_matches_the_disclosed_values() {
             "{name}: achieved {achieved} disagrees with the disclosed {disclosed}"
         );
         assert!(
-            (achieved - nominal(name)).abs() <= 0.17,
-            "{name}: achieved {achieved} is further than the disclosed 0.17 pp from nominal"
+            (achieved - nominal(name)).abs() <= 0.10,
+            "{name}: achieved {achieved} is further than the disclosed 0.098 pp from nominal"
         );
     }
 }
