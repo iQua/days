@@ -5390,3 +5390,41 @@ extern "C" __global__ void days_round_finalize(DAYS_BUFFERS) {
         control[C_ROUNDS] += 1;
     }
 }
+
+// T20l fix 2 — device-side readback compaction. Transliteration of `days_compact_gather` in
+// `metal_kernels.metal`; see that kernel's header for the audit and determinism argument.
+//
+// AUDIT (T20g style). Exactly ONE device write site, `destination[...]` below. `destination` is a
+// buffer allocated for the readback alone: never bound to a simulation kernel, never read by one,
+// never part of complete state. `source`, `plan` and `args` are `const`. This kernel is launched
+// outside the captured attempt graph, only after the attempt has been screened as successful.
+//
+// The entry ABI deliberately does NOT follow DAYS_BUFFERS: the gather is not part of the replayed
+// attempt DAG, so it takes its own four buffers instead of the uniform 29-plane signature.
+constexpr uint COMPACT_PLAN_ROW_WORDS = 5;
+
+extern "C" __global__ void days_compact_gather(
+    ulong *destination, const ulong *source, const ulong *plan, const ulong *args
+) {
+    ulong entity_count = args[0];
+    ulong record_words = args[1];
+    bool ring = args[2] != 0;
+    ulong entity = ulong(blockIdx.x) * ulong(blockDim.x) + ulong(threadIdx.x);
+    if (entity >= entity_count) {
+        return;
+    }
+    const ulong *row = plan + entity * COMPACT_PLAN_ROW_WORDS;
+    ulong source_words = row[0];
+    ulong span = max(row[1], 1ul);
+    ulong head = row[2];
+    ulong count = row[3];
+    ulong destination_words = row[4];
+    for (ulong index = 0; index < count; ++index) {
+        ulong physical = ring ? (head + index) % span : index;
+        ulong from = source_words + physical * record_words;
+        ulong to = destination_words + index * record_words;
+        for (ulong word = 0; word < record_words; ++word) {
+            destination[to + word] = source[from + word];
+        }
+    }
+}

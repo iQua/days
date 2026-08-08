@@ -9,6 +9,12 @@ pub mod cpu;
 pub mod cuda;
 mod dcqcn;
 mod device_capacity;
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+mod device_compaction;
 mod device_scheduler;
 pub mod device_sizing;
 pub mod event;

@@ -15,9 +15,15 @@
 //! The ledger is complete state: its decoded records feed the resident-packet map that the frozen
 //! fixture hashes cover. The ring is therefore a *physical* representation only. Logical index `i`
 //! of a flow's ledger lives at physical slot `(head + i) mod capacity`, and every reader walks
-//! `i = 0..count` through [`ledger_record_slot`], so the decoded order and content are identical
-//! to what the shifting array produced. [`mirror`] pins that equality against a transliteration of
-//! the pre-ring algorithm.
+//! `i = 0..count` in that order, so the decoded order and content are identical to what the
+//! shifting array produced. [`mirror`] pins that equality against a transliteration of the
+//! pre-ring algorithm.
+//!
+//! T20l fix 2 moved the *readback's* walk onto the device: `days_compact_gather` resolves the ring
+//! while gathering the live records, so the host decode sees logical order already. That kernel's
+//! slot expression is pinned against [`ledger_record_slot`] by
+//! `the_readback_compaction_ring_matches_the_canonical_ledger_slot`, which is why this function is
+//! now a test-only oracle rather than a readback-path call.
 //!
 //! # Metadata layout
 //!
@@ -73,8 +79,13 @@ pub(crate) const LEDGER_META_HIGH_WATER: usize = 5;
 /// Absolute word index of logical ledger record `logical` for a flow whose ring starts at
 /// `offset`, spans `capacity` records, and currently begins at physical slot `head`.
 ///
-/// This is the single source of truth for the host lowering; `tcp_ledger_slot` in
-/// `metal_kernels.metal` and `cuda_kernels.cu` are line-for-line transliterations of it.
+/// This is the single source of truth for the ring's slot arithmetic; `tcp_ledger_slot` in
+/// `metal_kernels.metal` and `cuda_kernels.cu` are line-for-line transliterations of it, and so is
+/// the `days_compact_gather` ring expression T20l fix 2 added.
+///
+/// It is **test-only** since T20l fix 2. The readback used to call it once per resident record;
+/// the gather kernel now resolves the ring on the device and hands the host logical order, so the
+/// function's remaining job is to be the oracle those kernels are pinned against.
 ///
 /// # Precondition, and why it is asserted rather than assumed
 ///
@@ -98,11 +109,7 @@ pub(crate) const LEDGER_META_HIGH_WATER: usize = 5;
 /// The residual limitation, stated: a release build does not check the bound, and no static gate
 /// can. `the_kernels_single_conditional_subtraction_matches_this_modulo` pins the two forms equal
 /// across the whole precondition domain and shows exactly where they part company outside it.
-#[cfg(any(
-    test,
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(test)]
 #[inline]
 pub(crate) fn ledger_record_slot(
     offset: usize,
@@ -546,6 +553,42 @@ mod tests {
         // while the modulo wraps to 0. This is the blind spot the precondition assertion covers.
         assert_eq!(kernel_slot(64, 4, 3, 5), 64 + 4 * TCP_LEDGER_RECORD_WORDS);
         assert_ne!(kernel_slot(64, 4, 3, 5), 64);
+    }
+
+    #[test]
+    fn the_readback_compaction_ring_matches_the_canonical_ledger_slot() {
+        // T20l fix 2 moved the readback's ring walk into `days_compact_gather`, whose slot
+        // expression is `source_words + ((head + index) % max(capacity, 1)) * record_words`.
+        // `device_compaction::CompactionEntity::live_record_slots` is that expression's host
+        // mirror, and this pins it against the canonical ledger slot over the same exhaustive
+        // domain the kernel-equality test uses, so the compacted readback cannot drift from the
+        // order the shifting array and the ring both produce.
+        for capacity in 0..=12_u64 {
+            let span = capacity.max(1);
+            for head in 0..span {
+                for count in 0..=span {
+                    let entity = crate::device_compaction::CompactionEntity {
+                        source_words: 64,
+                        capacity,
+                        head,
+                        count,
+                    };
+                    let gathered = entity.live_record_slots(
+                        crate::device_compaction::CompactionShape::Ring,
+                        TCP_LEDGER_RECORD_WORDS,
+                    );
+                    let canonical = (0..count as usize)
+                        .map(|logical| {
+                            ledger_record_slot(64, capacity as usize, head as usize, logical) as u64
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        gathered, canonical,
+                        "capacity {capacity} head {head} count {count}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

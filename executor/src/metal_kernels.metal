@@ -6106,3 +6106,56 @@ kernel void days_round_finalize(
         control[C_ROUNDS] += 1;
     }
 }
+
+// T20l fix 2 — device-side readback compaction.
+//
+// Every striped result arena is sized for worst-case occupancy and is therefore mostly empty:
+// T20l phase 1 §4.2 measured the frontier attempt copying 18.6-19.2 GB back to recover 487,958
+// pending events and 2,931,779 packet descriptors, and §8 recorded that the meta planes bounding
+// those live records are already on the device before the copy starts. This kernel gathers one
+// arena's live records into a dense destination so the host copies the live words instead of the
+// arena.
+//
+// AUDIT (T20g style). This kernel has exactly ONE device write site, `destination[...]` below.
+// `destination` is a buffer allocated for the readback alone: it is never bound to any simulation
+// kernel, never read by one, and never part of complete state. `source`, `plan` and `args` are all
+// `const device`. The kernel therefore cannot alter a single semantic word, and it runs only after
+// the attempt has been screened as successful, so it cannot alter a fault payload either.
+//
+// DETERMINISM. One thread owns one entity; destinations are disjoint by construction because the
+// host lays them out as the exclusive prefix sum of the device-written live counts, in the order
+// the host decode walks the entities. There are no atomics, and the output does not depend on
+// dispatch order, thread scheduling or threadgroup size.
+//
+// The slot arithmetic mirrors `executor/src/device_compaction.rs::live_record_slots`, which in turn
+// reproduces `read_queue`, the stream decode loop and `tcp_ledger_ring::ledger_record_slot`.
+constant uint COMPACT_PLAN_ROW_WORDS = 5;
+
+kernel void days_compact_gather(
+    device ulong *destination [[buffer(0)]],
+    const device ulong *source [[buffer(1)]],
+    const device ulong *plan [[buffer(2)]],
+    const device ulong *args [[buffer(3)]],
+    uint entity [[thread_position_in_grid]]
+) {
+    ulong entity_count = args[0];
+    ulong record_words = args[1];
+    bool ring = args[2] != 0;
+    if (ulong(entity) >= entity_count) {
+        return;
+    }
+    const device ulong *row = plan + ulong(entity) * COMPACT_PLAN_ROW_WORDS;
+    ulong source_words = row[0];
+    ulong span = max(row[1], 1ul);
+    ulong head = row[2];
+    ulong count = row[3];
+    ulong destination_words = row[4];
+    for (ulong index = 0; index < count; ++index) {
+        ulong physical = ring ? (head + index) % span : index;
+        ulong from = source_words + physical * record_words;
+        ulong to = destination_words + index * record_words;
+        for (ulong word = 0; word < record_words; ++word) {
+            destination[to + word] = source[from + word];
+        }
+    }
+}

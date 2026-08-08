@@ -26,6 +26,7 @@ use objc2_metal::{
     MTLResourceOptions, MTLSize, MTLStorageMode,
 };
 
+use crate::device_compaction::{CompactionEntity, CompactionPlan, CompactionShape};
 use crate::device_scheduler::{
     QUEUE_META_WORDS, prepare_device_schedulers, restore_device_scheduler,
 };
@@ -63,7 +64,7 @@ const TCP_RECEIVER_WORDS: usize = 7;
 const TCP_RANGE_WORDS: usize = 2;
 use crate::tcp_ledger_ring::{
     LEDGER_META_HEAD, LEDGER_META_HIGH_WATER, TCP_LEDGER_META_WORDS, TCP_LEDGER_RECORD_WORDS,
-    ledger_high_water_vector, ledger_record_slot,
+    ledger_high_water_vector,
 };
 
 /// One failed device attempt, carrying the retry-sizing evidence the failure produced.
@@ -97,6 +98,10 @@ const DEFAULT_ROUND_THREADS_PER_THREADGROUP: usize = 256;
 // callers deliberately request shorter buffers.
 const MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER: usize = 16_384;
 const MAX_ENCODED_PAIRS_PER_WAVE: usize = 64;
+// T20l fix 2: the readback gather is one thread per entity, and an entity's work is bounded by its
+// own live count. 256 keeps the dispatch a multiple of every current execution width without
+// reserving the maximum residency footprint; the gather's output does not depend on it.
+const COMPACT_THREADS_PER_THREADGROUP: usize = 256;
 const DEFAULT_ROUNDS_PER_COMMAND_BUFFER: usize = MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER;
 const MAX_COMMAND_BUFFERS: usize = 64;
 const PROFILED_ATTEMPTS: usize = 128;
@@ -113,6 +118,11 @@ std::thread_local! {
     /// Thread-local like the panic hook above: the retry loop, the readback and the test all run
     /// on the caller's thread, so no shared mutable state is introduced.
     static READBACK_WORDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Words in every result plane of the last attempt this thread allocated buffers for.
+    ///
+    /// T20l fix 2's counterfactual: this is exactly what the pre-fix `finish` read back, so
+    /// `readback_words / plane_words` is the compaction ratio a test can assert on.
+    static PLANE_WORDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Acquires the supported process-wide Metal execution envelope.
@@ -155,6 +165,22 @@ pub fn take_readback_words_for_testing() -> u64 {
 #[cfg(feature = "metal-test-hooks")]
 fn account_readback_words(words: usize) {
     READBACK_WORDS.with(|total| total.set(total.get().saturating_add(words as u64)));
+}
+
+/// Returns the total result-plane word count of the last attempt this thread planned.
+///
+/// T20l fix 2's gate is a ratio, and this is its denominator: the pre-fix `finish` read every one
+/// of these words on every successful attempt. It is recorded rather than derived so a test does
+/// not have to re-plan the image to know what the uncompacted readback would have cost.
+#[cfg(feature = "metal-test-hooks")]
+#[doc(hidden)]
+pub fn last_plane_words_for_testing() -> u64 {
+    PLANE_WORDS.with(std::cell::Cell::get)
+}
+
+#[cfg(feature = "metal-test-hooks")]
+fn record_plane_words(words: u64) {
+    PLANE_WORDS.with(|total| total.set(words));
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -205,6 +231,8 @@ const CONTROL_THREADGROUP_BYTES: usize =
 const NONE: u64 = u64::MAX;
 const PACKET_ECN_FLAG: u64 = 1_u64 << 63;
 const PACKET_KIND_MASK: u64 = !PACKET_ECN_FLAG;
+/// Params word holding the absolute word offset of the per-flow receiver state in `tcp_state`.
+const PARAM_RECEIVER_OFFSET: usize = 28;
 /// Params word holding the absolute word offset of the per-flow ledger metadata in `tcp_state`.
 const PARAM_LEDGER_META_OFFSET: usize = 29;
 const PARAM_ROUND_THREADS: usize = 30;
@@ -1126,7 +1154,7 @@ impl MetalExecutor {
             .direct
             .run_with_fel_probe(&buffers, config, true, Some(&probe))?;
         let run = buffers
-            .finish(image, ObservationMode::Summary, timing)
+            .finish(&self.direct, image, ObservationMode::Summary, timing)
             .map_err(|failure| failure.error)?;
         let fan_in = probe.merge_fan_in()?;
         Ok(MetalMergeFanInRun {
@@ -1168,7 +1196,7 @@ impl MetalExecutor {
             .direct
             .run_with_fel_probe(&buffers, config, true, Some(&probe))?;
         let run = buffers
-            .finish(image, ObservationMode::Summary, timing)
+            .finish(&self.direct, image, ObservationMode::Summary, timing)
             .map_err(|failure| failure.error)?;
         let (local_fel_pushes, injected_fel_round_trips) = probe.fel_counts()?;
         Ok((
@@ -1288,7 +1316,7 @@ impl MetalExecutor {
                 let timing = self.direct.run(&buffers, attempt_config, profile)?;
                 #[cfg(feature = "metal-test-hooks")]
                 panic_after_execution_if_requested();
-                buffers.finish(image, observation_mode, timing)
+                buffers.finish(&self.direct, image, observation_mode, timing)
             })();
             match attempt {
                 Ok(mut run) => {
@@ -3748,6 +3776,27 @@ impl SharedBuffer {
         })
     }
 
+    /// Allocates `words` device words without staging a host-side zero buffer.
+    ///
+    /// T20l fix 2's gather destination is written in full by the kernel before anything reads it,
+    /// so the ordinary [`Self::new`] path — which allocates a host `Vec` and copies it in — would
+    /// pay a host-side pass over the compacted arena for no effect.
+    fn uninitialized(
+        device: &ProtocolObject<dyn MTLDevice>,
+        words: usize,
+    ) -> Result<Self, MetalError> {
+        let words = words.max(1);
+        let bytes = words
+            .checked_mul(std::mem::size_of::<u64>())
+            .ok_or_else(|| MetalError::Validation("Metal buffer byte size overflows".into()))?;
+        let raw = device
+            .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| {
+                MetalError::Unavailable(format!("failed to allocate {bytes}-byte shared buffer"))
+            })?;
+        Ok(Self { raw, words })
+    }
+
     fn read(&self) -> Vec<u64> {
         #[cfg(feature = "metal-test-hooks")]
         account_readback_words(self.words);
@@ -3946,6 +3995,15 @@ impl MetalBuffers {
         .into_iter()
         .map(|words| SharedBuffer::new(device, words))
         .collect::<Result<Vec<_>, _>>()?;
+        #[cfg(feature = "metal-test-hooks")]
+        record_plane_words(
+            planes
+                .iter()
+                .chain(std::iter::once(&tcp_state))
+                .fold(0_u64, |total, plane| {
+                    total.saturating_add(plane.words as u64)
+                }),
+        );
         Ok(Self {
             planes,
             tcp_state,
@@ -3972,6 +4030,7 @@ impl MetalBuffers {
 
     fn finish(
         &self,
+        direct: &DirectMetal,
         image: &SimulationImage,
         observation_mode: ObservationMode,
         timing: MetalTiming,
@@ -4025,29 +4084,207 @@ impl MetalBuffers {
             .into());
         }
 
-        let mut planes = Vec::with_capacity(self.planes.len());
-        planes.push(control);
-        planes.extend(self.planes[1..].iter().map(SharedBuffer::read));
-        let tcp_state = self.tcp_state.read();
-        let control = &planes[0];
+        // T20l fix 2: on a SUCCESSFUL attempt, copy the LIVE regions rather than the arena.
+        //
+        // T20l phase 1 §4.2 measured this readback at 2,394,309,899 words (19.15 GB) on the RQ9
+        // frontier's successful attempt, delivering 487,958 pending events and 2,931,779 packet
+        // descriptors to a decode that costs 0.10-0.9 s against the 4.6-98.6 s the copy costs.
+        // §8 recorded why: the decode phases are the only ones that respect occupancy, and the
+        // meta planes that bound them are already on the device before the copy starts.
+        //
+        // Three classes of plane, and each one's justification:
+        //
+        //   * ELIDED — the decode never reads them, so their live region is empty by inspection
+        //     rather than by any device word: `flows`(4), `routes`(5), `links`(6) are planner
+        //     inputs; `outbox`(12), `worklist`(13), `remote_meta`(19), `remote_staging`(20),
+        //     `inbound_meta`(22), `inbound_producers`(23) and `merge_cursors`(24) are device
+        //     scratch. At the frontier that is 691,104,103 words, 28.86% of the plan, of which
+        //     `remote_staging` alone is 657,667,584.
+        //   * READ WHOLE — fixed words per entity, and the decode consumes all of them: control,
+        //     params, node_state, generators, fel_meta, queue_meta, in_service, summary, lp_state,
+        //     observation_meta, stream_state, scheduler_state, plus the two contiguous `tcp_state`
+        //     metadata regions.
+        //   * COMPACTED — striped record arenas whose live region every entity's own device-written
+        //     meta words describe. `compact` gathers those regions into a dense buffer on the
+        //     device and reads back only that.
+        //
+        // Byte-identity: the gather reproduces the decode's own slot arithmetic (see
+        // `device_compaction`), so the same records reach the same decoders in the same order.
+        // Nothing about WHICH words are decoded changes; only which words cross the bus.
+        let params = self.planes[1].read();
+        let node_state = self.planes[2].read();
+        let generators = self.planes[3].read();
+        let fel_meta = self.planes[7].read();
+        let queue_meta = self.planes[9].read();
+        let in_service = self.planes[11].read();
+        let summary_words = self.planes[14].read();
+        let lp_state = self.planes[18].read();
+        let observation_meta = self.planes[21].read();
+        // Only the per-stream ring metadata prefix of `stream_state` is decoded; the LP stream
+        // lists, outbound metadata, channel batches, staging channels and channel targets that
+        // follow it are device scratch. At the frontier that prefix is 1,667,976 of the plane's
+        // 52,426,754 words. The extent is the planner's own `stream_count` — the same bound the
+        // decode loop below already walks — not an inferred one.
+        let stream_state = self.planes[25].read_range(
+            0,
+            self.stream_layout
+                .stream_count
+                .saturating_mul(ARENA_META_WORDS),
+        );
+        let scheduler_state = self.planes[27].read();
 
-        let params = &planes[1];
-        let node_state = &planes[2];
-        let generators = &planes[3];
-        let fel_meta = &planes[7];
-        let fel_records = &planes[8];
-        let queue_meta = &planes[9];
-        let queue_records = &planes[10];
-        let in_service = &planes[11];
-        let summary_words = &planes[14];
-        let observed_words = &planes[15];
-        let departure_words = &planes[16];
-        let arrival_words = &planes[17];
-        let lp_state = &planes[18];
-        let observation_meta = &planes[21];
-        let stream_state = &planes[25];
-        let stream_records = &planes[26];
-        let scheduler_state = &planes[27];
+        let node_count = image.nodes.len();
+        let flow_count = image.flows.len();
+        let receiver_base = params[PARAM_RECEIVER_OFFSET] as usize;
+        let ledger_meta_offset = params[PARAM_LEDGER_META_OFFSET] as usize;
+        let receiver_state = self
+            .tcp_state
+            .read_range(receiver_base, flow_count.saturating_mul(TCP_RECEIVER_WORDS));
+        let ledger_meta = self.tcp_state.read_range(
+            ledger_meta_offset,
+            flow_count.saturating_mul(TCP_LEDGER_META_WORDS),
+        );
+
+        let fel_plan = arena_compaction_plan(
+            "FEL record",
+            CompactionShape::Linear,
+            EVENT_WORDS,
+            self.planes[8].words,
+            node_count,
+            |lp| {
+                let base = lp * ARENA_META_WORDS;
+                (
+                    fel_meta[base],
+                    fel_meta[base + 1],
+                    fel_meta[base + 2],
+                    fel_meta[base + 3],
+                )
+            },
+        )?;
+        let queue_plan = arena_compaction_plan(
+            "queue record",
+            CompactionShape::Ring,
+            EVENT_WORDS,
+            self.planes[10].words,
+            node_count,
+            |lp| {
+                let base = lp * QUEUE_META_WORDS;
+                (
+                    queue_meta[base],
+                    queue_meta[base + 1],
+                    queue_meta[base + 2],
+                    queue_meta[base + 3],
+                )
+            },
+        )?;
+        let stream_plan = arena_compaction_plan(
+            "stream record",
+            CompactionShape::Ring,
+            EVENT_WORDS,
+            self.planes[26].words,
+            self.stream_layout.stream_count,
+            |stream| {
+                let base = stream * ARENA_META_WORDS;
+                (
+                    stream_state[base],
+                    stream_state[base + 1],
+                    stream_state[base + 2],
+                    stream_state[base + 3],
+                )
+            },
+        )?;
+        // The two `tcp_state` record arenas already carry WORD offsets, so they are planned
+        // directly rather than through `arena_compaction_plan`'s record-offset conversion.
+        let ledger_plan = CompactionPlan::new(
+            "TCP segment ledger",
+            CompactionShape::Ring,
+            TCP_LEDGER_RECORD_WORDS,
+            (0..flow_count)
+                .map(|flow| {
+                    let base = flow * TCP_LEDGER_META_WORDS;
+                    CompactionEntity {
+                        source_words: ledger_meta[base],
+                        capacity: ledger_meta[base + 1],
+                        head: ledger_meta[base + LEDGER_META_HEAD],
+                        count: ledger_meta[base + 2],
+                    }
+                })
+                .collect(),
+            self.tcp_state.words,
+        )
+        .map_err(compaction_error)?;
+        let receiver_range_plan = CompactionPlan::new(
+            "TCP receiver range",
+            CompactionShape::Linear,
+            TCP_RANGE_WORDS,
+            (0..flow_count)
+                .map(|flow| {
+                    let base = flow * TCP_RECEIVER_WORDS;
+                    CompactionEntity {
+                        source_words: receiver_state[base + 4],
+                        capacity: receiver_state[base + 5],
+                        head: 0,
+                        count: receiver_state[base + 6],
+                    }
+                })
+                .collect(),
+            self.tcp_state.words,
+        )
+        .map_err(compaction_error)?;
+        let observation_plans = [
+            ("observed packet", 0, OBSERVED_WORDS, 15),
+            ("departure", ARENA_META_WORDS, DEPARTURE_WORDS, 16),
+            ("arrival", 2 * ARENA_META_WORDS, ARRIVAL_WORDS, 17),
+        ]
+        .map(|(arena, log_meta_offset, record_words, plane)| {
+            arena_compaction_plan(
+                arena,
+                CompactionShape::Linear,
+                record_words,
+                self.planes[plane].words,
+                if observation_mode == ObservationMode::Full {
+                    node_count
+                } else {
+                    0
+                },
+                |node| {
+                    let base = node * OBSERVATION_META_WORDS + log_meta_offset;
+                    (
+                        observation_meta[base],
+                        observation_meta[base + 1],
+                        observation_meta[base + 2],
+                        observation_meta[base + 3],
+                    )
+                },
+            )
+        });
+        let [observed_plan, departure_plan, arrival_plan] = match observation_plans {
+            [Ok(observed), Ok(departure), Ok(arrival)] => [observed, departure, arrival],
+            [Err(error), _, _] | [_, Err(error), _] | [_, _, Err(error)] => return Err(error),
+        };
+
+        let gathered = direct.compact(&[
+            (&self.planes[8], &fel_plan),
+            (&self.planes[10], &queue_plan),
+            (&self.planes[26], &stream_plan),
+            (&self.tcp_state, &ledger_plan),
+            (&self.tcp_state, &receiver_range_plan),
+            (&self.planes[15], &observed_plan),
+            (&self.planes[16], &departure_plan),
+            (&self.planes[17], &arrival_plan),
+        ])?;
+        let [
+            fel_records,
+            queue_records,
+            stream_records,
+            ledger_records,
+            receiver_ranges,
+            observed_words,
+            departure_words,
+            arrival_words,
+        ]: [Vec<u64>; 8] = gathered
+            .try_into()
+            .expect("compaction returns one buffer per request");
 
         let mut host_states = image.host_states.clone();
         let mut switch_states = image.switch_states.clone();
@@ -4060,7 +4297,7 @@ impl MetalBuffers {
         for node in &image.nodes {
             let lp = node.id.0 as usize;
             let base = lp * NODE_WORDS;
-            let queue = read_queue(lp, queue_meta, queue_records);
+            let queue = read_queue(&queue_plan, lp, &queue_records);
             #[cfg(debug_assertions)]
             if node.kind == NodeKind::Switch {
                 let derived_bytes = queue
@@ -4076,7 +4313,7 @@ impl MetalBuffers {
             for packet in &queue {
                 resident.insert(packet.id, *packet);
             }
-            let service = (node_state[base + 4] != 0).then(|| read_packet(in_service, lp));
+            let service = (node_state[base + 4] != 0).then(|| read_packet(&in_service, lp));
             if let Some(packet) = service {
                 resident.insert(packet.id, packet);
             }
@@ -4137,26 +4374,27 @@ impl MetalBuffers {
                             }
                         }
                     }
-                    let receiver_base = params[28] as usize;
                     for receiver in &mut state.tcp_receivers {
-                        let base = receiver_base + receiver.flow.0 as usize * TCP_RECEIVER_WORDS;
-                        if tcp_state[base] == 0 || tcp_state[base + 1] != node.id.0 {
+                        // T20l fix 2: the receiver state region is contiguous and read whole, so
+                        // it is rebased to its own start; the out-of-order ranges are gathered.
+                        let flow = receiver.flow.0 as usize;
+                        let base = flow * TCP_RECEIVER_WORDS;
+                        if receiver_state[base] == 0 || receiver_state[base + 1] != node.id.0 {
                             return Err(MetalError::DeviceExecution {
                                 code: 96,
                                 node: Some(node.id),
                             }
                             .into());
                         }
-                        receiver.ack_size_bytes = tcp_state[base + 2];
-                        receiver.next_expected_sequence = tcp_state[base + 3];
-                        let range_offset = tcp_state[base + 4] as usize;
-                        let range_count = tcp_state[base + 6] as usize;
-                        receiver.out_of_order = (0..range_count)
+                        receiver.ack_size_bytes = receiver_state[base + 2];
+                        receiver.next_expected_sequence = receiver_state[base + 3];
+                        let range_base = receiver_range_plan.destination(flow);
+                        receiver.out_of_order = (0..receiver_range_plan.count(flow))
                             .map(|index| {
-                                let offset = range_offset + index * TCP_RANGE_WORDS;
+                                let offset = (range_base + index) * TCP_RANGE_WORDS;
                                 TcpReceiveRange {
-                                    start: tcp_state[offset],
-                                    end: tcp_state[offset + 1],
+                                    start: receiver_ranges[offset],
+                                    end: receiver_ranges[offset + 1],
                                 }
                             })
                             .collect();
@@ -4168,7 +4406,7 @@ impl MetalBuffers {
                         switch_queue.queue = queue.iter().map(|packet| packet.id).collect();
                         switch_queue.in_service = service.map(|packet| packet.id);
                         switch_queue.tx_ready_pending = node_state[base + 3] != 0;
-                        restore_device_scheduler(lp, queue_meta, scheduler_state, switch_queue)
+                        restore_device_scheduler(lp, &queue_meta, &scheduler_state, switch_queue)
                             .map_err(MetalError::Validation)?;
                     }
                     state.next_origin_seq = node_state[base + 5];
@@ -4180,12 +4418,10 @@ impl MetalBuffers {
         }
 
         let mut pending_events = Vec::new();
-        for lp in 0..image.nodes.len() {
-            let base = lp * ARENA_META_WORDS;
-            let offset = fel_meta[base] as usize;
-            let count = fel_meta[base + 3] as usize;
-            for index in 0..count {
-                let record = read_record(fel_records, offset + index);
+        for lp in 0..node_count {
+            let base = fel_plan.destination(lp);
+            for index in 0..fel_plan.count(lp) {
+                let record = read_record(&fel_records, base + index);
                 let (event, packet) = decode_event(record)?;
                 if let Some(packet) = packet {
                     resident.insert(packet.id, packet);
@@ -4194,14 +4430,9 @@ impl MetalBuffers {
             }
         }
         for stream in 0..self.stream_layout.stream_count {
-            let base = stream * ARENA_META_WORDS;
-            let offset = stream_state[base] as usize;
-            let capacity = stream_state[base + 1] as usize;
-            let head = stream_state[base + 2] as usize;
-            let count = stream_state[base + 3] as usize;
-            for index in 0..count {
-                let physical = (head + index) % capacity.max(1);
-                let record = read_record(stream_records, offset + physical);
+            let base = stream_plan.destination(stream);
+            for index in 0..stream_plan.count(stream) {
+                let record = read_record(&stream_records, base + index);
                 let (event, packet) = decode_event(record)?;
                 if let Some(packet) = packet {
                     resident.insert(packet.id, packet);
@@ -4211,57 +4442,34 @@ impl MetalBuffers {
         }
         pending_events.sort_unstable_by_key(|event| event.key);
 
-        let ledger_meta_offset = params[PARAM_LEDGER_META_OFFSET] as usize;
-        for flow in 0..image.flows.len() {
-            let base = ledger_meta_offset + flow * TCP_LEDGER_META_WORDS;
-            let offset = tcp_state[base] as usize;
-            let capacity = tcp_state[base + 1] as usize;
-            let count = tcp_state[base + 2] as usize;
-            let head = tcp_state[base + LEDGER_META_HEAD] as usize;
-            for index in 0..count {
-                // Canonical decode: logical order, not physical. The ring is invisible here.
-                let record = ledger_record_slot(offset, capacity, head, index);
+        for flow in 0..flow_count {
+            // Canonical decode: logical order, not physical. The ring was already resolved by the
+            // gather, which applies `tcp_ledger_ring::ledger_record_slot`'s own arithmetic.
+            let base = ledger_plan.destination(flow);
+            for index in 0..ledger_plan.count(flow) {
+                let record = (base + index) * TCP_LEDGER_RECORD_WORDS;
                 let packet = PacketDescriptor {
-                    id: PayloadId(tcp_state[record]),
+                    id: PayloadId(ledger_records[record]),
                     flow: crate::FlowId(flow as u64),
-                    size_bytes: tcp_state[record + 1],
+                    size_bytes: ledger_records[record + 1],
                     ecn_marked: false,
                     kind: PacketKind::TcpData(TcpDataHeader {
-                        sequence: tcp_state[record + 2],
-                        sent_time_ns: tcp_state[record + 3],
-                        retransmission: tcp_state[record + 4] != 0,
+                        sequence: ledger_records[record + 2],
+                        sent_time_ns: ledger_records[record + 3],
+                        retransmission: ledger_records[record + 4] != 0,
                     }),
                 };
                 resident.entry(packet.id).or_insert(packet);
             }
         }
 
-        let summary = decode_summary_rows(summary_words, image.nodes.len());
+        let summary = decode_summary_rows(&summary_words, node_count);
         let mut observed_packets = BTreeMap::new();
         let mut departures = Vec::new();
         let mut arrivals = Vec::new();
         if observation_mode == ObservationMode::Full {
-            let observed_words = compact_lp_log(
-                observed_words,
-                observation_meta,
-                image.nodes.len(),
-                0,
-                OBSERVED_WORDS,
-            );
-            let departure_words = compact_lp_log(
-                departure_words,
-                observation_meta,
-                image.nodes.len(),
-                ARENA_META_WORDS,
-                DEPARTURE_WORDS,
-            );
-            let arrival_words = compact_lp_log(
-                arrival_words,
-                observation_meta,
-                image.nodes.len(),
-                2 * ARENA_META_WORDS,
-                ARRIVAL_WORDS,
-            );
+            // The gather already produced what `compact_lp_log` used to produce on the host: the
+            // per-LP live prefixes, concatenated in LP order.
             for words in observed_words.chunks_exact(OBSERVED_WORDS) {
                 let packet = decode_packet_words(words)?;
                 observed_packets
@@ -4373,6 +4581,47 @@ impl MetalBuffers {
     }
 }
 
+/// Wraps a T20l fix-2 sizing refusal as an attempt failure.
+///
+/// A compaction plan can only fail when a device-written meta word describes a region outside its
+/// own plane, which is a device-state defect. Refusing is the T20g contract: complete state is
+/// never truncated to fit a readback.
+fn compaction_error(error: crate::device_compaction::CompactionError) -> AttemptFailure {
+    MetalError::Validation(format!("device readback compaction refused: {error}")).into()
+}
+
+/// Builds one arena's compaction plan from a per-entity `(offset, capacity, head, count)` meta
+/// reader whose offset is a **record** index, which is how every plane except `tcp_state` stores it.
+fn arena_compaction_plan(
+    arena: &'static str,
+    shape: CompactionShape,
+    record_words: usize,
+    source_plane_words: usize,
+    entity_count: usize,
+    meta: impl Fn(usize) -> (u64, u64, u64, u64),
+) -> Result<CompactionPlan, AttemptFailure> {
+    CompactionPlan::new(
+        arena,
+        shape,
+        record_words,
+        (0..entity_count)
+            .map(|entity| {
+                let (offset, capacity, head, count) = meta(entity);
+                CompactionEntity {
+                    // Saturating rather than checked: an offset this large is already past the
+                    // source plane, and the plan's own bound check refuses it with the arena named.
+                    source_words: offset.saturating_mul(record_words as u64),
+                    capacity,
+                    head,
+                    count,
+                }
+            })
+            .collect(),
+        source_plane_words,
+    )
+    .map_err(compaction_error)
+}
+
 fn decode_device_error(control: &[u64]) -> MetalError {
     let identity = (control[CONTROL_ERROR_NODE] != NONE).then_some(control[CONTROL_ERROR_NODE]);
     let capacity = control[CONTROL_ERROR_CAPACITY] as usize;
@@ -4441,33 +4690,6 @@ fn decode_arena(value: u64) -> MetalArena {
     }
 }
 
-fn compact_lp_log(
-    records: &[u64],
-    meta: &[u64],
-    node_count: usize,
-    log_meta_offset: usize,
-    record_words: usize,
-) -> Vec<u64> {
-    let mut output_offsets = Vec::with_capacity(node_count + 1);
-    output_offsets.push(0_usize);
-    for node in 0..node_count {
-        let base = node * OBSERVATION_META_WORDS + log_meta_offset;
-        let next = output_offsets[node].saturating_add(meta[base + 3] as usize);
-        output_offsets.push(next);
-    }
-    let mut compact = vec![0_u64; output_offsets[node_count].saturating_mul(record_words)];
-    for (node, output_offset) in output_offsets.iter().copied().take(node_count).enumerate() {
-        let base = node * OBSERVATION_META_WORDS + log_meta_offset;
-        let source_record = meta[base] as usize;
-        let count = meta[base + 3] as usize;
-        let source = source_record * record_words;
-        let destination = output_offset * record_words;
-        let words = count * record_words;
-        compact[destination..destination + words].copy_from_slice(&records[source..source + words]);
-    }
-    compact
-}
-
 fn read_record(storage: &[u64], slot: usize) -> &[u64] {
     let offset = slot * EVENT_WORDS;
     &storage[offset..offset + EVENT_WORDS]
@@ -4485,14 +4707,14 @@ fn read_packet(storage: &[u64], slot: usize) -> PacketDescriptor {
     }
 }
 
-fn read_queue(lp: usize, meta: &[u64], records: &[u64]) -> Vec<PacketDescriptor> {
-    let base = lp * QUEUE_META_WORDS;
-    let offset = meta[base] as usize;
-    let capacity = meta[base + 1] as usize;
-    let head = meta[base + 2] as usize;
-    let count = meta[base + 3] as usize;
-    (0..count)
-        .map(|index| read_packet(records, offset + (head + index) % capacity.max(1)))
+/// Decodes one LP's queue out of the gathered queue records.
+///
+/// T20l fix 2: the ring rotation is resolved by the gather, so logical index `i` is at
+/// `destination(lp) + i`. The decoded order is the same logical order the ring walk produced.
+fn read_queue(plan: &CompactionPlan, lp: usize, records: &[u64]) -> Vec<PacketDescriptor> {
+    let base = plan.destination(lp);
+    (0..plan.count(lp))
+        .map(|index| read_packet(records, base + index))
         .collect()
 }
 
@@ -4719,6 +4941,9 @@ struct DirectMetal {
     exchange_scatter_pipeline: MetalPipeline,
     exchange_merge_pipeline: MetalPipeline,
     finalize_pipeline: MetalPipeline,
+    /// T20l fix 2: the readback gather. Not part of an attempt; encoded only by
+    /// [`DirectMetal::compact`], after the attempt has been screened as successful.
+    compact_pipeline: MetalPipeline,
     fel_probe_pipelines: Mutex<Option<FelProbePipelines>>,
 }
 
@@ -4741,6 +4966,7 @@ impl DirectMetal {
         let exchange_scatter_pipeline = create_pipeline(&device, source, "days_exchange_scatter")?;
         let exchange_merge_pipeline = create_pipeline(&device, source, "days_exchange_merge")?;
         let finalize_pipeline = create_pipeline(&device, source, "days_round_finalize")?;
+        let compact_pipeline = create_pipeline(&device, source, "days_compact_gather")?;
         let pipeline_creation_ns = duration_ns(pipeline_started.elapsed());
         for (name, pipeline) in [
             ("horizon", &horizon_pipeline),
@@ -4779,8 +5005,97 @@ impl DirectMetal {
             exchange_scatter_pipeline,
             exchange_merge_pipeline,
             finalize_pipeline,
+            compact_pipeline,
             fel_probe_pipelines: Mutex::new(None),
         })
+    }
+
+    /// T20l fix 2: gathers each arena's live records into a dense buffer and reads that back.
+    ///
+    /// One dispatch per arena, all in a single command buffer and a single synchronization. Every
+    /// extent comes from [`CompactionPlan`], i.e. from device-written meta words; an arena whose
+    /// device-written counts sum to zero is neither dispatched nor read.
+    ///
+    /// Returns one gathered word vector per request, in request order.
+    fn compact(
+        &self,
+        requests: &[(&SharedBuffer, &CompactionPlan)],
+    ) -> Result<Vec<Vec<u64>>, MetalError> {
+        let mut resources = Vec::with_capacity(requests.len());
+        for (source, plan) in requests {
+            if plan.total_records() == 0 || plan.entity_count() == 0 {
+                resources.push(None);
+                continue;
+            }
+            debug_assert!(plan.total_words() <= source.words);
+            // The gather writes every word of the destination, so it is deliberately not zeroed:
+            // a 250 MB `vec![0; n]` staging copy would reintroduce a fraction of the cost this
+            // fix removes.
+            let destination = SharedBuffer::uninitialized(&self.device, plan.total_words())?;
+            let plan_buffer = SharedBuffer::new(&self.device, plan.plan_words())?;
+            let argument_buffer = SharedBuffer::new(&self.device, plan.argument_words())?;
+            resources.push(Some((destination, plan_buffer, argument_buffer)));
+        }
+        if resources.iter().all(Option::is_none) {
+            return Ok(requests.iter().map(|_| Vec::new()).collect());
+        }
+
+        let command_buffer = self
+            .queue
+            .commandBuffer()
+            .ok_or_else(|| MetalError::Unavailable("compaction command buffer failed".into()))?;
+        let encoder = command_buffer
+            .computeCommandEncoderWithDispatchType(MTLDispatchType::Serial)
+            .ok_or_else(|| MetalError::Unavailable("compaction encoder creation failed".into()))?;
+        for ((source, plan), resource) in requests.iter().zip(&resources) {
+            let Some((destination, plan_buffer, argument_buffer)) = resource else {
+                continue;
+            };
+            encoder.setComputePipelineState(&self.compact_pipeline);
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(&destination.raw), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(&source.raw), 0, 1);
+                encoder.setBuffer_offset_atIndex(Some(&plan_buffer.raw), 0, 2);
+                encoder.setBuffer_offset_atIndex(Some(&argument_buffer.raw), 0, 3);
+            }
+            let groups = plan
+                .entity_count()
+                .div_ceil(COMPACT_THREADS_PER_THREADGROUP)
+                .max(1);
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                MTLSize {
+                    width: groups,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: COMPACT_THREADS_PER_THREADGROUP,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+        }
+        encoder.endEncoding();
+        command_buffer.commit();
+        command_buffer.waitUntilCompleted();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            let detail = command_buffer
+                .error()
+                .map(|error| error.localizedDescription().to_string())
+                .unwrap_or_else(|| "no NSError detail".into());
+            return Err(MetalError::Unavailable(format!(
+                "compaction command buffer status {:?}: {detail}",
+                command_buffer.status()
+            )));
+        }
+        Ok(requests
+            .iter()
+            .zip(&resources)
+            .map(|((_, plan), resource)| match resource {
+                Some((destination, _, _)) => destination.read_range(0, plan.total_words()),
+                None => Vec::new(),
+            })
+            .collect())
     }
 
     fn fel_probe_pipelines(&self) -> Result<(FelProbePipelines, u64), MetalError> {

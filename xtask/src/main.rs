@@ -27,14 +27,14 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "cuda.rs",
         predicate: r#"feature = "cuda-test-hooks""#,
-        count: 15,
-        purpose: "CUDA-only fault injection, capacity, planner measurement, and T20l readback-accounting hooks",
+        count: 19,
+        purpose: "CUDA-only fault injection, capacity, planner measurement, and T20l readback- and plane-word-accounting hooks",
     },
     AllowedFeatureGate {
         path: "metal.rs",
         predicate: r#"feature = "metal-test-hooks""#,
-        count: 10,
-        purpose: "Metal-only panic, fault-injection, planner measurement, and T20l readback-accounting hooks",
+        count: 13,
+        purpose: "Metal-only panic, fault-injection, planner measurement, and T20l readback- and plane-word-accounting hooks",
     },
     AllowedFeatureGate {
         path: "cuda.rs",
@@ -49,6 +49,12 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
         purpose: "Metal host-plan equality hook is enabled by the standard test feature",
     },
     AllowedFeatureGate {
+        path: "lib.rs",
+        predicate: r#"any(test, feature = "cuda", all(feature = "metal-spike", target_vendor = "apple"))"#,
+        count: 1,
+        purpose: "T20l fix 2's readback-compaction sizing module compiles only for the crate's own unit tests and the two device backends that gather with it",
+    },
+    AllowedFeatureGate {
         path: "device_capacity.rs",
         predicate: r#"any(test, feature = "cuda", all(feature = "metal-spike", target_vendor = "apple"))"#,
         count: 18,
@@ -57,8 +63,8 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "tcp_ledger_ring.rs",
         predicate: r#"any(test, feature = "cuda", all(feature = "metal-spike", target_vendor = "apple"))"#,
-        count: 4,
-        purpose: "T20i ledger-ring slot arithmetic and occupancy readback exist only for tests and device backends",
+        count: 3,
+        purpose: "T20i ledger-ring metadata indices and occupancy readback exist only for tests and device backends; T20l fix 2 moved the readback's own ring walk onto the device, so `ledger_record_slot` narrowed to `cfg(test)` and left this group",
     },
     AllowedFeatureGate {
         path: "device_sizing.rs",
