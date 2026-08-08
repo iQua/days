@@ -407,9 +407,32 @@ Three things follow, and none of them is summation order:
 2. **The divergence is exactly the non-rack-local traffic.** 8,704 = 8,192 intra-pod cross-rack
    + 512 cross-pod — i.e. **every flow that leaves its top-of-rack switch diverges, and all 8,192
    rack-local flows agree exactly.** That is execution-order contention at the aggregation and core
-   switches, which is precisely what MT changes. `queueing_delay_mean` hits all 8,704 in *every*
+   switches, which is precisely what MT changes. ~~`queueing_delay_mean` hits all 8,704 in *every*
    comparison; `one_way_delay_mean` falls a few short between MT runs only because a handful of
-   flows coincidentally land on the same value.
+   flows coincidentally land on the same value.~~
+
+   **Corrected by the P12 local baseline round (August 8, 2026).** The struck sentence was written
+   from **one ST and three MT samples**; it was a sound inference at that `n` and is superseded by
+   **`n = 10` per arm in each of two independent blocks** — 20 ST-vs-MT and 18 MT-vs-MT comparisons
+   (`days-gpu/evidence/P12/legacy-baselines-local.md` §4.4). What that larger `n` shows:
+
+   - `queueing_delay_mean` does hit all 8,704 in **every ST-vs-MT comparison** — 20 of 20. That half
+     stands, and the set is exactly components B + C: the differing `flow_id` set is `[8192, 16895]`
+     in all 20, and **no rack-local flow differs in any comparison, in either delay column** (0 of 76
+     differing sets contains a `flow_id` < 8192).
+   - **Between two MT runs it does not.** `queueing_delay_mean` reaches 8,704 in only **6 of 18**
+     MT-vs-MT pairs and lands on 8,701 / 8,702 / 8,703 in the other 12; `one_way_delay_mean` between
+     MT runs spans 8,680–8,695. Every short set is a strict *subset* of B + C, never a different set.
+   - So the coincidental-equality mechanism reaches **both** delay columns, not `one_way_delay_mean`
+     alone. **8,704 remains the structural set**; "in *every* comparison" is true only of the
+     ST-vs-MT direction.
+   - The same round newly establishes the other side of the pair: **ST vs ST differs in nothing, in
+     any column, in 18 of 18 comparisons** — the strongest support this contract has for "the ST arm
+     is the only delay-bearing legacy arm".
+
+   **No protocol consequence follows.** The absolute rule below is unchanged and, if anything,
+   reinforced: no legacy MT delay quantity may be cited. A measurer who read the struck sentence and
+   obeyed that rule did nothing that needs revisiting.
 3. **The logged aggregate is a faithful summary, not an artifact.** Recomputing the global mean
    from the per-sink means and counts gives ST 0.001517160 and MT 0.001518399 / 0.001518479,
    reproducing the logged `0.001517` / `0.001518` exactly. The four samples logged ST 0.001517 and
