@@ -1620,6 +1620,76 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
     );
 }
 
+/// T20l fix 3: the warm start records what the attempt PLANNED, not what one config field held.
+///
+/// `MetalConfig::raise_capacity` satisfies an outbox fault by raising the explicit
+/// `max_outbox_events` override and deliberately leaves `capacity_floors` alone — the override is
+/// what the next plan reads. A snapshot taken from `capacity_floors` would therefore be silently
+/// short for every arena with an override, and the replay would fault again on an image whose
+/// answer is already known. `record_warm_start_floor` records the effective grown capacity in the
+/// floor lane instead, which every planner site honours under both forms.
+///
+/// This is the plane-wide counterpart of the per-flow ledger case in `tcp_semantics`, and it is the
+/// only test that drives a plane-wide arena through a real retry on hardware.
+#[test]
+fn metal_capacity_warm_start_records_a_plane_wide_arena_raised_through_its_override() {
+    let image = generator_image(GeneratorTermination::Bytes(4));
+    let expected = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("scalar outbox oracle must run");
+    let executor = MetalExecutor::new().expect("Metal executor must initialize");
+    let config = MetalConfig {
+        max_outbox_events: Some(0),
+        ..MetalConfig::default()
+    };
+
+    let cold = executor
+        .run_with_observations(&image, None, config, ObservationMode::Full)
+        .expect("the outbox retry chain must converge");
+    assert!(
+        !cold.capacity_retry_trace.is_empty(),
+        "the fixture must actually discard an attempt, otherwise the test proves nothing"
+    );
+    // `max_outbox_events` is the override for both plane-wide producer arenas, so a zero override
+    // faults whichever the image reaches first.
+    for retry in &cold.capacity_retry_trace {
+        assert!(
+            matches!(retry.arena, MetalArena::Outbox | MetalArena::RemoteStaging),
+            "expected only plane-wide producer faults, got {:?}",
+            cold.capacity_retry_trace
+        );
+        assert_eq!(retry.capacity, 0);
+    }
+    assert_ne!(
+        cold.capacity_warm_start.floors,
+        days_executor::DeviceCapacityFloors::default(),
+        "the snapshot must carry the plane-wide capacity the successful attempt planned; \
+         `capacity_floors` alone stays at zero when a fault is satisfied by raising the \
+         `max_outbox_events` override instead"
+    );
+
+    let warm = executor
+        .run_with_observations_warm_started(
+            &image,
+            None,
+            MetalConfig {
+                max_capacity_retries: 0,
+                ..config
+            },
+            ObservationMode::Full,
+            &cold.capacity_warm_start,
+        )
+        .expect("the warm start must size the outbox on the FIRST attempt, under a zero budget");
+
+    assert!(warm.capacity_retry_trace.is_empty());
+    assert_eq!(warm.result, cold.result);
+    assert_metal_full_result_matches_scalar(
+        &warm.result,
+        &expected,
+        "warm-started Metal outbox run",
+    );
+    assert_eq!(warm.capacity_warm_start, cold.capacity_warm_start);
+}
+
 #[test]
 fn metal_channel_retry_grows_only_the_faulting_stream() {
     let mut image = generator_image(GeneratorTermination::Bytes(4));

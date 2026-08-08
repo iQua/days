@@ -529,31 +529,35 @@ impl MetalConfig {
     }
 }
 
-/// Records a plane-wide arena's converged capacity in a [`CapacityWarmStart`]'s floor lanes.
+/// The effective plane-wide capacity the converged attempt planned, expressed as floor lanes.
 ///
 /// [`MetalConfig::raise_capacity`] may satisfy a fault by raising an explicit `max_*` override
-/// rather than the matching floor, so `capacity_floors` alone does not always describe what the
-/// successful attempt planned. Every planner site takes the maximum of its bound and the floor, so
-/// recording the grown capacity here reproduces that attempt's sizing from the floor lane alone.
-/// The three entity-keyed arenas are excluded: their converged capacity lives in the per-stream
-/// and per-flow vectors instead.
-fn record_warm_start_floor(floors: &mut DeviceCapacityFloors, arena: MetalArena, grown: usize) {
-    let lane = match arena {
-        MetalArena::Fel => &mut floors.fallback_fel_events_per_lp,
-        MetalArena::ServiceStream => &mut floors.service_events_per_stream,
-        MetalArena::GeneratorStream => &mut floors.generator_events_per_stream,
-        MetalArena::Queue => &mut floors.queue_packets_per_lp,
-        MetalArena::Outbox => &mut floors.outbox_events_total,
-        MetalArena::Worklist => &mut floors.worklist_entries_total,
-        MetalArena::ObservedPackets | MetalArena::Departures | MetalArena::Arrivals => {
-            &mut floors.observation_events
-        }
-        MetalArena::RemoteStaging => &mut floors.remote_staging_events_per_lp,
-        MetalArena::ChannelInbox | MetalArena::TcpReceiverRanges | MetalArena::TcpSegmentLedger => {
-            return;
-        }
-    };
-    *lane = (*lane).max(grown);
+/// rather than the matching floor, and one override — `max_outbox_events` — serves **two** arenas,
+/// so `capacity_floors` alone does not describe what the successful attempt planned. Every planner
+/// site for these arenas reads `override.max(floor)` when an override is present and
+/// `bound_derived_capacity(..., floor, ...)` when it is not, so `max(floor, override)` is exactly
+/// the capacity that attempt used and never more. The entity-keyed arenas are absent here: their
+/// converged capacity lives in the per-stream and per-flow vectors instead.
+fn converged_capacity_floors(config: &MetalConfig) -> DeviceCapacityFloors {
+    let floors = config.capacity_floors;
+    let producer = config.max_outbox_events.unwrap_or(0);
+    DeviceCapacityFloors {
+        fallback_fel_events_per_lp: floors
+            .fallback_fel_events_per_lp
+            .max(config.max_fel_events_per_lp.unwrap_or(0)),
+        queue_packets_per_lp: floors
+            .queue_packets_per_lp
+            .max(config.max_queue_packets_per_lp.unwrap_or(0)),
+        channel_events_per_stream: floors
+            .channel_events_per_stream
+            .max(config.max_channel_events_per_stream.unwrap_or(0)),
+        remote_staging_events_per_lp: floors.remote_staging_events_per_lp.max(producer),
+        outbox_events_total: floors.outbox_events_total.max(producer),
+        observation_events: floors
+            .observation_events
+            .max(config.max_observations.unwrap_or(0)),
+        ..floors
+    }
 }
 
 /// Exact planned Metal event-arena footprint for one run.
@@ -1259,12 +1263,6 @@ impl MetalExecutor {
         let retry_budget = config.max_capacity_retries;
         let mut attempt_config = config;
         attempt_config.capacity_floors = config.capacity_floors.merged_with(warm_start.floors);
-        // The warm start's own learned floors, carried separately from `attempt_config` because
-        // `MetalConfig::raise_capacity` may satisfy a fault by raising an explicit `max_*`
-        // override instead of the floor lane. Every planner site honours the floor under both
-        // forms (`limit.max(floor)` with an override, `bound_derived_capacity` without one), so
-        // recording the effective capacity here makes the emitted snapshot exact.
-        let mut warm_start_floors = warm_start.floors;
         let mut channel_capacity_floors =
             crate::device_capacity::ChannelCapacityFloors::warm_started(
                 &warm_start.channel_events_by_stream,
@@ -1296,7 +1294,7 @@ impl MetalExecutor {
                 Ok(mut run) => {
                     run.capacity_retry_trace = retry_trace;
                     run.capacity_warm_start = CapacityWarmStart {
-                        floors: warm_start_floors,
+                        floors: converged_capacity_floors(&attempt_config),
                         channel_events_by_stream: channel_capacity_floors.converged_capacities(),
                         tcp_receiver_ranges_by_base: tcp_capacity_floors
                             .converged_receiver_ranges(),
@@ -1396,7 +1394,6 @@ impl MetalExecutor {
                         }
                         _ => {
                             attempt_config.raise_capacity(arena, capacity, grown_capacity);
-                            record_warm_start_floor(&mut warm_start_floors, arena, grown_capacity);
                             true
                         }
                     };

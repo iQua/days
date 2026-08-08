@@ -982,6 +982,70 @@ fn cuda_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
     }
 }
 
+/// The CUDA sibling of
+/// `metal_production::metal_capacity_warm_start_records_a_plane_wide_arena_raised_through_its_override`.
+///
+/// T20l fix 3: `CudaConfig::raise_capacity` satisfies a producer-arena fault by raising the
+/// explicit `max_outbox_events` override and leaves `capacity_floors` alone, and that one override
+/// serves BOTH the outbox and the remote-staging arena. A snapshot taken from `capacity_floors`
+/// would therefore be silently short and the replay would fault again; the snapshot records the
+/// effective planned capacity instead.
+#[cfg(feature = "cuda-test-hooks")]
+#[test]
+fn cuda_capacity_warm_start_records_a_plane_wide_arena_raised_through_its_override() {
+    let image = generator_image(GeneratorTermination::Bytes(4));
+    let expected = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("scalar outbox oracle must run");
+    let executor = CudaExecutor::new().expect("CUDA executor must initialize");
+    let config = CudaConfig {
+        max_outbox_events: Some(0),
+        ..CudaConfig::default()
+    };
+
+    let cold = executor
+        .run_with_observations(&image, None, config, ObservationMode::Full)
+        .expect("the producer-arena retry chain must converge");
+    assert!(
+        !cold.capacity_retry_trace.is_empty(),
+        "the fixture must actually discard an attempt, otherwise the test proves nothing"
+    );
+    for retry in &cold.capacity_retry_trace {
+        assert!(
+            matches!(retry.arena, CudaArena::Outbox | CudaArena::RemoteStaging),
+            "expected only plane-wide producer faults, got {:?}",
+            cold.capacity_retry_trace
+        );
+        assert_eq!(retry.capacity, 0);
+    }
+    assert_ne!(
+        cold.capacity_warm_start.floors,
+        days_executor::DeviceCapacityFloors::default(),
+        "the snapshot must carry the plane-wide capacity the successful attempt planned; \
+         `capacity_floors` alone stays at zero when a fault is satisfied by raising the \
+         `max_outbox_events` override instead"
+    );
+
+    let warm = executor
+        .run_with_observations_warm_started(
+            &image,
+            None,
+            CudaConfig {
+                max_capacity_retries: 0,
+                ..config
+            },
+            ObservationMode::Full,
+            &cold.capacity_warm_start,
+        )
+        .expect("the warm start must size the producer arenas on the FIRST attempt");
+
+    assert!(warm.capacity_retry_trace.is_empty());
+    assert_eq!(warm.result, cold.result);
+    let mut expected_without_diagnostics = expected.clone();
+    expected_without_diagnostics.diagnostics = None;
+    assert_eq!(warm.result, expected_without_diagnostics);
+    assert_eq!(warm.capacity_warm_start, cold.capacity_warm_start);
+}
+
 #[cfg(feature = "cuda-test-hooks")]
 #[test]
 fn process_wide_cuda_guard_recovers_after_a_mid_execution_panic() {
