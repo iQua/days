@@ -759,6 +759,71 @@ fn arr_dist_does_not_reach_e4s_lowered_image() {
     );
 }
 
+/// E4's ledger plane, derived: every flow gets its WHOLE-FLOW bound, not a window snapshot.
+///
+/// # The number this replaced
+///
+/// Before T21's ledger fix `device_sizing::tcp_ledger_segment_bound` was
+/// `min(2 * W + 8, whole_flow_attempts)` with `W` read out of the image's encoded congestion
+/// state. E4's flows carry TCP's default 65,535-byte `ssthresh` at MSS 1,460, so `W = 45` and
+/// **every one of the 8,192 flows was planned at `2 * 45 + 8 = 98` records** — including
+/// `FlowId(3667)`, whose 29,200,000 B are 20,000 segments. The whole `tcp_state` plane was
+/// 45,204,832 B. A run to completion leaves 98 behind in congestion avoidance, which is where
+/// `capacity: 98, demand: 99` came from on both Metal and CUDA.
+///
+/// # The number now, and why it is derived rather than pinned
+///
+/// E4's own 4 s horizon admits ~298,000 round trips against a 13.4 µs minimum round trip, so the
+/// horizon term saturates and each flow's bound is its own whole-flow attempt count. That count is
+/// `2 * ceil(size / MSS) + 3` — twice the nominal segment count for retransmission attempts, plus
+/// the generator's `+ 2`, plus the one initial data packet the fixture seeds — and the plane is
+/// exactly the four regions below. The delta is `+141,775,522 ledger records = +5,671,020,880 B`,
+/// and NOTHING else in the plane moves: receiver ranges deliberately keep the encoded-window form.
+#[test]
+fn e4_plans_every_flows_ledger_at_its_whole_flow_bound() {
+    /// `2 * W + 4` receiver ranges at `W = 45`, unchanged by the ledger fix.
+    const RECEIVER_RANGE_BOUND: u64 = 2 * 45 + 4;
+    /// `tcp_state` layout: 7 receiver words and 6 ledger-metadata words per flow, then the two
+    /// record arenas at 2 and 5 words each.
+    const PER_FLOW_METADATA_WORDS: u64 = 7 + 6;
+    const TCP_STATE_BYTES_BEFORE_THE_LEDGER_FIX: u64 = 45_204_832;
+
+    let image = lower(FIXTURE);
+    let report = days_executor::size_default_device_plan(&image)
+        .expect("E4's default device plan must size");
+    let plane = report
+        .planes
+        .iter()
+        .find(|plane| plane.name == "tcp_state")
+        .expect("the plan must carry a tcp_state plane");
+
+    let (mut ledger_records, mut receiver_ranges, mut ledger_records_at_the_old_bound) = (0, 0, 0);
+    for flow in fixture_flows() {
+        let whole_flow = 2 * flow.size_bytes.div_ceil(SEGMENT_BYTES) + 3;
+        ledger_records += whole_flow;
+        receiver_ranges += whole_flow.min(RECEIVER_RANGE_BOUND);
+        ledger_records_at_the_old_bound += whole_flow.min(2 * 45 + 8);
+    }
+    let words =
+        PER_FLOW_METADATA_WORDS * FLOW_COUNT as u64 + 2 * receiver_ranges + 5 * ledger_records;
+
+    assert_eq!(
+        plane.bytes as u64,
+        words * 8,
+        "E4's tcp_state plane is no longer the derived four-region sum"
+    );
+    assert_eq!(
+        plane.bytes as u64,
+        TCP_STATE_BYTES_BEFORE_THE_LEDGER_FIX
+            + 40 * (ledger_records - ledger_records_at_the_old_bound),
+        "the plane must move by exactly the ledger records the fix added, and by nothing else"
+    );
+    // Non-vacuity: the old bound really was one number for the whole workload, and really was
+    // shorter than the demand the device reported.
+    assert_eq!(2 * 45 + 8, 98);
+    assert!(ledger_records - ledger_records_at_the_old_bound > 141_000_000);
+}
+
 // -------------------------------------------------------------------------------------------
 // 4/5. Identity and anchors.
 // -------------------------------------------------------------------------------------------
@@ -795,11 +860,12 @@ fn e4_prefix_anchor_is_identical_across_local_backends() {
 /// resident packets, no pending events, no armed timers. That is the fixture working as specified,
 /// not a truncated run.
 ///
-/// SCALAR + CPU ONLY, because Metal cannot reach this state: it exhausts its per-flow TCP
-/// segment-ledger capacity. Metal IS in the prefix anchor, so the image is expressible on it;
-/// what it will not do is finish. `e4_completion_on_metal_exhausts_the_tcp_segment_ledger` pins
-/// the refusal verbatim, and `evidence/P12/e4-authoring.md` §6.4 hands it off as a Metal-lane
-/// blocker. It is neither diagnosed nor tuned around here — `MetalConfig::default()` throughout.
+/// SCALAR + CPU here; Metal is pinned against these SAME two frozen constants by
+/// `e4_completion_on_metal_matches_the_frozen_scalar_anchor`, in its own test because it is its
+/// own hour of device time. Until T21's ledger fix Metal could not reach this state at all — it
+/// exhausted its per-flow TCP segment-ledger capacity at 98 records — and that refusal, its
+/// diagnosis and its repair are recorded on that test and in `evidence/P12/ledger98-fix.md`.
+/// `MetalConfig::default()` throughout, there as here.
 #[test]
 #[ignore = "explicit P12 E4 RUN-TO-COMPLETION anchor: full 4 s horizon, 104 GB of payload"]
 fn e4_completion_anchor_is_identical_across_local_backends() {
@@ -980,57 +1046,73 @@ fn e4_runs_to_completion_and_drains() {
     );
 }
 
-/// Metal refuses E4's run to completion by exhausting its TCP segment ledger, and it is pinned.
+/// Metal RUNS E4 to completion and lands on the frozen scalar anchor. It used to refuse.
 ///
-/// A first-class result, not a skipped backend. Metal executes this same image happily for
-/// 1.152 ms — the prefix anchor is a four-backend fingerprint — so the fixture is expressible on
-/// Metal; a 96 ms, 104 GB run is not. Verbatim, and reproduced twice on an isolated worktree:
+/// # What this test replaced, and why the refusal is kept here
+///
+/// Until T21's ledger fix this test pinned a refusal, verbatim and reproduced twice:
 ///
 /// > Metal execution failed after 16 capacity retries: Metal TCP segment ledger capacity of 98
 /// > records exceeded at flow FlowId(3667); observed demand 99
 ///
-/// Note the shape: the executor's own capacity-retry loop grew the ledger sixteen times and still
-/// landed exactly ONE record short of the demand. That is a sizing-heuristic question for the
-/// Metal lane, not a fixture question, and this round neither diagnosed it nor tuned around it —
-/// `MetalConfig::default()` is what every other E4 gate uses and is what this one uses.
+/// The same three numbers appeared on madrid's CUDA sm_121 after 37:42 of wall clock, on a
+/// different backend, which is what identified the cause as **host-side plan sizing** rather than
+/// a kernel: `device_sizing::tcp_ledger_segment_bound` sized every flow's ledger from the encoded
+/// congestion window, and E4's flows carry TCP's default 65,535-byte `ssthresh` at MSS 1,460, so
+/// `2 * 45 + 8 = 98` records were planned for a run to completion whose windows grow for ~96 ms of
+/// congestion avoidance. The capacity-retry loop could not repair it: ledger growth is keyed per
+/// flow, E4's 8,192 flows start across a 95.787 ms span, and each attempt therefore repaired one
+/// flow and refused on the next one to cross 98 — the trace is sixteen records of
+/// `capacity: 98, demand: 99` on sixteen different flows.
 ///
-/// If Metal is ever fixed, THIS TEST GOES RED, which is the point: the exclusion in
-/// `e4_completion_anchor_is_identical_across_local_backends` must be revisited in the same change
-/// and E4's completion identity claim upgraded from three backends to four.
+/// The fix makes the plan-time window ceiling horizon-aware (`tcp_horizon_round_trips`), which for
+/// a run-to-completion horizon reduces to the flow's own whole-flow attempt bound. E4 therefore
+/// runs **without a single capacity retry**, which this test asserts: a retry here would mean the
+/// bound had stopped being a bound again.
+///
+/// # What it is worth
+///
+/// Metal is now pinned against the SAME frozen completion fingerprint scalar, CPU×2 and CPU×4 are
+/// pinned against, so E4's completion identity claim is four backends, not three.
 #[test]
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-#[ignore = "explicit P12 E4 Metal refusal probe: full 4 s horizon, 104 GB of payload"]
-fn e4_completion_on_metal_exhausts_the_tcp_segment_ledger() {
+#[ignore = "explicit P12 E4 Metal completion anchor: full 4 s horizon, 104 GB of payload"]
+fn e4_completion_on_metal_matches_the_frozen_scalar_anchor() {
     use days_executor::{MetalConfig, MetalExecutor};
     let image = lower(FIXTURE);
     let executor = MetalExecutor::new().expect("Metal executor must initialize");
-    let outcome = executor.run_with_observations(
-        &image,
-        None,
-        MetalConfig::default(),
-        ObservationMode::Summary,
-    );
-    let error = match outcome {
-        Ok(_) => panic!(
-            "Metal now COMPLETES E4. That is good news and this test is the notice: re-run the \
-             completion anchor with `identical_across_local_backends`, upgrade E4's completion \
-             identity claim from three backends to four, and update evidence/P12/e4-authoring.md."
-        ),
-        Err(error) => error.to_string(),
-    };
-    // CLASS, not instance. This pins the error CLASS — a TCP-segment-ledger capacity exhaustion —
-    // and deliberately not the three numbers that characterise today's instance (capacity 98,
-    // demand 99, sixteen retries) or `FlowId(3667)`, because those are Metal-lane sizing details
-    // that the Metal lane is expected to move. Anything that claims this gate "fails if the error
-    // ever changes" is overstating it; it fails if the error CLASS changes, and it fails if Metal
-    // ever succeeds. The verbatim string with the numbers is printed below and recorded in
-    // evidence/P12/e4-authoring.md §6.4.
+    let run = executor
+        .run_with_observations(
+            &image,
+            None,
+            MetalConfig::default(),
+            ObservationMode::Summary,
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "Metal must now RUN E4 to completion; it refused with: {error}. Before T21's \
+                 ledger fix this refused with `TCP segment ledger capacity of 98 records \
+                 exceeded at flow FlowId(3667); observed demand 99` — see this test's doc comment \
+                 and evidence/P12/ledger98-fix.md."
+            )
+        });
     assert!(
-        error.contains("TCP segment ledger capacity"),
-        "Metal still refuses E4 to completion, but with a DIFFERENT error CLASS than the one \
-         recorded in evidence/P12/e4-authoring.md §6.4: {error}"
+        run.capacity_retry_trace.is_empty(),
+        "E4's ledger is planned at its whole-flow bound, so a capacity retry means the plan-time \
+         bound regressed to a snapshot again: {:?}",
+        run.capacity_retry_trace
     );
-    println!("E4 Metal completion refusal, verbatim: {error}");
+    let observed = fingerprint(&run.result);
+    println!(
+        "E4 COMPLETION anchor on Metal: bytes={} fnv1a64={:016x}",
+        observed.bytes, observed.fnv1a64
+    );
+    assert_anchor(
+        FIXTURE,
+        observed,
+        E4_COMPLETION_ANCHOR_BYTES,
+        E4_COMPLETION_ANCHOR_FNV,
+    );
 }
 
 fn assert_anchor(name: &str, actual: Fingerprint, bytes: u64, fnv1a64: u64) {
