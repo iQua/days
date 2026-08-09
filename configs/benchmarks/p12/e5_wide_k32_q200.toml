@@ -13,7 +13,7 @@
 #   starts / seed         all 0 ns / 51001
 #   horizon               3 s; acceptance requires natural drain before it
 #   total demand          8,589,934,592 B
-#   frozen scalar result  549 drops / 9,551 retransmission attempts
+#   frozen scalar result  549 drops / 9,551 inferred data-attempt excess
 #
 # FIXTURE-FORM RULING. E5 retains the probe's `[[flow_set]]` semantic identity. Round 1's
 # explicit rewrite rerouted 8,158/8,192 flows and did not complete; E4 remains explicit

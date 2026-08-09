@@ -5,15 +5,17 @@
 //! same endpoints into `[[flow]]` blocks changes the trajectory. The first authoring gates pin the
 //! ruled form and byte-for-byte regeneration before expensive characterization is trusted.
 
+use std::collections::BTreeMap;
 use std::fmt::{self, Debug, Write as _};
 use std::path::PathBuf;
 use std::process::Command;
 
 use days::scenario::compile_config;
 use days_executor::{
-    ArrivalDisposition, Backend, CpuConfig, FlowGeneratorKind, ObservationMode, PacketKind,
-    RunResult, SimulationImage, TcpTransitionInput, run_cpu_with_observations,
-    run_scalar_rounds_with_observations, size_default_device_plan, validate,
+    ArrivalDisposition, Backend, CpuConfig, FlowGeneratorKind, ObservationMode, PacketDescriptor,
+    PacketKind, RunResult, SimulationImage, TcpTransitionInput, TcpTransitionRecord,
+    run_cpu_with_observations, run_scalar_rounds_with_observations, size_default_device_plan,
+    validate,
 };
 
 const FNV1A64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -32,20 +34,36 @@ const PRIMARY_COMPLETION_NS: u64 = 1_000_362_708;
 
 const FROZEN_PRIMARY_DROPS: u128 = 549;
 /// Design-probe identity: all data attempts minus `flow_count * ceil(bytes / MSS)`.
-const FROZEN_PRIMARY_RETRANSMISSIONS: u128 = 9_551;
+const FROZEN_PRIMARY_DATA_ATTEMPT_EXCESS: u128 = 9_551;
 /// Full-observation packet-header counters. Window-limited sends split 8,935 additional fresh
 /// packets, so the probe identity above is 8,935 + 616 rather than an exact retransmit flag count.
 const FROZEN_PRIMARY_EXPLICIT_ORIGINALS: u128 = 5_898_983;
 const FROZEN_PRIMARY_EXPLICIT_RETRANSMISSIONS: u128 = 616;
+const FROZEN_PRIMARY_RETRANSMIT_DATA_BYTES: u128 = 894_219;
+const FROZEN_PRIMARY_ACK_PACKETS: u128 = 5_899_120;
+const FROZEN_PRIMARY_ACK_BYTES: u128 = 235_964_800;
 const FROZEN_PRIMARY_DATA_DROPS: u128 = 479;
+const FROZEN_PRIMARY_DATA_DROP_BYTES: u128 = 696_163;
 const FROZEN_PRIMARY_ACK_DROPS: u128 = 70;
+const FROZEN_PRIMARY_DROP_BYTES: u128 = 698_963;
+const FROZEN_PRIMARY_FAST_RETRANSMIT_TRIGGERS: u128 = 317;
 const FROZEN_PRIMARY_RTO_FIRES: u128 = 2;
 const FROZEN_PRIMARY_ROUNDS: usize = 664;
 const FROZEN_PRIMARY_TRANSITIONS: u128 = 212_378_014;
+const FROZEN_PRIMARY_WEIGHTED_WIDTH_NUMERATOR: u128 = 7_750_198_793_034;
 const FROZEN_PRIMARY_WEIGHTED_WIDTH_CEILING: u128 = 36_493;
+const FROZEN_PRIMARY_WIDE_TRANSITIONS: u128 = 169_492_561;
 const FROZEN_PRIMARY_WIDE_SHARE_TENTHS_PERCENT: u128 = 798;
+const FROZEN_PRIMARY_EXCLUSIVE_HORIZON_NS: u128 = 1_000_363_709;
 const FROZEN_BACKUP_DROPS: u128 = 157;
-const FROZEN_BACKUP_RETRANSMISSIONS: u128 = 8_508;
+const FROZEN_BACKUP_DATA_ATTEMPT_EXCESS: u128 = 8_508;
+const FROZEN_BACKUP_ROUNDS: usize = 611;
+const FROZEN_BACKUP_TRANSITIONS: u128 = 212_351_652;
+const FROZEN_PRIMARY_LEDGER_RECORDS_PER_FLOW_CAP: usize = 727;
+#[cfg(all(feature = "metal-test-hooks", target_vendor = "apple"))]
+const E5_TCP_FIXED_WORDS_PER_FLOW: u128 = 7 + 64 * 2 + 6;
+#[cfg(all(feature = "metal-test-hooks", target_vendor = "apple"))]
+const TCP_LEDGER_RECORD_WORDS: u128 = 5;
 
 const GIB_BYTES: u128 = 1_u128 << 30;
 const DEVICE_CAP_BYTES: u128 = 22 * GIB_BYTES;
@@ -126,16 +144,153 @@ fn lower(name: &str) -> SimulationImage {
 #[derive(Clone, Copy, Default)]
 struct GoldenFlow {
     demand_bytes: u64,
+    start_ns: Option<u64>,
+    first_send_ns: Option<u64>,
     acked_bytes: u64,
     completion_ns: Option<u64>,
-    drop_packets: u64,
-    data_drop_packets: u64,
-    ack_drop_packets: u64,
     original_data_packets: u64,
+    original_data_bytes: u64,
     retransmit_data_packets: u64,
+    retransmit_data_bytes: u64,
+    ack_packets: u64,
+    ack_bytes: u64,
+    drop_packets: u64,
+    drop_bytes: u64,
+    data_drop_packets: u64,
+    data_drop_bytes: u64,
+    ack_drop_packets: u64,
+    ack_drop_bytes: u64,
+    fast_retransmit_triggers: u64,
     rto_fires: u64,
     final_cwnd_bytes: u64,
     final_ssthresh_bytes: u64,
+    final_rto_ns: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LedgerHighWater {
+    per_flow: Vec<usize>,
+    aggregate: usize,
+}
+
+/// Replays the Scalar Full trace through the canonical ledger count operations. Initial attempts
+/// are seeded from the image; later attempts are created after their equal-time sender transition,
+/// so advancing ACKs are applied before the replacement/refill attempts they cause. The aggregate
+/// is the conservative sum of per-flow peaks: stronger than a simultaneous peak for a plan whose
+/// capacity is also summed per flow.
+fn scalar_ledger_high_water(image: &SimulationImage, result: &RunResult) -> LedgerHighWater {
+    let diagnostics = result
+        .diagnostics
+        .as_ref()
+        .expect("ledger high-water requires Full observations");
+    let mut attempts = vec![Vec::<&PacketDescriptor>::new(); image.flows.len()];
+    for packet in &result.observed_packets {
+        let PacketKind::TcpData(_) = packet.kind else {
+            continue;
+        };
+        attempts[packet.flow.0 as usize].push(packet);
+    }
+    let mut acknowledgments = vec![Vec::<&TcpTransitionRecord>::new(); image.flows.len()];
+    for transition in &diagnostics.tcp_transitions {
+        let TcpTransitionInput::NewAck { .. } = transition.input else {
+            continue;
+        };
+        acknowledgments[transition.flow.0 as usize].push(transition);
+    }
+    let mut per_flow = vec![0_usize; image.flows.len()];
+    for flow in 0..image.flows.len() {
+        attempts[flow].sort_unstable_by_key(|packet| {
+            let PacketKind::TcpData(header) = packet.kind else {
+                unreachable!()
+            };
+            (header.sent_time_ns, packet.id)
+        });
+        acknowledgments[flow].sort_unstable_by_key(|transition| transition.key);
+        let mut ledger = BTreeMap::<u64, u64>::new();
+        for packet in image
+            .initial_packets
+            .iter()
+            .filter(|packet| packet.flow.0 as usize == flow)
+        {
+            let PacketKind::TcpData(header) = packet.kind else {
+                continue;
+            };
+            ledger.insert(header.sequence, header.sequence + packet.size_bytes);
+        }
+        let mut peak = ledger.len();
+        let mut attempt = 0_usize;
+        let mut acknowledgment = 0_usize;
+        while attempt < attempts[flow].len() || acknowledgment < acknowledgments[flow].len() {
+            let attempt_time = attempts[flow].get(attempt).map(|packet| {
+                let PacketKind::TcpData(header) = packet.kind else {
+                    unreachable!()
+                };
+                header.sent_time_ns
+            });
+            let acknowledgment_time = acknowledgments[flow]
+                .get(acknowledgment)
+                .map(|transition| transition.key.time_ns);
+            let time_ns = match (attempt_time, acknowledgment_time) {
+                (Some(left), Some(right)) => left.min(right),
+                (Some(time), None) | (None, Some(time)) => time,
+                (None, None) => unreachable!(),
+            };
+            while acknowledgments[flow]
+                .get(acknowledgment)
+                .is_some_and(|transition| transition.key.time_ns == time_ns)
+            {
+                let TcpTransitionInput::NewAck {
+                    acknowledgment: ack,
+                    ..
+                } = acknowledgments[flow][acknowledgment].input
+                else {
+                    unreachable!()
+                };
+                let mut unacknowledged = ledger.split_off(&ack);
+                if let Some((sequence, end)) = ledger.pop_last() {
+                    if ack < end {
+                        assert!(sequence < ack);
+                        unacknowledged.insert(ack, end);
+                    }
+                }
+                ledger = unacknowledged;
+                acknowledgment += 1;
+            }
+            while attempts[flow].get(attempt).is_some_and(|packet| {
+                let PacketKind::TcpData(header) = packet.kind else {
+                    unreachable!()
+                };
+                header.sent_time_ns == time_ns
+            }) {
+                let packet = attempts[flow][attempt];
+                let PacketKind::TcpData(header) = packet.kind else {
+                    unreachable!()
+                };
+                if let Some(original_end) =
+                    ledger.insert(header.sequence, header.sequence + packet.size_bytes)
+                {
+                    assert_eq!(
+                        original_end,
+                        header.sequence + packet.size_bytes,
+                        "flow {flow} replaced ledger sequence {} with a different end",
+                        header.sequence
+                    );
+                }
+                peak = peak.max(ledger.len());
+                attempt += 1;
+            }
+        }
+        assert!(
+            ledger.is_empty(),
+            "flow {flow} did not drain its Scalar ledger"
+        );
+        per_flow[flow] = peak;
+    }
+    let aggregate = per_flow.iter().sum();
+    LedgerHighWater {
+        per_flow,
+        aggregate,
+    }
 }
 
 /// Stable endpoint/work projection used by the GeDES port. This deliberately reads Full-mode
@@ -144,6 +299,16 @@ struct GoldenFlow {
 /// those identities without changing executor state.
 fn protocol_golden_csv(image: &SimulationImage, result: &RunResult) -> String {
     let mut rows = vec![GoldenFlow::default(); image.flows.len()];
+    for packet in &image.initial_packets {
+        let PacketKind::TcpData(header) = packet.kind else {
+            continue;
+        };
+        let row = &mut rows[packet.flow.0 as usize];
+        row.start_ns = Some(
+            row.start_ns
+                .map_or(header.sent_time_ns, |start| start.min(header.sent_time_ns)),
+        );
+    }
     for host in &result.host_states {
         for generator in &host.generators {
             let FlowGeneratorKind::Tcp(tcp) = generator.kind else {
@@ -154,17 +319,31 @@ fn protocol_golden_csv(image: &SimulationImage, result: &RunResult) -> String {
             row.acked_bytes = tcp.highest_ack;
             row.final_cwnd_bytes = tcp.control.cwnd_bytes(tcp.mss_bytes);
             row.final_ssthresh_bytes = tcp.control.ssthresh_bytes();
+            row.final_rto_ns = tcp.rto_ns;
         }
     }
 
     for packet in &result.observed_packets {
-        if let PacketKind::TcpData(header) = packet.kind {
-            let row = &mut rows[packet.flow.0 as usize];
-            if header.retransmission {
-                row.retransmit_data_packets += 1;
-            } else {
-                row.original_data_packets += 1;
+        let row = &mut rows[packet.flow.0 as usize];
+        match packet.kind {
+            PacketKind::TcpData(header) => {
+                row.first_send_ns = Some(
+                    row.first_send_ns
+                        .map_or(header.sent_time_ns, |first| first.min(header.sent_time_ns)),
+                );
+                if header.retransmission {
+                    row.retransmit_data_packets += 1;
+                    row.retransmit_data_bytes += packet.size_bytes;
+                } else {
+                    row.original_data_packets += 1;
+                    row.original_data_bytes += packet.size_bytes;
+                }
             }
+            PacketKind::TcpAck(_) => {
+                row.ack_packets += 1;
+                row.ack_bytes += packet.size_bytes;
+            }
+            _ => panic!("E5 contains only TCP data and ACK packets"),
         }
     }
     for arrival in &result.arrivals {
@@ -179,9 +358,16 @@ fn protocol_golden_csv(image: &SimulationImage, result: &RunResult) -> String {
             .expect("every dropped payload must have a Full-mode descriptor");
         let row = &mut rows[packet.flow.0 as usize];
         row.drop_packets += 1;
+        row.drop_bytes += packet.size_bytes;
         match packet.kind {
-            PacketKind::TcpData(_) => row.data_drop_packets += 1,
-            PacketKind::TcpAck(_) => row.ack_drop_packets += 1,
+            PacketKind::TcpData(_) => {
+                row.data_drop_packets += 1;
+                row.data_drop_bytes += packet.size_bytes;
+            }
+            PacketKind::TcpAck(_) => {
+                row.ack_drop_packets += 1;
+                row.ack_drop_bytes += packet.size_bytes;
+            }
             _ => panic!("E5 contains only TCP data and ACK packets"),
         }
     }
@@ -201,6 +387,12 @@ fn protocol_golden_csv(image: &SimulationImage, result: &RunResult) -> String {
                     transition.flow
                 );
             }
+            TcpTransitionInput::DuplicateAck { .. }
+                if transition.before.duplicate_acks() == 2
+                    && transition.after.duplicate_acks() == 3 =>
+            {
+                row.fast_retransmit_triggers += 1;
+            }
             TcpTransitionInput::Timeout { .. } => row.rto_fires += 1,
             _ => {}
         }
@@ -210,17 +402,26 @@ fn protocol_golden_csv(image: &SimulationImage, result: &RunResult) -> String {
     csv.push_str("# P12 E5-primary Days AGO Reno protocol golden vectors.\n");
     csv.push_str("# Generated by tests/t21_p12_e5.rs::e5_primary_protocol_golden_vectors_match.\n");
     csv.push_str(
-        "# completion_ns is the sender's cumulative-ACK completion instant. Drops include\n",
+        "# start/first_send come from initial/observed data sent_time_ns; completion is the\n",
     );
-    csv.push_str("# data and ACK packets; original/retransmit use TcpDataHeader.retransmission;\n");
     csv.push_str(
-        "# rto_fires counts TcpTransitionInput::Timeout. The aggregate final-window fields\n",
+        "# sender's cumulative-ACK completion instant. Packet and drop fields include bytes;\n",
     );
-    csv.push_str("# are blank because summing per-flow cwnd/ssthresh has no protocol meaning.\n");
     csv.push_str(
-        "record,flow_id,source_node,target_node,flow_count,demand_bytes,acked_bytes,completion_ns,\
-drop_packets,data_drop_packets,ack_drop_packets,original_data_packets,retransmit_data_packets,\
-rto_fires,final_cwnd_bytes,final_ssthresh_bytes\n",
+        "# original/retransmit use TcpDataHeader.retransmission. Fast retransmit is the exact\n",
+    );
+    csv.push_str(
+        "# third-duplicate-ACK trigger; rto_fires counts TcpTransitionInput::Timeout. Aggregate\n",
+    );
+    csv.push_str(
+        "# final cwnd/ssthresh/RTO fields are blank because sums have no protocol meaning.\n",
+    );
+    csv.push_str(
+        "record,flow_id,source_node,target_node,flow_count,demand_bytes,start_ns,first_send_ns,\
+completion_ns,acked_bytes,original_data_packets,original_data_bytes,retransmit_data_packets,\
+retransmit_data_bytes,ack_packets,ack_bytes,drop_packets,drop_bytes,data_drop_packets,\
+data_drop_bytes,ack_drop_packets,ack_drop_bytes,fast_retransmit_triggers,rto_fires,\
+final_cwnd_bytes,final_ssthresh_bytes,final_rto_ns\n",
     );
 
     let mut aggregate = GoldenFlow::default();
@@ -228,26 +429,53 @@ rto_fires,final_cwnd_bytes,final_ssthresh_bytes\n",
         let completion_ns = row
             .completion_ns
             .unwrap_or_else(|| panic!("flow {:?} has no completion transition", flow.id));
+        let start_ns = row
+            .start_ns
+            .unwrap_or_else(|| panic!("flow {:?} has no configured start", flow.id));
+        let first_send_ns = row
+            .first_send_ns
+            .unwrap_or_else(|| panic!("flow {:?} has no data attempt", flow.id));
         writeln!(
             csv,
-            "flow,{},{},{},,{},{},{},{},{},{},{},{},{},{},{}",
+            "flow,{},{},{},,{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             flow.id.0,
             flow.source.0,
             flow.target.0,
             row.demand_bytes,
-            row.acked_bytes,
+            start_ns,
+            first_send_ns,
             completion_ns,
-            row.drop_packets,
-            row.data_drop_packets,
-            row.ack_drop_packets,
+            row.acked_bytes,
             row.original_data_packets,
+            row.original_data_bytes,
             row.retransmit_data_packets,
+            row.retransmit_data_bytes,
+            row.ack_packets,
+            row.ack_bytes,
+            row.drop_packets,
+            row.drop_bytes,
+            row.data_drop_packets,
+            row.data_drop_bytes,
+            row.ack_drop_packets,
+            row.ack_drop_bytes,
+            row.fast_retransmit_triggers,
             row.rto_fires,
             row.final_cwnd_bytes,
             row.final_ssthresh_bytes,
+            row.final_rto_ns,
         )
         .expect("writing to String cannot fail");
         aggregate.demand_bytes += row.demand_bytes;
+        aggregate.start_ns = Some(
+            aggregate
+                .start_ns
+                .map_or(start_ns, |earliest| earliest.min(start_ns)),
+        );
+        aggregate.first_send_ns = Some(
+            aggregate
+                .first_send_ns
+                .map_or(first_send_ns, |earliest| earliest.min(first_send_ns)),
+        );
         aggregate.acked_bytes += row.acked_bytes;
         aggregate.completion_ns = Some(
             aggregate
@@ -256,29 +484,50 @@ rto_fires,final_cwnd_bytes,final_ssthresh_bytes\n",
                 .max(completion_ns),
         );
         aggregate.drop_packets += row.drop_packets;
+        aggregate.drop_bytes += row.drop_bytes;
         aggregate.data_drop_packets += row.data_drop_packets;
+        aggregate.data_drop_bytes += row.data_drop_bytes;
         aggregate.ack_drop_packets += row.ack_drop_packets;
+        aggregate.ack_drop_bytes += row.ack_drop_bytes;
         aggregate.original_data_packets += row.original_data_packets;
+        aggregate.original_data_bytes += row.original_data_bytes;
         aggregate.retransmit_data_packets += row.retransmit_data_packets;
+        aggregate.retransmit_data_bytes += row.retransmit_data_bytes;
+        aggregate.ack_packets += row.ack_packets;
+        aggregate.ack_bytes += row.ack_bytes;
+        aggregate.fast_retransmit_triggers += row.fast_retransmit_triggers;
         aggregate.rto_fires += row.rto_fires;
     }
     writeln!(
         csv,
-        "aggregate,,,,{FLOW_COUNT},{},{},{},{},{},{},{},{},{},,",
+        "aggregate,,,,{FLOW_COUNT},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},,,",
         aggregate.demand_bytes,
-        aggregate.acked_bytes,
+        aggregate.start_ns.expect("at least one start"),
+        aggregate.first_send_ns.expect("at least one send"),
         aggregate.completion_ns.expect("at least one completion"),
-        aggregate.drop_packets,
-        aggregate.data_drop_packets,
-        aggregate.ack_drop_packets,
+        aggregate.acked_bytes,
         aggregate.original_data_packets,
+        aggregate.original_data_bytes,
         aggregate.retransmit_data_packets,
+        aggregate.retransmit_data_bytes,
+        aggregate.ack_packets,
+        aggregate.ack_bytes,
+        aggregate.drop_packets,
+        aggregate.drop_bytes,
+        aggregate.data_drop_packets,
+        aggregate.data_drop_bytes,
+        aggregate.ack_drop_packets,
+        aggregate.ack_drop_bytes,
+        aggregate.fast_retransmit_triggers,
         aggregate.rto_fires,
     )
     .expect("writing to String cannot fail");
 
     assert_eq!(aggregate.demand_bytes as u128, TOTAL_BYTES);
+    assert_eq!(aggregate.start_ns, Some(0));
+    assert_eq!(aggregate.first_send_ns, Some(0));
     assert_eq!(aggregate.acked_bytes as u128, TOTAL_BYTES);
+    assert_eq!(aggregate.original_data_bytes as u128, TOTAL_BYTES);
     assert_eq!(aggregate.completion_ns, Some(PRIMARY_COMPLETION_NS));
     assert_eq!(aggregate.drop_packets as u128, FROZEN_PRIMARY_DROPS);
     assert_eq!(
@@ -286,6 +535,28 @@ rto_fires,final_cwnd_bytes,final_ssthresh_bytes\n",
         FROZEN_PRIMARY_DATA_DROPS
     );
     assert_eq!(aggregate.ack_drop_packets as u128, FROZEN_PRIMARY_ACK_DROPS);
+    assert_eq!(aggregate.drop_bytes as u128, FROZEN_PRIMARY_DROP_BYTES);
+    assert_eq!(
+        aggregate.data_drop_bytes as u128,
+        FROZEN_PRIMARY_DATA_DROP_BYTES
+    );
+    assert_eq!(
+        aggregate.drop_packets,
+        aggregate.data_drop_packets + aggregate.ack_drop_packets
+    );
+    assert_eq!(
+        aggregate.drop_bytes,
+        aggregate.data_drop_bytes + aggregate.ack_drop_bytes
+    );
+    assert_eq!(
+        aggregate.ack_drop_bytes,
+        aggregate.ack_drop_packets * ACK_BYTES
+    );
+    assert_eq!(aggregate.ack_bytes, aggregate.ack_packets * ACK_BYTES);
+    assert_eq!(
+        aggregate.original_data_packets + aggregate.retransmit_data_packets,
+        aggregate.ack_packets + aggregate.data_drop_packets
+    );
     let nominal_segments = FLOW_COUNT as u128 * u128::from(FLOW_BYTES.div_ceil(MSS_BYTES));
     assert_eq!(
         aggregate.original_data_packets as u128,
@@ -296,12 +567,44 @@ rto_fires,final_cwnd_bytes,final_ssthresh_bytes\n",
         FROZEN_PRIMARY_EXPLICIT_RETRANSMISSIONS
     );
     assert_eq!(
+        aggregate.retransmit_data_bytes as u128,
+        FROZEN_PRIMARY_RETRANSMIT_DATA_BYTES
+    );
+    assert_eq!(aggregate.ack_packets as u128, FROZEN_PRIMARY_ACK_PACKETS);
+    assert_eq!(aggregate.ack_bytes as u128, FROZEN_PRIMARY_ACK_BYTES);
+    assert_eq!(
+        aggregate.fast_retransmit_triggers as u128,
+        FROZEN_PRIMARY_FAST_RETRANSMIT_TRIGGERS
+    );
+    assert_eq!(
         u128::from(aggregate.original_data_packets + aggregate.retransmit_data_packets)
             - nominal_segments,
-        FROZEN_PRIMARY_RETRANSMISSIONS,
-        "the design study's inferred-retransmission probe identity moved"
+        FROZEN_PRIMARY_DATA_ATTEMPT_EXCESS,
+        "the design study's inferred data-attempt excess moved"
     );
     assert_eq!(aggregate.rto_fires as u128, FROZEN_PRIMARY_RTO_FIRES);
+    let ledger = scalar_ledger_high_water(image, result);
+    let max_per_flow = ledger.per_flow.iter().copied().max().unwrap_or_default();
+    assert!(
+        ledger
+            .per_flow
+            .iter()
+            .all(|observed| *observed <= FROZEN_PRIMARY_LEDGER_RECORDS_PER_FLOW_CAP),
+        "Scalar E5 per-flow ledger high-water exceeded the capped plan's \
+         {FROZEN_PRIMARY_LEDGER_RECORDS_PER_FLOW_CAP}-record capacity: max={max_per_flow}"
+    );
+    let aggregate_capacity = FLOW_COUNT * FROZEN_PRIMARY_LEDGER_RECORDS_PER_FLOW_CAP;
+    assert!(
+        ledger.aggregate <= aggregate_capacity,
+        "Scalar E5 aggregate ledger high-water {} exceeded capped-plan capacity {aggregate_capacity}",
+        ledger.aggregate
+    );
+    println!(
+        "E5 PRIMARY Scalar ledger high-water: maxPerFlow={max_per_flow} \
+         sumOfPerFlowPeaks={} perFlowCapacity={FROZEN_PRIMARY_LEDGER_RECORDS_PER_FLOW_CAP} \
+         aggregateCapacity={aggregate_capacity}",
+        ledger.aggregate
+    );
     csv
 }
 
@@ -350,11 +653,13 @@ fn e5_fixtures_use_the_ruled_flow_set_form() {
 
 #[test]
 fn e5_protocol_golden_format_and_aggregate_are_pinned() {
-    const HEADER: &str = "record,flow_id,source_node,target_node,flow_count,demand_bytes,acked_bytes,\
-completion_ns,drop_packets,data_drop_packets,ack_drop_packets,original_data_packets,\
-retransmit_data_packets,rto_fires,final_cwnd_bytes,final_ssthresh_bytes";
-    const AGGREGATE: &str =
-        "aggregate,,,,8192,8589934592,8589934592,1000362708,549,479,70,5898983,616,2,,";
+    const HEADER: &str = "record,flow_id,source_node,target_node,flow_count,demand_bytes,start_ns,\
+first_send_ns,completion_ns,acked_bytes,original_data_packets,original_data_bytes,\
+retransmit_data_packets,retransmit_data_bytes,ack_packets,ack_bytes,drop_packets,drop_bytes,\
+data_drop_packets,data_drop_bytes,ack_drop_packets,ack_drop_bytes,fast_retransmit_triggers,\
+rto_fires,final_cwnd_bytes,final_ssthresh_bytes,final_rto_ns";
+    const AGGREGATE: &str = "aggregate,,,,8192,8589934592,0,0,1000362708,8589934592,5898983,8589934592,616,\
+894219,5899120,235964800,549,698963,479,696163,70,2800,317,2,,,";
 
     let text = std::fs::read_to_string(p12_path(GOLDEN_VECTORS))
         .expect("E5 protocol golden vectors must be committed");
@@ -365,26 +670,62 @@ retransmit_data_packets,rto_fires,final_cwnd_bytes,final_ssthresh_bytes";
     assert_eq!(records.len(), FLOW_COUNT + 2, "header + flows + aggregate");
     assert_eq!(records[0], HEADER);
     assert_eq!(records.last().copied(), Some(AGGREGATE));
+    let mut sums = [0_u128; 27];
+    let mut last_completion = 0_u64;
     for (flow_id, line) in records[1..=FLOW_COUNT].iter().enumerate() {
         let fields = line.split(',').collect::<Vec<_>>();
-        assert_eq!(fields.len(), 16, "flow row {flow_id} width changed");
+        assert_eq!(fields.len(), 27, "flow row {flow_id} width changed");
         assert_eq!(fields[0], "flow");
         assert_eq!(fields[1].parse::<usize>(), Ok(flow_id));
         assert_eq!(fields[5].parse::<u64>(), Ok(FLOW_BYTES));
-        assert_eq!(fields[6].parse::<u64>(), Ok(FLOW_BYTES));
+        assert_eq!(fields[6].parse::<u64>(), Ok(0));
+        assert_eq!(fields[7].parse::<u64>(), Ok(0));
         assert!(
-            !fields[7].is_empty(),
+            !fields[8].is_empty(),
             "flow {flow_id} completion is missing"
         );
+        last_completion = last_completion.max(fields[8].parse().expect("numeric completion"));
+        assert_eq!(fields[9].parse::<u64>(), Ok(FLOW_BYTES));
+        for index in [
+            5_usize, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+        ] {
+            sums[index] += fields[index]
+                .parse::<u128>()
+                .unwrap_or_else(|error| panic!("flow {flow_id} field {index}: {error}"));
+        }
         assert!(
-            !fields[14].is_empty(),
+            !fields[24].is_empty(),
             "flow {flow_id} final cwnd is missing"
         );
         assert!(
-            !fields[15].is_empty(),
+            !fields[25].is_empty(),
             "flow {flow_id} final ssthresh is missing"
         );
+        assert!(
+            !fields[26].is_empty(),
+            "flow {flow_id} final RTO is missing"
+        );
     }
+    assert_eq!(sums[5], TOTAL_BYTES);
+    assert_eq!(sums[9], TOTAL_BYTES);
+    assert_eq!(sums[10], FROZEN_PRIMARY_EXPLICIT_ORIGINALS);
+    assert_eq!(sums[11], TOTAL_BYTES);
+    assert_eq!(sums[12], FROZEN_PRIMARY_EXPLICIT_RETRANSMISSIONS);
+    assert_eq!(sums[13], FROZEN_PRIMARY_RETRANSMIT_DATA_BYTES);
+    assert_eq!(sums[14], FROZEN_PRIMARY_ACK_PACKETS);
+    assert_eq!(sums[15], FROZEN_PRIMARY_ACK_BYTES);
+    assert_eq!(sums[16], FROZEN_PRIMARY_DROPS);
+    assert_eq!(sums[17], FROZEN_PRIMARY_DROP_BYTES);
+    assert_eq!(sums[18], FROZEN_PRIMARY_DATA_DROPS);
+    assert_eq!(sums[19], FROZEN_PRIMARY_DATA_DROP_BYTES);
+    assert_eq!(sums[20], FROZEN_PRIMARY_ACK_DROPS);
+    assert_eq!(sums[21], FROZEN_PRIMARY_ACK_DROPS * u128::from(ACK_BYTES));
+    assert_eq!(sums[22], FROZEN_PRIMARY_FAST_RETRANSMIT_TRIGGERS);
+    assert_eq!(sums[23], FROZEN_PRIMARY_RTO_FIRES);
+    assert_eq!(sums[16], sums[18] + sums[20]);
+    assert_eq!(sums[17], sums[19] + sums[21]);
+    assert_eq!(sums[10] + sums[12], sums[14] + sums[18]);
+    assert_eq!(last_completion, PRIMARY_COMPLETION_NS);
 }
 
 #[test]
@@ -505,6 +846,23 @@ fn e5_exact_capped_metal_plans_match_the_frozen_classes() {
         assert_eq!(derived_total, report.total_device_bytes as u128);
         assert_eq!(derived_total, expected_bytes);
         assert!(derived_total <= DEVICE_CAP_BYTES);
+        let tcp_state_bytes = report
+            .planes
+            .iter()
+            .find(|plane| plane.name == "tcp_state")
+            .expect("E5 Metal plan must report tcp_state")
+            .bytes as u128;
+        assert_eq!(tcp_state_bytes % 8, 0);
+        let tcp_words_per_flow = (tcp_state_bytes / 8) / FLOW_COUNT as u128;
+        let ledger_words_per_flow = tcp_words_per_flow
+            .checked_sub(E5_TCP_FIXED_WORDS_PER_FLOW)
+            .expect("TCP fixed state must fit its plane");
+        assert_eq!(ledger_words_per_flow % TCP_LEDGER_RECORD_WORDS, 0);
+        assert_eq!(
+            ledger_words_per_flow / TCP_LEDGER_RECORD_WORDS,
+            FROZEN_PRIMARY_LEDGER_RECORDS_PER_FLOW_CAP as u128,
+            "{fixture} capped plan's per-flow ledger capacity moved"
+        );
         assert_eq!(
             (derived_total * 1_000 + GIB_BYTES / 2) / GIB_BYTES,
             expected_milli_gib
@@ -566,14 +924,14 @@ fn e5_primary_flow_set_fixture_reproduces_the_frozen_scalar_probe() {
 
     // Every delivered TCP data attempt immediately sources one ACK. Therefore sourced minus
     // received is the number of data attempts; subtract the fixed original segment count to get
-    // the design study's inferred retransmission-attempt definition.
+    // the design study's inferred data-attempt-excess definition.
     let original_segments = FLOW_COUNT as u128 * u128::from(FLOW_BYTES.div_ceil(MSS_BYTES));
     let data_attempts = run
         .result
         .summary
         .sourced_packets
         .saturating_sub(run.result.summary.received_packets);
-    let retransmissions = data_attempts.saturating_sub(original_segments);
+    let data_attempt_excess = data_attempts.saturating_sub(original_segments);
     let last_round = run
         .rounds
         .last()
@@ -582,7 +940,7 @@ fn e5_primary_flow_set_fixture_reproduces_the_frozen_scalar_probe() {
 
     println!(
         "E5 PRIMARY flow-set diagnostic: completed={completed}/{FLOW_COUNT} demanded={demanded} \
-         acked={acked} drops={} retransmissions={retransmissions} rounds={} \
+         acked={acked} drops={} dataAttemptExcess={data_attempt_excess} rounds={} \
          transitions={transitions} weightedWidthNumerator={weighted_width_numerator} \
          weightedWidthCeiling={weighted_width_ceiling} wideTransitions={wide_transitions} \
          wideShareTenthsPercent={wide_share_tenths_percent} finalFrontierNs={} \
@@ -610,19 +968,29 @@ fn e5_primary_flow_set_fixture_reproduces_the_frozen_scalar_probe() {
         "E5 flow-set fixture does not reproduce the frozen probe drops; stop and report"
     );
     assert_eq!(
-        retransmissions, FROZEN_PRIMARY_RETRANSMISSIONS,
-        "E5 flow-set fixture does not reproduce the frozen probe retransmissions; stop and report"
+        data_attempt_excess, FROZEN_PRIMARY_DATA_ATTEMPT_EXCESS,
+        "E5 flow-set fixture does not reproduce the frozen inferred data-attempt excess; \
+         stop and report"
     );
     assert_eq!(run.rounds.len(), FROZEN_PRIMARY_ROUNDS);
     assert_eq!(last_round.frontier_ns, PRIMARY_COMPLETION_NS);
     assert_eq!(transitions, FROZEN_PRIMARY_TRANSITIONS);
     assert_eq!(
+        weighted_width_numerator,
+        FROZEN_PRIMARY_WEIGHTED_WIDTH_NUMERATOR
+    );
+    assert_eq!(
         weighted_width_ceiling,
         FROZEN_PRIMARY_WEIGHTED_WIDTH_CEILING
     );
+    assert_eq!(wide_transitions, FROZEN_PRIMARY_WIDE_TRANSITIONS);
     assert_eq!(
         wide_share_tenths_percent,
         FROZEN_PRIMARY_WIDE_SHARE_TENTHS_PERCENT
+    );
+    assert_eq!(
+        last_round.exclusive_horizon_ns,
+        FROZEN_PRIMARY_EXCLUSIVE_HORIZON_NS
     );
     assert_primary_anchor(anchor);
 }
@@ -665,10 +1033,57 @@ fn e5_primary_completion_anchor_is_identical_on_cpu_x2_and_x4() {
 }
 
 #[test]
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal-test-hooks", target_vendor = "apple"))]
 #[ignore = "E5 primary completion anchor on production Metal with the capped device plan"]
 fn e5_primary_completion_anchor_is_identical_on_metal() {
-    use days_executor::{MetalConfig, MetalExecutor};
+    use days_executor::{
+        ArenaOccupancyHighWater, MetalConfig, MetalExecutor,
+        take_dominant_arena_high_water_for_testing,
+    };
+
+    fn assert_high_water(
+        arena: &str,
+        occupancy: &ArenaOccupancyHighWater,
+        authored_cap: Option<u64>,
+    ) {
+        assert_eq!(
+            occupancy.high_water.len(),
+            occupancy.capacities.len(),
+            "{arena}: every planned entity needs a high-water mark"
+        );
+        assert!(
+            occupancy.high_water.iter().any(|observed| *observed > 0),
+            "{arena}: E5 must exercise the arena"
+        );
+        for (entity, (&observed, &capacity)) in occupancy
+            .high_water
+            .iter()
+            .zip(&occupancy.capacities)
+            .enumerate()
+        {
+            assert!(
+                observed <= capacity,
+                "{arena} entity {entity}: high-water {observed} exceeded planned capacity {capacity}"
+            );
+            if let Some(cap) = authored_cap {
+                assert!(
+                    capacity <= cap,
+                    "{arena} entity {entity}: final planned capacity {capacity} exceeded authored cap {cap}"
+                );
+            }
+        }
+        let (peak_entity, &peak) = occupancy
+            .high_water
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, observed)| *observed)
+            .expect("E5 arena must have entities");
+        println!(
+            "E5 PRIMARY capped Metal {arena} high-water: peak={peak} entity={peak_entity} \
+             capacityAtPeak={}",
+            occupancy.capacities[peak_entity]
+        );
+    }
 
     let image = lower(PRIMARY_FIXTURE);
     validate(&image, Backend::Metal).expect("E5 Metal validation failed");
@@ -684,6 +1099,41 @@ fn e5_primary_completion_anchor_is_identical_on_metal() {
             ObservationMode::Summary,
         )
         .unwrap_or_else(|error| panic!("E5 Metal completion run failed: {error}"));
+    let high_water = take_dominant_arena_high_water_for_testing()
+        .expect("completed E5 Metal attempt must publish arena high-water vectors");
+    assert_eq!(
+        high_water.stream_records.high_water.len(),
+        image.channels.len() + image.nodes.len() + image.flows.len()
+    );
+    assert_eq!(
+        high_water.remote_staging.high_water.len(),
+        image.nodes.len()
+    );
+    assert_eq!(high_water.queue_records.high_water.len(), image.nodes.len());
+    assert_high_water("stream_records", &high_water.stream_records, None);
+    assert_high_water(
+        "remote_staging",
+        &high_water.remote_staging,
+        E5_CAPACITY_CAPS
+            .remote_staging_events_per_lp
+            .map(|capacity| capacity as u64),
+    );
+    assert_high_water(
+        "queue_records",
+        &high_water.queue_records,
+        E5_CAPACITY_CAPS
+            .queue_packets_per_lp
+            .map(|capacity| capacity as u64),
+    );
+    let channel_cap = E5_CAPACITY_CAPS
+        .channel_events_per_stream
+        .expect("E5 capped plan must cap channel streams") as u64;
+    assert!(
+        high_water.stream_records.capacities[..image.channels.len()]
+            .iter()
+            .all(|capacity| *capacity <= channel_cap),
+        "E5 channel-stream plan exceeded the authored cap"
+    );
     let anchor = fingerprint(&run.result);
     println!(
         "E5 PRIMARY Metal anchor: bytes={} fnv1a64={:016x} rounds={} transitions={} \
@@ -730,18 +1180,20 @@ fn e5_backup_flow_set_fixture_reproduces_the_frozen_counts() {
         .summary
         .sourced_packets
         .saturating_sub(run.result.summary.received_packets);
-    let retransmissions = data_attempts.saturating_sub(original_segments);
+    let data_attempt_excess = data_attempts.saturating_sub(original_segments);
     let last_round = run.rounds.last().expect("E5 backup must execute");
+    let transitions = run
+        .rounds
+        .iter()
+        .map(|round| u128::from(round.events_processed))
+        .sum::<u128>();
     println!(
         "E5 BACKUP flow-set diagnostic: completed={completed}/{FLOW_COUNT} demanded={demanded} \
-         acked={acked} drops={} retransmissions={retransmissions} rounds={} transitions={} \
+         acked={acked} drops={} dataAttemptExcess={data_attempt_excess} rounds={} transitions={} \
          finalFrontierNs={} finalExclusiveHorizonNs={} residentPackets={} pendingEvents={}",
         run.result.summary.dropped_packets,
         run.rounds.len(),
-        run.rounds
-            .iter()
-            .map(|round| u128::from(round.events_processed))
-            .sum::<u128>(),
+        transitions,
         last_round.frontier_ns,
         last_round.exclusive_horizon_ns,
         run.result.resident_packets.len(),
@@ -751,7 +1203,9 @@ fn e5_backup_flow_set_fixture_reproduces_the_frozen_counts() {
     assert_eq!(demanded, TOTAL_BYTES);
     assert_eq!(acked, TOTAL_BYTES);
     assert_eq!(run.result.summary.dropped_packets, FROZEN_BACKUP_DROPS);
-    assert_eq!(retransmissions, FROZEN_BACKUP_RETRANSMISSIONS);
+    assert_eq!(data_attempt_excess, FROZEN_BACKUP_DATA_ATTEMPT_EXCESS);
+    assert_eq!(run.rounds.len(), FROZEN_BACKUP_ROUNDS);
+    assert_eq!(transitions, FROZEN_BACKUP_TRANSITIONS);
     assert!(run.result.resident_packets.is_empty());
     assert!(run.result.pending_events.is_empty());
     assert!(last_round.frontier_ns < HORIZON_NS);

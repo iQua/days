@@ -13,9 +13,10 @@ The protocol endpoint/work target is committed beside the fixtures as
 `e5_wide_k32_q200_protocol_golden.csv`. Its stable CSV schema is generated and byte-checked by the
 ignored Full-observation test `e5_primary_protocol_golden_vectors_match`; set
 `E5_UPDATE_GOLDEN=1` only when intentionally re-authoring it. Every `flow` row contains FlowId,
-endpoints, demand/ACKed bytes, sender completion instant, total/data/ACK drops, explicit original
-and retransmission packet counts, RTO fires, and final cwnd/ssthresh. The final `aggregate` row
-sums meaningful work counters and records the last completion; aggregate cwnd/ssthresh stay blank.
+endpoints, demand/ACKed bytes, start/first-send/completion instants, original/retransmitted data and
+ACK packet/byte counts, data/ACK drop packet/byte counts, fast-retransmit/RTO counters, and final
+cwnd/ssthresh/RTO. The final `aggregate` row sums meaningful work counters and records the earliest
+start/first send and last completion; aggregate final-state fields stay blank.
 """
 
 import argparse
@@ -42,7 +43,7 @@ VARIANTS = (
 )
 
 
-def render(name: str, queue_packets: int, role: str, drops: int, retransmits: int) -> str:
+def render(name: str, queue_packets: int, role: str, drops: int, data_attempt_excess: int) -> str:
     total_bytes = HOSTS * FLOW_BYTES
     out: list[str] = []
     write = out.append
@@ -61,7 +62,10 @@ def render(name: str, queue_packets: int, role: str, drops: int, retransmits: in
     write("#   starts / seed         all 0 ns / 51001")
     write("#   horizon               3 s; acceptance requires natural drain before it")
     write(f"#   total demand          {total_bytes:,} B")
-    write(f"#   frozen scalar result  {drops:,} drops / {retransmits:,} retransmission attempts")
+    write(
+        f"#   frozen scalar result  {drops:,} drops / "
+        f"{data_attempt_excess:,} inferred data-attempt excess"
+    )
     write("#")
     write("# FIXTURE-FORM RULING. E5 retains the probe's `[[flow_set]]` semantic identity. Round 1's")
     write("# explicit rewrite rerouted 8,158/8,192 flows and did not complete; E4 remains explicit")
@@ -121,9 +125,9 @@ def main(argv: list[str]) -> int:
     arguments = parser.parse_args(argv)
     arguments.out_dir.mkdir(parents=True, exist_ok=True)
 
-    for name, queue_packets, role, drops, retransmits in VARIANTS:
+    for name, queue_packets, role, drops, data_attempt_excess in VARIANTS:
         output = arguments.out_dir / name
-        output.write_text(render(name, queue_packets, role, drops, retransmits))
+        output.write_text(render(name, queue_packets, role, drops, data_attempt_excess))
         print(f"wrote {output} (one flow set, {HOSTS:,} flows, {HOSTS * FLOW_BYTES:,} B)")
     return 0
 
