@@ -5719,14 +5719,19 @@ kernel void days_round_control(
     }
 }
 
-kernel void days_exchange_prefix(
-    device ulong *control [[buffer(0)]],
+// T21 fix 1 — the exchange-prefix STREAMS scan, on the whole grid. Transliterated word for word
+// from `cuda_kernels.cu`; see that kernel's header, which also records that this is the kernel the
+// FIRST attempt's in-dispatch combine failed in.
+kernel void days_exchange_prefix_sweep(
+    const device ulong *control [[buffer(0)]],
     const device ulong *params [[buffer(1)]],
-    device ulong *remote_meta [[buffer(19)]],
     const device ulong *remote_staging [[buffer(20)]],
     device ulong *stream_state [[buffer(25)]],
     const device ulong *stream_records [[buffer(26)]],
-    uint lane [[thread_index_in_threadgroup]]
+    uint lane [[thread_index_in_threadgroup]],
+    uint block [[threadgroup_position_in_grid]],
+    uint block_size [[threads_per_threadgroup]],
+    uint blocks [[threadgroups_per_grid]]
 ) {
     threadgroup ulong sums[1024];
     threadgroup uint exceeded[1024];
@@ -5734,20 +5739,25 @@ kernel void days_exchange_prefix(
     if (
         control[C_ERROR] != 0 ||
         control[C_DONE] != 0 ||
-        control[C_CONTINUATION] != 2
+        control[C_CONTINUATION] != 2 ||
+        params[P_STREAMS_ENABLED] == 0
     ) {
         return;
     }
 
-    if (params[P_STREAMS_ENABLED] != 0) {
+    // Braced so the per-channel body below stays a line-for-line copy of the pre-T21 kernel's,
+    // including the `capacity` the stream header shadows inside the loop.
+    {
         ulong capacity = params[P_OUTBOX_CAPACITY];
         ulong local_sum = 0;
         uint local_exceeded = 0;
         ulong local_failure = NONE;
+        ulong first = ulong(block) * ulong(block_size) + ulong(lane);
+        ulong grid_stride = ulong(blocks) * ulong(block_size);
         for (
-            ulong channel = lane;
+            ulong channel = first;
             channel < params[P_CHANNEL_COUNT];
-            channel += 1024
+            channel += grid_stride
         ) {
             ulong batch =
                 params[P_CHANNEL_BATCH_OFFSET] +
@@ -5786,6 +5796,74 @@ kernel void days_exchange_prefix(
             if ((invalid_capacity || invalid_order) && channel < local_failure) {
                 local_failure = channel;
             }
+        }
+        sums[lane] = local_sum;
+        exceeded[lane] = local_exceeded;
+        failures[lane] = local_failure;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 512; stride != 0; stride >>= 1) {
+            if (lane < stride) {
+                ulong right_sum = sums[lane + stride];
+                uint combined_exceeded =
+                    exceeded[lane] | exceeded[lane + stride];
+                ulong combined_sum = saturating_add_ulong(sums[lane], right_sum);
+                combined_exceeded |= uint(combined_sum > capacity);
+                sums[lane] = combined_sum;
+                exceeded[lane] = combined_exceeded;
+                failures[lane] = min(failures[lane], failures[lane + stride]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (lane == 0) {
+            store_round_partial(stream_state, params, block, 0, sums[0]);
+            store_round_partial(stream_state, params, block, 1, ulong(exceeded[0]));
+            store_round_partial(stream_state, params, block, 2, failures[0]);
+        }
+    }
+}
+
+// T21 fix 1 — the exchange-prefix combine, plus the legacy node-ordered prefix scan.
+// Transliterated word for word from `cuda_kernels.cu`.
+kernel void days_exchange_prefix(
+    device ulong *control [[buffer(0)]],
+    const device ulong *params [[buffer(1)]],
+    device ulong *remote_meta [[buffer(19)]],
+    device ulong *stream_state [[buffer(25)]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    threadgroup ulong sums[1024];
+    threadgroup uint exceeded[1024];
+    threadgroup ulong failures[1024];
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 2
+    ) {
+        return;
+    }
+
+    if (params[P_STREAMS_ENABLED] != 0) {
+        ulong capacity = params[P_OUTBOX_CAPACITY];
+        ulong local_sum = 0;
+        uint local_exceeded = 0;
+        ulong local_failure = NONE;
+        for (
+            ulong block = lane;
+            block < CONTROL_SWEEP_BLOCKS;
+            block += 1024
+        ) {
+            local_sum = saturating_add_ulong(
+                local_sum,
+                load_round_partial(stream_state, params, block, 0)
+            );
+            local_exceeded |= uint(
+                load_round_partial(stream_state, params, block, 1) != 0
+            );
+            local_exceeded |= uint(local_sum > capacity);
+            local_failure = min(
+                local_failure,
+                load_round_partial(stream_state, params, block, 2)
+            );
         }
         sums[lane] = local_sum;
         exceeded[lane] = local_exceeded;

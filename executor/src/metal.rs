@@ -233,6 +233,7 @@ enum AttemptKernel {
     DrainExecute,
     ContinuationControlSweep,
     ContinuationControl,
+    ExchangePrefixSweep,
     ExchangePrefix,
     ExchangeScatter,
     TargetMerge,
@@ -258,7 +259,7 @@ impl DispatchGeometry {
     }
 }
 
-const ATTEMPT_DISPATCHES: [(AttemptKernel, AttemptPhase, DispatchGeometry); 12] = [
+const ATTEMPT_DISPATCHES: [(AttemptKernel, AttemptPhase, DispatchGeometry); 13] = [
     (
         AttemptKernel::HorizonSweep,
         AttemptPhase::Horizon,
@@ -293,6 +294,11 @@ const ATTEMPT_DISPATCHES: [(AttemptKernel, AttemptPhase, DispatchGeometry); 12] 
         AttemptKernel::ContinuationControl,
         AttemptPhase::ContinuationControl,
         DispatchGeometry::FixedControl,
+    ),
+    (
+        AttemptKernel::ExchangePrefixSweep,
+        AttemptPhase::ExchangePrefix,
+        DispatchGeometry::ControlSweep,
     ),
     (
         AttemptKernel::ExchangePrefix,
@@ -5087,6 +5093,8 @@ struct DirectMetal {
     /// T21 fix 1: the round-control scans, on the full grid.
     control_sweep_pipeline: MetalPipeline,
     control_pipeline: MetalPipeline,
+    /// T21 fix 1: the exchange-prefix streams scan, on the full grid.
+    exchange_prefix_sweep_pipeline: MetalPipeline,
     exchange_prefix_pipeline: MetalPipeline,
     exchange_scatter_pipeline: MetalPipeline,
     exchange_merge_pipeline: MetalPipeline,
@@ -5117,6 +5125,8 @@ impl DirectMetal {
         let round_pipeline = create_pipeline(&device, source, "days_round")?;
         let control_sweep_pipeline = create_pipeline(&device, source, "days_round_control_sweep")?;
         let control_pipeline = create_pipeline(&device, source, "days_round_control")?;
+        let exchange_prefix_sweep_pipeline =
+            create_pipeline(&device, source, "days_exchange_prefix_sweep")?;
         let exchange_prefix_pipeline = create_pipeline(&device, source, "days_exchange_prefix")?;
         let exchange_scatter_pipeline = create_pipeline(&device, source, "days_exchange_scatter")?;
         let exchange_merge_pipeline = create_pipeline(&device, source, "days_exchange_merge")?;
@@ -5132,6 +5142,7 @@ impl DirectMetal {
             ("round-prepare", &prepare_pipeline),
             ("round-control-sweep", &control_sweep_pipeline),
             ("round-control", &control_pipeline),
+            ("exchange-prefix-sweep", &exchange_prefix_sweep_pipeline),
             ("exchange-prefix", &exchange_prefix_pipeline),
             ("round-finalize-sweep", &finalize_sweep_pipeline),
             ("round-finalize", &finalize_pipeline),
@@ -5165,6 +5176,7 @@ impl DirectMetal {
             round_pipeline,
             control_sweep_pipeline,
             control_pipeline,
+            exchange_prefix_sweep_pipeline,
             exchange_prefix_pipeline,
             exchange_scatter_pipeline,
             exchange_merge_pipeline,
@@ -5657,6 +5669,7 @@ impl DirectMetal {
             AttemptKernel::DrainExecute => round_pipeline,
             AttemptKernel::ContinuationControlSweep => &self.control_sweep_pipeline,
             AttemptKernel::ContinuationControl => &self.control_pipeline,
+            AttemptKernel::ExchangePrefixSweep => &self.exchange_prefix_sweep_pipeline,
             AttemptKernel::ExchangePrefix => &self.exchange_prefix_pipeline,
             AttemptKernel::ExchangeScatter => &self.exchange_scatter_pipeline,
             AttemptKernel::TargetMerge => merge_pipeline,
@@ -6060,6 +6073,7 @@ mod tests {
             AttemptKernel::HorizonSweep,
             AttemptKernel::RoundReset,
             AttemptKernel::ContinuationControlSweep,
+            AttemptKernel::ExchangePrefixSweep,
             AttemptKernel::FinalControlSweep,
         ] {
             let (_, _, geometry) = ATTEMPT_DISPATCHES

@@ -5188,7 +5188,27 @@ extern "C" __global__ void days_round_control(DAYS_BUFFERS) {
     }
 }
 
-extern "C" __global__ void days_exchange_prefix(DAYS_BUFFERS) {
+// T21 fix 1 — the exchange-prefix STREAMS scan, on the whole grid.
+//
+// This is the kernel the FIRST attempt died in (`evidence/P12/aterm-fixes.md` §3.1-3.3): its
+// in-dispatch combine produced `demand: 18446744073709551615`, i.e. this clamped sum saturating on
+// garbage, at k=32 width only. Here the combine is a SEPARATE DISPATCH, so there are no partials
+// in flight and nothing to order.
+//
+// Three partition-free reductions: the clamped sum of the per-channel batch counts (associative on
+// non-negative values, so `min(true total, 2^64-1)` for every grouping), the `OR` of the capacity
+// flags (every tree node's value is its subtree's clamped sum, hence at most the total, and the
+// root re-checks the total, so the flag is exactly `total > capacity`), and the `min` over the
+// channel indices that failed validation.
+//
+// The per-channel `stream_state[batch + 3] = 0` reset comes along: it is one write per channel by
+// the one thread that owns that channel, and it touches the channel BATCH quadruple, not the
+// stream header at `channel * META_WORDS` that the combine re-reads for the failure detail.
+//
+// The LEGACY (streams-disabled) path is NOT here. It is a node-ordered prefix scan whose output —
+// each producer's staging base — depends on the partition, so it stays in the width-1 combine over
+// the retained 1,024-lane contiguous chunks.
+extern "C" __global__ void days_exchange_prefix_sweep(DAYS_BUFFERS) {
     uint lane = threadIdx.x;
     __shared__ ulong sums[1024];
     __shared__ uint exceeded[1024];
@@ -5196,20 +5216,25 @@ extern "C" __global__ void days_exchange_prefix(DAYS_BUFFERS) {
     if (
         control[C_ERROR] != 0 ||
         control[C_DONE] != 0 ||
-        control[C_CONTINUATION] != 2
+        control[C_CONTINUATION] != 2 ||
+        params[P_STREAMS_ENABLED] == 0
     ) {
         return;
     }
 
-    if (params[P_STREAMS_ENABLED] != 0) {
+    // Braced so the per-channel body below stays a line-for-line copy of the pre-T21 kernel's,
+    // including the `capacity` the stream header shadows inside the loop.
+    {
         ulong capacity = params[P_OUTBOX_CAPACITY];
         ulong local_sum = 0;
         uint local_exceeded = 0;
         ulong local_failure = NONE;
+        ulong first = ulong(blockIdx.x) * ulong(blockDim.x) + ulong(threadIdx.x);
+        ulong grid_stride = ulong(gridDim.x) * ulong(blockDim.x);
         for (
-            ulong channel = lane;
+            ulong channel = first;
             channel < params[P_CHANNEL_COUNT];
-            channel += 1024
+            channel += grid_stride
         ) {
             ulong batch =
                 params[P_CHANNEL_BATCH_OFFSET] +
@@ -5248,6 +5273,71 @@ extern "C" __global__ void days_exchange_prefix(DAYS_BUFFERS) {
             if ((invalid_capacity || invalid_order) && channel < local_failure) {
                 local_failure = channel;
             }
+        }
+        sums[lane] = local_sum;
+        exceeded[lane] = local_exceeded;
+        failures[lane] = local_failure;
+        __syncthreads();
+        for (uint stride = 512; stride != 0; stride >>= 1) {
+            if (lane < stride) {
+                ulong right_sum = sums[lane + stride];
+                uint combined_exceeded =
+                    exceeded[lane] | exceeded[lane + stride];
+                ulong combined_sum = saturating_add_ulong(sums[lane], right_sum);
+                combined_exceeded |= uint(combined_sum > capacity);
+                sums[lane] = combined_sum;
+                exceeded[lane] = combined_exceeded;
+                failures[lane] = min(failures[lane], failures[lane + stride]);
+            }
+            __syncthreads();
+        }
+        if (lane == 0) {
+            store_round_partial(stream_state, params, blockIdx.x, 0, sums[0]);
+            store_round_partial(stream_state, params, blockIdx.x, 1, ulong(exceeded[0]));
+            store_round_partial(stream_state, params, blockIdx.x, 2, failures[0]);
+        }
+    }
+}
+
+// T21 fix 1 — the exchange-prefix combine, plus the legacy node-ordered prefix scan.
+//
+// The guard is `days_exchange_prefix_sweep`'s, word for word; nothing between the two dispatches
+// writes a word it reads.
+extern "C" __global__ void days_exchange_prefix(DAYS_BUFFERS) {
+    uint lane = threadIdx.x;
+    __shared__ ulong sums[1024];
+    __shared__ uint exceeded[1024];
+    __shared__ ulong failures[1024];
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 2
+    ) {
+        return;
+    }
+
+    if (params[P_STREAMS_ENABLED] != 0) {
+        ulong capacity = params[P_OUTBOX_CAPACITY];
+        ulong local_sum = 0;
+        uint local_exceeded = 0;
+        ulong local_failure = NONE;
+        for (
+            ulong block = lane;
+            block < CONTROL_SWEEP_BLOCKS;
+            block += 1024
+        ) {
+            local_sum = saturating_add_ulong(
+                local_sum,
+                load_round_partial(stream_state, params, block, 0)
+            );
+            local_exceeded |= uint(
+                load_round_partial(stream_state, params, block, 1) != 0
+            );
+            local_exceeded |= uint(local_sum > capacity);
+            local_failure = min(
+                local_failure,
+                load_round_partial(stream_state, params, block, 2)
+            );
         }
         sums[lane] = local_sum;
         exceeded[lane] = local_exceeded;
