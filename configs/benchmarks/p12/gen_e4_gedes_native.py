@@ -40,8 +40,12 @@ liability with no upside when GeDES already writes the answer to a CSV:
     ~/gedes-bench/runs/k32pub_seed41_a.csv   (boston, GeDES tree at 1376c638a0ae661164...)
     md5 f9eec61c11a29a998d2c849f120eb396
 
-That md5 is the SAME one P09 sec 7.3 recorded on madrid -- GB10 / sm_121 / CUDA 13.0 / aarch64 --
+That md5 is the SAME one P09 sec 7.2 recorded on madrid -- GB10 / sm_121 / CUDA 13.0 / aarch64 --
 for the same seeded configuration, so the table is architecture-invariant, not a boston artifact.
+(sec 7.2 is the AS-PUBLISHED sweep row, `--flow_time_range=10000000`. P09 sec 7.3 is the SATURATED
+load-matched variant, `--flow_time_range=1000`, whose seed-41 table hashes to e94a96ea.. -- a
+different workload, and NOT the one E4 expresses. E4 is a lightly loaded fabric; citing 7.3 would
+point an auditor at the opposite reading.)
 It is committed beside this script as `gedes_k32_seed41_flows.csv`, verbatim and unmodified, and a
 test asserts that md5.
 
@@ -126,7 +130,8 @@ differenceable against them.
   mechanisms compose: Days' RTO floor is 1 s (`executor/src/tcp.rs` MIN_RTO_NS, RFC 6298) against a
   MEASURED 25-36 us smoothed RTT on this fabric, and after a timeout `cwnd` collapses to one MSS
   while `bytes_in_flight` is left standing (`scalar.rs:4338`: `allowance = cwnd - bytes_in_flight`),
-  so a flow moves exactly one segment per second until the receiver's cumulative ACK catches up.
+  so a stalled flow advances only as fast as the receiver's cumulative ACK releases the window --
+  MEASURED at ~39 kB, about 27 segments, per 1-second timeout, not one segment per second.
   Keeping 200 would therefore have bought GeDES-fidelity on one fabric constant at the price of a
   fixture that does not terminate -- and of a second, uncontrolled difference from E1/E2.
   The variant is recorded in `evidence/P12/e4-authoring.md` and is owed as a separate capability
@@ -197,8 +202,9 @@ SWITCH_CAPACITY_PACKETS = 1024
 # Days' RTO floor is 1 s (`executor/src/tcp.rs` MIN_RTO_NS, RFC 6298) against a MEASURED smoothed
 # RTT of 25-36 us on this fabric -- a floor roughly 30,000x the actual round trip -- and after a
 # timeout `cwnd` collapses to one MSS while `bytes_in_flight` stands (`scalar.rs:4338`:
-# `allowance = cwnd - bytes_in_flight`), so a flow that loses a burst moves about one segment per
-# second. A horizon sized to the drain would therefore turn a single drop into a SILENT truncation
+# `allowance = cwnd - bytes_in_flight`), so a flow that loses a burst advances only as fast as its
+# own cumulative ACK recovers the window -- MEASURED at ~39 kB per 1-second timeout on the rejected
+# 200-packet variant. A horizon sized to the drain would therefore turn a single drop into a SILENT truncation
 # instead of a loud one. Four seconds admits a first timeout plus one x2 backoff and still refuses
 # a third, so a pathology is reported rather than absorbed. The slack is measured to be free: the
 # 4 s horizon costs 78,999 rounds for a run that drains at 96 ms, because an empty fabric costs
@@ -300,8 +306,10 @@ def render(flows) -> str:
     w("#     (`script.py:102`: --ft_k=32 --packet_pool_size=10000000 --average_flow_size=10000")
     w("#     --flow_time_range=10000000, --rng_seed=41), committed beside this file as")
     w("#     `gedes_k32_seed41_flows.csv`, md5 f9eec61c11a29a998d2c849f120eb396 -- the same md5")
-    w("#     P09 sec 7.3 recorded on madrid (GB10/sm_121/aarch64), so the table is")
-    w("#     architecture-invariant. The adaptation burden is on Days: this is THE FAIR ROW.")
+    w("#     P09 sec 7.2 recorded on madrid (GB10/sm_121/aarch64), so the table is")
+    w("#     architecture-invariant. sec 7.2 is the AS-PUBLISHED row; sec 7.3 is the SATURATED")
+    w("#     variant (e94a96ea..) and is NOT this workload. The adaptation burden is on Days:")
+    w("#     this is THE FAIR ROW.")
     w("#")
     w("#   * RUN TO COMPLETION, NOT TO A HORIZON. Every flow is byte-terminated at its own")
     w("#     GeDES-defined size and the metric is time-to-completion. Days has no stop-when-idle")
@@ -312,8 +320,9 @@ def render(flows) -> str:
     w("#   * THE HORIZON IS 40x THE DRAIN, ON PURPOSE. One lost segment costs a full second here:")
     w("#     Days' RTO floor is 1 s (`executor/src/tcp.rs` MIN_RTO_NS, RFC 6298) against a MEASURED")
     w("#     25-36 us RTT, and after a timeout `cwnd` collapses to one MSS without releasing the")
-    w("#     in-flight bytes, so a flow that loses a burst advances ~one segment per second. A")
-    w("#     horizon sized to the 96 ms drain would turn a single drop into a SILENT truncation.")
+    w("#     in-flight bytes, so a flow that loses a burst advances only as fast as its cumulative")
+    w("#     ACK recovers the window -- MEASURED ~39 kB per 1 s timeout, not one segment per second.")
+    w("#     A horizon sized to the 96 ms drain would turn a single drop into a SILENT truncation.")
     w("#     4 s admits one timeout plus one x2 backoff and refuses a third. It is free: 78,999")
     w("#     rounds for a 4 s horizon that drains at 96 ms, because an empty fabric costs 0 rounds.")
     w("#     CROSS-ARM: GeDES's own rto is 1 ms, three orders of magnitude below Days' and ns-3's")

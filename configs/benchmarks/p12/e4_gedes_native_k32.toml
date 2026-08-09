@@ -9,8 +9,10 @@
 #     (`script.py:102`: --ft_k=32 --packet_pool_size=10000000 --average_flow_size=10000
 #     --flow_time_range=10000000, --rng_seed=41), committed beside this file as
 #     `gedes_k32_seed41_flows.csv`, md5 f9eec61c11a29a998d2c849f120eb396 -- the same md5
-#     P09 sec 7.3 recorded on madrid (GB10/sm_121/aarch64), so the table is
-#     architecture-invariant. The adaptation burden is on Days: this is THE FAIR ROW.
+#     P09 sec 7.2 recorded on madrid (GB10/sm_121/aarch64), so the table is
+#     architecture-invariant. sec 7.2 is the AS-PUBLISHED row; sec 7.3 is the SATURATED
+#     variant (e94a96ea..) and is NOT this workload. The adaptation burden is on Days:
+#     this is THE FAIR ROW.
 #
 #   * RUN TO COMPLETION, NOT TO A HORIZON. Every flow is byte-terminated at its own
 #     GeDES-defined size and the metric is time-to-completion. Days has no stop-when-idle
@@ -21,8 +23,9 @@
 #   * THE HORIZON IS 40x THE DRAIN, ON PURPOSE. One lost segment costs a full second here:
 #     Days' RTO floor is 1 s (`executor/src/tcp.rs` MIN_RTO_NS, RFC 6298) against a MEASURED
 #     25-36 us RTT, and after a timeout `cwnd` collapses to one MSS without releasing the
-#     in-flight bytes, so a flow that loses a burst advances ~one segment per second. A
-#     horizon sized to the 96 ms drain would turn a single drop into a SILENT truncation.
+#     in-flight bytes, so a flow that loses a burst advances only as fast as its cumulative
+#     ACK recovers the window -- MEASURED ~39 kB per 1 s timeout, not one segment per second.
+#     A horizon sized to the 96 ms drain would turn a single drop into a SILENT truncation.
 #     4 s admits one timeout plus one x2 backoff and refuses a third. It is free: 78,999
 #     rounds for a 4 s horizon that drains at 96 ms, because an empty fabric costs 0 rounds.
 #     CROSS-ARM: GeDES's own rto is 1 ms, three orders of magnitude below Days' and ns-3's
