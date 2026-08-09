@@ -11,6 +11,11 @@
 
 # These are files related to logged outputs
 **/*.csv
+# ...with one exception: GeDES's own emitted flow table is E4's WORKLOAD DEFINITION, not a
+# logged output. `configs/benchmarks/p12/e4_gedes_native_k32.toml` is generated from it and
+# `tests/t21_p12_e4.rs` gates its md5, so a clone without it cannot build the fixture or run
+# a single E4 test.
+!/configs/benchmarks/p12/gedes_k32_seed41_flows.csv
 **/logs/**
 
 # RepoPrompt
