@@ -16,6 +16,9 @@
 # `tests/t21_p12_e4.rs` gates its md5, so a clone without it cannot build the fixture or run
 # a single E4 test.
 !/configs/benchmarks/p12/gedes_k32_seed41_flows.csv
+# E5's per-flow protocol golden is an endpoint/work contract, not a logged measurement. The Full
+# observation gate in `tests/t21_p12_e5.rs` regenerates and compares it byte-for-byte.
+!/configs/benchmarks/p12/e5_wide_k32_q200_protocol_golden.csv
 **/logs/**
 
 # RepoPrompt
