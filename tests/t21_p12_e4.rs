@@ -759,7 +759,7 @@ fn arr_dist_does_not_reach_e4s_lowered_image() {
     );
 }
 
-/// E4's ledger plane, derived: every flow gets its WHOLE-FLOW bound, not a window snapshot.
+/// E4's production Metal ledger plane, derived from the cap its allocator actually uses.
 ///
 /// # The number this replaced
 ///
@@ -767,42 +767,51 @@ fn arr_dist_does_not_reach_e4s_lowered_image() {
 /// `min(2 * W + 8, whole_flow_attempts)` with `W` read out of the image's encoded congestion
 /// state. E4's flows carry TCP's default 65,535-byte `ssthresh` at MSS 1,460, so `W = 45` and
 /// **every one of the 8,192 flows was planned at `2 * 45 + 8 = 98` records** — including
-/// `FlowId(3667)`, whose 29,200,000 B are 20,000 segments. The whole `tcp_state` plane was
-/// 45,204,832 B. A run to completion leaves 98 behind in congestion avoidance, which is where
+/// `FlowId(3667)`, whose 29,200,000 B are 20,000 segments. Metal's whole `tcp_state` plane was
+/// 45,144,368 B. A run to completion leaves 98 behind in congestion avoidance, which is where
 /// `capacity: 98, demand: 99` came from on both Metal and CUDA.
 ///
 /// # The number now, and why it is derived rather than pinned
 ///
-/// E4's own 4 s horizon admits ~298,000 round trips against a 13.4 µs minimum round trip, so the
-/// horizon term saturates and each flow's bound is its own whole-flow attempt count. That count is
-/// `2 * ceil(size / MSS) + 3` — twice the nominal segment count for retransmission attempts, plus
-/// the generator's `+ 2`, plus the one initial data packet the fixture seeds — and the plane is
-/// exactly the four regions below. The delta is `+141,775,522 ledger records = +5,671,020,880 B`,
-/// and NOTHING else in the plane moves: receiver ranges deliberately keep the encoded-window form.
+/// E4's own 4 s horizon admits 314,317 round trips against its 12,726 ns minimum round trip, so the
+/// horizon term saturates and each flow's bound is the production planner's finite data cap. For a
+/// pristine E4 sender that cap is `ceil(size / MSS) + 8`: one live scheduled packet plus `n` fresh
+/// packets, four attempts per outstanding segment, and eight recovery slots, less the already
+/// scheduled packet. The plane is exactly the four regions below. The delta is `+70,541,451`
+/// ledger records = `+2,821,658,040 B`, and NOTHING else in the plane moves: receiver ranges
+/// deliberately keep the encoded-window form.
 #[test]
-fn e4_plans_every_flows_ledger_at_its_whole_flow_bound() {
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+fn e4_metal_plan_sizes_every_flows_ledger_at_its_finite_data_cap() {
+    use days_executor::{MetalConfig, size_metal_plan_for_testing};
+
     /// `2 * W + 4` receiver ranges at `W = 45`, unchanged by the ledger fix.
     const RECEIVER_RANGE_BOUND: u64 = 2 * 45 + 4;
     /// `tcp_state` layout: 7 receiver words and 6 ledger-metadata words per flow, then the two
     /// record arenas at 2 and 5 words each.
     const PER_FLOW_METADATA_WORDS: u64 = 7 + 6;
-    const TCP_STATE_BYTES_BEFORE_THE_LEDGER_FIX: u64 = 45_204_832;
+    const METAL_TCP_STATE_BYTES_BEFORE_THE_LEDGER_FIX: u64 = 45_144_368;
 
     let image = lower(FIXTURE);
-    let report = days_executor::size_default_device_plan(&image)
-        .expect("E4's default device plan must size");
+    let report = size_metal_plan_for_testing(
+        &image,
+        None,
+        MetalConfig::default(),
+        ObservationMode::Summary,
+    )
+    .expect("E4's production Metal plan must size");
     let plane = report
         .planes
         .iter()
         .find(|plane| plane.name == "tcp_state")
-        .expect("the plan must carry a tcp_state plane");
+        .expect("the Metal plan must carry a tcp_state plane");
 
     let (mut ledger_records, mut receiver_ranges, mut ledger_records_at_the_old_bound) = (0, 0, 0);
     for flow in fixture_flows() {
-        let whole_flow = 2 * flow.size_bytes.div_ceil(SEGMENT_BYTES) + 3;
-        ledger_records += whole_flow;
-        receiver_ranges += whole_flow.min(RECEIVER_RANGE_BOUND);
-        ledger_records_at_the_old_bound += whole_flow.min(2 * 45 + 8);
+        let finite_data_cap = flow.size_bytes.div_ceil(SEGMENT_BYTES) + 8;
+        ledger_records += finite_data_cap;
+        receiver_ranges += finite_data_cap.min(RECEIVER_RANGE_BOUND);
+        ledger_records_at_the_old_bound += finite_data_cap.min(2 * 45 + 8);
     }
     let words =
         PER_FLOW_METADATA_WORDS * FLOW_COUNT as u64 + 2 * receiver_ranges + 5 * ledger_records;
@@ -810,18 +819,31 @@ fn e4_plans_every_flows_ledger_at_its_whole_flow_bound() {
     assert_eq!(
         plane.bytes as u64,
         words * 8,
-        "E4's tcp_state plane is no longer the derived four-region sum"
+        "E4's production Metal tcp_state plane is no longer the derived four-region sum"
     );
     assert_eq!(
         plane.bytes as u64,
-        TCP_STATE_BYTES_BEFORE_THE_LEDGER_FIX
+        METAL_TCP_STATE_BYTES_BEFORE_THE_LEDGER_FIX
             + 40 * (ledger_records - ledger_records_at_the_old_bound),
         "the plane must move by exactly the ledger records the fix added, and by nothing else"
     );
+
+    let projected = days_executor::size_default_device_plan(&image)
+        .expect("E4's host-only default projection must size");
+    let projected_plane = projected
+        .planes
+        .iter()
+        .find(|plane| plane.name == "tcp_state")
+        .expect("the host-only projection must carry a tcp_state plane");
+    assert_eq!(
+        projected_plane.bytes, plane.bytes,
+        "the host-only projection and production Metal plan must use the same finite TCP cap"
+    );
+
     // Non-vacuity: the old bound really was one number for the whole workload, and really was
     // shorter than the demand the device reported.
     assert_eq!(2 * 45 + 8, 98);
-    assert!(ledger_records - ledger_records_at_the_old_bound > 141_000_000);
+    assert!(ledger_records - ledger_records_at_the_old_bound > 70_000_000);
 }
 
 // -------------------------------------------------------------------------------------------
@@ -1066,9 +1088,9 @@ fn e4_runs_to_completion_and_drains() {
 /// `capacity: 98, demand: 99` on sixteen different flows.
 ///
 /// The fix makes the plan-time window ceiling horizon-aware (`tcp_horizon_round_trips`), which for
-/// a run-to-completion horizon reduces to the flow's own whole-flow attempt bound. E4 therefore
-/// runs **without a single capacity retry**, which this test asserts: a retry here would mean the
-/// bound had stopped being a bound again.
+/// E4's run-to-completion horizon reaches the production planner's finite data capacity. The
+/// drop-free E4 trajectory fits that reservation **without a single capacity retry**, which this
+/// test asserts; lossy trajectories retain the exact capacity fault and retry-growth path.
 ///
 /// # What it is worth
 ///
@@ -1098,8 +1120,8 @@ fn e4_completion_on_metal_matches_the_frozen_scalar_anchor() {
         });
     assert!(
         run.capacity_retry_trace.is_empty(),
-        "E4's ledger is planned at its whole-flow bound, so a capacity retry means the plan-time \
-         bound regressed to a snapshot again: {:?}",
+        "E4's drop-free ledger is planned at its finite data capacity, so a capacity retry means \
+         the plan-time reservation regressed to a snapshot again: {:?}",
         run.capacity_retry_trace
     );
     let observed = fingerprint(&run.result);

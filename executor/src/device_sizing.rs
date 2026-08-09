@@ -1,8 +1,9 @@
-//! Host-only sizing for the default production GPU execution plan.
+//! Host-only projection of the common default GPU execution plan.
 //!
-//! This module mirrors the capacity derivation used by the CUDA and Metal planners, but retains
-//! only small host-side capacity vectors. It never materializes event planes or initializes a
-//! device backend.
+//! This module shares semantic capacity derivation with the CUDA and Metal planners, but retains
+//! only small host-side capacity vectors and uses a backend-neutral layout projection. It never
+//! materializes event planes or initializes a device backend. Exact allocated layouts come from
+//! `size_cuda_plan_for_testing` and `size_metal_plan_for_testing`.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
@@ -161,7 +162,7 @@ impl DeviceEventArenaSizing {
     }
 }
 
-/// Complete host-only sizing report for the default production GPU device planes.
+/// Complete host-only sizing report for a projected or exact GPU device plan.
 ///
 /// Open-loop images retain the established 28 planes. TCP images add one packed auxiliary plane
 /// for receiver ranges, segment ledgers, and full-observation transition state.
@@ -375,17 +376,17 @@ impl fmt::Display for DeviceSizingError {
 
 impl std::error::Error for DeviceSizingError {}
 
-/// Sizes the default streams-enabled, summary-observation GPU plan without allocating its planes.
+/// Projects a default streams-enabled, summary-observation GPU plan without allocating its planes.
+///
+/// This shares capacity semantics with the production backends but is not an exact Metal or CUDA
+/// layout report. Use the backend sizing hooks when byte-exact physical allocation matters.
 pub fn size_default_device_plan(
     image: &SimulationImage,
 ) -> Result<DeviceSizingReport, DeviceSizingError> {
     let node_count = image.nodes.len();
     let flow_count = image.flows.len();
     let link_count = image.links.len();
-    let initial_tcp_ack_counts = initial_tcp_ack_counts(image);
-    let flow_packet_counts = flow_packet_counts(image, &initial_tcp_ack_counts)?;
-    let flow_feedback_counts =
-        feedback_packet_counts(image, &flow_packet_counts, &initial_tcp_ack_counts);
+    let (flow_packet_counts, flow_feedback_counts) = flow_packet_counts(image)?;
     let flow_data_counts = flow_packet_counts
         .iter()
         .zip(&flow_feedback_counts)
@@ -788,23 +789,21 @@ impl CapacityContext {
     }
 }
 
-fn initial_tcp_ack_counts(image: &SimulationImage) -> Vec<u64> {
-    let mut counts = vec![0_u64; image.flows.len()];
-    for packet in &image.initial_packets {
-        if matches!(packet.kind, PacketKind::TcpAck(_)) {
-            let flow = packet.flow.0 as usize;
-            counts[flow] = counts[flow].saturating_add(1);
-        }
-    }
-    counts
-}
-
 fn flow_packet_counts(
     image: &SimulationImage,
-    initial_tcp_ack_counts: &[u64],
-) -> Result<Vec<usize>, DeviceSizingError> {
-    let mut counts = vec![0_usize; image.flows.len()];
+) -> Result<(Vec<usize>, Vec<usize>), DeviceSizingError> {
+    let live_payloads = crate::tcp_ledger::initial_live_payloads(image);
+    let mut data_counts = vec![0_usize; image.flows.len()];
+    let mut feedback_counts = vec![0_usize; image.flows.len()];
     for packet in &image.initial_packets {
+        if matches!(packet.kind, PacketKind::TcpData(_)) && !live_payloads.contains(&packet.id) {
+            continue;
+        }
+        let counts = if packet.kind.is_data() {
+            &mut data_counts
+        } else {
+            &mut feedback_counts
+        };
         counts[packet.flow.0 as usize] = counts[packet.flow.0 as usize].saturating_add(1);
     }
     let pacing_timer_tokens = image
@@ -853,24 +852,12 @@ fn flow_packet_counts(
                                 / constant.interval_ns
                         };
                     let future = termination_count.min(stop_count) as usize;
-                    counts[index] = counts[index].saturating_add(future.saturating_sub(1));
+                    data_counts[index] =
+                        data_counts[index].saturating_add(future.saturating_sub(1));
                 }
                 FlowGeneratorKind::Tcp(tcp) => {
-                    if matches!(
-                        generator.next_emission.status,
-                        GeneratorStatus::Finished | GeneratorStatus::Stopped
-                    ) || tcp.highest_ack >= tcp.total_bytes
-                    {
-                        continue;
-                    }
-                    // Closed-loop send plans can fragment one nominal MSS at a congestion-window
-                    // boundary and can retransmit. Twice the remaining nominal segment count plus
-                    // preloaded ACK triggers is the practical bounded device arena reservation;
-                    // a valid trajectory that exceeds it reports an exact capacity error.
-                    let bound =
-                        tcp_data_attempt_bound(generator, tcp, initial_tcp_ack_counts[index]);
-                    // Every delivered data attempt creates one cumulative ACK attempt.
-                    counts[index] = counts[index].saturating_add(bound.saturating_mul(2));
+                    let future = tcp_future_data_attempt_bound(generator, tcp);
+                    data_counts[index] = data_counts[index].saturating_add(future);
                 }
                 FlowGeneratorKind::Rate(rate) => {
                     let work = rate_device_work(image, generator, rate)?;
@@ -880,9 +867,9 @@ fn flow_packet_counts(
                         generator.next_emission.departure_time_ns,
                     ));
                     if owns_timer_token {
-                        counts[index] = counts[index].saturating_sub(1);
+                        data_counts[index] = data_counts[index].saturating_sub(1);
                     }
-                    counts[index] = counts[index].saturating_add(work.packets);
+                    data_counts[index] = data_counts[index].saturating_add(work.packets);
                 }
                 FlowGeneratorKind::Collective(collective) => {
                     if matches!(
@@ -897,7 +884,8 @@ fn flow_packet_counts(
                     let packets = remaining.div_ceil(collective.packet_size_bytes) as usize;
                     let resident =
                         usize::from(generator.next_emission.status == GeneratorStatus::Scheduled);
-                    counts[index] = counts[index].saturating_add(packets.saturating_sub(resident));
+                    data_counts[index] =
+                        data_counts[index].saturating_add(packets.saturating_sub(resident));
                 }
                 FlowGeneratorKind::Dcqcn(dcqcn) => {
                     if !matches!(
@@ -909,64 +897,26 @@ fn flow_packet_counts(
                     }
                     let remaining = dcqcn.rate.total_bytes - generator.bytes_emitted;
                     let count = remaining.div_ceil(dcqcn.rate.packet_size_bytes);
-                    counts[index] =
-                        counts[index].saturating_add(usize::try_from(count).unwrap_or(usize::MAX));
+                    data_counts[index] = data_counts[index]
+                        .saturating_add(usize::try_from(count).unwrap_or(usize::MAX));
                 }
             }
         }
     }
-    Ok(counts)
-}
-
-fn feedback_packet_counts(
-    image: &SimulationImage,
-    packet_counts: &[usize],
-    initial_tcp_ack_counts: &[u64],
-) -> Vec<usize> {
-    let mut counts = image.initial_packets.iter().fold(
-        vec![0_usize; image.flows.len()],
-        |mut counts, packet| {
-            if packet.kind.is_feedback() {
-                counts[packet.flow.0 as usize] = counts[packet.flow.0 as usize].saturating_add(1);
-            }
-            counts
-        },
-    );
     for state in &image.host_states {
         for generator in &state.generators {
-            if let FlowGeneratorKind::Tcp(tcp) = generator.kind {
-                let index = generator.flow.0 as usize;
-                let attempts =
-                    tcp_data_attempt_bound(generator, tcp, initial_tcp_ack_counts[index]);
-                counts[index] = counts[index].saturating_add(attempts);
-                counts[index] = counts[index].min(packet_counts[index]);
+            if matches!(generator.kind, FlowGeneratorKind::Tcp(_)) {
+                let flow = generator.flow.0 as usize;
+                feedback_counts[flow] = feedback_counts[flow].saturating_add(data_counts[flow]);
             }
         }
     }
-    counts
-}
-
-fn tcp_data_attempt_bound(
-    generator: &crate::FlowGeneratorState,
-    tcp: crate::TcpGenerator,
-    preloaded_acks: u64,
-) -> usize {
-    if matches!(
-        generator.next_emission.status,
-        GeneratorStatus::Finished | GeneratorStatus::Stopped
-    ) || tcp.highest_ack >= tcp.total_bytes
-    {
-        return 0;
-    }
-    let remaining = tcp.total_bytes - tcp.highest_ack;
-    let nominal = remaining.div_ceil(tcp.mss_bytes.max(1));
-    usize::try_from(
-        nominal
-            .saturating_mul(2)
-            .saturating_add(preloaded_acks)
-            .saturating_add(2),
-    )
-    .unwrap_or(usize::MAX)
+    let totals = data_counts
+        .into_iter()
+        .zip(&feedback_counts)
+        .map(|(data, feedback)| data.saturating_add(*feedback))
+        .collect();
+    Ok((totals, feedback_counts))
 }
 
 fn packed_tcp_state_words(
@@ -1064,6 +1014,10 @@ pub(crate) const TCP_WINDOW_SLACK_FACTOR: usize = 2;
 pub(crate) const TCP_LEDGER_RECOVERY_ALLOWANCE: usize = 8;
 /// Extra receiver gaps for the head-truncation/coalescing boundary during recovery.
 pub(crate) const TCP_RECEIVER_RECOVERY_ALLOWANCE: usize = 4;
+/// Recovery attempts reserved for each segment already outstanding in a TCP checkpoint.
+pub(crate) const TCP_DATA_RECOVERY_ATTEMPTS_PER_OUTSTANDING: usize = 4;
+/// Additional TCP data-attempt slots reserved for recovery and refill boundaries.
+pub(crate) const TCP_DATA_RECOVERY_ALLOWANCE: usize = 8;
 /// Fallback-heap records one source-owned TCP flow can occupy at once.
 ///
 /// The T20g live-state contract removes a superseded retransmission timeout at the transition that
@@ -1075,6 +1029,36 @@ pub(crate) const TCP_LIVE_TIMER_RECORDS_PER_FLOW: usize = 1;
 
 fn u64_segments(bytes: u64, mss_bytes: u64) -> usize {
     usize::try_from(bytes.div_ceil(mss_bytes.max(1))).unwrap_or(usize::MAX)
+}
+
+/// Future TCP data-attempt slots used by both production planners and the host-only projection.
+///
+/// Fresh sequence space is reserved once. Retransmissions replace an existing ledger record, so
+/// recovery head-room depends on the segments already outstanding, not twice the whole remaining
+/// flow. This is a practical finite device reservation, not a hard all-trajectory bound: an image
+/// that exceeds it reports an exact capacity fault and the retry policy grows from observed demand.
+pub(crate) fn tcp_future_data_attempt_bound(
+    generator: &crate::FlowGeneratorState,
+    tcp: crate::TcpGenerator,
+) -> usize {
+    if matches!(
+        generator.next_emission.status,
+        GeneratorStatus::Finished | GeneratorStatus::Stopped
+    ) || tcp.highest_ack >= tcp.total_bytes
+    {
+        return 0;
+    }
+    let fresh = u64_segments(
+        tcp.total_bytes.saturating_sub(tcp.next_sequence),
+        tcp.mss_bytes,
+    );
+    let outstanding = u64_segments(tcp.bytes_in_flight, tcp.mss_bytes);
+    let attempts = fresh
+        .saturating_add(outstanding.saturating_mul(TCP_DATA_RECOVERY_ATTEMPTS_PER_OUTSTANDING))
+        .saturating_add(TCP_DATA_RECOVERY_ALLOWANCE);
+    attempts.saturating_sub(usize::from(
+        generator.next_emission.status == GeneratorStatus::Scheduled,
+    ))
 }
 
 fn tcp_encoded_window_segments(tcp: crate::TcpGenerator) -> usize {
@@ -1096,16 +1080,16 @@ fn tcp_encoded_window_segments(tcp: crate::TcpGenerator) -> usize {
 
 fn tcp_window_plane_bound(
     tcp: crate::TcpGenerator,
-    whole_flow_segments: usize,
+    planned_data_capacity: usize,
     recovery_allowance: usize,
     head_room_segments: usize,
 ) -> usize {
     let outstanding = u64_segments(tcp.bytes_in_flight, tcp.mss_bytes);
-    let absolute_cap = whole_flow_segments.max(outstanding).max(1);
+    let finite_cap = planned_data_capacity.max(outstanding).max(1);
     tcp_encoded_window_segments(tcp)
         .saturating_add(head_room_segments)
         .saturating_add(recovery_allowance)
-        .min(absolute_cap)
+        .min(finite_cap)
 }
 
 /// Congestion-avoidance head-room the encoded window does not already pay for.
@@ -1119,7 +1103,7 @@ fn tcp_window_plane_bound(
 /// `round_trips <= W`. P12 E4 is the image where that condition fails by four orders of
 /// magnitude: its flows carry TCP's default 65,535-byte `ssthresh` at MSS 1,460, so `W = 45` and
 /// every one of its 8,192 flows was planned at `2 * 45 + 8 = 98` records for a run to completion
-/// that admits ~298,000 round trips. Every long flow therefore left 98 behind and the device
+/// that admits 314,317 round trips. Every long flow therefore left 98 behind and the device
 /// refused with `capacity: 98, demand: 99` — the same three numbers on Metal and on CUDA, because
 /// the number is host-derived.
 ///
@@ -1135,8 +1119,8 @@ fn tcp_window_plane_bound(
 /// never less than the head-room the pre-T21 constant already granted. The frontier T20i measured
 /// is untouched by construction: `rq9_frontier_closed_k32` encodes `W = 256` and its 1,152,000 ns
 /// horizon admits 94 round trips, so the `max` selects the old term and its derived floor is still
-/// exactly 520. Whole-flow capping does the rest: a horizon long enough to drain a flow yields a
-/// bound that is the flow's own attempt count, which no trajectory can exceed.
+/// exactly 520. Finite data-capacity capping does the rest: a horizon long enough to drain E4
+/// selects the same reservation the production Metal and CUDA planners already use.
 ///
 /// This is not a claim that the result is a hard bound in every trajectory — dup-ACK inflation
 /// during a stalled recovery is unbounded in the window (T20i layer 1 measured 11,058 records
@@ -1150,7 +1134,7 @@ pub(crate) fn tcp_horizon_round_trips(horizon_ns: u64, minimum_round_trip_ns: u6
 ///
 /// Serialization and propagation on every link of the flow's own canonical route and reverse
 /// route. Using a *lower* bound on the round trip is what makes the round-trip count in
-/// [`tcp_ledger_horizon_growth`] an upper bound, which is the direction sizing has to err in.
+/// [`tcp_horizon_round_trips`] an upper bound, which is the direction sizing has to err in.
 pub(crate) fn tcp_minimum_round_trip_ns(
     image: &SimulationImage,
     flow: usize,
@@ -1179,13 +1163,13 @@ pub(crate) fn planning_horizon_ns(stop_time_ns: u64, exclusive_horizon_ns: Optio
 
 pub(crate) fn tcp_ledger_segment_bound(
     tcp: crate::TcpGenerator,
-    whole_flow_segments: usize,
+    planned_data_capacity: usize,
     horizon_round_trips: usize,
 ) -> usize {
     let head_room = horizon_round_trips.max(tcp_encoded_window_segments(tcp));
     tcp_window_plane_bound(
         tcp,
-        whole_flow_segments,
+        planned_data_capacity,
         TCP_LEDGER_RECOVERY_ALLOWANCE,
         head_room,
     )
@@ -1200,11 +1184,11 @@ pub(crate) fn tcp_ledger_segment_bound(
 /// replan and the plan does not have to pay for it up front.
 pub(crate) fn tcp_receiver_range_bound(
     tcp: crate::TcpGenerator,
-    whole_flow_segments: usize,
+    planned_data_capacity: usize,
 ) -> usize {
     tcp_window_plane_bound(
         tcp,
-        whole_flow_segments,
+        planned_data_capacity,
         TCP_RECEIVER_RECOVERY_ALLOWANCE,
         tcp_encoded_window_segments(tcp) * (TCP_WINDOW_SLACK_FACTOR - 1),
     )
@@ -1212,10 +1196,10 @@ pub(crate) fn tcp_receiver_range_bound(
 
 /// Outward-safe fallback-heap residency of one source-owned TCP flow.
 ///
-/// `min` with the whole-flow attempt count keeps the bound exact for a flow that can never arm a
+/// `min` with the planned data capacity keeps the bound exact for a flow that can never arm a
 /// timer, so an image with no sendable bytes still plans zero records for it.
-pub(crate) fn tcp_fallback_timer_packet_bound(whole_flow_attempts: usize) -> usize {
-    whole_flow_attempts.min(TCP_LIVE_TIMER_RECORDS_PER_FLOW)
+pub(crate) fn tcp_fallback_timer_packet_bound(planned_data_capacity: usize) -> usize {
+    planned_data_capacity.min(TCP_LIVE_TIMER_RECORDS_PER_FLOW)
 }
 
 /// `ceil(L/S)+1` horizon emissions, `ceil(P/S)` propagation residency, and two records of
@@ -1878,23 +1862,24 @@ mod tests {
     /// flows — including `FlowId(3667)`, whose 29,200,000 B are 20,000 segments. E4 runs to
     /// completion, and Reno congestion avoidance adds one segment per round trip, so the window
     /// leaves 98 behind and the ledger reports `capacity: 98, demand: 99`. The horizon term is
-    /// what turns the snapshot back into a bound: the whole-flow attempt count caps it.
+    /// what turns the snapshot back into a usable reservation: the production planner's finite
+    /// data capacity caps it, with exact capacity faults retained for pathological loss.
     #[test]
     fn a_run_to_completion_horizon_sizes_the_ledger_past_the_encoded_window() {
         let tcp = TcpGenerator::new(29_200_000, 1_460, 1_460, TcpCongestionControl::reno(1_460));
-        let whole_flow_attempts = 40_002;
+        let planned_data_capacity = 20_008;
 
-        assert_eq!(tcp_ledger_segment_bound(tcp, whole_flow_attempts, 0), 98);
-        assert_eq!(tcp_ledger_segment_bound(tcp, whole_flow_attempts, 45), 98);
-        assert_eq!(tcp_ledger_segment_bound(tcp, whole_flow_attempts, 46), 99);
-        // E4's own 4 s horizon over its measured 13,401 ns minimum round trip.
+        assert_eq!(tcp_ledger_segment_bound(tcp, planned_data_capacity, 0), 98);
+        assert_eq!(tcp_ledger_segment_bound(tcp, planned_data_capacity, 45), 98);
+        assert_eq!(tcp_ledger_segment_bound(tcp, planned_data_capacity, 46), 99);
+        // E4's own 4 s horizon over its measured 12,726 ns minimum round trip.
         assert_eq!(
-            tcp_ledger_segment_bound(tcp, whole_flow_attempts, 298_485),
-            whole_flow_attempts,
+            tcp_ledger_segment_bound(tcp, planned_data_capacity, 314_317),
+            planned_data_capacity,
             "a horizon long enough to drain the flow can only be bounded by the flow itself"
         );
         // Receiver ranges deliberately keep the encoded-window form; see the doc comment.
-        assert_eq!(tcp_receiver_range_bound(tcp, whole_flow_attempts), 94);
+        assert_eq!(tcp_receiver_range_bound(tcp, planned_data_capacity), 94);
     }
 
     /// The T20i frontier is what the horizon term must NOT disturb.

@@ -432,14 +432,14 @@ impl PlannerCapacityContext {
         &self,
         image: &SimulationImage,
         flow: usize,
-        whole_flow_segments: usize,
+        planned_data_capacity: usize,
     ) -> usize {
         #[cfg(any(test, feature = "planner-test-hooks"))]
         if self.mode == PlannerCapacityMode::Legacy {
             return self.tcp_generator(image, flow).map_or(1, |tcp| {
                 crate::device_sizing::tcp_ledger_segment_bound(
                     tcp,
-                    whole_flow_segments,
+                    planned_data_capacity,
                     crate::device_sizing::tcp_horizon_round_trips(
                         self.planning_horizon_ns,
                         crate::device_sizing::tcp_minimum_round_trip_ns(image, flow, tcp),
@@ -447,7 +447,7 @@ impl PlannerCapacityContext {
                 )
             });
         }
-        let _ = (image, whole_flow_segments);
+        let _ = (image, planned_data_capacity);
         self.tcp_ledger_segment_bounds[flow]
     }
 
@@ -455,15 +455,15 @@ impl PlannerCapacityContext {
         &self,
         image: &SimulationImage,
         flow: usize,
-        whole_flow_segments: usize,
+        planned_data_capacity: usize,
     ) -> usize {
         #[cfg(any(test, feature = "planner-test-hooks"))]
         if self.mode == PlannerCapacityMode::Legacy {
             return self.tcp_generator(image, flow).map_or(1, |tcp| {
-                crate::device_sizing::tcp_receiver_range_bound(tcp, whole_flow_segments)
+                crate::device_sizing::tcp_receiver_range_bound(tcp, planned_data_capacity)
             });
         }
-        let _ = (image, whole_flow_segments);
+        let _ = (image, planned_data_capacity);
         self.tcp_receiver_range_bounds[flow]
     }
 
@@ -471,15 +471,15 @@ impl PlannerCapacityContext {
         &self,
         image: &SimulationImage,
         flow: usize,
-        whole_flow_attempts: usize,
+        planned_data_capacity: usize,
     ) -> usize {
         #[cfg(any(test, feature = "planner-test-hooks"))]
         if self.mode == PlannerCapacityMode::Legacy {
             return usize::from(self.tcp_generator(image, flow).is_some()).saturating_mul(
-                crate::device_sizing::tcp_fallback_timer_packet_bound(whole_flow_attempts),
+                crate::device_sizing::tcp_fallback_timer_packet_bound(planned_data_capacity),
             );
         }
-        let _ = (image, whole_flow_attempts);
+        let _ = (image, planned_data_capacity);
         self.tcp_fallback_timer_bounds[flow]
     }
 

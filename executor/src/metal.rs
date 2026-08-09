@@ -2529,19 +2529,9 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
                 if generator.next_emission.status == GeneratorStatus::Finished {
                     continue;
                 }
-                let remaining = tcp.total_bytes.saturating_sub(tcp.next_sequence);
-                let fresh = remaining.div_ceil(tcp.mss_bytes) as usize;
-                let outstanding = tcp.bytes_in_flight.div_ceil(tcp.mss_bytes) as usize;
-                // Retransmissions replace an existing ledger entry. Four attempts per outstanding
-                // segment plus a small recovery allowance is conservative for the finite T24
-                // corpora while retaining an explicit device-capacity fault for pathological loss.
-                let attempts = fresh
-                    .saturating_add(outstanding.saturating_mul(4))
-                    .saturating_add(8);
-                let already_scheduled =
-                    usize::from(generator.next_emission.status == GeneratorStatus::Scheduled);
-                data_counts[index] =
-                    data_counts[index].saturating_add(attempts.saturating_sub(already_scheduled));
+                data_counts[index] = data_counts[index].saturating_add(
+                    crate::device_sizing::tcp_future_data_attempt_bound(generator, tcp),
+                );
                 continue;
             };
             if generator.next_emission.status != GeneratorStatus::Scheduled {
