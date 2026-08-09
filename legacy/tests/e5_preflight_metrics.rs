@@ -115,6 +115,7 @@ fn q_high_e5_analogue_exports_exact_final_metrics_and_stops_timer_work() {
     assert!(rows.iter().all(|row| {
         row.completed
             && row.original_bytes == 3500
+            && row.final_original_segment_bytes == 580
             && row.acked_bytes == 3500
             && row.original_packets == 3
             && row.retransmissions == 0

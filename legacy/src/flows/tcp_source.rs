@@ -148,6 +148,7 @@ pub struct TCPPacketSource {
 
     packets_sent: usize,
     total_original_packets: usize,
+    final_original_segment_bytes: usize,
     sent_size: usize,
     sent_size_in_period: usize,
     retransmissions: usize,
@@ -270,6 +271,7 @@ impl TCPPacketSource {
             busy_until_ns: 0,
             packets_sent: 0,
             total_original_packets: 0,
+            final_original_segment_bytes: 0,
             sent_size: 0,
             sent_size_in_period: 0,
             retransmissions: 0,
@@ -709,6 +711,7 @@ impl TCPPacketSource {
         let now = seconds_view(now_ns);
         self.packets_sent += 1;
         self.total_original_packets += 1;
+        self.final_original_segment_bytes = packet.size;
         self.sent_size += packet.size;
         self.sent_size_in_period += packet.size;
 
@@ -948,6 +951,7 @@ impl TCPPacketSource {
                     flow_id: self.flow_id,
                     original_packets: self.total_original_packets,
                     original_bytes: self.sent_size,
+                    final_original_segment_bytes: self.final_original_segment_bytes,
                     retransmissions: self.retransmissions,
                     retransmitted_bytes: self.retransmitted_bytes,
                     acked_bytes: self.last_ack,

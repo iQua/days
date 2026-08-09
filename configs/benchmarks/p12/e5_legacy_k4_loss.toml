@@ -1,0 +1,40 @@
+seed = 51001
+duration = 3.0
+threading = "single"
+log_path = "/private/tmp/p12-e5-k4-loss"
+report_interval = 1.0
+model_host_attachment = true
+legacy_e5_metrics = true
+
+[topology]
+category = "FatTree"
+
+[topology.fat_tree]
+k = 4
+hosts_per_edge = 2
+
+[switch]
+port_rate = 100_000_000_000
+capacity = 2
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link]
+propagation_ns = 1000
+
+[routing]
+policy = "FatTreeEcmp"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 16
+pairing = "SwitchOffsetHalf"
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 3500
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1460, high = 1460 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"

@@ -31,6 +31,7 @@ pub struct TcpMetricsReport {
     pub flow_id: usize,
     pub original_packets: usize,
     pub original_bytes: usize,
+    pub final_original_segment_bytes: usize,
     pub retransmissions: usize,
     pub retransmitted_bytes: usize,
     pub acked_bytes: usize,
