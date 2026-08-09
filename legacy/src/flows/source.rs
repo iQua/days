@@ -116,6 +116,12 @@ impl PacketSource {
         }
     }
 
+    pub fn enable_e5_metrics(&mut self, enabled: bool) {
+        if let PacketSource::TCPPacketSource(source) = self {
+            source.enable_e5_metrics(enabled);
+        }
+    }
+
     pub fn ui_output(&mut self) -> &mut Output<FlowFinishMsg> {
         match self {
             PacketSource::DistPacketSource(source) => source.ui_output.borrow_mut(),
@@ -210,13 +216,15 @@ impl PacketSource {
                 let timer_start_ns = initial_delay_ns
                     .checked_add(100_000_000)
                     .expect("TCP timer start exceeds the u64 nanosecond clock range");
-                cx.schedule_periodic_event(
-                    Duration::from_nanos(timer_start_ns),
-                    timer_interval,
-                    &Self::PERIODIC_TIMER_SID,
-                    (),
-                )
-                .unwrap();
+                let timer_key = cx
+                    .schedule_keyed_periodic_event(
+                        Duration::from_nanos(timer_start_ns),
+                        timer_interval,
+                        &Self::PERIODIC_TIMER_SID,
+                        (),
+                    )
+                    .unwrap();
+                source.set_periodic_timer_key(timer_key);
 
                 // TCPPacketSource now owns the data from the application
                 source.busy_until_ns = start_ns;
@@ -356,6 +364,10 @@ impl PacketSource {
         match self {
             PacketSource::DistPacketSource(_) => (),
             PacketSource::TCPPacketSource(source) => {
+                if source.is_complete() {
+                    source.cancel_periodic_timer();
+                    return;
+                }
                 source.time = now;
                 source.timer_tick(now_ns).await;
             }
@@ -454,6 +466,7 @@ impl PacketSource {
             PacketSource::DistPacketSource(source) => source.traffic_exceeded(now),
             PacketSource::TCPPacketSource(source) => {
                 if source.is_complete() {
+                    source.cancel_periodic_timer();
                     source.wrap_up(now).await;
                     return true;
                 }

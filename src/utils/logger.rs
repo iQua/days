@@ -25,6 +25,23 @@ pub struct PacketSourceReport {
     pub ack_bytes: usize,
 }
 
+/// Final opt-in counters for the legacy E5 TCP correctness arm.
+#[derive(Clone, Default, Debug, Deserialize, Serialize)]
+pub struct TcpMetricsReport {
+    pub flow_id: usize,
+    pub original_packets: usize,
+    pub original_bytes: usize,
+    pub retransmissions: usize,
+    pub retransmitted_bytes: usize,
+    pub acked_bytes: usize,
+    pub completed: bool,
+    pub completion_time_ns: Option<u64>,
+    pub outstanding_bytes: usize,
+    pub pending_timeouts: usize,
+    pub timer_ticks: usize,
+    pub timer_cancelled: bool,
+}
+
 #[derive(Clone, Default, Debug, Serialize)]
 pub struct PacketSinkReport {
     pub id: usize,
@@ -331,6 +348,7 @@ static NEXT_PFC_FRAME_ID: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Debug)]
 pub enum Report {
     PacketSourceReport(PacketSourceReport),
+    TcpMetricsReport(TcpMetricsReport),
     SchedulerReport(SchedulerReport),
     PacketSinkReport(PacketSinkReport),
     #[cfg(feature = "l2_pfc")]
@@ -359,6 +377,7 @@ pub enum ReportTiming {
 #[derive(Default, Debug)]
 struct SharedState {
     source_reports: Vec<PacketSourceReport>,
+    tcp_metrics_reports: Vec<TcpMetricsReport>,
     scheduler_reports: Vec<SchedulerReport>,
     sink_reports: Vec<PacketSinkReport>,
     #[cfg(feature = "l2_pfc")]
@@ -381,6 +400,7 @@ struct SharedState {
 /// Enum to represent the type of log element
 enum ElementType {
     Source,
+    TcpMetrics,
     Scheduler,
     Sink,
     #[cfg(feature = "l2_pfc")]
@@ -566,6 +586,9 @@ impl CsvLogger {
             Report::PacketSourceReport(report) => {
                 state.source_reports.push(report);
             }
+            Report::TcpMetricsReport(report) => {
+                state.tcp_metrics_reports.push(report);
+            }
             Report::SchedulerReport(report) => {
                 state.scheduler_reports.push(report);
             }
@@ -635,6 +658,7 @@ impl CsvLogger {
     {
         let csv_file_name = match element {
             ElementType::Source => format!("{}sources.csv", self.log_path.get().unwrap()),
+            ElementType::TcpMetrics => format!("{}tcp_metrics.csv", self.log_path.get().unwrap()),
             ElementType::Scheduler => format!("{}switches.csv", self.log_path.get().unwrap()),
             ElementType::Sink => format!("{}sinks.csv", self.log_path.get().unwrap()),
             #[cfg(feature = "l2_pfc")]
@@ -656,6 +680,7 @@ impl CsvLogger {
         };
 
         let csv_file = fs::OpenOptions::new()
+            .create(true)
             .append(true)
             .open(&csv_file_name)
             .map_err(|e| format!("Failed to open {}: {}", csv_file_name, e))?;
@@ -722,6 +747,13 @@ impl CsvLogger {
             let reports = std::mem::take(&mut state.source_reports);
             if let Err(e) = self.write_to_csv(ElementType::Source, &reports) {
                 eprintln!("Error writing source reports to CSV: {}", e);
+            }
+        }
+
+        if state.tcp_metrics_reports.len() >= self.max_log_len {
+            let reports = std::mem::take(&mut state.tcp_metrics_reports);
+            if let Err(e) = self.write_to_csv(ElementType::TcpMetrics, &reports) {
+                eprintln!("Error writing TCP metrics to CSV: {e}");
             }
         }
 
@@ -811,6 +843,12 @@ impl CsvLogger {
             let reports = std::mem::take(&mut state.source_reports);
             self.write_to_csv(ElementType::Source, &reports)
                 .expect("Error writing source reports to CSV");
+        }
+
+        if !state.tcp_metrics_reports.is_empty() {
+            let reports = std::mem::take(&mut state.tcp_metrics_reports);
+            self.write_to_csv(ElementType::TcpMetrics, &reports)
+                .expect("Error writing TCP metrics to CSV");
         }
 
         // Write remaining scheduler reports

@@ -1742,6 +1742,48 @@ fn key_on_legacy_endpoint_stage_sequences_match_the_exact_image() {
 }
 
 #[test]
+fn e5_k4_preflight_matches_exact_ordered_endpoint_and_physical_stages() {
+    let directory = TempDir::new().expect("temporary directory should be available");
+    let path = write_config(
+        &directory,
+        "e5-k4-preflight.toml",
+        r#"seed = 51001
+duration = 0.001
+threading = "single"
+model_host_attachment = true
+
+[topology]
+category = "FatTree"
+
+[topology.fat_tree]
+k = 4
+hosts_per_edge = 2
+
+[switch]
+port_rate = 100_000_000_000
+capacity = 200
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link]
+propagation_ns = 1000
+
+[routing]
+policy = "FatTreeEcmp"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 16
+pairing = "SwitchOffsetHalf"
+traffic = { initial_delay = 0.0, size = 3500, arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }, pkt_size_dist = { type = "DiscreteUniform", low = 1460, high = 1460 }, tcp = { cc_algorithm = "Reno" } }
+"#,
+    );
+
+    let image = compile_config(&path).expect("E5-form preflight should lower");
+    assert_legacy_physical_routes(&path, &image);
+}
+
+#[test]
 fn legacy_fattree_with_distinct_host_and_switch_ids_matches_exact_observations() {
     let directory = TempDir::new().expect("temporary directory should be available");
     let log_path = directory.path().join("legacy");

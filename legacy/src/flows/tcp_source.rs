@@ -10,6 +10,7 @@ use rand::rngs::SmallRng;
 
 use nexosim::model::Model;
 use nexosim::ports::Output;
+use nexosim::simulation::EventKey;
 
 use crate::flows::app_source::AppSourceBufferHandle;
 use crate::flows::bbr::TCPBBR;
@@ -23,7 +24,7 @@ use crate::flows::{FlowFinishMsg, FlowSize, TrafficCharacteristics};
 use crate::next_endpoint_id;
 use crate::utils::exact_time::{behavior_delay_ns, seconds_view};
 use crate::utils::logger::CsvLogger;
-use crate::utils::logger::{Report, ReportTiming};
+use crate::utils::logger::{Report, ReportTiming, TcpMetricsReport};
 
 #[cfg(feature = "lean")]
 use crate::utils::logger::{CubicEventKind, CubicEventRow};
@@ -146,8 +147,16 @@ pub struct TCPPacketSource {
     pub busy_until_ns: u64,
 
     packets_sent: usize,
+    total_original_packets: usize,
     sent_size: usize,
     sent_size_in_period: usize,
+    retransmissions: usize,
+    retransmitted_bytes: usize,
+    timer_ticks: usize,
+    completion_time_ns: Option<u64>,
+    e5_metrics_enabled: bool,
+    periodic_timer_key: Option<EventKey>,
+    timer_cancelled: bool,
 
     pub output: Output<Packet>,
     /// output: outbound to the user interface
@@ -260,8 +269,16 @@ impl TCPPacketSource {
             remaining_bytes,
             busy_until_ns: 0,
             packets_sent: 0,
+            total_original_packets: 0,
             sent_size: 0,
             sent_size_in_period: 0,
+            retransmissions: 0,
+            retransmitted_bytes: 0,
+            timer_ticks: 0,
+            completion_time_ns: None,
+            e5_metrics_enabled: false,
+            periodic_timer_key: None,
+            timer_cancelled: false,
             output: Output::default(),
             ui_output: Output::default(),
             flow_finish_outputs: Vec::new(),
@@ -433,6 +450,8 @@ impl TCPPacketSource {
                 resent_pkt.time = now;
                 Self::apply_ecn_on_retransmit(resent_pkt);
                 self.output.send(resent_pkt.clone()).await;
+                self.retransmissions += 1;
+                self.retransmitted_bytes += resent_pkt.size;
 
                 debug!(
                     "Due to dupack, TCPPacketSource {} resent packet {} ({} bytes) from flow {} at time {:.3}.",
@@ -601,6 +620,10 @@ impl TCPPacketSource {
             self.timeout_queue
                 .retain(|packet| packet.packet_id >= ack.sequence_num);
 
+            if self.is_complete() && self.completion_time_ns.is_none() {
+                self.completion_time_ns = Some(now_ns);
+            }
+
             if now_ns >= self.busy_until_ns {
                 return true;
             }
@@ -618,6 +641,21 @@ impl TCPPacketSource {
     /// Returns true only after the full byte budget has been sent and cumulatively acknowledged.
     pub fn is_complete(&self) -> bool {
         self.traffic_exceeded && self.next_seq >= self.send_buffer && self.next_seq == self.last_ack
+    }
+
+    pub fn enable_e5_metrics(&mut self, enabled: bool) {
+        self.e5_metrics_enabled = enabled;
+    }
+
+    pub fn set_periodic_timer_key(&mut self, key: EventKey) {
+        self.periodic_timer_key = Some(key);
+    }
+
+    pub fn cancel_periodic_timer(&mut self) {
+        if let Some(key) = self.periodic_timer_key.take() {
+            key.cancel();
+            self.timer_cancelled = true;
+        }
     }
 
     fn bytes_in_flight(&self) -> usize {
@@ -670,6 +708,7 @@ impl TCPPacketSource {
     pub fn packet_sent(&mut self, packet: &Packet, now_ns: u64) {
         let now = seconds_view(now_ns);
         self.packets_sent += 1;
+        self.total_original_packets += 1;
         self.sent_size += packet.size;
         self.sent_size_in_period += packet.size;
 
@@ -744,6 +783,10 @@ impl TCPPacketSource {
 
     /// Checks if any sent packet reached timeout at regularly occurring intervals.
     pub async fn timer_tick(&mut self, now_ns: u64) {
+        if self.is_complete() {
+            return;
+        }
+        self.timer_ticks += 1;
         let now = seconds_view(now_ns);
         while !self.timeout_queue.is_empty() {
             let deadline_ns = self.timeout_queue.peek().unwrap().deadline_ns;
@@ -786,6 +829,8 @@ impl TCPPacketSource {
                 Self::apply_ecn_on_retransmit(resent_pkt);
 
                 self.output.send(resent_pkt.clone()).await;
+                self.retransmissions += 1;
+                self.retransmitted_bytes += resent_pkt.size;
 
                 debug!(
                     "Due to timeout, TCPPacketSource {} resent packet {} ({} bytes) from flow {} at time {:.3}.",
@@ -897,6 +942,25 @@ impl TCPPacketSource {
         };
 
         CsvLogger::log_report(Report::PacketSourceReport(report), timing);
+        if timing == ReportTiming::Final && self.e5_metrics_enabled {
+            CsvLogger::log_report(
+                Report::TcpMetricsReport(TcpMetricsReport {
+                    flow_id: self.flow_id,
+                    original_packets: self.total_original_packets,
+                    original_bytes: self.sent_size,
+                    retransmissions: self.retransmissions,
+                    retransmitted_bytes: self.retransmitted_bytes,
+                    acked_bytes: self.last_ack,
+                    completed: self.is_complete(),
+                    completion_time_ns: self.completion_time_ns,
+                    outstanding_bytes: self.bytes_in_flight(),
+                    pending_timeouts: self.timeout_queue.len(),
+                    timer_ticks: self.timer_ticks,
+                    timer_cancelled: self.timer_cancelled,
+                }),
+                timing,
+            );
+        }
 
         debug!(
             "TCPPacketSource {} logged a periodic report at time {:.3}.",
@@ -1245,6 +1309,9 @@ mod tests {
         assert_eq!(source.sent_packets[&0].time, 0.000_003);
         assert_eq!(source.pending_lost_bytes, 512);
         assert_eq!(source.congestion_control.get_cwnd(), 2560);
+        assert_eq!(source.total_original_packets, 4);
+        assert_eq!(source.sent_size, 2048);
+        assert_eq!(source.retransmissions, 1);
     }
 
     #[test]
@@ -1277,6 +1344,9 @@ mod tests {
         block_on(source.timer_tick(1_000_000_000));
         assert_eq!(source.sent_packets[&0].time, 1.0);
         assert_eq!(source.pending_lost_bytes, 512);
+        assert_eq!(source.total_original_packets, 1);
+        assert_eq!(source.sent_size, 512);
+        assert_eq!(source.retransmissions, 1);
 
         let ack = make_ack(source.flow_id, 512, 512, false, 1.000_001);
         let _ = block_on(source.ack_packet_received(ack, 1_000_001_000));

@@ -377,6 +377,12 @@ struct MailboxConfig {
     mailbox_capacity: Option<usize>,
 }
 
+#[derive(Deserialize)]
+struct LegacyE5MetricsConfig {
+    #[serde(default)]
+    legacy_e5_metrics: bool,
+}
+
 #[derive(Default)]
 struct SinkStatistics {
     /// a vector of sink ids
@@ -561,6 +567,7 @@ pub fn installed_host_attachment_state(
         duration_ns: 0,
         app_source_cfg: AppBufferConfig::default(),
         host_attachment: Some(host_attachment),
+        e5_metrics: false,
     };
     topology.init_mailboxes();
     let ui_mbox = Mailbox::with_capacity(mailbox_capacity);
@@ -621,6 +628,8 @@ pub struct Topology {
     app_source_cfg: AppBufferConfig,
     /// Opt-in host-to-switch and switch-to-host attachment stages.
     host_attachment: Option<HostAttachmentSpec>,
+    /// Opt-in final TCP counters for the E5 correctness arm.
+    e5_metrics: bool,
 }
 
 struct PreparedTcpAppSources {
@@ -770,6 +779,9 @@ impl Topology {
         let config: Config =
             toml::from_str(&content).expect("Failed to deserialize the configuration");
         let host_attachment = config.host_attachment_spec();
+        let e5_metrics = toml::from_str::<LegacyE5MetricsConfig>(&content)
+            .expect("Failed to deserialize legacy E5 metrics configuration")
+            .legacy_e5_metrics;
 
         let mailbox_config: MailboxConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of mailbox capacity");
@@ -910,6 +922,7 @@ impl Topology {
             duration_ns,
             app_source_cfg,
             host_attachment,
+            e5_metrics,
         }
     }
 
@@ -1779,6 +1792,7 @@ impl Topology {
                 flow.seed,
                 handle,
             );
+            source.enable_e5_metrics(self.e5_metrics);
             // records the PacketSource id for adding it as the start of the
             // flow's path in later construction of the path in
             // Flow::compute_path()
@@ -2258,6 +2272,7 @@ mod ring_allreduce_serialization_tests {
             duration_ns: 1_000_000_000,
             app_source_cfg: crate::flows::app_source::AppBufferConfig::default(),
             host_attachment: None,
+            e5_metrics: false,
         };
 
         // Produce flows for the collective (no scheduling, no routing).
@@ -2457,6 +2472,7 @@ mod ring_allreduce_serialization_tests {
             duration_ns: 1_000_000_000,
             app_source_cfg: crate::flows::app_source::AppBufferConfig::default(),
             host_attachment: None,
+            e5_metrics: false,
         };
 
         topo.process_collectives();
@@ -2563,6 +2579,7 @@ mod ring_allreduce_serialization_tests {
             duration_ns: 1_000_000_000,
             app_source_cfg: crate::flows::app_source::AppBufferConfig::default(),
             host_attachment: None,
+            e5_metrics: false,
         };
 
         topo.process_collectives();
@@ -2661,6 +2678,7 @@ mod ring_allreduce_serialization_tests {
             duration_ns: 1_000_000_000,
             app_source_cfg: crate::flows::app_source::AppBufferConfig::default(),
             host_attachment: None,
+            e5_metrics: false,
         };
 
         topo.process_collectives();
@@ -2728,6 +2746,7 @@ mod ring_allreduce_serialization_tests {
             duration_ns: 1_000_000_000,
             app_source_cfg: crate::flows::app_source::AppBufferConfig::default(),
             host_attachment: None,
+            e5_metrics: false,
         };
 
         topo.process_collectives();
@@ -2772,6 +2791,7 @@ mod ring_allreduce_serialization_tests {
             duration_ns: 1_000_000_000,
             app_source_cfg: crate::flows::app_source::AppBufferConfig::default(),
             host_attachment: None,
+            e5_metrics: false,
         };
 
         topo.process_collectives();
@@ -2827,6 +2847,7 @@ mod ring_allreduce_serialization_tests {
             duration_ns: 1_000_000_000,
             app_source_cfg: crate::flows::app_source::AppBufferConfig::default(),
             host_attachment: None,
+            e5_metrics: false,
         };
 
         topo.process_collectives();
