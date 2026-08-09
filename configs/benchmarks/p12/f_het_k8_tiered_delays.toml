@@ -1,11 +1,27 @@
 # P12 F-HET: delay heterogeneity in ONE image (wave-4 amendment).
 #
 # WHAT IT SHOWS. A slot pipeline has to quantise at the SHORTEST delay present anywhere in the
-# fabric -- here 100 ns -- for the whole run, whatever the traffic is doing. Days' safe horizon is
-# a function of the channels that can actually deliver an event, so it stretches toward the
-# 10,000 ns inter-pod scale as soon as the 100 ns rack-local traffic goes quiet. Both regimes are
-# in this single image, in sequence, so the contrast is internal to one fixture and needs no
-# second image to compare against.
+# fabric -- here 100 ns -- for the whole run, whatever the traffic is doing, and it ticks every one
+# of those quanta whether or not anything is scheduled in it. Days' frontier is the earliest
+# pending event anywhere in the image, so when the 100 ns rack-local traffic goes quiet the frontier
+# SKIPS the quanta in which nothing is scheduled and one round carries simulated time across them.
+# Both regimes are in this single image, in sequence, so the contrast is internal to one fixture and
+# needs no second image to compare against.
+#
+# > CORRECTION (2026-08-08; measured by the T21 horizon trace, evidence/P12/horizon-traces.md
+# > SS5.1). The paragraph above used to read: "Days' safe horizon is a function of the channels that
+# > can actually deliver an event, so it stretches toward the 10,000 ns inter-pod scale as soon as
+# > the 100 ns rack-local traffic goes quiet." THE HORIZON WINDOW DOES NOT STRETCH. The executor's
+# > lookahead is a single GLOBAL minimum over every channel in the image -- `safe_horizon.rs` sets
+# > `horizon = min(run_end, frontier_ns + min_channel_delay_ns)` -- so this fixture's horizon span
+# > is exactly 224 ns in every one of its 229 rounds: minimum, median and maximum all 224. What
+# > varies is the ADVANCE from one round's horizon to the next (median 248 ns, maximum 6,808 ns),
+# > which is the frontier skipping empty quanta. The measured outcome is unchanged and still what
+# > this fixture was authored to show -- 229 rounds against 2,000 equivalent 100 ns slots, and the
+# > collapse ratio doubling from 5.13x in the rack phase to 10.64x once only the inter-pod flows
+# > remain -- but the MECHANISM is frontier skipping, not lookahead widening. A per-channel or
+# > per-LP lookahead, which would genuinely widen the window toward 10,000 ns, is a possible future
+# > mechanism and is not what produced these numbers.
 #
 # THE FABRIC. k = 8, 4 hosts per edge switch: 32 edge, 32 aggregation, 16 core switches, 128 hosts.
 # Three delay tiers, stated as fabric layers rather than inferred:
@@ -30,6 +46,14 @@
 # demonstrates the FEWER-ROUNDS mechanism; it is not a wall-clock claim and must not be reported as
 # one. The first-class metric here is rounds versus equivalent slots at equal simulated time, which
 # is hardware-independent.
+#
+# THE DENOMINATOR CONVENTION (orchestrator decision, 2026-08-08; horizon-traces.md SS4). "Equivalent
+# slots" has two defensible quanta on this fabric and BOTH are printed on every table and figure.
+# The CONSERVATIVE one LEADS: our own lookahead, 224 ns = 100 ns propagation PLUS the 124 ns
+# serialization of a 1,540 B packet at 100 Gbit/s, giving 893 slots and 3.90x fewer rounds. The
+# propagation-only 100 ns quantum -- how a slot pipeline that charges serialization inside its tick
+# is built -- is the SECONDARY column, 2,000 slots and 8.73x, always with its definition attached.
+# Quoting the propagation-only figure alone would flatter us, so it never travels alone.
 seed = 21008
 duration = 0.000200
 threading = "single"
