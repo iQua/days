@@ -3,7 +3,7 @@
 use std::fs;
 
 use assert_cmd::Command;
-use days_legacy::utils::exact_time::serialization_ns;
+use days_legacy::utils::exact_time::{behavior_delay_ns, scenario_seconds_ns, serialization_ns};
 use predicates::prelude::*;
 use tempfile::TempDir;
 
@@ -13,6 +13,33 @@ fn positive_packets_always_serialize_to_a_future_integer_tick() {
     assert_eq!(serialization_ns(4, 100_000_000_000.0).unwrap(), 1);
     assert_eq!(serialization_ns(40, 100_000_000_000.0).unwrap(), 4);
     assert_eq!(serialization_ns(1_460, 100_000_000_000.0).unwrap(), 117);
+}
+
+#[test]
+fn scenario_time_boundaries_are_exact_integer_nanoseconds() {
+    assert_eq!(scenario_seconds_ns(0.0, "zero start").unwrap(), 0);
+    assert_eq!(scenario_seconds_ns(0.000_000_001, "start").unwrap(), 1);
+    assert_eq!(scenario_seconds_ns(0.1, "timer").unwrap(), 100_000_000);
+    assert_eq!(scenario_seconds_ns(1.0, "arrival").unwrap(), 1_000_000_000);
+    assert_eq!(scenario_seconds_ns(3.0, "horizon").unwrap(), 3_000_000_000);
+
+    for invalid in [
+        f64::NAN,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        -1.0,
+        0.5e-9,
+        1.5e-9,
+    ] {
+        assert!(scenario_seconds_ns(invalid, "test boundary").is_err());
+    }
+}
+
+#[test]
+fn positive_behavior_delays_round_up_to_a_future_tick() {
+    assert_eq!(behavior_delay_ns(0.32e-9, "sample").unwrap(), 1);
+    assert_eq!(behavior_delay_ns(1.01e-9, "sample").unwrap(), 2);
+    assert!(behavior_delay_ns(0.0, "sample").is_err());
 }
 
 #[test]
@@ -40,7 +67,7 @@ fn runtime_scheduling_failure_is_a_nonzero_cli_exit_without_completion_claim() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("Simulation failed"))
-        .stderr(predicate::str::contains("InvalidScheduledTime"))
+        .stderr(predicate::str::contains("must be finite and positive"))
         .stderr(predicate::str::contains("Simulation completed").not());
 }
 

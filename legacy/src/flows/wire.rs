@@ -11,20 +11,23 @@ use rand::rngs::SmallRng;
 use rand_distr::Exp;
 use tracing::instrument;
 
-use nexosim::model::{BuildContext, Context, Model, ModelRegistry, ProtoModel, SchedulableId};
-use nexosim::ports::Output;
-#[cfg(feature = "test")]
-use nexosim::time::MonotonicTime;
-
 use crate::flows::DistributionInfo;
 use crate::flows::packet::Packet;
 use crate::get_seed;
-use crate::utils::time::{quantize_after, quantize_time};
+use crate::utils::exact_time::{behavior_delay_ns, clock_ns, seconds_view};
+use nexosim::model::{BuildContext, Context, Model, ModelRegistry, ProtoModel, SchedulableId};
+use nexosim::ports::Output;
+
+#[derive(Debug)]
+enum WireDelay {
+    Distribution(DistributionInfo),
+    FixedNs(u64),
+}
 
 #[derive(Debug)]
 pub struct Wire {
     wire_id: usize,
-    delay_dist: DistributionInfo,
+    delay: WireDelay,
     rng: SmallRng,
 
     pub output: Output<Packet>,
@@ -46,18 +49,30 @@ impl Wire {
 
         Wire {
             wire_id,
-            delay_dist,
+            delay: WireDelay::Distribution(delay_dist),
             rng,
             output: Output::default(),
             scheduled_departures: VecDeque::new(),
         }
     }
 
+    pub fn with_propagation_ns(wire_id: usize, propagation_ns: u64) -> Wire {
+        let mut wire = Self::new(
+            wire_id,
+            DistributionInfo::DiscreteUniform { low: 0, high: 0 },
+        );
+        wire.delay = WireDelay::FixedNs(propagation_ns);
+        wire
+    }
+
     #[instrument(skip(self, cx))]
     pub async fn packet_received(&mut self, mut packet: Packet, cx: &Context<Self>) {
+        let now_ns = clock_ns(cx.time());
+        let now = seconds_view(now_ns);
+
         #[cfg(feature = "test")]
         {
-            let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+            let global_time = now;
 
             // makes sure that the current simulation time can be correctly retrieved from
             // the packet itself
@@ -69,39 +84,48 @@ impl Wire {
             );
         }
 
-        let mut now = packet.time;
-
         debug!(
             "Wire {} received packet {} ({} bytes) from flow {} at time {:.3}.",
             self.wire_id, packet.packet_id, packet.size, packet.flow_id, now,
         );
 
-        now = quantize_time(now);
         packet.departure_update(now);
 
-        let delay = match self.delay_dist {
-            DistributionInfo::DiscreteUniform { low, high } => {
+        let sampled_seconds = match &self.delay {
+            WireDelay::FixedNs(_) => None,
+            WireDelay::Distribution(DistributionInfo::DiscreteUniform { low, high }) => {
                 let dist = Uniform::new_inclusive(low, high).unwrap();
-                dist.sample(&mut self.rng) as f64
+                Some(dist.sample(&mut self.rng) as f64)
             }
-            DistributionInfo::Exp { lambda } => Exp::new(lambda).unwrap().sample(&mut self.rng),
-            DistributionInfo::Uniform { low, high } => {
+            WireDelay::Distribution(DistributionInfo::Exp { lambda }) => {
+                Some(Exp::new(*lambda).unwrap().sample(&mut self.rng))
+            }
+            WireDelay::Distribution(DistributionInfo::Uniform { low, high }) => {
                 if low == high {
-                    low
+                    Some(*low)
                 } else {
-                    Uniform::new(low, high).unwrap().sample(&mut self.rng)
+                    Some(Uniform::new(*low, *high).unwrap().sample(&mut self.rng))
                 }
             }
         };
+        let delay_ns = match (&self.delay, sampled_seconds) {
+            (WireDelay::FixedNs(delay_ns), _) => *delay_ns,
+            (_, Some(0.0)) => 0,
+            (_, Some(delay)) => behavior_delay_ns(delay, "wire delay sample")
+                .expect("wire delay distributions must produce finite nonnegative delays"),
+            (_, None) => unreachable!(),
+        };
+        let arrival_ns = now_ns
+            .checked_add(delay_ns)
+            .expect("wire arrival time exceeds the u64 nanosecond clock range");
+        let arrival_time = seconds_view(arrival_ns);
 
-        let arrival_time = quantize_after(now, delay);
         packet.departure_update(arrival_time);
 
-        if arrival_time > now {
-            let delay = (arrival_time - now).max(0.0);
+        if delay_ns > 0 {
             self.scheduled_departures.push_back(packet);
             cx.schedule_event_fast(
-                Duration::from_secs_f64(delay),
+                Duration::from_nanos(delay_ns),
                 &Self::FORWARD_SCHEDULED_SID,
                 Self::forward_scheduled,
                 (),

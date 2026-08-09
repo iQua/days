@@ -12,12 +12,6 @@ use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use tracing::instrument;
 
-use nexosim::model::{
-    BuildContext, Context, InitializedModel, Model, ModelRegistry, ProtoModel, SchedulableId,
-};
-use nexosim::ports::Output;
-use nexosim::time::MonotonicTime;
-
 use crate::flows::app_source::AppSourceBufferHandle;
 #[cfg(feature = "dcqcn")]
 use crate::flows::dcqcn_source::DcqcnPacketSource;
@@ -27,8 +21,12 @@ use crate::flows::packet::Packet;
 use crate::flows::tcp_source::TCPPacketSource;
 use crate::flows::{FlowFinishMsg, TrafficCharacteristics};
 use crate::get_seed;
+use crate::utils::exact_time::{behavior_delay_ns, clock_ns, scenario_seconds_ns, seconds_view};
 use crate::utils::logger::{CsvLogger, ReportTiming};
-use crate::utils::time::{quantize_after, quantize_time};
+use nexosim::model::{
+    BuildContext, Context, InitializedModel, Model, ModelRegistry, ProtoModel, SchedulableId,
+};
+use nexosim::ports::Output;
 
 #[derive(Debug)]
 pub enum PacketSource {
@@ -51,7 +49,7 @@ impl std::fmt::Display for PacketSource {
 
 impl PacketSource {
     const RUN_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(0);
-    const FETCH_APP_DATA_SID: SchedulableId<Self, f64> = SchedulableId::__from_decorated(1);
+    const FETCH_APP_DATA_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(1);
     const PERIODIC_TIMER_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(2);
     const LOG_REPORT_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(3);
 
@@ -147,9 +145,11 @@ impl PacketSource {
 
     #[instrument(skip(self, cx))]
     pub async fn packet_received(&mut self, mut packet: Packet, cx: &Context<Self>) {
+        let now_ns = clock_ns(cx.time());
+        let now = seconds_view(now_ns);
         #[cfg(test)]
         {
-            let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+            let global_time = now;
 
             let local_time = match self {
                 PacketSource::DistPacketSource(source) => source.time,
@@ -171,13 +171,12 @@ impl PacketSource {
             assert!((global_time - local_time).abs() <= 1e-7 || global_time > local_time);
         }
 
-        let now = quantize_time(cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64());
         packet.departure_update(now);
 
         match self {
             PacketSource::DistPacketSource(source) => source.packet_received(packet, now),
             PacketSource::TCPPacketSource(source) => {
-                if source.ack_packet_received(packet, now).await {
+                if source.ack_packet_received(packet, now_ns).await {
                     self.run((), cx).await;
                 }
             }
@@ -188,9 +187,11 @@ impl PacketSource {
         }
     }
 
-    async fn prepare_run(&mut self, now: f64, initial_delay: f64, cx: &Context<Self>) {
-        let now = quantize_time(now);
-        let start_time = quantize_after(now, initial_delay);
+    async fn prepare_run(&mut self, now_ns: u64, initial_delay_ns: u64, cx: &Context<Self>) {
+        let start_ns = now_ns
+            .checked_add(initial_delay_ns)
+            .expect("source start time exceeds the u64 nanosecond clock range");
+        let start_time = seconds_view(start_ns);
         match self {
             PacketSource::DistPacketSource(source) => {
                 source.report_start_time = start_time;
@@ -205,18 +206,20 @@ impl PacketSource {
 
                 // as suggested by RFC 6298, the clock granuarity, i.e., the
                 // interval of this periodic timer, is always 100 msec
-                let timer_start = quantize_after(now, initial_delay + 0.1);
-                let delay = (timer_start - now).max(0.0);
+                let timer_interval = Duration::from_millis(100);
+                let timer_start_ns = initial_delay_ns
+                    .checked_add(100_000_000)
+                    .expect("TCP timer start exceeds the u64 nanosecond clock range");
                 cx.schedule_periodic_event(
-                    Duration::from_secs_f64(delay),
-                    Duration::from_secs_f64(0.1),
+                    Duration::from_nanos(timer_start_ns),
+                    timer_interval,
                     &Self::PERIODIC_TIMER_SID,
                     (),
                 )
                 .unwrap();
 
                 // TCPPacketSource now owns the data from the application
-                source.busy_until = start_time;
+                source.busy_until_ns = start_ns;
 
                 if source.app_source.is_some() {
                     // On flow start, proactively pull packets from the AppSourceBufferHandle according to the current
@@ -234,15 +237,15 @@ impl PacketSource {
                     };
 
                     source.send_buffer += size;
-                    source.busy_until = start_time;
+                    source.busy_until_ns = start_ns;
 
-                    let fetch_time = quantize_after(start_time, interval);
-                    let delay = (fetch_time - start_time).max(0.0);
+                    let delay_ns = behavior_delay_ns(interval, "TCP application arrival sample")
+                        .expect("TCP arrival distribution must produce a positive finite delay");
                     cx.schedule_event_fast(
-                        Duration::from_secs_f64(delay),
+                        Duration::from_nanos(delay_ns),
                         &Self::FETCH_APP_DATA_SID,
                         Self::fetch_app_data,
-                        fetch_time,
+                        (),
                     )
                     .unwrap();
                 }
@@ -254,11 +257,14 @@ impl PacketSource {
                 source.time = start_time;
 
                 let interval = source.timer_interval();
-                let timer_start = quantize_after(now, initial_delay + interval);
-                let delay = (timer_start - now).max(0.0);
+                let interval_ns = behavior_delay_ns(interval, "DCQCN timer interval")
+                    .expect("DCQCN timer interval must be finite and positive");
+                let timer_start_ns = initial_delay_ns
+                    .checked_add(interval_ns)
+                    .expect("DCQCN timer start exceeds the u64 nanosecond clock range");
                 cx.schedule_periodic_event(
-                    Duration::from_secs_f64(delay),
-                    Duration::from_secs_f64(interval),
+                    Duration::from_nanos(timer_start_ns),
+                    Duration::from_nanos(interval_ns),
                     &Self::PERIODIC_TIMER_SID,
                     (),
                 )
@@ -270,11 +276,12 @@ impl PacketSource {
     #[instrument(skip(self, cx))]
     fn fetch_app_data<'a>(
         &'a mut self,
-        current_time: f64,
+        _: (),
         cx: &'a Context<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
-            let current_time = quantize_time(current_time);
+            let current_ns = clock_ns(cx.time());
+            let current_time = seconds_view(current_ns);
             match self {
                 PacketSource::DistPacketSource(source) => source.time = current_time,
                 PacketSource::TCPPacketSource(source) => {
@@ -282,7 +289,7 @@ impl PacketSource {
 
                     #[cfg(test)]
                     {
-                        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+                        let now = seconds_view(clock_ns(cx.time()));
                         assert!((now - source.time).abs() <= 1e-7);
                     }
 
@@ -299,13 +306,18 @@ impl PacketSource {
 
                         if !exceeded {
                             source.send_buffer += size;
-                            let next_time = quantize_after(timestamp, interval);
-                            let delay = (next_time - timestamp).max(0.0);
+                            let delay_ns = behavior_delay_ns(
+                                interval,
+                                "TCP application arrival sample",
+                            )
+                            .expect(
+                                "TCP arrival distribution must produce a positive finite delay",
+                            );
                             cx.schedule_event_fast(
-                                Duration::from_secs_f64(delay),
+                                Duration::from_nanos(delay_ns),
                                 &Self::FETCH_APP_DATA_SID,
                                 Self::fetch_app_data,
-                                next_time,
+                                (),
                             )
                             .unwrap();
                         } else {
@@ -315,7 +327,16 @@ impl PacketSource {
                         if source.next_seq < source.send_buffer {
                             self.run((), cx).await;
                         } else {
-                            source.busy_until = quantize_after(timestamp, interval);
+                            let delay_ns = behavior_delay_ns(
+                                interval,
+                                "TCP application arrival sample",
+                            )
+                            .expect(
+                                "TCP arrival distribution must produce a positive finite delay",
+                            );
+                            source.busy_until_ns = current_ns
+                                .checked_add(delay_ns)
+                                .expect("TCP application arrival exceeds the u64 nanosecond range");
                         }
                     } else if source.next_seq < source.send_buffer {
                         // For handle-backed sources, simply resume sending if there is pending data.
@@ -330,12 +351,13 @@ impl PacketSource {
         }
     }
     async fn periodic_timer_event<'a>(&'a mut self, _: (), cx: &'a Context<Self>) {
-        let now = quantize_time(cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64());
+        let now_ns = clock_ns(cx.time());
+        let now = seconds_view(now_ns);
         match self {
             PacketSource::DistPacketSource(_) => (),
             PacketSource::TCPPacketSource(source) => {
                 source.time = now;
-                source.timer_tick(now).await;
+                source.timer_tick(now_ns).await;
             }
             #[cfg(feature = "dcqcn")]
             PacketSource::DcqcnPacketSource(source) => {
@@ -344,18 +366,22 @@ impl PacketSource {
         }
     }
 
-    async fn send_packet(&mut self, cx: &Context<Self>, now: f64) {
+    async fn send_packet(&mut self, cx: &Context<Self>, now_ns: u64) {
+        let now = seconds_view(now_ns);
         match self {
             PacketSource::DistPacketSource(source) => {
                 if !source.traffic_exceeded(now) {
                     let interval = source.send_packet(now).await;
                     // updates the locally maintained simulation time
-                    let next_time = quantize_after(now, interval);
-                    source.time = next_time;
+                    let delay_ns = behavior_delay_ns(interval, "packet arrival sample")
+                        .expect("arrival distribution must produce a positive finite delay");
+                    let next_ns = now_ns
+                        .checked_add(delay_ns)
+                        .expect("packet arrival exceeds the u64 nanosecond clock range");
+                    source.time = seconds_view(next_ns);
                     // schedules the next packet to be sent
-                    let delay = (next_time - now).max(0.0);
                     cx.schedule_event_fast(
-                        Duration::from_secs_f64(delay),
+                        Duration::from_nanos(delay_ns),
                         &Self::RUN_SID,
                         Self::run,
                         (),
@@ -364,13 +390,16 @@ impl PacketSource {
                 }
             }
             PacketSource::TCPPacketSource(source) => {
-                if let Some(interval) = source.send_packet(now).await {
+                if let Some(interval) = source.send_packet(now_ns).await {
                     if interval > 0.0 {
-                        let next_time = quantize_after(now, interval);
-                        let delay = (next_time - now).max(0.0);
-                        source.time = next_time;
+                        let delay_ns = behavior_delay_ns(interval, "TCP pacing interval")
+                            .expect("TCP pacing must produce a positive finite delay");
+                        let next_ns = now_ns
+                            .checked_add(delay_ns)
+                            .expect("TCP pacing exceeds the u64 nanosecond clock range");
+                        source.time = seconds_view(next_ns);
                         cx.schedule_event_fast(
-                            Duration::from_secs_f64(delay),
+                            Duration::from_nanos(delay_ns),
                             &Self::RUN_SID,
                             Self::run,
                             (),
@@ -383,11 +412,14 @@ impl PacketSource {
             PacketSource::DcqcnPacketSource(source) => {
                 if let Some(interval) = source.send_packet(now).await {
                     if interval > 0.0 {
-                        let next_time = quantize_after(now, interval);
-                        let delay = (next_time - now).max(0.0);
-                        source.time = next_time;
+                        let delay_ns = behavior_delay_ns(interval, "DCQCN pacing interval")
+                            .expect("DCQCN pacing must produce a positive finite delay");
+                        let next_ns = now_ns
+                            .checked_add(delay_ns)
+                            .expect("DCQCN pacing exceeds the u64 nanosecond clock range");
+                        source.time = seconds_view(next_ns);
                         cx.schedule_event_fast(
-                            Duration::from_secs_f64(delay),
+                            Duration::from_nanos(delay_ns),
                             &Self::RUN_SID,
                             Self::run,
                             (),
@@ -400,7 +432,7 @@ impl PacketSource {
     }
 
     async fn log_report<'a>(&'a mut self, _: (), cx: &'a Context<Self>) {
-        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+        let now = seconds_view(clock_ns(cx.time()));
 
         match self {
             PacketSource::DistPacketSource(source) => {
@@ -448,51 +480,18 @@ impl PacketSource {
         cx: &'a Context<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
-            let mut now = match self {
-                PacketSource::DistPacketSource(source) => source.time,
-                PacketSource::TCPPacketSource(source) => source.time,
+            let now_ns = clock_ns(cx.time());
+            let now = seconds_view(now_ns);
+            match self {
+                PacketSource::DistPacketSource(source) => source.time = now,
+                PacketSource::TCPPacketSource(source) => source.time = now,
                 #[cfg(feature = "dcqcn")]
-                PacketSource::DcqcnPacketSource(source) => source.time,
-            };
-
-            if now == 0.0 {
-                let global_time =
-                    quantize_time(cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64());
-
-                match self {
-                    PacketSource::DistPacketSource(source) => {
-                        source.time = global_time;
-                    }
-                    PacketSource::TCPPacketSource(source) => {
-                        source.time = global_time;
-                    }
-                    #[cfg(feature = "dcqcn")]
-                    PacketSource::DcqcnPacketSource(source) => {
-                        source.time = global_time;
-                    }
-                };
-
-                now = global_time;
-            }
-
-            if let PacketSource::TCPPacketSource(source) = self {
-                let global_time =
-                    quantize_time(cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64());
-                source.time = global_time;
-                now = global_time;
-            }
-            #[cfg(feature = "dcqcn")]
-            if let PacketSource::DcqcnPacketSource(source) = self {
-                let global_time =
-                    quantize_time(cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64());
-                source.time = global_time;
-                now = global_time;
+                PacketSource::DcqcnPacketSource(source) => source.time = now,
             }
 
             #[cfg(feature = "test")]
             {
-                let global_time =
-                    quantize_time(cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64());
+                let global_time = seconds_view(clock_ns(cx.time()));
                 assert!(
                     now <= global_time + 1e-7,
                     "Timing mismatch: now = {}, global_time = {}",
@@ -501,7 +500,7 @@ impl PacketSource {
                 );
             }
 
-            self.send_packet(cx, now).await;
+            self.send_packet(cx, now_ns).await;
 
             if self.stop_run(now).await {
                 let name = format!("{self}");
@@ -530,7 +529,8 @@ impl PacketSource {
     }
 
     pub async fn flow_finished(&mut self, flow_finish_msg: FlowFinishMsg, cx: &Context<Self>) {
-        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+        let now_ns = clock_ns(cx.time());
+        let now = seconds_view(now_ns);
 
         debug!(
             "{} of flow {} received notification that flow {} ended at time {:.3}.",
@@ -545,9 +545,9 @@ impl PacketSource {
                 source.flow_start_after.remove(&flow_finish_msg.flow_id);
 
                 if source.flow_start_after.is_empty() {
-                    self.prepare_run(now, 0.0, cx).await;
+                    self.prepare_run(now_ns, 0, cx).await;
                     self.run((), cx).await;
-                    self.start_report_logger(0.0, cx);
+                    self.start_report_logger(0, cx);
 
                     debug!(
                         "{} of flow {} started sending packets at time {:.3}.",
@@ -572,9 +572,9 @@ impl PacketSource {
                 );
 
                 if source.flow_start_after.is_empty() {
-                    self.prepare_run(now, 0.0, cx).await;
+                    self.prepare_run(now_ns, 0, cx).await;
                     self.run((), cx).await;
-                    self.start_report_logger(0.0, cx);
+                    self.start_report_logger(0, cx);
 
                     debug!(
                         "{} of flow {} started sending packets at time {:.3}.",
@@ -594,9 +594,9 @@ impl PacketSource {
                 );
 
                 if source.flow_start_after.is_empty() {
-                    self.prepare_run(now, 0.0, cx).await;
+                    self.prepare_run(now_ns, 0, cx).await;
                     self.run((), cx).await;
-                    self.start_report_logger(0.0, cx);
+                    self.start_report_logger(0, cx);
 
                     debug!(
                         "{} of flow {} started sending packets at time {:.3}.",
@@ -609,7 +609,7 @@ impl PacketSource {
         }
     }
 
-    fn advance_initial_delay(&self) -> f64 {
+    fn advance_initial_delay(&self) -> u64 {
         let initial_delay = match &self {
             PacketSource::DistPacketSource(source) => source.traffic.initial_delay,
             PacketSource::TCPPacketSource(source) => source.traffic.initial_delay,
@@ -622,7 +622,8 @@ impl PacketSource {
             self, initial_delay
         );
 
-        initial_delay
+        scenario_seconds_ns(initial_delay, "flow initial delay")
+            .expect("flow initial delay must use exact integer nanoseconds")
     }
 
     /// Returns whether PacketSource should start now or wait for other flows to
@@ -651,12 +652,17 @@ impl PacketSource {
         }
     }
 
-    fn start_report_logger(&self, initial_delay: f64, cx: &Context<Self>) {
+    fn start_report_logger(&self, initial_delay_ns: u64, cx: &Context<Self>) {
         let report_interval = CsvLogger::get_instance().get_report_interval();
         if report_interval < f64::MAX {
+            let report_interval_ns = scenario_seconds_ns(report_interval, "source report interval")
+                .expect("source report interval must use exact integer nanoseconds");
+            let first_report_ns = initial_delay_ns
+                .checked_add(report_interval_ns)
+                .expect("source report start exceeds the u64 nanosecond clock range");
             cx.schedule_periodic_event(
-                Duration::from_secs_f64(initial_delay + report_interval),
-                Duration::from_secs_f64(report_interval),
+                Duration::from_nanos(first_report_ns),
+                Duration::from_nanos(report_interval_ns),
                 &Self::LOG_REPORT_SID,
                 (),
             )
@@ -681,11 +687,11 @@ impl Model for PacketSource {
     async fn init(mut self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
         if self.start_now() {
             let initial_delay = self.advance_initial_delay();
-            self.prepare_run(0.0, initial_delay, cx).await;
+            self.prepare_run(0, initial_delay, cx).await;
 
-            if initial_delay > 0.0 {
+            if initial_delay > 0 {
                 cx.schedule_event_fast(
-                    Duration::from_secs_f64(initial_delay),
+                    Duration::from_nanos(initial_delay),
                     &Self::RUN_SID,
                     Self::run,
                     (),

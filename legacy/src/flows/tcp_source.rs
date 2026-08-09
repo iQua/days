@@ -21,6 +21,7 @@ use crate::flows::reno::TCPReno;
 use crate::flows::source::PacketSourceReport;
 use crate::flows::{FlowFinishMsg, TrafficCharacteristics};
 use crate::next_endpoint_id;
+use crate::utils::exact_time::{behavior_delay_ns, seconds_view};
 use crate::utils::logger::CsvLogger;
 use crate::utils::logger::{Report, ReportTiming};
 
@@ -40,8 +41,8 @@ fn to_ppb(v: f64) -> u64 {
 #[derive(Debug, Clone)]
 pub struct PacketTimeout {
     pub packet_id: usize,
-    pub rto: f64,
-    pub timeout: f64,
+    pub rto_ns: u64,
+    pub deadline_ns: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -88,15 +89,14 @@ impl PartialOrd for PacketTimeout {
 
 impl PartialEq for PacketTimeout {
     fn eq(&self, other: &Self) -> bool {
-        self.timeout == other.timeout
+        self.deadline_ns == other.deadline_ns && self.packet_id == other.packet_id
     }
 }
 
 impl Ord for PacketTimeout {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.timeout
-            .partial_cmp(&other.timeout)
-            .unwrap_or(Ordering::Equal)
+        (self.deadline_ns, self.packet_id)
+            .cmp(&(other.deadline_ns, other.packet_id))
             .reverse()
     }
 }
@@ -143,7 +143,7 @@ pub struct TCPPacketSource {
     synthetic_source: Option<SyntheticDataSource>,
     /// the source is considered busy retrieving the current packet from flow
     /// until this time
-    pub busy_until: f64,
+    pub busy_until_ns: u64,
 
     packets_sent: usize,
     sent_size: usize,
@@ -256,7 +256,7 @@ impl TCPPacketSource {
             app_source,
             synthetic_source,
             remaining_bytes,
-            busy_until: 0.0,
+            busy_until_ns: 0,
             packets_sent: 0,
             sent_size: 0,
             sent_size_in_period: 0,
@@ -345,7 +345,8 @@ impl TCPPacketSource {
 
     /// Returns whether PacketSource should call run() after TCPPacketSource
     /// handles an acknowledgment.
-    pub async fn ack_packet_received(&mut self, ack_packet: Packet, now: f64) -> bool {
+    pub async fn ack_packet_received(&mut self, ack_packet: Packet, now_ns: u64) -> bool {
+        let now = seconds_view(now_ns);
         // updates the locally maintained simulation time
         self.time = now;
 
@@ -454,7 +455,7 @@ impl TCPPacketSource {
                     packet.set_priority(self.priority);
                     self.apply_ecn_on_new_data(&mut packet);
                     self.output.send(packet.clone()).await;
-                    self.packet_sent(&packet, now);
+                    self.packet_sent(&packet, now_ns);
                 }
             }
         }
@@ -595,7 +596,7 @@ impl TCPPacketSource {
             self.timeout_queue
                 .retain(|packet| packet.packet_id >= ack.sequence_num);
 
-            if now >= self.busy_until {
+            if now_ns >= self.busy_until_ns {
                 return true;
             }
 
@@ -656,7 +657,8 @@ impl TCPPacketSource {
         CsvLogger::try_log_report(Report::CubicEventRow(event), ReportTiming::InProgress);
     }
 
-    pub fn packet_sent(&mut self, packet: &Packet, now: f64) {
+    pub fn packet_sent(&mut self, packet: &Packet, now_ns: u64) {
+        let now = seconds_view(now_ns);
         self.packets_sent += 1;
         self.sent_size += packet.size;
         self.sent_size_in_period += packet.size;
@@ -689,10 +691,15 @@ impl TCPPacketSource {
 
         self.congestion_control.packet_sent(packet.size, now);
 
+        let rto_ns = behavior_delay_ns(self.rto, "TCP retransmission timeout")
+            .expect("TCP retransmission timeout must be finite and positive");
+        let deadline_ns = now_ns
+            .checked_add(rto_ns)
+            .expect("TCP retransmission deadline exceeds the u64 nanosecond clock range");
         self.timeout_queue.push(PacketTimeout {
             packet_id: packet.packet_id,
-            rto: self.rto,
-            timeout: self.rto + now,
+            rto_ns,
+            deadline_ns,
         });
 
         debug!(
@@ -700,7 +707,7 @@ impl TCPPacketSource {
             self.endpoint_id,
             packet.packet_id,
             self.rto,
-            self.rto + now
+            seconds_view(deadline_ns)
         );
     }
 
@@ -726,18 +733,19 @@ impl TCPPacketSource {
     }
 
     /// Checks if any sent packet reached timeout at regularly occurring intervals.
-    pub async fn timer_tick(&mut self, now: f64) {
+    pub async fn timer_tick(&mut self, now_ns: u64) {
+        let now = seconds_view(now_ns);
         while !self.timeout_queue.is_empty() {
-            let timeout_time = self.timeout_queue.peek().unwrap().timeout;
-            if timeout_time <= now {
+            let deadline_ns = self.timeout_queue.peek().unwrap().deadline_ns;
+            if deadline_ns <= now_ns {
                 let packet_timeout = self.timeout_queue.pop().unwrap();
                 debug!(
                     "TCPPacketSource {}'s sent packet {} reached timeout at time {:.3}, \
                     with a current RTO of {:.3}.",
                     self.endpoint_id,
                     packet_timeout.packet_id,
-                    packet_timeout.timeout,
-                    packet_timeout.rto,
+                    seconds_view(packet_timeout.deadline_ns),
+                    seconds_view(packet_timeout.rto_ns),
                 );
 
                 if let Some(lost_pkt) = self.sent_packets.get(&packet_timeout.packet_id) {
@@ -764,7 +772,7 @@ impl TCPPacketSource {
                     .get_mut(&packet_timeout.packet_id)
                     .unwrap();
 
-                resent_pkt.departure_update(packet_timeout.timeout);
+                resent_pkt.departure_update(now);
                 Self::apply_ecn_on_retransmit(resent_pkt);
 
                 self.output.send(resent_pkt.clone()).await;
@@ -775,25 +783,29 @@ impl TCPPacketSource {
                     resent_pkt.packet_id,
                     resent_pkt.size,
                     resent_pkt.flow_id,
-                    packet_timeout.timeout,
+                    now,
                 );
 
-                let revised_rto = f64::min(
-                    self.max_rto,
-                    packet_timeout.rto * 2.0, // Exponential backoff
-                );
+                let max_rto_ns = behavior_delay_ns(self.max_rto, "maximum TCP RTO")
+                    .expect("maximum TCP RTO must be finite and positive");
+                let revised_rto_ns = packet_timeout.rto_ns.saturating_mul(2).min(max_rto_ns);
 
                 let revised_timeout = PacketTimeout {
                     packet_id: packet_timeout.packet_id,
-                    rto: revised_rto,
-                    timeout: packet_timeout.timeout + revised_rto,
+                    rto_ns: revised_rto_ns,
+                    deadline_ns: packet_timeout
+                        .deadline_ns
+                        .checked_add(revised_rto_ns)
+                        .expect("TCP retransmission deadline exceeds the u64 nanosecond range"),
                 };
 
                 self.timeout_queue.push(revised_timeout);
 
                 debug!(
                     "TCPPacketSource {} reset a timer for packet {} with a RTO of {:.3}.",
-                    self.endpoint_id, packet_timeout.packet_id, revised_rto
+                    self.endpoint_id,
+                    packet_timeout.packet_id,
+                    seconds_view(revised_rto_ns)
                 );
             } else {
                 return;
@@ -801,7 +813,8 @@ impl TCPPacketSource {
         }
     }
 
-    pub async fn send_packet(&mut self, now: f64) -> Option<f64> {
+    pub async fn send_packet(&mut self, now_ns: u64) -> Option<f64> {
+        let now = seconds_view(now_ns);
         // Attempt to pull fresh packets from the application layer before sending, to ensure there is data ready within the current congestion window.
         self.pull_from_appsource(now).await;
 
@@ -831,14 +844,13 @@ impl TCPPacketSource {
                 self.apply_ecn_on_new_data(&mut packet);
 
                 self.output.send(packet.clone()).await;
-                self.packet_sent(&packet, now);
+                self.packet_sent(&packet, now_ns);
             }
             return None;
         }
 
-        if now < self.busy_until {
-            let interval = (self.busy_until - now).max(Self::MIN_PACING_INTERVAL);
-            return Some(interval);
+        if now_ns < self.busy_until_ns {
+            return Some(seconds_view(self.busy_until_ns - now_ns));
         }
 
         let mut packet = Packet::new(send_size, self.next_seq, self.flow_id, now);
@@ -846,10 +858,14 @@ impl TCPPacketSource {
         self.apply_ecn_on_new_data(&mut packet);
 
         self.output.send(packet.clone()).await;
-        self.packet_sent(&packet, now);
+        self.packet_sent(&packet, now_ns);
 
         let pacing_interval = pacing_interval.max(Self::MIN_PACING_INTERVAL);
-        self.busy_until = now + pacing_interval;
+        let pacing_interval_ns = behavior_delay_ns(pacing_interval, "TCP pacing interval")
+            .expect("TCP pacing interval must be finite and positive");
+        self.busy_until_ns = now_ns
+            .checked_add(pacing_interval_ns)
+            .expect("TCP pacing deadline exceeds the u64 nanosecond range");
 
         let next_can_send = self.sendable_bytes(cwnd_limit) > 0;
         if next_can_send {
@@ -969,7 +985,7 @@ mod tests {
         let mut source = make_source(true);
         let ack = make_ack(source.flow_id, source.mss, source.mss, true, 1.0);
 
-        let _ = block_on(source.ack_packet_received(ack, 1.0));
+        let _ = block_on(source.ack_packet_received(ack, 1_000_000_000));
         assert!(source.cwr_pending);
         assert!(source.ecn_reduction_in_flight);
 
@@ -984,11 +1000,11 @@ mod tests {
     fn test_ecn_reduction_clears_on_non_ece_ack() {
         let mut source = make_source(true);
         let ack_ece = make_ack(source.flow_id, source.mss, source.mss, true, 1.0);
-        let _ = block_on(source.ack_packet_received(ack_ece, 1.0));
+        let _ = block_on(source.ack_packet_received(ack_ece, 1_000_000_000));
         assert!(source.ecn_reduction_in_flight);
 
         let ack_no_ece = make_ack(source.flow_id, source.mss * 2, source.mss, false, 2.0);
-        let _ = block_on(source.ack_packet_received(ack_no_ece, 2.0));
+        let _ = block_on(source.ack_packet_received(ack_no_ece, 2_000_000_000));
         assert!(!source.ecn_reduction_in_flight);
     }
 
@@ -1009,11 +1025,11 @@ mod tests {
         source.dupack = 2;
 
         let ack_dup = make_ack(source.flow_id, 100, source.mss, false, 1.0);
-        let _ = block_on(source.ack_packet_received(ack_dup, 1.0));
+        let _ = block_on(source.ack_packet_received(ack_dup, 1_000_000_000));
         assert_eq!(source.dupack, 3);
 
         let ack_new = make_ack(source.flow_id, 200, source.mss, false, 2.0);
-        let _ = block_on(source.ack_packet_received(ack_new, 2.0));
+        let _ = block_on(source.ack_packet_received(ack_new, 2_000_000_000));
         assert_eq!(source.dupack, 0);
     }
 
@@ -1028,7 +1044,7 @@ mod tests {
         source.sent_packets.insert(100, packet);
 
         let ack_dup = make_ack(source.flow_id, 100, source.mss, false, 1.0);
-        let _ = block_on(source.ack_packet_received(ack_dup, 1.0));
+        let _ = block_on(source.ack_packet_received(ack_dup, 1_000_000_000));
 
         assert_eq!(source.dupack, 3);
         assert_eq!(source.pending_lost_bytes, source.mss);
@@ -1040,7 +1056,7 @@ mod tests {
         source.send_buffer = 128;
         source.traffic_exceeded = true;
 
-        let next_interval = block_on(source.send_packet(0.0));
+        let next_interval = block_on(source.send_packet(0));
 
         assert_eq!(next_interval, None);
         assert_eq!(source.next_seq, 128);
@@ -1053,6 +1069,31 @@ mod tests {
     }
 
     #[test]
+    fn retransmission_deadlines_use_exact_integer_nanoseconds() {
+        let mut source = make_source(false);
+        source.send_buffer = source.mss;
+        source.traffic_exceeded = true;
+        let now_ns = (1_u64 << 24) * 1_000_000_000;
+
+        block_on(source.send_packet(now_ns));
+
+        let timeout = source.timeout_queue.peek().expect("missing packet timeout");
+        assert_eq!(timeout.rto_ns, 1_000_000_000);
+        assert_eq!(timeout.deadline_ns, now_ns + 1_000_000_000);
+
+        block_on(source.timer_tick(now_ns + 999_999_999));
+        assert_eq!(
+            source.timeout_queue.peek().unwrap().deadline_ns,
+            now_ns + 1_000_000_000
+        );
+
+        block_on(source.timer_tick(now_ns + 1_000_000_000));
+        let backed_off = source.timeout_queue.peek().unwrap();
+        assert_eq!(backed_off.rto_ns, 2_000_000_000);
+        assert_eq!(backed_off.deadline_ns, now_ns + 3_000_000_000);
+    }
+
+    #[test]
     fn test_send_packet_sends_partial_tail_segment() {
         let mut source = make_source(false);
         source.next_seq = source.mss;
@@ -1060,7 +1101,7 @@ mod tests {
         source.send_buffer = 600;
         source.traffic_exceeded = true;
 
-        let next_interval = block_on(source.send_packet(0.0));
+        let next_interval = block_on(source.send_packet(0));
 
         assert_eq!(next_interval, None);
         assert_eq!(source.next_seq, 600);

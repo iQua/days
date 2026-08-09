@@ -27,6 +27,7 @@ use crate::flows::dcqcn_sink::DcqcnPacketSink;
 use crate::flows::packet::Packet;
 use crate::flows::source::PacketSource;
 use crate::flows::tcp_sink::TCPPacketSink;
+use crate::utils::exact_time::{clock_ns, scenario_seconds_ns, seconds_view};
 use crate::utils::logger::{CsvLogger, ReportTiming};
 
 /// A simple collector for statistical data.
@@ -260,7 +261,7 @@ impl PacketSink {
     }
 
     pub async fn report(&mut self, endpoint_id: usize, cx: &Context<Self>) {
-        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+        let now = seconds_view(clock_ns(cx.time()));
 
         assert_eq!(endpoint_id, self.id());
         debug!("{} reporting upon request.", self);
@@ -310,10 +311,7 @@ impl PacketSink {
             assert!((global_time - local_time).abs() <= 1e-7 || global_time > local_time);
         }
 
-        let now = _cx
-            .time()
-            .duration_since(MonotonicTime::EPOCH)
-            .as_secs_f64();
+        let now = seconds_view(clock_ns(_cx.time()));
 
         debug!(
             "{} received packet {} ({} bytes) from flow {} at time {:.3}.",
@@ -329,7 +327,7 @@ impl PacketSink {
     }
 
     async fn log_report<'a>(&'a mut self, _: (), cx: &'a Context<Self>) {
-        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+        let now = seconds_view(clock_ns(cx.time()));
 
         match self {
             PacketSink::BasicPacketSink(sink) => {
@@ -359,13 +357,11 @@ impl Model for PacketSink {
     async fn init(self, cx: &Context<Self>, _env: &mut Self::Env) -> InitializedModel<Self> {
         let report_interval = CsvLogger::get_instance().get_report_interval();
         if report_interval < f64::MAX {
-            cx.schedule_periodic_event(
-                Duration::from_secs_f64(report_interval),
-                Duration::from_secs_f64(report_interval),
-                &Self::LOG_REPORT_SID,
-                (),
-            )
-            .unwrap();
+            let report_interval_ns = scenario_seconds_ns(report_interval, "sink report interval")
+                .expect("sink report interval must use exact integer nanoseconds");
+            let report_interval = Duration::from_nanos(report_interval_ns);
+            cx.schedule_periodic_event(report_interval, report_interval, &Self::LOG_REPORT_SID, ())
+                .unwrap();
         }
 
         self.into()

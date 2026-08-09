@@ -9,18 +9,17 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use indicatif_log_bridge::LogWrapper;
 use log::debug;
 
+use crate::flows::FlowFinishMsg;
+use crate::utils::exact_time::{clock_ns, scenario_seconds_ns};
+use days::topos::config::UIConfig;
 use nexosim::model::{
     BuildContext, Context, InitializedModel, Model, ModelRegistry, ProtoModel, SchedulableId,
 };
-use nexosim::time::MonotonicTime;
-
-use crate::flows::FlowFinishMsg;
-use days::topos::config::UIConfig;
 
 pub struct UserInterface {
     progress_bar: ProgressBar,
-    ui_interval: f64,
-    duration: f64,
+    ui_interval_ns: u64,
+    duration_ns: u64,
     num_sources: usize,
     finished_sources: usize,
 }
@@ -34,15 +33,20 @@ impl UserInterface {
         // Obtain the user interface progress interval from the configuration file
         let ui_config: UIConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of the user interface");
-        let duration = ui_config.duration.unwrap_or(1.);
-        let ui_interval = ui_config.ui_interval.unwrap_or(duration / 100.);
+        let duration_ns = scenario_seconds_ns(ui_config.duration.unwrap_or(1.0), "UI duration")
+            .unwrap_or_else(|error| panic!("{error}"));
+        let ui_interval_ns = match ui_config.ui_interval {
+            Some(interval) => scenario_seconds_ns(interval, "UI interval")
+                .unwrap_or_else(|error| panic!("{error}")),
+            None => (duration_ns / 100).max(1),
+        };
 
         let multi = MultiProgress::new();
         let env_logger = env_logger::Builder::from_default_env().build();
 
         LogWrapper::new(multi.clone(), env_logger);
 
-        let progress_bar = ProgressBar::new((duration / ui_interval) as u64);
+        let progress_bar = ProgressBar::new(duration_ns / ui_interval_ns);
         progress_bar.set_style(
             ProgressStyle::with_template(
                 "[{elapsed_precise}] {bar:90.magenta/blue/cyan} {pos:>7}/{len:7} {msg}",
@@ -54,8 +58,8 @@ impl UserInterface {
 
         UserInterface {
             progress_bar: pg,
-            ui_interval,
-            duration,
+            ui_interval_ns,
+            duration_ns,
             num_sources,
             finished_sources: 0,
         }
@@ -70,20 +74,16 @@ impl UserInterface {
 
         if self.finished_sources == self.num_sources {
             self.progress_bar
-                .inc((self.duration / self.ui_interval) as u64 - self.progress_bar.position());
+                .inc(self.duration_ns / self.ui_interval_ns - self.progress_bar.position());
 
-            let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
-            let delay = if self.duration > now {
-                self.duration - now
-            } else {
-                0.0
-            };
+            let now_ns = clock_ns(cx.time());
+            let delay_ns = self.duration_ns.saturating_sub(now_ns);
 
-            if delay <= 0.0 {
+            if delay_ns == 0 {
                 self.run((), cx);
             } else {
                 cx.schedule_event_fast(
-                    Duration::from_secs_f64(delay),
+                    Duration::from_nanos(delay_ns),
                     &Self::RUN_SID,
                     Self::run,
                     (),
@@ -94,17 +94,17 @@ impl UserInterface {
     }
 
     fn run(&mut self, _: (), cx: &Context<Self>) {
-        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+        let now_ns = clock_ns(cx.time());
 
-        if now >= self.duration {
+        if now_ns >= self.duration_ns {
             self.progress_bar.finish_and_clear();
         } else {
-            if self.progress_bar.position() < (self.duration / self.ui_interval) as u64 {
+            if self.progress_bar.position() < self.duration_ns / self.ui_interval_ns {
                 self.progress_bar.inc(1);
             }
 
             cx.schedule_event_fast(
-                Duration::from_secs_f64(self.ui_interval),
+                Duration::from_nanos(self.ui_interval_ns),
                 &Self::RUN_SID,
                 Self::run,
                 (),

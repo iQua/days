@@ -30,7 +30,7 @@ use crate::flows::route::{RouteTableError, Routing, compute_shortest_path_route_
 use crate::flows::sink::{PacketSink, PacketStatistics};
 use crate::flows::source::PacketSource;
 use crate::flows::wire::Wire;
-use crate::flows::{DistributionInfo, FlowSize, TrafficCharacteristics};
+use crate::flows::{FlowSize, TrafficCharacteristics};
 #[cfg(feature = "l2_pfc")]
 use crate::l2::link::Link;
 #[cfg(feature = "l2_pfc")]
@@ -49,6 +49,7 @@ use crate::schedulers::wrr::WRRServer;
 use crate::switches::SchedulingDiscipline;
 use crate::switches::switch::PacketSwitch;
 use crate::topos::build::HostAttachments;
+use crate::utils::exact_time::scenario_seconds_ns;
 use crate::utils::logger::CsvLogger;
 use crate::utils::time::set_time_quantum_ns;
 use crate::utils::tracing::start_wall_clock_concurrency_sampler;
@@ -495,7 +496,7 @@ pub fn installed_host_attachment_state(
         output_states: Arc::new(RwLock::new(HashMap::new())),
         mailbox_capacity,
         config_path: config_path.to_owned(),
-        duration: 0.0,
+        duration_ns: 0,
         app_source_cfg: AppBufferConfig::default(),
         host_attachment: Some(host_attachment),
     };
@@ -552,8 +553,8 @@ pub struct Topology {
     mailbox_capacity: usize,
     /// the path to the configuration file
     config_path: String,
-    /// the duration of the simulation
-    duration: f64,
+    /// the exact duration of the simulation on the integer event clock
+    duration_ns: u64,
     /// app source runtime config
     app_source_cfg: AppBufferConfig,
     /// Opt-in host-to-switch and switch-to-host attachment stages.
@@ -719,7 +720,9 @@ impl Topology {
 
         let ui_config: UIConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of the user interface");
-        let duration = ui_config.duration.unwrap_or(1500.);
+        let duration_ns =
+            scenario_seconds_ns(ui_config.duration.unwrap_or(1500.0), "simulation duration")
+                .unwrap_or_else(|error| panic!("{error}"));
 
         let concurrency_config: ConcurrencyConfig = toml::from_str(&content)
             .expect("Failed to deserialize the configuration of concurrency");
@@ -842,7 +845,7 @@ impl Topology {
             output_states,
             mailbox_capacity,
             config_path: config_path.to_string(),
-            duration,
+            duration_ns,
             app_source_cfg,
             host_attachment,
         }
@@ -897,12 +900,7 @@ impl Topology {
                 if propagation_ns == 0 {
                     scheduler_output.connect(PacketSwitch::packet_received, downstream_mbox);
                 } else {
-                    let propagation_seconds = propagation_ns as f64 / 1_000_000_000.0;
-                    let delay = DistributionInfo::Uniform {
-                        low: propagation_seconds,
-                        high: propagation_seconds,
-                    };
-                    let mut wire = Wire::new(crate::next_link_id(), delay);
+                    let mut wire = Wire::with_propagation_ns(crate::next_link_id(), propagation_ns);
                     let wire_mbox = Mailbox::with_capacity(self.mailbox_capacity);
                     scheduler_output.connect(Wire::packet_received, &wire_mbox);
                     wire.output
@@ -1521,7 +1519,6 @@ impl Topology {
         BTreeMap<usize, PendingHostAttachment>,
     ) {
         let installed = build_host_attachment_state(spec, hosts, flows);
-        let propagation_seconds = spec.propagation_ns as f64 / 1_000_000_000.0;
         let pending = installed
             .hosts
             .iter()
@@ -1577,11 +1574,8 @@ impl Topology {
                         .connect(PacketSwitch::packet_received, &demux_mbox);
                     (None, None)
                 } else {
-                    let delay = DistributionInfo::Uniform {
-                        low: propagation_seconds,
-                        high: propagation_seconds,
-                    };
-                    let mut injection_wire = Wire::new(crate::next_link_id(), delay.clone());
+                    let mut injection_wire =
+                        Wire::with_propagation_ns(crate::next_link_id(), spec.propagation_ns);
                     let injection_wire_mbox = Mailbox::with_capacity(mailbox_capacity);
                     injection
                         .port
@@ -1594,7 +1588,8 @@ impl Topology {
                         .output
                         .connect(PacketSwitch::packet_received, edge_mbox);
 
-                    let mut delivery_wire = Wire::new(crate::next_link_id(), delay);
+                    let mut delivery_wire =
+                        Wire::with_propagation_ns(crate::next_link_id(), spec.propagation_ns);
                     let delivery_wire_mbox = Mailbox::with_capacity(mailbox_capacity);
                     delivery
                         .port
@@ -2004,7 +1999,7 @@ impl Topology {
 
         // creates and activates a UserInterface coroutine
         self = self.activate_ui(ui_mbox);
-        let duration = self.duration;
+        let duration = Duration::from_nanos(self.duration_ns);
         let config_path = self.config_path.clone();
 
         // activates all the switches and initializes the simulation
@@ -2019,7 +2014,7 @@ impl Topology {
 
         // starts the simulation
         let stepping_timer = std::time::Instant::now();
-        let step_result = sim.step_until(Duration::from_secs_f64(duration));
+        let step_result = sim.step_until(duration);
         let stepping_elapsed = stepping_timer.elapsed();
         if let Some(stats) = wall_sampler.as_mut().and_then(|s| s.stop()) {
             info!(
@@ -2198,7 +2193,7 @@ mod ring_allreduce_serialization_tests {
             output_states: Arc::new(RwLock::new(HashMap::new())),
             mailbox_capacity: 16,
             config_path: String::new(),
-            duration: 1.0,
+            duration_ns: 1_000_000_000,
             app_source_cfg: crate::flows::app_source::AppBufferConfig::default(),
             host_attachment: None,
         };
@@ -2397,7 +2392,7 @@ mod ring_allreduce_serialization_tests {
             output_states: Arc::new(RwLock::new(HashMap::new())),
             mailbox_capacity: 16,
             config_path: String::new(),
-            duration: 1.0,
+            duration_ns: 1_000_000_000,
             app_source_cfg: crate::flows::app_source::AppBufferConfig::default(),
             host_attachment: None,
         };
@@ -2503,7 +2498,7 @@ mod ring_allreduce_serialization_tests {
             output_states: Arc::new(RwLock::new(HashMap::new())),
             mailbox_capacity: 16,
             config_path: String::new(),
-            duration: 1.0,
+            duration_ns: 1_000_000_000,
             app_source_cfg: crate::flows::app_source::AppBufferConfig::default(),
             host_attachment: None,
         };
@@ -2601,7 +2596,7 @@ mod ring_allreduce_serialization_tests {
             output_states: Arc::new(RwLock::new(HashMap::new())),
             mailbox_capacity: 16,
             config_path: String::new(),
-            duration: 1.0,
+            duration_ns: 1_000_000_000,
             app_source_cfg: crate::flows::app_source::AppBufferConfig::default(),
             host_attachment: None,
         };
@@ -2668,7 +2663,7 @@ mod ring_allreduce_serialization_tests {
             output_states: Arc::new(RwLock::new(HashMap::new())),
             mailbox_capacity: 16,
             config_path: String::new(),
-            duration: 1.0,
+            duration_ns: 1_000_000_000,
             app_source_cfg: crate::flows::app_source::AppBufferConfig::default(),
             host_attachment: None,
         };
@@ -2712,7 +2707,7 @@ mod ring_allreduce_serialization_tests {
             output_states: Arc::new(RwLock::new(HashMap::new())),
             mailbox_capacity: 16,
             config_path: String::new(),
-            duration: 1.0,
+            duration_ns: 1_000_000_000,
             app_source_cfg: crate::flows::app_source::AppBufferConfig::default(),
             host_attachment: None,
         };
@@ -2767,7 +2762,7 @@ mod ring_allreduce_serialization_tests {
             output_states: Arc::new(RwLock::new(HashMap::new())),
             mailbox_capacity: 16,
             config_path: String::new(),
-            duration: 1.0,
+            duration_ns: 1_000_000_000,
             app_source_cfg: crate::flows::app_source::AppBufferConfig::default(),
             host_attachment: None,
         };

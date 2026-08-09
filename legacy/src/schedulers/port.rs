@@ -21,14 +21,16 @@ use crate::schedulers::drop::{
 };
 use crate::schedulers::state::QueueState;
 use crate::schedulers::{ReportStatistics, SchedulerReport};
-use crate::utils::exact_time::serialization_ns;
+use crate::utils::exact_time::{clock_ns, scenario_seconds_ns, seconds_view, serialization_ns};
 use crate::utils::logger::{CsvLogger, Report, ReportTiming};
 
 #[cfg(feature = "lean")]
 use crate::schedulers::drop::DropDecision;
 #[cfg(feature = "lean")]
 use crate::utils::logger::{AqmEventKind, AqmEventRow, AqmLoggedEcnField};
-use crate::utils::time::{quantize_after, quantize_time};
+use crate::utils::time::quantize_after;
+#[cfg(test)]
+use crate::utils::time::quantize_time;
 
 #[cfg(feature = "lean")]
 fn to_ns(time_s: f64) -> u64 {
@@ -333,7 +335,7 @@ impl Port {
 
     pub async fn send_and_run(&mut self, packet: Packet, cx: &Context<Self>) {
         let mut packet = packet;
-        let now = quantize_time(cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64());
+        let now = seconds_view(clock_ns(cx.time()));
         packet.departure_update(now);
         self.send(packet).await;
 
@@ -352,7 +354,7 @@ impl Port {
             );
             return;
         };
-        let now = quantize_time(cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64());
+        let now = seconds_view(clock_ns(cx.time()));
         packet.departure_update(now);
         self.send(packet).await;
 
@@ -396,7 +398,7 @@ impl Port {
                 );
             }
 
-            let run_time = quantize_time(now);
+            let run_time = seconds_view(clock_ns(cx.time()));
             self.time = run_time;
 
             if self.in_flight != 0 {
@@ -443,7 +445,7 @@ impl Port {
     }
 
     async fn log_report<'a>(&'a mut self, _: (), cx: &'a Context<Self>) {
-        let now = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
+        let now = seconds_view(clock_ns(cx.time()));
 
         let report = self.prepare_report(now);
         CsvLogger::log_report(Report::SchedulerReport(report), ReportTiming::InProgress);
@@ -523,13 +525,12 @@ impl Model for Port {
         let report_interval = CsvLogger::get_instance().get_report_interval();
 
         if report_interval < f64::MAX {
-            cx.schedule_periodic_event(
-                Duration::from_secs_f64(report_interval),
-                Duration::from_secs_f64(report_interval),
-                &Self::LOG_REPORT_SID,
-                (),
-            )
-            .unwrap();
+            let report_interval_ns =
+                scenario_seconds_ns(report_interval, "scheduler report interval")
+                    .expect("scheduler report interval must use exact integer nanoseconds");
+            let report_interval = Duration::from_nanos(report_interval_ns);
+            cx.schedule_periodic_event(report_interval, report_interval, &Self::LOG_REPORT_SID, ())
+                .unwrap();
         }
 
         self.into()
