@@ -85,7 +85,15 @@ const RTO_FLOOR_NS: u64 = 1_000_000_000;
 const MEASURED_LATEST_RTO_DEADLINE_NS: u64 = 1_013_783_350;
 /// The MEASURED drain instant of the committed fixture on scalar: 8,192/8,192 complete, zero drops,
 /// zero retransmitted bytes, nothing resident, nothing pending, over 78,999 rounds.
+///
+/// THIS IS E4'S OWN METRIC and it is ASSERTED against a run by `e4_runs_to_completion_and_drains`,
+/// not merely quoted: neither `RunResult` nor `RunSummary` carries a time field, so the two frozen
+/// anchors cannot cover it, and without a gate the executor's TCP timing could move while all the
+/// other gates stayed green and five committed artifacts quietly went false.
 const MEASURED_DRAIN_NS: u64 = 96_054_393;
+/// The MEASURED executor round count of that same run. Gated with `MEASURED_DRAIN_NS`, and for the
+/// same reason: `RoundMetrics` is instrumentation, not fingerprinted state.
+const MEASURED_ROUNDS: usize = 78_999;
 
 /// The documented prefix the scalar anchor is frozen at: GeDES's own F5 span, and E2's horizon.
 const PREFIX_ANCHOR_NS: u64 = 1_152_000;
@@ -814,6 +822,10 @@ fn e4_completion_anchor_is_identical_across_local_backends() {
 /// These are E4's definition of a valid run and every arm reproduces them in its own vocabulary:
 /// 8,192 of 8,192 flows byte-complete, the exact GeDES byte total delivered, nothing dropped
 /// unacknowledged, nothing left resident, and the drain strictly inside the horizon.
+///
+/// It is ALSO the only gate on E4's headline metric. The drain instant (`MEASURED_DRAIN_NS`) and
+/// the round count (`MEASURED_ROUNDS`) are asserted against this run, because neither is inside
+/// the two frozen fingerprints — see the constants' own doc comments.
 #[test]
 #[ignore = "explicit P12 E4 count gates: full 4 s horizon, 104 GB of payload"]
 fn e4_runs_to_completion_and_drains() {
@@ -944,6 +956,26 @@ fn e4_runs_to_completion_and_drains() {
         drain_ns < HORIZON_NS,
         "the horizon was BINDING (drain {drain_ns} ns >= {HORIZON_NS} ns): E4 is a completion-time \
          fixture, not a fixed-window one"
+    );
+
+    // E4'S OWN METRIC, GATED — not merely printed. The drain instant and the round count are the
+    // numbers E4 exists to produce and they are frozen in five artifacts (this file, the fixture
+    // header, the generator, and evidence/P12/e4-authoring.md §1/§5/§6.2/§6.4/§9), yet NEITHER is
+    // inside a fingerprint: `RunResult` and `RunSummary` carry no time field at all, and the drain
+    // lives in `ScalarRoundRun::rounds`, which is instrumentation. Before this assertion existed,
+    // a millisecond of executor TCP drift would have left all fifteen gates green while every one
+    // of those artifacts silently went false. That is the vacuous-gate defect class T21 §4.7 had
+    // to fix in this suite's siblings, applied to E4's headline number.
+    assert_eq!(
+        drain_ns, MEASURED_DRAIN_NS,
+        "E4's DRAIN INSTANT moved. This is E4's own time-to-completion metric; if the change is \
+         intended, the fixture header, the generator, this constant and \
+         evidence/P12/e4-authoring.md must all move with it in the same commit"
+    );
+    assert_eq!(
+        run.rounds.len(),
+        MEASURED_ROUNDS,
+        "E4's EXECUTOR ROUND COUNT moved; same obligation as the drain instant above"
     );
 }
 
