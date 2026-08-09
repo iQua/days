@@ -1,0 +1,58 @@
+# P12 E5 PRIMARY: frozen wide TCP, k=32, queue 200. GENERATED -- do not hand-edit.
+#
+# Regenerate with: python3 configs/benchmarks/p12/gen_e5_wide_tcp.py
+# The generator preserves the design probe's single `[[flow_set]]`; the test suite
+# compares regenerated files byte-for-byte and pins the ruled semantic form.
+#
+# FROZEN CONTRACT (evidence/P12/e5-design.md):
+#   topology              FatTree k=32, hosts_per_edge=16 (8,192 hosts)
+#   fabric                100 Gbit/s, 1,000 ns propagation, FatTreeEcmp
+#   queue                 FIFO TailDrop, 200 packets (PRIMARY)
+#   transport             Days AGO Reno, MSS 1,460 B, immediate 40 B ACK
+#   traffic               one fixed 1 MiB flow per host, SwitchOffsetHalf
+#   starts / seed         all 0 ns / 51001
+#   horizon               3 s; acceptance requires natural drain before it
+#   total demand          8,589,934,592 B
+#   frozen scalar result  549 drops / 9,551 retransmission attempts
+#
+# FIXTURE-FORM RULING. E5 retains the probe's `[[flow_set]]` semantic identity. Round 1's
+# explicit rewrite rerouted 8,158/8,192 flows and did not complete; E4 remains explicit
+# because its flows have distinct byte sizes and starts. See evidence/P12/e5-authoring.md.
+seed = 51001
+duration = 3.000000000
+threading = "single"
+log_path = "logs/p12/e5_wide_k32_q200"
+
+[topology]
+category = "FatTree"
+
+[topology.fat_tree]
+k = 32
+hosts_per_edge = 16
+
+[switch]
+port_rate = 100000000000
+capacity = 200
+weights = [1]
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link]
+propagation_ns = 1000
+
+[routing]
+policy = "FatTreeEcmp"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+pairing = "SwitchOffsetHalf"
+
+[flow_set.traffic]
+initial_delay = 0.000000000
+size = 1048576
+arr_dist = {type = "Uniform", low = 1.0, high = 1.0}
+pkt_size_dist = {type = "DiscreteUniform", low = 1460, high = 1460}
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
