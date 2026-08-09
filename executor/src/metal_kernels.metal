@@ -4985,13 +4985,81 @@ static inline ulong load_round_partial(
     ];
 }
 
-kernel void days_horizon(
-    device ulong *control [[buffer(0)]],
+// T21 fix 1 — the horizon's Θ(N) FEL-root sweep, on the whole grid. Transliterated word for word
+// from `cuda_kernels.cu`; see that kernel's header for the partition-invariance argument.
+kernel void days_horizon_sweep(
+    const device ulong *control [[buffer(0)]],
     const device ulong *params [[buffer(1)]],
     const device ulong *fel_meta [[buffer(7)]],
     const device ulong *fel_records [[buffer(8)]],
     device ulong *stream_state [[buffer(25)]],
     const device ulong *stream_records [[buffer(26)]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint block [[threadgroup_position_in_grid]],
+    uint block_size [[threads_per_threadgroup]],
+    uint blocks [[threadgroups_per_grid]]
+) {
+    threadgroup ulong minima[1024];
+    threadgroup uint validity[1024];
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 0 ||
+        control[C_ROUNDS] >= params[P_ROUND_CAPACITY]
+    ) {
+        return;
+    }
+    ulong first = ulong(block) * ulong(block_size) + ulong(lane);
+    ulong stride = ulong(blocks) * ulong(block_size);
+    ulong minimum = 0;
+    bool valid = false;
+    for (ulong node = first; node < params[P_NODE_COUNT]; node += stride) {
+        ulong candidate;
+        bool present = fel_root_time(
+            node,
+            params,
+            fel_meta,
+            fel_records,
+            stream_state,
+            stream_records,
+            candidate
+        );
+        // T21 fix 2: the round's single evaluation of this node's FEL root.
+        store_fel_root(stream_state, params, node, present, candidate);
+        if (present && (!valid || candidate < minimum)) {
+            minimum = candidate;
+            valid = true;
+        }
+    }
+    minima[lane] = minimum;
+    validity[lane] = valid ? 1 : 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride_lanes = 512; stride_lanes != 0; stride_lanes >>= 1) {
+        if (lane < stride_lanes) {
+            if (
+                validity[lane + stride_lanes] != 0 &&
+                (
+                    validity[lane] == 0 ||
+                    minima[lane + stride_lanes] < minima[lane]
+                )
+            ) {
+                minima[lane] = minima[lane + stride_lanes];
+                validity[lane] = 1;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) {
+        store_round_partial(stream_state, params, block, 0, minima[0]);
+        store_round_partial(stream_state, params, block, 1, ulong(validity[0]));
+    }
+}
+
+// T21 fix 1 — the horizon combine. Transliterated word for word from `cuda_kernels.cu`.
+kernel void days_horizon(
+    device ulong *control [[buffer(0)]],
+    const device ulong *params [[buffer(1)]],
+    const device ulong *stream_state [[buffer(25)]],
     uint lane [[thread_index_in_threadgroup]]
 ) {
     threadgroup ulong minima[1024];
@@ -5006,20 +5074,16 @@ kernel void days_horizon(
     }
     ulong minimum = 0;
     bool valid = false;
-    for (ulong node = lane; node < params[P_NODE_COUNT]; node += 1024) {
-        ulong candidate;
-        bool present = fel_root_time(
-            node,
-            params,
-            fel_meta,
-            fel_records,
-            stream_state,
-            stream_records,
-            candidate
-        );
-        // T21 fix 2: the round's single evaluation of this node's FEL root.
-        store_fel_root(stream_state, params, node, present, candidate);
-        if (present && (!valid || candidate < minimum)) {
+    for (
+        ulong block = lane;
+        block < CONTROL_SWEEP_BLOCKS;
+        block += 1024
+    ) {
+        if (load_round_partial(stream_state, params, block, 1) == 0) {
+            continue;
+        }
+        ulong candidate = load_round_partial(stream_state, params, block, 0);
+        if (!valid || candidate < minimum) {
             minimum = candidate;
             valid = true;
         }

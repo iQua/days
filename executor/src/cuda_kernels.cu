@@ -4714,6 +4714,80 @@ static __device__ inline ulong load_round_partial(
     ];
 }
 
+// T21 fix 1 — the horizon's Θ(N) FEL-root sweep, on the whole grid.
+//
+// This is the most expensive of the five re-gridded phases: it is the one that pays `fel_peek` per
+// LP, which `evidence/P12/perround-upperbound.md` §1.5.2 priced at ≈208 useful bytes per LP.
+//
+// The reduction is `min` under a validity flag. `min` is commutative, associative and idempotent,
+// with identity "invalid", so the reduced value is the same for EVERY partition of the LPs — which
+// is why moving from one block's 1,024-lane stride to a 128-block grid-stride cannot move a
+// complete-state byte. Each block publishes `{minimum, validity}`; `days_horizon` combines them in
+// the next dispatch.
+extern "C" __global__ void days_horizon_sweep(DAYS_BUFFERS) {
+    uint lane = threadIdx.x;
+    __shared__ ulong minima[1024];
+    __shared__ uint validity[1024];
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 0 ||
+        control[C_ROUNDS] >= params[P_ROUND_CAPACITY]
+    ) {
+        return;
+    }
+    ulong first = ulong(blockIdx.x) * ulong(blockDim.x) + ulong(threadIdx.x);
+    ulong stride = ulong(gridDim.x) * ulong(blockDim.x);
+    ulong minimum = 0;
+    bool valid = false;
+    for (ulong node = first; node < params[P_NODE_COUNT]; node += stride) {
+        ulong candidate;
+        bool present = fel_root_time(
+            node,
+            params,
+            fel_meta,
+            fel_records,
+            stream_state,
+            stream_records,
+            candidate
+        );
+        // T21 fix 2: the round's single evaluation of this node's FEL root.
+        store_fel_root(stream_state, params, node, present, candidate);
+        if (present && (!valid || candidate < minimum)) {
+            minimum = candidate;
+            valid = true;
+        }
+    }
+    minima[lane] = minimum;
+    validity[lane] = valid ? 1 : 0;
+    __syncthreads();
+    for (uint stride_lanes = 512; stride_lanes != 0; stride_lanes >>= 1) {
+        if (lane < stride_lanes) {
+            if (
+                validity[lane + stride_lanes] != 0 &&
+                (
+                    validity[lane] == 0 ||
+                    minima[lane + stride_lanes] < minima[lane]
+                )
+            ) {
+                minima[lane] = minima[lane + stride_lanes];
+                validity[lane] = 1;
+            }
+        }
+        __syncthreads();
+    }
+    if (lane == 0) {
+        store_round_partial(stream_state, params, blockIdx.x, 0, minima[0]);
+        store_round_partial(stream_state, params, blockIdx.x, 1, ulong(validity[0]));
+    }
+}
+
+// T21 fix 1 — the horizon combine. Reduces `days_horizon_sweep`'s per-block partials and keeps
+// every control write, so the frontier and the exclusive horizon are still decided in one place.
+//
+// The guard below is `days_horizon_sweep`'s, word for word. Nothing between the two dispatches
+// writes a word the guard reads — the sweep writes only the FEL cache and its own partial row —
+// so both dispatches take the same branch, and the combine never reads partials the sweep skipped.
 extern "C" __global__ void days_horizon(DAYS_BUFFERS) {
     uint lane = threadIdx.x;
     __shared__ ulong minima[1024];
@@ -4728,20 +4802,16 @@ extern "C" __global__ void days_horizon(DAYS_BUFFERS) {
     }
     ulong minimum = 0;
     bool valid = false;
-    for (ulong node = lane; node < params[P_NODE_COUNT]; node += 1024) {
-        ulong candidate;
-        bool present = fel_root_time(
-            node,
-            params,
-            fel_meta,
-            fel_records,
-            stream_state,
-            stream_records,
-            candidate
-        );
-        // T21 fix 2: the round's single evaluation of this node's FEL root.
-        store_fel_root(stream_state, params, node, present, candidate);
-        if (present && (!valid || candidate < minimum)) {
+    for (
+        ulong block = lane;
+        block < CONTROL_SWEEP_BLOCKS;
+        block += 1024
+    ) {
+        if (load_round_partial(stream_state, params, block, 1) == 0) {
+            continue;
+        }
+        ulong candidate = load_round_partial(stream_state, params, block, 0);
+        if (!valid || candidate < minimum) {
             minimum = candidate;
             valid = true;
         }

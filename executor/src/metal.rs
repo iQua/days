@@ -226,6 +226,7 @@ impl AttemptPhase {
 /// the `worklist` `days_round_prepare` wrote — so no kernel synchronizes across threadgroups.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AttemptKernel {
+    HorizonSweep,
     Horizon,
     RoundReset,
     Compaction,
@@ -255,7 +256,12 @@ impl DispatchGeometry {
     }
 }
 
-const ATTEMPT_DISPATCHES: [(AttemptKernel, AttemptPhase, DispatchGeometry); 9] = [
+const ATTEMPT_DISPATCHES: [(AttemptKernel, AttemptPhase, DispatchGeometry); 10] = [
+    (
+        AttemptKernel::HorizonSweep,
+        AttemptPhase::Horizon,
+        DispatchGeometry::ControlSweep,
+    ),
     (
         AttemptKernel::Horizon,
         AttemptPhase::Horizon,
@@ -5059,6 +5065,8 @@ struct DirectMetal {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     initialization_timings: MetalInitializationTimings,
+    /// T21 fix 1: the Θ(N) FEL-root sweep, on the full grid.
+    horizon_sweep_pipeline: MetalPipeline,
     horizon_pipeline: MetalPipeline,
     /// T21 fix 1: `days_round_prepare`'s Θ(N) + Θ(C) resets, on the full grid.
     reset_pipeline: MetalPipeline,
@@ -5086,6 +5094,7 @@ impl DirectMetal {
             .ok_or_else(|| MetalError::Unavailable("command queue creation failed".into()))?;
         let source = include_str!("metal_kernels.metal");
         let pipeline_started = Instant::now();
+        let horizon_sweep_pipeline = create_pipeline(&device, source, "days_horizon_sweep")?;
         let horizon_pipeline = create_pipeline(&device, source, "days_horizon")?;
         let reset_pipeline = create_pipeline(&device, source, "days_round_reset")?;
         let prepare_pipeline = create_pipeline(&device, source, "days_round_prepare")?;
@@ -5098,6 +5107,7 @@ impl DirectMetal {
         let compact_pipeline = create_pipeline(&device, source, "days_compact_gather")?;
         let pipeline_creation_ns = duration_ns(pipeline_started.elapsed());
         for (name, pipeline) in [
+            ("horizon-sweep", &horizon_sweep_pipeline),
             ("horizon", &horizon_pipeline),
             ("round-reset", &reset_pipeline),
             ("round-prepare", &prepare_pipeline),
@@ -5127,6 +5137,7 @@ impl DirectMetal {
                 pipeline_creation_ns,
                 reused_cached_executor: false,
             },
+            horizon_sweep_pipeline,
             horizon_pipeline,
             reset_pipeline,
             prepare_pipeline,
@@ -5616,6 +5627,7 @@ impl DirectMetal {
         merge_pipeline: &'a ProtocolObject<dyn MTLComputePipelineState>,
     ) -> &'a ProtocolObject<dyn MTLComputePipelineState> {
         match kernel {
+            AttemptKernel::HorizonSweep => &self.horizon_sweep_pipeline,
             AttemptKernel::Horizon => &self.horizon_pipeline,
             AttemptKernel::RoundReset => &self.reset_pipeline,
             AttemptKernel::Compaction => &self.prepare_pipeline,
@@ -6019,7 +6031,7 @@ mod tests {
         }
 
         // T21 fix 1: the re-gridded sweeps take the whole grid at the retained threadgroup width.
-        for kernel in [AttemptKernel::RoundReset] {
+        for kernel in [AttemptKernel::HorizonSweep, AttemptKernel::RoundReset] {
             let (_, _, geometry) = ATTEMPT_DISPATCHES
                 .into_iter()
                 .find(|(candidate, _, _)| *candidate == kernel)
