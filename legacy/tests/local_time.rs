@@ -36,5 +36,5 @@ fn test_local_time() {
     let topology = Topology::new(path, graph.clone(), hosts, flows, collectives);
 
     // runs the topology
-    topology.run(graph);
+    topology.run(graph).unwrap();
 }

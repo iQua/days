@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use indicatif_log_bridge::LogWrapper;
-use log::{debug, error, info};
+use log::{debug, info};
 use petgraph::graph::{NodeIndex, UnGraph};
 use serde::Deserialize;
 
@@ -1940,7 +1940,7 @@ impl Topology {
     }
 
     /// Activates all the switches and initializes the simulation.
-    fn init_sim(mut self) -> Simulation {
+    fn init_sim(mut self) -> Result<Simulation, String> {
         info!(
             "Activating all {} switches and initializing the simulation.",
             self.switches.len(),
@@ -1951,13 +1951,12 @@ impl Topology {
             self.sim_init = self.sim_init.add_model(switch, switch_mbox, "Switch");
         }
 
-        match self.sim_init.init(MonotonicTime::EPOCH) {
-            Ok(simulation) => simulation,
-            Err(error) => panic!("Problem when initializing the simulation: {error:?}"),
-        }
+        self.sim_init
+            .init(MonotonicTime::EPOCH)
+            .map_err(|error| format!("Problem when initializing the simulation: {error:?}"))
     }
 
-    pub fn run(mut self, graph: UnGraph<usize, ()>) {
+    pub fn run(mut self, graph: UnGraph<usize, ()>) -> Result<(), String> {
         let mut statistics = SinkStatistics::default();
 
         // initializes the logger
@@ -2009,7 +2008,7 @@ impl Topology {
         let config_path = self.config_path.clone();
 
         // activates all the switches and initializes the simulation
-        let mut sim = self.init_sim();
+        let mut sim = self.init_sim()?;
 
         // starts the performance measurement clock
         let mut wall_sampler = start_wall_clock_concurrency_sampler(&config_path);
@@ -2022,13 +2021,6 @@ impl Topology {
         let stepping_timer = std::time::Instant::now();
         let step_result = sim.step_until(Duration::from_secs_f64(duration));
         let stepping_elapsed = stepping_timer.elapsed();
-        match step_result {
-            Ok(()) => {}
-            Err(err) => {
-                error!("Simulation stopped early: {err}");
-            }
-        }
-
         if let Some(stats) = wall_sampler.as_mut().and_then(|s| s.stop()) {
             info!(
                 "Concurrency: peak {}, average {:.3} (wall-clock, {:.3}s).",
@@ -2037,6 +2029,7 @@ impl Topology {
                 stats.elapsed.as_secs_f64()
             );
         }
+        step_result.map_err(|err| format!("Simulation stopped early: {err}"))?;
         sim = statistics.collect_statistics(sim);
 
         // logs the remaining reports
@@ -2061,6 +2054,7 @@ impl Topology {
             "Elapsed wall-clock time: {:.3} seconds.",
             elapsed.as_secs_f64()
         );
+        Ok(())
     }
 }
 

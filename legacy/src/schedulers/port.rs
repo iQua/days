@@ -21,6 +21,7 @@ use crate::schedulers::drop::{
 };
 use crate::schedulers::state::QueueState;
 use crate::schedulers::{ReportStatistics, SchedulerReport};
+use crate::utils::exact_time::serialization_ns;
 use crate::utils::logger::{CsvLogger, Report, ReportTiming};
 
 #[cfg(feature = "lean")]
@@ -407,22 +408,18 @@ impl Port {
             };
 
             packet.queueing_delay_update(run_time);
-            let timeout = packet.size as f64 * 8.0 / self.rate;
-            let departure_time = quantize_after(run_time, timeout);
+            let delay_ns = serialization_ns(packet.size, self.rate)
+                .expect("Port requires a finite positive integral bit rate");
+            let delay = Duration::from_nanos(delay_ns);
+            let departure_time = quantize_after(run_time, delay.as_secs_f64());
             packet.departure_update(departure_time);
 
             self.packet_sent(departure_time, &packet);
 
-            let delay = (departure_time - run_time).max(0.0);
             self.scheduled_departures.push_back(packet);
             self.in_flight = 1;
-            cx.schedule_event_fast(
-                Duration::from_secs_f64(delay),
-                &Self::SEND_SCHEDULED_SID,
-                Self::send_scheduled,
-                (),
-            )
-            .unwrap();
+            cx.schedule_event_fast(delay, &Self::SEND_SCHEDULED_SID, Self::send_scheduled, ())
+                .unwrap();
         }
     }
 
@@ -433,8 +430,10 @@ impl Port {
 
         if let Some(mut packet) = self.queue.pop_front() {
             packet.queueing_delay_update(run_time);
-            let timeout = packet.size as f64 * 8.0 / self.rate;
-            let departure_time = quantize_after(run_time, timeout);
+            let delay_ns = serialization_ns(packet.size, self.rate)
+                .expect("Port requires a finite positive integral bit rate");
+            let departure_time =
+                quantize_after(run_time, Duration::from_nanos(delay_ns).as_secs_f64());
             packet.departure_update(departure_time);
 
             self.busy_until = departure_time;

@@ -93,6 +93,5 @@ pub fn run_simulation_from_config(config_path: &str) -> Result<(), String> {
     let collectives = Collective::collectives_from_config(config_path, hosts.host_ids());
 
     let topology = Topology::new(config_path, graph.clone(), hosts, flows, collectives);
-    topology.run(graph);
-    Ok(())
+    topology.run(graph)
 }
