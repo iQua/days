@@ -5075,6 +5075,67 @@ extern "C" __global__ __launch_bounds__(1024) void days_round(DAYS_BUFFERS) {
 // transition. Probe-minus-control measures the marginal stress cost; a per-LP counter reports
 // real local pushes from the unchanged body.
 
+// T21 fix 1 — the round-control scans, on the whole grid.
+//
+// Two scans, two partition-free reductions. `first_error` is a `min` over the LP indices whose
+// `L_ERROR` is set: each thread takes the smallest such index in ITS OWN subsequence (that is what
+// the `break` computes), and the tree takes the smallest of those, so the answer is the global
+// smallest for every partition. `unfinished` is an `OR`. Neither depends on how the LPs were
+// divided, so re-gridding cannot move a control word.
+extern "C" __global__ void days_round_control_sweep(DAYS_BUFFERS) {
+    uint lane = threadIdx.x;
+    __shared__ ulong first_errors[1024];
+    __shared__ uint unfinished_lanes[1024];
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 1
+    ) {
+        return;
+    }
+
+    ulong first = ulong(blockIdx.x) * ulong(blockDim.x) + ulong(threadIdx.x);
+    ulong stride = ulong(gridDim.x) * ulong(blockDim.x);
+    ulong first_error = NONE;
+    for (ulong node = first; node < params[P_NODE_COUNT]; node += stride) {
+        ulong state = node * LP_STATE_WORDS;
+        if (lp_state[state + L_ERROR] != 0) {
+            first_error = node;
+            break;
+        }
+    }
+    uint unfinished = 0;
+    for (ulong active = first; active < control[C_ACTIVE]; active += stride) {
+        ulong node = worklist[active];
+        if (lp_state[node * LP_STATE_WORDS + L_FINISHED] == 0) {
+            unfinished = 1;
+            break;
+        }
+    }
+    first_errors[lane] = first_error;
+    unfinished_lanes[lane] = unfinished;
+    __syncthreads();
+    for (uint stride_lanes = 512; stride_lanes != 0; stride_lanes >>= 1) {
+        if (lane < stride_lanes) {
+            first_errors[lane] = min(first_errors[lane], first_errors[lane + stride_lanes]);
+            unfinished_lanes[lane] |= unfinished_lanes[lane + stride_lanes];
+        }
+        __syncthreads();
+    }
+    if (lane == 0) {
+        store_round_partial(stream_state, params, blockIdx.x, 0, first_errors[0]);
+        store_round_partial(
+            stream_state,
+            params,
+            blockIdx.x,
+            1,
+            ulong(unfinished_lanes[0])
+        );
+    }
+}
+
+// T21 fix 1 — the round-control combine. The guard is `days_round_control_sweep`'s, word for word,
+// and nothing between the two dispatches writes a word it reads.
 extern "C" __global__ void days_round_control(DAYS_BUFFERS) {
     uint lane = threadIdx.x;
     __shared__ ulong first_errors[1024];
@@ -5088,20 +5149,17 @@ extern "C" __global__ void days_round_control(DAYS_BUFFERS) {
     }
 
     ulong first_error = NONE;
-    for (ulong node = lane; node < params[P_NODE_COUNT]; node += 1024) {
-        ulong state = node * LP_STATE_WORDS;
-        if (lp_state[state + L_ERROR] != 0) {
-            first_error = node;
-            break;
-        }
-    }
     uint unfinished = 0;
-    for (ulong active = lane; active < control[C_ACTIVE]; active += 1024) {
-        ulong node = worklist[active];
-        if (lp_state[node * LP_STATE_WORDS + L_FINISHED] == 0) {
-            unfinished = 1;
-            break;
-        }
+    for (
+        ulong block = lane;
+        block < CONTROL_SWEEP_BLOCKS;
+        block += 1024
+    ) {
+        first_error = min(
+            first_error,
+            load_round_partial(stream_state, params, block, 0)
+        );
+        unfinished |= uint(load_round_partial(stream_state, params, block, 1) != 0);
     }
     first_errors[lane] = first_error;
     unfinished_lanes[lane] = unfinished;

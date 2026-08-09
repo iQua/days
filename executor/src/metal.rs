@@ -231,6 +231,7 @@ enum AttemptKernel {
     RoundReset,
     Compaction,
     DrainExecute,
+    ContinuationControlSweep,
     ContinuationControl,
     ExchangePrefix,
     ExchangeScatter,
@@ -256,7 +257,7 @@ impl DispatchGeometry {
     }
 }
 
-const ATTEMPT_DISPATCHES: [(AttemptKernel, AttemptPhase, DispatchGeometry); 10] = [
+const ATTEMPT_DISPATCHES: [(AttemptKernel, AttemptPhase, DispatchGeometry); 11] = [
     (
         AttemptKernel::HorizonSweep,
         AttemptPhase::Horizon,
@@ -281,6 +282,11 @@ const ATTEMPT_DISPATCHES: [(AttemptKernel, AttemptPhase, DispatchGeometry); 10] 
         AttemptKernel::DrainExecute,
         AttemptPhase::DrainExecute,
         DispatchGeometry::ActiveWorklist,
+    ),
+    (
+        AttemptKernel::ContinuationControlSweep,
+        AttemptPhase::ContinuationControl,
+        DispatchGeometry::ControlSweep,
     ),
     (
         AttemptKernel::ContinuationControl,
@@ -5072,6 +5078,8 @@ struct DirectMetal {
     reset_pipeline: MetalPipeline,
     prepare_pipeline: MetalPipeline,
     round_pipeline: MetalPipeline,
+    /// T21 fix 1: the round-control scans, on the full grid.
+    control_sweep_pipeline: MetalPipeline,
     control_pipeline: MetalPipeline,
     exchange_prefix_pipeline: MetalPipeline,
     exchange_scatter_pipeline: MetalPipeline,
@@ -5099,6 +5107,7 @@ impl DirectMetal {
         let reset_pipeline = create_pipeline(&device, source, "days_round_reset")?;
         let prepare_pipeline = create_pipeline(&device, source, "days_round_prepare")?;
         let round_pipeline = create_pipeline(&device, source, "days_round")?;
+        let control_sweep_pipeline = create_pipeline(&device, source, "days_round_control_sweep")?;
         let control_pipeline = create_pipeline(&device, source, "days_round_control")?;
         let exchange_prefix_pipeline = create_pipeline(&device, source, "days_exchange_prefix")?;
         let exchange_scatter_pipeline = create_pipeline(&device, source, "days_exchange_scatter")?;
@@ -5111,6 +5120,7 @@ impl DirectMetal {
             ("horizon", &horizon_pipeline),
             ("round-reset", &reset_pipeline),
             ("round-prepare", &prepare_pipeline),
+            ("round-control-sweep", &control_sweep_pipeline),
             ("round-control", &control_pipeline),
             ("exchange-prefix", &exchange_prefix_pipeline),
             ("round-finalize", &finalize_pipeline),
@@ -5142,6 +5152,7 @@ impl DirectMetal {
             reset_pipeline,
             prepare_pipeline,
             round_pipeline,
+            control_sweep_pipeline,
             control_pipeline,
             exchange_prefix_pipeline,
             exchange_scatter_pipeline,
@@ -5632,6 +5643,7 @@ impl DirectMetal {
             AttemptKernel::RoundReset => &self.reset_pipeline,
             AttemptKernel::Compaction => &self.prepare_pipeline,
             AttemptKernel::DrainExecute => round_pipeline,
+            AttemptKernel::ContinuationControlSweep => &self.control_sweep_pipeline,
             AttemptKernel::ContinuationControl => &self.control_pipeline,
             AttemptKernel::ExchangePrefix => &self.exchange_prefix_pipeline,
             AttemptKernel::ExchangeScatter => &self.exchange_scatter_pipeline,
@@ -6031,7 +6043,11 @@ mod tests {
         }
 
         // T21 fix 1: the re-gridded sweeps take the whole grid at the retained threadgroup width.
-        for kernel in [AttemptKernel::HorizonSweep, AttemptKernel::RoundReset] {
+        for kernel in [
+            AttemptKernel::HorizonSweep,
+            AttemptKernel::RoundReset,
+            AttemptKernel::ContinuationControlSweep,
+        ] {
             let (_, _, geometry) = ATTEMPT_DISPATCHES
                 .into_iter()
                 .find(|(candidate, _, _)| *candidate == kernel)

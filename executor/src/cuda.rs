@@ -4402,12 +4402,13 @@ impl CudaBuffers {
 /// the sweep's per-block partials. The **launch boundary is the barrier**: nothing in the kernels
 /// synchronizes across blocks inside a launch. That costs extra launches, which the analysis
 /// budgeted for at ≤0.11 % of a round, and buys the whole grid for the sweeps.
-const KERNEL_NAMES: [&str; 10] = [
+const KERNEL_NAMES: [&str; 11] = [
     "days_horizon_sweep",
     "days_horizon",
     "days_round_reset",
     "days_round_prepare",
     "days_round",
+    "days_round_control_sweep",
     "days_round_control",
     "days_exchange_prefix",
     "days_exchange_scatter",
@@ -4418,7 +4419,7 @@ const KERNEL_NAMES: [&str; 10] = [
 ///
 /// The reported decomposition deliberately does not grow with the launch count: a phase's time is
 /// the sum of its launches', so `t17c_cuda_profile` compares before and after like for like.
-const DISPATCH_PHASE: [usize; 10] = [0, 0, 1, 1, 2, 3, 4, 5, 6, 7];
+const DISPATCH_PHASE: [usize; 11] = [0, 0, 1, 1, 2, 3, 3, 4, 5, 6, 7];
 /// T20l fix 2's readback gather. Deliberately outside [`KERNEL_NAMES`]: it is not part of the
 /// captured attempt DAG, does not take the uniform 29-plane ABI, and is launched only after an
 /// attempt has been screened as successful.
@@ -4428,11 +4429,11 @@ const COMPACT_KERNEL_NAME: &str = "days_compact_gather";
 // gather's output does not depend on it.
 const COMPACT_THREADS_PER_BLOCK: usize = 256;
 /// Launches that need the full [`LANES`]-wide block their deterministic reduction assumes.
-const CONTROL_KERNELS: [usize; 7] = [0, 1, 2, 3, 5, 6, 9];
+const CONTROL_KERNELS: [usize; 8] = [0, 1, 2, 3, 5, 6, 7, 10];
 /// Launches that take the full-grid control geometry:
 /// [`crate::device_sizing::CONTROL_SWEEP_BLOCKS`] blocks of [`LANES`] threads.
-const SWEEP_KERNELS: [usize; 2] = [0, 2];
-const PARALLEL_KERNELS: [usize; 3] = [4, 7, 8];
+const SWEEP_KERNELS: [usize; 3] = [0, 2, 5];
+const PARALLEL_KERNELS: [usize; 3] = [4, 8, 9];
 
 struct DirectCuda {
     _context: Arc<CudaContext>,
