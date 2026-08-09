@@ -160,7 +160,16 @@ impl TCPPacketSink {
 
         self.recv_buffer = merged_stats;
 
-        self.next_seq_expected = self.recv_buffer[0].1;
+        let mut cumulative_ack = self.next_seq_expected;
+        for (start, end) in &self.recv_buffer {
+            if *start > cumulative_ack {
+                break;
+            }
+            cumulative_ack = cumulative_ack.max(*end);
+        }
+        self.next_seq_expected = cumulative_ack;
+        self.recv_buffer
+            .retain(|(_, end)| *end > self.next_seq_expected);
 
         let acknowledgment = self.build_acknowledgment(&packet, now);
 
@@ -263,5 +272,19 @@ mod tests {
             ack.ack.expect("missing ack").sequence_num,
             packet.packet_id + packet.size
         );
+    }
+
+    #[test]
+    fn cumulative_ack_never_advances_across_a_sequence_hole() {
+        let mut sink = TCPPacketSink::new(9);
+
+        futures::executor::block_on(sink.produce_ack(Packet::new(1460, 1460, 9, 0.0), 0.000_001));
+        assert_eq!(sink.next_seq_expected, 0);
+
+        futures::executor::block_on(sink.produce_ack(Packet::new(580, 2920, 9, 0.0), 0.000_002));
+        assert_eq!(sink.next_seq_expected, 0);
+
+        futures::executor::block_on(sink.produce_ack(Packet::new(1460, 0, 9, 0.0), 0.000_003));
+        assert_eq!(sink.next_seq_expected, 3500);
     }
 }

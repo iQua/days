@@ -29,7 +29,7 @@ pub struct TCPReno {
     min_cwnd: usize,
     /// Maximum allowed window size
     max_cwnd: usize,
-    /// Count of unacknowledged packets
+    /// Unacknowledged bytes tracked through the source integration hook
     packets_in_flight: usize,
     /// Most recent RTT sample
     last_rtt: f64,
@@ -57,7 +57,7 @@ pub struct TCPReno {
     pre_recovery_flight_size: usize,
     /// Sequence threshold for recovery exit
     recovery_high_seq: usize,
-    /// Outstanding segments estimate
+    /// Outstanding byte estimate
     pipe: usize,
     /// Highest transmitted sequence
     snd_max: usize,
@@ -256,11 +256,11 @@ impl TCPReno {
         }
     }
 
-    /// Estimates pipe (segments in flight) during recovery
+    /// Estimates bytes in flight during recovery.
     fn estimate_pipe(&self) -> usize {
         self.packets_in_flight
             + if self.state == TCPRenoState::FastRecovery {
-                self.dupack_count + self.lost_sequences.len()
+                (self.dupack_count + self.lost_sequences.len()).saturating_mul(self.mss)
             } else {
                 0
             }
@@ -292,6 +292,11 @@ impl TCPReno {
 }
 
 impl CongestionControl for TCPReno {
+    fn packet_sent(&mut self, bytes: usize, _now: f64) {
+        self.packets_in_flight = self.packets_in_flight.saturating_add(bytes);
+        self.snd_max = self.snd_max.saturating_add(bytes);
+    }
+
     fn ack_received(&mut self, event: AckEvent) {
         let ack_seq = event.ack_seq;
         let rtt = event.rtt;
@@ -321,9 +326,7 @@ impl CongestionControl for TCPReno {
             self.update_cwnd(bytes_acked);
         }
 
-        if self.packets_in_flight > 0 {
-            self.packets_in_flight -= 1;
-        }
+        self.packets_in_flight = self.packets_in_flight.saturating_sub(actual_bytes_acked);
     }
 
     fn consecutive_dupacks_received(&mut self) {
@@ -365,12 +368,7 @@ impl CongestionControl for TCPReno {
             self.cwnd += self.mss;
             self.dupack_count += 1;
 
-            // Allow new transmissions if pipe < cwnd
-            if self.pipe < self.cwnd {
-                // Can send new segments
-                self.packets_in_flight += 1;
-                self.pipe += 1;
-            }
+            // New sends, if the inflated window permits them, are accounted by packet_sent.
         }
     }
 
@@ -391,6 +389,13 @@ impl CongestionControl for TCPReno {
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
+    }
+}
+
+#[cfg(test)]
+impl TCPReno {
+    pub(crate) fn flight_accounting(&self) -> (usize, usize) {
+        (self.packets_in_flight, self.snd_max)
     }
 }
 
@@ -568,7 +573,7 @@ mod tests {
         reno.lost_sequences.insert(2000);
 
         let pipe = reno.estimate_pipe();
-        assert_eq!(pipe, 1000 + 3 + 2); // in_flight + dupacks + lost_seqs
+        assert_eq!(pipe, 1000 + (3 + 2) * reno.mss);
     }
 
     #[test]

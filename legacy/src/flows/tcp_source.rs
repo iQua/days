@@ -1220,4 +1220,66 @@ mod tests {
     fn duration_tcp_keeps_the_legacy_synthetic_application_source() {
         assert!(make_source(false).has_synthetic_source());
     }
+
+    #[test]
+    fn three_duplicate_acks_fast_retransmit_the_hole_with_byte_flight_accounting() {
+        let mut source = make_source(false);
+        for sequence in [0, 512, 1024, 1536] {
+            let packet = Packet::new(512, sequence, source.flow_id, 0.0);
+            source.packet_sent(&packet, 0);
+        }
+        let reno = source
+            .congestion_control
+            .as_any()
+            .downcast_ref::<TCPReno>()
+            .expect("Reno controller");
+        assert_eq!(reno.flight_accounting(), (2048, 2048));
+
+        for (packet_id, now_ns) in [(512, 1_000), (1024, 2_000), (1536, 3_000)] {
+            let mut ack = make_ack(source.flow_id, 0, 512, false, now_ns as f64 * 1e-9);
+            ack.packet_id = packet_id;
+            let _ = block_on(source.ack_packet_received(ack, now_ns));
+        }
+
+        assert_eq!(source.dupack, 3);
+        assert_eq!(source.sent_packets[&0].time, 0.000_003);
+        assert_eq!(source.pending_lost_bytes, 512);
+        assert_eq!(source.congestion_control.get_cwnd(), 2560);
+    }
+
+    #[test]
+    fn rto_retransmission_occurs_on_the_exact_tick_and_can_complete() {
+        let traffic = TrafficCharacteristics::new(
+            0.0,
+            None,
+            Some(512),
+            DistributionInfo::Uniform {
+                low: 1.0,
+                high: 1.0,
+            },
+            DistributionInfo::DiscreteUniform {
+                low: 512,
+                high: 512,
+            },
+            Some(TCPCharacteristics {
+                cc_algorithm: CCAlgorithm::TCPReno,
+                ecn: false,
+                cubic: None,
+            }),
+        );
+        let mut rng = rand::rng();
+        let rng = SmallRng::from_rng(&mut rng);
+        let mut source = TCPPacketSource::new(8, Vec::new(), traffic, 0, None, rng);
+        block_on(source.send_packet(0));
+
+        block_on(source.timer_tick(999_999_999));
+        assert_eq!(source.sent_packets[&0].time, 0.0);
+        block_on(source.timer_tick(1_000_000_000));
+        assert_eq!(source.sent_packets[&0].time, 1.0);
+        assert_eq!(source.pending_lost_bytes, 512);
+
+        let ack = make_ack(source.flow_id, 512, 512, false, 1.000_001);
+        let _ = block_on(source.ack_packet_received(ack, 1_000_001_000));
+        assert!(source.is_complete());
+    }
 }
