@@ -33,6 +33,45 @@ fn p12_image(name: &str) -> days_executor::SimulationImage {
     compile_config(&path).unwrap_or_else(|error| panic!("{} must lower: {error}", path.display()))
 }
 
+fn fixture_image(relative: &str) -> days_executor::SimulationImage {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative);
+    compile_config(&path).unwrap_or_else(|error| panic!("{} must lower: {error}", path.display()))
+}
+
+fn print_plan(label: &str, relative: &str) {
+    let image = fixture_image(relative);
+    let report = size_metal_plan_for_testing(
+        &image,
+        None,
+        MetalConfig {
+            capacity_caps: FRONTIER_CAPS,
+            ..MetalConfig::default()
+        },
+        ObservationMode::Summary,
+    )
+    .unwrap_or_else(|error| panic!("{label} capped plan must size: {error}"));
+    let plane_bytes = |name| {
+        report
+            .planes
+            .iter()
+            .find(|plane| plane.name == name)
+            .unwrap_or_else(|| panic!("{label} must carry {name}"))
+            .bytes
+    };
+    let max_channel_capacity = report
+        .channel_stream_capacity_distribution
+        .last()
+        .map_or(0, |level| level.capacity);
+    println!(
+        "plan={label} total={} stream_records={} remote_staging={} queue_records={} channel_capacity_levels={} max_channel_capacity={max_channel_capacity}",
+        report.total_device_bytes,
+        plane_bytes("stream_records"),
+        plane_bytes("remote_staging"),
+        plane_bytes("queue_records"),
+        report.channel_stream_capacity_distribution.len(),
+    );
+}
+
 fn print_arena(label: &str, occupancy: &ArenaOccupancyHighWater) {
     let (peak_entity, peak) = occupancy
         .high_water
@@ -176,6 +215,17 @@ fn dominant_arena_high_water_is_test_only_and_fingerprint_neutral() {
     )
     .expect("plan must size after the instrumented run");
     assert_eq!(after, before, "the hook must add no planned device bytes");
+}
+
+#[test]
+#[ignore = "explicit P12 before/after capped plan-size table"]
+fn capped_plan_size_table() {
+    print_plan("E4", "configs/benchmarks/p12/e4_gedes_native_k32.toml");
+    print_plan("E2", "configs/benchmarks/p12/e2_closed_k32_tcp_reno.toml");
+    print_plan(
+        "frontier",
+        "configs/benchmarks/p11/rq9_frontier_closed_k32.toml",
+    );
 }
 
 #[test]
