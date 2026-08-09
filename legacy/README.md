@@ -6,6 +6,14 @@ superseded. It is retired from development and retained, permanently, as a **run
 baseline**. Frozen does **not** mean unbuilt: CI keeps building, testing, and running it,
 and the gates in [Standing gates](#standing-gates) must stay green forever.
 
+**E5 amendment (August 9, 2026 / T22a):** the user-authorized
+`LEGACY-ON-E5 ORDERED — FREEZE CONTRACT AMENDED` registry entry in
+`days-gpu/plans/p12-opening-plan.md` permits only the minimal correctness changes required
+to express and run E5 with legacy's existing Reno implementation. The published E3 and
+other frozen legacy baseline rows remain tied to annotated tag `p12-legacy-pre-e5`
+(`3295ad08f345c4f57c0fa6c30d0749b6a80e0a95`; legacy tree
+`a6a99594ed0334bc0864c6315af339850a6846eb`), never to a post-amendment revision.
+
 If you are looking for the current simulator, it is `../executor/` (crate `days-executor`).
 Nothing outside this directory may depend on `days-legacy`; `cargo xtask audit` enforces
 that direction mechanically.
@@ -85,7 +93,7 @@ legacy number is republished. Automating that check is an open recommendation, n
 
 ## 3. Freeze policy
 
-**No changes. Three narrow exceptions, each requiring a changelog row in
+**No changes. Four narrow exceptions, each requiring a changelog row in
 [§8](#8-freeze-changelog).**
 
 | # | Allowed change | Why it must be allowed |
@@ -93,8 +101,9 @@ legacy number is republished. Automating that check is an open recommendation, n
 | **(a)** | **Exhaustive-match arms forced by a workspace-shared enum growing a variant.** The new arm must not implement behaviour; it panics (or otherwise refuses) with a comment stating why legacy can never legitimately reach it. | `days-legacy` matches exhaustively on enums owned by the live `days` crate. When live work adds a variant, the frozen crate stops compiling. Refusing the arm would mean refusing all live development. |
 | **(b)** | **Toolchain compatibility.** Edition/rustc/clippy-lint churn that breaks the build with no semantic change. | Required by the retirement policy (`days-executor-plan.md:605`): "changes only for toolchain compatibility". |
 | **(c)** | **Dependency pin bumps.** Editing a `=x.y.z` pin in `legacy/Cargo.toml`. | Exact pins on crates that the *live* root crate also uses (see [§4](#4-dependency-pinning-and-the-lockfile)) mean a live-side patch bump inside the same semver range requires touching this manifest. That coupling is deliberate; it is also the only way to move a frozen dependency, so it is auditable. |
+| **(d)** | **The ordered E5 expressibility repair.** Minimal fixes for exact event scheduling, strict `FatTreeEcmp`/structural-pairing handling, byte-budget TCP with configurable MSS, sound cumulative ACK/loss recovery using the existing Reno controller, propagation activation, and correctness observability. | Explicit user authority in `days-gpu/plans/p12-opening-plan.md`, registry entry `LEGACY-ON-E5 ORDERED — FREEZE CONTRACT AMENDED` (August 9, 2026). This is bounded to the reviewed T0–T7 plan; it does not authorize a new controller or general legacy development. |
 
-**Never, under any exception:**
+**Never, under exceptions (a)–(c), and outside the exact bounds of exception (d):**
 
 - no new protocols, mechanisms, schedulers, queue disciplines, or congestion-control variants;
 - no new configuration keys, no new output fields, no new features in `[features]`;
@@ -545,3 +554,4 @@ to anything else under `legacy/` always do.
 |---|---|---|---|---|
 | 2026-08-08 | `14a0e60` | (a) | Added the `RouteTableError::UnsupportedTopology` arm in `src/topos/topo.rs`; it panics with the reason legacy can never legitimately reach it (legacy selects only the topology-agnostic shortest-path table). No behaviour change. | `b270b98` added the variant to the shared `days` routing enum, breaking `cargo build --workspace` and both legacy CI jobs. Recorded pre-freeze; kept here as the worked precedent for class (a). |
 | 2026-08-08 | `5cdb775` | (c) | Converted every dependency and external dev-dependency in `Cargo.toml` from a caret range to an exact `=x.y.z` pin, at the versions already resolved. `cargo metadata` reproduced `Cargo.lock` byte-for-byte; no version moved. | The freeze itself ([§4](#4-dependency-pinning-and-the-lockfile)). |
+| 2026-08-09 | `T22a: Amend the legacy freeze contract for E5` | (d) | Recorded the bounded E5 exception and pinned all pre-amendment E3/baseline provenance to annotated tag `p12-legacy-pre-e5` at `3295ad0` (legacy tree `a6a99594`). | The `LEGACY-ON-E5 ORDERED — FREEZE CONTRACT AMENDED` registry entry in `days-gpu/plans/p12-opening-plan.md`. |
