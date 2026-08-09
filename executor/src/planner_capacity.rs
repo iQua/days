@@ -55,6 +55,10 @@ pub(crate) struct PlannerCapacityContext {
     host_to_lp: Vec<Option<NodeId>>,
     #[cfg(any(test, feature = "planner-test-hooks"))]
     lookahead: Option<u64>,
+    /// Endpoint the plan is sized for: the image's own, or an earlier probe endpoint. Only the
+    /// legacy comparison path recomputes bounds from it; the precomputed table already holds them.
+    #[cfg(any(test, feature = "planner-test-hooks"))]
+    planning_horizon_ns: u64,
 }
 
 impl PlannerCapacityContext {
@@ -62,6 +66,7 @@ impl PlannerCapacityContext {
         image: &SimulationImage,
         data_counts: &[usize],
         lookahead: Option<u64>,
+        planning_horizon_ns: u64,
         tcp_minimum_packet_size: TcpMinimumPacketSize,
         mode: PlannerCapacityMode,
     ) -> Self {
@@ -83,6 +88,7 @@ impl PlannerCapacityContext {
                 flow_to_generator: Vec::new(),
                 host_to_lp: Vec::new(),
                 lookahead,
+                planning_horizon_ns,
             };
         }
 
@@ -190,8 +196,14 @@ impl PlannerCapacityContext {
             else {
                 continue;
             };
-            tcp_ledger_segment_bounds[flow] =
-                crate::device_sizing::tcp_ledger_segment_bound(tcp, data_counts[flow]);
+            tcp_ledger_segment_bounds[flow] = crate::device_sizing::tcp_ledger_segment_bound(
+                tcp,
+                data_counts[flow],
+                crate::device_sizing::tcp_horizon_round_trips(
+                    planning_horizon_ns,
+                    crate::device_sizing::tcp_minimum_round_trip_ns(image, flow, tcp),
+                ),
+            );
             tcp_receiver_range_bounds[flow] =
                 crate::device_sizing::tcp_receiver_range_bound(tcp, data_counts[flow]);
             tcp_fallback_timer_bounds[flow] =
@@ -317,6 +329,8 @@ impl PlannerCapacityContext {
             flow_to_generator,
             host_to_lp,
             #[cfg(any(test, feature = "planner-test-hooks"))]
+            planning_horizon_ns,
+            #[cfg(any(test, feature = "planner-test-hooks"))]
             lookahead,
         };
         context.debug_assert_sampled_minimum_packet_sizes(image);
@@ -423,7 +437,14 @@ impl PlannerCapacityContext {
         #[cfg(any(test, feature = "planner-test-hooks"))]
         if self.mode == PlannerCapacityMode::Legacy {
             return self.tcp_generator(image, flow).map_or(1, |tcp| {
-                crate::device_sizing::tcp_ledger_segment_bound(tcp, whole_flow_segments)
+                crate::device_sizing::tcp_ledger_segment_bound(
+                    tcp,
+                    whole_flow_segments,
+                    crate::device_sizing::tcp_horizon_round_trips(
+                        self.planning_horizon_ns,
+                        crate::device_sizing::tcp_minimum_round_trip_ns(image, flow, tcp),
+                    ),
+                )
             });
         }
         let _ = (image, whole_flow_segments);
@@ -512,12 +533,14 @@ impl PlannerCapacityContext {
         image: &SimulationImage,
         data_counts: &[usize],
         lookahead: Option<u64>,
+        planning_horizon_ns: u64,
         tcp_minimum_packet_size: TcpMinimumPacketSize,
     ) -> bool {
         let precomputed = Self::new(
             image,
             data_counts,
             lookahead,
+            planning_horizon_ns,
             tcp_minimum_packet_size,
             PlannerCapacityMode::Precomputed,
         );
@@ -525,6 +548,7 @@ impl PlannerCapacityContext {
             image,
             data_counts,
             lookahead,
+            planning_horizon_ns,
             tcp_minimum_packet_size,
             PlannerCapacityMode::Legacy,
         );
@@ -991,6 +1015,7 @@ mod tests {
             &image,
             &[PACKET_COUNT],
             Some(LOOKAHEAD_NS),
+            image.stop_time_ns,
             TcpMinimumPacketSize::One,
             PlannerCapacityMode::Precomputed,
         );

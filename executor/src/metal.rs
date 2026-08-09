@@ -1575,6 +1575,7 @@ pub fn assert_metal_planner_bit_equal_for_testing(
         image,
         &data_counts,
         lookahead,
+        crate::device_sizing::planning_horizon_ns(image.stop_time_ns, exclusive_horizon_ns),
         TcpMinimumPacketSize::One,
     ) {
         return Err(MetalError::Validation(
@@ -1890,6 +1891,7 @@ impl MetalPlan {
             image,
             &flow_data_counts,
             minimum_lookahead_ns,
+            crate::device_sizing::planning_horizon_ns(image.stop_time_ns, exclusive_horizon_ns),
             TcpMinimumPacketSize::One,
             capacity_mode,
         );

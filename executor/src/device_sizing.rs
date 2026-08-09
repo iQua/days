@@ -1008,8 +1008,16 @@ fn packed_tcp_state_words(
         let resident = ledger
             .get(&crate::FlowId(flow as u64))
             .map_or(0, BTreeMap::len);
-        let bound = context.tcp_generators[flow]
-            .map_or(1, |tcp| tcp_ledger_segment_bound(tcp, data_counts[flow]));
+        let bound = context.tcp_generators[flow].map_or(1, |tcp| {
+            tcp_ledger_segment_bound(
+                tcp,
+                data_counts[flow],
+                tcp_horizon_round_trips(
+                    planning_horizon_ns(image.stop_time_ns, None),
+                    tcp_minimum_round_trip_ns(image, flow, tcp),
+                ),
+            )
+        });
         total
             .checked_add(bound.max(resident))
             .ok_or_else(|| sizing_error("TCP ledger record slots overflow usize"))
@@ -1044,8 +1052,13 @@ pub(crate) fn paced_single_source_queue_bound(
     }
 }
 
-/// Multiplier covering Reno fast-recovery inflation and transient reordering beyond the encoded
-/// congestion window. Device overflow remains fail-stop and adaptive re-planning can grow it.
+/// Segments of head-room allowed beyond the encoded congestion window, as a multiple of it.
+///
+/// It covers Reno fast-recovery inflation and transient reordering, and — the reading T21 made
+/// explicit — `W` round trips of congestion-avoidance growth, because congestion avoidance adds
+/// **one segment per round trip** and `2 * W = W + W`. That second reading is why the constant is
+/// no longer the whole story: see [`tcp_horizon_round_trips`]. Device overflow remains fail-stop
+/// and adaptive re-planning can grow either term.
 pub(crate) const TCP_WINDOW_SLACK_FACTOR: usize = 2;
 /// Extra ledger records for a partial cumulative ACK boundary and recovery retransmissions.
 pub(crate) const TCP_LEDGER_RECOVERY_ALLOWANCE: usize = 8;
@@ -1085,27 +1098,116 @@ fn tcp_window_plane_bound(
     tcp: crate::TcpGenerator,
     whole_flow_segments: usize,
     recovery_allowance: usize,
+    head_room_segments: usize,
 ) -> usize {
     let outstanding = u64_segments(tcp.bytes_in_flight, tcp.mss_bytes);
     let absolute_cap = whole_flow_segments.max(outstanding).max(1);
     tcp_encoded_window_segments(tcp)
-        .saturating_mul(TCP_WINDOW_SLACK_FACTOR)
+        .saturating_add(head_room_segments)
         .saturating_add(recovery_allowance)
         .min(absolute_cap)
+}
+
+/// Congestion-avoidance head-room the encoded window does not already pay for.
+///
+/// # The defect this repairs
+///
+/// The encoded window is a **snapshot of the image's congestion state**, and
+/// `TCP_WINDOW_SLACK_FACTOR * W` reads as a bound only while the run is short enough that the
+/// window cannot outgrow it. Reno congestion avoidance adds one segment per round trip, so
+/// `cwnd <= W + round_trips` and `2 * W + allowance` covers the flow exactly while
+/// `round_trips <= W`. P12 E4 is the image where that condition fails by four orders of
+/// magnitude: its flows carry TCP's default 65,535-byte `ssthresh` at MSS 1,460, so `W = 45` and
+/// every one of its 8,192 flows was planned at `2 * 45 + 8 = 98` records for a run to completion
+/// that admits ~298,000 round trips. Every long flow therefore left 98 behind and the device
+/// refused with `capacity: 98, demand: 99` — the same three numbers on Metal and on CUDA, because
+/// the number is host-derived.
+///
+/// The retry loop cannot repair it. Ledger growth is keyed per flow (T20i retired class growth for
+/// this arena), and E4's flows start at staggered instants spanning 95.787 ms, so the occupancy
+/// vector a fault carries shows almost nothing above the derived floor: each attempt repairs one
+/// flow of 8,192 and the next attempt faults on the next flow to cross 98, at the same capacity,
+/// with the same demand. Sixteen retries and 37 minutes bought sixteen flows.
+///
+/// # The term
+///
+/// `max(W, round_trips)` — the growth the flow can actually complete inside the plan's horizon,
+/// never less than the head-room the pre-T21 constant already granted. The frontier T20i measured
+/// is untouched by construction: `rq9_frontier_closed_k32` encodes `W = 256` and its 1,152,000 ns
+/// horizon admits 94 round trips, so the `max` selects the old term and its derived floor is still
+/// exactly 520. Whole-flow capping does the rest: a horizon long enough to drain a flow yields a
+/// bound that is the flow's own attempt count, which no trajectory can exceed.
+///
+/// This is not a claim that the result is a hard bound in every trajectory — dup-ACK inflation
+/// during a stalled recovery is unbounded in the window (T20i layer 1 measured 11,058 records
+/// against a 520 floor), and that residual is what the capacity-retry loop exists for. It is the
+/// claim that the *congestion-avoidance* term is now horizon-aware instead of horizon-blind.
+pub(crate) fn tcp_horizon_round_trips(horizon_ns: u64, minimum_round_trip_ns: u64) -> usize {
+    usize::try_from(horizon_ns / minimum_round_trip_ns.max(1)).unwrap_or(usize::MAX)
+}
+
+/// Lower bound on one flow's round trip: one MSS out, one ACK back, no queueing anywhere.
+///
+/// Serialization and propagation on every link of the flow's own canonical route and reverse
+/// route. Using a *lower* bound on the round trip is what makes the round-trip count in
+/// [`tcp_ledger_horizon_growth`] an upper bound, which is the direction sizing has to err in.
+pub(crate) fn tcp_minimum_round_trip_ns(
+    image: &SimulationImage,
+    flow: usize,
+    tcp: crate::TcpGenerator,
+) -> u64 {
+    let Some(descriptor) = image.flows.get(flow) else {
+        return 1;
+    };
+    let leg = |links: &[crate::LinkId], size_bytes: u64| {
+        links.iter().fold(0_u64, |total, link| {
+            let Some(link) = image.links.get(link.0 as usize) else {
+                return total;
+            };
+            total.saturating_add(link.delay_ns(size_bytes.max(1)).unwrap_or(1))
+        })
+    };
+    leg(&descriptor.route, tcp.mss_bytes)
+        .saturating_add(leg(&descriptor.reverse_route, tcp.ack_size_bytes))
+        .max(1)
+}
+
+/// The horizon the plan is sized for: the image's own endpoint, or an earlier probe endpoint.
+pub(crate) fn planning_horizon_ns(stop_time_ns: u64, exclusive_horizon_ns: Option<u64>) -> u64 {
+    exclusive_horizon_ns.map_or(stop_time_ns, |horizon| horizon.min(stop_time_ns))
 }
 
 pub(crate) fn tcp_ledger_segment_bound(
     tcp: crate::TcpGenerator,
     whole_flow_segments: usize,
+    horizon_round_trips: usize,
 ) -> usize {
-    tcp_window_plane_bound(tcp, whole_flow_segments, TCP_LEDGER_RECOVERY_ALLOWANCE)
+    let head_room = horizon_round_trips.max(tcp_encoded_window_segments(tcp));
+    tcp_window_plane_bound(
+        tcp,
+        whole_flow_segments,
+        TCP_LEDGER_RECOVERY_ALLOWANCE,
+        head_room,
+    )
 }
 
+/// Receiver ranges keep the encoded-window head-room, deliberately.
+///
+/// The horizon term above exists because the ledger's retry policy is keyed **per flow** and
+/// therefore repairs one flow per attempt, which cannot converge on an image whose whole flow
+/// population outgrows the derived floor. Receiver ranges kept T20i's **class** keying: one
+/// representative overflow raises every flow in the class, so a dense deep set converges in one
+/// replan and the plan does not have to pay for it up front.
 pub(crate) fn tcp_receiver_range_bound(
     tcp: crate::TcpGenerator,
     whole_flow_segments: usize,
 ) -> usize {
-    tcp_window_plane_bound(tcp, whole_flow_segments, TCP_RECEIVER_RECOVERY_ALLOWANCE)
+    tcp_window_plane_bound(
+        tcp,
+        whole_flow_segments,
+        TCP_RECEIVER_RECOVERY_ALLOWANCE,
+        tcp_encoded_window_segments(tcp) * (TCP_WINDOW_SLACK_FACTOR - 1),
+    )
 }
 
 /// Outward-safe fallback-heap residency of one source-owned TCP flow.
@@ -1725,7 +1827,7 @@ fn sizing_error(message: impl Into<String>) -> DeviceSizingError {
 mod tests {
     use super::{
         ecn_queue_packet_bound, exact_plan_report, finite_generator_minimum_packet_size,
-        horizon_queue_packet_bound, paced_single_source_queue_bound,
+        horizon_queue_packet_bound, paced_single_source_queue_bound, planning_horizon_ns,
         tcp_fallback_timer_packet_bound, tcp_ledger_segment_bound, tcp_receiver_range_bound,
     };
     use crate::{
@@ -1759,10 +1861,72 @@ mod tests {
         let mut tcp = TcpGenerator::new(1 << 20, 1_024, 64, TcpCongestionControl::reno(1_024));
         tcp.bytes_in_flight = 3_073;
 
-        assert_eq!(tcp_ledger_segment_bound(tcp, 1_024), 136);
+        // A horizon that admits no more round trips than the encoded window keeps the pre-T21
+        // number exactly: `W + max(W, round_trips) + 8` is `2 * W + 8` while `round_trips <= W`.
+        assert_eq!(tcp_ledger_segment_bound(tcp, 1_024, 0), 136);
+        assert_eq!(tcp_ledger_segment_bound(tcp, 1_024, 64), 136);
         assert_eq!(tcp_receiver_range_bound(tcp, 1_024), 132);
-        assert_eq!(tcp_ledger_segment_bound(tcp, 16), 16);
+        assert_eq!(tcp_ledger_segment_bound(tcp, 16, 0), 16);
+        assert_eq!(tcp_ledger_segment_bound(tcp, 16, 1_000_000), 16);
         assert_eq!(tcp_receiver_range_bound(tcp, 16), 16);
+    }
+
+    /// P12 E4's defect, in one line of arithmetic.
+    ///
+    /// E4's flows carry TCP's default 65,535-byte initial `ssthresh` at MSS 1,460, so
+    /// `W_encoded = 45` and the pre-T21 bound is `2 * 45 + 8 = 98` for every one of the 8,192
+    /// flows — including `FlowId(3667)`, whose 29,200,000 B are 20,000 segments. E4 runs to
+    /// completion, and Reno congestion avoidance adds one segment per round trip, so the window
+    /// leaves 98 behind and the ledger reports `capacity: 98, demand: 99`. The horizon term is
+    /// what turns the snapshot back into a bound: the whole-flow attempt count caps it.
+    #[test]
+    fn a_run_to_completion_horizon_sizes_the_ledger_past_the_encoded_window() {
+        let tcp = TcpGenerator::new(29_200_000, 1_460, 1_460, TcpCongestionControl::reno(1_460));
+        let whole_flow_attempts = 40_002;
+
+        assert_eq!(tcp_ledger_segment_bound(tcp, whole_flow_attempts, 0), 98);
+        assert_eq!(tcp_ledger_segment_bound(tcp, whole_flow_attempts, 45), 98);
+        assert_eq!(tcp_ledger_segment_bound(tcp, whole_flow_attempts, 46), 99);
+        // E4's own 4 s horizon over its measured 13,401 ns minimum round trip.
+        assert_eq!(
+            tcp_ledger_segment_bound(tcp, whole_flow_attempts, 298_485),
+            whole_flow_attempts,
+            "a horizon long enough to drain the flow can only be bounded by the flow itself"
+        );
+        // Receiver ranges deliberately keep the encoded-window form; see the doc comment.
+        assert_eq!(tcp_receiver_range_bound(tcp, whole_flow_attempts), 94);
+    }
+
+    /// The T20i frontier is what the horizon term must NOT disturb.
+    ///
+    /// `rq9_frontier_closed_k32` encodes `W = 256` at MSS 256 and runs a 1,152,000 ns horizon
+    /// whose minimum round trip is 12,246 ns for a cross-pod flow: 94 round trips, well inside
+    /// the window, so the derived floor stays at exactly the 520 T20i measured against.
+    #[test]
+    fn the_frontier_floor_is_unchanged_because_its_horizon_is_inside_its_window() {
+        let mut reno = TcpCongestionControl::reno(256);
+        let TcpCongestionControl::Reno(ref mut state) = reno else {
+            unreachable!("reno constructor returns Reno")
+        };
+        state.ssthresh_bytes = 256 * 256;
+        let tcp = TcpGenerator::new(1 << 24, 256, 64, reno);
+
+        assert_eq!(tcp_ledger_segment_bound(tcp, 131_074, 94), 520);
+        assert_eq!(tcp_ledger_segment_bound(tcp, 131_074, 256), 520);
+        assert_eq!(tcp_ledger_segment_bound(tcp, 131_074, 257), 521);
+    }
+
+    #[test]
+    fn the_planning_horizon_is_the_earlier_of_the_image_and_the_probe_endpoint() {
+        assert_eq!(planning_horizon_ns(4_000_000_000, None), 4_000_000_000);
+        assert_eq!(
+            planning_horizon_ns(4_000_000_000, Some(1_152_000)),
+            1_152_000
+        );
+        assert_eq!(
+            planning_horizon_ns(1_152_000, Some(4_000_000_000)),
+            1_152_000
+        );
     }
 
     #[test]
