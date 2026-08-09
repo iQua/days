@@ -9,7 +9,7 @@
 //! Five kinds of gate here:
 //!
 //! 1. **Provenance** — the committed flow table is byte-for-byte GeDES's own emitted CSV, checked
-//!    by md5 against the value P09 §7.3 recorded on a different GPU architecture. If that file is
+//!    by md5 against the value P09 §7.2 recorded on a different GPU architecture. If that file is
 //!    ever edited, E4 stops being GeDES's workload and this test says so.
 //! 2. **Workload fidelity** — every flow in the fixture carries the byte count and start instant
 //!    GeDES drew for it, and the endpoint permutation is GeDES's, restated on Days' host grid.
@@ -49,8 +49,10 @@ const FLOW_TABLE: &str = "gedes_k32_seed41_flows.csv";
 /// md5 of the GeDES-emitted flow table for `script.py`'s k=32 sweep row at `--rng_seed=41`.
 ///
 /// Recorded on boston (RTX 4090 / sm_89 / x86_64) at GeDES tree `1376c638a0ae66116430f953da137d0c536675ad`,
-/// and identical to the md5 P09 §7.3 recorded on madrid (GB10 / sm_121 / aarch64). The table is a
-/// property of GeDES's seeded generator, not of either machine.
+/// and identical to the md5 P09 §7.2 recorded on madrid (GB10 / sm_121 / aarch64). The table is a
+/// property of GeDES's seeded generator, not of either machine. §7.2 is the AS-PUBLISHED sweep row
+/// (`--flow_time_range=10000000`); P09 §7.3 is the *saturated* load-matched variant and hashes to
+/// `e94a96ea…`, which is NOT this table and is not E4's workload.
 const FLOW_TABLE_MD5: &str = "f9eec61c11a29a998d2c849f120eb396";
 
 // The workload, as GeDES drew it. Every one of these is arithmetic over the committed CSV.
@@ -622,7 +624,9 @@ fn e4_keeps_the_family_queue_depth_and_says_why() {
 /// The horizon is nonetheless forty times that, because the cost of ONE lost segment is a full
 /// second: Days' RTO floor is one second (RFC 6298) against a measured 25–36 µs RTT, and after a
 /// timeout `cwnd` collapses to one MSS without releasing the in-flight bytes, so a flow that loses
-/// a burst advances about one segment per second. That is not hypothetical — it was measured on
+/// a burst advances only as fast as its own cumulative ACK recovers the window — MEASURED at
+/// ~39 kB (about 27 segments) per one-second timeout, not one segment per second. That is not
+/// hypothetical — it was measured on
 /// the rejected 200-packet-queue variant, where seven flows parked on timers out to
 /// 1,013,783,350 ns. A horizon sized to the drain would turn a single drop into a SILENT
 /// truncation instead of a loud one, and the slack is free: 78,999 rounds for a 4 s horizon whose
@@ -708,13 +712,16 @@ fn e4_lowers_to_gedes_byte_demand() {
 /// executor semantic effect." Frozen legacy does NOT share that semantic: its TCP source draws its
 /// application data from the same distribution-driven generator the open-loop source uses, so
 /// `arr_dist` is a hard send-rate cap there. Measured on the E4 file itself
-/// (`evidence/P12/e4-authoring.md` §5): legacy's delivered-packet count scales inversely with the
-/// interval over four decades — 4,641 at 1 s, 11,223 at 1 ms, 93,878 at 100 us, 838,228 at 10 us
-/// (2 ms horizon), against a workload of 71,276,147 segments.
+/// (`evidence/P12/e4-authoring.md` §8.2): at E4's OWN 4 s horizon legacy's `Total packets
+/// processed` scales inversely with the interval over four decades — 98,280 at 1 s, 196,536 at
+/// 500 ms, 981,330 at 100 ms, 9,670,380 at 10 ms — and then, at 1 ms, where the extrapolation
+/// would first approach the workload's own 71,276,147 segments, legacy PANICS in its port
+/// scheduler (`legacy/src/schedulers/port.rs:425`, `InvalidScheduledTime`) and reports 0 packets
+/// while still exiting 0.
 ///
 /// This test is the Days-AGO half of that finding, and it is what makes it a SEMANTIC divergence
-/// rather than a fixture typo: the same edit that moves legacy's packet count by 180x moves
-/// nothing at all in the image E4's own arms execute.
+/// rather than a fixture typo: the same edit that moves legacy's packet count by two orders of
+/// magnitude, or crashes it outright, moves nothing at all in the image E4's own arms execute.
 #[test]
 fn arr_dist_does_not_reach_e4s_lowered_image() {
     let committed = std::fs::read_to_string(fixture_path(FIXTURE)).expect("fixture readable");
@@ -754,7 +761,7 @@ fn arr_dist_does_not_reach_e4s_lowered_image() {
 /// 284 of 8,192 flows completed there, i.e. the prefix is the arrival transient, not the drained
 /// fabric. E4's run-to-completion state is anchored separately and is NOT this fingerprint.
 #[test]
-#[ignore = "explicit P12 E4 PREFIX anchor: 1.152 ms of 150 ms, 8,192 TCP flows on k=32"]
+#[ignore = "explicit P12 E4 PREFIX anchor: 1.152 ms of the 4 s horizon, 8,192 TCP flows on k=32"]
 fn e4_prefix_anchor_is_identical_across_local_backends() {
     let image = lower(FIXTURE);
     let observed = identical_across_local_backends(FIXTURE, &image, Some(PREFIX_ANCHOR_NS));
@@ -978,10 +985,17 @@ fn e4_completion_on_metal_exhausts_the_tcp_segment_ledger() {
         ),
         Err(error) => error.to_string(),
     };
+    // CLASS, not instance. This pins the error CLASS — a TCP-segment-ledger capacity exhaustion —
+    // and deliberately not the three numbers that characterise today's instance (capacity 98,
+    // demand 99, sixteen retries) or `FlowId(3667)`, because those are Metal-lane sizing details
+    // that the Metal lane is expected to move. Anything that claims this gate "fails if the error
+    // ever changes" is overstating it; it fails if the error CLASS changes, and it fails if Metal
+    // ever succeeds. The verbatim string with the numbers is printed below and recorded in
+    // evidence/P12/e4-authoring.md §6.4.
     assert!(
         error.contains("TCP segment ledger capacity"),
-        "Metal still refuses E4 to completion, but with a DIFFERENT error than the one recorded \
-         in evidence/P12/e4-authoring.md: {error}"
+        "Metal still refuses E4 to completion, but with a DIFFERENT error CLASS than the one \
+         recorded in evidence/P12/e4-authoring.md §6.4: {error}"
     );
     println!("E4 Metal completion refusal, verbatim: {error}");
 }
