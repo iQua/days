@@ -141,8 +141,8 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "planner_capacity.rs",
         predicate: r#"any(test, feature = "planner-test-hooks")"#,
-        count: 17,
-        purpose: "legacy quadratic helpers exist only for unit and standard full-plan equality tests",
+        count: 19,
+        purpose: "legacy quadratic helpers exist only for unit and standard full-plan equality tests. T21 added two: the retained `planning_horizon_ns` field and its literal, which is an INPUT the legacy ledger-bound arm recomputes from and the precomputed table has already baked in, so a production build must not carry it",
     },
     AllowedFeatureGate {
         path: "planner_capacity.rs",
