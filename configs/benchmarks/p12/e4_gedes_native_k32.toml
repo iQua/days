@@ -18,9 +18,23 @@
 #     flows complete and the fabric drains strictly inside it. An empty fabric costs zero
 #     executor rounds (the F-BURST tail measured exactly that), so the slack is free.
 #
-#   * COUNT GATES. flows 8192/8192 completed; total delivered payload exactly
-#     104,063,174,620 B = the sum of GeDES's own flow_size column; sourced == received;
-#     zero packets resident at the drain instant.
+#   * THE HORIZON IS 40x THE DRAIN, ON PURPOSE. One lost segment costs a full second here:
+#     Days' RTO floor is 1 s (`executor/src/tcp.rs` MIN_RTO_NS, RFC 6298) against a MEASURED
+#     25-36 us RTT, and after a timeout `cwnd` collapses to one MSS without releasing the
+#     in-flight bytes, so a flow that loses a burst advances ~one segment per second. A
+#     horizon sized to the 96 ms drain would turn a single drop into a SILENT truncation.
+#     4 s admits one timeout plus one x2 backoff and refuses a third. It is free: 78,999
+#     rounds for a 4 s horizon that drains at 96 ms, because an empty fabric costs 0 rounds.
+#     CROSS-ARM: GeDES's own rto is 1 ms, three orders of magnitude below Days' and ns-3's
+#     floor, so any E4 completion time is RTO-floor-dominated the moment a segment is lost
+#     and must be published beside the drop count. Days drops NOTHING here, which is what
+#     makes its 96.054393 ms drain a workload result and not a timer result.
+#
+#   * COUNT GATES, ALL MEASURED GREEN on scalar. flows 8192/8192 completed; cumulative ACK
+#     exactly 104,063,174,620 B = the sum of GeDES's own flow_size column;
+#     0 packets resident, 0 events pending, 0 retransmission timers armed at the end;
+#     0 dropped packets and 0 retransmitted bytes; DRAIN at 96,054,393 ns over 78,999
+#     rounds, against the 4,000,000,000 ns horizon -- a margin of 3,903,945,607 ns.
 #
 # WORKLOAD SHAPE (measured over the committed table, asserted in tests/t21_p12_e4.rs):
 #   flows                              8,192
@@ -34,11 +48,14 @@
 #
 # FABRIC. Taken from GeDES where GeDES fixes it and Days can express it exactly: k = 32 with
 # 16 hosts per edge switch (8,192 hosts), 100 Gbit/s ports, 1,000 ns propagation, 1,460 B
-# segments, FIFO tail-drop, and 200-packet egress queues -- GeDES's
-# Switch_DEFAULT_EGRESS_QUEUE_SIZE. THE 200 IS A DEPARTURE FROM E1/E2's 1,024 AND IS
-# DELIBERATE: E4's premise is GeDES's fabric, so where GeDES fixes a parameter Days can
-# express, E4 takes GeDES's value. E4 is therefore NOT `E2 with different traffic` and must
-# never be differenced against E1/E2 as though only the workload changed.
+# segments, FIFO tail-drop. The one fabric constant NOT taken from GeDES is the queue depth:
+# E4 uses E1/E2's 1,024 packets, not GeDES's Switch_DEFAULT_EGRESS_QUEUE_SIZE = 200, so that
+# E4 stays differenceable against its own family. The 200-packet variant was authored, run
+# and REJECTED, and that rejection is a measured result: at 200 this workload does not
+# complete on Days (776 tail drops in 142,738,118 packets, concentrated in 7 flows, each
+# then advancing ~39 kB per 1-second retransmission timeout -- 8,185/8,192 done at 150 ms,
+# 8,189/8,192 at 4 s, ~400 s of tail owed). See the generator docstring and
+# evidence/P12/e4-authoring.md for the two mechanisms that compose to produce it.
 #
 # TRAJECTORY NON-IDENTITY, DISCLOSED. GeDES runs DCTCP (ENABLE_DCTCP = 1; its Reno branch is
 # compiled out), Go-Back-N, null payloads, ACK-per-5-packets, and per-packet round-robin
@@ -52,7 +69,7 @@
 # single-path table is not usable on an offset permutation -- it collapses every cross-pod
 # route out of a pod onto one aggregation switch and one core.
 seed = 21032
-duration = 0.150000000
+duration = 4.000000000
 threading = "single"
 log_path = "logs/p12/e4_gedes_native_k32"
 
@@ -65,7 +82,7 @@ hosts_per_edge = 16
 
 [switch]
 port_rate = 100000000000
-capacity = 200
+capacity = 1024
 weights = [1]
 discipline = "FIFO"
 drop = "TailDrop"

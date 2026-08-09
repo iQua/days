@@ -19,12 +19,11 @@
 //! 4. **Cross-backend identity** — scalar, CPU (two worker counts) and, on Apple hardware, Metal
 //!    must return byte-identical `RunResult`s. CUDA is not reachable from this machine; that
 //!    deferral is stated, not implied.
-//! 5. **Frozen anchors** — the scalar `RunResult` fingerprint. E4's own horizon is 150 ms of
-//!    simulated time over a 104 GB workload, which is far past what a scalar backend can anchor in
-//!    a review round, so the anchor set is split: a PREFIX anchor at 1.152 ms (GeDES's own F5 span,
-//!    and E2's horizon, so the prefix is a meaningful span rather than an arbitrary cut) plus a
-//!    separately-recorded run-to-completion state. Which is which is stated on each test, per the
-//!    E1-LONG precedent.
+//! 5. **Frozen anchors** — the scalar `RunResult` fingerprint, at two horizons, each named on its
+//!    own test per the E1-LONG precedent: a PREFIX anchor at 1.152 ms (GeDES's own F5 span, and
+//!    E2's horizon, so the prefix is a meaningful span rather than an arbitrary cut) and the
+//!    RUN-TO-COMPLETION anchor at the fixture's own 4 s horizon, which is the state E4's metric is
+//!    actually defined on.
 //!
 //! The fingerprint is FNV-1a64 over the pretty `Debug` rendering of the whole `RunResult`, the same
 //! function `src/bin/t20f_frontier.rs` prints, so a fingerprint here and one from that binary are
@@ -38,7 +37,7 @@ use days::scenario::compile_config;
 use days::topos::build::{PairingPolicy, build_graph};
 use days_executor::{
     Backend, CpuConfig, ObservationMode, RunResult, SimulationImage, run_cpu_with_observations,
-    run_scalar_with_observations, validate,
+    run_scalar_rounds_with_observations, run_scalar_with_observations, validate,
 };
 
 const FNV1A64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -69,12 +68,22 @@ const HOSTS_PER_EDGE: i64 = 16;
 const EDGE_SWITCHES: usize = 512;
 const PORT_RATE_BPS: i64 = 100_000_000_000;
 const PROPAGATION_NS: i64 = 1_000;
-/// GeDES's `Switch_DEFAULT_EGRESS_QUEUE_SIZE`. NOT E1/E2's 1,024 — see
-/// `e4_takes_gedes_queue_depth_and_says_so_against_e2`.
-const SWITCH_CAPACITY_PACKETS: i64 = 200;
+/// E1/E2's depth, NOT GeDES's `Switch_DEFAULT_EGRESS_QUEUE_SIZE = 200` — see
+/// `e4_keeps_the_family_queue_depth_and_says_why`.
+const SWITCH_CAPACITY_PACKETS: i64 = 1_024;
 
 /// E4's `duration`, in nanoseconds. A NON-BINDING upper bound, not a measurement window.
-const HORIZON_NS: u64 = 150_000_000;
+const HORIZON_NS: u64 = 4_000_000_000;
+/// Days' RTO floor (`executor/src/tcp.rs` `MIN_RTO_NS`) — RFC 6298's one second.
+const RTO_FLOOR_NS: u64 = 1_000_000_000;
+/// The latest armed retransmission deadline MEASURED on the REJECTED 200-packet-queue variant of
+/// this workload, where 7 of 8,192 flows were parked on timers. The committed fixture drops
+/// nothing, so this is the cost-of-one-loss datum the horizon is sized against, not an observation
+/// of the committed fixture.
+const MEASURED_LATEST_RTO_DEADLINE_NS: u64 = 1_013_783_350;
+/// The MEASURED drain instant of the committed fixture on scalar: 8,192/8,192 complete, zero drops,
+/// zero retransmitted bytes, nothing resident, nothing pending, over 78,999 rounds.
+const MEASURED_DRAIN_NS: u64 = 96_054_393;
 
 /// The documented prefix the scalar anchor is frozen at: GeDES's own F5 span, and E2's horizon.
 const PREFIX_ANCHOR_NS: u64 = 1_152_000;
@@ -286,6 +295,41 @@ fn identical_across_local_backends(
         assert_eq!(fingerprint(&run.result), reference);
     }
 
+    reference
+}
+
+/// Scalar + CPU (two worker counts) identity, for the horizon Metal cannot reach.
+///
+/// Used ONLY by the run-to-completion anchor, and only because Metal REFUSES that run — see
+/// `e4_completion_on_metal_is_a_refusal`, which pins the refusal so this exclusion can never
+/// become a silent one. Every other E4 gate uses `identical_across_local_backends`.
+fn identical_across_cpu_backends(
+    name: &str,
+    image: &SimulationImage,
+    horizon_ns: Option<u64>,
+) -> Fingerprint {
+    validate(image, Backend::Scalar).unwrap_or_else(|error| panic!("{name} scalar: {error}"));
+    let scalar = scalar_run(image, horizon_ns);
+    let reference = fingerprint(&scalar);
+    for workers in [2_usize, 4] {
+        validate(image, Backend::Cpu { workers })
+            .unwrap_or_else(|error| panic!("{name} cpu {workers}: {error}"));
+        let cpu = run_cpu_with_observations(
+            image,
+            horizon_ns,
+            CpuConfig {
+                workers,
+                ..CpuConfig::default()
+            },
+            ObservationMode::Summary,
+        )
+        .unwrap_or_else(|error| panic!("{name} cpu {workers} run: {error}"));
+        assert_eq!(
+            cpu.result, scalar,
+            "{name}: CPU with {workers} workers diverged from scalar"
+        );
+        assert_eq!(fingerprint(&cpu.result), reference);
+    }
     reference
 }
 
@@ -517,15 +561,23 @@ fn e4_fabric_is_gedes_fabric_where_days_can_express_it() {
     );
 }
 
-/// E4 takes GeDES's queue depth, and the divergence from E1/E2 is deliberate and visible.
+/// E4 keeps E1/E2's queue depth, and the one place it does NOT follow GeDES is stated here.
 ///
-/// E1 and E2 are one fabric with two traffic models, so they share `capacity = 1024`. E4 is a
-/// different premise — GeDES's fabric AND GeDES's workload — so it takes GeDES's
-/// `Switch_DEFAULT_EGRESS_QUEUE_SIZE = 200`. The consequence is that E4 must never be differenced
-/// against E1/E2 as though only the workload changed, and this test exists so that constraint is
-/// asserted rather than remembered.
+/// E4's subject is GeDES's WORKLOAD — flow sizes, pairings, arrivals, on a k = 32 fat tree. The
+/// queue depth is a fabric parameter E1 and E2 already fix at 1,024 and disclose, so E4 keeps it
+/// and stays differenceable against its own family.
+///
+/// THE 200-PACKET VARIANT WAS AUTHORED, RUN AND REJECTED, AND THE REJECTION IS A MEASURED RESULT.
+/// At GeDES's own `Switch_DEFAULT_EGRESS_QUEUE_SIZE = 200` this workload does not complete on Days:
+/// 776 tail drops out of 142,738,118 sourced packets (0.00054 %) concentrated in seven flows, which
+/// then advance ~39 kB per retransmission timeout — 8,185/8,192 complete by 150 ms, 8,189/8,192 by
+/// 4 s, ~400 s of tail still owed. Two mechanisms compose: the 1 s RTO floor against a measured
+/// 25–36 µs RTT, and `scalar.rs`'s `allowance = cwnd − bytes_in_flight` after a timeout collapses
+/// `cwnd` to one MSS without releasing the in-flight bytes. `evidence/P12/e4-authoring.md` carries
+/// the full record; the variant is owed as its own capability row and must not be folded into the
+/// completion-time row.
 #[test]
-fn e4_takes_gedes_queue_depth_and_says_so_against_e2() {
+fn e4_keeps_the_family_queue_depth_and_says_why() {
     let e4 = fixture_table(FIXTURE);
     let e2 = fixture_table("e2_closed_k32_tcp_reno.toml");
     assert_eq!(
@@ -533,15 +585,15 @@ fn e4_takes_gedes_queue_depth_and_says_so_against_e2() {
         Some(SWITCH_CAPACITY_PACKETS)
     );
     assert_eq!(
-        e2["switch"]["capacity"].as_integer(),
-        Some(1_024),
-        "E1/E2's shared depth; if this ever becomes 200 the two families have silently merged"
+        e4["switch"]["capacity"], e2["switch"]["capacity"],
+        "E4 and E2 must share the family queue depth; the GeDES-depth variant is a separate row"
     );
     assert_ne!(
-        e4["switch"]["capacity"], e2["switch"]["capacity"],
-        "the E4/E2 queue-depth divergence is deliberate and must stay visible"
+        SWITCH_CAPACITY_PACKETS, 200,
+        "200 is GeDES's egress depth and is the value this workload provably does not complete at"
     );
-    // The fabric they DO share, so the divergence is exactly one parameter wide.
+    // The rest of the fabric E4 and E2 share, so a reader can name the differences exactly: the
+    // traffic, and nothing else.
     for key in ["port_rate", "weights", "discipline", "drop"] {
         assert_eq!(
             e4["switch"].get(key),
@@ -558,12 +610,22 @@ fn e4_takes_gedes_queue_depth_and_says_so_against_e2() {
 ///
 /// E4's semantics are run-to-completion: the run ends when the fabric drains, and Days has no
 /// stop-when-idle control, so `duration` has to be past the drain instant. A horizon that turned
-/// out to be binding would silently convert E4 from a completion-time fixture into a
-/// fixed-window one, and the count gates (8,192/8,192 completed, sourced == received, nothing
-/// resident) are what detect that at run time. This test pins the sizing argument at author time:
-/// the last flow ARRIVES at 95.787147 ms and the largest flow needs 2.336 ms of pure serialisation
-/// at 100 Gbit/s, so an uncongested lower bound on the drain instant is 98.123 ms and the horizon
-/// leaves 51.877 ms — better than 22x the largest flow's serialisation — for congestion.
+/// out to be binding would silently convert E4 from a completion-time fixture into a fixed-window
+/// one, and `e4_runs_to_completion_and_drains` is what detects that at run time.
+///
+/// THE SIZING IS SET BY THE RTO FLOOR, NOT BY THE WORKLOAD, and that is the whole content of this
+/// test. The workload's own arithmetic is small — the last flow ARRIVES at 95.787147 ms and the
+/// largest flow needs 2.336 ms of serialisation at 100 Gbit/s, so 98.123147 ms bounds an
+/// uncongested drain, and the committed fixture MEASURES a drain at 96,054,393 ns, drop-free.
+///
+/// The horizon is nonetheless forty times that, because the cost of ONE lost segment is a full
+/// second: Days' RTO floor is one second (RFC 6298) against a measured 25–36 µs RTT, and after a
+/// timeout `cwnd` collapses to one MSS without releasing the in-flight bytes, so a flow that loses
+/// a burst advances about one segment per second. That is not hypothetical — it was measured on
+/// the rejected 200-packet-queue variant, where seven flows parked on timers out to
+/// 1,013,783,350 ns. A horizon sized to the drain would turn a single drop into a SILENT
+/// truncation instead of a loud one, and the slack is free: 78,999 rounds for a 4 s horizon whose
+/// fabric is empty after 96 ms.
 #[test]
 fn e4_horizon_is_a_non_binding_upper_bound() {
     let config = fixture_table(FIXTURE);
@@ -572,19 +634,45 @@ fn e4_horizon_is_a_non_binding_upper_bound() {
         .expect("duration is a decimal-seconds literal");
     assert_eq!(duration, HORIZON_NS as f64 / 1e9);
 
+    // (1) The workload's own bound — necessary, and nowhere near sufficient.
     let serialisation_ns = LARGEST_FLOW_BYTES * 8 * 1_000_000_000 / PORT_RATE_BPS as u64;
     assert_eq!(serialisation_ns, 2_336_000, "29.2 MB at 100 Gbit/s");
     let uncongested_drain_ns = LATEST_ARRIVAL_NS + serialisation_ns;
+    assert_eq!(uncongested_drain_ns, 98_123_147);
     assert!(
         uncongested_drain_ns < HORIZON_NS,
-        "the horizon must exceed even the uncongested drain bound"
+        "the horizon must exceed the uncongested drain bound"
     );
     assert!(
-        HORIZON_NS - uncongested_drain_ns > 20 * serialisation_ns,
-        "the slack over the uncongested bound must leave real room for congestion"
+        MEASURED_DRAIN_NS < uncongested_drain_ns,
+        "the measured drain must sit under its own uncongested bound, or the bound is wrong"
     );
-    // Slack is free: an empty fabric costs zero executor rounds, as the F-BURST tail measured.
-    assert_eq!(HORIZON_NS - uncongested_drain_ns, 51_876_853);
+
+    // (2) The bound that actually binds: a lost segment costs at least one RTO floor, and the
+    // measured worst deadline on this workload is already past it.
+    const {
+        assert!(
+            MEASURED_LATEST_RTO_DEADLINE_NS > RTO_FLOOR_NS,
+            "the measured deadline must be at or beyond the floor, or the constant is stale"
+        );
+    }
+    assert!(
+        MEASURED_LATEST_RTO_DEADLINE_NS > 10 * uncongested_drain_ns,
+        "the RTO floor, not the workload, is what sizes this fixture — if that ever stops being \
+         true the header's explanation has to be rewritten"
+    );
+
+    // (3) One full x2 backoff past the measured deadline must still fit, so a single further
+    // timeout is recoverable inside the horizon. A SECOND backoff deliberately does not fit: a
+    // flow needing three consecutive timeouts is a finding and must fail the gate, not be absorbed.
+    let one_backoff_ns = MEASURED_LATEST_RTO_DEADLINE_NS + 2 * RTO_FLOOR_NS;
+    let two_backoffs_ns = one_backoff_ns + 4 * RTO_FLOOR_NS;
+    assert!(one_backoff_ns < HORIZON_NS, "one backoff must fit");
+    assert!(
+        two_backoffs_ns > HORIZON_NS,
+        "two backoffs must NOT fit; an unbounded horizon would absorb a pathology instead of \
+         reporting it"
+    );
 }
 
 /// E4 lowers, and lowers to the workload it states.
@@ -683,16 +771,27 @@ fn e4_prefix_anchor_is_identical_across_local_backends() {
 
 /// RUN-TO-COMPLETION anchor: the state E4's metric is actually defined on.
 ///
-/// Separate from the prefix anchor, and separately reported, because a scalar run over 104 GB of
-/// payload across 150 ms of simulated time is hours of single-threaded work. The measurement round
-/// owns the timing; this gate owns the state.
+/// Separate from the prefix anchor because they are different states, not because the full run is
+/// out of reach: it is not. The measurement round owns E4's timing; this gate owns its state.
+///
+/// SCALAR + CPU ONLY, AND THE REASON IS A MEASURED METAL REFUSAL, NOT A CONVENIENCE. Metal runs
+/// E4 fine at the 1.152 ms prefix — the prefix anchor above is a four-backend fingerprint — but
+/// refuses the run to completion with `Metal execution failed after 1 capacity retries: Metal
+/// transition kernel reported semantic error 45 at LP NodeId(0)`. Code 45 is
+/// `metal_kernels.metal`'s per-generator counter-overflow guard
+/// (`generators[generator + G_PACKETS] == NONE || generators[generator + G_BYTES] > NONE -
+/// size_bytes`, `NONE = 0xffff_ffff_ffff_ffff`), which cannot be a true overflow here: E4's
+/// largest flow emits 20,000 packets and 29,200,000 bytes. The refusal is pinned by
+/// `e4_completion_on_metal_is_a_refusal` and reported in `evidence/P12/e4-authoring.md` as a
+/// blocker for the Metal lane; it is NOT worked around and NOT diagnosed here.
 #[test]
-#[ignore = "explicit P12 E4 RUN-TO-COMPLETION anchor: full 150 ms horizon, 104 GB of payload"]
+#[ignore = "explicit P12 E4 RUN-TO-COMPLETION anchor: full 4 s horizon, 104 GB of payload"]
 fn e4_completion_anchor_is_identical_across_local_backends() {
     let image = lower(FIXTURE);
-    let observed = identical_across_local_backends(FIXTURE, &image, None);
+    let observed = identical_across_cpu_backends(FIXTURE, &image, None);
     println!(
-        "E4 COMPLETION anchor: bytes={} fnv1a64={:016x}",
+        "E4 COMPLETION anchor (scalar + CPU x2/x4; Metal refuses, see the doc comment): \
+         bytes={} fnv1a64={:016x}",
         observed.bytes, observed.fnv1a64
     );
     assert_anchor(
@@ -709,31 +808,121 @@ fn e4_completion_anchor_is_identical_across_local_backends() {
 /// 8,192 of 8,192 flows byte-complete, the exact GeDES byte total delivered, nothing dropped
 /// unacknowledged, nothing left resident, and the drain strictly inside the horizon.
 #[test]
-#[ignore = "explicit P12 E4 count gates: full 150 ms horizon, 104 GB of payload"]
+#[ignore = "explicit P12 E4 count gates: full 4 s horizon, 104 GB of payload"]
 fn e4_runs_to_completion_and_drains() {
     let image = lower(FIXTURE);
-    let result = scalar_run(&image, None);
+    // The ROUND path, not the plain one, because E4's own metric is the DRAIN INSTANT and
+    // `RoundMetrics::frontier_ns` already carries it. Same canonical scalar execution, so the
+    // `RunResult` below is the anchored one; the round vector is instrumentation the executor
+    // has always returned (the F-HET horizon trace established that it needs no executor delta).
+    let run = run_scalar_rounds_with_observations(&image, None, ObservationMode::Summary)
+        .expect("scalar round run must succeed");
+    let result = run.result;
+    let drain_ns = run
+        .rounds
+        .last()
+        .map(|round| round.frontier_ns)
+        .expect("a run this long has rounds");
+    println!(
+        "E4 DRAIN: drainNs={drain_ns} horizonNs={HORIZON_NS} marginNs={} rounds={} \
+         uncongestedDrainBoundNs={}",
+        HORIZON_NS.saturating_sub(drain_ns),
+        run.rounds.len(),
+        LATEST_ARRIVAL_NS + LARGEST_FLOW_BYTES * 8 * 1_000_000_000 / PORT_RATE_BPS as u64,
+    );
 
+    // DIAGNOSE FIRST, ASSERT SECOND. A run this expensive must not fail on its first assertion
+    // and throw away the state that explains the failure: the whole point of the gate is to say
+    // WHICH invariant broke and by how much.
     let mut completed = 0_usize;
     let mut demanded = 0_u128;
     let mut emitted = 0_u128;
+    let mut acked = 0_u128;
+    let mut in_flight = 0_u128;
+    let mut in_flight_flows = 0_usize;
+    let mut armed_timers = 0_usize;
+    let mut latest_deadline_ns = 0_u64;
+    let mut stalled = Vec::new();
     for host in &result.host_states {
         for generator in &host.generators {
             if let days_executor::FlowGeneratorKind::Tcp(tcp) = generator.kind {
                 demanded += u128::from(tcp.total_bytes);
                 emitted += u128::from(generator.bytes_emitted);
+                acked += u128::from(tcp.highest_ack);
                 if tcp.highest_ack >= tcp.total_bytes {
                     completed += 1;
+                } else {
+                    // An incomplete flow is the only thing that can make the horizon binding, so
+                    // it is reported in full: what it owes, and WHEN its transport intends to try
+                    // again. That deadline is what sizes `duration`.
+                    stalled.push((
+                        generator.flow,
+                        tcp.total_bytes,
+                        tcp.highest_ack,
+                        tcp.bytes_in_flight,
+                        tcp.rto_ns,
+                        tcp.srtt_ns,
+                        tcp.active_timer.map(|timer| timer.deadline_ns),
+                    ));
                 }
-                assert_eq!(
-                    tcp.bytes_in_flight, 0,
-                    "a completed flow has nothing in flight"
-                );
+                if tcp.bytes_in_flight != 0 {
+                    in_flight += u128::from(tcp.bytes_in_flight);
+                    in_flight_flows += 1;
+                }
+                if let Some(timer) = tcp.active_timer {
+                    armed_timers += 1;
+                    latest_deadline_ns = latest_deadline_ns.max(timer.deadline_ns);
+                }
             }
         }
     }
-    assert_eq!(completed, FLOW_COUNT, "8,192 of 8,192 flows must complete");
+    for entry in &stalled {
+        println!(
+            "E4 stalled flow {:?}: total={} acked={} inFlight={} rto_ns={} srtt_ns={} \
+             timerDeadlineNs={:?}",
+            entry.0, entry.1, entry.2, entry.3, entry.4, entry.5, entry.6
+        );
+    }
+    println!("E4 latest armed retransmission deadline: {latest_deadline_ns} ns");
+
+    println!(
+        "E4 completion state: completed={completed}/{FLOW_COUNT} demandedBytes={demanded} \
+         ackedBytes={acked} emittedBytes={emitted} flowsWithBytesInFlight={in_flight_flows} \
+         bytesInFlight={in_flight} armedRetransmissionTimers={armed_timers} \
+         residentPackets={} pendingEvents={}",
+        result.resident_packets.len(),
+        result.pending_events.len(),
+    );
+    // The retransmission publication: emitted payload beyond demand IS the retransmitted volume,
+    // read straight off complete state with no instrumentation and no measurement delta.
+    let retransmitted = emitted.saturating_sub(demanded);
+    println!(
+        "E4 retransmission publication: demanded={demanded} B emitted={emitted} B \
+         retransmitted={retransmitted} B ({:.6}%) sourced={} received={} departed={} \
+         dropped_packets={} dropped_bytes={}",
+        100.0 * retransmitted as f64 / demanded as f64,
+        result.summary.sourced_packets,
+        result.summary.received_packets,
+        result.summary.departed_packets,
+        result.summary.dropped_packets,
+        result.summary.dropped_bytes,
+    );
+
     assert_eq!(demanded, TOTAL_PAYLOAD_BYTES);
+    assert_eq!(completed, FLOW_COUNT, "8,192 of 8,192 flows must complete");
+    assert_eq!(
+        acked, TOTAL_PAYLOAD_BYTES,
+        "every flow's cumulative ACK must reach its own GeDES-defined size, so the fabric \
+         delivered exactly the byte total GeDES's table demands"
+    );
+    assert_eq!(
+        in_flight, 0,
+        "a completed flow has nothing in flight ({in_flight_flows} flows still did)"
+    );
+    assert_eq!(
+        armed_timers, 0,
+        "no retransmission timer may still be armed once every flow has completed"
+    );
     assert!(
         result.resident_packets.is_empty(),
         "the fabric must be empty at the drain instant"
@@ -742,17 +931,54 @@ fn e4_runs_to_completion_and_drains() {
         result.pending_events.is_empty(),
         "no event may remain scheduled once every flow has completed"
     );
-
-    // The retransmission publication: emitted payload beyond demand IS the retransmitted volume,
-    // read straight off complete state with no instrumentation and no measurement delta.
-    let retransmitted = emitted - demanded;
-    println!(
-        "E4 retransmission publication: demanded={demanded} B emitted={emitted} B \
-         retransmitted={retransmitted} B ({:.6}%) dropped_packets={} dropped_bytes={}",
-        100.0 * retransmitted as f64 / demanded as f64,
-        result.summary.dropped_packets,
-        result.summary.dropped_bytes,
+    // G4, the Days-side twin of the ns-3 scenario's drain gate: the run ended because the fabric
+    // drained, not because the clock ran out.
+    assert!(
+        drain_ns < HORIZON_NS,
+        "the horizon was BINDING (drain {drain_ns} ns >= {HORIZON_NS} ns): E4 is a completion-time \
+         fixture, not a fixed-window one"
     );
+}
+
+/// Metal REFUSES E4's run to completion, and the refusal is gated so it cannot become silent.
+///
+/// This is a first-class result, not a skipped backend. Metal executes the same image happily for
+/// 1.152 ms (the prefix anchor is a four-backend fingerprint), so the fixture is expressible on
+/// Metal; something further into a 96 ms, 104 GB run is not. The error is
+/// `metal_kernels.metal`'s code 45, the per-generator counter-overflow guard, at a scale where no
+/// counter can have overflowed — E4's largest flow emits 20,000 packets and 29,200,000 bytes
+/// against a `NONE` sentinel of 2^64-1.
+///
+/// If Metal is ever fixed, THIS TEST GOES RED, which is the point: the exclusion in
+/// `e4_completion_anchor_is_identical_across_local_backends` must be revisited in the same change,
+/// and E4's completion identity claim upgraded from three backends to four.
+#[test]
+#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[ignore = "explicit P12 E4 Metal refusal probe: full 4 s horizon, 104 GB of payload"]
+fn e4_completion_on_metal_is_a_refusal() {
+    use days_executor::{MetalConfig, MetalExecutor};
+    let image = lower(FIXTURE);
+    let executor = MetalExecutor::new().expect("Metal executor must initialize");
+    let outcome = executor.run_with_observations(
+        &image,
+        None,
+        MetalConfig::default(),
+        ObservationMode::Summary,
+    );
+    let error = match outcome {
+        Ok(_) => panic!(
+            "Metal now COMPLETES E4. That is good news and this test is the notice: re-run the \
+             completion anchor with `identical_across_local_backends`, upgrade E4's completion \
+             identity claim from three backends to four, and update evidence/P12/e4-authoring.md."
+        ),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        error.contains("semantic error 45"),
+        "Metal still refuses E4 to completion, but with a DIFFERENT error than the one recorded \
+         in evidence/P12/e4-authoring.md: {error}"
+    );
+    println!("E4 Metal completion refusal, verbatim: {error}");
 }
 
 fn assert_anchor(name: &str, actual: Fingerprint, bytes: u64, fnv1a64: u64) {
@@ -769,13 +995,16 @@ fn assert_anchor(name: &str, actual: Fingerprint, bytes: u64, fnv1a64: u64) {
 // Frozen anchor values. See `evidence/P12/e4-authoring.md` for how each was produced.
 // -------------------------------------------------------------------------------------------
 
-/// Scalar/CPU/Metal fingerprint of E4's first 1.152 ms. OWED — the authoring round records it.
-const E4_PREFIX_ANCHOR_BYTES: u64 = 0;
-const E4_PREFIX_ANCHOR_FNV: u64 = 0;
+/// Scalar/CPU/Metal fingerprint of E4's first 1.152 ms, frozen by the T21 authoring round.
+const E4_PREFIX_ANCHOR_BYTES: u64 = 114_896_891;
+const E4_PREFIX_ANCHOR_FNV: u64 = 0x9d85_6e6d_66b0_17ae;
 
-/// Scalar/CPU/Metal fingerprint of E4 run to completion. OWED.
-const E4_COMPLETION_ANCHOR_BYTES: u64 = 0;
-const E4_COMPLETION_ANCHOR_FNV: u64 = 0;
+/// Scalar + CPU(2) + CPU(4) fingerprint of E4 run to completion. Metal refuses; see above.
+///
+/// Smaller than the prefix anchor because it is a DRAINED image: no resident packets, no pending
+/// events, no armed timers. That is the fixture working as specified, not a truncated run.
+const E4_COMPLETION_ANCHOR_BYTES: u64 = 50_866_719;
+const E4_COMPLETION_ANCHOR_FNV: u64 = 0x64fb_70c3_3345_c10e;
 
 // -------------------------------------------------------------------------------------------
 // md5, so the provenance gate does not need a dependency the workspace does not already carry.

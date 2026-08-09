@@ -112,12 +112,25 @@ FABRIC. k = 32 with 16 hosts per edge switch (8,192 hosts, 1,280 switches); 100 
 (`tx_rate = 100` bits/ns, `main.cc:55-71`); 1,000 ns propagation per link
 (`popogation_delay = 1000`).
 
-QUEUES. `capacity = 200`, GeDES's `Switch_DEFAULT_EGRESS_QUEUE_SIZE` (`include/conf.h`), FIFO
-tail-drop (`switch.cu:216-223`). THIS IS A DELIBERATE DEPARTURE FROM E1/E2's 1,024, and it is the
-one place where E4 chooses GeDES-fidelity over intra-family comparability: E4's premise is "GeDES's
-own fabric and GeDES's own workload", so where GeDES fixes a fabric parameter Days can express
-exactly, E4 takes GeDES's value. E4 is consequently NOT "E2 with a different traffic model" and
-must never be differenced against E1/E2 as if it were.
+QUEUES. `capacity = 1024`, FIFO tail-drop -- E1 and E2's depth, NOT GeDES's
+`Switch_DEFAULT_EGRESS_QUEUE_SIZE = 200` (`include/conf.h`, `switch.cu:216-223`). E4's subject is
+GeDES's WORKLOAD -- flow sizes, pairings, arrivals, on a k=32 fat tree -- and the queue depth is a
+fabric parameter E1/E2 already fix and disclose, so E4 keeps the family's value and stays
+differenceable against them.
+
+  THE 200-PACKET VARIANT WAS AUTHORED, RUN AND REJECTED, AND THAT IS A RESULT. At `capacity = 200`
+  this exact workload does NOT complete on Days. Measured (full scalar runs at 150 ms and at 4 s):
+  776 tail drops out of 142,738,118 sourced packets -- 0.00054 %, concentrated in 7 flows -- and
+  those flows then make ~39 kB of progress per RETRANSMISSION TIMEOUT, so 8,185/8,192 complete by
+  150 ms, 8,189/8,192 by 4 s, and the remaining flows owe ~400 more seconds of simulated tail. Two
+  mechanisms compose: Days' RTO floor is 1 s (`executor/src/tcp.rs` MIN_RTO_NS, RFC 6298) against a
+  MEASURED 25-36 us smoothed RTT on this fabric, and after a timeout `cwnd` collapses to one MSS
+  while `bytes_in_flight` is left standing (`scalar.rs:4338`: `allowance = cwnd - bytes_in_flight`),
+  so a flow moves exactly one segment per second until the receiver's cumulative ACK catches up.
+  Keeping 200 would therefore have bought GeDES-fidelity on one fabric constant at the price of a
+  fixture that does not terminate -- and of a second, uncontrolled difference from E1/E2.
+  The variant is recorded in `evidence/P12/e4-authoring.md` and is owed as a separate capability
+  row, not smuggled into the completion-time row.
 
 ORDERING. Flows are emitted in ascending Days source host id, not in GeDES's CSV order. The two
 are related by the switch-major/ordinal-major permutation above; the SET of flows, every byte
@@ -169,13 +182,35 @@ HOSTS = EDGE_SWITCHES * HOSTS_PER_EDGE  # 8192
 SEGMENT_BYTES = 1460
 PORT_RATE_BPS = 100_000_000_000
 PROPAGATION_NS = 1000
-SWITCH_CAPACITY_PACKETS = 200
+SWITCH_CAPACITY_PACKETS = 1024
 
 # Horizon. NOT a measurement window: E4 is run-to-completion and the horizon is a non-binding
 # upper bound whose non-bindingness is a gate (every flow completed, fabric drained, strictly
-# inside it). 150 ms is 54.2 ms past the last arrival (95.787147 ms) -- 23x the 2.336 ms a
-# 100 Gbit/s host needs to serialise the largest flow in the table (29,200,000 B).
-DURATION_S = "0.150000000"
+# inside it).
+#
+# WHAT THE HORIZON IS SIZED AGAINST, and it is not the workload. The workload's own arithmetic is
+# small: the last flow ARRIVES at 95.787147 ms and the largest flow (29,200,000 B) needs 2.336 ms
+# of serialisation at 100 Gbit/s, so 98.123147 ms bounds an uncongested drain -- and the committed
+# fixture MEASURES a drain at 96.054393 ms, drop-free, 8,192/8,192 complete, 78,999 rounds.
+#
+# The horizon is nonetheless four seconds, because the cost of ONE lost segment is a full second.
+# Days' RTO floor is 1 s (`executor/src/tcp.rs` MIN_RTO_NS, RFC 6298) against a MEASURED smoothed
+# RTT of 25-36 us on this fabric -- a floor roughly 30,000x the actual round trip -- and after a
+# timeout `cwnd` collapses to one MSS while `bytes_in_flight` stands (`scalar.rs:4338`:
+# `allowance = cwnd - bytes_in_flight`), so a flow that loses a burst moves about one segment per
+# second. A horizon sized to the drain would therefore turn a single drop into a SILENT truncation
+# instead of a loud one. Four seconds admits a first timeout plus one x2 backoff and still refuses
+# a third, so a pathology is reported rather than absorbed. The slack is measured to be free: the
+# 4 s horizon costs 78,999 rounds for a run that drains at 96 ms, because an empty fabric costs
+# zero executor rounds.
+#
+# THIS IS ALSO A CROSS-ARM DISCLOSURE. GeDES's own `rto = 1000000` ns is ONE MILLISECOND
+# (`component.cc:173-227`), three orders of magnitude below the floor Days and ns-3 both use. Any
+# E4 time-to-completion compared across arms is RTO-floor-dominated the moment a single segment is
+# lost, so the completion instant must always be published beside the drop count. On the committed
+# fabric Days drops nothing, which is what makes its 96.054393 ms drain a workload result rather
+# than a timer result.
+DURATION_S = "4.000000000"
 
 # Family seed. E4 draws no random endpoints (every flow is explicit), so this only keeps the file
 # in the shape of its E1/E2 siblings.
@@ -274,9 +309,23 @@ def render(flows) -> str:
     w("#     flows complete and the fabric drains strictly inside it. An empty fabric costs zero")
     w("#     executor rounds (the F-BURST tail measured exactly that), so the slack is free.")
     w("#")
-    w("#   * COUNT GATES. flows 8192/8192 completed; total delivered payload exactly")
-    w(f"#     {total_bytes:,} B = the sum of GeDES's own flow_size column; sourced == received;")
-    w("#     zero packets resident at the drain instant.")
+    w("#   * THE HORIZON IS 40x THE DRAIN, ON PURPOSE. One lost segment costs a full second here:")
+    w("#     Days' RTO floor is 1 s (`executor/src/tcp.rs` MIN_RTO_NS, RFC 6298) against a MEASURED")
+    w("#     25-36 us RTT, and after a timeout `cwnd` collapses to one MSS without releasing the")
+    w("#     in-flight bytes, so a flow that loses a burst advances ~one segment per second. A")
+    w("#     horizon sized to the 96 ms drain would turn a single drop into a SILENT truncation.")
+    w("#     4 s admits one timeout plus one x2 backoff and refuses a third. It is free: 78,999")
+    w("#     rounds for a 4 s horizon that drains at 96 ms, because an empty fabric costs 0 rounds.")
+    w("#     CROSS-ARM: GeDES's own rto is 1 ms, three orders of magnitude below Days' and ns-3's")
+    w("#     floor, so any E4 completion time is RTO-floor-dominated the moment a segment is lost")
+    w("#     and must be published beside the drop count. Days drops NOTHING here, which is what")
+    w("#     makes its 96.054393 ms drain a workload result and not a timer result.")
+    w("#")
+    w("#   * COUNT GATES, ALL MEASURED GREEN on scalar. flows 8192/8192 completed; cumulative ACK")
+    w(f"#     exactly {total_bytes:,} B = the sum of GeDES's own flow_size column;")
+    w("#     0 packets resident, 0 events pending, 0 retransmission timers armed at the end;")
+    w("#     0 dropped packets and 0 retransmitted bytes; DRAIN at 96,054,393 ns over 78,999")
+    w("#     rounds, against the 4,000,000,000 ns horizon -- a margin of 3,903,945,607 ns.")
     w("#")
     w("# WORKLOAD SHAPE (measured over the committed table, asserted in tests/t21_p12_e4.rs):")
     w(f"#   flows                 {len(flows):>18,}")
@@ -290,11 +339,14 @@ def render(flows) -> str:
     w("#")
     w("# FABRIC. Taken from GeDES where GeDES fixes it and Days can express it exactly: k = 32 with")
     w("# 16 hosts per edge switch (8,192 hosts), 100 Gbit/s ports, 1,000 ns propagation, 1,460 B")
-    w("# segments, FIFO tail-drop, and 200-packet egress queues -- GeDES's")
-    w("# Switch_DEFAULT_EGRESS_QUEUE_SIZE. THE 200 IS A DEPARTURE FROM E1/E2's 1,024 AND IS")
-    w("# DELIBERATE: E4's premise is GeDES's fabric, so where GeDES fixes a parameter Days can")
-    w("# express, E4 takes GeDES's value. E4 is therefore NOT `E2 with different traffic` and must")
-    w("# never be differenced against E1/E2 as though only the workload changed.")
+    w("# segments, FIFO tail-drop. The one fabric constant NOT taken from GeDES is the queue depth:")
+    w("# E4 uses E1/E2's 1,024 packets, not GeDES's Switch_DEFAULT_EGRESS_QUEUE_SIZE = 200, so that")
+    w("# E4 stays differenceable against its own family. The 200-packet variant was authored, run")
+    w("# and REJECTED, and that rejection is a measured result: at 200 this workload does not")
+    w("# complete on Days (776 tail drops in 142,738,118 packets, concentrated in 7 flows, each")
+    w("# then advancing ~39 kB per 1-second retransmission timeout -- 8,185/8,192 done at 150 ms,")
+    w("# 8,189/8,192 at 4 s, ~400 s of tail owed). See the generator docstring and")
+    w("# evidence/P12/e4-authoring.md for the two mechanisms that compose to produce it.")
     w("#")
     w("# TRAJECTORY NON-IDENTITY, DISCLOSED. GeDES runs DCTCP (ENABLE_DCTCP = 1; its Reno branch is")
     w("# compiled out), Go-Back-N, null payloads, ACK-per-5-packets, and per-packet round-robin")
