@@ -443,11 +443,11 @@ const fn span_ns(image: &SimulationImage, horizon_ns: Option<u64>) -> u64 {
     }
 }
 
-fn print_identity(cli: &Cli, result: &RunResult, quanta: Quanta) {
+fn print_identity(cli: &Cli, result: &RunResult, quanta: Quanta, lp_count: usize) {
     let fingerprint = fingerprint(result);
     println!(
         "record=t21_horizon_identity config={} label={} horizon_ns={} min_channel_delay_ns={} \
-         min_link_propagation_ns={} propagation_slot_quantum_ns={} dump={} \
+         min_link_propagation_ns={} propagation_slot_quantum_ns={} lp_count={lp_count} dump={} \
          engine=scalar_rounds observations=summary result_bytes={} result_fnv1a64={:016x} \
          pending_events={} resident_packets={} sourced_packets={} departed_packets={} \
          received_packets={} dropped_packets={}",
@@ -470,7 +470,7 @@ fn print_identity(cli: &Cli, result: &RunResult, quanta: Quanta) {
     );
 }
 
-fn print_rounds(cli: &Cli, trace: &Trace, quanta: Quanta, span_ns: u64) {
+fn print_rounds(cli: &Cli, trace: &Trace, quanta: Quanta, span_ns: u64, lp_count: usize) {
     let widths = trace
         .widths
         .iter()
@@ -489,7 +489,7 @@ fn print_rounds(cli: &Cli, trace: &Trace, quanta: Quanta, span_ns: u64) {
 
     println!(
         "record=t21_horizon_rounds config={} label={} horizon_ns={} min_channel_delay_ns={} \
-         min_link_propagation_ns={} propagation_slot_quantum_ns={} \
+         min_link_propagation_ns={} propagation_slot_quantum_ns={} lp_count={lp_count} \
          stop_time_ns_span={span_ns} \
          channel_slots_configured={channel_slots_configured} \
          propagation_slots_configured={propagation_slots_configured} rounds={} \
@@ -585,8 +585,8 @@ fn main() {
         });
     }
 
-    print_identity(&cli, &run.result, quanta);
-    print_rounds(&cli, &trace, quanta, span_ns);
+    print_identity(&cli, &run.result, quanta, image.nodes.len());
+    print_rounds(&cli, &trace, quanta, span_ns, image.nodes.len());
     for (width, rounds) in &trace.width_histogram {
         println!(
             "record=t21_horizon_width_bin config={} label={} active_lp_count={width} rounds={rounds}",
