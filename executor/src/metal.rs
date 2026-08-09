@@ -6055,7 +6055,11 @@ mod tests {
         for (index, phase) in reported.iter().enumerate() {
             assert_eq!(phase.index(), index);
         }
+        // Every width-1 dispatch, including `Compaction` — the worklist compaction, whose OUTPUT
+        // ORDER depends on the partition and which the first version of this list omitted.
         for kernel in [
+            AttemptKernel::Horizon,
+            AttemptKernel::Compaction,
             AttemptKernel::ContinuationControl,
             AttemptKernel::ExchangePrefix,
             AttemptKernel::FinalControl,
@@ -6064,7 +6068,11 @@ mod tests {
                 .into_iter()
                 .find(|(candidate, _, _)| *candidate == kernel)
                 .expect("every control dispatch is present");
-            assert_eq!(geometry, DispatchGeometry::FixedControl);
+            assert_eq!(
+                geometry,
+                DispatchGeometry::FixedControl,
+                "{kernel:?} must be dispatched at width 1"
+            );
             assert_eq!(geometry.threads_per_threadgroup(256), LANES);
         }
 

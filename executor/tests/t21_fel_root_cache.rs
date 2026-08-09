@@ -12,26 +12,73 @@
 
 use days_executor::device_sizing::{ROUND_SCRATCH_CACHE_WORDS, round_scratch_words};
 
+#[path = "support/kernel_span.rs"]
+mod kernel_span;
+
+use kernel_span::{CUDA_MARKER, METAL_MARKER, kernel_body, kernel_names};
+
 const CUDA_KERNELS: &str = include_str!("../src/cuda_kernels.cu");
 const METAL_KERNELS: &str = include_str!("../src/metal_kernels.metal");
 
-/// The body of one kernel, from its entry signature to the start of the next entry point.
-fn kernel_body<'a>(source: &'a str, entry: &str, opener: &str) -> &'a str {
-    let signature = format!("{opener}{entry}(");
-    let start = source
-        .find(&signature)
-        .unwrap_or_else(|| panic!("`{entry}` must exist in the kernel source"));
-    let rest = &source[start + signature.len()..];
-    let end = rest.find(opener).unwrap_or(rest.len());
-    &rest[..end]
-}
-
 fn cuda_kernel(entry: &str) -> &'static str {
-    kernel_body(CUDA_KERNELS, entry, "extern \"C\" __global__ void ")
+    kernel_body(CUDA_KERNELS, CUDA_MARKER, entry)
 }
 
 fn metal_kernel(entry: &str) -> &'static str {
-    kernel_body(METAL_KERNELS, entry, "kernel void ")
+    kernel_body(METAL_KERNELS, METAL_MARKER, entry)
+}
+
+/// The extraction every other test in this file depends on sees each kernel and *only* that kernel.
+///
+/// The first version of the helper split on the literal `extern "C" __global__ void `, which does
+/// not match `days_round`'s `__launch_bounds__(1024)` form, so `days_round_prepare`'s span ran on
+/// through the whole of `days_round`. Two assertions below were consequently evaluated over the
+/// wrong text, and one of them could not fail at all. This test is the floor under both.
+#[test]
+fn each_kernel_span_stops_at_the_next_entry_point_whatever_form_it_takes() {
+    let cuda = kernel_names(CUDA_KERNELS, CUDA_MARKER);
+    assert!(
+        cuda.contains(&"days_round".to_string()),
+        "the `__launch_bounds__` entry form must be recognized, or the kernel before it absorbs \
+         `days_round`: saw {cuda:?}",
+    );
+    // The pair the regression was about: `days_round_prepare` is declared immediately before
+    // `days_round`, so a miss on the latter's form is exactly what widened the former's span.
+    let prepare = cuda_kernel("days_round_prepare");
+    assert!(
+        !prepare.contains("days_round(") && !prepare.contains("active_index"),
+        "CUDA `days_round_prepare`'s span must stop before `days_round`",
+    );
+    assert!(
+        !prepare.contains("__launch_bounds__"),
+        "no attribute from the NEXT kernel's declaration may appear in this span",
+    );
+    for (backend, names) in [
+        ("CUDA", cuda),
+        ("Metal", kernel_names(METAL_KERNELS, METAL_MARKER)),
+    ] {
+        for named in [
+            "days_horizon_sweep",
+            "days_horizon",
+            "days_round_reset",
+            "days_round_prepare",
+            "days_round",
+            "days_round_control_sweep",
+            "days_round_control",
+            "days_exchange_prefix_sweep",
+            "days_exchange_prefix",
+            "days_exchange_scatter",
+            "days_exchange_merge",
+            "days_round_finalize_sweep",
+            "days_round_finalize",
+            "days_compact_gather",
+        ] {
+            assert!(
+                names.contains(&named.to_string()),
+                "{backend} extraction must see `{named}`; saw {names:?}",
+            );
+        }
+    }
 }
 
 /// `evidence/P12/perround-upperbound.md` §1.5.2 measured the per-node FEL root query at three
@@ -102,8 +149,34 @@ fn the_cache_is_two_words_per_lp() {
 /// worklist's order, and each producer's staging base — so unlike every reduced quantity in
 /// `t21_control_regrid.rs` they are *not* partition-free, and they stay in a width-1 dispatch over
 /// the retained 1,024 lanes. This test exists so that a later widening cannot happen quietly.
+///
+/// **It has to be able to fail.** The first version asserted only that each body contained the
+/// substrings `"ulong chunk = "`, `"ulong remainder = "` and `"1024"`, and the adversarial review
+/// re-gridded Metal's `days_round_prepare` across the whole grid — the exact change this test
+/// forbids — while keeping all three, and every gate stayed green. The two assertions below are the
+/// ones that break under that probe:
+///
+/// 1. **The divisor is the literal 1,024**, not a grid-derived count. A re-grid must compute the
+///    partition from `threadgroups_per_grid × threads_per_threadgroup` (or `gridDim.x × blockDim.x`)
+///    and cannot leave `nodes / 1024` in place.
+/// 2. **The body consults no grid-wide quantity at all.** These two kernels are the only ones in
+///    the attempt DAG that may not know how wide the grid is; reading a grid attribute is the
+///    prerequisite for every re-grid, so its absence is the property worth pinning.
+///
+/// The host side is gated separately, in
+/// `t21_control_regrid::the_two_partition_dependent_scans_are_dispatched_at_width_one`: a kernel
+/// that keeps its 1,024-lane partition is still wrong if the host hands it 128 threadgroups.
 #[test]
 fn the_two_node_ordered_scans_keep_the_retained_single_block_partition() {
+    // Every way either language has of asking how wide the grid is.
+    const GRID_WIDE: [&str; 6] = [
+        "gridDim",
+        "blockIdx",
+        "blockDim",
+        "threadgroups_per_grid",
+        "threadgroup_position_in_grid",
+        "threads_per_threadgroup",
+    ];
     for (backend, prepare, prefix) in [
         (
             "CUDA",
@@ -125,9 +198,17 @@ fn the_two_node_ordered_scans_keep_the_retained_single_block_partition() {
                 "{backend} `{name}` keeps the contiguous node-ordered chunk partition",
             );
             assert!(
-                body.contains("1024"),
-                "{backend} `{name}` keeps the retained 1,024-lane width",
+                body.contains("/ 1024") && body.contains("% 1024"),
+                "{backend} `{name}` must partition by the LITERAL 1,024 lanes; a divisor derived \
+                 from the grid is a re-grid of a scan whose output depends on the partition",
             );
+            for attribute in GRID_WIDE {
+                assert!(
+                    !body.contains(attribute),
+                    "{backend} `{name}` must not consult `{attribute}`: it runs at width 1 and its \
+                     output depends on the partition, so it may not learn how wide the grid is",
+                );
+            }
         }
     }
 }
