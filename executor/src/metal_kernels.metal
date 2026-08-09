@@ -6235,12 +6235,18 @@ kernel void days_exchange_merge_fan_in_probe(
 }
 #endif
 
-kernel void days_round_finalize(
-    device ulong *control [[buffer(0)]],
+// T21 fix 1 — the finalize scans, on the whole grid. Transliterated word for word from
+// `cuda_kernels.cu`; see that kernel's header for the clamped-sum associativity argument.
+kernel void days_round_finalize_sweep(
+    const device ulong *control [[buffer(0)]],
     const device ulong *params [[buffer(1)]],
     const device ulong *lp_state [[buffer(18)]],
     const device ulong *observation_meta [[buffer(21)]],
-    uint lane [[thread_index_in_threadgroup]]
+    device ulong *stream_state [[buffer(25)]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint block [[threadgroup_position_in_grid]],
+    uint block_size [[threads_per_threadgroup]],
+    uint blocks [[threadgroups_per_grid]]
 ) {
     threadgroup ulong values[1024];
     threadgroup uint exceeded[1024];
@@ -6260,7 +6266,9 @@ kernel void days_round_finalize(
     ulong local_totals[3] = {0, 0, 0};
     uint local_exceeded[3] = {0, 0, 0};
     ulong first_error = NONE;
-    for (ulong node = lane; node < params[P_NODE_COUNT]; node += 1024) {
+    ulong first = ulong(block) * ulong(block_size) + ulong(lane);
+    ulong stride = ulong(blocks) * ulong(block_size);
+    for (ulong node = first; node < params[P_NODE_COUNT]; node += stride) {
         ulong state = node * LP_STATE_WORDS;
         if (first_error == NONE && lp_state[state + L_ERROR] != 0) {
             first_error = node;
@@ -6273,6 +6281,84 @@ kernel void days_round_finalize(
                 local_exceeded[log] |= uint(local_totals[log] > capacities[log]);
             }
         }
+    }
+
+    values[lane] = first_error;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride_lanes = 512; stride_lanes != 0; stride_lanes >>= 1) {
+        if (lane < stride_lanes) {
+            values[lane] = min(values[lane], values[lane + stride_lanes]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane == 0) {
+        store_round_partial(stream_state, params, block, 0, values[0]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint log = 0; log < 3; ++log) {
+        values[lane] = local_totals[log];
+        exceeded[lane] = local_exceeded[log];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride_lanes = 512; stride_lanes != 0; stride_lanes >>= 1) {
+            if (lane < stride_lanes) {
+                ulong left = values[lane];
+                ulong right = values[lane + stride_lanes];
+                uint combined_exceeded = exceeded[lane] | exceeded[lane + stride_lanes];
+                ulong combined_total = saturating_add_ulong(left, right);
+                combined_exceeded |= uint(combined_total > capacities[log]);
+                values[lane] = combined_total;
+                exceeded[lane] = combined_exceeded;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (lane == 0) {
+            store_round_partial(stream_state, params, block, 1 + log * 2, values[0]);
+            store_round_partial(
+                stream_state,
+                params,
+                block,
+                2 + log * 2,
+                ulong(exceeded[0])
+            );
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// T21 fix 1 — the finalize combine. Transliterated word for word from `cuda_kernels.cu`.
+kernel void days_round_finalize(
+    device ulong *control [[buffer(0)]],
+    const device ulong *params [[buffer(1)]],
+    const device ulong *lp_state [[buffer(18)]],
+    const device ulong *stream_state [[buffer(25)]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    threadgroup ulong values[1024];
+    threadgroup uint exceeded[1024];
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 2
+    ) {
+        return;
+    }
+
+    ulong capacities[3] = {
+        params[P_OBSERVED_CAPACITY],
+        params[P_DEPARTURE_CAPACITY],
+        params[P_ARRIVAL_CAPACITY]
+    };
+    ulong first_error = NONE;
+    for (
+        ulong block = lane;
+        block < CONTROL_SWEEP_BLOCKS;
+        block += 1024
+    ) {
+        first_error = min(
+            first_error,
+            load_round_partial(stream_state, params, block, 0)
+        );
     }
 
     values[lane] = first_error;
@@ -6307,8 +6393,24 @@ kernel void days_round_finalize(
 
     ulong arenas[3] = {ARENA_OBSERVED, ARENA_DEPARTURES, ARENA_ARRIVALS};
     for (uint log = 0; log < 3; ++log) {
-        values[lane] = local_totals[log];
-        exceeded[lane] = local_exceeded[log];
+        ulong local_total = 0;
+        uint local_exceeded = 0;
+        for (
+            ulong block = lane;
+            block < CONTROL_SWEEP_BLOCKS;
+            block += 1024
+        ) {
+            local_total = saturating_add_ulong(
+                local_total,
+                load_round_partial(stream_state, params, block, 1 + log * 2)
+            );
+            local_exceeded |= uint(
+                load_round_partial(stream_state, params, block, 2 + log * 2) != 0
+            );
+            local_exceeded |= uint(local_total > capacities[log]);
+        }
+        values[lane] = local_total;
+        exceeded[lane] = local_exceeded;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (uint stride = 512; stride != 0; stride >>= 1) {
             if (lane < stride) {

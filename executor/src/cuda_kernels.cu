@@ -5534,7 +5534,21 @@ extern "C" __global__ void days_exchange_merge(DAYS_BUFFERS) {
 
 // T15e diagnostic counterpart of `days_exchange_merge`. The merge itself is unchanged; a
 // read-only pre-scan records actual producer fan-in and remote-event counts per target-round.
-extern "C" __global__ void days_round_finalize(DAYS_BUFFERS) {
+// T21 fix 1 — the finalize scans, on the whole grid.
+//
+// Four partition-free reductions: a `min` over the LP indices whose `L_ERROR` is set, and one
+// CLAMPED SUM plus capacity flag for each of the three observation logs.
+//
+// The clamped sum is associative on non-negative values — `sat(sat(a,b),c) = min(a+b+c, 2^64-1) =
+// sat(a,sat(b,c))`, because if `a+b` already saturates then so does the true total — so the
+// multi-way clamped sum is `min(true total, 2^64-1)` for EVERY grouping. And every tree node's
+// value is the clamped sum of its own subtree, hence at most the total, so a node exceeding the
+// capacity implies the total does; the root re-checks the total. The flag is therefore exactly
+// `clamped total > capacity`, again for every grouping. Neither the totals nor the flags can tell
+// how the LPs were divided.
+//
+// Seven words per block: `{first_error, total0, exceeded0, total1, exceeded1, total2, exceeded2}`.
+extern "C" __global__ void days_round_finalize_sweep(DAYS_BUFFERS) {
     uint lane = threadIdx.x;
     __shared__ ulong values[1024];
     __shared__ uint exceeded[1024];
@@ -5554,7 +5568,9 @@ extern "C" __global__ void days_round_finalize(DAYS_BUFFERS) {
     ulong local_totals[3] = {0, 0, 0};
     uint local_exceeded[3] = {0, 0, 0};
     ulong first_error = NONE;
-    for (ulong node = lane; node < params[P_NODE_COUNT]; node += 1024) {
+    ulong first = ulong(blockIdx.x) * ulong(blockDim.x) + ulong(threadIdx.x);
+    ulong stride = ulong(gridDim.x) * ulong(blockDim.x);
+    for (ulong node = first; node < params[P_NODE_COUNT]; node += stride) {
         ulong state = node * LP_STATE_WORDS;
         if (first_error == NONE && lp_state[state + L_ERROR] != 0) {
             first_error = node;
@@ -5567,6 +5583,80 @@ extern "C" __global__ void days_round_finalize(DAYS_BUFFERS) {
                 local_exceeded[log] |= uint(local_totals[log] > capacities[log]);
             }
         }
+    }
+
+    values[lane] = first_error;
+    __syncthreads();
+    for (uint stride_lanes = 512; stride_lanes != 0; stride_lanes >>= 1) {
+        if (lane < stride_lanes) {
+            values[lane] = min(values[lane], values[lane + stride_lanes]);
+        }
+        __syncthreads();
+    }
+    if (lane == 0) {
+        store_round_partial(stream_state, params, blockIdx.x, 0, values[0]);
+    }
+    __syncthreads();
+
+    for (uint log = 0; log < 3; ++log) {
+        values[lane] = local_totals[log];
+        exceeded[lane] = local_exceeded[log];
+        __syncthreads();
+        for (uint stride_lanes = 512; stride_lanes != 0; stride_lanes >>= 1) {
+            if (lane < stride_lanes) {
+                ulong left = values[lane];
+                ulong right = values[lane + stride_lanes];
+                uint combined_exceeded = exceeded[lane] | exceeded[lane + stride_lanes];
+                ulong combined_total = saturating_add_ulong(left, right);
+                combined_exceeded |= uint(combined_total > capacities[log]);
+                values[lane] = combined_total;
+                exceeded[lane] = combined_exceeded;
+            }
+            __syncthreads();
+        }
+        if (lane == 0) {
+            store_round_partial(stream_state, params, blockIdx.x, 1 + log * 2, values[0]);
+            store_round_partial(
+                stream_state,
+                params,
+                blockIdx.x,
+                2 + log * 2,
+                ulong(exceeded[0])
+            );
+        }
+        __syncthreads();
+    }
+}
+
+// T21 fix 1 — the finalize combine. The guard is `days_round_finalize_sweep`'s, word for word, and
+// nothing between the two dispatches writes a word it reads.
+extern "C" __global__ void days_round_finalize(DAYS_BUFFERS) {
+    uint lane = threadIdx.x;
+    __shared__ ulong values[1024];
+    __shared__ uint exceeded[1024];
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 2
+    ) {
+        return;
+    }
+
+    ulong capacities[3] = {
+        params[P_OBSERVED_CAPACITY],
+        params[P_DEPARTURE_CAPACITY],
+        params[P_ARRIVAL_CAPACITY]
+    };
+    ulong first_error = NONE;
+    for (
+        ulong block = lane;
+        block < CONTROL_SWEEP_BLOCKS;
+        block += 1024
+    ) {
+        first_error = min(
+            first_error,
+            load_round_partial(stream_state, params, block, 0)
+        );
     }
 
     values[lane] = first_error;
@@ -5601,8 +5691,24 @@ extern "C" __global__ void days_round_finalize(DAYS_BUFFERS) {
 
     ulong arenas[3] = {ARENA_OBSERVED, ARENA_DEPARTURES, ARENA_ARRIVALS};
     for (uint log = 0; log < 3; ++log) {
-        values[lane] = local_totals[log];
-        exceeded[lane] = local_exceeded[log];
+        ulong local_total = 0;
+        uint local_exceeded = 0;
+        for (
+            ulong block = lane;
+            block < CONTROL_SWEEP_BLOCKS;
+            block += 1024
+        ) {
+            local_total = saturating_add_ulong(
+                local_total,
+                load_round_partial(stream_state, params, block, 1 + log * 2)
+            );
+            local_exceeded |= uint(
+                load_round_partial(stream_state, params, block, 2 + log * 2) != 0
+            );
+            local_exceeded |= uint(local_total > capacities[log]);
+        }
+        values[lane] = local_total;
+        exceeded[lane] = local_exceeded;
         __syncthreads();
         for (uint stride = 512; stride != 0; stride >>= 1) {
             if (lane < stride) {

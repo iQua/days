@@ -236,6 +236,7 @@ enum AttemptKernel {
     ExchangePrefix,
     ExchangeScatter,
     TargetMerge,
+    FinalControlSweep,
     FinalControl,
 }
 
@@ -257,7 +258,7 @@ impl DispatchGeometry {
     }
 }
 
-const ATTEMPT_DISPATCHES: [(AttemptKernel, AttemptPhase, DispatchGeometry); 11] = [
+const ATTEMPT_DISPATCHES: [(AttemptKernel, AttemptPhase, DispatchGeometry); 12] = [
     (
         AttemptKernel::HorizonSweep,
         AttemptPhase::Horizon,
@@ -307,6 +308,11 @@ const ATTEMPT_DISPATCHES: [(AttemptKernel, AttemptPhase, DispatchGeometry); 11] 
         AttemptKernel::TargetMerge,
         AttemptPhase::TargetMerge,
         DispatchGeometry::Parallel,
+    ),
+    (
+        AttemptKernel::FinalControlSweep,
+        AttemptPhase::FinalControl,
+        DispatchGeometry::ControlSweep,
     ),
     (
         AttemptKernel::FinalControl,
@@ -5084,6 +5090,8 @@ struct DirectMetal {
     exchange_prefix_pipeline: MetalPipeline,
     exchange_scatter_pipeline: MetalPipeline,
     exchange_merge_pipeline: MetalPipeline,
+    /// T21 fix 1: the finalize scans, on the full grid.
+    finalize_sweep_pipeline: MetalPipeline,
     finalize_pipeline: MetalPipeline,
     /// T20l fix 2: the readback gather. Not part of an attempt; encoded only by
     /// [`DirectMetal::compact`], after the attempt has been screened as successful.
@@ -5112,6 +5120,8 @@ impl DirectMetal {
         let exchange_prefix_pipeline = create_pipeline(&device, source, "days_exchange_prefix")?;
         let exchange_scatter_pipeline = create_pipeline(&device, source, "days_exchange_scatter")?;
         let exchange_merge_pipeline = create_pipeline(&device, source, "days_exchange_merge")?;
+        let finalize_sweep_pipeline =
+            create_pipeline(&device, source, "days_round_finalize_sweep")?;
         let finalize_pipeline = create_pipeline(&device, source, "days_round_finalize")?;
         let compact_pipeline = create_pipeline(&device, source, "days_compact_gather")?;
         let pipeline_creation_ns = duration_ns(pipeline_started.elapsed());
@@ -5123,6 +5133,7 @@ impl DirectMetal {
             ("round-control-sweep", &control_sweep_pipeline),
             ("round-control", &control_pipeline),
             ("exchange-prefix", &exchange_prefix_pipeline),
+            ("round-finalize-sweep", &finalize_sweep_pipeline),
             ("round-finalize", &finalize_pipeline),
         ] {
             if pipeline.maxTotalThreadsPerThreadgroup() < LANES {
@@ -5157,6 +5168,7 @@ impl DirectMetal {
             exchange_prefix_pipeline,
             exchange_scatter_pipeline,
             exchange_merge_pipeline,
+            finalize_sweep_pipeline,
             finalize_pipeline,
             compact_pipeline,
             fel_probe_pipelines: Mutex::new(None),
@@ -5648,6 +5660,7 @@ impl DirectMetal {
             AttemptKernel::ExchangePrefix => &self.exchange_prefix_pipeline,
             AttemptKernel::ExchangeScatter => &self.exchange_scatter_pipeline,
             AttemptKernel::TargetMerge => merge_pipeline,
+            AttemptKernel::FinalControlSweep => &self.finalize_sweep_pipeline,
             AttemptKernel::FinalControl => &self.finalize_pipeline,
         }
     }
@@ -6047,6 +6060,7 @@ mod tests {
             AttemptKernel::HorizonSweep,
             AttemptKernel::RoundReset,
             AttemptKernel::ContinuationControlSweep,
+            AttemptKernel::FinalControlSweep,
         ] {
             let (_, _, geometry) = ATTEMPT_DISPATCHES
                 .into_iter()
