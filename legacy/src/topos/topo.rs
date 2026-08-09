@@ -26,7 +26,10 @@ use crate::flows::app_source::{AppBufferConfig, AppSourceBufferHandle};
 use crate::flows::collective::{Collective, CollectiveType};
 use crate::flows::flow::{Flow, FlowParams, FlowType};
 use crate::flows::packet::Packet;
-use crate::flows::route::{RouteTableError, Routing, compute_shortest_path_route_table};
+use crate::flows::route::{
+    EcmpFlow, RouteTableError, Routing, compute_fat_tree_ecmp_route_table,
+    compute_shortest_path_route_table,
+};
 use crate::flows::sink::{PacketSink, PacketStatistics};
 use crate::flows::source::PacketSource;
 use crate::flows::wire::Wire;
@@ -90,6 +93,26 @@ fn physical_flow_paths(graph: &UnGraph<usize, ()>, flows: &[Flow]) -> Vec<Vec<No
             panic!("Legacy Days selects only topology-agnostic shortest-path routing.")
         }
     });
+    let fat_tree_paths = if flows
+        .iter()
+        .any(|flow| matches!(flow.routing, Routing::FatTreeEcmp { .. }))
+    {
+        compute_fat_tree_ecmp_route_table(
+            graph,
+            flows.iter().filter_map(|flow| match flow.routing {
+                Routing::FatTreeEcmp { flow_hash } => Some(EcmpFlow {
+                    key: flow.id,
+                    source_switch: NodeIndex::new(flow.source_switch),
+                    target_switch: NodeIndex::new(flow.sink_switch),
+                    flow_hash,
+                }),
+                _ => None,
+            }),
+        )
+        .unwrap_or_else(|error| panic!("{}", route_table_error(error)))
+    } else {
+        BTreeMap::new()
+    };
 
     flows
         .iter()
@@ -99,8 +122,47 @@ fn physical_flow_paths(graph: &UnGraph<usize, ()>, flows: &[Flow]) -> Vec<Vec<No
                 let path = flow.compute_path(graph);
                 path[1..path.len() - 1].to_vec()
             }
+            Routing::FatTreeEcmp { .. } => fat_tree_paths[&flow.id].clone(),
         })
         .collect()
+}
+
+fn route_table_error(error: RouteTableError<usize>) -> String {
+    match error {
+        RouteTableError::Unreachable(flow_id) => {
+            format!("FatTreeEcmp flow {flow_id} has no physical route")
+        }
+        RouteTableError::DuplicateKey(flow_id) => {
+            format!("FatTreeEcmp has duplicate flow id {flow_id}")
+        }
+        RouteTableError::UnsupportedTopology => {
+            "FatTreeEcmp is supported only on a canonical FatTree topology".to_owned()
+        }
+    }
+}
+
+/// Refuses a requested topology-restricted route before simulation construction can panic.
+pub fn validate_flow_routing(graph: &UnGraph<usize, ()>, flows: &[Flow]) -> Result<(), String> {
+    if !flows
+        .iter()
+        .any(|flow| matches!(flow.routing, Routing::FatTreeEcmp { .. }))
+    {
+        return Ok(());
+    }
+    compute_fat_tree_ecmp_route_table(
+        graph,
+        flows.iter().filter_map(|flow| match flow.routing {
+            Routing::FatTreeEcmp { flow_hash } => Some(EcmpFlow {
+                key: flow.id,
+                source_switch: NodeIndex::new(flow.source_switch),
+                target_switch: NodeIndex::new(flow.sink_switch),
+                flow_hash,
+            }),
+            _ => None,
+        }),
+    )
+    .map(|_| ())
+    .map_err(route_table_error)
 }
 
 fn install_forwarding_path(

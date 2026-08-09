@@ -37,7 +37,7 @@ pub enum TopologyProfile {
 /// `Random` is the standing behaviour: endpoints are drawn from the scenario's endpoint RNG. The
 /// structural policies draw nothing — they are pure functions of the host attachment grid — and so
 /// leave the RNG stream of any later `Random` flow set exactly where they found it.
-#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
 pub enum PairingPolicy {
     #[default]
     Random,

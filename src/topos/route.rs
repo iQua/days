@@ -114,6 +114,10 @@ pub enum Routing {
     ShortestPath(ShortestPath),
     PathFromConfig(PathFromConfig),
     ECMP(ECMP),
+    /// Shared semantic-hash ECMP selection on a canonical fat tree.
+    FatTreeEcmp {
+        flow_hash: u64,
+    },
 }
 
 /// Defines the interface for all routing protocols.

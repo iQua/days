@@ -11,6 +11,7 @@ use nexosim::model::{
     BuildContext, Context, InitializedModel, Model, ModelRegistry, ProtoModel, SchedulableId,
 };
 use nexosim::ports::Output;
+#[cfg(feature = "test")]
 use nexosim::time::MonotonicTime;
 
 use crate::flows::packet::Packet;

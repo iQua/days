@@ -84,7 +84,7 @@ pub fn run_simulation_from_config(config_path: &str) -> Result<(), String> {
     use crate::flows::collective::Collective;
     use crate::flows::flow::Flow;
     use crate::topos::build::build_graph;
-    use crate::topos::topo::Topology;
+    use crate::topos::topo::{Topology, validate_flow_routing};
     use crate::utils::exact_time::scenario_seconds_ns;
     use days::topos::config::UIConfig;
 
@@ -97,7 +97,8 @@ pub fn run_simulation_from_config(config_path: &str) -> Result<(), String> {
     let _ = seed_from_config(config_path);
 
     let (graph, hosts) = build_graph(config_path).map_err(|error| error.to_string())?;
-    let flows = Flow::flows_from_config_with_attachments(config_path, &hosts);
+    let flows = Flow::try_flows_from_config_with_attachments(config_path, &hosts)?;
+    validate_flow_routing(&graph, &flows)?;
     let collectives = Collective::collectives_from_config(config_path, hosts.host_ids());
     for (kind, id, traffic) in flows
         .iter()

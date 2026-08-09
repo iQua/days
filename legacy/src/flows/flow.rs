@@ -1,6 +1,7 @@
 //! Implements a network flow with a source and a sink, and with its configurations
 //! and traffic characteristics.
 
+use std::collections::BTreeMap;
 use std::fs;
 
 use petgraph::graph::{DiGraph, NodeIndex, UnGraph};
@@ -11,8 +12,13 @@ use serde::Deserialize;
 
 use crate::flows::route::{ECMP, PathFromConfig, Routing, RoutingConfig, ShortestPath};
 use crate::flows::{TomlTrafficCharacteristics, TrafficCharacteristics};
-use crate::topos::build::HostAttachments;
-use crate::{next_flow_id, seed_from_config, update_next_flow_id};
+use crate::topos::build::{HostAttachments, PairingPolicy};
+use crate::utils::exact_time::scenario_seconds_ns;
+use crate::{next_flow_id, update_next_flow_id};
+use days::scenario::{
+    FatTreeEcmpTermination, FatTreeEcmpTrafficKey, FatTreeEcmpTransport,
+    fat_tree_ecmp_explicit_flow_hash, fat_tree_ecmp_flow_set_member_hash,
+};
 
 /// Represents the type of a flow.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -48,13 +54,30 @@ struct TomlFlowSet {
     flow_count: u32,
     priority: Option<u8>,
     routing: Option<RoutingConfig>,
+    pairing: Option<PairingPolicy>,
     traffic: TomlTrafficCharacteristics,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+enum TopRoutingPolicy {
+    ShortestPath,
+    FatTreeEcmp,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TopRouting {
+    policy: TopRoutingPolicy,
 }
 
 #[derive(Deserialize, Debug)]
 struct FlowConfig {
+    seed: Option<u64>,
+    routing: Option<TopRouting>,
     flow: Option<Vec<TomlFlow>>,
     flow_set: Option<Vec<TomlFlowSet>>,
+    collective: Option<Vec<toml::Value>>,
+    collective_set: Option<Vec<toml::Value>>,
 }
 
 /// Parameters required to initialize a `Flow`.
@@ -117,14 +140,111 @@ pub struct Flow {
     pub seed: usize,
 }
 
-fn checked_priority(priority: Option<u8>) -> u8 {
+fn checked_priority(priority: Option<u8>) -> Result<u8, String> {
     let priority = priority.unwrap_or(0);
-    assert!(
-        priority <= 7,
-        "Flow priority must be within 0..=7, got {}",
-        priority
-    );
-    priority
+    (priority <= 7)
+        .then_some(priority)
+        .ok_or_else(|| format!("flow priority must be within 0..=7, got {priority}"))
+}
+
+fn fixed_packet_size(traffic: &TomlTrafficCharacteristics) -> Result<u64, String> {
+    let value = match traffic.pkt_size_dist {
+        days::scenario::DistributionInfo::DiscreteUniform { low, high } if low == high => {
+            u64::try_from(low).ok()
+        }
+        days::scenario::DistributionInfo::Uniform { low, high }
+            if low == high && low.is_finite() && low.fract() == 0.0 =>
+        {
+            Some(low as u64).filter(|value| *value as f64 == low)
+        }
+        _ => None,
+    };
+    value
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "FatTreeEcmp requires a positive fixed integral packet size".to_owned())
+}
+
+fn fixed_arrival_ns(traffic: &TomlTrafficCharacteristics) -> Result<u64, String> {
+    let seconds = match traffic.arr_dist {
+        days::scenario::DistributionInfo::DiscreteUniform { low, high } if low == high => {
+            low as f64
+        }
+        days::scenario::DistributionInfo::Uniform { low, high } if low == high => low,
+        _ => {
+            return Err(
+                "FatTreeEcmp PacketDistribution traffic requires a fixed arrival interval"
+                    .to_owned(),
+            );
+        }
+    };
+    let interval = scenario_seconds_ns(seconds, "packet arrival interval")?;
+    (interval > 0)
+        .then_some(interval)
+        .ok_or_else(|| "packet arrival interval must be positive".to_owned())
+}
+
+fn fat_tree_traffic_key(
+    flow_type: &FlowType,
+    traffic: &TomlTrafficCharacteristics,
+) -> Result<FatTreeEcmpTrafficKey, String> {
+    let initial_delay_ns = scenario_seconds_ns(
+        traffic.initial_delay.unwrap_or_default(),
+        "flow initial delay",
+    )?;
+    let packet_size_bytes = fixed_packet_size(traffic)?;
+    let (interval_ns, termination, transport) = match flow_type {
+        FlowType::PacketDistribution => {
+            let termination = match (traffic.size, traffic.duration) {
+                (Some(bytes), _) => FatTreeEcmpTermination::Bytes(bytes as u64),
+                (None, Some(seconds)) => FatTreeEcmpTermination::DurationNs(scenario_seconds_ns(
+                    seconds,
+                    "flow duration",
+                )?),
+                (None, None) => {
+                    return Err("flow must specify `size` or `duration`".to_owned());
+                }
+            };
+            (
+                fixed_arrival_ns(traffic)?,
+                termination,
+                FatTreeEcmpTransport::Constant,
+            )
+        }
+        FlowType::TCP => {
+            let bytes = traffic.size.ok_or_else(|| {
+                "FatTreeEcmp refuses duration-terminated TCP; specify an exact byte `size`"
+                    .to_owned()
+            })?;
+            if bytes == 0 {
+                return Err("TCP traffic `size` must be positive".to_owned());
+            }
+            let tcp = traffic
+                .tcp
+                .as_ref()
+                .ok_or_else(|| "TCP traffic must provide `traffic.tcp`".to_owned())?;
+            let transport = match tcp.cc_algorithm {
+                crate::flows::cc::CCAlgorithm::TCPReno => FatTreeEcmpTransport::TcpReno,
+                crate::flows::cc::CCAlgorithm::TCPCubic => FatTreeEcmpTransport::TcpCubic,
+                crate::flows::cc::CCAlgorithm::TCPBBR => {
+                    return Err(
+                        "FatTreeEcmp refuses unsupported TCP congestion control `BBR`".to_owned(),
+                    );
+                }
+            };
+            (0, FatTreeEcmpTermination::Bytes(bytes as u64), transport)
+        }
+        #[cfg(feature = "dcqcn")]
+        FlowType::DCQCN => {
+            return Err("FatTreeEcmp refuses unsupported legacy DCQCN traffic".to_owned());
+        }
+    };
+    Ok(FatTreeEcmpTrafficKey {
+        initial_delay_ns,
+        interval_ns,
+        packet_size_bytes,
+        termination,
+        transport,
+    })
 }
 
 impl Flow {
@@ -254,65 +374,101 @@ impl Flow {
         file_path: &str,
         hosts: &HostAttachments,
     ) -> Vec<Flow> {
-        let content =
-            fs::read_to_string(file_path).expect("The configuration file could not be read.");
+        Self::try_flows_from_config_with_attachments(file_path, hosts)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
 
-        let flow_config: FlowConfig =
-            toml::from_str(&content).expect("Failed to deserialize the configuration.");
+    /// Fallible configuration lowering used by the CLI so unsupported routing is never ignored.
+    pub fn try_flows_from_config_with_attachments(
+        file_path: &str,
+        hosts: &HostAttachments,
+    ) -> Result<Vec<Flow>, String> {
+        let content = fs::read_to_string(file_path)
+            .map_err(|error| format!("failed to read flow configuration: {error}"))?;
+
+        let flow_config: FlowConfig = toml::from_str(&content)
+            .map_err(|error| format!("failed to parse routing/pairing configuration: {error}"))?;
+        let FlowConfig {
+            seed,
+            routing,
+            flow,
+            flow_set,
+            collective,
+            collective_set,
+        } = flow_config;
+        let seed = seed.ok_or_else(|| "simulation configuration must specify `seed`".to_owned())?;
+        let top_policy = routing.as_ref().map(|routing| routing.policy);
+        if top_policy == Some(TopRoutingPolicy::FatTreeEcmp)
+            && (collective.as_ref().is_some_and(|items| !items.is_empty())
+                || collective_set
+                    .as_ref()
+                    .is_some_and(|items| !items.is_empty()))
+        {
+            return Err(
+                "FatTreeEcmp refuses legacy collectives because they have no shared semantic flow identity"
+                    .to_owned(),
+            );
+        }
 
         let mut flows = Vec::new();
+        let mut explicit_duplicates = BTreeMap::<(u64, u64, u8, FatTreeEcmpTrafficKey), u64>::new();
+        let mut set_duplicates =
+            BTreeMap::<(u64, u8, FatTreeEcmpTrafficKey, PairingPolicy), u64>::new();
 
-        if let Some(flows_vec) = flow_config.flow {
+        if let Some(flows_vec) = flow {
             for flow in flows_vec {
+                if top_policy.is_some() && (flow.routing.is_some() || flow.path.is_some()) {
+                    return Err(
+                        "conflict: root `[routing]` cannot be combined with per-flow `routing` or `path`"
+                            .to_owned(),
+                    );
+                }
                 let graph = DiGraph::<usize, ()>::from_edges(&flow.graph);
-                assert!(
-                    graph.edge_references().len() == 1,
-                    "Each graph should contain exactly one edge."
-                );
+                if graph.edge_references().len() != 1 {
+                    return Err("each flow graph must contain exactly one edge".to_owned());
+                }
 
                 for edge in graph.edge_references() {
                     let mut flow_id = next_flow_id();
                     if let Some(new_id) = flow.flow_id {
-                        assert!(
-                            new_id >= flow_id,
-                            "The specified flow id {} should be at least {}",
-                            new_id,
-                            flow_id
-                        );
+                        if new_id < flow_id {
+                            return Err(format!(
+                                "specified flow id {new_id} must be at least {flow_id}"
+                            ));
+                        }
                         update_next_flow_id(new_id + 1);
                         flow_id = new_id;
                     }
 
                     if let Some(ref path) = flow.path {
+                        if path.is_empty() {
+                            return Err(format!(
+                                "flow {flow_id}'s configured path must not be empty"
+                            ));
+                        }
                         let (source_host, sink_host) = &flow.graph[0];
-                        let source_switch = hosts
-                            .switch_for(*source_host as usize)
-                            .expect("explicit flow source must be a configured host");
-                        let sink_switch = hosts
-                            .switch_for(*sink_host as usize)
-                            .expect("explicit flow sink must be a configured host");
-                        assert!(
-                            path[0] == source_switch,
-                            "Flow {}'s source specified in path ({}) should match host {}'s attachment switch ({})",
-                            flow_id,
-                            path[0],
-                            source_host,
-                            source_switch,
-                        );
-                        assert!(
-                            path[path.len() - 1] == sink_switch,
-                            "Flow {}'s sink specified in path ({}) should match host {}'s attachment switch ({})",
-                            flow_id,
-                            path[path.len() - 1],
-                            sink_host,
-                            sink_switch,
-                        );
+                        let source_switch =
+                            hosts.switch_for(*source_host as usize).ok_or_else(|| {
+                                format!("explicit flow source host {source_host} is not configured")
+                            })?;
+                        let sink_switch =
+                            hosts.switch_for(*sink_host as usize).ok_or_else(|| {
+                                format!("explicit flow sink host {sink_host} is not configured")
+                            })?;
+                        if path[0] != source_switch || path[path.len() - 1] != sink_switch {
+                            return Err(format!(
+                                "flow {flow_id}'s configured path endpoints must match host attachment switches {source_switch} and {sink_switch}"
+                            ));
+                        }
                     }
 
                     let starts_before = flow.starts_before.clone().unwrap_or_default();
                     let starts_after = flow.starts_after.clone().unwrap_or_default();
+                    if flow.traffic.size.is_none() && flow.traffic.duration.is_none() {
+                        return Err("flow must specify `size` or `duration`".to_owned());
+                    }
                     let traffic = TrafficCharacteristics::clone(&flow.traffic);
-                    let priority = checked_priority(flow.priority);
+                    let priority = checked_priority(flow.priority)?;
 
                     let source_host = edge.source().index();
                     let sink_host = edge.target().index();
@@ -330,29 +486,80 @@ impl Flow {
                         seed: flow_id,
                     });
                     lowered_flow.set_attachment_switches(hosts);
+                    if top_policy == Some(TopRoutingPolicy::FatTreeEcmp) {
+                        let traffic_key = fat_tree_traffic_key(&flow.flow_type, &flow.traffic)?;
+                        let semantic = (
+                            source_host as u64,
+                            sink_host as u64,
+                            priority,
+                            traffic_key.clone(),
+                        );
+                        let duplicate_ordinal = *explicit_duplicates.get(&semantic).unwrap_or(&0);
+                        explicit_duplicates.insert(semantic, duplicate_ordinal + 1);
+                        lowered_flow.routing = Routing::FatTreeEcmp {
+                            flow_hash: fat_tree_ecmp_explicit_flow_hash(
+                                seed,
+                                source_host as u64,
+                                sink_host as u64,
+                                priority,
+                                traffic_key,
+                                duplicate_ordinal,
+                            ),
+                        };
+                    }
                     flows.push(lowered_flow);
                 }
             }
         }
 
-        if let Some(flow_set_vec) = flow_config.flow_set {
-            let mut rng = SmallRng::seed_from_u64(seed_from_config(file_path) as u64);
+        if let Some(flow_set_vec) = flow_set {
+            let mut rng = SmallRng::seed_from_u64(seed);
 
             for flow_set in flow_set_vec {
+                if top_policy.is_some() && flow_set.routing.is_some() {
+                    return Err(
+                        "conflict: root `[routing]` cannot be combined with per-flow-set `routing`"
+                            .to_owned(),
+                    );
+                }
                 let mut first_flow_id = next_flow_id();
                 if let Some(new_first_flow_id) = flow_set.first_flow_id {
-                    assert!(
-                        new_first_flow_id >= first_flow_id,
-                        "The specified first flow id {} of the flow set should be at least {}",
-                        new_first_flow_id,
-                        first_flow_id
-                    );
+                    if new_first_flow_id < first_flow_id {
+                        return Err(format!(
+                            "specified first flow id {new_first_flow_id} must be at least {first_flow_id}"
+                        ));
+                    }
                     first_flow_id = new_first_flow_id;
                 }
-                let priority = checked_priority(flow_set.priority);
-                let host_pairs = hosts
-                    .sample_flow_pairs(&mut rng, flow_set.flow_count as usize)
-                    .unwrap_or_else(|error| panic!("{error}"));
+                if flow_set.traffic.size.is_none() && flow_set.traffic.duration.is_none() {
+                    return Err("flow set must specify `size` or `duration`".to_owned());
+                }
+                let priority = checked_priority(flow_set.priority)?;
+                let pairing = flow_set.pairing.unwrap_or_default();
+                let host_pairs = match pairing {
+                    PairingPolicy::Random => {
+                        hosts.sample_flow_pairs(&mut rng, flow_set.flow_count as usize)?
+                    }
+                    structural => {
+                        hosts.structural_flow_pairs(structural, flow_set.flow_count as usize)?
+                    }
+                };
+                let traffic_key = (top_policy == Some(TopRoutingPolicy::FatTreeEcmp))
+                    .then(|| fat_tree_traffic_key(&flow_set.flow_type, &flow_set.traffic))
+                    .transpose()?;
+                let duplicate_ordinal = if let Some(traffic_key) = &traffic_key {
+                    let semantic = (
+                        u64::from(flow_set.flow_count),
+                        priority,
+                        traffic_key.clone(),
+                        pairing,
+                    );
+                    let ordinal = *set_duplicates.get(&semantic).unwrap_or(&0);
+                    set_duplicates.insert(semantic, ordinal + 1);
+                    ordinal
+                } else {
+                    0
+                };
 
                 for (id_counter, (source_host, sink_host)) in host_pairs.into_iter().enumerate() {
                     let flow_id = first_flow_id + id_counter;
@@ -374,13 +581,28 @@ impl Flow {
                         seed: flow_id,
                     });
                     lowered_flow.set_attachment_switches(hosts);
+                    if let Some(traffic_key) = traffic_key.clone() {
+                        lowered_flow.routing = Routing::FatTreeEcmp {
+                            flow_hash: fat_tree_ecmp_flow_set_member_hash(
+                                seed,
+                                u64::from(flow_set.flow_count),
+                                priority,
+                                traffic_key,
+                                pairing,
+                                duplicate_ordinal,
+                                id_counter as u64,
+                                source_host as u64,
+                                sink_host as u64,
+                            ),
+                        };
+                    }
                     flows.push(lowered_flow);
                 }
                 update_next_flow_id(first_flow_id + flow_set.flow_count as usize);
             }
         }
 
-        flows
+        Ok(flows)
     }
 
     /// Computes the routing path for the flow based on the provided network graph.
@@ -436,6 +658,9 @@ impl Flow {
                 path.push(NodeIndex::new(self.sink_id));
 
                 path
+            }
+            Routing::FatTreeEcmp { .. } => {
+                panic!("FatTreeEcmp paths are computed by the shared O(1) route table")
             }
         }
     }
@@ -535,13 +760,17 @@ mod tests {
 
         let path = flow.compute_path(&graph);
 
-        // ECMP may choose either path 0-1-3 or 0-2-3
-        assert_eq!(path.len(), 5); // source_id, nodes en route, sink_id
-        assert_eq!(path[0], NodeIndex::new(0));
-        assert_eq!(path[path.len() - 1], NodeIndex::new(3));
-
-        let intermediate = path[2].index();
-        assert!(intermediate == 1 || intermediate == 2);
+        assert_eq!(
+            path,
+            vec![
+                NodeIndex::new(0),
+                NodeIndex::new(0),
+                NodeIndex::new(2),
+                NodeIndex::new(3),
+                NodeIndex::new(3),
+            ],
+            "the legacy per-flow ECMP route must remain unchanged"
+        );
     }
 
     #[test]

@@ -5,7 +5,11 @@ mod ids;
 
 use serde::Deserialize;
 
-pub use compile::{CompileError, compile_config, compile_config_with_route_workers};
+pub use compile::{
+    CompileError, FatTreeEcmpTermination, FatTreeEcmpTrafficKey, FatTreeEcmpTransport,
+    compile_config, compile_config_with_route_workers, fat_tree_ecmp_explicit_flow_hash,
+    fat_tree_ecmp_flow_set_member_hash,
+};
 
 /// Distribution configuration shared by legacy traffic models and exact lowering.
 #[derive(Deserialize, Debug, Clone, PartialEq)]

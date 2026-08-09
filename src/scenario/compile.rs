@@ -301,6 +301,111 @@ struct TrafficKey {
     kind: TrafficKind,
 }
 
+/// Termination identity used when another backend must select the same semantic ECMP route.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum FatTreeEcmpTermination {
+    /// Stop after sending the given byte count.
+    Bytes(u64),
+    /// Stop after the given exact duration in nanoseconds.
+    DurationNs(u64),
+}
+
+/// Transport identity used when another backend must select the same semantic ECMP route.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum FatTreeEcmpTransport {
+    /// Constant packet generation.
+    Constant,
+    /// TCP Reno.
+    TcpReno,
+    /// TCP CUBIC.
+    TcpCubic,
+}
+
+/// Traffic identity shared by the exact compiler and legacy fat-tree ECMP selection.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct FatTreeEcmpTrafficKey {
+    /// Exact source start offset.
+    pub initial_delay_ns: u64,
+    /// Exact constant packet interval, or zero for window-driven TCP.
+    pub interval_ns: u64,
+    /// Packet payload size in bytes.
+    pub packet_size_bytes: u64,
+    /// Flow termination condition.
+    pub termination: FatTreeEcmpTermination,
+    /// Traffic transport/controller identity.
+    pub transport: FatTreeEcmpTransport,
+}
+
+impl From<FatTreeEcmpTrafficKey> for TrafficKey {
+    fn from(value: FatTreeEcmpTrafficKey) -> Self {
+        Self {
+            initial_delay_ns: value.initial_delay_ns,
+            interval_ns: value.interval_ns,
+            packet_size_bytes: value.packet_size_bytes,
+            termination: match value.termination {
+                FatTreeEcmpTermination::Bytes(bytes) => Termination::Bytes(bytes),
+                FatTreeEcmpTermination::DurationNs(duration_ns) => {
+                    Termination::DurationNs(duration_ns)
+                }
+            },
+            kind: match value.transport {
+                FatTreeEcmpTransport::Constant => TrafficKind::Constant,
+                FatTreeEcmpTransport::TcpReno => TrafficKind::Tcp(TcpAlgorithm::Reno),
+                FatTreeEcmpTransport::TcpCubic => TrafficKind::Tcp(TcpAlgorithm::Cubic),
+            },
+        }
+    }
+}
+
+/// Selects the compiler-identical fat-tree ECMP hash for an explicit flow.
+pub fn fat_tree_ecmp_explicit_flow_hash(
+    seed: u64,
+    source: u64,
+    target: u64,
+    priority: u8,
+    traffic: FatTreeEcmpTrafficKey,
+    duplicate_ordinal: u64,
+) -> u64 {
+    let key = FlowKey::Explicit {
+        semantic: ExplicitFlowKey {
+            source,
+            target,
+            priority,
+            traffic: traffic.into(),
+        },
+        duplicate_ordinal,
+    };
+    generator_seed(seed ^ 0x4543_4d50_5f48_4153, &key)
+}
+
+/// Selects the compiler-identical fat-tree ECMP hash for one flow-set member.
+#[allow(clippy::too_many_arguments)]
+pub fn fat_tree_ecmp_flow_set_member_hash(
+    seed: u64,
+    flow_count: u64,
+    priority: u8,
+    traffic: FatTreeEcmpTrafficKey,
+    pairing: PairingPolicy,
+    duplicate_ordinal: u64,
+    member_ordinal: u64,
+    source: u64,
+    target: u64,
+) -> u64 {
+    let key = FlowKey::SetMember {
+        semantic: FlowSetKey {
+            flow_count,
+            priority,
+            traffic: traffic.into(),
+            pairing,
+        },
+        duplicate_ordinal,
+        member_ordinal,
+        source,
+        target,
+    };
+    generator_seed(seed ^ 0x4543_4d50_5f48_4153, &key)
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ExplicitFlowKey {
     source: u64,
