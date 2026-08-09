@@ -371,7 +371,20 @@ fn assert_0695_initial_plan(
         .find(|plane| plane.name == "stream_records")
         .expect("stream-record plane must exist");
     assert_eq!(stream_records.words, stream_slots * EVENT_WORDS_AT_0695F02);
-    assert_eq!(strict.total_device_bytes, expected_total_device_bytes);
+    // T21 fix 2 appended the per-round FEL root cache to `stream_state` (two words per LP) and one
+    // params word that addresses it. Both are device scratch: nothing decodes them, and no capacity
+    // number moved. The anchor is left at its pre-T21 value and the delta is DERIVED from this
+    // plan's own dimensions, so it stays honest if the image or the region ever changes shape.
+    let t21_round_scratch_bytes =
+        (days_executor::device_sizing::round_scratch_words(image.nodes.len())
+            .expect("round scratch must size")
+            + 1)
+            * std::mem::size_of::<u64>();
+    assert_eq!(
+        strict.total_device_bytes,
+        expected_total_device_bytes + t21_round_scratch_bytes,
+        "{backend} initial plan bytes, pre-T21 anchor plus the derived round-scratch region",
+    );
 }
 
 #[test]

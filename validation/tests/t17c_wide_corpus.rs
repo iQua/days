@@ -284,6 +284,14 @@ fn k48_wide_load60_sizing_reproduces_retained_arenas_and_plane_total() {
     let image = compile_config(fixture_path(FIXTURES[1].name)).unwrap();
     let report = size_default_device_plan(&image).unwrap();
 
+    // T21 fix 2 appended the per-round FEL root cache to `stream_state` — two words per LP.
+    // `stream_arena_bytes` counts the whole `stream_state` plane, so it moves by exactly that
+    // region and by nothing else. Derived from the image rather than pinned, so the retained
+    // pre-T21 anchor stays legible.
+    let t21_round_scratch_bytes =
+        days_executor::device_sizing::round_scratch_words(image.nodes.len())
+            .expect("round scratch must size")
+            * std::mem::size_of::<u64>();
     assert_eq!(
         report.event_arenas,
         DeviceEventArenaSizing {
@@ -293,7 +301,7 @@ fn k48_wide_load60_sizing_reproduces_retained_arenas_and_plane_total() {
             service_stream_event_slots: 294_912,
             generator_stream_event_slots: 22_118,
             heap_arena_bytes: 22_472_272,
-            stream_arena_bytes: 1_019_285_424,
+            stream_arena_bytes: 1_019_285_424 + t21_round_scratch_bytes,
             legacy_heap_arena_bytes: 7_217_131_632,
         }
     );

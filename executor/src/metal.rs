@@ -1684,6 +1684,7 @@ struct StreamLayout {
     channel_batch_offset: usize,
     staging_channel_offset: usize,
     channel_target_offset: usize,
+    round_scratch_offset: usize,
 }
 
 struct PreparedStreams {
@@ -2325,6 +2326,7 @@ impl MetalPlan {
             tcp_state.layout.receiver_offset as u64,
             tcp_state.layout.ledger_meta_offset as u64,
             config.round_threads_per_threadgroup as u64,
+            streams.layout.round_scratch_offset as u64,
         ];
 
         if node_count.div_ceil(config.round_threads_per_threadgroup) > u32::MAX as usize {
@@ -2790,10 +2792,18 @@ fn prepare_streams(
         image.nodes.len() * ARENA_META_WORDS,
     )?;
     if !config.streams_enabled {
+        // T21 fix 2: the per-round FEL root cache is NOT a stream-path feature. `days_horizon`
+        // publishes it and `days_round_prepare` reads it in both stream modes, so a legacy plan
+        // allocates the region too — at offset 0, since it has no stream metadata in front of it.
+        let round_scratch_words = crate::device_sizing::round_scratch_words(image.nodes.len())
+            .ok_or_else(|| MetalError::Validation("round scratch size overflows usize".into()))?;
         return Ok(PreparedStreams {
-            state: vec![0],
+            state: vec![0; round_scratch_words.max(1)],
             records: vec![0],
-            layout: StreamLayout::default(),
+            layout: StreamLayout {
+                round_scratch_offset: 0,
+                ..StreamLayout::default()
+            },
             memory_layout: MetalMemoryLayout {
                 streams_enabled: false,
                 legacy_heap_event_slots,
@@ -2925,6 +2935,13 @@ fn prepare_streams(
     let channel_batch_offset = take_words(&mut next, channel_count, CHANNEL_BATCH_WORDS)?;
     let staging_channel_offset = take_words(&mut next, remote_staging_slots, 1)?;
     let channel_target_offset = take_words(&mut next, channel_count, 1)?;
+    // T21 fix 2: the per-round FEL root cache, two words per LP.
+    let round_scratch_offset = take_words(
+        &mut next,
+        crate::device_sizing::round_scratch_words(node_count)
+            .ok_or_else(|| MetalError::Validation("round scratch size overflows usize".into()))?,
+        1,
+    )?;
 
     let mut state = stream_meta;
     state.resize(next.max(1), 0);
@@ -3001,6 +3018,7 @@ fn prepare_streams(
             channel_batch_offset,
             staging_channel_offset,
             channel_target_offset,
+            round_scratch_offset,
         },
         memory_layout: MetalMemoryLayout {
             streams_enabled: true,

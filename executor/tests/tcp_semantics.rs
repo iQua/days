@@ -2915,6 +2915,19 @@ fn device_sizing_derives_a_tcp_plan() {
         checkpoint_image(&image, &completed)
     };
 
+    // T21 fix 2 appended the per-round FEL root cache to `stream_state` — two words per LP.
+    // `stream_arena_bytes` counts the whole `stream_state` plane, so the retained pre-T21 anchor
+    // moves by exactly that region. Derived from the checkpoint's own dimensions rather than
+    // re-pinned, so the anchor stays legible.
+    #[cfg(any(
+        feature = "cuda",
+        all(feature = "metal-spike", target_vendor = "apple")
+    ))]
+    let t21_round_scratch_bytes =
+        days_executor::device_sizing::round_scratch_words(checkpoint.nodes.len())
+            .expect("round scratch must size")
+            * std::mem::size_of::<u64>();
+
     #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
     {
         let metal = run_metal_with_observations(
@@ -2927,7 +2940,10 @@ fn device_sizing_derives_a_tcp_plan() {
         assert_eq!(metal.memory_layout.legacy_heap_event_slots, 20);
         assert_eq!(metal.memory_layout.fallback_heap_event_slots, 2);
         assert_eq!(metal.memory_layout.channel_stream_event_slots, 4);
-        assert_eq!(metal.memory_layout.total_event_arena_bytes(), 2_128);
+        assert_eq!(
+            metal.memory_layout.total_event_arena_bytes(),
+            2_128 + t21_round_scratch_bytes
+        );
     }
 
     #[cfg(feature = "cuda")]
@@ -2942,7 +2958,10 @@ fn device_sizing_derives_a_tcp_plan() {
         assert_eq!(cuda.memory_layout.legacy_heap_event_slots, 20);
         assert_eq!(cuda.memory_layout.fallback_heap_event_slots, 2);
         assert_eq!(cuda.memory_layout.channel_stream_event_slots, 4);
-        assert_eq!(cuda.memory_layout.total_event_arena_bytes(), 2_128);
+        assert_eq!(
+            cuda.memory_layout.total_event_arena_bytes(),
+            2_128 + t21_round_scratch_bytes
+        );
     }
 }
 

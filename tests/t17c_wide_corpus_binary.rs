@@ -67,13 +67,23 @@ fn k48_wide_sizing_dry_run_is_host_only_and_reproduces_load30_arenas() {
             "scheduler_state",
         ]
     );
-    assert!(stdout.contains(
+    // T21 fix 2 appended the per-round FEL root cache to `stream_state`: two words per LP. This
+    // fixture lowers to 147,456 LPs. `stream_arena_bytes` counts the whole `stream_state` plane, so
+    // it and the arena total move by exactly that region and by nothing else. Derived, so the
+    // retained pre-T21 anchors stay legible as literals.
+    const LOWERED_LPS: usize = 147_456;
+    let round_scratch_bytes = days_executor::device_sizing::round_scratch_words(LOWERED_LPS)
+        .expect("round scratch must size")
+        * std::mem::size_of::<u64>();
+    assert!(stdout.contains(&format!(
         "record=t17c_wide_sizing_arena \
          legacy_heap_event_slots=32775270 fallback_heap_event_slots=152986 \
          channel_stream_event_slots=2355300 service_stream_event_slots=294912 \
          generator_stream_event_slots=11060 heap_arena_bytes=21853024 \
-         stream_arena_bytes=568736328 total_event_arena_bytes=590589352 \
-         legacy_heap_arena_bytes=3675548832"
-    ));
+         stream_arena_bytes={} total_event_arena_bytes={} \
+         legacy_heap_arena_bytes=3675548832",
+        568_736_328_usize + round_scratch_bytes,
+        590_589_352_usize + round_scratch_bytes,
+    )));
     assert!(stdout.contains("record=t17c_wide_sizing_total plane_count=28 total_device_bytes="));
 }

@@ -57,6 +57,24 @@ const WORD_BYTES: usize = std::mem::size_of::<u64>();
 /// One slot rather than zero keeps every backend's buffer non-empty.
 pub(crate) const STREAMS_OUTBOX_RECORD_SLOTS: usize = 1;
 
+/// Words the T21 per-round FEL-root cache occupies inside `stream_state`, per LP: the root event's
+/// time and a validity flag.
+///
+/// `evidence/P12/perround-upperbound.md` §1.5.2 measured the per-node FEL root query running three
+/// times per round — once in `days_horizon`, twice in `days_round_prepare` — over a read set
+/// nothing between the call sites writes. `days_horizon` now evaluates it once and publishes the
+/// answer here; `days_round_prepare`'s count pass and write pass read it back.
+///
+/// The region is device scratch in the strictest sense: written and consumed inside a single
+/// attempt, never decoded by the readback (which reads only `stream_state`'s metadata prefix),
+/// never part of complete state.
+pub const ROUND_SCRATCH_CACHE_WORDS: usize = 2;
+
+/// Words the T21 per-round scratch region occupies inside `stream_state`.
+pub fn round_scratch_words(node_count: usize) -> Option<usize> {
+    node_count.checked_mul(ROUND_SCRATCH_CACHE_WORDS)
+}
+
 const PLANE_NAMES: [&str; 28] = [
     "control",
     "params",
@@ -1617,6 +1635,8 @@ fn stream_state_words(
         checked_product(channel_count, CHANNEL_BATCH_WORDS, "channel batches")?,
         remote_staging_slots,
         channel_count,
+        round_scratch_words(node_count)
+            .ok_or_else(|| sizing_error("round scratch size overflows usize"))?,
     ]
     .into_iter()
     .try_fold(0_usize, |total, words| {

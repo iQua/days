@@ -105,6 +105,16 @@ constexpr uint P_CHANNEL_TARGET_OFFSET = 26;
 constexpr uint P_STREAM_ORDER_CHECKS = 27;
 constexpr uint P_TCP_RECEIVER_OFFSET = 28;
 constexpr uint P_TCP_LEDGER_META_OFFSET = 29;
+// T21 fix 2. Word offset, inside `stream_state`, of the per-round FEL root cache: two words per
+// LP, `{root time, validity}`. `days_horizon` evaluates `fel_root_time` once per node and writes it
+// here; `days_round_prepare`'s count pass and write pass read it back instead of re-running the
+// query, which `evidence/P12/perround-upperbound.md` §1.5.2 measured at three full-width
+// evaluations per round over a read set nothing between the call sites writes.
+//
+// The region is device scratch: written and consumed inside one attempt, never decoded by the
+// readback (which reads only `stream_state`'s metadata prefix), never part of complete state.
+constexpr uint P_ROUND_SCRATCH_OFFSET = 30;
+constexpr uint ROUND_SCRATCH_CACHE_WORDS = 2;
 
 constexpr uint N_KIND = 0;
 constexpr uint N_EGRESS = 1;
@@ -4613,6 +4623,44 @@ __device__ __forceinline__ bool dispatch_event(
     return false;
 }
 
+// T21 fix 2 — per-round FEL root cache accessors. Transliterated word for word in
+// `metal_kernels.metal`; the two must stay in lockstep or the backends diverge.
+//
+// CORRECTNESS. `fel_peek`'s read set is the LP stream metadata, that LP's active-stream entries,
+// the selected stream's header, `fel_meta`, `fel_records` and `stream_records`. Between
+// `days_horizon`'s evaluation and `days_round_prepare`'s two reads the only device writes are
+// `days_horizon`'s control words and this cache, and `days_round_prepare`'s own `lp_state` error
+// words, `remote_meta[node * META_WORDS + 3]` and the channel BATCH quadruple at
+// `P_CHANNEL_BATCH_OFFSET + channel * CHANNEL_BATCH_WORDS`. None of those is in the read set — the
+// batch quadruple is a different region of `stream_state` from the per-channel stream headers
+// `fel_peek` reads — so the cached answer is the answer a recomputed query would return.
+static __device__ inline ulong round_scratch_cache(const ulong *params) {
+    return params[P_ROUND_SCRATCH_OFFSET];
+}
+
+static __device__ inline void store_fel_root(
+    ulong *stream_state,
+    const ulong *params,
+    ulong node,
+    bool present,
+    ulong time
+) {
+    ulong slot = round_scratch_cache(params) + node * ROUND_SCRATCH_CACHE_WORDS;
+    stream_state[slot] = present ? time : 0;
+    stream_state[slot + 1] = present ? 1 : 0;
+}
+
+static __device__ inline bool load_fel_root(
+    const ulong *stream_state,
+    const ulong *params,
+    ulong node,
+    ulong &time
+) {
+    ulong slot = round_scratch_cache(params) + node * ROUND_SCRATCH_CACHE_WORDS;
+    time = stream_state[slot];
+    return stream_state[slot + 1] != 0;
+}
+
 extern "C" __global__ void days_horizon(DAYS_BUFFERS) {
     uint lane = threadIdx.x;
     __shared__ ulong minima[1024];
@@ -4629,18 +4677,18 @@ extern "C" __global__ void days_horizon(DAYS_BUFFERS) {
     bool valid = false;
     for (ulong node = lane; node < params[P_NODE_COUNT]; node += 1024) {
         ulong candidate;
-        if (
-            fel_root_time(
-                node,
-                params,
-                fel_meta,
-                fel_records,
-                stream_state,
-                stream_records,
-                candidate
-            ) &&
-            (!valid || candidate < minimum)
-        ) {
+        bool present = fel_root_time(
+            node,
+            params,
+            fel_meta,
+            fel_records,
+            stream_state,
+            stream_records,
+            candidate
+        );
+        // T21 fix 2: the round's single evaluation of this node's FEL root.
+        store_fel_root(stream_state, params, node, present, candidate);
+        if (present && (!valid || candidate < minimum)) {
             minimum = candidate;
             valid = true;
         }
@@ -4735,15 +4783,7 @@ extern "C" __global__ void days_round_prepare(DAYS_BUFFERS) {
         remote_meta[node * META_WORDS + 3] = 0;
         ulong time;
         if (
-            fel_root_time(
-                node,
-                params,
-                fel_meta,
-                fel_records,
-                stream_state,
-                stream_records,
-                time
-            ) &&
+            load_fel_root(stream_state, params, node, time) &&
             before_horizon(time, control)
         ) {
             local_count += 1;
@@ -4763,15 +4803,7 @@ extern "C" __global__ void days_round_prepare(DAYS_BUFFERS) {
     for (ulong node = start; node < end; ++node) {
         ulong time;
         if (
-            fel_root_time(
-                node,
-                params,
-                fel_meta,
-                fel_records,
-                stream_state,
-                stream_records,
-                time
-            ) &&
+            load_fel_root(stream_state, params, node, time) &&
             before_horizon(time, control)
         ) {
             if (write >= params[P_WORKLIST_CAPACITY]) {
