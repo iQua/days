@@ -1427,10 +1427,20 @@ fn metal_capacity_fault_is_screened_before_the_arena_readback() {
     );
     // Non-vacuity: the second arm must really plan a much larger arena, or the equalities below
     // would hold for the trivial reason that nothing changed.
+    //
+    // T21 fix 1 added a PLAN-INDEPENDENT floor to every plan: `CONTROL_SWEEP_BLOCKS *
+    // ROUND_SCRATCH_PARTIAL_WORDS` words of per-block reduction partials, the same number in both
+    // arms because it does not depend on the image. It is subtracted from both sides so the ratio
+    // keeps measuring the arena, which is the thing the equalities are about — the alternative,
+    // lowering the factor, would silently weaken the bound every time a fixed cost is added.
+    let floor = days_executor::device_sizing::ROUND_SCRATCH_PARTIAL_TOTAL_WORDS as u64;
+    let small_arena = small_plane.saturating_sub(floor);
+    let large_arena = large_plane.saturating_sub(floor);
     assert!(
-        large_plane > small_plane.saturating_mul(100),
+        large_arena > small_arena.saturating_mul(100),
         "the inflated arm must plan a far larger arena for the equalities to mean anything: \
-         {small_plane} -> {large_plane} words"
+         {small_plane} -> {large_plane} words ({small_arena} -> {large_arena} outside the \
+         {floor}-word T21 round-scratch floor)"
     );
 
     // Fix 1: the fault path does not read the arena, so its cost is the same on a 109x plan.
