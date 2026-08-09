@@ -390,6 +390,17 @@ fn assert_0695_initial_plan(
 #[test]
 fn channel_starting_cap_preserves_the_0695f02_initial_plan_bytes() {
     let image = compile_fixture("configs/benchmarks/baseline/fattree_k4_f8_st.toml");
+    let tcp_generator_count = image
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .filter(|generator| matches!(generator.kind, FlowGeneratorKind::Tcp(_)))
+        .count();
+    assert_eq!(
+        tcp_generator_count, 0,
+        "the ACK-minimum delta is image-derived: this PacketDistribution fixture lowers to \
+         Constant generators and therefore has no TCP feedback leg",
+    );
     let capacity_caps = DeviceCapacityCaps {
         channel_events_per_stream: Some(2),
         ..DeviceCapacityCaps::default()
@@ -422,8 +433,10 @@ fn channel_starting_cap_preserves_the_0695f02_initial_plan_bytes() {
         )
         .expect("retry-enabled Metal initial capped plan must size"),
         // T20i widened the per-flow TCP ledger metadata row from 4 words to 6 (ring head +
-        // occupancy high-water). This fixture has 8 TCP flows, so the anchor moves by exactly
-        // 8 * 2 * 8 = 128 B. Nothing else in the plan changed.
+        // occupancy high-water). The eight open-loop flows still reserve those generic per-flow
+        // rows, so the anchor moves by exactly 8 * 2 * 8 = 128 B. Nothing else in the plan
+        // changed. T21's ACK minimum moves no bytes: the image-derived assertion above proves
+        // this fixture has zero TCP generators.
         //
         // T21 stopped allocating the legacy exchange outbox in a streams-enabled plan, which is
         // what `MetalConfig::default()` selects here. The plane held 54,432 words (435,456 B) and
@@ -460,7 +473,7 @@ fn channel_starting_cap_preserves_the_0695f02_initial_plan_bytes() {
         )
         .expect("retry-enabled CUDA initial capped plan must size"),
         // T20i ledger-metadata widening: 8 flows * 2 words * 8 B = 128 B. T21 streams-path outbox
-        // elision: -435,344 B. See the Metal anchor for both.
+        // elision: -435,344 B. The image-derived ACK-minimum delta is zero; see the Metal anchor.
         1_269_904 + 128 - 435_344,
     );
 }

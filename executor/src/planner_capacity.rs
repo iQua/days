@@ -160,6 +160,12 @@ impl PlannerCapacityContext {
                     }
                 };
                 update_minimum_packet_size(&mut minimum_packet_sizes[flow][0], size);
+                if let FlowGeneratorKind::Tcp(tcp) = generator.kind {
+                    update_minimum_packet_size(
+                        &mut minimum_packet_sizes[flow][1],
+                        tcp.ack_size_bytes,
+                    );
+                }
 
                 if !matches!(
                     generator.next_emission.status,
@@ -662,6 +668,9 @@ fn precompute_minimum_packet_sizes(
             }
         };
         update_minimum_packet_size(&mut minimums[flow][0], size);
+        if let FlowGeneratorKind::Tcp(tcp) = generator.kind {
+            update_minimum_packet_size(&mut minimums[flow][1], tcp.ack_size_bytes);
+        }
     }
     materialize_minimum_packet_sizes(&mut minimums);
     minimums
@@ -720,6 +729,25 @@ fn legacy_minimum_packet_size(
             packet.flow.0 as usize == flow && packet.kind.is_data() == packet_kind.is_data()
         })
         .map(|packet| packet.size_bytes)
+        .chain(
+            (!packet_kind.is_data())
+                .then(|| {
+                    image
+                        .host_states
+                        .iter()
+                        .flat_map(|state| &state.generators)
+                        .filter(move |generator| generator.flow.0 as usize == flow)
+                        .filter_map(|generator| match generator.kind {
+                            FlowGeneratorKind::Tcp(tcp) => Some(tcp.ack_size_bytes),
+                            FlowGeneratorKind::Constant(_)
+                            | FlowGeneratorKind::Rate(_)
+                            | FlowGeneratorKind::Collective(_)
+                            | FlowGeneratorKind::Dcqcn(_) => None,
+                        })
+                })
+                .into_iter()
+                .flatten(),
+        )
         .chain(
             packet_kind
                 .is_data()
@@ -1021,6 +1049,11 @@ mod tests {
         );
 
         assert_eq!(context.minimum_packet_size(&image, 0, PacketKind::Data), 1);
+        assert_eq!(
+            context.minimum_packet_size(&image, 0, PacketKind::Feedback),
+            40,
+            "runtime TCP feedback uses the image's ACK size",
+        );
         let one_byte_serialization = crate::time::serialization_time_ns(1, link.rate_bps).unwrap();
         let mss_serialization =
             crate::time::serialization_time_ns(MSS_BYTES, link.rate_bps).unwrap();
