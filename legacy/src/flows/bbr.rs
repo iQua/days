@@ -625,10 +625,13 @@ impl Default for TCPBBR {
 
 impl TCPBBR {
     pub fn new() -> Self {
-        let default_mss = 512;
+        Self::with_mss(512)
+    }
 
+    pub fn with_mss(mss: usize) -> Self {
+        assert!(mss > 0, "TCP MSS must be positive");
         TCPBBR {
-            state: BBRState::new(default_mss),
+            state: BBRState::new(mss),
         }
     }
 }

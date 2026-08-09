@@ -453,10 +453,7 @@ impl PacketSource {
         match self {
             PacketSource::DistPacketSource(source) => source.traffic_exceeded(now),
             PacketSource::TCPPacketSource(source) => {
-                if source.traffic_exceeded
-                    && source.next_seq >= source.send_buffer
-                    && source.next_seq == source.last_ack
-                {
+                if source.is_complete() {
                     source.wrap_up(now).await;
                     return true;
                 }

@@ -100,6 +100,21 @@ pub fn run_simulation_from_config(config_path: &str) -> Result<(), String> {
     let flows = Flow::try_flows_from_config_with_attachments(config_path, &hosts)?;
     validate_flow_routing(&graph, &flows)?;
     let collectives = Collective::collectives_from_config(config_path, hosts.host_ids());
+    for flow in &flows {
+        if matches!(flow.flow_type, crate::flows::flow::FlowType::TCP) {
+            flow.traffic
+                .tcp_mss()
+                .map_err(|error| format!("flow {}: {error}", flow.id))?;
+        }
+    }
+    for collective in &collectives {
+        if matches!(collective.flow_type, crate::flows::flow::FlowType::TCP) {
+            collective
+                .traffic
+                .tcp_mss()
+                .map_err(|error| format!("collective {}: {error}", collective.id))?;
+        }
+    }
     for (kind, id, traffic) in flows
         .iter()
         .map(|flow| ("flow", flow.id, &flow.traffic))

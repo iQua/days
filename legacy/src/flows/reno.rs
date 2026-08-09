@@ -82,7 +82,12 @@ pub struct TCPReno {
 impl TCPReno {
     /// Creates new TCP Reno instance with default parameters
     pub fn new() -> TCPReno {
-        let mss = 512;
+        Self::with_mss(512)
+    }
+
+    /// Creates a TCP Reno instance for the configured maximum segment size.
+    pub fn with_mss(mss: usize) -> TCPReno {
+        assert!(mss > 0, "TCP MSS must be positive");
         let initial_window = 2 * mss;
 
         TCPReno {

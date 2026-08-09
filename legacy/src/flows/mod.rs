@@ -109,6 +109,24 @@ impl TrafficCharacteristics {
             dcqcn: traffic.dcqcn.clone(),
         }
     }
+
+    /// Returns the configured TCP maximum segment size.
+    pub fn tcp_mss(&self) -> Result<usize, String> {
+        let mss = match self.pkt_size_dist {
+            DistributionInfo::DiscreteUniform { low, high } if low == high => {
+                usize::try_from(low).ok()
+            }
+            DistributionInfo::Uniform { low, high }
+                if low == high && low.is_finite() && low.fract() == 0.0 =>
+            {
+                let value = low as usize;
+                (value as f64 == low).then_some(value)
+            }
+            _ => None,
+        };
+        mss.filter(|value| *value > 0)
+            .ok_or_else(|| "TCP `pkt_size_dist` must be a positive fixed integral MSS".to_owned())
+    }
 }
 
 impl Default for TrafficCharacteristics {
@@ -124,6 +142,63 @@ impl Default for TrafficCharacteristics {
             },
             None,
         )
+    }
+}
+
+#[cfg(test)]
+mod e5_mss_tests {
+    use super::*;
+
+    fn traffic(packet_size: DistributionInfo) -> TrafficCharacteristics {
+        TrafficCharacteristics::new(
+            0.0,
+            None,
+            Some(3500),
+            DistributionInfo::Uniform {
+                low: 1.0,
+                high: 1.0,
+            },
+            packet_size,
+            Some(TCPCharacteristics {
+                cc_algorithm: CCAlgorithm::TCPReno,
+                ecn: false,
+                cubic: None,
+            }),
+        )
+    }
+
+    #[test]
+    fn tcp_mss_accepts_only_a_positive_fixed_integral_packet_size() {
+        assert_eq!(
+            traffic(DistributionInfo::DiscreteUniform {
+                low: 1460,
+                high: 1460,
+            })
+            .tcp_mss(),
+            Ok(1460)
+        );
+        assert_eq!(
+            traffic(DistributionInfo::Uniform {
+                low: 1460.0,
+                high: 1460.0,
+            })
+            .tcp_mss(),
+            Ok(1460)
+        );
+        for unsupported in [
+            DistributionInfo::DiscreteUniform { low: 0, high: 0 },
+            DistributionInfo::DiscreteUniform {
+                low: 1400,
+                high: 1460,
+            },
+            DistributionInfo::Uniform {
+                low: 1460.5,
+                high: 1460.5,
+            },
+            DistributionInfo::Exp { lambda: 1.0 },
+        ] {
+            assert!(traffic(unsupported).tcp_mss().is_err());
+        }
     }
 }
 

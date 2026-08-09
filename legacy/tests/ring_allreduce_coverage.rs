@@ -113,7 +113,7 @@ sinks = [2, 3, 0, 1]
 initial_delay = 0.0
 size = 3072
 arr_dist = {{ type = "Uniform", low = 0.1, high = 0.1 }}
-pkt_size_dist = {{ type = "Uniform", low = 2000, high = 2500 }}
+pkt_size_dist = {{ type = "DiscreteUniform", low = 512, high = 512 }}
 
 [collective.traffic.tcp]
 cc_algorithm = "TCPReno"
@@ -130,7 +130,7 @@ sinks = [1, 2, 3, 0]
 initial_delay = 0.0
 size = 512
 arr_dist = {{ type = "Uniform", low = 0.1, high = 0.1 }}
-pkt_size_dist = {{ type = "Uniform", low = 2000, high = 2500 }}
+pkt_size_dist = {{ type = "DiscreteUniform", low = 512, high = 512 }}
 
 [collective.traffic.tcp]
 cc_algorithm = "TCPReno"

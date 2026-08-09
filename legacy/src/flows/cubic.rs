@@ -67,8 +67,13 @@ pub struct CubicSnapshot {
 impl TCPCubic {
     /// Creates a new TCP CUBIC instance with RFC 8312 defaults.
     pub fn new() -> TCPCubic {
-        let mss = 512;
-        let init_cwnd_bytes = 512; // 1 MSS
+        Self::with_mss(512)
+    }
+
+    /// Creates a TCP CUBIC instance for the configured maximum segment size.
+    pub fn with_mss(mss: usize) -> TCPCubic {
+        assert!(mss > 0, "TCP MSS must be positive");
+        let init_cwnd_bytes = mss; // 1 MSS
         let init_ssthresh_bytes = 65535;
         let init_cwnd = init_cwnd_bytes as f64 / mss as f64;
         let init_ssthresh = init_ssthresh_bytes as f64 / mss as f64;

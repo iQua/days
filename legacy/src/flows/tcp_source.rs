@@ -19,7 +19,7 @@ use crate::flows::dist_source::DistPacketSource;
 use crate::flows::packet::{EcnField, Packet};
 use crate::flows::reno::TCPReno;
 use crate::flows::source::PacketSourceReport;
-use crate::flows::{FlowFinishMsg, TrafficCharacteristics};
+use crate::flows::{FlowFinishMsg, FlowSize, TrafficCharacteristics};
 use crate::next_endpoint_id;
 use crate::utils::exact_time::{behavior_delay_ns, seconds_view};
 use crate::utils::logger::CsvLogger;
@@ -211,28 +211,30 @@ impl TCPPacketSource {
             .expect("TCP traffic requires TCP characteristics");
         let cc_algorithm = tcp_config.cc_algorithm;
         let cubic_config = tcp_config.cubic.as_ref();
+        let mss = traffic
+            .tcp_mss()
+            .expect("TCP traffic requires a positive fixed integral MSS");
 
         let congestion_control: Box<dyn CongestionControl + Send + Sync> = match cc_algorithm {
-            CCAlgorithm::TCPReno => Box::new(TCPReno::new()),
+            CCAlgorithm::TCPReno => Box::new(TCPReno::with_mss(mss)),
             CCAlgorithm::TCPCubic => {
-                let mut cubic = TCPCubic::new();
+                let mut cubic = TCPCubic::with_mss(mss);
                 if let Some(config) = cubic_config {
                     cubic.apply_config(config);
                 }
                 Box::new(cubic)
             }
-            CCAlgorithm::TCPBBR => Box::new(TCPBBR::new()),
+            CCAlgorithm::TCPBBR => Box::new(TCPBBR::with_mss(mss)),
         };
         let ecn_enabled = traffic.tcp.as_ref().map(|tcp| tcp.ecn).unwrap_or(false);
-        let synthetic_source = if app_source.is_some() {
-            None
-        } else {
-            Some(SyntheticDataSource::new(flow_id, traffic.clone(), rng))
+        let (synthetic_source, remaining_bytes) = match (&app_source, &traffic.size) {
+            (Some(handle), _) => (None, handle.get_total_size().unwrap_or(usize::MAX)),
+            (None, FlowSize::Bytes(bytes)) => (None, *bytes),
+            (None, FlowSize::Duration(_)) => (
+                Some(SyntheticDataSource::new(flow_id, traffic.clone(), rng)),
+                usize::MAX,
+            ),
         };
-        let remaining_bytes = app_source
-            .as_ref()
-            .and_then(|h| h.get_total_size())
-            .unwrap_or(usize::MAX);
         TCPPacketSource {
             time: 0.0,
             endpoint_id: next_endpoint_id(),
@@ -242,7 +244,7 @@ impl TCPPacketSource {
             traffic,
             traffic_exceeded: false,
             congestion_control,
-            mss: 512,
+            mss,
             next_seq: 0,
             send_buffer: 0,
             last_ack: 0,
@@ -334,6 +336,9 @@ impl TCPPacketSource {
                 self.remaining_bytes = self.remaining_bytes.saturating_sub(chunk_size);
                 offset += chunk_size;
             }
+        } else if self.synthetic_source.is_none() {
+            self.send_buffer = self.send_buffer.saturating_add(pull_size);
+            self.remaining_bytes -= pull_size;
         }
 
         // if all bytes have been sent and acknowledged, complete the flow
@@ -608,6 +613,11 @@ impl TCPPacketSource {
 
     pub fn get_cwnd_limit(&self) -> usize {
         self.last_ack + self.congestion_control.get_cwnd()
+    }
+
+    /// Returns true only after the full byte budget has been sent and cumulatively acknowledged.
+    pub fn is_complete(&self) -> bool {
+        self.traffic_exceeded && self.next_seq >= self.send_buffer && self.next_seq == self.last_ack
     }
 
     fn bytes_in_flight(&self) -> usize {
@@ -934,6 +944,7 @@ mod tests {
     use futures::executor::block_on;
     use futures::join;
     use rand::SeedableRng;
+    use std::collections::BTreeSet;
 
     fn make_source(ecn: bool) -> TCPPacketSource {
         let traffic = TrafficCharacteristics::new(
@@ -1140,5 +1151,73 @@ mod tests {
         assert_eq!(source.send_buffer, cwnd);
         assert_eq!(source.remaining_bytes, 0);
         assert!(source.traffic_exceeded);
+    }
+
+    fn fixed_byte_trace(arrival_seconds: f64) -> Vec<(usize, usize)> {
+        let traffic = TrafficCharacteristics::new(
+            0.0,
+            None,
+            Some(3500),
+            DistributionInfo::Uniform {
+                low: arrival_seconds,
+                high: arrival_seconds,
+            },
+            DistributionInfo::DiscreteUniform {
+                low: 1460,
+                high: 1460,
+            },
+            Some(TCPCharacteristics {
+                cc_algorithm: CCAlgorithm::TCPReno,
+                ecn: false,
+                cubic: None,
+            }),
+        );
+        let mut rng = rand::rng();
+        let rng = SmallRng::from_rng(&mut rng);
+        let mut source = TCPPacketSource::new(7, Vec::new(), traffic, 0, None, rng);
+
+        assert_eq!(source.mss, 1460);
+        assert_eq!(source.congestion_control.get_cwnd(), 2920);
+        assert!(!source.has_synthetic_source());
+        assert!(!source.is_complete());
+
+        block_on(source.send_packet(0));
+        let initial = source
+            .sent_packets
+            .values()
+            .map(|packet| (packet.packet_id, packet.size))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(initial, BTreeSet::from([(0, 1460), (1460, 1460)]));
+        assert!(!source.is_complete());
+
+        let mut ack = make_ack(source.flow_id, 1460, 1460, false, 0.000_001);
+        ack.packet_id = 0;
+        let _ = block_on(source.ack_packet_received(ack, 1_000));
+        block_on(source.send_packet(1_000));
+        assert_eq!(
+            source.sent_packets.get(&2920).map(|packet| packet.size),
+            Some(580)
+        );
+        assert_eq!(source.next_seq, 3500);
+        assert_eq!(source.send_buffer, 3500);
+        assert_eq!(source.sent_size, 3500);
+        assert!(!source.is_complete());
+
+        let mut final_ack = make_ack(source.flow_id, 3500, 580, false, 0.000_002);
+        final_ack.packet_id = 2920;
+        let _ = block_on(source.ack_packet_received(final_ack, 2_000));
+        assert!(source.is_complete());
+
+        vec![(0, 1460), (1460, 1460), (2920, 580)]
+    }
+
+    #[test]
+    fn fixed_byte_tcp_uses_mss_and_sends_an_exact_tail_independent_of_arrival_distribution() {
+        assert_eq!(fixed_byte_trace(1.0), fixed_byte_trace(0.000_000_001));
+    }
+
+    #[test]
+    fn duration_tcp_keeps_the_legacy_synthetic_application_source() {
+        assert!(make_source(false).has_synthetic_source());
     }
 }

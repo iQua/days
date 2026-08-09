@@ -59,6 +59,10 @@ fn four_byte_tcp_residue_no_longer_panics_at_100_gbps() {
 #[test]
 fn runtime_scheduling_failure_is_a_nonzero_cli_exit_without_completion_claim() {
     let fixture = Fixture::new("zero-arrival", 0, 1_032);
+    let content = fs::read_to_string(&fixture.config_path)
+        .unwrap()
+        .replace("size = 1032", "duration = 0.0000005");
+    fs::write(&fixture.config_path, content).unwrap();
 
     Command::cargo_bin("days")
         .unwrap()
@@ -68,6 +72,24 @@ fn runtime_scheduling_failure_is_a_nonzero_cli_exit_without_completion_claim() {
         .failure()
         .stderr(predicate::str::contains("Simulation failed"))
         .stderr(predicate::str::contains("must be finite and positive"))
+        .stderr(predicate::str::contains("Simulation completed").not());
+}
+
+#[test]
+fn varying_tcp_packet_size_is_a_clean_cli_refusal() {
+    let fixture = Fixture::new("varying-mss", 1, 1_032);
+    let content = fs::read_to_string(&fixture.config_path)
+        .unwrap()
+        .replace("low = 512, high = 512", "low = 512, high = 1460");
+    fs::write(&fixture.config_path, content).unwrap();
+
+    Command::cargo_bin("days")
+        .unwrap()
+        .env("RUST_LOG", "info")
+        .arg(&fixture.config_path)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("positive fixed integral MSS"))
         .stderr(predicate::str::contains("Simulation completed").not());
 }
 
@@ -109,7 +131,7 @@ routing = "ShortestPath"
 initial_delay = {initial_delay}
 size = {size}
 arr_dist = {{ type = "Uniform", low = {arrival_seconds}, high = {arrival_seconds} }}
-pkt_size_dist = {{ type = "DiscreteUniform", low = 516, high = 516 }}
+pkt_size_dist = {{ type = "DiscreteUniform", low = 512, high = 512 }}
 
 [flow.traffic.tcp]
 cc_algorithm = "TCPReno"
