@@ -97,6 +97,19 @@ constant uint P_ROUND_THREADS = 30;
 constant uint P_ROUND_SCRATCH_OFFSET = 31;
 constant uint ROUND_SCRATCH_CACHE_WORDS = 2;
 
+// T21 fix 1 — the re-gridded control sweeps. `evidence/P12/aterm-fixes.md` §3.4. Transliterated
+// word for word from `cuda_kernels.cu`; see that file for the design note.
+//
+// Every phase that swept Θ(nodes + channels) from a grid of ONE threadgroup is now a full-grid
+// `_sweep` dispatch that publishes one partial per threadgroup into the tail of the round scratch
+// region, plus a width-1 combine dispatch that reduces those partials and performs the phase's
+// control writes. The barrier between the two is the DISPATCH BOUNDARY, which under
+// `MTLDispatchType::Serial` is the same ordering `days_round` already relies on to see the
+// `worklist` `days_round_prepare` wrote. Nothing here synchronizes across threadgroups inside a
+// dispatch: no atomics, no `volatile`, no device-scope fence used as one.
+constant ulong CONTROL_SWEEP_BLOCKS = 128;
+constant ulong ROUND_SCRATCH_PARTIAL_WORDS = 8;
+
 constant uint N_KIND = 0;
 constant uint N_EGRESS = 1;
 constant uint N_SEMANTIC_QUEUE_CAPACITY = 2;
@@ -4931,6 +4944,47 @@ static inline bool load_fel_root(
     return stream_state[slot + 1] != 0;
 }
 
+// T21 fix 1 — the per-block reduction partials, `CONTROL_SWEEP_BLOCKS * ROUND_SCRATCH_PARTIAL_WORDS`
+// words appended after the FEL-root cache in the same scratch region. Transliterated word for word
+// from `cuda_kernels.cu`.
+//
+// A sweep threadgroup writes ONLY its own row, and only from lane 0 after that threadgroup's own
+// `threadgroup_barrier`. A combine reads rows written by a PREVIOUS dispatch. There is therefore
+// no cross-threadgroup ordering to establish: the dispatch boundary establishes it. These are
+// plain `device ulong` accesses — deliberately NOT `volatile`, which is one of the two suspects
+// `evidence/P12/aterm-fixes.md` §3.3 named.
+static inline ulong round_scratch_partials(const device ulong *params) {
+    return params[P_ROUND_SCRATCH_OFFSET] +
+        params[P_NODE_COUNT] * ROUND_SCRATCH_CACHE_WORDS;
+}
+
+static inline void store_round_partial(
+    device ulong *stream_state,
+    const device ulong *params,
+    ulong block,
+    ulong slot,
+    ulong value
+) {
+    stream_state[
+        round_scratch_partials(params) +
+        block * ROUND_SCRATCH_PARTIAL_WORDS +
+        slot
+    ] = value;
+}
+
+static inline ulong load_round_partial(
+    const device ulong *stream_state,
+    const device ulong *params,
+    ulong block,
+    ulong slot
+) {
+    return stream_state[
+        round_scratch_partials(params) +
+        block * ROUND_SCRATCH_PARTIAL_WORDS +
+        slot
+    ];
+}
+
 kernel void days_horizon(
     device ulong *control [[buffer(0)]],
     const device ulong *params [[buffer(1)]],
@@ -5017,6 +5071,56 @@ kernel void days_horizon(
     control[C_HORIZON_HI] = horizon_hi;
 }
 
+// T21 fix 1 — `days_round_prepare`'s Θ(N) + Θ(C) resets, on the whole grid. Transliterated word
+// for word from `cuda_kernels.cu`; see that kernel's header for the disjointness argument.
+kernel void days_round_reset(
+    const device ulong *control [[buffer(0)]],
+    const device ulong *params [[buffer(1)]],
+    device ulong *lp_state [[buffer(18)]],
+    device ulong *remote_meta [[buffer(19)]],
+    device ulong *stream_state [[buffer(25)]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint block [[threadgroup_position_in_grid]],
+    uint block_size [[threads_per_threadgroup]],
+    uint blocks [[threadgroups_per_grid]]
+) {
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 0 ||
+        control[C_ROUNDS] >= params[P_ROUND_CAPACITY]
+    ) {
+        return;
+    }
+
+    ulong first = ulong(block) * ulong(block_size) + ulong(lane);
+    ulong stride = ulong(blocks) * ulong(block_size);
+    if (params[P_STREAMS_ENABLED] != 0) {
+        for (
+            ulong channel = first;
+            channel < params[P_CHANNEL_COUNT];
+            channel += stride
+        ) {
+            ulong batch =
+                params[P_CHANNEL_BATCH_OFFSET] +
+                channel * CHANNEL_BATCH_WORDS;
+            stream_state[batch] = 0;
+            stream_state[batch + 1] = NONE;
+            stream_state[batch + 2] = NONE;
+            stream_state[batch + 3] = 0;
+        }
+    }
+    for (ulong node = first; node < params[P_NODE_COUNT]; node += stride) {
+        ulong state = node * LP_STATE_WORDS;
+        lp_state[state + L_ERROR] = 0;
+        lp_state[state + L_ERROR_ARENA] = 0;
+        lp_state[state + L_ERROR_NODE] = NONE;
+        lp_state[state + L_ERROR_CAPACITY] = 0;
+        lp_state[state + L_ERROR_DEMAND] = 0;
+        remote_meta[node * META_WORDS + 3] = 0;
+    }
+}
+
 kernel void days_round_prepare(
     device ulong *control [[buffer(0)]],
     const device ulong *params [[buffer(1)]],
@@ -5045,29 +5149,7 @@ kernel void days_round_prepare(
     ulong start = ulong(lane) * chunk + min(ulong(lane), remainder);
     ulong end = start + chunk + (ulong(lane) < remainder ? 1 : 0);
     ulong local_count = 0;
-    if (params[P_STREAMS_ENABLED] != 0) {
-        for (
-            ulong channel = lane;
-            channel < params[P_CHANNEL_COUNT];
-            channel += 1024
-        ) {
-            ulong batch =
-                params[P_CHANNEL_BATCH_OFFSET] +
-                channel * CHANNEL_BATCH_WORDS;
-            stream_state[batch] = 0;
-            stream_state[batch + 1] = NONE;
-            stream_state[batch + 2] = NONE;
-            stream_state[batch + 3] = 0;
-        }
-    }
     for (ulong node = start; node < end; ++node) {
-        ulong state = node * LP_STATE_WORDS;
-        lp_state[state + L_ERROR] = 0;
-        lp_state[state + L_ERROR_ARENA] = 0;
-        lp_state[state + L_ERROR_NODE] = NONE;
-        lp_state[state + L_ERROR_CAPACITY] = 0;
-        lp_state[state + L_ERROR_DEMAND] = 0;
-        remote_meta[node * META_WORDS + 3] = 0;
         ulong time;
         if (
             load_fel_root(stream_state, params, node, time) &&

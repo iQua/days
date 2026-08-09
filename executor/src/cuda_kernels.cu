@@ -116,6 +116,21 @@ constexpr uint P_TCP_LEDGER_META_OFFSET = 29;
 constexpr uint P_ROUND_SCRATCH_OFFSET = 30;
 constexpr uint ROUND_SCRATCH_CACHE_WORDS = 2;
 
+// T21 fix 1 — the re-gridded control sweeps. `evidence/P12/aterm-fixes.md` §3.4.
+//
+// Every phase that swept Θ(nodes + channels) from a grid of ONE block is now a full-grid `_sweep`
+// dispatch that publishes one partial per block into the tail of the round scratch region, plus a
+// width-1 combine dispatch that reduces those partials and performs the phase's control writes.
+// The barrier between the two is the DISPATCH BOUNDARY — nothing here synchronizes across blocks
+// inside a dispatch, and there are no atomics, no `volatile` and no fences.
+//
+// The width is a fixed constant rather than a function of the plan, so the combine knows how many
+// partials to read without being told and every slot is rewritten by its own block on every
+// dispatch. A slot is therefore never read stale, which is the whole reason this shape is sound
+// where the first attempt's in-dispatch combine was not.
+constexpr ulong CONTROL_SWEEP_BLOCKS = 128;
+constexpr ulong ROUND_SCRATCH_PARTIAL_WORDS = 8;
+
 constexpr uint N_KIND = 0;
 constexpr uint N_EGRESS = 1;
 constexpr uint N_SEMANTIC_QUEUE_CAPACITY = 2;
@@ -4661,6 +4676,44 @@ static __device__ inline bool load_fel_root(
     return stream_state[slot + 1] != 0;
 }
 
+// T21 fix 1 — the per-block reduction partials, `CONTROL_SWEEP_BLOCKS * ROUND_SCRATCH_PARTIAL_WORDS`
+// words appended after the FEL-root cache in the same scratch region.
+//
+// A sweep block writes ONLY its own row, and only from lane 0 after that block's own
+// `__syncthreads()`. A combine reads rows written by a PREVIOUS dispatch. There is therefore no
+// cross-block ordering to establish: the dispatch boundary establishes it.
+static __device__ inline ulong round_scratch_partials(const ulong *params) {
+    return params[P_ROUND_SCRATCH_OFFSET] +
+        params[P_NODE_COUNT] * ROUND_SCRATCH_CACHE_WORDS;
+}
+
+static __device__ inline void store_round_partial(
+    ulong *stream_state,
+    const ulong *params,
+    ulong block,
+    ulong slot,
+    ulong value
+) {
+    stream_state[
+        round_scratch_partials(params) +
+        block * ROUND_SCRATCH_PARTIAL_WORDS +
+        slot
+    ] = value;
+}
+
+static __device__ inline ulong load_round_partial(
+    const ulong *stream_state,
+    const ulong *params,
+    ulong block,
+    ulong slot
+) {
+    return stream_state[
+        round_scratch_partials(params) +
+        block * ROUND_SCRATCH_PARTIAL_WORDS +
+        slot
+    ];
+}
+
 extern "C" __global__ void days_horizon(DAYS_BUFFERS) {
     uint lane = threadIdx.x;
     __shared__ ulong minima[1024];
@@ -4740,6 +4793,55 @@ extern "C" __global__ void days_horizon(DAYS_BUFFERS) {
     control[C_HORIZON_HI] = horizon_hi;
 }
 
+// T21 fix 1 — `days_round_prepare`'s Θ(N) + Θ(C) resets, on the whole grid.
+//
+// `evidence/P12/aterm-fixes.md` §3.4 item 2. These writes need NO cross-block communication and no
+// reduction of any kind: each thread owns whole LPs and whole channels, every word is written by
+// exactly one thread, and nothing here reads a word any other thread writes. They are also
+// per-word-disjoint from the worklist compaction that used to run beside them — `L_FINISHED` is
+// `lp_state` word 0, the reset writes words 2..6 — which is why splitting them out is inert.
+//
+// It runs immediately before `days_round_prepare` and replays that kernel's guard exactly. Nothing
+// between the two dispatches writes a word the guard reads, so both dispatches take the same
+// branch. It writes no control word, which is the property `t21_control_regrid.rs` asserts.
+extern "C" __global__ void days_round_reset(DAYS_BUFFERS) {
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 0 ||
+        control[C_ROUNDS] >= params[P_ROUND_CAPACITY]
+    ) {
+        return;
+    }
+
+    ulong first = ulong(blockIdx.x) * ulong(blockDim.x) + ulong(threadIdx.x);
+    ulong stride = ulong(gridDim.x) * ulong(blockDim.x);
+    if (params[P_STREAMS_ENABLED] != 0) {
+        for (
+            ulong channel = first;
+            channel < params[P_CHANNEL_COUNT];
+            channel += stride
+        ) {
+            ulong batch =
+                params[P_CHANNEL_BATCH_OFFSET] +
+                channel * CHANNEL_BATCH_WORDS;
+            stream_state[batch] = 0;
+            stream_state[batch + 1] = NONE;
+            stream_state[batch + 2] = NONE;
+            stream_state[batch + 3] = 0;
+        }
+    }
+    for (ulong node = first; node < params[P_NODE_COUNT]; node += stride) {
+        ulong state = node * LP_STATE_WORDS;
+        lp_state[state + L_ERROR] = 0;
+        lp_state[state + L_ERROR_ARENA] = 0;
+        lp_state[state + L_ERROR_NODE] = NONE;
+        lp_state[state + L_ERROR_CAPACITY] = 0;
+        lp_state[state + L_ERROR_DEMAND] = 0;
+        remote_meta[node * META_WORDS + 3] = 0;
+    }
+}
+
 extern "C" __global__ void days_round_prepare(DAYS_BUFFERS) {
     uint lane = threadIdx.x;
     __shared__ ulong counts[1024];
@@ -4758,29 +4860,7 @@ extern "C" __global__ void days_round_prepare(DAYS_BUFFERS) {
     ulong start = ulong(lane) * chunk + min(ulong(lane), remainder);
     ulong end = start + chunk + (ulong(lane) < remainder ? 1 : 0);
     ulong local_count = 0;
-    if (params[P_STREAMS_ENABLED] != 0) {
-        for (
-            ulong channel = lane;
-            channel < params[P_CHANNEL_COUNT];
-            channel += 1024
-        ) {
-            ulong batch =
-                params[P_CHANNEL_BATCH_OFFSET] +
-                channel * CHANNEL_BATCH_WORDS;
-            stream_state[batch] = 0;
-            stream_state[batch + 1] = NONE;
-            stream_state[batch + 2] = NONE;
-            stream_state[batch + 3] = 0;
-        }
-    }
     for (ulong node = start; node < end; ++node) {
-        ulong state = node * LP_STATE_WORDS;
-        lp_state[state + L_ERROR] = 0;
-        lp_state[state + L_ERROR_ARENA] = 0;
-        lp_state[state + L_ERROR_NODE] = NONE;
-        lp_state[state + L_ERROR_CAPACITY] = 0;
-        lp_state[state + L_ERROR_DEMAND] = 0;
-        remote_meta[node * META_WORDS + 3] = 0;
         ulong time;
         if (
             load_fel_root(stream_state, params, node, time) &&

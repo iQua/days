@@ -70,9 +70,35 @@ pub(crate) const STREAMS_OUTBOX_RECORD_SLOTS: usize = 1;
 /// never part of complete state.
 pub const ROUND_SCRATCH_CACHE_WORDS: usize = 2;
 
-/// Words the T21 per-round scratch region occupies inside `stream_state`.
+/// Threadgroups (Metal) / blocks (CUDA) in every re-gridded control sweep — T21 fix 1.
+///
+/// `evidence/P12/aterm-fixes.md` §3.4 replaced the first attempt's in-dispatch cross-block combine
+/// with a pair of dispatches: a full-grid sweep that publishes one partial per block, and a
+/// width-1 combine that reduces them. The width is a **fixed constant**, identical in
+/// `cuda_kernels.cu`, `metal_kernels.metal` and here, for two reasons. It lets the combine know
+/// how many partials to read without a params word or any host/device agreement to get wrong; and
+/// because the grid is the same on every dispatch, every partial slot is rewritten by its own
+/// block every time, so the combine can never read a slot left over from an earlier round.
+///
+/// 128 is the SM count of the RTX 4090 the analysis profiled. Blocks with no work still run — they
+/// publish the reduction's identity element and cost a launch, not a memory transaction.
+pub const CONTROL_SWEEP_BLOCKS: usize = 128;
+
+/// Words one sweep block publishes. The widest consumer is `days_round_finalize_sweep`, which
+/// carries a first-error index plus three clamped observation-log totals and their capacity flags:
+/// seven. Eight keeps the row a power of two.
+pub const ROUND_SCRATCH_PARTIAL_WORDS: usize = 8;
+
+/// Words the per-block reduction partials occupy inside `stream_state`.
+pub const ROUND_SCRATCH_PARTIAL_TOTAL_WORDS: usize =
+    CONTROL_SWEEP_BLOCKS * ROUND_SCRATCH_PARTIAL_WORDS;
+
+/// Words the T21 per-round scratch region occupies inside `stream_state`: the fix 2 FEL-root cache
+/// (two words per LP) followed by the fix 1 reduction partials (a fixed 1,024 words).
 pub fn round_scratch_words(node_count: usize) -> Option<usize> {
-    node_count.checked_mul(ROUND_SCRATCH_CACHE_WORDS)
+    node_count
+        .checked_mul(ROUND_SCRATCH_CACHE_WORDS)?
+        .checked_add(ROUND_SCRATCH_PARTIAL_TOTAL_WORDS)
 }
 
 const PLANE_NAMES: [&str; 28] = [

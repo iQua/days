@@ -185,6 +185,11 @@ fn record_plane_words(words: u64) {
     PLANE_WORDS.with(|total| total.set(words));
 }
 
+/// The eight *reported* phases of a round attempt.
+///
+/// T21 fix 1 dispatches more kernels than this — see [`ATTEMPT_DISPATCHES`] — but the reported
+/// decomposition does not grow with the dispatch count: a phase's time is the sum of its
+/// dispatches', so `t15b_round_profile` compares before and after the re-grid like for like.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AttemptPhase {
     Horizon,
@@ -197,9 +202,46 @@ enum AttemptPhase {
     FinalControl,
 }
 
+impl AttemptPhase {
+    const fn index(self) -> usize {
+        match self {
+            Self::Horizon => 0,
+            Self::Compaction => 1,
+            Self::DrainExecute => 2,
+            Self::ContinuationControl => 3,
+            Self::ExchangePrefix => 4,
+            Self::ExchangeScatter => 5,
+            Self::TargetMerge => 6,
+            Self::FinalControl => 7,
+        }
+    }
+}
+
+/// One dispatch of the attempt DAG, in encode order.
+///
+/// T21 fix 1 (`evidence/P12/aterm-fixes.md` §3.4) splits the phases that swept Θ(nodes + channels)
+/// from a grid of one threadgroup into a full-grid `_sweep` dispatch plus a width-1 dispatch that
+/// combines the sweep's per-threadgroup partials. **The dispatch boundary is the barrier** —
+/// `MTLDispatchType::Serial` ordering, the same guarantee `days_round` already relies on to see
+/// the `worklist` `days_round_prepare` wrote — so no kernel synchronizes across threadgroups.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AttemptKernel {
+    Horizon,
+    RoundReset,
+    Compaction,
+    DrainExecute,
+    ContinuationControl,
+    ExchangePrefix,
+    ExchangeScatter,
+    TargetMerge,
+    FinalControl,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DispatchGeometry {
     FixedControl,
+    /// T21 fix 1: [`crate::device_sizing::CONTROL_SWEEP_BLOCKS`] threadgroups of [`LANES`].
+    ControlSweep,
     ActiveWorklist,
     Parallel,
 }
@@ -207,27 +249,61 @@ enum DispatchGeometry {
 impl DispatchGeometry {
     const fn threads_per_threadgroup(self, parallel_threads: usize) -> usize {
         match self {
-            Self::FixedControl => LANES,
+            Self::FixedControl | Self::ControlSweep => LANES,
             Self::ActiveWorklist | Self::Parallel => parallel_threads,
         }
     }
 }
 
-const ATTEMPT_PHASES: [(AttemptPhase, DispatchGeometry); 8] = [
-    (AttemptPhase::Horizon, DispatchGeometry::FixedControl),
-    (AttemptPhase::Compaction, DispatchGeometry::FixedControl),
-    (AttemptPhase::DrainExecute, DispatchGeometry::ActiveWorklist),
+const ATTEMPT_DISPATCHES: [(AttemptKernel, AttemptPhase, DispatchGeometry); 9] = [
     (
+        AttemptKernel::Horizon,
+        AttemptPhase::Horizon,
+        DispatchGeometry::FixedControl,
+    ),
+    (
+        AttemptKernel::RoundReset,
+        AttemptPhase::Compaction,
+        DispatchGeometry::ControlSweep,
+    ),
+    (
+        AttemptKernel::Compaction,
+        AttemptPhase::Compaction,
+        DispatchGeometry::FixedControl,
+    ),
+    (
+        AttemptKernel::DrainExecute,
+        AttemptPhase::DrainExecute,
+        DispatchGeometry::ActiveWorklist,
+    ),
+    (
+        AttemptKernel::ContinuationControl,
         AttemptPhase::ContinuationControl,
         DispatchGeometry::FixedControl,
     ),
-    (AttemptPhase::ExchangePrefix, DispatchGeometry::FixedControl),
-    (AttemptPhase::ExchangeScatter, DispatchGeometry::Parallel),
-    (AttemptPhase::TargetMerge, DispatchGeometry::Parallel),
-    (AttemptPhase::FinalControl, DispatchGeometry::FixedControl),
+    (
+        AttemptKernel::ExchangePrefix,
+        AttemptPhase::ExchangePrefix,
+        DispatchGeometry::FixedControl,
+    ),
+    (
+        AttemptKernel::ExchangeScatter,
+        AttemptPhase::ExchangeScatter,
+        DispatchGeometry::Parallel,
+    ),
+    (
+        AttemptKernel::TargetMerge,
+        AttemptPhase::TargetMerge,
+        DispatchGeometry::Parallel,
+    ),
+    (
+        AttemptKernel::FinalControl,
+        AttemptPhase::FinalControl,
+        DispatchGeometry::FixedControl,
+    ),
 ];
-const PROFILE_PHASES: usize = ATTEMPT_PHASES.len();
-const PROFILE_SAMPLES_PER_ATTEMPT: usize = PROFILE_PHASES * 2;
+const PROFILE_PHASES: usize = 8;
+const PROFILE_SAMPLES_PER_ATTEMPT: usize = ATTEMPT_DISPATCHES.len() * 2;
 const CONTROL_THREADGROUP_BYTES: usize =
     LANES * (std::mem::size_of::<u64>() + std::mem::size_of::<u32>());
 const NONE: u64 = u64::MAX;
@@ -4984,6 +5060,8 @@ struct DirectMetal {
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     initialization_timings: MetalInitializationTimings,
     horizon_pipeline: MetalPipeline,
+    /// T21 fix 1: `days_round_prepare`'s Θ(N) + Θ(C) resets, on the full grid.
+    reset_pipeline: MetalPipeline,
     prepare_pipeline: MetalPipeline,
     round_pipeline: MetalPipeline,
     control_pipeline: MetalPipeline,
@@ -5009,6 +5087,7 @@ impl DirectMetal {
         let source = include_str!("metal_kernels.metal");
         let pipeline_started = Instant::now();
         let horizon_pipeline = create_pipeline(&device, source, "days_horizon")?;
+        let reset_pipeline = create_pipeline(&device, source, "days_round_reset")?;
         let prepare_pipeline = create_pipeline(&device, source, "days_round_prepare")?;
         let round_pipeline = create_pipeline(&device, source, "days_round")?;
         let control_pipeline = create_pipeline(&device, source, "days_round_control")?;
@@ -5020,6 +5099,7 @@ impl DirectMetal {
         let pipeline_creation_ns = duration_ns(pipeline_started.elapsed());
         for (name, pipeline) in [
             ("horizon", &horizon_pipeline),
+            ("round-reset", &reset_pipeline),
             ("round-prepare", &prepare_pipeline),
             ("round-control", &control_pipeline),
             ("exchange-prefix", &exchange_prefix_pipeline),
@@ -5048,6 +5128,7 @@ impl DirectMetal {
                 reused_cached_executor: false,
             },
             horizon_pipeline,
+            reset_pipeline,
             prepare_pipeline,
             round_pipeline,
             control_pipeline,
@@ -5259,6 +5340,13 @@ impl DirectMetal {
             height: 1,
             depth: 1,
         };
+        // T21 fix 1: the full-grid control geometry. Fixed, so that every partial slot the combine
+        // dispatch reads was written by its own threadgroup in the sweep that just ran.
+        let sweep_grid = MTLSize {
+            width: crate::device_sizing::CONTROL_SWEEP_BLOCKS,
+            height: 1,
+            depth: 1,
+        };
         let control_group = MTLSize {
             width: DispatchGeometry::FixedControl.threads_per_threadgroup(round_threads),
             height: 1,
@@ -5307,6 +5395,7 @@ impl DirectMetal {
                             attempt * PROFILE_SAMPLES_PER_ATTEMPT,
                             buffers,
                             control_grid,
+                            sweep_grid,
                             control_group,
                             parallel_grid,
                             parallel_group,
@@ -5331,6 +5420,7 @@ impl DirectMetal {
                             &encoder,
                             buffers,
                             control_grid,
+                            sweep_grid,
                             control_group,
                             parallel_grid,
                             parallel_group,
@@ -5422,17 +5512,21 @@ impl DirectMetal {
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         buffers: &MetalBuffers,
         control_grid: MTLSize,
+        sweep_grid: MTLSize,
         control_group: MTLSize,
         parallel_grid: MTLSize,
         parallel_group: MTLSize,
         round_pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
         merge_pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
     ) {
-        for (phase, geometry) in ATTEMPT_PHASES {
-            encoder.setComputePipelineState(self.pipeline(phase, round_pipeline, merge_pipeline));
+        for (kernel, _, geometry) in ATTEMPT_DISPATCHES {
+            encoder.setComputePipelineState(self.pipeline(kernel, round_pipeline, merge_pipeline));
             match geometry {
                 DispatchGeometry::FixedControl => {
                     encoder.dispatchThreadgroups_threadsPerThreadgroup(control_grid, control_group);
+                }
+                DispatchGeometry::ControlSweep => {
+                    encoder.dispatchThreadgroups_threadsPerThreadgroup(sweep_grid, control_group);
                 }
                 DispatchGeometry::ActiveWorklist => unsafe {
                     encoder
@@ -5458,6 +5552,7 @@ impl DirectMetal {
         first_sample: usize,
         buffers: &MetalBuffers,
         control_grid: MTLSize,
+        sweep_grid: MTLSize,
         control_group: MTLSize,
         parallel_grid: MTLSize,
         parallel_group: MTLSize,
@@ -5465,7 +5560,7 @@ impl DirectMetal {
         merge_pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
         fel_probe: Option<&FelProbeResources>,
     ) -> Result<(), MetalError> {
-        for (phase_index, (phase, geometry)) in ATTEMPT_PHASES.into_iter().enumerate() {
+        for (dispatch_index, (kernel, _, geometry)) in ATTEMPT_DISPATCHES.into_iter().enumerate() {
             let descriptor = MTLComputePassDescriptor::new();
             descriptor.setDispatchType(MTLDispatchType::Serial);
             let attachment = unsafe {
@@ -5474,7 +5569,7 @@ impl DirectMetal {
                     .objectAtIndexedSubscript(0)
             };
             attachment.setSampleBuffer(Some(counter_buffer));
-            let sample = first_sample + phase_index * 2;
+            let sample = first_sample + dispatch_index * 2;
             unsafe {
                 attachment.setStartOfEncoderSampleIndex(sample);
                 attachment.setEndOfEncoderSampleIndex(sample + 1);
@@ -5488,10 +5583,13 @@ impl DirectMetal {
             if let Some(probe) = fel_probe {
                 probe.bind(&encoder);
             }
-            encoder.setComputePipelineState(self.pipeline(phase, round_pipeline, merge_pipeline));
+            encoder.setComputePipelineState(self.pipeline(kernel, round_pipeline, merge_pipeline));
             match geometry {
                 DispatchGeometry::FixedControl => {
                     encoder.dispatchThreadgroups_threadsPerThreadgroup(control_grid, control_group);
+                }
+                DispatchGeometry::ControlSweep => {
+                    encoder.dispatchThreadgroups_threadsPerThreadgroup(sweep_grid, control_group);
                 }
                 DispatchGeometry::ActiveWorklist => unsafe {
                     encoder
@@ -5513,19 +5611,20 @@ impl DirectMetal {
 
     fn pipeline<'a>(
         &'a self,
-        phase: AttemptPhase,
+        kernel: AttemptKernel,
         round_pipeline: &'a ProtocolObject<dyn MTLComputePipelineState>,
         merge_pipeline: &'a ProtocolObject<dyn MTLComputePipelineState>,
     ) -> &'a ProtocolObject<dyn MTLComputePipelineState> {
-        match phase {
-            AttemptPhase::Horizon => &self.horizon_pipeline,
-            AttemptPhase::Compaction => &self.prepare_pipeline,
-            AttemptPhase::DrainExecute => round_pipeline,
-            AttemptPhase::ContinuationControl => &self.control_pipeline,
-            AttemptPhase::ExchangePrefix => &self.exchange_prefix_pipeline,
-            AttemptPhase::ExchangeScatter => &self.exchange_scatter_pipeline,
-            AttemptPhase::TargetMerge => merge_pipeline,
-            AttemptPhase::FinalControl => &self.finalize_pipeline,
+        match kernel {
+            AttemptKernel::Horizon => &self.horizon_pipeline,
+            AttemptKernel::RoundReset => &self.reset_pipeline,
+            AttemptKernel::Compaction => &self.prepare_pipeline,
+            AttemptKernel::DrainExecute => round_pipeline,
+            AttemptKernel::ContinuationControl => &self.control_pipeline,
+            AttemptKernel::ExchangePrefix => &self.exchange_prefix_pipeline,
+            AttemptKernel::ExchangeScatter => &self.exchange_scatter_pipeline,
+            AttemptKernel::TargetMerge => merge_pipeline,
+            AttemptKernel::FinalControl => &self.finalize_pipeline,
         }
     }
 
@@ -5682,9 +5781,9 @@ fn resolve_profile_attempts(
         .chunks_exact(PROFILE_SAMPLES_PER_ATTEMPT)
         .map(|attempt| {
             let mut values = [0_u64; PROFILE_PHASES];
-            for (phase, value) in values.iter_mut().enumerate() {
-                let start = attempt[phase * 2].timestamp;
-                let end = attempt[phase * 2 + 1].timestamp;
+            for (dispatch, (_, phase, _)) in ATTEMPT_DISPATCHES.into_iter().enumerate() {
+                let start = attempt[dispatch * 2].timestamp;
+                let end = attempt[dispatch * 2 + 1].timestamp;
                 if start == 0
                     || end == 0
                     || start == MTLCounterErrorValue
@@ -5702,8 +5801,9 @@ fn resolve_profile_attempts(
                     &mut pass_gap_ns,
                     &mut pass_overlap_ns,
                 );
-                // Resolved counter timestamps use `MTLTimestamp`, whose unit is nanoseconds.
-                *value = end - start;
+                // Resolved counter timestamps use `MTLTimestamp`, whose unit is nanoseconds. A
+                // phase with more than one dispatch accumulates all of them into its own bucket.
+                values[phase.index()] = values[phase.index()].saturating_add(end - start);
             }
             Ok(MetalPhaseTimings::from_values(values))
         })
@@ -5789,7 +5889,7 @@ fn seconds_ns(seconds: f64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ATTEMPT_PHASES, AttemptPhase, DispatchGeometry, LANES,
+        ATTEMPT_DISPATCHES, AttemptKernel, AttemptPhase, DispatchGeometry, LANES,
         MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER, MAX_ENCODED_PAIRS_PER_WAVE, MetalConfig, MetalError,
         MetalPhaseTimings, PROFILE_SAMPLES_PER_ATTEMPT, PROFILED_ATTEMPTS,
         accumulate_profile_interval, build_phase_profile, decode_device_error, encoding_limits,
@@ -5885,8 +5985,12 @@ mod tests {
 
     #[test]
     fn production_attempt_uses_fixed_parallel_control_geometry() {
+        // The eight reported phases still appear in this order, and every dispatch belongs to
+        // exactly one of them. T21 fix 1 adds dispatches, never phases.
+        let mut reported = ATTEMPT_DISPATCHES.map(|(_, phase, _)| phase).to_vec();
+        reported.dedup();
         assert_eq!(
-            ATTEMPT_PHASES.map(|(phase, _)| phase),
+            reported,
             [
                 AttemptPhase::Horizon,
                 AttemptPhase::Compaction,
@@ -5898,23 +6002,36 @@ mod tests {
                 AttemptPhase::FinalControl,
             ]
         );
-        for phase in [
-            AttemptPhase::ContinuationControl,
-            AttemptPhase::ExchangePrefix,
-            AttemptPhase::FinalControl,
+        for (index, phase) in reported.iter().enumerate() {
+            assert_eq!(phase.index(), index);
+        }
+        for kernel in [
+            AttemptKernel::ContinuationControl,
+            AttemptKernel::ExchangePrefix,
+            AttemptKernel::FinalControl,
         ] {
-            let (_, geometry) = ATTEMPT_PHASES
+            let (_, _, geometry) = ATTEMPT_DISPATCHES
                 .into_iter()
-                .find(|(candidate, _)| *candidate == phase)
-                .expect("every control phase is present");
+                .find(|(candidate, _, _)| *candidate == kernel)
+                .expect("every control dispatch is present");
             assert_eq!(geometry, DispatchGeometry::FixedControl);
             assert_eq!(geometry.threads_per_threadgroup(256), LANES);
         }
 
-        let (_, drain_geometry) = ATTEMPT_PHASES
+        // T21 fix 1: the re-gridded sweeps take the whole grid at the retained threadgroup width.
+        for kernel in [AttemptKernel::RoundReset] {
+            let (_, _, geometry) = ATTEMPT_DISPATCHES
+                .into_iter()
+                .find(|(candidate, _, _)| *candidate == kernel)
+                .expect("every sweep dispatch is present");
+            assert_eq!(geometry, DispatchGeometry::ControlSweep);
+            assert_eq!(geometry.threads_per_threadgroup(256), LANES);
+        }
+
+        let (_, _, drain_geometry) = ATTEMPT_DISPATCHES
             .into_iter()
-            .find(|(candidate, _)| *candidate == AttemptPhase::DrainExecute)
-            .expect("the drain phase is present");
+            .find(|(candidate, _, _)| *candidate == AttemptKernel::DrainExecute)
+            .expect("the drain dispatch is present");
         assert_eq!(drain_geometry, DispatchGeometry::ActiveWorklist);
     }
 

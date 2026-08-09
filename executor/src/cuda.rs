@@ -916,7 +916,11 @@ pub struct CudaRun {
     pub memory_layout: CudaMemoryLayout,
 }
 
-/// Device-timestamp totals for the eight phases in every encoded CUDA graph attempt.
+/// Device-timestamp totals for the eight reported phases of every encoded CUDA graph attempt.
+///
+/// T21 fix 1 launches more kernels than there are phases here — see [`KERNEL_NAMES`] and
+/// [`DISPATCH_PHASE`]. A phase's total is the sum of its launches', so this decomposition is
+/// unchanged across the re-grid and before/after profiles are directly comparable.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CudaPhaseProfile {
     pub recorded_attempts: u64,
@@ -4391,8 +4395,16 @@ impl CudaBuffers {
     }
 }
 
-const KERNEL_NAMES: [&str; 8] = [
+/// The attempt DAG, in launch order.
+///
+/// T21 fix 1 (`evidence/P12/aterm-fixes.md` §3.4) splits the phases that swept Θ(nodes + channels)
+/// from a grid of one block into a full-grid `_sweep` launch plus a width-1 launch that combines
+/// the sweep's per-block partials. The **launch boundary is the barrier**: nothing in the kernels
+/// synchronizes across blocks inside a launch. That costs extra launches, which the analysis
+/// budgeted for at ≤0.11 % of a round, and buys the whole grid for the sweeps.
+const KERNEL_NAMES: [&str; 9] = [
     "days_horizon",
+    "days_round_reset",
     "days_round_prepare",
     "days_round",
     "days_round_control",
@@ -4401,6 +4413,11 @@ const KERNEL_NAMES: [&str; 8] = [
     "days_exchange_merge",
     "days_round_finalize",
 ];
+/// Which of the eight *reported* profile phases each launch belongs to.
+///
+/// The reported decomposition deliberately does not grow with the launch count: a phase's time is
+/// the sum of its launches', so `t17c_cuda_profile` compares before and after like for like.
+const DISPATCH_PHASE: [usize; 9] = [0, 1, 1, 2, 3, 4, 5, 6, 7];
 /// T20l fix 2's readback gather. Deliberately outside [`KERNEL_NAMES`]: it is not part of the
 /// captured attempt DAG, does not take the uniform 29-plane ABI, and is launched only after an
 /// attempt has been screened as successful.
@@ -4409,8 +4426,12 @@ const COMPACT_KERNEL_NAME: &str = "days_compact_gather";
 // keeps the launch a whole number of warps without reserving the maximum block footprint; the
 // gather's output does not depend on it.
 const COMPACT_THREADS_PER_BLOCK: usize = 256;
-const CONTROL_KERNELS: [usize; 5] = [0, 1, 3, 4, 7];
-const PARALLEL_KERNELS: [usize; 3] = [2, 5, 6];
+/// Launches that need the full [`LANES`]-wide block their deterministic reduction assumes.
+const CONTROL_KERNELS: [usize; 6] = [0, 1, 2, 4, 5, 8];
+/// Launches that take the full-grid control geometry:
+/// [`crate::device_sizing::CONTROL_SWEEP_BLOCKS`] blocks of [`LANES`] threads.
+const SWEEP_KERNELS: [usize; 1] = [1];
+const PARALLEL_KERNELS: [usize; 3] = [3, 6, 7];
 
 struct DirectCuda {
     _context: Arc<CudaContext>,
@@ -4623,19 +4644,7 @@ impl DirectCuda {
         let parallel_threads = u32::try_from(parallel_threads).map_err(|_| {
             CudaError::Validation("round_threads_per_block does not fit in u32".into())
         })?;
-        let control = LaunchConfig {
-            grid_dim: (1, 1, 1),
-            block_dim: (LANES as u32, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let parallel = LaunchConfig {
-            grid_dim: (parallel_blocks, 1, 1),
-            block_dim: (parallel_threads, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let configs = [
-            control, control, parallel, control, control, parallel, parallel, control,
-        ];
+        let configs = attempt_launch_configs(parallel_blocks, parallel_threads);
 
         let wall_started = Instant::now();
         let capture_started = Instant::now();
@@ -4743,19 +4752,7 @@ impl DirectCuda {
         let parallel_threads = u32::try_from(parallel_threads).map_err(|_| {
             CudaError::Validation("round_threads_per_block does not fit in u32".into())
         })?;
-        let control = LaunchConfig {
-            grid_dim: (1, 1, 1),
-            block_dim: (LANES as u32, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let parallel = LaunchConfig {
-            grid_dim: (parallel_blocks, 1, 1),
-            block_dim: (parallel_threads, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let configs = [
-            control, control, parallel, control, control, parallel, parallel, control,
-        ];
+        let configs = attempt_launch_configs(parallel_blocks, parallel_threads);
 
         let wall_started = Instant::now();
         let maximum_waves = buffers
@@ -4829,7 +4826,10 @@ impl DirectCuda {
                                 error,
                             )
                         })?;
-                    profile.observe(phase, (f64::from(elapsed_ms) * 1_000_000.0) as u64);
+                    profile.observe(
+                        DISPATCH_PHASE[phase],
+                        (f64::from(elapsed_ms) * 1_000_000.0) as u64,
+                    );
                 }
             }
             profile.recorded_attempts = profile
@@ -4881,7 +4881,7 @@ impl DirectCuda {
     fn capture_graph(
         &self,
         buffers: &CudaBuffers,
-        configs: &[LaunchConfig; 8],
+        configs: &[LaunchConfig; KERNEL_NAMES.len()],
         attempts: usize,
     ) -> Result<CudaGraph, CudaError> {
         self.stream
@@ -4917,6 +4917,38 @@ impl DirectCuda {
             .map_err(|error| driver_error("CUDA Graph upload", error))?;
         Ok(graph)
     }
+}
+
+/// One [`LaunchConfig`] per entry of [`KERNEL_NAMES`], in launch order.
+///
+/// Three geometries: width-1 control (the combines and the two node-ordered scans), the T21 fix 1
+/// full-grid sweep at a fixed [`crate::device_sizing::CONTROL_SWEEP_BLOCKS`] blocks, and the
+/// per-LP parallel grid.
+fn attempt_launch_configs(
+    parallel_blocks: u32,
+    parallel_threads: u32,
+) -> [LaunchConfig; KERNEL_NAMES.len()] {
+    let control = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (LANES as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut configs = [control; KERNEL_NAMES.len()];
+    for index in SWEEP_KERNELS {
+        configs[index] = LaunchConfig {
+            grid_dim: (crate::device_sizing::CONTROL_SWEEP_BLOCKS as u32, 1, 1),
+            block_dim: (LANES as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+    }
+    for index in PARALLEL_KERNELS {
+        configs[index] = LaunchConfig {
+            grid_dim: (parallel_blocks, 1, 1),
+            block_dim: (parallel_threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+    }
+    configs
 }
 
 fn launch_uniform(
