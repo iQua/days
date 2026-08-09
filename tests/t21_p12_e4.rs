@@ -300,9 +300,10 @@ fn identical_across_local_backends(
 
 /// Scalar + CPU (two worker counts) identity, for the horizon Metal cannot reach.
 ///
-/// Used ONLY by the run-to-completion anchor, and only because Metal REFUSES that run — see
-/// `e4_completion_on_metal_is_a_refusal`, which pins the refusal so this exclusion can never
-/// become a silent one. Every other E4 gate uses `identical_across_local_backends`.
+/// Used ONLY by the run-to-completion anchor, and only because Metal refuses that run — see
+/// `e4_completion_on_metal_exhausts_the_tcp_segment_ledger`, which pins the refusal so this
+/// exclusion can never become a silent one. Every other E4 gate, including the prefix anchor,
+/// uses `identical_across_local_backends` and Metal is in it.
 fn identical_across_cpu_backends(
     name: &str,
     image: &SimulationImage,
@@ -774,24 +775,23 @@ fn e4_prefix_anchor_is_identical_across_local_backends() {
 /// Separate from the prefix anchor because they are different states, not because the full run is
 /// out of reach: it is not. The measurement round owns E4's timing; this gate owns its state.
 ///
-/// SCALAR + CPU ONLY, AND THE REASON IS A MEASURED METAL REFUSAL, NOT A CONVENIENCE. Metal runs
-/// E4 fine at the 1.152 ms prefix — the prefix anchor above is a four-backend fingerprint — but
-/// refuses the run to completion with `Metal execution failed after 1 capacity retries: Metal
-/// transition kernel reported semantic error 45 at LP NodeId(0)`. Code 45 is
-/// `metal_kernels.metal`'s per-generator counter-overflow guard
-/// (`generators[generator + G_PACKETS] == NONE || generators[generator + G_BYTES] > NONE -
-/// size_bytes`, `NONE = 0xffff_ffff_ffff_ffff`), which cannot be a true overflow here: E4's
-/// largest flow emits 20,000 packets and 29,200,000 bytes. The refusal is pinned by
-/// `e4_completion_on_metal_is_a_refusal` and reported in `evidence/P12/e4-authoring.md` as a
-/// blocker for the Metal lane; it is NOT worked around and NOT diagnosed here.
+/// The fingerprint is SMALLER than the prefix anchor's because this is a DRAINED image — no
+/// resident packets, no pending events, no armed timers. That is the fixture working as specified,
+/// not a truncated run.
+///
+/// SCALAR + CPU ONLY, because Metal cannot reach this state: it exhausts its per-flow TCP
+/// segment-ledger capacity. Metal IS in the prefix anchor, so the image is expressible on it;
+/// what it will not do is finish. `e4_completion_on_metal_exhausts_the_tcp_segment_ledger` pins
+/// the refusal verbatim, and `evidence/P12/e4-authoring.md` §6.4 hands it off as a Metal-lane
+/// blocker. It is neither diagnosed nor tuned around here — `MetalConfig::default()` throughout.
 #[test]
 #[ignore = "explicit P12 E4 RUN-TO-COMPLETION anchor: full 4 s horizon, 104 GB of payload"]
 fn e4_completion_anchor_is_identical_across_local_backends() {
     let image = lower(FIXTURE);
     let observed = identical_across_cpu_backends(FIXTURE, &image, None);
     println!(
-        "E4 COMPLETION anchor (scalar + CPU x2/x4; Metal refuses, see the doc comment): \
-         bytes={} fnv1a64={:016x}",
+        "E4 COMPLETION anchor (scalar + CPU x2/x4; Metal exhausts its ledger, see the doc \
+         comment): bytes={} fnv1a64={:016x}",
         observed.bytes, observed.fnv1a64
     );
     assert_anchor(
@@ -940,22 +940,27 @@ fn e4_runs_to_completion_and_drains() {
     );
 }
 
-/// Metal REFUSES E4's run to completion, and the refusal is gated so it cannot become silent.
+/// Metal refuses E4's run to completion by exhausting its TCP segment ledger, and it is pinned.
 ///
-/// This is a first-class result, not a skipped backend. Metal executes the same image happily for
-/// 1.152 ms (the prefix anchor is a four-backend fingerprint), so the fixture is expressible on
-/// Metal; something further into a 96 ms, 104 GB run is not. The error is
-/// `metal_kernels.metal`'s code 45, the per-generator counter-overflow guard, at a scale where no
-/// counter can have overflowed — E4's largest flow emits 20,000 packets and 29,200,000 bytes
-/// against a `NONE` sentinel of 2^64-1.
+/// A first-class result, not a skipped backend. Metal executes this same image happily for
+/// 1.152 ms — the prefix anchor is a four-backend fingerprint — so the fixture is expressible on
+/// Metal; a 96 ms, 104 GB run is not. Verbatim, and reproduced twice on an isolated worktree:
+///
+/// > Metal execution failed after 16 capacity retries: Metal TCP segment ledger capacity of 98
+/// > records exceeded at flow FlowId(3667); observed demand 99
+///
+/// Note the shape: the executor's own capacity-retry loop grew the ledger sixteen times and still
+/// landed exactly ONE record short of the demand. That is a sizing-heuristic question for the
+/// Metal lane, not a fixture question, and this round neither diagnosed it nor tuned around it —
+/// `MetalConfig::default()` is what every other E4 gate uses and is what this one uses.
 ///
 /// If Metal is ever fixed, THIS TEST GOES RED, which is the point: the exclusion in
-/// `e4_completion_anchor_is_identical_across_local_backends` must be revisited in the same change,
+/// `e4_completion_anchor_is_identical_across_local_backends` must be revisited in the same change
 /// and E4's completion identity claim upgraded from three backends to four.
 #[test]
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 #[ignore = "explicit P12 E4 Metal refusal probe: full 4 s horizon, 104 GB of payload"]
-fn e4_completion_on_metal_is_a_refusal() {
+fn e4_completion_on_metal_exhausts_the_tcp_segment_ledger() {
     use days_executor::{MetalConfig, MetalExecutor};
     let image = lower(FIXTURE);
     let executor = MetalExecutor::new().expect("Metal executor must initialize");
@@ -974,7 +979,7 @@ fn e4_completion_on_metal_is_a_refusal() {
         Err(error) => error.to_string(),
     };
     assert!(
-        error.contains("semantic error 45"),
+        error.contains("TCP segment ledger capacity"),
         "Metal still refuses E4 to completion, but with a DIFFERENT error than the one recorded \
          in evidence/P12/e4-authoring.md: {error}"
     );
@@ -1001,8 +1006,10 @@ const E4_PREFIX_ANCHOR_FNV: u64 = 0x9d85_6e6d_66b0_17ae;
 
 /// Scalar + CPU(2) + CPU(4) fingerprint of E4 run to completion. Metal refuses; see above.
 ///
-/// Smaller than the prefix anchor because it is a DRAINED image: no resident packets, no pending
-/// events, no armed timers. That is the fixture working as specified, not a truncated run.
+/// Frozen from an ISOLATED worktree at this fixture's own commit, after another lane's uncommitted
+/// executor work was found in the shared tree (`evidence/P12/e4-authoring.md` §6.4). The value is
+/// bit-identical to the one the shared tree produced, which is the cross-check that the other
+/// lane's changes were device-only — but the frozen number is the isolated one.
 const E4_COMPLETION_ANCHOR_BYTES: u64 = 50_866_719;
 const E4_COMPLETION_ANCHOR_FNV: u64 = 0x64fb_70c3_3345_c10e;
 
