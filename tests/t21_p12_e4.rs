@@ -721,8 +721,9 @@ fn e4_lowers_to_gedes_byte_demand() {
 /// application data from the same distribution-driven generator the open-loop source uses, so
 /// `arr_dist` is a hard send-rate cap there. Measured on the E4 file itself
 /// (`evidence/P12/e4-authoring.md` §8.2): at E4's OWN 4 s horizon legacy's `Total packets
-/// processed` scales inversely with the interval over four decades — 98,280 at 1 s, 196,536 at
-/// 500 ms, 981,330 at 100 ms, 9,670,380 at 10 ms — and then, at 1 ms, where the extrapolation
+/// processed` scales inversely with the interval across the two decades it survives — 98,280 at
+/// 1 s, 196,536 at 500 ms, 981,330 at 100 ms, 9,670,380 at 10 ms — and then, at 1 ms, where the
+/// extrapolation
 /// would first approach the workload's own 71,276,147 segments, legacy PANICS in its port
 /// scheduler (`legacy/src/schedulers/port.rs:425`, `InvalidScheduledTime`) and reports 0 packets
 /// while still exiting 0.
