@@ -370,6 +370,39 @@ the MT interleaving still reorders execution extensively (§6.6.2); what the dra
 that the reordering cannot change a *total*. **This is an expectation to be tested per machine, not
 an assumption to be asserted.**
 
+**ADDED 2026-08-08, from the P12 E1 spine-legacy round
+(`days-gpu/evidence/P12/spine-legacy-e1.md` §5.2). This is an ADDITION, not a correction: every
+sentence above stands, and E3 remains count-invariant on both machines it has been run on. What the
+new evidence adds is the scope of the word "drained".**
+
+**Count invariance is a property of the DRAINED HORIZON, not of the crate, not of the arm, and not
+of drop-freeness.** Until now the drained-horizon expectation had been tested on exactly one
+fixture, E3, where it held; E1 is the worked counter-instance where it fails, and the two together
+say what the property actually attaches to.
+
+| | E3 (18 s, byte-terminated) | **E1 spine (20 µs, horizon-cut)** |
+|---|---|---|
+| drain state at the stop boundary | **drained** — every flow completes by ~16.0 s | **undrained** — **90,990** packets still in the fabric at load 0.10, rising to 995,117 at load 0.90 |
+| MT delivered counts | all **20** samples delivered 41,932,800 | **7–9 distinct values per 10 samples**, at every load, in both measurement blocks |
+| MT `sinks.csv` digest | invariant | **10 distinct digests out of 10 samples**, on every MT arm of both blocks — no two MT samples produced the same sink state at all |
+| ST counts | invariant | invariant (so step 5's stop condition did **not** trigger; the reference holds and the nondeterminism is MT's) |
+| §6.6.1 step 3 `legacy-MT-nondeterministic` label | did not apply | **APPLIES, on the counts** |
+
+Two consequences, and a boundary on what may be inferred.
+
+- **The expectation is to be tested per FIXTURE as well as per machine.** The sentence above —
+  "an expectation to be tested per machine, not an assumption to be asserted" — is hereby read as
+  covering the fixture axis too. A new fixture does not inherit E3's count invariance, however
+  drop-free it looks; it earns it by being drained and by being measured.
+- **A fixture that cuts a live fabric cannot carry a legacy MT count at all** without the step-3
+  label and the full per-sample spread. On such a fixture the delivered count is not a property of
+  the workload, it is whatever had landed when the clock stopped.
+- **What is NOT established.** The natural reading — that the P01 formulation generalises from
+  *drops* to *any* count-affecting tie-break, drops on E3 and an undrained horizon on E1 — is a
+  reading, **not isolated by measurement**: E1 differs from E3 in drain state, routing, traffic
+  matrix, horizon and termination mode all at once, and separating those would need its own
+  experiment. What is measured is that the label applies on E1 and did not on E3.
+
 The protocol:
 
 1. Extract and record the count fields for **every** MT sample individually. Never report only
@@ -386,6 +419,13 @@ The protocol:
    named, never as a silent footnote.
 5. The ST arm's counts are the legacy-side reference. If ST itself varies between samples, stop:
    that is a new finding, not a disclosure item.
+6. **(ADDED 2026-08-08.)** Before citing any legacy MT count on a fixture other than E3, establish
+   the fixture's **drain state at the stop boundary** and record it beside the count: how many
+   packets are in the fabric when the simulation stops, and how that was determined. If the fixture
+   does not drain, expect step 3 to apply and run enough samples to publish the spread rather than a
+   value. On E1 the figure was obtained from a diagnostic copy that adds `report_interval` equal to
+   the horizon — one report, at the cut — which was shown not to change the simulation by
+   reproducing the timed arms' delivered counts exactly at all four loads.
 
 #### 6.6.2 Delays: MT is nondeterministic, and no MT delay is citable
 
