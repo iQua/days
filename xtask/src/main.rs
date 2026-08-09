@@ -33,8 +33,14 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "metal.rs",
         predicate: r#"feature = "metal-test-hooks""#,
-        count: 13,
-        purpose: "Metal-only panic, fault-injection, planner measurement, and T20l readback- and plane-word-accounting hooks",
+        count: 27,
+        purpose: "Metal-only panic, fault-injection, planner measurement, T20l readback accounting, and T21 dominant-arena occupancy readback hooks",
+    },
+    AllowedFeatureGate {
+        path: "metal.rs",
+        predicate: r#"not(feature = "metal-test-hooks")"#,
+        count: 1,
+        purpose: "the production Metal source omits T21's test-only dominant-arena occupancy writes and physical metadata tails",
     },
     AllowedFeatureGate {
         path: "cuda.rs",

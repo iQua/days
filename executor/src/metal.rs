@@ -125,6 +125,32 @@ std::thread_local! {
     /// T20l fix 2's counterfactual: this is exactly what the pre-fix `finish` read back, so
     /// `readback_words / plane_words` is the compaction ratio a test can assert on.
     static PLANE_WORDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// High-water occupancy of the three dominant record arenas in the last completed run.
+    ///
+    /// The device counters live beyond the production control-buffer extent and exist only when
+    /// `metal-test-hooks` is enabled. They are diagnostics, never decoded semantic state.
+    static DOMINANT_ARENA_HIGH_WATER: std::cell::RefCell<Option<DominantArenaHighWater>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Per-entity capacity and maximum live record count in one dominant device arena.
+#[cfg(feature = "metal-test-hooks")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArenaOccupancyHighWater {
+    pub capacities: Vec<u64>,
+    pub high_water: Vec<u64>,
+}
+
+/// Per-entity occupancy high-water for the three dominant device arenas.
+///
+/// This type and its readback exist only on the Metal test-hook surface. Vector order is planner
+/// order: all channel/service/generator streams, all LP remote-staging rows, and all LP queues.
+#[cfg(feature = "metal-test-hooks")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DominantArenaHighWater {
+    pub stream_records: ArenaOccupancyHighWater,
+    pub remote_staging: ArenaOccupancyHighWater,
+    pub queue_records: ArenaOccupancyHighWater,
 }
 
 /// Acquires the supported process-wide Metal execution envelope.
@@ -183,6 +209,18 @@ pub fn last_plane_words_for_testing() -> u64 {
 #[cfg(feature = "metal-test-hooks")]
 fn record_plane_words(words: u64) {
     PLANE_WORDS.with(|total| total.set(words));
+}
+
+/// Returns and clears the dominant-arena occupancy high-water from the last completed run.
+#[cfg(feature = "metal-test-hooks")]
+#[doc(hidden)]
+pub fn take_dominant_arena_high_water_for_testing() -> Option<DominantArenaHighWater> {
+    DOMINANT_ARENA_HIGH_WATER.with(|high_water| high_water.borrow_mut().take())
+}
+
+#[cfg(feature = "metal-test-hooks")]
+fn reset_dominant_arena_high_water() {
+    DOMINANT_ARENA_HIGH_WATER.with(|high_water| *high_water.borrow_mut() = None);
 }
 
 /// The eight *reported* phases of a round attempt.
@@ -1386,6 +1424,8 @@ impl MetalExecutor {
         profile: bool,
         warm_start: &CapacityWarmStart,
     ) -> Result<MetalRun, MetalError> {
+        #[cfg(feature = "metal-test-hooks")]
+        reset_dominant_arena_high_water();
         validate(image, Backend::Metal)
             .map_err(|error| MetalError::Validation(error.to_string()))?;
         validate_config(config)?;
@@ -4071,10 +4111,61 @@ struct MetalBuffers {
     channel_stream_capacity_distribution: Vec<crate::ChannelStreamCapacityLevel>,
     round_capacity: usize,
     dispatch_capacity: usize,
+    #[cfg(feature = "metal-test-hooks")]
+    dominant_arena_diagnostics: DominantArenaDiagnosticLayout,
+}
+
+#[cfg(feature = "metal-test-hooks")]
+struct DominantArenaDiagnosticLayout {
+    stream_high_water_offset: usize,
+    stream_count: usize,
+    remote_high_water_offset: usize,
+    node_count: usize,
+    queue_high_water_offset: usize,
 }
 
 impl MetalBuffers {
     fn new(device: &ProtocolObject<dyn MTLDevice>, plan: MetalPlan) -> Result<Self, MetalError> {
+        #[cfg(feature = "metal-test-hooks")]
+        let mut plan = plan;
+        #[cfg(feature = "metal-test-hooks")]
+        let dominant_arena_diagnostics = {
+            let initial_stream_high_water = plan.stream_state[..plan
+                .stream_layout
+                .stream_count
+                .saturating_mul(ARENA_META_WORDS)]
+                .chunks_exact(ARENA_META_WORDS)
+                .map(|meta| meta[3])
+                .collect::<Vec<_>>();
+            let initial_remote_high_water = plan
+                .remote_meta
+                .chunks_exact(ARENA_META_WORDS)
+                .map(|meta| meta[3])
+                .collect::<Vec<_>>();
+            let initial_queue_high_water = plan
+                .queue_meta
+                .chunks_exact(QUEUE_META_WORDS)
+                .map(|meta| meta[3])
+                .collect::<Vec<_>>();
+            let stream_high_water_offset = plan.stream_state.len();
+            plan.stream_state.extend(initial_stream_high_water);
+            let remote_high_water_offset = plan.remote_meta.len();
+            plan.remote_meta.extend(initial_remote_high_water);
+            let queue_high_water_offset = plan.queue_meta.len();
+            plan.queue_meta.extend(initial_queue_high_water);
+            plan.params.extend([
+                stream_high_water_offset as u64,
+                remote_high_water_offset as u64,
+                queue_high_water_offset as u64,
+            ]);
+            DominantArenaDiagnosticLayout {
+                stream_high_water_offset,
+                stream_count: plan.stream_layout.stream_count,
+                remote_high_water_offset,
+                node_count: plan.params[0] as usize,
+                queue_high_water_offset,
+            }
+        };
         let round_capacity = plan.round_capacity;
         let dispatch_capacity = plan.dispatch_capacity;
         let orphan_packets = plan.orphan_packets;
@@ -4117,14 +4208,21 @@ impl MetalBuffers {
         .map(|words| SharedBuffer::new(device, words))
         .collect::<Result<Vec<_>, _>>()?;
         #[cfg(feature = "metal-test-hooks")]
-        record_plane_words(
-            planes
-                .iter()
-                .chain(std::iter::once(&tcp_state))
-                .fold(0_u64, |total, plane| {
-                    total.saturating_add(plane.words as u64)
-                }),
-        );
+        {
+            let diagnostic_words = dominant_arena_diagnostics
+                .stream_count
+                .saturating_add(dominant_arena_diagnostics.node_count.saturating_mul(2))
+                .saturating_add(3);
+            record_plane_words(
+                planes
+                    .iter()
+                    .chain(std::iter::once(&tcp_state))
+                    .fold(0_u64, |total, plane| {
+                        total.saturating_add(plane.words as u64)
+                    })
+                    .saturating_sub(diagnostic_words as u64),
+            );
+        }
         Ok(Self {
             planes,
             tcp_state,
@@ -4135,6 +4233,8 @@ impl MetalBuffers {
             channel_stream_capacity_distribution,
             round_capacity,
             dispatch_capacity,
+            #[cfg(feature = "metal-test-hooks")]
+            dominant_arena_diagnostics,
         })
     }
 
@@ -4147,6 +4247,49 @@ impl MetalBuffers {
         unsafe {
             encoder.setBuffer_offset_atIndex(Some(&self.tcp_state.raw), 0, 30);
         }
+    }
+
+    #[cfg(feature = "metal-test-hooks")]
+    fn record_dominant_arena_high_water(&self) {
+        fn arena(
+            meta: Vec<u64>,
+            meta_words: usize,
+            high_water: Vec<u64>,
+        ) -> ArenaOccupancyHighWater {
+            let capacities = meta
+                .chunks_exact(meta_words)
+                .map(|row| row[1])
+                .collect::<Vec<_>>();
+            debug_assert_eq!(capacities.len(), high_water.len());
+            ArenaOccupancyHighWater {
+                capacities,
+                high_water,
+            }
+        }
+
+        let layout = &self.dominant_arena_diagnostics;
+        let stream_records = arena(
+            self.planes[25].read_range(0, layout.stream_count.saturating_mul(ARENA_META_WORDS)),
+            ARENA_META_WORDS,
+            self.planes[25].read_range(layout.stream_high_water_offset, layout.stream_count),
+        );
+        let remote_staging = arena(
+            self.planes[19].read_range(0, layout.node_count.saturating_mul(ARENA_META_WORDS)),
+            ARENA_META_WORDS,
+            self.planes[19].read_range(layout.remote_high_water_offset, layout.node_count),
+        );
+        let queue_records = arena(
+            self.planes[9].read_range(0, layout.node_count.saturating_mul(QUEUE_META_WORDS)),
+            QUEUE_META_WORDS,
+            self.planes[9].read_range(layout.queue_high_water_offset, layout.node_count),
+        );
+        DOMINANT_ARENA_HIGH_WATER.with(|high_water| {
+            *high_water.borrow_mut() = Some(DominantArenaHighWater {
+                stream_records,
+                remote_staging,
+                queue_records,
+            });
+        });
     }
 
     fn finish(
@@ -4204,6 +4347,8 @@ impl MetalBuffers {
             }
             .into());
         }
+        #[cfg(feature = "metal-test-hooks")]
+        self.record_dominant_arena_high_water();
 
         // T20l fix 2: on a SUCCESSFUL attempt, copy the LIVE regions rather than the arena.
         //
@@ -5108,6 +5253,14 @@ impl DirectMetal {
         let queue = device
             .newCommandQueue()
             .ok_or_else(|| MetalError::Unavailable("command queue creation failed".into()))?;
+        #[cfg(feature = "metal-test-hooks")]
+        let instrumented_source = format!(
+            "#define DAYS_DOMINANT_ARENA_HIGH_WATER 1\n{}",
+            include_str!("metal_kernels.metal")
+        );
+        #[cfg(feature = "metal-test-hooks")]
+        let source = instrumented_source.as_str();
+        #[cfg(not(feature = "metal-test-hooks"))]
         let source = include_str!("metal_kernels.metal");
         let pipeline_started = Instant::now();
         let horizon_sweep_pipeline = create_pipeline(&device, source, "days_horizon_sweep")?;

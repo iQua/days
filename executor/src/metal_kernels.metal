@@ -97,6 +97,33 @@ constant uint P_ROUND_THREADS = 30;
 constant uint P_ROUND_SCRATCH_OFFSET = 31;
 constant uint ROUND_SCRATCH_CACHE_WORDS = 2;
 
+// Test-hook-only vector offsets appended to the physical metadata buffers after planning. Each
+// entity owns its own slot, so ordinary max writes preserve the actor model and need no atomics.
+#ifdef DAYS_DOMINANT_ARENA_HIGH_WATER
+constant uint P_STREAM_HIGH_WATER_OFFSET = 32;
+constant uint P_REMOTE_HIGH_WATER_OFFSET = 33;
+constant uint P_QUEUE_HIGH_WATER_OFFSET = 34;
+#define RECORD_STREAM_HIGH_WATER(params, state, entity, occupancy) \
+    (state)[(params)[P_STREAM_HIGH_WATER_OFFSET] + (entity)] = max( \
+        (state)[(params)[P_STREAM_HIGH_WATER_OFFSET] + (entity)], \
+        (ulong)(occupancy) \
+    )
+#define RECORD_REMOTE_HIGH_WATER(params, meta, entity, occupancy) \
+    (meta)[(params)[P_REMOTE_HIGH_WATER_OFFSET] + (entity)] = max( \
+        (meta)[(params)[P_REMOTE_HIGH_WATER_OFFSET] + (entity)], \
+        (ulong)(occupancy) \
+    )
+#define RECORD_QUEUE_HIGH_WATER(params, meta, entity, occupancy) \
+    (meta)[(params)[P_QUEUE_HIGH_WATER_OFFSET] + (entity)] = max( \
+        (meta)[(params)[P_QUEUE_HIGH_WATER_OFFSET] + (entity)], \
+        (ulong)(occupancy) \
+    )
+#else
+#define RECORD_STREAM_HIGH_WATER(params, state, entity, occupancy) ((void)0)
+#define RECORD_REMOTE_HIGH_WATER(params, meta, entity, occupancy) ((void)0)
+#define RECORD_QUEUE_HIGH_WATER(params, meta, entity, occupancy) ((void)0)
+#endif
+
 // T21 fix 1 — the re-gridded control sweeps. `evidence/P12/aterm-fixes.md` §3.4. Transliterated
 // word for word from `cuda_kernels.cu`; see that file for the design note.
 //
@@ -839,6 +866,7 @@ inline bool stream_push(
     ulong physical = (head + count) % max(capacity, 1ul);
     copy_thread_to_device(record, stream_records, offset + physical);
     stream_state[base + 3] = count + 1;
+    RECORD_STREAM_HIGH_WATER(params, stream_state, stream, count + 1);
     return count != 0 || !activate ||
         active_add(node, stream, record, params, error, stream_state);
 }
@@ -1172,6 +1200,7 @@ inline bool queue_push(
     ulong node,
     const thread ulong *record,
     device ulong *error,
+    const device ulong *params,
     device ulong *meta,
     device ulong *records
 ) {
@@ -1187,6 +1216,7 @@ inline bool queue_push(
     ulong physical = (head + count) % max(capacity, 1ul);
     copy_thread_to_device(record, records, offset + physical);
     meta[base + 3] = count + 1;
+    RECORD_QUEUE_HIGH_WATER(params, meta, node, count + 1);
     return true;
 }
 
@@ -1212,6 +1242,7 @@ inline bool source_queue_insert(
     ulong node,
     const thread ulong *record,
     device ulong *error,
+    const device ulong *params,
     device ulong *meta,
     device ulong *records
 ) {
@@ -1241,6 +1272,7 @@ inline bool source_queue_insert(
         offset + (head + insertion) % max(capacity, 1ul)
     );
     meta[base + 3] = count + 1;
+    RECORD_QUEUE_HIGH_WATER(params, meta, node, count + 1);
     return true;
 }
 
@@ -1509,6 +1541,7 @@ inline bool append_remote(
     }
     copy_thread_to_device(record, remote_staging, offset + index);
     remote_meta[base + 3] = index + 1;
+    RECORD_REMOTE_HIGH_WATER(params, remote_meta, node, index + 1);
     if (params[P_STREAMS_ENABLED] != 0) {
         ulong outbound_meta =
             params[P_OUTBOUND_META_OFFSET] + node * OUTBOUND_META_WORDS;
@@ -2827,6 +2860,7 @@ inline bool sp_queue_insert(
     ulong node,
     const thread ulong *record,
     device ulong *error,
+    const device ulong *params,
     device ulong *queue_meta,
     device ulong *queue_records,
     const device ulong *scheduler_state
@@ -2877,6 +2911,7 @@ inline bool sp_queue_insert(
         offset + (head + insertion) % max(capacity, 1ul)
     );
     queue_meta[meta_base + 3] = count + 1;
+    RECORD_QUEUE_HIGH_WATER(params, queue_meta, node, count + 1);
     return true;
 }
 
@@ -2886,6 +2921,7 @@ inline bool wfq_queue_insert(
     const thread uint *finish_num,
     const thread uint *finish_den,
     device ulong *error,
+    const device ulong *params,
     device ulong *queue_meta,
     device ulong *queue_records,
     device ulong *scheduler_state
@@ -2946,6 +2982,7 @@ inline bool wfq_queue_insert(
         tag_offset + destination * RATIONAL_WORDS
     );
     queue_meta[meta_base + 3] = count + 1;
+    RECORD_QUEUE_HIGH_WATER(params, queue_meta, node, count + 1);
     return true;
 }
 
@@ -2954,6 +2991,7 @@ inline bool wfq_enqueue(
     const thread ulong *record,
     ulong rate,
     device ulong *error,
+    const device ulong *params,
     device ulong *queue_meta,
     device ulong *queue_records,
     device ulong *scheduler_state
@@ -3049,6 +3087,7 @@ inline bool wfq_enqueue(
             finish_num,
             finish_den,
             error,
+            params,
             queue_meta,
             queue_records,
             scheduler_state
@@ -3529,7 +3568,7 @@ inline bool tcp_enqueue_attempt(
     packet[PK_META_2] = ulong(retransmission);
     if (
         !tcp_ledger_insert(flow, packet, error, params, tcp_state) ||
-        !source_queue_insert(node, packet, error, queue_meta, queue_records) ||
+        !source_queue_insert(node, packet, error, params, queue_meta, queue_records) ||
         !record_sourced(node, packet, error, params, summary, observation_meta, observed)
     ) {
         return false;
@@ -3909,7 +3948,8 @@ inline bool dispatch_event(
             sourced_packet[word] = event[word];
         }
         sourced_packet[E_PHASE] = 1;
-        if (!source_queue_insert(node, sourced_packet, error, queue_meta, queue_records) ||
+        if (!source_queue_insert(
+                node, sourced_packet, error, params, queue_meta, queue_records) ||
             !record_sourced(
                 node, event, error, params, summary, observation_meta, observed)) {
             return false;
@@ -3977,7 +4017,8 @@ inline bool dispatch_event(
             sourced_packet[E_PHASE] = 1;
             if (
                 !tcp_ledger_insert(event[PK_FLOW], event, error, params, tcp_state) ||
-                !source_queue_insert(node, sourced_packet, error, queue_meta, queue_records) ||
+                !source_queue_insert(
+                    node, sourced_packet, error, params, queue_meta, queue_records) ||
                 !record_sourced(
                     node,
                     event,
@@ -4131,6 +4172,7 @@ inline bool dispatch_event(
             node,
             sourced_packet,
             error,
+            params,
             queue_meta,
             queue_records
         )) {
@@ -4452,12 +4494,13 @@ inline bool dispatch_event(
         ulong scheduler_kind = scheduler_state[scheduler_base + S_KIND];
         bool inserted;
         if (scheduler_kind == SCHED_FIFO) {
-            inserted = queue_push(node, event, error, queue_meta, queue_records);
+            inserted = queue_push(node, event, error, params, queue_meta, queue_records);
         } else if (scheduler_kind == SCHED_SP) {
             inserted = sp_queue_insert(
                 node,
                 event,
                 error,
+                params,
                 queue_meta,
                 queue_records,
                 scheduler_state
@@ -4468,12 +4511,13 @@ inline bool dispatch_event(
                 event,
                 links[egress * LINK_WORDS + 2],
                 error,
+                params,
                 queue_meta,
                 queue_records,
                 scheduler_state
             );
         } else if (scheduler_kind == SCHED_DRR || scheduler_kind == SCHED_WRR) {
-            inserted = queue_push(node, event, error, queue_meta, queue_records);
+            inserted = queue_push(node, event, error, params, queue_meta, queue_records);
         } else {
             set_semantic_error(error, 32, node);
             return false;
@@ -4593,7 +4637,7 @@ inline bool dispatch_event(
         ack[PK_META_1] = event[PK_SIZE];
         ack[PK_META_2] = event[PK_META_1];
         if (
-            !source_queue_insert(node, ack, error, queue_meta, queue_records) ||
+            !source_queue_insert(node, ack, error, params, queue_meta, queue_records) ||
             !record_sourced(node, ack, error, params, summary, observation_meta, observed)
         ) {
             return false;
@@ -6032,7 +6076,10 @@ kernel void days_exchange_scatter(
             ulong batch =
                 params[P_CHANNEL_BATCH_OFFSET] +
                 channel * CHANNEL_BATCH_WORDS;
-            stream_state[channel * META_WORDS + 3] += stream_state[batch];
+            ulong count =
+                stream_state[channel * META_WORDS + 3] + stream_state[batch];
+            stream_state[channel * META_WORDS + 3] = count;
+            RECORD_STREAM_HIGH_WATER(params, stream_state, channel, count);
         }
         return;
     }

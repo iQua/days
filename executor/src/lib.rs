@@ -101,9 +101,6 @@ pub use mechanism_trace::{
 ))]
 #[doc(hidden)]
 pub use metal::assert_metal_planner_bit_equal_for_testing;
-#[cfg(all(feature = "metal-test-hooks", target_vendor = "apple"))]
-#[doc(hidden)]
-pub use metal::measure_metal_planner_for_testing;
 #[cfg(all(
     feature = "metal-spike",
     feature = "planner-test-hooks",
@@ -111,6 +108,12 @@ pub use metal::measure_metal_planner_for_testing;
 ))]
 #[doc(hidden)]
 pub use metal::size_metal_plan_for_testing;
+#[cfg(all(feature = "metal-test-hooks", target_vendor = "apple"))]
+#[doc(hidden)]
+pub use metal::{
+    ArenaOccupancyHighWater, DominantArenaHighWater, last_plane_words_for_testing,
+    measure_metal_planner_for_testing, take_dominant_arena_high_water_for_testing,
+};
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub use metal::{
     MetalArena, MetalConfig, MetalDrainDecomposition, MetalError, MetalExecutor,
