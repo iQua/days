@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Generate the frozen P12 E5 wide-TCP primary and backup fixtures.
+"""Generate the frozen P12 E5 wide-TCP Reno fixtures or CUBIC sensitivity row.
 
 Run from any directory:
 
     python3 configs/benchmarks/p12/gen_e5_wide_tcp.py
+    python3 configs/benchmarks/p12/gen_e5_wide_tcp.py --controller cubic
 
 The authored fixtures preserve the design probe's single `[[flow_set]]`. This is intentional:
 `FatTreeEcmp` hashes semantic flow identity, and round 1 proved that expanding the same endpoints
@@ -41,23 +42,38 @@ VARIANTS = (
     ("e5_wide_k32_q200.toml", 200, "PRIMARY", 549, 9_551),
     ("e5_wide_k32_q256.toml", 256, "BACKUP", 157, 8_508),
 )
+CUBIC_VARIANT = ("e5_wide_k32_q200_cubic.toml", 200, "CUBIC SENSITIVITY", 1_140, 27_537)
 
 
-def render(name: str, queue_packets: int, role: str, drops: int, data_attempt_excess: int) -> str:
+def render(
+    name: str,
+    queue_packets: int,
+    role: str,
+    drops: int,
+    data_attempt_excess: int,
+    controller: str = "reno",
+) -> str:
     total_bytes = HOSTS * FLOW_BYTES
     out: list[str] = []
     write = out.append
     write(f"# P12 E5 {role}: frozen wide TCP, k=32, queue {queue_packets}. GENERATED -- do not hand-edit.")
     write("#")
-    write("# Regenerate with: python3 configs/benchmarks/p12/gen_e5_wide_tcp.py")
+    regenerate = "python3 configs/benchmarks/p12/gen_e5_wide_tcp.py"
+    if controller == "cubic":
+        regenerate += " --controller cubic"
+    write(f"# Regenerate with: {regenerate}")
     write("# The generator preserves the design probe's single `[[flow_set]]`; the test suite")
     write("# compares regenerated files byte-for-byte and pins the ruled semantic form.")
+    if controller == "cubic":
+        write("# DISCLOSED UNPAIRED sensitivity: GeDES PATCH-E5-TCP ports Reno only.")
+        write("# Controller identity participates in Days' ECMP hash; endpoints remain frozen.")
     write("#")
     write("# FROZEN CONTRACT (evidence/P12/e5-design.md):")
     write("#   topology              FatTree k=32, hosts_per_edge=16 (8,192 hosts)")
     write("#   fabric                100 Gbit/s, 1,000 ns propagation, FatTreeEcmp")
     write(f"#   queue                 FIFO TailDrop, {queue_packets} packets ({role})")
-    write("#   transport             Days AGO Reno, MSS 1,460 B, immediate 40 B ACK")
+    transport = "Days exact fixed-point CUBIC" if controller == "cubic" else "Days AGO Reno"
+    write(f"#   transport             {transport}, MSS 1,460 B, immediate 40 B ACK")
     write("#   traffic               one fixed 1 MiB flow per host, SwitchOffsetHalf")
     write("#   starts / seed         all 0 ns / 51001")
     write("#   horizon               3 s; acceptance requires natural drain before it")
@@ -110,7 +126,15 @@ def render(name: str, queue_packets: int, role: str, drops: int, data_attempt_ex
     )
     write("")
     write("[flow_set.traffic.tcp]")
-    write('cc_algorithm = "TCPReno"')
+    if controller == "cubic":
+        write('cc_algorithm = "CUBIC"')
+        write("")
+        write("[flow_set.traffic.tcp.cubic]")
+        write("beta = 0.7")
+        write("c = 0.4")
+        write("fast_convergence = true")
+    else:
+        write('cc_algorithm = "TCPReno"')
     return "\n".join(out) + "\n"
 
 
@@ -120,14 +144,30 @@ def main(argv: list[str]) -> int:
         "--out-dir",
         type=pathlib.Path,
         default=HERE,
-        help="directory for both generated TOML files (default: beside this script)",
+        help="directory for generated TOML files (default: beside this script)",
+    )
+    parser.add_argument(
+        "--controller",
+        choices=("reno", "cubic"),
+        default="reno",
+        help="controller row to generate (default: reno primary and backup)",
     )
     arguments = parser.parse_args(argv)
     arguments.out_dir.mkdir(parents=True, exist_ok=True)
 
-    for name, queue_packets, role, drops, data_attempt_excess in VARIANTS:
+    variants = (CUBIC_VARIANT,) if arguments.controller == "cubic" else VARIANTS
+    for name, queue_packets, role, drops, data_attempt_excess in variants:
         output = arguments.out_dir / name
-        output.write_text(render(name, queue_packets, role, drops, data_attempt_excess))
+        output.write_text(
+            render(
+                name,
+                queue_packets,
+                role,
+                drops,
+                data_attempt_excess,
+                arguments.controller,
+            )
+        )
         print(f"wrote {output} (one flow set, {HOSTS:,} flows, {HOSTS * FLOW_BYTES:,} B)")
     return 0
 
