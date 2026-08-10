@@ -43,23 +43,34 @@ fn only_streams_summary_omits_the_finalize_sweep() {
                 && source.contains("plan.params[14] != 0"),
             "{backend} must derive the finalize policy from the lowered Full and streams words",
         );
-        assert_eq!(
-            source.matches("!buffers.finalize_sweep_required").count(),
-            2,
-            "{backend} production and profiled paths must share the lowered-plan policy",
-        );
     }
+    assert_eq!(
+        CUDA_BACKEND
+            .matches("!buffers.finalize_sweep_required")
+            .count(),
+        2,
+        "CUDA production and profiled paths must share the lowered-plan policy",
+    );
+    assert_eq!(
+        METAL_BACKEND
+            .matches("!buffers.finalize_sweep_required")
+            .count(),
+        1,
+        "Metal ordinary encoding must apply the lowered-plan policy directly",
+    );
     assert!(
         CUDA_BACKEND.contains("dispatch_index == FINALIZE_SWEEP_KERNEL_INDEX")
             && CUDA_BACKEND.contains("index == FINALIZE_SWEEP_KERNEL_INDEX"),
         "CUDA must apply the policy only to the finalize-sweep entry",
     );
-    assert_eq!(
+    assert!(
         METAL_BACKEND
-            .matches("kernel == AttemptKernel::FinalControlSweep")
-            .count(),
-        2,
-        "Metal must apply the policy only to the finalize-sweep entry",
+            .contains("profiled_attempt_dispatches(buffers.finalize_sweep_required).enumerate()")
+            && METAL_BACKEND
+                .contains("finalize_sweep_required || *kernel != AttemptKernel::FinalControlSweep")
+            && METAL_BACKEND
+                .contains("profiled_attempt_dispatches(finalize_sweep_required).enumerate()"),
+        "Metal profiling and resolution must share one compact, policy-selected dispatch layout",
     );
 
     for (backend, finalize) in [

@@ -1329,6 +1329,45 @@ fn metal_phase_profiling_is_opt_in_and_preserves_the_full_result() {
 }
 
 #[test]
+fn metal_streams_summary_profile_decodes_the_shortened_dispatch_plan() {
+    let image = fifo_taildrop_image();
+    let executor = MetalExecutor::new().expect("Metal executor must initialize");
+    let config = MetalConfig::default();
+    assert!(config.streams_enabled);
+
+    let ordinary = executor
+        .run(&image, Some(27), config)
+        .expect("ordinary streams+Summary Metal run must succeed");
+    let profiled = executor
+        .run_profiled(&image, Some(27), config)
+        .expect("profiled streams+Summary Metal run must decode every sampled dispatch");
+
+    assert_eq!(profiled.result, ordinary.result);
+    assert_eq!(profiled.rounds, ordinary.rounds);
+    assert_eq!(profiled.transitions, ordinary.transitions);
+    assert_eq!(
+        profiled.continuation_relaunches,
+        ordinary.continuation_relaunches
+    );
+    assert_eq!(profiled.encoded_attempts, ordinary.encoded_attempts);
+
+    let profile = profiled
+        .phase_profile
+        .expect("profiled run must return decoded phase timestamps");
+    assert!(profile.estimate_complete);
+    assert_eq!(
+        profile.useful_attempts,
+        profiled.rounds + profiled.continuation_relaunches
+    );
+    assert!(profile.captured_attempts > profile.useful_attempts);
+    assert!(profile.useful.total_ns() > 0);
+    assert!(
+        profile.useful.final_control_ns > 0,
+        "the retained final-control dispatch after the omitted sweep must keep its phase label",
+    );
+}
+
+#[test]
 fn metal_fel_probe_preserves_outcome_and_counts_real_heap_work() {
     let image = fifo_taildrop_image();
     let executor = MetalExecutor::new().expect("Metal executor must initialize");
