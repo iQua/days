@@ -275,6 +275,23 @@ fn main() {
         let profile = profiled
             .phase_profile
             .expect("profile sample must contain timestamps");
+        if profile.captured_attempts < profile.useful_attempts {
+            println!(
+                "record=t15b_profile_incomplete config={relative} stream_mode={stream_mode} sample={sample} \
+                 rounds={} transitions={} encoded_attempts={} captured_attempts={} useful_attempts={} \
+                 captured_prefix_active_ns={} captured_pass_gap_ns={} captured_pass_overlap_ns={} \
+                 estimate_complete=0",
+                expected.rounds,
+                expected.transitions,
+                profile.encoded_attempts,
+                profile.captured_attempts,
+                profile.useful_attempts,
+                profile.useful.total_ns(),
+                profile.captured_pass_gap_ns,
+                profile.captured_pass_overlap_ns,
+            );
+            return;
+        }
         assert!(
             profile.estimate_complete,
             "phase estimate must cover all work"

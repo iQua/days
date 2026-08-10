@@ -94,6 +94,20 @@ pub const ROUND_SCRATCH_PARTIAL_WORDS: usize = 8;
 pub const ROUND_SCRATCH_PARTIAL_TOTAL_WORDS: usize =
     CONTROL_SWEEP_BLOCKS * ROUND_SCRATCH_PARTIAL_WORDS;
 
+/// Whether a lowered device plan must dispatch the full-width finalize sweep.
+///
+/// Summary observations need no cumulative observation-log totals. With stream decomposition,
+/// continuation control has already collected every drain error, exchange prefix writes its errors
+/// directly to control, scatter has no error writer, and stream merge does not write LP errors. The
+/// streams+Summary path can therefore retain only the ordered width-1 finalize dispatch. Full
+/// observations and the legacy heap path keep the sweep.
+///
+/// This selector depends only on lowering inputs, never on timing, occupancy, or prior rounds.
+#[doc(hidden)]
+pub const fn finalize_sweep_required(full_observations: bool, streams_enabled: bool) -> bool {
+    full_observations || !streams_enabled
+}
+
 /// Words the T21 per-round scratch region occupies inside `stream_state`: the fix 2 FEL-root cache
 /// (two words per LP) followed by the fix 1 reduction partials (a fixed 1,024 words).
 pub fn round_scratch_words(node_count: usize) -> Option<usize> {

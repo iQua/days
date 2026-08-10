@@ -356,17 +356,17 @@ fn no_kernel_synchronizes_across_blocks_inside_a_dispatch() {
     }
 }
 
-/// The dispatch count, disclosed. Eight phases become thirteen dispatches; the eight *reported*
-/// profile buckets are unchanged, so `t15b_round_profile` and `t17c_cuda_profile` still compare
-/// before and after like for like.
+/// The maximum dispatch count, disclosed. Full and legacy plans retain thirteen dispatches; T24's
+/// exact streams+Summary specialization omits only `FinalControlSweep`. The eight *reported*
+/// profile buckets are unchanged, so `t15b_round_profile` and `t17c_cuda_profile` still compare.
 ///
 /// `perround-upperbound.md` Lever 2a budgeted "adds 2-5 dispatches per round — free at ≤0.11 %".
 /// This is +5, at that bound.
 #[test]
-fn the_attempt_dag_is_thirteen_dispatches_over_eight_reported_phases() {
+fn the_full_and_legacy_attempt_dag_is_thirteen_dispatches_over_eight_reported_phases() {
     assert!(
         CUDA_BACKEND.contains("const KERNEL_NAMES: [&str; 13]"),
-        "the CUDA attempt DAG is thirteen launches",
+        "the CUDA Full/legacy attempt DAG is thirteen launches",
     );
     assert!(
         CUDA_BACKEND.contains("const DISPATCH_PHASE: [usize; 13]"),
@@ -376,7 +376,7 @@ fn the_attempt_dag_is_thirteen_dispatches_over_eight_reported_phases() {
         METAL_BACKEND.contains(
             "const ATTEMPT_DISPATCHES: [(AttemptKernel, AttemptPhase, DispatchGeometry); 13]"
         ),
-        "the Metal attempt DAG is thirteen dispatches over the eight reported phases",
+        "the Metal Full/legacy attempt DAG is thirteen dispatches over eight reported phases",
     );
     assert!(
         METAL_BACKEND.contains("DispatchGeometry::ControlSweep"),

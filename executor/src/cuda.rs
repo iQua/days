@@ -3739,6 +3739,8 @@ struct CudaBuffers {
     planes: Vec<CudaSlice<u64>>,
     orphan_packets: Vec<PacketDescriptor>,
     node_count: usize,
+    /// Lowered-image policy: false only for streams + Summary observations.
+    finalize_sweep_required: bool,
     stream_layout: StreamLayout,
     memory_layout: CudaMemoryLayout,
     channel_stream_capacity_distribution: Vec<crate::ChannelStreamCapacityLevel>,
@@ -3755,6 +3757,10 @@ impl CudaBuffers {
         let memory_layout = plan.memory_layout;
         let channel_stream_capacity_distribution = plan.channel_stream_capacity_distribution;
         let node_count = plan.params[0] as usize;
+        let finalize_sweep_required = crate::device_sizing::finalize_sweep_required(
+            plan.params[8] != 0,
+            plan.params[14] != 0,
+        );
         let planes = vec![
             plan.control,
             plan.params,
@@ -3803,6 +3809,7 @@ impl CudaBuffers {
             planes,
             orphan_packets,
             node_count,
+            finalize_sweep_required,
             stream_layout,
             memory_layout,
             channel_stream_capacity_distribution,
@@ -4387,13 +4394,15 @@ impl CudaBuffers {
     }
 }
 
-/// The attempt DAG, in launch order.
+/// The maximum attempt DAG, in launch order.
 ///
 /// T21 fix 1 (`evidence/P12/aterm-fixes.md` §3.4) splits the phases that swept Θ(nodes + channels)
 /// from a grid of one block into a full-grid `_sweep` launch plus a width-1 launch that combines
 /// the sweep's per-block partials. The **launch boundary is the barrier**: nothing in the kernels
 /// synchronizes across blocks inside a launch. That costs extra launches, which the analysis
 /// budgeted for at ≤0.11 % of a round, and buys the whole grid for the sweeps.
+/// T24 omits only `days_round_finalize_sweep` for a streams+Summary lowered plan; Full and legacy
+/// plans dispatch all thirteen entries.
 const KERNEL_NAMES: [&str; 13] = [
     "days_horizon_sweep",
     "days_horizon",
@@ -4428,6 +4437,7 @@ const CONTROL_KERNELS: [usize; 10] = [0, 1, 2, 3, 5, 6, 7, 8, 11, 12];
 /// [`crate::device_sizing::CONTROL_SWEEP_BLOCKS`] blocks of [`LANES`] threads.
 const SWEEP_KERNELS: [usize; 5] = [0, 2, 5, 7, 11];
 const PARALLEL_KERNELS: [usize; 3] = [4, 9, 10];
+const FINALIZE_SWEEP_KERNEL_INDEX: usize = 11;
 
 struct DirectCuda {
     _context: Arc<CudaContext>,
@@ -4773,16 +4783,26 @@ impl DirectCuda {
                 boundaries[0]
                     .record(&self.stream)
                     .map_err(|error| driver_error("profile attempt start event", error))?;
-                for (phase, ((function, launch_config), name)) in self
+                for (dispatch_index, ((function, launch_config), name)) in self
                     .functions
                     .iter()
                     .zip(configs)
                     .zip(KERNEL_NAMES)
                     .enumerate()
                 {
+                    if !buffers.finalize_sweep_required
+                        && dispatch_index == FINALIZE_SWEEP_KERNEL_INDEX
+                    {
+                        boundaries[dispatch_index + 1]
+                            .record(&self.stream)
+                            .map_err(|error| {
+                                driver_error("profile omitted finalize sweep end event", error)
+                            })?;
+                        continue;
+                    }
                     launch_uniform(&self.stream, function, buffers, launch_config)
                         .map_err(|error| driver_error(format!("profile `{name}` launch"), error))?;
-                    boundaries[phase + 1]
+                    boundaries[dispatch_index + 1]
                         .record(&self.stream)
                         .map_err(|error| {
                             driver_error(format!("profile `{name}` end event"), error)
@@ -4886,9 +4906,16 @@ impl DirectCuda {
 
         let captured = (|| {
             for _ in 0..attempts {
-                for ((function, config), name) in
-                    self.functions.iter().zip(configs).zip(KERNEL_NAMES)
+                for (index, ((function, config), name)) in self
+                    .functions
+                    .iter()
+                    .zip(configs)
+                    .zip(KERNEL_NAMES)
+                    .enumerate()
                 {
+                    if !buffers.finalize_sweep_required && index == FINALIZE_SWEEP_KERNEL_INDEX {
+                        continue;
+                    }
                     launch_uniform(&self.stream, function, buffers, *config)
                         .map_err(|error| driver_error(format!("capture `{name}` launch"), error))?;
                 }

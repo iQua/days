@@ -5080,11 +5080,15 @@ extern "C" __global__ __launch_bounds__(1024) void days_round(DAYS_BUFFERS) {
 
 // T21 fix 1 — the round-control scans, on the whole grid.
 //
-// Two scans, two partition-free reductions. `first_error` is a `min` over the LP indices whose
-// `L_ERROR` is set: each thread takes the smallest such index in ITS OWN subsequence (that is what
-// the `break` computes), and the tree takes the smallest of those, so the answer is the global
-// smallest for every partition. `unfinished` is an `OR`. Neither depends on how the LPs were
-// divided, so re-gridding cannot move a control word.
+// One active-worklist scan, two partition-free reductions. `days_round_reset` cleared every LP's
+// error state before `days_round_prepare` built this round's canonical ascending unique worklist;
+// between prepare and this sweep, only `days_round` can change error or finished state, and it runs
+// only worklist LPs. Every LP outside the worklist therefore contributes the identity element.
+//
+// `first_error` is a `min` over errored worklist LP indices: each thread keeps the first such LP in
+// its ascending active-index subsequence, and the tree takes the smallest of those, so the answer
+// is the global smallest for every partition. `unfinished` is an `OR`. Neither depends on how the
+// worklist was divided, and the active set needs no construction beyond the existing compaction.
 extern "C" __global__ void days_round_control_sweep(DAYS_BUFFERS) {
     uint lane = threadIdx.x;
     __shared__ ulong first_errors[1024];
@@ -5100,18 +5104,17 @@ extern "C" __global__ void days_round_control_sweep(DAYS_BUFFERS) {
     ulong first = ulong(blockIdx.x) * ulong(blockDim.x) + ulong(threadIdx.x);
     ulong stride = ulong(gridDim.x) * ulong(blockDim.x);
     ulong first_error = NONE;
-    for (ulong node = first; node < params[P_NODE_COUNT]; node += stride) {
-        ulong state = node * LP_STATE_WORDS;
-        if (lp_state[state + L_ERROR] != 0) {
-            first_error = node;
-            break;
-        }
-    }
     uint unfinished = 0;
     for (ulong active = first; active < control[C_ACTIVE]; active += stride) {
         ulong node = worklist[active];
-        if (lp_state[node * LP_STATE_WORDS + L_FINISHED] == 0) {
+        ulong state = node * LP_STATE_WORDS;
+        if (first_error == NONE && lp_state[state + L_ERROR] != 0) {
+            first_error = node;
+        }
+        if (unfinished == 0 && lp_state[state + L_FINISHED] == 0) {
             unfinished = 1;
+        }
+        if (first_error != NONE && unfinished != 0) {
             break;
         }
     }
@@ -5907,6 +5910,21 @@ extern "C" __global__ void days_round_finalize(DAYS_BUFFERS) {
         control[C_DONE] != 0 ||
         control[C_CONTINUATION] != 2
     ) {
+        return;
+    }
+
+    // T24: on the streams + Summary path, every possible post-control error is already published
+    // directly to `control`, stream merge writes no LP error, and cumulative observation totals are
+    // disabled. The host omits the sweep for exactly this lowered-image predicate; this ordered
+    // dispatch remains as the publish boundary before the next horizon sweep.
+    if (
+        params[P_STREAMS_ENABLED] != 0 &&
+        params[P_FULL_OBSERVATIONS] == 0
+    ) {
+        if (lane == 0) {
+            control[C_CONTINUATION] = 0;
+            control[C_ROUNDS] += 1;
+        }
         return;
     }
 

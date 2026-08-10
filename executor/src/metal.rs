@@ -256,13 +256,15 @@ impl AttemptPhase {
     }
 }
 
-/// One dispatch of the attempt DAG, in encode order.
+/// One dispatch of the maximum attempt DAG, in encode order.
 ///
 /// T21 fix 1 (`evidence/P12/aterm-fixes.md` §3.4) splits the phases that swept Θ(nodes + channels)
 /// from a grid of one threadgroup into a full-grid `_sweep` dispatch plus a width-1 dispatch that
 /// combines the sweep's per-threadgroup partials. **The dispatch boundary is the barrier** —
 /// `MTLDispatchType::Serial` ordering, the same guarantee `days_round` already relies on to see
 /// the `worklist` `days_round_prepare` wrote — so no kernel synchronizes across threadgroups.
+/// T24 omits only `FinalControlSweep` for a streams+Summary lowered plan; Full and legacy plans
+/// dispatch all thirteen entries.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AttemptKernel {
     HorizonSweep,
@@ -366,7 +368,20 @@ const ATTEMPT_DISPATCHES: [(AttemptKernel, AttemptPhase, DispatchGeometry); 13] 
     ),
 ];
 const PROFILE_PHASES: usize = 8;
-const PROFILE_SAMPLES_PER_ATTEMPT: usize = ATTEMPT_DISPATCHES.len() * 2;
+
+fn profiled_attempt_dispatches(
+    finalize_sweep_required: bool,
+) -> impl Iterator<Item = (AttemptKernel, AttemptPhase, DispatchGeometry)> {
+    ATTEMPT_DISPATCHES
+        .into_iter()
+        .filter(move |(kernel, _, _)| {
+            finalize_sweep_required || *kernel != AttemptKernel::FinalControlSweep
+        })
+}
+
+fn profile_samples_per_attempt(finalize_sweep_required: bool) -> usize {
+    profiled_attempt_dispatches(finalize_sweep_required).count() * 2
+}
 const CONTROL_THREADGROUP_BYTES: usize =
     LANES * (std::mem::size_of::<u64>() + std::mem::size_of::<u32>());
 const NONE: u64 = u64::MAX;
@@ -4107,6 +4122,8 @@ struct MetalBuffers {
     tcp_state: SharedBuffer,
     orphan_packets: Vec<PacketDescriptor>,
     node_count: usize,
+    /// Lowered-image policy: false only for streams + Summary observations.
+    finalize_sweep_required: bool,
     stream_layout: StreamLayout,
     memory_layout: MetalMemoryLayout,
     channel_stream_capacity_distribution: Vec<crate::ChannelStreamCapacityLevel>,
@@ -4174,6 +4191,10 @@ impl MetalBuffers {
         let memory_layout = plan.memory_layout;
         let channel_stream_capacity_distribution = plan.channel_stream_capacity_distribution;
         let node_count = plan.params[0] as usize;
+        let finalize_sweep_required = crate::device_sizing::finalize_sweep_required(
+            plan.params[8] != 0,
+            plan.params[14] != 0,
+        );
         let tcp_state = SharedBuffer::new(device, plan.tcp_state)?;
         let planes = vec![
             plan.control,
@@ -4229,6 +4250,7 @@ impl MetalBuffers {
             tcp_state,
             orphan_packets,
             node_count,
+            finalize_sweep_required,
             stream_layout,
             memory_layout,
             channel_stream_capacity_distribution,
@@ -5573,12 +5595,16 @@ impl DirectMetal {
                 } else {
                     0
                 };
+                let samples_per_attempt = if captured == 0 {
+                    0
+                } else {
+                    profile_samples_per_attempt(buffers.finalize_sweep_required)
+                };
                 let counter_buffer = if captured == 0 {
                     None
                 } else {
-                    let sample_count = captured
-                        .checked_mul(PROFILE_SAMPLES_PER_ATTEMPT)
-                        .ok_or_else(|| {
+                    let sample_count =
+                        captured.checked_mul(samples_per_attempt).ok_or_else(|| {
                             MetalError::Unavailable(
                                 "profile counter sample count overflows usize".into(),
                             )
@@ -5597,7 +5623,7 @@ impl DirectMetal {
                         self.encode_profiled_attempt(
                             &command_buffer,
                             counter_buffer,
-                            attempt * PROFILE_SAMPLES_PER_ATTEMPT,
+                            attempt * samples_per_attempt,
                             buffers,
                             control_grid,
                             sweep_grid,
@@ -5675,8 +5701,11 @@ impl DirectMetal {
                 }
                 device_ns = device_ns.saturating_add(seconds_ns(end - start));
                 if let Some(counter_buffer) = encoded.counter_buffer.as_deref() {
-                    let resolved =
-                        resolve_profile_attempts(counter_buffer, encoded.captured_attempts)?;
+                    let resolved = resolve_profile_attempts(
+                        counter_buffer,
+                        encoded.captured_attempts,
+                        buffers.finalize_sweep_required,
+                    )?;
                     profiled_attempts.extend(resolved.attempts);
                     profiled_pass_gap_ns =
                         profiled_pass_gap_ns.saturating_add(resolved.pass_gap_ns);
@@ -5725,6 +5754,9 @@ impl DirectMetal {
         merge_pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
     ) {
         for (kernel, _, geometry) in ATTEMPT_DISPATCHES {
+            if !buffers.finalize_sweep_required && kernel == AttemptKernel::FinalControlSweep {
+                continue;
+            }
             encoder.setComputePipelineState(self.pipeline(kernel, round_pipeline, merge_pipeline));
             match geometry {
                 DispatchGeometry::FixedControl => {
@@ -5765,7 +5797,12 @@ impl DirectMetal {
         merge_pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
         fel_probe: Option<&FelProbeResources>,
     ) -> Result<(), MetalError> {
-        for (dispatch_index, (kernel, _, geometry)) in ATTEMPT_DISPATCHES.into_iter().enumerate() {
+        // Metal counter samples are attached to encoder boundaries. An omitted dispatch has no
+        // honest boundary to sample, so the shortened plan uses a compact 12-dispatch layout.
+        // Resolution applies the same filter, preserving every remaining dispatch's phase label.
+        for (dispatch_index, (kernel, _, geometry)) in
+            profiled_attempt_dispatches(buffers.finalize_sweep_required).enumerate()
+        {
             let descriptor = MTLComputePassDescriptor::new();
             descriptor.setDispatchType(MTLDispatchType::Serial);
             let attachment = unsafe {
@@ -5960,9 +5997,11 @@ fn accumulate_profile_interval(
 fn resolve_profile_attempts(
     counter_buffer: &ProtocolObject<dyn MTLCounterSampleBuffer>,
     attempts: usize,
+    finalize_sweep_required: bool,
 ) -> Result<ResolvedProfileAttempts, MetalError> {
+    let samples_per_attempt = profile_samples_per_attempt(finalize_sweep_required);
     let sample_count = attempts
-        .checked_mul(PROFILE_SAMPLES_PER_ATTEMPT)
+        .checked_mul(samples_per_attempt)
         .ok_or_else(|| MetalError::Unavailable("profile sample count overflows usize".into()))?;
     let data = unsafe { counter_buffer.resolveCounterRange(NSRange::new(0, sample_count)) }
         .ok_or_else(|| MetalError::Unavailable("counter sample resolution failed".into()))?;
@@ -5987,10 +6026,12 @@ fn resolve_profile_attempts(
     let mut pass_gap_ns = 0_u64;
     let mut pass_overlap_ns = 0_u64;
     let attempts = samples
-        .chunks_exact(PROFILE_SAMPLES_PER_ATTEMPT)
+        .chunks_exact(samples_per_attempt)
         .map(|attempt| {
             let mut values = [0_u64; PROFILE_PHASES];
-            for (dispatch, (_, phase, _)) in ATTEMPT_DISPATCHES.into_iter().enumerate() {
+            for (dispatch, (_, phase, _)) in
+                profiled_attempt_dispatches(finalize_sweep_required).enumerate()
+            {
                 let start = attempt[dispatch * 2].timestamp;
                 let end = attempt[dispatch * 2 + 1].timestamp;
                 if start == 0
@@ -6100,8 +6141,8 @@ mod tests {
     use super::{
         ATTEMPT_DISPATCHES, AttemptKernel, AttemptPhase, DispatchGeometry, LANES,
         MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER, MAX_ENCODED_PAIRS_PER_WAVE, MetalConfig, MetalError,
-        MetalPhaseTimings, PROFILE_SAMPLES_PER_ATTEMPT, PROFILED_ATTEMPTS,
-        accumulate_profile_interval, build_phase_profile, decode_device_error, encoding_limits,
+        MetalPhaseTimings, PROFILED_ATTEMPTS, accumulate_profile_interval, build_phase_profile,
+        decode_device_error, encoding_limits,
     };
     use crate::CapacityRetryRecord;
 
@@ -6297,7 +6338,7 @@ mod tests {
     #[test]
     fn phase_profile_capture_fits_the_device_sample_buffer_limit() {
         const {
-            assert!(PROFILED_ATTEMPTS * PROFILE_SAMPLES_PER_ATTEMPT <= 4_096);
+            assert!(PROFILED_ATTEMPTS * ATTEMPT_DISPATCHES.len() * 2 <= 4_096);
         }
     }
 
