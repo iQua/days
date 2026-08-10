@@ -5643,7 +5643,7 @@ kernel void days_round_fel_probe(
 }
 #endif
 
-// T21 fix 1 — the round-control scans, on the whole grid. Transliterated word for word from
+// T21 fix 1 — the round-control scan, on the whole grid. Transliterated word for word from
 // `cuda_kernels.cu`; see that kernel's header for the partition-invariance argument.
 kernel void days_round_control_sweep(
     const device ulong *control [[buffer(0)]],
@@ -5669,18 +5669,17 @@ kernel void days_round_control_sweep(
     ulong first = ulong(block) * ulong(block_size) + ulong(lane);
     ulong stride = ulong(blocks) * ulong(block_size);
     ulong first_error = NONE;
-    for (ulong node = first; node < params[P_NODE_COUNT]; node += stride) {
-        ulong state = node * LP_STATE_WORDS;
-        if (lp_state[state + L_ERROR] != 0) {
-            first_error = node;
-            break;
-        }
-    }
     uint unfinished = 0;
     for (ulong active = first; active < control[C_ACTIVE]; active += stride) {
         ulong node = worklist[active];
-        if (lp_state[node * LP_STATE_WORDS + L_FINISHED] == 0) {
+        ulong state = node * LP_STATE_WORDS;
+        if (first_error == NONE && lp_state[state + L_ERROR] != 0) {
+            first_error = node;
+        }
+        if (unfinished == 0 && lp_state[state + L_FINISHED] == 0) {
             unfinished = 1;
+        }
+        if (first_error != NONE && unfinished != 0) {
             break;
         }
     }
