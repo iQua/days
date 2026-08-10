@@ -45,6 +45,7 @@ use crate::{
 
 const LANES: usize = 1_024;
 const EVENT_WORDS: usize = 14;
+const SCATTER_COPY_LANES: usize = EVENT_WORDS * 2;
 const NODE_WORDS: usize = 11;
 const GENERATOR_WORDS: usize = 43;
 const FLOW_WORDS: usize = 6;
@@ -5274,6 +5275,12 @@ impl DirectMetal {
             create_pipeline(&device, source, "days_exchange_prefix_sweep")?;
         let exchange_prefix_pipeline = create_pipeline(&device, source, "days_exchange_prefix")?;
         let exchange_scatter_pipeline = create_pipeline(&device, source, "days_exchange_scatter")?;
+        if exchange_scatter_pipeline.threadExecutionWidth() < SCATTER_COPY_LANES {
+            return Err(MetalError::Unavailable(format!(
+                "exchange-scatter pipeline has SIMD width {}, but paired record copies require {SCATTER_COPY_LANES} lanes",
+                exchange_scatter_pipeline.threadExecutionWidth()
+            )));
+        }
         let exchange_merge_pipeline = create_pipeline(&device, source, "days_exchange_merge")?;
         let finalize_sweep_pipeline =
             create_pipeline(&device, source, "days_round_finalize_sweep")?;
@@ -5474,6 +5481,13 @@ impl DirectMetal {
             return Err(MetalError::Validation(format!(
                 "round_threads_per_threadgroup must be a multiple of the device execution width \
                  {execution_width}"
+            )));
+        }
+        let scatter_execution_width = self.exchange_scatter_pipeline.threadExecutionWidth();
+        if !round_threads.is_multiple_of(scatter_execution_width) {
+            return Err(MetalError::Validation(format!(
+                "round_threads_per_threadgroup must be a multiple of the exchange-scatter \
+                 execution width {scatter_execution_width}"
             )));
         }
         let parallel_pipelines = [
