@@ -3,6 +3,7 @@ const METAL: &str = include_str!("../src/metal_kernels.metal");
 const METAL_HOST: &str = include_str!("../src/metal.rs");
 
 const EVENT_WORDS: usize = 14;
+const SCATTER_COOPERATIVE_RECORDS: usize = 3;
 
 fn kernel_body<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     let start = source
@@ -13,6 +14,55 @@ fn kernel_body<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
         .find(end)
         .unwrap_or_else(|| panic!("missing kernel end marker `{end}`"));
     &tail[..end]
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScatterMapping {
+    Lane,
+    Cooperative,
+}
+
+fn scatter_mapping(record_count: usize) -> ScatterMapping {
+    if record_count < SCATTER_COOPERATIVE_RECORDS {
+        ScatterMapping::Lane
+    } else {
+        ScatterMapping::Cooperative
+    }
+}
+
+#[test]
+fn scatter_selects_lane_for_one_cluster_and_cooperative_beyond_it() {
+    assert_eq!(EVENT_WORDS * 8, 112, "one record must occupy 112 bytes");
+    assert_eq!(2 * EVENT_WORDS, 28, "one cooperative cluster is 28 words");
+    assert_eq!(2 * EVENT_WORDS * 8, 224, "one cluster must occupy 224 bytes");
+
+    for count in 0..SCATTER_COOPERATIVE_RECORDS {
+        assert_eq!(
+            scatter_mapping(count),
+            ScatterMapping::Lane,
+            "{count} records fit in at most one cooperative cluster"
+        );
+    }
+    for count in SCATTER_COOPERATIVE_RECORDS..=5 {
+        assert_eq!(
+            scatter_mapping(count),
+            ScatterMapping::Cooperative,
+            "{count} records require more than one cooperative cluster"
+        );
+    }
+
+    for (backend, source) in [("CUDA", CUDA), ("Metal", METAL)] {
+        for fragment in [
+            "SCATTER_COOPERATIVE_RECORDS = 3",
+            "count < SCATTER_COOPERATIVE_RECORDS",
+            "count >= SCATTER_COOPERATIVE_RECORDS",
+        ] {
+            assert!(
+                source.contains(fragment),
+                "{backend} deterministic scatter selector must contain `{fragment}`"
+            );
+        }
+    }
 }
 
 #[test]
