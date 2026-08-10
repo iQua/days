@@ -215,6 +215,12 @@ impl TCPPacketSource {
         app_source: Option<AppSourceBufferHandle>,
         rng: SmallRng,
     ) -> TCPPacketSource {
+        #[cfg(feature = "test")]
+        assert!(
+            std::env::var_os("DAYS_E3_ASSERT_NO_TCP_SOURCE").is_none(),
+            "E3 constructed a TCP source"
+        );
+
         let tcp_config = traffic
             .tcp
             .as_ref()
@@ -796,7 +802,18 @@ impl TCPPacketSource {
     fn sendable_bytes(&self, cwnd_limit: usize) -> usize {
         let send_limit = min(self.send_buffer, cwnd_limit);
         let available = send_limit.saturating_sub(self.next_seq);
-        min(self.mss, available)
+        let send_size = min(self.mss, available);
+        if send_size == 0 || send_size == self.mss {
+            return send_size;
+        }
+
+        let is_final_segment =
+            self.traffic_exceeded && self.send_buffer.saturating_sub(self.next_seq) <= self.mss;
+        if is_final_segment || self.sent_packets.is_empty() {
+            send_size
+        } else {
+            0
+        }
     }
 
     /// Checks if any sent packet reached timeout at regularly occurring intervals.
@@ -1033,6 +1050,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingCongestionControl {
         last_ack: Option<AckEvent>,
+        cwnd: usize,
     }
 
     impl CongestionControl for RecordingCongestionControl {
@@ -1049,7 +1067,7 @@ mod tests {
         fn more_dupacks_received(&mut self) {}
 
         fn get_cwnd(&self) -> usize {
-            0
+            self.cwnd
         }
 
         fn as_any(&self) -> &dyn Any {
@@ -1083,6 +1101,36 @@ mod tests {
         let mut rng = rand::rng();
         let rng = SmallRng::from_rng(&mut rng);
         TCPPacketSource::new(0, Vec::new(), traffic, 0, None, rng)
+    }
+
+    fn make_fixed_window_source(total_bytes: usize, mss: usize, cwnd: usize) -> TCPPacketSource {
+        let mss_sample = i64::try_from(mss).expect("MSS fits the distribution domain");
+        let traffic = TrafficCharacteristics::new(
+            0.0,
+            None,
+            Some(total_bytes),
+            DistributionInfo::Uniform {
+                low: 1.0,
+                high: 1.0,
+            },
+            DistributionInfo::DiscreteUniform {
+                low: mss_sample,
+                high: mss_sample,
+            },
+            Some(TCPCharacteristics {
+                cc_algorithm: CCAlgorithm::TCPReno,
+                ecn: false,
+                cubic: None,
+            }),
+        );
+        let mut rng = rand::rng();
+        let rng = SmallRng::from_rng(&mut rng);
+        let mut source = TCPPacketSource::new(7, Vec::new(), traffic, 0, None, rng);
+        source.congestion_control = Box::new(RecordingCongestionControl {
+            last_ack: None,
+            cwnd,
+        });
+        source
     }
 
     fn make_ack(flow_id: usize, seq: usize, acked: usize, ece: bool, now: f64) -> Packet {
@@ -1289,6 +1337,56 @@ mod tests {
         assert_eq!(source.send_buffer, cwnd);
         assert_eq!(source.remaining_bytes, 0);
         assert!(source.traffic_exceeded);
+    }
+
+    #[test]
+    fn partially_open_window_waits_for_mss_until_the_final_segment() {
+        let mss = 512_usize;
+        let final_bytes = 88_usize;
+        let mut source = make_fixed_window_source(2 * mss + final_bytes, mss, mss + 128);
+
+        block_on(source.send_packet(0));
+
+        let first_flight = source
+            .sent_packets
+            .values()
+            .map(|packet| (packet.packet_id, packet.size))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(first_flight, BTreeSet::from([(0, mss)]));
+        assert_eq!(source.next_seq, mss);
+
+        let mut ack = make_ack(source.flow_id, mss, mss, false, 0.000_001);
+        ack.packet_id = 0;
+        let _ = block_on(source.ack_packet_received(ack, 1_000));
+        block_on(source.send_packet(1_000));
+
+        let final_flight = source
+            .sent_packets
+            .values()
+            .map(|packet| (packet.packet_id, packet.size))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            final_flight,
+            BTreeSet::from([(mss, mss), (2 * mss, final_bytes)])
+        );
+        assert_eq!(source.next_seq, 2 * mss + final_bytes);
+        assert_eq!(source.total_original_packets, 3);
+    }
+
+    #[test]
+    fn empty_flight_uses_sub_mss_window_to_avoid_deadlock() {
+        let mss = 512_usize;
+        let mut source = make_fixed_window_source(2 * mss + 88, mss, 128);
+
+        block_on(source.send_packet(0));
+
+        let packet = source
+            .sent_packets
+            .get(&0)
+            .expect("escape segment not sent");
+        assert_eq!(packet.size, 128);
+        assert_eq!(source.next_seq, 128);
+        assert!(source.remaining_bytes > mss);
     }
 
     fn fixed_byte_trace(arrival_seconds: f64) -> Vec<(usize, usize)> {
