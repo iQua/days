@@ -3,7 +3,7 @@ const METAL: &str = include_str!("../src/metal_kernels.metal");
 const METAL_HOST: &str = include_str!("../src/metal.rs");
 
 const EVENT_WORDS: usize = 14;
-const SCATTER_COOPERATIVE_RECORDS: usize = 3;
+const SCATTER_COOPERATIVE_MIN_RECORDS: usize = 3;
 
 fn kernel_body<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     let start = source
@@ -23,7 +23,7 @@ enum ScatterMapping {
 }
 
 fn scatter_mapping(record_count: usize) -> ScatterMapping {
-    if record_count < SCATTER_COOPERATIVE_RECORDS {
+    if record_count < SCATTER_COOPERATIVE_MIN_RECORDS {
         ScatterMapping::Lane
     } else {
         ScatterMapping::Cooperative
@@ -34,16 +34,20 @@ fn scatter_mapping(record_count: usize) -> ScatterMapping {
 fn scatter_selects_lane_for_one_cluster_and_cooperative_beyond_it() {
     assert_eq!(EVENT_WORDS * 8, 112, "one record must occupy 112 bytes");
     assert_eq!(2 * EVENT_WORDS, 28, "one cooperative cluster is 28 words");
-    assert_eq!(2 * EVENT_WORDS * 8, 224, "one cluster must occupy 224 bytes");
+    assert_eq!(
+        2 * EVENT_WORDS * 8,
+        224,
+        "one cluster must occupy 224 bytes"
+    );
 
-    for count in 0..SCATTER_COOPERATIVE_RECORDS {
+    for count in 0..SCATTER_COOPERATIVE_MIN_RECORDS {
         assert_eq!(
             scatter_mapping(count),
             ScatterMapping::Lane,
             "{count} records fit in at most one cooperative cluster"
         );
     }
-    for count in SCATTER_COOPERATIVE_RECORDS..=5 {
+    for count in SCATTER_COOPERATIVE_MIN_RECORDS..=5 {
         assert_eq!(
             scatter_mapping(count),
             ScatterMapping::Cooperative,
@@ -53,9 +57,9 @@ fn scatter_selects_lane_for_one_cluster_and_cooperative_beyond_it() {
 
     for (backend, source) in [("CUDA", CUDA), ("Metal", METAL)] {
         for fragment in [
-            "SCATTER_COOPERATIVE_RECORDS = 3",
-            "count < SCATTER_COOPERATIVE_RECORDS",
-            "count >= SCATTER_COOPERATIVE_RECORDS",
+            "SCATTER_COOPERATIVE_MIN_RECORDS = 3",
+            "count < SCATTER_COOPERATIVE_MIN_RECORDS",
+            "count >= SCATTER_COOPERATIVE_MIN_RECORDS",
         ] {
             assert!(
                 source.contains(fragment),
@@ -66,7 +70,7 @@ fn scatter_selects_lane_for_one_cluster_and_cooperative_beyond_it() {
 }
 
 #[test]
-fn scatter_maps_one_simd_group_to_each_active_producer() {
+fn scatter_keeps_lane_mapping_for_short_and_group_mapping_for_long_producers() {
     let cuda = kernel_body(
         CUDA,
         "__device__ __forceinline__ void scatter_stream_producer",
@@ -74,6 +78,7 @@ fn scatter_maps_one_simd_group_to_each_active_producer() {
     );
     for fragment in [
         "SCATTER_GROUP_WIDTH",
+        "scatter_stream_producer_lane",
         "worklist[active_index]",
         "__shfl_sync",
         "index += 2",
@@ -81,7 +86,7 @@ fn scatter_maps_one_simd_group_to_each_active_producer() {
     ] {
         assert!(
             cuda.contains(fragment),
-            "CUDA cooperative scatter must contain `{fragment}`"
+            "CUDA dual-mapping scatter must contain `{fragment}`"
         );
     }
 
@@ -92,6 +97,7 @@ fn scatter_maps_one_simd_group_to_each_active_producer() {
     );
     for fragment in [
         "worklist [[buffer(13)]]",
+        "scatter_stream_producer_lane",
         "thread_index_in_simdgroup",
         "simdgroup_index_in_threadgroup",
         "simdgroups_per_threadgroup",
@@ -101,7 +107,7 @@ fn scatter_maps_one_simd_group_to_each_active_producer() {
     ] {
         assert!(
             metal.contains(fragment),
-            "Metal cooperative scatter must contain `{fragment}`"
+            "Metal dual-mapping scatter must contain `{fragment}`"
         );
     }
     assert!(

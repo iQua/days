@@ -2,6 +2,7 @@
 using namespace metal;
 
 constant uint EVENT_WORDS = 14;
+constant uint SCATTER_COOPERATIVE_MIN_RECORDS = 3;
 constant uint NODE_WORDS = 11;
 constant uint GENERATOR_WORDS = 43;
 constant uint FLOW_WORDS = 6;
@@ -6047,6 +6048,50 @@ inline ulong scatter_stream_target(
     return stream_state[stream_base] + physical;
 }
 
+inline void scatter_stream_commit(
+    ulong producer,
+    const device ulong *params,
+    device ulong *stream_state
+) {
+    ulong outbound_meta =
+        params[P_OUTBOUND_META_OFFSET] + producer * OUTBOUND_META_WORDS;
+    ulong entry = stream_state[outbound_meta];
+    ulong entry_count = stream_state[outbound_meta + 1];
+    for (ulong index = 0; index < entry_count; ++index) {
+        ulong channel =
+            stream_state[entry + index * OUTBOUND_ENTRY_WORDS + 1];
+        ulong batch =
+            params[P_CHANNEL_BATCH_OFFSET] + channel * CHANNEL_BATCH_WORDS;
+        ulong count = stream_state[channel * META_WORDS + 3] + stream_state[batch];
+        stream_state[channel * META_WORDS + 3] = count;
+        RECORD_STREAM_HIGH_WATER(params, stream_state, channel, count);
+    }
+}
+
+inline void scatter_stream_producer_lane(
+    ulong producer,
+    ulong count,
+    const device ulong *params,
+    const device ulong *remote_meta,
+    const device ulong *remote_staging,
+    device ulong *stream_state,
+    device ulong *stream_records
+) {
+    ulong base = producer * META_WORDS;
+    ulong staging = remote_meta[base];
+    for (ulong index = 0; index < count; ++index) {
+        ulong target =
+            scatter_stream_target(staging + index, params, stream_state);
+        copy_device_record(
+            remote_staging,
+            staging + index,
+            stream_records,
+            target
+        );
+    }
+    scatter_stream_commit(producer, params, stream_state);
+}
+
 kernel void days_exchange_scatter(
     device ulong *control [[buffer(0)]],
     const device ulong *params [[buffer(1)]],
@@ -6071,10 +6116,28 @@ kernel void days_exchange_scatter(
         return;
     }
     if (params[P_STREAMS_ENABLED] != 0) {
-        // days_round can append only for this round's unique worklist entries,
-        // so each SIMD group owns one producer and all of its channels. Lane
-        // zero preserves the scalar channel-cursor recurrence; the other lanes
-        // only copy words into its selected, disjoint ring slots.
+        // Counts below three fit in at most one two-record copy cluster. Keep
+        // those producers on the original lane mapping so one SIMD group can
+        // advance one producer per lane concurrently.
+        if (global_thread < params[P_NODE_COUNT]) {
+            ulong producer = global_thread;
+            ulong count = remote_meta[producer * META_WORDS + 3];
+            if (count < SCATTER_COOPERATIVE_MIN_RECORDS) {
+                scatter_stream_producer_lane(
+                    producer,
+                    count,
+                    params,
+                    remote_meta,
+                    remote_staging,
+                    stream_state,
+                    stream_records
+                );
+            }
+        }
+
+        // Long producers retain one cooperative SIMD group each. The worklist
+        // is deterministic and unique; the count predicate makes the lane and
+        // cooperative traversals disjoint.
         ulong group = ulong(block) * groups_per_block + group_in_block;
         ulong group_stride = ulong(blocks) * groups_per_block;
         for (
@@ -6083,61 +6146,53 @@ kernel void days_exchange_scatter(
             active_index += group_stride
         ) {
             ulong producer = worklist[active_index];
-            ulong staging = 0;
             ulong count = 0;
             if (lane == 0) {
-                ulong base = producer * META_WORDS;
-                staging = remote_meta[base];
-                count = remote_meta[base + 3];
+                count = remote_meta[producer * META_WORDS + 3];
             }
-            staging = scatter_simd_broadcast_ulong(staging);
             count = scatter_simd_broadcast_ulong(count);
 
-            for (ulong index = 0; index < count; index += 2) {
-                ulong first_target = 0;
-                ulong second_target = 0;
+            if (count >= SCATTER_COOPERATIVE_MIN_RECORDS) {
+                ulong staging = 0;
                 if (lane == 0) {
-                    first_target =
-                        scatter_stream_target(staging + index, params, stream_state);
-                    if (index + 1 < count) {
-                        second_target = scatter_stream_target(
-                            staging + index + 1,
+                    staging = remote_meta[producer * META_WORDS];
+                }
+                staging = scatter_simd_broadcast_ulong(staging);
+                for (ulong index = 0; index < count; index += 2) {
+                    ulong first_target = 0;
+                    ulong second_target = 0;
+                    if (lane == 0) {
+                        first_target = scatter_stream_target(
+                            staging + index,
                             params,
                             stream_state
                         );
+                        if (index + 1 < count) {
+                            second_target = scatter_stream_target(
+                                staging + index + 1,
+                                params,
+                                stream_state
+                            );
+                        }
+                    }
+                    first_target = scatter_simd_broadcast_ulong(first_target);
+                    second_target = scatter_simd_broadcast_ulong(second_target);
+
+                    if (lane < 2 * EVENT_WORDS) {
+                        ulong record = lane / EVENT_WORDS;
+                        uint word = lane % EVENT_WORDS;
+                        if (index + record < count) {
+                            ulong source_slot = staging + index + record;
+                            ulong target_slot =
+                                record == 0 ? first_target : second_target;
+                            stream_records[target_slot * EVENT_WORDS + word] =
+                                remote_staging[source_slot * EVENT_WORDS + word];
+                        }
                     }
                 }
-                first_target = scatter_simd_broadcast_ulong(first_target);
-                second_target = scatter_simd_broadcast_ulong(second_target);
 
-                if (lane < 2 * EVENT_WORDS) {
-                    ulong record = lane / EVENT_WORDS;
-                    uint word = lane % EVENT_WORDS;
-                    if (index + record < count) {
-                        ulong source_slot = staging + index + record;
-                        ulong target_slot = record == 0 ? first_target : second_target;
-                        stream_records[target_slot * EVENT_WORDS + word] =
-                            remote_staging[source_slot * EVENT_WORDS + word];
-                    }
-                }
-            }
-
-            if (lane == 0) {
-                ulong outbound_meta =
-                    params[P_OUTBOUND_META_OFFSET] +
-                    producer * OUTBOUND_META_WORDS;
-                ulong entry = stream_state[outbound_meta];
-                ulong entry_count = stream_state[outbound_meta + 1];
-                for (ulong index = 0; index < entry_count; ++index) {
-                    ulong channel =
-                        stream_state[entry + index * OUTBOUND_ENTRY_WORDS + 1];
-                    ulong batch =
-                        params[P_CHANNEL_BATCH_OFFSET] +
-                        channel * CHANNEL_BATCH_WORDS;
-                    ulong count =
-                        stream_state[channel * META_WORDS + 3] + stream_state[batch];
-                    stream_state[channel * META_WORDS + 3] = count;
-                    RECORD_STREAM_HIGH_WATER(params, stream_state, channel, count);
+                if (lane == 0) {
+                    scatter_stream_commit(producer, params, stream_state);
                 }
             }
         }

@@ -25,6 +25,7 @@ using ulong = uint64_t;
 constexpr uint EVENT_WORDS = 14;
 constexpr uint SCATTER_GROUP_WIDTH = 32;
 constexpr uint SCATTER_GROUP_MASK = 0xffffffffu;
+constexpr uint SCATTER_COOPERATIVE_MIN_RECORDS = 3;
 constexpr uint NODE_WORDS = 11;
 constexpr uint GENERATOR_WORDS = 43;
 constexpr uint FLOW_WORDS = 6;
@@ -5473,8 +5474,51 @@ __device__ __forceinline__ ulong scatter_stream_target(
     return stream_state[stream_base] + physical;
 }
 
+__device__ __forceinline__ void scatter_stream_commit(
+    ulong producer,
+    const ulong *params,
+    ulong *stream_state
+) {
+    ulong outbound_meta =
+        params[P_OUTBOUND_META_OFFSET] + producer * OUTBOUND_META_WORDS;
+    ulong entry = stream_state[outbound_meta];
+    ulong entry_count = stream_state[outbound_meta + 1];
+    for (ulong index = 0; index < entry_count; ++index) {
+        ulong channel =
+            stream_state[entry + index * OUTBOUND_ENTRY_WORDS + 1];
+        ulong batch =
+            params[P_CHANNEL_BATCH_OFFSET] + channel * CHANNEL_BATCH_WORDS;
+        stream_state[channel * META_WORDS + 3] += stream_state[batch];
+    }
+}
+
+__device__ __forceinline__ void scatter_stream_producer_lane(
+    ulong producer,
+    ulong count,
+    const ulong *params,
+    const ulong *remote_meta,
+    const ulong *remote_staging,
+    ulong *stream_state,
+    ulong *stream_records
+) {
+    ulong base = producer * META_WORDS;
+    ulong staging = remote_meta[base];
+    for (ulong index = 0; index < count; ++index) {
+        ulong target =
+            scatter_stream_target(staging + index, params, stream_state);
+        copy_device_record(
+            remote_staging,
+            staging + index,
+            stream_records,
+            target
+        );
+    }
+    scatter_stream_commit(producer, params, stream_state);
+}
+
 __device__ __forceinline__ void scatter_stream_producer(
     ulong producer,
+    ulong count,
     uint lane,
     const ulong *params,
     const ulong *remote_meta,
@@ -5485,14 +5529,11 @@ __device__ __forceinline__ void scatter_stream_producer(
     // The leader preserves the scalar channel-cursor recurrence. The other
     // lanes only copy words into the disjoint slots that recurrence selects.
     ulong staging = 0;
-    ulong count = 0;
     if (lane == 0) {
         ulong base = producer * META_WORDS;
         staging = remote_meta[base];
-        count = remote_meta[base + 3];
     }
     staging = __shfl_sync(SCATTER_GROUP_MASK, staging, 0);
-    count = __shfl_sync(SCATTER_GROUP_MASK, count, 0);
 
     for (ulong index = 0; index < count; index += 2) {
         ulong first_target = 0;
@@ -5520,19 +5561,7 @@ __device__ __forceinline__ void scatter_stream_producer(
     }
 
     if (lane == 0) {
-        ulong outbound_meta =
-            params[P_OUTBOUND_META_OFFSET] +
-            producer * OUTBOUND_META_WORDS;
-        ulong entry = stream_state[outbound_meta];
-        ulong entry_count = stream_state[outbound_meta + 1];
-        for (ulong index = 0; index < entry_count; ++index) {
-            ulong channel =
-                stream_state[entry + index * OUTBOUND_ENTRY_WORDS + 1];
-            ulong batch =
-                params[P_CHANNEL_BATCH_OFFSET] +
-                channel * CHANNEL_BATCH_WORDS;
-            stream_state[channel * META_WORDS + 3] += stream_state[batch];
-        }
+        scatter_stream_commit(producer, params, stream_state);
     }
 }
 
@@ -5550,8 +5579,28 @@ extern "C" __global__ void days_exchange_scatter(DAYS_BUFFERS) {
         blockDim.x >= SCATTER_GROUP_WIDTH &&
         blockDim.x % SCATTER_GROUP_WIDTH == 0
     ) {
-        // days_round can append only for this round's unique worklist entries,
-        // so each warp owns one producer and all of that producer's channels.
+        // Counts below three fit in at most one two-record copy cluster. Keep
+        // those producers on the original lane mapping so one warp can advance
+        // up to 32 of them concurrently.
+        if (global_thread < params[P_NODE_COUNT]) {
+            ulong producer = global_thread;
+            ulong count = remote_meta[producer * META_WORDS + 3];
+            if (count < SCATTER_COOPERATIVE_MIN_RECORDS) {
+                scatter_stream_producer_lane(
+                    producer,
+                    count,
+                    params,
+                    remote_meta,
+                    remote_staging,
+                    stream_state,
+                    stream_records
+                );
+            }
+        }
+
+        // Long producers retain one cooperative warp each. The worklist is
+        // deterministic and unique; the count predicate makes the lane and
+        // cooperative traversals disjoint.
         uint lane = threadIdx.x % SCATTER_GROUP_WIDTH;
         ulong groups_per_block = blockDim.x / SCATTER_GROUP_WIDTH;
         ulong group =
@@ -5563,15 +5612,24 @@ extern "C" __global__ void days_exchange_scatter(DAYS_BUFFERS) {
             active_index < control[C_ACTIVE];
             active_index += group_stride
         ) {
-            scatter_stream_producer(
-                worklist[active_index],
-                lane,
-                params,
-                remote_meta,
-                remote_staging,
-                stream_state,
-                stream_records
-            );
+            ulong producer = worklist[active_index];
+            ulong count = 0;
+            if (lane == 0) {
+                count = remote_meta[producer * META_WORDS + 3];
+            }
+            count = __shfl_sync(SCATTER_GROUP_MASK, count, 0);
+            if (count >= SCATTER_COOPERATIVE_MIN_RECORDS) {
+                scatter_stream_producer(
+                    producer,
+                    count,
+                    lane,
+                    params,
+                    remote_meta,
+                    remote_staging,
+                    stream_state,
+                    stream_records
+                );
+            }
         }
         return;
     }
