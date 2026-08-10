@@ -65,19 +65,16 @@ stable baseline:
 allow-listed dependant of this crate (`xtask/src/main.rs`) and is a **standing gate**, listed in
 [§5](#standing-gates). What it guards is **legacy↔executor agreement** — that and no more.
 
-**No automated check catches common-mode drift, and none can be differential.** Legacy's
+**Differential checks do not catch common-mode drift.** Legacy's
 `physical_flow_paths` (`src/topos/topo.rs:68`) and executor lowering both call
 `compute_shortest_path_route_table`. A change under `days`'s `src/topos/` therefore moves **both
 sides together**, so every assertion of the form "legacy agrees with the executor" stays green
-through precisely the change that moves a published legacy baseline. Only an *absolute* anchor — a
-pin of this fixture's counts against the frozen 41,932,800 — would catch it, and **no such pin
-exists in CI today**.
-
-The mitigation is therefore not a test. It is the freeze policy in [§3](#3-freeze-policy), its
-changelog in [§8](#8-freeze-changelog), review, and one manual step: anyone changing shared `days`
-code that legacy consumes runs the gates in [§5](#standing-gates) **and re-runs the E3 count check
-of [§6.6](#66-mt-nondeterminism-disclosure-protocol-counts-and-delays) against the frozen anchor** before any
-legacy number is republished. Automating that check is an open recommendation, not a shipped one.
+through precisely the change that moves a published legacy baseline. The explicit ignored release
+gate `tests/e3_integer_regression.rs` supplies the independent absolute anchor: it runs E3 ST and
+byte-compares a canonical integer-total record against the `p12-legacy-pre-e5` contract. Anyone
+changing shared `days` code that legacy consumes runs the gates in [§5](#standing-gates), including
+that full E3 gate, before any legacy number is republished. Timing and delay fields are intentionally
+outside the anchor under the exact-time erratum in [§6.9](#69-exact-time-erratum).
 
 ## 2. Why it is frozen
 
@@ -180,6 +177,12 @@ cargo test -p days-legacy --features test -- --show-output
 # 2b. The differential suite that guards the live-`days` exposure described in §1.
 #     Also verbatim from .github/workflows/examples.yml.
 cargo test -p days-validation --features test -- --show-output
+
+# 2c. The absolute E3 integer anchor. This is ignored in ordinary suites because it processes
+#     41,932,800 packets; it is mandatory before publishing a legacy result.
+cargo test --release --locked -p days-legacy --features test \
+  --test e3_integer_regression e3_integer_totals_match_pre_e5_tag \
+  -- --ignored --exact --show-output
 
 # 3. All six examples, verbatim what .github/workflows/examples.yml runs.
 for example in legacy/examples/*; do
@@ -439,8 +442,8 @@ The protocol:
 #### 6.6.2 Delays: MT is nondeterministic, and no MT delay is citable
 
 <a id="662-delays-mt-is-nondeterministic-and-no-mt-delay-is-citable"></a>
-The count invariance above does **not** extend to the delay columns. Measured at the freeze on this
-fixture, by diffing `sinks.csv` per flow (one ST run, three MT runs):
+The count invariance above does **not** extend to the delay columns. Measured at the tag-era freeze
+state on this fixture, by diffing `sinks.csv` per flow (one ST run, three MT runs):
 
 | comparison | `queueing_delay_mean` differing | `one_way_delay_mean` differing | integer counts / bytes / ids / times differing |
 |---|---:|---:|---:|
@@ -511,7 +514,7 @@ scoping decision with its own evidence, not something this contract permits.
   numbers are not carried forward; P12 re-measures at final HEAD.
 - The P01 baselines are a historical record at commit `b4e5f07`, explicitly **not** a diff target.
 
-### 6.8 Verified once, locally, at the freeze
+### 6.8 Verified once, locally, at the tag-era freeze
 
 The legacy side of E3 was smoke-run once per arm on the freeze machine to prove runnability —
 **not** to measure it. Single sample, machine not under the quiet gate, `n = 1`:
@@ -525,6 +528,21 @@ Both arms reproduced the frozen Days AGO anchor's **integer counts** exactly. Th
 on the delay columns — 8,704 of 16,896 sinks differ, and MT differs run to run
 ([§6.6.2](#662-delays-mt-is-nondeterministic-and-no-mt-delay-is-citable)). No number in this table
 may be cited, compared, or plotted.
+
+### 6.9 Exact-time erratum
+
+<a id="69-exact-time-erratum"></a>
+Commit `5e0ea0a` made integer nanoseconds authoritative at legacy scheduling boundaries. The E3
+integer contract did not move: 16,896 flows delivered 41,932,800 packets / 41,932,800,000 bytes
+with zero drops. The new absolute gate in §5 pins that result against `p12-legacy-pre-e5`.
+
+The simulated-time CSV bytes did move because the corrected scheduler no longer accumulates f64
+event-time drift. The maximum source `end_time` is now exact `16.0`, superseding tag-era
+`16.000000000001492` (published as `16.0000000000015`), and the source time plus sink delay fields
+must be treated as different provenance classes. Post-amendment work cites the exact-time CSVs for
+simulated-time or delay values. The annotated tag and its published CSVs remain citable as faithful
+outputs of the frozen tag-era state; this erratum does not rewrite that historical result. It only
+forbids presenting its drifted time/delay bytes as outputs of the exact-time implementation.
 
 ## 7. Provenance
 
@@ -562,3 +580,4 @@ to anything else under `legacy/` always do.
 | 2026-08-09 | `T22a: Repair legacy TCP loss recovery integration` | (d) | Made cumulative ACK advancement hole-safe, implemented Reno's missing send hook with byte-consistent flight/sequence accounting, and pinned deterministic fast and exact-RTO retransmission behavior through final completion. | Ordered E5 plan T5: minimally repair the existing Reno integration so loss cannot be falsely acknowledged; the controller itself remains legacy Reno and was not replaced. |
 | 2026-08-09 | `T22a: Add E5 propagation and metrics preflight` | (d) | Added an E5-form ordered-stage preflight, opt-in final TCP correctness counters in a separate CSV, and keyed cancellation of completed sources' periodic timeout events. Historical no-key propagation and default log artifacts remain unchanged. | Ordered E5 plan T6: make the E5 compatibility mode and its completion/drop/retransmission evidence explicit without moving E3 defaults. |
 | 2026-08-09 | `T22a: Add the lossy E5 analogue gate` | (d) | Added the k=4 simultaneous-start lossy correctness fixture and its exact demand/tail/drop/retransmission/drain assertions, plus a final-segment metric. Full E5 was not run: the ordered T7 E3 gate stopped the round because T2 exact scheduling changes published E3 timing/delay fields despite identical counts. | Ordered E5 plan T7 up to its binding E3 stop condition; see `days-gpu/evidence/P12/legacy-e5-fixes.md`. |
+| 2026-08-09 | `T22a: Accept exact E3 timing provenance` | (d) | Added the explicit release-only E3 integer-total anchor and documented the exact-time erratum: post-amendment time/delay CSVs supersede their f64-drifted bytes while the annotated tag remains citable for its own state. | User ruling accepting the exact times and requiring E3 re-verification before completing T7. |
