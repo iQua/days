@@ -5913,6 +5913,21 @@ extern "C" __global__ void days_round_finalize(DAYS_BUFFERS) {
         return;
     }
 
+    // T24: on the streams + Summary path, every possible post-control error is already published
+    // directly to `control`, stream merge writes no LP error, and cumulative observation totals are
+    // disabled. The host omits the sweep for exactly this lowered-image predicate; this ordered
+    // dispatch remains as the publish boundary before the next horizon sweep.
+    if (
+        params[P_STREAMS_ENABLED] != 0 &&
+        params[P_FULL_OBSERVATIONS] == 0
+    ) {
+        if (lane == 0) {
+            control[C_CONTINUATION] = 0;
+            control[C_ROUNDS] += 1;
+        }
+        return;
+    }
+
     ulong capacities[3] = {
         params[P_OBSERVED_CAPACITY],
         params[P_DEPARTURE_CAPACITY],

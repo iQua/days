@@ -256,13 +256,15 @@ impl AttemptPhase {
     }
 }
 
-/// One dispatch of the attempt DAG, in encode order.
+/// One dispatch of the maximum attempt DAG, in encode order.
 ///
 /// T21 fix 1 (`evidence/P12/aterm-fixes.md` §3.4) splits the phases that swept Θ(nodes + channels)
 /// from a grid of one threadgroup into a full-grid `_sweep` dispatch plus a width-1 dispatch that
 /// combines the sweep's per-threadgroup partials. **The dispatch boundary is the barrier** —
 /// `MTLDispatchType::Serial` ordering, the same guarantee `days_round` already relies on to see
 /// the `worklist` `days_round_prepare` wrote — so no kernel synchronizes across threadgroups.
+/// T24 omits only `FinalControlSweep` for a streams+Summary lowered plan; Full and legacy plans
+/// dispatch all thirteen entries.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AttemptKernel {
     HorizonSweep,
@@ -4107,6 +4109,8 @@ struct MetalBuffers {
     tcp_state: SharedBuffer,
     orphan_packets: Vec<PacketDescriptor>,
     node_count: usize,
+    /// Lowered-image policy: false only for streams + Summary observations.
+    finalize_sweep_required: bool,
     stream_layout: StreamLayout,
     memory_layout: MetalMemoryLayout,
     channel_stream_capacity_distribution: Vec<crate::ChannelStreamCapacityLevel>,
@@ -4174,6 +4178,10 @@ impl MetalBuffers {
         let memory_layout = plan.memory_layout;
         let channel_stream_capacity_distribution = plan.channel_stream_capacity_distribution;
         let node_count = plan.params[0] as usize;
+        let finalize_sweep_required = crate::device_sizing::finalize_sweep_required(
+            plan.params[8] != 0,
+            plan.params[14] != 0,
+        );
         let tcp_state = SharedBuffer::new(device, plan.tcp_state)?;
         let planes = vec![
             plan.control,
@@ -4229,6 +4237,7 @@ impl MetalBuffers {
             tcp_state,
             orphan_packets,
             node_count,
+            finalize_sweep_required,
             stream_layout,
             memory_layout,
             channel_stream_capacity_distribution,
@@ -5725,6 +5734,9 @@ impl DirectMetal {
         merge_pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
     ) {
         for (kernel, _, geometry) in ATTEMPT_DISPATCHES {
+            if !buffers.finalize_sweep_required && kernel == AttemptKernel::FinalControlSweep {
+                continue;
+            }
             encoder.setComputePipelineState(self.pipeline(kernel, round_pipeline, merge_pipeline));
             match geometry {
                 DispatchGeometry::FixedControl => {
@@ -5787,6 +5799,11 @@ impl DirectMetal {
             buffers.bind(&encoder);
             if let Some(probe) = fel_probe {
                 probe.bind(&encoder);
+            }
+            if !buffers.finalize_sweep_required && kernel == AttemptKernel::FinalControlSweep {
+                // Preserve the fixed profiling sample schema without encoding a device dispatch.
+                encoder.endEncoding();
+                continue;
             }
             encoder.setComputePipelineState(self.pipeline(kernel, round_pipeline, merge_pipeline));
             match geometry {

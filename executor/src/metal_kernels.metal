@@ -6591,6 +6591,19 @@ kernel void days_round_finalize(
         return;
     }
 
+    // T24: the host omits the sweep only for streams + Summary. Transliterated word for word from
+    // CUDA; the retained dispatch is the ordered round-state publication boundary.
+    if (
+        params[P_STREAMS_ENABLED] != 0 &&
+        params[P_FULL_OBSERVATIONS] == 0
+    ) {
+        if (lane == 0) {
+            control[C_CONTINUATION] = 0;
+            control[C_ROUNDS] += 1;
+        }
+        return;
+    }
+
     ulong capacities[3] = {
         params[P_OBSERVED_CAPACITY],
         params[P_DEPARTURE_CAPACITY],
