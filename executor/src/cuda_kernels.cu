@@ -23,6 +23,8 @@ using ulong = uint64_t;
     ulong *scheduler_state, ulong *tcp_state
 
 constexpr uint EVENT_WORDS = 14;
+constexpr uint SCATTER_GROUP_WIDTH = 32;
+constexpr uint SCATTER_GROUP_MASK = 0xffffffffu;
 constexpr uint NODE_WORDS = 11;
 constexpr uint GENERATOR_WORDS = 43;
 constexpr uint FLOW_WORDS = 6;
@@ -5449,16 +5451,134 @@ extern "C" __global__ void days_exchange_prefix(DAYS_BUFFERS) {
     }
 }
 
+__device__ __forceinline__ ulong scatter_stream_target(
+    ulong staging_slot,
+    const ulong *params,
+    ulong *stream_state
+) {
+    ulong channel =
+        stream_state[params[P_STAGING_CHANNEL_OFFSET] + staging_slot];
+    ulong batch =
+        params[P_CHANNEL_BATCH_OFFSET] +
+        channel * CHANNEL_BATCH_WORDS;
+    ulong cursor = stream_state[batch + 3];
+    ulong stream_base = channel * META_WORDS;
+    ulong capacity = stream_state[stream_base + 1];
+    ulong physical = (
+        stream_state[stream_base + 2] +
+        stream_state[stream_base + 3] +
+        cursor
+    ) % max(capacity, 1ul);
+    stream_state[batch + 3] = cursor + 1;
+    return stream_state[stream_base] + physical;
+}
+
+__device__ __forceinline__ void scatter_stream_producer(
+    ulong producer,
+    uint lane,
+    const ulong *params,
+    const ulong *remote_meta,
+    const ulong *remote_staging,
+    ulong *stream_state,
+    ulong *stream_records
+) {
+    // The leader preserves the scalar channel-cursor recurrence. The other
+    // lanes only copy words into the disjoint slots that recurrence selects.
+    ulong staging = 0;
+    ulong count = 0;
+    if (lane == 0) {
+        ulong base = producer * META_WORDS;
+        staging = remote_meta[base];
+        count = remote_meta[base + 3];
+    }
+    staging = __shfl_sync(SCATTER_GROUP_MASK, staging, 0);
+    count = __shfl_sync(SCATTER_GROUP_MASK, count, 0);
+
+    for (ulong index = 0; index < count; index += 2) {
+        ulong first_target = 0;
+        ulong second_target = 0;
+        if (lane == 0) {
+            first_target = scatter_stream_target(staging + index, params, stream_state);
+            if (index + 1 < count) {
+                second_target =
+                    scatter_stream_target(staging + index + 1, params, stream_state);
+            }
+        }
+        first_target = __shfl_sync(SCATTER_GROUP_MASK, first_target, 0);
+        second_target = __shfl_sync(SCATTER_GROUP_MASK, second_target, 0);
+
+        if (lane < 2 * EVENT_WORDS) {
+            ulong record = lane / EVENT_WORDS;
+            uint word = lane % EVENT_WORDS;
+            if (index + record < count) {
+                ulong source_slot = staging + index + record;
+                ulong target_slot = record == 0 ? first_target : second_target;
+                stream_records[target_slot * EVENT_WORDS + word] =
+                    remote_staging[source_slot * EVENT_WORDS + word];
+            }
+        }
+    }
+
+    if (lane == 0) {
+        ulong outbound_meta =
+            params[P_OUTBOUND_META_OFFSET] +
+            producer * OUTBOUND_META_WORDS;
+        ulong entry = stream_state[outbound_meta];
+        ulong entry_count = stream_state[outbound_meta + 1];
+        for (ulong index = 0; index < entry_count; ++index) {
+            ulong channel =
+                stream_state[entry + index * OUTBOUND_ENTRY_WORDS + 1];
+            ulong batch =
+                params[P_CHANNEL_BATCH_OFFSET] +
+                channel * CHANNEL_BATCH_WORDS;
+            stream_state[channel * META_WORDS + 3] += stream_state[batch];
+        }
+    }
+}
+
 extern "C" __global__ void days_exchange_scatter(DAYS_BUFFERS) {
-    uint producer = blockIdx.x * blockDim.x + threadIdx.x;
+    uint global_thread = blockIdx.x * blockDim.x + threadIdx.x;
     if (
         control[C_ERROR] != 0 ||
         control[C_DONE] != 0 ||
-        control[C_CONTINUATION] != 2 ||
-        producer >= params[P_NODE_COUNT]
+        control[C_CONTINUATION] != 2
     ) {
         return;
     }
+    if (
+        params[P_STREAMS_ENABLED] != 0 &&
+        blockDim.x >= SCATTER_GROUP_WIDTH &&
+        blockDim.x % SCATTER_GROUP_WIDTH == 0
+    ) {
+        // days_round can append only for this round's unique worklist entries,
+        // so each warp owns one producer and all of that producer's channels.
+        uint lane = threadIdx.x % SCATTER_GROUP_WIDTH;
+        ulong groups_per_block = blockDim.x / SCATTER_GROUP_WIDTH;
+        ulong group =
+            ulong(blockIdx.x) * groups_per_block +
+            threadIdx.x / SCATTER_GROUP_WIDTH;
+        ulong group_stride = ulong(gridDim.x) * groups_per_block;
+        for (
+            ulong active_index = group;
+            active_index < control[C_ACTIVE];
+            active_index += group_stride
+        ) {
+            scatter_stream_producer(
+                worklist[active_index],
+                lane,
+                params,
+                remote_meta,
+                remote_staging,
+                stream_state,
+                stream_records
+            );
+        }
+        return;
+    }
+    if (global_thread >= params[P_NODE_COUNT]) {
+        return;
+    }
+    ulong producer = global_thread;
     ulong base = ulong(producer) * META_WORDS;
     ulong staging = remote_meta[base];
     ulong compact = remote_meta[base + 2];

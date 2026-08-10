@@ -6019,70 +6019,138 @@ kernel void days_exchange_prefix(
     }
 }
 
+inline ulong scatter_simd_broadcast_ulong(ulong value) {
+    uint low = simd_broadcast(uint(value), 0);
+    uint high = simd_broadcast(uint(value >> 32), 0);
+    return ulong(low) | (ulong(high) << 32);
+}
+
+inline ulong scatter_stream_target(
+    ulong staging_slot,
+    const device ulong *params,
+    device ulong *stream_state
+) {
+    ulong channel =
+        stream_state[params[P_STAGING_CHANNEL_OFFSET] + staging_slot];
+    ulong batch =
+        params[P_CHANNEL_BATCH_OFFSET] +
+        channel * CHANNEL_BATCH_WORDS;
+    ulong cursor = stream_state[batch + 3];
+    ulong stream_base = channel * META_WORDS;
+    ulong capacity = stream_state[stream_base + 1];
+    ulong physical = (
+        stream_state[stream_base + 2] +
+        stream_state[stream_base + 3] +
+        cursor
+    ) % max(capacity, 1ul);
+    stream_state[batch + 3] = cursor + 1;
+    return stream_state[stream_base] + physical;
+}
+
 kernel void days_exchange_scatter(
     device ulong *control [[buffer(0)]],
     const device ulong *params [[buffer(1)]],
     device ulong *outbox [[buffer(12)]],
+    const device ulong *worklist [[buffer(13)]],
     const device ulong *remote_meta [[buffer(19)]],
     const device ulong *remote_staging [[buffer(20)]],
     device ulong *stream_state [[buffer(25)]],
     device ulong *stream_records [[buffer(26)]],
-    uint producer [[thread_position_in_grid]]
+    uint global_thread [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint group_in_block [[simdgroup_index_in_threadgroup]],
+    uint groups_per_block [[simdgroups_per_threadgroup]],
+    uint block [[threadgroup_position_in_grid]],
+    uint blocks [[threadgroups_per_grid]]
 ) {
     if (
         control[C_ERROR] != 0 ||
         control[C_DONE] != 0 ||
-        control[C_CONTINUATION] != 2 ||
-        producer >= params[P_NODE_COUNT]
+        control[C_CONTINUATION] != 2
     ) {
         return;
     }
+    if (params[P_STREAMS_ENABLED] != 0) {
+        // days_round can append only for this round's unique worklist entries,
+        // so each SIMD group owns one producer and all of its channels. Lane
+        // zero preserves the scalar channel-cursor recurrence; the other lanes
+        // only copy words into its selected, disjoint ring slots.
+        ulong group = ulong(block) * groups_per_block + group_in_block;
+        ulong group_stride = ulong(blocks) * groups_per_block;
+        for (
+            ulong active_index = group;
+            active_index < control[C_ACTIVE];
+            active_index += group_stride
+        ) {
+            ulong producer = worklist[active_index];
+            ulong staging = 0;
+            ulong count = 0;
+            if (lane == 0) {
+                ulong base = producer * META_WORDS;
+                staging = remote_meta[base];
+                count = remote_meta[base + 3];
+            }
+            staging = scatter_simd_broadcast_ulong(staging);
+            count = scatter_simd_broadcast_ulong(count);
+
+            for (ulong index = 0; index < count; index += 2) {
+                ulong first_target = 0;
+                ulong second_target = 0;
+                if (lane == 0) {
+                    first_target =
+                        scatter_stream_target(staging + index, params, stream_state);
+                    if (index + 1 < count) {
+                        second_target = scatter_stream_target(
+                            staging + index + 1,
+                            params,
+                            stream_state
+                        );
+                    }
+                }
+                first_target = scatter_simd_broadcast_ulong(first_target);
+                second_target = scatter_simd_broadcast_ulong(second_target);
+
+                if (lane < 2 * EVENT_WORDS) {
+                    ulong record = lane / EVENT_WORDS;
+                    uint word = lane % EVENT_WORDS;
+                    if (index + record < count) {
+                        ulong source_slot = staging + index + record;
+                        ulong target_slot = record == 0 ? first_target : second_target;
+                        stream_records[target_slot * EVENT_WORDS + word] =
+                            remote_staging[source_slot * EVENT_WORDS + word];
+                    }
+                }
+            }
+
+            if (lane == 0) {
+                ulong outbound_meta =
+                    params[P_OUTBOUND_META_OFFSET] +
+                    producer * OUTBOUND_META_WORDS;
+                ulong entry = stream_state[outbound_meta];
+                ulong entry_count = stream_state[outbound_meta + 1];
+                for (ulong index = 0; index < entry_count; ++index) {
+                    ulong channel =
+                        stream_state[entry + index * OUTBOUND_ENTRY_WORDS + 1];
+                    ulong batch =
+                        params[P_CHANNEL_BATCH_OFFSET] +
+                        channel * CHANNEL_BATCH_WORDS;
+                    ulong count =
+                        stream_state[channel * META_WORDS + 3] + stream_state[batch];
+                    stream_state[channel * META_WORDS + 3] = count;
+                    RECORD_STREAM_HIGH_WATER(params, stream_state, channel, count);
+                }
+            }
+        }
+        return;
+    }
+    if (global_thread >= params[P_NODE_COUNT]) {
+        return;
+    }
+    ulong producer = global_thread;
     ulong base = ulong(producer) * META_WORDS;
     ulong staging = remote_meta[base];
     ulong compact = remote_meta[base + 2];
     ulong count = remote_meta[base + 3];
-    if (params[P_STREAMS_ENABLED] != 0) {
-        for (ulong index = 0; index < count; ++index) {
-            ulong staging_slot = staging + index;
-            ulong channel =
-                stream_state[params[P_STAGING_CHANNEL_OFFSET] + staging_slot];
-            ulong batch =
-                params[P_CHANNEL_BATCH_OFFSET] +
-                channel * CHANNEL_BATCH_WORDS;
-            ulong cursor = stream_state[batch + 3];
-            ulong stream_base = channel * META_WORDS;
-            ulong capacity = stream_state[stream_base + 1];
-            ulong physical = (
-                stream_state[stream_base + 2] +
-                stream_state[stream_base + 3] +
-                cursor
-            ) % max(capacity, 1ul);
-            copy_device_record(
-                remote_staging,
-                staging_slot,
-                stream_records,
-                stream_state[stream_base] + physical
-            );
-            stream_state[batch + 3] = cursor + 1;
-        }
-        ulong outbound_meta =
-            params[P_OUTBOUND_META_OFFSET] +
-            ulong(producer) * OUTBOUND_META_WORDS;
-        ulong entry = stream_state[outbound_meta];
-        ulong entry_count = stream_state[outbound_meta + 1];
-        for (ulong index = 0; index < entry_count; ++index) {
-            ulong channel =
-                stream_state[entry + index * OUTBOUND_ENTRY_WORDS + 1];
-            ulong batch =
-                params[P_CHANNEL_BATCH_OFFSET] +
-                channel * CHANNEL_BATCH_WORDS;
-            ulong count =
-                stream_state[channel * META_WORDS + 3] + stream_state[batch];
-            stream_state[channel * META_WORDS + 3] = count;
-            RECORD_STREAM_HIGH_WATER(params, stream_state, channel, count);
-        }
-        return;
-    }
     for (ulong index = 0; index < count; ++index) {
         copy_device_record(
             remote_staging,
