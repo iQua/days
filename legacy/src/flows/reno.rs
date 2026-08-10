@@ -27,8 +27,6 @@ pub struct TCPReno {
     state: TCPRenoState,
     /// Minimum allowed window size
     min_cwnd: usize,
-    /// Maximum allowed window size
-    max_cwnd: usize,
     /// Unacknowledged bytes tracked through the source integration hook
     packets_in_flight: usize,
     /// Most recent RTT sample
@@ -96,7 +94,6 @@ impl TCPReno {
             ssthresh: 65535,
             state: TCPRenoState::SlowStart,
             min_cwnd: mss,
-            max_cwnd: 65535,
             packets_in_flight: 0,
             last_rtt: 0.0,
             prev_rtt: None,
@@ -174,8 +171,7 @@ impl TCPReno {
     /// - Retransmitting next unacknowledged segment
     fn update_recovery_window(&mut self) {
         if self.state == TCPRenoState::FastRecovery {
-            self.recovery_window = self.pre_recovery_flight_size + self.mss;
-            self.recovery_window = self.recovery_window.min(self.max_cwnd);
+            self.recovery_window = self.pre_recovery_flight_size.saturating_add(self.mss);
             self.recovery_exit_threshold = self.recovery_window;
         }
     }
@@ -211,7 +207,7 @@ impl TCPReno {
         match self.state {
             TCPRenoState::SlowStart => {
                 let increase = self.mss.min(bytes_acked);
-                self.cwnd = (self.cwnd + increase).max(self.min_cwnd).min(self.max_cwnd);
+                self.cwnd = self.cwnd.saturating_add(increase).max(self.min_cwnd);
 
                 if self.cwnd >= self.ssthresh {
                     self.state = TCPRenoState::CongestionAvoidance;
@@ -227,7 +223,7 @@ impl TCPReno {
                 let cwnd_increase = self.cwnd_increment.floor() as usize;
 
                 if cwnd_increase > 0 {
-                    self.cwnd = (self.cwnd + cwnd_increase).min(self.max_cwnd);
+                    self.cwnd = self.cwnd.saturating_add(cwnd_increase);
                     self.cwnd_increment -= cwnd_increase as f64;
                 }
             }
@@ -235,10 +231,12 @@ impl TCPReno {
                 if bytes_acked < self.recovery_high_seq {
                     // Partial ACK - RFC 6582 Section 3.2
                     // Deflate cwnd by the amount of new data acknowledged and add one MSS
-                    self.cwnd = (self.cwnd.saturating_sub(
-                        bytes_acked - (self.highest_ack - (self.highest_ack - bytes_acked)),
-                    ) + self.mss)
-                        .min(self.max_cwnd);
+                    self.cwnd = self
+                        .cwnd
+                        .saturating_sub(
+                            bytes_acked - (self.highest_ack - (self.highest_ack - bytes_acked)),
+                        )
+                        .saturating_add(self.mss);
 
                     self.retransmit_required = true;
                 } else {
@@ -337,7 +335,10 @@ impl CongestionControl for TCPReno {
         self.ssthresh = (self.pre_recovery_flight_size / 2).max(2 * self.mss);
         self.update_recovery_window();
         self.pipe = self.estimate_pipe();
-        self.cwnd = (self.ssthresh + 3 * self.mss).max(self.min_cwnd);
+        self.cwnd = self
+            .ssthresh
+            .saturating_add(self.mss.saturating_mul(3))
+            .max(self.min_cwnd);
         self.dupack_count = 3;
         self.recovery_high_seq = self.snd_max;
         self.retransmit_required = false;
@@ -365,7 +366,7 @@ impl CongestionControl for TCPReno {
             self.pipe = self.estimate_pipe();
 
             // Inflate window by 1 MSS per additional dupack
-            self.cwnd += self.mss;
+            self.cwnd = self.cwnd.saturating_add(self.mss);
             self.dupack_count += 1;
 
             // New sends, if the inflated window permits them, are accounted by packet_sent.
@@ -592,22 +593,11 @@ mod tests {
     }
 
     #[test]
-    fn test_window_bounds() {
-        // Test minimum bound
+    fn test_minimum_window_bound() {
         let mut reno = TCPReno::new();
         reno.cwnd = 100;
         reno.timer_expired();
         assert_eq!(reno.cwnd, reno.min_cwnd);
-
-        // Create a new instance for the maximum bound test
-        let mut reno = TCPReno::new();
-
-        // Test maximum bound
-        reno.cwnd = reno.max_cwnd + 1000;
-        let mss = reno.mss;
-        let snd_max = reno.snd_max;
-        ack(mss, &mut reno, snd_max, 0.1, 0.1);
-        assert_eq!(reno.cwnd, reno.max_cwnd);
     }
 
     #[test]
@@ -708,7 +698,6 @@ mod tests {
 
         // Recovery window should be flight size + MSS
         assert_eq!(reno.recovery_window, 10000 + reno.mss);
-        assert!(reno.recovery_window <= reno.max_cwnd);
     }
 
     #[test]

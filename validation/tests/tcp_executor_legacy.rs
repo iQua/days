@@ -16,7 +16,7 @@ fn legacy_ack(control: &mut dyn CongestionControl, acknowledgment: u64, now_ns: 
 }
 
 #[test]
-fn executor_reno_matches_legacy_slow_start_then_documents_exact_ca_divergence() {
+fn executor_reno_matches_legacy_slow_start_then_documents_f64_ca_divergence() {
     let mut legacy = TCPReno::new();
     let mut executor = TcpCongestionControl::reno(MSS);
     let mut acknowledgment = 0;
@@ -68,9 +68,11 @@ fn executor_reno_matches_legacy_slow_start_then_documents_exact_ca_divergence() 
         }
     }
     let (ack_index, exact, float) = first_divergence.expect("the CA trajectories must diverge");
-    assert_eq!(float, 65_535, "legacy clamps CA at max_cwnd");
+    assert_eq!(ack_index, 1);
+    assert_eq!(exact, 65_535);
+    assert_eq!(float, 65_539);
     println!(
-        "reno first_ca_divergence_ack={ack_index} executor={exact} legacy={float} divergence={} (integer ABC versus legacy f64 accumulator plus 65535-byte cap)",
+        "reno first_ca_divergence_ack={ack_index} executor={exact} legacy={float} divergence={} (integer ABC versus legacy f64 accumulator)",
         float as i64 - exact as i64
     );
 }
