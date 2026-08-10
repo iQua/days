@@ -61,6 +61,7 @@ fn main() {
     );
 
     let mut sink = PacketSink::new(&source);
+    let sink_id = sink.id();
 
     // instantiates models' mailboxes
     let source_mbox = Mailbox::new();
@@ -87,7 +88,7 @@ fn main() {
         Ok(mut sim) => {
             let _ = sim.step_until(Duration::from_secs(10));
 
-            let _ = sim.process_event_fn(PacketSink::report, 2, &sink_addr);
+            let _ = sim.process_event_fn(PacketSink::report, sink_id, &sink_addr);
 
             info!(
                 "Simulation completed at time {:.3}.",

@@ -78,6 +78,7 @@ fn main() {
     );
 
     let mut sink = PacketSink::new(&source);
+    let sink_id = sink.id();
 
     let source_mbox = Mailbox::new();
     let server_mbox = Mailbox::new();
@@ -111,7 +112,7 @@ fn main() {
             let _ = sim.step_until(Duration::from_secs(20));
 
             // requests the packet sink to report statistics
-            let _ = sim.process_event_fn(PacketSink::report, 2, &sink_addr);
+            let _ = sim.process_event_fn(PacketSink::report, sink_id, &sink_addr);
             if let Some(statistics) = sink_statistics.next() {
                 info!("{:#.3}", statistics);
             }

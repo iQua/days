@@ -128,11 +128,11 @@ fn assert_only_capacity_valid_packets_departed(mut reader: impl EventSinkReader<
 }
 
 #[test]
-fn fifo_rounding_does_not_delay_future_service_starts() {
+fn fifo_uses_exact_ceiling_service_deadlines() {
     let mut packets: Vec<_> = (0..20)
         .map(|packet_id| Packet::new(64, packet_id, 0, 0.0))
         .collect();
-    packets.push(Packet::new(1_280, 20, 0, 101e-9));
+    packets.push(Packet::new(1_280, 20, 0, 121e-9));
 
     let mut source = ScriptedPacketSource::new(packets);
     let mut scheduler = Port::new(
@@ -169,23 +169,20 @@ fn fifo_rounding_does_not_delay_future_service_starts() {
     }
 
     let mut expected: Vec<_> = (0..20)
-        .map(|packet_id| (packet_id, (packet_id as u128 + 1) * 5))
+        .map(|packet_id| (packet_id, (packet_id as u128 + 1) * 6))
         .collect();
-    expected.push((20, 203));
+    expected.push((20, 224));
 
     assert_eq!(
         observed, expected,
-        "the backlog must depart by 100 ns so the 101 ns arrival is admitted"
+        "64 bytes at 100 Gb/s must consume the exact 6 ns ceiling without f64 drift"
     );
 }
 
 #[test]
-fn fifo_idle_port_starts_service_when_busy_until_is_one_ulp_ahead() {
-    let rate = f64::from_bits(800.0_f64.to_bits() - 1);
+fn fifo_idle_port_starts_service_at_the_exact_integer_deadline() {
+    let rate = 800.0;
     let first_size = 149_935;
-    let busy_until = first_size as f64 * 8.0 / rate;
-    let event_time = Duration::from_secs_f64(busy_until).as_nanos() as f64 / 1_000_000_000.0;
-    assert_eq!(busy_until - event_time, f64::EPSILON * 1024.0);
 
     let mut source = ScriptedPacketSource::new(vec![Packet::new(first_size, 0, 0, 0.0)]);
     let mut scheduler = Port::new(rate, 2, CapacityUnit::Packets, DropStrategy::TailDrop, 0.0);
@@ -225,7 +222,7 @@ fn fifo_idle_port_starts_service_when_busy_until_is_one_ulp_ahead() {
     assert_eq!(
         observed,
         vec![0, 1],
-        "an idle port must not strand a queued packet when busy_until is one ULP ahead"
+        "an idle port must not strand a packet returned at its exact service deadline"
     );
 }
 
