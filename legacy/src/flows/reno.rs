@@ -323,7 +323,7 @@ impl CongestionControl for TCPReno {
             }
             self.last_reduction_time = current_time;
         } else {
-            self.update_cwnd(bytes_acked);
+            self.update_cwnd(actual_bytes_acked);
         }
 
         self.packets_in_flight = self.packets_in_flight.saturating_sub(actual_bytes_acked);
@@ -430,6 +430,21 @@ mod tests {
         // Another ACK
         ack(mss, &mut reno, mss * 2, 0.1, 0.2);
         assert_eq!(reno.cwnd, initial_cwnd + 2 * reno.mss);
+    }
+
+    #[test]
+    fn hole_closing_cumulative_ack_credits_full_advance_outside_fast_recovery() {
+        let mut reno = TCPReno::new();
+        reno.state = TCPRenoState::CongestionAvoidance;
+        reno.cwnd = 4096;
+        reno.highest_ack = 512;
+        reno.cwnd_increment = 0.0;
+
+        ack(512, &mut reno, 2048, 0.1, 0.1);
+
+        assert_eq!(reno.highest_ack, 2048);
+        assert_eq!(reno.cwnd, 4288);
+        assert_eq!(reno.cwnd_increment, 0.0);
     }
 
     #[test]

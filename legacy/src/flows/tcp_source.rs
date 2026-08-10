@@ -542,6 +542,15 @@ impl TCPPacketSource {
                 );
             }
 
+            let newly_acknowledged = ack.sequence_num.saturating_sub(self.last_ack);
+            #[cfg(feature = "test")]
+            assert!(
+                std::env::var_os("DAYS_E3_ASSERT_NO_CUMULATIVE_ACK_JUMP").is_none()
+                    || newly_acknowledged <= ack.acknowledged_size,
+                "E3 source cumulative ACK advance {newly_acknowledged} exceeded sink-reported advance {}",
+                ack.acknowledged_size
+            );
+
             let prev_delivered = self.delivered;
             let delivered_bytes = if ack.sequence_num > prev_delivered {
                 ack.sequence_num - prev_delivered
@@ -560,7 +569,7 @@ impl TCPPacketSource {
                 ack_elapsed: sample_rtt,
                 send_elapsed: sample_rtt,
                 rtt: sample_rtt,
-                acked: ack.acknowledged_size,
+                acked: newly_acknowledged,
                 lost: self.pending_lost_bytes,
                 ecn_marked: self.pending_ecn_marked,
                 ..RateSample::default()
@@ -586,12 +595,12 @@ impl TCPPacketSource {
                 ack_seq: ack.sequence_num,
                 rtt: sample_rtt,
                 now,
-                bytes_acked: ack.acknowledged_size,
+                bytes_acked: newly_acknowledged,
                 rate_sample,
             });
             #[cfg(feature = "lean")]
             {
-                let acked_bytes = ack.acknowledged_size.max(1);
+                let acked_bytes = newly_acknowledged.max(1);
                 let acked_segs = acked_bytes.saturating_add(self.mss.saturating_sub(1)) / self.mss;
                 let rtt_ns = to_ns(sample_rtt);
                 let rtt_s = (rtt_ns as f64) * 1e-9;
@@ -1018,7 +1027,39 @@ mod tests {
     use futures::executor::block_on;
     use futures::join;
     use rand::SeedableRng;
+    use std::any::Any;
     use std::collections::BTreeSet;
+
+    #[derive(Default)]
+    struct RecordingCongestionControl {
+        last_ack: Option<AckEvent>,
+    }
+
+    impl CongestionControl for RecordingCongestionControl {
+        fn ack_received(&mut self, event: AckEvent) {
+            self.last_ack = Some(event);
+        }
+
+        fn timer_expired(&mut self) {}
+
+        fn dupack_over(&mut self) {}
+
+        fn consecutive_dupacks_received(&mut self) {}
+
+        fn more_dupacks_received(&mut self) {}
+
+        fn get_cwnd(&self) -> usize {
+            0
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn as_any_mut(&mut self) -> &mut dyn Any {
+            self
+        }
+    }
 
     fn make_source(ecn: bool) -> TCPPacketSource {
         let traffic = TrafficCharacteristics::new(
@@ -1116,6 +1157,29 @@ mod tests {
         let ack_new = make_ack(source.flow_id, 200, source.mss, false, 2.0);
         let _ = block_on(source.ack_packet_received(ack_new, 2_000_000_000));
         assert_eq!(source.dupack, 0);
+    }
+
+    #[test]
+    fn hole_closing_cumulative_ack_credits_full_advance_at_source() {
+        let mut source = make_source(false);
+        source.last_ack = 512;
+        source.delivered = 512;
+        source.congestion_control = Box::new(RecordingCongestionControl::default());
+
+        let mut closing_ack = make_ack(source.flow_id, 2048, 512, false, 0.000_001);
+        closing_ack.packet_id = 512;
+        let _ = block_on(source.ack_packet_received(closing_ack, 1_000));
+
+        let event = &source
+            .congestion_control
+            .as_any()
+            .downcast_ref::<RecordingCongestionControl>()
+            .expect("recording congestion controller")
+            .last_ack
+            .as_ref()
+            .expect("controller did not receive ACK");
+        assert_eq!(event.bytes_acked, 1536);
+        assert_eq!(event.rate_sample.acked, 1536);
     }
 
     #[test]

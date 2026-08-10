@@ -116,7 +116,7 @@ impl TCPPacketSink {
         }
     }
 
-    fn build_acknowledgment(&self, packet: &Packet, now: f64) -> Packet {
+    fn build_acknowledgment(&self, packet: &Packet, newly_acknowledged: usize, now: f64) -> Packet {
         Packet {
             time: now,
             creation_time: packet.creation_time,
@@ -128,7 +128,7 @@ impl TCPPacketSink {
             priority: packet.priority,
             ack: Some(TCPAck {
                 sequence_num: self.next_seq_expected,
-                acknowledged_size: packet.size,
+                acknowledged_size: newly_acknowledged,
                 ece: self.ecn_echo,
             }),
             control: None,
@@ -140,6 +140,7 @@ impl TCPPacketSink {
     #[instrument(skip(self))]
     pub async fn produce_ack(&mut self, packet: Packet, now: f64) {
         let sequence_num = packet.packet_id;
+        let previous_ack = self.next_seq_expected;
 
         // inserts the packet into the receive buffer and sorts based on the
         // sequence number of the packet (packet_id)
@@ -171,7 +172,16 @@ impl TCPPacketSink {
         self.recv_buffer
             .retain(|(_, end)| *end > self.next_seq_expected);
 
-        let acknowledgment = self.build_acknowledgment(&packet, now);
+        let newly_acknowledged = self.next_seq_expected.saturating_sub(previous_ack);
+        #[cfg(feature = "test")]
+        assert!(
+            std::env::var_os("DAYS_E3_ASSERT_NO_CUMULATIVE_ACK_JUMP").is_none()
+                || newly_acknowledged <= packet.size,
+            "E3 sink cumulative ACK advance {newly_acknowledged} exceeded triggering packet size {}",
+            packet.size
+        );
+
+        let acknowledgment = self.build_acknowledgment(&packet, newly_acknowledged, now);
 
         // sends the acknowledgment packet out to the TCPPacketSource now
         let ack_size = acknowledgment.size;
@@ -212,6 +222,7 @@ impl Model for TCPPacketSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nexosim::ports::{EventSinkReader, SinkState, event_queue};
 
     #[test]
     fn test_ece_echo_latches_and_clears_on_cwr() {
@@ -262,7 +273,7 @@ mod tests {
             .push((packet.packet_id, packet.packet_id + packet.size));
         sink.next_seq_expected = packet.packet_id + packet.size;
 
-        let ack = sink.build_acknowledgment(&packet, 0.250);
+        let ack = sink.build_acknowledgment(&packet, packet.size, 0.250);
 
         assert_eq!(ack.time, 0.250);
         assert_eq!(ack.creation_time, 0.125);
@@ -275,16 +286,28 @@ mod tests {
     }
 
     #[test]
-    fn cumulative_ack_never_advances_across_a_sequence_hole() {
+    fn hole_closing_cumulative_ack_credits_full_advance_at_sink() {
         let mut sink = TCPPacketSink::new(9);
+        let (writer, mut acknowledgments) = event_queue(SinkState::Enabled);
+        sink.output.connect_sink(writer);
 
         futures::executor::block_on(sink.produce_ack(Packet::new(1460, 1460, 9, 0.0), 0.000_001));
         assert_eq!(sink.next_seq_expected, 0);
+        let first = acknowledgments.try_read().expect("missing first ACK");
+        assert_eq!(first.ack.expect("missing TCP ACK").sequence_num, 0);
 
         futures::executor::block_on(sink.produce_ack(Packet::new(580, 2920, 9, 0.0), 0.000_002));
         assert_eq!(sink.next_seq_expected, 0);
+        let second = acknowledgments.try_read().expect("missing second ACK");
+        assert_eq!(second.ack.expect("missing TCP ACK").sequence_num, 0);
 
         futures::executor::block_on(sink.produce_ack(Packet::new(1460, 0, 9, 0.0), 0.000_003));
         assert_eq!(sink.next_seq_expected, 3500);
+        let closing = acknowledgments
+            .try_read()
+            .expect("missing hole-closing ACK");
+        let ack = closing.ack.expect("missing TCP ACK");
+        assert_eq!(ack.sequence_num, 3500);
+        assert_eq!(ack.acknowledged_size, 3500);
     }
 }
