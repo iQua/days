@@ -93,6 +93,7 @@ fn e3_integer_totals_match_pre_e5_tag() {
 
     cargo_bin_cmd!("days")
         .env("RUST_LOG", "error")
+        .env("DAYS_E3_ASSERT_NO_FAST_RETRANSMIT", "1")
         .arg(&config)
         .assert()
         .success();

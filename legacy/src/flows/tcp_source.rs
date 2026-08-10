@@ -426,6 +426,12 @@ impl TCPPacketSource {
         }
 
         if self.dupack >= 3 {
+            #[cfg(feature = "test")]
+            assert!(
+                std::env::var_os("DAYS_E3_ASSERT_NO_FAST_RETRANSMIT").is_none(),
+                "E3 entered the duplicate-ACK fast-retransmit path"
+            );
+
             if self.dupack == 3 {
                 let loss_size = self
                     .sent_packets
@@ -446,23 +452,23 @@ impl TCPPacketSource {
                     now,
                     Some(flight_size_bytes),
                 );
-            }
 
-            if let Some(resent_pkt) = self.sent_packets.get_mut(&ack.sequence_num) {
-                resent_pkt.time = now;
-                Self::apply_ecn_on_retransmit(resent_pkt);
-                self.output.send(resent_pkt.clone()).await;
-                self.retransmissions += 1;
-                self.retransmitted_bytes += resent_pkt.size;
+                if let Some(resent_pkt) = self.sent_packets.get_mut(&ack.sequence_num) {
+                    resent_pkt.time = now;
+                    Self::apply_ecn_on_retransmit(resent_pkt);
+                    self.output.send(resent_pkt.clone()).await;
+                    self.retransmissions += 1;
+                    self.retransmitted_bytes += resent_pkt.size;
 
-                debug!(
-                    "Due to dupack, TCPPacketSource {} resent packet {} ({} bytes) from flow {} at time {:.3}.",
-                    self.endpoint_id,
-                    resent_pkt.packet_id,
-                    resent_pkt.size,
-                    resent_pkt.flow_id,
-                    now,
-                );
+                    debug!(
+                        "Due to dupack, TCPPacketSource {} resent packet {} ({} bytes) from flow {} at time {:.3}.",
+                        self.endpoint_id,
+                        resent_pkt.packet_id,
+                        resent_pkt.size,
+                        resent_pkt.flow_id,
+                        now,
+                    );
+                }
             }
 
             if self.dupack > 3 {
@@ -1290,12 +1296,13 @@ mod tests {
     }
 
     #[test]
-    fn three_duplicate_acks_fast_retransmit_the_hole_with_byte_flight_accounting() {
+    fn later_duplicate_acks_inflate_the_window_without_retransmitting_the_hole_again() {
         let mut source = make_source(false);
         for sequence in [0, 512, 1024, 1536] {
             let packet = Packet::new(512, sequence, source.flow_id, 0.0);
             source.packet_sent(&packet, 0);
         }
+        source.send_buffer = 2560;
         let reno = source
             .congestion_control
             .as_any()
@@ -1316,6 +1323,19 @@ mod tests {
         assert_eq!(source.total_original_packets, 4);
         assert_eq!(source.sent_size, 2048);
         assert_eq!(source.retransmissions, 1);
+
+        let mut fourth_ack = make_ack(source.flow_id, 0, 512, false, 0.000_004);
+        fourth_ack.packet_id = 1536;
+        let _ = block_on(source.ack_packet_received(fourth_ack, 4_000));
+
+        assert_eq!(source.dupack, 4);
+        assert_eq!(source.sent_packets[&0].time, 0.000_003);
+        assert_eq!(source.congestion_control.get_cwnd(), 3072);
+        assert_eq!(source.retransmissions, 1);
+        assert_eq!(source.retransmitted_bytes, 512);
+        assert_eq!(source.sent_packets[&2048].time, 0.000_004);
+        assert_eq!(source.total_original_packets, 5);
+        assert_eq!(source.sent_size, 2560);
     }
 
     #[test]
