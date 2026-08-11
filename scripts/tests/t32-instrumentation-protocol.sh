@@ -12,7 +12,7 @@ PROOF_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/t32-protocol-test.XXXXXX")
 trap 'rm -rf "$PROOF_ROOT"' EXIT
 
 expect_failure() {
-    local reason="$1" output="$2"
+    local reason="$1" output="$2" failure expected
     shift 2
     set +e
     "$@" >"$output" 2>&1
@@ -22,14 +22,31 @@ expect_failure() {
         echo "expected nonzero failure reason=$reason" >&2
         return 1
     fi
-    grep -Fq "T32_PROTOCOL_FAIL reason=$reason" "$output"
+    case "$reason" in
+        DIRTY_WORKTREE) expected=70 ;;
+        FIXTURE_SHA256_MISMATCH) expected=72 ;;
+        MISSING_QUIET_CAPTURE) expected=73 ;;
+        IDENTITY_MISMATCH) expected=74 ;;
+        MISSING_PREPARE_COMPARISON) expected=78 ;;
+        PREPARE_TOLERANCE_EXCEEDED) expected=86 ;;
+        QUIET_PROBE_FAILED) expected=87 ;;
+        SOURCE_CONTENT_DRIFT) expected=88 ;;
+        *) expected="$rc" ;;
+    esac
+    if [[ "$rc" -ne "$expected" ]]; then
+        echo "wrong exit reason=$reason expected=$expected actual=$rc" >&2
+        return 1
+    fi
+    failure=$(grep -Fm1 "T32_PROTOCOL_FAIL reason=$reason" "$output")
+    printf '%s\n' "$failure"
     printf 'proof=%s exit=%s status=PASS\n' "$reason" "$rc"
 }
 
 make_repo() {
     local target="$1"
-    mkdir -p "$target/scripts"
+    mkdir -p "$target/scripts" "$target/src/bin"
     cp "$DRIVER" "$ANALYZER" "$MANIFEST" "$target/scripts/"
+    cp "$REPO/src/bin/t32_drain_profile.rs" "$target/src/bin/"
     while IFS=$'\t' read -r name path sha rounds transitions bytes fnv; do
         [[ -n "$name" ]] || continue
         mkdir -p "$target/$(dirname "$path")"
@@ -38,7 +55,7 @@ make_repo() {
     git -C "$target" init -q
     git -C "$target" config user.name "T32 Protocol Test"
     git -C "$target" config user.email "t32-protocol@example.invalid"
-    git -C "$target" add scripts configs
+    git -C "$target" add scripts configs src
     git -C "$target" commit -qm "Create protocol proof repository"
 }
 
@@ -98,10 +115,10 @@ emit_quiet() {
 }
 
 make_valid_cuda_log() {
-    local log="$1"
+    local log="$1" machine="${2:-boston}"
     local pin=2222222222222222222222222222222222222222
     : >"$log"
-    printf 'record=t32_protocol_start mode=cuda machine=boston expected_commit=%s actual_commit=%s\n' "$pin" "$pin" >>"$log"
+    printf 'record=t32_protocol_start mode=cuda machine=%s expected_commit=%s actual_commit=%s\n' "$machine" "$pin" "$pin" >>"$log"
     printf 'record=t32_protocol_preflight status=PASS fixture_count=7 worktree=clean\n' >>"$log"
     printf 'record=t32_protocol_binary role=phase sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n' >>"$log"
     printf 'record=t32_protocol_binary role=counter sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' >>"$log"
@@ -110,7 +127,7 @@ make_valid_cuda_log() {
         for position in 0 1 2 3 4 5 6; do
             i=$(((sample + position) % 7))
             IFS=$'\t' read -r name path sha rounds transitions bytes fnv < <(sed -n "$((i + 1))p" "$MANIFEST")
-            sample_id="boston_s${sample}_i${i}_a1"
+            sample_id="${machine}_s${sample}_i${i}_a1"
             order=unsplit_then_split
             if ((sample % 2 == 1)); then
                 order=split_then_unsplit
@@ -141,6 +158,34 @@ touch "$dirty_repo/untracked-drift"
 expect_failure DIRTY_WORKTREE "$PROOF_ROOT/dirty.out" \
     "$dirty_repo/scripts/t32-instrumentation-protocol.sh" preflight "$dirty_pin"
 
+clean_source_repo="$PROOF_ROOT/clean-source-repo"
+make_repo "$clean_source_repo"
+clean_source_pin=$(git -C "$clean_source_repo" rev-parse HEAD)
+"$clean_source_repo/scripts/t32-instrumentation-protocol.sh" preflight "$clean_source_pin" \
+    >"$PROOF_ROOT/clean-source.out"
+grep -Fq 'record=t32_protocol_preflight status=PASS' "$PROOF_ROOT/clean-source.out"
+echo 'proof=SOURCE_CONTENT_CLEAN exit=0 status=PASS'
+
+visible_source_repo="$PROOF_ROOT/visible-source-repo"
+make_repo "$visible_source_repo"
+visible_source_pin=$(git -C "$visible_source_repo" rev-parse HEAD)
+printf '\n// visible tracked drift retains its existing refusal\n' \
+    >>"$visible_source_repo/src/bin/t32_drain_profile.rs"
+expect_failure DIRTY_WORKTREE "$PROOF_ROOT/visible-source.out" \
+    "$visible_source_repo/scripts/t32-instrumentation-protocol.sh" preflight "$visible_source_pin"
+
+hidden_source_repo="$PROOF_ROOT/hidden-source-repo"
+make_repo "$hidden_source_repo"
+hidden_source_pin=$(git -C "$hidden_source_repo" rev-parse HEAD)
+printf '\n// assume-unchanged must not hide this drift\n' \
+    >>"$hidden_source_repo/src/bin/t32_drain_profile.rs"
+git -C "$hidden_source_repo" update-index --assume-unchanged src/bin/t32_drain_profile.rs
+hidden_status=$(git -C "$hidden_source_repo" status --porcelain=v1 --untracked-files=all)
+[[ -z "$hidden_status" ]]
+echo 'proof=ASSUME_UNCHANGED_OLD_STATUS exit=0 status=PASS'
+expect_failure SOURCE_CONTENT_DRIFT "$PROOF_ROOT/hidden-source.out" \
+    "$hidden_source_repo/scripts/t32-instrumentation-protocol.sh" preflight "$hidden_source_pin"
+
 fixture_repo="$PROOF_ROOT/fixture-repo"
 make_repo "$fixture_repo"
 fixture_pin=$(git -C "$fixture_repo" rev-parse HEAD)
@@ -158,6 +203,31 @@ sed '/sample_id=local_s0_i0_a1 surface=counter phase=pre/d' "$valid_log" >"$miss
 expect_failure MISSING_QUIET_CAPTURE "$PROOF_ROOT/missing-quiet.out" \
     python3 "$ANALYZER" local "$missing_quiet_log"
 
+failed_probe_log="$PROOF_ROOT/failed-probe.log"
+: >"$failed_probe_log"
+expect_failure QUIET_PROBE_FAILED "$PROOF_ROOT/failed-probe.out" \
+    bash -c '
+        eval "$(sed '\''/^\[\[ -n /,$d'\'' "$1")"
+        CURRENT_LOG="$2"
+        ps() { printf '\''%s 1 0.0 protocol-test\n'\'' "$$"; }
+        nvidia-smi() { return 23; }
+        quiet_probe failed_probe counter pre 1
+    ' bash "$DRIVER" "$failed_probe_log"
+
+successful_probe_log="$PROOF_ROOT/successful-probe.log"
+: >"$successful_probe_log"
+bash -c '
+    eval "$(sed '\''/^\[\[ -n /,$d'\'' "$1")"
+    CURRENT_LOG="$2"
+    ps() { printf '\''%s 1 0.0 protocol-test\n'\'' "$$"; }
+    nvidia-smi() { return 0; }
+    quiet_probe successful_probe counter pre 1
+' bash "$DRIVER" "$successful_probe_log" >"$PROOF_ROOT/successful-probe.out"
+grep -Fq 'sample_id=successful_probe' "$successful_probe_log"
+grep -Fq 'gpu_rows=0 external_busy=0 external_gpu=0' "$successful_probe_log"
+grep -Fq 'status=CLEAR' "$successful_probe_log"
+echo 'proof=QUIET_PROBE_EMPTY_SUCCESS exit=0 status=PASS'
+
 identity_log="$PROOF_ROOT/identity-mismatch.log"
 sed 's/sample_id=local_s0_i0_a1 surface=counter fixture=e1_10 rounds=18/sample_id=local_s0_i0_a1 surface=counter fixture=e1_10 rounds=19/' \
     "$valid_log" >"$identity_log"
@@ -168,6 +238,27 @@ cuda_log="$PROOF_ROOT/cuda.log"
 make_valid_cuda_log "$cuda_log"
 python3 "$ANALYZER" cuda "$cuda_log" >"$PROOF_ROOT/cuda.out"
 grep -Fq 'record=t32_protocol_analysis mode=cuda status=COLLECTED accepted=35' "$PROOF_ROOT/cuda.out"
+
+madrid_log="$PROOF_ROOT/madrid.log"
+make_valid_cuda_log "$madrid_log" madrid
+compare_local_log="$PROOF_ROOT/compare-local.log"
+sed 's/1111111111111111111111111111111111111111/2222222222222222222222222222222222222222/g' \
+    "$valid_log" >"$compare_local_log"
+"$DRIVER" compare-cuda "$cuda_log" "$madrid_log" "$compare_local_log" \
+    >"$PROOF_ROOT/compare-valid.out"
+grep -Fq 'record=t32_protocol_cross_machine status=PASS' "$PROOF_ROOT/compare-valid.out"
+echo 'proof=PREPARE_TOLERANCE_BOUNDARY exit=0 status=PASS'
+
+outlier_log="$PROOF_ROOT/outlier.log"
+sed \
+    -e '/sample_id=boston_s0_i0_a1 clock=cuda_device_events/ s/split_prepare_sum_ns=1050/split_prepare_sum_ns=1051/' \
+    -e '/sample_id=boston_s0_i0_a1 clock=cuda_device_events/ s/split_minus_unsplit_ns=50/split_minus_unsplit_ns=51/' \
+    -e '/sample_id=boston_s0_i0_a1 clock=cuda_device_events/ s/split_over_unsplit_numerator_ns=1050/split_over_unsplit_numerator_ns=1051/' \
+    -e '/sample_id=boston_s0_i0_a1 clock=cuda_device_events/ s/within_tolerance=true/within_tolerance=false/' \
+    -e '/sample_id=boston_s0_i0_a1 clock=cuda_device_events/ s/split_total_attribution=within_bound/split_total_attribution=perturbed_unusable/' \
+    "$cuda_log" >"$outlier_log"
+expect_failure PREPARE_TOLERANCE_EXCEEDED "$PROOF_ROOT/outlier.out" \
+    "$DRIVER" compare-cuda "$outlier_log" "$madrid_log" "$compare_local_log"
 
 missing_prepare_log="$PROOF_ROOT/missing-prepare.log"
 sed '/sample_id=boston_s0_i0_a1 clock=cuda_device_events/d' "$cuda_log" >"$missing_prepare_log"

@@ -92,6 +92,36 @@ verify_fixture_manifest() {
     [[ "$count" -eq 7 ]] || fail FIXTURE_MANIFEST_INVALID 72 "fixture_count=$count"
 }
 
+verify_tracked_content_at_pin() {
+    local pin="$1" index_dir index refresh_rc=0 diff_rc=0 drift first_path entries
+    index_dir=$(mktemp -d "${TMPDIR:-/tmp}/t32-source-index.XXXXXX") \
+        || fail SOURCE_CONTENT_DRIFT 88 "stage=create_temporary_index"
+    index="$index_dir/index"
+    if ! GIT_INDEX_FILE="$index" git -C "$REPO" read-tree "$pin" 2>/dev/null; then
+        rmdir "$index_dir" 2>/dev/null || true
+        fail SOURCE_CONTENT_DRIFT 88 "stage=read_pinned_tree"
+    fi
+
+    # A fresh index has no assume-unchanged bits or trusted worktree stat data. Really-refresh
+    # therefore hashes the current content against the pinned tree before diff-files reports drift.
+    GIT_INDEX_FILE="$index" git -C "$REPO" update-index -q --really-refresh -- \
+        >/dev/null 2>&1 || refresh_rc=$?
+    drift=$(GIT_INDEX_FILE="$index" git -C "$REPO" \
+        diff-files --name-only --ignore-submodules=none -- 2>/dev/null) || diff_rc=$?
+    rm -f "$index" "$index.lock"
+    rmdir "$index_dir" 2>/dev/null || true
+
+    [[ "$diff_rc" -eq 0 ]] \
+        || fail SOURCE_CONTENT_DRIFT 88 "stage=compare_pinned_tree rc=$diff_rc"
+    if [[ -n "$drift" ]]; then
+        first_path=$(printf '%s\n' "$drift" | sed -n '1p')
+        entries=$(printf '%s\n' "$drift" | awk 'NF { count++ } END { print count + 0 }')
+        fail SOURCE_CONTENT_DRIFT 88 "entries=$entries first_path=$first_path"
+    fi
+    [[ "$refresh_rc" -eq 0 ]] \
+        || fail SOURCE_CONTENT_DRIFT 88 "stage=hash_tracked_content rc=$refresh_rc"
+}
+
 verify_source_state() {
     local pin="$1" actual status
     require_literal_commit "$pin"
@@ -102,6 +132,7 @@ verify_source_state() {
     verify_fixture_manifest
     status=$(git -C "$REPO" status --porcelain=v1 --untracked-files=all)
     [[ -z "$status" ]] || fail DIRTY_WORKTREE 70 "entries=$(printf '%s\n' "$status" | wc -l | tr -d ' ')"
+    verify_tracked_content_at_pin "$pin"
 }
 
 preflight() {
@@ -142,17 +173,45 @@ quiet_probe() {
     local sample_id="$1" surface="$2" phase="$3" probe="$4"
     local snapshot tree busy gpu gpu_external process_rows gpu_rows external_busy external_gpu
     local tree_line busy_lines gpu_lines gpu_external_lines tree_sha process_sha busy_sha gpu_sha gpu_external_sha
+    local probe_rc=0
     snapshot=$(mktemp "${TMPDIR:-/tmp}/t32-processes.XXXXXX")
-    ps -Ao pid=,ppid=,%cpu=,command= >"$snapshot"
-    tree=$(own_process_tree "$snapshot" | tr '\n' ' ')
-    busy=$(awk -v limit="$BUSY_PCT" -v tree=" $tree " \
-        'NF >= 3 && $3 + 0 >= limit + 0 && index(tree, " " $1 " ") == 0 { print }' "$snapshot")
-    gpu=""
-    if command -v nvidia-smi >/dev/null 2>&1; then
-        gpu=$(nvidia-smi --query-compute-apps=pid,used_memory,name --format=csv,noheader 2>/dev/null || true)
+    ps -Ao pid=,ppid=,%cpu=,command= >"$snapshot" || probe_rc=$?
+    if [[ "$probe_rc" -ne 0 ]]; then
+        rm -f "$snapshot"
+        fail QUIET_PROBE_FAILED 87 "sample_id=$sample_id surface=$surface phase=$phase probe=$probe source=ps rc=$probe_rc"
     fi
+    probe_rc=0
+    tree=$(own_process_tree "$snapshot" | tr '\n' ' ') || probe_rc=$?
+    if [[ "$probe_rc" -ne 0 ]]; then
+        rm -f "$snapshot"
+        fail QUIET_PROBE_FAILED 87 "sample_id=$sample_id surface=$surface phase=$phase probe=$probe source=process_tree rc=$probe_rc"
+    fi
+    probe_rc=0
+    busy=$(awk -v limit="$BUSY_PCT" -v tree=" $tree " \
+        'NF >= 3 && $3 + 0 >= limit + 0 && index(tree, " " $1 " ") == 0 { print }' "$snapshot") \
+        || probe_rc=$?
+    if [[ "$probe_rc" -ne 0 ]]; then
+        rm -f "$snapshot"
+        fail QUIET_PROBE_FAILED 87 "sample_id=$sample_id surface=$surface phase=$phase probe=$probe source=process_filter rc=$probe_rc"
+    fi
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        rm -f "$snapshot"
+        fail QUIET_PROBE_FAILED 87 "sample_id=$sample_id surface=$surface phase=$phase probe=$probe source=nvidia_smi_compute_apps error=command_not_found"
+    fi
+    probe_rc=0
+    gpu=$(nvidia-smi --query-compute-apps=pid,used_memory,name \
+        --format=csv,noheader 2>/dev/null) || probe_rc=$?
+    if [[ "$probe_rc" -ne 0 ]]; then
+        rm -f "$snapshot"
+        fail QUIET_PROBE_FAILED 87 "sample_id=$sample_id surface=$surface phase=$phase probe=$probe source=nvidia_smi_compute_apps rc=$probe_rc"
+    fi
+    probe_rc=0
     gpu_external=$(printf '%s\n' "$gpu" | awk -F', *' -v tree=" $tree " \
-        'NF && index(tree, " " $1 " ") == 0 { print }')
+        'NF && index(tree, " " $1 " ") == 0 { print }') || probe_rc=$?
+    if [[ "$probe_rc" -ne 0 ]]; then
+        rm -f "$snapshot"
+        fail QUIET_PROBE_FAILED 87 "sample_id=$sample_id surface=$surface phase=$phase probe=$probe source=gpu_filter rc=$probe_rc"
+    fi
     process_rows=$(wc -l <"$snapshot" | tr -d ' ')
     if [[ -n "$gpu" ]]; then
         gpu_rows=$(printf '%s\n' "$gpu" | awk 'NF { count++ } END { print count + 0 }')
@@ -238,6 +297,21 @@ reason_code() {
         PROTOCOL_CONTRACT_MISMATCH) printf '80\n' ;;
         *) printf '69\n' ;;
     esac
+}
+
+require_prepare_tolerance() {
+    local machine="$1" analysis="$2" cell_count failed fixture
+    cell_count=$(printf '%s\n' "$analysis" \
+        | grep -c '^record=t32_protocol_prepare_cell ' || true)
+    [[ "$cell_count" -eq 7 ]] \
+        || fail PREPARE_TOLERANCE_EXCEEDED 86 "machine=$machine cells=$cell_count"
+    failed=$(printf '%s\n' "$analysis" \
+        | grep '^record=t32_protocol_prepare_cell .* all_within_tolerance=false ' \
+        | sed -n '1p' || true)
+    if [[ -n "$failed" ]]; then
+        fixture=$(field "$failed" fixture)
+        fail PREPARE_TOLERANCE_EXCEEDED 86 "machine=$machine fixture=$fixture"
+    fi
 }
 
 single_record() {
@@ -536,8 +610,11 @@ run_cuda() {
 compare_cuda() {
     local boston_log="$1" madrid_log="$2" local_log="$3" role fixture
     local boston_sha madrid_sha local_sha boston_pin madrid_pin local_pin boston_machine madrid_machine
-    python3 "$ANALYZER" cuda "$boston_log"
-    python3 "$ANALYZER" cuda "$madrid_log"
+    local boston_analysis madrid_analysis
+    boston_analysis=$(python3 "$ANALYZER" cuda "$boston_log")
+    printf '%s\n' "$boston_analysis"
+    madrid_analysis=$(python3 "$ANALYZER" cuda "$madrid_log")
+    printf '%s\n' "$madrid_analysis"
     python3 "$ANALYZER" local "$local_log"
     boston_machine=$(awk '/^record=t32_protocol_start /{for(i=1;i<=NF;i++)if($i~/^machine=/){sub("machine=","",$i);print $i}}' "$boston_log")
     madrid_machine=$(awk '/^record=t32_protocol_start /{for(i=1;i<=NF;i++)if($i~/^machine=/){sub("machine=","",$i);print $i}}' "$madrid_log")
@@ -562,6 +639,8 @@ compare_cuda() {
         [[ "$boston_sha" == "$madrid_sha" && "$boston_sha" == "$local_sha" && -n "$boston_sha" ]] \
             || fail CROSS_MACHINE_COUNTER_MISMATCH 85 "fixture=$fixture boston=$boston_sha madrid=$madrid_sha local=$local_sha"
     done
+    require_prepare_tolerance boston "$boston_analysis"
+    require_prepare_tolerance madrid "$madrid_analysis"
     printf 'record=t32_protocol_cross_machine status=PASS commit=%s binary_hashes_equal=true counter_digests_equal=true local_reference_equal=true\n' "$boston_pin"
 }
 
