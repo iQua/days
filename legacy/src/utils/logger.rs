@@ -2,6 +2,8 @@
 
 use std::sync::{Arc, OnceLock};
 
+#[cfg(feature = "test")]
+pub use days::utils::logger::CorrectnessSnapshot;
 #[cfg(feature = "l2_pfc")]
 pub use days::utils::logger::PfcPortReport;
 #[cfg(feature = "lean")]
@@ -109,6 +111,11 @@ impl CsvLogger {
     #[cfg(feature = "test")]
     pub fn total_packets_sent(&self) -> usize {
         self.inner.total_packets_sent()
+    }
+
+    #[cfg(feature = "test")]
+    pub fn correctness_snapshot(&self) -> CorrectnessSnapshot {
+        self.inner.correctness_snapshot()
     }
 
     pub fn flush_reports(&self) {

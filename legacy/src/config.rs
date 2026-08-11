@@ -26,6 +26,7 @@ struct LegacyConfig {
     hot_workers: Option<usize>,
     concurrency_level: Option<toml::Value>,
     log_path: Option<toml::Value>,
+    csv_logging: Option<bool>,
     report_interval: Option<f64>,
     mailbox_capacity: Option<usize>,
     legacy_e5_metrics: Option<toml::Value>,
