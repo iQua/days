@@ -5432,6 +5432,289 @@ kernel void days_round(
 
 }
 
+// T32 read-only drain diagnostics. The production `days_round` entry above is intentionally
+// untouched. This counterpart occupies the same dispatch position and geometry, executes the
+// same semantic operations in the same order, and writes only a separate diagnostic buffer.
+//
+// Layout: one flag word per LP, then one disjoint histogram row per LP with a bin for each
+// possible active-head count, then one emission counter per immutable outbound channel. An LP is
+// owned by one canonical-worklist lane and every channel has exactly one source LP, so all writes
+// below have one owner across serial continuation dispatches. No cross-thread synchronization
+// participates in the observation.
+#if defined(DAYS_T32_DRAIN_PROFILE)
+constant ulong T32_FLAG_STREAMS_DISABLED = 1ul;
+constant ulong T32_FLAG_ACTIVE_LAYOUT = 2ul;
+constant ulong T32_FLAG_ACTIVE_COUNT = 4ul;
+constant ulong T32_FLAG_HEAD_OVERFLOW = 8ul;
+constant ulong T32_FLAG_REMOTE_COUNT = 16ul;
+constant ulong T32_FLAG_STAGING_SLOT = 32ul;
+constant ulong T32_FLAG_CHANNEL = 64ul;
+constant ulong T32_FLAG_CHANNEL_OVERFLOW = 128ul;
+
+inline void t32_diagnostic_flag(
+    ulong node,
+    ulong flag,
+    device ulong *diagnostics
+) {
+    diagnostics[node] = diagnostics[node] | flag;
+}
+
+inline bool t32_active_entry_capacity(
+    const device ulong *params,
+    thread ulong &capacity
+) {
+    ulong active_base = params[P_LP_ACTIVE_IDS_OFFSET];
+    ulong outbound_base = params[P_OUTBOUND_META_OFFSET];
+    if (outbound_base < active_base) {
+        return false;
+    }
+    ulong words = outbound_base - active_base;
+    if (words % ACTIVE_STREAM_ENTRY_WORDS != 0) {
+        return false;
+    }
+    capacity = words / ACTIVE_STREAM_ENTRY_WORDS;
+    return true;
+}
+
+inline void t32_record_head_visit(
+    ulong node,
+    ulong active_offset,
+    ulong active_count,
+    const device ulong *params,
+    const device ulong *stream_state,
+    device ulong *diagnostics
+) {
+    ulong active_entry_capacity;
+    ulong active_base = params[P_LP_ACTIVE_IDS_OFFSET];
+    if (
+        !t32_active_entry_capacity(params, active_entry_capacity) ||
+        active_offset < active_base
+    ) {
+        t32_diagnostic_flag(node, T32_FLAG_ACTIVE_LAYOUT, diagnostics);
+        return;
+    }
+    ulong relative = active_offset - active_base;
+    if (relative % ACTIVE_STREAM_ENTRY_WORDS != 0) {
+        t32_diagnostic_flag(node, T32_FLAG_ACTIVE_LAYOUT, diagnostics);
+        return;
+    }
+    ulong row = relative / ACTIVE_STREAM_ENTRY_WORDS;
+    ulong lp_meta = params[P_LP_STREAM_META_OFFSET] + node * LP_STREAM_META_WORDS;
+    ulong declared = stream_state[lp_meta + 1];
+    if (
+        declared == NONE ||
+        active_count == 0 ||
+        active_count > declared + 1 ||
+        row >= active_entry_capacity ||
+        active_count > active_entry_capacity - row
+    ) {
+        t32_diagnostic_flag(node, T32_FLAG_ACTIVE_COUNT, diagnostics);
+        return;
+    }
+    ulong counter = params[P_NODE_COUNT] + row + active_count - 1;
+    ulong previous = diagnostics[counter];
+    if (previous == NONE) {
+        t32_diagnostic_flag(node, T32_FLAG_HEAD_OVERFLOW, diagnostics);
+        return;
+    }
+    diagnostics[counter] = previous + 1;
+}
+
+inline void t32_record_remote_emissions(
+    ulong node,
+    ulong before,
+    ulong after,
+    const device ulong *params,
+    const device ulong *remote_meta,
+    const device ulong *stream_state,
+    device ulong *diagnostics
+) {
+    ulong active_entry_capacity;
+    if (!t32_active_entry_capacity(params, active_entry_capacity)) {
+        t32_diagnostic_flag(node, T32_FLAG_ACTIVE_LAYOUT, diagnostics);
+        return;
+    }
+    if (after < before) {
+        t32_diagnostic_flag(node, T32_FLAG_REMOTE_COUNT, diagnostics);
+        return;
+    }
+    ulong channel_emissions_offset =
+        params[P_NODE_COUNT] + active_entry_capacity;
+    ulong staging = remote_meta[node * META_WORDS];
+    for (ulong index = before; index < after; ++index) {
+        if (staging > NONE - index) {
+            t32_diagnostic_flag(node, T32_FLAG_STAGING_SLOT, diagnostics);
+            return;
+        }
+        ulong staging_slot = staging + index;
+        ulong channel =
+            stream_state[params[P_STAGING_CHANNEL_OFFSET] + staging_slot];
+        if (channel >= params[P_CHANNEL_COUNT]) {
+            t32_diagnostic_flag(node, T32_FLAG_CHANNEL, diagnostics);
+            continue;
+        }
+        ulong counter = channel_emissions_offset + channel;
+        ulong previous = diagnostics[counter];
+        if (previous == NONE) {
+            t32_diagnostic_flag(node, T32_FLAG_CHANNEL_OVERFLOW, diagnostics);
+            continue;
+        }
+        diagnostics[counter] = previous + 1;
+    }
+}
+
+kernel void days_round_drain_profile(
+    device ulong *control [[buffer(0)]],
+    const device ulong *params [[buffer(1)]],
+    device ulong *node_state [[buffer(2)]],
+    device ulong *generators [[buffer(3)]],
+    const device ulong *flows [[buffer(4)]],
+    const device ulong *routes [[buffer(5)]],
+    const device ulong *links [[buffer(6)]],
+    device ulong *fel_meta [[buffer(7)]],
+    device ulong *fel_records [[buffer(8)]],
+    device ulong *queue_meta [[buffer(9)]],
+    device ulong *queue_records [[buffer(10)]],
+    device ulong *in_service [[buffer(11)]],
+    const device ulong *worklist [[buffer(13)]],
+    device ulong *summary [[buffer(14)]],
+    device ulong *observed [[buffer(15)]],
+    device ulong *departures [[buffer(16)]],
+    device ulong *arrivals [[buffer(17)]],
+    device ulong *lp_state [[buffer(18)]],
+    device ulong *remote_meta [[buffer(19)]],
+    device ulong *remote_staging [[buffer(20)]],
+    device ulong *observation_meta [[buffer(21)]],
+    device ulong *stream_state [[buffer(25)]],
+    device ulong *stream_records [[buffer(26)]],
+    device ulong *scheduler_state [[buffer(27)]],
+    device ulong *diagnostics [[buffer(28)]],
+    device ulong *tcp_state [[buffer(30)]],
+    uint active_index [[thread_position_in_grid]]
+) {
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 1 ||
+        active_index >= control[C_ACTIVE]
+    ) {
+        return;
+    }
+    ulong node = worklist[active_index];
+    device ulong *state = lp_state + node * LP_STATE_WORDS;
+    if (state[L_FINISHED] != 0 || state[L_ERROR] != 0) {
+        return;
+    }
+
+    ulong dispatch_transitions = 0;
+    while (dispatch_transitions < params[P_TRANSITION_CAPACITY]) {
+        bool diagnostic_streams = params[P_STREAMS_ENABLED] != 0;
+        ulong active_offset = 0;
+        ulong active_count = 0;
+        if (diagnostic_streams) {
+            ulong lp_meta =
+                params[P_LP_STREAM_META_OFFSET] + node * LP_STREAM_META_WORDS;
+            active_offset = stream_state[lp_meta + 2];
+            active_count = stream_state[lp_meta + 3];
+        }
+
+        ulong event[EVENT_WORDS];
+        ulong selected_active;
+        ulong selected_stream;
+        if (!fel_peek(
+            node,
+            params,
+            fel_meta,
+            fel_records,
+            stream_state,
+            stream_records,
+            event,
+            selected_active,
+            selected_stream
+        ) || !before_horizon(event[E_TIME], control)) {
+            state[L_FINISHED] = 1;
+            return;
+        }
+        ulong popped_timer_owner;
+        if (!fel_pop_selected(
+            node,
+            selected_active,
+            selected_stream,
+            params,
+            fel_meta,
+            fel_records,
+            stream_state,
+            stream_records,
+            tcp_state,
+            event,
+            popped_timer_owner
+        )) {
+            set_semantic_error(state, 26, node);
+            return;
+        }
+        ulong remote_counter = node * META_WORDS + 3;
+        ulong remote_before = remote_meta[remote_counter];
+        if (!dispatch_event(
+            node,
+            event,
+            popped_timer_owner,
+            state,
+            params,
+            node_state,
+            generators,
+            flows,
+            routes,
+            links,
+            fel_meta,
+            fel_records,
+            queue_meta,
+            queue_records,
+            in_service,
+            scheduler_state,
+            remote_meta,
+            remote_staging,
+            stream_state,
+            stream_records,
+            summary,
+            observation_meta,
+            observed,
+            departures,
+            arrivals,
+            tcp_state
+        )) {
+            return;
+        }
+        if (state[L_TRANSITIONS] == NONE) {
+            set_semantic_error(state, 27, node);
+            return;
+        }
+        if (diagnostic_streams) {
+            t32_record_head_visit(
+                node,
+                active_offset,
+                active_count,
+                params,
+                stream_state,
+                diagnostics
+            );
+            t32_record_remote_emissions(
+                node,
+                remote_before,
+                remote_meta[remote_counter],
+                params,
+                remote_meta,
+                stream_state,
+                diagnostics
+            );
+        } else {
+            t32_diagnostic_flag(node, T32_FLAG_STREAMS_DISABLED, diagnostics);
+        }
+        state[L_TRANSITIONS] += 1;
+        dispatch_transitions += 1;
+    }
+}
+#endif
+
 // T15e diagnostic only. This kernel preserves the production event set and transition body. Its
 // uniform mode word optionally adds one push/pop pair for the just-popped event before each real
 // transition. Probe-minus-control measures the marginal stress cost; a per-LP counter reports

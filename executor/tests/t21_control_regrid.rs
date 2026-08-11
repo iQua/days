@@ -11,7 +11,7 @@
 //! publishes one partial per block, followed by a width-1 combine that reads them. The barrier
 //! between the two is the **dispatch boundary** — CUDA stream ordering between launches, Metal
 //! `MTLDispatchType::Serial` ordering between dispatches — which is the same guarantee the
-//! pre-existing 8-phase DAG already depends on (`days_round_prepare` writes `worklist`; the next
+//! pre-existing attempt DAG already depends on (`days_round_prepare` writes `worklist`; the next
 //! dispatch, `days_round`, reads it). No atomic, no `volatile`, no fence, and no reliance on
 //! cross-block memory ordering *within* a dispatch appears anywhere in either kernel source.
 //!
@@ -357,26 +357,40 @@ fn no_kernel_synchronizes_across_blocks_inside_a_dispatch() {
 }
 
 /// The maximum dispatch count, disclosed. Full and legacy plans retain thirteen dispatches; T24's
-/// exact streams+Summary specialization omits only `FinalControlSweep`. The eight *reported*
-/// profile buckets are unchanged, so `t15b_round_profile` and `t17c_cuda_profile` still compare.
+/// exact streams+Summary specialization omits only `FinalControlSweep`. The nine *reported*
+/// profile buckets keep reset and ordered worklist preparation separate without changing that DAG.
 ///
 /// `perround-upperbound.md` Lever 2a budgeted "adds 2-5 dispatches per round — free at ≤0.11 %".
 /// This is +5, at that bound.
 #[test]
-fn the_full_and_legacy_attempt_dag_is_thirteen_dispatches_over_eight_reported_phases() {
+fn the_full_and_legacy_attempt_dag_is_thirteen_dispatches_over_nine_reported_phases() {
     assert!(
         CUDA_BACKEND.contains("const KERNEL_NAMES: [&str; 13]"),
         "the CUDA Full/legacy attempt DAG is thirteen launches",
     );
     assert!(
         CUDA_BACKEND.contains("const DISPATCH_PHASE: [usize; 13]"),
-        "each CUDA launch is attributed to one of the eight reported phases",
+        "each CUDA launch is attributed to one of the nine reported phases",
+    );
+    assert!(
+        CUDA_BACKEND.contains(
+            "const DISPATCH_PHASE: [usize; 13] = [0, 0, 1, 2, 3, 4, 4, 5, 5, 6, 7, 8, 8];"
+        ),
+        "CUDA reset and ordered worklist preparation must have distinct profile buckets",
     );
     assert!(
         METAL_BACKEND.contains(
             "const ATTEMPT_DISPATCHES: [(AttemptKernel, AttemptPhase, DispatchGeometry); 13]"
         ),
-        "the Metal Full/legacy attempt DAG is thirteen dispatches over eight reported phases",
+        "the Metal Full/legacy attempt DAG is thirteen dispatches over nine reported phases",
+    );
+    assert!(
+        METAL_BACKEND.contains("AttemptKernel::RoundReset,\n        AttemptPhase::RoundReset,"),
+        "Metal reset must have its own profile bucket",
+    );
+    assert!(
+        METAL_BACKEND.contains("AttemptKernel::Compaction,\n        AttemptPhase::Compaction,"),
+        "Metal ordered worklist preparation must retain its own profile bucket",
     );
     assert!(
         METAL_BACKEND.contains("DispatchGeometry::ControlSweep"),

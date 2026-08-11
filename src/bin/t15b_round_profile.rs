@@ -27,10 +27,11 @@ fn main() {
         }
     }
 
-    fn phases(timing: MetalPhaseTimings) -> [(&'static str, u64); 8] {
+    fn phases(timing: MetalPhaseTimings) -> [(&'static str, u64); 9] {
         [
             ("horizon", timing.horizon_ns),
-            ("compaction", timing.compaction_ns),
+            ("reset", timing.round_reset_ns),
+            ("prepare", timing.round_prepare_ns),
             ("drain_execute", timing.drain_execute_ns),
             ("continuation_control", timing.continuation_control_ns),
             ("exchange_prefix", timing.exchange_prefix_ns),
@@ -63,19 +64,20 @@ fn main() {
             .map(selected)
             .map(phases)
             .collect::<Vec<_>>();
-        let mut values = [0_u64; 8];
+        let mut values = [0_u64; 9];
         for (index, value) in values.iter_mut().enumerate() {
             *value = median(rows.iter().map(|row| row[index].1).collect());
         }
         MetalPhaseTimings {
             horizon_ns: values[0],
-            compaction_ns: values[1],
-            drain_execute_ns: values[2],
-            continuation_control_ns: values[3],
-            exchange_prefix_ns: values[4],
-            exchange_scatter_ns: values[5],
-            target_merge_ns: values[6],
-            final_control_ns: values[7],
+            round_reset_ns: values[1],
+            round_prepare_ns: values[2],
+            drain_execute_ns: values[3],
+            continuation_control_ns: values[4],
+            exchange_prefix_ns: values[5],
+            exchange_scatter_ns: values[6],
+            target_merge_ns: values[7],
+            final_control_ns: values[8],
         }
     }
 

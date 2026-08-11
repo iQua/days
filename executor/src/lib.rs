@@ -17,6 +17,7 @@ mod device_capacity;
 mod device_compaction;
 mod device_scheduler;
 pub mod device_sizing;
+mod drain_profile;
 pub mod event;
 pub mod image;
 mod mechanism_trace;
@@ -59,7 +60,8 @@ pub use cuda::size_cuda_plan_for_testing;
 #[cfg(feature = "cuda")]
 pub use cuda::{
     CudaArena, CudaConfig, CudaError, CudaExecutor, CudaInitializationTimings, CudaMemoryLayout,
-    CudaRun, run_cuda, run_cuda_with_observations,
+    CudaRun, CudaUnsplitPrepareProfile, CudaUnsplitPrepareProfiledRun, run_cuda,
+    run_cuda_with_observations,
 };
 pub use dcqcn::{
     DCQCN_FRACTION_SCALE, DCQCN_STAGE_STEPS, DcqcnArithmeticError, DcqcnController,
@@ -72,6 +74,10 @@ pub use device_capacity::{
 pub use device_sizing::{
     DeviceEventArenaSizing, DevicePlaneSizing, DeviceSizingError, DeviceSizingReport,
     size_default_device_plan,
+};
+pub use drain_profile::{
+    DrainProfile, DrainProfileChannel, DrainProfileError, DrainProfileLayout, HeadVisitProfile,
+    LookupIterationProfile, OutboundDegreeProfile,
 };
 pub use event::{
     Event, EventFelClass, EventKey, EventKind, FlowId, LinkId, NodeId, PayloadId, event_fel_class,
@@ -130,9 +136,12 @@ pub use model::{
 };
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub use safe_horizon::run_scalar_rounds_with_replay_trace;
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+pub use safe_horizon::take_t32_root_observation_constructions_for_testing;
 pub use safe_horizon::{
-    LpRoundWork, RoundMetrics, ScalarRoundRun, run_scalar_rounds,
-    run_scalar_rounds_with_observations,
+    LpRoundWork, RootGroupTrace, RoundMetrics, ScalarRoundRun, ScalarT32RootTraceRun,
+    run_scalar_rounds, run_scalar_rounds_with_observations, run_scalar_rounds_with_t32_root_trace,
 };
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub use safe_horizon::{

@@ -27,14 +27,14 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "cuda.rs",
         predicate: r#"feature = "cuda-test-hooks""#,
-        count: 20,
-        purpose: "CUDA-only fault injection, capacity, planner measurement, and T20l readback- and plane-word-accounting hooks",
+        count: 22,
+        purpose: "CUDA-only fault injection, capacity, planner measurement, T20l readback- and plane-word-accounting hooks, and T32 exact drain profiling",
     },
     AllowedFeatureGate {
         path: "metal.rs",
         predicate: r#"feature = "metal-test-hooks""#,
-        count: 27,
-        purpose: "Metal-only panic, fault-injection, planner measurement, T20l readback accounting, and T21 dominant-arena occupancy readback hooks",
+        count: 29,
+        purpose: "Metal-only panic, fault-injection, planner measurement, T20l readback accounting, T21 dominant-arena occupancy readback, and T32 exact drain profiling hooks",
     },
     AllowedFeatureGate {
         path: "metal.rs",
@@ -87,8 +87,8 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "safe_horizon.rs",
         predicate: r#"all(feature = "metal-spike", target_vendor = "apple")"#,
-        count: 39,
-        purpose: "replay and window capture instrumentation for Apple Metal profiling",
+        count: 48,
+        purpose: "replay and window capture instrumentation for Apple Metal profiling, including the separately selected T32 scalar trace loop",
     },
     AllowedFeatureGate {
         path: "scalar.rs",
@@ -171,8 +171,14 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "lib.rs",
         predicate: r#"feature = "planner-test-hooks""#,
-        count: 1,
-        purpose: "validator flow-index equality hook is exported only for standard tests",
+        count: 2,
+        purpose: "validator flow-index equality and T32 observation-construction hooks are exported only for standard tests",
+    },
+    AllowedFeatureGate {
+        path: "safe_horizon.rs",
+        predicate: r#"feature = "planner-test-hooks""#,
+        count: 4,
+        purpose: "the T32 negative control counts per-round observation-state construction only in standard tests",
     },
 ];
 
