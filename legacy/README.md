@@ -19,6 +19,10 @@ task permits only the minimal correctness work needed to execute the frozen E1 f
 reject configuration input that legacy cannot honor, and add direct expression and regression
 proofs. It does not authorize performance work or general legacy development.
 
+**CSV logging amendment (August 11, 2026 / T30):** the user-authorized `csv_logging` root TOML
+key defaults to `true` and may be set to `false` to suppress CSV and trace-manifest filesystem
+work. Correctness verification remains CSV-on and untimed; any future timed sample is CSV-off.
+
 If you are looking for the current simulator, it is `../executor/` (crate `days-executor`).
 Nothing outside this directory may depend on `days-legacy`; `cargo xtask audit` enforces
 that direction mechanically.
@@ -95,7 +99,7 @@ outside the anchor under the exact-time erratum in [§6.9](#69-exact-time-erratu
 
 ## 3. Freeze policy
 
-**No changes. Five narrow exceptions, each requiring a changelog row in
+**No changes. Six narrow exceptions, each requiring a changelog row in
 [§8](#8-freeze-changelog).**
 
 | # | Allowed change | Why it must be allowed |
@@ -105,8 +109,9 @@ outside the anchor under the exact-time erratum in [§6.9](#69-exact-time-erratu
 | **(c)** | **Dependency pin bumps.** Editing a `=x.y.z` pin in `legacy/Cargo.toml`. | Exact pins on crates that the *live* root crate also uses (see [§4](#4-dependency-pinning-and-the-lockfile)) mean a live-side patch bump inside the same semver range requires touching this manifest. That coupling is deliberate; it is also the only way to move a frozen dependency, so it is auditable. |
 | **(d)** | **The ordered E5 expressibility repair.** Minimal fixes for exact event scheduling, strict `FatTreeEcmp`/structural-pairing handling, byte-budget TCP with configurable MSS, sound cumulative ACK/loss recovery using the existing Reno controller, propagation activation, and correctness observability. | Explicit user authority in `days-gpu/plans/p12-opening-plan.md`, registry entry `LEGACY-ON-E5 ORDERED — FREEZE CONTRACT AMENDED` (August 9, 2026). This is bounded to the reviewed T0–T7 plan and the individually authorized, guardrailed follow-up repairs recorded in the same registry (fast retransmit, cumulative-ACK credit, Reno window-cap alignment, and sender-side SWS avoidance); it does not authorize a new controller or general legacy development. |
 | **(e)** | **The T28 E1 expression and configuration-integrity repair.** Minimal scalar-propagation activation, a strict legacy-owned configuration vocabulary, and correctness gates for the frozen E1 family, E3, and E5. | Explicit user authority in the T28 legacy E1 task (August 10, 2026). This exception is limited to exact E1 semantics and refusal of unimplemented input; it does not authorize a new protocol, controller, output field, or performance work. |
+| **(f)** | **The T30 configurable CSV suppression repair.** A default-on root TOML boolean may suppress CSV initialization, threshold/final writes, and trace-manifest work while retaining simulation semantics and bounded correctness bookkeeping. | Explicit user authority in the T30 legacy CSV logging task (August 11, 2026). This exception is limited to the configuration key, output suppression, its correctness gates, and the timed-quiet/untimed-verify contract. |
 
-**Never, under exceptions (a)–(c), and outside the exact bounds of exceptions (d)–(e):**
+**Never, under exceptions (a)–(c), and outside the exact bounds of exceptions (d)–(f):**
 
 - no new protocols, mechanisms, schedulers, queue disciplines, or congestion-control variants;
 - no new configuration keys, no new output fields, no new features in `[features]`;
@@ -114,9 +119,9 @@ outside the anchor under the exact-time erratum in [§6.9](#69-exact-time-erratu
 - no behaviour change of any kind. If a change would alter what any existing fixture
   produces, it is out of policy — stop and escalate rather than proceed.
 
-**Every** change under (a), (b), (c), (d), or (e) adds a row to [§8](#8-freeze-changelog) in the same
-commit. A change to `legacy/` without a changelog row is a policy violation regardless of how
-small it is.
+**Every** change under (a), (b), (c), (d), (e), or (f) adds a row to
+[§8](#8-freeze-changelog) in the same commit. A change to `legacy/` without a changelog row is a
+policy violation regardless of how small it is.
 
 **This rule is enforced by review, not by CI.** Nothing mechanically checks that a diff touching
 `legacy/` also touches the changelog table — `cargo xtask audit` enforces the dependency
@@ -261,21 +266,41 @@ Record `rustc --version`, `cargo --version`, and the git commit for every machin
 
 ### 6.3 Invocations
 
-Timed samples, per arm, under the standing quiet-machine gate:
+Never edit the frozen fixtures. For each arm, materialize two temporary copies that change only
+`log_path` and add one root key:
+
+```toml
+# Untimed correctness verification copy.
+csv_logging = true
+
+# Future warmup/timed copy.
+csv_logging = false
+```
+
+Run one CSV-on verification first. It is correctness evidence only; none of its clocks enters a
+timing sample set:
+
+```bash
+env RUST_LOG=info ./target/release/days /tmp/e3-st-csv-on.toml > verify-st.log 2>&1
+env RUST_LOG=info ./target/release/days /tmp/e3-mt-csv-on.toml > verify-mt.log 2>&1
+```
+
+Timed samples, per arm, under the standing quiet-machine gate, use only the corresponding
+`csv_logging = false` copies:
 
 ```bash
 # ST
 /usr/bin/time -p -o wall-st-<n>.txt \
   env RUST_LOG=info ./target/release/days \
-  configs/benchmarks/p12/e3_legacy_rack_local_st.toml > run-st-<n>.log 2>&1
+  /tmp/e3-st-csv-off.toml > run-st-<n>.log 2>&1
 
 # MT
 /usr/bin/time -p -o wall-mt-<n>.txt \
   env RUST_LOG=info ./target/release/days \
-  configs/benchmarks/p12/e3_legacy_rack_local_mt.toml > run-mt-<n>.log 2>&1
+  /tmp/e3-mt-csv-off.toml > run-mt-<n>.log 2>&1
 ```
 
-Four requirements on the invocation, each with a reason:
+Five requirements on the protocol, each with a reason:
 
 - **`RUST_LOG=info`, not `error`.** The legacy binary reports its own in-process clocks and its
   effective concurrency configuration at `info`; `error` throws both away and leaves a 0-byte log.
@@ -289,13 +314,23 @@ Four requirements on the invocation, each with a reason:
   Neither is a diff target for P12, so the change costs nothing and buys the clock pair.)
 - **Redirect both streams to a file.** `indicatif` draws a progress bar on a tty and not on a
   pipe; redirecting removes that work and makes samples comparable across shells.
-- **Copy the CSVs out after every sample.** `log_path` is
-  `logs/p12/e3_legacy_rack_local_{st,mt}` and the logger **truncates** `sources.csv`,
-  `switches.csv`, and `sinks.csv` at startup (`fs::File::create` in `CsvLogger::init_output_files`).
-  Sample *n*'s counts are destroyed the moment sample *n+1* starts, and the per-sample counts are
-  exactly what [§6.6](#66-mt-nondeterminism-disclosure-protocol-counts-and-delays) requires. `logs/` is
-  gitignored, so archive the extracted fields, not the raw CSVs (1.1 MB + 1.7 MB per sample).
-- **One warmup, untimed, per arm per machine**, then the timed samples (the P01 protocol).
+- **Every timed sample sets `csv_logging = false`.** False mode skips log-directory creation,
+  file creation/truncation, threshold and final CSV serialization/writes/flushes, metadata reads,
+  and trace-manifest work. A timed sample that creates its configured `log_path` is invalid.
+- **One separate untimed `csv_logging = true` verification per arm and machine is mandatory.**
+  Archive or extract its CSV-backed fields before another CSV-on run can truncate them, then apply
+  every count/drain gate in §6.4 and §6.6. Removing filesystem work from measurement does not
+  remove CSV-backed correctness verification.
+- **One CSV-off warmup, untimed, per arm per machine**, then the CSV-off timed samples (the P01
+  protocol). The warmup matches the future measured mode and does not replace CSV-on verification.
+
+The old I/O placement is established by the logger lifecycle. E3 has no `report_interval`, so its
+source and sink rows were written by the final `flush_reports`: after `step_until`, but before the
+`Nexosim total` sample. Other fixtures can cross the 10,000-row threshold and write during
+`step_until`. Startup file creation/truncation occurs before the internal total clock. Setting
+`csv_logging = false` removes all three classes of work. Disabled reports are reduced into
+constant-size aggregate counters and dropped immediately, so report-vector memory does not grow
+with the run.
 
 Sample count: the legacy arms cost tens of seconds per sample, not the tens of minutes that force
 the slow-arm `n = 3` budget on the external arms. Run them at the **headline `n`** from the outset
@@ -305,7 +340,7 @@ sample count disagrees with it**, and every median must be published with its ra
 
 ### 6.4 Fields the measurer round MUST retain
 
-Per **sample** — not per arm, not per median:
+Per **timed CSV-off sample** — not per arm, not per median:
 
 | Field | Where it comes from |
 |---|---|
@@ -316,14 +351,20 @@ Per **sample** — not per arm, not per median:
 | `threading`, `effective_num_threads` | `Starting simulation with <mode> threading (N thread(s)).` — both arms |
 | `hot_workers` | `Using N hot standby worker(s).` — **MT only**; the line is absent on ST, record `n/a` |
 | `concurrency_level` | `Using <default\|accelerated> concurrency level.` — **MT only**; absent on ST, record `n/a` |
+| `global_one_way_delay_mean_s` | `Average one-way delay: X seconds.` — **observe-only, NOT citable** (see [§6.6](#66-mt-nondeterminism-disclosure-protocol-counts-and-delays)) |
+| `log_bytes` | size of the run log (the guard above) |
+| machine, commit, `rustc`/`cargo` versions, quiet-gate record | the standing protocol |
+
+Per **untimed CSV-on verification run**, separately for each arm:
+
+| Field | Where it comes from |
+|---|---|
 | `sent_packets`, `sent_bytes` | **sum** of `sent_packets` / `packet_sizes` over `sources.csv` |
 | `received_packets`, `received_bytes` | **sum** of `received_packets` / `received_sizes` over `sinks.csv` |
 | `derived_dropped_packets` | `sent_packets − received_packets` (see below) |
 | `max_source_end_time`, `duration` | max `end_time` over `sources.csv`; `duration` from the fixture |
 | `sink_rows`, `source_rows` | row counts of each CSV |
-| `global_one_way_delay_mean_s` | `Average one-way delay: X seconds.` — **observe-only, NOT citable** (see [§6.6](#66-mt-nondeterminism-disclosure-protocol-counts-and-delays)); retained so the MT delay nondeterminism is visible per sample rather than merely warned about |
-| `log_bytes` | size of the run log (the guard above) |
-| machine, commit, `rustc`/`cargo` versions, quiet-gate record | the standing protocol |
+| CSV digests and extracted integer record | retained correctness identity; raw CSV retention is optional when both are archived |
 
 Notes that will otherwise be got wrong:
 
@@ -337,7 +378,8 @@ Notes that will otherwise be got wrong:
   columns; never infer flow count from row count. Expect 33,792 source rows and 16,896 sink rows.
 - **Clock pairs are mandatory** (the same discipline the external arms carry). Report
   `process_wall_s` **and** `elapsed_wall_s` together, always. They differ: process wall includes
-  process start, topology construction, and the final CSV flush.
+  process start and topology construction. Neither includes CSV filesystem work in a conforming
+  `csv_logging = false` timed sample.
 - **Never publish a median without its range**, and never emit a statistic whose sample count
   disagrees with the arm's declared `n`.
 - **Every agreement claim on this fixture covers integer counts ONLY.** The delay columns do not
@@ -423,11 +465,15 @@ Two consequences, and a boundary on what may be inferred.
 
 The protocol:
 
-1. Extract and record the count fields for **every** MT sample individually. Never report only
-   the median, and never report counts once "for the arm".
-2. State explicitly whether all MT samples agreed. If they agreed, say so with the sample count:
-   "all n = X MT samples delivered 41,932,800 packets / 41,932,800,000 bytes".
-3. If any sample disagrees, publish the full per-sample spread, publish
+1. For E3, extract the count fields from the mandatory untimed CSV-on verification run for each
+   ST/MT arm. Timed CSV-off samples carry clocks and constant-size aggregate log lines, never
+   fabricated per-flow CSV fields. For any new fixture where MT count nondeterminism is possible,
+   run a separate untimed CSV-on verification sample set large enough to expose its spread.
+2. State explicitly whether the verification runs agree. For E3, say: "both untimed ST and MT
+   verification runs delivered 41,932,800 packets / 41,932,800,000 bytes". Historical claims over
+   larger CSV-on sample sets retain their original `n`; do not relabel a one-run-per-arm gate as
+   timed-sample agreement.
+3. If any verification sample disagrees, publish the full per-sample spread, publish
    `max_source_end_time` for each, and label the arm's counts as
    **legacy-MT-nondeterministic**. Do not median them away, and do not attribute the divergence
    to Days AGO — the ST arm and the Days AGO scalar anchor are the references.
@@ -435,8 +481,8 @@ The protocol:
    **41,932,800 packets / 41,932,800,000 bytes, 0 drops** (`days-gpu/evidence/P12/t21-fixture-authoring.md`
    §4.8). Any legacy deviation from it is reported as a legacy-side finding with its mechanism
    named, never as a silent footnote.
-5. The ST arm's counts are the legacy-side reference. If ST itself varies between samples, stop:
-   that is a new finding, not a disclosure item.
+5. The ST arm's counts are the legacy-side reference. If ST itself varies between verification
+   samples, stop: that is a new finding, not a disclosure item.
 6. **(ADDED 2026-08-08.)** Before citing any legacy MT count on a fixture other than E3, establish
    the fixture's **drain state at the stop boundary** and record it beside the count: how many
    packets are in the fabric when the simulation stops, and how that was determined. If the fixture
@@ -593,3 +639,4 @@ to anything else under `legacy/` always do.
 | 2026-08-09 | `T22a: Remove the legacy Reno window cap` | (d) | Removed Reno's fixed 65,535-byte congestion-window ceiling while retaining the shared 65,535-byte initial slow-start threshold; window state remains `usize` and legacy keeps its f64 congestion-avoidance accumulator. | The `LEGACY CWND CAP TO BE REMOVED — ENGINES MATCH ON TRANSPORT MODELLING` registry entry in `days-gpu/plans/p12-opening-plan.md`. |
 | 2026-08-10 | `T22a: Avoid legacy sender silly windows` | (d) | Delayed non-final sub-MSS originals while data remains in flight, while retaining an exact final tail and the empty-flight deadlock escape; added focused behavior tests and an E3-only TCP-source-construction tripwire. | The `THIRD LEGACY DEFECT — SENDER-SIDE SILLY WINDOW` registry entry in `days-gpu/plans/p12-opening-plan.md`. |
 | 2026-08-10 | `T28: Express legacy E1 fixtures exactly` | (e) | Activated the configured scalar propagation model, added strict rejection of unowned or unimplemented legacy input, and added direct E1 expression, E3 inertness, and E5 non-regression gates. | The user-authorized T28 legacy E1 implementation and correctness task. |
+| 2026-08-11 | `T30: Configure legacy CSV logging from TOML` | (f) | Added default-on `csv_logging`; false mode performs no CSV or trace-manifest filesystem work and drops reports after constant-size correctness reduction, while temporary true/false overlays prove identical E3/E5 outcomes. | The user-authorized T30 legacy CSV logging implementation and correctness task. |
