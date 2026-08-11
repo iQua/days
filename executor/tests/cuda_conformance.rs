@@ -22,6 +22,41 @@ const REVERSE: LinkId = LinkId(1);
 const FLOW: FlowId = FlowId(0);
 const FIRST_PACKET: PayloadId = PayloadId(0);
 
+#[cfg(feature = "cuda-test-hooks")]
+#[test]
+fn cuda_runtime_provisioning_matches_device_capabilities() {
+    let executor = CudaExecutor::new().expect("CUDA executor must initialize");
+    let (integrated, managed_memory, concurrent_managed_access, managed_selected) = executor
+        .managed_memory_selection_for_testing()
+        .expect("CUDA memory capabilities must be queryable");
+    assert_eq!(
+        managed_selected,
+        integrated && managed_memory && concurrent_managed_access
+    );
+    println!(
+        "CUDA provisioning: integrated={integrated} managed_memory={managed_memory} \
+         concurrent_managed_access={concurrent_managed_access} managed_selected={managed_selected}"
+    );
+}
+
+#[cfg(feature = "cuda-test-hooks")]
+#[test]
+fn cuda_managed_provisioning_binds_the_context_on_the_execution_thread() {
+    let executor = CudaExecutor::new().expect("CUDA executor must initialize");
+    let image = generator_image(GeneratorTermination::Bytes(4));
+    let expected = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("scalar cross-thread oracle must run");
+    let actual = thread::spawn(move || {
+        executor.run_with_observations(&image, None, CudaConfig::default(), ObservationMode::Full)
+    })
+    .join()
+    .expect("CUDA execution thread must not panic")
+    .expect("CUDA executor must bind its context on the execution thread");
+    let mut expected = expected;
+    expected.diagnostics = None;
+    assert_eq!(actual.result, expected);
+}
+
 fn generator_image(termination: GeneratorTermination) -> SimulationImage {
     let first_packet = PacketDescriptor {
         id: FIRST_PACKET,

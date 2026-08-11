@@ -6,19 +6,21 @@
 //! LPs; one CUDA lane owns each active LP transition drain; boundary exchange remains
 //! producer-local followed by deterministic per-channel scatter. The host reads only the control
 //! plane at graph-wave boundaries, then explicitly transfers every result plane for normalization.
-//! No unified or host-mapped device memory and no result-affecting atomics are used.
+//! Integrated devices provision the same bytes in managed allocations; discrete devices retain
+//! explicit device allocations and uploads. No result-affecting atomics are used.
 
 #[cfg(feature = "cuda-test-hooks")]
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::error::Error;
 use std::fmt;
+use std::ops::{Bound, RangeBounds};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use cudarc::driver::{
-    CudaContext, CudaEvent, CudaFunction, CudaGraph, CudaSlice, CudaStream, LaunchConfig,
-    PushKernelArg, sys,
+    CudaContext, CudaEvent, CudaFunction, CudaGraph, CudaSlice, CudaStream, DevicePtr, DeviceSlice,
+    LaunchArgs, LaunchConfig, PushKernelArg, SyncOnDrop, UnifiedSlice, sys,
 };
 use cudarc::nvrtc::Ptx;
 
@@ -110,6 +112,24 @@ const CONTROL_WORDS: usize = 20;
 
 static CUDA_DEVICE_EXECUTION: Mutex<()> = Mutex::new(());
 static CUDA_DIRECT: OnceLock<Result<Arc<DirectCuda>, String>> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CudaProvisioning {
+    Device,
+    Managed,
+}
+
+fn select_cuda_provisioning(
+    integrated: bool,
+    managed_memory: bool,
+    concurrent_managed_access: bool,
+) -> CudaProvisioning {
+    if integrated && managed_memory && concurrent_managed_access {
+        CudaProvisioning::Managed
+    } else {
+        CudaProvisioning::Device
+    }
+}
 
 #[cfg(feature = "cuda-test-hooks")]
 std::thread_local! {
@@ -270,7 +290,7 @@ fn arena_compaction_plan(
 /// a typed refusal, never a clamp.
 fn bounded_plane_words<const N: usize>(
     stream: &std::sync::Arc<CudaStream>,
-    ranges: [(&CudaSlice<u64>, usize, usize, &'static str); N],
+    ranges: [(&CudaBuffer, usize, usize, &'static str); N],
 ) -> Result<[Vec<u64>; N], AttemptFailure> {
     let mut regions = Vec::with_capacity(N);
     let mut readback_error = None;
@@ -1044,6 +1064,34 @@ impl CudaExecutor {
         self.direct.initialization_timings
     }
 
+    /// Returns `(integrated, managed_memory, concurrent_managed_access, managed_selected)` for
+    /// actual-device tests.
+    #[cfg(feature = "cuda-test-hooks")]
+    #[doc(hidden)]
+    pub fn managed_memory_selection_for_testing(
+        &self,
+    ) -> Result<(bool, bool, bool, bool), CudaError> {
+        let context = self.direct.stream.context();
+        let integrated = context
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_INTEGRATED)
+            .map_err(|error| driver_error("integrated-memory capability query", error))?
+            != 0;
+        let managed_memory = context
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY)
+            .map_err(|error| driver_error("managed-memory capability query", error))?
+            != 0;
+        let concurrent_managed_access = context
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS)
+            .map_err(|error| driver_error("concurrent-managed-access capability query", error))?
+            != 0;
+        Ok((
+            integrated,
+            managed_memory,
+            concurrent_managed_access,
+            self.direct.provisioning == CudaProvisioning::Managed,
+        ))
+    }
+
     pub fn run(
         &self,
         image: &SimulationImage,
@@ -1122,7 +1170,8 @@ impl CudaExecutor {
                     &mut tcp_capacity_floors,
                 )?;
                 let _execution_guard = cuda_device_execution_guard();
-                let buffers = CudaBuffers::new(&self.direct.stream, plan)?;
+                let buffers =
+                    CudaBuffers::new(&self.direct.stream, plan, self.direct.provisioning)?;
                 let timing = self.direct.run(&buffers, attempt_config)?;
                 #[cfg(feature = "cuda-test-hooks")]
                 panic_after_execution_if_requested();
@@ -1283,7 +1332,8 @@ impl CudaExecutor {
                     &mut tcp_capacity_floors,
                 )?;
                 let _execution_guard = cuda_device_execution_guard();
-                let buffers = CudaBuffers::new(&self.direct.stream, plan)?;
+                let buffers =
+                    CudaBuffers::new(&self.direct.stream, plan, self.direct.provisioning)?;
                 let (timing, profile) = self.direct.run_profiled(&buffers, attempt_config)?;
                 #[cfg(feature = "cuda-test-hooks")]
                 panic_after_execution_if_requested();
@@ -3735,8 +3785,146 @@ fn queue_push_host(
     meta[base + 3] = (count + 1) as u64;
     Ok(())
 }
+enum CudaBufferStorage {
+    Device(CudaSlice<u64>),
+    Managed(UnifiedSlice<u64>),
+}
+
+/// Owns one CUDA allocation behind the backend's single-stream synchronization contract.
+///
+/// Integrated devices use managed storage initialized directly by the CPU. Discrete devices keep
+/// the existing device allocation and explicit upload. The raw pointer is cached so managed
+/// storage does not inject cudarc's per-allocation event tracking into every captured graph node;
+/// this executor already serializes all device access and synchronizes every readback boundary.
+struct CudaBuffer {
+    storage: CudaBufferStorage,
+    raw: sys::CUdeviceptr,
+    len: usize,
+    stream: Arc<CudaStream>,
+}
+
+impl CudaBuffer {
+    fn from_host(
+        stream: &Arc<CudaStream>,
+        words: Vec<u64>,
+        provisioning: CudaProvisioning,
+    ) -> Result<Self, cudarc::driver::DriverError> {
+        let words = if words.is_empty() { vec![0] } else { words };
+        let len = words.len();
+        let storage = match provisioning {
+            CudaProvisioning::Device => CudaBufferStorage::Device(stream.clone_htod(&words)?),
+            CudaProvisioning::Managed => {
+                stream.context().bind_to_thread()?;
+                let mut allocation = unsafe { stream.context().alloc_unified::<u64>(len, true) }?;
+                allocation.as_mut_slice()?.copy_from_slice(&words);
+                CudaBufferStorage::Managed(allocation)
+            }
+        };
+        let raw = match &storage {
+            CudaBufferStorage::Device(allocation) => {
+                let (raw, record) = allocation.device_ptr(stream);
+                drop(record);
+                raw
+            }
+            CudaBufferStorage::Managed(allocation) => {
+                let (raw, record) = allocation.device_ptr(stream);
+                drop(record);
+                raw
+            }
+        };
+        Ok(Self {
+            storage,
+            raw,
+            len,
+            stream: Arc::clone(stream),
+        })
+    }
+
+    fn slice(&self, bounds: impl RangeBounds<usize>) -> CudaBufferView<'_> {
+        let start = match bounds.start_bound() {
+            Bound::Included(&start) => start,
+            Bound::Excluded(&start) => start.checked_add(1).expect("CUDA slice start overflows"),
+            Bound::Unbounded => 0,
+        };
+        let end = match bounds.end_bound() {
+            Bound::Included(&end) => end.checked_add(1).expect("CUDA slice end overflows"),
+            Bound::Excluded(&end) => end,
+            Bound::Unbounded => self.len,
+        };
+        assert!(
+            start <= end && end <= self.len,
+            "CUDA slice is out of bounds"
+        );
+        let byte_offset = start
+            .checked_mul(std::mem::size_of::<u64>())
+            .and_then(|offset| u64::try_from(offset).ok())
+            .expect("CUDA slice byte offset overflows");
+        CudaBufferView {
+            buffer: self,
+            raw: self
+                .raw
+                .checked_add(byte_offset)
+                .expect("CUDA slice pointer overflows"),
+            len: end - start,
+        }
+    }
+}
+
+impl Drop for CudaBuffer {
+    fn drop(&mut self) {
+        if matches!(&self.storage, CudaBufferStorage::Managed(_)) {
+            self.stream.context().record_err(self.stream.synchronize());
+        }
+    }
+}
+
+impl DeviceSlice<u64> for CudaBuffer {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
+}
+
+impl DevicePtr<u64> for CudaBuffer {
+    fn device_ptr<'a>(&'a self, _stream: &'a CudaStream) -> (sys::CUdeviceptr, SyncOnDrop<'a>) {
+        (self.raw, SyncOnDrop::Sync(None))
+    }
+}
+
+unsafe impl<'a, 'b: 'a> PushKernelArg<&'b CudaBuffer> for LaunchArgs<'a> {
+    #[inline(always)]
+    fn arg(&mut self, buffer: &'b CudaBuffer) -> &mut Self {
+        self.arg(&buffer.raw)
+    }
+}
+
+struct CudaBufferView<'a> {
+    buffer: &'a CudaBuffer,
+    raw: sys::CUdeviceptr,
+    len: usize,
+}
+
+impl DeviceSlice<u64> for CudaBufferView<'_> {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn stream(&self) -> &Arc<CudaStream> {
+        &self.buffer.stream
+    }
+}
+
+impl DevicePtr<u64> for CudaBufferView<'_> {
+    fn device_ptr<'a>(&'a self, _stream: &'a CudaStream) -> (sys::CUdeviceptr, SyncOnDrop<'a>) {
+        (self.raw, SyncOnDrop::Sync(None))
+    }
+}
+
 struct CudaBuffers {
-    planes: Vec<CudaSlice<u64>>,
+    planes: Vec<CudaBuffer>,
     orphan_packets: Vec<PacketDescriptor>,
     node_count: usize,
     /// Lowered-image policy: false only for streams + Summary observations.
@@ -3749,7 +3937,11 @@ struct CudaBuffers {
 }
 
 impl CudaBuffers {
-    fn new(stream: &std::sync::Arc<CudaStream>, plan: CudaPlan) -> Result<Self, CudaError> {
+    fn new(
+        stream: &std::sync::Arc<CudaStream>,
+        plan: CudaPlan,
+        provisioning: CudaProvisioning,
+    ) -> Result<Self, CudaError> {
         let round_capacity = plan.round_capacity;
         let dispatch_capacity = plan.dispatch_capacity;
         let orphan_packets = plan.orphan_packets;
@@ -3795,9 +3987,7 @@ impl CudaBuffers {
         .into_iter()
         .enumerate()
         .map(|(index, words)| {
-            let words = if words.is_empty() { vec![0] } else { words };
-            stream
-                .clone_htod(&words)
+            CudaBuffer::from_host(stream, words, provisioning)
                 .map_err(|error| driver_error(format!("result plane {index} upload"), error))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -4446,6 +4636,7 @@ struct DirectCuda {
     /// T20l fix 2: the readback gather, loaded beside the eight attempt kernels.
     compact_function: CudaFunction,
     initialization_timings: CudaInitializationTimings,
+    provisioning: CudaProvisioning,
 }
 
 impl DirectCuda {
@@ -4485,6 +4676,20 @@ impl DirectCuda {
         let (major, minor) = context
             .compute_capability()
             .map_err(|error| driver_error("compute capability query", error))?;
+        let integrated = context
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_INTEGRATED)
+            .map_err(|error| driver_error("integrated-memory capability query", error))?
+            != 0;
+        let managed_memory = context
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY)
+            .map_err(|error| driver_error("managed-memory capability query", error))?
+            != 0;
+        let concurrent_managed_access = context
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS)
+            .map_err(|error| driver_error("concurrent-managed-access capability query", error))?
+            != 0;
+        let provisioning =
+            select_cuda_provisioning(integrated, managed_memory, concurrent_managed_access);
         if (major, minor) != (12, 1) && (major, minor) != (8, 9) {
             return Err(CudaError::Unavailable(format!(
                 "embedded kernels target sm_121 and sm_89, but device 0 reports sm_{major}{minor}"
@@ -4515,6 +4720,7 @@ impl DirectCuda {
                 context_stream_setup_ns,
                 module_function_load_ns,
             },
+            provisioning,
         })
     }
 
@@ -4527,7 +4733,7 @@ impl DirectCuda {
     /// Returns one gathered word vector per request, in request order.
     fn compact(
         &self,
-        requests: &[(&CudaSlice<u64>, &CompactionPlan)],
+        requests: &[(&CudaBuffer, &CompactionPlan)],
     ) -> Result<Vec<Vec<u64>>, CudaError> {
         let mut destinations = Vec::with_capacity(requests.len());
         // The plan and argument buffers must outlive the launches, so they are retained here
@@ -4545,13 +4751,12 @@ impl DirectCuda {
                     .map_err(|error| {
                         driver_error(format!("{} compaction destination", plan.arena), error)
                     })?;
-            let plan_buffer = self
-                .stream
-                .clone_htod(&plan.plan_words())
-                .map_err(|error| driver_error(format!("{} compaction plan", plan.arena), error))?;
+            let plan_buffer =
+                CudaBuffer::from_host(&self.stream, plan.plan_words(), self.provisioning).map_err(
+                    |error| driver_error(format!("{} compaction plan", plan.arena), error),
+                )?;
             let argument_buffer =
-                self.stream
-                    .clone_htod(&plan.argument_words())
+                CudaBuffer::from_host(&self.stream, plan.argument_words(), self.provisioning)
                     .map_err(|error| {
                         driver_error(format!("{} compaction arguments", plan.arena), error)
                     })?;
@@ -5008,7 +5213,7 @@ struct CudaTiming {
 /// screen copy synchronizes on its own rather than joining the batched result readback.
 fn screen_plane_words(
     stream: &std::sync::Arc<CudaStream>,
-    view: cudarc::driver::CudaView<'_, u64>,
+    view: CudaBufferView<'_>,
     context: &str,
 ) -> Result<Vec<u64>, CudaError> {
     #[cfg(feature = "cuda-test-hooks")]
@@ -5032,8 +5237,43 @@ fn duration_ns(duration: Duration) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{CudaArena, CudaError, decode_arena, decode_device_error};
+    use super::{
+        CudaArena, CudaError, CudaProvisioning, decode_arena, decode_device_error,
+        select_cuda_provisioning,
+    };
     use crate::CapacityRetryRecord;
+
+    #[test]
+    fn integrated_managed_device_selects_managed_provisioning() {
+        assert_eq!(
+            select_cuda_provisioning(true, true, true),
+            CudaProvisioning::Managed
+        );
+    }
+
+    #[test]
+    fn integrated_device_without_concurrent_managed_access_keeps_device_provisioning() {
+        assert_eq!(
+            select_cuda_provisioning(true, true, false),
+            CudaProvisioning::Device
+        );
+    }
+
+    #[test]
+    fn discrete_device_keeps_explicit_device_provisioning() {
+        assert_eq!(
+            select_cuda_provisioning(false, true, true),
+            CudaProvisioning::Device
+        );
+    }
+
+    #[test]
+    fn integrated_device_without_managed_memory_keeps_device_provisioning() {
+        assert_eq!(
+            select_cuda_provisioning(true, false, true),
+            CudaProvisioning::Device
+        );
+    }
 
     #[test]
     fn cuda_decodes_tcp_capacity_arenas_with_metal_parity() {
