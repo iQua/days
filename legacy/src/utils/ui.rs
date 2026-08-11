@@ -28,6 +28,7 @@ impl UserInterface {
     const RUN_SID: SchedulableId<Self, ()> = SchedulableId::__from_decorated(0);
 
     pub fn new(num_sources: usize, config_path: &str) -> UserInterface {
+        crate::validate_config(config_path).unwrap_or_else(|error| panic!("{error}"));
         let content = fs::read_to_string(config_path).expect("The configuration is not valid");
 
         // Obtain the user interface progress interval from the configuration file

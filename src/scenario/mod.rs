@@ -13,7 +13,7 @@ pub use compile::{
 
 /// Distribution configuration shared by legacy traffic models and exact lowering.
 #[derive(Deserialize, Debug, Clone, PartialEq)]
-#[serde(tag = "type")]
+#[serde(tag = "type", deny_unknown_fields)]
 pub enum DistributionInfo {
     DiscreteUniform { low: i64, high: i64 },
     Exp { lambda: f64 },

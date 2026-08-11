@@ -29,7 +29,7 @@ pub fn validate_config(config_path: &str) -> Result<(), String> {
 }
 
 #[derive(Deserialize)]
-pub struct SeedConfig {
+struct SeedConfig {
     seed: usize,
 }
 
@@ -43,6 +43,7 @@ static COLLECTIVE_ID: AtomicUsize = AtomicUsize::new(0);
 static LINK_ID: AtomicUsize = AtomicUsize::new(0);
 
 pub fn seed_from_config(file_path: &str) -> usize {
+    validate_config(file_path).unwrap_or_else(|error| panic!("{error}"));
     let content = fs::read_to_string(file_path).expect("The configuration is not valid");
     let config: SeedConfig =
         toml::from_str(&content).expect("Failed to deserialize the configuration");

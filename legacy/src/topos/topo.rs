@@ -518,6 +518,7 @@ pub fn installed_host_attachment_state(
     hosts: &HostAttachments,
     expected_flows: &[Flow],
 ) -> Option<InstalledHostAttachmentState> {
+    crate::validate_config(config_path).unwrap_or_else(|error| panic!("{error}"));
     let content = fs::read_to_string(config_path).expect("The configuration is not valid");
     let config: Config = toml::from_str(&content).expect("Failed to deserialize the configuration");
     let host_attachment = config.host_attachment_spec()?;

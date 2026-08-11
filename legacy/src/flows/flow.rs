@@ -33,6 +33,7 @@ pub enum FlowType {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 struct TomlFlow {
     flow_id: Option<usize>,
     starts_before: Option<Vec<usize>>,
@@ -46,6 +47,7 @@ struct TomlFlow {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 struct TomlFlowSet {
     first_flow_id: Option<usize>,
     starts_before: Option<Vec<usize>>,
@@ -383,6 +385,7 @@ impl Flow {
         file_path: &str,
         hosts: &HostAttachments,
     ) -> Result<Vec<Flow>, String> {
+        crate::validate_config(file_path)?;
         let content = fs::read_to_string(file_path)
             .map_err(|error| format!("failed to read flow configuration: {error}"))?;
 
@@ -815,13 +818,14 @@ mod tests {
             starts_after = [12]
             flow_type = "TCP"
             graph = [[0, 1]]
-            routing = "ShortestPath"
+            routing = "PathFromConfig"
             path = [0, 1]
             [flow.traffic]
                 initial_delay = 1.0
                 size = 10000
-                arr_dist = {type = "Exp", lambda = 1.0}
-                pkt_size_dist = {type = "Uniform", low = 1000, high = 1500}
+                arr_dist = {type = "Uniform", low = 1.0, high = 1.0}
+                pkt_size_dist = {type = "Uniform", low = 1000, high = 1000}
+                tcp = {cc_algorithm = "TCPReno"}
 
             [[flow_set]]
             first_flow_id = 20
@@ -874,7 +878,7 @@ mod tests {
             seed = 1
 
             [[flow]]
-            flow_type = "TCP"
+            flow_type = "PacketDistribution"
             graph = [[0, 1]]
             routing = "PathFromConfig"
             path = []
@@ -905,7 +909,7 @@ mod tests {
             seed = 1
 
             [[flow]]
-            flow_type = "TCP"
+            flow_type = "PacketDistribution"
             graph = [[0, 1]]
             routing = "PathFromConfig"
             path = [2, 3]
@@ -939,7 +943,7 @@ mod tests {
             seed = 1
 
             [[flow]]
-            flow_type = "TCP"
+            flow_type = "PacketDistribution"
             graph = [[0, 1], [1, 2]]
             routing = "ShortestPath"
             [flow.traffic]

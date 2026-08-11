@@ -43,6 +43,7 @@ impl FlowSize {
 }
 
 #[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct TomlTrafficCharacteristics {
     pub initial_delay: Option<f64>,
     pub duration: Option<f64>,
@@ -208,6 +209,7 @@ pub struct FlowFinishMsg {
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct CubicConfig {
     pub beta: Option<f64>,
     pub c: Option<f64>,
@@ -215,6 +217,7 @@ pub struct CubicConfig {
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct TCPCharacteristics {
     pub cc_algorithm: CCAlgorithm,
     #[serde(default)]
@@ -225,6 +228,7 @@ pub struct TCPCharacteristics {
 
 #[cfg(feature = "dcqcn")]
 #[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DcqcnCharacteristics {
     pub rate_gbps: f64,
     pub min_rate_gbps: f64,

@@ -30,7 +30,6 @@ log_path = "{log_path}"
 
 [app_source]
 req_channel_capacity = 128
-chunk_size = 512
 initial_delay = 1
 run_interval = 50
 

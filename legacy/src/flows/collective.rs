@@ -22,6 +22,7 @@ pub enum CollectiveType {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 struct TomlCollective {
     collective_type: CollectiveType,
     first_flow_id: Option<usize>,
@@ -36,6 +37,7 @@ struct TomlCollective {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
 struct TomlCollectiveSet {
     collective_type: CollectiveType,
     collective_count: usize,
@@ -317,6 +319,7 @@ impl Collective {
 
     /// Initializes collectives from a configuration file.
     pub fn collectives_from_config(file_path: &str, hosts: &[usize]) -> Vec<Collective> {
+        crate::validate_config(file_path).unwrap_or_else(|error| panic!("{error}"));
         let content = fs::read_to_string(file_path).expect("The configuration is not valid");
 
         let config: CollectiveConfig =
@@ -328,18 +331,29 @@ impl Collective {
 
         if let Some(collectives_vec) = config.collective {
             for collective in collectives_vec {
-                let graph = collective.graph.map(DiGraph::<usize, ()>::from_edges);
+                let graph = collective
+                    .graph
+                    .as_ref()
+                    .map(DiGraph::<usize, ()>::from_edges);
 
                 let collective_type = collective.collective_type.clone();
                 let flow_type = collective.flow_type.clone();
                 let routing = collective.routing.clone();
+                let mut sources = collective.sources.unwrap_or_default();
+                let mut sinks = collective.sinks.unwrap_or_default();
+                if sources.is_empty() && sinks.is_empty() {
+                    if let Some(edges) = &collective.graph {
+                        sources = edges.iter().map(|(source, _)| *source as usize).collect();
+                        sinks = edges.iter().map(|(_, sink)| *sink as usize).collect();
+                    }
+                }
 
                 let (sources, sinks) = Self::generate_endpoints(
                     collective_type.clone(),
                     collective.flow_count,
                     &collective.paths,
-                    collective.sources.unwrap_or_default(),
-                    collective.sinks.unwrap_or_default(),
+                    sources,
+                    sinks,
                     hosts,
                     rng.clone(),
                 );
