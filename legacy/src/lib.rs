@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde::Deserialize;
 
+mod config;
 pub mod flows;
 #[cfg(feature = "l2")]
 pub mod l2;
@@ -14,7 +15,18 @@ pub mod topos;
 pub mod utils;
 
 pub use days::utils::tracing::{current_concurrency, peak_concurrency, reset_peak_concurrency};
-pub use days::validate_config;
+pub fn validate_config(config_path: &str) -> Result<(), String> {
+    days::validate_config(config_path)?;
+    if let Err(error) = config::validate(config_path) {
+        #[cfg(feature = "test")]
+        assert!(
+            std::env::var_os("DAYS_E3_ASSERT_NO_UNSUPPORTED_CONFIG_INPUT").is_none(),
+            "E3 entered the unsupported-configuration rejection path: {error}"
+        );
+        return Err(error);
+    }
+    Ok(())
+}
 
 #[derive(Deserialize)]
 pub struct SeedConfig {

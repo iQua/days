@@ -181,7 +181,16 @@ pub struct HostAttachmentSpec {
 
 impl Config {
     pub fn host_attachment_spec(&self) -> Option<HostAttachmentSpec> {
-        self.model_host_attachment.then_some(HostAttachmentSpec {
+        // A declared scalar propagation delay is executable input, not an inert annotation. The
+        // legacy topology uses this same physical-stage specification for fabric wires and host
+        // attachments, so scalar propagation activates the complete ordered stage model. The
+        // explicit key remains available to model finite-rate attachments with zero propagation.
+        let scalar_propagation = self
+            .link
+            .as_ref()
+            .and_then(|link| link.propagation_ns)
+            .is_some();
+        (self.model_host_attachment || scalar_propagation).then_some(HostAttachmentSpec {
             rate_bps: self.switch.port_rate,
             propagation_ns: self
                 .link
