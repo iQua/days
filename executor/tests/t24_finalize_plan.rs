@@ -48,8 +48,8 @@ fn only_streams_summary_omits_the_finalize_sweep() {
         CUDA_BACKEND
             .matches("!buffers.finalize_sweep_required")
             .count(),
-        2,
-        "CUDA production and profiled paths must share the lowered-plan policy",
+        3,
+        "CUDA production, phase-profile, and drain-profile paths must share the lowered-plan policy",
     );
     assert_eq!(
         METAL_BACKEND
@@ -59,7 +59,7 @@ fn only_streams_summary_omits_the_finalize_sweep() {
         "Metal ordinary encoding must apply the lowered-plan policy directly",
     );
     assert!(
-        CUDA_BACKEND.contains("dispatch_index == FINALIZE_SWEEP_KERNEL_INDEX")
+        CUDA_BACKEND.contains("dispatch_index == PROFILE_FINALIZE_SWEEP_KERNEL_INDEX")
             && CUDA_BACKEND.contains("index == FINALIZE_SWEEP_KERNEL_INDEX"),
         "CUDA must apply the policy only to the finalize-sweep entry",
     );

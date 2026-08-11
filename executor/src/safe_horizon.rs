@@ -17,6 +17,7 @@ use crate::{Event, EventKey, NodeId, SimulationImage};
 
 const TIME_AFTER_U64_MAX: u128 = 1_u128 << 64;
 const REMOTE_ORDER_BYTES: usize = 34;
+const ROOT_TRACE_GROUP_SIZE: usize = 64;
 
 /// Deterministic transition work performed by one active LP in one round.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,6 +32,19 @@ pub struct LpRoundWork {
     /// CPU round execution currently store every non-continuation local event in the same ordered
     /// `BTreeMap`.
     pub fallback_classified_pushes: u64,
+}
+
+/// Exact scalar observations for the 64-LP root-publication hierarchy.
+///
+/// A group is identified by `lp_slot / 64`. Receiver-only LPs received at least one remote event
+/// during the round but were not members of the round's initial active set.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RootGroupTrace {
+    pub eligible_groups: usize,
+    pub root_time_changed_groups: usize,
+    pub publication_dirty_groups: usize,
+    pub receiver_only_lps: usize,
+    pub receiver_only_groups: usize,
 }
 
 /// Cheap, deterministic instrumentation retained for one safe-horizon round.
@@ -54,6 +68,8 @@ pub struct RoundMetrics {
     pub frontier_heap_pops: u64,
     /// Physical LP-table slots visited by frontier, dispatch, and merge machinery.
     pub physical_lp_probes: u64,
+    /// Exact root-group observations when the executing backend records them.
+    pub root_group_trace: Option<RootGroupTrace>,
 }
 
 impl RoundMetrics {
@@ -503,6 +519,27 @@ impl<'image> RoundExecutor<'image> {
                 active.push(entry);
             }
 
+            let active_slots = active
+                .iter()
+                .map(|entry| entry.lp_slot)
+                .collect::<BTreeSet<_>>();
+            let eligible_groups = active_slots
+                .iter()
+                .map(|lp_slot| lp_slot / ROOT_TRACE_GROUP_SIZE)
+                .collect::<BTreeSet<_>>();
+            let mut publication_dirty_groups = eligible_groups.clone();
+            let mut receiver_only_slots = BTreeSet::new();
+            let mut receiver_only_groups = BTreeSet::new();
+            let mut pre_round_root_times = active_slots
+                .iter()
+                .map(|&lp_slot| {
+                    let root_time = self.futures[lp_slot]
+                        .first_key_value()
+                        .map(|(key, _)| key.time_ns);
+                    (lp_slot, root_time)
+                })
+                .collect::<BTreeMap<_, _>>();
+
             let mut children = Vec::new();
             let mut outboxes = Vec::with_capacity(active.len());
             let mut lp_work = Vec::with_capacity(active.len());
@@ -561,6 +598,18 @@ impl<'image> RoundExecutor<'image> {
                 let target = remote_events[offset].target;
                 let lp_slot =
                     node_slot(self.image, target).ok_or(ExecutionError::UnknownNode(target))?;
+                publication_dirty_groups.insert(lp_slot / ROOT_TRACE_GROUP_SIZE);
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    pre_round_root_times.entry(lp_slot)
+                {
+                    entry.insert(
+                        self.futures[lp_slot]
+                            .first_key_value()
+                            .map(|(key, _)| key.time_ns),
+                    );
+                    receiver_only_slots.insert(lp_slot);
+                    receiver_only_groups.insert(lp_slot / ROOT_TRACE_GROUP_SIZE);
+                }
                 physical_lp_probes = physical_lp_probes.saturating_add(1);
                 let mut end = offset + 1;
                 while end < remote_events.len() && remote_events[end].target == target {
@@ -581,6 +630,24 @@ impl<'image> RoundExecutor<'image> {
                 frontier_updates = frontier_updates.saturating_add(1);
                 offset = end;
             }
+
+            let root_time_changed_groups = pre_round_root_times
+                .iter()
+                .filter_map(|(&lp_slot, &pre_round_root_time)| {
+                    let post_round_root_time = self.futures[lp_slot]
+                        .first_key_value()
+                        .map(|(key, _)| key.time_ns);
+                    (pre_round_root_time != post_round_root_time)
+                        .then_some(lp_slot / ROOT_TRACE_GROUP_SIZE)
+                })
+                .collect::<BTreeSet<_>>();
+            let root_group_trace = RootGroupTrace {
+                eligible_groups: eligible_groups.len(),
+                root_time_changed_groups: root_time_changed_groups.len(),
+                publication_dirty_groups: publication_dirty_groups.len(),
+                receiver_only_lps: receiver_only_slots.len(),
+                receiver_only_groups: receiver_only_groups.len(),
+            };
 
             let active_lp_count = lp_work.len();
             let max_work = lp_work
@@ -619,6 +686,7 @@ impl<'image> RoundExecutor<'image> {
                 frontier_updates,
                 frontier_heap_pops,
                 physical_lp_probes,
+                root_group_trace: Some(root_group_trace),
             };
             #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
             if let (RoundRetention::Window(window), Some(totals)) =

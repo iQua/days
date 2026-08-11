@@ -411,6 +411,46 @@ fn scalar_rounds_match_the_global_queue_and_record_sparse_round_work() {
     assert_eq!(run.rounds[1].lp_work[0].node, SINK);
     assert_eq!(run.rounds[0].parallel_efficiency, 1.0);
     assert_eq!(run.rounds[1].parallel_efficiency, 1.0);
+    assert_eq!(
+        run.rounds[0].root_group_trace,
+        Some(days_executor::RootGroupTrace {
+            eligible_groups: 1,
+            root_time_changed_groups: 1,
+            publication_dirty_groups: 1,
+            receiver_only_lps: 1,
+            receiver_only_groups: 1,
+        })
+    );
+    assert_eq!(
+        run.rounds[1].root_group_trace,
+        Some(days_executor::RootGroupTrace {
+            eligible_groups: 1,
+            root_time_changed_groups: 1,
+            publication_dirty_groups: 1,
+            receiver_only_lps: 0,
+            receiver_only_groups: 0,
+        })
+    );
+}
+
+#[test]
+fn scalar_rounds_record_exact_root_group_trace() {
+    let run = run_scalar_rounds_with_observations(
+        &packet_arrival_incast_image(64),
+        Some(10),
+        ObservationMode::Summary,
+    )
+    .unwrap();
+
+    assert_eq!(run.rounds.len(), 1);
+    let trace = run.rounds[0]
+        .root_group_trace
+        .expect("scalar rounds must retain exact root-group instrumentation");
+    assert_eq!(trace.eligible_groups, 1);
+    assert_eq!(trace.root_time_changed_groups, 2);
+    assert_eq!(trace.publication_dirty_groups, 2);
+    assert_eq!(trace.receiver_only_lps, 1);
+    assert_eq!(trace.receiver_only_groups, 1);
 }
 
 #[test]
@@ -2954,6 +2994,31 @@ fn incast_image(sender_count: usize) -> SimulationImage {
         initial_events,
         seed: 1,
     }
+}
+
+fn packet_arrival_incast_image(sender_count: usize) -> SimulationImage {
+    let mut image = incast_image(sender_count);
+    image.initial_events.clear();
+    for sender in 0..sender_count {
+        let sender = NodeId(sender as u64);
+        let state = &mut image.host_states[sender.0 as usize];
+        state.in_service = None;
+        state.next_origin_seq = 1;
+        state.sourced_packets = 0;
+        let payload = image.initial_packets[sender.0 as usize].id;
+        image.initial_events.push(Event {
+            key: EventKey {
+                time_ns: 0,
+                phase: event_phase(EventKind::PacketArrival),
+                origin_node: sender,
+                origin_seq: 0,
+            },
+            target: sender,
+            kind: EventKind::PacketArrival,
+            payload,
+        });
+    }
+    image
 }
 
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]

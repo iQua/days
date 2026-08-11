@@ -41,9 +41,13 @@ fn main() {
     );
 
     let profile = profiled.profile;
-    let phases = [
+    let phases: [(&str, u64); 12] = [
         ("horizon", profile.horizon_ns),
-        ("prepare", profile.prepare_ns),
+        ("reset", profile.round_reset_ns),
+        ("prepare_count", profile.prepare_count_ns),
+        ("prepare_prefix", profile.prepare_prefix_ns),
+        ("prepare_write", profile.prepare_write_ns),
+        ("prepare_combine", profile.prepare_combine_ns),
         ("drain", profile.drain_ns),
         ("control", profile.control_ns),
         ("exchange_prefix", profile.exchange_prefix_ns),
@@ -52,15 +56,21 @@ fn main() {
         ("finalize", profile.finalize_ns),
     ];
     let total_kernel_ns = profile.total_kernel_ns();
+    assert_eq!(
+        phases.iter().map(|(_, elapsed_ns)| elapsed_ns).sum::<u64>(),
+        total_kernel_ns,
+        "the twelve reported rows must attribute every profile dispatch exactly once"
+    );
     let (dominant_phase, dominant_ns) = phases
         .iter()
         .copied()
         .max_by_key(|(_, elapsed_ns)| *elapsed_ns)
-        .expect("CUDA profile has eight phases");
+        .expect("CUDA profile has twelve phases");
 
     println!(
         "record=t17c_cuda_phase_profile_protocol fixture={fixture} \
-         orchestration=direct_eight_kernel_attempts timestamps=cuda_device_events \
+         orchestration=direct_16_dispatch_profile_attempts production_dispatches=13 \
+         timestamps=cuda_device_events \
          production_graph_perturbed=false correctness=complete_RunResult_equality \
          percentage_basis=sum_of_phase_kernel_intervals"
     );

@@ -34,11 +34,11 @@ use crate::planner_capacity::{PlannerCapacityContext, PlannerCapacityMode, TcpMi
 use crate::tcp::{TcpCubic, TcpReno};
 use crate::{
     ArrivalDisposition, Backend, CapacityRetryRecord, CapacityWarmStart, DeviceCapacityCaps,
-    DeviceCapacityFloors, Event, EventKey, EventKind, FlowGeneratorKind, FlowId, GeneratorStatus,
-    GeneratorTermination, NodeId, NodeKind, ObservationMode, PacketArrivalObservation,
-    PacketDeparture, PacketDescriptor, PacketKind, PayloadId, RunResult, RunSummary,
-    SimulationImage, TcpAckHeader, TcpCongestionControl, TcpDataHeader, TcpPhase, TcpReceiveRange,
-    TcpTimerState, validate,
+    DeviceCapacityFloors, DrainProfile, DrainProfileChannel, DrainProfileLayout, Event, EventKey,
+    EventKind, FlowGeneratorKind, FlowId, GeneratorStatus, GeneratorTermination, NodeId, NodeKind,
+    ObservationMode, PacketArrivalObservation, PacketDeparture, PacketDescriptor, PacketKind,
+    PayloadId, RunResult, RunSummary, SimulationImage, TcpAckHeader, TcpCongestionControl,
+    TcpDataHeader, TcpPhase, TcpReceiveRange, TcpTimerState, validate,
 };
 
 const LANES: usize = 1_024;
@@ -936,7 +936,7 @@ pub struct CudaRun {
     pub memory_layout: CudaMemoryLayout,
 }
 
-/// Device-timestamp totals for the eight reported phases of every encoded CUDA graph attempt.
+/// Device-timestamp totals for the twelve reported phases of every encoded CUDA profile attempt.
 ///
 /// T21 fix 1 launches more kernels than there are phases here — see [`KERNEL_NAMES`] and
 /// [`DISPATCH_PHASE`]. A phase's total is the sum of its launches', so this decomposition is
@@ -945,7 +945,13 @@ pub struct CudaRun {
 pub struct CudaPhaseProfile {
     pub recorded_attempts: u64,
     pub horizon_ns: u64,
-    pub prepare_ns: u64,
+    pub round_reset_ns: u64,
+    /// Aggregate of the four profile-only prepare dispatches.
+    pub round_prepare_ns: u64,
+    pub prepare_count_ns: u64,
+    pub prepare_prefix_ns: u64,
+    pub prepare_write_ns: u64,
+    pub prepare_combine_ns: u64,
     pub drain_ns: u64,
     pub control_ns: u64,
     pub exchange_prefix_ns: u64,
@@ -958,7 +964,8 @@ impl CudaPhaseProfile {
     pub fn total_kernel_ns(self) -> u64 {
         [
             self.horizon_ns,
-            self.prepare_ns,
+            self.round_reset_ns,
+            self.round_prepare_ns,
             self.drain_ns,
             self.control_ns,
             self.exchange_prefix_ns,
@@ -973,16 +980,23 @@ impl CudaPhaseProfile {
     fn observe(&mut self, phase: usize, elapsed_ns: u64) {
         let total = match phase {
             0 => &mut self.horizon_ns,
-            1 => &mut self.prepare_ns,
-            2 => &mut self.drain_ns,
-            3 => &mut self.control_ns,
-            4 => &mut self.exchange_prefix_ns,
-            5 => &mut self.exchange_scatter_ns,
-            6 => &mut self.exchange_merge_ns,
-            7 => &mut self.finalize_ns,
-            _ => unreachable!("CUDA graph has exactly eight profiled phases"),
+            1 => &mut self.round_reset_ns,
+            2 => &mut self.prepare_count_ns,
+            3 => &mut self.prepare_prefix_ns,
+            4 => &mut self.prepare_write_ns,
+            5 => &mut self.prepare_combine_ns,
+            6 => &mut self.drain_ns,
+            7 => &mut self.control_ns,
+            8 => &mut self.exchange_prefix_ns,
+            9 => &mut self.exchange_scatter_ns,
+            10 => &mut self.exchange_merge_ns,
+            11 => &mut self.finalize_ns,
+            _ => unreachable!("CUDA profile has exactly twelve reported phases"),
         };
         *total = total.saturating_add(elapsed_ns);
+        if matches!(phase, 2..=5) {
+            self.round_prepare_ns = self.round_prepare_ns.saturating_add(elapsed_ns);
+        }
     }
 }
 
@@ -991,6 +1005,13 @@ impl CudaPhaseProfile {
 pub struct CudaProfiledRun {
     pub run: CudaRun,
     pub profile: CudaPhaseProfile,
+}
+
+/// Complete CUDA result paired with exact opt-in drain counters.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CudaDrainProfileRun {
+    pub run: CudaRun,
+    pub profile: DrainProfile,
 }
 
 /// One-time CUDA context, stream, module, and kernel initialization costs.
@@ -1467,6 +1488,202 @@ impl CudaExecutor {
             }
         }
     }
+
+    /// Executes the opt-in, exact drain-counter kernel without changing the production graph.
+    ///
+    /// The diagnostic graph has the same thirteen dispatch boundaries, order, and geometry as the
+    /// production graph, but replaces only `days_round` with its read-only counter counterpart.
+    /// Counter-run timing fields are incidental and must not be used as performance measurements.
+    pub fn run_drain_profile_with_observations(
+        &self,
+        image: &SimulationImage,
+        exclusive_horizon_ns: Option<u64>,
+        config: CudaConfig,
+        observation_mode: ObservationMode,
+    ) -> Result<CudaDrainProfileRun, CudaError> {
+        validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
+        validate_config(config)?;
+        if !config.streams_enabled {
+            return Err(CudaError::Validation(
+                "drain profiling requires streams_enabled=true".into(),
+            ));
+        }
+
+        let retry_budget = config.max_capacity_retries;
+        let mut attempt_config = config;
+        let mut channel_capacity_floors = crate::device_capacity::ChannelCapacityFloors::default();
+        let mut tcp_capacity_floors = crate::device_capacity::TcpCapacityFloors::default();
+        let mut retry_trace = Vec::new();
+        loop {
+            let attempt = (|| {
+                let plan = CudaPlan::new_with_entity_capacity_floors(
+                    image,
+                    exclusive_horizon_ns,
+                    attempt_config,
+                    observation_mode,
+                    &mut channel_capacity_floors,
+                    &mut tcp_capacity_floors,
+                )?;
+                let layout = cuda_drain_profile_layout(&plan, image)?;
+                let _execution_guard = cuda_device_execution_guard();
+                let diagnostics = CudaBuffer::from_host(
+                    &self.direct.stream,
+                    layout.zeroed_words(),
+                    self.direct.provisioning,
+                )
+                .map_err(|error| driver_error("drain profile allocation", error))?;
+                let buffers =
+                    CudaBuffers::new(&self.direct.stream, plan, self.direct.provisioning)?;
+                let timing =
+                    self.direct
+                        .run_drain_profile(&buffers, attempt_config, &diagnostics)?;
+                let words = self
+                    .direct
+                    .stream
+                    .clone_dtoh(&diagnostics)
+                    .map_err(|error| driver_error("drain profile readback", error))?;
+                self.direct.stream.synchronize().map_err(|error| {
+                    driver_error("drain profile readback synchronization", error)
+                })?;
+                #[cfg(feature = "cuda-test-hooks")]
+                panic_after_execution_if_requested();
+                let run = buffers.finish(&self.direct, image, observation_mode, timing)?;
+                let profile = layout
+                    .decode(&words)
+                    .map_err(|error| CudaError::Validation(error.to_string()))?;
+                if profile.selected_events != u128::from(run.transitions) {
+                    return Err(CudaError::Validation(format!(
+                        "drain profile selected {} events but the run completed {} transitions",
+                        profile.selected_events, run.transitions
+                    ))
+                    .into());
+                }
+                Ok(CudaDrainProfileRun { run, profile })
+            })();
+            match attempt {
+                Ok(mut profiled) => {
+                    profiled.run.capacity_retry_trace = retry_trace;
+                    profiled.run.capacity_warm_start = CapacityWarmStart {
+                        floors: converged_capacity_floors(&attempt_config),
+                        channel_events_by_stream: channel_capacity_floors.converged_capacities(),
+                        tcp_receiver_ranges_by_base: tcp_capacity_floors
+                            .converged_receiver_ranges(),
+                        tcp_ledger_segments_by_flow: tcp_capacity_floors
+                            .converged_ledger_segments(),
+                    };
+                    return Ok(profiled);
+                }
+                Err(failure) => {
+                    let AttemptFailure {
+                        error,
+                        ledger_high_water,
+                    } = failure;
+                    let (arena, node, flow, stream, capacity, demand) = match error {
+                        CudaError::CapacityExceeded {
+                            arena,
+                            node,
+                            flow,
+                            stream,
+                            capacity,
+                            demand,
+                        } => (arena, node, flow, stream, capacity, demand),
+                        error => return Err(error.with_retry_trace(&retry_trace)),
+                    };
+                    if retry_trace.len() == retry_budget {
+                        return Err(CudaError::CapacityExceeded {
+                            arena,
+                            node,
+                            flow,
+                            stream,
+                            capacity,
+                            demand,
+                        }
+                        .with_retry_trace(&retry_trace));
+                    }
+                    let grown_capacity = match arena {
+                        CudaArena::TcpReceiverRanges => {
+                            crate::device_capacity::grown_capacity_with_slack(
+                                capacity,
+                                demand,
+                                crate::device_capacity::TCP_RECEIVER_RETRY_SLACK,
+                            )
+                        }
+                        CudaArena::TcpSegmentLedger => {
+                            crate::device_capacity::grown_ledger_capacity(
+                                capacity,
+                                demand,
+                                crate::device_capacity::observed_ledger_high_water(
+                                    ledger_high_water.as_deref(),
+                                    flow,
+                                ),
+                            )
+                        }
+                        _ => crate::device_capacity::grown_capacity(capacity, demand),
+                    };
+                    if grown_capacity <= capacity {
+                        return Err(CudaError::CapacityExceeded {
+                            arena,
+                            node,
+                            flow,
+                            stream,
+                            capacity,
+                            demand,
+                        }
+                        .with_retry_trace(&retry_trace));
+                    }
+                    let entity_floor_raised = match (arena, flow, stream) {
+                        (CudaArena::ChannelInbox, None, Some(stream)) => {
+                            channel_capacity_floors.raise(stream, capacity, grown_capacity)
+                        }
+                        (CudaArena::ChannelInbox, _, None) => {
+                            return Err(CudaError::Validation(
+                                "channel capacity fault omitted its stream identity".into(),
+                            )
+                            .with_retry_trace(&retry_trace));
+                        }
+                        (CudaArena::TcpReceiverRanges, Some(flow), None) => {
+                            tcp_capacity_floors.raise_receiver(flow, capacity, grown_capacity)
+                        }
+                        (CudaArena::TcpSegmentLedger, Some(flow), None) => {
+                            let raised =
+                                tcp_capacity_floors.raise_ledger(flow, capacity, grown_capacity);
+                            if let (true, Some(high_water)) = (raised, ledger_high_water.as_deref())
+                            {
+                                tcp_capacity_floors.raise_ledger_from_occupancy(high_water);
+                            }
+                            raised
+                        }
+                        (CudaArena::TcpReceiverRanges | CudaArena::TcpSegmentLedger, None, _) => {
+                            return Err(CudaError::Validation(
+                                "TCP capacity fault omitted its flow identity".into(),
+                            )
+                            .with_retry_trace(&retry_trace));
+                        }
+                        _ => {
+                            attempt_config.raise_capacity(arena, capacity, grown_capacity);
+                            true
+                        }
+                    };
+                    if !entity_floor_raised {
+                        return Err(CudaError::Validation(
+                            "capacity fault did not match its immutable planned entity".into(),
+                        )
+                        .with_retry_trace(&retry_trace));
+                    }
+                    retry_trace.push(CapacityRetryRecord {
+                        retry: retry_trace.len() + 1,
+                        arena,
+                        node,
+                        flow,
+                        stream,
+                        capacity,
+                        demand,
+                        grown_capacity,
+                    });
+                }
+            }
+        }
+    }
 }
 
 /// Asserts that the linear-table planner produces the complete legacy host plan bit-for-bit.
@@ -1718,6 +1935,35 @@ struct StreamLayout {
     staging_channel_offset: usize,
     channel_target_offset: usize,
     round_scratch_offset: usize,
+}
+
+fn cuda_drain_profile_layout(
+    plan: &CudaPlan,
+    image: &SimulationImage,
+) -> Result<DrainProfileLayout, CudaError> {
+    let mut maximum_heads = Vec::with_capacity(image.nodes.len());
+    for node in 0..image.nodes.len() {
+        let meta = node
+            .checked_mul(LP_STREAM_META_WORDS)
+            .and_then(|offset| plan.stream_layout.lp_stream_meta_offset.checked_add(offset))
+            .ok_or_else(|| CudaError::Validation("drain profile LP metadata overflows".into()))?;
+        let declared = usize::try_from(plan.stream_state[meta + 1]).map_err(|_| {
+            CudaError::Validation("drain profile stream count does not fit usize".into())
+        })?;
+        maximum_heads.push(declared.checked_add(1).ok_or_else(|| {
+            CudaError::Validation("drain profile head-row size overflows".into())
+        })?);
+    }
+    let channels = image
+        .channels
+        .iter()
+        .map(|channel| DrainProfileChannel {
+            source: channel.source.0 as usize,
+            target: channel.target.0,
+        })
+        .collect::<Vec<_>>();
+    DrainProfileLayout::new(&maximum_heads, &channels)
+        .map_err(|error| CudaError::Validation(error.to_string()))
 }
 
 struct PreparedStreams {
@@ -4608,15 +4854,41 @@ const KERNEL_NAMES: [&str; 13] = [
     "days_round_finalize_sweep",
     "days_round_finalize",
 ];
-/// Which of the eight *reported* profile phases each launch belongs to.
+/// Direct-profile launch order. Only the opt-in profiling path uses these extra boundaries.
+///
+/// The four prepare kernels are a semantics-preserving decomposition of `days_round_prepare`.
+/// The production graph above remains thirteen dispatches and continues to use the original
+/// single prepare kernel.
+const PROFILE_KERNEL_NAMES: [&str; 16] = [
+    "days_horizon_sweep",
+    "days_horizon",
+    "days_round_reset",
+    "days_round_prepare_count_profile",
+    "days_round_prepare_prefix_profile",
+    "days_round_prepare_write_profile",
+    "days_round_prepare_combine_profile",
+    "days_round",
+    "days_round_control_sweep",
+    "days_round_control",
+    "days_exchange_prefix_sweep",
+    "days_exchange_prefix",
+    "days_exchange_scatter",
+    "days_exchange_merge",
+    "days_round_finalize_sweep",
+    "days_round_finalize",
+];
+/// Which of the nine *reported* profile phases each launch belongs to.
 ///
 /// The reported decomposition deliberately does not grow with the launch count: a phase's time is
 /// the sum of its launches', so `t17c_cuda_profile` compares before and after like for like.
-const DISPATCH_PHASE: [usize; 13] = [0, 0, 1, 1, 2, 3, 3, 4, 4, 5, 6, 7, 7];
+#[allow(dead_code)] // Retained as the static production-DAG attribution contract.
+const DISPATCH_PHASE: [usize; 13] = [0, 0, 1, 2, 3, 4, 4, 5, 5, 6, 7, 8, 8];
+const PROFILE_DISPATCH_PHASE: [usize; 16] = [0, 0, 1, 2, 3, 4, 5, 6, 7, 7, 8, 8, 9, 10, 11, 11];
 /// T20l fix 2's readback gather. Deliberately outside [`KERNEL_NAMES`]: it is not part of the
 /// captured attempt DAG, does not take the uniform 29-plane ABI, and is launched only after an
 /// attempt has been screened as successful.
 const COMPACT_KERNEL_NAME: &str = "days_compact_gather";
+const DRAIN_PROFILE_KERNEL_NAME: &str = "days_round_drain_profile";
 // T20l fix 2: one thread per entity, and an entity's work is bounded by its own live count. 256
 // keeps the launch a whole number of warps without reserving the maximum block footprint; the
 // gather's output does not depend on it.
@@ -4628,11 +4900,16 @@ const CONTROL_KERNELS: [usize; 10] = [0, 1, 2, 3, 5, 6, 7, 8, 11, 12];
 const SWEEP_KERNELS: [usize; 5] = [0, 2, 5, 7, 11];
 const PARALLEL_KERNELS: [usize; 3] = [4, 9, 10];
 const FINALIZE_SWEEP_KERNEL_INDEX: usize = 11;
+const PROFILE_SWEEP_KERNELS: [usize; 5] = [0, 2, 8, 10, 14];
+const PROFILE_PARALLEL_KERNELS: [usize; 3] = [7, 12, 13];
+const PROFILE_FINALIZE_SWEEP_KERNEL_INDEX: usize = 14;
 
 struct DirectCuda {
     _context: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     functions: Vec<CudaFunction>,
+    profile_functions: Vec<CudaFunction>,
+    drain_profile_function: CudaFunction,
     /// T20l fix 2: the readback gather, loaded beside the eight attempt kernels.
     compact_function: CudaFunction,
     initialization_timings: CudaInitializationTimings,
@@ -4668,6 +4945,20 @@ impl DirectCuda {
                     .map_err(|error| driver_error(format!("kernel `{name}` load"), error))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let profile_functions = PROFILE_KERNEL_NAMES
+            .iter()
+            .map(|name| {
+                module
+                    .load_function(name)
+                    .map_err(|error| driver_error(format!("kernel `{name}` load"), error))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let drain_profile_function =
+            module
+                .load_function(DRAIN_PROFILE_KERNEL_NAME)
+                .map_err(|error| {
+                    driver_error(format!("kernel `{DRAIN_PROFILE_KERNEL_NAME}` load"), error)
+                })?;
         let compact_function = module
             .load_function(COMPACT_KERNEL_NAME)
             .map_err(|error| driver_error(format!("kernel `{COMPACT_KERNEL_NAME}` load"), error))?;
@@ -4710,11 +5001,33 @@ impl DirectCuda {
                 )));
             }
         }
+        for (index, function) in profile_functions.iter().enumerate() {
+            if PROFILE_PARALLEL_KERNELS.contains(&index) {
+                continue;
+            }
+            let supported = function.max_threads_per_block().map_err(|error| {
+                driver_error(
+                    format!(
+                        "kernel `{}` thread limit query",
+                        PROFILE_KERNEL_NAMES[index]
+                    ),
+                    error,
+                )
+            })? as usize;
+            if supported < LANES {
+                return Err(CudaError::Unavailable(format!(
+                    "kernel `{}` supports only {supported} threads per block; {LANES} are required",
+                    PROFILE_KERNEL_NAMES[index]
+                )));
+            }
+        }
 
         Ok(Self {
             _context: context,
             stream,
             functions,
+            profile_functions,
+            drain_profile_function,
             compact_function,
             initialization_timings: CudaInitializationTimings {
                 context_stream_setup_ns,
@@ -4926,6 +5239,109 @@ impl DirectCuda {
         })
     }
 
+    fn run_drain_profile(
+        &self,
+        buffers: &CudaBuffers,
+        config: CudaConfig,
+        diagnostics: &CudaBuffer,
+    ) -> Result<CudaTiming, CudaError> {
+        let parallel_threads = config.round_threads_per_block;
+        let supported_parallel_threads = self
+            .drain_profile_function
+            .max_threads_per_block()
+            .map_err(|error| {
+                driver_error(
+                    format!("kernel `{DRAIN_PROFILE_KERNEL_NAME}` thread limit query"),
+                    error,
+                )
+            })? as usize;
+        if parallel_threads > supported_parallel_threads {
+            return Err(CudaError::Validation(format!(
+                "round_threads_per_block {parallel_threads} exceeds the drain-profile maximum \
+                 {supported_parallel_threads}"
+            )));
+        }
+        let parallel_blocks = buffers.node_count.div_ceil(parallel_threads).max(1);
+        let parallel_blocks = u32::try_from(parallel_blocks).map_err(|_| {
+            CudaError::Validation("parallel CUDA grid does not fit in u32 blocks".into())
+        })?;
+        let parallel_threads = u32::try_from(parallel_threads).map_err(|_| {
+            CudaError::Validation("round_threads_per_block does not fit in u32".into())
+        })?;
+        let configs = attempt_launch_configs(parallel_blocks, parallel_threads);
+
+        let wall_started = Instant::now();
+        let capture_started = Instant::now();
+        let graph = self.capture_drain_profile_graph(
+            buffers,
+            diagnostics,
+            &configs,
+            config.attempts_per_graph_wave,
+        )?;
+        let graph_capture_ns = duration_ns(capture_started.elapsed());
+        let maximum_replays = buffers
+            .dispatch_capacity
+            .div_ceil(config.attempts_per_graph_wave)
+            .max(1);
+        let mut graph_replays = 0_u64;
+        let mut wave_boundary_syncs = 0_u64;
+        let mut mid_round_wave_boundary_syncs = 0_u64;
+        let mut host_submit_ns = 0_u64;
+        let mut device_ns = 0_u64;
+        let mut encoded_attempts = 0_u64;
+
+        for _ in 0..maximum_replays {
+            let start = self
+                .stream
+                .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                .map_err(|error| driver_error("drain-profile wave start event", error))?;
+            let submitted = Instant::now();
+            graph
+                .launch()
+                .map_err(|error| driver_error("drain-profile CUDA Graph replay", error))?;
+            host_submit_ns = host_submit_ns.saturating_add(duration_ns(submitted.elapsed()));
+            let end = self
+                .stream
+                .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
+                .map_err(|error| driver_error("drain-profile wave end event", error))?;
+            let control = self
+                .stream
+                .clone_dtoh(&buffers.planes[0])
+                .map_err(|error| driver_error("drain-profile control readback", error))?;
+            self.stream
+                .synchronize()
+                .map_err(|error| driver_error("drain-profile control synchronization", error))?;
+            let elapsed_ms = start
+                .elapsed_ms(&end)
+                .map_err(|error| driver_error("drain-profile wave elapsed time", error))?;
+            device_ns = device_ns.saturating_add((f64::from(elapsed_ms) * 1_000_000.0) as u64);
+            graph_replays = graph_replays.saturating_add(1);
+            wave_boundary_syncs = wave_boundary_syncs.saturating_add(1);
+            encoded_attempts =
+                encoded_attempts.saturating_add(config.attempts_per_graph_wave as u64);
+
+            let done = control[CONTROL_DONE] != 0;
+            let error = control[CONTROL_ERROR] != 0;
+            if !done && !error && control[CONTROL_CONTINUATION] != 0 {
+                mid_round_wave_boundary_syncs = mid_round_wave_boundary_syncs.saturating_add(1);
+            }
+            if done || error {
+                break;
+            }
+        }
+
+        Ok(CudaTiming {
+            encoded_attempts,
+            graph_replays,
+            wave_boundary_syncs,
+            mid_round_wave_boundary_syncs,
+            graph_capture_ns,
+            host_submit_ns,
+            device_ns,
+            wall_ns: duration_ns(wall_started.elapsed()),
+        })
+    }
+
     fn run_profiled(
         &self,
         buffers: &CudaBuffers,
@@ -4963,7 +5379,10 @@ impl DirectCuda {
         let parallel_threads = u32::try_from(parallel_threads).map_err(|_| {
             CudaError::Validation("round_threads_per_block does not fit in u32".into())
         })?;
-        let configs = attempt_launch_configs(parallel_blocks, parallel_threads);
+        let configs = profile_launch_configs(parallel_blocks, parallel_threads);
+        let prepare_scratch =
+            CudaBuffer::from_host(&self.stream, vec![0_u64; LANES * 2], self.provisioning)
+                .map_err(|error| driver_error("profile prepare scratch allocation", error))?;
 
         let wall_started = Instant::now();
         let maximum_waves = buffers
@@ -4989,14 +5408,14 @@ impl DirectCuda {
                     .record(&self.stream)
                     .map_err(|error| driver_error("profile attempt start event", error))?;
                 for (dispatch_index, ((function, launch_config), name)) in self
-                    .functions
+                    .profile_functions
                     .iter()
                     .zip(configs)
-                    .zip(KERNEL_NAMES)
+                    .zip(PROFILE_KERNEL_NAMES)
                     .enumerate()
                 {
                     if !buffers.finalize_sweep_required
-                        && dispatch_index == FINALIZE_SWEEP_KERNEL_INDEX
+                        && dispatch_index == PROFILE_FINALIZE_SWEEP_KERNEL_INDEX
                     {
                         boundaries[dispatch_index + 1]
                             .record(&self.stream)
@@ -5005,8 +5424,18 @@ impl DirectCuda {
                             })?;
                         continue;
                     }
-                    launch_uniform(&self.stream, function, buffers, launch_config)
-                        .map_err(|error| driver_error(format!("profile `{name}` launch"), error))?;
+                    if (3..=6).contains(&dispatch_index) {
+                        launch_with_diagnostic(
+                            &self.stream,
+                            function,
+                            buffers,
+                            &prepare_scratch,
+                            launch_config,
+                        )
+                    } else {
+                        launch_uniform(&self.stream, function, buffers, launch_config)
+                    }
+                    .map_err(|error| driver_error(format!("profile `{name}` launch"), error))?;
                     boundaries[dispatch_index + 1]
                         .record(&self.stream)
                         .map_err(|error| {
@@ -5035,20 +5464,20 @@ impl DirectCuda {
                 encoded_attempts.saturating_add(config.attempts_per_graph_wave as u64);
 
             for boundaries in &phase_events {
-                for phase in 0..KERNEL_NAMES.len() {
+                for phase in 0..PROFILE_KERNEL_NAMES.len() {
                     let elapsed_ms = boundaries[phase]
                         .elapsed_ms(&boundaries[phase + 1])
                         .map_err(|error| {
                             driver_error(
                                 format!(
                                     "profile `{}` device-event elapsed time",
-                                    KERNEL_NAMES[phase]
+                                    PROFILE_KERNEL_NAMES[phase]
                                 ),
                                 error,
                             )
                         })?;
                     profile.observe(
-                        DISPATCH_PHASE[phase],
+                        PROFILE_DISPATCH_PHASE[phase],
                         (f64::from(elapsed_ms) * 1_000_000.0) as u64,
                     );
                 }
@@ -5085,8 +5514,8 @@ impl DirectCuda {
     fn create_phase_events(&self, attempts: usize) -> Result<Vec<Vec<CudaEvent>>, CudaError> {
         let mut phase_events = Vec::with_capacity(attempts);
         for _ in 0..attempts {
-            let mut boundaries = Vec::with_capacity(KERNEL_NAMES.len() + 1);
-            for _ in 0..=KERNEL_NAMES.len() {
+            let mut boundaries = Vec::with_capacity(PROFILE_KERNEL_NAMES.len() + 1);
+            for _ in 0..=PROFILE_KERNEL_NAMES.len() {
                 boundaries.push(
                     self.stream
                         .context()
@@ -5145,6 +5574,67 @@ impl DirectCuda {
             .map_err(|error| driver_error("CUDA Graph upload", error))?;
         Ok(graph)
     }
+
+    fn capture_drain_profile_graph(
+        &self,
+        buffers: &CudaBuffers,
+        diagnostics: &CudaBuffer,
+        configs: &[LaunchConfig; KERNEL_NAMES.len()],
+        attempts: usize,
+    ) -> Result<CudaGraph, CudaError> {
+        self.stream
+            .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
+            .map_err(|error| driver_error("drain-profile CUDA Graph capture begin", error))?;
+
+        let captured = (|| {
+            for _ in 0..attempts {
+                for (index, ((function, config), name)) in self
+                    .functions
+                    .iter()
+                    .zip(configs)
+                    .zip(KERNEL_NAMES)
+                    .enumerate()
+                {
+                    if !buffers.finalize_sweep_required && index == FINALIZE_SWEEP_KERNEL_INDEX {
+                        continue;
+                    }
+                    let launched = if index == 4 {
+                        launch_with_diagnostic(
+                            &self.stream,
+                            &self.drain_profile_function,
+                            buffers,
+                            diagnostics,
+                            *config,
+                        )
+                    } else {
+                        launch_uniform(&self.stream, function, buffers, *config)
+                    };
+                    launched.map_err(|error| {
+                        driver_error(format!("drain-profile capture `{name}` launch"), error)
+                    })?;
+                }
+            }
+            Ok(())
+        })();
+        let ended = self.stream.end_capture(
+            sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_USE_NODE_PRIORITY,
+        );
+        if let Err(error) = captured {
+            let _ = ended;
+            return Err(error);
+        }
+        let graph = ended
+            .map_err(|error| {
+                driver_error("drain-profile CUDA Graph capture end/instantiate", error)
+            })?
+            .ok_or_else(|| {
+                CudaError::Unavailable("drain-profile CUDA Graph capture returned no graph".into())
+            })?;
+        graph
+            .upload()
+            .map_err(|error| driver_error("drain-profile CUDA Graph upload", error))?;
+        Ok(graph)
+    }
 }
 
 /// One [`LaunchConfig`] per entry of [`KERNEL_NAMES`], in launch order.
@@ -5179,6 +5669,33 @@ fn attempt_launch_configs(
     configs
 }
 
+fn profile_launch_configs(
+    parallel_blocks: u32,
+    parallel_threads: u32,
+) -> [LaunchConfig; PROFILE_KERNEL_NAMES.len()] {
+    let control = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (LANES as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut configs = [control; PROFILE_KERNEL_NAMES.len()];
+    for index in PROFILE_SWEEP_KERNELS {
+        configs[index] = LaunchConfig {
+            grid_dim: (crate::device_sizing::CONTROL_SWEEP_BLOCKS as u32, 1, 1),
+            block_dim: (LANES as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+    }
+    for index in PROFILE_PARALLEL_KERNELS {
+        configs[index] = LaunchConfig {
+            grid_dim: (parallel_blocks, 1, 1),
+            block_dim: (parallel_threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+    }
+    configs
+}
+
 fn launch_uniform(
     stream: &CudaStream,
     function: &CudaFunction,
@@ -5190,6 +5707,25 @@ fn launch_uniform(
     for plane in &buffers.planes {
         arguments.arg(plane);
     }
+    unsafe {
+        arguments.launch(config)?;
+    }
+    Ok(())
+}
+
+fn launch_with_diagnostic(
+    stream: &CudaStream,
+    function: &CudaFunction,
+    buffers: &CudaBuffers,
+    diagnostic: &CudaBuffer,
+    config: LaunchConfig,
+) -> Result<(), cudarc::driver::DriverError> {
+    debug_assert_eq!(buffers.planes.len(), 29);
+    let mut arguments = stream.launch_builder(function);
+    for plane in &buffers.planes {
+        arguments.arg(plane);
+    }
+    arguments.arg(diagnostic);
     unsafe {
         arguments.launch(config)?;
     }
@@ -5238,8 +5774,8 @@ fn duration_ns(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CudaArena, CudaError, CudaProvisioning, decode_arena, decode_device_error,
-        select_cuda_provisioning,
+        CudaArena, CudaError, CudaPhaseProfile, CudaProvisioning, PROFILE_DISPATCH_PHASE,
+        decode_arena, decode_device_error, select_cuda_provisioning,
     };
     use crate::CapacityRetryRecord;
 
@@ -5265,6 +5801,29 @@ mod tests {
             select_cuda_provisioning(false, true, true),
             CudaProvisioning::Device
         );
+    }
+
+    #[test]
+    fn cuda_phase_profile_attributes_every_dispatch_exactly_once() {
+        let mut profile = CudaPhaseProfile::default();
+        for (elapsed_ns, phase) in (1_u64..).zip(PROFILE_DISPATCH_PHASE) {
+            profile.observe(phase, elapsed_ns);
+        }
+
+        assert_eq!(profile.horizon_ns, 3);
+        assert_eq!(profile.round_reset_ns, 3);
+        assert_eq!(profile.prepare_count_ns, 4);
+        assert_eq!(profile.prepare_prefix_ns, 5);
+        assert_eq!(profile.prepare_write_ns, 6);
+        assert_eq!(profile.prepare_combine_ns, 7);
+        assert_eq!(profile.round_prepare_ns, 22);
+        assert_eq!(profile.drain_ns, 8);
+        assert_eq!(profile.control_ns, 19);
+        assert_eq!(profile.exchange_prefix_ns, 23);
+        assert_eq!(profile.exchange_scatter_ns, 13);
+        assert_eq!(profile.exchange_merge_ns, 14);
+        assert_eq!(profile.finalize_ns, 31);
+        assert_eq!(profile.total_kernel_ns(), (1_u64..=16).sum::<u64>());
     }
 
     #[test]

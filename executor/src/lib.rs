@@ -17,6 +17,7 @@ mod device_capacity;
 mod device_compaction;
 mod device_scheduler;
 pub mod device_sizing;
+mod drain_profile;
 pub mod event;
 pub mod image;
 mod mechanism_trace;
@@ -72,6 +73,10 @@ pub use device_capacity::{
 pub use device_sizing::{
     DeviceEventArenaSizing, DevicePlaneSizing, DeviceSizingError, DeviceSizingReport,
     size_default_device_plan,
+};
+pub use drain_profile::{
+    DrainProfile, DrainProfileChannel, DrainProfileError, DrainProfileLayout, HeadVisitProfile,
+    LookupIterationProfile, OutboundDegreeProfile,
 };
 pub use event::{
     Event, EventFelClass, EventKey, EventKind, FlowId, LinkId, NodeId, PayloadId, event_fel_class,
@@ -131,7 +136,7 @@ pub use model::{
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub use safe_horizon::run_scalar_rounds_with_replay_trace;
 pub use safe_horizon::{
-    LpRoundWork, RoundMetrics, ScalarRoundRun, run_scalar_rounds,
+    LpRoundWork, RootGroupTrace, RoundMetrics, ScalarRoundRun, run_scalar_rounds,
     run_scalar_rounds_with_observations,
 };
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]

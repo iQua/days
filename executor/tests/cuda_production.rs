@@ -519,6 +519,8 @@ fn cuda_phase_profile_uses_device_timestamps_without_changing_the_result() {
         profiled.profile.recorded_attempts,
         profiled.run.encoded_attempts
     );
+    assert!(profiled.profile.round_reset_ns > 0);
+    assert!(profiled.profile.round_prepare_ns > 0);
     assert!(profiled.profile.total_kernel_ns() > 0);
     assert!(profiled.profile.total_kernel_ns() <= profiled.run.device_ns);
 }

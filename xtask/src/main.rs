@@ -27,14 +27,14 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "cuda.rs",
         predicate: r#"feature = "cuda-test-hooks""#,
-        count: 20,
-        purpose: "CUDA-only fault injection, capacity, planner measurement, and T20l readback- and plane-word-accounting hooks",
+        count: 22,
+        purpose: "CUDA-only fault injection, capacity, planner measurement, T20l readback- and plane-word-accounting hooks, and T32 exact drain profiling",
     },
     AllowedFeatureGate {
         path: "metal.rs",
         predicate: r#"feature = "metal-test-hooks""#,
-        count: 27,
-        purpose: "Metal-only panic, fault-injection, planner measurement, T20l readback accounting, and T21 dominant-arena occupancy readback hooks",
+        count: 29,
+        purpose: "Metal-only panic, fault-injection, planner measurement, T20l readback accounting, T21 dominant-arena occupancy readback, and T32 exact drain profiling hooks",
     },
     AllowedFeatureGate {
         path: "metal.rs",

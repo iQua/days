@@ -11,7 +11,8 @@ use days_executor::{
     LinkId, MetalArena, MetalConfig, MetalError, MetalExecutor, NodeDescriptor, NodeId, NodeKind,
     ObservationMode, PacketDescriptor, PacketKind, PayloadId, RemoteChannel, RunResult,
     ScheduledEmission, SchedulerKind, SimulationImage, SwitchQueueState, SwitchState, event_phase,
-    run_metal, run_metal_with_observations, run_scalar_with_observations, validate,
+    run_metal, run_metal_with_observations, run_scalar_rounds, run_scalar_with_observations,
+    validate,
 };
 
 const GENERATOR_SOURCE: NodeId = NodeId(0);
@@ -1323,9 +1324,43 @@ fn metal_phase_profiling_is_opt_in_and_preserves_the_full_result() {
         );
         assert!(profile.captured_attempts > profile.useful_attempts);
         let estimated_ns = profile.estimated_total.total_ns();
+        assert!(profile.estimated_total.round_reset_ns > 0);
+        assert!(profile.estimated_total.round_prepare_ns > 0);
         assert!(estimated_ns > 0);
         assert!(estimated_ns <= profiled.device_ns.saturating_mul(2));
     }
+}
+
+#[test]
+fn metal_drain_profile_is_exact_and_preserves_the_full_result() {
+    let image = generator_image(GeneratorTermination::Bytes(12));
+    let executor = MetalExecutor::new().expect("Metal executor must initialize");
+    let config = MetalConfig::default();
+    let ordinary = executor
+        .run_with_observations(&image, None, config, ObservationMode::Full)
+        .expect("ordinary production Metal run must succeed");
+    let profiled = executor
+        .run_drain_profile_with_observations(&image, None, config, ObservationMode::Full)
+        .expect("drain-profile Metal run must succeed");
+    let scalar = run_scalar_rounds(&image, None).expect("scalar round oracle must succeed");
+    let scalar_messages = scalar.rounds.iter().try_fold(0_u128, |total, round| {
+        total.checked_add(u128::from(round.messages_exchanged))
+    });
+
+    assert_eq!(profiled.run.result, ordinary.result);
+    assert_eq!(profiled.run.rounds, ordinary.rounds);
+    assert_eq!(profiled.run.transitions, ordinary.transitions);
+    assert_eq!(
+        profiled.run.capacity_retry_trace,
+        ordinary.capacity_retry_trace
+    );
+    assert_eq!(
+        profiled.profile.selected_events,
+        u128::from(ordinary.transitions)
+    );
+    assert_eq!(profiled.profile.remote_emissions, scalar_messages.unwrap());
+    assert!(profiled.profile.head_visits >= profiled.profile.selected_events);
+    assert!(!profiled.profile.head_visit_histogram.is_empty());
 }
 
 #[test]
