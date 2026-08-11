@@ -311,6 +311,49 @@ impl DrainProfileLayout {
         })
     }
 
+    /// Decodes counters and reconciles every LP-owned histogram row with that LP's independent
+    /// final transition counter.
+    ///
+    /// The per-LP check rejects compensating misses/double-counts that leave the run-wide sum
+    /// unchanged. Device profiling APIs use this checked entry point; the unchecked decoder is
+    /// retained for layout-focused tests and tooling that has no execution result to reconcile.
+    pub fn decode_checked(
+        &self,
+        words: &[u64],
+        expected_transitions_by_lp: &[u64],
+    ) -> Result<DrainProfile, DrainProfileError> {
+        let profile = self.decode(words)?;
+        if expected_transitions_by_lp.len() != self.head_ranges.len() {
+            return Err(DrainProfileError::new(format!(
+                "drain profile has {} LP transition totals, expected {}",
+                expected_transitions_by_lp.len(),
+                self.head_ranges.len()
+            )));
+        }
+        for (node, (range, &expected)) in self
+            .head_ranges
+            .iter()
+            .zip(expected_transitions_by_lp)
+            .enumerate()
+        {
+            let selected = words[range.clone()]
+                .iter()
+                .try_fold(0_u128, |total, &count| {
+                    total.checked_add(u128::from(count)).ok_or_else(|| {
+                        DrainProfileError::new(format!(
+                            "drain profile LP {node} selected-event total overflows u128"
+                        ))
+                    })
+                })?;
+            if selected != u128::from(expected) {
+                return Err(DrainProfileError::new(format!(
+                    "drain profile LP {node} selected {selected} events but executed {expected} transitions"
+                )));
+            }
+        }
+        Ok(profile)
+    }
+
     #[doc(hidden)]
     pub fn set_node_flag_for_testing(&self, words: &mut [u64], node: usize, flag: u64) {
         assert!(node < self.head_histogram_offset);

@@ -4,6 +4,8 @@
 //! owner on one thread; later backends can partition the same index without changing round
 //! semantics or the shared transition handlers.
 
+#[cfg(feature = "planner-test-hooks")]
+use std::cell::Cell;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
@@ -68,8 +70,6 @@ pub struct RoundMetrics {
     pub frontier_heap_pops: u64,
     /// Physical LP-table slots visited by frontier, dispatch, and merge machinery.
     pub physical_lp_probes: u64,
-    /// Exact root-group observations when the executing backend records them.
-    pub root_group_trace: Option<RootGroupTrace>,
 }
 
 impl RoundMetrics {
@@ -84,6 +84,13 @@ impl RoundMetrics {
 pub struct ScalarRoundRun {
     pub result: RunResult,
     pub rounds: Vec<RoundMetrics>,
+}
+
+/// Explicitly opt-in T32 root observations, kept outside the production metrics API.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScalarT32RootTraceRun {
+    pub run: ScalarRoundRun,
+    pub root_group_trace: Vec<RootGroupTrace>,
 }
 
 /// Contiguous safe-horizon round window retained by the T13e spike harness.
@@ -197,6 +204,30 @@ pub fn run_scalar_rounds_with_observations(
     observation_mode: ObservationMode,
 ) -> Result<ScalarRoundRun, ExecutionError> {
     RoundExecutor::new(image, observation_mode)?.run(exclusive_horizon_ns)
+}
+
+/// Runs the scalar round executor with T32's exact root-group observations enabled.
+///
+/// This separate API is the T32 selector. The ordinary scalar round APIs retain their original
+/// metrics shape and execute the original, observation-free round loop.
+pub fn run_scalar_rounds_with_t32_root_trace(
+    image: &SimulationImage,
+    exclusive_horizon_ns: Option<u64>,
+    observation_mode: ObservationMode,
+) -> Result<ScalarT32RootTraceRun, ExecutionError> {
+    RoundExecutor::new(image, observation_mode)?.run_with_t32_root_trace(exclusive_horizon_ns)
+}
+
+#[cfg(feature = "planner-test-hooks")]
+std::thread_local! {
+    static T32_ROOT_OBSERVATION_CONSTRUCTIONS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Returns and clears this thread's T32 per-round observation construction count.
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+pub fn take_t32_root_observation_constructions_for_testing() -> u64 {
+    T32_ROOT_OBSERVATION_CONSTRUCTIONS.with(Cell::take)
 }
 
 /// Records a bounded real-image window while executing the canonical safe-horizon CPU path.
@@ -359,6 +390,85 @@ struct DrainedLp {
     replay: Option<RecordedReplayLp>,
 }
 
+struct T32RootObservation {
+    active_slots: BTreeSet<usize>,
+    eligible_groups: BTreeSet<usize>,
+    publication_dirty_groups: BTreeSet<usize>,
+    receiver_only_slots: BTreeSet<usize>,
+    receiver_only_groups: BTreeSet<usize>,
+    pre_round_root_times: BTreeMap<usize, Option<u64>>,
+}
+
+impl T32RootObservation {
+    fn new(active: &[FrontierEntry], futures: &[BTreeMap<EventKey, Event>]) -> Self {
+        #[cfg(feature = "planner-test-hooks")]
+        T32_ROOT_OBSERVATION_CONSTRUCTIONS.with(|count| count.set(count.get().saturating_add(1)));
+
+        let active_slots = active
+            .iter()
+            .map(|entry| entry.lp_slot)
+            .collect::<BTreeSet<_>>();
+        let eligible_groups = active_slots
+            .iter()
+            .map(|lp_slot| lp_slot / ROOT_TRACE_GROUP_SIZE)
+            .collect::<BTreeSet<_>>();
+        let publication_dirty_groups = eligible_groups.clone();
+        let pre_round_root_times = active_slots
+            .iter()
+            .map(|&lp_slot| {
+                let root_time = futures[lp_slot]
+                    .first_key_value()
+                    .map(|(key, _)| key.time_ns);
+                (lp_slot, root_time)
+            })
+            .collect::<BTreeMap<_, _>>();
+        Self {
+            active_slots,
+            eligible_groups,
+            publication_dirty_groups,
+            receiver_only_slots: BTreeSet::new(),
+            receiver_only_groups: BTreeSet::new(),
+            pre_round_root_times,
+        }
+    }
+
+    fn observe_receiver(&mut self, lp_slot: usize, futures: &[BTreeMap<EventKey, Event>]) {
+        self.publication_dirty_groups
+            .insert(lp_slot / ROOT_TRACE_GROUP_SIZE);
+        if !self.active_slots.contains(&lp_slot) {
+            self.pre_round_root_times.entry(lp_slot).or_insert_with(|| {
+                futures[lp_slot]
+                    .first_key_value()
+                    .map(|(key, _)| key.time_ns)
+            });
+            self.receiver_only_slots.insert(lp_slot);
+            self.receiver_only_groups
+                .insert(lp_slot / ROOT_TRACE_GROUP_SIZE);
+        }
+    }
+
+    fn finish(self, futures: &[BTreeMap<EventKey, Event>]) -> RootGroupTrace {
+        let root_time_changed_groups = self
+            .pre_round_root_times
+            .iter()
+            .filter_map(|(&lp_slot, &pre_round_root_time)| {
+                let post_round_root_time = futures[lp_slot]
+                    .first_key_value()
+                    .map(|(key, _)| key.time_ns);
+                (pre_round_root_time != post_round_root_time)
+                    .then_some(lp_slot / ROOT_TRACE_GROUP_SIZE)
+            })
+            .collect::<BTreeSet<_>>();
+        RootGroupTrace {
+            eligible_groups: self.eligible_groups.len(),
+            root_time_changed_groups: root_time_changed_groups.len(),
+            publication_dirty_groups: self.publication_dirty_groups.len(),
+            receiver_only_lps: self.receiver_only_slots.len(),
+            receiver_only_groups: self.receiver_only_groups.len(),
+        }
+    }
+}
+
 impl<'image> RoundExecutor<'image> {
     fn new(
         image: &'image SimulationImage,
@@ -424,6 +534,23 @@ impl<'image> RoundExecutor<'image> {
             .min(configured_stop);
         let rounds = self.execute_rounds(run_end, RoundRetention::All)?;
         Ok(self.finish(rounds.retained))
+    }
+
+    fn run_with_t32_root_trace(
+        mut self,
+        exclusive_horizon_ns: Option<u64>,
+    ) -> Result<ScalarT32RootTraceRun, ExecutionError> {
+        let configured_stop = u128::from(self.image.stop_time_ns) + 1;
+        let run_end = exclusive_horizon_ns
+            .map(u128::from)
+            .unwrap_or(TIME_AFTER_U64_MAX)
+            .min(configured_stop);
+        let (rounds, root_group_trace) =
+            self.execute_rounds_with_t32_root_trace(run_end, RoundRetention::All)?;
+        Ok(ScalarT32RootTraceRun {
+            run: self.finish(rounds.retained),
+            root_group_trace,
+        })
     }
 
     #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
@@ -519,26 +646,199 @@ impl<'image> RoundExecutor<'image> {
                 active.push(entry);
             }
 
-            let active_slots = active
-                .iter()
-                .map(|entry| entry.lp_slot)
-                .collect::<BTreeSet<_>>();
-            let eligible_groups = active_slots
-                .iter()
-                .map(|lp_slot| lp_slot / ROOT_TRACE_GROUP_SIZE)
-                .collect::<BTreeSet<_>>();
-            let mut publication_dirty_groups = eligible_groups.clone();
-            let mut receiver_only_slots = BTreeSet::new();
-            let mut receiver_only_groups = BTreeSet::new();
-            let mut pre_round_root_times = active_slots
-                .iter()
-                .map(|&lp_slot| {
-                    let root_time = self.futures[lp_slot]
+            let mut children = Vec::new();
+            let mut outboxes = Vec::with_capacity(active.len());
+            let mut lp_work = Vec::with_capacity(active.len());
+            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+            let capture_replay = self
+                .replay_trace
+                .as_ref()
+                .is_some_and(|trace| trace.captures(total_rounds));
+            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+            let mut replay_rows = Vec::with_capacity(if capture_replay { active.len() } else { 0 });
+            let mut events_processed = 0_u64;
+            let mut frontier_updates = 0_u64;
+            for entry in active {
+                physical_lp_probes = physical_lp_probes.saturating_add(1);
+                let drained = self.drain_lp(
+                    entry.lp_slot,
+                    horizon,
+                    &mut children,
+                    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+                    capture_replay,
+                )?;
+                events_processed = events_processed.saturating_add(drained.work.events_processed);
+                lp_work.push(drained.work);
+                if !drained.outbox.is_empty() {
+                    outboxes.push(drained.outbox);
+                }
+                #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+                if let Some(replay) = drained.replay {
+                    replay_rows.push(replay);
+                }
+                self.update_frontier(entry.lp_slot, &mut physical_lp_probes)?;
+                frontier_updates = frontier_updates.saturating_add(1);
+            }
+
+            if let Some(entry) = self
+                .frontier
+                .peek_min(&mut frontier_heap_pops, &mut physical_lp_probes)
+            {
+                if u128::from(entry.time_ns) < horizon {
+                    let key = self.futures[entry.lp_slot]
                         .first_key_value()
-                        .map(|(key, _)| key.time_ns);
-                    (lp_slot, root_time)
-                })
-                .collect::<BTreeMap<_, _>>();
+                        .map(|(key, _)| *key)
+                        .expect("a live frontier entry has a pending event");
+                    return Err(ExecutionError::EventBelowHorizonAfterDrain {
+                        key,
+                        exclusive_horizon_ns: horizon,
+                    });
+                }
+            }
+
+            let mut remote_events = outboxes.into_iter().flatten().collect::<Vec<Event>>();
+            let messages_exchanged = u64::try_from(remote_events.len()).unwrap_or(u64::MAX);
+            radix_sort_remote_events(&mut remote_events);
+            let mut offset = 0;
+            while offset < remote_events.len() {
+                let target = remote_events[offset].target;
+                let lp_slot =
+                    node_slot(self.image, target).ok_or(ExecutionError::UnknownNode(target))?;
+                physical_lp_probes = physical_lp_probes.saturating_add(1);
+                let mut end = offset + 1;
+                while end < remote_events.len() && remote_events[end].target == target {
+                    end += 1;
+                }
+                for event in &remote_events[offset..end] {
+                    if u128::from(event.key.time_ns) < horizon {
+                        return Err(ExecutionError::RemoteEventBeforeHorizon {
+                            key: event.key,
+                            exclusive_horizon_ns: horizon,
+                        });
+                    }
+                    if self.futures[lp_slot].insert(event.key, *event).is_some() {
+                        return Err(ExecutionError::DuplicateEventKey(event.key));
+                    }
+                }
+                self.update_frontier(lp_slot, &mut physical_lp_probes)?;
+                frontier_updates = frontier_updates.saturating_add(1);
+                offset = end;
+            }
+
+            let active_lp_count = lp_work.len();
+            let max_work = lp_work
+                .iter()
+                .map(|work| work.events_processed)
+                .max()
+                .unwrap_or(0);
+            let parallel_efficiency = if active_lp_count == 0 || max_work == 0 {
+                1.0
+            } else {
+                events_processed as f64 / (active_lp_count as f64 * max_work as f64)
+            };
+            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+            if capture_replay {
+                self.replay_trace
+                    .as_mut()
+                    .expect("capture flag requires a trace builder")
+                    .push_round(
+                        total_rounds,
+                        frontier_ns,
+                        horizon,
+                        events_processed,
+                        parallel_efficiency,
+                        replay_rows,
+                    );
+            }
+            let metrics = RoundMetrics {
+                frontier_ns,
+                exclusive_horizon_ns: horizon,
+                horizon_advance_ns,
+                events_processed,
+                active_lp_count,
+                lp_work,
+                parallel_efficiency,
+                messages_exchanged,
+                frontier_updates,
+                frontier_heap_pops,
+                physical_lp_probes,
+            };
+            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+            if let (RoundRetention::Window(window), Some(totals)) =
+                (retention, window_totals.as_mut())
+            {
+                totals.observe(
+                    window,
+                    total_rounds,
+                    events_processed,
+                    metrics.active_lp_count,
+                );
+            }
+            if retention.retains(total_rounds) {
+                rounds.push(metrics);
+            }
+            total_rounds = total_rounds
+                .checked_add(1)
+                .ok_or(ExecutionError::CounterOverflow(NodeId(0)))?;
+            previous_horizon = Some(horizon);
+        }
+
+        Ok(ExecutedRounds {
+            retained: rounds,
+            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+            total_rounds,
+            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+            window_totals,
+        })
+    }
+
+    fn execute_rounds_with_t32_root_trace(
+        &mut self,
+        run_end: u128,
+        retention: RoundRetention,
+    ) -> Result<(ExecutedRounds, Vec<RootGroupTrace>), ExecutionError> {
+        let mut previous_horizon = None;
+        let mut rounds = Vec::new();
+        let mut root_group_trace = Vec::new();
+        let mut total_rounds = 0_usize;
+        #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+        let mut window_totals = match retention {
+            RoundRetention::All => None,
+            RoundRetention::Window(_) => Some(WindowedRunTotals::default()),
+        };
+
+        loop {
+            let mut frontier_heap_pops = 0;
+            let mut physical_lp_probes = 0_u64;
+            let Some(frontier_entry) = self
+                .frontier
+                .peek_min(&mut frontier_heap_pops, &mut physical_lp_probes)
+            else {
+                break;
+            };
+            let frontier_ns = frontier_entry.time_ns;
+            if u128::from(frontier_ns) >= run_end {
+                break;
+            }
+
+            let lookahead_end = self
+                .minimum_lookahead_ns
+                .map_or(TIME_AFTER_U64_MAX, |delay| {
+                    (u128::from(frontier_ns) + u128::from(delay)).min(TIME_AFTER_U64_MAX)
+                });
+            let horizon = run_end.min(lookahead_end);
+            let horizon_advance_ns =
+                horizon.saturating_sub(previous_horizon.unwrap_or(u128::from(frontier_ns)));
+
+            let mut active = Vec::new();
+            while let Some(entry) =
+                self.frontier
+                    .pop_before(horizon, &mut frontier_heap_pops, &mut physical_lp_probes)
+            {
+                active.push(entry);
+            }
+
+            let mut root_observation = T32RootObservation::new(&active, &self.futures);
 
             let mut children = Vec::new();
             let mut outboxes = Vec::with_capacity(active.len());
@@ -598,18 +898,7 @@ impl<'image> RoundExecutor<'image> {
                 let target = remote_events[offset].target;
                 let lp_slot =
                     node_slot(self.image, target).ok_or(ExecutionError::UnknownNode(target))?;
-                publication_dirty_groups.insert(lp_slot / ROOT_TRACE_GROUP_SIZE);
-                if let std::collections::btree_map::Entry::Vacant(entry) =
-                    pre_round_root_times.entry(lp_slot)
-                {
-                    entry.insert(
-                        self.futures[lp_slot]
-                            .first_key_value()
-                            .map(|(key, _)| key.time_ns),
-                    );
-                    receiver_only_slots.insert(lp_slot);
-                    receiver_only_groups.insert(lp_slot / ROOT_TRACE_GROUP_SIZE);
-                }
+                root_observation.observe_receiver(lp_slot, &self.futures);
                 physical_lp_probes = physical_lp_probes.saturating_add(1);
                 let mut end = offset + 1;
                 while end < remote_events.len() && remote_events[end].target == target {
@@ -631,23 +920,7 @@ impl<'image> RoundExecutor<'image> {
                 offset = end;
             }
 
-            let root_time_changed_groups = pre_round_root_times
-                .iter()
-                .filter_map(|(&lp_slot, &pre_round_root_time)| {
-                    let post_round_root_time = self.futures[lp_slot]
-                        .first_key_value()
-                        .map(|(key, _)| key.time_ns);
-                    (pre_round_root_time != post_round_root_time)
-                        .then_some(lp_slot / ROOT_TRACE_GROUP_SIZE)
-                })
-                .collect::<BTreeSet<_>>();
-            let root_group_trace = RootGroupTrace {
-                eligible_groups: eligible_groups.len(),
-                root_time_changed_groups: root_time_changed_groups.len(),
-                publication_dirty_groups: publication_dirty_groups.len(),
-                receiver_only_lps: receiver_only_slots.len(),
-                receiver_only_groups: receiver_only_groups.len(),
-            };
+            root_group_trace.push(root_observation.finish(&self.futures));
 
             let active_lp_count = lp_work.len();
             let max_work = lp_work
@@ -686,7 +959,6 @@ impl<'image> RoundExecutor<'image> {
                 frontier_updates,
                 frontier_heap_pops,
                 physical_lp_probes,
-                root_group_trace: Some(root_group_trace),
             };
             #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
             if let (RoundRetention::Window(window), Some(totals)) =
@@ -708,13 +980,16 @@ impl<'image> RoundExecutor<'image> {
             previous_horizon = Some(horizon);
         }
 
-        Ok(ExecutedRounds {
-            retained: rounds,
-            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-            total_rounds,
-            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-            window_totals,
-        })
+        Ok((
+            ExecutedRounds {
+                retained: rounds,
+                #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+                total_rounds,
+                #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+                window_totals,
+            },
+            root_group_trace,
+        ))
     }
 
     fn finish(self, rounds: Vec<RoundMetrics>) -> ScalarRoundRun {

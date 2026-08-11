@@ -1290,8 +1290,14 @@ impl MetalExecutor {
                 )?;
                 #[cfg(feature = "metal-test-hooks")]
                 panic_after_execution_if_requested();
+                let expected_transitions_by_lp = buffers.planes[18]
+                    .read()
+                    .chunks_exact(LP_STATE_WORDS)
+                    .take(image.nodes.len())
+                    .map(|state| state[1])
+                    .collect::<Vec<_>>();
                 let run = buffers.finish(&self.direct, image, observation_mode, timing)?;
-                let profile = probe.drain_profile()?;
+                let profile = probe.drain_profile(&expected_transitions_by_lp)?;
                 if profile.selected_events != u128::from(run.transitions) {
                     return Err(MetalError::Validation(format!(
                         "drain profile selected {} events but the run completed {} transitions",
@@ -4331,12 +4337,15 @@ impl FelProbeResources {
         ))
     }
 
-    fn drain_profile(&self) -> Result<DrainProfile, MetalError> {
+    fn drain_profile(
+        &self,
+        expected_transitions_by_lp: &[u64],
+    ) -> Result<DrainProfile, MetalError> {
         let layout = self.drain_profile_layout.as_ref().ok_or_else(|| {
             MetalError::Validation("FEL resources do not contain a drain profile layout".into())
         })?;
         layout
-            .decode(&self.counts.read())
+            .decode_checked(&self.counts.read(), expected_transitions_by_lp)
             .map_err(|error| MetalError::Validation(error.to_string()))
     }
 

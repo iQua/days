@@ -11,8 +11,8 @@ use days::scenario::compile_config;
     feature = "cuda",
     all(feature = "metal-spike", target_vendor = "apple")
 ))]
-use days_executor::{DeviceCapacityCaps, ObservationMode};
-use days_executor::{DrainProfile, RunResult};
+use days_executor::DeviceCapacityCaps;
+use days_executor::{DrainProfile, ObservationMode, RunResult};
 
 const FNV1A64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -129,14 +129,18 @@ fn fingerprint(value: &impl Debug) -> Fingerprint {
 }
 
 fn fixture_row(path: &Path) -> (&'static str, u64, u64, Fingerprint) {
-    let path = path.to_string_lossy();
     FIXTURES
         .iter()
-        .find(|(_, candidate, ..)| path.ends_with(candidate))
+        .find(|(_, candidate, ..)| path == Path::new(candidate))
         .map(|&(name, _, rounds, transitions, bytes, fnv1a64)| {
             (name, rounds, transitions, Fingerprint { bytes, fnv1a64 })
         })
-        .unwrap_or_else(|| panic!("fixture is not one of T32's seven registered points: {path}"))
+        .unwrap_or_else(|| {
+            panic!(
+                "fixture is not one of T32's seven registered points: {}",
+                path.display()
+            )
+        })
 }
 
 fn report_profile(name: &str, profile: &DrainProfile) {
@@ -285,6 +289,17 @@ fn main() {
             outcome.profile.selected_events,
             u128::from(expected_transitions)
         );
+        if name == "e5" {
+            assert_eq!(
+                outcome.profile.remote_emissions, outcome.result.summary.departed_packets,
+                "E5 remote emissions must equal channel departures"
+            );
+            println!(
+                "record=p12t32_e5_channel_reconciliation remote_emissions={} \
+                 channel_departures={} equal=true",
+                outcome.profile.remote_emissions, outcome.result.summary.departed_packets,
+            );
+        }
         println!(
             "record=p12t32_identity fixture={name} rounds={expected_rounds} \
              transitions={expected_transitions} result_bytes={} result_fnv1a64={:016x} \
@@ -294,20 +309,31 @@ fn main() {
         report_profile(name, &outcome.profile);
 
         if root_trace {
-            let scalar = days_executor::run_scalar_rounds(&image, None)
-                .unwrap_or_else(|error| panic!("{name} scalar root trace failed: {error}"));
+            let scalar = days_executor::run_scalar_rounds_with_t32_root_trace(
+                &image,
+                None,
+                ObservationMode::Summary,
+            )
+            .unwrap_or_else(|error| panic!("{name} scalar root trace failed: {error}"));
             assert_eq!(
-                scalar.result, outcome.result,
+                scalar.run.result, outcome.result,
                 "{name} scalar/device result mismatch"
             );
+            assert_eq!(scalar.root_group_trace.len(), scalar.run.rounds.len());
             let mut messages = 0_u128;
-            for (round, metrics) in scalar.rounds.iter().enumerate() {
+            for (round, (metrics, trace)) in scalar
+                .run
+                .rounds
+                .iter()
+                .zip(&scalar.root_group_trace)
+                .enumerate()
+            {
                 messages = messages
                     .checked_add(u128::from(metrics.messages_exchanged))
                     .expect("message total must fit u128");
-                let trace = metrics
-                    .root_group_trace
-                    .expect("scalar round must contain the exact root-group trace");
+                assert!(trace.eligible_groups <= trace.publication_dirty_groups);
+                assert!(trace.root_time_changed_groups <= trace.publication_dirty_groups);
+                assert!(trace.receiver_only_groups <= trace.publication_dirty_groups);
                 println!(
                     "record=p12t32_root_trace fixture={name} round={round} eligible_groups={} \
                      root_time_changed_groups={} publication_dirty_groups={} receiver_only_lps={} \
@@ -337,5 +363,17 @@ mod tests {
                 (name, rounds, transitions, Fingerprint { bytes, fnv1a64 })
             );
         }
+    }
+
+    #[test]
+    fn counter_runner_rejects_paths_outside_the_frozen_roster() {
+        assert!(
+            std::panic::catch_unwind(|| {
+                fixture_row(Path::new(
+                    "other/configs/benchmarks/p12/e1_open_k32_load_10.toml",
+                ))
+            })
+            .is_err()
+        );
     }
 }

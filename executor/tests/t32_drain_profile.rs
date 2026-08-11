@@ -95,6 +95,22 @@ fn decoder_rejects_truncated_or_internally_inconsistent_counters() {
 }
 
 #[test]
+fn decoder_rejects_compensating_per_lp_selected_event_corruption() {
+    let layout = DrainProfileLayout::new(&[1, 1], &[]).unwrap();
+    let mut words = layout.zeroed_words();
+    layout.set_head_bin_for_testing(&mut words, 0, 1, 1);
+    layout.set_head_bin_for_testing(&mut words, 1, 1, 3);
+
+    assert_eq!(layout.decode(&words).unwrap().selected_events, 4);
+    let error = layout
+        .decode_checked(&words, &[2, 2])
+        .expect_err("equal aggregate totals must not hide compensating LP corruption")
+        .to_string();
+    println!("compensating_corruption_rejected={error}");
+    assert!(error.contains("LP 0 selected 1 events but executed 2 transitions"));
+}
+
+#[test]
 fn layout_rejects_mismatched_node_shapes_and_zero_head_capacity() {
     assert!(
         DrainProfileLayout::new(

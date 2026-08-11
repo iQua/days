@@ -89,6 +89,18 @@ fn both_profile_only_drain_entries_exist_at_the_declared_abi() {
     assert!(cuda.contains("DAYS_BUFFERS, ulong *diagnostics"));
     assert!(metal.contains("device ulong *diagnostics [[buffer(28)]]"));
 
+    let cuda_declaration = CUDA_KERNELS
+        .find("void days_round_drain_profile")
+        .expect("CUDA T32 entry exists");
+    let cuda_guard = CUDA_KERNELS[..cuda_declaration]
+        .rfind("#if defined(DAYS_T32_PROFILE)")
+        .expect("CUDA T32 entry is compiled only for the opt-in diagnostic fatbin");
+    let cuda_end = CUDA_KERNELS[cuda_declaration..]
+        .find("#endif")
+        .map(|offset| cuda_declaration + offset)
+        .expect("CUDA T32 entry has a closing feature guard");
+    assert!(cuda_guard < cuda_declaration && cuda_declaration < cuda_end);
+
     let declaration = METAL_KERNELS
         .find("kernel void days_round_drain_profile")
         .expect("Metal T32 entry exists");

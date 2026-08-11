@@ -135,9 +135,12 @@ pub use model::{
 };
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub use safe_horizon::run_scalar_rounds_with_replay_trace;
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+pub use safe_horizon::take_t32_root_observation_constructions_for_testing;
 pub use safe_horizon::{
-    LpRoundWork, RootGroupTrace, RoundMetrics, ScalarRoundRun, run_scalar_rounds,
-    run_scalar_rounds_with_observations,
+    LpRoundWork, RootGroupTrace, RoundMetrics, ScalarRoundRun, ScalarT32RootTraceRun,
+    run_scalar_rounds, run_scalar_rounds_with_observations, run_scalar_rounds_with_t32_root_trace,
 };
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub use safe_horizon::{

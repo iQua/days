@@ -2,7 +2,7 @@
 //!
 //! The production CUDA graph remains the existing 13-dispatch DAG. The direct profiling path may
 //! replace its one prepare dispatch with four ordered diagnostic dispatches so count, prefix,
-//! ordered write, and fixed publication have honest event boundaries.
+//! ordered write, and fixed publication have explicit split-path event boundaries.
 
 const CUDA_KERNELS: &str = include_str!("../src/cuda_kernels.cu");
 const CUDA_BACKEND: &str = include_str!("../src/cuda.rs");
@@ -38,10 +38,25 @@ fn profiled_prepare_has_four_ordered_dispatch_boundaries() {
             "missing profile-only kernel {name}"
         );
     }
+
+    let first = CUDA_KERNELS
+        .find("void days_round_prepare_count_profile(")
+        .expect("first profile prepare entry");
+    let guard = CUDA_KERNELS[..first]
+        .rfind("#if defined(DAYS_T32_PROFILE)")
+        .expect("profile prepare entries need an opt-in translation-unit guard");
+    let last = CUDA_KERNELS
+        .find("void days_round_prepare_combine_profile(")
+        .expect("last profile prepare entry");
+    let end = CUDA_KERNELS[last..]
+        .find("#endif")
+        .map(|offset| last + offset)
+        .expect("profile prepare guard must close");
+    assert!(guard < first && first < last && last < end);
 }
 
 #[test]
-fn prepare_profile_reports_every_true_subphase_once() {
+fn prepare_profile_reports_every_diagnostic_split_interval_once() {
     for field in [
         "round_reset_ns",
         "prepare_count_ns",
@@ -54,6 +69,34 @@ fn prepare_profile_reports_every_true_subphase_once() {
             "missing retained profile field {field}"
         );
     }
+}
+
+#[test]
+fn ordinary_cuda_constructor_has_no_t32_symbol_dependency() {
+    let direct_impl = CUDA_BACKEND
+        .find("impl DirectCuda")
+        .expect("DirectCuda implementation");
+    let start = CUDA_BACKEND[direct_impl..]
+        .find("fn new() -> Result<Self, CudaError>")
+        .map(|offset| direct_impl + offset)
+        .expect("DirectCuda constructor");
+    let end = CUDA_BACKEND[start..]
+        .find("fn t32_kernels(")
+        .map(|offset| start + offset)
+        .expect("lazy T32 loader follows ordinary constructor");
+    let constructor = &CUDA_BACKEND[start..end];
+    for forbidden in [
+        "PROFILE_KERNEL_NAMES",
+        "DRAIN_PROFILE_KERNEL_NAME",
+        "profile_functions",
+        "drain_profile_function",
+    ] {
+        assert!(
+            !constructor.contains(forbidden),
+            "ordinary DirectCuda::new must not reference `{forbidden}`"
+        );
+    }
+    assert!(constructor.contains("let functions = KERNEL_NAMES"));
 }
 
 fn position(values: &[String], needle: &str) -> usize {

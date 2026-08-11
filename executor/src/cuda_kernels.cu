@@ -4921,6 +4921,7 @@ extern "C" __global__ void days_round_reset(DAYS_BUFFERS) {
 // production graph continues to launch the single `days_round_prepare` below. `prepare_profile`
 // has 2 * 1024 words: per-lane counts followed by the inclusive prefix. The dispatch boundaries
 // are the only cross-block (here, cross-kernel) synchronization added by this diagnostic path.
+#if defined(DAYS_T32_PROFILE)
 extern "C" __global__ void days_round_prepare_count_profile(
     DAYS_BUFFERS,
     ulong *prepare_profile
@@ -5039,6 +5040,7 @@ extern "C" __global__ void days_round_prepare_combine_profile(
     control[C_OUTBOX] = 0;
     control[C_CONTINUATION] = 1;
 }
+#endif
 
 extern "C" __global__ void days_round_prepare(DAYS_BUFFERS) {
     uint lane = threadIdx.x;
@@ -5207,6 +5209,7 @@ extern "C" __global__ __launch_bounds__(1024) void days_round(DAYS_BUFFERS) {
 // owned by one canonical-worklist lane and every channel has exactly one source LP, so all writes
 // below have one owner across the stream-ordered continuation dispatches. No atomic or device-wide
 // synchronization participates in the observation.
+#if defined(DAYS_T32_PROFILE)
 constexpr ulong T32_FLAG_STREAMS_DISABLED = 1ul;
 constexpr ulong T32_FLAG_ACTIVE_LAYOUT = 2ul;
 constexpr ulong T32_FLAG_ACTIVE_COUNT = 4ul;
@@ -5453,6 +5456,7 @@ extern "C" __global__ __launch_bounds__(1024) void days_round_drain_profile(
         dispatch_transitions += 1;
     }
 }
+#endif
 
 // T15e diagnostic only. This kernel preserves the production event set and transition body. Its
 // uniform mode word optionally adds one push/pop pair for the just-popped event before each real

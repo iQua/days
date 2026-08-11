@@ -7,9 +7,11 @@ use days_executor::{
     HostState, LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, ObservationMode,
     PacketDescriptor, PacketKind, PayloadId, RemoteChannel, ScheduledEmission, SchedulerKind,
     SimulationImage, StaticPartitionPolicy, SwitchQueueState, SwitchState, WorkClass, event_phase,
-    run_cpu_with_observations, run_scalar_rounds_with_observations, run_scalar_with_observations,
-    validate,
+    run_cpu_with_observations, run_scalar_rounds_with_observations,
+    run_scalar_rounds_with_t32_root_trace, run_scalar_with_observations, validate,
 };
+#[cfg(feature = "planner-test-hooks")]
+use days_executor::{run_scalar_rounds, take_t32_root_observation_constructions_for_testing};
 // The only unqualified uses of this type are in `assert_device_full_result_eq`, which is
 // device-gated; the two remaining uses spell out `days_executor::RunResult`.
 #[cfg(any(
@@ -411,46 +413,57 @@ fn scalar_rounds_match_the_global_queue_and_record_sparse_round_work() {
     assert_eq!(run.rounds[1].lp_work[0].node, SINK);
     assert_eq!(run.rounds[0].parallel_efficiency, 1.0);
     assert_eq!(run.rounds[1].parallel_efficiency, 1.0);
-    assert_eq!(
-        run.rounds[0].root_group_trace,
-        Some(days_executor::RootGroupTrace {
-            eligible_groups: 1,
-            root_time_changed_groups: 1,
-            publication_dirty_groups: 1,
-            receiver_only_lps: 1,
-            receiver_only_groups: 1,
-        })
-    );
-    assert_eq!(
-        run.rounds[1].root_group_trace,
-        Some(days_executor::RootGroupTrace {
-            eligible_groups: 1,
-            root_time_changed_groups: 1,
-            publication_dirty_groups: 1,
-            receiver_only_lps: 0,
-            receiver_only_groups: 0,
-        })
-    );
 }
 
 #[test]
 fn scalar_rounds_record_exact_root_group_trace() {
-    let run = run_scalar_rounds_with_observations(
+    let traced = run_scalar_rounds_with_t32_root_trace(
         &packet_arrival_incast_image(64),
         Some(10),
         ObservationMode::Summary,
     )
     .unwrap();
 
-    assert_eq!(run.rounds.len(), 1);
-    let trace = run.rounds[0]
-        .root_group_trace
-        .expect("scalar rounds must retain exact root-group instrumentation");
+    assert_eq!(traced.run.rounds.len(), 1);
+    let trace = traced.root_group_trace[0];
     assert_eq!(trace.eligible_groups, 1);
     assert_eq!(trace.root_time_changed_groups, 2);
     assert_eq!(trace.publication_dirty_groups, 2);
     assert_eq!(trace.receiver_only_lps, 1);
     assert_eq!(trace.receiver_only_groups, 1);
+}
+
+#[cfg(feature = "planner-test-hooks")]
+#[test]
+fn ordinary_round_apis_do_not_construct_t32_root_observations() {
+    let image = image(100, 0, 10);
+    assert_eq!(take_t32_root_observation_constructions_for_testing(), 0);
+
+    run_scalar_rounds(&image, None).unwrap();
+    run_scalar_rounds_with_observations(&image, None, ObservationMode::Full).unwrap();
+    run_cpu_with_observations(
+        &image,
+        None,
+        CpuConfig {
+            workers: 1,
+            ..CpuConfig::default()
+        },
+        ObservationMode::Summary,
+    )
+    .unwrap();
+    let ordinary_constructions = take_t32_root_observation_constructions_for_testing();
+    println!("ordinary_t32_observation_constructions={ordinary_constructions}");
+    assert_eq!(ordinary_constructions, 0);
+
+    let traced =
+        run_scalar_rounds_with_t32_root_trace(&image, None, ObservationMode::Summary).unwrap();
+    let opt_in_constructions = take_t32_root_observation_constructions_for_testing();
+    println!(
+        "opt_in_t32_observation_constructions={opt_in_constructions} trace_rows={}",
+        traced.root_group_trace.len()
+    );
+    assert_eq!(opt_in_constructions as usize, traced.root_group_trace.len());
+    assert!(!traced.root_group_trace.is_empty());
 }
 
 #[test]

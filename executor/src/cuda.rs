@@ -112,6 +112,7 @@ const CONTROL_WORDS: usize = 20;
 
 static CUDA_DEVICE_EXECUTION: Mutex<()> = Mutex::new(());
 static CUDA_DIRECT: OnceLock<Result<Arc<DirectCuda>, String>> = OnceLock::new();
+static CUDA_T32_KERNELS: OnceLock<Result<Arc<CudaT32Kernels>, String>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CudaProvisioning {
@@ -944,9 +945,13 @@ pub struct CudaRun {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CudaPhaseProfile {
     pub recorded_attempts: u64,
+    pub recorded_dispatches: u64,
     pub horizon_ns: u64,
     pub round_reset_ns: u64,
-    /// Aggregate of the four profile-only prepare dispatches.
+    /// Aggregate of the four diagnostic split-path prepare dispatches.
+    ///
+    /// This is not a production `days_round_prepare` sub-cost: the split adds three launches and
+    /// global scratch handoffs that the production kernel does not execute.
     pub round_prepare_ns: u64,
     pub prepare_count_ns: u64,
     pub prepare_prefix_ns: u64,
@@ -1545,11 +1550,21 @@ impl CudaExecutor {
                 self.direct.stream.synchronize().map_err(|error| {
                     driver_error("drain profile readback synchronization", error)
                 })?;
+                let lp_state = screen_plane_words(
+                    &self.direct.stream,
+                    buffers.planes[18].slice(..),
+                    "drain profile LP transition proof",
+                )?;
+                let expected_transitions_by_lp = lp_state
+                    .chunks_exact(LP_STATE_WORDS)
+                    .take(image.nodes.len())
+                    .map(|state| state[1])
+                    .collect::<Vec<_>>();
                 #[cfg(feature = "cuda-test-hooks")]
                 panic_after_execution_if_requested();
                 let run = buffers.finish(&self.direct, image, observation_mode, timing)?;
                 let profile = layout
-                    .decode(&words)
+                    .decode_checked(&words, &expected_transitions_by_lp)
                     .map_err(|error| CudaError::Validation(error.to_string()))?;
                 if profile.selected_events != u128::from(run.transitions) {
                     return Err(CudaError::Validation(format!(
@@ -4908,12 +4923,37 @@ struct DirectCuda {
     _context: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     functions: Vec<CudaFunction>,
-    profile_functions: Vec<CudaFunction>,
-    drain_profile_function: CudaFunction,
     /// T20l fix 2: the readback gather, loaded beside the eight attempt kernels.
     compact_function: CudaFunction,
     initialization_timings: CudaInitializationTimings,
     provisioning: CudaProvisioning,
+}
+
+struct CudaT32Kernels {
+    profile_functions: Vec<CudaFunction>,
+    drain_profile_function: CudaFunction,
+}
+
+fn load_named_functions<T, E>(
+    names: &[&str],
+    mut load: impl FnMut(&str) -> Result<T, E>,
+) -> Result<Vec<T>, E> {
+    names.iter().map(|name| load(name)).collect()
+}
+
+#[cfg(test)]
+fn load_production_kernel_set<T, E>(
+    mut load: impl FnMut(&str) -> Result<T, E>,
+) -> Result<(Vec<T>, T), E> {
+    let functions = load_named_functions(&KERNEL_NAMES, &mut load)?;
+    let compact = load(COMPACT_KERNEL_NAME)?;
+    Ok((functions, compact))
+}
+
+fn load_t32_kernel_set<T, E>(mut load: impl FnMut(&str) -> Result<T, E>) -> Result<(Vec<T>, T), E> {
+    let functions = load_named_functions(&PROFILE_KERNEL_NAMES, &mut load)?;
+    let drain = load(DRAIN_PROFILE_KERNEL_NAME)?;
+    Ok((functions, drain))
 }
 
 impl DirectCuda {
@@ -4945,20 +4985,6 @@ impl DirectCuda {
                     .map_err(|error| driver_error(format!("kernel `{name}` load"), error))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let profile_functions = PROFILE_KERNEL_NAMES
-            .iter()
-            .map(|name| {
-                module
-                    .load_function(name)
-                    .map_err(|error| driver_error(format!("kernel `{name}` load"), error))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let drain_profile_function =
-            module
-                .load_function(DRAIN_PROFILE_KERNEL_NAME)
-                .map_err(|error| {
-                    driver_error(format!("kernel `{DRAIN_PROFILE_KERNEL_NAME}` load"), error)
-                })?;
         let compact_function = module
             .load_function(COMPACT_KERNEL_NAME)
             .map_err(|error| driver_error(format!("kernel `{COMPACT_KERNEL_NAME}` load"), error))?;
@@ -5001,6 +5027,42 @@ impl DirectCuda {
                 )));
             }
         }
+        Ok(Self {
+            _context: context,
+            stream,
+            functions,
+            compact_function,
+            initialization_timings: CudaInitializationTimings {
+                context_stream_setup_ns,
+                module_function_load_ns,
+            },
+            provisioning,
+        })
+    }
+
+    fn t32_kernels(&self) -> Result<Arc<CudaT32Kernels>, CudaError> {
+        let kernels = CUDA_T32_KERNELS.get_or_init(|| {
+            self.load_t32_kernels()
+                .map(Arc::new)
+                .map_err(|error| error.to_string())
+        });
+        kernels
+            .as_ref()
+            .map(Arc::clone)
+            .map_err(|error| CudaError::Unavailable(error.clone()))
+    }
+
+    fn load_t32_kernels(&self) -> Result<CudaT32Kernels, CudaError> {
+        let fatbin = include_bytes!(concat!(env!("OUT_DIR"), "/days_cuda_t32_kernels.fatbin"));
+        let module = self
+            ._context
+            .load_module(Ptx::from_binary(fatbin.to_vec()))
+            .map_err(|error| driver_error("embedded T32 CUDA fatbin load", error))?;
+        let (profile_functions, drain_profile_function) = load_t32_kernel_set(|name| {
+            module
+                .load_function(name)
+                .map_err(|error| driver_error(format!("T32 kernel `{name}` load"), error))
+        })?;
         for (index, function) in profile_functions.iter().enumerate() {
             if PROFILE_PARALLEL_KERNELS.contains(&index) {
                 continue;
@@ -5008,7 +5070,7 @@ impl DirectCuda {
             let supported = function.max_threads_per_block().map_err(|error| {
                 driver_error(
                     format!(
-                        "kernel `{}` thread limit query",
+                        "T32 kernel `{}` thread limit query",
                         PROFILE_KERNEL_NAMES[index]
                     ),
                     error,
@@ -5016,24 +5078,14 @@ impl DirectCuda {
             })? as usize;
             if supported < LANES {
                 return Err(CudaError::Unavailable(format!(
-                    "kernel `{}` supports only {supported} threads per block; {LANES} are required",
+                    "T32 kernel `{}` supports only {supported} threads per block; {LANES} are required",
                     PROFILE_KERNEL_NAMES[index]
                 )));
             }
         }
-
-        Ok(Self {
-            _context: context,
-            stream,
-            functions,
+        Ok(CudaT32Kernels {
             profile_functions,
             drain_profile_function,
-            compact_function,
-            initialization_timings: CudaInitializationTimings {
-                context_stream_setup_ns,
-                module_function_load_ns,
-            },
-            provisioning,
         })
     }
 
@@ -5245,8 +5297,9 @@ impl DirectCuda {
         config: CudaConfig,
         diagnostics: &CudaBuffer,
     ) -> Result<CudaTiming, CudaError> {
+        let t32_kernels = self.t32_kernels()?;
         let parallel_threads = config.round_threads_per_block;
-        let supported_parallel_threads = self
+        let supported_parallel_threads = t32_kernels
             .drain_profile_function
             .max_threads_per_block()
             .map_err(|error| {
@@ -5275,6 +5328,7 @@ impl DirectCuda {
         let graph = self.capture_drain_profile_graph(
             buffers,
             diagnostics,
+            &t32_kernels.drain_profile_function,
             &configs,
             config.attempts_per_graph_wave,
         )?;
@@ -5347,6 +5401,7 @@ impl DirectCuda {
         buffers: &CudaBuffers,
         config: CudaConfig,
     ) -> Result<(CudaTiming, CudaPhaseProfile), CudaError> {
+        let t32_kernels = self.t32_kernels()?;
         let parallel_threads = config.round_threads_per_block;
         let supported_parallel_threads = PARALLEL_KERNELS
             .iter()
@@ -5380,6 +5435,7 @@ impl DirectCuda {
             CudaError::Validation("round_threads_per_block does not fit in u32".into())
         })?;
         let configs = profile_launch_configs(parallel_blocks, parallel_threads);
+        let dispatch_indices = profile_dispatch_indices(buffers.finalize_sweep_required);
         let prepare_scratch =
             CudaBuffer::from_host(&self.stream, vec![0_u64; LANES * 2], self.provisioning)
                 .map_err(|error| driver_error("profile prepare scratch allocation", error))?;
@@ -5397,7 +5453,8 @@ impl DirectCuda {
         let mut profile = CudaPhaseProfile::default();
 
         for _ in 0..maximum_waves {
-            let phase_events = self.create_phase_events(config.attempts_per_graph_wave)?;
+            let phase_events =
+                self.create_phase_events(config.attempts_per_graph_wave, dispatch_indices.len())?;
             let start = self
                 .stream
                 .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
@@ -5407,23 +5464,10 @@ impl DirectCuda {
                 boundaries[0]
                     .record(&self.stream)
                     .map_err(|error| driver_error("profile attempt start event", error))?;
-                for (dispatch_index, ((function, launch_config), name)) in self
-                    .profile_functions
-                    .iter()
-                    .zip(configs)
-                    .zip(PROFILE_KERNEL_NAMES)
-                    .enumerate()
-                {
-                    if !buffers.finalize_sweep_required
-                        && dispatch_index == PROFILE_FINALIZE_SWEEP_KERNEL_INDEX
-                    {
-                        boundaries[dispatch_index + 1]
-                            .record(&self.stream)
-                            .map_err(|error| {
-                                driver_error("profile omitted finalize sweep end event", error)
-                            })?;
-                        continue;
-                    }
+                for (boundary_index, &dispatch_index) in dispatch_indices.iter().enumerate() {
+                    let function = &t32_kernels.profile_functions[dispatch_index];
+                    let launch_config = configs[dispatch_index];
+                    let name = PROFILE_KERNEL_NAMES[dispatch_index];
                     if (3..=6).contains(&dispatch_index) {
                         launch_with_diagnostic(
                             &self.stream,
@@ -5436,7 +5480,7 @@ impl DirectCuda {
                         launch_uniform(&self.stream, function, buffers, launch_config)
                     }
                     .map_err(|error| driver_error(format!("profile `{name}` launch"), error))?;
-                    boundaries[dispatch_index + 1]
+                    boundaries[boundary_index + 1]
                         .record(&self.stream)
                         .map_err(|error| {
                             driver_error(format!("profile `{name}` end event"), error)
@@ -5464,20 +5508,20 @@ impl DirectCuda {
                 encoded_attempts.saturating_add(config.attempts_per_graph_wave as u64);
 
             for boundaries in &phase_events {
-                for phase in 0..PROFILE_KERNEL_NAMES.len() {
-                    let elapsed_ms = boundaries[phase]
-                        .elapsed_ms(&boundaries[phase + 1])
+                for (boundary_index, &dispatch_index) in dispatch_indices.iter().enumerate() {
+                    let elapsed_ms = boundaries[boundary_index]
+                        .elapsed_ms(&boundaries[boundary_index + 1])
                         .map_err(|error| {
                             driver_error(
                                 format!(
                                     "profile `{}` device-event elapsed time",
-                                    PROFILE_KERNEL_NAMES[phase]
+                                    PROFILE_KERNEL_NAMES[dispatch_index]
                                 ),
                                 error,
                             )
                         })?;
                     profile.observe(
-                        PROFILE_DISPATCH_PHASE[phase],
+                        PROFILE_DISPATCH_PHASE[dispatch_index],
                         (f64::from(elapsed_ms) * 1_000_000.0) as u64,
                     );
                 }
@@ -5485,6 +5529,9 @@ impl DirectCuda {
             profile.recorded_attempts = profile
                 .recorded_attempts
                 .saturating_add(phase_events.len() as u64);
+            profile.recorded_dispatches = profile.recorded_dispatches.saturating_add(
+                (phase_events.len() as u64).saturating_mul(dispatch_indices.len() as u64),
+            );
 
             let done = control[CONTROL_DONE] != 0;
             let error = control[CONTROL_ERROR] != 0;
@@ -5511,11 +5558,15 @@ impl DirectCuda {
         ))
     }
 
-    fn create_phase_events(&self, attempts: usize) -> Result<Vec<Vec<CudaEvent>>, CudaError> {
+    fn create_phase_events(
+        &self,
+        attempts: usize,
+        dispatches: usize,
+    ) -> Result<Vec<Vec<CudaEvent>>, CudaError> {
         let mut phase_events = Vec::with_capacity(attempts);
         for _ in 0..attempts {
-            let mut boundaries = Vec::with_capacity(PROFILE_KERNEL_NAMES.len() + 1);
-            for _ in 0..=PROFILE_KERNEL_NAMES.len() {
+            let mut boundaries = Vec::with_capacity(dispatches + 1);
+            for _ in 0..=dispatches {
                 boundaries.push(
                     self.stream
                         .context()
@@ -5579,6 +5630,7 @@ impl DirectCuda {
         &self,
         buffers: &CudaBuffers,
         diagnostics: &CudaBuffer,
+        drain_profile_function: &CudaFunction,
         configs: &[LaunchConfig; KERNEL_NAMES.len()],
         attempts: usize,
     ) -> Result<CudaGraph, CudaError> {
@@ -5601,7 +5653,7 @@ impl DirectCuda {
                     let launched = if index == 4 {
                         launch_with_diagnostic(
                             &self.stream,
-                            &self.drain_profile_function,
+                            drain_profile_function,
                             buffers,
                             diagnostics,
                             *config,
@@ -5667,6 +5719,12 @@ fn attempt_launch_configs(
         };
     }
     configs
+}
+
+fn profile_dispatch_indices(finalize_sweep_required: bool) -> Vec<usize> {
+    (0..PROFILE_KERNEL_NAMES.len())
+        .filter(|&index| finalize_sweep_required || index != PROFILE_FINALIZE_SWEEP_KERNEL_INDEX)
+        .collect()
 }
 
 fn profile_launch_configs(
@@ -5774,8 +5832,11 @@ fn duration_ns(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        CudaArena, CudaError, CudaPhaseProfile, CudaProvisioning, PROFILE_DISPATCH_PHASE,
-        decode_arena, decode_device_error, select_cuda_provisioning,
+        COMPACT_KERNEL_NAME, CudaArena, CudaError, CudaPhaseProfile, CudaProvisioning,
+        DRAIN_PROFILE_KERNEL_NAME, FINALIZE_SWEEP_KERNEL_INDEX, KERNEL_NAMES,
+        PROFILE_DISPATCH_PHASE, PROFILE_FINALIZE_SWEEP_KERNEL_INDEX, PROFILE_KERNEL_NAMES,
+        decode_arena, decode_device_error, load_named_functions, load_production_kernel_set,
+        load_t32_kernel_set, profile_dispatch_indices, select_cuda_provisioning,
     };
     use crate::CapacityRetryRecord;
 
@@ -5824,6 +5885,66 @@ mod tests {
         assert_eq!(profile.exchange_merge_ns, 14);
         assert_eq!(profile.finalize_ns, 31);
         assert_eq!(profile.total_kernel_ns(), (1_u64..=16).sum::<u64>());
+    }
+
+    #[test]
+    fn summary_profile_selector_records_only_existing_dispatches() {
+        let summary = profile_dispatch_indices(false);
+        assert_eq!(summary.len(), 15);
+        assert!(!summary.contains(&PROFILE_FINALIZE_SWEEP_KERNEL_INDEX));
+        assert_eq!(
+            KERNEL_NAMES
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != FINALIZE_SWEEP_KERNEL_INDEX)
+                .count(),
+            12
+        );
+
+        let mut summary_profile = CudaPhaseProfile::default();
+        for &dispatch_index in &summary {
+            summary_profile.observe(PROFILE_DISPATCH_PHASE[dispatch_index], 1);
+        }
+        assert_eq!(summary_profile.finalize_ns, 1);
+
+        let full = profile_dispatch_indices(true);
+        assert_eq!(full.len(), 16);
+        let mut full_profile = CudaPhaseProfile::default();
+        for &dispatch_index in &full {
+            full_profile.observe(PROFILE_DISPATCH_PHASE[dispatch_index], 1);
+        }
+        assert_eq!(full_profile.finalize_ns, 2);
+    }
+
+    #[test]
+    fn cuda_ordinary_initialization_ignores_missing_t32_symbols() {
+        fn missing_t32(name: &str) -> Result<String, String> {
+            if name.ends_with("_profile") || name == DRAIN_PROFILE_KERNEL_NAME {
+                Err(format!("missing diagnostic symbol `{name}`"))
+            } else {
+                Ok(name.to_owned())
+            }
+        }
+
+        let ordinary = load_production_kernel_set(missing_t32);
+        assert!(ordinary.is_ok());
+
+        let rejected_eager = (|| {
+            load_named_functions(&KERNEL_NAMES, missing_t32)?;
+            load_named_functions(&PROFILE_KERNEL_NAMES, missing_t32)?;
+            missing_t32(DRAIN_PROFILE_KERNEL_NAME)?;
+            missing_t32(COMPACT_KERNEL_NAME)?;
+            Ok::<(), String>(())
+        })();
+        let rejected_error = rejected_eager.expect_err("8cdc9ae's eager roster must fail");
+        assert!(rejected_error.contains("days_round_prepare_count_profile"));
+
+        let t32_opt_in = load_t32_kernel_set(missing_t32);
+        assert!(t32_opt_in.is_err());
+        assert!(load_production_kernel_set(missing_t32).is_ok());
+        println!(
+            "fixed_ordinary=ok rejected_eager=missing_symbol t32_opt_in=missing_symbol subsequent_ordinary=ok"
+        );
     }
 
     #[test]

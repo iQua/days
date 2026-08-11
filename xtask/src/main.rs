@@ -87,8 +87,8 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "safe_horizon.rs",
         predicate: r#"all(feature = "metal-spike", target_vendor = "apple")"#,
-        count: 39,
-        purpose: "replay and window capture instrumentation for Apple Metal profiling",
+        count: 48,
+        purpose: "replay and window capture instrumentation for Apple Metal profiling, including the separately selected T32 scalar trace loop",
     },
     AllowedFeatureGate {
         path: "scalar.rs",
@@ -171,8 +171,14 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "lib.rs",
         predicate: r#"feature = "planner-test-hooks""#,
-        count: 1,
-        purpose: "validator flow-index equality hook is exported only for standard tests",
+        count: 2,
+        purpose: "validator flow-index equality and T32 observation-construction hooks are exported only for standard tests",
+    },
+    AllowedFeatureGate {
+        path: "safe_horizon.rs",
+        predicate: r#"feature = "planner-test-hooks""#,
+        count: 4,
+        purpose: "the T32 negative control counts per-round observation-state construction only in standard tests",
     },
 ];
 
