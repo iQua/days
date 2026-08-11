@@ -72,6 +72,24 @@ fn prepare_profile_reports_every_diagnostic_split_interval_once() {
 }
 
 #[test]
+fn unsplit_prepare_comparison_uses_the_production_function_with_direct_events() {
+    for required in [
+        "pub struct CudaUnsplitPrepareProfile",
+        "pub unsplit_prepare_ns: u64",
+        "run_unsplit_prepare_profiled_with_observations",
+        "fn run_unsplit_prepare_profiled(",
+        "KERNEL_NAMES",
+        "self.functions",
+        "create_phase_events",
+    ] {
+        assert!(
+            CUDA_BACKEND.contains(required),
+            "missing executable unsplit-prepare comparison surface `{required}`"
+        );
+    }
+}
+
+#[test]
 fn ordinary_cuda_constructor_has_no_t32_symbol_dependency() {
     let direct_impl = CUDA_BACKEND
         .find("impl DirectCuda")

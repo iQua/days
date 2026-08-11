@@ -1012,6 +1012,41 @@ pub struct CudaProfiledRun {
     pub profile: CudaPhaseProfile,
 }
 
+/// Device-event timing for the production, unsplit `days_round_prepare` dispatch.
+///
+/// This opt-in path launches the production function directly and brackets it with the same CUDA
+/// event method as [`CudaPhaseProfile`]. It exists only to quantify the split profiler's aggregate
+/// perturbation; it does not change or replace the production graph path.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CudaUnsplitPrepareProfile {
+    pub recorded_attempts: u64,
+    pub recorded_dispatches: u64,
+    pub unsplit_prepare_ns: u64,
+}
+
+/// Complete CUDA result paired with the opt-in unsplit prepare timing.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CudaUnsplitPrepareProfiledRun {
+    pub run: CudaRun,
+    pub profile: CudaUnsplitPrepareProfile,
+}
+
+#[derive(Clone, Copy)]
+enum CudaDirectProfileKind {
+    Split,
+    UnsplitPrepare,
+}
+
+enum CudaDirectProfile {
+    Split(CudaPhaseProfile),
+    UnsplitPrepare(CudaUnsplitPrepareProfile),
+}
+
+struct CudaDirectProfiledRun {
+    run: CudaRun,
+    profile: CudaDirectProfile,
+}
+
 /// Complete CUDA result paired with exact opt-in drain counters.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CudaDrainProfileRun {
@@ -1339,6 +1374,59 @@ impl CudaExecutor {
         config: CudaConfig,
         observation_mode: ObservationMode,
     ) -> Result<CudaProfiledRun, CudaError> {
+        let profiled = self.run_direct_profiled_with_observations(
+            image,
+            exclusive_horizon_ns,
+            config,
+            observation_mode,
+            CudaDirectProfileKind::Split,
+        )?;
+        let CudaDirectProfile::Split(profile) = profiled.profile else {
+            unreachable!("split profile request returned the unsplit profile shape")
+        };
+        Ok(CudaProfiledRun {
+            run: profiled.run,
+            profile,
+        })
+    }
+
+    /// Executes the production dispatch roster directly and times the original unsplit prepare.
+    ///
+    /// This is an explicit diagnostic API. It uses the production module's exact
+    /// `days_round_prepare` function, direct stream launches, and the same per-dispatch CUDA event
+    /// method as [`Self::run_profiled_with_observations`]. The caller must compare separate fresh
+    /// runs because both prepare implementations mutate the attempt state.
+    pub fn run_unsplit_prepare_profiled_with_observations(
+        &self,
+        image: &SimulationImage,
+        exclusive_horizon_ns: Option<u64>,
+        config: CudaConfig,
+        observation_mode: ObservationMode,
+    ) -> Result<CudaUnsplitPrepareProfiledRun, CudaError> {
+        let profiled = self.run_direct_profiled_with_observations(
+            image,
+            exclusive_horizon_ns,
+            config,
+            observation_mode,
+            CudaDirectProfileKind::UnsplitPrepare,
+        )?;
+        let CudaDirectProfile::UnsplitPrepare(profile) = profiled.profile else {
+            unreachable!("unsplit profile request returned the split profile shape")
+        };
+        Ok(CudaUnsplitPrepareProfiledRun {
+            run: profiled.run,
+            profile,
+        })
+    }
+
+    fn run_direct_profiled_with_observations(
+        &self,
+        image: &SimulationImage,
+        exclusive_horizon_ns: Option<u64>,
+        config: CudaConfig,
+        observation_mode: ObservationMode,
+        kind: CudaDirectProfileKind,
+    ) -> Result<CudaDirectProfiledRun, CudaError> {
         validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
         validate_config(config)?;
 
@@ -1360,11 +1448,23 @@ impl CudaExecutor {
                 let _execution_guard = cuda_device_execution_guard();
                 let buffers =
                     CudaBuffers::new(&self.direct.stream, plan, self.direct.provisioning)?;
-                let (timing, profile) = self.direct.run_profiled(&buffers, attempt_config)?;
+                let (timing, profile) = match kind {
+                    CudaDirectProfileKind::Split => {
+                        let (timing, profile) =
+                            self.direct.run_profiled(&buffers, attempt_config)?;
+                        (timing, CudaDirectProfile::Split(profile))
+                    }
+                    CudaDirectProfileKind::UnsplitPrepare => {
+                        let (timing, profile) = self
+                            .direct
+                            .run_unsplit_prepare_profiled(&buffers, attempt_config)?;
+                        (timing, CudaDirectProfile::UnsplitPrepare(profile))
+                    }
+                };
                 #[cfg(feature = "cuda-test-hooks")]
                 panic_after_execution_if_requested();
                 let run = buffers.finish(&self.direct, image, observation_mode, timing)?;
-                Ok(CudaProfiledRun { run, profile })
+                Ok(CudaDirectProfiledRun { run, profile })
             })();
             match attempt {
                 Ok(mut profiled) => {
@@ -4934,6 +5034,21 @@ struct CudaT32Kernels {
     drain_profile_function: CudaFunction,
 }
 
+struct DirectProfileDispatch<'a> {
+    name: &'static str,
+    function: &'a CudaFunction,
+    config: LaunchConfig,
+    reported_phase: Option<usize>,
+    uses_diagnostic: bool,
+}
+
+struct DirectProfileMeasurement {
+    timing: CudaTiming,
+    dispatch_ns: Vec<u64>,
+    recorded_attempts: u64,
+    recorded_dispatches: u64,
+}
+
 fn load_named_functions<T, E>(
     names: &[&str],
     mut load: impl FnMut(&str) -> Result<T, E>,
@@ -5402,6 +5517,82 @@ impl DirectCuda {
         config: CudaConfig,
     ) -> Result<(CudaTiming, CudaPhaseProfile), CudaError> {
         let t32_kernels = self.t32_kernels()?;
+        let (parallel_blocks, parallel_threads) =
+            self.direct_profile_parallel_geometry(buffers, config)?;
+        let configs = profile_launch_configs(parallel_blocks, parallel_threads);
+        let dispatch_indices = profile_dispatch_indices(buffers.finalize_sweep_required);
+        let prepare_scratch =
+            CudaBuffer::from_host(&self.stream, vec![0_u64; LANES * 2], self.provisioning)
+                .map_err(|error| driver_error("profile prepare scratch allocation", error))?;
+        let dispatches = dispatch_indices
+            .iter()
+            .map(|&index| DirectProfileDispatch {
+                name: PROFILE_KERNEL_NAMES[index],
+                function: &t32_kernels.profile_functions[index],
+                config: configs[index],
+                reported_phase: Some(PROFILE_DISPATCH_PHASE[index]),
+                uses_diagnostic: (3..=6).contains(&index),
+            })
+            .collect::<Vec<_>>();
+        let measurement = self.run_direct_profile_dispatches(
+            buffers,
+            config,
+            &dispatches,
+            Some(&prepare_scratch),
+        )?;
+        let mut profile = CudaPhaseProfile {
+            recorded_attempts: measurement.recorded_attempts,
+            recorded_dispatches: measurement.recorded_dispatches,
+            ..CudaPhaseProfile::default()
+        };
+        for (dispatch, elapsed_ns) in dispatches.iter().zip(&measurement.dispatch_ns) {
+            profile.observe(
+                dispatch
+                    .reported_phase
+                    .expect("split dispatches must declare a reported phase"),
+                *elapsed_ns,
+            );
+        }
+        Ok((measurement.timing, profile))
+    }
+
+    fn run_unsplit_prepare_profiled(
+        &self,
+        buffers: &CudaBuffers,
+        config: CudaConfig,
+    ) -> Result<(CudaTiming, CudaUnsplitPrepareProfile), CudaError> {
+        let (parallel_blocks, parallel_threads) =
+            self.direct_profile_parallel_geometry(buffers, config)?;
+        let configs = attempt_launch_configs(parallel_blocks, parallel_threads);
+        let dispatch_indices = production_dispatch_indices(buffers.finalize_sweep_required);
+        let dispatches = dispatch_indices
+            .iter()
+            .map(|&index| DirectProfileDispatch {
+                name: KERNEL_NAMES[index],
+                function: &self.functions[index],
+                config: configs[index],
+                reported_phase: None,
+                uses_diagnostic: false,
+            })
+            .collect::<Vec<_>>();
+        let measurement = self.run_direct_profile_dispatches(buffers, config, &dispatches, None)?;
+        let prepare_index = dispatches
+            .iter()
+            .position(|dispatch| dispatch.name == "days_round_prepare")
+            .expect("production direct profile must include days_round_prepare");
+        let profile = CudaUnsplitPrepareProfile {
+            recorded_attempts: measurement.recorded_attempts,
+            recorded_dispatches: measurement.recorded_dispatches,
+            unsplit_prepare_ns: measurement.dispatch_ns[prepare_index],
+        };
+        Ok((measurement.timing, profile))
+    }
+
+    fn direct_profile_parallel_geometry(
+        &self,
+        buffers: &CudaBuffers,
+        config: CudaConfig,
+    ) -> Result<(u32, u32), CudaError> {
         let parallel_threads = config.round_threads_per_block;
         let supported_parallel_threads = PARALLEL_KERNELS
             .iter()
@@ -5434,12 +5625,16 @@ impl DirectCuda {
         let parallel_threads = u32::try_from(parallel_threads).map_err(|_| {
             CudaError::Validation("round_threads_per_block does not fit in u32".into())
         })?;
-        let configs = profile_launch_configs(parallel_blocks, parallel_threads);
-        let dispatch_indices = profile_dispatch_indices(buffers.finalize_sweep_required);
-        let prepare_scratch =
-            CudaBuffer::from_host(&self.stream, vec![0_u64; LANES * 2], self.provisioning)
-                .map_err(|error| driver_error("profile prepare scratch allocation", error))?;
+        Ok((parallel_blocks, parallel_threads))
+    }
 
+    fn run_direct_profile_dispatches(
+        &self,
+        buffers: &CudaBuffers,
+        config: CudaConfig,
+        dispatches: &[DirectProfileDispatch<'_>],
+        diagnostic: Option<&CudaBuffer>,
+    ) -> Result<DirectProfileMeasurement, CudaError> {
         let wall_started = Instant::now();
         let maximum_waves = buffers
             .dispatch_capacity
@@ -5450,11 +5645,13 @@ impl DirectCuda {
         let mut host_submit_ns = 0_u64;
         let mut device_ns = 0_u64;
         let mut encoded_attempts = 0_u64;
-        let mut profile = CudaPhaseProfile::default();
+        let mut dispatch_ns = vec![0_u64; dispatches.len()];
+        let mut recorded_attempts = 0_u64;
+        let mut recorded_dispatches = 0_u64;
 
         for _ in 0..maximum_waves {
             let phase_events =
-                self.create_phase_events(config.attempts_per_graph_wave, dispatch_indices.len())?;
+                self.create_phase_events(config.attempts_per_graph_wave, dispatches.len())?;
             let start = self
                 .stream
                 .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
@@ -5464,26 +5661,28 @@ impl DirectCuda {
                 boundaries[0]
                     .record(&self.stream)
                     .map_err(|error| driver_error("profile attempt start event", error))?;
-                for (boundary_index, &dispatch_index) in dispatch_indices.iter().enumerate() {
-                    let function = &t32_kernels.profile_functions[dispatch_index];
-                    let launch_config = configs[dispatch_index];
-                    let name = PROFILE_KERNEL_NAMES[dispatch_index];
-                    if (3..=6).contains(&dispatch_index) {
+                for (boundary_index, dispatch) in dispatches.iter().enumerate() {
+                    if dispatch.uses_diagnostic {
                         launch_with_diagnostic(
                             &self.stream,
-                            function,
+                            dispatch.function,
                             buffers,
-                            &prepare_scratch,
-                            launch_config,
+                            diagnostic.expect("diagnostic dispatch must have a scratch buffer"),
+                            dispatch.config,
                         )
                     } else {
-                        launch_uniform(&self.stream, function, buffers, launch_config)
+                        launch_uniform(&self.stream, dispatch.function, buffers, dispatch.config)
                     }
-                    .map_err(|error| driver_error(format!("profile `{name}` launch"), error))?;
+                    .map_err(|error| {
+                        driver_error(format!("direct profile `{}` launch", dispatch.name), error)
+                    })?;
                     boundaries[boundary_index + 1]
                         .record(&self.stream)
                         .map_err(|error| {
-                            driver_error(format!("profile `{name}` end event"), error)
+                            driver_error(
+                                format!("direct profile `{}` end event", dispatch.name),
+                                error,
+                            )
                         })?;
                 }
             }
@@ -5508,29 +5707,25 @@ impl DirectCuda {
                 encoded_attempts.saturating_add(config.attempts_per_graph_wave as u64);
 
             for boundaries in &phase_events {
-                for (boundary_index, &dispatch_index) in dispatch_indices.iter().enumerate() {
+                for (boundary_index, dispatch) in dispatches.iter().enumerate() {
                     let elapsed_ms = boundaries[boundary_index]
                         .elapsed_ms(&boundaries[boundary_index + 1])
                         .map_err(|error| {
                             driver_error(
                                 format!(
-                                    "profile `{}` device-event elapsed time",
-                                    PROFILE_KERNEL_NAMES[dispatch_index]
+                                    "direct profile `{}` device-event elapsed time",
+                                    dispatch.name
                                 ),
                                 error,
                             )
                         })?;
-                    profile.observe(
-                        PROFILE_DISPATCH_PHASE[dispatch_index],
-                        (f64::from(elapsed_ms) * 1_000_000.0) as u64,
-                    );
+                    dispatch_ns[boundary_index] = dispatch_ns[boundary_index]
+                        .saturating_add((f64::from(elapsed_ms) * 1_000_000.0) as u64);
                 }
             }
-            profile.recorded_attempts = profile
-                .recorded_attempts
-                .saturating_add(phase_events.len() as u64);
-            profile.recorded_dispatches = profile.recorded_dispatches.saturating_add(
-                (phase_events.len() as u64).saturating_mul(dispatch_indices.len() as u64),
+            recorded_attempts = recorded_attempts.saturating_add(phase_events.len() as u64);
+            recorded_dispatches = recorded_dispatches.saturating_add(
+                (phase_events.len() as u64).saturating_mul(dispatches.len() as u64),
             );
 
             let done = control[CONTROL_DONE] != 0;
@@ -5543,8 +5738,8 @@ impl DirectCuda {
             }
         }
 
-        Ok((
-            CudaTiming {
+        Ok(DirectProfileMeasurement {
+            timing: CudaTiming {
                 encoded_attempts,
                 graph_replays: 0,
                 wave_boundary_syncs,
@@ -5554,8 +5749,10 @@ impl DirectCuda {
                 device_ns,
                 wall_ns: duration_ns(wall_started.elapsed()),
             },
-            profile,
-        ))
+            dispatch_ns,
+            recorded_attempts,
+            recorded_dispatches,
+        })
     }
 
     fn create_phase_events(
@@ -5727,6 +5924,12 @@ fn profile_dispatch_indices(finalize_sweep_required: bool) -> Vec<usize> {
         .collect()
 }
 
+fn production_dispatch_indices(finalize_sweep_required: bool) -> Vec<usize> {
+    (0..KERNEL_NAMES.len())
+        .filter(|&index| finalize_sweep_required || index != FINALIZE_SWEEP_KERNEL_INDEX)
+        .collect()
+}
+
 fn profile_launch_configs(
     parallel_blocks: u32,
     parallel_threads: u32,
@@ -5836,7 +6039,8 @@ mod tests {
         DRAIN_PROFILE_KERNEL_NAME, FINALIZE_SWEEP_KERNEL_INDEX, KERNEL_NAMES,
         PROFILE_DISPATCH_PHASE, PROFILE_FINALIZE_SWEEP_KERNEL_INDEX, PROFILE_KERNEL_NAMES,
         decode_arena, decode_device_error, load_named_functions, load_production_kernel_set,
-        load_t32_kernel_set, profile_dispatch_indices, select_cuda_provisioning,
+        load_t32_kernel_set, production_dispatch_indices, profile_dispatch_indices,
+        select_cuda_provisioning,
     };
     use crate::CapacityRetryRecord;
 
@@ -5892,14 +6096,9 @@ mod tests {
         let summary = profile_dispatch_indices(false);
         assert_eq!(summary.len(), 15);
         assert!(!summary.contains(&PROFILE_FINALIZE_SWEEP_KERNEL_INDEX));
-        assert_eq!(
-            KERNEL_NAMES
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| *index != FINALIZE_SWEEP_KERNEL_INDEX)
-                .count(),
-            12
-        );
+        let unsplit_summary = production_dispatch_indices(false);
+        assert_eq!(unsplit_summary.len(), 12);
+        assert!(!unsplit_summary.contains(&FINALIZE_SWEEP_KERNEL_INDEX));
 
         let mut summary_profile = CudaPhaseProfile::default();
         for &dispatch_index in &summary {
@@ -5909,6 +6108,7 @@ mod tests {
 
         let full = profile_dispatch_indices(true);
         assert_eq!(full.len(), 16);
+        assert_eq!(production_dispatch_indices(true).len(), KERNEL_NAMES.len());
         let mut full_profile = CudaPhaseProfile::default();
         for &dispatch_index in &full {
             full_profile.observe(PROFILE_DISPATCH_PHASE[dispatch_index], 1);

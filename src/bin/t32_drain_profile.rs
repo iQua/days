@@ -306,6 +306,11 @@ fn main() {
              instrumentation_off_on_equal=true",
             actual.bytes, actual.fnv1a64,
         );
+        println!(
+            "record=p12t32_counter_contract fixture={name} \
+             capacity_caps=fallback_fel:16384,queue:2048,channel:2048,remote_staging:2048,outbox:2000000,tcp_ranges:64,tcp_ledger:4096,observation:512 \
+             max_capacity_retries=16 observation_mode=summary"
+        );
         report_profile(name, &outcome.profile);
 
         if root_trace {
