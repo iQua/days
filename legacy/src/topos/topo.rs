@@ -518,6 +518,7 @@ pub fn installed_host_attachment_state(
     hosts: &HostAttachments,
     expected_flows: &[Flow],
 ) -> Option<InstalledHostAttachmentState> {
+    crate::validate_config(config_path).unwrap_or_else(|error| panic!("{error}"));
     let content = fs::read_to_string(config_path).expect("The configuration is not valid");
     let config: Config = toml::from_str(&content).expect("Failed to deserialize the configuration");
     let host_attachment = config.host_attachment_spec()?;
@@ -2188,6 +2189,16 @@ drop = "TailDrop"
         let enabled: Config = toml::from_str(&format!("model_host_attachment = true\n{base}"))
             .expect("host attachment config should deserialize");
         assert!(enabled.model_host_attachment);
+        assert_eq!(enabled.host_attachment_spec().unwrap().propagation_ns, 0);
+
+        let propagated: Config = toml::from_str(&format!("[link]\npropagation_ns = 1000\n{base}"))
+            .expect("scalar propagation config should deserialize");
+        assert!(!propagated.model_host_attachment);
+        assert_eq!(
+            propagated.host_attachment_spec().unwrap().propagation_ns,
+            1000,
+            "declared scalar propagation must activate legacy physical stages"
+        );
     }
 }
 

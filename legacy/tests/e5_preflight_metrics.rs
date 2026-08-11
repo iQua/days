@@ -1,5 +1,6 @@
 #![cfg(feature = "test")]
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -63,7 +64,7 @@ fn log_dir(config: &Path) -> PathBuf {
 }
 
 #[test]
-fn e5_requires_the_attachment_key_and_installs_exact_propagation_stages() {
+fn scalar_propagation_installs_exact_stages_with_or_without_the_attachment_key() {
     let directory = TempDir::new().unwrap();
     let absent = fixture(&directory, "absent", None);
     let enabled = fixture(&directory, "enabled", Some(true));
@@ -72,11 +73,13 @@ fn e5_requires_the_attachment_key_and_installs_exact_propagation_stages() {
     let absent_flows =
         Flow::try_flows_from_config_with_attachments(absent.to_str().unwrap(), &absent_hosts)
             .unwrap();
-    assert!(
+    let absent_stages =
         installed_host_attachment_state(absent.to_str().unwrap(), &absent_hosts, &absent_flows)
-            .is_none(),
-        "the historical no-key mode must not silently activate propagation stages"
-    );
+            .expect("declared scalar propagation must activate physical stages");
+    assert_eq!(absent_stages.physical.propagation_ns, 1000);
+    assert!(absent_stages.hosts.values().all(|host| {
+        host.injection.propagation_ns == 1000 && host.delivery.propagation_ns == 1000
+    }));
 
     let (_, hosts) = build_graph(enabled.to_str().unwrap()).unwrap();
     let flows =
@@ -125,4 +128,70 @@ fn q_high_e5_analogue_exports_exact_final_metrics_and_stops_timer_work() {
             && row.timer_cancelled
             && row.completion_time_ns.is_some()
     }));
+}
+
+/// Explicit correctness gate for the frozen k=32 E5 fixture. It asserts final byte ledgers only;
+/// it does not collect or assert any wall-clock quantity.
+#[test]
+#[ignore = "full k=32 E5 non-regression gate; run explicitly for legacy publication"]
+fn frozen_e5_completes_every_flow_and_acks_every_demand_byte() {
+    let directory = TempDir::new().unwrap();
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../configs/benchmarks/p12/e5_wide_k32_q200.toml");
+    let original = fs::read_to_string(&source).unwrap();
+    let logs = directory.path().join("e5-logs");
+    let body = original.replacen(
+        "log_path = \"logs/p12/e5_wide_k32_q200\"",
+        &format!(
+            "log_path = \"{}\"\nreport_interval = 1.0\nmodel_host_attachment = true\nlegacy_e5_metrics = true",
+            logs.display()
+        ),
+        1,
+    );
+    assert_ne!(body, original, "E5 overlay must replace the log path");
+    let config = directory.path().join("e5.toml");
+    fs::write(&config, body).unwrap();
+
+    cargo_bin_cmd!("days")
+        .env("RUST_LOG", "error")
+        .arg(&config)
+        .assert()
+        .success();
+
+    let rows = csv::Reader::from_path(logs.join("tcp_metrics.csv"))
+        .unwrap()
+        .deserialize::<days::utils::logger::TcpMetricsReport>()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let flows = rows.iter().map(|row| row.flow_id).collect::<BTreeSet<_>>();
+    let completed = rows.iter().filter(|row| row.completed).count();
+    let demand = rows
+        .iter()
+        .map(|row| row.original_bytes as u64)
+        .sum::<u64>();
+    let acked = rows.iter().map(|row| row.acked_bytes as u64).sum::<u64>();
+    assert_eq!(rows.len(), 8192);
+    assert_eq!(flows.len(), 8192);
+    assert_eq!(completed, 8192);
+    assert_eq!(demand, 8_589_934_592);
+    assert_eq!(acked, demand);
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.outstanding_bytes as u64)
+            .sum::<u64>(),
+        0
+    );
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.pending_timeouts as u64)
+            .sum::<u64>(),
+        0
+    );
+    assert!(rows.iter().all(|row| row.timer_cancelled));
+    println!(
+        "E5_NON_REGRESSION rows={} unique_flows={} completed={completed} demand={demand} acked={acked} outstanding=0 pending_timeouts=0 timers_cancelled={}",
+        rows.len(),
+        flows.len(),
+        rows.iter().filter(|row| row.timer_cancelled).count(),
+    );
 }

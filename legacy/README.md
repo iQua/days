@@ -14,6 +14,11 @@ other frozen legacy baseline rows remain tied to annotated tag `p12-legacy-pre-e
 (`3295ad08f345c4f57c0fa6c30d0749b6a80e0a95`; legacy tree
 `a6a99594ed0334bc0864c6315af339850a6846eb`), never to a post-amendment revision.
 
+**E1 amendment (August 10, 2026 / T28):** the user-authorized legacy E1 expression
+task permits only the minimal correctness work needed to execute the frozen E1 family exactly,
+reject configuration input that legacy cannot honor, and add direct expression and regression
+proofs. It does not authorize performance work or general legacy development.
+
 If you are looking for the current simulator, it is `../executor/` (crate `days-executor`).
 Nothing outside this directory may depend on `days-legacy`; `cargo xtask audit` enforces
 that direction mechanically.
@@ -90,7 +95,7 @@ outside the anchor under the exact-time erratum in [§6.9](#69-exact-time-erratu
 
 ## 3. Freeze policy
 
-**No changes. Four narrow exceptions, each requiring a changelog row in
+**No changes. Five narrow exceptions, each requiring a changelog row in
 [§8](#8-freeze-changelog).**
 
 | # | Allowed change | Why it must be allowed |
@@ -99,8 +104,9 @@ outside the anchor under the exact-time erratum in [§6.9](#69-exact-time-erratu
 | **(b)** | **Toolchain compatibility.** Edition/rustc/clippy-lint churn that breaks the build with no semantic change. | Required by the retirement policy (`days-executor-plan.md:605`): "changes only for toolchain compatibility". |
 | **(c)** | **Dependency pin bumps.** Editing a `=x.y.z` pin in `legacy/Cargo.toml`. | Exact pins on crates that the *live* root crate also uses (see [§4](#4-dependency-pinning-and-the-lockfile)) mean a live-side patch bump inside the same semver range requires touching this manifest. That coupling is deliberate; it is also the only way to move a frozen dependency, so it is auditable. |
 | **(d)** | **The ordered E5 expressibility repair.** Minimal fixes for exact event scheduling, strict `FatTreeEcmp`/structural-pairing handling, byte-budget TCP with configurable MSS, sound cumulative ACK/loss recovery using the existing Reno controller, propagation activation, and correctness observability. | Explicit user authority in `days-gpu/plans/p12-opening-plan.md`, registry entry `LEGACY-ON-E5 ORDERED — FREEZE CONTRACT AMENDED` (August 9, 2026). This is bounded to the reviewed T0–T7 plan and the individually authorized, guardrailed follow-up repairs recorded in the same registry (fast retransmit, cumulative-ACK credit, Reno window-cap alignment, and sender-side SWS avoidance); it does not authorize a new controller or general legacy development. |
+| **(e)** | **The T28 E1 expression and configuration-integrity repair.** Minimal scalar-propagation activation, a strict legacy-owned configuration vocabulary, and correctness gates for the frozen E1 family, E3, and E5. | Explicit user authority in the T28 legacy E1 task (August 10, 2026). This exception is limited to exact E1 semantics and refusal of unimplemented input; it does not authorize a new protocol, controller, output field, or performance work. |
 
-**Never, under exceptions (a)–(c), and outside the exact bounds of exception (d):**
+**Never, under exceptions (a)–(c), and outside the exact bounds of exceptions (d)–(e):**
 
 - no new protocols, mechanisms, schedulers, queue disciplines, or congestion-control variants;
 - no new configuration keys, no new output fields, no new features in `[features]`;
@@ -108,7 +114,7 @@ outside the anchor under the exact-time erratum in [§6.9](#69-exact-time-erratu
 - no behaviour change of any kind. If a change would alter what any existing fixture
   produces, it is out of policy — stop and escalate rather than proceed.
 
-**Every** change under (a), (b), (c), or (d) adds a row to [§8](#8-freeze-changelog) in the same
+**Every** change under (a), (b), (c), (d), or (e) adds a row to [§8](#8-freeze-changelog) in the same
 commit. A change to `legacy/` without a changelog row is a policy violation regardless of how
 small it is.
 
@@ -586,3 +592,4 @@ to anything else under `legacy/` always do.
 | 2026-08-09 | `T22a: Credit full legacy cumulative ACK advances` | (d) | Made the sink report its full cumulative advance, the source forward its sender-relative advance to controller and rate-sample consumers, and Reno use that advance outside Fast Recovery; added an E3-only tripwire for ACK jumps. | The `SECOND LEGACY RENO DEFECT — FIX AUTHORIZED` registry entry in `days-gpu/plans/p12-opening-plan.md`. |
 | 2026-08-09 | `T22a: Remove the legacy Reno window cap` | (d) | Removed Reno's fixed 65,535-byte congestion-window ceiling while retaining the shared 65,535-byte initial slow-start threshold; window state remains `usize` and legacy keeps its f64 congestion-avoidance accumulator. | The `LEGACY CWND CAP TO BE REMOVED — ENGINES MATCH ON TRANSPORT MODELLING` registry entry in `days-gpu/plans/p12-opening-plan.md`. |
 | 2026-08-10 | `T22a: Avoid legacy sender silly windows` | (d) | Delayed non-final sub-MSS originals while data remains in flight, while retaining an exact final tail and the empty-flight deadlock escape; added focused behavior tests and an E3-only TCP-source-construction tripwire. | The `THIRD LEGACY DEFECT — SENDER-SIDE SILLY WINDOW` registry entry in `days-gpu/plans/p12-opening-plan.md`. |
+| 2026-08-10 | `T28: Express legacy E1 fixtures exactly` | (e) | Activated the configured scalar propagation model, added strict rejection of unowned or unimplemented legacy input, and added direct E1 expression, E3 inertness, and E5 non-regression gates. | The user-authorized T28 legacy E1 implementation and correctness task. |

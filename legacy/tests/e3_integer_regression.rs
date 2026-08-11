@@ -79,51 +79,65 @@ fn e3_integer_totals_match_pre_e5_tag() {
     const TAG_INTEGER_RECORD: &str = "flows=16896,source_rows=33792,sink_rows=16896,sent_packets=41932800,sent_bytes=41932800000,received_packets=41932800,received_bytes=41932800000,derived_drops=0\n";
 
     let directory = TempDir::new().unwrap();
-    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../configs/benchmarks/p12/e3_legacy_rack_local_st.toml");
-    let config = directory.path().join("e3-legacy-rack-local-st.toml");
-    let logs = directory.path().join("logs");
-    let original = fs::read_to_string(source).unwrap();
-    let body = original.replace(
-        "log_path = \"logs/p12/e3_legacy_rack_local_st\"",
-        &format!("log_path = \"{}\"", logs.display()),
-    );
-    assert_ne!(body, original, "E3 log path replacement must take effect");
-    fs::write(&config, body).unwrap();
+    for mode in ["st", "mt"] {
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../configs/benchmarks/p12/e3_legacy_rack_local_{mode}.toml"
+        ));
+        let config = directory
+            .path()
+            .join(format!("e3-legacy-rack-local-{mode}.toml"));
+        let logs = directory.path().join(format!("{mode}-logs"));
+        let original = fs::read_to_string(source).unwrap();
+        let body = original.replace(
+            &format!("log_path = \"logs/p12/e3_legacy_rack_local_{mode}\""),
+            &format!("log_path = \"{}\"", logs.display()),
+        );
+        assert_ne!(body, original, "E3 log path replacement must take effect");
+        fs::write(&config, body).unwrap();
 
-    cargo_bin_cmd!("days")
-        .env("RUST_LOG", "error")
-        .env("DAYS_E3_ASSERT_NO_FAST_RETRANSMIT", "1")
-        .env("DAYS_E3_ASSERT_NO_CUMULATIVE_ACK_JUMP", "1")
-        .arg(&config)
-        .assert()
-        .success();
-    assert!(
-        !logs.join("tcp_metrics.csv").exists(),
-        "the default E3 surface must not gain E5 metrics"
-    );
+        println!(
+            "E3_TRIPWIRES_ARMED mode={mode} tcp_source=1 fast_retransmit=1 cumulative_ack_jump=1 unsupported_config_input=1"
+        );
+        cargo_bin_cmd!("days")
+            .env("RUST_LOG", "error")
+            .env("DAYS_E3_ASSERT_NO_TCP_SOURCE", "1")
+            .env("DAYS_E3_ASSERT_NO_FAST_RETRANSMIT", "1")
+            .env("DAYS_E3_ASSERT_NO_CUMULATIVE_ACK_JUMP", "1")
+            .env("DAYS_E3_ASSERT_NO_UNSUPPORTED_CONFIG_INPUT", "1")
+            .arg(&config)
+            .assert()
+            .success();
+        assert!(
+            !logs.join("tcp_metrics.csv").exists(),
+            "the default E3 surface must not gain E5 metrics"
+        );
 
-    let (source_rows, sent_packets, sent_bytes, source_flows) =
-        summarize(&logs.join("sources.csv"), "sent_packets", "packet_sizes");
-    let (sink_rows, received_packets, received_bytes, sink_flows) = summarize(
-        &logs.join("sinks.csv"),
-        "received_packets",
-        "received_sizes",
-    );
-    assert_eq!(source_flows, sink_flows, "source and sink flow IDs moved");
+        let (source_rows, sent_packets, sent_bytes, source_flows) =
+            summarize(&logs.join("sources.csv"), "sent_packets", "packet_sizes");
+        let (sink_rows, received_packets, received_bytes, sink_flows) = summarize(
+            &logs.join("sinks.csv"),
+            "received_packets",
+            "received_sizes",
+        );
+        assert_eq!(source_flows, sink_flows, "source and sink flow IDs moved");
 
-    let totals = IntegerTotals {
-        flows: sink_flows.len(),
-        source_rows,
-        sink_rows,
-        sent_packets,
-        sent_bytes,
-        received_packets,
-        received_bytes,
-        derived_drops: sent_packets.checked_sub(received_packets).unwrap(),
-    };
-    assert_eq!(
-        totals.stable_record().as_bytes(),
-        TAG_INTEGER_RECORD.as_bytes()
-    );
+        let totals = IntegerTotals {
+            flows: sink_flows.len(),
+            source_rows,
+            sink_rows,
+            sent_packets,
+            sent_bytes,
+            received_packets,
+            received_bytes,
+            derived_drops: sent_packets.checked_sub(received_packets).unwrap(),
+        };
+        assert_eq!(
+            totals.stable_record().as_bytes(),
+            TAG_INTEGER_RECORD.as_bytes()
+        );
+        println!(
+            "E3_INERTNESS mode={mode} {} tcp_metrics=absent",
+            totals.stable_record().trim_end()
+        );
+    }
 }

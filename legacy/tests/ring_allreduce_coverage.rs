@@ -90,7 +90,6 @@ log_path = "{log_path}"
 
 [app_source]
 req_channel_capacity = 128
-chunk_size = 512
 initial_delay = 1
 run_interval = 50
 
@@ -112,7 +111,7 @@ sinks = [2, 3, 0, 1]
 [collective.traffic]
 initial_delay = 0.0
 size = 3072
-arr_dist = {{ type = "Uniform", low = 0.1, high = 0.1 }}
+arr_dist = {{ type = "Uniform", low = 1.0, high = 1.0 }}
 pkt_size_dist = {{ type = "DiscreteUniform", low = 512, high = 512 }}
 
 [collective.traffic.tcp]
@@ -129,7 +128,7 @@ sinks = [1, 2, 3, 0]
 [collective.traffic]
 initial_delay = 0.0
 size = 512
-arr_dist = {{ type = "Uniform", low = 0.1, high = 0.1 }}
+arr_dist = {{ type = "Uniform", low = 1.0, high = 1.0 }}
 pkt_size_dist = {{ type = "DiscreteUniform", low = 512, high = 512 }}
 
 [collective.traffic.tcp]

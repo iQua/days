@@ -61,7 +61,8 @@ fn runtime_scheduling_failure_is_a_nonzero_cli_exit_without_completion_claim() {
     let fixture = Fixture::new("zero-arrival", 0, 1_032);
     let content = fs::read_to_string(&fixture.config_path)
         .unwrap()
-        .replace("size = 1032", "duration = 0.0000005");
+        .replace("size = 1032", "duration = 0.0000005")
+        .replace("low = 1.0, high = 1.0", "low = 0.0, high = 0.0");
     fs::write(&fixture.config_path, content).unwrap();
 
     Command::cargo_bin("days")
@@ -103,7 +104,6 @@ impl Fixture {
         let temp_dir = tempfile::tempdir().unwrap();
         let config_path = temp_dir.path().join(format!("{name}.toml"));
         let log_path = temp_dir.path().join("logs");
-        let arrival_seconds = arrival_ns as f64 / 1_000_000_000.0;
         let initial_delay = if arrival_ns == 0 { 0.000000001 } else { 0.0 };
         fs::write(
             &config_path,
@@ -130,7 +130,7 @@ routing = "ShortestPath"
 [flow.traffic]
 initial_delay = {initial_delay}
 size = {size}
-arr_dist = {{ type = "Uniform", low = {arrival_seconds}, high = {arrival_seconds} }}
+arr_dist = {{ type = "Uniform", low = 1.0, high = 1.0 }}
 pkt_size_dist = {{ type = "DiscreteUniform", low = 512, high = 512 }}
 
 [flow.traffic.tcp]

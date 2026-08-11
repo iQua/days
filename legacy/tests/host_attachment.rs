@@ -2,6 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use assert_cmd::cargo::cargo_bin_cmd;
+use predicates::prelude::*;
 use tempfile::TempDir;
 
 fn write_config(
@@ -85,7 +86,7 @@ fn sink_delays(log_directory: &Path) -> Vec<f64> {
 }
 
 #[test]
-fn key_off_is_byte_identical_to_an_absent_key() {
+fn key_off_conflicting_with_scalar_propagation_is_rejected() {
     let directory = TempDir::new().expect("temporary directory should be available");
     let historical_logs = directory.path().join("historical");
     let explicit_off_logs = directory.path().join("explicit-off");
@@ -98,15 +99,13 @@ fn key_off_is_byte_identical_to_an_absent_key() {
     );
 
     run(&historical);
-    run(&explicit_off);
-
-    for artifact in ["sources.csv", "switches.csv", "sinks.csv", "traces.json"] {
-        assert_eq!(
-            fs::read(historical_logs.join(artifact)).expect("historical artifact should exist"),
-            fs::read(explicit_off_logs.join(artifact)).expect("key-off artifact should exist"),
-            "{artifact} changed when the opt-in key was false"
-        );
-    }
+    cargo_bin_cmd!("days")
+        .env("RUST_LOG", "error")
+        .arg(explicit_off)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("model_host_attachment"))
+        .stderr(predicate::str::contains("link.propagation_ns"));
 }
 
 #[test]

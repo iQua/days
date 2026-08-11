@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 
 use days::scenario::compile_config;
-use days::topos::build::PairingPolicy;
+use days::topos::build::{PairingPolicy, build_graph as build_shared_graph};
 use days::topos::route::{EcmpFlow, compute_fat_tree_ecmp_route_table};
 use days_executor::NodeKind;
 use days_legacy::flows::flow::Flow;
@@ -182,7 +182,7 @@ fn unsupported_or_conflicting_e5_routing_vocabulary_is_refused() {
     ] {
         let file = config(&body);
         let path = file.path().to_str().unwrap();
-        let (_, hosts) = build_graph(path).expect("topology remains valid");
+        let (_, hosts) = build_shared_graph(path).expect("topology remains valid");
         let error = Flow::try_flows_from_config_with_attachments(path, &hosts)
             .expect_err("unsupported vocabulary must return an error");
         assert!(

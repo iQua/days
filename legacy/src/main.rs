@@ -6,7 +6,7 @@ use log::info;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
 
-use days::utils::tracing::{ConcurrencyTrackerLayer, is_tracing_active};
+use days_legacy::utils::tracing::{ConcurrencyTrackerLayer, is_tracing_active};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
