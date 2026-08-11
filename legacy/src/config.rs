@@ -5,6 +5,7 @@ use days::topos::route::RoutingConfig;
 use serde::Deserialize;
 
 use crate::flows::cc::CCAlgorithm;
+use crate::utils::exact_time::scenario_seconds_ns;
 
 /// Complete legacy configuration vocabulary.
 ///
@@ -22,10 +23,10 @@ struct LegacyConfig {
     tracing_interval: Option<f64>,
     threading: Option<ThreadingModel>,
     num_threads: Option<usize>,
-    hot_workers: Option<toml::Value>,
+    hot_workers: Option<usize>,
     concurrency_level: Option<toml::Value>,
     log_path: Option<toml::Value>,
-    report_interval: Option<toml::Value>,
+    report_interval: Option<f64>,
     mailbox_capacity: Option<usize>,
     legacy_e5_metrics: Option<toml::Value>,
     time_quantum_ns: Option<toml::Value>,
@@ -923,6 +924,16 @@ pub(crate) fn validate(file_path: &str) -> Result<(), String> {
             "tracing interval must be finite and positive",
         ));
     }
+    if let Some(interval) = config.report_interval {
+        if interval <= 0.0 {
+            return Err(unsupported(
+                "report_interval",
+                "report interval must be positive",
+            ));
+        }
+        scenario_seconds_ns(interval, "report interval")
+            .map_err(|reason| unsupported("report_interval", &reason))?;
+    }
 
     if config.seed == Some(0) {
         return Err(unsupported(
@@ -946,14 +957,19 @@ pub(crate) fn validate(file_path: &str) -> Result<(), String> {
         }
     }
 
-    if config
-        .mailbox_capacity
-        .is_some_and(|capacity| capacity > usize::MAX / 2 + 1)
-    {
-        return Err(unsupported(
-            "mailbox_capacity",
-            "value exceeds the runtime's maximum representable mailbox capacity",
-        ));
+    if let Some(capacity) = config.mailbox_capacity {
+        if capacity == 0 {
+            return Err(unsupported(
+                "mailbox_capacity",
+                "mailbox capacity must be at least one",
+            ));
+        }
+        if capacity > usize::MAX / 2 + 1 {
+            return Err(unsupported(
+                "mailbox_capacity",
+                "value exceeds the runtime's maximum representable mailbox capacity",
+            ));
+        }
     }
     match (config.threading, config.num_threads) {
         (None, Some(_)) => {
@@ -978,6 +994,30 @@ pub(crate) fn validate(file_path: &str) -> Result<(), String> {
             ));
         }
         _ => {}
+    }
+    if let Some(hot_workers) = config.hot_workers {
+        let effective_workers = match config.threading {
+            Some(ThreadingModel::Single) => 1,
+            Some(ThreadingModel::Multiple) => config.num_threads.unwrap_or_else(num_cpus::get),
+            None => num_cpus::get(),
+        };
+        let effective_workers = if cfg!(target_family = "wasm") {
+            1
+        } else {
+            effective_workers.clamp(1, usize::BITS as usize)
+        };
+        if effective_workers == 1 {
+            return Err(unsupported(
+                "hot_workers",
+                "the key is inactive with a single-thread executor",
+            ));
+        }
+        if hot_workers > effective_workers {
+            return Err(unsupported(
+                "hot_workers",
+                "value exceeds the executor worker count and would be clamped",
+            ));
+        }
     }
 
     if let Some(app_source) = &config.app_source {

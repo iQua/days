@@ -208,6 +208,43 @@ fn silent_substitution_cases() -> Vec<(String, &'static str)> {
     ]
 }
 
+fn remaining_root_control_cases() -> Vec<(String, &'static str)> {
+    vec![
+        (
+            EXPLICIT_FLOW_BASE.replacen(
+                "threading = \"single\"",
+                "threading = \"single\"\nhot_workers = 999",
+                1,
+            ),
+            "hot_workers",
+        ),
+        (
+            EXPLICIT_FLOW_BASE.replacen(
+                "threading = \"single\"",
+                "threading = \"multiple\"\nnum_threads = 2\nhot_workers = 3",
+                1,
+            ),
+            "hot_workers",
+        ),
+        (
+            EXPLICIT_FLOW_BASE.replacen(
+                "duration = 0.0",
+                "duration = 0.0\nreport_interval = nan",
+                1,
+            ),
+            "report_interval",
+        ),
+        (
+            EXPLICIT_FLOW_BASE.replacen(
+                "threading = \"single\"",
+                "threading = \"single\"\nmailbox_capacity = 0",
+                1,
+            ),
+            "mailbox_capacity",
+        ),
+    ]
+}
+
 fn hunted_substitution_cases() -> Vec<(String, &'static str)> {
     let tcp_with_cubic_on_reno = EXPLICIT_FLOW_BASE
         .replacen(
@@ -737,6 +774,16 @@ fn legacy_rejects_further_hunted_substitutions_by_name() {
 }
 
 #[test]
+fn legacy_rejects_remaining_root_control_substitutions_by_name() {
+    for (body, key) in remaining_root_control_cases() {
+        let file = config(&body);
+        let error = days_legacy::validate_config(file.path().to_str().unwrap())
+            .expect_err("legacy must reject inactive, clamped, or invalid root controls");
+        assert!(error.contains(key), "hard error must name {key:?}: {error}");
+    }
+}
+
+#[test]
 fn collective_graph_is_executable_endpoint_input() {
     let body = COLLECTIVE_BASE.replacen("sources = [0]\n", "", 1).replacen(
         "sinks = [1]",
@@ -761,6 +808,20 @@ fn cli_hard_errors_name_silent_semantic_substitutions() {
             .code(1)
             .stderr(predicate::str::contains(key));
         println!("SEMANTIC_NEGATIVE_CONTROL exit=1 named_key={key}");
+    }
+}
+
+#[test]
+fn cli_hard_errors_name_remaining_root_control_substitutions() {
+    for (body, key) in remaining_root_control_cases() {
+        let file = config(&body);
+        cargo_bin_cmd!("days")
+            .env("RUST_LOG", "error")
+            .arg(file.path())
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains(key));
+        println!("ROOT_NEGATIVE_CONTROL exit=1 named_key={key}");
     }
 }
 
