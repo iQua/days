@@ -1,10 +1,26 @@
 ---
 title: Days
-description: A performant discrete-event network simulator in Rust.
+description: Discrete-event network simulation in Rust — a process-based legacy engine and an exact multi-backend executor.
 icon: Network
 ---
 
-Days is a high-performance discrete-event network simulator written in Rust. It models a network as a graph of **actors** (stackless coroutines) that communicate via **message passing** (packets and control messages). Simulations can run on a single-threaded runtime (minimal overhead) or a multi-threaded runtime (parallel execution).
+Days is a discrete-event network simulator written in Rust. The repository
+ships **two engines** that share a lineage but make different guarantees:
+
+- **Days AGO, the exact engine.** A scenario is compiled into a
+  `SimulationImage` — logical-process (LP) state plus canonical events — and
+  executed on any of four backends: a serial **Scalar** reference, a
+  multicore **CPU** pool, **Apple Metal**, or **NVIDIA CUDA**. Execution is
+  *exact*: simultaneous events have one canonical order, no float appears in
+  the semantics, and every backend reproduces the byte-identical complete
+  state of the serial reference. Protocols are written once, as sequential
+  per-entity state machines, and compiled for each backend.
+- **Legacy Days, the process-based engine.** The original actor
+  implementation on Nexosim: each network element is a coroutine with
+  private state, communicating by message passing, on a single- or
+  multi-threaded runtime. It remains fully supported for CPU-only
+  simulation and is the reference point the exact engine is measured
+  against.
 
 <Cards>
   <Card title="Install" href="/docs/install" />
@@ -12,33 +28,61 @@ Days is a high-performance discrete-event network simulator written in Rust. It 
   <Card title="Examples" href="/docs/examples" />
   <Card title="Configuration" href="/docs/configuration/overview" />
   <Card title="Architecture" href="/docs/architecture/overview" />
-  <Card title="Verification (LeanGuard)" href="/docs/verification" />
+  <Card title="Verification & Research" href="/docs/research" />
 </Cards>
 
-## What you get
+## What the exact engine guarantees
 
-- **Config-driven experiments**: run a simulation from a single TOML file (topology, traffic, switch discipline, logging).
-- **Pluggable queueing/scheduling**: FIFO, DRR, WRR, WFQ, Static Priority, Virtual Clock.
-- **Transport and congestion control models**:
-  - Packet-distribution traffic sources (arrival + size distributions)
-  - TCP sources with Reno, CUBIC, and BBR congestion control
-  - Optional DCQCN (feature-gated)
-- **Optional link-layer models**: PFC/802.1Qbb (feature-gated and runtime-configured).
-- **Structured outputs**: CSV reports for sources/sinks/switches (and optional PFC/DCQCN traces).
+- **Byte-identity across backends.** The shipped corpus gate compares the
+  CPU pool and every compiled device backend against the global Scalar
+  reference: with device-omitted diagnostics excluded, the remaining
+  complete result must be byte-for-byte identical, on every fixture in the
+  corpus.
+- **Scale with refuse-or-run capacity.** The device planner derives every
+  arena capacity from the image before execution; a plan either fits or the
+  attempt aborts with a typed fault — nothing is dropped silently. Compact
+  readback returns only live regions, and an opt-in warm start reuses a
+  prior run's converged sizing (sizing only; it cannot change an answer).
+  The largest committed fixture runs 262,144 closed-loop TCP flows;
+  campaign evidence records its complete state byte-identical across the
+  two CUDA architectures the project measures on.
+- **Capability honesty.** Metal and CUDA accept all five exact schedulers,
+  TailDrop and ECN-threshold marking, and TCP Reno/CUBIC; they reject RED,
+  PFC, DCQCN/CNP, and collective generators *before* execution with a
+  precise, tested error. Unsupported never means silently different.
+
+## What both engines offer
+
+- **Config-driven experiments**: one TOML file describes topology, traffic,
+  switch discipline, and logging.
+- **Pluggable queueing/scheduling**: FIFO, DRR, WRR, WFQ, Static Priority
+  (plus Virtual Clock in the legacy engine).
+- **Transport and congestion control**: packet-distribution sources, TCP
+  Reno/CUBIC (legacy additionally BBR), optional DCQCN, and feature-gated
+  PFC in the legacy engine.
+- **Structured outputs with `csv_logging`**: CSV reports default on; setting
+  `csv_logging = false` performs no CSV, trace, or manifest filesystem work
+  while preserving every correctness reduction — the configuration of choice
+  for benchmarking.
 
 ## Quick start
 
-From the repo root:
+Legacy engine, from the repo root:
 
 ```bash
 RUST_LOG=info cargo run --release -p days-legacy --bin days -- configs/simple.toml
 ```
 
-Output CSV files are written under the configured `log_path` (default: `./output/`).
+For the exact engine's build, fixtures, and backend selection, start at
+[/docs/quickstart](/docs/quickstart); the CLI reference covers the
+production runners.
 
 ## Where to go next
 
-- Start running simulations: [/docs/quickstart](/docs/quickstart)
-- Learn how configuration maps to code: [/docs/configuration/overview](/docs/configuration/overview)
-- Understand the simulator architecture: [/docs/architecture/overview](/docs/architecture/overview)
-- Dive into core components (packets, switches, schedulers, flows): [/docs/components/packet](/docs/components/packet)
+- Run simulations on either engine: [/docs/quickstart](/docs/quickstart)
+- Configuration reference, including `csv_logging`:
+  [/docs/configuration/overview](/docs/configuration/overview)
+- The execution model and backends:
+  [/docs/architecture/overview](/docs/architecture/overview)
+- Proofs, certificates, and the research story:
+  [/docs/research](/docs/research)

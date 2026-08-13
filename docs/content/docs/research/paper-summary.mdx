@@ -1,45 +1,85 @@
 ---
 title: Paper summary
-description: High-level summary of the LeanGuard/Days research narrative.
+description: The research narrative — LeanGuard trace certificates and the exact multi-backend executor.
 ---
+
+Two research lines share this repository: **LeanGuard**, the trace-certificate
+methodology built on the legacy engine, and the **exact executor** (Days AGO),
+whose execution model is itself proved in Lean and whose backends are held to
+byte-identity. This page summarizes both, and is careful to separate shipped
+code, committed fixtures, and external campaign evidence.
+
+## LeanGuard: trace certificates + trusted replay
 
 ![LeanGuard overview: the simulator emits a per-transition trace certificate and a trusted Lean checker replays it.](/figures/leanguard-intro.svg)
 
-## Core idea: trace certificates + trusted replay
-
 LeanGuard follows an "untrusted producer / trusted checker" workflow:
 
-1. **Days** emits a *per-transition* trace (one row per protocol transition), including a deterministic snapshot of post-state.
-2. A **Lean 4 checker** canonicalizes the trace (typically sorting by `(time_ns, event_id)` and rejecting duplicates).
-3. The checker **replays** an executable reference model and returns `ACCEPT` or `REJECT` with the first counterexample row.
+1. **Days** emits a *per-transition* trace (one row per protocol transition),
+   including a deterministic snapshot of post-state.
+2. A **Lean 4 checker** canonicalizes the trace — legacy protocol families
+   sort by `(time_ns, event_id)` and reject duplicates; exact-engine (P10c)
+   checkers key on the full `EventKey` and some require already-strict
+   canonical order.
+3. The checker **replays** an executable reference model and returns
+   `ACCEPT` or `REJECT` with the first counterexample row.
 
-See:
+See [/docs/verification/design](/docs/verification/design) for the practical
+guide, [/docs/research/design](/docs/research/design) for the design notes,
+and [/docs/reference/traces/schema](/docs/reference/traces/schema) for row
+conventions. The coverage-guided test-generation loop that builds on these
+checkers is summarized in
+[/docs/research/test-generation](/docs/research/test-generation).
 
-- [/docs/verification/design](/docs/verification/design) (practical guide)
-- [/docs/research/design](/docs/research/design) (more formal design notes)
-- [/docs/reference/traces/schema](/docs/reference/traces/schema) (row conventions and encodings)
+## The exact executor: proofs down, byte-identity across
 
-## Why canonicalization matters
+The exact engine's claim is structural: five Lean theorems about the
+execution machinery (`lean/DaysExecutor*`) license safe-horizon rounds and
+intra-round reordering, and the shipped corpus gate then holds every backend
+to the theorems' promise — the CPU pool and each compiled device backend
+must reproduce the global Scalar reference's complete result byte-for-byte
+(device-omitted diagnostics excluded) on every corpus fixture.
 
-Because Days can run many models concurrently, the physical file order of trace rows is not treated as semantically meaningful. Canonicalization is part of the specification: the checker defines what ordering is acceptable, and the simulator only needs to log enough information to support that ordering.
+The device arc that made this practical at scale shipped in this tree:
+planner equality across backends, persistent arenas, per-entity capacity
+derivation with refuse-or-run faults and bounded retry, ring and vector
+sizing, compact readback (only live regions return), and an opt-in capacity
+warm start that affects sizing only. The largest committed fixture runs
+**262,144 closed-loop TCP flows**
+(`configs/benchmarks/p11/rq9_frontier_closed_k32.toml`); campaign evidence
+records its complete state byte-identical across the two CUDA architectures
+the project measures on.
 
-## Scaling beyond one run: coverage-guided generation
+Recent shipped work also includes: the exact TCP corpus/device gate (T24),
+CUDA upload provisioning for unified-memory hosts (T27), strict legacy
+configuration validation with exact fixture expression (T28), and
+TOML-configurable `csv_logging` (T30).
 
-The paper also describes a test generation loop that uses checkers as both:
+## Runnable benchmarks and indicative figures
 
-- a correctness oracle (`ACCEPT`/`REJECT` + first failing step)
-- a **semantic coverage sensor** (which spec-level branches/obligations were exercised)
+The committed E5 fixture family — 8,192 byte-terminated TCP flows on a k32
+fat tree, Reno primary (`q200`), CUBIC, and a `q256` backup — is the
+recommended runnable benchmark set. Indicative native run-clock medians on
+one machine (`boston`: Intel i7-13700K, RTX 4090): **Scalar 126.2 s, CPU
+pool at 22 workers 5.007 s, CUDA 0.759 s** on the Reno fixture. These are
+machine-qualified measurements, not cross-platform guarantees.
 
-The generator mutates scenarios, keeps those that expand coverage, and minimizes failures into stable regression tests.
+## Measured negatives, kept on the record
 
-See:
+Two device optimizations were implemented, measured in paired A/B campaigns,
+and **not merged** — recorded here because the method is the point:
 
-- [/docs/research/test-generation](/docs/research/test-generation) (paper-derived overview + results)
-- [/docs/reference/cli/leanguard-testgen](/docs/reference/cli/leanguard-testgen) (CLI reference)
+- **Pinned staging (T31)**: exactness passed; process wall regressed
+  materially on the discrete-GPU host. Verdict: hold.
+- **Structure-of-arrays drain layout**: all seven identity anchors byte-exact;
+  slower on the E5 and every E6 device clock in the paired A/B (one process
+  wall at parity). Verdict: the shipped layout stands.
 
-## Evaluation (high level)
+## External campaign evidence
 
-The paper includes an experimental evaluation of:
-
-- trace checking cost (runtime/memory) on a suite of protocol traces
-- coverage-guided test generation behavior on a prototype corpus
+The E6 UDP/CBR fixture family and the multi-engine comparison campaigns
+(against sequential and MPI ns-3, Unison, GeDES, and the legacy engine) are
+recorded in the project's evidence archive with machine-qualified results;
+the E6 fixtures are not committed in this tree and are labeled external
+until imported. Results quoted from those campaigns carry their machine and
+clock definitions at the citation site.
