@@ -23,10 +23,9 @@ The worst offenders are `architecture/executor-scope.mdx`,
 `configuration/logging.mdx`, `configuration/topology.mdx`,
 `reference/traces/schema.mdx`, and `verification/leanguard.mdx`.
 
-No page directly names the cleanup's deleted `t17c_cuda_profile`,
-`t21_horizon_trace`, T32 profiling counters, legacy `perf_stats`, or legacy
-tracing sampler. Several pages do, however, omit the post-cleanup production
-surface and should not reintroduce those names.
+No page directly names a profiling-only binary, counter set, or sampler removed
+by the cleanup. Several pages do, however, omit the post-cleanup production
+surface and should not reintroduce removed instrumentation.
 
 ## Repository boundary found during the audit
 
@@ -61,7 +60,11 @@ The baseline site has no adequate home for these required topics:
   `src/bin/t20f_frontier.rs:383-528`).
 - The 262,144-flow frontier is a committed fixture and production runner
   surface (`configs/benchmarks/p11/rq9_frontier_closed_k32.toml:9-16`,
-  `src/bin/t20f_frontier.rs:383-528`).
+  `src/bin/t20f_frontier.rs:383-528`). The CUDA artifact explicitly targets
+  `sm_89` and `sm_121` (`executor/build.rs:42-70`). The supplied campaign
+  result says both architectures matched the Scalar fingerprint byte for byte;
+  that result is not stored as a committed output artifact and must remain
+  machine-qualified evidence.
 - Metal/CUDA reject DCQCN/CNP, collective generators, PFC control/pause, and
   RED admission before execution, with messages that name the backend and
   suggest Scalar or CPU (`executor/src/validate.rs:405-469`).
