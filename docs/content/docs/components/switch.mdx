@@ -1,38 +1,44 @@
 ---
-title: Switch (PacketSwitch)
-description: Demultiplexing switch that forwards packets using per-flow FIB tables.
+title: Switches and logical processes
+description: Legacy packet demultiplexing and exact switch-egress ownership.
 ---
 
-`PacketSwitch` (`legacy/src/switches/switch.rs`) is a demultiplexing switch model:
+Legacy and exact execution place the switch boundary at different points. Legacy has one demultiplexer actor per physical topology switch. Exact execution makes each directed switch egress port a logical process.
 
-- It does **not** implement queueing or link serialization.
-- It forwards packets to the correct next hop using a per-flow forwarding table.
+## Legacy `PacketSwitch`
 
-## Forwarding tables
+`PacketSwitch` does not queue packets or serialize links. Its `outputs` map connects the demultiplexer to schedulers, endpoint actors, or host-attachment models.
 
-Each switch maintains:
+Each switch stores two flow tables:
 
-- `fib: HashMap<flow_id, next_id>` for forward (data) traffic
-- `r_fib: HashMap<flow_id, prev_id>` for reverse traffic (TCP ACKs and control packets)
+- `fib: flow_id -> next_id` routes data toward the sink.
+- `r_fib: flow_id -> previous_id` routes TCP ACKs and control packets toward the source.
 
-These tables are installed after flow paths are computed in `Topology::route_flows` (`legacy/src/topos/topo.rs`).
+`packet_received` classifies packets with neither `ack` nor `control` as forward data. It sends ACK and control packets through `r_fib`. `Topology::route_flows` installs both tables after it computes all paths.
 
-## Output ports
+The Nexosim event clock drives the handler. `PacketSwitch::time` is a seconds view of `Context::time()`. Test assertions permit `packet.time` to precede the current event, so the packet field is a compatibility timestamp rather than a second clock.
 
-`PacketSwitch.outputs` maps a destination ID to an `Output<Packet>`:
+## Exact LP model
 
-- destination IDs can be **neighboring switch IDs** or **endpoint IDs** (source/sink actors),
-- the topology builder ensures IDs don’t collide by starting endpoint IDs after the switch ID range.
+Exact lowering assigns one LP to each host and one LP to each semantic `(physical switch, directed egress link)` pair. It sorts those semantic keys before assigning dense `NodeId` values, which removes construction order and hash-map iteration from identity.
 
-## Packet classification
+A lowered switch LP owns:
 
-`packet_received` distinguishes:
+- `SwitchState.physical_switch`, shared by all egress LPs for that physical switch
+- one `SwitchQueueState` with its egress link, scheduler, admission policy, optional PFC state, waiting queue, and in-service packet
+- a local child-event sequence and packet counters
 
-- **Data packets**: `ack.is_none()` and `control.is_none()` → forward via `fib[flow_id]`
-- **Reverse/control traffic**: ACKs or control packets → forward via `r_fib[flow_id]`
+The exact image has no standalone FIB actor. Each `FlowDescriptor` carries canonical forward and reverse `LinkId` routes. On `RemoteArrival`, the transition finds the packet's next directed link and therefore the destination egress LP. The owning LP performs admission, service selection, and completion without shared mutable switch state.
 
-This split keeps “reverse-path” semantics explicit without building a second network.
+This ownership is the unit used by Scalar, persistent CPU workers, Metal, and CUDA. Safe-horizon rounds drain each active LP below the exclusive horizon, buffer remote events, then merge those events at the round barrier in canonical order.
 
-## Time handling
+## Capability checks
 
-Switches maintain a local `time: f64` and update it from `packet.time`. In test builds (`--features test`), switches also assert that `packet.time` matches the simulation engine clock (`cx.time()`).
+The lowerer rejects mechanisms outside the exact model, such as VirtualClock. Backend validation then checks device-specific state before launch. Metal and CUDA reject:
+
+- collective generators
+- DCQCN controller and CNP state
+- PFC control payloads and per-priority pause state
+- RED admission state
+
+Errors name the backend and direct the caller to Scalar or CPU. A capability failure returns no partial run result.
