@@ -1,59 +1,47 @@
 ---
-title: Simulation Engine
-description: How Days forks the Nexosim discrete-event simulation runtime.
+title: Simulation Engines
+description: Execution and lifecycle boundaries for the exact and legacy engines.
 ---
 
-Days builds on `nexosim`, which provides:
+Days does not have one interchangeable runtime API. The exact engine consumes a compiled `SimulationImage`; the legacy engine builds and runs Nexosim models.
 
-- **Models**: stateful actors (`impl Model`) with async message handlers.
-- **Mailboxes**: bounded queues for messages delivered to a model.
-- **Ports**: typed outputs (`Output<T>`) that can be connected to a method on another model.
-- **Event scheduling**: models can schedule one-shot or periodic events in the future.
+## Exact transition engine
 
-## What a model looks like
+The exact image is a closed data structure: model kinds, event kinds, state ownership, initial payloads, and channels are known before execution. An event identifies its target LP and carries a fixed payload rather than a callback. The transition code in `executor/src/scalar.rs` updates the target's owned state and emits local or remote events with canonical keys.
 
-Most core components follow this pattern:
+The same transition contract is used by five entry paths:
 
-- a method like `packet_received(...)` (or `frame_received(...)`) is connected to an upstream `Output`.
-- the handler updates local state and schedules future work using `cx.schedule_event(...)`.
-- output is sent via `self.output.send(msg).await`.
+- `run_scalar`: one global ordered event calendar
+- `run_scalar_rounds`: single-threaded reference execution with per-LP queues and safe horizons
+- `run_cpu`: persistent workers that own complete LPs
+- `run_metal` and `run_cuda`: planned device arenas and device round execution
 
-Example kinds of models in this repo:
+Every path returns the same normalized `RunResult` contract. Device backends omit diagnostic-only observation planes, but not canonical state or measurement results.
 
-- `PacketSwitch` (`legacy/src/switches/switch.rs`)
-- schedulers such as `Port`, `DRRServer`, `WFQServer` (`legacy/src/schedulers/`)
-- flow endpoints such as `DistPacketSource`, `TCPPacketSink` (`legacy/src/flows/`)
+## Exact safe-horizon lifecycle
 
-## Time
+For the round paths, `executor/src/safe_horizon.rs` and the parallel backends repeat:
 
-`nexosim` maintains an internal clock (exposed as `cx.time()` / `sim.time()`), represented as a `MonotonicTime`.
+1. Find the minimum pending LP frontier.
+2. Set an exclusive horizon to `frontier + minimum_channel_lookahead`, clamped to the run boundary.
+3. Drain every active LP strictly before that horizon.
+4. Collect cross-LP outboxes.
+5. Sort remote events canonically and merge them at the barrier.
+6. Update the sparse frontier and begin the next round.
 
-Days typically works in **seconds as `f64`**:
+The minimum delay on every cross-LP channel makes the drain safe: work emitted in the round cannot arrive below the horizon. Global scalar does not need this rule and can run a zero-delay image; all round and parallel paths reject nonpositive lookahead.
 
-- handlers read “now” from `Packet.time` (or `LinkFrame.time()`),
-- handlers schedule future work with `Duration::from_secs_f64(delta)`,
-- some code converts from `cx.time()` to `f64` only when needed (often gated by the `test` feature).
+## Legacy Nexosim lifecycle
 
-This “time-carrying message” design is central to performance; see [/docs/architecture/time-concurrency](/docs/architecture/time-concurrency).
+The legacy simulator uses actor-like models with async handlers:
 
-## Single-threaded vs multi-threaded runs
+- `Mailbox<M>` is a bounded inbound queue.
+- `Output<T>` connects one model to typed handlers on other models.
+- `Context` exposes the scheduler and authoritative `MonotonicTime` clock.
+- `SimInit` registers models and selects the single-threaded or multithreaded executor.
 
-Days chooses the runtime based on config:
+`legacy/src/topos/topo.rs` creates and connects switches, per-edge schedulers, endpoints, optional wires and L2/PFC models, and the UI. It then initializes a Nexosim `Simulation`, injects source start events, advances through the configured integer-nanosecond stop time, collects sink statistics, and flushes enabled logs.
 
-- `threading = "single"` uses a single-threaded runtime (lower scheduling overhead).
-- `threading = "multiple"` uses a multi-threaded runtime sized to CPU cores by default (override with `num_threads`).
+With `threading = "single"`, `Topology::new` selects one Nexosim worker. With `threading = "multiple"`, it uses `num_threads` or the detected CPU count. `hot_workers` and `concurrency_level` tune the vendored executor; they do not configure exact CPU ownership.
 
-The choice is made in `Topology::new` (`legacy/src/topos/topo.rs`) using `SimInit::with_num_threads(...)`.
-
-## Wiring models together
-
-Days constructs the full model graph in two stages:
-
-1. Create `Mailbox<M>` for every model and attach `Output<T>` ports.
-2. Register models into the simulation initializer (`SimInit`) and call `init(MonotonicTime::EPOCH)` to produce a `Simulation`.
-
-The entrypoint `Topology::run` (`legacy/src/topos/topo.rs`) performs this wiring and then runs:
-
-```text
-sim.step_until(Duration::from_secs_f64(duration))
-```
+See [/docs/internals/nexosim](/docs/internals/nexosim) for the legacy runtime API and [/docs/internals](/docs/internals) for exact executor internals.

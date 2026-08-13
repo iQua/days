@@ -1,34 +1,22 @@
 ---
-title: Topology
-description: Configure FatTree, Torus, or custom graphs using TOML.
+title: Topology & Routing
+description: Custom, FatTree, Torus, and Dragonfly graphs with propagation and routing.
 ---
 
-Topology parsing and graph construction is implemented in `src/topos/build.rs`.
+`src/topos/build.rs` builds an undirected switch graph plus explicit host-to-switch attachments. Days accepts one of four topology forms.
 
-Days supports three input modes:
+## Custom graph
 
-1. **Fat-tree** (`[topology] category = "FatTree"`)
-2. **Torus** (`[topology] category = "Torus"`)
-3. **Custom graph** (omit `[topology]`, provide `edges` and `hosts`)
-
-All modes ultimately produce:
-
-- an undirected graph `UnGraph<usize, ()>` (nodes are `usize` IDs),
-- a `hosts: Vec<usize>` list indicating which nodes can host flow endpoints.
-
-## 1) Custom topology (explicit edges)
-
-Use this mode when you want exact control over the graph:
+Omit `[topology]` and provide non-empty `edges` and `hosts` arrays:
 
 ```toml
 edges = [[0, 1], [0, 2]]
 hosts = [0, 1, 2]
 ```
 
-- `edges` is a list of undirected edges (pairs of node IDs).
-- `hosts` is a list of node IDs that can host sources/sinks.
+Each edge is undirected. In custom graphs, each host ID attaches to the switch with the same ID. Do not combine `edges` or `hosts` with `[topology]`.
 
-## 2) Fat-tree
+## FatTree
 
 ```toml
 [topology]
@@ -36,17 +24,12 @@ category = "FatTree"
 
 [topology.fat_tree]
 k = 8
+hosts_per_edge = 4
 ```
 
-Constraints:
+`k` must be positive and even. `hosts_per_edge` defaults to `1` and must fall in `1..=k/2`. The builder creates `k²/2` edge switches, the same number of aggregation switches, and `k²/4` core switches. It attaches `hosts_per_edge` hosts to every edge switch.
 
-- `k` must be even and positive.
-
-Notes:
-
-- Days constructs the canonical k-ary fat-tree and sets `hosts = 0..(k^2/2)`.
-
-## 3) Torus
+## Torus
 
 ```toml
 [topology]
@@ -57,16 +40,67 @@ dim = 2
 n = 3
 ```
 
-Constraints:
+`dim` must be 1, 2, or 3. `n` must be positive. Every one of the `n^dim` torus nodes also serves as a host attachment.
 
-- `dim` must be 1, 2, or 3.
-- `n` must be positive.
+## Dragonfly
 
-Notes:
+```toml
+[topology]
+category = "Dragonfly"
 
-- Days builds a wrap-around torus and sets `hosts = 0..(n^dim)`.
+[topology.dragonfly]
+routers_per_group = 4
+global_ports_per_router = 2
+hosts_per_router = 1
+```
 
-## Common failure modes
+`routers_per_group` must be at least 2. `global_ports_per_router` and `hosts_per_router` must be positive; `hosts_per_router` defaults to 1. The builder uses the balanced group count
 
-- Missing the required sub-table (`[topology.fat_tree]` or `[topology.torus]`) for the chosen category.
-- Using fewer than 2 hosts when you rely on random endpoint selection (flow sets, collective endpoint generation).
+```text
+groups = routers_per_group * global_ports_per_router + 1
+```
+
+Routers form an all-to-all graph inside each group, and each group pair receives one global link.
+
+## Propagation
+
+Uniform propagation works in legacy and exact execution:
+
+```toml
+[link]
+propagation_ns = 1000
+```
+
+In legacy, setting `link.propagation_ns` activates explicit finite-rate host injection/delivery stages and inserts propagation wires on host and fabric links. `model_host_attachment = true` activates the host stages even when propagation is zero. An explicit `model_host_attachment = false` conflicts with `link.propagation_ns`.
+
+Exact lowering also supports per-tier FatTree delays:
+
+```toml
+[link.propagation_tiers]
+host_to_edge_ns = 1000
+edge_to_aggregation_ns = 2000
+aggregation_to_core_ns = 4000
+```
+
+`propagation_ns` and `propagation_tiers` are mutually exclusive. Tiered propagation applies only to FatTree exact lowering; legacy rejects it. Legacy PFC also rejects `propagation_ns` because its PFC link pipeline has no propagation stage.
+
+## Scenario-wide routing
+
+```toml
+[routing]
+policy = "ShortestPath" # or "FatTreeEcmp"
+```
+
+`ShortestPath` is the default. `FatTreeEcmp` selects a deterministic equal-cost FatTree route from semantic flow identity. It requires a FatTree and the deterministic traffic forms accepted by its lowering path.
+
+Do not combine root `[routing]` with per-flow `routing` or `path`, or with `flow_set.routing`. Legacy also rejects root routing when the scenario contains collectives. Exact collective lowering derives its own deterministic routes.
+
+## Flow-set pairing
+
+`[[flow_set]]` accepts three pairing policies:
+
+- `Random` (default): seeded endpoint selection.
+- `SwitchOffsetHalf`: same host ordinal on the attachment switch halfway around an even switch set.
+- `SameSwitchNext`: next host ordinal on the same attachment switch.
+
+Structural pairings require a uniform host-attachment grid. They reject requests larger than the host count; `SwitchOffsetHalf` needs an even attachment-switch count, and `SameSwitchNext` needs at least two hosts per attachment switch.

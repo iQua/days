@@ -1,111 +1,79 @@
 ---
 title: Switches & Queues
-description: Configure per-edge schedulers, buffering, and drop/ECN behavior.
+description: Scheduler, capacity, drop, ECN, and backend capability configuration.
 ---
 
-Switch configuration is global: it applies to **every scheduler instantiated per directed edge** in the topology graph (see `Topology::connect_neighbours` in `legacy/src/topos/topo.rs`).
+The global `[switch]` table configures every egress scheduler created from the topology.
 
 ```toml
 [switch]
-port_rate = 1e9
+port_rate = 1000000000
 capacity = 100
 discipline = "FIFO"
 drop = "TailDrop"
 ```
 
-## `switch.port_rate`
+| Field | Type | Requirement |
+| --- | --- | --- |
+| `port_rate` | number | Required. Bits per second. Exact lowering requires a positive integer bps value representable in `u64`. |
+| `capacity` | integer | Required. Packet capacity for configured switch queues. |
+| `discipline` | string | Required. Selects the scheduler. |
+| `drop` | string | Required. Selects admission or ECN marking. |
+| `ecn_threshold` | fraction | Valid only with `drop = "ECN_THRESHOLD"`; must satisfy `0 < value <= 1`. |
+| `weights` | integer array | Used by WFQ, DRR, and WRR. |
+| `priorities` | integer array | Used by SP. |
+| `vticks` | number array | Used by legacy VirtualClock. |
 
-Bit rate of each egress port in bits per second.
+The strict legacy loader rejects inactive combinations. It permits the historical neutral `weights = [1]` token with FIFO, SP, or VirtualClock, but rejects other inactive weights.
 
-- Type: `f64`
-- Required: yes
-- Used by: all schedulers (serialization delay = `size_bits / port_rate`)
+## Scheduling disciplines
 
-## `switch.capacity`
+| Value | Legacy | Exact Scalar/CPU | Exact Metal/CUDA | Extra field |
+| --- | --- | --- | --- | --- |
+| `FIFO` | yes | yes | yes | none |
+| `SP` | yes | yes | yes | optional `priorities` |
+| `WFQ` | yes | yes | yes, with bounded exact rationals | `weights` |
+| `DRR` | yes | yes | yes | `weights` |
+| `WRR` | yes | yes | yes | `weights` |
+| `VirtualClock` | yes | no | no | optional `vticks` |
 
-Queue capacity at each egress scheduler.
+All classed schedulers map `class_id = flow_id % class_count`.
 
-- Type: `usize`
-- Required: yes
-- Semantics: currently interpreted as **packets**, not bytes (Days instantiates schedulers with `CapacityUnit::Packets`)
-- Special value: `0` means “unlimited” for built-in drop/ECN strategies
+For SP, `priorities[class_id]` gives the service priority; larger values run first, with FIFO order inside a priority. Missing legacy priorities default to `[1]`. Exact lowering uses the same default.
 
-## `switch.discipline`
+Legacy requires a non-empty weights array for WFQ, DRR, and WRR. Exact lowering also requires every weight to be positive. It converts DRR weights into 1500-byte-relative quanta. Metal and CUDA reject WFQ checkpoints whose rational numerator or denominator exceeds the device representation; the error reports the field and required bit width.
 
-Selects the scheduling discipline (which scheduler model is instantiated).
+Legacy VirtualClock defaults missing `vticks` to `[1.0]`. Each tick is seconds per bit. Exact lowering returns:
 
-Supported values:
+```text
+unsupported scheduler `VirtualClock`; Days executor supports FIFO, SP, WFQ, DRR, and WRR
+```
 
-| Discipline | Scheduler model | Extra required fields |
-|---|---|---|
-| `FIFO` | `Port` | none |
-| `DRR` | `DRRServer` | `weights` |
-| `WRR` | `WRRServer` | `weights` |
-| `WFQ` | `WFQServer` | `weights` |
-| `SP` | `SPServer` | `priorities` |
-| `VirtualClock` | `VirtualClockServer` | `vticks` |
+## Drop and ECN policies
 
-Schedulers inspect their queue and select at most one packet whenever link service can start. Packets arriving before the next service start are therefore visible to the next scheduling decision.
+| Value | Legacy | Exact Scalar/CPU | Exact Metal/CUDA |
+| --- | --- | --- | --- |
+| `TailDrop` | yes | yes | yes |
+| `ECN_THRESHOLD` | yes | yes | yes |
+| `RED` | yes | yes | rejected |
+| `RED_ECN` | yes | yes | rejected |
 
-## `switch.drop`
+TailDrop drops a packet when admitting it would exceed packet capacity. Capacity `0` means unlimited for TailDrop.
 
-Selects the congestion policy applied on enqueue.
+`ECN_THRESHOLD` has a default fraction of `0.8`. Legacy marks an ECN-capable packet and drops a non-ECN-capable packet at the threshold; it marks when post-admission depth is greater than `floor(ecn_threshold * capacity)`. Exact packets carry a lowered `ecn_marked` bit, so the exact scheduler sets that bit at or above `ceil(ecn_threshold * capacity)`. Exact ECN threshold requires positive capacity. Physical capacity overflow drops packets in both runtimes.
 
-Supported values:
+Legacy RED and RED_ECN use packet occupancy, thresholds at 70% and 90% of capacity, EWMA weight `2^-9`, and maximum probability `0.8`. RED drops on a congestion action. RED_ECN marks an ECN-capable packet on that action and still drops at physical overflow. Exact RED uses integer deterministic state for byte-identical execution and requires capacity of at least 10 packets.
 
-| Value | Behavior |
-|---|---|
-| `TailDrop` | drop only when capacity is exceeded |
-| `RED` | RFC 2309-style random early drop |
-| `RED_ECN` | RED, but tries to mark ECN instead of dropping |
-| `ECN_THRESHOLD` | marks ECN when occupancy exceeds `ecn_threshold` |
+Metal and CUDA reject lowered RED state before execution:
 
-Notes:
+```text
+backend Cuda does not support RED admission; use Scalar or Cpu
+```
 
-- Marking ECN only works if the packet is ECN-capable (`Ect0`/`Ect1`). Otherwise the scheduler will drop the packet when asked to “mark”.
-- For TCP, enable ECN marking by setting `[flow.traffic.tcp] ecn = true` so the TCP source emits `Ect0` packets (see [/docs/configuration/flows](/docs/configuration/flows)).
-- DCQCN sources always emit `Ect0` packets.
+## ECN-capable transports
 
-## `switch.ecn_threshold` (optional)
+Legacy TCP emits `Ect0` only when `[flow.traffic.tcp] ecn = true`. Legacy and exact DCQCN data is ECN-capable. Exact TCP currently rejects ECN, so use loss feedback for exact TCP scenarios.
 
-Occupancy fraction used by `drop = "ECN_THRESHOLD"`.
+## PFC interaction
 
-- Type: `f64` (fraction in `[0, 1]`)
-- Default: `0.8`
-- Meaning (with packet capacity): if `queue_len + 1 > floor(ecn_threshold * capacity)`, the scheduler returns `MarkEcn`.
-
-## `switch.weights` (required for DRR/WRR/WFQ)
-
-Class weights.
-
-- Type: `Vec<usize>`
-- Required when `discipline` is `DRR`, `WRR`, or `WFQ`
-- WFQ requires at least one class and rejects zero weights in the exact executor.
-
-Class assignment:
-
-- Days uses a simple mapping `class_id = flow_id % weights.len()`.
-
-## `switch.priorities` (optional for SP)
-
-Maps class IDs to strict priority levels.
-
-- Type: `Vec<usize>`
-- Default: `[1]` when the field is missing or empty
-- Interpretation: **larger numbers are served first** (the scheduler iterates priorities in descending order).
-
-Class assignment:
-
-- `class_id = flow_id % priorities.len()`
-
-## `switch.vticks` (required for VirtualClock)
-
-Virtual clock tick values per class.
-
-- Type: `Vec<f64>`
-- Required when `discipline = "VirtualClock"`
-- Interpretation: seconds per bit (i.e., inverse of target rate in bits/s)
-
-Class assignment:
-
-- `class_id = flow_id % vticks.len()`
+PFC monitors per-priority byte occupancy while the scheduler retains packet-capacity admission. Legacy schedulers expose shared queue state to their PFC ingress actors. Exact PFC runs on Scalar and CPU; Metal and CUDA reject it. See [L2 and PFC](/docs/configuration/l2).

@@ -1,49 +1,74 @@
 ---
 title: Installation
-description: Build Days from source and enable optional protocol features.
+description: Build the legacy runtime and the exact Scalar, CPU, Metal, and CUDA surfaces.
 ---
 
-## Prerequisites
+Days is a Rust workspace. Use the current stable Rust toolchain and run commands
+from the repository root.
 
-- Rust toolchain (stable) with Cargo.
-- Optional: `cargo-nextest` for faster test runs.
+## Legacy Nexosim CLI
 
-## Build
+Build the config-driven `days` binary:
 
 ```bash
 cargo build -p days-legacy
 ```
 
-## Run from source
-
-The `days` CLI expects exactly one argument: the path to a TOML configuration file.
+Run the small checked-in fixture:
 
 ```bash
 RUST_LOG=info cargo run -p days-legacy --bin days -- configs/simple.toml
 ```
 
-## Feature flags
-
-Days uses Cargo features to keep the default build lean.
-
-- `l2`: enables the legacy layer-2 module boundary (`legacy/src/l2/`)
-- `l2_pfc`: enables PFC components (implies `l2`)
-- `dcqcn`: enables the DCQCN flow type and related code
-- `lean`: enables additional per-transition protocol trace logging used by LeanGuard
-- `test`: enables extra assertions and test-only helpers
-
-Examples:
+Legacy protocol features are opt-in:
 
 ```bash
-# Build with PFC support available (still opt-in at runtime via config)
 cargo build -p days-legacy --features l2,l2_pfc
-
-# Run a PFC-configured experiment
-RUST_LOG=info cargo run -p days-legacy --features l2,l2_pfc --bin days -- configs/pfc.toml
-
-# Run DCQCN (typically paired with PFC in lossless fabrics)
-RUST_LOG=info cargo run -p days-legacy --features dcqcn,l2_pfc --bin days -- configs/dcqcn_simple.toml
-
-# Emit dcqcn_events.csv for LeanGuard (conformance checking)
-RUST_LOG=info cargo run -p days-legacy --features dcqcn,lean,l2_pfc --bin days -- configs/dcqcn_simple.toml
+cargo build -p days-legacy --features dcqcn,l2_pfc,lean
 ```
+
+`l2_pfc` enables the legacy PFC pipeline, `dcqcn` enables legacy DCQCN models,
+and `lean` enables legacy protocol-certificate CSVs.
+
+## Exact Scalar and CPU executor
+
+The root `days` package compiles TOML into an exact integer-nanosecond
+`SimulationImage`; `days-executor` runs that image:
+
+```bash
+cargo build -p days -p days-executor
+```
+
+The checked-in root examples expose global Scalar and safe-horizon Scalar/CPU
+execution. See the [quickstart](/docs/quickstart).
+
+## Metal
+
+On Apple platforms, enable the production Metal backend on the root package:
+
+```bash
+cargo build -p days --features metal-spike --bin t20f_frontier
+```
+
+The feature name is historical; it enables the current Metal executor.
+
+## CUDA
+
+Enable the CUDA backend on a host with a compatible NVIDIA driver and CUDA
+toolkit. `nvcc` must be on `PATH` (or selected with `NVCC`):
+
+```bash
+cargo build -p days --features cuda --bin t20f_frontier
+```
+
+The host-only planner equality surface does not initialize a GPU:
+
+```bash
+cargo test -p days --features cuda-planner-test \
+  --test t20e_planner_bit_equal -- --show-output
+```
+
+Metal and CUDA are exact executor backends, not features of the legacy `days`
+CLI. Images containing an unsupported device mechanism are rejected before
+execution; see
+[executor capabilities](/docs/internals#backend-capability-validation).

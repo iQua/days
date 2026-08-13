@@ -1,45 +1,54 @@
 ---
 title: Packet
-description: The core message type, carrying time, size, priority, and control signals.
+description: Legacy actor packets and exact event payload records.
 ---
 
-The legacy simulator’s primary message is `Packet` (`legacy/src/flows/packet.rs`). Packets are plain structs (no payload modeling) that carry:
+The two runtimes use different packet representations.
 
-- **Timestamp**: `Packet.time` is the current simulation time associated with the packet.
-- **Creation time**: `Packet.creation_time` is the time the source first created the packet.
-- **Size**: `Packet.size` (bytes) determines serialization delay at schedulers/links.
-- **Identifiers**: `packet_id` is per-flow, `flow_id` identifies the flow globally.
-- **Accumulated queueing delay**: `queueing_delay` tracks time spent waiting in scheduler queues.
-- **Priority (PCP)**: `priority` is an 802.1Q priority code point (0–7).
-- **End-of-flow marker**: `last_packet` is used for dependency wiring and “flow finished” events.
+## Legacy `Packet`
 
-Packets also model minimal transport/control signals:
+`legacy/src/flows/packet.rs` defines the actor message. It contains no payload bytes; `size` supplies serialization cost.
 
-- **TCP acks**: `ack: Option<TCPAck>` is used by the TCP source/sink pair.
-- **Control packets**: `control: Option<ControlPacket>` currently includes DCQCN’s CNP (`DcqcnCnp`).
-- **ECN**: `ecn: EcnField` can be `NotEct`, `Ect0`, `Ect1`, or `Ce`.
-- **TCP CWR**: `cwr: bool` is used for ECN-CWR signaling in TCP.
+| Field | Purpose |
+| --- | --- |
+| `time` | Floating-point compatibility and report view of the latest component departure. |
+| `creation_time` | Source creation time used for delay reporting. |
+| `size` | Packet size in bytes. |
+| `packet_id`, `flow_id` | Per-flow packet identity and global legacy flow identity. |
+| `queueing_delay` | Accumulated time spent in scheduler queues. |
+| `priority` | 802.1Q priority in `0..=7`. |
+| `last_packet` | End marker used by basic and DCQCN delivery paths. TCP completion is source-owned. |
+| `ack` | Optional TCP ACK header. |
+| `control` | Optional DCQCN CNP marker. |
+| `ecn`, `cwr` | ECN codepoint and TCP CWR flag. |
 
-## Time updates
+`mark_ce()` changes `Ect0` or `Ect1` to `Ce`. It returns `false` for `NotEct`, which lets legacy ECN-marking policies drop a packet that cannot carry CE.
 
-Two helper methods encode the intended invariants:
+### Legacy time
 
-- `queueing_delay_update(now)` adds `now - packet.time` to `queueing_delay`. Call this when a packet **leaves** a queue.
-- `departure_update(now)` sets `packet.time = now`. Call this when a packet **departs** a component and is scheduled for delivery downstream.
+The Nexosim event clock is authoritative. Current handlers read `Context::time()` at the integer-nanosecond boundary and convert it to seconds for the packet compatibility view. A switch accepts `packet.time` values no later than the current event; it does not use that field as the event clock.
 
-Schedulers follow the pattern:
+Schedulers call `queueing_delay_update(now)` when service starts and `departure_update(now)` when a scheduled transmission completes or when they stamp its planned departure. Those helpers maintain reporting fields, while Nexosim controls event order.
 
-1. Pop packet at time `now`
-2. `packet.queueing_delay_update(now)`
-3. Compute serialization delay `timeout = size_bits / rate_bps`
-4. `packet.departure_update(now + timeout)`
-5. Schedule downstream delivery after `timeout`
+## Exact packet and event records
 
-## ECN marking
+The exact executor separates immutable packet data from scheduling:
 
-Drop/mark policies can call `packet.mark_ce()`:
+- `PacketDescriptor` stores `PayloadId`, `FlowId`, size, one congestion-experienced bit, and a typed `PacketKind`.
+- `Event` stores the target LP, event kind, payload ID, and canonical `EventKey`.
+- `FlowDescriptor` stores priority and forward/reverse routes, so priority is not repeated in each exact packet record.
 
-- If `packet.ecn == NotEct`, `mark_ce()` returns `false` (cannot be ECN-marked).
-- If ECN-capable (`Ect0`/`Ect1`), `mark_ce()` sets `ecn = Ce` and returns `true`.
+`PacketKind` is closed over data, feedback, TCP data, TCP ACK, PFC, DCQCN CNP, and a source-local DCQCN control timer token. Exact data is `Ect0` until `ecn_marked` becomes true; feedback and control packets are `NotEct`. The exact image has no legacy `Packet.time`, `queueing_delay`, or `last_packet` fields.
 
-Schedulers that “mark ECN” will drop packets that are not ECN-capable.
+### Exact time and order
+
+`EventKey` orders events lexicographically by:
+
+1. `time_ns`
+2. equal-time phase
+3. origin node
+4. origin sequence
+
+Arrivals use phase 0. Transmission completions and transport timers use phase 1. Service selection uses phase 2. Link service computes `ceil(8 * bytes * 10^9 / rate_bps)` in integer arithmetic, then adds propagation delay with checked `u64` arithmetic.
+
+Payload IDs come from the origin LP's monotone local sequence and the stable node count. They do not depend on pointer identity or backend allocation order.

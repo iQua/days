@@ -1,45 +1,78 @@
 ---
 title: Examples
-description: Run config-driven simulations and Rust example binaries.
+description: Runnable legacy, exact-executor, T24, E5, and frontier examples.
 ---
 
-Days supports two “example styles”:
+Run commands from the repository root.
 
-1. **Config-driven simulations** (`configs/*.toml`) run via the legacy CLI (`cargo run -p days-legacy --bin days -- <config>`).
-2. **Rust examples** (`legacy/examples/*.rs`) run via `cargo run -p days-legacy --example <name>`.
-
-## Config examples
-
-Run a config from the repo root:
+## Legacy CLI and Rust example
 
 ```bash
 RUST_LOG=info cargo run -p days-legacy --bin days -- configs/simple.toml
+cargo run -p days-legacy --example basic
 ```
 
-Measure wall-clock time without logs:
+Other legacy examples are `ecn`, `switch`, `tcp`, `tcp_test`, and `wire`.
+
+## Exact Scalar and CPU
+
+Use the small T24 TCP smoke fixture:
 
 ```bash
-time cargo run -p days-legacy --bin days -- configs/simple.toml
+cargo run --example scalar_benchmark -- \
+  configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml
+
+cargo run --example round_benchmark -- \
+  configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml \
+  --workers 2 --repetitions 1
 ```
 
-DCQCN example (requires `dcqcn` and typically `l2_pfc`):
+The full T24 fixture list and expected shapes are pinned in
+`configs/benchmarks/tcp/t24-corpus-manifest.md`.
+
+## E5 wide TCP fixtures
+
+E5 is a committed 8,192-flow, byte-terminated TCP family:
+
+- `configs/benchmarks/p12/e5_wide_k32_q200.toml` (Reno primary)
+- `configs/benchmarks/p12/e5_wide_k32_q200_cubic.toml`
+- `configs/benchmarks/p12/e5_wide_k32_q256.toml` (backup)
+
+For example, run the primary fixture on the exact CPU executor:
 
 ```bash
-RUST_LOG=info cargo run -p days-legacy --features dcqcn,l2_pfc --bin days -- configs/dcqcn_simple.toml
+cargo run --release --example round_benchmark -- \
+  configs/benchmarks/p12/e5_wide_k32_q200.toml \
+  --workers 4 --repetitions 1
 ```
 
-## Rust examples
+E6 is not in the post-cleanup tree used for this documentation refresh, so it
+is not presented as runnable.
 
-List available example binaries:
+## Frontier fingerprint and capacity warm start
+
+The P11 frontier fixture contains 262,144 TCP flows. A Scalar run is:
 
 ```bash
-ls legacy/examples
+cargo run --release --bin t20f_frontier -- \
+  configs/benchmarks/p11/rq9_frontier_closed_k32.toml \
+  --engine scalar
 ```
 
-Run one:
+For device execution, enable Metal or CUDA and use `--engine device`.
+Capacity warm starts are opt-in sizing hints:
 
 ```bash
-RUST_LOG=info cargo run -p days-legacy --example basic
+cargo run --release --features metal-spike --bin t20f_frontier -- \
+  configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml \
+  --engine device \
+  --dump-capacity-warm-start /tmp/days-capacity-warm-start.txt
+
+cargo run --release --features metal-spike --bin t20f_frontier -- \
+  configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml \
+  --engine device \
+  --capacity-warm-start /tmp/days-capacity-warm-start.txt
 ```
 
-The repo currently includes examples such as `basic`, `switch`, `wire`, `tcp`, and `ecn` (names match the `.rs` filenames in `legacy/examples/`).
+The snapshot changes initial arena sizing only. Capacity is refuse-or-run, so a
+successful retry or warm start cannot change simulation semantics.

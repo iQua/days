@@ -3,7 +3,10 @@ title: days
 description: Run a simulation from a single TOML configuration file.
 ---
 
-The legacy binary (built from `legacy/src/main.rs`) runs a simulation described by a TOML configuration file.
+The legacy-only binary (built from `legacy/src/main.rs`) runs a Nexosim
+simulation described by one TOML configuration file. It does not select the
+exact Scalar, CPU, Metal, or CUDA executor; use the root examples or
+[`t20f_frontier`](/docs/reference/cli/t20f-frontier) for those paths.
 
 ## Usage
 

@@ -1,36 +1,43 @@
 ---
 title: Time & Concurrency
-description: Why packets carry time in the concurrent legacy engine.
+description: Integer-nanosecond time and concurrency rules in both Days engines.
 ---
 
-Days is designed around many concurrent actors (sources, sinks, schedulers, switches). One design choice is especially important for performance and correctness:
+Both Days engines execute on an integer-nanosecond event timeline, but they expose and parallelize that timeline differently.
 
-1. **Time is carried in messages** (packets/frames), and most models maintain a **local** `time: f64`.
+## Exact time and ordering
 
-## Time propagation via `Packet.time`
+The exact engine stores time as `u64` nanoseconds. Every event has a canonical key:
 
-Most message handlers treat `Packet.time` as “now”:
+```text
+(time_ns, phase, origin_node, origin_seq)
+```
 
-- sources create packets with `Packet::new(..., creation_time)` and set `packet.time` to the current simulated time,
-- schedulers compute serialization delay and update the packet with `packet.departure_update(now + timeout)`,
-- sinks record statistics at the packet’s arrival time.
+`phase` makes same-time protocol ordering explicit. `origin_node` and `origin_seq` provide a stable total order without relying on worker scheduling or device execution order. Checked time arithmetic rejects an image or execution that would overflow its supported bounds.
 
-This reduces pressure on `cx.time()`, which can be a contention point when many actors run concurrently.
+The global scalar backend pops this order from one calendar. Round scalar, CPU, Metal, and CUDA partition state by LP and use positive channel lookahead to process a half-open interval safely:
 
-When built with the `test` feature, many handlers assert:
+```text
+[frontier, frontier + minimum_channel_lookahead)
+```
 
-- `packet.time` matches `cx.time()` within a small epsilon,
-- local time does not move backwards.
+Each LP is single-owner during a round. Remote events are invisible until the canonical barrier merge. CPU workers retain whole-LP ownership rather than sharing mutable protocol state per event; device plans preserve the same LP and event identities in bounded arenas.
 
-These checks validate that “time-in-message” is consistent with the simulation engine.
+## Legacy time
 
-## Local time fields
+Nexosim stores the legacy engine clock as `MonotonicTime`. Days converts that clock to an exact `u64` nanosecond offset with `clock_ns` in `legacy/src/utils/exact_time.rs`.
 
-Core models keep a local `time: f64`:
+Legacy configuration and model behavior cross this boundary as follows:
 
-- `PacketSwitch.time` (`legacy/src/switches/switch.rs`)
-- `Port.time`, `DRRServer.time`, etc. (`legacy/src/schedulers/`)
-- endpoint time in sources/sinks (`legacy/src/flows/`)
-- link-layer time in `Link`/PFC components (`legacy/src/l2/`)
+- Scenario values must resolve to finite, nonnegative integer nanoseconds.
+- Positive sampled/controller delays round up to the earliest non-early tick.
+- Serialization delay uses checked integer arithmetic and rounds up.
+- `seconds_view` produces `f64` only for compatibility, controllers, and reports.
 
-The local time is updated from the incoming message (or from `cx.time()` only in limited cases).
+Packets and frames may carry an `f64` time view, and several legacy models retain local `f64` fields. Those values do not replace the event clock. Source, sink, switch, scheduler, wire, and L2 handlers read `Context::time()` where they need authoritative “now”; compatibility timestamps must not be described as an independent local clock.
+
+## Legacy concurrency
+
+Nexosim advances to the next event or ticker time and processes work ready at that timestamp. Its multithreaded executor may run independent actor tasks concurrently. Models normally communicate through typed ports, though the legacy application source uses channels and scheduler/PFC bookkeeping uses explicit shared atomic state.
+
+This concurrency model is distinct from exact safe-horizon execution. Nexosim actors do not become exact LPs, and exact CPU worker settings do not control the legacy runtime.

@@ -1,36 +1,18 @@
 ---
 title: Collectives
-description: High-level communication patterns expanded into concrete flows.
+description: Legacy collective expansion and exact RingAllReduce/AllGather lowering.
 ---
 
-Collectives are higher-level communication patterns (common in ML training workloads) that are expanded into concrete flows at simulation start (`Topology::process_collectives` in `legacy/src/topos/topo.rs`).
+Days models collective traffic, not application payload arithmetic. Legacy expands collectives into ordinary flow actors before routing. Exact lowering creates deterministic collective generators in a `SimulationImage`.
 
-Days does not model payload contents. In particular, `RingAllReduce` exists to reproduce the network traffic pattern of a reduce-scatter plus all-gather schedule; it does not simulate arithmetic reduction over application data.
+The two paths accept different algorithms.
 
-Legacy parsing is implemented in `legacy/src/flows/collective.rs`.
+| Runtime | Algorithms | Backends |
+| --- | --- | --- |
+| Legacy actor runtime | `Broadcast`, `Gather`, `AllReduce`, `RingAllReduce` | Nexosim |
+| Exact executor | `RingAllReduce`, `AllGather` | Scalar and CPU; Metal and CUDA reject collective generators |
 
-Supported `collective_type` values:
-
-- `Broadcast`
-- `Gather`
-- `AllReduce`
-- `RingAllReduce`
-
-The current executor lowering in `src/scenario/compile.rs` supports `RingAllReduce` and
-`AllGather` with deterministic, byte-terminated `PacketDistribution` traffic. Its edge rules are
-algorithm-specific:
-
-- `RingAllReduce` requires at least two ranks and at least one byte per rank.
-- `AllGather` requires at least one rank. A single-rank group or a zero-byte transfer is a valid
-  no-op and lowers to an empty propagation program.
-- If an `AllGather` byte count is smaller than its rank count, zero-byte partitions are finished
-  initially and the non-zero partitions still propagate normally.
-
-Collectives can be specified individually (`[[collective]]`) or as sets (`[[collective_set]]`).
-
-## `[[collective]]` schema
-
-Example (broadcast with packet distribution flows):
+## Legacy `[[collective]]`
 
 ```toml
 [[collective]]
@@ -39,52 +21,38 @@ flow_type = "PacketDistribution"
 flow_count = 2
 sources = [0, 0]
 sinks = [1, 2]
+
 [collective.traffic]
-  initial_delay = 1.0
-  duration = 10.0
-  arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
-  pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1500 }
+initial_delay = 1.0
+duration = 10.0
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1500 }
 ```
 
-Supported fields:
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `collective_type` | yes | One of the four legacy algorithms above. |
+| `first_flow_id` | no | Base legacy flow ID. |
+| `flow_type` | yes | `PacketDistribution`, `TCP`, or feature-gated `DCQCN`. |
+| `flow_count` | yes | Configured member/edge count. For RingAllReduce, this is the rank count. |
+| `graph` | no | Endpoint edges. Legacy derives sources and sinks from it when explicit endpoints are absent. |
+| `paths` | no | One explicit topology path per configured flow. |
+| `sources`, `sinks` | no | Paired endpoint lists. Supply both or neither. |
+| `routing` | no | Legacy routing selection. |
+| `traffic` | yes | The same traffic schema as flows. |
 
-- `collective_type` (required)
-- `first_flow_id` (optional): base ID for flows produced by this collective
-- `flow_type` (required): `PacketDistribution` or `TCP` (or `DCQCN` if enabled)
-- `flow_count` (required): number of flows in the collective; for `RingAllReduce`, this is the ring size / participant count used for expansion
-- `paths` (optional): explicit per-flow paths; sources/sinks are derived from each path’s endpoints
-- `sources` / `sinks` (optional): explicit per-flow endpoints
-- `routing` (optional): routing protocol for produced flows
-- `traffic` (required): `[collective.traffic]` (same schema as flows)
+If you provide more than one endpoint representation, graph edges, path endpoints, and explicit sources/sinks must agree.
 
-Notes:
+Legacy endpoint rules are algorithm-specific:
 
-- The optional `graph` field is currently stored but not used to derive endpoints; to control endpoints, use `sources`/`sinks` or `paths`.
-- `RingAllReduce` is expanded internally into per-hop traffic flows for a reduce-scatter-style phase followed by an all-gather-style phase.
-- `RingAllReduce` currently supports byte-sized traffic only. Duration-based ring collectives are rejected.
-- For byte-sized `RingAllReduce`, `traffic.size` must be at least the ring size so every generated hop carries a non-zero chunk. This constraint does not apply to `AllGather`.
+- Broadcast requires one repeated source.
+- Gather requires one repeated sink.
+- RingAllReduce requires `sources[i] == sinks[i - 1]` around the ring.
+- With no explicit endpoints, Broadcast and Gather/AllReduce sample endpoints from `hosts`. RingAllReduce uses every configured host and requires `flow_count == hosts.len()`.
 
-## Endpoint selection rules
+Legacy RingAllReduce accepts byte termination only and requires `size >= flow_count`. It expands reduce-scatter and all-gather phases into `2 * flow_count * (flow_count - 1)` concrete flows.
 
-Days determines `(source_host, sink_host)` for each flow in this order:
-
-1. If `sources` and `sinks` are provided, they must each contain `flow_count` entries and satisfy type-specific constraints:
-   - `Broadcast`: all entries of `sources` must be the same
-   - `Gather`: all entries of `sinks` must be the same
-   - `RingAllReduce`: ring consistency (`sources[i] == sinks[i-1]`)
-2. Else, if `paths` is provided, it must contain `flow_count` paths:
-   - sources are `path[0]`, sinks are `path[last]`
-   - for `RingAllReduce`, each sink must match the next flow’s source
-3. Else, endpoints are generated randomly from `hosts` (seeded by `seed`):
-   - `Broadcast`: pick one source, choose sinks from the other hosts
-   - `Gather` / `AllReduce`: pick one sink, choose sources from the other hosts
-   - `RingAllReduce`: requires `flow_count == hosts.len()` and uses all hosts in a ring
-
-## `[[collective_set]]` schema
-
-Collective sets generate multiple collectives with the same shape.
-
-Example:
+## Legacy `[[collective_set]]`
 
 ```toml
 [[collective_set]]
@@ -94,39 +62,50 @@ flow_type = "PacketDistribution"
 flow_count = 2
 sources = [[0, 1], [1, 2]]
 sinks = [[2, 2], [3, 3]]
+
 [collective_set.traffic]
-  initial_delay = 1.0
-  duration = 10.0
-  arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
-  pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 }
+initial_delay = 1.0
+duration = 10.0
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 }
 ```
 
-Fields:
+`collective_count` gives the number of members in the set. Each nested source/sink list must contain `flow_count` endpoints. Legacy reserves a contiguous concrete-flow range for each member; RingAllReduce uses its expanded flow count for that reservation.
 
-- `collective_type` (required)
-- `collective_count` (required)
-- `first_flow_id` (optional): base flow ID for the entire set
-- `flow_type` (required)
-- `flow_count` (required): number of flows per collective in the set
-- `sources` / `sinks` (optional): list-of-lists, one entry per collective
-- `routing` (optional)
-- `traffic` (required)
+## Exact collectives
 
-Flow ID assignment:
+Exact collectives require `flow_type = "PacketDistribution"`, a positive constant packet size, and exact byte termination. They reject `first_flow_id`, `graph`, `paths`, source routing, TCP, and DCQCN.
 
-- For non-ring collectives, each collective in the set gets a contiguous flow ID range:
-  - `first_flow_id + index * flow_count .. first_flow_id + (index + 1) * flow_count`
-- For `RingAllReduce`, the configured `flow_count` is the ring size. Runtime expansion produces `2 * flow_count * (flow_count - 1)` concrete flows per collective.
+```toml
+[[collective]]
+collective_type = "RingAllReduce"
+flow_type = "PacketDistribution"
+flow_count = 4
+priority = 0
+sources = [0, 1, 2, 3]
+sinks = [1, 2, 3, 0]
 
-## TCP collectives and application data
+[collective.traffic]
+initial_delay = 0.0
+size = 1048576
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1024, high = 1024 }
+```
 
-For TCP collectives, legacy Days can optionally back flows with application-level byte buffers (`legacy/src/flows/app_source.rs`).
+Both exact algorithms require ring-next endpoint order when endpoints are explicit: `sinks[i] == sources[(i + 1) % n]`. Omitted endpoint lists use deterministic topology selection.
 
-These buffers are synthetic byte stores used to bound transmitted bytes and pacing. Days does not mutate or interpret payload contents while modeling the collective.
+RingAllReduce requires at least two ranks and at least one byte per rank. AllGather requires at least one rank. A one-rank AllGather or zero-byte AllGather lowers to an empty propagation program; byte counts smaller than the rank count leave zero-byte partitions complete at initialization.
 
-Behavior:
+The exact compiler emits clear capability errors, including:
 
-- **TCP Broadcast**: all flows in the broadcast share one collective-wide buffer, so each receiver gets the same byte stream.
-- **TCP RingAllReduce**: each collective gets one app-source buffer per directed ring link, and each generated hop reads a specific byte range from that link-local buffer via an offset/length handle. This models per-hop byte counts for the ring schedule; it does not model payload reduction across hops.
+```text
+unsupported collective algorithm `...`; T26 supports RingAllReduce and AllGather
+unsupported collective flow type `...`; T26 collectives require deterministic byte-terminated PacketDistribution traffic
+backend Metal does not support collective generators; use Scalar or Cpu
+```
 
-Tune the app-source actor via `[app_source]` (see [/docs/configuration/logging](/docs/configuration/logging)).
+## Legacy TCP application buffers
+
+Legacy TCP Broadcast shares one collective-wide byte buffer across receivers. TCP RingAllReduce creates one buffer per directed ring link and gives each hop a byte-range handle. The actors bound and pace traffic; they do not mutate or reduce payload data.
+
+Configure polling under `[app_source]` as described in [Logging and runtime](/docs/configuration/logging).

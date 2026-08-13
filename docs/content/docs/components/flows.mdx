@@ -1,67 +1,51 @@
 ---
 title: Flows
-description: Sources, sinks, traffic generation, routing, and dependencies.
+description: Source ownership, traffic generation, routing, and completion.
 ---
 
-Flows are specified in TOML and expanded into source/sink actors attached to host switches.
+Days has two flow implementations. The legacy CLI builds Nexosim source and sink actors. The exact compiler lowers supported TOML into backend-neutral flow descriptors and source-owned generator state.
 
-Core types:
+## Legacy actor path
 
-- `Flow` and `FlowType` (`legacy/src/flows/flow.rs`)
-- `TrafficCharacteristics` (`legacy/src/flows/mod.rs`)
-- `PacketSource` / `PacketSink` enums (`legacy/src/flows/source.rs`, `legacy/src/flows/sink.rs`)
+Each `Flow` records its endpoints, type, traffic, route selection, priority, and dependency IDs. `Topology::attach_flows` creates one `PacketSource` and one `PacketSink` actor for every concrete flow.
 
-## Flow types
+The source and sink implementations depend on `flow_type`:
 
-`FlowType` determines which source/sink implementation is instantiated:
+| Flow type | Source behavior | Sink behavior |
+| --- | --- | --- |
+| `PacketDistribution` | Samples arrival and packet-size distributions. | Counts delivery and owns last-packet completion. |
+| `TCP` | Owns congestion control, retransmission, ACK handling, and completion. | Builds ACKs and cumulative receive state. |
+| `DCQCN` | Owns pacing and reaction-point state. Requires the `dcqcn` feature. | Detects CE, rate-limits CNPs, and owns last-packet delivery state. |
 
-- `PacketDistribution`: distribution-driven packet source + basic sink
-- `TCP`: TCP source + TCP sink (ACK-based, congestion control)
-- `DCQCN`: DCQCN source + DCQCN sink (feature `dcqcn`)
+`starts_before` and `starts_after` become `FlowFinishMsg` connections. Distribution sinks signal completion; TCP and DCQCN sources signal completion after their feedback-driven work finishes.
 
-## Traffic model
+### Legacy routing
 
-Every flow has `TrafficCharacteristics`:
+`Flow::compute_path` produces a path containing the source actor, switch IDs, and sink actor. `Topology::route_flows` installs two per-flow tables in each switch:
 
-- start delay: `initial_delay`
-- termination: either `size` (bytes) or `duration` (seconds)
-- packet arrival distribution: `arr_dist`
-- packet size distribution: `pkt_size_dist`
+- `fib` routes data toward the sink.
+- `r_fib` routes TCP ACKs and control packets toward the source.
 
-Optional per-flow protocol config:
+Legacy supports per-flow `ShortestPath`, `ECMP`, and `PathFromConfig`. Root `routing.policy = "FatTreeEcmp"` uses the shared canonical fat-tree policy. Flow sets can choose `Random`, `SwitchOffsetHalf`, or `SameSwitchNext` endpoint pairing.
 
-- TCP: `tcp.cc_algorithm` (Reno/CUBIC/BBR) and `tcp.ecn` (send ECN-capable packets)
-- DCQCN: `dcqcn.*` parameters (rate bounds, alpha gain, pacing, CNP settings)
+## Exact image path
 
-## Routing
+Exact lowering creates a `FlowDescriptor` with stable `FlowId`, source and target `NodeId` values, priority, a directed data route, and a reverse feedback route. Routes contain `LinkId` values, not actor IDs.
 
-Paths are computed in `Flow::compute_path(...)`:
+The source host LP owns a `FlowGeneratorState`. The TOML compiler lowers supported traffic into these generator families:
 
-- `ShortestPath`: uses `petgraph` A* to find a shortest path
-- `ECMP`: finds all equal-cost paths and selects one deterministically per flow
-- `PathFromConfig`: uses an explicit `path = [...]` from TOML
+- constant open-loop traffic for `PacketDistribution`
+- source-owned TCP Reno or CUBIC state
+- exact rate and controller state for DCQCN
+- resolved stages for RingAllReduce and AllGather
 
-Computed paths include endpoints:
+Target hosts own TCP cumulative-ACK state and DCQCN notification-point state. Generator status records whether the next emission is scheduled, blocked, finished, or stopped beyond the scenario endpoint.
 
+Exact lowering derives flow IDs and routes from canonical semantic keys. It rejects explicit flow IDs, dependency lists, per-flow routing, and explicit paths instead of discarding them. It also rejects nondeterministic packet distributions and transport options outside the exact mechanism set. See [Flow configuration](/docs/configuration/flows) for the accepted subsets.
+
+Scalar and CPU execute every lowered generator family. Metal and CUDA execute supported constant, rate, and TCP generators, but capability validation rejects DCQCN and collective state before execution:
+
+```text
+backend Cuda does not support DCQCN controller or CNP state planes; use Scalar or Cpu
+backend Metal does not support collective generators; use Scalar or Cpu
 ```
-[source_endpoint_id] + [switch nodes...] + [sink_endpoint_id]
-```
-
-The topology builder then installs forwarding table entries (`fib` and `r_fib`) into each switch for each flow ID.
-
-## Dependencies
-
-Flows can declare ordering constraints:
-
-- `starts_after = [flow_id, ...]`
-- `starts_before = [flow_id, ...]`
-
-These are wired by sending `FlowFinishMsg` when a flow completes (either from the sink for distribution flows, or from the source for TCP/DCQCN flows).
-
-## Collectives
-
-Collectives (`legacy/src/flows/collective.rs`) generate sets of flows from higher-level patterns:
-
-- `Broadcast`, `Gather`, `AllReduce`, and `RingAllReduce`
-
-They are expanded into concrete flows inside `Topology::process_collectives` (`legacy/src/topos/topo.rs`) before routing happens.

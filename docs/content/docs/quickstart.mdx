@@ -1,53 +1,66 @@
 ---
 title: Quickstart
-description: Run built-in configs, inspect outputs, and debug simulations.
+description: Run a legacy simulation and the exact Scalar and CPU executors.
 ---
 
-## Run the built-in config examples
+Run commands from the repository root.
 
-The repository ships with runnable TOML configs in `configs/`.
+## Legacy config-driven run
 
 ```bash
 RUST_LOG=info cargo run -p days-legacy --bin days -- configs/simple.toml
 ```
 
-Useful variations:
+The legacy CLI accepts exactly one TOML path. With the default
+`csv_logging = true`, it creates `log_path` (default `./output`) and initializes
+`sources.csv`, `sinks.csv`, and `switches.csv`. Feature-gated report and
+certificate files may also be created. Set this root key when filesystem output
+is unwanted:
 
-```bash
-# TCP example
-RUST_LOG=info cargo run -p days-legacy --bin days -- configs/tcp_simple.toml
-
-# Fat-tree topology examples
-RUST_LOG=info cargo run -p days-legacy --bin days -- configs/fattree.toml
-RUST_LOG=info cargo run -p days-legacy --bin days -- configs/tcp_fattree.toml
-RUST_LOG=info cargo run -p days-legacy --bin days -- configs/bbr_fattree.toml
+```toml
+csv_logging = false
 ```
 
-## Output artifacts
+That setting suppresses directory creation, CSV rows, traces, and
+`traces.json`; it does not skip simulation accounting.
 
-By default, Days writes periodic reports to CSV files under `log_path` (see [/docs/configuration/logging](/docs/configuration/logging)):
+## Exact Scalar run
 
-- `sources.csv`: per-source send statistics
-- `sinks.csv`: per-sink receive statistics
-- `switches.csv`: per-scheduler (port) statistics
-- `pfc.csv`: PFC port statistics (only with `--features l2_pfc`)
-- `dcqcn_events.csv`: DCQCN event trace (only with `--features dcqcn,lean`)
-- `cubic_events.csv`: TCP CUBIC event trace (only with `--features lean`)
-- `drr_events.csv`: DRR event trace (only with `--features lean`)
-- `wfq_events.csv`: WFQ event trace (only with `--features lean`)
-
-## Debugging
-
-Increase log verbosity with `RUST_LOG`:
+The root example compiles TOML to an exact `SimulationImage` and runs the
+global Scalar oracle:
 
 ```bash
-RUST_LOG=debug cargo run -p days-legacy --bin days -- configs/simple.toml
+cargo run --example scalar_benchmark -- \
+  configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml
 ```
 
-## Mental model
+## Exact safe-horizon CPU run
 
-At a high level, Days runs this pipeline for each flow:
+```bash
+cargo run --example round_benchmark -- \
+  configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml \
+  --workers 2 --repetitions 1
+```
 
-`PacketSource -> (host) PacketSwitch -> [Scheduler per hop] -> ... -> PacketSwitch -> PacketSink`
+The CPU executor owns each logical process (LP) on one worker for a run. Each
+round drains active LPs below an exclusive safe horizon, exchanges remote
+events at a barrier, and canonically merges those events for the next round.
 
-Packets carry the current simulation timestamp (`Packet.time`) and accumulate queueing delay. Most components avoid querying the global simulation clock, using packet timestamps instead (see [/docs/architecture/time-concurrency](/docs/architecture/time-concurrency)).
+## Device smoke run
+
+On Apple Metal:
+
+```bash
+cargo run --features metal-spike --bin t20f_frontier -- \
+  configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml \
+  --engine device
+```
+
+On a CUDA host, replace `--features metal-spike` with `--features cuda`.
+The production runner prints a complete-state byte length and FNV-1a
+fingerprint. It also supports capacity retry and warm-start flags; see
+[`t20f_frontier`](/docs/reference/cli/t20f-frontier).
+
+Metal/CUDA reject images containing RED, PFC, DCQCN/CNP state, or collective
+generators. The error names the backend and recommends Scalar or CPU. This is a
+capability rejection, not a silent fallback.

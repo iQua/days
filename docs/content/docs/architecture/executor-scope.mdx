@@ -1,147 +1,79 @@
 ---
-title: Days Executor v1 Scope
-description: Supported models, non-goals, follow-on work, and required validation errors for the new executor.
+title: Exact Executor
+description: Implemented model coverage, safe-horizon execution, and backend capabilities.
 ---
 
-The Days executor is an exact-time, conservative executor planned alongside the
-existing Nexosim runtime. This page records the model boundary for its first
-complete version. It is a project scope, not a claim that models outside the
-boundary are impossible to support.
+The exact executor is implemented alongside the legacy Nexosim engine. `src/scenario/compile.rs` lowers supported TOML scenarios into `SimulationImage`; callers then select scalar, CPU, Metal, or CUDA explicitly.
 
-The new executor is not implemented yet, so it cannot currently be selected.
-Nexosim remains the working runtime and `time_quantum_ns` remains a supported
-legacy Nexosim option. Nothing described here changes current behavior.
+## Compiled model
 
-## Supported v1 model
+The current image supports:
 
-The first complete vertical slice supports:
+- static FatTree, Torus, Dragonfly, and custom topologies
+- one LP per host and one LP per switch egress queue
+- integer nanosecond time with no timestamp quantization
+- FIFO, strict priority, WFQ, DRR, and WRR scheduling
+- TailDrop, RED, RED with ECN, and ECN-threshold admission
+- constant-rate, non-preemptive links with uniform or tiered propagation
+- deterministic packet-distribution traffic, TCP Reno/CUBIC, and DCQCN
+- exact PFC per-priority pause state
+- RingAllReduce and AllGather over deterministic, byte-terminated packet-distribution traffic
+- shortest-path and semantic `FatTreeEcmp` routing
 
-- static topologies with one LP per host and one LP per switch egress port;
-- integer nanosecond logical time without timestamp quantization;
-- FIFO, Static Priority (SP), and Weighted Fair Queueing (WFQ) with TailDrop;
-- constant-rate, non-preemptive links;
-- a constant propagation delay for each directed link;
-- open-loop UDP traffic generated from deterministic, precomputed inputs;
-- one CPU process and one GPU device; and
-- a known, positive lookahead on every channel that crosses LP boundaries.
+Exact lowering retains host attachment LPs. Each host has an unbounded injection stage toward its switch and a bounded delivery queue in the reverse direction. The compiler assigns stable semantic node, link, flow, and payload IDs before constructing initial state and events.
 
-All four backends execute all three disciplines. Scalar and multicore CPU retain
-unbounded `BigUint` arithmetic. Metal and CUDA use checked 320-bit rational
-components and reject checkpoints or static weight bounds outside that device
-capability; every accepted execution either remains exact or faults explicitly
-before an overflowing result can be committed.
+The image has a closed set of model and event kinds. Runtime callbacks, dynamic LP migration, multi-device placement, and automatic backend selection are not part of the contract.
 
-### SP and WFQ service semantics
+## Execution paths
 
-SP maps `flow_id % priorities.len()` to a class. Larger numeric priorities win,
-and packets with the same priority retain canonical arrival order. An SP arrival
-cannot preempt an in-service packet.
+Global scalar uses one canonical event calendar and accepts zero-delay channels. The other paths use conservative safe-horizon rounds:
 
-WFQ maps `flow_id % weights.len()` to a class and requires a positive weight for
-each class. The executor assigns a finish tag when it admits a packet, keeps the
-waiting queue in tag order, and commits the first packet only when `TxReady`
-starts service. Arrivals processed before that `TxReady`, including phase-zero
-arrivals at the same timestamp, participate in the decision.
+- **Round scalar** is the single-threaded per-LP reference.
+- **CPU** uses persistent workers with static whole-LP ownership and barrier exchange.
+- **Metal and CUDA** execute the same LP/event contract from bounded device arenas.
 
-The WFQ state uses exact rational arithmetic over arbitrary-precision integers.
-Let `V` and `F` denote legacy virtual time and finish time multiplied by the link
-rate. For elapsed integer time `delta_ns`, the executor applies:
+At each round, the executor finds the global frontier, adds the minimum channel lookahead, drains events below that exclusive horizon, canonically sorts remote outboxes, and merges them at the barrier. No parallel path speculates beyond the safe horizon.
 
-```text
-V += delta_ns * rate_bps / (1_000_000_000 * active_weight_sum)
-F[class] = max(V, F[class]) + 8 * size_bytes / weight[class]
-```
+## Backend capability matrix
 
-This recurrence preserves the mathematical order behind the legacy `f64`
-calculation without float rounding. Exact tag ties use canonical arrival order.
-The device representation stores five 64-bit limbs for each numerator and
-denominator, compares with complete 640-bit cross-products, and uses complete
-512-bit scratch for the recurrence's bounded-denominator additions. Device
-validation requires canonical checkpoint rationals no wider than 320 bits and
-requires `1_000_000_000 * sum(weights)` to fit `u64`. Scalar and CPU do not have
-those width limits. Metal and CUDA report a capability fault instead of
-wrapping if a reduced runtime result outgrows 320 bits.
-Legacy WFQ compares only the `f64` tag in an unstable binary heap, so its order
-for equal tags is unspecified. Near float-rounding boundaries and equal-time
-legacy LIFO arrivals can also change a cross-version trajectory. Compare
-nontied integer-time fixtures packet by packet; use per-timestamp multisets and
-per-flow sequences at those version boundaries.
+| Capability | Scalar | CPU | Metal | CUDA |
+| --- | --- | --- | --- | --- |
+| FIFO, strict priority, WFQ, DRR, WRR | Yes | Yes | Yes | Yes |
+| TailDrop, ECN threshold | Yes | Yes | Yes | Yes |
+| RED, RED with ECN | Yes | Yes | Rejected | Rejected |
+| TCP Reno, TCP CUBIC | Yes | Yes | Yes | Yes |
+| PFC | Yes | Yes | Rejected | Rejected |
+| DCQCN | Yes | Yes | Rejected | Rejected |
+| Collective generators | Yes | Yes | Rejected | Rejected |
+| Zero-delay channels | Yes | Rejected | Rejected | Rejected |
 
-## Migration comparison policy
+Metal and CUDA use checked 320-bit rational components for WFQ. Validation checks checkpoint widths and static weight bounds; runtime arithmetic faults rather than committing an overflowing result. Scalar and CPU use unbounded `BigUint` rational arithmetic.
 
-The P05 gate's recorded k16 and k32 terminal-observation rows compared
-differently routed networks: exact lowering used canonical BFS while legacy
-Nexosim used `ShortestPath::compute_route_in`. Those rows are historical
-workload and performance evidence, not equivalence results.
+Device `RunResult` values contain the canonical state and measurement surface. Scalar and CPU can retain diagnostic-only observation planes; Metal and CUDA omit them. Byte comparisons normalize those reference-only fields first.
 
-Before any legacy-versus-Days observation comparison, assert that every flow
-traverses the same ordered physical links and that both engines model the same
-endpoint stages. Only residuals measured after those structural preconditions
-hold may be assessed as legacy `f64` behavior outside the exact common domain.
-The endpoint-attachment model is settled: the exact model retains attachment
-links, and legacy provides the same endpoint structure when the top-level
-`model_host_attachment = true` key is set. The key defaults to `false` so
-historical Nexosim behavior remains reproducible. In the opt-in model, every
-host shares one unbounded FIFO injection stage to its edge switch, while the
-reverse delivery stage is a FIFO/TailDrop queue with `switch.capacity`; both
-directions use `switch.port_rate` and `link.propagation_ns`. With the key on,
-legacy physical links also apply `link.propagation_ns`, matching exact lowering;
-the key-off physical path remains unchanged.
+## Device planning, retry, and readback
 
-Equal-time observation-vector order is version-specific. Days orders records by
-`(time, phase, origin_node, origin_seq)`, so splitting one switch LP into egress-port
-LPs re-keys `origin_node` and may permute records emitted by different ports. In the
-star regression, the pre-split arrival order at 4 ns is flow 0 then flow 1, while
-the port-LP order is flow 1 then flow 0. This is the same kind of version boundary
-as legacy's LIFO tie order differing from Days' canonical order.
+The Metal and CUDA planners derive all arena sizes before a kernel attempt. Large record arenas are striped by their owning LP, stream, receiver class, or flow. Plane-wide and per-entity caps remain explicit and are checked before use.
 
-Cross-version comparisons therefore require exact per-timestamp record multisets,
-per-packet fields and times, dispositions, dropped-packet identities, per-flow
-sequences, summaries, and normalized terminal state. Within one version, the full
-observation vectors remain deterministic and byte-identical across backends,
-worker counts, granularities, and work classifications.
+Capacity overflow is refuse-or-run: a failed attempt emits no partial result. The host records the reported demand, raises only the relevant capacity floor, replans, and retries up to `max_capacity_retries`. A successful run returns the converged floors as `CapacityWarmStart`.
 
-## Project non-goals
+`CapacityWarmStart` is a sizing hint for a later run of the same image. It can skip known failed plans. It contains no simulated state, checkpoint, or device cache.
 
-The following capabilities are outside this project. They may be reasonable
-future work; their absence is a scope decision, not a statement that they
-cannot be implemented.
+Metal and CUDA plan readback after execution. They copy fixed planes directly. For variable striped arenas, they read metadata and run a gather kernel that copies live records in canonical entity and ring order. Invalid metadata returns an error, and compact readback decodes to the same bytes as full-capacity readback.
 
-- **Timestamp quantization:** the new executor has one exact-time model.
-- **Legacy scheduler run batching:** each service-start event selects at most
-  one packet.
-- **Speculation beyond the safe horizon:** v1 remains conservative.
-- **Per-run proof checking or proof certificates:** Lean is an offline
-  development and CI tool, not part of normal execution.
-- **Hybrid CPU/GPU placement:** one selected backend runs the model.
-- **Zero-lookahead cross-LP parallel execution:** v1 parallel backends require a
-  positive delay bound.
-- **PFC and DCQCN:** neither protocol is part of this project's supported model.
-- **Automatic backend selection:** callers select a backend explicitly.
-- **Nexosim removal or a default-runtime cutover:** either decision requires a
-  later proposal based on completed coverage and performance evidence.
-- **General callback-to-GPU compilation:** the image uses a closed set of model
-  and event kinds.
-- **Runtime LP migration:** LP ownership is fixed for a run.
-- **Multi-GPU execution:** v1 uses at most one GPU device.
+The shipped `configs/benchmarks/p11/rq9_frontier_closed_k32.toml` fixture defines 32 groups of 8,192 resident flows, or 262,144 flows. `src/bin/t20f_frontier.rs` runs and fingerprints the frontier result for scalar and available device backends. The CUDA build contains device images for `sm_89` and `sm_121`.
 
-## Follow-on model work
+## Rejection boundaries
 
-Deficit Round Robin (DRR), Weighted Round Robin (WRR), TCP, CUBIC, RED-family active queue
-management, PFC, and DCQCN are not required for the first result. A later
-project may qualify these models against the same exact execution contract.
+Each layer reports errors once it has enough information:
 
-## Required rejection paths
+| Boundary | Examples |
+| --- | --- |
+| Scenario compilation | Nonzero `time_quantum_ns`; VirtualClock; BBR; unsupported flow dependencies or explicit per-flow routes; unsupported pairing/collective form |
+| Backend validation | Device RED, PFC, DCQCN, or collective state; zero-lookahead parallel channel; invalid device WFQ width |
+| Device planning | Arithmetic/memory-size overflow or an invalid arena layout |
+| Device attempt and retry | Capacity demand beyond the current plan or configured cap, invalid readback metadata, or checked arithmetic overflow |
 
-These errors are requirements for later phases, not behavior implemented by
-this page.
+Compilation and validation errors name the rejected field, mechanism, or backend and, for device-only gaps, direct callers to scalar or CPU. Unsupported configuration is never silently ignored.
 
-| Invalid selection or model | Phase | Required diagnostic |
-|---|---|---|
-| The Days executor is selected with a nonzero `time_quantum_ns`. | P03, when backend selection is introduced | State that `time_quantum_ns` is unsupported by the Days executor and tell the user to remove or set it to zero, or select Nexosim. The setting must never be ignored and must never alter Days-executor timestamps. |
-| A parallel backend is selected for an image with zero or unknown lookahead on a cross-LP channel. | P04 load-time validation | Identify the channel and state that the selected parallel backend requires a known positive `min_delay_ns`. The diagnostic may suggest the scalar backend, which may execute zero-lookahead models. |
-| The selected backend does not support an image's scheduler or event kind. | P04 load-time validation | Name the backend and the unsupported scheduler or event kind. Validation must reject the image before execution. |
-| A model requests preemptive or cancellable service, or changes a link rate during an in-progress service. | P04 load-time validation | State which unsupported service behavior was requested and that v1 requires constant-rate, non-preemptive, non-cancellable transmission. |
-
-P03 owns the explicit backend-selection boundary. P04 owns validation of the
-lowered simulation image and its backend-specific model constraints.
+See [/docs/internals](/docs/internals) for the code-level round, capacity, warm-start, and compaction paths.
