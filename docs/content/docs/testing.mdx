@@ -1,13 +1,12 @@
 ---
 title: Testing
-description: Run Days unit and integration tests, including feature-gated suites.
+description: Default, exactness, planner, and fixture test commands.
 ---
 
-Days uses a mix of unit tests and integration tests under `tests/`.
+Tests live under `executor/tests/`, `tests/`, `legacy/tests/`, and
+`validation/tests/`.
 
-## Run tests
-
-Recommended:
+## Default workspace matrix
 
 ```bash
 cargo test -p days-executor -- --show-output
@@ -16,29 +15,60 @@ cargo test -p days-legacy --features test -- --show-output
 cargo test -p days-validation --features test -- --show-output
 ```
 
-If you have `cargo-nextest` installed:
+If `cargo-nextest` is installed, the same package surface can be selected with
+`cargo nextest run`; do not use `--all-features` on a machine that cannot build
+both device toolchains.
+
+## Planner equality
 
 ```bash
-cargo nextest run --workspace --all-features --no-capture
+# Apple Metal
+cargo test -p days --features test,metal-spike \
+  --test t20e_planner_bit_equal -- --show-output
+
+# Host-only CUDA planner; no GPU execution
+cargo test -p days --features cuda-planner-test \
+  --test t20e_planner_bit_equal -- --show-output
 ```
 
-The T13f full-load width lane deliberately uses the debug test profile and runs
-one fixture per nextest process:
+## T24 byte-identity campaign
+
+The explicit ignored test lowers the committed TCP corpus and compares CPU and
+each compiled device backend with the global Scalar oracle:
 
 ```bash
-cargo xtask t13f-full-load
+cargo test --release -p days-validation --features test \
+  --test t24_tcp_corpora \
+  full_tcp_corpora_are_byte_identical_across_available_backends \
+  -- --ignored --exact --show-output
 ```
 
-## Feature-gated test suites
+Add `metal-spike` on Apple or `cuda` on a CUDA host to include that device. The
+comparison removes device-omitted diagnostic planes, then requires the complete
+remaining `RunResult` to be byte-identical.
 
-Many tests use `#![cfg(feature = "test")]` to enable additional invariants and helpers (for example, verifying that local time tracking matches the simulation engine clock).
+## E5 fixture gates
 
-Some legacy tests also require protocol features:
+Fast fixture/generator checks:
 
-- PFC tests: `cargo test -p days-legacy --features test,l2_pfc`
-- DCQCN tests: `cargo test -p days-legacy --features test,dcqcn`
-- Current Metal tests: `cargo test -p days-executor --features metal-spike`, `cargo test -p days --features test,metal-spike`, and `cargo test -p days-validation --features test,metal-spike`
+```bash
+cargo test -p days --features test --test t21_p12_e5 \
+  e5_generator_reproduces_committed_flow_set_fixtures -- --exact --show-output
+```
 
-## Test fixtures
+The same test target contains ignored full Scalar, CPU, Metal, and protocol
+golden-vector gates. List their exact names before selecting a long campaign:
 
-Integration tests may have adjacent TOML fixtures (for example `tests/build_graph.rs` + `tests/build_graph.toml`). Configuration examples for manual runs live under `configs/`.
+```bash
+cargo test -p days --features test --test t21_p12_e5 -- --list
+```
+
+E6 fixtures are not present in this branch and therefore have no runnable E6
+command here.
+
+## Legacy protocol features
+
+```bash
+cargo test -p days-legacy --features test,l2_pfc
+cargo test -p days-legacy --features test,dcqcn
+```
