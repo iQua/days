@@ -27,14 +27,14 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "cuda.rs",
         predicate: r#"feature = "cuda-test-hooks""#,
-        count: 22,
-        purpose: "CUDA-only fault injection, capacity, planner measurement, T20l readback- and plane-word-accounting hooks, and T32 exact drain profiling",
+        count: 19,
+        purpose: "CUDA-only fault injection, capacity, and T20l readback- and plane-word-accounting hooks",
     },
     AllowedFeatureGate {
         path: "metal.rs",
         predicate: r#"feature = "metal-test-hooks""#,
-        count: 29,
-        purpose: "Metal-only panic, fault-injection, planner measurement, T20l readback accounting, T21 dominant-arena occupancy readback, and T32 exact drain profiling hooks",
+        count: 26,
+        purpose: "Metal-only panic, fault-injection, T20l readback accounting, and T21 dominant-arena occupancy readback hooks",
     },
     AllowedFeatureGate {
         path: "metal.rs",
@@ -51,7 +51,7 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "metal.rs",
         predicate: r#"feature = "planner-test-hooks""#,
-        count: 3,
+        count: 4,
         purpose: "Metal host-plan equality hook is enabled by the standard test feature",
     },
     AllowedFeatureGate {
@@ -87,8 +87,8 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "safe_horizon.rs",
         predicate: r#"all(feature = "metal-spike", target_vendor = "apple")"#,
-        count: 48,
-        purpose: "replay and window capture instrumentation for Apple Metal profiling, including the separately selected T32 scalar trace loop",
+        count: 39,
+        purpose: "replay and window capture instrumentation for Apple Metal profiling",
     },
     AllowedFeatureGate {
         path: "scalar.rs",
@@ -110,15 +110,9 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     },
     AllowedFeatureGate {
         path: "lib.rs",
-        predicate: r#"feature = "cuda-test-hooks""#,
-        count: 1,
-        purpose: "CUDA planner measurement hook is exported only for dedicated test tools",
-    },
-    AllowedFeatureGate {
-        path: "lib.rs",
         predicate: r#"all(feature = "metal-test-hooks", target_vendor = "apple")"#,
         count: 1,
-        purpose: "Metal planner measurement hook requires dedicated test tools and Apple Metal",
+        purpose: "Metal capacity, plane-word, and dominant-arena test hooks require dedicated test tools and Apple Metal",
     },
     AllowedFeatureGate {
         path: "lib.rs",
@@ -171,14 +165,8 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "lib.rs",
         predicate: r#"feature = "planner-test-hooks""#,
-        count: 2,
-        purpose: "validator flow-index equality and T32 observation-construction hooks are exported only for standard tests",
-    },
-    AllowedFeatureGate {
-        path: "safe_horizon.rs",
-        predicate: r#"feature = "planner-test-hooks""#,
-        count: 4,
-        purpose: "the T32 negative control counts per-round observation-state construction only in standard tests",
+        count: 1,
+        purpose: "validator flow-index equality hook is exported only for standard tests",
     },
 ];
 

@@ -16,14 +16,11 @@ use std::time::{Duration, Instant};
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_foundation::{NSRange, NSString};
+use objc2_foundation::NSString;
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
-    MTLCommonCounterSetTimestamp, MTLComputeCommandEncoder, MTLComputePassDescriptor,
-    MTLComputePipelineState, MTLCounterErrorValue, MTLCounterResultTimestamp,
-    MTLCounterSampleBuffer, MTLCounterSampleBufferDescriptor, MTLCounterSamplingPoint,
-    MTLCounterSet, MTLCreateSystemDefaultDevice, MTLDevice, MTLDispatchType, MTLLibrary,
-    MTLResourceOptions, MTLSize, MTLStorageMode,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLDispatchType, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 
 use crate::device_compaction::{
@@ -36,11 +33,11 @@ use crate::planner_capacity::{PlannerCapacityContext, PlannerCapacityMode, TcpMi
 use crate::tcp::{TcpCubic, TcpReno};
 use crate::{
     ArrivalDisposition, Backend, CapacityRetryRecord, CapacityWarmStart, DeviceCapacityCaps,
-    DeviceCapacityFloors, DrainProfile, DrainProfileChannel, DrainProfileLayout, Event, EventKey,
-    EventKind, FlowGeneratorKind, FlowId, GeneratorStatus, GeneratorTermination, NodeId, NodeKind,
-    ObservationMode, PacketArrivalObservation, PacketDeparture, PacketDescriptor, PacketKind,
-    PayloadId, RunResult, RunSummary, SimulationImage, TcpAckHeader, TcpCongestionControl,
-    TcpDataHeader, TcpPhase, TcpReceiveRange, TcpTimerState, validate,
+    DeviceCapacityFloors, Event, EventKey, EventKind, FlowGeneratorKind, FlowId, GeneratorStatus,
+    GeneratorTermination, NodeId, NodeKind, ObservationMode, PacketArrivalObservation,
+    PacketDeparture, PacketDescriptor, PacketKind, PayloadId, RunResult, RunSummary,
+    SimulationImage, TcpAckHeader, TcpCongestionControl, TcpDataHeader, TcpPhase, TcpReceiveRange,
+    TcpTimerState, validate,
 };
 
 const LANES: usize = 1_024;
@@ -107,7 +104,6 @@ const MAX_ENCODED_PAIRS_PER_WAVE: usize = 64;
 const COMPACT_THREADS_PER_THREADGROUP: usize = 256;
 const DEFAULT_ROUNDS_PER_COMMAND_BUFFER: usize = MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER;
 const MAX_COMMAND_BUFFERS: usize = 64;
-const PROFILED_ATTEMPTS: usize = 128;
 
 static METAL_DEVICE_EXECUTION: Mutex<()> = Mutex::new(());
 static METAL_DIRECT: Mutex<Option<Arc<DirectMetal>>> = Mutex::new(None);
@@ -224,40 +220,6 @@ fn reset_dominant_arena_high_water() {
     DOMINANT_ARENA_HIGH_WATER.with(|high_water| *high_water.borrow_mut() = None);
 }
 
-/// The nine *reported* phases of a round attempt.
-///
-/// T21 fix 1 dispatches more kernels than this — see [`ATTEMPT_DISPATCHES`] — but the reported
-/// decomposition does not grow with the dispatch count: a phase's time is the sum of its
-/// dispatches', so `t15b_round_profile` compares before and after the re-grid like for like.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AttemptPhase {
-    Horizon,
-    RoundReset,
-    Compaction,
-    DrainExecute,
-    ContinuationControl,
-    ExchangePrefix,
-    ExchangeScatter,
-    TargetMerge,
-    FinalControl,
-}
-
-impl AttemptPhase {
-    const fn index(self) -> usize {
-        match self {
-            Self::Horizon => 0,
-            Self::RoundReset => 1,
-            Self::Compaction => 2,
-            Self::DrainExecute => 3,
-            Self::ContinuationControl => 4,
-            Self::ExchangePrefix => 5,
-            Self::ExchangeScatter => 6,
-            Self::TargetMerge => 7,
-            Self::FinalControl => 8,
-        }
-    }
-}
-
 /// One dispatch of the maximum attempt DAG, in encode order.
 ///
 /// T21 fix 1 (`evidence/P12/aterm-fixes.md` §3.4) splits the phases that swept Θ(nodes + channels)
@@ -302,88 +264,39 @@ impl DispatchGeometry {
     }
 }
 
-const ATTEMPT_DISPATCHES: [(AttemptKernel, AttemptPhase, DispatchGeometry); 13] = [
-    (
-        AttemptKernel::HorizonSweep,
-        AttemptPhase::Horizon,
-        DispatchGeometry::ControlSweep,
-    ),
-    (
-        AttemptKernel::Horizon,
-        AttemptPhase::Horizon,
-        DispatchGeometry::FixedControl,
-    ),
-    (
-        AttemptKernel::RoundReset,
-        AttemptPhase::RoundReset,
-        DispatchGeometry::ControlSweep,
-    ),
-    (
-        AttemptKernel::Compaction,
-        AttemptPhase::Compaction,
-        DispatchGeometry::FixedControl,
-    ),
+const ATTEMPT_DISPATCHES: [(AttemptKernel, DispatchGeometry); 13] = [
+    (AttemptKernel::HorizonSweep, DispatchGeometry::ControlSweep),
+    (AttemptKernel::Horizon, DispatchGeometry::FixedControl),
+    (AttemptKernel::RoundReset, DispatchGeometry::ControlSweep),
+    (AttemptKernel::Compaction, DispatchGeometry::FixedControl),
     (
         AttemptKernel::DrainExecute,
-        AttemptPhase::DrainExecute,
         DispatchGeometry::ActiveWorklist,
     ),
     (
         AttemptKernel::ContinuationControlSweep,
-        AttemptPhase::ContinuationControl,
         DispatchGeometry::ControlSweep,
     ),
     (
         AttemptKernel::ContinuationControl,
-        AttemptPhase::ContinuationControl,
         DispatchGeometry::FixedControl,
     ),
     (
         AttemptKernel::ExchangePrefixSweep,
-        AttemptPhase::ExchangePrefix,
         DispatchGeometry::ControlSweep,
     ),
     (
         AttemptKernel::ExchangePrefix,
-        AttemptPhase::ExchangePrefix,
         DispatchGeometry::FixedControl,
     ),
-    (
-        AttemptKernel::ExchangeScatter,
-        AttemptPhase::ExchangeScatter,
-        DispatchGeometry::Parallel,
-    ),
-    (
-        AttemptKernel::TargetMerge,
-        AttemptPhase::TargetMerge,
-        DispatchGeometry::Parallel,
-    ),
+    (AttemptKernel::ExchangeScatter, DispatchGeometry::Parallel),
+    (AttemptKernel::TargetMerge, DispatchGeometry::Parallel),
     (
         AttemptKernel::FinalControlSweep,
-        AttemptPhase::FinalControl,
         DispatchGeometry::ControlSweep,
     ),
-    (
-        AttemptKernel::FinalControl,
-        AttemptPhase::FinalControl,
-        DispatchGeometry::FixedControl,
-    ),
+    (AttemptKernel::FinalControl, DispatchGeometry::FixedControl),
 ];
-const PROFILE_PHASES: usize = 9;
-
-fn profiled_attempt_dispatches(
-    finalize_sweep_required: bool,
-) -> impl Iterator<Item = (AttemptKernel, AttemptPhase, DispatchGeometry)> {
-    ATTEMPT_DISPATCHES
-        .into_iter()
-        .filter(move |(kernel, _, _)| {
-            finalize_sweep_required || *kernel != AttemptKernel::FinalControlSweep
-        })
-}
-
-fn profile_samples_per_attempt(finalize_sweep_required: bool) -> usize {
-    profiled_attempt_dispatches(finalize_sweep_required).count() * 2
-}
 const CONTROL_THREADGROUP_BYTES: usize =
     LANES * (std::mem::size_of::<u64>() + std::mem::size_of::<u32>());
 const NONE: u64 = u64::MAX;
@@ -411,9 +324,6 @@ const CONTROL_INDIRECT_OFFSET_WORDS: usize = CONTROL_WORDS;
 const CONTROL_STORAGE_WORDS: usize = CONTROL_WORDS + 2;
 
 type RawMetalBuffer = Retained<ProtocolObject<dyn MTLBuffer>>;
-type RawCommandBuffer = Retained<ProtocolObject<dyn MTLCommandBuffer>>;
-type RawCounterSampleBuffer = Retained<ProtocolObject<dyn MTLCounterSampleBuffer>>;
-type RawCounterSet = Retained<ProtocolObject<dyn MTLCounterSet>>;
 type MetalPipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
 
 /// Bounded device arena reported by a production Metal capacity fault.
@@ -807,306 +717,8 @@ pub struct MetalRun {
     /// Wall time from the first encode through final device completion. Image planning, pipeline
     /// creation, and final Rust result normalization are intentionally outside this interval.
     pub wall_ns: u64,
-    /// Opt-in diagnostic timings. Normal production runs leave this `None`.
-    pub phase_profile: Option<MetalPhaseProfile>,
     /// Exact record and metadata bytes planned for the fallback heap and monotone streams.
     pub memory_layout: MetalMemoryLayout,
-}
-
-/// Opt-in T15e FEL round-trip probe result.
-///
-/// The probe executes the production transition body and geometry unchanged, but reinserts and
-/// removes the event that was just popped before each transition. This adds one real heap
-/// push/pop pair while restoring the same logical FEL. It is a differential diagnostic, not a
-/// production execution mode.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MetalFelProbeRun {
-    pub run: MetalRun,
-    /// Local FEL pushes performed by the unchanged transition bodies.
-    pub local_fel_pushes: u64,
-    /// Net-zero heap push/pop pairs counted on-device by the probe.
-    pub injected_fel_round_trips: u64,
-    /// Lazy creation cost for all diagnostic pipelines paid by this call, or zero when the
-    /// executor reused its cache.
-    /// This cost is excluded from run and phase timings.
-    pub diagnostic_pipeline_creation_ns: u64,
-}
-
-/// Complete Metal result paired with exact opt-in drain counters.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MetalDrainProfileRun {
-    pub run: MetalRun,
-    pub profile: DrainProfile,
-}
-
-/// Matched counting-only control for [`MetalFelProbeRun`].
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MetalFelControlRun {
-    pub run: MetalRun,
-    pub local_fel_pushes: u64,
-    /// Lazy creation cost for all diagnostic pipelines paid by this call, or zero when the
-    /// executor reused its cache.
-    pub diagnostic_pipeline_creation_ns: u64,
-}
-
-/// Actual remote-merge fan-in accumulated across eventful target-rounds.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct MetalMergeFanIn {
-    pub eventful_target_rounds: u64,
-    pub active_producer_target_rounds: u64,
-    pub remote_events: u64,
-    pub maximum_active_fan_in: u64,
-    pub first_maximum_fan_in_target: Option<NodeId>,
-    pub maximum_fan_in_target_count: u64,
-}
-
-/// Separate fan-in instrumentation run, kept out of FEL differential samples.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MetalMergeFanInRun {
-    pub run: MetalRun,
-    pub fan_in: MetalMergeFanIn,
-    /// Lazy creation cost for all diagnostic pipelines paid by this call, or zero when the
-    /// executor reused its cache.
-    pub diagnostic_pipeline_creation_ns: u64,
-}
-
-/// Heuristic drain decomposition derived from a production profile and a matching FEL probe.
-///
-/// A positive probe-minus-control delta measures an added root-key heap round trip at the exact
-/// production transition points. Reinserting the just-popped minimum is a near-worst-case push
-/// compared with future-key production children, so the scaled FEL value is an upper-biased stress
-/// heuristic, not a mathematical bound or representative production cost. The residual still includes
-/// root/horizon checks and fused-loop overhead and is not a pure transition-body measurement.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MetalDrainDecomposition {
-    pub baseline_drain_execute_ns: u64,
-    pub matched_control_drain_execute_ns: u64,
-    pub probe_drain_execute_ns: u64,
-    pub fel_round_trip_delta_ns: i128,
-    pub rounds: u64,
-    pub transitions: u64,
-    pub local_fel_pushes: u64,
-    pub production_drain_fel_operations: u64,
-    pub injected_fel_operations: u64,
-    pub stress_scaled_fel_estimate_ns: Option<u64>,
-    pub residual_after_stress_scaled_estimate_ns: Option<u64>,
-}
-
-impl MetalFelProbeRun {
-    /// Builds the differential split when both profiles captured every useful attempt.
-    ///
-    /// A non-positive delta is retained as measurement evidence, but the cost estimates are
-    /// `None`: timestamp noise cannot establish a nonnegative FEL cost from that sample. The
-    /// residual is also `None` when the scaled FEL estimate exceeds the baseline.
-    pub fn decompose_against(
-        &self,
-        baseline: &MetalRun,
-        control: &MetalFelControlRun,
-    ) -> Result<MetalDrainDecomposition, MetalError> {
-        if baseline.result != self.run.result
-            || baseline.rounds != self.run.rounds
-            || baseline.transitions != self.run.transitions
-            || baseline.continuation_relaunches != self.run.continuation_relaunches
-            || control.run.result != self.run.result
-            || control.run.rounds != self.run.rounds
-            || control.run.transitions != self.run.transitions
-            || control.run.continuation_relaunches != self.run.continuation_relaunches
-        {
-            return Err(MetalError::Validation(
-                "FEL probe, matched control, and baseline outcomes must match exactly".into(),
-            ));
-        }
-        if self.run.rounds == 0 {
-            return Err(MetalError::Validation(
-                "FEL decomposition requires at least one completed round".into(),
-            ));
-        }
-        if self.injected_fel_round_trips != self.run.transitions {
-            return Err(MetalError::Validation(
-                "FEL probe must inject exactly one round trip per transition".into(),
-            ));
-        }
-        let baseline_profile = baseline.phase_profile.as_ref().ok_or_else(|| {
-            MetalError::Validation("FEL decomposition baseline must be profiled".into())
-        })?;
-        let probe_profile = self.run.phase_profile.as_ref().ok_or_else(|| {
-            MetalError::Validation("FEL probe run must include phase profiling".into())
-        })?;
-        let control_profile = control.run.phase_profile.as_ref().ok_or_else(|| {
-            MetalError::Validation("FEL matched control must include phase profiling".into())
-        })?;
-        if baseline_profile.captured_attempts < baseline_profile.useful_attempts
-            || probe_profile.captured_attempts < probe_profile.useful_attempts
-            || control_profile.captured_attempts < control_profile.useful_attempts
-        {
-            return Err(MetalError::Validation(
-                "FEL decomposition requires complete useful-attempt profile capture".into(),
-            ));
-        }
-        if baseline_profile.useful_attempts != probe_profile.useful_attempts
-            || control_profile.useful_attempts != probe_profile.useful_attempts
-        {
-            return Err(MetalError::Validation(
-                "FEL probe, matched control, and baseline useful-attempt counts must match".into(),
-            ));
-        }
-        if control.local_fel_pushes != self.local_fel_pushes {
-            return Err(MetalError::Validation(
-                "FEL probe and matched control local-push counts must match".into(),
-            ));
-        }
-
-        let baseline_ns = baseline_profile.useful.drain_execute_ns;
-        let control_ns = control_profile.useful.drain_execute_ns;
-        let probe_ns = probe_profile.useful.drain_execute_ns;
-        let delta_ns = i128::from(probe_ns) - i128::from(control_ns);
-        let production_drain_fel_operations = self
-            .run
-            .transitions
-            .checked_add(self.local_fel_pushes)
-            .ok_or_else(|| {
-                MetalError::Validation("production drain FEL operation count overflows".into())
-            })?;
-        let injected_fel_operations =
-            self.injected_fel_round_trips
-                .checked_mul(2)
-                .ok_or_else(|| {
-                    MetalError::Validation("injected FEL operation count overflows".into())
-                })?;
-        let stress_scaled_fel_estimate_ns = if delta_ns > 0 && injected_fel_operations != 0 {
-            let scaled = (delta_ns as u128)
-                .checked_mul(u128::from(production_drain_fel_operations))
-                .ok_or_else(|| MetalError::Validation("scaled FEL time overflows".into()))?
-                / u128::from(injected_fel_operations);
-            Some(u64::try_from(scaled).map_err(|_| {
-                MetalError::Validation("scaled FEL time does not fit in u64".into())
-            })?)
-        } else {
-            None
-        };
-        let residual_after_stress_scaled_estimate_ns =
-            stress_scaled_fel_estimate_ns.and_then(|fel_ns| baseline_ns.checked_sub(fel_ns));
-        Ok(MetalDrainDecomposition {
-            baseline_drain_execute_ns: baseline_ns,
-            matched_control_drain_execute_ns: control_ns,
-            probe_drain_execute_ns: probe_ns,
-            fel_round_trip_delta_ns: delta_ns,
-            rounds: self.run.rounds,
-            transitions: self.run.transitions,
-            local_fel_pushes: self.local_fel_pushes,
-            production_drain_fel_operations,
-            injected_fel_operations,
-            stress_scaled_fel_estimate_ns,
-            residual_after_stress_scaled_estimate_ns,
-        })
-    }
-}
-
-/// Dispatch-level GPU timestamp totals for one production round attempt.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct MetalPhaseTimings {
-    pub horizon_ns: u64,
-    pub round_reset_ns: u64,
-    pub round_prepare_ns: u64,
-    pub drain_execute_ns: u64,
-    pub continuation_control_ns: u64,
-    pub exchange_prefix_ns: u64,
-    pub exchange_scatter_ns: u64,
-    /// Target-owned k-way heap merge when streams are disabled; target active-head refresh when
-    /// stream decomposition is enabled. Keeping one aligned slot makes same-binary phase ablation
-    /// tables directly comparable.
-    pub target_merge_ns: u64,
-    pub final_control_ns: u64,
-}
-
-impl MetalPhaseTimings {
-    /// Sum of all sampled dispatch intervals.
-    pub fn total_ns(self) -> u64 {
-        [
-            self.horizon_ns,
-            self.round_reset_ns,
-            self.round_prepare_ns,
-            self.drain_execute_ns,
-            self.continuation_control_ns,
-            self.exchange_prefix_ns,
-            self.exchange_scatter_ns,
-            self.target_merge_ns,
-            self.final_control_ns,
-        ]
-        .into_iter()
-        .fold(0, u64::saturating_add)
-    }
-
-    fn from_values(values: [u64; PROFILE_PHASES]) -> Self {
-        Self {
-            horizon_ns: values[0],
-            round_reset_ns: values[1],
-            round_prepare_ns: values[2],
-            drain_execute_ns: values[3],
-            continuation_control_ns: values[4],
-            exchange_prefix_ns: values[5],
-            exchange_scatter_ns: values[6],
-            target_merge_ns: values[7],
-            final_control_ns: values[8],
-        }
-    }
-
-    fn values(self) -> [u64; PROFILE_PHASES] {
-        [
-            self.horizon_ns,
-            self.round_reset_ns,
-            self.round_prepare_ns,
-            self.drain_execute_ns,
-            self.continuation_control_ns,
-            self.exchange_prefix_ns,
-            self.exchange_scatter_ns,
-            self.target_merge_ns,
-            self.final_control_ns,
-        ]
-    }
-
-    fn saturating_add(self, other: Self) -> Self {
-        Self::from_values(std::array::from_fn(|index| {
-            self.values()[index].saturating_add(other.values()[index])
-        }))
-    }
-
-    fn saturating_mul(self, factor: u64) -> Self {
-        Self::from_values(self.values().map(|value| value.saturating_mul(factor)))
-    }
-
-    fn divided_by(self, divisor: u64) -> Self {
-        if divisor == 0 {
-            Self::default()
-        } else {
-            Self::from_values(self.values().map(|value| value / divisor))
-        }
-    }
-}
-
-/// Opt-in diagnostic phase decomposition from stage-boundary GPU timestamp samples.
-///
-/// The current Apple device cannot sample counters at dispatch boundaries, so profiling uses one
-/// compute pass per dispatch for the first 128 attempts. Remaining attempts use the normal encoder.
-/// `estimated_total` combines all captured useful work, the captured termination attempt, and the
-/// mean sampled no-op tail multiplied by the number of remaining encoded tail attempts.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct MetalPhaseProfile {
-    pub timestamp_frequency_hz: u64,
-    pub encoded_attempts: u64,
-    pub captured_attempts: u64,
-    pub useful_attempts: u64,
-    pub idle_sample_attempts: u64,
-    /// Gaps between consecutive sampled compute passes within captured command buffers.
-    pub captured_pass_gap_ns: u64,
-    /// Overlap between consecutive sampled pass intervals. Stage-boundary timestamps can overlap
-    /// slightly even when the compute passes use serial dispatch.
-    pub captured_pass_overlap_ns: u64,
-    pub estimate_complete: bool,
-    pub useful: MetalPhaseTimings,
-    pub termination: MetalPhaseTimings,
-    pub idle_mean: MetalPhaseTimings,
-    pub estimated_total: MetalPhaseTimings,
 }
 
 /// Runs the production Metal executor through the inclusive scenario stop.
@@ -1216,362 +828,6 @@ impl MetalExecutor {
         self.initialization_timings
     }
 
-    /// Runs the production backend with diagnostic stage-boundary phase timestamps enabled.
-    ///
-    /// This mode is intended for tests and benchmark evidence. It preserves simulation semantics
-    /// but splits the first 128 round attempts into separate compute passes, so its wall and device
-    /// totals are not production performance measurements. Concurrent Metal callers queue behind
-    /// the process-wide execution guard.
-    pub fn run_profiled(
-        &self,
-        image: &SimulationImage,
-        exclusive_horizon_ns: Option<u64>,
-        config: MetalConfig,
-    ) -> Result<MetalRun, MetalError> {
-        self.run_with_observations_profiled(
-            image,
-            exclusive_horizon_ns,
-            config,
-            ObservationMode::Summary,
-        )
-    }
-
-    /// Executes the opt-in, exact drain-counter kernel with production dispatch boundaries.
-    ///
-    /// Only the drain pipeline is replaced. The diagnostic buffer is single-writer by LP/channel,
-    /// and the returned run timing fields are incidental rather than performance measurements.
-    pub fn run_drain_profile_with_observations(
-        &self,
-        image: &SimulationImage,
-        exclusive_horizon_ns: Option<u64>,
-        config: MetalConfig,
-        observation_mode: ObservationMode,
-    ) -> Result<MetalDrainProfileRun, MetalError> {
-        #[cfg(feature = "metal-test-hooks")]
-        reset_dominant_arena_high_water();
-        validate(image, Backend::Metal)
-            .map_err(|error| MetalError::Validation(error.to_string()))?;
-        validate_config(config)?;
-        if !config.streams_enabled {
-            return Err(MetalError::Validation(
-                "drain profiling requires streams_enabled=true".into(),
-            ));
-        }
-        let drain_profile_pipeline = self.direct.drain_profile_pipeline()?;
-        let retry_budget = config.max_capacity_retries;
-        let mut attempt_config = config;
-        let mut channel_capacity_floors = crate::device_capacity::ChannelCapacityFloors::default();
-        let mut tcp_capacity_floors = crate::device_capacity::TcpCapacityFloors::default();
-        let mut retry_trace = Vec::new();
-        loop {
-            let attempt = (|| {
-                let plan = MetalPlan::new_with_entity_capacity_floors(
-                    image,
-                    exclusive_horizon_ns,
-                    attempt_config,
-                    observation_mode,
-                    &mut channel_capacity_floors,
-                    &mut tcp_capacity_floors,
-                )?;
-                let layout = metal_drain_profile_layout(&plan, image)?;
-                let buffers = MetalBuffers::new(&self.direct.device, plan)?;
-                let probe = FelProbeResources::new_drain_profile(
-                    &self.direct.device,
-                    image.nodes.len(),
-                    drain_profile_pipeline.clone(),
-                    layout,
-                )?;
-                let _execution_guard = metal_device_execution_guard();
-                let timing = self.direct.run_with_fel_probe(
-                    &buffers,
-                    attempt_config,
-                    false,
-                    Some(&probe),
-                )?;
-                #[cfg(feature = "metal-test-hooks")]
-                panic_after_execution_if_requested();
-                let expected_transitions_by_lp = buffers.planes[18]
-                    .read()
-                    .chunks_exact(LP_STATE_WORDS)
-                    .take(image.nodes.len())
-                    .map(|state| state[1])
-                    .collect::<Vec<_>>();
-                let run = buffers.finish(&self.direct, image, observation_mode, timing)?;
-                let profile = probe.drain_profile(&expected_transitions_by_lp)?;
-                if profile.selected_events != u128::from(run.transitions) {
-                    return Err(MetalError::Validation(format!(
-                        "drain profile selected {} events but the run completed {} transitions",
-                        profile.selected_events, run.transitions
-                    ))
-                    .into());
-                }
-                Ok(MetalDrainProfileRun { run, profile })
-            })();
-            match attempt {
-                Ok(mut profiled) => {
-                    profiled.run.capacity_retry_trace = retry_trace;
-                    profiled.run.capacity_warm_start = CapacityWarmStart {
-                        floors: converged_capacity_floors(&attempt_config),
-                        channel_events_by_stream: channel_capacity_floors.converged_capacities(),
-                        tcp_receiver_ranges_by_base: tcp_capacity_floors
-                            .converged_receiver_ranges(),
-                        tcp_ledger_segments_by_flow: tcp_capacity_floors
-                            .converged_ledger_segments(),
-                    };
-                    return Ok(profiled);
-                }
-                Err(failure) => {
-                    let AttemptFailure {
-                        error,
-                        ledger_high_water,
-                    } = failure;
-                    let (arena, node, flow, stream, capacity, demand) = match error {
-                        MetalError::CapacityExceeded {
-                            arena,
-                            node,
-                            flow,
-                            stream,
-                            capacity,
-                            demand,
-                        } => (arena, node, flow, stream, capacity, demand),
-                        error => return Err(error.with_retry_trace(&retry_trace)),
-                    };
-                    if retry_trace.len() == retry_budget {
-                        return Err(MetalError::CapacityExceeded {
-                            arena,
-                            node,
-                            flow,
-                            stream,
-                            capacity,
-                            demand,
-                        }
-                        .with_retry_trace(&retry_trace));
-                    }
-                    let grown_capacity = match arena {
-                        MetalArena::TcpReceiverRanges => {
-                            crate::device_capacity::grown_capacity_with_slack(
-                                capacity,
-                                demand,
-                                crate::device_capacity::TCP_RECEIVER_RETRY_SLACK,
-                            )
-                        }
-                        MetalArena::TcpSegmentLedger => {
-                            crate::device_capacity::grown_ledger_capacity(
-                                capacity,
-                                demand,
-                                crate::device_capacity::observed_ledger_high_water(
-                                    ledger_high_water.as_deref(),
-                                    flow,
-                                ),
-                            )
-                        }
-                        _ => crate::device_capacity::grown_capacity(capacity, demand),
-                    };
-                    if grown_capacity <= capacity {
-                        return Err(MetalError::CapacityExceeded {
-                            arena,
-                            node,
-                            flow,
-                            stream,
-                            capacity,
-                            demand,
-                        }
-                        .with_retry_trace(&retry_trace));
-                    }
-                    let entity_floor_raised = match (arena, flow, stream) {
-                        (MetalArena::ChannelInbox, None, Some(stream)) => {
-                            channel_capacity_floors.raise(stream, capacity, grown_capacity)
-                        }
-                        (MetalArena::ChannelInbox, _, None) => {
-                            return Err(MetalError::Validation(
-                                "channel capacity fault omitted its stream identity".into(),
-                            )
-                            .with_retry_trace(&retry_trace));
-                        }
-                        (MetalArena::TcpReceiverRanges, Some(flow), None) => {
-                            tcp_capacity_floors.raise_receiver(flow, capacity, grown_capacity)
-                        }
-                        (MetalArena::TcpSegmentLedger, Some(flow), None) => {
-                            let raised =
-                                tcp_capacity_floors.raise_ledger(flow, capacity, grown_capacity);
-                            if let (true, Some(high_water)) = (raised, ledger_high_water.as_deref())
-                            {
-                                tcp_capacity_floors.raise_ledger_from_occupancy(high_water);
-                            }
-                            raised
-                        }
-                        (MetalArena::TcpReceiverRanges | MetalArena::TcpSegmentLedger, None, _) => {
-                            return Err(MetalError::Validation(
-                                "TCP capacity fault omitted its flow identity".into(),
-                            )
-                            .with_retry_trace(&retry_trace));
-                        }
-                        _ => {
-                            attempt_config.raise_capacity(arena, capacity, grown_capacity);
-                            true
-                        }
-                    };
-                    if !entity_floor_raised {
-                        return Err(MetalError::Validation(
-                            "capacity fault did not match its immutable planned entity".into(),
-                        )
-                        .with_retry_trace(&retry_trace));
-                    }
-                    retry_trace.push(CapacityRetryRecord {
-                        retry: retry_trace.len() + 1,
-                        arena,
-                        node,
-                        flow,
-                        stream,
-                        capacity,
-                        demand,
-                        grown_capacity,
-                    });
-                }
-            }
-        }
-    }
-
-    /// Runs the matched counting-only control for [`Self::run_fel_probe_profiled`].
-    ///
-    /// The retained diagnostic kernel measures the legacy heap mechanism and therefore requires
-    /// `config.streams_enabled == false`. Concurrent Metal callers queue behind the process-wide
-    /// execution guard.
-    pub fn run_fel_control_profiled(
-        &self,
-        image: &SimulationImage,
-        exclusive_horizon_ns: Option<u64>,
-        config: MetalConfig,
-    ) -> Result<MetalFelControlRun, MetalError> {
-        let (run, local_fel_pushes, injected_fel_round_trips, diagnostic_pipeline_creation_ns) =
-            self.run_fel_diagnostic_profiled(image, exclusive_horizon_ns, config, false)?;
-        if injected_fel_round_trips != 0 {
-            return Err(MetalError::Validation(
-                "FEL matched control must not inject heap round trips".into(),
-            ));
-        }
-        Ok(MetalFelControlRun {
-            run,
-            local_fel_pushes,
-            diagnostic_pipeline_creation_ns,
-        })
-    }
-
-    /// Runs the opt-in T15e FEL round-trip stress probe with phase profiling enabled.
-    ///
-    /// Compare against both [`Self::run_profiled`] and [`Self::run_fel_control_profiled`] using
-    /// [`MetalFelProbeRun::decompose_against`]. Reinserting the just-popped minimum exercises a
-    /// near-worst-case heap push, so the scaled result is an upper-biased heuristic, not a
-    /// representative average or sufficient evidence by itself to indict the FEL. This legacy
-    /// heap diagnostic requires `config.streams_enabled == false`. Concurrent Metal callers queue
-    /// behind the process-wide execution guard.
-    pub fn run_fel_probe_profiled(
-        &self,
-        image: &SimulationImage,
-        exclusive_horizon_ns: Option<u64>,
-        config: MetalConfig,
-    ) -> Result<MetalFelProbeRun, MetalError> {
-        let (run, local_fel_pushes, injected_fel_round_trips, diagnostic_pipeline_creation_ns) =
-            self.run_fel_diagnostic_profiled(image, exclusive_horizon_ns, config, true)?;
-        Ok(MetalFelProbeRun {
-            run,
-            local_fel_pushes,
-            injected_fel_round_trips,
-            diagnostic_pipeline_creation_ns,
-        })
-    }
-
-    /// Runs a separate target-merge fan-in counter probe.
-    ///
-    /// The read-only pre-scan changes target-merge timing, so callers should use a matching
-    /// [`Self::run_profiled`] result for production merge time and this result only for exact fan-in
-    /// counts and outcome parity. This legacy exchange diagnostic requires
-    /// `config.streams_enabled == false`. Concurrent Metal callers queue behind the process-wide
-    /// execution guard.
-    pub fn run_merge_fan_in_profiled(
-        &self,
-        image: &SimulationImage,
-        exclusive_horizon_ns: Option<u64>,
-        config: MetalConfig,
-    ) -> Result<MetalMergeFanInRun, MetalError> {
-        validate(image, Backend::Metal)
-            .map_err(|error| MetalError::Validation(error.to_string()))?;
-        validate_config(config)?;
-        require_heap_diagnostic(config, "exchange")?;
-
-        let (pipelines, diagnostic_pipeline_creation_ns) = self.direct.fel_probe_pipelines()?;
-        let plan = MetalPlan::new(
-            image,
-            exclusive_horizon_ns,
-            config,
-            ObservationMode::Summary,
-        )?;
-        let buffers = MetalBuffers::new(&self.direct.device, plan)?;
-        let probe = FelProbeResources::new(
-            &self.direct.device,
-            image.nodes.len(),
-            None,
-            Some(pipelines.merge_pipeline),
-            false,
-        )?;
-        let _execution_guard = metal_device_execution_guard();
-        let timing = self
-            .direct
-            .run_with_fel_probe(&buffers, config, true, Some(&probe))?;
-        let run = buffers
-            .finish(&self.direct, image, ObservationMode::Summary, timing)
-            .map_err(|failure| failure.error)?;
-        let fan_in = probe.merge_fan_in()?;
-        Ok(MetalMergeFanInRun {
-            run,
-            fan_in,
-            diagnostic_pipeline_creation_ns,
-        })
-    }
-
-    fn run_fel_diagnostic_profiled(
-        &self,
-        image: &SimulationImage,
-        exclusive_horizon_ns: Option<u64>,
-        config: MetalConfig,
-        inject_round_trip: bool,
-    ) -> Result<(MetalRun, u64, u64, u64), MetalError> {
-        validate(image, Backend::Metal)
-            .map_err(|error| MetalError::Validation(error.to_string()))?;
-        validate_config(config)?;
-        require_heap_diagnostic(config, "FEL")?;
-
-        let (pipelines, diagnostic_pipeline_creation_ns) = self.direct.fel_probe_pipelines()?;
-        let plan = MetalPlan::new(
-            image,
-            exclusive_horizon_ns,
-            config,
-            ObservationMode::Summary,
-        )?;
-        let buffers = MetalBuffers::new(&self.direct.device, plan)?;
-        let probe = FelProbeResources::new(
-            &self.direct.device,
-            image.nodes.len(),
-            Some(pipelines.round_pipeline),
-            None,
-            inject_round_trip,
-        )?;
-        let _execution_guard = metal_device_execution_guard();
-        let timing = self
-            .direct
-            .run_with_fel_probe(&buffers, config, true, Some(&probe))?;
-        let run = buffers
-            .finish(&self.direct, image, ObservationMode::Summary, timing)
-            .map_err(|failure| failure.error)?;
-        let (local_fel_pushes, injected_fel_round_trips) = probe.fel_counts()?;
-        Ok((
-            run,
-            local_fel_pushes,
-            injected_fel_round_trips,
-            diagnostic_pipeline_creation_ns,
-        ))
-    }
-
     /// Runs with explicit observation retention under the process-wide Metal execution envelope.
     pub fn run_with_observations(
         &self,
@@ -1585,7 +841,6 @@ impl MetalExecutor {
             exclusive_horizon_ns,
             config,
             observation_mode,
-            false,
             &CapacityWarmStart::default(),
         )
     }
@@ -1615,28 +870,7 @@ impl MetalExecutor {
             exclusive_horizon_ns,
             config,
             observation_mode,
-            false,
             warm_start,
-        )
-    }
-
-    /// Full-observation counterpart of [`Self::run_profiled`].
-    ///
-    /// Concurrent Metal callers queue behind the process-wide execution guard.
-    pub fn run_with_observations_profiled(
-        &self,
-        image: &SimulationImage,
-        exclusive_horizon_ns: Option<u64>,
-        config: MetalConfig,
-        observation_mode: ObservationMode,
-    ) -> Result<MetalRun, MetalError> {
-        self.run_with_observations_mode(
-            image,
-            exclusive_horizon_ns,
-            config,
-            observation_mode,
-            true,
-            &CapacityWarmStart::default(),
         )
     }
 
@@ -1646,7 +880,6 @@ impl MetalExecutor {
         exclusive_horizon_ns: Option<u64>,
         config: MetalConfig,
         observation_mode: ObservationMode,
-        profile: bool,
         warm_start: &CapacityWarmStart,
     ) -> Result<MetalRun, MetalError> {
         #[cfg(feature = "metal-test-hooks")]
@@ -1680,7 +913,7 @@ impl MetalExecutor {
                 )?;
                 let buffers = MetalBuffers::new(&self.direct.device, plan)?;
                 let _execution_guard = metal_device_execution_guard();
-                let timing = self.direct.run(&buffers, attempt_config, profile)?;
+                let timing = self.direct.run(&buffers, attempt_config)?;
                 #[cfg(feature = "metal-test-hooks")]
                 panic_after_execution_if_requested();
                 buffers.finish(&self.direct, image, observation_mode, timing)
@@ -1869,37 +1102,6 @@ pub fn assert_metal_planner_bit_equal_for_testing(
     Ok(())
 }
 
-/// Measures host plan construction only; device initialization and execution are excluded.
-#[cfg(feature = "metal-test-hooks")]
-#[doc(hidden)]
-pub fn measure_metal_planner_for_testing(
-    image: &SimulationImage,
-    exclusive_horizon_ns: Option<u64>,
-    config: MetalConfig,
-    observation_mode: ObservationMode,
-    legacy: bool,
-) -> Result<u64, MetalError> {
-    validate(image, Backend::Metal).map_err(|error| MetalError::Validation(error.to_string()))?;
-    validate_config(config)?;
-    let mode = if legacy {
-        PlannerCapacityMode::Legacy
-    } else {
-        PlannerCapacityMode::Precomputed
-    };
-    let started = Instant::now();
-    let plan = MetalPlan::new_with_capacity_mode(
-        image,
-        exclusive_horizon_ns,
-        config,
-        observation_mode,
-        mode,
-    )?;
-    let planning_ns = duration_ns(started.elapsed());
-    std::hint::black_box(&plan.params);
-    drop(plan);
-    Ok(planning_ns)
-}
-
 /// Returns the exact production-plan plane lengths without creating a Metal device.
 #[cfg(feature = "planner-test-hooks")]
 #[doc(hidden)]
@@ -1979,15 +1181,6 @@ fn validate_config(config: MetalConfig) -> Result<(), MetalError> {
     Ok(())
 }
 
-fn require_heap_diagnostic(config: MetalConfig, mechanism: &str) -> Result<(), MetalError> {
-    if config.streams_enabled {
-        return Err(MetalError::Validation(format!(
-            "legacy heap {mechanism} diagnostics require streams_enabled=false"
-        )));
-    }
-    Ok(())
-}
-
 fn encoding_limits(rounds_per_command_buffer: usize) -> (usize, usize) {
     let pairs_per_command_buffer =
         rounds_per_command_buffer.min(MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER);
@@ -2053,35 +1246,6 @@ struct StreamLayout {
     round_scratch_offset: usize,
 }
 
-fn metal_drain_profile_layout(
-    plan: &MetalPlan,
-    image: &SimulationImage,
-) -> Result<DrainProfileLayout, MetalError> {
-    let mut maximum_heads = Vec::with_capacity(image.nodes.len());
-    for node in 0..image.nodes.len() {
-        let meta = node
-            .checked_mul(LP_STREAM_META_WORDS)
-            .and_then(|offset| plan.stream_layout.lp_stream_meta_offset.checked_add(offset))
-            .ok_or_else(|| MetalError::Validation("drain profile LP metadata overflows".into()))?;
-        let declared = usize::try_from(plan.stream_state[meta + 1]).map_err(|_| {
-            MetalError::Validation("drain profile stream count does not fit usize".into())
-        })?;
-        maximum_heads.push(declared.checked_add(1).ok_or_else(|| {
-            MetalError::Validation("drain profile head-row size overflows".into())
-        })?);
-    }
-    let channels = image
-        .channels
-        .iter()
-        .map(|channel| DrainProfileChannel {
-            source: channel.source.0 as usize,
-            target: channel.target.0,
-        })
-        .collect::<Vec<_>>();
-    DrainProfileLayout::new(&maximum_heads, &channels)
-        .map_err(|error| MetalError::Validation(error.to_string()))
-}
-
 struct PreparedStreams {
     state: Vec<u64>,
     records: Vec<u64>,
@@ -2102,6 +1266,7 @@ struct PreparedTcpState {
 }
 
 impl MetalPlan {
+    #[cfg(feature = "planner-test-hooks")]
     fn new(
         image: &SimulationImage,
         exclusive_horizon_ns: Option<u64>,
@@ -4246,149 +3411,6 @@ impl SharedBuffer {
     }
 }
 
-#[derive(Clone)]
-struct FelProbePipelines {
-    round_pipeline: MetalPipeline,
-    merge_pipeline: MetalPipeline,
-}
-
-struct FelProbeResources {
-    round_pipeline: Option<MetalPipeline>,
-    merge_pipeline: Option<MetalPipeline>,
-    node_count: usize,
-    counts: SharedBuffer,
-    merge_fan_in: SharedBuffer,
-    drain_profile_layout: Option<DrainProfileLayout>,
-}
-
-impl FelProbeResources {
-    fn new(
-        device: &ProtocolObject<dyn MTLDevice>,
-        node_count: usize,
-        round_pipeline: Option<MetalPipeline>,
-        merge_pipeline: Option<MetalPipeline>,
-        inject_round_trip: bool,
-    ) -> Result<Self, MetalError> {
-        let fan_in_words = node_count
-            .checked_mul(4)
-            .ok_or_else(|| MetalError::Validation("merge fan-in counter size overflows".into()))?;
-        let count_words = node_count
-            .checked_mul(2)
-            .and_then(|words| words.checked_add(1))
-            .ok_or_else(|| {
-                MetalError::Validation("FEL diagnostic counter size overflows".into())
-            })?;
-        let mut counts = vec![0; count_words];
-        counts[0] = u64::from(inject_round_trip);
-        Ok(Self {
-            round_pipeline,
-            merge_pipeline,
-            node_count,
-            counts: SharedBuffer::new(device, counts)?,
-            merge_fan_in: SharedBuffer::new(device, vec![0; fan_in_words])?,
-            drain_profile_layout: None,
-        })
-    }
-
-    fn new_drain_profile(
-        device: &ProtocolObject<dyn MTLDevice>,
-        node_count: usize,
-        round_pipeline: MetalPipeline,
-        layout: DrainProfileLayout,
-    ) -> Result<Self, MetalError> {
-        let fan_in_words = node_count
-            .checked_mul(4)
-            .ok_or_else(|| MetalError::Validation("merge fan-in counter size overflows".into()))?;
-        let counts = SharedBuffer::new(device, layout.zeroed_words())?;
-        Ok(Self {
-            round_pipeline: Some(round_pipeline),
-            merge_pipeline: None,
-            node_count,
-            counts,
-            merge_fan_in: SharedBuffer::new(device, vec![0; fan_in_words])?,
-            drain_profile_layout: Some(layout),
-        })
-    }
-
-    fn bind(&self, encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>) {
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(&self.counts.raw), 0, 28);
-            encoder.setBuffer_offset_atIndex(Some(&self.merge_fan_in.raw), 0, 29);
-        }
-    }
-
-    fn fel_counts(&self) -> Result<(u64, u64), MetalError> {
-        fn checked_sum(values: &[u64], label: &str) -> Result<u64, MetalError> {
-            values.iter().try_fold(0_u64, |total, value| {
-                total.checked_add(*value).ok_or_else(|| {
-                    MetalError::Validation(format!("FEL diagnostic {label} count overflows"))
-                })
-            })
-        }
-
-        let counts = self.counts.read();
-        let local_end = self.node_count + 1;
-        Ok((
-            checked_sum(&counts[1..local_end], "local-push")?,
-            checked_sum(
-                &counts[local_end..local_end + self.node_count],
-                "injected-round-trip",
-            )?,
-        ))
-    }
-
-    fn drain_profile(
-        &self,
-        expected_transitions_by_lp: &[u64],
-    ) -> Result<DrainProfile, MetalError> {
-        let layout = self.drain_profile_layout.as_ref().ok_or_else(|| {
-            MetalError::Validation("FEL resources do not contain a drain profile layout".into())
-        })?;
-        layout
-            .decode_checked(&self.counts.read(), expected_transitions_by_lp)
-            .map_err(|error| MetalError::Validation(error.to_string()))
-    }
-
-    fn merge_fan_in(&self) -> Result<MetalMergeFanIn, MetalError> {
-        self.merge_fan_in
-            .read()
-            .chunks_exact(4)
-            .enumerate()
-            .try_fold(MetalMergeFanIn::default(), |mut total, (target, row)| {
-                total.eventful_target_rounds = total
-                    .eventful_target_rounds
-                    .checked_add(row[0])
-                    .ok_or_else(|| {
-                        MetalError::Validation("merge eventful-target-round count overflows".into())
-                    })?;
-                total.active_producer_target_rounds = total
-                    .active_producer_target_rounds
-                    .checked_add(row[1])
-                    .ok_or_else(|| {
-                        MetalError::Validation("merge active-producer count overflows".into())
-                    })?;
-                total.remote_events = total.remote_events.checked_add(row[2]).ok_or_else(|| {
-                    MetalError::Validation("merge remote-event count overflows".into())
-                })?;
-                if row[3] > total.maximum_active_fan_in {
-                    total.maximum_active_fan_in = row[3];
-                    total.first_maximum_fan_in_target = Some(NodeId(target as u64));
-                    total.maximum_fan_in_target_count = 1;
-                } else if row[3] != 0 && row[3] == total.maximum_active_fan_in {
-                    total.maximum_fan_in_target_count = total
-                        .maximum_fan_in_target_count
-                        .checked_add(1)
-                        .ok_or_else(|| {
-                            MetalError::Validation(
-                                "merge maximum-fan-in target count overflows".into(),
-                            )
-                        })?;
-                }
-                Ok(total)
-            })
-    }
-}
-
 struct MetalBuffers {
     planes: Vec<SharedBuffer>,
     tcp_state: SharedBuffer,
@@ -5118,17 +4140,6 @@ impl MetalBuffers {
                 .collect();
         }
 
-        let phase_profile = (!timing.profiled_attempts.is_empty()).then(|| {
-            build_phase_profile(
-                &timing.profiled_attempts,
-                timing.encoded_attempts,
-                control[CONTROL_ROUNDS],
-                control[CONTROL_RELAUNCHES],
-                timing.timestamp_frequency_hz,
-                timing.profiled_pass_gap_ns,
-                timing.profiled_pass_overlap_ns,
-            )
-        });
         Ok(MetalRun {
             result: RunResult {
                 host_states,
@@ -5157,7 +4168,6 @@ impl MetalBuffers {
             host_encode_submit_ns: timing.host_encode_submit_ns,
             device_ns: timing.device_ns,
             wall_ns: timing.wall_ns,
-            phase_profile,
             memory_layout: self.memory_layout,
         })
     }
@@ -5536,8 +4546,6 @@ struct DirectMetal {
     /// T20l fix 2: the readback gather. Not part of an attempt; encoded only by
     /// [`DirectMetal::compact`], after the attempt has been screened as successful.
     compact_pipeline: MetalPipeline,
-    fel_probe_pipelines: Mutex<Option<FelProbePipelines>>,
-    drain_profile_pipeline: Mutex<Option<MetalPipeline>>,
 }
 
 impl DirectMetal {
@@ -5630,8 +4638,6 @@ impl DirectMetal {
             finalize_sweep_pipeline,
             finalize_pipeline,
             compact_pipeline,
-            fel_probe_pipelines: Mutex::new(None),
-            drain_profile_pipeline: Mutex::new(None),
         })
     }
 
@@ -5723,72 +4729,9 @@ impl DirectMetal {
             .collect())
     }
 
-    fn fel_probe_pipelines(&self) -> Result<(FelProbePipelines, u64), MetalError> {
-        let mut cached = self.fel_probe_pipelines.lock().map_err(|_| {
-            MetalError::Unavailable("FEL diagnostic pipeline cache is poisoned".into())
-        })?;
-        if let Some(pipelines) = cached.as_ref() {
-            return Ok((pipelines.clone(), 0));
-        }
-
-        let started = Instant::now();
-        let source = format!(
-            "#define DAYS_T15E_DIAGNOSTICS 1\n{}",
-            include_str!("metal_kernels.metal")
-        );
-        let pipelines = FelProbePipelines {
-            round_pipeline: create_pipeline(&self.device, &source, "days_round_fel_probe")?,
-            merge_pipeline: create_pipeline(
-                &self.device,
-                &source,
-                "days_exchange_merge_fan_in_probe",
-            )?,
-        };
-        let creation_ns = duration_ns(started.elapsed());
-        *cached = Some(pipelines.clone());
-        Ok((pipelines, creation_ns))
-    }
-
-    fn drain_profile_pipeline(&self) -> Result<MetalPipeline, MetalError> {
-        let mut cached = self.drain_profile_pipeline.lock().map_err(|_| {
-            MetalError::Unavailable("drain diagnostic pipeline cache is poisoned".into())
-        })?;
-        if let Some(pipeline) = cached.as_ref() {
-            return Ok(pipeline.clone());
-        }
-        let source = format!(
-            "#define DAYS_T32_DRAIN_PROFILE 1\n{}",
-            include_str!("metal_kernels.metal")
-        );
-        let pipeline = create_pipeline(&self.device, &source, "days_round_drain_profile")?;
-        *cached = Some(pipeline.clone());
-        Ok(pipeline)
-    }
-
-    fn run(
-        &self,
-        buffers: &MetalBuffers,
-        config: MetalConfig,
-        profile: bool,
-    ) -> Result<MetalTiming, MetalError> {
-        self.run_with_fel_probe(buffers, config, profile, None)
-    }
-
-    fn run_with_fel_probe(
-        &self,
-        buffers: &MetalBuffers,
-        config: MetalConfig,
-        profile: bool,
-        fel_probe: Option<&FelProbeResources>,
-    ) -> Result<MetalTiming, MetalError> {
+    fn run(&self, buffers: &MetalBuffers, config: MetalConfig) -> Result<MetalTiming, MetalError> {
         let round_threads = config.round_threads_per_threadgroup;
-        let round_pipeline = fel_probe
-            .and_then(|probe| probe.round_pipeline.as_deref())
-            .unwrap_or(&self.round_pipeline);
-        let merge_pipeline = fel_probe
-            .and_then(|probe| probe.merge_pipeline.as_deref())
-            .unwrap_or(&self.exchange_merge_pipeline);
-        let execution_width = round_pipeline.threadExecutionWidth();
+        let execution_width = self.round_pipeline.threadExecutionWidth();
         if !round_threads.is_multiple_of(execution_width) {
             return Err(MetalError::Validation(format!(
                 "round_threads_per_threadgroup must be a multiple of the device execution width \
@@ -5803,9 +4746,9 @@ impl DirectMetal {
             )));
         }
         let parallel_pipelines = [
-            round_pipeline,
+            &self.round_pipeline,
             &self.exchange_scatter_pipeline,
-            merge_pipeline,
+            &self.exchange_merge_pipeline,
         ];
         let supported_threads = parallel_pipelines
             .iter()
@@ -5824,21 +4767,6 @@ impl DirectMetal {
         let mut wave_boundary_syncs = 0_u64;
         let mut mid_round_wave_boundary_syncs = 0_u64;
         let mut encoded_attempts = 0_u64;
-        let mut captured_attempts_encoded = 0_usize;
-        let mut profiled_attempts = Vec::new();
-        let mut profiled_pass_gap_ns = 0_u64;
-        let mut profiled_pass_overlap_ns = 0_u64;
-        let timestamp_counter_set = profile.then(|| self.timestamp_counter_set()).transpose()?;
-        let timestamp_frequency_hz = if profile {
-            self.device.queryTimestampFrequency()
-        } else {
-            0
-        };
-        if profile && timestamp_frequency_hz == 0 {
-            return Err(MetalError::Unavailable(
-                "GPU timestamp frequency is zero".into(),
-            ));
-        }
         let (pairs_per_command_buffer, pairs_per_wave) =
             encoding_limits(config.rounds_per_command_buffer);
         let parallel_groups = buffers.node_count.div_ceil(round_threads).max(1);
@@ -5880,98 +4808,38 @@ impl DirectMetal {
                 let command_buffer = self.queue.commandBuffer().ok_or_else(|| {
                     MetalError::Unavailable("command buffer creation failed".into())
                 })?;
-                let captured = if timestamp_counter_set.is_some() {
-                    encoded.min(PROFILED_ATTEMPTS.saturating_sub(captured_attempts_encoded))
-                } else {
-                    0
-                };
-                let samples_per_attempt = if captured == 0 {
-                    0
-                } else {
-                    profile_samples_per_attempt(buffers.finalize_sweep_required)
-                };
-                let counter_buffer = if captured == 0 {
-                    None
-                } else {
-                    let sample_count =
-                        captured.checked_mul(samples_per_attempt).ok_or_else(|| {
-                            MetalError::Unavailable(
-                                "profile counter sample count overflows usize".into(),
-                            )
-                        })?;
-                    Some(
-                        self.counter_sample_buffer(
-                            timestamp_counter_set
-                                .as_deref()
-                                .expect("captured attempts require a counter set"),
-                            sample_count,
-                        )?,
-                    )
-                };
-                if let Some(counter_buffer) = counter_buffer.as_deref() {
-                    for attempt in 0..captured {
-                        self.encode_profiled_attempt(
-                            &command_buffer,
-                            counter_buffer,
-                            attempt * samples_per_attempt,
-                            buffers,
-                            control_grid,
-                            sweep_grid,
-                            control_group,
-                            parallel_grid,
-                            parallel_group,
-                            round_pipeline,
-                            merge_pipeline,
-                            fel_probe,
-                        )?;
-                    }
+                let encoder = command_buffer
+                    .computeCommandEncoderWithDispatchType(MTLDispatchType::Serial)
+                    .ok_or_else(|| {
+                        MetalError::Unavailable("serial compute encoder creation failed".into())
+                    })?;
+                buffers.bind(&encoder);
+                for _ in 0..encoded {
+                    self.encode_attempt(
+                        &encoder,
+                        buffers,
+                        control_grid,
+                        sweep_grid,
+                        control_group,
+                        parallel_grid,
+                        parallel_group,
+                    );
                 }
-                if captured != encoded {
-                    let encoder = command_buffer
-                        .computeCommandEncoderWithDispatchType(MTLDispatchType::Serial)
-                        .ok_or_else(|| {
-                            MetalError::Unavailable("serial compute encoder creation failed".into())
-                        })?;
-                    buffers.bind(&encoder);
-                    if let Some(probe) = fel_probe {
-                        probe.bind(&encoder);
-                    }
-                    for _ in captured..encoded {
-                        self.encode_attempt(
-                            &encoder,
-                            buffers,
-                            control_grid,
-                            sweep_grid,
-                            control_group,
-                            parallel_grid,
-                            parallel_group,
-                            round_pipeline,
-                            merge_pipeline,
-                        );
-                    }
-                    encoder.endEncoding();
-                }
-                command_buffers.push(ProfiledCommandBuffer {
-                    command_buffer,
-                    counter_buffer,
-                    captured_attempts: captured,
-                });
-                captured_attempts_encoded = captured_attempts_encoded.saturating_add(captured);
+                encoder.endEncoding();
+                command_buffers.push(command_buffer);
                 encoded_attempts = encoded_attempts.saturating_add(encoded as u64);
                 wave_remaining -= encoded;
             }
-            for encoded in &command_buffers {
-                encoded.command_buffer.commit();
+            for command_buffer in &command_buffers {
+                command_buffer.commit();
             }
             host_encode_submit_ns =
                 host_encode_submit_ns.saturating_add(duration_ns(wave_started.elapsed()));
             command_buffers
                 .last()
                 .expect("nonzero wave produces a command buffer")
-                .command_buffer
                 .waitUntilCompleted();
-            for encoded in &command_buffers {
-                let command_buffer = &encoded.command_buffer;
+            for command_buffer in &command_buffers {
                 if command_buffer.status() != MTLCommandBufferStatus::Completed {
                     let detail = command_buffer
                         .error()
@@ -5990,18 +4858,6 @@ impl DirectMetal {
                     )));
                 }
                 device_ns = device_ns.saturating_add(seconds_ns(end - start));
-                if let Some(counter_buffer) = encoded.counter_buffer.as_deref() {
-                    let resolved = resolve_profile_attempts(
-                        counter_buffer,
-                        encoded.captured_attempts,
-                        buffers.finalize_sweep_required,
-                    )?;
-                    profiled_attempts.extend(resolved.attempts);
-                    profiled_pass_gap_ns =
-                        profiled_pass_gap_ns.saturating_add(resolved.pass_gap_ns);
-                    profiled_pass_overlap_ns =
-                        profiled_pass_overlap_ns.saturating_add(resolved.pass_overlap_ns);
-                }
             }
             wave_boundary_syncs = wave_boundary_syncs.saturating_add(1);
             remaining -= wave_rounds;
@@ -6023,10 +4879,6 @@ impl DirectMetal {
             wave_boundary_syncs,
             mid_round_wave_boundary_syncs,
             encoded_attempts,
-            timestamp_frequency_hz,
-            profiled_attempts,
-            profiled_pass_gap_ns,
-            profiled_pass_overlap_ns,
         })
     }
 
@@ -6040,14 +4892,12 @@ impl DirectMetal {
         control_group: MTLSize,
         parallel_grid: MTLSize,
         parallel_group: MTLSize,
-        round_pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
-        merge_pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
     ) {
-        for (kernel, _, geometry) in ATTEMPT_DISPATCHES {
+        for (kernel, geometry) in ATTEMPT_DISPATCHES {
             if !buffers.finalize_sweep_required && kernel == AttemptKernel::FinalControlSweep {
                 continue;
             }
-            encoder.setComputePipelineState(self.pipeline(kernel, round_pipeline, merge_pipeline));
+            encoder.setComputePipelineState(self.pipeline(kernel));
             match geometry {
                 DispatchGeometry::FixedControl => {
                     encoder.dispatchThreadgroups_threadsPerThreadgroup(control_grid, control_group);
@@ -6071,143 +4921,22 @@ impl DirectMetal {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn encode_profiled_attempt(
-        &self,
-        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
-        counter_buffer: &ProtocolObject<dyn MTLCounterSampleBuffer>,
-        first_sample: usize,
-        buffers: &MetalBuffers,
-        control_grid: MTLSize,
-        sweep_grid: MTLSize,
-        control_group: MTLSize,
-        parallel_grid: MTLSize,
-        parallel_group: MTLSize,
-        round_pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
-        merge_pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
-        fel_probe: Option<&FelProbeResources>,
-    ) -> Result<(), MetalError> {
-        // Metal counter samples are attached to encoder boundaries. An omitted dispatch has no
-        // honest boundary to sample, so the shortened plan uses a compact 12-dispatch layout.
-        // Resolution applies the same filter, preserving every remaining dispatch's phase label.
-        for (dispatch_index, (kernel, _, geometry)) in
-            profiled_attempt_dispatches(buffers.finalize_sweep_required).enumerate()
-        {
-            let descriptor = MTLComputePassDescriptor::new();
-            descriptor.setDispatchType(MTLDispatchType::Serial);
-            let attachment = unsafe {
-                descriptor
-                    .sampleBufferAttachments()
-                    .objectAtIndexedSubscript(0)
-            };
-            attachment.setSampleBuffer(Some(counter_buffer));
-            let sample = first_sample + dispatch_index * 2;
-            unsafe {
-                attachment.setStartOfEncoderSampleIndex(sample);
-                attachment.setEndOfEncoderSampleIndex(sample + 1);
-            }
-            let encoder = command_buffer
-                .computeCommandEncoderWithDescriptor(&descriptor)
-                .ok_or_else(|| {
-                    MetalError::Unavailable("profile compute encoder creation failed".into())
-                })?;
-            buffers.bind(&encoder);
-            if let Some(probe) = fel_probe {
-                probe.bind(&encoder);
-            }
-            encoder.setComputePipelineState(self.pipeline(kernel, round_pipeline, merge_pipeline));
-            match geometry {
-                DispatchGeometry::FixedControl => {
-                    encoder.dispatchThreadgroups_threadsPerThreadgroup(control_grid, control_group);
-                }
-                DispatchGeometry::ControlSweep => {
-                    encoder.dispatchThreadgroups_threadsPerThreadgroup(sweep_grid, control_group);
-                }
-                DispatchGeometry::ActiveWorklist => unsafe {
-                    encoder
-                        .dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
-                            &buffers.planes[0].raw,
-                            CONTROL_INDIRECT_OFFSET_WORDS * std::mem::size_of::<u64>(),
-                            parallel_group,
-                        );
-                },
-                DispatchGeometry::Parallel => {
-                    encoder
-                        .dispatchThreadgroups_threadsPerThreadgroup(parallel_grid, parallel_group);
-                }
-            }
-            encoder.endEncoding();
-        }
-        Ok(())
-    }
-
-    fn pipeline<'a>(
-        &'a self,
-        kernel: AttemptKernel,
-        round_pipeline: &'a ProtocolObject<dyn MTLComputePipelineState>,
-        merge_pipeline: &'a ProtocolObject<dyn MTLComputePipelineState>,
-    ) -> &'a ProtocolObject<dyn MTLComputePipelineState> {
+    fn pipeline(&self, kernel: AttemptKernel) -> &ProtocolObject<dyn MTLComputePipelineState> {
         match kernel {
             AttemptKernel::HorizonSweep => &self.horizon_sweep_pipeline,
             AttemptKernel::Horizon => &self.horizon_pipeline,
             AttemptKernel::RoundReset => &self.reset_pipeline,
             AttemptKernel::Compaction => &self.prepare_pipeline,
-            AttemptKernel::DrainExecute => round_pipeline,
+            AttemptKernel::DrainExecute => &self.round_pipeline,
             AttemptKernel::ContinuationControlSweep => &self.control_sweep_pipeline,
             AttemptKernel::ContinuationControl => &self.control_pipeline,
             AttemptKernel::ExchangePrefixSweep => &self.exchange_prefix_sweep_pipeline,
             AttemptKernel::ExchangePrefix => &self.exchange_prefix_pipeline,
             AttemptKernel::ExchangeScatter => &self.exchange_scatter_pipeline,
-            AttemptKernel::TargetMerge => merge_pipeline,
+            AttemptKernel::TargetMerge => &self.exchange_merge_pipeline,
             AttemptKernel::FinalControlSweep => &self.finalize_sweep_pipeline,
             AttemptKernel::FinalControl => &self.finalize_pipeline,
         }
-    }
-
-    fn timestamp_counter_set(&self) -> Result<RawCounterSet, MetalError> {
-        if !self
-            .device
-            .supportsCounterSampling(MTLCounterSamplingPoint::AtStageBoundary)
-        {
-            return Err(MetalError::Unavailable(
-                "device does not support stage-boundary counter sampling".into(),
-            ));
-        }
-        let sets = self
-            .device
-            .counterSets()
-            .ok_or_else(|| MetalError::Unavailable("device exposes no counter sets".into()))?;
-        let expected = unsafe { MTLCommonCounterSetTimestamp }.to_string();
-        for index in 0..sets.count() {
-            let set = sets.objectAtIndex(index);
-            if set.name().to_string() == expected {
-                return Ok(set);
-            }
-        }
-        Err(MetalError::Unavailable(
-            "device exposes no timestamp counter set".into(),
-        ))
-    }
-
-    fn counter_sample_buffer(
-        &self,
-        counter_set: &ProtocolObject<dyn MTLCounterSet>,
-        sample_count: usize,
-    ) -> Result<RawCounterSampleBuffer, MetalError> {
-        let descriptor = MTLCounterSampleBufferDescriptor::new();
-        descriptor.setCounterSet(Some(counter_set));
-        descriptor.setStorageMode(MTLStorageMode::Shared);
-        unsafe {
-            descriptor.setSampleCount(sample_count);
-        }
-        self.device
-            .newCounterSampleBufferWithDescriptor_error(&descriptor)
-            .map_err(|error| {
-                MetalError::Unavailable(format!(
-                    "counter sample buffer creation failed: {}",
-                    error.localizedDescription()
-                ))
-            })
     }
 }
 
@@ -6239,12 +4968,6 @@ fn create_pipeline(
         })
 }
 
-struct ProfiledCommandBuffer {
-    command_buffer: RawCommandBuffer,
-    counter_buffer: Option<RawCounterSampleBuffer>,
-    captured_attempts: usize,
-}
-
 struct MetalTiming {
     host_encode_submit_ns: u64,
     device_ns: u64,
@@ -6252,168 +4975,6 @@ struct MetalTiming {
     wave_boundary_syncs: u64,
     mid_round_wave_boundary_syncs: u64,
     encoded_attempts: u64,
-    timestamp_frequency_hz: u64,
-    profiled_attempts: Vec<MetalPhaseTimings>,
-    profiled_pass_gap_ns: u64,
-    profiled_pass_overlap_ns: u64,
-}
-
-struct ResolvedProfileAttempts {
-    attempts: Vec<MetalPhaseTimings>,
-    pass_gap_ns: u64,
-    pass_overlap_ns: u64,
-}
-
-fn accumulate_profile_interval(
-    frontier: &mut Option<u64>,
-    start: u64,
-    end: u64,
-    pass_gap_ns: &mut u64,
-    pass_overlap_ns: &mut u64,
-) {
-    if let Some(previous) = *frontier {
-        if start >= previous {
-            *pass_gap_ns = pass_gap_ns.saturating_add(start - previous);
-        } else {
-            *pass_overlap_ns =
-                pass_overlap_ns.saturating_add(previous.min(end).saturating_sub(start));
-        }
-        *frontier = Some(previous.max(end));
-    } else {
-        *frontier = Some(end);
-    }
-}
-
-fn resolve_profile_attempts(
-    counter_buffer: &ProtocolObject<dyn MTLCounterSampleBuffer>,
-    attempts: usize,
-    finalize_sweep_required: bool,
-) -> Result<ResolvedProfileAttempts, MetalError> {
-    let samples_per_attempt = profile_samples_per_attempt(finalize_sweep_required);
-    let sample_count = attempts
-        .checked_mul(samples_per_attempt)
-        .ok_or_else(|| MetalError::Unavailable("profile sample count overflows usize".into()))?;
-    let data = unsafe { counter_buffer.resolveCounterRange(NSRange::new(0, sample_count)) }
-        .ok_or_else(|| MetalError::Unavailable("counter sample resolution failed".into()))?;
-    let expected_bytes = sample_count
-        .checked_mul(std::mem::size_of::<MTLCounterResultTimestamp>())
-        .ok_or_else(|| MetalError::Unavailable("profile byte count overflows usize".into()))?;
-    if data.length() != expected_bytes {
-        return Err(MetalError::Unavailable(format!(
-            "counter sample resolution returned {} bytes, expected {expected_bytes}",
-            data.length()
-        )));
-    }
-    let mut samples = vec![MTLCounterResultTimestamp { timestamp: 0 }; sample_count];
-    if expected_bytes != 0 {
-        let destination = std::ptr::NonNull::new(samples.as_mut_ptr().cast())
-            .expect("nonempty sample allocation has a nonnull pointer");
-        unsafe {
-            data.getBytes_length(destination, expected_bytes);
-        }
-    }
-    let mut frontier = None;
-    let mut pass_gap_ns = 0_u64;
-    let mut pass_overlap_ns = 0_u64;
-    let attempts = samples
-        .chunks_exact(samples_per_attempt)
-        .map(|attempt| {
-            let mut values = [0_u64; PROFILE_PHASES];
-            for (dispatch, (_, phase, _)) in
-                profiled_attempt_dispatches(finalize_sweep_required).enumerate()
-            {
-                let start = attempt[dispatch * 2].timestamp;
-                let end = attempt[dispatch * 2 + 1].timestamp;
-                if start == 0
-                    || end == 0
-                    || start == MTLCounterErrorValue
-                    || end == MTLCounterErrorValue
-                    || end < start
-                {
-                    return Err(MetalError::Unavailable(format!(
-                        "invalid phase timestamp range {start}..{end}"
-                    )));
-                }
-                accumulate_profile_interval(
-                    &mut frontier,
-                    start,
-                    end,
-                    &mut pass_gap_ns,
-                    &mut pass_overlap_ns,
-                );
-                // Resolved counter timestamps use `MTLTimestamp`, whose unit is nanoseconds. A
-                // phase with more than one dispatch accumulates all of them into its own bucket.
-                values[phase.index()] = values[phase.index()].saturating_add(end - start);
-            }
-            Ok(MetalPhaseTimings::from_values(values))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(ResolvedProfileAttempts {
-        attempts,
-        pass_gap_ns,
-        pass_overlap_ns,
-    })
-}
-
-fn build_phase_profile(
-    attempts: &[MetalPhaseTimings],
-    encoded_attempts: u64,
-    rounds: u64,
-    continuation_relaunches: u64,
-    timestamp_frequency_hz: u64,
-    captured_pass_gap_ns: u64,
-    captured_pass_overlap_ns: u64,
-) -> MetalPhaseProfile {
-    let useful_attempts = rounds.saturating_add(continuation_relaunches);
-    let captured_useful = usize::try_from(useful_attempts)
-        .unwrap_or(usize::MAX)
-        .min(attempts.len());
-    let useful = attempts[..captured_useful].iter().copied().fold(
-        MetalPhaseTimings::default(),
-        MetalPhaseTimings::saturating_add,
-    );
-    let captured_all_useful = captured_useful as u64 == useful_attempts;
-    let captured_termination = captured_all_useful && attempts.len() > captured_useful;
-    let termination = if captured_termination {
-        attempts[captured_useful]
-    } else {
-        MetalPhaseTimings::default()
-    };
-    let idle_start = captured_useful.saturating_add(usize::from(captured_termination));
-    let idle_samples = attempts.get(idle_start..).unwrap_or_default();
-    let idle_sum = idle_samples.iter().copied().fold(
-        MetalPhaseTimings::default(),
-        MetalPhaseTimings::saturating_add,
-    );
-    let idle_mean = idle_sum.divided_by(idle_samples.len() as u64);
-    let encoded_idle = encoded_attempts
-        .saturating_sub(useful_attempts)
-        .saturating_sub(u64::from(captured_termination));
-    let estimate_complete = captured_termination && (encoded_idle == 0 || !idle_samples.is_empty());
-    let estimated_total = if estimate_complete {
-        useful
-            .saturating_add(termination)
-            .saturating_add(idle_mean.saturating_mul(encoded_idle))
-    } else {
-        attempts.iter().copied().fold(
-            MetalPhaseTimings::default(),
-            MetalPhaseTimings::saturating_add,
-        )
-    };
-    MetalPhaseProfile {
-        timestamp_frequency_hz,
-        encoded_attempts,
-        captured_attempts: attempts.len() as u64,
-        useful_attempts,
-        idle_sample_attempts: idle_samples.len() as u64,
-        captured_pass_gap_ns,
-        captured_pass_overlap_ns,
-        estimate_complete,
-        useful,
-        termination,
-        idle_mean,
-        estimated_total,
-    }
 }
 
 fn duration_ns(duration: Duration) -> u64 {
@@ -6429,10 +4990,9 @@ fn seconds_ns(seconds: f64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ATTEMPT_DISPATCHES, AttemptKernel, AttemptPhase, DispatchGeometry, LANES,
+        ATTEMPT_DISPATCHES, AttemptKernel, DispatchGeometry, LANES,
         MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER, MAX_ENCODED_PAIRS_PER_WAVE, MetalConfig, MetalError,
-        MetalPhaseTimings, PROFILE_PHASES, PROFILED_ATTEMPTS, accumulate_profile_interval,
-        build_phase_profile, decode_device_error, encoding_limits,
+        decode_device_error, encoding_limits,
     };
     use crate::CapacityRetryRecord;
 
@@ -6525,27 +5085,7 @@ mod tests {
 
     #[test]
     fn production_attempt_uses_fixed_parallel_control_geometry() {
-        // The nine reported phases appear in dispatch order, and every dispatch belongs to exactly
-        // one of them. T32 exposes T21's reset dispatch separately from ordered preparation.
-        let mut reported = ATTEMPT_DISPATCHES.map(|(_, phase, _)| phase).to_vec();
-        reported.dedup();
-        assert_eq!(
-            reported,
-            [
-                AttemptPhase::Horizon,
-                AttemptPhase::RoundReset,
-                AttemptPhase::Compaction,
-                AttemptPhase::DrainExecute,
-                AttemptPhase::ContinuationControl,
-                AttemptPhase::ExchangePrefix,
-                AttemptPhase::ExchangeScatter,
-                AttemptPhase::TargetMerge,
-                AttemptPhase::FinalControl,
-            ]
-        );
-        for (index, phase) in reported.iter().enumerate() {
-            assert_eq!(phase.index(), index);
-        }
+        assert_eq!(ATTEMPT_DISPATCHES.len(), 13);
         // Every width-1 dispatch, including `Compaction` — the worklist compaction, whose OUTPUT
         // ORDER depends on the partition and which the first version of this list omitted.
         for kernel in [
@@ -6555,9 +5095,9 @@ mod tests {
             AttemptKernel::ExchangePrefix,
             AttemptKernel::FinalControl,
         ] {
-            let (_, _, geometry) = ATTEMPT_DISPATCHES
+            let (_, geometry) = ATTEMPT_DISPATCHES
                 .into_iter()
-                .find(|(candidate, _, _)| *candidate == kernel)
+                .find(|(candidate, _)| *candidate == kernel)
                 .expect("every control dispatch is present");
             assert_eq!(
                 geometry,
@@ -6575,17 +5115,17 @@ mod tests {
             AttemptKernel::ExchangePrefixSweep,
             AttemptKernel::FinalControlSweep,
         ] {
-            let (_, _, geometry) = ATTEMPT_DISPATCHES
+            let (_, geometry) = ATTEMPT_DISPATCHES
                 .into_iter()
-                .find(|(candidate, _, _)| *candidate == kernel)
+                .find(|(candidate, _)| *candidate == kernel)
                 .expect("every sweep dispatch is present");
             assert_eq!(geometry, DispatchGeometry::ControlSweep);
             assert_eq!(geometry.threads_per_threadgroup(256), LANES);
         }
 
-        let (_, _, drain_geometry) = ATTEMPT_DISPATCHES
+        let (_, drain_geometry) = ATTEMPT_DISPATCHES
             .into_iter()
-            .find(|(candidate, _, _)| *candidate == AttemptKernel::DrainExecute)
+            .find(|(candidate, _)| *candidate == AttemptKernel::DrainExecute)
             .expect("the drain dispatch is present");
         assert_eq!(drain_geometry, DispatchGeometry::ActiveWorklist);
     }
@@ -6608,92 +5148,5 @@ mod tests {
             encoding_limits(MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER),
             (MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER, 64)
         );
-    }
-
-    #[test]
-    fn phase_profile_separates_useful_termination_and_idle_tail_attempts() {
-        let attempts = [1_u64, 2, 3, 4].map(|value| MetalPhaseTimings::from_values([value; 9]));
-        let profile = build_phase_profile(&attempts, 10, 2, 0, 24_000_000, 17, 3);
-
-        assert!(profile.estimate_complete);
-        assert_eq!(profile.useful_attempts, 2);
-        assert_eq!(profile.idle_sample_attempts, 1);
-        assert_eq!(profile.captured_pass_gap_ns, 17);
-        assert_eq!(profile.captured_pass_overlap_ns, 3);
-        assert_eq!(profile.useful.horizon_ns, 3);
-        assert_eq!(profile.termination.horizon_ns, 3);
-        assert_eq!(profile.idle_mean.horizon_ns, 4);
-        assert_eq!(profile.estimated_total.horizon_ns, 34);
-    }
-
-    #[test]
-    fn phase_profile_capture_fits_the_device_sample_buffer_limit() {
-        const {
-            assert!(PROFILED_ATTEMPTS * ATTEMPT_DISPATCHES.len() * 2 <= 4_096);
-        }
-    }
-
-    #[test]
-    fn phase_profile_does_not_invent_an_uncaptured_termination_attempt() {
-        let attempts = vec![MetalPhaseTimings::from_values([1; 9]); PROFILED_ATTEMPTS];
-        let profile = build_phase_profile(
-            &attempts,
-            PROFILED_ATTEMPTS as u64 + 1,
-            PROFILED_ATTEMPTS as u64,
-            0,
-            24_000_000,
-            0,
-            0,
-        );
-
-        assert!(!profile.estimate_complete);
-        assert_eq!(profile.termination, MetalPhaseTimings::default());
-    }
-
-    #[test]
-    fn phase_profile_preserves_the_fused_dispatch_order() {
-        let values = [1, 2, 3, 4, 5, 6, 7, 8, 9];
-        let timing = MetalPhaseTimings::from_values(values);
-
-        assert_eq!(timing.values(), values);
-        assert_eq!(timing.round_reset_ns, 2);
-        assert_eq!(timing.round_prepare_ns, 3);
-        assert_eq!(timing.continuation_control_ns, 5);
-        assert_eq!(timing.exchange_prefix_ns, 6);
-        assert_eq!(timing.final_control_ns, 9);
-    }
-
-    #[test]
-    fn phase_profile_attributes_every_dispatch_exactly_once() {
-        let mut values = [0_u64; PROFILE_PHASES];
-        for (dispatch, (_, phase, _)) in ATTEMPT_DISPATCHES.into_iter().enumerate() {
-            values[phase.index()] += dispatch as u64 + 1;
-        }
-        let timing = MetalPhaseTimings::from_values(values);
-
-        assert_eq!(timing.horizon_ns, 3);
-        assert_eq!(timing.round_reset_ns, 3);
-        assert_eq!(timing.round_prepare_ns, 4);
-        assert_eq!(timing.drain_execute_ns, 5);
-        assert_eq!(timing.continuation_control_ns, 13);
-        assert_eq!(timing.exchange_prefix_ns, 17);
-        assert_eq!(timing.exchange_scatter_ns, 10);
-        assert_eq!(timing.target_merge_ns, 11);
-        assert_eq!(timing.final_control_ns, 25);
-        assert_eq!(timing.total_ns(), (1_u64..=13).sum::<u64>());
-    }
-
-    #[test]
-    fn phase_profile_interval_accounting_handles_gaps_overlaps_and_nesting() {
-        let mut frontier = None;
-        let mut gaps = 0;
-        let mut overlaps = 0;
-        for (start, end) in [(0, 10), (12, 20), (18, 25), (19, 22), (30, 35)] {
-            accumulate_profile_interval(&mut frontier, start, end, &mut gaps, &mut overlaps);
-        }
-
-        assert_eq!(frontier, Some(35));
-        assert_eq!(gaps, 7);
-        assert_eq!(overlaps, 5);
     }
 }

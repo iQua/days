@@ -492,68 +492,6 @@ fn cuda_two_runs_are_byte_exact() {
 }
 
 #[test]
-fn cuda_phase_profile_uses_device_timestamps_without_changing_the_result() {
-    let image = fifo_taildrop_image();
-    let executor = CudaExecutor::new().expect("CUDA executor must initialize");
-    let unprofiled = executor
-        .run_with_observations(
-            &image,
-            Some(27),
-            CudaConfig::default(),
-            ObservationMode::Full,
-        )
-        .expect("unprofiled CUDA run must succeed");
-    let unsplit = executor
-        .run_unsplit_prepare_profiled_with_observations(
-            &image,
-            Some(27),
-            CudaConfig::default(),
-            ObservationMode::Full,
-        )
-        .expect("unsplit direct-event CUDA run must succeed");
-    let profiled = executor
-        .run_profiled_with_observations(
-            &image,
-            Some(27),
-            CudaConfig::default(),
-            ObservationMode::Full,
-        )
-        .expect("profiled CUDA run must succeed");
-
-    assert_eq!(unsplit.run.result, unprofiled.result);
-    assert_eq!(unsplit.run.rounds, unprofiled.rounds);
-    assert_eq!(unsplit.run.transitions, unprofiled.transitions);
-    assert_eq!(profiled.run.result, unprofiled.result);
-    assert_eq!(profiled.run.rounds, unprofiled.rounds);
-    assert_eq!(profiled.run.transitions, unprofiled.transitions);
-    assert_eq!(
-        profiled.profile.recorded_attempts,
-        profiled.run.encoded_attempts
-    );
-    assert_eq!(
-        unsplit.profile.recorded_attempts,
-        unsplit.run.encoded_attempts
-    );
-    assert_eq!(
-        unsplit.profile.recorded_attempts,
-        profiled.profile.recorded_attempts
-    );
-    assert_eq!(
-        unsplit.profile.recorded_dispatches,
-        unsplit.profile.recorded_attempts * 13
-    );
-    assert_eq!(
-        profiled.profile.recorded_dispatches,
-        profiled.profile.recorded_attempts * 16
-    );
-    assert!(unsplit.profile.unsplit_prepare_ns > 0);
-    assert!(profiled.profile.round_reset_ns > 0);
-    assert!(profiled.profile.round_prepare_ns > 0);
-    assert!(profiled.profile.total_kernel_ns() > 0);
-    assert!(profiled.profile.total_kernel_ns() <= profiled.run.device_ns);
-}
-
-#[test]
 fn cuda_continuation_state_crosses_graph_waves_exactly() {
     let image = long_continuation_image();
     let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)

@@ -48,8 +48,8 @@ fn only_streams_summary_omits_the_finalize_sweep() {
         CUDA_BACKEND
             .matches("!buffers.finalize_sweep_required")
             .count(),
-        2,
-        "CUDA production and drain-profile graphs must share the lowered-plan policy",
+        1,
+        "CUDA production encoding must apply the lowered-plan policy directly",
     );
     assert_eq!(
         METAL_BACKEND
@@ -59,20 +59,9 @@ fn only_streams_summary_omits_the_finalize_sweep() {
         "Metal ordinary encoding must apply the lowered-plan policy directly",
     );
     assert!(
-        CUDA_BACKEND.contains("index != PROFILE_FINALIZE_SWEEP_KERNEL_INDEX")
-            && CUDA_BACKEND.contains("index == FINALIZE_SWEEP_KERNEL_INDEX"),
-        "CUDA must omit the finalize sweep from graph capture and profile event attribution",
+        CUDA_BACKEND.contains("index == FINALIZE_SWEEP_KERNEL_INDEX"),
+        "CUDA must apply the policy only to the finalize-sweep entry",
     );
-    assert!(
-        METAL_BACKEND
-            .contains("profiled_attempt_dispatches(buffers.finalize_sweep_required).enumerate()")
-            && METAL_BACKEND
-                .contains("finalize_sweep_required || *kernel != AttemptKernel::FinalControlSweep")
-            && METAL_BACKEND
-                .contains("profiled_attempt_dispatches(finalize_sweep_required).enumerate()"),
-        "Metal profiling and resolution must share one compact, policy-selected dispatch layout",
-    );
-
     for (backend, finalize) in [
         ("CUDA", cuda_kernel("days_round_finalize")),
         ("Metal", metal_kernel("days_round_finalize")),

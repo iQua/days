@@ -14,15 +14,12 @@ fn main() {
 
     let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo provides OUT_DIR"))
         .join("days_cuda_kernels.fatbin");
-    let t32_output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo provides OUT_DIR"))
-        .join("days_cuda_t32_kernels.fatbin");
     if env::var_os("CARGO_FEATURE_CUDA_PLANNER_TEST").is_some()
         && env::var_os("CARGO_FEATURE_CUDA_TEST_HOOKS").is_none()
     {
         // The planner equality surface constructs host plans only. Keep it runnable on hosts
         // without nvcc while ensuring full CUDA test-hook and all-feature builds compile kernels.
         fs::write(&output, []).expect("host-only CUDA planner placeholder must be written");
-        fs::write(&t32_output, []).expect("host-only T32 CUDA planner placeholder must be written");
         return;
     }
 
@@ -44,27 +41,17 @@ fn main() {
         env::var_os("CARGO_MANIFEST_DIR").expect("Cargo provides CARGO_MANIFEST_DIR"),
     );
     let source = manifest_dir.join("src/cuda_kernels.cu");
-    compile_fatbin(&nvcc, &source, &output, false);
-    compile_fatbin(&nvcc, &source, &t32_output, true);
-}
-
-fn compile_fatbin(nvcc: &OsString, source: &PathBuf, output: &PathBuf, t32: bool) {
-    let mut command = Command::new(nvcc);
-    command
+    let compiled = Command::new(&nvcc)
         .arg("-std=c++17")
         .arg("-O3")
         .arg("-fatbin")
         .arg("-lineinfo")
         .arg("--diag-suppress=177")
         .arg("--generate-code=arch=compute_121,code=sm_121")
-        .arg("--generate-code=arch=compute_89,code=sm_89");
-    if t32 {
-        command.arg("-DDAYS_T32_PROFILE=1");
-    }
-    let compiled = command
+        .arg("--generate-code=arch=compute_89,code=sm_89")
         .arg("-o")
-        .arg(output)
-        .arg(source)
+        .arg(&output)
+        .arg(&source)
         .output()
         .unwrap_or_else(|error| {
             panic!(
@@ -72,12 +59,7 @@ fn compile_fatbin(nvcc: &OsString, source: &PathBuf, output: &PathBuf, t32: bool
                 nvcc.to_string_lossy()
             )
         });
-    let surface = if t32 { "T32 diagnostic" } else { "production" };
-    require_success(
-        nvcc,
-        &format!("sm_121 + sm_89 {surface} fatbin compilation"),
-        compiled,
-    );
+    require_success(&nvcc, "sm_121 + sm_89 fatbin compilation", compiled);
 }
 
 fn require_success(nvcc: &OsString, operation: &str, output: Output) {
