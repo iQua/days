@@ -1,94 +1,65 @@
 ---
 title: Topology Build Pipeline
-description: How a TOML config becomes a runnable simulation.
+description: How shared graph configuration becomes an exact image or legacy model graph.
 ---
 
-This page describes how a TOML config turns into a runnable simulation.
+Both engines start with the shared topology builder, then diverge into different runtime representations.
 
-## 1) Build the network graph
+## 1. Build the shared graph
 
-`src/topos/build.rs` constructs an undirected `petgraph::graph::UnGraph<usize, ()>` plus a `hosts: Vec<usize>` list.
+`src/topos/build.rs` returns:
 
-Supported topology modes:
+- an undirected `petgraph::graph::UnGraph<usize, ()>` of switches
+- `HostAttachments`, which maps semantic host IDs to attachment switches
+- `TopologyProfile`, used by topology-specific routing and lowering
 
-- **FatTree** (`[topology] category="FatTree"` + `[topology.fat_tree] k = ...`)
-- **Torus** (`[topology] category="Torus"` + `[topology.torus] dim = ... n = ...`)
-- **Custom graph** (omit `[topology]` and provide `edges = [...]` + `hosts = [...]`)
+Supported inputs are FatTree, Torus, Dragonfly, and custom `edges`/`hosts` graphs. Host IDs are not assumed to be switch IDs; all flow pairing and routing resolves them through `HostAttachments`.
 
-## 2) Initialize `Topology`
+## 2A. Compile an exact image
 
-`Topology::new` (`legacy/src/topos/topo.rs`) reads the config multiple times into smaller structs:
+`compile_config` in `src/scenario/compile.rs` validates the exact-model vocabulary and creates stable semantic IDs. It lowers:
 
-- `Config` (switch config, optional topology config, optional L2/app-source config, `time_quantum_ns`)
-- `MailboxConfig` (`mailbox_capacity`)
-- `UIConfig` (`duration`, `ui_interval`)
-- `ConcurrencyConfig` (`threading`, `hot_workers`, `concurrency_level`)
+1. one host LP for each semantic host
+2. one switch LP for each directed egress queue
+3. queue scheduler, admission, PFC, and in-service state
+4. forward and reverse channels with rate and propagation delay bounds
+5. flow generators, TCP/DCQCN state, collective generators, packets, and initial events
 
-It also sets global ID ranges so that switch IDs and endpoint IDs do not collide:
+Exact scheduling supports FIFO, strict priority, WFQ, DRR, and WRR. The exact compiler rejects VirtualClock. Exact routing supports shortest path and `FatTreeEcmp`; the latter requires a canonical FatTree and derives a stable semantic flow hash rather than using construction order.
 
-- switches are assigned IDs `[0..num_switches)`
-- endpoints (sources/sinks) start at `ENDPOINT_ID = num_switches`
+Flow sets support `Random`, `SwitchOffsetHalf`, and `SameSwitchNext` pairing. Exact collectives support RingAllReduce and AllGather only with deterministic byte-terminated packet-distribution traffic.
 
-This matters because `PacketSwitch.outputs` can target either a neighboring switch ID or an endpoint ID.
+Callers pass the completed `SimulationImage` to `executor::validate(image, backend)`. Image invariants are backend-independent; capability checks then reject mechanisms not ported to the selected device.
 
-## 3) Expand collectives into flows
+## 2B. Assemble legacy actors
 
-Collectives (`[[collective]]` / `[[collective_set]]`) are high-level communication patterns used for ML-style workloads. Before routing, `Topology::process_collectives` produces concrete `Flow` entries for each collective.
+The legacy CLI validates the complete TOML surface before `Topology::new` in `legacy/src/topos/topo.rs` assembles Nexosim models. It:
 
-Special case: `CollectiveType::RingAllReduce` expands into reduce-scatter-style + all-gather-style traffic phases with explicit dependency ordering. This expansion models communication, not payload reduction. Current constraints: ring traffic must be byte-sized, and `traffic.size` must be at least the ring size.
+1. configures Nexosim threading, mailbox capacity, time quantum, UI, and logger
+2. creates switches and bounded mailboxes
+3. creates one scheduler actor for every directed graph edge
+4. creates sources, sinks, collectives, and dependency connections
+5. computes routes and installs forward and reverse FIB entries
+6. initializes the simulation, injects start events, runs to the stop time, and flushes enabled logs
 
-## 4) Connect switches (create per-edge schedulers)
+Legacy scheduling additionally supports VirtualClock. Legacy routing supports shortest path, per-flow ECMP, explicit paths, and the shared semantic `FatTreeEcmp` policy, subject to each policy's validation rules. Legacy collective expansion supports RingAllReduce.
 
-`Topology::connect` iterates the graph edges and calls `connect_neighbours(upstream, downstream)` for each adjacency.
+## Host attachment and link stages
 
-For every directed edge, Days instantiates a **scheduler model** based on `switch.discipline`:
+The exact image always models host injection and delivery stages. Legacy preserves its historical direct endpoint wiring unless host attachment is enabled.
 
-- `FIFO` -> `Port`
-- `DRR` -> `DRRServer`
-- `WRR` -> `WRRServer`
-- `WFQ` -> `WFQServer`
-- `SP` -> `SPServer`
-- `VirtualClock` -> `VirtualClockServer`
+`model_host_attachment = true` enables the matching legacy stages. Omitting that key while setting `link.propagation_ns` also enables them, applying propagation to host and physical links. The strict validator rejects an explicit `model_host_attachment = false` combined with `link.propagation_ns`.
 
-Each scheduler is registered into `SimInit` and connected so that:
+For a legacy physical hop without PFC:
 
+```text
+PacketSwitch -> Scheduler -> optional Wire -> PacketSwitch
 ```
-PacketSwitch.outputs[downstream_id] -> Scheduler::packet_received
-Scheduler.output -> (optional L2 pipeline) -> downstream PacketSwitch::packet_received
+
+With `link.mode = "Pfc"` and the legacy `l2_pfc` feature:
+
+```text
+PacketSwitch -> Scheduler -> PfcEgressGate -> Link -> PfcIngressPort -> PacketSwitch
 ```
 
-## 5) Attach flow endpoints to host switches
-
-For each `Flow`, Days creates:
-
-- a `PacketSource` (distribution, TCP, or DCQCN)
-- a `PacketSink` (basic sink, TCP sink, or DCQCN sink)
-
-and wires them to the host switches selected by `flow.graph` (or generated host pairs for `flow_set`).
-
-Flow dependencies (`starts_after` / `starts_before`) are wired using `FlowFinishMsg`:
-
-- for packet distribution flows: the sink notifies dependents on `last_packet`
-- for TCP/DCQCN: the source notifies dependents when the flow completes
-
-## 6) Route flows and install forwarding tables (FIB)
-
-`Topology::route_flows`:
-
-1. Computes each flow’s path (`Flow::compute_path`) using one of:
-   - shortest path
-   - ECMP
-   - explicit `path = [...]`
-2. Installs per-flow forwarding entries:
-   - `fib[flow_id]` on intermediate switches for forward traffic
-   - `r_fib[flow_id]` on intermediate switches for reverse traffic (ACK/control)
-
-Once FIBs are installed, switches can forward packets purely based on `flow_id`.
-
-## 7) Activate UI and run
-
-Finally, `Topology::run`:
-
-- activates the progress UI,
-- initializes the simulation and steps until `duration`,
-- collects sink statistics and flushes CSV logs.
+The exact compiler can lower PFC into image state, but only scalar and CPU currently execute it; Metal and CUDA reject the image during backend validation.

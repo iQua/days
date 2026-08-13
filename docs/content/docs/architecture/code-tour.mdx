@@ -1,73 +1,77 @@
 ---
 title: Code Tour
-description: Map Days subsystems to the Rust source tree.
+description: Map shared, exact-executor, and legacy subsystems to the Rust source tree.
 ---
 
-This page maps the main subsystems of Days to the source tree, to make it easier to navigate the codebase.
+The repository contains shared scenario code plus two engine implementations. Start by deciding whether a file belongs to exact execution or the legacy Nexosim actor path.
 
-## Entry points
+## Workspace and entrypoints
 
-- `legacy/src/main.rs`: legacy CLI entry point (expects a TOML config path).
-- `src/lib.rs`: shared/current library root; `legacy/src/lib.rs` owns legacy IDs, seed state, and simulation entry points.
+- `src/lib.rs`: shared/current library root.
+- `src/scenario/`: exact scenario parsing, semantic IDs, and image lowering.
+- `src/topos/`: shared topology construction and routing.
+- `executor/`: exact scalar, CPU, Metal, and CUDA engine crate.
+- `legacy/src/lib.rs`: legacy IDs, seed state, configuration, and simulation entrypoints.
+- `legacy/src/main.rs`: the `days` legacy CLI.
+- `validation/`: cross-engine and cross-backend validation tests.
+- `lean/`: offline protocol conformance models and proofs.
 
-## Topology construction and execution
+## Shared topology and exact lowering
 
-- `src/topos/build.rs`: parses topology settings and builds a `petgraph` `UnGraph` (FatTree, Torus, or custom edges/hosts).
-- `legacy/src/topos/topo.rs`: the legacy orchestration layer:
-  - parses runtime config (threads, duration, mailbox capacity),
-  - instantiates switches, schedulers, sources/sinks,
-  - computes routes and installs switch forwarding tables,
-  - runs the simulation and flushes logs,
-  - conditionally wires the PFC link pipeline when enabled.
+- `src/topos/config.rs`: topology, switch, link, host-attachment, and routing configuration types.
+- `src/topos/build.rs`: FatTree, Torus, Dragonfly, and custom graph builders; returns `HostAttachments` and `TopologyProfile` with the graph.
+- `src/topos/route.rs`: shortest path, per-flow ECMP, explicit path, and semantic FatTree ECMP implementations.
+- `src/scenario/compile.rs`: exact-model validation and lowering into `SimulationImage`.
+- `src/scenario/ids.rs`: stable semantic LP, link, flow, packet, and payload ID assignment.
 
-## Switching and forwarding
+## Exact executor
 
-- `legacy/src/switches/mod.rs`: scheduler selection reexports.
-- `legacy/src/switches/switch.rs`: `PacketSwitch` (demultiplexes packets using `fib` / `r_fib` and forwards via `Output<Packet>` ports).
+Core representation and semantics:
 
-## Queueing and scheduling (per edge)
+- `executor/src/image.rs`: immutable image descriptors and owned host/switch/flow state.
+- `executor/src/event.rs`: fixed event payloads, phases, and canonical `EventKey` ordering.
+- `executor/src/model.rs`: schedulers, admission policies, queue units, and protocol state types.
+- `executor/src/scalar.rs`: shared transition semantics, global scalar calendar, observations, and `RunResult`.
+- `executor/src/validate.rs`: image invariants and backend capability rejection.
+- `executor/src/time.rs`: checked integer-nanosecond arithmetic.
 
-- `legacy/src/schedulers/mod.rs`: `ReportStatistics` trait and shared report reexports.
-- `legacy/src/schedulers/drop.rs`: drop/mark policies (`TailDrop`, `RED`, `RED_ECN`, `ECN_THRESHOLD`).
-- `legacy/src/schedulers/state.rs`: `QueueState` (shared occupancy tracking, used by PFC).
-- `legacy/src/schedulers/port.rs`: FIFO scheduler (`Port`).
-- `legacy/src/schedulers/drr.rs`: Deficit Round Robin.
-- `legacy/src/schedulers/wrr.rs`: Weighted Round Robin.
-- `legacy/src/schedulers/wfq.rs`: Weighted Fair Queueing.
-- `legacy/src/schedulers/sp.rs`: Static Priority.
-- `legacy/src/schedulers/vc.rs`: Virtual Clock.
+Parallel execution:
 
-## Flows (sources, sinks, routing, collectives)
+- `executor/src/safe_horizon.rs`: round scalar, sparse LP frontier, exclusive horizons, and canonical remote exchange.
+- `executor/src/cpu.rs`: persistent CPU workers and whole-LP ownership.
+- `executor/src/metal.rs` and `executor/src/metal_kernels.metal`: Metal planning, execution, retry, gather, and readback.
+- `executor/src/cuda.rs` and `executor/src/cuda_kernels.cu`: CUDA planning, execution, retry, gather, and readback.
+- `executor/src/device_sizing.rs`: shared arena sizing.
+- `executor/src/device_capacity.rs`: caps, per-entity floors, retries, and `CapacityWarmStart`.
+- `executor/src/device_compaction.rs`: canonical live-record readback plans.
+- `executor/src/device_scheduler.rs`: checked device scheduler arithmetic.
+- `executor/src/planner_capacity.rs`: planner capacity context shared by device paths.
 
-- `legacy/src/flows/mod.rs`: traffic types and legacy process-model exports.
-- `legacy/src/flows/packet.rs`: `Packet`, ECN field, TCP ACK metadata, control packet markers.
-- `legacy/src/flows/flow.rs`: `Flow` config parsing and path computation.
-- `src/topos/route.rs`: shared routing implementations (ShortestPath, ECMP, PathFromConfig).
-- `legacy/src/flows/source.rs`: `PacketSource` enum (dispatch wrapper for different sources).
-- `legacy/src/flows/dist_source.rs`: packet distribution source.
-- `legacy/src/flows/tcp_source.rs`: TCP source (Reno/CUBIC/BBR congestion control, optional app-backed data).
-- `legacy/src/flows/sink.rs`: `PacketSink` enum (dispatch wrapper for different sinks).
-- `legacy/src/flows/basic_sink.rs`: basic sink (stats + completion notification).
-- `legacy/src/flows/tcp_sink.rs`: TCP sink (ACK generation, ECN echo).
-- `legacy/src/flows/cc.rs`: congestion control trait + algorithm selection.
-- `legacy/src/flows/reno.rs`, `legacy/src/flows/cubic.rs`, `legacy/src/flows/bbr.rs`: congestion control algorithm implementations.
-- `legacy/src/flows/collective.rs`: collective parsing and endpoint generation.
-- `legacy/src/flows/app_source.rs`: application-level byte buffers for TCP collectives (actor-based).
-- `legacy/src/flows/wire.rs`: optional propagation-delay element (not part of the default topology pipeline).
-- `legacy/src/flows/dcqcn_source.rs`, `legacy/src/flows/dcqcn_sink.rs`: DCQCN models (feature `dcqcn`).
+Mechanism-specific exact state and traces live in `executor/src/tcp.rs`, `tcp_ledger.rs`, `dcqcn.rs`, `aqm_trace.rs`, `mechanism_trace.rs`, and `tcp_trace.rs`.
 
-## Optional L2 / PFC
+The frontier harness is `src/bin/t20f_frontier.rs`; its closed 262,144-flow fixture is `configs/benchmarks/p11/rq9_frontier_closed_k32.toml`.
 
-- `legacy/src/l2/frame.rs`: `LinkFrame` (data + optional PFC frames).
-- `legacy/src/l2/link.rs`: `Link` serializer (transmits frames at a configured rate).
-- `legacy/src/l2/pfc.rs`: `PfcIngressPort` + `PfcEgressGate` and reporting.
+## Legacy Nexosim engine
 
-## Logging and UI
+Assembly and runtime boundary:
 
-- `src/utils/logger.rs`: CSV logger singleton, report buffering, optional DCQCN event traces.
-- `legacy/src/utils/ui.rs`: progress bar UI model.
+- `legacy/src/config.rs`: strict validation of the legacy configuration surface.
+- `legacy/src/topos/topo.rs`: actor construction, port wiring, routing/FIB installation, execution, and result collection.
+- `legacy/src/utils/exact_time.rs`: integer-nanosecond event-clock conversions.
 
-## Tests and examples
+Network actors:
 
-- `tests/`, `legacy/tests/`, and `validation/tests/`: current, legacy, and cross-engine integration tests.
-- `legacy/examples/`: runnable Rust examples (`cargo run -p days-legacy --example <name>`).
+- `legacy/src/switches/switch.rs`: `PacketSwitch` forwarding.
+- `legacy/src/schedulers/`: FIFO, strict priority, WFQ, DRR, WRR, VirtualClock, and admission policies.
+- `legacy/src/flows/`: packet-distribution, TCP, DCQCN, collective, source/sink, application-source, and wire models.
+- `legacy/src/l2/`: feature-gated link frames and PFC actors.
+- `crates/nexosim/`: vendored actor runtime, ports, mailboxes, scheduler, clock, and executors.
+
+## Logging and verification
+
+- `src/utils/logger.rs`: `csv_logging`, periodic reports, CSV file ownership, and trace manifest generation.
+- `legacy/src/utils/ui.rs`: legacy progress UI.
+- `tests/`: shared lowering and exact integration tests.
+- `executor/tests/`: executor unit and backend contract tests.
+- `legacy/tests/`: legacy configuration and behavior tests.
+- `validation/tests/`: normalized cross-engine/backend comparisons.
