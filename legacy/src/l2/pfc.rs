@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use log::debug;
 use serde::{Deserialize, Serialize};
-use tracing::instrument;
 
 use nexosim::model::{
     BuildContext, Context, InitializedModel, Model, ModelRegistry, ProtoModel, SchedulableId,
@@ -326,7 +325,6 @@ impl PfcIngressPort {
         }
     }
 
-    #[instrument(skip(self, cx))]
     pub async fn frame_received(&mut self, frame: LinkFrame, cx: &Context<Self>) {
         #[cfg(feature = "test")]
         {
@@ -352,12 +350,10 @@ impl PfcIngressPort {
         }
     }
 
-    #[instrument(skip(self, cx))]
     pub async fn packet_received(&mut self, packet: Packet, cx: &Context<Self>) {
         self.frame_received(LinkFrame::Data(packet), cx).await;
     }
 
-    #[instrument(skip(self, cx))]
     async fn refresh(&mut self, priority: usize, cx: &Context<Self>) {
         let now = quantize_time(cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64());
         self.refresh_scheduled_at[priority] = None;
@@ -366,7 +362,6 @@ impl PfcIngressPort {
         }
     }
 
-    #[instrument(skip(self, cx))]
     async fn drain_retry(&mut self, now: f64, cx: &Context<Self>) {
         self.drain_scheduled_at = None;
         self.drain(now, cx).await;
@@ -563,7 +558,6 @@ impl PfcEgressGate {
         }
     }
 
-    #[instrument(skip(self, cx))]
     pub async fn frame_received(&mut self, frame: LinkFrame, cx: &Context<Self>) {
         #[cfg(feature = "test")]
         {
@@ -582,12 +576,10 @@ impl PfcEgressGate {
         self.schedule_resume(now, cx);
     }
 
-    #[instrument(skip(self, cx))]
     pub async fn packet_received(&mut self, packet: Packet, cx: &Context<Self>) {
         self.frame_received(LinkFrame::Data(packet), cx).await;
     }
 
-    #[instrument(skip(self, cx))]
     pub async fn pfc_received(&mut self, frame: PfcFrame, cx: &Context<Self>) {
         #[cfg(feature = "test")]
         {
@@ -634,7 +626,6 @@ impl PfcEgressGate {
         self.schedule_resume(now, cx);
     }
 
-    #[instrument(skip(self, cx))]
     async fn resume(&mut self, now: f64, cx: &Context<Self>) {
         let now = quantize_time(now);
         self.resume_scheduled_at = None;

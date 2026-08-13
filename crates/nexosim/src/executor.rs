@@ -57,12 +57,6 @@ pub(crate) fn worker_id() -> Option<usize> {
     WORKER_ID.map(|id| *id)
 }
 
-#[cfg(feature = "perf_stats")]
-#[allow(dead_code)]
-pub(crate) fn report_executor_perf_stats() {
-    mt_executor::report_perf_stats();
-}
-
 /// A single-threaded or multi-threaded `async` executor.
 #[derive(Debug)]
 pub(crate) enum Executor {

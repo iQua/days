@@ -28,6 +28,9 @@ production implementation around them.
 | `configs/benchmarks/p11/fattree_k32_load90_profile.toml` | Deleted the profile-only fixture introduced with the T20 reporter and unreferenced elsewhere. |
 | `src/bin/t20e_plan_benchmark.rs` and `measure_{cuda,metal}_planner_for_testing` | Deleted the planner timing/probe binary and its orphaned timing hooks. Exact plan sizing and planner equality APIs/tests remain. |
 | `src/bin/t21_horizon_trace.rs`, `tests/t21_horizon_trace.rs` | Deleted the horizon/round trace instrument, CSV/histogram output, and its binary tests. |
+| CUDA/Metal readback word counters | Deleted `READBACK_WORDS`, `PLANE_WORDS`, their test-only APIs, all accounting calls, and the measurement-only size/ratio assertions. The production T20l live-region gather/readback mechanism remains. |
+| Shared and legacy concurrency tracing | Deleted the two active/peak task counters, the tracing layer, wall-clock sampler thread, `tracing_active`/`tracing_interval` config and CLI/topology plumbing, 37 model `#[instrument]` spans, tests, direct dependencies, example keys, and documentation. Nexosim's generic optional tracing feature remains for independent upstream tracing support. |
+| Nexosim `perf_stats` | Deleted both Cargo features, all 15 atomic counters, all gated accounting/reporting sites, `[perf_stats]` output, and documentation/research references. |
 | `MetalPlan::new` production compilation | Restricted to `planner-test-hooks` after the planner-timing binary was deleted; its only remaining caller is the retained exact sizing helper `size_metal_plan_for_testing`. |
 | Public exports, opt-in flags, test-gate audit rows, and Cargo feature members orphaned by the above | Deleted only after repository-wide reference searches and full builds proved they had no remaining consumer. |
 
@@ -42,6 +45,8 @@ production implementation around them.
 | Metal dominant-arena high-water hook (`DAYS_DOMINANT_ARENA_HIGH_WATER`, `ArenaOccupancyHighWater`, `DominantArenaHighWater`) | Ambiguous, so kept. It is diagnostic-only, but the protected E5 capped-Metal capacity gate consumes it to prove observed arena occupancy stays within authored production capacities. Removing it would weaken a capacity derivation/correctness gate that is explicitly out of scope. |
 | `size_{cuda,metal}_plan_for_testing`, planner test-hook features, `DeviceSizingReport`, capacity caps/floors/retry/warm-start/high-water growth | Production capacity derivation, refusal/retry behavior, exact layout reporting, and planner equality depend on these surfaces. Only wall-clock planner measurement wrappers were removed. |
 | `CapacityRetryRecord` and `capacity_retry_trace` | Deterministic production retry/refusal evidence used by production runners and correctness tests, not a measurement-only counter. |
+| CUDA/Metal T20l live-region gather/readback | Production result recovery compacts live device regions before copying them to the host. Only its measurement bookkeeping was removed; gather functions, kernels, decode ordering, and retry behavior remain. |
+| Structural safe-horizon tests in `executor/tests/safe_horizon_rounds.rs` | Restored the three executor invariants for horizon lookahead, monotonic round partitioning, and the equivalent-slot round bound. They do not depend on the deleted trace binary or CSV output. |
 | Queue byte totals and `t20b3_queue_bytes` | Production byte-unit admission state and a production-run regression harness; no diagnostic selector is involved. |
 | `aqm_trace`, `mechanism_trace`, `tcp_trace`, LeanGuard CSV traces, and trace manifests | Semantic protocol certificates and validator inputs, not performance measurement instrumentation. |
 | Validator, checkpoints, `csv_logging`, topology/lowering, actor/executor mechanisms, protocol state, device compaction/scheduling, and TCP ledger/ring state | Explicitly protected production behavior. No deletion in this branch targets these mechanisms. |
@@ -54,6 +59,10 @@ production implementation around them.
   `56f7b24157e2e852`, 664 rounds, and 212,378,014 transitions.
 - CUDA native fields retained: `graph_capture_ns`, `host_submit_ns`, `device_ns`, and `wall_ns`.
 - Metal native fields retained: `host_encode_submit_ns`, `device_ns`, and `wall_ns`.
+- Legacy native timing output retained byte-for-byte:
+  `Nexosim step_until wall-clock time: {:.9} seconds.`,
+  `Nexosim total wall-clock time: {:.9} seconds.`, and
+  `Elapsed wall-clock time: {:.3} seconds.`
 - Benchmark output retained: `backend_ns` in `t20a_round_timing`; `run_ns`, `wall_ns`, and
   `device_ns` in `t20f_frontier`.
 
@@ -62,7 +71,7 @@ production implementation around them.
 All commands ran from the isolated cleanup worktree.
 
 - `cargo build --workspace --locked`: PASS.
-- `cargo test -p days-executor -- --show-output`: PASS, 326 passed, 2 ignored, 0 failed.
+- `cargo test -p days-executor -- --show-output`: PASS, 329 passed, 2 ignored, 0 failed.
 - `cargo test -p days --features test -- --show-output`: PASS, 178 passed, 26 ignored,
   0 failed.
 - `cargo test -p days-legacy --features test -- --show-output`: PASS, 247 passed,
@@ -75,11 +84,16 @@ All commands ran from the isolated cleanup worktree.
   --show-output`: PASS, 5/5.
 - `cargo test --release -p days --features test,metal-spike --test t20b3_queue_bytes
   k32_byte_policy_strict_run_is_retry_free -- --show-output`: PASS.
-- Warnings denied: executor default, executor `metal-spike`, root `test,metal-spike`, and
-  `leanguard-run` all PASS.
+- `cargo build -p days-legacy --all-features` and the all-feature legacy config-hardening suite:
+  PASS, 22/22 config-hardening tests.
+- Warnings denied: executor default, executor `metal-spike`, root `test,metal-spike`,
+  `leanguard-run`, and legacy all-features all PASS.
 - `cargo fmt --all -- --check`, `cargo xtask audit`, and `git diff --check`: PASS.
 - Repository-wide deleted-symbol and deleted-binary reference searches: zero matches outside this
   inventory.
+- A short isolated legacy run emitted the preserved 9-decimal `Nexosim step_until` and
+  `Nexosim total` lines plus the 3-decimal `Elapsed` line; no `Concurrency:` or `[perf_stats]`
+  output appeared.
 
 E5 PRIMARY Summary anchors:
 
@@ -91,5 +105,5 @@ E5 PRIMARY Summary anchors:
 - Production-only `t20f_frontier` Metal run: PASS — preserved `wall_ns`, `device_ns`, and
   `run_ns` records and reproduced the same bytes/FNV/rounds/transitions.
 
-The final cleanup diff is strongly net-negative; its exact short stat is recorded in the commit and
-handoff summary.
+The final cleanup diff is strongly net-negative: **85 files changed, 578 insertions, and 12,880
+deletions** against base `acd7f10`.

@@ -108,8 +108,7 @@ pub use metal::size_metal_plan_for_testing;
 #[cfg(all(feature = "metal-test-hooks", target_vendor = "apple"))]
 #[doc(hidden)]
 pub use metal::{
-    ArenaOccupancyHighWater, DominantArenaHighWater, last_plane_words_for_testing,
-    take_dominant_arena_high_water_for_testing,
+    ArenaOccupancyHighWater, DominantArenaHighWater, take_dominant_arena_high_water_for_testing,
 };
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub use metal::{

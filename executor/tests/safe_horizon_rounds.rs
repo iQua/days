@@ -139,6 +139,15 @@ fn image(stop_time_ns: u64, event_time_ns: u64, channel_delay_ns: u64) -> Simula
     }
 }
 
+fn minimum_channel_delay_ns(image: &SimulationImage) -> u64 {
+    image
+        .channels
+        .iter()
+        .map(|channel| channel.min_delay_ns)
+        .min()
+        .expect("a simulation image has at least one channel")
+}
+
 fn add_sink_owned_egress(image: &mut SimulationImage) {
     let sink_egress = LinkDescriptor {
         id: LinkId(1),
@@ -411,6 +420,75 @@ fn scalar_rounds_match_the_global_queue_and_record_sparse_round_work() {
     assert_eq!(run.rounds[1].lp_work[0].node, SINK);
     assert_eq!(run.rounds[0].parallel_efficiency, 1.0);
     assert_eq!(run.rounds[1].parallel_efficiency, 1.0);
+}
+
+/// The horizon is exactly `frontier + minimum channel delay`, clamped by the configured stop.
+///
+/// This is the definition the equivalent-slot denominator is derived from: a pipeline that must
+/// quantise at the shortest delay anywhere in the fabric needs one tick per `min_delay_ns`.
+#[test]
+fn every_round_horizon_is_the_frontier_plus_the_minimum_channel_delay() {
+    let image = image(100, 0, 10);
+    let quantum = u128::from(minimum_channel_delay_ns(&image));
+    let run_end = u128::from(image.stop_time_ns) + 1;
+    let run = run_scalar_rounds_with_observations(&image, None, ObservationMode::Summary)
+        .expect("scalar round run must succeed");
+
+    assert!(!run.rounds.is_empty(), "fixture must execute rounds");
+    for (index, round) in run.rounds.iter().enumerate() {
+        assert_eq!(
+            round.exclusive_horizon_ns,
+            run_end.min(u128::from(round.frontier_ns) + quantum),
+            "round {index} horizon is not the frontier plus the lookahead quantum",
+        );
+    }
+}
+
+/// Round boundaries never move backwards, and no round starts before the previous one ended.
+///
+/// Without this the per-round trace could not be read as a partition of simulated time, and the
+/// horizon-width-over-simulated-time artifact would be meaningless.
+#[test]
+fn round_boundaries_partition_simulated_time_forwards() {
+    let image = image(100, 0, 10);
+    let run = run_scalar_rounds_with_observations(&image, None, ObservationMode::Summary)
+        .expect("scalar round run must succeed");
+
+    for pair in run.rounds.windows(2) {
+        assert!(
+            u128::from(pair[1].frontier_ns) >= pair[0].exclusive_horizon_ns,
+            "round frontier {} precedes the previous horizon {}",
+            pair[1].frontier_ns,
+            pair[0].exclusive_horizon_ns,
+        );
+        assert!(
+            pair[1].exclusive_horizon_ns > pair[0].exclusive_horizon_ns,
+            "round horizon did not advance past {}",
+            pair[0].exclusive_horizon_ns,
+        );
+    }
+}
+
+/// The hardware-independent claim: our round count is bounded by the equivalent slot count.
+///
+/// A slot pipeline quantised at the fabric's shortest delay needs `ceil(span / quantum)` ticks to
+/// cover the same simulated span. Because the horizon advances by at least one quantum per round,
+/// our round count can only meet or beat that bound. The rounds-vs-slots ratio published for a
+/// fixture is therefore a structural statement, never a hardware one.
+#[test]
+fn rounds_never_exceed_the_equivalent_slot_count_at_the_minimum_delay_quantum() {
+    let image = image(100, 0, 10);
+    let quantum = u128::from(minimum_channel_delay_ns(&image));
+    let run = run_scalar_rounds_with_observations(&image, None, ObservationMode::Summary)
+        .expect("scalar round run must succeed");
+
+    let span_ns = u128::from(image.stop_time_ns);
+    let equivalent_slots = span_ns.div_ceil(quantum);
+    assert!(
+        run.rounds.len() as u128 <= equivalent_slots,
+        "{} rounds exceed the {equivalent_slots} equivalent slots of a {quantum} ns quantum",
+        run.rounds.len(),
+    );
 }
 
 #[test]

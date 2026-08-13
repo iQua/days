@@ -99,7 +99,7 @@ outside the anchor under the exact-time erratum in [§6.9](#69-exact-time-erratu
 
 ## 3. Freeze policy
 
-**No changes. Six narrow exceptions, each requiring a changelog row in
+**No changes. Seven narrow exceptions, each requiring a changelog row in
 [§8](#8-freeze-changelog).**
 
 | # | Allowed change | Why it must be allowed |
@@ -110,8 +110,9 @@ outside the anchor under the exact-time erratum in [§6.9](#69-exact-time-erratu
 | **(d)** | **The ordered E5 expressibility repair.** Minimal fixes for exact event scheduling, strict `FatTreeEcmp`/structural-pairing handling, byte-budget TCP with configurable MSS, sound cumulative ACK/loss recovery using the existing Reno controller, propagation activation, and correctness observability. | Explicit user authority in `days-gpu/plans/p12-opening-plan.md`, registry entry `LEGACY-ON-E5 ORDERED — FREEZE CONTRACT AMENDED` (August 9, 2026). This is bounded to the reviewed T0–T7 plan and the individually authorized, guardrailed follow-up repairs recorded in the same registry (fast retransmit, cumulative-ACK credit, Reno window-cap alignment, and sender-side SWS avoidance); it does not authorize a new controller or general legacy development. |
 | **(e)** | **The T28 E1 expression and configuration-integrity repair.** Minimal scalar-propagation activation, a strict legacy-owned configuration vocabulary, and correctness gates for the frozen E1 family, E3, and E5. | Explicit user authority in the T28 legacy E1 task (August 10, 2026). This exception is limited to exact E1 semantics and refusal of unimplemented input; it does not authorize a new protocol, controller, output field, or performance work. |
 | **(f)** | **The T30 configurable CSV suppression repair.** A default-on root TOML boolean may suppress CSV initialization, threshold/final writes, and trace-manifest work while retaining simulation semantics and bounded correctness bookkeeping. | Explicit user authority in the T30 legacy CSV logging task (August 11, 2026). This exception is limited to the configuration key, output suppression, its correctness gates, and the timed-quiet/untimed-verify contract. |
+| **(g)** | **The user-authorized instrumentation cleanup.** Remove measurement-only legacy concurrency task/peak sampling, its tracing/config/CLI/model-span plumbing, and Nexosim `perf_stats` counters, features, reporters, and documentation. | Explicit user authority in the instrumentation-removal review follow-up (August 12, 2026). This exception is limited to Findings 3 and 4 and must preserve the native `step_until`, `Nexosim total`, and elapsed wall-clock calculations and output formats byte-for-byte. |
 
-**Never, under exceptions (a)–(c), and outside the exact bounds of exceptions (d)–(f):**
+**Never, under exceptions (a)–(c), and outside the exact bounds of exceptions (d)–(g):**
 
 - no new protocols, mechanisms, schedulers, queue disciplines, or congestion-control variants;
 - no new configuration keys, no new output fields, no new features in `[features]`;
@@ -119,7 +120,7 @@ outside the anchor under the exact-time erratum in [§6.9](#69-exact-time-erratu
 - no behaviour change of any kind. If a change would alter what any existing fixture
   produces, it is out of policy — stop and escalate rather than proceed.
 
-**Every** change under (a), (b), (c), (d), (e), or (f) adds a row to
+**Every** change under (a), (b), (c), (d), (e), (f), or (g) adds a row to
 [§8](#8-freeze-changelog) in the same commit. A change to `legacy/` without a changelog row is a
 policy violation regardless of how small it is.
 
@@ -151,7 +152,7 @@ version per semver-compatible range across the workspace. Most of legacy's pins 
 live crate also uses. **Consult this split before touching any pin:**
 
 - **Shared — a live crate depends on these, so legacy's pin is the version the whole workspace
-  gets:** `csv`, `env_logger`, `log`, `tracing`, `tracing-subscriber`, `parking_lot`, `petgraph`,
+  gets:** `csv`, `env_logger`, `log`, `parking_lot`, `petgraph`,
   `rand`, `serde`, `serde_json`, `thiserror`, `toml`, `tempfile`, `assert_cmd`, `predicates`, and
   **`nexosim`** — `days-validation` carries `nexosim = { version = "1.0.0", … }`
   (`validation/Cargo.toml:18`). The `[patch.crates-io]` entry in the root manifest redirects every
@@ -640,3 +641,4 @@ to anything else under `legacy/` always do.
 | 2026-08-10 | `T22a: Avoid legacy sender silly windows` | (d) | Delayed non-final sub-MSS originals while data remains in flight, while retaining an exact final tail and the empty-flight deadlock escape; added focused behavior tests and an E3-only TCP-source-construction tripwire. | The `THIRD LEGACY DEFECT — SENDER-SIDE SILLY WINDOW` registry entry in `days-gpu/plans/p12-opening-plan.md`. |
 | 2026-08-10 | `T28: Express legacy E1 fixtures exactly` | (e) | Activated the configured scalar propagation model, added strict rejection of unowned or unimplemented legacy input, and added direct E1 expression, E3 inertness, and E5 non-regression gates. | The user-authorized T28 legacy E1 implementation and correctness task. |
 | 2026-08-11 | `T30: Configure legacy CSV logging from TOML` | (f) | Added default-on `csv_logging`; false mode performs no CSV or trace-manifest filesystem work and drops reports after constant-size correctness reduction, while temporary true/false overlays prove identical E3/E5 outcomes. | The user-authorized T30 legacy CSV logging implementation and correctness task. |
+| 2026-08-12 | `Fix instrumentation cleanup review findings` | (g) | Removed legacy concurrency sampling and its tracing/config/CLI/model-span plumbing, plus Nexosim `perf_stats` counters, features, accounting, reporters, and references. Preserved the native `step_until`, `Nexosim total`, and elapsed wall-clock calculations and output formats byte-for-byte. | The user-authorized instrumentation-removal review follow-up, Findings 3 and 4. |

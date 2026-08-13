@@ -85,10 +85,10 @@ Flow dependencies (`starts_after` / `starts_before`) are wired using `FlowFinish
 
 Once FIBs are installed, switches can forward packets purely based on `flow_id`.
 
-## 7) Activate UI, tracing, and run
+## 7) Activate UI and run
 
 Finally, `Topology::run`:
 
-- activates the progress UI and optional concurrency tracer,
+- activates the progress UI,
 - initializes the simulation and steps until `duration`,
 - collects sink statistics and flushes CSV logs.

@@ -62,11 +62,10 @@ This page maps the main subsystems of Days to the source tree, to make it easier
 - `legacy/src/l2/link.rs`: `Link` serializer (transmits frames at a configured rate).
 - `legacy/src/l2/pfc.rs`: `PfcIngressPort` + `PfcEgressGate` and reporting.
 
-## Logging, UI, and tracing
+## Logging and UI
 
 - `src/utils/logger.rs`: CSV logger singleton, report buffering, optional DCQCN event traces.
 - `legacy/src/utils/ui.rs`: progress bar UI model.
-- `src/utils/tracing.rs`: concurrency tracking layer and sampler model.
 
 ## Tests and examples
 

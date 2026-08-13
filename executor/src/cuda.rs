@@ -134,16 +134,6 @@ fn select_cuda_provisioning(
 #[cfg(feature = "cuda-test-hooks")]
 std::thread_local! {
     static PANIC_AFTER_NEXT_EXECUTION: Cell<bool> = const { Cell::new(false) };
-    /// Words this thread has copied out of device buffers since the last reset.
-    ///
-    /// Thread-local like the panic hook above: the retry loop, the readback and the test all run
-    /// on the caller's thread, so no shared mutable state is introduced.
-    static READBACK_WORDS: Cell<u64> = const { Cell::new(0) };
-    /// Words in every result plane of the last attempt this thread allocated buffers for.
-    ///
-    /// T20l fix 2's counterfactual: this is exactly what the pre-fix `finish` read back, so
-    /// `readback_words / plane_words` is the compaction ratio a test can assert on.
-    static PLANE_WORDS: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Acquires the supported process-wide CUDA execution envelope.
@@ -170,37 +160,6 @@ fn panic_after_execution_if_requested() {
     if PANIC_AFTER_NEXT_EXECUTION.replace(false) {
         panic!("injected panic after CUDA execution");
     }
-}
-
-/// Returns and clears this thread's device-to-host readback word count.
-///
-/// T20l fix 1 is an ordering property — *when* the result arena crosses the bus — and this is the
-/// quantity that makes it testable: a screened faulting attempt copies the control plane (and, on
-/// a ledger fault, the per-flow occupancy metadata) instead of every plane.
-#[cfg(feature = "cuda-test-hooks")]
-#[doc(hidden)]
-pub fn take_readback_words_for_testing() -> u64 {
-    READBACK_WORDS.replace(0)
-}
-
-#[cfg(feature = "cuda-test-hooks")]
-fn account_readback_words(words: usize) {
-    READBACK_WORDS.set(READBACK_WORDS.get().saturating_add(words as u64));
-}
-
-/// Returns the total result-plane word count of the last attempt this thread planned.
-///
-/// T20l fix 2's gate is a ratio, and this is its denominator: the pre-fix `finish` read every one
-/// of these words on every successful attempt.
-#[cfg(feature = "cuda-test-hooks")]
-#[doc(hidden)]
-pub fn last_plane_words_for_testing() -> u64 {
-    PLANE_WORDS.get()
-}
-
-#[cfg(feature = "cuda-test-hooks")]
-fn record_plane_words(words: u64) {
-    PLANE_WORDS.set(words);
 }
 
 /// Bounded device arena reported by a production CUDA capacity fault.
@@ -299,8 +258,6 @@ fn bounded_plane_words<const N: usize>(
         // is built — by the same shared function Metal validates its clamped `read_range` with, so
         // the two backends refuse identically and one unit test covers both.
         let range = metadata_region(plane.len(), start, len, region).map_err(compaction_error)?;
-        #[cfg(feature = "cuda-test-hooks")]
-        account_readback_words(range.len());
         match stream.clone_dtoh(&plane.slice(range)) {
             Ok(words) => regions.push(words),
             Err(error) => {
@@ -3740,10 +3697,6 @@ impl CudaBuffers {
                 .map_err(|error| driver_error(format!("result plane {index} upload"), error))
         })
         .collect::<Result<Vec<_>, _>>()?;
-        #[cfg(feature = "cuda-test-hooks")]
-        record_plane_words(planes.iter().fold(0_u64, |total, plane| {
-            total.saturating_add(plane.len() as u64)
-        }));
         Ok(Self {
             planes,
             orphan_packets,
@@ -3835,8 +3788,6 @@ impl CudaBuffers {
         let mut readback_error = None;
         for index in WHOLE_PLANES {
             let plane = &self.planes[index];
-            #[cfg(feature = "cuda-test-hooks")]
-            account_readback_words(plane.len());
             match stream.clone_dtoh(plane) {
                 Ok(words) => whole.push(words),
                 Err(error) => {
@@ -4543,17 +4494,13 @@ impl DirectCuda {
         for destination in &destinations {
             match destination {
                 None => gathered.push(Vec::new()),
-                Some(destination) => {
-                    #[cfg(feature = "cuda-test-hooks")]
-                    account_readback_words(destination.len());
-                    match self.stream.clone_dtoh(destination) {
-                        Ok(words) => gathered.push(words),
-                        Err(error) => {
-                            readback_error = Some(driver_error("compacted arena readback", error));
-                            break;
-                        }
+                Some(destination) => match self.stream.clone_dtoh(destination) {
+                    Ok(words) => gathered.push(words),
+                    Err(error) => {
+                        readback_error = Some(driver_error("compacted arena readback", error));
+                        break;
                     }
-                }
+                },
             }
         }
         self.stream
@@ -4787,8 +4734,6 @@ fn screen_plane_words(
     view: CudaBufferView<'_>,
     context: &str,
 ) -> Result<Vec<u64>, CudaError> {
-    #[cfg(feature = "cuda-test-hooks")]
-    account_readback_words(view.len());
     let words = stream
         .clone_dtoh(&view)
         .map_err(|error| driver_error(format!("{context} readback"), error));

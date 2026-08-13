@@ -1107,58 +1107,6 @@ fn cuda_capacity_warm_start_records_a_plane_wide_arena_raised_through_its_overri
     assert_eq!(warm.capacity_warm_start, cold.capacity_warm_start);
 }
 
-/// The CUDA sibling of
-/// `metal_production::metal_readback_copies_the_live_regions_and_not_the_arena`.
-///
-/// T20l fix 2: a successful attempt copies the live regions, not the arena. The Metal test carries
-/// the *magnitude* (11,604 plane words down to 2,773, a 4.19x ratio, with the fixture's live
-/// counts pinned); this sibling carries the *property* on the CUDA backend, and deliberately
-/// asserts only strict inequality rather than a ratio, because this round could not execute it and
-/// a ratio picked without a measurement would be a guess. Its decode identity is the full
-/// `RunResult` against the scalar oracle, which pins every live count exactly.
-///
-/// RED — the pre-fix `finish`, which read every plane — makes the two counts equal and fails.
-#[cfg(feature = "cuda-test-hooks")]
-#[test]
-fn cuda_readback_copies_the_live_regions_and_not_the_arena() {
-    let image = fan_in_tail_drop_contention_image();
-    let scalar = run_scalar_with_observations(&image, None, ObservationMode::Full)
-        .expect("scalar oracle must run");
-
-    let _ = days_executor::cuda::take_readback_words_for_testing();
-    let cuda =
-        run_cuda_with_observations(&image, None, CudaConfig::default(), ObservationMode::Full)
-            .expect("the compacted readback must decode a completed run");
-    let readback_words = days_executor::cuda::take_readback_words_for_testing();
-    let plane_words = days_executor::cuda::last_plane_words_for_testing();
-
-    // Decode identity first: a smaller readback that lost a record is a defect, not a fix.
-    let mut expected = scalar.clone();
-    expected.diagnostics = None;
-    assert_eq!(
-        cuda.result, expected,
-        "compacted CUDA readback differs from scalar"
-    );
-    // The oracle's own live counts, restated so a future change that empties an arena cannot make
-    // the inequality below trivially true.
-    assert_eq!(
-        cuda.result.pending_events.len(),
-        scalar.pending_events.len()
-    );
-    assert_eq!(
-        cuda.result.resident_packets.len(),
-        scalar.resident_packets.len()
-    );
-    assert_eq!(cuda.result.departures.len(), scalar.departures.len());
-    assert_eq!(cuda.result.arrivals.len(), scalar.arrivals.len());
-
-    assert!(
-        readback_words < plane_words,
-        "the successful attempt must copy back strictly less than the arena: it copied \
-         {readback_words} of {plane_words} plane words"
-    );
-}
-
 #[cfg(feature = "cuda-test-hooks")]
 #[test]
 fn process_wide_cuda_guard_recovers_after_a_mid_execution_panic() {

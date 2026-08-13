@@ -1,12 +1,11 @@
 ---
 title: Time & Concurrency
-description: Why packets carry time, and how to observe runtime concurrency.
+description: Why packets carry time in the concurrent legacy engine.
 ---
 
-Days is designed around many concurrent actors (sources, sinks, schedulers, switches). Two design choices are especially important for performance and correctness:
+Days is designed around many concurrent actors (sources, sinks, schedulers, switches). One design choice is especially important for performance and correctness:
 
 1. **Time is carried in messages** (packets/frames), and most models maintain a **local** `time: f64`.
-2. Concurrency is optionally observable via `tracing` hooks and a small runtime sampler.
 
 ## Time propagation via `Packet.time`
 
@@ -35,19 +34,3 @@ Core models keep a local `time: f64`:
 - link-layer time in `Link`/PFC components (`legacy/src/l2/`)
 
 The local time is updated from the incoming message (or from `cx.time()` only in limited cases).
-
-## Concurrency tracing
-
-Days supports two complementary mechanisms:
-
-1. **A tracing layer** (`ConcurrencyTrackerLayer`, `src/utils/tracing.rs`) increments/decrements a global `ACTIVE_TASKS` counter on span enter/exit.
-2. **A wall-clock sampler** (`start_wall_clock_concurrency_sampler`, `src/utils/tracing.rs`) samples `ACTIVE_TASKS` during `Simulation::step_until` and logs a wall-clock average concurrency (plus the peak observed by the layer).
-
-Enable it via config:
-
-```toml
-tracing_active = true
-tracing_interval = 1.0
-```
-
-This is intended as a lightweight way to correlate workload shape with runtime behavior.

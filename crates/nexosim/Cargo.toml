@@ -39,7 +39,6 @@ server = [
     "dep:tonic-prost",
 ]
 tracing = ["dep:tracing", "dep:tracing-subscriber"]
-perf_stats = []
 
 # DEVELOPMENT ONLY: API-unstable public exports meant for external test/benchmarking.
 dev-hooks = []

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use days::scenario::compile_config;
 use days_executor::{
     ArenaOccupancyHighWater, DeviceCapacityCaps, MetalConfig, MetalExecutor, ObservationMode,
-    last_plane_words_for_testing, run_scalar_with_observations, size_metal_plan_for_testing,
+    run_scalar_with_observations, size_metal_plan_for_testing,
     take_dominant_arena_high_water_for_testing,
 };
 
@@ -168,11 +168,6 @@ fn dominant_arena_high_water_is_test_only_and_fingerprint_neutral() {
     assert_eq!(
         actual.result, expected,
         "the hook must not touch complete state"
-    );
-    assert_eq!(
-        last_plane_words_for_testing(),
-        (before.total_device_bytes / std::mem::size_of::<u64>()) as u64,
-        "test-only metadata tails must not count as planned device words"
     );
     assert_eq!(
         high_water.stream_records.high_water.len(),

@@ -72,6 +72,6 @@ What’s happening today (why send_and_run dominates)
       - packet time matches expected departures,
       - RED behavior matches (sensitive to queue-length accounting).
   - Run cargo test --features test -- --show-output.
-  - Benchmark with configs/exp_tcp_fattree.toml:1 after setting num_threads > 1 and using the existing concurrency sampler (src/utils/tracing.rs:1) to confirm average/peak concurrency rises and total runtime drops.
+  - Benchmark with configs/exp_tcp_fattree.toml:1 after setting num_threads > 1 and compare total runtime.
 
   If you want, I can propose concrete batch-size defaults + a minimal Nexosim API surface that won’t leak internals but still enables schedule_event_batch.

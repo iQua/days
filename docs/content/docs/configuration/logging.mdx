@@ -1,6 +1,6 @@
 ---
 title: Logging & Runtime
-description: Seed, duration, threading, mailbox sizing, CSV reports, and tracing.
+description: Seed, duration, threading, mailbox sizing, and CSV reports.
 ---
 
 This page documents “general” configuration keys that are not specific to flows/topology.
@@ -8,7 +8,7 @@ This page documents “general” configuration keys that are not specific to fl
 Implementation notes:
 
 - `CsvLogger` reads logging keys from `src/utils/logger.rs`.
-- Runtime/UI/tracing keys are read from shared config structs in `src/topos/config.rs`, the legacy runtime in `legacy/src/topos/topo.rs`, and `src/utils/`.
+- Runtime and UI keys are read from shared config structs in `src/topos/config.rs` and the legacy runtime in `legacy/src/topos/topo.rs`.
 
 ## `seed` (required)
 
@@ -28,7 +28,7 @@ Total simulated time in seconds.
 duration = 20.0
 ```
 
-Note: `duration` is parsed by multiple subsystems (topology, UI, tracing). For consistency, prefer setting it explicitly.
+Note: `duration` is parsed by multiple subsystems (topology and UI). For consistency, prefer setting it explicitly.
 
 ## `threading` (optional)
 
@@ -134,20 +134,6 @@ UI refresh interval in seconds.
 ```toml
 ui_interval = 1.0
 ```
-
-## Concurrency tracing (optional)
-
-Enable lightweight concurrency sampling:
-
-```toml
-tracing_active = true
-tracing_interval = 1.0
-```
-
-- `tracing_active` (default: `false`)
-- `tracing_interval` (default: `duration / 100`)
-
-When enabled, Days installs a tracing subscriber layer and computes a wall-clock average concurrency during `Simulation::step_until` (and logs the peak observed by the tracing layer).
 
 ## Application-level sources for TCP collectives (optional)
 

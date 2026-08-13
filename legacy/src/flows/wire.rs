@@ -9,7 +9,6 @@ use rand::distr::Distribution;
 use rand::distr::Uniform;
 use rand::rngs::SmallRng;
 use rand_distr::Exp;
-use tracing::instrument;
 
 use crate::flows::DistributionInfo;
 use crate::flows::packet::Packet;
@@ -65,7 +64,6 @@ impl Wire {
         wire
     }
 
-    #[instrument(skip(self, cx))]
     pub async fn packet_received(&mut self, mut packet: Packet, cx: &Context<Self>) {
         let now_ns = clock_ns(cx.time());
         let now = seconds_view(now_ns);
@@ -136,7 +134,6 @@ impl Wire {
         }
     }
 
-    #[instrument(skip(self))]
     async fn forward_packet(&mut self, packet: Packet) {
         debug!(
             "Wire {} sent packet {} ({} bytes) from flow {} at time {:.3}.",

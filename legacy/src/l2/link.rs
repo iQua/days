@@ -5,7 +5,6 @@ use std::future::Future;
 use std::time::Duration;
 
 use log::debug;
-use tracing::instrument;
 
 use nexosim::model::{BuildContext, Context, Model, ModelRegistry, ProtoModel, SchedulableId};
 use nexosim::ports::Output;
@@ -51,7 +50,6 @@ impl Link {
         self.link_id
     }
 
-    #[instrument(skip(self, cx))]
     pub async fn frame_received(&mut self, mut frame: LinkFrame, cx: &Context<Self>) {
         #[cfg(feature = "test")]
         {
@@ -73,7 +71,6 @@ impl Link {
         }
     }
 
-    #[instrument(skip(self))]
     pub async fn send(&mut self, _: ()) {
         let Some(frame) = self.scheduled_departures.pop_front() else {
             debug_assert!(
@@ -87,7 +84,7 @@ impl Link {
         self.output.send(frame).await;
     }
 
-    #[instrument(skip(self, cx))]
+    #[allow(clippy::manual_async_fn)]
     pub fn run<'a>(
         &'a mut self,
         now: f64,

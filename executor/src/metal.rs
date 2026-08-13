@@ -112,16 +112,6 @@ static METAL_DIRECT: Mutex<Option<Arc<DirectMetal>>> = Mutex::new(None);
 std::thread_local! {
     static PANIC_AFTER_NEXT_EXECUTION: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
-    /// Words this thread has copied out of device buffers since the last reset.
-    ///
-    /// Thread-local like the panic hook above: the retry loop, the readback and the test all run
-    /// on the caller's thread, so no shared mutable state is introduced.
-    static READBACK_WORDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    /// Words in every result plane of the last attempt this thread allocated buffers for.
-    ///
-    /// T20l fix 2's counterfactual: this is exactly what the pre-fix `finish` read back, so
-    /// `readback_words / plane_words` is the compaction ratio a test can assert on.
-    static PLANE_WORDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// High-water occupancy of the three dominant record arenas in the last completed run.
     ///
     /// The device counters live beyond the production control-buffer extent and exist only when
@@ -174,38 +164,6 @@ fn panic_after_execution_if_requested() {
     if PANIC_AFTER_NEXT_EXECUTION.with(std::cell::Cell::take) {
         panic!("injected panic after Metal execution");
     }
-}
-
-/// Returns and clears this thread's device-to-host readback word count.
-///
-/// T20l fix 1 is an ordering property — *when* the result arena crosses the bus — and this is the
-/// quantity that makes it testable: a screened faulting attempt copies the control plane (and, on
-/// a ledger fault, the per-flow occupancy metadata) instead of every plane.
-#[cfg(feature = "metal-test-hooks")]
-#[doc(hidden)]
-pub fn take_readback_words_for_testing() -> u64 {
-    READBACK_WORDS.with(std::cell::Cell::take)
-}
-
-#[cfg(feature = "metal-test-hooks")]
-fn account_readback_words(words: usize) {
-    READBACK_WORDS.with(|total| total.set(total.get().saturating_add(words as u64)));
-}
-
-/// Returns the total result-plane word count of the last attempt this thread planned.
-///
-/// T20l fix 2's gate is a ratio, and this is its denominator: the pre-fix `finish` read every one
-/// of these words on every successful attempt. It is recorded rather than derived so a test does
-/// not have to re-plan the image to know what the uncompacted readback would have cost.
-#[cfg(feature = "metal-test-hooks")]
-#[doc(hidden)]
-pub fn last_plane_words_for_testing() -> u64 {
-    PLANE_WORDS.with(std::cell::Cell::get)
-}
-
-#[cfg(feature = "metal-test-hooks")]
-fn record_plane_words(words: u64) {
-    PLANE_WORDS.with(|total| total.set(words));
 }
 
 /// Returns and clears the dominant-arena occupancy high-water from the last completed run.
@@ -3378,8 +3336,6 @@ impl SharedBuffer {
     }
 
     fn read(&self) -> Vec<u64> {
-        #[cfg(feature = "metal-test-hooks")]
-        account_readback_words(self.words);
         unsafe {
             std::slice::from_raw_parts(self.raw.contents().cast::<u64>().as_ptr(), self.words)
                 .to_vec()
@@ -3395,8 +3351,6 @@ impl SharedBuffer {
     fn read_range(&self, start: usize, len: usize) -> Vec<u64> {
         let start = start.min(self.words);
         let len = len.min(self.words - start);
-        #[cfg(feature = "metal-test-hooks")]
-        account_readback_words(len);
         unsafe {
             std::slice::from_raw_parts(self.raw.contents().cast::<u64>().as_ptr().add(start), len)
                 .to_vec()
@@ -3405,8 +3359,6 @@ impl SharedBuffer {
 
     fn word(&self, index: usize) -> u64 {
         assert!(index < self.words);
-        #[cfg(feature = "metal-test-hooks")]
-        account_readback_words(1);
         unsafe { *self.raw.contents().cast::<u64>().as_ptr().add(index) }
     }
 }
@@ -3523,22 +3475,6 @@ impl MetalBuffers {
         .into_iter()
         .map(|words| SharedBuffer::new(device, words))
         .collect::<Result<Vec<_>, _>>()?;
-        #[cfg(feature = "metal-test-hooks")]
-        {
-            let diagnostic_words = dominant_arena_diagnostics
-                .stream_count
-                .saturating_add(dominant_arena_diagnostics.node_count.saturating_mul(2))
-                .saturating_add(3);
-            record_plane_words(
-                planes
-                    .iter()
-                    .chain(std::iter::once(&tcp_state))
-                    .fold(0_u64, |total, plane| {
-                        total.saturating_add(plane.words as u64)
-                    })
-                    .saturating_sub(diagnostic_words as u64),
-            );
-        }
         Ok(Self {
             planes,
             tcp_state,

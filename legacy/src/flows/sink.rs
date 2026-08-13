@@ -11,7 +11,6 @@ use std::fmt::{Debug, Display, Formatter};
 use std::time::Duration;
 
 use log::debug;
-use tracing::instrument;
 
 pub use days::utils::logger::PacketSinkReport;
 use nexosim::model::{
@@ -284,7 +283,6 @@ impl PacketSink {
         }
     }
 
-    #[instrument(skip(self, _cx))]
     pub async fn packet_received(&mut self, packet: Packet, _cx: &Context<Self>) {
         #[cfg(feature = "test")]
         {

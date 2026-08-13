@@ -798,8 +798,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -845,8 +843,6 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -1657,8 +1653,6 @@ dependencies = [
  "st3",
  "tai-time",
  "tonic-prost-build",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

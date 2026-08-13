@@ -4,7 +4,6 @@
 use std::fmt::Debug;
 
 use log::debug;
-use tracing::instrument;
 
 use nexosim::model::Model;
 use nexosim::ports::Output;
@@ -137,7 +136,6 @@ impl TCPPacketSink {
         }
     }
 
-    #[instrument(skip(self))]
     pub async fn produce_ack(&mut self, packet: Packet, now: f64) {
         let sequence_num = packet.packet_id;
         let previous_ack = self.next_seq_expected;

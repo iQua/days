@@ -27,14 +27,14 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "cuda.rs",
         predicate: r#"feature = "cuda-test-hooks""#,
-        count: 19,
-        purpose: "CUDA-only fault injection, capacity, and T20l readback- and plane-word-accounting hooks",
+        count: 10,
+        purpose: "CUDA-only fault injection and capacity hooks",
     },
     AllowedFeatureGate {
         path: "metal.rs",
         predicate: r#"feature = "metal-test-hooks""#,
-        count: 26,
-        purpose: "Metal-only panic, fault-injection, T20l readback accounting, and T21 dominant-arena occupancy readback hooks",
+        count: 18,
+        purpose: "Metal-only panic, fault-injection, and T21 dominant-arena occupancy readback hooks",
     },
     AllowedFeatureGate {
         path: "metal.rs",
@@ -112,7 +112,7 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
         path: "lib.rs",
         predicate: r#"all(feature = "metal-test-hooks", target_vendor = "apple")"#,
         count: 1,
-        purpose: "Metal capacity, plane-word, and dominant-arena test hooks require dedicated test tools and Apple Metal",
+        purpose: "Metal capacity and dominant-arena test hooks require dedicated test tools and Apple Metal",
     },
     AllowedFeatureGate {
         path: "lib.rs",

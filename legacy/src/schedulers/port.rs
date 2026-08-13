@@ -5,7 +5,6 @@ use std::future::Future;
 use std::time::Duration;
 
 use log::debug;
-use tracing::instrument;
 
 use nexosim::model::{
     BuildContext, Context, InitializedModel, Model, ModelRegistry, ProtoModel, SchedulableId,
@@ -243,7 +242,6 @@ impl Port {
         self.queue.push_back(packet);
     }
 
-    #[instrument(skip(self, cx))]
     pub async fn packet_received(&mut self, packet: Packet, cx: &Context<Self>) {
         #[cfg(feature = "test")]
         {
@@ -327,7 +325,6 @@ impl Port {
         }
     }
 
-    #[instrument(skip(self))]
     pub async fn send(&mut self, packet: Packet) {
         self.time = packet.time;
         self.update_stats_on_packet_forwarded(&packet);
@@ -380,10 +377,10 @@ impl Port {
         );
     }
 
-    #[instrument(skip(self, cx))]
+    #[allow(clippy::manual_async_fn)]
     pub fn run<'a>(
         &'a mut self,
-        now: f64,
+        _now: f64,
         cx: &'a Context<Self>,
     ) -> impl Future<Output = ()> + Send + 'a {
         async move {
@@ -392,9 +389,9 @@ impl Port {
                 let global_time = cx.time().duration_since(MonotonicTime::EPOCH).as_secs_f64();
 
                 assert!(
-                    now <= global_time + 1e-7,
+                    _now <= global_time + 1e-7,
                     "Timing mismatch: now = {}, global_time = {}",
-                    now,
+                    _now,
                     global_time
                 );
             }

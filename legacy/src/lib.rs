@@ -14,7 +14,7 @@ pub mod switches;
 pub mod topos;
 pub mod utils;
 
-pub use days::utils::tracing::{current_concurrency, peak_concurrency, reset_peak_concurrency};
+#[allow(clippy::question_mark)]
 pub fn validate_config(config_path: &str) -> Result<(), String> {
     days::validate_config(config_path)?;
     if let Err(error) = config::validate(config_path) {

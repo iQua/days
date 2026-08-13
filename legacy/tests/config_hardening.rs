@@ -8,9 +8,6 @@ use days_legacy::flows::flow::Flow;
 use days_legacy::topos::build::{HostAttachments, build_graph, build_graph_with_profile};
 use days_legacy::topos::topo::installed_host_attachment_state;
 use days_legacy::utils::logger::CsvLogger;
-use days_legacy::utils::tracing::{
-    is_tracing_active, start_wall_clock_concurrency_sampler, tracing_interval,
-};
 use days_legacy::utils::ui::UserInterface;
 use predicates::prelude::*;
 use tempfile::NamedTempFile;
@@ -432,14 +429,6 @@ fn hunted_substitution_cases() -> Vec<(String, &'static str)> {
         (
             EXPLICIT_FLOW_BASE.replacen("seed = 51002", "seed = 0", 1),
             "seed",
-        ),
-        (
-            EXPLICIT_FLOW_BASE.replacen(
-                "duration = 0.0",
-                "duration = 0.0\ntracing_active = false\ntracing_interval = 0.01",
-                1,
-            ),
-            "tracing_interval",
         ),
         (
             EXPLICIT_FLOW_BASE
@@ -917,15 +906,6 @@ fn other_public_legacy_config_readers_validate_the_complete_document() {
         catch_unwind(AssertUnwindSafe(|| {
             let _ = UserInterface::new(0, path);
         })),
-        catch_unwind(AssertUnwindSafe(|| {
-            let _ = is_tracing_active(path);
-        })),
-        catch_unwind(AssertUnwindSafe(|| {
-            let _ = tracing_interval(path);
-        })),
-        catch_unwind(AssertUnwindSafe(|| {
-            let _ = start_wall_clock_concurrency_sampler(path);
-        })),
     ] {
         let panic = call.expect_err("public legacy config reader must validate");
         assert!(panic_message(panic).contains("mandatory_experiment"));
@@ -966,7 +946,7 @@ fn strict_validation_accepts_every_tracked_legacy_fixture_except_tiered_delays()
             Err(error) => rejected.push((fixture, error)),
         }
     }
-    assert_eq!(accepted, 132, "tracked accepted-fixture count changed");
+    assert_eq!(accepted, 131, "tracked accepted-fixture count changed");
     assert_eq!(
         rejected.len(),
         1,

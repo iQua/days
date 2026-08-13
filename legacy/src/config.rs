@@ -19,8 +19,6 @@ struct LegacyConfig {
     seed: Option<usize>,
     duration: Option<f64>,
     ui_interval: Option<f64>,
-    tracing_active: Option<bool>,
-    tracing_interval: Option<f64>,
     threading: Option<ThreadingModel>,
     num_threads: Option<usize>,
     hot_workers: Option<usize>,
@@ -908,21 +906,6 @@ pub(crate) fn validate(file_path: &str) -> Result<(), String> {
         return Err(unsupported(
             "ui_interval",
             "UI interval must be finite and positive",
-        ));
-    }
-    if config.tracing_interval.is_some() && config.tracing_active != Some(true) {
-        return Err(unsupported(
-            "tracing_interval` + `tracing_active",
-            "tracing_interval is inactive unless tracing_active = true",
-        ));
-    }
-    if config
-        .tracing_interval
-        .is_some_and(|interval| !interval.is_finite() || interval <= 0.0)
-    {
-        return Err(unsupported(
-            "tracing_interval",
-            "tracing interval must be finite and positive",
         ));
     }
     if let Some(interval) = config.report_interval {

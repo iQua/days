@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use log::debug;
-use tracing::instrument;
 
 use nexosim::model::{
     BuildContext, Context, InitializedModel, Model, ModelRegistry, ProtoModel, SchedulableId,
@@ -395,7 +394,6 @@ impl DRRServer {
         self.byte_sizes[class_id] += packet_size;
     }
 
-    #[instrument(skip(self, cx))]
     pub async fn packet_received(&mut self, packet: Packet, cx: &Context<Self>) {
         #[cfg(feature = "test")]
         {
@@ -419,7 +417,6 @@ impl DRRServer {
         }
     }
 
-    #[instrument(skip(self))]
     pub async fn send(&mut self, packet: Packet) {
         self.time = packet.time;
         self.update_stats_on_packet_forwarded(&packet);
@@ -534,7 +531,6 @@ impl DRRServer {
         }
     }
 
-    #[instrument(skip(self, cx))]
     pub fn run(&mut self, now: f64, cx: &Context<Self>) {
         #[cfg(feature = "test")]
         {

@@ -9,13 +9,6 @@ pub struct UIConfig {
 }
 
 #[derive(Deserialize)]
-pub struct TracingConfig {
-    pub tracing_active: Option<bool>,
-    pub tracing_interval: Option<f64>,
-    pub duration: Option<f64>,
-}
-
-#[derive(Deserialize)]
 pub struct ConcurrencyConfig {
     pub threading: Option<ThreadingModel>,
     pub num_threads: Option<usize>,

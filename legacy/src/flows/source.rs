@@ -10,7 +10,6 @@ pub use days::utils::logger::PacketSourceReport;
 use log::debug;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
-use tracing::instrument;
 
 use crate::flows::app_source::AppSourceBufferHandle;
 #[cfg(feature = "dcqcn")]
@@ -149,7 +148,6 @@ impl PacketSource {
         }
     }
 
-    #[instrument(skip(self, cx))]
     pub async fn packet_received(&mut self, mut packet: Packet, cx: &Context<Self>) {
         let now_ns = clock_ns(cx.time());
         let now = seconds_view(now_ns);
@@ -281,7 +279,7 @@ impl PacketSource {
         }
     }
 
-    #[instrument(skip(self, cx))]
+    #[allow(clippy::manual_async_fn)]
     fn fetch_app_data<'a>(
         &'a mut self,
         _: (),
@@ -483,7 +481,7 @@ impl PacketSource {
         }
     }
 
-    #[instrument(skip(self, cx))]
+    #[allow(clippy::manual_async_fn)]
     pub fn run<'a>(
         &'a mut self,
         _: (),
