@@ -47,6 +47,17 @@ def walk(root):
             yield os.path.join(dirpath, name)
 
 
+def docs_word_count(root="docs/content/docs"):
+    words = 0
+    for dirpath, _, filenames in os.walk(root):
+        for name in filenames:
+            if name.endswith(".mdx"):
+                path = os.path.join(dirpath, name)
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    words += len(f.read().split())
+    return words
+
+
 def main():
     rust_total, cpp_total = 0, 0
     per_root = {}
@@ -64,6 +75,7 @@ def main():
     for root, (r, c) in per_root.items():
         print(f"{root:12s} Rust {r:7d}   C++ {c:7d}")
     print(f"{'TOTAL':12s} Rust {rust_total:7d}   C++ {cpp_total:7d}")
+    print(f"{'docs':12s} words {docs_word_count():6d}")
 
 
 if __name__ == "__main__":
