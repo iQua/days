@@ -7,14 +7,17 @@ icon: Network
 Days is a discrete-event network simulator written in Rust. The repository
 ships **two engines** that share a lineage but make different guarantees:
 
-- **Days AGO, the exact engine.** A scenario is compiled into a
+- **Days AGO (Adaptive Guaranteed Ordering), the exact engine.** A scenario
+  is compiled into a
   `SimulationImage` — logical-process (LP) state plus canonical events — and
   executed on any of four backends: a serial **Scalar** reference, a
   multicore **CPU** pool, **Apple Metal**, or **NVIDIA CUDA**. Execution is
   *exact*: simultaneous events have one canonical order, no float appears in
   the semantics, and every backend reproduces the byte-identical complete
   state of the serial reference. Protocols are written once, as sequential
-  per-entity state machines, and compiled for each backend.
+  per-entity state machines; the scalar and CPU backends execute that one
+  compiled implementation, and the Metal and CUDA transition planes are
+  ports of it, held byte-identical by the conformance matrix.
 - **Legacy Days, the process-based engine.** The original actor
   implementation on Nexosim: each network element is a coroutine with
   private state, communicating by message passing, on a single- or
