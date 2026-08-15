@@ -29,3 +29,30 @@ subcommand). To force web search for exec explicitly, use `-c` config, not `--se
 - After every Codex run, verify the result yourself: read the diff, run the
   relevant tests, and check `pnpm test:boundaries` when imports changed. If a
   run hangs or produces no edits, kill it and re-brief with a narrower task.
+
+## Live-steerable Codex lanes via herdr (preferred for long/multi-commit work)
+
+For implementations that benefit from mid-flight steering, launch Codex
+interactively in a herdr pane instead of `codex exec`. The pane runs the
+user's interactive shell, whose `codex` alias already injects the sandbox
+flags — pass ONLY the model args, or the duplicated flags error out:
+
+```bash
+herdr workspace create --cwd /Users/bli/Playground/days --label <lane-name>
+# note the root pane_id in the JSON reply, e.g. w4T:p1
+herdr agent start <lane-name> --kind codex --pane <pane_id> -- -m gpt-5.6-sol -c model_reasoning_effort=xhigh
+herdr agent prompt <lane-name> "$(cat brief.txt)" --wait --until working --timeout 15000
+```
+
+- Briefs still go through a quoted-heredoc file and `"$(cat brief.txt)"` —
+  `agent prompt` takes positional TEXT only (there is no `--file` option),
+  and inline backticks in a raw string get shell-executed.
+- Steer with further `herdr agent prompt <lane-name> "<message>"` calls;
+  inspect with `herdr agent read <lane-name>` and `herdr workspace list`
+  (agent_status: working/idle/blocked).
+- `--wait --until <status> --timeout <ms>` confirms the submission landed;
+  without `--timeout` the wait is indefinite.
+- Choose the route by need: `codex exec` (detached, `-o` final-message
+  file) for fire-and-forget batch runs; a herdr lane when you may need to
+  redirect the worker mid-task. The 20-minute watchdog rule applies to
+  both.
