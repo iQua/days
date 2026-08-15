@@ -54,5 +54,28 @@ herdr agent prompt <lane-name> "$(cat brief.txt)" --wait --until working --timeo
   without `--timeout` the wait is indefinite.
 - Choose the route by need: `codex exec` (detached, `-o` final-message
   file) for fire-and-forget batch runs; a herdr lane when you may need to
-  redirect the worker mid-task. The 20-minute watchdog rule applies to
-  both.
+  redirect the worker mid-task.
+
+### React the moment a lane finishes (no periodic watchdog needed)
+
+Instead of polling a herdr lane on a timer, arm a blocking wait as a
+background task immediately after submitting the brief:
+
+```bash
+herdr agent prompt <lane-name> "$(cat brief.txt)" --wait --until working --timeout 15000
+# then, as a run-in-background Bash task:
+herdr agent wait <lane-name>
+```
+
+`herdr agent wait` blocks until the agent settles (idle, done, or
+blocked; indefinite without `--timeout`). Run in the background, it
+exits the instant Codex finishes — the harness re-invokes the
+orchestrator with a task notification, and review starts immediately
+with zero polling latency. `blocked` matching also surfaces a Codex
+question the moment it is asked instead of at the next timer tick.
+
+- The wait does not track turns: it matches the NEXT settled state, so
+  re-arm it after every prompt on multi-prompt lanes.
+- Keep at most one long fallback wakeup (20+ minutes) in case the wait
+  process itself dies; the periodic 20-minute watchdog remains for work
+  the harness cannot track (remote campaigns, GitHub Actions runs).
