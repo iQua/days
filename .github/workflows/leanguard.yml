@@ -52,6 +52,11 @@ jobs:
             aqm_check \
             aqm_dcqcn_check
 
+      - name: Install ripgrep
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+
       - name: Audit DaysExecutor axioms and placeholders
         run: bash lean/scripts/audit-days-executor-axioms.sh
 
