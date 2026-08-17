@@ -8,6 +8,7 @@
 !/Cargo.lock
 **/uv.lock
 **/.lake/
+.claude/
 
 # These are files related to logged outputs
 **/*.csv
