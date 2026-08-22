@@ -125,8 +125,9 @@ pub use model::{
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub use safe_horizon::run_scalar_rounds_with_replay_trace;
 pub use safe_horizon::{
-    LpRoundWork, RoundMetrics, ScalarRoundRun, run_scalar_rounds,
-    run_scalar_rounds_with_observations,
+    LpRoundWork, RoundMetrics, ScalarRoundRun, ScalarTransitionHistogram,
+    ScalarTransitionHistogramRun, TransitionKindCounts, run_scalar_rounds,
+    run_scalar_rounds_with_observations, run_scalar_rounds_with_transition_histogram,
 };
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub use safe_horizon::{
