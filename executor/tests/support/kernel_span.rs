@@ -6,7 +6,7 @@
 //! `extern "C" __global__ void `. That literal does not match
 //!
 //! ```text
-//! extern "C" __global__ __launch_bounds__(1024) void days_round(DAYS_BUFFERS) {
+//! extern "C" __global__ __launch_bounds__(256) void days_round(DAYS_BUFFERS) {
 //! ```
 //!
 //! which is the one CUDA entry point in the tree carrying an attribute between `__global__` and
@@ -15,7 +15,8 @@
 //! `days_round` — 170 lines instead of 66. The adversarial review demonstrated both consequences
 //! with probes: the fix-2 recompute count was being measured over `days_round_prepare ∪
 //! days_round`, and the "retained 1,024-lane width" assertion could not fail, because
-//! `__launch_bounds__(1024)` on `days_round`'s signature satisfied `body.contains("1024")` even
+//! the then-`__launch_bounds__(1024)` on `days_round`'s signature satisfied
+//! `body.contains("1024")` even
 //! after every real `1024` in `days_round_prepare` was rewritten to `512`.
 //!
 //! The extraction below is form-agnostic: it enumerates every entry point in a source, whatever

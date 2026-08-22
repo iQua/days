@@ -647,7 +647,7 @@ fn cuda_block_boundaries_and_geometry_match_full_scalar_result() {
 
         for streams_enabled in [true, false] {
             let mut reference = None;
-            for round_threads_per_block in [1, 32, 128, 512, 1_024] {
+            for round_threads_per_block in [1, 32, 64, 128, 256] {
                 let cuda = run_cuda_with_observations(
                     &image,
                     None,

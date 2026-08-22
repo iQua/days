@@ -1,5 +1,5 @@
 #[cfg(any(feature = "cuda", test))]
-const WIDTHS: [usize; 3] = [256, 512, 1_024];
+const WIDTHS: [usize; 3] = [256, 128, 64];
 #[cfg(any(feature = "cuda", test))]
 const SAMPLES: usize = 2;
 
@@ -19,7 +19,7 @@ fn order_for_sample(sample: usize) -> [usize; 3] {
     if sample.is_multiple_of(2) {
         WIDTHS
     } else {
-        [1_024, 512, 256]
+        [64, 128, 256]
     }
 }
 
@@ -115,8 +115,8 @@ fn main() {
 
     println!(
         "record=t17c_cuda_geometry_protocol fixture={fixture} mechanism=threads_per_block \
-         widths=256,512,1024 samples={SAMPLES} \
-         order_schedule=ascending,descending predecessor=same_geometry_discarded \
+         widths=256,128,64 samples={SAMPLES} \
+         order_schedule=descending,ascending predecessor=same_geometry_discarded \
          correctness=complete_RunResult_equality credible_threshold_percent=5.000000"
     );
     let (baseline_warm, expected) = measure(&executor, &image, WIDTHS[0], None);
@@ -131,9 +131,9 @@ fn main() {
     let mut measurements = Vec::with_capacity(WIDTHS.len() * SAMPLES);
     for sample in 0..SAMPLES {
         let order = if sample == 0 {
-            "ascending"
-        } else {
             "descending"
+        } else {
+            "ascending"
         };
         for width in order_for_sample(sample) {
             let _ = measure(&executor, &image, width, Some(&expected));
@@ -191,7 +191,7 @@ mod tests {
     fn geometry_probe_balances_ascending_and_descending_orders() {
         assert_eq!(SAMPLES, 2);
         assert_eq!(order_for_sample(0), WIDTHS);
-        assert_eq!(order_for_sample(1), [1_024, 512, 256]);
+        assert_eq!(order_for_sample(1), [64, 128, 256]);
         assert_eq!(median(vec![1, 2, 3, 4]), 2);
         assert_eq!(retained_range(&[1, 4]), 3);
     }
