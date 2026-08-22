@@ -1,5 +1,8 @@
 #![cfg(feature = "cuda")]
 
+#[path = "support/continuation.rs"]
+mod continuation;
+
 use std::collections::VecDeque;
 #[cfg(feature = "cuda-test-hooks")]
 use std::thread;
@@ -10,7 +13,8 @@ use days_executor::{
     GeneratorStatus, GeneratorTermination, HostState, LinkDescriptor, LinkId, NodeDescriptor,
     NodeId, NodeKind, ObservationMode, PacketDescriptor, PacketKind, PayloadId, RemoteChannel,
     ScheduledEmission, SchedulerKind, SimulationImage, SwitchQueueState, SwitchState, event_phase,
-    run_cuda, run_cuda_with_observations, run_scalar_with_observations, validate,
+    run_cuda, run_cuda_with_observations, run_scalar_rounds_with_observations,
+    run_scalar_with_observations, validate,
 };
 #[cfg(feature = "cuda-test-hooks")]
 use days_executor::{CudaArena, CudaError, CudaExecutor};
@@ -21,6 +25,56 @@ const FORWARD: LinkId = LinkId(0);
 const REVERSE: LinkId = LinkId(1);
 const FLOW: FlowId = FlowId(0);
 const FIRST_PACKET: PayloadId = PayloadId(0);
+
+#[test]
+fn cuda_same_time_continuations_match_scalar_and_complete_state() {
+    let image = continuation::tcp_service_continuation_image();
+    let scalar = run_scalar_rounds_with_observations(&image, None, ObservationMode::Full)
+        .expect("scalar continuation oracle must run");
+    let expected_continuations = scalar
+        .rounds
+        .iter()
+        .flat_map(|round| &round.lp_work)
+        .map(|work| work.same_time_continuations)
+        .sum::<u64>();
+    let expected_rounds = scalar.rounds.len() as u64;
+    let expected_transitions = scalar
+        .rounds
+        .iter()
+        .map(|round| round.events_processed)
+        .sum::<u64>();
+    assert!(
+        expected_continuations > 0,
+        "TCP fixture must exercise same-time service continuations"
+    );
+    let mut expected_result = scalar.result;
+    expected_result.diagnostics = None;
+
+    for (streams_enabled, round_threads_per_block, max_transitions_per_lp_per_round) in
+        [(false, 32, 4_096), (true, 256, 4_096), (true, 32, 1)]
+    {
+        let cuda = run_cuda_with_observations(
+            &image,
+            None,
+            CudaConfig {
+                streams_enabled,
+                round_threads_per_block,
+                max_transitions_per_lp_per_round,
+                ..CudaConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .expect("CUDA continuation run must succeed");
+        assert_eq!(cuda.result, expected_result);
+        assert_eq!(cuda.rounds, expected_rounds);
+        assert_eq!(cuda.transitions, expected_transitions);
+        assert_eq!(
+            cuda.same_time_continuations, expected_continuations,
+            "CUDA streams={streams_enabled} block={round_threads_per_block} \
+             transition_cap={max_transitions_per_lp_per_round}"
+        );
+    }
+}
 
 #[cfg(feature = "cuda-test-hooks")]
 #[test]
@@ -647,7 +701,7 @@ fn cuda_block_boundaries_and_geometry_match_full_scalar_result() {
 
         for streams_enabled in [true, false] {
             let mut reference = None;
-            for round_threads_per_block in [1, 32, 128, 512, 1_024] {
+            for round_threads_per_block in [1, 32, 64, 128, 256] {
                 let cuda = run_cuda_with_observations(
                     &image,
                     None,

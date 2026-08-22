@@ -2,8 +2,8 @@
 //!
 //! The backend keeps the safe-horizon round loop resident in explicit CUDA device buffers. One
 //! fixed thirteen-kernel attempt DAG is captured as a CUDA Graph and replayed in bounded waves.
-//! Deterministic 1,024-lane reductions publish each exact exclusive horizon and compact active
-//! LPs; one CUDA lane owns each active LP transition drain; boundary exchange remains
+//! Deterministic reductions publish each exact exclusive horizon and compact active LPs; one CUDA
+//! lane owns each active LP transition drain; boundary exchange remains
 //! producer-local followed by deterministic per-channel scatter. The host reads only the control
 //! plane at graph-wave boundaries, then explicitly transfers every result plane for normalization.
 //! Integrated devices provision the same bytes in managed allocations; discrete devices retain
@@ -53,6 +53,8 @@ const OBSERVED_WORDS: usize = 7;
 const DEPARTURE_WORDS: usize = 12;
 const ARRIVAL_WORDS: usize = 13;
 const LP_STATE_WORDS: usize = 7;
+// On a successful attempt LP error-arena storage is unused and carries this cumulative metric.
+const LP_SAME_TIME_CONTINUATIONS: usize = 3;
 const OBSERVATION_META_WORDS: usize = ARENA_META_WORDS * 3;
 const INBOUND_META_WORDS: usize = 2;
 const LP_STREAM_META_WORDS: usize = 4;
@@ -873,6 +875,8 @@ pub struct CudaRun {
     pub channel_stream_capacity_distribution: Vec<crate::ChannelStreamCapacityLevel>,
     pub rounds: u64,
     pub transitions: u64,
+    /// Scalar-equivalent local `TxComplete` to same-time `TxReady` continuations.
+    pub same_time_continuations: u64,
     /// Physical attempts present in launched graph replays, including deterministic no-op tails.
     pub encoded_attempts: u64,
     pub continuation_relaunches: u64,
@@ -990,6 +994,134 @@ impl CudaExecutor {
             concurrent_managed_access,
             self.direct.provisioning == CudaProvisioning::Managed,
         ))
+    }
+
+    /// Runs only O1.4's reset/count and stable-write dispatches over a synthetic FEL-root cache.
+    ///
+    /// This is an actual-device output gate for the production kernels. `eligible[node]` becomes
+    /// that node's cached `load_fel_root && before_horizon` result; the returned worklist is the
+    /// active prefix written by Dispatch B.
+    #[cfg(feature = "cuda-test-hooks")]
+    #[doc(hidden)]
+    pub fn worklist_compaction_for_testing(
+        &self,
+        eligible: &[bool],
+        threads_per_block: usize,
+    ) -> Result<(u64, Vec<u64>), CudaError> {
+        if !(1..=LANES).contains(&threads_per_block) {
+            return Err(CudaError::Validation(format!(
+                "worklist test threads per block must be in 1..={LANES}"
+            )));
+        }
+        let supported = [2_usize, 3]
+            .into_iter()
+            .map(|index| {
+                self.direct.functions[index]
+                    .max_threads_per_block()
+                    .map(|threads| threads as usize)
+                    .map_err(|error| {
+                        driver_error(
+                            format!("kernel `{}` thread limit query", KERNEL_NAMES[index]),
+                            error,
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .min()
+            .unwrap_or(0);
+        if threads_per_block > supported {
+            return Err(CudaError::Validation(format!(
+                "worklist test threads per block {threads_per_block} exceeds supported maximum \
+                 {supported}"
+            )));
+        }
+
+        let node_count = eligible.len();
+        let blocks = node_count.div_ceil(threads_per_block).max(1);
+        let blocks = u32::try_from(blocks)
+            .map_err(|_| CudaError::Validation("worklist test grid exceeds u32".into()))?;
+        let threads = threads_per_block as u32;
+
+        let mut control = vec![0_u64; CONTROL_WORDS];
+        control[5] = 1;
+        let mut params = vec![0_u64; 31];
+        params[0] = node_count as u64;
+        params[4] = node_count.max(1) as u64;
+        params[13] = 1;
+        params[30] = 0;
+        let scratch_words = crate::device_sizing::round_scratch_words(node_count)
+            .ok_or_else(|| CudaError::Validation("worklist test scratch overflows usize".into()))?;
+        let mut stream_state = vec![0_u64; scratch_words];
+        for (node, present) in eligible.iter().copied().enumerate() {
+            stream_state[node * crate::device_sizing::ROUND_SCRATCH_CACHE_WORDS + 1] =
+                u64::from(present);
+        }
+
+        let mut host_planes = (0..29).map(|_| vec![0_u64]).collect::<Vec<_>>();
+        host_planes[0] = control;
+        host_planes[1] = params;
+        host_planes[13] = vec![NONE; node_count.max(1)];
+        host_planes[18] = vec![0; node_count.saturating_mul(LP_STATE_WORDS).max(1)];
+        host_planes[19] = vec![0; node_count.saturating_mul(ARENA_META_WORDS).max(1)];
+        host_planes[25] = stream_state;
+
+        let _execution_guard = cuda_device_execution_guard();
+        let planes = host_planes
+            .into_iter()
+            .enumerate()
+            .map(|(index, words)| {
+                CudaBuffer::from_host(&self.direct.stream, words, self.direct.provisioning)
+                    .map_err(|error| driver_error(format!("worklist test plane {index}"), error))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let config = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        for index in [2_usize, 3] {
+            let mut arguments = self
+                .direct
+                .stream
+                .launch_builder(&self.direct.functions[index]);
+            for plane in &planes {
+                arguments.arg(plane);
+            }
+            unsafe { arguments.launch(config) }.map_err(|error| {
+                driver_error(
+                    format!("worklist test `{}` launch", KERNEL_NAMES[index]),
+                    error,
+                )
+            })?;
+        }
+        let control = self
+            .direct
+            .stream
+            .clone_dtoh(&planes[0])
+            .map_err(|error| driver_error("worklist test control readback", error))?;
+        let worklist = self
+            .direct
+            .stream
+            .clone_dtoh(&planes[13])
+            .map_err(|error| driver_error("worklist test output readback", error))?;
+        self.direct
+            .stream
+            .synchronize()
+            .map_err(|error| driver_error("worklist test synchronization", error))?;
+        if control[CONTROL_ERROR] != 0 {
+            return Err(decode_device_error(&control));
+        }
+        let active = usize::try_from(control[15]).map_err(|_| {
+            CudaError::Validation("worklist test active count exceeds usize".into())
+        })?;
+        if active > worklist.len() {
+            return Err(CudaError::Validation(format!(
+                "worklist test active count {active} exceeds capacity {}",
+                worklist.len()
+            )));
+        }
+        Ok((active as u64, worklist[..active].to_vec()))
     }
 
     pub fn run(
@@ -2679,8 +2811,8 @@ fn prepare_streams(
         image.nodes.len() * ARENA_META_WORDS,
     )?;
     if !config.streams_enabled {
-        // T21 fix 2: the per-round FEL root cache is NOT a stream-path feature. `days_horizon`
-        // publishes it and `days_round_prepare` reads it in both stream modes, so a legacy plan
+        // The per-round FEL root cache is NOT a stream-path feature. `days_horizon_sweep`
+        // publishes it and O1.4's count/write pair reads it in both stream modes, so a legacy plan
         // allocates the region too — at offset 0, since it has no stream metadata in front of it.
         let round_scratch_words = crate::device_sizing::round_scratch_words(image.nodes.len())
             .ok_or_else(|| CudaError::Validation("round scratch size overflows usize".into()))?;
@@ -4270,6 +4402,11 @@ impl CudaBuffers {
                 .take(image.nodes.len())
                 .map(|state| state[1])
                 .fold(0_u64, u64::saturating_add),
+            same_time_continuations: lp_state
+                .chunks_exact(LP_STATE_WORDS)
+                .take(image.nodes.len())
+                .map(|state| state[LP_SAME_TIME_CONTINUATIONS])
+                .fold(0_u64, u64::saturating_add),
             encoded_attempts: timing.encoded_attempts,
             continuation_relaunches: control[CONTROL_RELAUNCHES],
             wave_boundary_syncs: timing.wave_boundary_syncs,
@@ -4317,11 +4454,11 @@ const COMPACT_KERNEL_NAME: &str = "days_compact_gather";
 // gather's output does not depend on it.
 const COMPACT_THREADS_PER_BLOCK: usize = 256;
 /// Launches that need the full [`LANES`]-wide block their deterministic reduction assumes.
-const CONTROL_KERNELS: [usize; 10] = [0, 1, 2, 3, 5, 6, 7, 8, 11, 12];
+const CONTROL_KERNELS: [usize; 8] = [0, 1, 5, 6, 7, 8, 11, 12];
 /// Launches that take the full-grid control geometry:
 /// [`crate::device_sizing::CONTROL_SWEEP_BLOCKS`] blocks of [`LANES`] threads.
-const SWEEP_KERNELS: [usize; 5] = [0, 2, 5, 7, 11];
-const PARALLEL_KERNELS: [usize; 3] = [4, 9, 10];
+const SWEEP_KERNELS: [usize; 4] = [0, 5, 7, 11];
+const PARALLEL_KERNELS: [usize; 5] = [2, 3, 4, 9, 10];
 const FINALIZE_SWEEP_KERNEL_INDEX: usize = 11;
 
 struct DirectCuda {
@@ -4667,9 +4804,9 @@ impl DirectCuda {
 
 /// One [`LaunchConfig`] per entry of [`KERNEL_NAMES`], in launch order.
 ///
-/// Three geometries: width-1 control (the combines and the two node-ordered scans), the T21 fix 1
-/// full-grid sweep at a fixed [`crate::device_sizing::CONTROL_SWEEP_BLOCKS`] blocks, and the
-/// per-LP parallel grid.
+/// Three geometries: width-1 control (the combines and the retained legacy node-ordered scan), the
+/// T21 full-grid sweep at a fixed [`crate::device_sizing::CONTROL_SWEEP_BLOCKS`] blocks, and the
+/// configurable per-LP parallel grid (including both O1.4 compaction dispatches).
 fn attempt_launch_configs(
     parallel_blocks: u32,
     parallel_threads: u32,

@@ -12,15 +12,24 @@ using ulong = uint64_t;
 #define min(left, right) ((left) < (right) ? (left) : (right))
 #define max(left, right) ((left) > (right) ? (left) : (right))
 
+// `CudaBuffers::new` owns one allocation per entry in this exact order, including one-word
+// allocations for logically empty planes. Never bind one allocation at two entries: the complete
+// attempt ABI relies on their pairwise disjointness.
 #define DAYS_BUFFERS \
-    ulong *control, const ulong *params, ulong *node_state, ulong *generators, \
-    const ulong *flows, const ulong *routes, const ulong *links, ulong *fel_meta, \
-    ulong *fel_records, ulong *queue_meta, ulong *queue_records, ulong *in_service, \
-    ulong *outbox, ulong *worklist, ulong *summary, ulong *observed, ulong *departures, \
-    ulong *arrivals, ulong *lp_state, ulong *remote_meta, ulong *remote_staging, \
-    ulong *observation_meta, ulong *inbound_meta, ulong *inbound_producers, \
-    ulong *merge_cursors, ulong *stream_state, ulong *stream_records, \
-    ulong *scheduler_state, ulong *tcp_state
+    ulong *__restrict__ control, const ulong *__restrict__ params, \
+    ulong *__restrict__ node_state, ulong *__restrict__ generators, \
+    const ulong *__restrict__ flows, const ulong *__restrict__ routes, \
+    const ulong *__restrict__ links, ulong *__restrict__ fel_meta, \
+    ulong *__restrict__ fel_records, ulong *__restrict__ queue_meta, \
+    ulong *__restrict__ queue_records, ulong *__restrict__ in_service, \
+    ulong *__restrict__ outbox, ulong *__restrict__ worklist, ulong *__restrict__ summary, \
+    ulong *__restrict__ observed, ulong *__restrict__ departures, ulong *__restrict__ arrivals, \
+    ulong *__restrict__ lp_state, ulong *__restrict__ remote_meta, \
+    ulong *__restrict__ remote_staging, ulong *__restrict__ observation_meta, \
+    const ulong *__restrict__ inbound_meta, const ulong *__restrict__ inbound_producers, \
+    ulong *__restrict__ merge_cursors, ulong *__restrict__ stream_state, \
+    ulong *__restrict__ stream_records, ulong *__restrict__ scheduler_state, \
+    ulong *__restrict__ tcp_state
 
 constexpr uint EVENT_WORDS = 14;
 constexpr uint SCATTER_GROUP_WIDTH = 32;
@@ -109,9 +118,9 @@ constexpr uint P_STREAM_ORDER_CHECKS = 27;
 constexpr uint P_TCP_RECEIVER_OFFSET = 28;
 constexpr uint P_TCP_LEDGER_META_OFFSET = 29;
 // T21 fix 2. Word offset, inside `stream_state`, of the per-round FEL root cache: two words per
-// LP, `{root time, validity}`. `days_horizon` evaluates `fel_root_time` once per node and writes it
-// here; `days_round_prepare`'s count pass and write pass read it back instead of re-running the
-// query, which `evidence/P12/perround-upperbound.md` §1.5.2 measured at three full-width
+// LP, `{root time, validity}`. `days_horizon_sweep` evaluates `fel_root_time` once per node and
+// writes it here; O1.4's reset/count and prepare/write passes each read it instead of re-running
+// the query, which `evidence/P12/perround-upperbound.md` §1.5.2 measured at three full-width
 // evaluations per round over a read set nothing between the call sites writes.
 //
 // The region is device scratch: written and consumed inside one attempt, never decoded by the
@@ -289,6 +298,9 @@ constexpr uint L_ERROR_ARENA = 3;
 constexpr uint L_ERROR_NODE = 4;
 constexpr uint L_ERROR_CAPACITY = 5;
 constexpr uint L_ERROR_DEMAND = 6;
+// Tagged success/error storage: while L_ERROR is zero this word is the cumulative continuation
+// count. A capacity error overwrites it with its arena and terminates the discarded attempt.
+constexpr uint L_SAME_TIME_CONTINUATIONS = L_ERROR_ARENA;
 
 __device__ __forceinline__ bool key_less(const ulong *left, const ulong *right) {
     if (left[E_TIME] != right[E_TIME]) {
@@ -1612,6 +1624,112 @@ __device__ __forceinline__ bool append_remote(
     return true;
 }
 
+__device__ __forceinline__ bool build_child(
+    ulong node,
+    const ulong *parent,
+    ulong target,
+    ulong kind,
+    ulong time,
+    const ulong *packet,
+    ulong *error,
+    ulong *node_state,
+    ulong *child
+) {
+    ulong node_base = node * NODE_WORDS;
+    ulong sequence = node_state[node_base + N_NEXT_ORIGIN];
+    if (sequence == NONE) {
+        set_semantic_error(error, 1, node);
+        return false;
+    }
+    node_state[node_base + N_NEXT_ORIGIN] = sequence + 1;
+    child[E_TIME] = time;
+    child[E_PHASE] = event_phase(kind);
+    child[E_ORIGIN] = node;
+    child[E_SEQUENCE] = sequence;
+    child[E_TARGET] = target;
+    child[E_KIND] = kind;
+    child[E_PAYLOAD] = packet[PK_ID];
+    child[PK_ID] = packet[PK_ID];
+    child[PK_FLOW] = packet[PK_FLOW];
+    child[PK_SIZE] = packet[PK_SIZE];
+    child[PK_KIND] = packet[PK_KIND];
+    child[PK_META_0] = packet[PK_META_0];
+    child[PK_META_1] = packet[PK_META_1];
+    child[PK_META_2] = packet[PK_META_2];
+    if (!key_less(parent, child)) {
+        set_semantic_error(error, 2, node);
+        return false;
+    }
+    return true;
+}
+
+__device__ __forceinline__ bool thread_stored_key_less(
+    const ulong *left,
+    const ulong *right
+) {
+    for (uint word = E_TIME; word <= E_SEQUENCE; ++word) {
+        if (left[word] != right[word]) {
+            return left[word] < right[word];
+        }
+    }
+    return false;
+}
+
+// The live active-entry cache contains exactly one current head key for every non-empty stream
+// plus the fallback heap root. Requiring the child to precede every cached key is therefore
+// equivalent to the scalar `child.key < first_future_key` predicate. Heap-only mode compares the
+// same child against the live post-pop heap root directly.
+__device__ __forceinline__ bool child_precedes_lp_next_key(
+    ulong node,
+    const ulong *child,
+    const ulong *params,
+    const ulong *fel_meta,
+    const ulong *fel_records,
+    const ulong *stream_state
+) {
+    if (params[P_STREAMS_ENABLED] == 0) {
+        ulong heap = node * META_WORDS;
+        return fel_meta[heap + 3] == 0 || thread_stored_key_less(
+            child,
+            fel_records + fel_meta[heap] * EVENT_WORDS
+        );
+    }
+    ulong lp_meta = params[P_LP_STREAM_META_OFFSET] + node * LP_STREAM_META_WORDS;
+    ulong active_offset = stream_state[lp_meta + 2];
+    ulong active_count = stream_state[lp_meta + 3];
+    for (ulong index = 0; index < active_count; ++index) {
+        ulong entry = active_offset + index * ACTIVE_STREAM_ENTRY_WORDS;
+        if (!thread_stored_key_less(child, stream_state + entry + 1)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+__device__ __forceinline__ bool is_same_time_tx_ready_continuation(
+    ulong node,
+    const ulong *parent,
+    const ulong *child,
+    const ulong *params,
+    const ulong *fel_meta,
+    const ulong *fel_records,
+    const ulong *stream_state
+) {
+    return parent[E_KIND] == TX_COMPLETE &&
+        child[E_TARGET] == node &&
+        child[E_KIND] == TX_READY &&
+        child[E_TIME] == parent[E_TIME] &&
+        child[E_PHASE] == event_phase(TX_READY) &&
+        child_precedes_lp_next_key(
+            node,
+            child,
+            params,
+            fel_meta,
+            fel_records,
+            stream_state
+        );
+}
+
 __device__ __forceinline__ bool emit_child(
     ulong node,
     const ulong *parent,
@@ -1630,30 +1748,18 @@ __device__ __forceinline__ bool emit_child(
     ulong *stream_records,
     ulong *tcp_state
 ) {
-    ulong node_base = node * NODE_WORDS;
-    ulong sequence = node_state[node_base + N_NEXT_ORIGIN];
-    if (sequence == NONE) {
-        set_semantic_error(error, 1, node);
-        return false;
-    }
-    node_state[node_base + N_NEXT_ORIGIN] = sequence + 1;
     ulong child[EVENT_WORDS];
-    child[E_TIME] = time;
-    child[E_PHASE] = event_phase(kind);
-    child[E_ORIGIN] = node;
-    child[E_SEQUENCE] = sequence;
-    child[E_TARGET] = target;
-    child[E_KIND] = kind;
-    child[E_PAYLOAD] = packet[PK_ID];
-    child[PK_ID] = packet[PK_ID];
-    child[PK_FLOW] = packet[PK_FLOW];
-    child[PK_SIZE] = packet[PK_SIZE];
-    child[PK_KIND] = packet[PK_KIND];
-    child[PK_META_0] = packet[PK_META_0];
-    child[PK_META_1] = packet[PK_META_1];
-    child[PK_META_2] = packet[PK_META_2];
-    if (!key_less(parent, child)) {
-        set_semantic_error(error, 2, node);
+    if (!build_child(
+        node,
+        parent,
+        target,
+        kind,
+        time,
+        packet,
+        error,
+        node_state,
+        child
+    )) {
         return false;
     }
     if (target == node) {
@@ -3665,7 +3771,10 @@ __device__ __forceinline__ bool dispatch_event(
     ulong *observed,
     ulong *departures,
     ulong *arrivals,
-    ulong *tcp_state
+    ulong *tcp_state,
+    bool retain_continuation,
+    bool &has_continuation,
+    bool &counted_continuation
 ) {
     ulong node_base = node * NODE_WORDS;
     ulong role = node_state[node_base + N_KIND];
@@ -4225,7 +4334,8 @@ __device__ __forceinline__ bool dispatch_event(
                 return false;
             }
             node_state[node_base + N_READY_PENDING] = 1;
-            return emit_child(
+            ulong child[EVENT_WORDS];
+            if (!build_child(
                 node,
                 event,
                 node,
@@ -4233,15 +4343,38 @@ __device__ __forceinline__ bool dispatch_event(
                 event[E_TIME],
                 next,
                 error,
-                params,
                 node_state,
+                child
+            )) {
+                return false;
+            }
+            counted_continuation = is_same_time_tx_ready_continuation(
+                node,
+                event,
+                child,
+                params,
                 fel_meta,
                 fel_records,
-                remote_meta,
-                remote_staging,
+                stream_state
+            );
+            if (counted_continuation && retain_continuation) {
+                for (uint word = 0; word < EVENT_WORDS; ++word) {
+                    event[word] = child[word];
+                }
+                has_continuation = true;
+                return true;
+            }
+            return classified_push(
+                node,
+                child,
+                params,
+                error,
+                fel_meta,
+                fel_records,
                 stream_state,
                 stream_records,
-                tcp_state);
+                tcp_state
+            );
         }
         return true;
     }
@@ -4646,9 +4779,9 @@ __device__ __forceinline__ bool dispatch_event(
 //
 // CORRECTNESS. `fel_peek`'s read set is the LP stream metadata, that LP's active-stream entries,
 // the selected stream's header, `fel_meta`, `fel_records` and `stream_records`. Between
-// `days_horizon`'s evaluation and `days_round_prepare`'s two reads the only device writes are
-// `days_horizon`'s control words and this cache, and `days_round_prepare`'s own `lp_state` error
-// words, `remote_meta[node * META_WORDS + 3]` and the channel BATCH quadruple at
+// `days_horizon_sweep`'s evaluation and the reset/count + prepare/write reads, the only device
+// writes are horizon control/cache output, reset's `lp_state` error words,
+// `remote_meta[node * META_WORDS + 3]`, and the channel BATCH quadruple at
 // `P_CHANNEL_BATCH_OFFSET + channel * CHANNEL_BATCH_WORDS`. None of those is in the read set — the
 // batch quadruple is a different region of `stream_state` from the per-channel stream headers
 // `fel_peek` reads — so the cached answer is the answer a recomputed query would return.
@@ -4715,6 +4848,31 @@ static __device__ inline ulong load_round_partial(
         block * ROUND_SCRATCH_PARTIAL_WORDS +
         slot
     ];
+}
+
+// O1.4 — one count per block in the widest configurable per-LP grid. The host sizes this tail to
+// max(P_NODE_COUNT, 1), because one thread per block is the widest supported geometry. Dispatch A
+// writes every launched slot; Dispatch B reads only those previous-dispatch values.
+static __device__ inline ulong round_scratch_compaction_counts(const ulong *params) {
+    return round_scratch_partials(params) +
+        CONTROL_SWEEP_BLOCKS * ROUND_SCRATCH_PARTIAL_WORDS;
+}
+
+static __device__ inline void store_compaction_count(
+    ulong *stream_state,
+    const ulong *params,
+    ulong block,
+    ulong value
+) {
+    stream_state[round_scratch_compaction_counts(params) + block] = value;
+}
+
+static __device__ inline ulong load_compaction_count(
+    const ulong *stream_state,
+    const ulong *params,
+    ulong block
+) {
+    return stream_state[round_scratch_compaction_counts(params) + block];
 }
 
 // T21 fix 1 — the horizon's Θ(N) FEL-root sweep, on the whole grid.
@@ -4866,28 +5024,37 @@ extern "C" __global__ void days_horizon(DAYS_BUFFERS) {
     control[C_HORIZON_HI] = horizon_hi;
 }
 
-// T21 fix 1 — `days_round_prepare`'s Θ(N) + Θ(C) resets, on the whole grid.
+// O1.4 dispatch A — `days_round_prepare`'s Θ(N) + Θ(C) resets plus one eligible count per
+// configurable per-LP block.
 //
-// `evidence/P12/aterm-fixes.md` §3.4 item 2. These writes need NO cross-block communication and no
-// reduction of any kind: each thread owns whole LPs and whole channels, every word is written by
-// exactly one thread, and nothing here reads a word any other thread writes. They are also
-// per-word-disjoint from the worklist compaction that used to run beside them — `L_FINISHED` is
-// `lp_state` word 0, the reset writes words 2..6 — which is why splitting them out is inert.
+// `evidence/P12/aterm-fixes.md` §3.4 item 2. The reset writes need NO cross-block communication:
+// each thread owns whole LPs and whole channels, every word is written by exactly one thread, and
+// nothing here reads a word any other thread writes. They are per-word-disjoint from compaction —
+// `L_FINISHED` is `lp_state` word 0, while reset owns the error words other than the tagged
+// `L_ERROR_ARENA`. That word remains the cumulative successful-attempt continuation count; an
+// actual capacity error overwrites it and terminates the attempt. The eligible sum uses only a
+// deterministic in-block scan and publishes one word owned by that block.
 //
-// It runs immediately before `days_round_prepare` and replays that kernel's guard exactly. Nothing
-// between the two dispatches writes a word the guard reads, so both dispatches take the same
-// branch. It writes no control word, which is the property `t21_control_regrid.rs` asserts.
+// It runs immediately before `days_round_prepare`. A disabled block writes NONE rather than
+// returning without publishing, so the next dispatch consumes an explicit previous-dispatch guard
+// snapshot instead of reading any control word that it also writes. It writes no control word.
 extern "C" __global__ void days_round_reset(DAYS_BUFFERS) {
-    if (
+    uint lane = threadIdx.x;
+    __shared__ ulong counts[1024];
+    bool enabled = !(
         control[C_ERROR] != 0 ||
         control[C_DONE] != 0 ||
         control[C_CONTINUATION] != 0 ||
         control[C_ROUNDS] >= params[P_ROUND_CAPACITY]
-    ) {
+    );
+    if (!enabled) {
+        if (lane == 0) {
+            store_compaction_count(stream_state, params, blockIdx.x, NONE);
+        }
         return;
     }
 
-    ulong first = ulong(blockIdx.x) * ulong(blockDim.x) + ulong(threadIdx.x);
+    ulong first = ulong(blockIdx.x) * ulong(blockDim.x) + ulong(lane);
     ulong stride = ulong(gridDim.x) * ulong(blockDim.x);
     if (params[P_STREAMS_ENABLED] != 0) {
         for (
@@ -4904,36 +5071,52 @@ extern "C" __global__ void days_round_reset(DAYS_BUFFERS) {
             stream_state[batch + 3] = 0;
         }
     }
-    for (ulong node = first; node < params[P_NODE_COUNT]; node += stride) {
+    ulong local_count = 0;
+    if (first < params[P_NODE_COUNT]) {
+        ulong node = first;
         ulong state = node * LP_STATE_WORDS;
         lp_state[state + L_ERROR] = 0;
-        lp_state[state + L_ERROR_ARENA] = 0;
         lp_state[state + L_ERROR_NODE] = NONE;
         lp_state[state + L_ERROR_CAPACITY] = 0;
         lp_state[state + L_ERROR_DEMAND] = 0;
         remote_meta[node * META_WORDS + 3] = 0;
+        ulong time;
+        local_count = ulong(
+            load_fel_root(stream_state, params, node, time) &&
+            before_horizon(time, control)
+        );
+    }
+
+    counts[lane] = local_count;
+    __syncthreads();
+    for (uint offset = 1; offset < blockDim.x; offset <<= 1) {
+        ulong addend = lane >= offset ? counts[lane - offset] : 0;
+        __syncthreads();
+        counts[lane] += addend;
+        __syncthreads();
+    }
+    if (lane + 1 == blockDim.x) {
+        store_compaction_count(stream_state, params, blockIdx.x, counts[lane]);
     }
 }
 
+// O1.4 dispatch B — stable write from per-block counts published by the previous dispatch.
+// No control word this kernel writes is part of its guard: NONE in this block's count slot is the
+// disabled-attempt snapshot. Each block derives its exclusive base by summing the same immutable
+// count plane, then an in-block scan assigns ascending ranks to ascending node ids.
 extern "C" __global__ void days_round_prepare(DAYS_BUFFERS) {
     uint lane = threadIdx.x;
     __shared__ ulong counts[1024];
-    if (
-        control[C_ERROR] != 0 ||
-        control[C_DONE] != 0 ||
-        control[C_CONTINUATION] != 0 ||
-        control[C_ROUNDS] >= params[P_ROUND_CAPACITY]
-    ) {
+    __shared__ ulong block_base;
+    __shared__ ulong active_total;
+    ulong block_count = load_compaction_count(stream_state, params, blockIdx.x);
+    if (block_count == NONE) {
         return;
     }
 
-    ulong nodes = params[P_NODE_COUNT];
-    ulong chunk = nodes / 1024;
-    ulong remainder = nodes % 1024;
-    ulong start = ulong(lane) * chunk + min(ulong(lane), remainder);
-    ulong end = start + chunk + (ulong(lane) < remainder ? 1 : 0);
+    ulong node = ulong(blockIdx.x) * ulong(blockDim.x) + ulong(lane);
     ulong local_count = 0;
-    for (ulong node = start; node < end; ++node) {
+    if (node < params[P_NODE_COUNT]) {
         ulong time;
         if (
             load_fel_root(stream_state, params, node, time) &&
@@ -4945,43 +5128,53 @@ extern "C" __global__ void days_round_prepare(DAYS_BUFFERS) {
 
     counts[lane] = local_count;
     __syncthreads();
-    for (uint offset = 1; offset < 1024; offset <<= 1) {
+    for (uint offset = 1; offset < blockDim.x; offset <<= 1) {
         ulong addend = lane >= offset ? counts[lane - offset] : 0;
         __syncthreads();
         counts[lane] += addend;
         __syncthreads();
     }
 
-    ulong write = counts[lane] - local_count;
-    for (ulong node = start; node < end; ++node) {
-        ulong time;
-        if (
-            load_fel_root(stream_state, params, node, time) &&
-            before_horizon(time, control)
-        ) {
-            if (write >= params[P_WORKLIST_CAPACITY]) {
-                if (lane == 0) {
-                    control[C_ERROR] = ERROR_CAPACITY;
-                    control[C_ERROR_ARENA] = ARENA_WORKLIST;
-                    control[C_ERROR_NODE] = NONE;
-                    control[C_ERROR_CAPACITY] = params[P_WORKLIST_CAPACITY];
-                    control[C_ERROR_DEMAND] = write + 1;
-                }
-                return;
+    if (lane == 0) {
+        ulong base = 0;
+        ulong total = 0;
+        for (ulong block = 0; block < gridDim.x; ++block) {
+            ulong count = load_compaction_count(stream_state, params, block);
+            if (block < blockIdx.x) {
+                base += count;
             }
-            worklist[write++] = node;
-            lp_state[node * LP_STATE_WORDS + L_FINISHED] = 0;
+            total += count;
         }
+        block_base = base;
+        active_total = total;
     }
     __syncthreads();
-    if (lane == 0) {
-        control[C_ACTIVE] = counts[1023];
+
+    if (active_total > params[P_WORKLIST_CAPACITY]) {
+        if (blockIdx.x == 0 && lane == 0) {
+            control[C_ERROR] = ERROR_CAPACITY;
+            control[C_ERROR_ARENA] = ARENA_WORKLIST;
+            control[C_ERROR_NODE] = NONE;
+            control[C_ERROR_CAPACITY] = params[P_WORKLIST_CAPACITY];
+            control[C_ERROR_DEMAND] = active_total;
+        }
+        return;
+    }
+
+    if (local_count != 0) {
+        ulong write = block_base + counts[lane] - local_count;
+        worklist[write] = node;
+        lp_state[node * LP_STATE_WORDS + L_FINISHED] = 0;
+    }
+    __syncthreads();
+    if (lane == 0 && blockIdx.x + 1 == gridDim.x) {
+        control[C_ACTIVE] = active_total;
         control[C_OUTBOX] = 0;
         control[C_CONTINUATION] = 1;
     }
 }
 
-extern "C" __global__ __launch_bounds__(1024) void days_round(DAYS_BUFFERS) {
+extern "C" __global__ __launch_bounds__(256) void days_round(DAYS_BUFFERS) {
     uint active_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (
         control[C_ERROR] != 0 ||
@@ -4997,42 +5190,48 @@ extern "C" __global__ __launch_bounds__(1024) void days_round(DAYS_BUFFERS) {
         return;
     }
 
+    ulong event[EVENT_WORDS];
+    bool has_continuation = false;
     ulong dispatch_transitions = 0;
     while (dispatch_transitions < params[P_TRANSITION_CAPACITY]) {
-        ulong event[EVENT_WORDS];
-        ulong selected_active;
-        ulong selected_stream;
-        if (!fel_peek(
-            node,
-            params,
-            fel_meta,
-            fel_records,
-            stream_state,
-            stream_records,
-            event,
-            selected_active,
-            selected_stream
-        ) || !before_horizon(event[E_TIME], control)) {
-            state[L_FINISHED] = 1;
-            return;
+        ulong popped_timer_owner = NONE;
+        if (has_continuation) {
+            has_continuation = false;
+        } else {
+            ulong selected_active;
+            ulong selected_stream;
+            if (!fel_peek(
+                node,
+                params,
+                fel_meta,
+                fel_records,
+                stream_state,
+                stream_records,
+                event,
+                selected_active,
+                selected_stream
+            ) || !before_horizon(event[E_TIME], control)) {
+                state[L_FINISHED] = 1;
+                return;
+            }
+            if (!fel_pop_selected(
+                node,
+                selected_active,
+                selected_stream,
+                params,
+                fel_meta,
+                fel_records,
+                stream_state,
+                stream_records,
+                tcp_state,
+                event,
+                popped_timer_owner
+            )) {
+                set_semantic_error(state, 26, node);
+                return;
+            }
         }
-        ulong popped_timer_owner;
-        if (!fel_pop_selected(
-            node,
-            selected_active,
-            selected_stream,
-            params,
-            fel_meta,
-            fel_records,
-            stream_state,
-            stream_records,
-            tcp_state,
-            event,
-            popped_timer_owner
-        )) {
-            set_semantic_error(state, 26, node);
-            return;
-        }
+        bool counted_continuation = false;
         if (!dispatch_event(
             node,
             event,
@@ -5059,9 +5258,15 @@ extern "C" __global__ __launch_bounds__(1024) void days_round(DAYS_BUFFERS) {
             observed,
             departures,
             arrivals,
-            tcp_state
+            tcp_state,
+            dispatch_transitions + 1 < params[P_TRANSITION_CAPACITY],
+            has_continuation,
+            counted_continuation
         )) {
             return;
+        }
+        if (counted_continuation && state[L_SAME_TIME_CONTINUATIONS] != NONE) {
+            state[L_SAME_TIME_CONTINUATIONS] += 1;
         }
         if (state[L_TRANSITIONS] == NONE) {
             set_semantic_error(state, 27, node);
