@@ -1185,7 +1185,7 @@ fn md5_hex(message: &[u8]) -> String {
     }
     padded.extend_from_slice(&((message.len() as u64) * 8).to_le_bytes());
 
-    for chunk in padded.chunks_exact(64) {
+    for chunk in padded.as_chunks::<64>().0 {
         let words: [u32; 16] = std::array::from_fn(|index| {
             u32::from_le_bytes(chunk[index * 4..index * 4 + 4].try_into().expect("word"))
         });

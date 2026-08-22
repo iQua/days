@@ -3535,17 +3535,23 @@ impl MetalBuffers {
                 .stream_layout
                 .stream_count
                 .saturating_mul(ARENA_META_WORDS)]
-                .chunks_exact(ARENA_META_WORDS)
+                .as_chunks::<ARENA_META_WORDS>()
+                .0
+                .iter()
                 .map(|meta| meta[3])
                 .collect::<Vec<_>>();
             let initial_remote_high_water = plan
                 .remote_meta
-                .chunks_exact(ARENA_META_WORDS)
+                .as_chunks::<ARENA_META_WORDS>()
+                .0
+                .iter()
                 .map(|meta| meta[3])
                 .collect::<Vec<_>>();
             let initial_queue_high_water = plan
                 .queue_meta
-                .chunks_exact(QUEUE_META_WORDS)
+                .as_chunks::<QUEUE_META_WORDS>()
+                .0
+                .iter()
                 .map(|meta| meta[3])
                 .collect::<Vec<_>>();
             let stream_high_water_offset = plan.stream_state.len();
@@ -4147,7 +4153,7 @@ impl MetalBuffers {
         if observation_mode == ObservationMode::Full {
             // The gather already produced what `compact_lp_log` used to produce on the host: the
             // per-LP live prefixes, concatenated in LP order.
-            for words in observed_words.chunks_exact(OBSERVED_WORDS) {
+            for words in observed_words.as_chunks::<OBSERVED_WORDS>().0 {
                 let packet = decode_packet_words(words)?;
                 observed_packets
                     .entry(packet.id)
@@ -4158,7 +4164,7 @@ impl MetalBuffers {
             }
             let mut keyed_departures = Vec::new();
             let mut keyed_arrivals = Vec::new();
-            for words in departure_words.chunks_exact(DEPARTURE_WORDS) {
+            for words in departure_words.as_chunks::<DEPARTURE_WORDS>().0 {
                 let key = decode_key(words)?;
                 let packet = PacketDescriptor {
                     id: PayloadId(words[4]),
@@ -4179,7 +4185,7 @@ impl MetalBuffers {
                     },
                 ));
             }
-            for words in arrival_words.chunks_exact(ARRIVAL_WORDS) {
+            for words in arrival_words.as_chunks::<ARRIVAL_WORDS>().0 {
                 let key = decode_key(words)?;
                 let packet = PacketDescriptor {
                     id: PayloadId(words[4]),
@@ -4230,12 +4236,16 @@ impl MetalBuffers {
             channel_stream_capacity_distribution: self.channel_stream_capacity_distribution.clone(),
             rounds: control[CONTROL_ROUNDS],
             transitions: lp_state
-                .chunks_exact(LP_STATE_WORDS)
+                .as_chunks::<LP_STATE_WORDS>()
+                .0
+                .iter()
                 .take(image.nodes.len())
                 .map(|state| state[1])
                 .fold(0_u64, u64::saturating_add),
             same_time_continuations: lp_state
-                .chunks_exact(LP_STATE_WORDS)
+                .as_chunks::<LP_STATE_WORDS>()
+                .0
+                .iter()
                 .take(image.nodes.len())
                 .map(|state| state[LP_SAME_TIME_CONTINUATIONS])
                 .fold(0_u64, u64::saturating_add),
