@@ -1,5 +1,8 @@
 #![cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 
+#[path = "support/continuation.rs"]
+mod continuation;
+
 use std::collections::VecDeque;
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -11,7 +14,8 @@ use days_executor::{
     LinkId, MetalArena, MetalConfig, MetalError, MetalExecutor, NodeDescriptor, NodeId, NodeKind,
     ObservationMode, PacketDescriptor, PacketKind, PayloadId, RemoteChannel, RunResult,
     ScheduledEmission, SchedulerKind, SimulationImage, SwitchQueueState, SwitchState, event_phase,
-    run_metal, run_metal_with_observations, run_scalar_with_observations, validate,
+    run_metal, run_metal_with_observations, run_scalar_rounds_with_observations,
+    run_scalar_with_observations, validate,
 };
 
 const GENERATOR_SOURCE: NodeId = NodeId(0);
@@ -20,6 +24,56 @@ const GENERATOR_FORWARD: LinkId = LinkId(0);
 const GENERATOR_REVERSE: LinkId = LinkId(1);
 const GENERATOR_FLOW: FlowId = FlowId(0);
 const GENERATOR_FIRST_PACKET: PayloadId = PayloadId(0);
+
+#[test]
+fn metal_same_time_continuations_match_scalar_and_complete_state() {
+    let image = continuation::tcp_service_continuation_image();
+    let scalar = run_scalar_rounds_with_observations(&image, None, ObservationMode::Full)
+        .expect("scalar continuation oracle must run");
+    let expected_continuations = scalar
+        .rounds
+        .iter()
+        .flat_map(|round| &round.lp_work)
+        .map(|work| work.same_time_continuations)
+        .sum::<u64>();
+    let expected_rounds = scalar.rounds.len() as u64;
+    let expected_transitions = scalar
+        .rounds
+        .iter()
+        .map(|round| round.events_processed)
+        .sum::<u64>();
+    assert!(
+        expected_continuations > 0,
+        "TCP fixture must exercise same-time service continuations"
+    );
+    let mut expected_result = scalar.result;
+    expected_result.diagnostics = None;
+
+    for (streams_enabled, round_threads_per_threadgroup, max_transitions_per_lp_per_round) in
+        [(false, 32, 4_096), (true, 256, 4_096), (true, 32, 1)]
+    {
+        let metal = run_metal_with_observations(
+            &image,
+            None,
+            MetalConfig {
+                streams_enabled,
+                round_threads_per_threadgroup,
+                max_transitions_per_lp_per_round,
+                ..MetalConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .expect("Metal continuation run must succeed");
+        assert_eq!(metal.result, expected_result);
+        assert_eq!(metal.rounds, expected_rounds);
+        assert_eq!(metal.transitions, expected_transitions);
+        assert_eq!(
+            metal.same_time_continuations, expected_continuations,
+            "Metal streams={streams_enabled} threadgroup={round_threads_per_threadgroup} \
+             transition_cap={max_transitions_per_lp_per_round}"
+        );
+    }
+}
 
 fn generator_image(termination: GeneratorTermination) -> SimulationImage {
     let first_packet = PacketDescriptor {
