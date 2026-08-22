@@ -109,9 +109,9 @@ constexpr uint P_STREAM_ORDER_CHECKS = 27;
 constexpr uint P_TCP_RECEIVER_OFFSET = 28;
 constexpr uint P_TCP_LEDGER_META_OFFSET = 29;
 // T21 fix 2. Word offset, inside `stream_state`, of the per-round FEL root cache: two words per
-// LP, `{root time, validity}`. `days_horizon` evaluates `fel_root_time` once per node and writes it
-// here; `days_round_prepare`'s count pass and write pass read it back instead of re-running the
-// query, which `evidence/P12/perround-upperbound.md` §1.5.2 measured at three full-width
+// LP, `{root time, validity}`. `days_horizon_sweep` evaluates `fel_root_time` once per node and
+// writes it here; O1.4's reset/count and prepare/write passes each read it instead of re-running
+// the query, which `evidence/P12/perround-upperbound.md` §1.5.2 measured at three full-width
 // evaluations per round over a read set nothing between the call sites writes.
 //
 // The region is device scratch: written and consumed inside one attempt, never decoded by the
@@ -4646,9 +4646,9 @@ __device__ __forceinline__ bool dispatch_event(
 //
 // CORRECTNESS. `fel_peek`'s read set is the LP stream metadata, that LP's active-stream entries,
 // the selected stream's header, `fel_meta`, `fel_records` and `stream_records`. Between
-// `days_horizon`'s evaluation and `days_round_prepare`'s two reads the only device writes are
-// `days_horizon`'s control words and this cache, and `days_round_prepare`'s own `lp_state` error
-// words, `remote_meta[node * META_WORDS + 3]` and the channel BATCH quadruple at
+// `days_horizon_sweep`'s evaluation and the reset/count + prepare/write reads, the only device
+// writes are horizon control/cache output, reset's `lp_state` error words,
+// `remote_meta[node * META_WORDS + 3]`, and the channel BATCH quadruple at
 // `P_CHANNEL_BATCH_OFFSET + channel * CHANNEL_BATCH_WORDS`. None of those is in the read set — the
 // batch quadruple is a different region of `stream_state` from the per-channel stream headers
 // `fel_peek` reads — so the cached answer is the answer a recomputed query would return.
@@ -4715,6 +4715,31 @@ static __device__ inline ulong load_round_partial(
         block * ROUND_SCRATCH_PARTIAL_WORDS +
         slot
     ];
+}
+
+// O1.4 — one count per block in the widest configurable per-LP grid. The host sizes this tail to
+// max(P_NODE_COUNT, 1), because one thread per block is the widest supported geometry. Dispatch A
+// writes every launched slot; Dispatch B reads only those previous-dispatch values.
+static __device__ inline ulong round_scratch_compaction_counts(const ulong *params) {
+    return round_scratch_partials(params) +
+        CONTROL_SWEEP_BLOCKS * ROUND_SCRATCH_PARTIAL_WORDS;
+}
+
+static __device__ inline void store_compaction_count(
+    ulong *stream_state,
+    const ulong *params,
+    ulong block,
+    ulong value
+) {
+    stream_state[round_scratch_compaction_counts(params) + block] = value;
+}
+
+static __device__ inline ulong load_compaction_count(
+    const ulong *stream_state,
+    const ulong *params,
+    ulong block
+) {
+    return stream_state[round_scratch_compaction_counts(params) + block];
 }
 
 // T21 fix 1 — the horizon's Θ(N) FEL-root sweep, on the whole grid.
@@ -4866,28 +4891,35 @@ extern "C" __global__ void days_horizon(DAYS_BUFFERS) {
     control[C_HORIZON_HI] = horizon_hi;
 }
 
-// T21 fix 1 — `days_round_prepare`'s Θ(N) + Θ(C) resets, on the whole grid.
+// O1.4 dispatch A — `days_round_prepare`'s Θ(N) + Θ(C) resets plus one eligible count per
+// configurable per-LP block.
 //
-// `evidence/P12/aterm-fixes.md` §3.4 item 2. These writes need NO cross-block communication and no
-// reduction of any kind: each thread owns whole LPs and whole channels, every word is written by
-// exactly one thread, and nothing here reads a word any other thread writes. They are also
-// per-word-disjoint from the worklist compaction that used to run beside them — `L_FINISHED` is
-// `lp_state` word 0, the reset writes words 2..6 — which is why splitting them out is inert.
+// `evidence/P12/aterm-fixes.md` §3.4 item 2. The reset writes need NO cross-block communication:
+// each thread owns whole LPs and whole channels, every word is written by exactly one thread, and
+// nothing here reads a word any other thread writes. They are per-word-disjoint from compaction —
+// `L_FINISHED` is `lp_state` word 0, while reset writes words 2..6. The eligible sum uses only a
+// deterministic in-block scan and publishes one word owned by that block.
 //
-// It runs immediately before `days_round_prepare` and replays that kernel's guard exactly. Nothing
-// between the two dispatches writes a word the guard reads, so both dispatches take the same
-// branch. It writes no control word, which is the property `t21_control_regrid.rs` asserts.
+// It runs immediately before `days_round_prepare`. A disabled block writes NONE rather than
+// returning without publishing, so the next dispatch consumes an explicit previous-dispatch guard
+// snapshot instead of reading any control word that it also writes. It writes no control word.
 extern "C" __global__ void days_round_reset(DAYS_BUFFERS) {
-    if (
+    uint lane = threadIdx.x;
+    __shared__ ulong counts[1024];
+    bool enabled = !(
         control[C_ERROR] != 0 ||
         control[C_DONE] != 0 ||
         control[C_CONTINUATION] != 0 ||
         control[C_ROUNDS] >= params[P_ROUND_CAPACITY]
-    ) {
+    );
+    if (!enabled) {
+        if (lane == 0) {
+            store_compaction_count(stream_state, params, blockIdx.x, NONE);
+        }
         return;
     }
 
-    ulong first = ulong(blockIdx.x) * ulong(blockDim.x) + ulong(threadIdx.x);
+    ulong first = ulong(blockIdx.x) * ulong(blockDim.x) + ulong(lane);
     ulong stride = ulong(gridDim.x) * ulong(blockDim.x);
     if (params[P_STREAMS_ENABLED] != 0) {
         for (
@@ -4904,7 +4936,9 @@ extern "C" __global__ void days_round_reset(DAYS_BUFFERS) {
             stream_state[batch + 3] = 0;
         }
     }
-    for (ulong node = first; node < params[P_NODE_COUNT]; node += stride) {
+    ulong local_count = 0;
+    if (first < params[P_NODE_COUNT]) {
+        ulong node = first;
         ulong state = node * LP_STATE_WORDS;
         lp_state[state + L_ERROR] = 0;
         lp_state[state + L_ERROR_ARENA] = 0;
@@ -4912,28 +4946,43 @@ extern "C" __global__ void days_round_reset(DAYS_BUFFERS) {
         lp_state[state + L_ERROR_CAPACITY] = 0;
         lp_state[state + L_ERROR_DEMAND] = 0;
         remote_meta[node * META_WORDS + 3] = 0;
+        ulong time;
+        local_count = ulong(
+            load_fel_root(stream_state, params, node, time) &&
+            before_horizon(time, control)
+        );
+    }
+
+    counts[lane] = local_count;
+    __syncthreads();
+    for (uint offset = 1; offset < blockDim.x; offset <<= 1) {
+        ulong addend = lane >= offset ? counts[lane - offset] : 0;
+        __syncthreads();
+        counts[lane] += addend;
+        __syncthreads();
+    }
+    if (lane + 1 == blockDim.x) {
+        store_compaction_count(stream_state, params, blockIdx.x, counts[lane]);
     }
 }
 
+// O1.4 dispatch B — stable write from per-block counts published by the previous dispatch.
+// No control word this kernel writes is part of its guard: NONE in this block's count slot is the
+// disabled-attempt snapshot. Each block derives its exclusive base by summing the same immutable
+// count plane, then an in-block scan assigns ascending ranks to ascending node ids.
 extern "C" __global__ void days_round_prepare(DAYS_BUFFERS) {
     uint lane = threadIdx.x;
     __shared__ ulong counts[1024];
-    if (
-        control[C_ERROR] != 0 ||
-        control[C_DONE] != 0 ||
-        control[C_CONTINUATION] != 0 ||
-        control[C_ROUNDS] >= params[P_ROUND_CAPACITY]
-    ) {
+    __shared__ ulong block_base;
+    __shared__ ulong active_total;
+    ulong block_count = load_compaction_count(stream_state, params, blockIdx.x);
+    if (block_count == NONE) {
         return;
     }
 
-    ulong nodes = params[P_NODE_COUNT];
-    ulong chunk = nodes / 1024;
-    ulong remainder = nodes % 1024;
-    ulong start = ulong(lane) * chunk + min(ulong(lane), remainder);
-    ulong end = start + chunk + (ulong(lane) < remainder ? 1 : 0);
+    ulong node = ulong(blockIdx.x) * ulong(blockDim.x) + ulong(lane);
     ulong local_count = 0;
-    for (ulong node = start; node < end; ++node) {
+    if (node < params[P_NODE_COUNT]) {
         ulong time;
         if (
             load_fel_root(stream_state, params, node, time) &&
@@ -4945,37 +4994,47 @@ extern "C" __global__ void days_round_prepare(DAYS_BUFFERS) {
 
     counts[lane] = local_count;
     __syncthreads();
-    for (uint offset = 1; offset < 1024; offset <<= 1) {
+    for (uint offset = 1; offset < blockDim.x; offset <<= 1) {
         ulong addend = lane >= offset ? counts[lane - offset] : 0;
         __syncthreads();
         counts[lane] += addend;
         __syncthreads();
     }
 
-    ulong write = counts[lane] - local_count;
-    for (ulong node = start; node < end; ++node) {
-        ulong time;
-        if (
-            load_fel_root(stream_state, params, node, time) &&
-            before_horizon(time, control)
-        ) {
-            if (write >= params[P_WORKLIST_CAPACITY]) {
-                if (lane == 0) {
-                    control[C_ERROR] = ERROR_CAPACITY;
-                    control[C_ERROR_ARENA] = ARENA_WORKLIST;
-                    control[C_ERROR_NODE] = NONE;
-                    control[C_ERROR_CAPACITY] = params[P_WORKLIST_CAPACITY];
-                    control[C_ERROR_DEMAND] = write + 1;
-                }
-                return;
+    if (lane == 0) {
+        ulong base = 0;
+        ulong total = 0;
+        for (ulong block = 0; block < gridDim.x; ++block) {
+            ulong count = load_compaction_count(stream_state, params, block);
+            if (block < blockIdx.x) {
+                base += count;
             }
-            worklist[write++] = node;
-            lp_state[node * LP_STATE_WORDS + L_FINISHED] = 0;
+            total += count;
         }
+        block_base = base;
+        active_total = total;
     }
     __syncthreads();
-    if (lane == 0) {
-        control[C_ACTIVE] = counts[1023];
+
+    if (active_total > params[P_WORKLIST_CAPACITY]) {
+        if (blockIdx.x == 0 && lane == 0) {
+            control[C_ERROR] = ERROR_CAPACITY;
+            control[C_ERROR_ARENA] = ARENA_WORKLIST;
+            control[C_ERROR_NODE] = NONE;
+            control[C_ERROR_CAPACITY] = params[P_WORKLIST_CAPACITY];
+            control[C_ERROR_DEMAND] = active_total;
+        }
+        return;
+    }
+
+    if (local_count != 0) {
+        ulong write = block_base + counts[lane] - local_count;
+        worklist[write] = node;
+        lp_state[node * LP_STATE_WORDS + L_FINISHED] = 0;
+    }
+    __syncthreads();
+    if (lane == 0 && blockIdx.x + 1 == gridDim.x) {
+        control[C_ACTIVE] = active_total;
         control[C_OUTBOX] = 0;
         control[C_CONTINUATION] = 1;
     }

@@ -21,7 +21,9 @@
 //! that. They pin the shape, so the single-block geometry cannot creep back and a future edit
 //! cannot reintroduce in-dispatch cross-block synchronization without this file going red.
 
-use days_executor::device_sizing::{ROUND_SCRATCH_CACHE_WORDS, round_scratch_words};
+use days_executor::device_sizing::{
+    ROUND_SCRATCH_CACHE_WORDS, round_compaction_count_words, round_scratch_words,
+};
 
 #[path = "support/kernel_span.rs"]
 mod kernel_span;
@@ -141,12 +143,10 @@ fn writes_control(body: &str) -> bool {
     false
 }
 
-/// Item 2 of `aterm-fixes.md` §3.4, and the cheapest real slice of 3(b): `days_round_prepare`'s
-/// Θ(N) LP-error reset and Θ(C) channel-batch reset need no cross-block communication at all —
-/// they are per-word-disjoint from the compaction that used to run beside them — so they become
-/// their own full-grid dispatch and leave the compaction alone.
+/// O1.4 keeps the existing reset slot and folds the eligible-count pass into it. Dispatch A writes
+/// no control word; Dispatch B consumes only its prior-dispatch count/guard snapshot.
 #[test]
-fn the_round_prepare_resets_run_on_the_whole_grid() {
+fn reset_and_count_publish_for_the_stable_write_dispatch() {
     for (backend, reset, prepare) in [
         (
             "CUDA",
@@ -174,6 +174,23 @@ fn the_round_prepare_resets_run_on_the_whole_grid() {
         assert!(
             !writes_control(reset),
             "{backend} `days_round_reset` must not write a control word",
+        );
+        assert!(
+            reset.contains("store_compaction_count(") && reset.contains("load_fel_root("),
+            "{backend} `days_round_reset` publishes one eligible count per block",
+        );
+        assert!(
+            prepare.contains("load_compaction_count(")
+                && prepare.contains("block_count == NONE")
+                && prepare.contains("counts[lane] - local_count"),
+            "{backend} `days_round_prepare` consumes the previous-dispatch snapshot and writes a \
+             stable rank",
+        );
+        assert!(
+            !prepare.contains("control[C_DONE] != 0")
+                && !prepare.contains("control[C_CONTINUATION] != 0")
+                && !prepare.contains("control[C_ROUNDS] >="),
+            "{backend} Dispatch B must not guard on control words it can publish",
         );
         assert!(
             !prepare.contains("L_ERROR_DEMAND] = 0"),
@@ -404,29 +421,23 @@ fn the_full_and_legacy_attempt_dag_is_thirteen_dispatches() {
 /// Every launch's geometry, read out of the two backends' dispatch tables, with **no kernel
 /// unaccounted for**.
 ///
-/// The adversarial review found the previous coverage one kernel short in both places: the host
-/// table was gated only for the five sweeps and three of the four width-1 combines, and
-/// `days_round_prepare` — the one width-1 kernel whose *output order* depends on the partition —
-/// appeared in neither list. Combined with a source gate that could not fail, nothing in the tree
-/// pinned it to width 1. This test enumerates the whole table and asserts an expected geometry for
-/// every entry, so a new dispatch cannot be added without a decision recorded here.
+/// O1.4 deliberately moves reset/count and prepare/write onto the configurable per-LP grid. The
+/// actual-device gate pins their output; this source gate records every dispatch's intended class
+/// and retains width one only for genuine combines and the legacy producer prefix.
 #[test]
-fn the_two_partition_dependent_scans_are_dispatched_at_width_one() {
+fn every_attempt_dispatch_has_its_intended_geometry() {
     // The complete expected geometry of the attempt DAG, in encode order. `FixedControl` is one
     // threadgroup; `ControlSweep` is `CONTROL_SWEEP_BLOCKS` of them.
     const EXPECTED: [(&str, &str); 13] = [
         ("HorizonSweep", "ControlSweep"),
         ("Horizon", "FixedControl"),
-        ("RoundReset", "ControlSweep"),
-        // The worklist compaction. Its output is the ORDER of `worklist`, which depends on the
-        // partition, so it may never be widened.
-        ("Compaction", "FixedControl"),
+        ("RoundReset", "Parallel"),
+        ("Compaction", "Parallel"),
         ("DrainExecute", "ActiveWorklist"),
         ("ContinuationControlSweep", "ControlSweep"),
         ("ContinuationControl", "FixedControl"),
         ("ExchangePrefixSweep", "ControlSweep"),
-        // The legacy node-ordered prefix. Its output is each producer's staging base, which depends
-        // on the partition, so it may never be widened either.
+        // The legacy node-ordered prefix still depends on its retained partition.
         ("ExchangePrefix", "FixedControl"),
         ("ExchangeScatter", "Parallel"),
         ("TargetMerge", "Parallel"),
@@ -460,10 +471,10 @@ fn the_two_partition_dependent_scans_are_dispatched_at_width_one() {
         "the CUDA DAG is thirteen launches: {names:?}"
     );
     for (kernel, expected) in [
-        ("days_round_prepare", "FixedControl"),
+        ("days_round_prepare", "Parallel"),
         ("days_exchange_prefix", "FixedControl"),
         ("days_horizon_sweep", "ControlSweep"),
-        ("days_round_reset", "ControlSweep"),
+        ("days_round_reset", "Parallel"),
         ("days_round_control_sweep", "ControlSweep"),
         ("days_exchange_prefix_sweep", "ControlSweep"),
         ("days_round_finalize_sweep", "ControlSweep"),
@@ -492,17 +503,17 @@ fn the_two_partition_dependent_scans_are_dispatched_at_width_one() {
     }
     assert!(
         CUDA_BACKEND.contains("grid_dim: (1, 1, 1)"),
-        "the width-1 CUDA control geometry must still exist for the combines and the two scans",
+        "the width-1 CUDA control geometry must still exist for combines and the legacy scan",
     );
 }
 
-/// The sweep width is a fixed constant, shared by both backends and both kernel sources.
+/// The fixed sweep rows and variable-geometry O1.4 count tail share one exactly sized scratch.
 ///
 /// Fixing it is what makes the combine sound without a params word or a host/device agreement to
 /// get wrong: every one of the `CONTROL_SWEEP_BLOCKS` partial slots is written by its own block on
 /// every dispatch, so the combine never reads a slot left over from a previous round.
 #[test]
-fn the_sweep_width_and_its_scratch_are_one_shared_constant() {
+fn sweep_partials_and_compaction_counts_are_sized_exactly() {
     assert_eq!(ROUND_SCRATCH_CACHE_WORDS, 2);
     assert!(
         DEVICE_SIZING.contains("CONTROL_SWEEP_BLOCKS: usize = 128"),
@@ -513,10 +524,15 @@ fn the_sweep_width_and_its_scratch_are_one_shared_constant() {
         "the host allocates eight words per sweep block",
     );
     let partials = CONTROL_SWEEP_BLOCKS * ROUND_SCRATCH_PARTIAL_WORDS;
-    assert_eq!(round_scratch_words(0), Some(partials));
-    assert_eq!(round_scratch_words(1), Some(2 + partials));
+    assert_eq!(round_compaction_count_words(0), 1);
+    assert_eq!(round_compaction_count_words(1), 1);
+    assert_eq!(round_compaction_count_words(49_152), 49_152);
+    assert_eq!(round_scratch_words(0), Some(partials + 1));
+    assert_eq!(round_scratch_words(1), Some(2 + partials + 1));
     // E1 k=32, the fixture the analysis measured: 49,152 LPs.
-    assert_eq!(round_scratch_words(49_152), Some(98_304 + partials));
+    assert_eq!(round_scratch_words(49_152), Some(148_480));
+    // E6 k=32: 147,456 LPs.
+    assert_eq!(round_scratch_words(147_456), Some(443_392));
     assert_eq!(round_scratch_words(usize::MAX), None);
     for (backend, source) in [("CUDA", CUDA_KERNELS), ("Metal", METAL_KERNELS)] {
         assert!(
@@ -526,6 +542,10 @@ fn the_sweep_width_and_its_scratch_are_one_shared_constant() {
         assert!(
             source.contains("ROUND_SCRATCH_PARTIAL_WORDS = 8"),
             "{backend} kernels pin the same partial stride the host allocates for",
+        );
+        assert!(
+            source.contains("round_scratch_compaction_counts"),
+            "{backend} kernels address the planner-sized count tail",
         );
     }
     assert!(

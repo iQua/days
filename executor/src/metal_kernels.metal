@@ -88,9 +88,9 @@ constant uint P_TCP_RECEIVER_OFFSET = 28;
 constant uint P_TCP_LEDGER_META_OFFSET = 29;
 constant uint P_ROUND_THREADS = 30;
 // T21 fix 2. Word offset, inside `stream_state`, of the per-round FEL root cache: two words per
-// LP, `{root time, validity}`. `days_horizon` evaluates `fel_root_time` once per node and writes it
-// here; `days_round_prepare`'s count pass and write pass read it back instead of re-running the
-// query, which `evidence/P12/perround-upperbound.md` §1.5.2 measured at three full-width
+// LP, `{root time, validity}`. `days_horizon_sweep` evaluates `fel_root_time` once per node and
+// writes it here; O1.4's reset/count and prepare/write passes each read it instead of re-running
+// the query, which `evidence/P12/perround-upperbound.md` §1.5.2 measured at three full-width
 // evaluations per round over a read set nothing between the call sites writes.
 //
 // The region is device scratch: written and consumed inside one attempt, never decoded by the
@@ -5030,6 +5030,31 @@ static inline ulong load_round_partial(
     ];
 }
 
+// O1.4 — one count per threadgroup in the widest configurable per-LP grid. The host sizes this
+// tail to max(P_NODE_COUNT, 1), because one thread per threadgroup is the widest supported
+// geometry. Dispatch A writes every launched slot; Dispatch B reads only those values.
+static inline ulong round_scratch_compaction_counts(const device ulong *params) {
+    return round_scratch_partials(params) +
+        CONTROL_SWEEP_BLOCKS * ROUND_SCRATCH_PARTIAL_WORDS;
+}
+
+static inline void store_compaction_count(
+    device ulong *stream_state,
+    const device ulong *params,
+    ulong block,
+    ulong value
+) {
+    stream_state[round_scratch_compaction_counts(params) + block] = value;
+}
+
+static inline ulong load_compaction_count(
+    const device ulong *stream_state,
+    const device ulong *params,
+    ulong block
+) {
+    return stream_state[round_scratch_compaction_counts(params) + block];
+}
+
 // T21 fix 1 — the horizon's Θ(N) FEL-root sweep, on the whole grid. Transliterated word for word
 // from `cuda_kernels.cu`; see that kernel's header for the partition-invariance argument.
 kernel void days_horizon_sweep(
@@ -5180,8 +5205,9 @@ kernel void days_horizon(
     control[C_HORIZON_HI] = horizon_hi;
 }
 
-// T21 fix 1 — `days_round_prepare`'s Θ(N) + Θ(C) resets, on the whole grid. Transliterated word
-// for word from `cuda_kernels.cu`; see that kernel's header for the disjointness argument.
+// O1.4 dispatch A — `days_round_prepare`'s Θ(N) + Θ(C) resets plus one eligible count per
+// configurable per-LP threadgroup. Transliterated from CUDA; see that kernel for the guard-snapshot
+// and disjointness arguments.
 kernel void days_round_reset(
     const device ulong *control [[buffer(0)]],
     const device ulong *params [[buffer(1)]],
@@ -5193,12 +5219,17 @@ kernel void days_round_reset(
     uint block_size [[threads_per_threadgroup]],
     uint blocks [[threadgroups_per_grid]]
 ) {
-    if (
+    threadgroup ulong counts[1024];
+    bool enabled = !(
         control[C_ERROR] != 0 ||
         control[C_DONE] != 0 ||
         control[C_CONTINUATION] != 0 ||
         control[C_ROUNDS] >= params[P_ROUND_CAPACITY]
-    ) {
+    );
+    if (!enabled) {
+        if (lane == 0) {
+            store_compaction_count(stream_state, params, block, NONE);
+        }
         return;
     }
 
@@ -5219,7 +5250,9 @@ kernel void days_round_reset(
             stream_state[batch + 3] = 0;
         }
     }
-    for (ulong node = first; node < params[P_NODE_COUNT]; node += stride) {
+    ulong local_count = 0;
+    if (first < params[P_NODE_COUNT]) {
+        ulong node = first;
         ulong state = node * LP_STATE_WORDS;
         lp_state[state + L_ERROR] = 0;
         lp_state[state + L_ERROR_ARENA] = 0;
@@ -5227,9 +5260,27 @@ kernel void days_round_reset(
         lp_state[state + L_ERROR_CAPACITY] = 0;
         lp_state[state + L_ERROR_DEMAND] = 0;
         remote_meta[node * META_WORDS + 3] = 0;
+        ulong time;
+        local_count = ulong(
+            load_fel_root(stream_state, params, node, time) &&
+            before_horizon(time, control)
+        );
+    }
+
+    counts[lane] = local_count;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint offset = 1; offset < block_size; offset <<= 1) {
+        ulong addend = lane >= offset ? counts[lane - offset] : 0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        counts[lane] += addend;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane + 1 == block_size) {
+        store_compaction_count(stream_state, params, block, counts[lane]);
     }
 }
 
+// O1.4 dispatch B — stable write from counts and the guard snapshot published by Dispatch A.
 kernel void days_round_prepare(
     device ulong *control [[buffer(0)]],
     const device ulong *params [[buffer(1)]],
@@ -5240,25 +5291,22 @@ kernel void days_round_prepare(
     device ulong *remote_meta [[buffer(19)]],
     device ulong *stream_state [[buffer(25)]],
     const device ulong *stream_records [[buffer(26)]],
-    uint lane [[thread_index_in_threadgroup]]
+    uint lane [[thread_index_in_threadgroup]],
+    uint block [[threadgroup_position_in_grid]],
+    uint block_size [[threads_per_threadgroup]],
+    uint blocks [[threadgroups_per_grid]]
 ) {
     threadgroup ulong counts[1024];
-    if (
-        control[C_ERROR] != 0 ||
-        control[C_DONE] != 0 ||
-        control[C_CONTINUATION] != 0 ||
-        control[C_ROUNDS] >= params[P_ROUND_CAPACITY]
-    ) {
+    threadgroup ulong block_base;
+    threadgroup ulong active_total;
+    ulong block_count = load_compaction_count(stream_state, params, block);
+    if (block_count == NONE) {
         return;
     }
 
-    ulong nodes = params[P_NODE_COUNT];
-    ulong chunk = nodes / 1024;
-    ulong remainder = nodes % 1024;
-    ulong start = ulong(lane) * chunk + min(ulong(lane), remainder);
-    ulong end = start + chunk + (ulong(lane) < remainder ? 1 : 0);
+    ulong node = ulong(block) * ulong(block_size) + ulong(lane);
     ulong local_count = 0;
-    for (ulong node = start; node < end; ++node) {
+    if (node < params[P_NODE_COUNT]) {
         ulong time;
         if (
             load_fel_root(stream_state, params, node, time) &&
@@ -5270,37 +5318,52 @@ kernel void days_round_prepare(
 
     counts[lane] = local_count;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint offset = 1; offset < 1024; offset <<= 1) {
+    for (uint offset = 1; offset < block_size; offset <<= 1) {
         ulong addend = lane >= offset ? counts[lane - offset] : 0;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         counts[lane] += addend;
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    ulong write = counts[lane] - local_count;
-    for (ulong node = start; node < end; ++node) {
-        ulong time;
-        if (
-            load_fel_root(stream_state, params, node, time) &&
-            before_horizon(time, control)
-        ) {
-            if (write >= params[P_WORKLIST_CAPACITY]) {
-                if (lane == 0) {
-                    control[C_ERROR] = ERROR_CAPACITY;
-                    control[C_ERROR_ARENA] = ARENA_WORKLIST;
-                    control[C_ERROR_NODE] = NONE;
-                    control[C_ERROR_CAPACITY] = params[P_WORKLIST_CAPACITY];
-                    control[C_ERROR_DEMAND] = write + 1;
-                }
-                return;
+    if (lane == 0) {
+        ulong base = 0;
+        ulong total = 0;
+        for (ulong candidate = 0; candidate < blocks; ++candidate) {
+            ulong count = load_compaction_count(stream_state, params, candidate);
+            if (candidate < block) {
+                base += count;
             }
-            worklist[write++] = node;
-            lp_state[node * LP_STATE_WORDS + L_FINISHED] = 0;
+            total += count;
         }
+        block_base = base;
+        active_total = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (active_total > params[P_WORKLIST_CAPACITY]) {
+        if (block == 0 && lane == 0) {
+            control[C_ERROR] = ERROR_CAPACITY;
+            control[C_ERROR_ARENA] = ARENA_WORKLIST;
+            control[C_ERROR_NODE] = NONE;
+            control[C_ERROR_CAPACITY] = params[P_WORKLIST_CAPACITY];
+            control[C_ERROR_DEMAND] = active_total;
+            device uint *drain_dispatch =
+                reinterpret_cast<device uint *>(control + C_INDIRECT_OFFSET_WORDS);
+            drain_dispatch[0] = 0;
+            drain_dispatch[1] = 1;
+            drain_dispatch[2] = 1;
+        }
+        return;
+    }
+
+    if (local_count != 0) {
+        ulong write = block_base + counts[lane] - local_count;
+        worklist[write] = node;
+        lp_state[node * LP_STATE_WORDS + L_FINISHED] = 0;
     }
     threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
-    if (lane == 0) {
-        ulong active = counts[1023];
+    if (lane == 0 && block + 1 == blocks) {
+        ulong active = active_total;
         device uint *drain_dispatch =
             reinterpret_cast<device uint *>(control + C_INDIRECT_OFFSET_WORDS);
         control[C_ACTIVE] = active;
