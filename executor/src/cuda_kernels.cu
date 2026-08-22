@@ -12,15 +12,24 @@ using ulong = uint64_t;
 #define min(left, right) ((left) < (right) ? (left) : (right))
 #define max(left, right) ((left) > (right) ? (left) : (right))
 
+// `CudaBuffers::new` owns one allocation per entry in this exact order, including one-word
+// allocations for logically empty planes. Never bind one allocation at two entries: the complete
+// attempt ABI relies on their pairwise disjointness.
 #define DAYS_BUFFERS \
-    ulong *control, const ulong *params, ulong *node_state, ulong *generators, \
-    const ulong *flows, const ulong *routes, const ulong *links, ulong *fel_meta, \
-    ulong *fel_records, ulong *queue_meta, ulong *queue_records, ulong *in_service, \
-    ulong *outbox, ulong *worklist, ulong *summary, ulong *observed, ulong *departures, \
-    ulong *arrivals, ulong *lp_state, ulong *remote_meta, ulong *remote_staging, \
-    ulong *observation_meta, ulong *inbound_meta, ulong *inbound_producers, \
-    ulong *merge_cursors, ulong *stream_state, ulong *stream_records, \
-    ulong *scheduler_state, ulong *tcp_state
+    ulong *__restrict__ control, const ulong *__restrict__ params, \
+    ulong *__restrict__ node_state, ulong *__restrict__ generators, \
+    const ulong *__restrict__ flows, const ulong *__restrict__ routes, \
+    const ulong *__restrict__ links, ulong *__restrict__ fel_meta, \
+    ulong *__restrict__ fel_records, ulong *__restrict__ queue_meta, \
+    ulong *__restrict__ queue_records, ulong *__restrict__ in_service, \
+    ulong *__restrict__ outbox, ulong *__restrict__ worklist, ulong *__restrict__ summary, \
+    ulong *__restrict__ observed, ulong *__restrict__ departures, ulong *__restrict__ arrivals, \
+    ulong *__restrict__ lp_state, ulong *__restrict__ remote_meta, \
+    ulong *__restrict__ remote_staging, ulong *__restrict__ observation_meta, \
+    const ulong *__restrict__ inbound_meta, const ulong *__restrict__ inbound_producers, \
+    ulong *__restrict__ merge_cursors, ulong *__restrict__ stream_state, \
+    ulong *__restrict__ stream_records, ulong *__restrict__ scheduler_state, \
+    ulong *__restrict__ tcp_state
 
 constexpr uint EVENT_WORDS = 14;
 constexpr uint SCATTER_GROUP_WIDTH = 32;
@@ -5165,7 +5174,7 @@ extern "C" __global__ void days_round_prepare(DAYS_BUFFERS) {
     }
 }
 
-extern "C" __global__ __launch_bounds__(1024) void days_round(DAYS_BUFFERS) {
+extern "C" __global__ __launch_bounds__(256) void days_round(DAYS_BUFFERS) {
     uint active_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (
         control[C_ERROR] != 0 ||

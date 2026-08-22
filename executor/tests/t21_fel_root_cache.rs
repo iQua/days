@@ -31,7 +31,8 @@ fn metal_kernel(entry: &str) -> &'static str {
 /// The extraction every other test in this file depends on sees each kernel and *only* that kernel.
 ///
 /// The first version of the helper split on the literal `extern "C" __global__ void `, which does
-/// not match `days_round`'s `__launch_bounds__(1024)` form, so `days_round_prepare`'s span ran on
+/// did not match `days_round`'s attributed `__launch_bounds__` form, so
+/// `days_round_prepare`'s span ran on
 /// through the whole of `days_round`. Two assertions below were consequently evaluated over the
 /// wrong text, and one of them could not fail at all. This test is the floor under both.
 #[test]

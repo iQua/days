@@ -1,6 +1,9 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// `MetalBuffers::new` creates and binds one allocation per buffer index used by the attempt
+// kernels. Their `__restrict` contract depends on preserving that pairwise-disjoint binding.
+
 constant uint EVENT_WORDS = 14;
 constant uint SCATTER_COOPERATIVE_MIN_RECORDS = 3;
 constant uint NODE_WORDS = 11;
@@ -5181,12 +5184,12 @@ static inline ulong load_compaction_count(
 // T21 fix 1 — the horizon's Θ(N) FEL-root sweep, on the whole grid. Transliterated word for word
 // from `cuda_kernels.cu`; see that kernel's header for the partition-invariance argument.
 kernel void days_horizon_sweep(
-    const device ulong *control [[buffer(0)]],
-    const device ulong *params [[buffer(1)]],
-    const device ulong *fel_meta [[buffer(7)]],
-    const device ulong *fel_records [[buffer(8)]],
-    device ulong *stream_state [[buffer(25)]],
-    const device ulong *stream_records [[buffer(26)]],
+    const device ulong * __restrict control [[buffer(0)]],
+    const device ulong * __restrict params [[buffer(1)]],
+    const device ulong * __restrict fel_meta [[buffer(7)]],
+    const device ulong * __restrict fel_records [[buffer(8)]],
+    device ulong * __restrict stream_state [[buffer(25)]],
+    const device ulong * __restrict stream_records [[buffer(26)]],
     uint lane [[thread_index_in_threadgroup]],
     uint block [[threadgroup_position_in_grid]],
     uint block_size [[threads_per_threadgroup]],
@@ -5250,9 +5253,9 @@ kernel void days_horizon_sweep(
 
 // T21 fix 1 — the horizon combine. Transliterated word for word from `cuda_kernels.cu`.
 kernel void days_horizon(
-    device ulong *control [[buffer(0)]],
-    const device ulong *params [[buffer(1)]],
-    const device ulong *stream_state [[buffer(25)]],
+    device ulong * __restrict control [[buffer(0)]],
+    const device ulong * __restrict params [[buffer(1)]],
+    const device ulong * __restrict stream_state [[buffer(25)]],
     uint lane [[thread_index_in_threadgroup]]
 ) {
     threadgroup ulong minima[1024];
@@ -5332,11 +5335,11 @@ kernel void days_horizon(
 // configurable per-LP threadgroup. Transliterated from CUDA; see that kernel for the guard-snapshot
 // and disjointness arguments.
 kernel void days_round_reset(
-    const device ulong *control [[buffer(0)]],
-    const device ulong *params [[buffer(1)]],
-    device ulong *lp_state [[buffer(18)]],
-    device ulong *remote_meta [[buffer(19)]],
-    device ulong *stream_state [[buffer(25)]],
+    const device ulong * __restrict control [[buffer(0)]],
+    const device ulong * __restrict params [[buffer(1)]],
+    device ulong * __restrict lp_state [[buffer(18)]],
+    device ulong * __restrict remote_meta [[buffer(19)]],
+    device ulong * __restrict stream_state [[buffer(25)]],
     uint lane [[thread_index_in_threadgroup]],
     uint block [[threadgroup_position_in_grid]],
     uint block_size [[threads_per_threadgroup]],
@@ -5406,15 +5409,15 @@ kernel void days_round_reset(
 
 // O1.4 dispatch B — stable write from counts and the guard snapshot published by Dispatch A.
 kernel void days_round_prepare(
-    device ulong *control [[buffer(0)]],
-    const device ulong *params [[buffer(1)]],
-    const device ulong *fel_meta [[buffer(7)]],
-    const device ulong *fel_records [[buffer(8)]],
-    device ulong *worklist [[buffer(13)]],
-    device ulong *lp_state [[buffer(18)]],
-    device ulong *remote_meta [[buffer(19)]],
-    device ulong *stream_state [[buffer(25)]],
-    const device ulong *stream_records [[buffer(26)]],
+    device ulong * __restrict control [[buffer(0)]],
+    const device ulong * __restrict params [[buffer(1)]],
+    const device ulong * __restrict fel_meta [[buffer(7)]],
+    const device ulong * __restrict fel_records [[buffer(8)]],
+    device ulong * __restrict worklist [[buffer(13)]],
+    device ulong * __restrict lp_state [[buffer(18)]],
+    device ulong * __restrict remote_meta [[buffer(19)]],
+    device ulong * __restrict stream_state [[buffer(25)]],
+    const device ulong * __restrict stream_records [[buffer(26)]],
     uint lane [[thread_index_in_threadgroup]],
     uint block [[threadgroup_position_in_grid]],
     uint block_size [[threads_per_threadgroup]],
@@ -5502,31 +5505,31 @@ kernel void days_round_prepare(
 }
 
 kernel void days_round(
-    device ulong *control [[buffer(0)]],
-    const device ulong *params [[buffer(1)]],
-    device ulong *node_state [[buffer(2)]],
-    device ulong *generators [[buffer(3)]],
-    const device ulong *flows [[buffer(4)]],
-    const device ulong *routes [[buffer(5)]],
-    const device ulong *links [[buffer(6)]],
-    device ulong *fel_meta [[buffer(7)]],
-    device ulong *fel_records [[buffer(8)]],
-    device ulong *queue_meta [[buffer(9)]],
-    device ulong *queue_records [[buffer(10)]],
-    device ulong *in_service [[buffer(11)]],
-    const device ulong *worklist [[buffer(13)]],
-    device ulong *summary [[buffer(14)]],
-    device ulong *observed [[buffer(15)]],
-    device ulong *departures [[buffer(16)]],
-    device ulong *arrivals [[buffer(17)]],
-    device ulong *lp_state [[buffer(18)]],
-    device ulong *remote_meta [[buffer(19)]],
-    device ulong *remote_staging [[buffer(20)]],
-    device ulong *observation_meta [[buffer(21)]],
-    device ulong *stream_state [[buffer(25)]],
-    device ulong *stream_records [[buffer(26)]],
-    device ulong *scheduler_state [[buffer(27)]],
-    device ulong *tcp_state [[buffer(30)]],
+    const device ulong * __restrict control [[buffer(0)]],
+    const device ulong * __restrict params [[buffer(1)]],
+    device ulong * __restrict node_state [[buffer(2)]],
+    device ulong * __restrict generators [[buffer(3)]],
+    const device ulong * __restrict flows [[buffer(4)]],
+    const device ulong * __restrict routes [[buffer(5)]],
+    const device ulong * __restrict links [[buffer(6)]],
+    device ulong * __restrict fel_meta [[buffer(7)]],
+    device ulong * __restrict fel_records [[buffer(8)]],
+    device ulong * __restrict queue_meta [[buffer(9)]],
+    device ulong * __restrict queue_records [[buffer(10)]],
+    device ulong * __restrict in_service [[buffer(11)]],
+    const device ulong * __restrict worklist [[buffer(13)]],
+    device ulong * __restrict summary [[buffer(14)]],
+    device ulong * __restrict observed [[buffer(15)]],
+    device ulong * __restrict departures [[buffer(16)]],
+    device ulong * __restrict arrivals [[buffer(17)]],
+    device ulong * __restrict lp_state [[buffer(18)]],
+    device ulong * __restrict remote_meta [[buffer(19)]],
+    device ulong * __restrict remote_staging [[buffer(20)]],
+    device ulong * __restrict observation_meta [[buffer(21)]],
+    device ulong * __restrict stream_state [[buffer(25)]],
+    device ulong * __restrict stream_records [[buffer(26)]],
+    device ulong * __restrict scheduler_state [[buffer(27)]],
+    device ulong * __restrict tcp_state [[buffer(30)]],
     uint active_index [[thread_position_in_grid]]
 ) {
     if (
@@ -5633,11 +5636,11 @@ kernel void days_round(
 // T21 fix 1 — the round-control scan, on the whole grid. Transliterated word for word from
 // `cuda_kernels.cu`; see that kernel's header for the partition-invariance argument.
 kernel void days_round_control_sweep(
-    const device ulong *control [[buffer(0)]],
-    const device ulong *params [[buffer(1)]],
-    const device ulong *worklist [[buffer(13)]],
-    const device ulong *lp_state [[buffer(18)]],
-    device ulong *stream_state [[buffer(25)]],
+    const device ulong * __restrict control [[buffer(0)]],
+    const device ulong * __restrict params [[buffer(1)]],
+    const device ulong * __restrict worklist [[buffer(13)]],
+    const device ulong * __restrict lp_state [[buffer(18)]],
+    device ulong * __restrict stream_state [[buffer(25)]],
     uint lane [[thread_index_in_threadgroup]],
     uint block [[threadgroup_position_in_grid]],
     uint block_size [[threads_per_threadgroup]],
@@ -5694,10 +5697,10 @@ kernel void days_round_control_sweep(
 
 // T21 fix 1 — the round-control combine. Transliterated word for word from `cuda_kernels.cu`.
 kernel void days_round_control(
-    device ulong *control [[buffer(0)]],
-    const device ulong *params [[buffer(1)]],
-    const device ulong *lp_state [[buffer(18)]],
-    const device ulong *stream_state [[buffer(25)]],
+    device ulong * __restrict control [[buffer(0)]],
+    const device ulong * __restrict params [[buffer(1)]],
+    const device ulong * __restrict lp_state [[buffer(18)]],
+    const device ulong * __restrict stream_state [[buffer(25)]],
     uint lane [[thread_index_in_threadgroup]]
 ) {
     threadgroup ulong first_errors[1024];
@@ -5754,11 +5757,11 @@ kernel void days_round_control(
 // from `cuda_kernels.cu`; see that kernel's header, which also records that this is the kernel the
 // FIRST attempt's in-dispatch combine failed in.
 kernel void days_exchange_prefix_sweep(
-    const device ulong *control [[buffer(0)]],
-    const device ulong *params [[buffer(1)]],
-    const device ulong *remote_staging [[buffer(20)]],
-    device ulong *stream_state [[buffer(25)]],
-    const device ulong *stream_records [[buffer(26)]],
+    const device ulong * __restrict control [[buffer(0)]],
+    const device ulong * __restrict params [[buffer(1)]],
+    const device ulong * __restrict remote_staging [[buffer(20)]],
+    device ulong * __restrict stream_state [[buffer(25)]],
+    const device ulong * __restrict stream_records [[buffer(26)]],
     uint lane [[thread_index_in_threadgroup]],
     uint block [[threadgroup_position_in_grid]],
     uint block_size [[threads_per_threadgroup]],
@@ -5856,10 +5859,10 @@ kernel void days_exchange_prefix_sweep(
 // T21 fix 1 — the exchange-prefix combine, plus the legacy node-ordered prefix scan.
 // Transliterated word for word from `cuda_kernels.cu`.
 kernel void days_exchange_prefix(
-    device ulong *control [[buffer(0)]],
-    const device ulong *params [[buffer(1)]],
-    device ulong *remote_meta [[buffer(19)]],
-    device ulong *stream_state [[buffer(25)]],
+    device ulong * __restrict control [[buffer(0)]],
+    const device ulong * __restrict params [[buffer(1)]],
+    device ulong * __restrict remote_meta [[buffer(19)]],
+    const device ulong * __restrict stream_state [[buffer(25)]],
     uint lane [[thread_index_in_threadgroup]]
 ) {
     threadgroup ulong sums[1024];
@@ -6079,14 +6082,14 @@ inline void scatter_stream_producer_lane(
 }
 
 kernel void days_exchange_scatter(
-    device ulong *control [[buffer(0)]],
-    const device ulong *params [[buffer(1)]],
-    device ulong *outbox [[buffer(12)]],
-    const device ulong *worklist [[buffer(13)]],
-    const device ulong *remote_meta [[buffer(19)]],
-    const device ulong *remote_staging [[buffer(20)]],
-    device ulong *stream_state [[buffer(25)]],
-    device ulong *stream_records [[buffer(26)]],
+    const device ulong * __restrict control [[buffer(0)]],
+    const device ulong * __restrict params [[buffer(1)]],
+    device ulong * __restrict outbox [[buffer(12)]],
+    const device ulong * __restrict worklist [[buffer(13)]],
+    const device ulong * __restrict remote_meta [[buffer(19)]],
+    const device ulong * __restrict remote_staging [[buffer(20)]],
+    device ulong * __restrict stream_state [[buffer(25)]],
+    device ulong * __restrict stream_records [[buffer(26)]],
     uint global_thread [[thread_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]],
     uint group_in_block [[simdgroup_index_in_threadgroup]],
@@ -6203,19 +6206,19 @@ kernel void days_exchange_scatter(
 }
 
 kernel void days_exchange_merge(
-    device ulong *control [[buffer(0)]],
-    const device ulong *params [[buffer(1)]],
-    device ulong *fel_meta [[buffer(7)]],
-    device ulong *fel_records [[buffer(8)]],
-    const device ulong *outbox [[buffer(12)]],
-    device ulong *lp_state [[buffer(18)]],
-    const device ulong *remote_meta [[buffer(19)]],
-    const device ulong *inbound_meta [[buffer(22)]],
-    const device ulong *inbound_producers [[buffer(23)]],
-    device ulong *merge_cursors [[buffer(24)]],
-    device ulong *stream_state [[buffer(25)]],
-    const device ulong *stream_records [[buffer(26)]],
-    device ulong *tcp_state [[buffer(30)]],
+    const device ulong * __restrict control [[buffer(0)]],
+    const device ulong * __restrict params [[buffer(1)]],
+    device ulong * __restrict fel_meta [[buffer(7)]],
+    device ulong * __restrict fel_records [[buffer(8)]],
+    const device ulong * __restrict outbox [[buffer(12)]],
+    device ulong * __restrict lp_state [[buffer(18)]],
+    const device ulong * __restrict remote_meta [[buffer(19)]],
+    const device ulong * __restrict inbound_meta [[buffer(22)]],
+    const device ulong * __restrict inbound_producers [[buffer(23)]],
+    device ulong * __restrict merge_cursors [[buffer(24)]],
+    device ulong * __restrict stream_state [[buffer(25)]],
+    const device ulong * __restrict stream_records [[buffer(26)]],
+    device ulong * __restrict tcp_state [[buffer(30)]],
     uint target [[thread_position_in_grid]]
 ) {
     if (
@@ -6329,11 +6332,11 @@ kernel void days_exchange_merge(
 // T21 fix 1 — the finalize scans, on the whole grid. Transliterated word for word from
 // `cuda_kernels.cu`; see that kernel's header for the clamped-sum associativity argument.
 kernel void days_round_finalize_sweep(
-    const device ulong *control [[buffer(0)]],
-    const device ulong *params [[buffer(1)]],
-    const device ulong *lp_state [[buffer(18)]],
-    const device ulong *observation_meta [[buffer(21)]],
-    device ulong *stream_state [[buffer(25)]],
+    const device ulong * __restrict control [[buffer(0)]],
+    const device ulong * __restrict params [[buffer(1)]],
+    const device ulong * __restrict lp_state [[buffer(18)]],
+    const device ulong * __restrict observation_meta [[buffer(21)]],
+    device ulong * __restrict stream_state [[buffer(25)]],
     uint lane [[thread_index_in_threadgroup]],
     uint block [[threadgroup_position_in_grid]],
     uint block_size [[threads_per_threadgroup]],
@@ -6419,10 +6422,10 @@ kernel void days_round_finalize_sweep(
 
 // T21 fix 1 — the finalize combine. Transliterated word for word from `cuda_kernels.cu`.
 kernel void days_round_finalize(
-    device ulong *control [[buffer(0)]],
-    const device ulong *params [[buffer(1)]],
-    const device ulong *lp_state [[buffer(18)]],
-    const device ulong *stream_state [[buffer(25)]],
+    device ulong * __restrict control [[buffer(0)]],
+    const device ulong * __restrict params [[buffer(1)]],
+    const device ulong * __restrict lp_state [[buffer(18)]],
+    const device ulong * __restrict stream_state [[buffer(25)]],
     uint lane [[thread_index_in_threadgroup]]
 ) {
     threadgroup ulong values[1024];

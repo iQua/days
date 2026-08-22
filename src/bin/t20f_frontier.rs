@@ -611,7 +611,7 @@ mod tests {
             "--channel-events-per-stream",
             "256",
         ])
-        .expect("the recorded frontier override must parse");
+        .expect("the recorded frontier capacity override must parse");
         let mut expected = CAPACITY_CAPS;
         expected.channel_events_per_stream = Some(256);
         assert_eq!(effective_caps(&overridden), expected);
