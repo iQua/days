@@ -293,6 +293,9 @@ constant uint L_ERROR_ARENA = 3;
 constant uint L_ERROR_NODE = 4;
 constant uint L_ERROR_CAPACITY = 5;
 constant uint L_ERROR_DEMAND = 6;
+// Tagged success/error storage: while L_ERROR is zero this word is the cumulative continuation
+// count. A capacity error overwrites it with its arena and terminates the discarded attempt.
+constant uint L_SAME_TIME_CONTINUATIONS = L_ERROR_ARENA;
 
 inline bool key_less(const thread ulong *left, const thread ulong *right) {
     if (left[E_TIME] != right[E_TIME]) {
@@ -1622,6 +1625,112 @@ inline bool append_remote(
     return true;
 }
 
+inline bool build_child(
+    ulong node,
+    const thread ulong *parent,
+    ulong target,
+    ulong kind,
+    ulong time,
+    const thread ulong *packet,
+    device ulong *error,
+    device ulong *node_state,
+    thread ulong *child
+) {
+    ulong node_base = node * NODE_WORDS;
+    ulong sequence = node_state[node_base + N_NEXT_ORIGIN];
+    if (sequence == NONE) {
+        set_semantic_error(error, 1, node);
+        return false;
+    }
+    node_state[node_base + N_NEXT_ORIGIN] = sequence + 1;
+    child[E_TIME] = time;
+    child[E_PHASE] = event_phase(kind);
+    child[E_ORIGIN] = node;
+    child[E_SEQUENCE] = sequence;
+    child[E_TARGET] = target;
+    child[E_KIND] = kind;
+    child[E_PAYLOAD] = packet[PK_ID];
+    child[PK_ID] = packet[PK_ID];
+    child[PK_FLOW] = packet[PK_FLOW];
+    child[PK_SIZE] = packet[PK_SIZE];
+    child[PK_KIND] = packet[PK_KIND];
+    child[PK_META_0] = packet[PK_META_0];
+    child[PK_META_1] = packet[PK_META_1];
+    child[PK_META_2] = packet[PK_META_2];
+    if (!key_less(parent, child)) {
+        set_semantic_error(error, 2, node);
+        return false;
+    }
+    return true;
+}
+
+inline bool thread_stored_key_less(
+    const thread ulong *left,
+    const device ulong *right
+) {
+    for (uint word = E_TIME; word <= E_SEQUENCE; ++word) {
+        if (left[word] != right[word]) {
+            return left[word] < right[word];
+        }
+    }
+    return false;
+}
+
+// The live active-entry cache contains exactly one current head key for every non-empty stream
+// plus the fallback heap root. Requiring the child to precede every cached key is therefore
+// equivalent to the scalar `child.key < first_future_key` predicate. Heap-only mode compares the
+// same child against the live post-pop heap root directly.
+inline bool child_precedes_lp_next_key(
+    ulong node,
+    const thread ulong *child,
+    const device ulong *params,
+    const device ulong *fel_meta,
+    const device ulong *fel_records,
+    const device ulong *stream_state
+) {
+    if (params[P_STREAMS_ENABLED] == 0) {
+        ulong heap = node * META_WORDS;
+        return fel_meta[heap + 3] == 0 || thread_stored_key_less(
+            child,
+            fel_records + fel_meta[heap] * EVENT_WORDS
+        );
+    }
+    ulong lp_meta = params[P_LP_STREAM_META_OFFSET] + node * LP_STREAM_META_WORDS;
+    ulong active_offset = stream_state[lp_meta + 2];
+    ulong active_count = stream_state[lp_meta + 3];
+    for (ulong index = 0; index < active_count; ++index) {
+        ulong entry = active_offset + index * ACTIVE_STREAM_ENTRY_WORDS;
+        if (!thread_stored_key_less(child, stream_state + entry + 1)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline bool is_same_time_tx_ready_continuation(
+    ulong node,
+    const thread ulong *parent,
+    const thread ulong *child,
+    const device ulong *params,
+    const device ulong *fel_meta,
+    const device ulong *fel_records,
+    const device ulong *stream_state
+) {
+    return parent[E_KIND] == TX_COMPLETE &&
+        child[E_TARGET] == node &&
+        child[E_KIND] == TX_READY &&
+        child[E_TIME] == parent[E_TIME] &&
+        child[E_PHASE] == event_phase(TX_READY) &&
+        child_precedes_lp_next_key(
+            node,
+            child,
+            params,
+            fel_meta,
+            fel_records,
+            stream_state
+        );
+}
+
 inline bool emit_child(
     ulong node,
     const thread ulong *parent,
@@ -1640,30 +1749,18 @@ inline bool emit_child(
     device ulong *stream_records,
     device ulong *tcp_state
 ) {
-    ulong node_base = node * NODE_WORDS;
-    ulong sequence = node_state[node_base + N_NEXT_ORIGIN];
-    if (sequence == NONE) {
-        set_semantic_error(error, 1, node);
-        return false;
-    }
-    node_state[node_base + N_NEXT_ORIGIN] = sequence + 1;
     ulong child[EVENT_WORDS];
-    child[E_TIME] = time;
-    child[E_PHASE] = event_phase(kind);
-    child[E_ORIGIN] = node;
-    child[E_SEQUENCE] = sequence;
-    child[E_TARGET] = target;
-    child[E_KIND] = kind;
-    child[E_PAYLOAD] = packet[PK_ID];
-    child[PK_ID] = packet[PK_ID];
-    child[PK_FLOW] = packet[PK_FLOW];
-    child[PK_SIZE] = packet[PK_SIZE];
-    child[PK_KIND] = packet[PK_KIND];
-    child[PK_META_0] = packet[PK_META_0];
-    child[PK_META_1] = packet[PK_META_1];
-    child[PK_META_2] = packet[PK_META_2];
-    if (!key_less(parent, child)) {
-        set_semantic_error(error, 2, node);
+    if (!build_child(
+        node,
+        parent,
+        target,
+        kind,
+        time,
+        packet,
+        error,
+        node_state,
+        child
+    )) {
         return false;
     }
     if (target == node) {
@@ -3817,7 +3914,10 @@ inline bool dispatch_event(
     device ulong *observed,
     device ulong *departures,
     device ulong *arrivals,
-    device ulong *tcp_state
+    device ulong *tcp_state,
+    bool retain_continuation,
+    thread bool &has_continuation,
+    thread bool &counted_continuation
 ) {
     ulong node_base = node * NODE_WORDS;
     ulong role = node_state[node_base + N_KIND];
@@ -4418,7 +4518,8 @@ inline bool dispatch_event(
                 return false;
             }
             node_state[node_base + N_READY_PENDING] = 1;
-            return emit_child(
+            ulong child[EVENT_WORDS];
+            if (!build_child(
                 node,
                 event,
                 node,
@@ -4426,12 +4527,34 @@ inline bool dispatch_event(
                 event[E_TIME],
                 next,
                 error,
-                params,
                 node_state,
+                child
+            )) {
+                return false;
+            }
+            counted_continuation = is_same_time_tx_ready_continuation(
+                node,
+                event,
+                child,
+                params,
                 fel_meta,
                 fel_records,
-                remote_meta,
-                remote_staging,
+                stream_state
+            );
+            if (counted_continuation && retain_continuation) {
+                for (uint word = 0; word < EVENT_WORDS; ++word) {
+                    event[word] = child[word];
+                }
+                has_continuation = true;
+                return true;
+            }
+            return classified_push(
+                node,
+                child,
+                params,
+                error,
+                fel_meta,
+                fel_records,
                 stream_state,
                 stream_records,
                 tcp_state
@@ -5222,7 +5345,8 @@ kernel void days_round_reset(
     for (ulong node = first; node < params[P_NODE_COUNT]; node += stride) {
         ulong state = node * LP_STATE_WORDS;
         lp_state[state + L_ERROR] = 0;
-        lp_state[state + L_ERROR_ARENA] = 0;
+        // L_ERROR_ARENA is tagged as the cumulative continuation count while L_ERROR is zero.
+        // A capacity error overwrites it and terminates the discarded attempt.
         lp_state[state + L_ERROR_NODE] = NONE;
         lp_state[state + L_ERROR_CAPACITY] = 0;
         lp_state[state + L_ERROR_DEMAND] = 0;
@@ -5356,42 +5480,48 @@ kernel void days_round(
         return;
     }
 
+    ulong event[EVENT_WORDS];
+    bool has_continuation = false;
     ulong dispatch_transitions = 0;
     while (dispatch_transitions < params[P_TRANSITION_CAPACITY]) {
-        ulong event[EVENT_WORDS];
-        ulong selected_active;
-        ulong selected_stream;
-        if (!fel_peek(
-            node,
-            params,
-            fel_meta,
-            fel_records,
-            stream_state,
-            stream_records,
-            event,
-            selected_active,
-            selected_stream
-        ) || !before_horizon(event[E_TIME], control)) {
-            state[L_FINISHED] = 1;
-            return;
+        ulong popped_timer_owner = NONE;
+        if (has_continuation) {
+            has_continuation = false;
+        } else {
+            ulong selected_active;
+            ulong selected_stream;
+            if (!fel_peek(
+                node,
+                params,
+                fel_meta,
+                fel_records,
+                stream_state,
+                stream_records,
+                event,
+                selected_active,
+                selected_stream
+            ) || !before_horizon(event[E_TIME], control)) {
+                state[L_FINISHED] = 1;
+                return;
+            }
+            if (!fel_pop_selected(
+                node,
+                selected_active,
+                selected_stream,
+                params,
+                fel_meta,
+                fel_records,
+                stream_state,
+                stream_records,
+                tcp_state,
+                event,
+                popped_timer_owner
+            )) {
+                set_semantic_error(state, 26, node);
+                return;
+            }
         }
-        ulong popped_timer_owner;
-        if (!fel_pop_selected(
-            node,
-            selected_active,
-            selected_stream,
-            params,
-            fel_meta,
-            fel_records,
-            stream_state,
-            stream_records,
-            tcp_state,
-            event,
-            popped_timer_owner
-        )) {
-            set_semantic_error(state, 26, node);
-            return;
-        }
+        bool counted_continuation = false;
         if (!dispatch_event(
             node,
             event,
@@ -5418,9 +5548,15 @@ kernel void days_round(
             observed,
             departures,
             arrivals,
-            tcp_state
+            tcp_state,
+            dispatch_transitions + 1 < params[P_TRANSITION_CAPACITY],
+            has_continuation,
+            counted_continuation
         )) {
             return;
+        }
+        if (counted_continuation && state[L_SAME_TIME_CONTINUATIONS] != NONE) {
+            state[L_SAME_TIME_CONTINUATIONS] += 1;
         }
         if (state[L_TRANSITIONS] == NONE) {
             set_semantic_error(state, 27, node);

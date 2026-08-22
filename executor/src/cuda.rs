@@ -53,6 +53,8 @@ const OBSERVED_WORDS: usize = 7;
 const DEPARTURE_WORDS: usize = 12;
 const ARRIVAL_WORDS: usize = 13;
 const LP_STATE_WORDS: usize = 7;
+// On a successful attempt LP error-arena storage is unused and carries this cumulative metric.
+const LP_SAME_TIME_CONTINUATIONS: usize = 3;
 const OBSERVATION_META_WORDS: usize = ARENA_META_WORDS * 3;
 const INBOUND_META_WORDS: usize = 2;
 const LP_STREAM_META_WORDS: usize = 4;
@@ -873,6 +875,8 @@ pub struct CudaRun {
     pub channel_stream_capacity_distribution: Vec<crate::ChannelStreamCapacityLevel>,
     pub rounds: u64,
     pub transitions: u64,
+    /// Scalar-equivalent local `TxComplete` to same-time `TxReady` continuations.
+    pub same_time_continuations: u64,
     /// Physical attempts present in launched graph replays, including deterministic no-op tails.
     pub encoded_attempts: u64,
     pub continuation_relaunches: u64,
@@ -4269,6 +4273,11 @@ impl CudaBuffers {
                 .chunks_exact(LP_STATE_WORDS)
                 .take(image.nodes.len())
                 .map(|state| state[1])
+                .fold(0_u64, u64::saturating_add),
+            same_time_continuations: lp_state
+                .chunks_exact(LP_STATE_WORDS)
+                .take(image.nodes.len())
+                .map(|state| state[LP_SAME_TIME_CONTINUATIONS])
                 .fold(0_u64, u64::saturating_add),
             encoded_attempts: timing.encoded_attempts,
             continuation_relaunches: control[CONTROL_RELAUNCHES],

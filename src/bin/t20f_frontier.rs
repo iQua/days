@@ -474,8 +474,14 @@ fn run_device(cli: &Cli, image: &days_executor::SimulationImage, lowering_ns: u1
     println!(
         "record=p11_t20f_frontier_device engine=metal wall_ns={} device_ns={} rounds={} \
          transitions={} retry_count={retry_count} grown_stream_count={grown_stream_count} \
-         channel_capacity_distribution={channel_capacity_distribution} retry_trace={:?}",
-        run.wall_ns, run.device_ns, run.rounds, run.transitions, run.capacity_retry_trace,
+         channel_capacity_distribution={channel_capacity_distribution} retry_trace={:?} \
+         same_time_continuations={}",
+        run.wall_ns,
+        run.device_ns,
+        run.rounds,
+        run.transitions,
+        run.capacity_retry_trace,
+        run.same_time_continuations,
     );
     print_result("metal", &run.result, lowering_ns, run_ns);
 }
@@ -522,8 +528,14 @@ fn run_device(cli: &Cli, image: &days_executor::SimulationImage, lowering_ns: u1
     println!(
         "record=p11_t20f_frontier_device engine=cuda wall_ns={} device_ns={} rounds={} \
          transitions={} retry_count={retry_count} grown_stream_count={grown_stream_count} \
-         channel_capacity_distribution={channel_capacity_distribution} retry_trace={:?}",
-        run.wall_ns, run.device_ns, run.rounds, run.transitions, run.capacity_retry_trace,
+         channel_capacity_distribution={channel_capacity_distribution} retry_trace={:?} \
+         same_time_continuations={}",
+        run.wall_ns,
+        run.device_ns,
+        run.rounds,
+        run.transitions,
+        run.capacity_retry_trace,
+        run.same_time_continuations,
     );
     print_result("cuda", &run.result, lowering_ns, run_ns);
 }
