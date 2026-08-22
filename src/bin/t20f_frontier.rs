@@ -58,6 +58,27 @@ struct Cli {
     /// the same fixture can pass it back through `--capacity-warm-start`.
     #[arg(long)]
     dump_capacity_warm_start: Option<PathBuf>,
+    /// Override the plane-wide channel-stream starting cap for a recorded identity configuration.
+    ///
+    /// The full frontier fixture is anchored at 256 because the stock 2,048 cap exceeds Boston's
+    /// device memory. Capacity is refuse-or-run and never simulation semantics.
+    #[arg(long)]
+    channel_events_per_stream: Option<usize>,
+    /// Override the parallel round/exchange launch width for the Stage 1 geometry sweep.
+    #[arg(long)]
+    round_threads_per_block: Option<usize>,
+}
+
+fn effective_caps(cli: &Cli) -> DeviceCapacityCaps {
+    let mut caps = CAPACITY_CAPS;
+    if let Some(cap) = cli.channel_events_per_stream {
+        caps.channel_events_per_stream = Some(cap);
+    }
+    caps
+}
+
+fn effective_round_threads(cli: &Cli, default: usize) -> usize {
+    cli.round_threads_per_block.unwrap_or(default)
 }
 
 /// The `--capacity-warm-start` / `--dump-capacity-warm-start` snapshot file format (T20l fix 3).
@@ -406,11 +427,13 @@ fn main() {
     let lowering_ns = lowering_started.elapsed().as_nanos();
     println!(
         "record=p11_t20f_frontier_protocol fixture={} engine={:?} \
-         exclusive_horizon_ns={:?} observation_mode=Summary capacity_caps={CAPACITY_CAPS:?} \
-         max_capacity_retries={} capacity_warm_start={} dump_capacity_warm_start={}",
+         exclusive_horizon_ns={:?} observation_mode=Summary capacity_caps={:?} \
+         max_capacity_retries={} capacity_warm_start={} dump_capacity_warm_start={} \
+         channel_events_per_stream_override={:?} round_threads_per_block={}",
         cli.fixture.display(),
         cli.engine,
         cli.exclusive_horizon_ns,
+        effective_caps(&cli),
         cli.max_capacity_retries,
         cli.capacity_warm_start
             .as_ref()
@@ -418,6 +441,8 @@ fn main() {
         cli.dump_capacity_warm_start
             .as_ref()
             .map_or_else(|| "none".to_owned(), |path| path.display().to_string()),
+        cli.channel_events_per_stream,
+        effective_round_threads(&cli, 256),
     );
 
     match cli.engine {
@@ -441,11 +466,13 @@ fn run_device(cli: &Cli, image: &days_executor::SimulationImage, lowering_ns: u1
 
     let executor = MetalExecutor::new().expect("Metal executor must initialize");
     let warm_start = cli.capacity_warm_start.as_deref().map(warm_start::load);
-    let config = MetalConfig {
-        capacity_caps: CAPACITY_CAPS,
+    let mut config = MetalConfig {
+        capacity_caps: effective_caps(cli),
         max_capacity_retries: cli.max_capacity_retries,
         ..MetalConfig::default()
     };
+    config.round_threads_per_threadgroup =
+        effective_round_threads(cli, config.round_threads_per_threadgroup);
     let started = Instant::now();
     // Default OFF: with no `--capacity-warm-start` this is the stock entry point, unchanged.
     let run = match &warm_start {
@@ -489,11 +516,12 @@ fn run_device(cli: &Cli, image: &days_executor::SimulationImage, lowering_ns: u1
 
     let executor = CudaExecutor::new().expect("CUDA executor must initialize");
     let warm_start = cli.capacity_warm_start.as_deref().map(warm_start::load);
-    let config = CudaConfig {
-        capacity_caps: CAPACITY_CAPS,
+    let mut config = CudaConfig {
+        capacity_caps: effective_caps(cli),
         max_capacity_retries: cli.max_capacity_retries,
         ..CudaConfig::default()
     };
+    config.round_threads_per_block = effective_round_threads(cli, config.round_threads_per_block);
     let started = Instant::now();
     // Default OFF: with no `--capacity-warm-start` this is the stock entry point, unchanged.
     let run = match &warm_start {
@@ -541,9 +569,13 @@ fn run_device(_cli: &Cli, _image: &days_executor::SimulationImage, _lowering_ns:
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
     use days_executor::{CapacityRetryRecord, CapacityWarmStart, DeviceCapacityFloors};
 
-    use super::{capacity_retry_counts, fingerprint, warm_start};
+    use super::{
+        CAPACITY_CAPS, Cli, capacity_retry_counts, effective_caps, effective_round_threads,
+        fingerprint, warm_start,
+    };
 
     fn retry_record(retry: usize, stream: Option<usize>) -> CapacityRetryRecord<&'static str> {
         CapacityRetryRecord {
@@ -563,6 +595,30 @@ mod tests {
         let value = vec![1_u64, 2, 3];
         assert_eq!(fingerprint(&value), fingerprint(&value));
         assert_ne!(fingerprint(&value), fingerprint(&vec![3_u64, 2, 1]));
+    }
+
+    #[test]
+    fn measurement_overrides_are_exact() {
+        let default = Cli::try_parse_from(["t20f_frontier", "fixture.toml", "--engine", "device"])
+            .expect("the stock device CLI must parse");
+        assert_eq!(effective_caps(&default), CAPACITY_CAPS);
+        assert_eq!(effective_round_threads(&default, 256), 256);
+
+        let overridden = Cli::try_parse_from([
+            "t20f_frontier",
+            "fixture.toml",
+            "--engine",
+            "device",
+            "--channel-events-per-stream",
+            "256",
+            "--round-threads-per-block",
+            "64",
+        ])
+        .expect("the Stage 1 measurement overrides must parse");
+        let mut expected_caps = CAPACITY_CAPS;
+        expected_caps.channel_events_per_stream = Some(256);
+        assert_eq!(effective_caps(&overridden), expected_caps);
+        assert_eq!(effective_round_threads(&overridden, 256), 64);
     }
 
     fn sample_warm_start() -> CapacityWarmStart {

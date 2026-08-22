@@ -6,6 +6,7 @@ use std::process::{Command, Output};
 
 fn main() {
     println!("cargo:rerun-if-env-changed=NVCC");
+    println!("cargo:rerun-if-env-changed=DAYS_PTXAS_VERBOSE");
     println!("cargo:rerun-if-changed=src/cuda_kernels.cu");
 
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
@@ -41,14 +42,20 @@ fn main() {
         env::var_os("CARGO_MANIFEST_DIR").expect("Cargo provides CARGO_MANIFEST_DIR"),
     );
     let source = manifest_dir.join("src/cuda_kernels.cu");
-    let compiled = Command::new(&nvcc)
+    let ptxas_verbose = env::var_os("DAYS_PTXAS_VERBOSE").is_some();
+    let mut compile = Command::new(&nvcc);
+    compile
         .arg("-std=c++17")
         .arg("-O3")
         .arg("-fatbin")
         .arg("-lineinfo")
         .arg("--diag-suppress=177")
         .arg("--generate-code=arch=compute_121,code=sm_121")
-        .arg("--generate-code=arch=compute_89,code=sm_89")
+        .arg("--generate-code=arch=compute_89,code=sm_89");
+    if ptxas_verbose {
+        compile.arg("-Xptxas=-v");
+    }
+    let compiled = compile
         .arg("-o")
         .arg(&output)
         .arg(&source)
@@ -59,6 +66,10 @@ fn main() {
                 nvcc.to_string_lossy()
             )
         });
+    if ptxas_verbose {
+        eprint!("{}", String::from_utf8_lossy(&compiled.stdout));
+        eprint!("{}", String::from_utf8_lossy(&compiled.stderr));
+    }
     require_success(&nvcc, "sm_121 + sm_89 fatbin compilation", compiled);
 }
 
