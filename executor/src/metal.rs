@@ -1,7 +1,7 @@
 //! Correctness-first production Metal executor.
 //!
 //! The backend keeps the safe-horizon round loop resident on the device within bounded encoding
-//! waves. Deterministic 1,024-lane reductions publish each horizon, stably compact active LPs, and
+//! waves. Deterministic reductions publish each horizon, stably compact active LPs, and
 //! resolve round control. One lane per active LP then performs chronological drains and real
 //! transitions, followed by a stable parallel prefix and deterministic boundary-only remote
 //! exchange. The host synchronizes only at wave boundaries, and every such synchronization is
@@ -225,8 +225,8 @@ impl DispatchGeometry {
 const ATTEMPT_DISPATCHES: [(AttemptKernel, DispatchGeometry); 13] = [
     (AttemptKernel::HorizonSweep, DispatchGeometry::ControlSweep),
     (AttemptKernel::Horizon, DispatchGeometry::FixedControl),
-    (AttemptKernel::RoundReset, DispatchGeometry::ControlSweep),
-    (AttemptKernel::Compaction, DispatchGeometry::FixedControl),
+    (AttemptKernel::RoundReset, DispatchGeometry::Parallel),
+    (AttemptKernel::Compaction, DispatchGeometry::Parallel),
     (
         AttemptKernel::DrainExecute,
         DispatchGeometry::ActiveWorklist,
@@ -764,6 +764,139 @@ impl MetalExecutor {
             direct,
             initialization_timings,
         })
+    }
+
+    /// Runs only O1.4's reset/count and stable-write dispatches over a synthetic FEL-root cache.
+    ///
+    /// This calls the production Metal pipelines and returns the active prefix written by Dispatch
+    /// B at every threadgroup width supported by those pipelines.
+    #[cfg(feature = "metal-test-hooks")]
+    #[doc(hidden)]
+    pub fn worklist_compaction_for_testing(
+        &self,
+        eligible: &[bool],
+        threads_per_threadgroup: usize,
+    ) -> Result<(u64, Vec<u64>), MetalError> {
+        if !(1..=LANES).contains(&threads_per_threadgroup) {
+            return Err(MetalError::Validation(format!(
+                "worklist test threads per threadgroup must be in 1..={LANES}"
+            )));
+        }
+        let execution_width = self
+            .direct
+            .reset_pipeline
+            .threadExecutionWidth()
+            .max(self.direct.prepare_pipeline.threadExecutionWidth());
+        if !threads_per_threadgroup.is_multiple_of(execution_width) {
+            return Err(MetalError::Validation(format!(
+                "worklist test threads per threadgroup must be a multiple of execution width \
+                 {execution_width}"
+            )));
+        }
+        let supported = self
+            .direct
+            .reset_pipeline
+            .maxTotalThreadsPerThreadgroup()
+            .min(self.direct.prepare_pipeline.maxTotalThreadsPerThreadgroup());
+        if threads_per_threadgroup > supported {
+            return Err(MetalError::Validation(format!(
+                "worklist test threads per threadgroup {threads_per_threadgroup} exceeds supported \
+                 maximum {supported}"
+            )));
+        }
+
+        let node_count = eligible.len();
+        let groups = node_count.div_ceil(threads_per_threadgroup).max(1);
+        let mut control = vec![0_u64; CONTROL_STORAGE_WORDS];
+        control[5] = 1;
+        let mut params = vec![0_u64; 35];
+        params[0] = node_count as u64;
+        params[4] = node_count.max(1) as u64;
+        params[13] = 1;
+        params[PARAM_ROUND_THREADS] = threads_per_threadgroup as u64;
+        let scratch_words =
+            crate::device_sizing::round_scratch_words(node_count).ok_or_else(|| {
+                MetalError::Validation("worklist test scratch overflows usize".into())
+            })?;
+        let mut stream_state = vec![0_u64; scratch_words];
+        for (node, present) in eligible.iter().copied().enumerate() {
+            stream_state[node * crate::device_sizing::ROUND_SCRATCH_CACHE_WORDS + 1] =
+                u64::from(present);
+        }
+
+        let mut host_planes = (0..28).map(|_| vec![0_u64]).collect::<Vec<_>>();
+        host_planes[0] = control;
+        host_planes[1] = params;
+        host_planes[13] = vec![NONE; node_count.max(1)];
+        host_planes[18] = vec![0; node_count.saturating_mul(LP_STATE_WORDS).max(1)];
+        host_planes[19] = vec![0; node_count.saturating_mul(ARENA_META_WORDS).max(1)];
+        host_planes[25] = stream_state;
+
+        let _execution_guard = metal_device_execution_guard();
+        let planes = host_planes
+            .into_iter()
+            .map(|words| SharedBuffer::new(&self.direct.device, words))
+            .collect::<Result<Vec<_>, _>>()?;
+        let tcp_state = SharedBuffer::new(&self.direct.device, vec![0])?;
+        let command_buffer = self.direct.queue.commandBuffer().ok_or_else(|| {
+            MetalError::Unavailable("worklist test command buffer creation failed".into())
+        })?;
+        let encoder = command_buffer
+            .computeCommandEncoderWithDispatchType(MTLDispatchType::Serial)
+            .ok_or_else(|| {
+                MetalError::Unavailable("worklist test encoder creation failed".into())
+            })?;
+        for (index, plane) in planes.iter().enumerate() {
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(&plane.raw), 0, index);
+            }
+        }
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(&tcp_state.raw), 0, 30);
+        }
+        let grid = MTLSize {
+            width: groups,
+            height: 1,
+            depth: 1,
+        };
+        let group = MTLSize {
+            width: threads_per_threadgroup,
+            height: 1,
+            depth: 1,
+        };
+        for pipeline in [&self.direct.reset_pipeline, &self.direct.prepare_pipeline] {
+            encoder.setComputePipelineState(pipeline);
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, group);
+        }
+        encoder.endEncoding();
+        command_buffer.commit();
+        command_buffer.waitUntilCompleted();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            let detail = command_buffer
+                .error()
+                .map(|error| error.localizedDescription().to_string())
+                .unwrap_or_else(|| "no NSError detail".into());
+            return Err(MetalError::Unavailable(format!(
+                "worklist test command buffer status {:?}: {detail}",
+                command_buffer.status()
+            )));
+        }
+
+        let control = planes[0].read();
+        if control[0] != 0 {
+            return Err(decode_device_error(&control));
+        }
+        let worklist = planes[13].read();
+        let active = usize::try_from(control[15]).map_err(|_| {
+            MetalError::Validation("worklist test active count exceeds usize".into())
+        })?;
+        if active > worklist.len() {
+            return Err(MetalError::Validation(format!(
+                "worklist test active count {active} exceeds capacity {}",
+                worklist.len()
+            )));
+        }
+        Ok((active as u64, worklist[..active].to_vec()))
     }
 
     /// Runs with summary observations under the process-wide Metal execution envelope.
@@ -2301,8 +2434,8 @@ fn prepare_streams(
         image.nodes.len() * ARENA_META_WORDS,
     )?;
     if !config.streams_enabled {
-        // T21 fix 2: the per-round FEL root cache is NOT a stream-path feature. `days_horizon`
-        // publishes it and `days_round_prepare` reads it in both stream modes, so a legacy plan
+        // The per-round FEL root cache is NOT a stream-path feature. `days_horizon_sweep`
+        // publishes it and O1.4's count/write pair reads it in both stream modes, so a legacy plan
         // allocates the region too — at offset 0, since it has no stream metadata in front of it.
         let round_scratch_words = crate::device_sizing::round_scratch_words(image.nodes.len())
             .ok_or_else(|| MetalError::Validation("round scratch size overflows usize".into()))?;
@@ -4529,8 +4662,6 @@ impl DirectMetal {
         for (name, pipeline) in [
             ("horizon-sweep", &horizon_sweep_pipeline),
             ("horizon", &horizon_pipeline),
-            ("round-reset", &reset_pipeline),
-            ("round-prepare", &prepare_pipeline),
             ("round-control-sweep", &control_sweep_pipeline),
             ("round-control", &control_pipeline),
             ("exchange-prefix-sweep", &exchange_prefix_sweep_pipeline),
@@ -4682,6 +4813,8 @@ impl DirectMetal {
             )));
         }
         let parallel_pipelines = [
+            &self.reset_pipeline,
+            &self.prepare_pipeline,
             &self.round_pipeline,
             &self.exchange_scatter_pipeline,
             &self.exchange_merge_pipeline,
@@ -5020,13 +5153,10 @@ mod tests {
     }
 
     #[test]
-    fn production_attempt_uses_fixed_parallel_control_geometry() {
+    fn production_attempt_assigns_every_geometry_class() {
         assert_eq!(ATTEMPT_DISPATCHES.len(), 13);
-        // Every width-1 dispatch, including `Compaction` — the worklist compaction, whose OUTPUT
-        // ORDER depends on the partition and which the first version of this list omitted.
         for kernel in [
             AttemptKernel::Horizon,
-            AttemptKernel::Compaction,
             AttemptKernel::ContinuationControl,
             AttemptKernel::ExchangePrefix,
             AttemptKernel::FinalControl,
@@ -5046,7 +5176,6 @@ mod tests {
         // T21 fix 1: the re-gridded sweeps take the whole grid at the retained threadgroup width.
         for kernel in [
             AttemptKernel::HorizonSweep,
-            AttemptKernel::RoundReset,
             AttemptKernel::ContinuationControlSweep,
             AttemptKernel::ExchangePrefixSweep,
             AttemptKernel::FinalControlSweep,
@@ -5057,6 +5186,15 @@ mod tests {
                 .expect("every sweep dispatch is present");
             assert_eq!(geometry, DispatchGeometry::ControlSweep);
             assert_eq!(geometry.threads_per_threadgroup(256), LANES);
+        }
+
+        for kernel in [AttemptKernel::RoundReset, AttemptKernel::Compaction] {
+            let (_, geometry) = ATTEMPT_DISPATCHES
+                .into_iter()
+                .find(|(candidate, _)| *candidate == kernel)
+                .expect("every O1.4 dispatch is present");
+            assert_eq!(geometry, DispatchGeometry::Parallel);
+            assert_eq!(geometry.threads_per_threadgroup(256), 256);
         }
 
         let (_, drain_geometry) = ATTEMPT_DISPATCHES

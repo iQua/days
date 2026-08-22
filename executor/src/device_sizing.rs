@@ -62,9 +62,8 @@ pub(crate) const STREAMS_OUTBOX_RECORD_SLOTS: usize = 1;
 /// time and a validity flag.
 ///
 /// `evidence/P12/perround-upperbound.md` §1.5.2 measured the per-node FEL root query running three
-/// times per round — once in `days_horizon`, twice in `days_round_prepare` — over a read set
-/// nothing between the call sites writes. `days_horizon` now evaluates it once and publishes the
-/// answer here; `days_round_prepare`'s count pass and write pass read it back.
+/// times per round. `days_horizon_sweep` now evaluates it once and publishes the answer here;
+/// O1.4's `days_round_reset` count pass and `days_round_prepare` write pass each read it once.
 ///
 /// The region is device scratch in the strictest sense: written and consumed inside a single
 /// attempt, never decoded by the readback (which reads only `stream_state`'s metadata prefix),
@@ -94,6 +93,16 @@ pub const ROUND_SCRATCH_PARTIAL_WORDS: usize = 8;
 pub const ROUND_SCRATCH_PARTIAL_TOTAL_WORDS: usize =
     CONTROL_SWEEP_BLOCKS * ROUND_SCRATCH_PARTIAL_WORDS;
 
+/// Per-block counts for deterministic worklist compaction.
+///
+/// Worklist compaction follows the configurable per-LP grid. The smallest supported block has one
+/// lane, so a plan with `N` LPs can launch at most `N` compaction blocks. An empty image still
+/// launches one inert block, hence the retained one-word minimum. This tail is fixed when the plan
+/// is built and reused every round; no runtime allocation participates in simulation execution.
+pub const fn round_compaction_count_words(node_count: usize) -> usize {
+    if node_count == 0 { 1 } else { node_count }
+}
+
 /// Whether a lowered device plan must dispatch the full-width finalize sweep.
 ///
 /// Summary observations need no cumulative observation-log totals. With stream decomposition,
@@ -108,12 +117,14 @@ pub const fn finalize_sweep_required(full_observations: bool, streams_enabled: b
     full_observations || !streams_enabled
 }
 
-/// Words the T21 per-round scratch region occupies inside `stream_state`: the fix 2 FEL-root cache
-/// (two words per LP) followed by the fix 1 reduction partials (a fixed 1,024 words).
+/// Words the per-round scratch region occupies inside `stream_state`: the T21 FEL-root cache (two
+/// words per LP), the T21 reduction partials (a fixed 1,024 words), and one O1.4 worklist count per
+/// block at the widest supported grid geometry.
 pub fn round_scratch_words(node_count: usize) -> Option<usize> {
     node_count
         .checked_mul(ROUND_SCRATCH_CACHE_WORDS)?
         .checked_add(ROUND_SCRATCH_PARTIAL_TOTAL_WORDS)
+        .and_then(|words| words.checked_add(round_compaction_count_words(node_count)))
 }
 
 const PLANE_NAMES: [&str; 28] = [
