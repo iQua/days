@@ -53,7 +53,8 @@ const OBSERVED_WORDS: usize = 7;
 const DEPARTURE_WORDS: usize = 12;
 const ARRIVAL_WORDS: usize = 13;
 const LP_STATE_WORDS: usize = 7;
-// On a successful attempt LP error-arena storage is unused and carries this cumulative metric.
+// O1.3-compatible diagnostic slot: fast-path shaders accumulate here; specialized shaders leave
+// the reset value at zero.
 const LP_SAME_TIME_CONTINUATIONS: usize = 3;
 const OBSERVATION_META_WORDS: usize = ARENA_META_WORDS * 3;
 const INBOUND_META_WORDS: usize = 2;
