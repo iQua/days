@@ -211,8 +211,6 @@ enum DispatchGeometry {
     FixedControl,
     /// T21 fix 1: [`crate::device_sizing::CONTROL_SWEEP_BLOCKS`] threadgroups of [`LANES`].
     ControlSweep,
-    /// O1.4's one-node-per-lane count/write passes use every lane in their 1,024-word scan.
-    WorklistCompaction,
     ActiveWorklist,
     Parallel,
 }
@@ -220,7 +218,7 @@ enum DispatchGeometry {
 impl DispatchGeometry {
     const fn threads_per_threadgroup(self, parallel_threads: usize) -> usize {
         match self {
-            Self::FixedControl | Self::ControlSweep | Self::WorklistCompaction => LANES,
+            Self::FixedControl | Self::ControlSweep => LANES,
             Self::ActiveWorklist | Self::Parallel => parallel_threads,
         }
     }
@@ -229,14 +227,8 @@ impl DispatchGeometry {
 const ATTEMPT_DISPATCHES: [(AttemptKernel, DispatchGeometry); 13] = [
     (AttemptKernel::HorizonSweep, DispatchGeometry::ControlSweep),
     (AttemptKernel::Horizon, DispatchGeometry::FixedControl),
-    (
-        AttemptKernel::RoundReset,
-        DispatchGeometry::WorklistCompaction,
-    ),
-    (
-        AttemptKernel::Compaction,
-        DispatchGeometry::WorklistCompaction,
-    ),
+    (AttemptKernel::RoundReset, DispatchGeometry::Parallel),
+    (AttemptKernel::Compaction, DispatchGeometry::Parallel),
     (
         AttemptKernel::DrainExecute,
         DispatchGeometry::ActiveWorklist,
@@ -4842,19 +4834,9 @@ impl DirectMetal {
                  execution width {scatter_execution_width}"
             )));
         }
-        let worklist_threads =
-            DispatchGeometry::WorklistCompaction.threads_per_threadgroup(round_threads);
-        let worklist_supported_threads = self
-            .reset_pipeline
-            .maxTotalThreadsPerThreadgroup()
-            .min(self.prepare_pipeline.maxTotalThreadsPerThreadgroup());
-        if worklist_threads > worklist_supported_threads {
-            return Err(MetalError::Validation(format!(
-                "worklist compaction threads per threadgroup {worklist_threads} exceeds the \
-                 supported maximum {worklist_supported_threads}"
-            )));
-        }
         let parallel_pipelines = [
+            &self.reset_pipeline,
+            &self.prepare_pipeline,
             &self.round_pipeline,
             &self.exchange_scatter_pipeline,
             &self.exchange_merge_pipeline,
@@ -4886,16 +4868,6 @@ impl DirectMetal {
         };
         let parallel_group = MTLSize {
             width: round_threads,
-            height: 1,
-            depth: 1,
-        };
-        let worklist_grid = MTLSize {
-            width: buffers.node_count.div_ceil(worklist_threads).max(1),
-            height: 1,
-            depth: 1,
-        };
-        let worklist_group = MTLSize {
-            width: worklist_threads,
             height: 1,
             depth: 1,
         };
@@ -4940,8 +4912,6 @@ impl DirectMetal {
                         control_grid,
                         sweep_grid,
                         control_group,
-                        worklist_grid,
-                        worklist_group,
                         parallel_grid,
                         parallel_group,
                     );
@@ -5011,8 +4981,6 @@ impl DirectMetal {
         control_grid: MTLSize,
         sweep_grid: MTLSize,
         control_group: MTLSize,
-        worklist_grid: MTLSize,
-        worklist_group: MTLSize,
         parallel_grid: MTLSize,
         parallel_group: MTLSize,
     ) {
@@ -5027,10 +4995,6 @@ impl DirectMetal {
                 }
                 DispatchGeometry::ControlSweep => {
                     encoder.dispatchThreadgroups_threadsPerThreadgroup(sweep_grid, control_group);
-                }
-                DispatchGeometry::WorklistCompaction => {
-                    encoder
-                        .dispatchThreadgroups_threadsPerThreadgroup(worklist_grid, worklist_group);
                 }
                 DispatchGeometry::ActiveWorklist => unsafe {
                     encoder
@@ -5251,8 +5215,8 @@ mod tests {
                 .into_iter()
                 .find(|(candidate, _)| *candidate == kernel)
                 .expect("every O1.4 dispatch is present");
-            assert_eq!(geometry, DispatchGeometry::WorklistCompaction);
-            assert_eq!(geometry.threads_per_threadgroup(256), LANES);
+            assert_eq!(geometry, DispatchGeometry::Parallel);
+            assert_eq!(geometry.threads_per_threadgroup(256), 256);
         }
 
         let (_, drain_geometry) = ATTEMPT_DISPATCHES
