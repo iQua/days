@@ -12,6 +12,7 @@ default = []
 cuda = ["dep:cudarc"]
 cuda-planner-test = ["cuda", "planner-test-hooks"]
 planner-test-hooks = []
+o23-sort-bench = []
 cuda-test-hooks = ["cuda", "planner-test-hooks"]
 metal-spike = [
     "dep:cubecl",
@@ -57,3 +58,7 @@ objc2-metal = { version = "=0.3.2", default-features = false, features = [
 [[example]]
 name = "t13_metal_spike"
 required-features = ["metal-spike"]
+
+[[example]]
+name = "o23_sort_bench"
+required-features = ["o23-sort-bench"]
