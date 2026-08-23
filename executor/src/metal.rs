@@ -53,7 +53,8 @@ const OBSERVED_WORDS: usize = 7;
 const DEPARTURE_WORDS: usize = 12;
 const ARRIVAL_WORDS: usize = 13;
 const LP_STATE_WORDS: usize = 7;
-// On a successful attempt LP error-arena storage is unused and carries this cumulative metric.
+// O1.3-compatible diagnostic slot: fast-path shaders accumulate here; specialized shaders leave
+// the reset value at zero.
 const LP_SAME_TIME_CONTINUATIONS: usize = 3;
 const OBSERVATION_META_WORDS: usize = ARENA_META_WORDS * 3;
 const INBOUND_META_WORDS: usize = 2;
@@ -660,7 +661,10 @@ pub struct MetalRun {
     pub channel_stream_capacity_distribution: Vec<crate::ChannelStreamCapacityLevel>,
     pub rounds: u64,
     pub transitions: u64,
-    /// Scalar-equivalent local `TxComplete` to same-time `TxReady` continuations.
+    /// Local `TxComplete` to same-time `TxReady` continuations executed through Metal's bypass.
+    ///
+    /// This is an optimization diagnostic, not semantic state. It is zero when the Metal-specific
+    /// bypass is compiled out; rounds, transitions, and the complete result remain unchanged.
     pub same_time_continuations: u64,
     /// Physical round attempts encoded into submitted command buffers, including termination and
     /// speculative no-op tail attempts.
