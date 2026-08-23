@@ -85,7 +85,7 @@ fn cuda_round_bound_and_geometry_sweep_match_the_production_limit() {
 }
 
 #[test]
-fn metal_attempt_kernel_buffers_are_restrict_qualified() {
+fn metal_attempt_kernel_buffers_are_not_restrict_qualified() {
     let mut pointer_count = 0;
     for kernel in ATTEMPT_KERNELS {
         let body = kernel_body(METAL, METAL_MARKER, kernel);
@@ -96,8 +96,8 @@ fn metal_attempt_kernel_buffers_are_restrict_qualified() {
         for line in arguments.lines().filter(|line| line.contains("[[buffer(")) {
             pointer_count += 1;
             assert!(
-                line.contains("* __restrict "),
-                "Metal kernel `{kernel}` buffer is not restricted: {line}",
+                !line.contains("__restrict"),
+                "Metal kernel `{kernel}` buffer must use Apple's unqualified ABI: {line}",
             );
         }
     }
