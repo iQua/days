@@ -8,6 +8,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=NVCC");
     println!("cargo:rerun-if-env-changed=DAYS_PTXAS_VERBOSE");
     println!("cargo:rerun-if-changed=src/cuda_kernels.cu");
+    println!("cargo:rerun-if-changed=src/o23_sort_bench.cu");
 
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
         return;
@@ -15,12 +16,18 @@ fn main() {
 
     let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo provides OUT_DIR"))
         .join("days_cuda_kernels.fatbin");
+    let sort_output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo provides OUT_DIR"))
+        .join("o23_sort_bench.fatbin");
     if env::var_os("CARGO_FEATURE_CUDA_PLANNER_TEST").is_some()
         && env::var_os("CARGO_FEATURE_CUDA_TEST_HOOKS").is_none()
     {
         // The planner equality surface constructs host plans only. Keep it runnable on hosts
         // without nvcc while ensuring full CUDA test-hook and all-feature builds compile kernels.
         fs::write(&output, []).expect("host-only CUDA planner placeholder must be written");
+        if env::var_os("CARGO_FEATURE_O23_SORT_BENCH").is_some() {
+            fs::write(&sort_output, [])
+                .expect("host-only CUDA sort-benchmark placeholder must be written");
+        }
         return;
     }
 
@@ -41,9 +48,33 @@ fn main() {
     let manifest_dir = PathBuf::from(
         env::var_os("CARGO_MANIFEST_DIR").expect("Cargo provides CARGO_MANIFEST_DIR"),
     );
-    let source = manifest_dir.join("src/cuda_kernels.cu");
     let ptxas_verbose = env::var_os("DAYS_PTXAS_VERBOSE").is_some();
-    let mut compile = Command::new(&nvcc);
+    compile_fatbin(
+        &nvcc,
+        &manifest_dir.join("src/cuda_kernels.cu"),
+        &output,
+        ptxas_verbose,
+        "sm_121 + sm_89 simulator fatbin compilation",
+    );
+    if env::var_os("CARGO_FEATURE_O23_SORT_BENCH").is_some() {
+        compile_fatbin(
+            &nvcc,
+            &manifest_dir.join("src/o23_sort_bench.cu"),
+            &sort_output,
+            ptxas_verbose,
+            "sm_121 + sm_89 O2.3 sort fatbin compilation",
+        );
+    }
+}
+
+fn compile_fatbin(
+    nvcc: &OsString,
+    source: &std::path::Path,
+    output: &std::path::Path,
+    ptxas_verbose: bool,
+    operation: &str,
+) {
+    let mut compile = Command::new(nvcc);
     compile
         .arg("-std=c++17")
         .arg("-O3")
@@ -57,8 +88,8 @@ fn main() {
     }
     let compiled = compile
         .arg("-o")
-        .arg(&output)
-        .arg(&source)
+        .arg(output)
+        .arg(source)
         .output()
         .unwrap_or_else(|error| {
             panic!(
@@ -70,7 +101,7 @@ fn main() {
         eprint!("{}", String::from_utf8_lossy(&compiled.stdout));
         eprint!("{}", String::from_utf8_lossy(&compiled.stderr));
     }
-    require_success(&nvcc, "sm_121 + sm_89 fatbin compilation", compiled);
+    require_success(nvcc, operation, compiled);
 }
 
 fn require_success(nvcc: &OsString, operation: &str, output: Output) {
