@@ -26,7 +26,7 @@ const GENERATOR_FLOW: FlowId = FlowId(0);
 const GENERATOR_FIRST_PACKET: PayloadId = PayloadId(0);
 
 #[test]
-fn metal_same_time_continuations_match_scalar_and_complete_state() {
+fn metal_disables_same_time_continuation_bypass_and_preserves_complete_state() {
     let image = continuation::tcp_service_continuation_image();
     let scalar = run_scalar_rounds_with_observations(&image, None, ObservationMode::Full)
         .expect("scalar continuation oracle must run");
@@ -68,8 +68,9 @@ fn metal_same_time_continuations_match_scalar_and_complete_state() {
         assert_eq!(metal.rounds, expected_rounds);
         assert_eq!(metal.transitions, expected_transitions);
         assert_eq!(
-            metal.same_time_continuations, expected_continuations,
-            "Metal streams={streams_enabled} threadgroup={round_threads_per_threadgroup} \
+            metal.same_time_continuations, 0,
+            "the Metal-only specialization must compile out the diagnostic bypass at \
+             streams={streams_enabled} threadgroup={round_threads_per_threadgroup} \
              transition_cap={max_transitions_per_lp_per_round}"
         );
     }

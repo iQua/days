@@ -4,6 +4,11 @@ using namespace metal;
 // `MetalBuffers::new` creates and binds one allocation per buffer index used by the attempt
 // kernels. Their `__restrict` contract depends on preserving that pairwise-disjoint binding.
 
+// Apple's scheduler loses more to O1.3's extra head scan and live continuation state than it
+// recovers from bypassing the service-stream push/pop. The bypass changes no semantic value, so
+// Metal compiles it out while CUDA retains the independently tuned fast path.
+#define DAYS_ENABLE_SAME_TIME_CONTINUATION_FAST_PATH 0
+
 constant uint EVENT_WORDS = 14;
 constant uint SCATTER_COOPERATIVE_MIN_RECORDS = 3;
 constant uint NODE_WORDS = 11;
@@ -4535,6 +4540,7 @@ inline bool dispatch_event(
             )) {
                 return false;
             }
+#if DAYS_ENABLE_SAME_TIME_CONTINUATION_FAST_PATH
             counted_continuation = is_same_time_tx_ready_continuation(
                 node,
                 event,
@@ -4551,6 +4557,7 @@ inline bool dispatch_event(
                 has_continuation = true;
                 return true;
             }
+#endif
             return classified_push(
                 node,
                 child,

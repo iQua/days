@@ -421,7 +421,7 @@ fn the_full_and_legacy_attempt_dag_is_thirteen_dispatches() {
 /// Every launch's geometry, read out of the two backends' dispatch tables, with **no kernel
 /// unaccounted for**.
 ///
-/// O1.4 deliberately moves reset/count and prepare/write onto the configurable per-LP grid. The
+/// O1.4 deliberately moves reset/count and prepare/write onto backend-tuned per-LP grids. The
 /// actual-device gate pins their output; this source gate records every dispatch's intended class
 /// and retains width one only for genuine combines and the legacy producer prefix.
 #[test]
@@ -431,8 +431,8 @@ fn every_attempt_dispatch_has_its_intended_geometry() {
     const EXPECTED: [(&str, &str); 13] = [
         ("HorizonSweep", "ControlSweep"),
         ("Horizon", "FixedControl"),
-        ("RoundReset", "Parallel"),
-        ("Compaction", "Parallel"),
+        ("RoundReset", "WorklistCompaction"),
+        ("Compaction", "WorklistCompaction"),
         ("DrainExecute", "ActiveWorklist"),
         ("ContinuationControlSweep", "ControlSweep"),
         ("ContinuationControl", "FixedControl"),
