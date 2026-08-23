@@ -1061,7 +1061,7 @@ fn long_flight_backlog_image() -> SimulationImage {
 }
 
 fn rich_mid_state_image() -> SimulationImage {
-    let mut image = generator_image(GeneratorTermination::Bytes(12));
+    let mut image = generator_image(GeneratorTermination::Bytes(20));
     let FlowGeneratorKind::Constant(mut generator) = image.host_states[0].generators[0].kind else {
         panic!("fixture uses a constant generator")
     };
@@ -2068,12 +2068,28 @@ fn metal_full_path_matches_scalar_from_a_rich_mid_state() {
         })
     }));
 
-    let checkpoint = run_metal(&image, None, MetalConfig::default())
+    let checkpoint = run_metal(&image, Some(6), MetalConfig::default())
         .expect("streams-enabled checkpoint classification must run");
     assert_eq!(
         checkpoint.memory_layout.checkpoint_fallback_events,
         image.initial_events.len()
     );
+    let pending_kinds = checkpoint
+        .result
+        .pending_events
+        .iter()
+        .map(|event| event.kind)
+        .collect::<Vec<_>>();
+    for kind in [
+        EventKind::PacketArrival,
+        EventKind::TxComplete,
+        EventKind::RemoteArrival,
+    ] {
+        assert!(
+            pending_kinds.contains(&kind),
+            "rich checkpoint must exercise compact {kind:?} readback; pending={pending_kinds:?}"
+        );
+    }
     assert_full_parity(&image, None);
 }
 

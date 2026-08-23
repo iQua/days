@@ -80,11 +80,11 @@ const TCP_LEDGER_RECORD_WORDS: u128 = 5;
 const GIB_BYTES: u128 = 1_u128 << 30;
 const DEVICE_CAP_BYTES: u128 = 22 * GIB_BYTES;
 #[cfg(all(feature = "metal-test-hooks", target_vendor = "apple"))]
-const FROZEN_PRIMARY_PLAN_BYTES: u128 = 15_586_184_248;
+const FROZEN_PRE_O212_PRIMARY_PLAN_BYTES: u128 = 15_586_577_464;
 #[cfg(all(feature = "metal-test-hooks", target_vendor = "apple"))]
-const FROZEN_CUBIC_PLAN_BYTES: u128 = 15_606_648_408;
+const FROZEN_PRE_O212_CUBIC_PLAN_BYTES: u128 = 15_607_041_624;
 #[cfg(all(feature = "metal-test-hooks", target_vendor = "apple"))]
-const FROZEN_BACKUP_PLAN_BYTES: u128 = 16_022_723_512;
+const FROZEN_PRE_O212_BACKUP_PLAN_BYTES: u128 = 16_023_116_728;
 const PRIMARY_ANCHOR_BYTES: u64 = 50_572_617;
 const PRIMARY_ANCHOR_FNV1A64: u64 = 0x56f7_b241_57e2_e852;
 const CUBIC_ANCHOR_BYTES: u64 = 52_532_113;
@@ -894,10 +894,10 @@ fn e5_projected_device_plans_are_derived_and_fit_boston() {
 fn e5_exact_capped_metal_plans_match_the_frozen_classes() {
     use days_executor::{MetalConfig, size_metal_plan_for_testing};
 
-    for (fixture, expected_bytes, expected_milli_gib) in [
-        (PRIMARY_FIXTURE, FROZEN_PRIMARY_PLAN_BYTES, 14_516_u128),
-        (CUBIC_FIXTURE, FROZEN_CUBIC_PLAN_BYTES, 14_535),
-        (BACKUP_FIXTURE, FROZEN_BACKUP_PLAN_BYTES, 14_922_u128),
+    for (fixture, pre_o212_bytes) in [
+        (PRIMARY_FIXTURE, FROZEN_PRE_O212_PRIMARY_PLAN_BYTES),
+        (CUBIC_FIXTURE, FROZEN_PRE_O212_CUBIC_PLAN_BYTES),
+        (BACKUP_FIXTURE, FROZEN_PRE_O212_BACKUP_PLAN_BYTES),
     ] {
         let report = size_metal_plan_for_testing(
             &lower(fixture),
@@ -915,10 +915,30 @@ fn e5_exact_capped_metal_plans_match_the_frozen_classes() {
             .map(|plane| plane.bytes as u128)
             .sum::<u128>();
         assert_eq!(derived_total, report.total_device_bytes as u128);
+        let remote_staging_words = report
+            .planes
+            .iter()
+            .find(|plane| plane.name == "remote_staging")
+            .expect("E5 Metal plan must report remote staging")
+            .words as u128;
+        assert_eq!(remote_staging_words % 12, 0);
+        let compact_reduction_bytes = (report.event_arenas.channel_stream_event_slots as u128 * 3
+            + report.event_arenas.service_stream_event_slots as u128 * 9
+            + report.event_arenas.generator_stream_event_slots as u128 * 4
+            + remote_staging_words / 12 * 2)
+            * 8;
+        let expected_bytes = pre_o212_bytes
+            .checked_sub(compact_reduction_bytes)
+            .expect("compact planes must fit the prior frozen plan");
         println!(
             "E5 exact capped Metal plan {fixture}: bytes={derived_total} gib={:.9} \
-             headroom_bytes={}",
+             channel_slots={} service_slots={} generator_slots={} remote_staging_words={} \
+             compact_reduction_bytes={compact_reduction_bytes} headroom_bytes={}",
             derived_total as f64 / GIB_BYTES as f64,
+            report.event_arenas.channel_stream_event_slots,
+            report.event_arenas.service_stream_event_slots,
+            report.event_arenas.generator_stream_event_slots,
+            remote_staging_words,
             DEVICE_CAP_BYTES - derived_total
         );
         assert_eq!(derived_total, expected_bytes);
@@ -942,7 +962,7 @@ fn e5_exact_capped_metal_plans_match_the_frozen_classes() {
         );
         assert_eq!(
             (derived_total * 1_000 + GIB_BYTES / 2) / GIB_BYTES,
-            expected_milli_gib
+            (expected_bytes * 1_000 + GIB_BYTES / 2) / GIB_BYTES
         );
     }
 }

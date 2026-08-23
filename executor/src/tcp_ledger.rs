@@ -35,6 +35,67 @@ pub(crate) fn initial_live_payloads(image: &SimulationImage) -> BTreeSet<Payload
         .collect()
 }
 
+/// Non-TCP descriptors whose initial placement is only a control token or whose in-service copy
+/// will disappear when its completion fires. Device readback cannot recover these descriptors
+/// from the TCP ledger, so retain exactly the same orphan set that the CPU state pins.
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal-spike", target_vendor = "apple")
+))]
+pub(crate) fn initial_non_tcp_orphan_packets(image: &SimulationImage) -> Vec<PacketDescriptor> {
+    let meaningful_event_payloads = image
+        .initial_events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                EventKind::PacketArrival | EventKind::RemoteArrival | EventKind::PacingTimer
+            )
+        })
+        .map(|event| event.payload)
+        .collect::<BTreeSet<_>>();
+    let completion_payloads = image
+        .initial_events
+        .iter()
+        .filter(|event| event.kind == EventKind::TxComplete)
+        .map(|event| event.payload)
+        .collect::<BTreeSet<_>>();
+    let queued_payloads = image
+        .host_states
+        .iter()
+        .flat_map(|state| state.queue.iter().copied())
+        .chain(image.switch_states.iter().flat_map(|state| {
+            state
+                .queues
+                .iter()
+                .flat_map(|queue| queue.queue.iter().copied())
+        }))
+        .collect::<BTreeSet<_>>();
+    let in_service_payloads = image
+        .host_states
+        .iter()
+        .filter_map(|state| state.in_service)
+        .chain(
+            image
+                .switch_states
+                .iter()
+                .flat_map(|state| state.queues.iter().filter_map(|queue| queue.in_service)),
+        )
+        .collect::<BTreeSet<_>>();
+
+    image
+        .initial_packets
+        .iter()
+        .copied()
+        .filter(|packet| !matches!(packet.kind, PacketKind::TcpData(_)))
+        .filter(|packet| !meaningful_event_payloads.contains(&packet.id))
+        .filter(|packet| !queued_payloads.contains(&packet.id))
+        .filter(|packet| {
+            !in_service_payloads.contains(&packet.id) || completion_payloads.contains(&packet.id)
+        })
+        .collect()
+}
+
 pub(crate) fn seed_image(image: &SimulationImage) -> Result<TcpSegmentLedger, TcpSegmentConflict> {
     let mut segments = TcpSegmentLedger::new();
     for packet in image.initial_packets.iter().copied() {

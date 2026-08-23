@@ -375,7 +375,7 @@ fn ready_control_token_can_coexist_with_an_in_flight_payload() {
 }
 
 #[test]
-fn cpu_preserves_accepted_orphan_packet_snapshots() {
+fn backends_preserve_accepted_orphan_packet_snapshots() {
     let mut lost_remote = in_flight_image(4);
     lost_remote
         .initial_events
@@ -404,6 +404,30 @@ fn cpu_preserves_accepted_orphan_packet_snapshots() {
         )
         .unwrap();
         assert_eq!(actual.result, expected);
+
+        #[cfg(feature = "cuda")]
+        {
+            let actual = run_cuda_with_observations(
+                &image,
+                None,
+                CudaConfig::default(),
+                ObservationMode::Full,
+            )
+            .unwrap();
+            assert_device_full_result_eq(&actual.result, &expected, "CUDA orphan snapshot");
+        }
+
+        #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+        {
+            let actual = run_metal_with_observations(
+                &image,
+                None,
+                MetalConfig::default(),
+                ObservationMode::Full,
+            )
+            .unwrap();
+            assert_device_full_result_eq(&actual.result, &expected, "Metal orphan snapshot");
+        }
     }
 }
 

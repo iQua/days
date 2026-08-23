@@ -26,6 +26,11 @@ use objc2_metal::{
 use crate::device_compaction::{
     CompactionEntity, CompactionPlan, CompactionShape, metadata_region,
 };
+use crate::device_event_record::{
+    CHANNEL_EVENT_WORDS, EVENT_WORDS, GENERATOR_EVENT_WORDS, REMOTE_STAGING_EVENT_WORDS,
+    SERVICE_EVENT_WORDS, StoredEventClass, decode_event_record, stored_event_words,
+    stream_event_class,
+};
 use crate::device_scheduler::{
     QUEUE_META_WORDS, prepare_device_schedulers, restore_device_scheduler,
 };
@@ -41,8 +46,7 @@ use crate::{
 };
 
 const LANES: usize = 1_024;
-const EVENT_WORDS: usize = 14;
-const SCATTER_COPY_LANES: usize = EVENT_WORDS * 2;
+const SCATTER_COPY_LANES: usize = CHANNEL_EVENT_WORDS * 2;
 const NODE_WORDS: usize = 11;
 const GENERATOR_WORDS: usize = 43;
 const FLOW_WORDS: usize = 6;
@@ -1459,14 +1463,7 @@ impl MetalPlan {
             .copied()
             .map(|packet| (packet.id, packet))
             .collect::<BTreeMap<_, _>>();
-        let positioned_payloads = crate::tcp_ledger::initial_live_payloads(image);
-        let orphan_packets = image
-            .initial_packets
-            .iter()
-            .copied()
-            .filter(|packet| !positioned_payloads.contains(&packet.id))
-            .filter(|packet| !matches!(packet.kind, PacketKind::TcpData(_)))
-            .collect();
+        let orphan_packets = crate::tcp_ledger::initial_non_tcp_orphan_packets(image);
 
         let mut queue_caps = vec![1_usize; node_count];
         let mut aggregate_queue_packets = vec![0_usize; node_count];
@@ -2021,7 +2018,14 @@ impl MetalPlan {
             arrivals: zero_words(observation_slots, ARRIVAL_WORDS)?,
             lp_state: vec![0_u64; node_count.max(1) * LP_STATE_WORDS],
             remote_meta,
-            remote_staging: zero_words(remote_staging_slots, EVENT_WORDS)?,
+            remote_staging: zero_words(
+                remote_staging_slots,
+                if config.streams_enabled {
+                    REMOTE_STAGING_EVENT_WORDS
+                } else {
+                    EVENT_WORDS
+                },
+            )?,
             observation_meta,
             inbound_meta,
             merge_cursors: vec![0_u64; inbound_producers.len().max(1)],
@@ -2516,7 +2520,12 @@ fn prepare_streams(
     stream_caps.extend_from_slice(&generator_caps);
 
     let mut stream_meta = vec![0_u64; stream_count * ARENA_META_WORDS];
-    let stream_record_slots = assign_arena_offsets(&mut stream_meta, &stream_caps)?;
+    let stream_record_words = assign_stream_offsets(
+        &mut stream_meta,
+        &stream_caps,
+        service_stream_base,
+        generator_stream_base,
+    )?;
     let mut lp_streams = vec![Vec::<u64>::new(); node_count];
     for (channel, descriptor) in image.channels.iter().enumerate() {
         lp_streams[descriptor.target.0 as usize].push(channel as u64);
@@ -2641,9 +2650,8 @@ fn prepare_streams(
     let service_stream_event_slots = checked_sum_usize(&service_caps, "service stream slots")?;
     let generator_stream_event_slots =
         checked_sum_usize(&generator_caps, "generator stream slots")?;
-    let stream_arena_bytes = stream_record_slots
-        .checked_mul(EVENT_WORDS)
-        .and_then(|words| words.checked_mul(std::mem::size_of::<u64>()))
+    let stream_arena_bytes = stream_record_words
+        .checked_mul(std::mem::size_of::<u64>())
         .and_then(|bytes| {
             state
                 .len()
@@ -2654,7 +2662,7 @@ fn prepare_streams(
 
     Ok(PreparedStreams {
         state,
-        records: zero_words(stream_record_slots, EVENT_WORDS)?,
+        records: vec![0; stream_record_words.max(1)],
         layout: StreamLayout {
             stream_count,
             channel_count,
@@ -2957,6 +2965,33 @@ fn assign_arena_offsets(meta: &mut [u64], capacities: &[usize]) -> Result<usize,
         offset = offset
             .checked_add(capacity)
             .ok_or_else(|| MetalError::Validation("device arena size overflows usize".into()))?;
+    }
+    Ok(offset)
+}
+
+fn assign_stream_offsets(
+    meta: &mut [u64],
+    capacities: &[usize],
+    service_stream_base: usize,
+    generator_stream_base: usize,
+) -> Result<usize, MetalError> {
+    let mut offset = 0_usize;
+    for (stream, capacity) in capacities.iter().copied().enumerate() {
+        let base = stream * ARENA_META_WORDS;
+        meta[base] = offset as u64;
+        meta[base + 1] = capacity as u64;
+        let record_words = stored_event_words(stream_event_class(
+            stream,
+            service_stream_base,
+            generator_stream_base,
+        ));
+        offset = offset
+            .checked_add(capacity.checked_mul(record_words).ok_or_else(|| {
+                MetalError::Validation("device stream arena size overflows usize".into())
+            })?)
+            .ok_or_else(|| {
+                MetalError::Validation("device stream arena size overflows usize".into())
+            })?;
     }
     Ok(offset)
 }
@@ -3864,21 +3899,26 @@ impl MetalBuffers {
                 )
             },
         )?;
-        let stream_plan = arena_compaction_plan(
-            "stream record",
-            CompactionShape::Ring,
-            EVENT_WORDS,
+        let channel_stream_plan = stream_compaction_plan(
+            "channel stream record",
+            CHANNEL_EVENT_WORDS,
             self.planes[26].words,
-            self.stream_layout.stream_count,
-            |stream| {
-                let base = stream * ARENA_META_WORDS;
-                (
-                    stream_state[base],
-                    stream_state[base + 1],
-                    stream_state[base + 2],
-                    stream_state[base + 3],
-                )
-            },
+            0..self.stream_layout.service_stream_base,
+            &stream_state,
+        )?;
+        let service_stream_plan = stream_compaction_plan(
+            "service stream record",
+            SERVICE_EVENT_WORDS,
+            self.planes[26].words,
+            self.stream_layout.service_stream_base..self.stream_layout.generator_stream_base,
+            &stream_state,
+        )?;
+        let generator_stream_plan = stream_compaction_plan(
+            "generator stream record",
+            GENERATOR_EVENT_WORDS,
+            self.planes[26].words,
+            self.stream_layout.generator_stream_base..self.stream_layout.stream_count,
+            &stream_state,
         )?;
         // The two `tcp_state` record arenas already carry WORD offsets, so they are planned
         // directly rather than through `arena_compaction_plan`'s record-offset conversion.
@@ -3953,7 +3993,9 @@ impl MetalBuffers {
         let gathered = direct.compact(&[
             (&self.planes[8], &fel_plan),
             (&self.planes[10], &queue_plan),
-            (&self.planes[26], &stream_plan),
+            (&self.planes[26], &channel_stream_plan),
+            (&self.planes[26], &service_stream_plan),
+            (&self.planes[26], &generator_stream_plan),
             (&self.tcp_state, &ledger_plan),
             (&self.tcp_state, &receiver_range_plan),
             (&self.planes[15], &observed_plan),
@@ -3963,13 +4005,15 @@ impl MetalBuffers {
         let [
             fel_records,
             queue_records,
-            stream_records,
+            channel_stream_records,
+            service_stream_records,
+            generator_stream_records,
             ledger_records,
             receiver_ranges,
             observed_words,
             departure_words,
             arrival_words,
-        ]: [Vec<u64>; 8] = gathered
+        ]: [Vec<u64>; 10] = gathered
             .try_into()
             .expect("compaction returns one buffer per request");
 
@@ -4116,11 +4160,76 @@ impl MetalBuffers {
                 pending_events.push(event);
             }
         }
-        for stream in 0..self.stream_layout.stream_count {
-            let base = stream_plan.destination(stream);
-            for index in 0..stream_plan.count(stream) {
-                let record = read_record(&stream_records, base + index);
-                let (event, packet) = decode_event(record)?;
+        for channel in 0..self.stream_layout.service_stream_base {
+            let base = channel_stream_plan.destination(channel);
+            let target = image.channels[channel].target.0;
+            for index in 0..channel_stream_plan.count(channel) {
+                let slot = base + index;
+                let offset = slot * CHANNEL_EVENT_WORDS;
+                let record = decode_event_record(
+                    &channel_stream_records[offset..offset + CHANNEL_EVENT_WORDS],
+                    StoredEventClass::Channel,
+                    target,
+                    None,
+                    None,
+                );
+                let (event, packet) = decode_event(&record)?;
+                if let Some(packet) = packet {
+                    resident.insert(packet.id, packet);
+                }
+                pending_events.push(event);
+            }
+        }
+        for node in 0..node_count {
+            let base = service_stream_plan.destination(node);
+            let service: &[u64; EVENT_WORDS] = in_service
+                [node * EVENT_WORDS..(node + 1) * EVENT_WORDS]
+                .try_into()
+                .expect("one fixed-width in-service record per node");
+            for index in 0..service_stream_plan.count(node) {
+                let slot = base + index;
+                let offset = slot * SERVICE_EVENT_WORDS;
+                let encoded = &service_stream_records[offset..offset + SERVICE_EVENT_WORDS];
+                let service_valid = node_state[node * NODE_WORDS + 4] != 0;
+                if !matches!(encoded[1], 1 | 2)
+                    || (encoded[1] == 1 && (!service_valid || service[7] != encoded[4]))
+                {
+                    return Err(MetalError::DeviceExecution {
+                        code: 96,
+                        node: Some(NodeId(node as u64)),
+                    }
+                    .into());
+                }
+                let record = decode_event_record(
+                    encoded,
+                    StoredEventClass::Service,
+                    node as u64,
+                    None,
+                    Some(service),
+                );
+                let kind = decode_event_kind(record[5])?;
+                let event = decode_event_header(&record, kind)?;
+                if kind == EventKind::TxComplete {
+                    let packet = read_packet(&record, 0);
+                    resident.insert(packet.id, packet);
+                }
+                pending_events.push(event);
+            }
+        }
+        for flow in 0..flow_count {
+            let base = generator_stream_plan.destination(flow);
+            let target = image.flows[flow].source.0;
+            for index in 0..generator_stream_plan.count(flow) {
+                let slot = base + index;
+                let offset = slot * GENERATOR_EVENT_WORDS;
+                let record = decode_event_record(
+                    &generator_stream_records[offset..offset + GENERATOR_EVENT_WORDS],
+                    StoredEventClass::Generator,
+                    target,
+                    Some(flow as u64),
+                    None,
+                );
+                let (event, packet) = decode_event(&record)?;
                 if let Some(packet) = packet {
                     resident.insert(packet.id, packet);
                 }
@@ -4306,6 +4415,35 @@ fn arena_compaction_plan(
     .map_err(compaction_error)
 }
 
+/// Builds a compaction plan for a class-homogeneous range of streams whose metadata offsets are
+/// already expressed in words.
+fn stream_compaction_plan(
+    arena: &'static str,
+    record_words: usize,
+    source_plane_words: usize,
+    streams: std::ops::Range<usize>,
+    stream_state: &[u64],
+) -> Result<CompactionPlan, AttemptFailure> {
+    CompactionPlan::new(
+        arena,
+        CompactionShape::Ring,
+        record_words,
+        streams
+            .map(|stream| {
+                let base = stream * ARENA_META_WORDS;
+                CompactionEntity {
+                    source_words: stream_state[base],
+                    capacity: stream_state[base + 1],
+                    head: stream_state[base + 2],
+                    count: stream_state[base + 3],
+                }
+            })
+            .collect(),
+        source_plane_words,
+    )
+    .map_err(compaction_error)
+}
+
 fn decode_device_error(control: &[u64]) -> MetalError {
     let identity = (control[CONTROL_ERROR_NODE] != NONE).then_some(control[CONTROL_ERROR_NODE]);
     let capacity = control[CONTROL_ERROR_CAPACITY] as usize;
@@ -4415,23 +4553,24 @@ fn decode_event(record: &[u64]) -> Result<(Event, Option<PacketDescriptor>), Met
             })
         })
         .transpose()?;
-    Ok((
-        Event {
-            key: EventKey {
-                time_ns: record[0],
-                phase: u16::try_from(record[1]).map_err(|_| MetalError::DeviceExecution {
-                    code: 90,
-                    node: None,
-                })?,
-                origin_node: NodeId(record[2]),
-                origin_seq: record[3],
-            },
-            target: NodeId(record[4]),
-            kind,
-            payload: PayloadId(record[6]),
+    Ok((decode_event_header(record, kind)?, packet))
+}
+
+fn decode_event_header(record: &[u64], kind: EventKind) -> Result<Event, MetalError> {
+    Ok(Event {
+        key: EventKey {
+            time_ns: record[0],
+            phase: u16::try_from(record[1]).map_err(|_| MetalError::DeviceExecution {
+                code: 90,
+                node: None,
+            })?,
+            origin_node: NodeId(record[2]),
+            origin_seq: record[3],
         },
-        packet,
-    ))
+        target: NodeId(record[4]),
+        kind,
+        payload: PayloadId(record[6]),
+    })
 }
 
 fn decode_key(words: &[u64]) -> Result<EventKey, MetalError> {

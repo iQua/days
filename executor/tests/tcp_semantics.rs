@@ -2757,10 +2757,10 @@ fn device_sizing_derives_a_tcp_plan() {
         checkpoint_image(&image, &completed)
     };
 
-    // T21 fix 2 appended the per-round FEL root cache to `stream_state` — two words per LP.
-    // `stream_arena_bytes` counts the whole `stream_state` plane, so the retained pre-T21 anchor
-    // moves by exactly that region. Derived from the checkpoint's own dimensions rather than
-    // re-pinned, so the anchor stays legible.
+    // T21 fix 2 appended the per-round FEL root cache to `stream_state` — two words per LP. O2.12
+    // also replaces four 14-word channel slots with 11-word slots (96 fewer bytes) and 22 staging
+    // slots with 12-word records (352 fewer bytes), for a 448-byte exact reduction. Scratch stays
+    // image-derived.
     #[cfg(any(
         feature = "cuda",
         all(feature = "metal-spike", target_vendor = "apple")
@@ -2784,7 +2784,7 @@ fn device_sizing_derives_a_tcp_plan() {
         assert_eq!(metal.memory_layout.channel_stream_event_slots, 4);
         assert_eq!(
             metal.memory_layout.total_event_arena_bytes(),
-            2_128 + t21_round_scratch_bytes
+            1_680 + t21_round_scratch_bytes
         );
     }
 
@@ -2802,7 +2802,7 @@ fn device_sizing_derives_a_tcp_plan() {
         assert_eq!(cuda.memory_layout.channel_stream_event_slots, 4);
         assert_eq!(
             cuda.memory_layout.total_event_arena_bytes(),
-            2_128 + t21_round_scratch_bytes
+            1_680 + t21_round_scratch_bytes
         );
     }
 }
