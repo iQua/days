@@ -70,6 +70,146 @@ pub struct ScalarRoundRun {
     pub rounds: Vec<RoundMetrics>,
 }
 
+/// Exact transition counts by the closed [`crate::EventKind`] set.
+///
+/// This is an opt-in analysis surface. Normal scalar round execution does not allocate or update
+/// these counters.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TransitionKindCounts {
+    pub packet_arrival: u64,
+    pub tx_ready: u64,
+    pub tx_complete: u64,
+    pub remote_arrival: u64,
+    pub retransmission_timeout: u64,
+    pub pacing_timer: u64,
+}
+
+impl TransitionKindCounts {
+    pub const fn total(self) -> u64 {
+        self.packet_arrival
+            .saturating_add(self.tx_ready)
+            .saturating_add(self.tx_complete)
+            .saturating_add(self.remote_arrival)
+            .saturating_add(self.retransmission_timeout)
+            .saturating_add(self.pacing_timer)
+    }
+
+    fn observe(&mut self, node: NodeId, kind: crate::EventKind) -> Result<(), ExecutionError> {
+        let counter = match kind {
+            crate::EventKind::PacketArrival => &mut self.packet_arrival,
+            crate::EventKind::TxReady => &mut self.tx_ready,
+            crate::EventKind::TxComplete => &mut self.tx_complete,
+            crate::EventKind::RemoteArrival => &mut self.remote_arrival,
+            crate::EventKind::RetransmissionTimeout => &mut self.retransmission_timeout,
+            crate::EventKind::PacingTimer => &mut self.pacing_timer,
+        };
+        *counter = counter
+            .checked_add(1)
+            .ok_or(ExecutionError::CounterOverflow(node))?;
+        Ok(())
+    }
+}
+
+/// Compact, exact analysis of scalar safe-horizon transition work.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ScalarTransitionHistogram {
+    pub rounds: u64,
+    pub total_transitions: u64,
+    pub active_lp_rounds: u64,
+    pub kind_counts: TransitionKindCounts,
+    /// Maps transitions performed by one LP in one round to the number of such LP-rounds.
+    pub lp_round_transition_histogram: BTreeMap<u64, u64>,
+    /// Numerator of the divergence-cap ratio for 32-lane worklist groups.
+    ///
+    /// Each round's active worklist is sorted by node, split into consecutive groups of 32, and
+    /// contributes the maximum LP work in each group. The exact denominator is
+    /// [`Self::total_transitions`].
+    pub warp_max_transitions: u128,
+    /// Lane-equivalent padded work used for the divergence-cap ratio.
+    ///
+    /// Each group contributes `group_len * max(lane)`. The short final group uses its actual
+    /// length, matching the existing T20a lane-utilization analysis.
+    pub warp_padded_transitions: u128,
+}
+
+impl ScalarTransitionHistogram {
+    fn observe_event(
+        &mut self,
+        node: NodeId,
+        kind: crate::EventKind,
+    ) -> Result<(), ExecutionError> {
+        self.kind_counts.observe(node, kind)
+    }
+
+    fn observe_round(
+        &mut self,
+        lp_work: &mut [LpRoundWork],
+        events_processed: u64,
+    ) -> Result<(), ExecutionError> {
+        lp_work.sort_unstable_by_key(|work| work.node);
+
+        let round_sum = lp_work.iter().try_fold(0_u64, |total, work| {
+            total
+                .checked_add(work.events_processed)
+                .ok_or(ExecutionError::CounterOverflow(work.node))
+        })?;
+        if round_sum != events_processed {
+            return Err(ExecutionError::InvalidCpuConfig(
+                "transition histogram LP work does not equal the round transition total",
+            ));
+        }
+
+        self.rounds = self
+            .rounds
+            .checked_add(1)
+            .ok_or(ExecutionError::CounterOverflow(NodeId(0)))?;
+        self.total_transitions = self
+            .total_transitions
+            .checked_add(events_processed)
+            .ok_or(ExecutionError::CounterOverflow(NodeId(0)))?;
+        self.active_lp_rounds = self
+            .active_lp_rounds
+            .checked_add(lp_work.len() as u64)
+            .ok_or(ExecutionError::CounterOverflow(NodeId(0)))?;
+
+        for work in lp_work.iter() {
+            let occurrences = self
+                .lp_round_transition_histogram
+                .entry(work.events_processed)
+                .or_default();
+            *occurrences = occurrences
+                .checked_add(1)
+                .ok_or(ExecutionError::CounterOverflow(work.node))?;
+        }
+        for lanes in lp_work.chunks(32) {
+            let maximum = lanes
+                .iter()
+                .map(|work| work.events_processed)
+                .max()
+                .unwrap_or(0);
+            self.warp_max_transitions = self
+                .warp_max_transitions
+                .checked_add(u128::from(maximum))
+                .ok_or(ExecutionError::CounterOverflow(NodeId(0)))?;
+            let padded = u128::from(maximum)
+                .checked_mul(lanes.len() as u128)
+                .ok_or(ExecutionError::CounterOverflow(NodeId(0)))?;
+            self.warp_padded_transitions = self
+                .warp_padded_transitions
+                .checked_add(padded)
+                .ok_or(ExecutionError::CounterOverflow(NodeId(0)))?;
+        }
+        Ok(())
+    }
+}
+
+/// Complete scalar state plus opt-in transition analysis.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScalarTransitionHistogramRun {
+    pub result: RunResult,
+    pub histogram: ScalarTransitionHistogram,
+}
+
 /// Contiguous safe-horizon round window retained by the T13e spike harness.
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -183,6 +323,19 @@ pub fn run_scalar_rounds_with_observations(
     RoundExecutor::new(image, observation_mode)?.run(exclusive_horizon_ns)
 }
 
+/// Runs scalar safe-horizon execution with compact transition-kind and LP-round counters.
+///
+/// Unlike [`run_scalar_rounds`], this analysis path does not retain [`RoundMetrics`] for every
+/// round. Instrumentation is absent from normal scalar execution unless this function is called.
+pub fn run_scalar_rounds_with_transition_histogram(
+    image: &SimulationImage,
+    exclusive_horizon_ns: Option<u64>,
+) -> Result<ScalarTransitionHistogramRun, ExecutionError> {
+    let mut executor = RoundExecutor::new(image, ObservationMode::Summary)?;
+    executor.transition_histogram = Some(ScalarTransitionHistogram::default());
+    executor.run_with_transition_histogram(exclusive_horizon_ns)
+}
+
 /// Records a bounded real-image window while executing the canonical safe-horizon CPU path.
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub fn run_scalar_rounds_with_replay_trace(
@@ -219,6 +372,7 @@ pub fn run_scalar_rounds_with_windowed_replay_trace(
 #[derive(Clone, Copy)]
 enum RoundRetention {
     All,
+    None,
     #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
     Window(RoundMetricsWindow),
 }
@@ -227,6 +381,7 @@ impl RoundRetention {
     fn retains(self, _round: usize) -> bool {
         match self {
             Self::All => true,
+            Self::None => false,
             #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
             Self::Window(window) => window.contains(_round),
         }
@@ -332,6 +487,7 @@ struct RoundExecutor<'image> {
     pending_keys: BTreeSet<EventKey>,
     frontier: OwnerFrontierIndex,
     minimum_lookahead_ns: Option<u64>,
+    transition_histogram: Option<ScalarTransitionHistogram>,
     #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
     replay_trace: Option<RealReplayTraceBuilder>,
 }
@@ -395,6 +551,7 @@ impl<'image> RoundExecutor<'image> {
             pending_keys,
             frontier,
             minimum_lookahead_ns,
+            transition_histogram: None,
             #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
             replay_trace: None,
         })
@@ -408,6 +565,31 @@ impl<'image> RoundExecutor<'image> {
             .min(configured_stop);
         let rounds = self.execute_rounds(run_end, RoundRetention::All)?;
         Ok(self.finish(rounds.retained))
+    }
+
+    fn run_with_transition_histogram(
+        mut self,
+        exclusive_horizon_ns: Option<u64>,
+    ) -> Result<ScalarTransitionHistogramRun, ExecutionError> {
+        let configured_stop = u128::from(self.image.stop_time_ns) + 1;
+        let run_end = exclusive_horizon_ns
+            .map(u128::from)
+            .unwrap_or(TIME_AFTER_U64_MAX)
+            .min(configured_stop);
+        self.execute_rounds(run_end, RoundRetention::None)?;
+        let histogram = self
+            .transition_histogram
+            .take()
+            .expect("histogram execution installs an accumulator");
+        if histogram.kind_counts.total() != histogram.total_transitions {
+            return Err(ExecutionError::InvalidCpuConfig(
+                "transition-kind counts do not equal the scalar transition total",
+            ));
+        }
+        Ok(ScalarTransitionHistogramRun {
+            result: self.finish_result(),
+            histogram,
+        })
     }
 
     #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
@@ -468,7 +650,7 @@ impl<'image> RoundExecutor<'image> {
         let mut total_rounds = 0_usize;
         #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
         let mut window_totals = match retention {
-            RoundRetention::All => None,
+            RoundRetention::All | RoundRetention::None => None,
             RoundRetention::Window(_) => Some(WindowedRunTotals::default()),
         };
 
@@ -593,6 +775,9 @@ impl<'image> RoundExecutor<'image> {
             } else {
                 events_processed as f64 / (active_lp_count as f64 * max_work as f64)
             };
+            if let Some(histogram) = self.transition_histogram.as_mut() {
+                histogram.observe_round(&mut lp_work, events_processed)?;
+            }
             #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
             if capture_replay {
                 self.replay_trace
@@ -722,6 +907,9 @@ impl<'image> RoundExecutor<'image> {
                 None
             };
             self.transitions.dispatch(event, children)?;
+            if let Some(histogram) = self.transition_histogram.as_mut() {
+                histogram.observe_event(node, event.kind)?;
+            }
             // Live-state contract (T20g item 2): a source-owned retransmission timeout targets its
             // own host, so eager removal stays inside this LP's future map and its pending-key
             // index. `update_frontier` after the drain republishes the LP minimum.
@@ -1199,5 +1387,60 @@ mod tests {
             ratio <= 1.5,
             "100x idle LPs materially changed round-loop time: ratio={ratio:.3}"
         );
+    }
+
+    #[test]
+    fn transition_histogram_counts_kinds_without_changing_state() {
+        let image = idle_cost_image(0, 2);
+        let baseline = run_scalar_rounds(&image, None).unwrap();
+        let measured = run_scalar_rounds_with_transition_histogram(&image, None).unwrap();
+
+        assert_eq!(measured.result, baseline.result);
+        assert_eq!(measured.histogram.total_transitions, 8);
+        assert_eq!(measured.histogram.kind_counts.packet_arrival, 2);
+        assert_eq!(measured.histogram.kind_counts.tx_ready, 2);
+        assert_eq!(measured.histogram.kind_counts.tx_complete, 2);
+        assert_eq!(measured.histogram.kind_counts.remote_arrival, 2);
+        assert_eq!(measured.histogram.kind_counts.retransmission_timeout, 0);
+        assert_eq!(measured.histogram.kind_counts.pacing_timer, 0);
+        assert_eq!(
+            measured.histogram.lp_round_transition_histogram.get(&1),
+            Some(&4)
+        );
+        assert_eq!(
+            measured.histogram.lp_round_transition_histogram.get(&2),
+            Some(&2)
+        );
+        assert_eq!(measured.histogram.warp_max_transitions, 6);
+        assert_eq!(measured.histogram.warp_padded_transitions, 8);
+    }
+
+    #[test]
+    fn transition_histogram_groups_node_sorted_worklists_in_32_lanes() {
+        let mut work = vec![LpRoundWork {
+            node: NodeId(32),
+            events_processed: 5,
+            same_time_continuations: 0,
+            fallback_classified_pushes: 0,
+        }];
+        work.extend((1..32).map(|node| LpRoundWork {
+            node: NodeId(node),
+            events_processed: 1,
+            same_time_continuations: 0,
+            fallback_classified_pushes: 0,
+        }));
+        work.push(LpRoundWork {
+            node: NodeId(0),
+            events_processed: 10,
+            same_time_continuations: 0,
+            fallback_classified_pushes: 0,
+        });
+        let mut histogram = ScalarTransitionHistogram::default();
+
+        histogram.observe_round(&mut work, 46).unwrap();
+
+        assert!(work.windows(2).all(|nodes| nodes[0].node < nodes[1].node));
+        assert_eq!(histogram.warp_max_transitions, 15);
+        assert_eq!(histogram.warp_padded_transitions, 325);
     }
 }
