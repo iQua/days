@@ -39,6 +39,14 @@ cargo run --features metal-spike --bin t20f_frontier -- \
   first-attempt sizing hint.
 - `--dump-capacity-warm-start <path>`: after a successful device run, write the
   converged sizing snapshot.
+- `--channel-events-per-stream <usize>`: override the plane-wide
+  channel-stream starting cap for a recorded identity configuration. The
+  full frontier fixture is anchored at 256 because the stock 2,048 cap
+  exceeds a 24 GB device; capacity is refuse-or-run, never simulation
+  semantics.
+- `--round-threads-per-block <usize>`: override the parallel round and
+  exchange launch width. Measurement campaigns select this per fixture and
+  record it beside every timed sample; it changes geometry, never bytes.
 
 A warm start contains capacities, not simulation state or compiled kernels.
 Devices use refuse-or-run capacity checks: an insufficient attempt is discarded
