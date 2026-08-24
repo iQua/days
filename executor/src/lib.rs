@@ -15,6 +15,7 @@ mod device_capacity;
     all(feature = "metal-spike", target_vendor = "apple")
 ))]
 mod device_compaction;
+mod device_event_record;
 mod device_scheduler;
 pub mod device_sizing;
 pub mod event;

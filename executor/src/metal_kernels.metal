@@ -2,6 +2,10 @@
 using namespace metal;
 
 constant uint EVENT_WORDS = 14;
+constant uint CHANNEL_EVENT_WORDS = 11;
+constant uint SERVICE_EVENT_WORDS = 5;
+constant uint GENERATOR_EVENT_WORDS = 10;
+constant uint REMOTE_STAGING_EVENT_WORDS = 12;
 constant uint SCATTER_COOPERATIVE_MIN_RECORDS = 3;
 constant uint NODE_WORDS = 11;
 constant uint GENERATOR_WORDS = 43;
@@ -346,6 +350,20 @@ inline bool stored_cross_key_less(
     return left_records[left + E_SEQUENCE] < right_records[right + E_SEQUENCE];
 }
 
+inline bool stored_word_cross_key_less(
+    const device ulong *left_records,
+    ulong left_word,
+    const device ulong *right_records,
+    ulong right_word
+) {
+    for (uint word = 0; word < 4; ++word) {
+        if (left_records[left_word + word] != right_records[right_word + word]) {
+            return left_records[left_word + word] < right_records[right_word + word];
+        }
+    }
+    return false;
+}
+
 inline bool stored_thread_key_less(
     const device ulong *left_records,
     ulong left_slot,
@@ -362,6 +380,19 @@ inline bool stored_thread_key_less(
         return left_records[left + E_ORIGIN] < right[E_ORIGIN];
     }
     return left_records[left + E_SEQUENCE] < right[E_SEQUENCE];
+}
+
+inline bool stored_word_thread_key_less(
+    const device ulong *left_records,
+    ulong left_word,
+    const thread ulong *right
+) {
+    for (uint word = 0; word < 4; ++word) {
+        if (left_records[left_word + word] != right[word]) {
+            return left_records[left_word + word] < right[word];
+        }
+    }
+    return false;
 }
 
 inline void copy_thread_to_device(
@@ -396,6 +427,126 @@ inline void copy_device_record(
     ulong target_offset = target_slot * EVENT_WORDS;
     for (uint word = 0; word < EVENT_WORDS; ++word) {
         target[target_offset + word] = source[source_offset + word];
+    }
+}
+
+// Stream-record offsets are word offsets. Capacities, heads, and counts remain record counts.
+// Every compact record retains the canonical four-word key verbatim at words 0..3.
+inline uint stream_record_words(ulong stream, const device ulong *params) {
+    if (stream < params[P_SERVICE_STREAM_BASE]) {
+        return CHANNEL_EVENT_WORDS;
+    }
+    if (stream < params[P_GENERATOR_STREAM_BASE]) {
+        return SERVICE_EVENT_WORDS;
+    }
+    return GENERATOR_EVENT_WORDS;
+}
+
+inline ulong stream_record_offset(
+    ulong stream,
+    ulong physical,
+    const device ulong *params,
+    const device ulong *stream_state
+) {
+    return stream_state[stream * META_WORDS] +
+        physical * ulong(stream_record_words(stream, params));
+}
+
+inline void encode_stream_record(
+    const thread ulong *record,
+    ulong stream,
+    const device ulong *params,
+    device ulong *encoded
+) {
+    for (uint word = 0; word < 4; ++word) {
+        encoded[word] = record[word];
+    }
+    encoded[4] = record[E_PAYLOAD];
+    if (stream < params[P_SERVICE_STREAM_BASE]) {
+        encoded[5] = record[PK_FLOW];
+        encoded[6] = record[PK_SIZE];
+        encoded[7] = record[PK_KIND];
+        encoded[8] = record[PK_META_0];
+        encoded[9] = record[PK_META_1];
+        encoded[10] = record[PK_META_2];
+    } else if (stream >= params[P_GENERATOR_STREAM_BASE]) {
+        encoded[5] = record[PK_SIZE];
+        encoded[6] = record[PK_KIND];
+        encoded[7] = record[PK_META_0];
+        encoded[8] = record[PK_META_1];
+        encoded[9] = record[PK_META_2];
+    }
+}
+
+inline void decode_stream_record(
+    const device ulong *encoded,
+    ulong stream,
+    ulong node,
+    const device ulong *params,
+    thread ulong *record
+) {
+    for (uint word = 0; word < EVENT_WORDS; ++word) {
+        record[word] = 0;
+    }
+    for (uint word = 0; word < 4; ++word) {
+        record[word] = encoded[word];
+    }
+    record[E_TARGET] = node;
+    record[E_PAYLOAD] = encoded[4];
+    if (stream < params[P_SERVICE_STREAM_BASE]) {
+        record[E_KIND] = REMOTE_ARRIVAL;
+        record[PK_ID] = encoded[4];
+        record[PK_FLOW] = encoded[5];
+        record[PK_SIZE] = encoded[6];
+        record[PK_KIND] = encoded[7];
+        record[PK_META_0] = encoded[8];
+        record[PK_META_1] = encoded[9];
+        record[PK_META_2] = encoded[10];
+    } else if (stream < params[P_GENERATOR_STREAM_BASE]) {
+        record[E_KIND] = record[E_PHASE] == 2
+            ? TX_READY
+            : TX_COMPLETE;
+    } else {
+        record[E_KIND] = PACKET_ARRIVAL;
+        record[PK_ID] = encoded[4];
+        record[PK_FLOW] = stream - params[P_GENERATOR_STREAM_BASE];
+        record[PK_SIZE] = encoded[5];
+        record[PK_KIND] = encoded[6];
+        record[PK_META_0] = encoded[7];
+        record[PK_META_1] = encoded[8];
+        record[PK_META_2] = encoded[9];
+    }
+}
+
+inline void encode_remote_staging_record(
+    const thread ulong *record,
+    device ulong *encoded
+) {
+    for (uint word = 0; word < 4; ++word) {
+        encoded[word] = record[word];
+    }
+    encoded[4] = record[E_TARGET];
+    encoded[5] = record[E_PAYLOAD];
+    encoded[6] = record[PK_FLOW];
+    encoded[7] = record[PK_SIZE];
+    encoded[8] = record[PK_KIND];
+    encoded[9] = record[PK_META_0];
+    encoded[10] = record[PK_META_1];
+    encoded[11] = record[PK_META_2];
+}
+
+inline void copy_staging_to_channel(
+    const device ulong *remote_staging,
+    ulong source_slot,
+    device ulong *stream_records,
+    ulong target_word
+) {
+    ulong source_word = source_slot * REMOTE_STAGING_EVENT_WORDS;
+    for (uint word = 0; word < 4; ++word) {
+        stream_records[target_word + word] = remote_staging[source_word + word];
+    }
+    for (uint word = 4; word < CHANNEL_EVENT_WORDS; ++word) {
+        stream_records[target_word + word] = remote_staging[source_word + word + 1];
     }
 }
 
@@ -619,13 +770,33 @@ inline bool heap_root_time(
 }
 
 inline ulong stream_arena(ulong stream, const device ulong *params) {
-    if (stream < params[P_CHANNEL_COUNT]) {
+    if (stream < params[P_SERVICE_STREAM_BASE]) {
         return ARENA_CHANNEL_INBOX;
     }
     if (stream < params[P_GENERATOR_STREAM_BASE]) {
         return ARENA_SERVICE_STREAM;
     }
     return ARENA_GENERATOR_STREAM;
+}
+
+inline void active_update_stream_key(
+    ulong node,
+    ulong active_index,
+    ulong stream,
+    ulong physical,
+    const device ulong *params,
+    device ulong *stream_state,
+    const device ulong *stream_records
+) {
+    ulong meta =
+        params[P_LP_STREAM_META_OFFSET] + node * LP_STREAM_META_WORDS;
+    ulong entry =
+        stream_state[meta + 2] +
+        active_index * ACTIVE_STREAM_ENTRY_WORDS;
+    ulong record = stream_record_offset(stream, physical, params, stream_state);
+    for (uint word = 0; word < 4; ++word) {
+        stream_state[entry + 1 + word] = stream_records[record + word];
+    }
 }
 
 inline bool active_add(
@@ -859,13 +1030,19 @@ inline bool stream_push(
     }
     if (params[P_STREAM_ORDER_CHECKS] != 0 && count != 0) {
         ulong tail = (head + count - 1) % max(capacity, 1ul);
-        if (!stored_thread_key_less(stream_records, offset + tail, record)) {
+        ulong tail_word = offset + tail * ulong(stream_record_words(stream, params));
+        if (!stored_word_thread_key_less(stream_records, tail_word, record)) {
             set_semantic_error(error, 39, node);
             return false;
         }
     }
     ulong physical = (head + count) % max(capacity, 1ul);
-    copy_thread_to_device(record, stream_records, offset + physical);
+    encode_stream_record(
+        record,
+        stream,
+        params,
+        stream_records + offset + physical * ulong(stream_record_words(stream, params))
+    );
     stream_state[base + 3] = count + 1;
     RECORD_STREAM_HIGH_WATER(params, stream_state, stream, count + 1);
     return count != 0 || !activate ||
@@ -1026,9 +1203,16 @@ inline bool fel_peek(
         }
         ulong capacity = stream_state[base + 1];
         ulong physical = stream_state[base + 2] % max(capacity, 1ul);
-        copy_device_to_thread(
-            stream_records,
-            stream_state[base] + physical,
+        decode_stream_record(
+            stream_records + stream_record_offset(
+                selected_stream,
+                physical,
+                params,
+                stream_state
+            ),
+            selected_stream,
+            node,
+            params,
             record
         );
     }
@@ -1128,13 +1312,14 @@ inline bool fel_pop_selected(
         active_remove(node, selected_active, params, stream_state);
     } else {
         ulong physical = stream_state[base + 2] % max(capacity, 1ul);
-        active_update_key(
+        active_update_stream_key(
             node,
             selected_active,
+            selected_stream,
+            physical,
             params,
             stream_state,
-            stream_records,
-            stream_state[base] + physical
+            stream_records
         );
     }
     return true;
@@ -1540,7 +1725,14 @@ inline bool append_remote(
         set_capacity_error(error, ARENA_REMOTE_STAGING, node, capacity, index + 1);
         return false;
     }
-    copy_thread_to_device(record, remote_staging, offset + index);
+    if (params[P_STREAMS_ENABLED] != 0) {
+        encode_remote_staging_record(
+            record,
+            remote_staging + (offset + index) * REMOTE_STAGING_EVENT_WORDS
+        );
+    } else {
+        copy_thread_to_device(record, remote_staging, offset + index);
+    }
     remote_meta[base + 3] = index + 1;
     RECORD_REMOTE_HIGH_WATER(params, remote_meta, node, index + 1);
     if (params[P_STREAMS_ENABLED] != 0) {
@@ -1585,11 +1777,11 @@ inline bool append_remote(
         ulong batch_count = stream_state[batch];
         if (params[P_STREAM_ORDER_CHECKS] != 0 && batch_count != 0) {
             ulong previous_slot = stream_state[batch + 2];
-            if (!stored_cross_key_less(
+            if (!stored_word_cross_key_less(
                 remote_staging,
-                previous_slot,
+                previous_slot * REMOTE_STAGING_EVENT_WORDS,
                 remote_staging,
-                offset + index
+                (offset + index) * REMOTE_STAGING_EVENT_WORDS
             )) {
                 set_semantic_error(error, 41, node);
                 return false;
@@ -4960,6 +5152,26 @@ inline bool dispatch_event(
     return false;
 }
 
+inline bool hydrate_tx_complete_event(
+    ulong node,
+    thread ulong *event,
+    device ulong *error,
+    const device ulong *in_service
+) {
+    if (event[E_KIND] != TX_COMPLETE) {
+        return true;
+    }
+    ulong service = node * EVENT_WORDS;
+    if (in_service[service + PK_ID] != event[E_PAYLOAD]) {
+        set_semantic_error(error, 15, node);
+        return false;
+    }
+    for (uint word = PK_ID; word <= PK_META_2; ++word) {
+        event[word] = in_service[service + word];
+    }
+    return true;
+}
+
 // T21 fix 2 — per-round FEL root cache accessors. Transliterated word for word from
 // `cuda_kernels.cu`; see that file's header for the read-set argument that makes the cache exact.
 static inline ulong round_scratch_cache(const device ulong *params) {
@@ -5455,6 +5667,9 @@ kernel void days_round(
             set_semantic_error(state, 26, node);
             return;
         }
+        if (!hydrate_tx_complete_event(node, event, state, in_service)) {
+            return;
+        }
         if (!dispatch_event(
             node,
             event,
@@ -5674,17 +5889,24 @@ kernel void days_exchange_prefix_sweep(
             ) {
                 ulong first_slot = stream_state[batch + 1];
                 invalid_order = before_horizon(
-                    remote_staging[first_slot * EVENT_WORDS + E_TIME],
+                    remote_staging[
+                        first_slot * REMOTE_STAGING_EVENT_WORDS + E_TIME
+                    ],
                     control
                 );
                 if (!invalid_order && count != 0) {
                     ulong head = stream_state[stream_base + 2];
                     ulong tail = (head + count - 1) % max(capacity, 1ul);
-                    invalid_order = !stored_cross_key_less(
+                    invalid_order = !stored_word_cross_key_less(
                         stream_records,
-                        stream_state[stream_base] + tail,
+                        stream_record_offset(
+                            channel,
+                            tail,
+                            params,
+                            stream_state
+                        ),
                         remote_staging,
-                        first_slot
+                        first_slot * REMOTE_STAGING_EVENT_WORDS
                     );
                 }
             }
@@ -5895,7 +6117,7 @@ inline ulong scatter_stream_target(
         cursor
     ) % max(capacity, 1ul);
     stream_state[batch + 3] = cursor + 1;
-    return stream_state[stream_base] + physical;
+    return stream_state[stream_base] + physical * CHANNEL_EVENT_WORDS;
 }
 
 inline void scatter_stream_commit(
@@ -5932,7 +6154,7 @@ inline void scatter_stream_producer_lane(
     for (ulong index = 0; index < count; ++index) {
         ulong target =
             scatter_stream_target(staging + index, params, stream_state);
-        copy_device_record(
+        copy_staging_to_channel(
             remote_staging,
             staging + index,
             stream_records,
@@ -6028,15 +6250,17 @@ kernel void days_exchange_scatter(
                     first_target = scatter_simd_broadcast_ulong(first_target);
                     second_target = scatter_simd_broadcast_ulong(second_target);
 
-                    if (lane < 2 * EVENT_WORDS) {
-                        ulong record = lane / EVENT_WORDS;
-                        uint word = lane % EVENT_WORDS;
+                    if (lane < 2 * CHANNEL_EVENT_WORDS) {
+                        ulong record = lane / CHANNEL_EVENT_WORDS;
+                        uint word = lane % CHANNEL_EVENT_WORDS;
                         if (index + record < count) {
                             ulong source_slot = staging + index + record;
-                            ulong target_slot =
+                            ulong target_word =
                                 record == 0 ? first_target : second_target;
-                            stream_records[target_slot * EVENT_WORDS + word] =
-                                remote_staging[source_slot * EVENT_WORDS + word];
+                            ulong source_word = source_slot * REMOTE_STAGING_EVENT_WORDS +
+                                (word < 4 ? word : word + 1);
+                            stream_records[target_word + word] =
+                                remote_staging[source_word];
                         }
                     }
                 }
@@ -6119,8 +6343,12 @@ kernel void days_exchange_merge(
                 ulong capacity = stream_state[stream_base + 1];
                 ulong physical =
                     stream_state[stream_base + 2] % max(capacity, 1ul);
-                ulong record =
-                    (stream_state[stream_base] + physical) * EVENT_WORDS;
+                ulong record = stream_record_offset(
+                    stream,
+                    physical,
+                    params,
+                    stream_state
+                );
                 for (uint word = 0; word < 4; ++word) {
                     stream_state[entry + 1 + word] =
                         stream_records[record + word];

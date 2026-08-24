@@ -348,7 +348,9 @@ fn assert_0695_initial_plan(
     retry_enabled: DeviceSizingReport,
     expected_total_device_bytes: usize,
 ) {
-    const EVENT_WORDS_AT_0695F02: usize = 14;
+    const CHANNEL_EVENT_WORDS: usize = 11;
+    const SERVICE_EVENT_WORDS: usize = 5;
+    const GENERATOR_EVENT_WORDS: usize = 10;
 
     assert_eq!(
         retry_enabled, strict,
@@ -362,15 +364,17 @@ fn assert_0695_initial_plan(
         }],
         "the plane-wide cap remains the starting capacity for every stream",
     );
-    let stream_slots = strict.event_arenas.channel_stream_event_slots
-        + strict.event_arenas.service_stream_event_slots
-        + strict.event_arenas.generator_stream_event_slots;
     let stream_records = strict
         .planes
         .iter()
         .find(|plane| plane.name == "stream_records")
         .expect("stream-record plane must exist");
-    assert_eq!(stream_records.words, stream_slots * EVENT_WORDS_AT_0695F02);
+    assert_eq!(
+        stream_records.words,
+        strict.event_arenas.channel_stream_event_slots * CHANNEL_EVENT_WORDS
+            + strict.event_arenas.service_stream_event_slots * SERVICE_EVENT_WORDS
+            + strict.event_arenas.generator_stream_event_slots * GENERATOR_EVENT_WORDS
+    );
     // T21 fix 2 appended the per-round FEL root cache to `stream_state` (two words per LP) and one
     // params word that addresses it. Both are device scratch: nothing decodes them, and no capacity
     // number moved. The anchor is left at its pre-T21 value and the delta is DERIVED from this
@@ -443,7 +447,9 @@ fn channel_starting_cap_preserves_the_0695f02_initial_plan_bytes() {
         // now holds one record (112 B), so the anchor moves by exactly -435,344 B. No capacity
         // number moved with it: `P_OUTBOX_CAPACITY` is still the derived 54,432, so this plan
         // faults and grows exactly where it did before. Nothing else in the plan changed.
-        1_269_928 + 128 - 435_344,
+        // O2.12 exact compact streams remove 13,232 B and 12-word streams staging removes
+        // 62,208 B. Capacities remain record counts.
+        1_269_928 + 128 - 435_344 - 75_440,
     );
 
     #[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
@@ -474,7 +480,7 @@ fn channel_starting_cap_preserves_the_0695f02_initial_plan_bytes() {
         .expect("retry-enabled CUDA initial capped plan must size"),
         // T20i ledger-metadata widening: 8 flows * 2 words * 8 B = 128 B. T21 streams-path outbox
         // elision: -435,344 B. The image-derived ACK-minimum delta is zero; see the Metal anchor.
-        1_269_904 + 128 - 435_344,
+        1_269_904 + 128 - 435_344 - 75_440,
     );
 }
 
@@ -568,17 +574,17 @@ fn assert_outbox_partition(
     );
     // The derived outbox capacity — what both paths upload as `P_OUTBOX_CAPACITY` — is the sum of
     // the per-producer remote-staging capacities, so uncapped the legacy arena is exactly the
-    // `remote_staging` plane. Both plans size `remote_staging` identically, which is the visible
-    // consequence of the capacity number being untouched: only the storage moved.
+    // `remote_staging` plane. O2.12 stores one 12-word compact staging record in streams mode and
+    // one full 14-word record in legacy mode; the record capacity remains identical.
     assert_eq!(
         legacy_outbox,
         plane(legacy, "remote_staging"),
         "{backend} {fixture}: the uncapped legacy outbox arena is the remote-staging arena"
     );
     assert_eq!(
-        plane(streams, "remote_staging"),
-        plane(legacy, "remote_staging"),
-        "{backend} {fixture}: the derived remote capacity must not depend on the exchange path"
+        plane(streams, "remote_staging") / 12,
+        plane(legacy, "remote_staging") / 14,
+        "{backend} {fixture}: the derived remote record capacity must not depend on the exchange path"
     );
 }
 

@@ -3,6 +3,8 @@ const METAL: &str = include_str!("../src/metal_kernels.metal");
 const METAL_HOST: &str = include_str!("../src/metal.rs");
 
 const EVENT_WORDS: usize = 14;
+const REMOTE_STAGING_EVENT_WORDS: usize = 12;
+const CHANNEL_EVENT_WORDS: usize = 11;
 const SCATTER_COOPERATIVE_MIN_RECORDS: usize = 3;
 
 fn kernel_body<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
@@ -32,12 +34,26 @@ fn scatter_mapping(record_count: usize) -> ScatterMapping {
 
 #[test]
 fn scatter_selects_lane_for_one_cluster_and_cooperative_beyond_it() {
-    assert_eq!(EVENT_WORDS * 8, 112, "one record must occupy 112 bytes");
-    assert_eq!(2 * EVENT_WORDS, 28, "one cooperative cluster is 28 words");
+    assert_eq!(EVENT_WORDS * 8, 112, "legacy records remain 112 bytes");
     assert_eq!(
-        2 * EVENT_WORDS * 8,
-        224,
-        "one cluster must occupy 224 bytes"
+        REMOTE_STAGING_EVENT_WORDS * 8,
+        96,
+        "one staging record must occupy 96 bytes"
+    );
+    assert_eq!(
+        CHANNEL_EVENT_WORDS * 8,
+        88,
+        "one channel record must occupy 88 bytes"
+    );
+    assert_eq!(
+        2 * CHANNEL_EVENT_WORDS,
+        22,
+        "one cooperative output cluster is 22 words"
+    );
+    assert_eq!(
+        2 * CHANNEL_EVENT_WORDS * 8,
+        176,
+        "one output cluster must occupy 176 bytes"
     );
 
     for count in 0..SCATTER_COOPERATIVE_MIN_RECORDS {
@@ -82,7 +98,7 @@ fn scatter_keeps_lane_mapping_for_short_and_group_mapping_for_long_producers() {
         "worklist[active_index]",
         "__shfl_sync",
         "index += 2",
-        "lane < 2 * EVENT_WORDS",
+        "lane < 2 * CHANNEL_EVENT_WORDS",
     ] {
         assert!(
             cuda.contains(fragment),
@@ -103,7 +119,7 @@ fn scatter_keeps_lane_mapping_for_short_and_group_mapping_for_long_producers() {
         "simdgroups_per_threadgroup",
         "scatter_simd_broadcast_ulong",
         "index += 2",
-        "lane < 2 * EVENT_WORDS",
+        "lane < 2 * CHANNEL_EVENT_WORDS",
     ] {
         assert!(
             metal.contains(fragment),
@@ -173,19 +189,20 @@ fn destination(ring: &mut Ring) -> usize {
 }
 
 fn copy_record(
-    source: &[[u64; EVENT_WORDS]],
+    source: &[[u64; REMOTE_STAGING_EVENT_WORDS]],
     source_slot: usize,
-    target: &mut [[u64; EVENT_WORDS]],
+    target: &mut [[u64; CHANNEL_EVENT_WORDS]],
     target_slot: usize,
 ) {
-    target[target_slot] = source[source_slot];
+    target[target_slot][..4].copy_from_slice(&source[source_slot][..4]);
+    target[target_slot][4..].copy_from_slice(&source[source_slot][5..]);
 }
 
 fn scatter_scalar(
     tags: &[usize],
-    source: &[[u64; EVENT_WORDS]],
+    source: &[[u64; REMOTE_STAGING_EVENT_WORDS]],
     rings: &mut [Ring],
-    target: &mut [[u64; EVENT_WORDS]],
+    target: &mut [[u64; CHANNEL_EVENT_WORDS]],
 ) {
     for (source_slot, channel) in tags.iter().copied().enumerate() {
         let target_slot = destination(&mut rings[channel]);
@@ -195,9 +212,9 @@ fn scatter_scalar(
 
 fn scatter_paired(
     tags: &[usize],
-    source: &[[u64; EVENT_WORDS]],
+    source: &[[u64; REMOTE_STAGING_EVENT_WORDS]],
     rings: &mut [Ring],
-    target: &mut [[u64; EVENT_WORDS]],
+    target: &mut [[u64; CHANNEL_EVENT_WORDS]],
 ) {
     let mut index = 0;
     while index < tags.len() {
@@ -235,7 +252,7 @@ fn paired_copy_preserves_interleaved_channel_slots_and_bytes() {
     ];
     let mut scalar_rings = rings;
     let mut paired_rings = rings;
-    let mut scalar = [[u64::MAX; EVENT_WORDS]; 9];
+    let mut scalar = [[u64::MAX; CHANNEL_EVENT_WORDS]; 9];
     let mut paired = scalar;
 
     scatter_scalar(&tags, &source, &mut scalar_rings, &mut scalar);

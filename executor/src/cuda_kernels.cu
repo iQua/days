@@ -32,6 +32,10 @@ using ulong = uint64_t;
     ulong *__restrict__ tcp_state
 
 constexpr uint EVENT_WORDS = 14;
+constexpr uint CHANNEL_EVENT_WORDS = 11;
+constexpr uint SERVICE_EVENT_WORDS = 5;
+constexpr uint GENERATOR_EVENT_WORDS = 10;
+constexpr uint REMOTE_STAGING_EVENT_WORDS = 12;
 constexpr uint SCATTER_GROUP_WIDTH = 32;
 constexpr uint SCATTER_GROUP_MASK = 0xffffffffu;
 constexpr uint SCATTER_COOPERATIVE_MIN_RECORDS = 3;
@@ -407,6 +411,126 @@ __device__ __forceinline__ void copy_device_record(
     }
 }
 
+// Stream-record offsets are word offsets. Capacities, heads, and counts remain record counts.
+// Every compact record retains the canonical four-word key verbatim at words 0..3.
+__device__ __forceinline__ uint stream_record_words(ulong stream, const ulong *params) {
+    if (stream < params[P_SERVICE_STREAM_BASE]) {
+        return CHANNEL_EVENT_WORDS;
+    }
+    if (stream < params[P_GENERATOR_STREAM_BASE]) {
+        return SERVICE_EVENT_WORDS;
+    }
+    return GENERATOR_EVENT_WORDS;
+}
+
+__device__ __forceinline__ ulong stream_record_offset(
+    ulong stream,
+    ulong physical,
+    const ulong *params,
+    const ulong *stream_state
+) {
+    return stream_state[stream * META_WORDS] +
+        physical * ulong(stream_record_words(stream, params));
+}
+
+__device__ __forceinline__ void encode_stream_record(
+    const ulong *record,
+    ulong stream,
+    const ulong *params,
+    ulong *encoded
+) {
+    for (uint word = 0; word < 4; ++word) {
+        encoded[word] = record[word];
+    }
+    encoded[4] = record[E_PAYLOAD];
+    if (stream < params[P_SERVICE_STREAM_BASE]) {
+        encoded[5] = record[PK_FLOW];
+        encoded[6] = record[PK_SIZE];
+        encoded[7] = record[PK_KIND];
+        encoded[8] = record[PK_META_0];
+        encoded[9] = record[PK_META_1];
+        encoded[10] = record[PK_META_2];
+    } else if (stream >= params[P_GENERATOR_STREAM_BASE]) {
+        encoded[5] = record[PK_SIZE];
+        encoded[6] = record[PK_KIND];
+        encoded[7] = record[PK_META_0];
+        encoded[8] = record[PK_META_1];
+        encoded[9] = record[PK_META_2];
+    }
+}
+
+__device__ __forceinline__ void decode_stream_record(
+    const ulong *encoded,
+    ulong stream,
+    ulong node,
+    const ulong *params,
+    ulong *record
+) {
+    for (uint word = 0; word < EVENT_WORDS; ++word) {
+        record[word] = 0;
+    }
+    for (uint word = 0; word < 4; ++word) {
+        record[word] = encoded[word];
+    }
+    record[E_TARGET] = node;
+    record[E_PAYLOAD] = encoded[4];
+    if (stream < params[P_SERVICE_STREAM_BASE]) {
+        record[E_KIND] = REMOTE_ARRIVAL;
+        record[PK_ID] = encoded[4];
+        record[PK_FLOW] = encoded[5];
+        record[PK_SIZE] = encoded[6];
+        record[PK_KIND] = encoded[7];
+        record[PK_META_0] = encoded[8];
+        record[PK_META_1] = encoded[9];
+        record[PK_META_2] = encoded[10];
+    } else if (stream < params[P_GENERATOR_STREAM_BASE]) {
+        record[E_KIND] = record[E_PHASE] == 2
+            ? TX_READY
+            : TX_COMPLETE;
+    } else {
+        record[E_KIND] = PACKET_ARRIVAL;
+        record[PK_ID] = encoded[4];
+        record[PK_FLOW] = stream - params[P_GENERATOR_STREAM_BASE];
+        record[PK_SIZE] = encoded[5];
+        record[PK_KIND] = encoded[6];
+        record[PK_META_0] = encoded[7];
+        record[PK_META_1] = encoded[8];
+        record[PK_META_2] = encoded[9];
+    }
+}
+
+__device__ __forceinline__ void encode_remote_staging_record(
+    const ulong *record,
+    ulong *encoded
+) {
+    for (uint word = 0; word < 4; ++word) {
+        encoded[word] = record[word];
+    }
+    encoded[4] = record[E_TARGET];
+    encoded[5] = record[E_PAYLOAD];
+    encoded[6] = record[PK_FLOW];
+    encoded[7] = record[PK_SIZE];
+    encoded[8] = record[PK_KIND];
+    encoded[9] = record[PK_META_0];
+    encoded[10] = record[PK_META_1];
+    encoded[11] = record[PK_META_2];
+}
+
+__device__ __forceinline__ void copy_staging_to_channel(
+    const ulong *remote_staging,
+    ulong source_slot,
+    ulong *stream_records,
+    ulong target_word
+) {
+    ulong source_word = source_slot * REMOTE_STAGING_EVENT_WORDS;
+    for (uint word = 0; word < 4; ++word) {
+        stream_records[target_word + word] = remote_staging[source_word + word];
+    }
+    for (uint word = 4; word < CHANNEL_EVENT_WORDS; ++word) {
+        stream_records[target_word + word] = remote_staging[source_word + word + 1];
+    }
+}
+
 __device__ __forceinline__ void swap_records(ulong *records, ulong left_slot, ulong right_slot) {
     ulong left = left_slot * EVENT_WORDS;
     ulong right = right_slot * EVENT_WORDS;
@@ -627,13 +751,33 @@ __device__ __forceinline__ bool heap_root_time(
 }
 
 __device__ __forceinline__ ulong stream_arena(ulong stream, const ulong *params) {
-    if (stream < params[P_CHANNEL_COUNT]) {
+    if (stream < params[P_SERVICE_STREAM_BASE]) {
         return ARENA_CHANNEL_INBOX;
     }
     if (stream < params[P_GENERATOR_STREAM_BASE]) {
         return ARENA_SERVICE_STREAM;
     }
     return ARENA_GENERATOR_STREAM;
+}
+
+__device__ __forceinline__ void active_update_stream_key(
+    ulong node,
+    ulong active_index,
+    ulong stream,
+    ulong physical,
+    const ulong *params,
+    ulong *stream_state,
+    const ulong *stream_records
+) {
+    ulong meta =
+        params[P_LP_STREAM_META_OFFSET] + node * LP_STREAM_META_WORDS;
+    ulong entry =
+        stream_state[meta + 2] +
+        active_index * ACTIVE_STREAM_ENTRY_WORDS;
+    ulong record = stream_record_offset(stream, physical, params, stream_state);
+    for (uint word = 0; word < 4; ++word) {
+        stream_state[entry + 1 + word] = stream_records[record + word];
+    }
 }
 
 __device__ __forceinline__ bool active_add(
@@ -867,13 +1011,19 @@ __device__ __forceinline__ bool stream_push(
     }
     if (params[P_STREAM_ORDER_CHECKS] != 0 && count != 0) {
         ulong tail = (head + count - 1) % max(capacity, 1ul);
-        if (!stored_thread_key_less(stream_records, offset + tail, record)) {
+        ulong tail_word = offset + tail * ulong(stream_record_words(stream, params));
+        if (!key_less(stream_records + tail_word, record)) {
             set_semantic_error(error, 39, node);
             return false;
         }
     }
     ulong physical = (head + count) % max(capacity, 1ul);
-    copy_thread_to_device(record, stream_records, offset + physical);
+    encode_stream_record(
+        record,
+        stream,
+        params,
+        stream_records + offset + physical * ulong(stream_record_words(stream, params))
+    );
     stream_state[base + 3] = count + 1;
     return count != 0 || !activate ||
         active_add(node, stream, record, params, error, stream_state);
@@ -1033,9 +1183,16 @@ __device__ __forceinline__ bool fel_peek(
         }
         ulong capacity = stream_state[base + 1];
         ulong physical = stream_state[base + 2] % max(capacity, 1ul);
-        copy_device_to_thread(
-            stream_records,
-            stream_state[base] + physical,
+        decode_stream_record(
+            stream_records + stream_record_offset(
+                selected_stream,
+                physical,
+                params,
+                stream_state
+            ),
+            selected_stream,
+            node,
+            params,
             record
         );
     }
@@ -1135,13 +1292,14 @@ __device__ __forceinline__ bool fel_pop_selected(
         active_remove(node, selected_active, params, stream_state);
     } else {
         ulong physical = stream_state[base + 2] % max(capacity, 1ul);
-        active_update_key(
+        active_update_stream_key(
             node,
             selected_active,
+            selected_stream,
+            physical,
             params,
             stream_state,
-            stream_records,
-            stream_state[base] + physical
+            stream_records
         );
     }
     return true;
@@ -1543,7 +1701,14 @@ __device__ __forceinline__ bool append_remote(
         set_capacity_error(error, ARENA_REMOTE_STAGING, node, capacity, index + 1);
         return false;
     }
-    copy_thread_to_device(record, remote_staging, offset + index);
+    if (params[P_STREAMS_ENABLED] != 0) {
+        encode_remote_staging_record(
+            record,
+            remote_staging + (offset + index) * REMOTE_STAGING_EVENT_WORDS
+        );
+    } else {
+        copy_thread_to_device(record, remote_staging, offset + index);
+    }
     remote_meta[base + 3] = index + 1;
     if (params[P_STREAMS_ENABLED] != 0) {
         ulong outbound_meta =
@@ -1587,11 +1752,9 @@ __device__ __forceinline__ bool append_remote(
         ulong batch_count = stream_state[batch];
         if (params[P_STREAM_ORDER_CHECKS] != 0 && batch_count != 0) {
             ulong previous_slot = stream_state[batch + 2];
-            if (!stored_cross_key_less(
-                remote_staging,
-                previous_slot,
-                remote_staging,
-                offset + index
+            if (!key_less(
+                remote_staging + previous_slot * REMOTE_STAGING_EVENT_WORDS,
+                remote_staging + (offset + index) * REMOTE_STAGING_EVENT_WORDS
             )) {
                 set_semantic_error(error, 41, node);
                 return false;
@@ -4774,6 +4937,26 @@ __device__ __forceinline__ bool dispatch_event(
     return false;
 }
 
+__device__ __forceinline__ bool hydrate_tx_complete_event(
+    ulong node,
+    ulong *event,
+    ulong *error,
+    const ulong *in_service
+) {
+    if (event[E_KIND] != TX_COMPLETE) {
+        return true;
+    }
+    ulong service = node * EVENT_WORDS;
+    if (in_service[service + PK_ID] != event[E_PAYLOAD]) {
+        set_semantic_error(error, 15, node);
+        return false;
+    }
+    for (uint word = PK_ID; word <= PK_META_2; ++word) {
+        event[word] = in_service[service + word];
+    }
+    return true;
+}
+
 // T21 fix 2 — per-round FEL root cache accessors. Transliterated word for word in
 // `metal_kernels.metal`; the two must stay in lockstep or the backends diverge.
 //
@@ -5232,6 +5415,9 @@ extern "C" __global__ __launch_bounds__(256) void days_round(DAYS_BUFFERS) {
             }
         }
         bool counted_continuation = false;
+        if (!hydrate_tx_complete_event(node, event, state, in_service)) {
+            return;
+        }
         if (!dispatch_event(
             node,
             event,
@@ -5462,17 +5648,23 @@ extern "C" __global__ void days_exchange_prefix_sweep(DAYS_BUFFERS) {
             ) {
                 ulong first_slot = stream_state[batch + 1];
                 invalid_order = before_horizon(
-                    remote_staging[first_slot * EVENT_WORDS + E_TIME],
+                    remote_staging[
+                        first_slot * REMOTE_STAGING_EVENT_WORDS + E_TIME
+                    ],
                     control
                 );
                 if (!invalid_order && count != 0) {
                     ulong head = stream_state[stream_base + 2];
                     ulong tail = (head + count - 1) % max(capacity, 1ul);
-                    invalid_order = !stored_cross_key_less(
-                        stream_records,
-                        stream_state[stream_base] + tail,
-                        remote_staging,
-                        first_slot
+                    invalid_order = !key_less(
+                        stream_records + stream_record_offset(
+                            channel,
+                            tail,
+                            params,
+                            stream_state
+                        ),
+                        remote_staging +
+                            first_slot * REMOTE_STAGING_EVENT_WORDS
                     );
                 }
             }
@@ -5674,7 +5866,7 @@ __device__ __forceinline__ ulong scatter_stream_target(
         cursor
     ) % max(capacity, 1ul);
     stream_state[batch + 3] = cursor + 1;
-    return stream_state[stream_base] + physical;
+    return stream_state[stream_base] + physical * CHANNEL_EVENT_WORDS;
 }
 
 __device__ __forceinline__ void scatter_stream_commit(
@@ -5709,7 +5901,7 @@ __device__ __forceinline__ void scatter_stream_producer_lane(
     for (ulong index = 0; index < count; ++index) {
         ulong target =
             scatter_stream_target(staging + index, params, stream_state);
-        copy_device_record(
+        copy_staging_to_channel(
             remote_staging,
             staging + index,
             stream_records,
@@ -5751,14 +5943,15 @@ __device__ __forceinline__ void scatter_stream_producer(
         first_target = __shfl_sync(SCATTER_GROUP_MASK, first_target, 0);
         second_target = __shfl_sync(SCATTER_GROUP_MASK, second_target, 0);
 
-        if (lane < 2 * EVENT_WORDS) {
-            ulong record = lane / EVENT_WORDS;
-            uint word = lane % EVENT_WORDS;
+        if (lane < 2 * CHANNEL_EVENT_WORDS) {
+            ulong record = lane / CHANNEL_EVENT_WORDS;
+            uint word = lane % CHANNEL_EVENT_WORDS;
             if (index + record < count) {
                 ulong source_slot = staging + index + record;
-                ulong target_slot = record == 0 ? first_target : second_target;
-                stream_records[target_slot * EVENT_WORDS + word] =
-                    remote_staging[source_slot * EVENT_WORDS + word];
+                ulong target_word = record == 0 ? first_target : second_target;
+                ulong source_word = source_slot * REMOTE_STAGING_EVENT_WORDS +
+                    (word < 4 ? word : word + 1);
+                stream_records[target_word + word] = remote_staging[source_word];
             }
         }
     }
@@ -5860,11 +6053,11 @@ extern "C" __global__ void days_exchange_scatter(DAYS_BUFFERS) {
                 stream_state[stream_base + 3] +
                 cursor
             ) % max(capacity, 1ul);
-            copy_device_record(
+            copy_staging_to_channel(
                 remote_staging,
                 staging_slot,
                 stream_records,
-                stream_state[stream_base] + physical
+                stream_state[stream_base] + physical * CHANNEL_EVENT_WORDS
             );
             stream_state[batch + 3] = cursor + 1;
         }
@@ -5932,8 +6125,12 @@ extern "C" __global__ void days_exchange_merge(DAYS_BUFFERS) {
                 ulong capacity = stream_state[stream_base + 1];
                 ulong physical =
                     stream_state[stream_base + 2] % max(capacity, 1ul);
-                ulong record =
-                    (stream_state[stream_base] + physical) * EVENT_WORDS;
+                ulong record = stream_record_offset(
+                    stream,
+                    physical,
+                    params,
+                    stream_state
+                );
                 for (uint word = 0; word < 4; ++word) {
                     stream_state[entry + 1 + word] =
                         stream_records[record + word];

@@ -10,13 +10,16 @@ use std::fmt;
 
 use num_bigint::BigUint;
 
+use crate::device_event_record::{
+    CHANNEL_EVENT_WORDS, EVENT_WORDS, GENERATOR_EVENT_WORDS, REMOTE_STAGING_EVENT_WORDS,
+    SERVICE_EVENT_WORDS,
+};
 use crate::device_scheduler::{QUEUE_META_WORDS, device_scheduler_word_count};
 use crate::{
     EventKind, FlowGeneratorKind, GeneratorStatus, LinkId, NodeKind, PacketKind, SimulationImage,
     serialization_time_ns,
 };
 
-const EVENT_WORDS: usize = 14;
 const NODE_WORDS: usize = 11;
 const GENERATOR_WORDS: usize = 43;
 const FLOW_WORDS: usize = 6;
@@ -568,10 +571,19 @@ pub fn size_default_device_plan(
     let generator_stream_event_slots = flow_count
         .checked_mul(2)
         .ok_or_else(|| sizing_error("generator stream slots overflow usize"))?;
-    let stream_record_slots = channel_stream_event_slots
-        .checked_add(service_stream_event_slots)
-        .and_then(|slots| slots.checked_add(generator_stream_event_slots))
-        .ok_or_else(|| sizing_error("stream record slots overflow usize"))?;
+    let stream_record_words = channel_stream_event_slots
+        .checked_mul(CHANNEL_EVENT_WORDS)
+        .and_then(|words| {
+            service_stream_event_slots
+                .checked_mul(SERVICE_EVENT_WORDS)
+                .and_then(|service| words.checked_add(service))
+        })
+        .and_then(|words| {
+            generator_stream_event_slots
+                .checked_mul(GENERATOR_EVENT_WORDS)
+                .and_then(|generator| words.checked_add(generator))
+        })
+        .ok_or_else(|| sizing_error("stream record words overflow usize"))?;
     let stream_state_words = stream_state_words(image, remote_staging_slots)?.max(1);
     let inbound_producer_words = inbound_producer_words(image);
 
@@ -606,7 +618,12 @@ pub fn size_default_device_plan(
         1,
         checked_product(node_count.max(1), LP_STATE_WORDS, "LP-state plane")?,
         checked_product(node_count, ARENA_META_WORDS, "remote metadata plane")?,
-        checked_product(remote_staging_slots, EVENT_WORDS, "remote staging plane")?.max(1),
+        checked_product(
+            remote_staging_slots,
+            REMOTE_STAGING_EVENT_WORDS,
+            "remote staging plane",
+        )?
+        .max(1),
         checked_product(
             node_count,
             OBSERVATION_META_WORDS,
@@ -616,7 +633,7 @@ pub fn size_default_device_plan(
         inbound_producer_words.max(1),
         inbound_producer_words.max(1),
         stream_state_words,
-        checked_product(stream_record_slots, EVENT_WORDS, "stream record plane")?.max(1),
+        stream_record_words.max(1),
         device_scheduler_word_count(image, &queue_capacities).map_err(DeviceSizingError)?,
     ];
 
@@ -657,7 +674,7 @@ pub fn size_default_device_plan(
     let heap_arena_bytes = event_arena_bytes(fallback_fel_event_slots, node_count)?;
     let stream_arena_bytes = checked_product(stream_state_words, WORD_BYTES, "stream state bytes")?
         .checked_add(checked_product(
-            checked_product(stream_record_slots, EVENT_WORDS, "stream record words")?,
+            stream_record_words,
             WORD_BYTES,
             "stream record bytes",
         )?)

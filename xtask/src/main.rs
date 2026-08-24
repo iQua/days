@@ -67,6 +67,18 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
         purpose: "shared device-arena cap, per-entity retry, and T20l warm-start replay helpers compile only for tests and device backends",
     },
     AllowedFeatureGate {
+        path: "device_event_record.rs",
+        predicate: r#"any(test, feature = "cuda", all(feature = "metal-spike", target_vendor = "apple"))"#,
+        count: 5,
+        purpose: "O2.12 compact event-record classes and codecs compile only for unit tests and the two device backends that store those records",
+    },
+    AllowedFeatureGate {
+        path: "tcp_ledger.rs",
+        predicate: r#"any(feature = "cuda", all(feature = "metal-spike", target_vendor = "apple"))"#,
+        count: 1,
+        purpose: "O2.12 device readback retains non-TCP orphan packet descriptors only for the two device backends that reconstruct compact records",
+    },
+    AllowedFeatureGate {
         path: "tcp_ledger_ring.rs",
         predicate: r#"any(test, feature = "cuda", all(feature = "metal-spike", target_vendor = "apple"))"#,
         count: 3,
