@@ -1,0 +1,2 @@
+exit=1
+REJECT: line 4: scheduled packet is not the exact minimum finish tag: got flow 0/packet 0, expected flow 1/packet 0

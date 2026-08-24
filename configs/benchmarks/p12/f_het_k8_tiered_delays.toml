@@ -1,0 +1,93 @@
+# P12 F-HET: delay heterogeneity in ONE image (wave-4 amendment).
+#
+# WHAT IT SHOWS. A slot pipeline has to quantise at the SHORTEST delay present anywhere in the
+# fabric -- here 100 ns -- for the whole run, whatever the traffic is doing, and it ticks every one
+# of those quanta whether or not anything is scheduled in it. Days' frontier is the earliest
+# pending event anywhere in the image, so when the 100 ns rack-local traffic goes quiet the frontier
+# SKIPS the quanta in which nothing is scheduled and one round carries simulated time across them.
+# Both regimes are in this single image, in sequence, so the contrast is internal to one fixture and
+# needs no second image to compare against.
+#
+# > CORRECTION (2026-08-08; measured by the T21 horizon trace, evidence/P12/horizon-traces.md
+# > SS5.1). The paragraph above used to read: "Days' safe horizon is a function of the channels that
+# > can actually deliver an event, so it stretches toward the 10,000 ns inter-pod scale as soon as
+# > the 100 ns rack-local traffic goes quiet." THE HORIZON WINDOW DOES NOT STRETCH. The executor's
+# > lookahead is a single GLOBAL minimum over every channel in the image -- `safe_horizon.rs` sets
+# > `horizon = min(run_end, frontier_ns + min_channel_delay_ns)` -- so this fixture's horizon span
+# > is exactly 224 ns in every one of its 229 rounds: minimum, median and maximum all 224. What
+# > varies is the ADVANCE from one round's horizon to the next (median 248 ns, maximum 6,808 ns),
+# > which is the frontier skipping empty quanta. The measured outcome is unchanged and still what
+# > this fixture was authored to show -- 229 rounds against 2,000 equivalent 100 ns slots, and the
+# > collapse ratio doubling from 5.13x in the rack phase to 10.64x once only the inter-pod flows
+# > remain -- but the MECHANISM is frontier skipping, not lookahead widening. A per-channel or
+# > per-LP lookahead, which would genuinely widen the window toward 10,000 ns, is a possible future
+# > mechanism and is not what produced these numbers.
+#
+# THE FABRIC. k = 8, 4 hosts per edge switch: 32 edge, 32 aggregation, 16 core switches, 128 hosts.
+# Three delay tiers, stated as fabric layers rather than inferred:
+#   host <-> edge switch          100 ns   (intra-rack)
+#   edge <-> aggregation switch  1,000 ns  (intra-pod spine)
+#   aggregation <-> core switch 10,000 ns  (inter-pod)
+# A 100x spread across one image. `link.propagation_tiers` is refused on any topology other than a
+# fat tree, because these are fat-tree layer names.
+#
+# THE TWO PHASES.
+#   RACK PHASE, 0 to ~48 us. `SameSwitchNext` pairs every host with the next host on its own
+#   top-of-rack switch, so all 128 flows ride host -> edge -> host: two 100 ns links and nothing
+#   else. 25 packets at 2,000 ns spacing, byte-terminated, last emission at 48 us.
+#   INTER-POD PHASE, throughout, and ALONE after ~48 us. `SwitchOffsetHalf` pairs the ordinal-0
+#   host of each of the 32 racks with the same ordinal on the rack 16 away, i.e. pod p -> pod p+4
+#   mod 8: every one of those routes crosses two 10,000 ns aggregation-core links. 20 packets at
+#   10,000 ns spacing, last emission at 190 us.
+#
+# HONESTY. This is a sparse fixture on purpose (3,840 sourced packets over 200 us: 128 rack flows
+# x 25 packets plus 32 inter-pod flows x 20, both byte-terminated). Per the wave-4
+# honesty constraint, per-round device cost carries width-fixed terms, so a sparse fixture
+# demonstrates the FEWER-ROUNDS mechanism; it is not a wall-clock claim and must not be reported as
+# one. The first-class metric here is rounds versus equivalent slots at equal simulated time, which
+# is hardware-independent.
+#
+# THE DENOMINATOR CONVENTION (orchestrator decision, 2026-08-08; horizon-traces.md SS4). "Equivalent
+# slots" has two defensible quanta on this fabric and BOTH are printed on every table and figure.
+# The CONSERVATIVE one LEADS: our own lookahead, 224 ns = 100 ns propagation PLUS the 124 ns
+# serialization of a 1,540 B packet at 100 Gbit/s, giving 893 slots and 3.90x fewer rounds. The
+# propagation-only 100 ns quantum -- how a slot pipeline that charges serialization inside its tick
+# is built -- is the SECONDARY column, 2,000 slots and 8.73x, always with its definition attached.
+# Quoting the propagation-only figure alone would flatter us, so it never travels alone.
+seed = 21008
+duration = 0.000200
+threading = "single"
+log_path = "logs/p12/f_het_k8_tiered_delays"
+
+[topology]
+category = "FatTree"
+
+[topology.fat_tree]
+k = 8
+hosts_per_edge = 4
+
+[switch]
+port_rate = 100_000_000_000
+capacity = 1024
+weights = [1]
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link.propagation_tiers]
+host_to_edge_ns = 100
+edge_to_aggregation_ns = 1000
+aggregation_to_core_ns = 10000
+
+# Rack-local phase: 128 flows, two 100 ns hops, silent after 48 us.
+[[flow_set]]
+flow_type = "PacketDistribution"
+flow_count = 128
+pairing = "SameSwitchNext"
+traffic = { initial_delay = 0.0, size = 38_500, arr_dist = { type = "Uniform", low = 0.000002, high = 0.000002 }, pkt_size_dist = { type = "DiscreteUniform", low = 1540, high = 1540 } }
+
+# Inter-pod phase: 32 flows, two 10,000 ns hops, the only traffic left after 48 us.
+[[flow_set]]
+flow_type = "PacketDistribution"
+flow_count = 32
+pairing = "SwitchOffsetHalf"
+traffic = { initial_delay = 0.0, size = 30_800, arr_dist = { type = "Uniform", low = 0.00001, high = 0.00001 }, pkt_size_dist = { type = "DiscreteUniform", low = 1540, high = 1540 } }

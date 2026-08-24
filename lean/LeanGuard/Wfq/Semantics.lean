@@ -1,7 +1,6 @@
 import Std
 
 import LeanGuard.Shared.Check
-import LeanGuard.Shared.Numeric
 
 namespace LeanGuard.Wfq.Semantics
 
@@ -37,7 +36,10 @@ structure QueuedPacket where
     key : Nat × Nat
     classId : Nat
     sizeBytes : Nat
+    finishTime : Rat
     finishTimeNs : Nat
+    enqueueTimeNs : Nat
+    enqueueEventId : Nat
 deriving Repr
 
 structure PendingPacket where
@@ -52,9 +54,9 @@ deriving Repr
 structure SchedulerState where
     rateBps : Nat := 0
     weights : Std.HashMap Nat Nat := ∅
-    finishTimes : Std.HashMap Nat Float := ∅
+    finishTimes : Std.HashMap Nat Rat := ∅
     flowCounts : Std.HashMap Nat Nat := ∅
-    vtime : Float := 0.0
+    vtime : Rat := 0
     lastUpdatedNs : Nat := 0
     queue : Std.HashMap (Nat × Nat) QueuedPacket := ∅
     pending : Option PendingPacket := none
@@ -65,8 +67,23 @@ structure Global where
     schedulers : Std.HashMap Nat SchedulerState := ∅
 deriving Repr
 
-def toNs (v : Float) : Nat :=
-    ((Float.round (max0 v * 1.0e9)).toUInt64).toNat
+/-- Exact conversion from an integer nanosecond timestamp to rational seconds. -/
+def nsToSeconds (ns : Nat) : Rat :=
+    (ns : Rat) / (1_000_000_000 : Rat)
+
+/--
+Round a nonnegative rational to the nearest natural number, with exact half values rounded upward.
+All WFQ values are nonnegative; the defensive negative branch matches the old logging projection.
+-/
+def roundNonnegative (v : Rat) : Nat :=
+    if v < 0 then
+        0
+    else
+        (v.num.natAbs * 2 + v.den) / (v.den * 2)
+
+/-- Exact rational-seconds projection to the integer-nanosecond CSV contract. -/
+def toNs (v : Rat) : Nat :=
+    roundNonnegative (v * (1_000_000_000 : Rat))
 
 def ensureRate (lineNo : Nat) (st : SchedulerState) (rateBps : Nat) :
     Except String SchedulerState := do
@@ -97,8 +114,8 @@ def updateLastTime (lineNo : Nat) (st : SchedulerState) (timeNs : Nat) :
         require lineNo (prev <= timeNs) s!"time went backwards: {prev} > {timeNs}"
         pure { st with lastTimeNs := some timeNs }
 
-def activeWeightSum (lineNo : Nat) (st : SchedulerState) : Except String Float := do
-    let rec go (xs : List (Nat × Nat)) (acc : Float) : Except String Float :=
+def activeWeightSum (lineNo : Nat) (st : SchedulerState) : Except String Nat := do
+    let rec go (xs : List (Nat × Nat)) (acc : Nat) : Except String Nat :=
         match xs with
         | [] => pure acc
         | (classId, count) :: rest =>
@@ -107,8 +124,8 @@ def activeWeightSum (lineNo : Nat) (st : SchedulerState) : Except String Float :
             else
                 match st.weights.get? classId with
                 | none => throw s!"line {lineNo}: missing weight for class {classId}"
-                | some w => go rest (acc + Float.ofNat w)
-    go st.flowCounts.toList 0.0
+                | some w => go rest (acc + w)
+    go st.flowCounts.toList 0
 
 def hasActive (st : SchedulerState) : Bool :=
     let rec go (xs : List (Nat × Nat)) : Bool :=
@@ -126,7 +143,12 @@ def minQueued (lineNo : Nat) (st : SchedulerState) : Except String QueuedPacket 
             | [] => best
             | (_, q) :: xs' =>
                 let best' :=
-                    if q.finishTimeNs < best.finishTimeNs then
+                    if q.finishTime < best.finishTime then
+                        q
+                    else if q.finishTime = best.finishTime &&
+                        decide (q.enqueueTimeNs < best.enqueueTimeNs ∨
+                            (q.enqueueTimeNs = best.enqueueTimeNs ∧
+                                q.enqueueEventId < best.enqueueEventId)) then
                         q
                     else
                         best
@@ -150,16 +172,16 @@ def stepEnqueue (lineNo : Nat) (st : SchedulerState) (e : Event) :
     let lastUpdated := nsToSeconds st.lastUpdatedNs
 
     let (vtimeBase, finishTimesBase) :=
-        if weightSum == 0.0 then
-            (0.0, (∅ : Std.HashMap Nat Float))
+        if weightSum = 0 then
+            (0, (∅ : Std.HashMap Nat Rat))
         else
-            (st.vtime + (arrivalTime - lastUpdated) / weightSum, st.finishTimes)
+            (st.vtime + (arrivalTime - lastUpdated) / (weightSum : Rat), st.finishTimes)
 
-    let prevFinish := finishTimesBase.get? e.classId |>.getD 0.0
+    let prevFinish := finishTimesBase.get? e.classId |>.getD 0
     let virtualStart := if vtimeBase > prevFinish then vtimeBase else prevFinish
     let serviceTime :=
-        (Float.ofNat e.sizeBytes) * 8.0
-            / (Float.ofNat e.rateBps * Float.ofNat e.weight)
+        ((e.sizeBytes * 8 : Nat) : Rat)
+            / ((e.rateBps * e.weight : Nat) : Rat)
     let finishTime := virtualStart + serviceTime
     let expFinishNs := toNs finishTime
     require lineNo (expFinishNs = e.finishTimeNs)
@@ -177,7 +199,10 @@ def stepEnqueue (lineNo : Nat) (st : SchedulerState) (e : Event) :
             { key
               classId := e.classId
               sizeBytes := e.sizeBytes
-              finishTimeNs := e.finishTimeNs }
+              finishTime := finishTime
+              finishTimeNs := e.finishTimeNs
+              enqueueTimeNs := e.timeNs
+              enqueueEventId := e.eventId }
 
     pure
         { st with
@@ -210,8 +235,8 @@ def stepSchedule (lineNo : Nat) (st : SchedulerState) (e : Event) :
     require lineNo (queued.finishTimeNs = e.finishTimeNs) "finish_time_ns mismatch"
 
     let minQ ← minQueued lineNo st
-    require lineNo (minQ.finishTimeNs = e.finishTimeNs)
-        s!"scheduled packet is not minimal finish_time_ns: got {e.finishTimeNs}, min {minQ.finishTimeNs}"
+    require lineNo (minQ.key = key)
+        s!"scheduled packet is not the exact minimum finish tag: got flow {e.flowId}/packet {e.packetId}, expected flow {minQ.key.1}/packet {minQ.key.2}"
 
     let queue := st.queue.erase key
     let pending :=
@@ -243,10 +268,10 @@ def stepDepart (lineNo : Nat) (st : SchedulerState) (e : Event) :
         s!"departure_time_ns mismatch (scheduled at line {pending.scheduleLine})"
 
     let weightSum ← activeWeightSum lineNo st
-    require lineNo (weightSum > 0.0) "depart with empty active set"
+    require lineNo (weightSum > 0) "depart with empty active set"
     let departTime := nsToSeconds dep
     let lastUpdated := nsToSeconds st.lastUpdatedNs
-    let vtimeNext := st.vtime + (departTime - lastUpdated) / weightSum
+    let vtimeNext := st.vtime + (departTime - lastUpdated) / (weightSum : Rat)
 
     let count := st.flowCounts.get? e.classId |>.getD 0
     require lineNo (count > 0) "flow_queue_count underflow"
@@ -256,7 +281,7 @@ def stepDepart (lineNo : Nat) (st : SchedulerState) (e : Event) :
         if hasActive stTemp then
             (vtimeNext, st.finishTimes)
         else
-            (0.0, st.finishTimes.insert e.classId 0.0)
+            (0, st.finishTimes.insert e.classId 0)
 
     let expVtimeNs := toNs vtimeFinal
     require lineNo (expVtimeNs = e.vtimeNs)

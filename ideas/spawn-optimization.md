@@ -1,4 +1,4 @@
-Got it – I’ve updated the analysis based on the new perf_stats data.
+Got it – I’ve updated the analysis based on the captured profile data.
 
 
 Those stats are the smoking gun.
@@ -203,7 +203,7 @@ Answer: Here's Action::into_future(): /// Returns a boxed future that performs t
 
 Perfect — that signature makes **E1 (batch spawning)** straightforward, because you can store each group as a **`Pin<Box<dyn Future<Output=()> + Send>>`** and feed them to a batch-spawn API.
 
-Given your `perf_stats`:
+Given the captured profile:
 
 * you’re doing **~4.7M groups ⇒ ~4.7M spawns**
 * and on MT each spawn hits **two mutexes** (`active_tasks` + `injector.inner`)
@@ -489,4 +489,3 @@ If MT is *still* slower after this, the next culprit is usually **the “309k ca
 But **with your current stats**, batch-spawning is the next most “code-backed” move.
 
 If you paste your `crates/nexosim/src/executor.rs` (the wrapper), I can rewrite section (3) as an exact diff matching your real type definitions.
-

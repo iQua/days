@@ -1,0 +1,2 @@
+exit=1
+REJECT: line 3: rate state discontinuity for source (node_id=0, flow_id=0)

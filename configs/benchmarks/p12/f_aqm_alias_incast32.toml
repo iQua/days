@@ -1,0 +1,223 @@
+# P12 AQM-aliasing fixture: tight ECN thresholds at high load (wave-4 amendment).
+#
+# THE CLAIM IT SUPPORTS. Slot aliasing is not a precision error. Round a packet's arrival to a slot
+# boundary and the queue depth the AQM comparator sees changes, so a DIFFERENT packet crosses the
+# marking threshold and a DIFFERENT packet is at the head when the queue is full. Which packets
+# carry an ECN mark, and which are dropped, is part of complete state -- not a rounding residue.
+# Days' contrast is that this fixture returns byte-identical complete state on scalar, CPU, Metal
+# and CUDA, marks and drops included.
+#
+# WHY OPEN-LOOP AND NOT A CONGESTION CONTROLLER. A DCQCN phrasing was authored first, because DCQCN
+# is the ECN-REACTING protocol Days implements, and it was rejected on a hard capability boundary:
+# image validation refuses DCQCN on the device backends ("backend Metal does not support DCQCN
+# controller or CNP state planes; use Scalar or Cpu"). ECN-enabled TCP is not an alternative --
+# lowering refuses `tcp.ecn = true` outright ("the T23 executor TCP lattice models loss feedback
+# only"). So no ECN-reacting protocol reaches all four backends today, and a fixture whose entire
+# point is FOUR-backend identity on the marking decision cannot be built on one. The gap is
+# recorded as a P12 finding; it is not worked around. Open-loop CBR keeps the marking and drop
+# decisions themselves in complete state, on every backend, which is exactly what the claim needs.
+#
+# THE CONGESTION. A 32-to-1 incast: hosts 1..32 each send to host 0. Every route ends on the same
+# switch-0 egress port toward host 0, so that one queue is where the threshold binds. Senders start
+# at 34 ns intervals rather than together, so arrivals interleave finely and the queue crosses the
+# threshold on packet boundaries instead of in synchronised blocks -- the regime where "which
+# packet" is maximally sensitive.
+#
+# THE LOAD. 512-byte packets at 1,365 ns give 3.0007 Gbit/s per sender, 96.02 Gbit/s aggregate into
+# a 100 Gbit/s egress. Deliberately just BELOW saturation: at over 100% an open-loop queue simply
+# pins at capacity and every packet above the threshold is marked, which is the least sensitive
+# regime there is. Just under, the occupancy oscillates across the 8-packet threshold and the
+# marking decision is genuinely per-packet.
+#
+# THE THRESHOLD. 64-packet queue, `ecn_threshold = 0.125`, i.e. mark from the 8th packet on. Tight
+# by design: at 8 of 64 the marking point sits far below the drop point, so the run exercises the
+# marking boundary and the drop boundary as two separate events.
+#
+# ROUTING. `FatTreeEcmp`, so the 32 senders do not also pile onto one core switch on the way in.
+# Without it the single-path table would add a second, incidental bottleneck upstream and the
+# fixture would no longer isolate the receiver-port AQM.
+seed = 21064
+duration = 0.000200
+threading = "single"
+log_path = "logs/p12/f_aqm_alias_incast32"
+
+[topology]
+category = "FatTree"
+
+[topology.fat_tree]
+k = 8
+hosts_per_edge = 4
+
+[switch]
+port_rate = 100_000_000_000
+capacity = 64
+weights = [1]
+discipline = "FIFO"
+drop = "ECN_THRESHOLD"
+ecn_threshold = 0.125
+
+[link]
+propagation_ns = 1000
+
+[routing]
+policy = "FatTreeEcmp"
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[1, 0]]
+traffic = { initial_delay = 0.000000000, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[2, 0]]
+traffic = { initial_delay = 0.000000034, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[3, 0]]
+traffic = { initial_delay = 0.000000068, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[4, 0]]
+traffic = { initial_delay = 0.000000102, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[5, 0]]
+traffic = { initial_delay = 0.000000136, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[6, 0]]
+traffic = { initial_delay = 0.000000170, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[7, 0]]
+traffic = { initial_delay = 0.000000204, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[8, 0]]
+traffic = { initial_delay = 0.000000238, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[9, 0]]
+traffic = { initial_delay = 0.000000272, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[10, 0]]
+traffic = { initial_delay = 0.000000306, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[11, 0]]
+traffic = { initial_delay = 0.000000340, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[12, 0]]
+traffic = { initial_delay = 0.000000374, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[13, 0]]
+traffic = { initial_delay = 0.000000408, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[14, 0]]
+traffic = { initial_delay = 0.000000442, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[15, 0]]
+traffic = { initial_delay = 0.000000476, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[16, 0]]
+traffic = { initial_delay = 0.000000510, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[17, 0]]
+traffic = { initial_delay = 0.000000544, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[18, 0]]
+traffic = { initial_delay = 0.000000578, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[19, 0]]
+traffic = { initial_delay = 0.000000612, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[20, 0]]
+traffic = { initial_delay = 0.000000646, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[21, 0]]
+traffic = { initial_delay = 0.000000680, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[22, 0]]
+traffic = { initial_delay = 0.000000714, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[23, 0]]
+traffic = { initial_delay = 0.000000748, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[24, 0]]
+traffic = { initial_delay = 0.000000782, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[25, 0]]
+traffic = { initial_delay = 0.000000816, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[26, 0]]
+traffic = { initial_delay = 0.000000850, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[27, 0]]
+traffic = { initial_delay = 0.000000884, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[28, 0]]
+traffic = { initial_delay = 0.000000918, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[29, 0]]
+traffic = { initial_delay = 0.000000952, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[30, 0]]
+traffic = { initial_delay = 0.000000986, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[31, 0]]
+traffic = { initial_delay = 0.000001020, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[32, 0]]
+traffic = { initial_delay = 0.000001054, size = 1_048_576, arr_dist = { type = "Uniform", low = 0.000001365, high = 0.000001365 }, pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 } }

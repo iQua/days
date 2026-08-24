@@ -9,7 +9,7 @@ rm -rf "$LOG_DIR"
 out=$(mktemp)
 trap 'rm -f "$out"' EXIT
 
-{ /usr/bin/time -p cargo run --release --bin days "$CONFIG"; } >"$out" 2>&1
+{ /usr/bin/time -p cargo run --release -p days-legacy --bin days -- "$CONFIG"; } >"$out" 2>&1
 cat "$out"
 
 sim_wall_s=$(grep 'Elapsed wall-clock time:' "$out" | tail -n1 | sed -E 's/.*Elapsed wall-clock time: ([0-9.]+) seconds.*/\1/' || true)

@@ -1,0 +1,30 @@
+# T15e sustained ~30% point: exact 64x flow-byte and stop-time scaling of load_30.
+# T15d W4 estimate: 842,258,374 ns / 30 rounds * 1,920 rounds ~= 53.9 s.
+# Estimated work is ~1.3495B transitions; this intentionally exceeds the spike budget.
+# Endpoint seed 13032 preserves the short fixture's 2,458 source/sink pairs.
+seed = 13032
+duration = 0.001920
+threading = "single"
+log_path = "logs/width_via_load_full/fattree_k32_load_30_sustained"
+
+[topology]
+category = "FatTree"
+
+[topology.fat_tree]
+k = 32
+hosts_per_edge = 16
+
+[switch]
+port_rate = 100_000_000_000
+capacity = 1024
+weights = [1]
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link]
+propagation_ns = 1000
+
+[[flow_set]]
+flow_type = "PacketDistribution"
+flow_count = 2458
+traffic = { initial_delay = 0.0, size = 33_554_432, arr_dist = { type = "Uniform", low = 0.000000021, high = 0.000000021 }, pkt_size_dist = { type = "Uniform", low = 256, high = 256 } }

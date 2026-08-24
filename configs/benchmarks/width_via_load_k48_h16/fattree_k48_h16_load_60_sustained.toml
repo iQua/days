@@ -1,0 +1,32 @@
+# T17c k48/h16 wide-corpus ~60% point.
+# 18,432 hosts + 129,024 switch-port LPs = 147,456 topology LPs.
+# Inclusive source budget: floor(1,024,000 ns / 21 ns) + 1 = 48,762 packets/flow.
+# 11,059 flows source 539,258,958 packets = 138,050,293,248 bytes, or
+# 58.513341796875% of aggregate host capacity through the stop.
+# Estimated semantic work: 2.73B–3.32B transitions.
+seed = 17048
+duration = 0.001024
+threading = "single"
+log_path = "logs/width_via_load_k48_h16/fattree_k48_h16_load_60_sustained"
+
+[topology]
+category = "FatTree"
+
+[topology.fat_tree]
+k = 48
+hosts_per_edge = 16
+
+[switch]
+port_rate = 100_000_000_000
+capacity = 1024
+weights = [1]
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link]
+propagation_ns = 1000
+
+[[flow_set]]
+flow_type = "PacketDistribution"
+flow_count = 11059
+traffic = { initial_delay = 0.0, size = 16_777_216, arr_dist = { type = "Uniform", low = 0.000000021, high = 0.000000021 }, pkt_size_dist = { type = "Uniform", low = 256, high = 256 } }

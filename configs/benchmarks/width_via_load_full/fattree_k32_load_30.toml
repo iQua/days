@@ -1,0 +1,29 @@
+# T13f canonical-host ~30% point: 2,458 flows, 512 KiB/flow, 30 us stop.
+# Expected sourced-byte offered host load: 29.270683% of 8,192 x 100 Gbps.
+# Endpoint seed 13032; all T13f points use this seed and nested flow-set prefixes.
+seed = 13032
+duration = 0.000030
+threading = "single"
+log_path = "logs/width_via_load_full/fattree_k32_load_30"
+
+[topology]
+category = "FatTree"
+
+[topology.fat_tree]
+k = 32
+hosts_per_edge = 16
+
+[switch]
+port_rate = 100_000_000_000
+capacity = 1024
+weights = [1]
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link]
+propagation_ns = 1000
+
+[[flow_set]]
+flow_type = "PacketDistribution"
+flow_count = 2458
+traffic = { initial_delay = 0.0, size = 524_288, arr_dist = { type = "Uniform", low = 0.000000021, high = 0.000000021 }, pkt_size_dist = { type = "Uniform", low = 256, high = 256 } }

@@ -1,0 +1,4 @@
+time_ns,event_id,kind,scheduler_id,packet_id,flow_id,class_id,size_bytes,weight,rate_bps,vtime_ns,finish_time_ns,departure_time_ns
+0,0,enqueue,1,0,0,0,1,1,32000000000,0,0,
+0,1,enqueue,1,0,1,1,1,2,32000000000,0,0,
+0,2,schedule,1,0,0,0,1,1,32000000000,0,0,1

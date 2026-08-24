@@ -3,7 +3,7 @@
 ## Objective
 Reduce the **in-simulator elapsed wall-clock time** of:
 
-`cargo run --release --bin days configs/benchmarks/flow/fattree_k32_tcp_f32_mt.toml`
+`cargo run --release -p days-legacy --bin days -- configs/benchmarks/flow/fattree_k32_tcp_f32_mt.toml`
 
 The primary metric is **not** total command wall time. Instead, it is the value reported by the simulator's final log line:
 
@@ -32,12 +32,12 @@ It runs the benchmark command, prints output, and emits:
 
 ## Files in Scope
 - `configs/benchmarks/flow/fattree_k32_tcp_f32_mt.toml` — fixed benchmark workload reference; read-only unless harness maintenance is necessary
-- `src/flows/route.rs` — shortest-path / ECMP routing implementation
-- `src/flows/flow.rs` — flow path construction
-- `src/topos/topo.rs` — routing setup and runtime configuration wiring
+- `src/topos/route.rs` — shared shortest-path / ECMP routing implementation
+- `legacy/src/flows/flow.rs` — legacy flow path construction
+- `legacy/src/topos/topo.rs` — legacy routing setup and runtime configuration wiring
 - `crates/nexosim/src/executor/mt_executor.rs` — MT executor park/linger/search behavior
 - `crates/nexosim/src/simulation.rs` — simulation stepping hot path and task grouping
-- `src/schedulers/port.rs`, `src/flows/wire.rs`, `src/flows/tcp_source.rs` — simulation hot-path scheduling if the new benchmark points there
+- `legacy/src/schedulers/port.rs`, `legacy/src/flows/wire.rs`, `legacy/src/flows/tcp_source.rs` — simulation hot-path scheduling if the new benchmark points there
 
 ## Off Limits
 - Lean proofs under `lean/`
@@ -46,7 +46,7 @@ It runs the benchmark command, prints output, and emits:
 - New dependencies unless absolutely required
 
 ## Constraints
-- Keep the benchmark command/workload fixed: `cargo run --release --bin days configs/benchmarks/flow/fattree_k32_tcp_f32_mt.toml`
+- Keep the benchmark command/workload fixed: `cargo run --release -p days-legacy --bin days -- configs/benchmarks/flow/fattree_k32_tcp_f32_mt.toml`
 - Primary metric comes from the simulator's own elapsed-wall-clock log line
 - Do not cheat by suppressing work, changing workload semantics, or biasing the benchmark harness
 - Prefer low-risk runtime changes; correctness-sensitive routing changes need extra scrutiny

@@ -1,67 +1,45 @@
 ---
 title: L2 (Frames + PFC)
-description: Optional link-layer frames and priority-based flow control pipeline.
+description: Legacy frame actors and exact per-priority pause state.
 ---
 
-Layer-2 support is optional and is designed to have **zero overhead when disabled**:
+Days implements Priority-based Flow Control in both runtime models. The state layout and control path differ.
 
-- compile-time opt-in via Cargo features (`l2`, `l2_pfc`)
-- runtime opt-in via config (`link.mode = "Pfc"`)
+## Legacy PFC actors
 
-## Frame model
+Legacy PFC requires the `l2_pfc` Cargo feature and `link.mode = "Pfc"`. The topology inserts three actors on each directed fabric edge:
 
-When L2 is compiled in, internal link pipelines use `LinkFrame` (`src/l2/frame.rs`):
-
-- `LinkFrame::Data(Packet)`
-- `LinkFrame::Pfc(PfcFrame)` (only with `l2_pfc`)
-
-Frames carry timestamps and sizes so that links can serialize them at a given rate.
-
-## Link serializer
-
-`Link` (`src/l2/link.rs`) is a small model that:
-
-- queues `LinkFrame`s,
-- schedules a delivery event after `size_bits / rate_bps`,
-- forwards the frame downstream via `output: Output<LinkFrame>`.
-
-This lets L2 control frames and data frames share the same serialization logic.
-
-## PFC (802.1Qbb-style pause)
-
-PFC is implemented by two per-edge actors (`src/l2/pfc.rs`):
-
-- **Ingress** (`PfcIngressPort`): per-priority buffering, XON/XOFF thresholds, generates pause/resume frames upstream.
-- **Egress** (`PfcEgressGate`): per-priority gating of outbound frames based on received pause frames.
-
-Pipeline constructed by the topology builder (`Topology::attach_pfc_link`):
-
-```
+```text
 Scheduler
-  -> PfcEgressGate (gates per priority)
-  -> Link (serializes frames)
-  -> PfcIngressPort (buffers + generates PFC)
+  -> PfcEgressGate
+  -> Link
+  -> PfcIngressPort
   -> downstream PacketSwitch
-
-PfcIngressPort.pfc_output -> PfcEgressGate.pfc_received (reverse direction)
 ```
 
-### Ingress behavior
+The gate and ingress exchange `PfcFrame` values; data uses `LinkFrame::Data(Packet)`. The `Link` type can serialize either `LinkFrame` variant at the configured bit rate. The installed topology sends forward data through that actor, while the ingress sends pause and resume frames directly to the upstream gate through `pfc_output`.
 
-`PfcIngressPort` tracks per-priority occupancy and:
+`PfcIngressPort` owns eight byte queues and tracks occupancy per 802.1Q priority. It asserts XOFF at or above `xoff`, clears it at or below `xon`, enforces optional ingress capacities, and can refresh pause frames or retry a blocked drain. Its `can_forward` closure reads the downstream scheduler's shared `QueueState` to avoid forwarding into a full queue.
 
-- asserts pause when `occupancy >= xoff[prio]`,
-- clears pause when `occupancy <= xon[prio]`,
-- optionally refreshes pause frames and schedules drain retries when downstream is congested.
+`PfcEgressGate` owns per-priority queues and `paused_until` deadlines derived from pause quanta. It starts service only for an unpaused priority.
 
-Forward progress depends on a `can_forward(packet)` closure, which is connected to scheduler queue occupancy (`QueueState`) so that ingress can avoid triggering downstream drops.
+Legacy rejects configured propagation delay with PFC because this actor pipeline does not combine the two mechanisms.
 
-### Egress behavior
+## Exact PFC state
 
-`PfcEgressGate` maintains:
+Exact lowering stores PFC state inside each switch-egress LP:
 
-- `paused_until[prio]` deadlines,
-- per-priority queues,
-- a scheduled “resume” event at the earliest next deadline.
+- `PfcIngressState` tracks byte occupancy, XON/XOFF thresholds, capacity, and asserted state for one monitored incoming link.
+- `PfcQueueState::paused_by_controller` records every downstream controller that currently pauses each priority.
 
-It only drains frames for priorities that are not paused, and time-stamps drained frames at the current simulated time.
+Admission increases monitored occupancy. Service selection decreases it. Crossing XOFF emits a 64-byte `PacketKind::Pfc` pause on the exact reverse-link channel; crossing XON emits a resume. The control packet arrives as an ordinary `RemoteArrival`, and the egress queue remains paused until every asserting controller resumes it.
+
+The exact mechanism is edge-triggered. Nonzero refresh and drain timers are rejected during lowering. A zero XOFF or pause-quanta entry disables that priority. Exact PFC can coexist with lowered propagation delay because the reverse control channel carries the exact 64-byte serialization and propagation delay.
+
+Scalar and CPU execute exact PFC. Metal and CUDA reject its state planes before allocating device work:
+
+```text
+backend Cuda does not support PFC per-priority link pause; use Scalar or Cpu
+```
+
+See [L2 and PFC configuration](/docs/configuration/l2) for thresholds and validation rules.

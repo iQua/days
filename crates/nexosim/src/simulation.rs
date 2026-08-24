@@ -140,9 +140,6 @@ use std::task::Poll;
 use std::time::Duration;
 use std::{panic, task};
 
-#[cfg(feature = "perf_stats")]
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-
 use pin_project::pin_project;
 use recycle_box::{RecycleBox, coerce_box};
 use serde::de::DeserializeOwned;
@@ -169,66 +166,6 @@ thread_local! { pub(crate) static CURRENT_MODEL_ID: Cell<ModelId> = const { Cell
 // Note: `usize::MAX` is not a valid origin ID as it is denotes the lack of an
 // origin ID for a `ModelId`.
 const GLOBAL_ORIGIN_ID: usize = usize::MAX - 1;
-
-#[cfg(feature = "perf_stats")]
-static STEPS: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "perf_stats")]
-static ACTIONS: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "perf_stats")]
-static GROUPS: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "perf_stats")]
-static SCHEDULED_EVENTS_ERASED: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "perf_stats")]
-static SCHEDULED_EVENTS_FAST: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "perf_stats")]
-static INJECTED_EVENTS: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "perf_stats")]
-static SCHEDULED_QUERIES: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "perf_stats")]
-static MAX_ACTIONS_PER_STEP: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "perf_stats")]
-static MAX_GROUPS_PER_STEP: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(feature = "perf_stats")]
-fn bump_max(dst: &AtomicU64, v: u64) {
-    let mut cur = dst.load(AtomicOrdering::Relaxed);
-    while v > cur {
-        match dst.compare_exchange_weak(cur, v, AtomicOrdering::Relaxed, AtomicOrdering::Relaxed)
-        {
-            Ok(_) => break,
-            Err(next) => cur = next,
-        }
-    }
-}
-
-#[cfg(feature = "perf_stats")]
-fn report_sim_perf_stats() {
-    let steps = STEPS.load(AtomicOrdering::Relaxed);
-    let actions = ACTIONS.load(AtomicOrdering::Relaxed);
-    let groups = GROUPS.load(AtomicOrdering::Relaxed);
-    let erased = SCHEDULED_EVENTS_ERASED.load(AtomicOrdering::Relaxed);
-    let fast = SCHEDULED_EVENTS_FAST.load(AtomicOrdering::Relaxed);
-    let injected = INJECTED_EVENTS.load(AtomicOrdering::Relaxed);
-    let queries = SCHEDULED_QUERIES.load(AtomicOrdering::Relaxed);
-    let nonzero_steps = steps.max(1);
-
-    eprintln!(
-        "[perf_stats] steps={} actions={} groups={} avg_actions/step={:.2} avg_groups/step={:.2} max_actions/step={} max_groups/step={} scheduled_erased={} scheduled_fast={} injected_events={} scheduled_queries={}",
-        steps,
-        actions,
-        groups,
-        actions as f64 / nonzero_steps as f64,
-        groups as f64 / nonzero_steps as f64,
-        MAX_ACTIONS_PER_STEP.load(AtomicOrdering::Relaxed),
-        MAX_GROUPS_PER_STEP.load(AtomicOrdering::Relaxed),
-        erased,
-        fast,
-        injected,
-        queries,
-    );
-
-    crate::executor::report_executor_perf_stats();
-}
 
 /// The simulation environment.
 ///
@@ -757,39 +694,16 @@ impl Simulation {
             spawn_futs.push(fut);
         };
 
-        #[cfg(feature = "perf_stats")]
-        let mut actions_this_step: u64 = 0;
-        #[cfg(feature = "perf_stats")]
-        let mut groups_this_step: u64 = 0;
-        #[cfg(feature = "perf_stats")]
-        let mut scheduled_erased_this_step: u64 = 0;
-        #[cfg(feature = "perf_stats")]
-        let mut scheduled_fast_this_step: u64 = 0;
-        #[cfg(feature = "perf_stats")]
-        let mut injected_this_step: u64 = 0;
-        #[cfg(feature = "perf_stats")]
-        let mut queries_this_step: u64 = 0;
-
         // Spawn scheduled events matching the current time stamp.
         if fast_only_scheduled_hint {
             while next_key.map(|key| key.0 == time).unwrap_or(false) {
                 let current_key = next_key.unwrap();
                 let ((item_time, origin_id), item) = scheduler_queue.pull().unwrap();
 
-                #[cfg(feature = "perf_stats")]
-                {
-                    actions_this_step += 1;
-                }
-
                 let mut candidate_next = peek_next_key(&mut scheduler_queue);
 
                 let first_fut = if let QueueItem::FastEvent(event) = item {
                     if allow_direct_fast_spawn && candidate_next != Some(current_key) {
-                        #[cfg(feature = "perf_stats")]
-                        {
-                            scheduled_fast_this_step += 1;
-                            groups_this_step += 1;
-                        }
 
                         event.spawn_and_forget(&self.executor);
                         has_events = true;
@@ -797,19 +711,10 @@ impl Simulation {
                         continue;
                     }
 
-                    #[cfg(feature = "perf_stats")]
-                    {
-                        scheduled_fast_this_step += 1;
-                    }
-
                     event.into_future()
                 } else {
                     match item {
                         QueueItem::Event(event) => {
-                            #[cfg(feature = "perf_stats")]
-                            {
-                                scheduled_erased_this_step += 1;
-                            }
 
                             let source = self
                                 .scheduler_registry
@@ -831,10 +736,6 @@ impl Simulation {
                             }
                         }
                         QueueItem::Query(query) => {
-                            #[cfg(feature = "perf_stats")]
-                            {
-                                queries_this_step += 1;
-                            }
 
                             let source = self
                                 .scheduler_registry
@@ -856,25 +757,12 @@ impl Simulation {
                     while candidate_next == Some(current_key) {
                         let ((item_time, origin_id), item) = scheduler_queue.pull().unwrap();
 
-                        #[cfg(feature = "perf_stats")]
-                        {
-                            actions_this_step += 1;
-                        }
-
                         let fut = if let QueueItem::FastEvent(event) = item {
-                            #[cfg(feature = "perf_stats")]
-                            {
-                                scheduled_fast_this_step += 1;
-                            }
 
                             event.into_future()
                         } else {
                             match item {
                                 QueueItem::Event(event) => {
-                                    #[cfg(feature = "perf_stats")]
-                                    {
-                                        scheduled_erased_this_step += 1;
-                                    }
 
                                     let source = self
                                         .scheduler_registry
@@ -898,10 +786,6 @@ impl Simulation {
                                     }
                                 }
                                 QueueItem::Query(query) => {
-                                    #[cfg(feature = "perf_stats")]
-                                    {
-                                        queries_this_step += 1;
-                                    }
 
                                     let source = self
                                         .scheduler_registry
@@ -922,11 +806,6 @@ impl Simulation {
                     push_group_future(Box::pin(event_seq));
                 }
 
-                #[cfg(feature = "perf_stats")]
-                {
-                    groups_this_step += 1;
-                }
-
                 has_events = true;
                 next_key = candidate_next;
             }
@@ -935,22 +814,12 @@ impl Simulation {
                 let current_key = next_key.unwrap();
                 let ((item_time, origin_id), item) = scheduler_queue.pull().unwrap();
 
-                #[cfg(feature = "perf_stats")]
-                {
-                    actions_this_step += 1;
-                }
-
                 let mut candidate_next = peek_next_key(&mut scheduler_queue);
 
                 let first_fut = match item {
                     QueueItem::FastEvent(event)
                         if allow_direct_fast_spawn && candidate_next != Some(current_key) =>
                     {
-                        #[cfg(feature = "perf_stats")]
-                        {
-                            scheduled_fast_this_step += 1;
-                            groups_this_step += 1;
-                        }
 
                         // Dominant hot path in Days ST/MT runs: singleton fast events.
                         // Spawn directly to avoid transient future boxing.
@@ -960,18 +829,10 @@ impl Simulation {
                         continue;
                     }
                     QueueItem::FastEvent(event) => {
-                        #[cfg(feature = "perf_stats")]
-                        {
-                            scheduled_fast_this_step += 1;
-                        }
 
                         event.into_future()
                     }
                     QueueItem::Event(event) => {
-                        #[cfg(feature = "perf_stats")]
-                        {
-                            scheduled_erased_this_step += 1;
-                        }
 
                         let source = self
                             .scheduler_registry
@@ -993,10 +854,6 @@ impl Simulation {
                         }
                     }
                     QueueItem::Query(query) => {
-                        #[cfg(feature = "perf_stats")]
-                        {
-                            queries_this_step += 1;
-                        }
 
                         let source = self
                             .scheduler_registry
@@ -1018,25 +875,12 @@ impl Simulation {
                     while candidate_next == Some(current_key) {
                         let ((item_time, origin_id), item) = scheduler_queue.pull().unwrap();
 
-                        #[cfg(feature = "perf_stats")]
-                        {
-                            actions_this_step += 1;
-                        }
-
                         let fut = match item {
                             QueueItem::FastEvent(event) => {
-                                #[cfg(feature = "perf_stats")]
-                                {
-                                    scheduled_fast_this_step += 1;
-                                }
 
                                 event.into_future()
                             }
                             QueueItem::Event(event) => {
-                                #[cfg(feature = "perf_stats")]
-                                {
-                                    scheduled_erased_this_step += 1;
-                                }
 
                                 let source = self
                                     .scheduler_registry
@@ -1058,10 +902,6 @@ impl Simulation {
                                 }
                             }
                             QueueItem::Query(query) => {
-                                #[cfg(feature = "perf_stats")]
-                                {
-                                    queries_this_step += 1;
-                                }
 
                                 let source = self
                                     .scheduler_registry
@@ -1078,11 +918,6 @@ impl Simulation {
                     // Spawn a compound future that sequentially polls all events
                     // targeting the same mailbox.
                     push_group_future(Box::pin(event_seq));
-                }
-
-                #[cfg(feature = "perf_stats")]
-                {
-                    groups_this_step += 1;
                 }
 
                 has_events = true;
@@ -1103,11 +938,6 @@ impl Simulation {
 
             while let Some((origin_id, event)) = injector_queue.pull() {
                 has_events = true;
-                #[cfg(feature = "perf_stats")]
-                {
-                    actions_this_step += 1;
-                    injected_this_step += 1;
-                }
 
                 let source = self
                     .scheduler_registry
@@ -1127,12 +957,6 @@ impl Simulation {
                     while next_origin_id == Some(origin_id) {
                         let (_id, event) = injector_queue.pull().unwrap();
 
-                        #[cfg(feature = "perf_stats")]
-                        {
-                            actions_this_step += 1;
-                            injected_this_step += 1;
-                        }
-
                         let source = self
                             .scheduler_registry
                             .get_event_source(&event.event_id)
@@ -1145,10 +969,6 @@ impl Simulation {
                     push_group_future(Box::pin(event_seq));
                 }
 
-                #[cfg(feature = "perf_stats")]
-                {
-                    groups_this_step += 1;
-                }
             }
 
             self.injector_nonempty_hint.store(false, Ordering::Release);
@@ -1194,18 +1014,6 @@ impl Simulation {
             }
             self.run_executor()?;
 
-            #[cfg(feature = "perf_stats")]
-            {
-                STEPS.fetch_add(1, AtomicOrdering::Relaxed);
-                ACTIONS.fetch_add(actions_this_step, AtomicOrdering::Relaxed);
-                GROUPS.fetch_add(groups_this_step, AtomicOrdering::Relaxed);
-                SCHEDULED_EVENTS_ERASED.fetch_add(scheduled_erased_this_step, AtomicOrdering::Relaxed);
-                SCHEDULED_EVENTS_FAST.fetch_add(scheduled_fast_this_step, AtomicOrdering::Relaxed);
-                INJECTED_EVENTS.fetch_add(injected_this_step, AtomicOrdering::Relaxed);
-                SCHEDULED_QUERIES.fetch_add(queries_this_step, AtomicOrdering::Relaxed);
-                bump_max(&MAX_ACTIONS_PER_STEP, actions_this_step);
-                bump_max(&MAX_GROUPS_PER_STEP, groups_this_step);
-            }
         }
 
         Ok(Some(time))
@@ -1228,8 +1036,6 @@ impl Simulation {
             match self.step_to_next(target_time) {
                 // The target time was reached exactly.
                 Ok(time) if time == target_time => {
-                    #[cfg(feature = "perf_stats")]
-                    report_sim_perf_stats();
                     return Ok(());
                 }
                 // No events are scheduled before or at the target time.
@@ -1239,8 +1045,6 @@ impl Simulation {
                         self.time.write(target_time);
                         self.synchronize(target_time)?;
                     }
-                    #[cfg(feature = "perf_stats")]
-                    report_sim_perf_stats();
                     return Ok(());
                 }
                 Err(e) => return Err(e),

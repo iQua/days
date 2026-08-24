@@ -1,59 +1,45 @@
 ---
 title: Trace schema conventions
-description: Common conventions across *_events.csv trace families (canonicalization, units, and required fields).
+description: Canonical keys and integer encodings for legacy and exact certificates.
 ---
 
-Days emits **per-transition** protocol traces as CSV files named `*_events.csv` when built with the appropriate Cargo features (see [/docs/verification/leanguard](/docs/verification/leanguard)).
+There is no single global CSV schema. Each certificate family defines its own
+row type, required fields, event vocabulary, and replay rule.
 
-This page records the shared schema conventions used across trace families. It is reconciled with the current Rust logging structs in `days/src/utils/logger.rs`.
+## Legacy LeanGuard CSVs
 
-## Common CSV conventions
+Legacy simulator traces such as `dcqcn_events.csv`, `pfc_events.csv`,
+`aqm_events.csv`, `wfq_events.csv`, `drr_events.csv`, and
+`cubic_events.csv` use a per-family schema. Their Lean checkers generally sort
+by `(time_ns, event_id)` and reject duplicate keys. Legacy `time_ns` values are
+exact integer encodings derived at the logging boundary from legacy model time.
 
-Across trace families (DCQCN, PFC, WFQ, DRR, CUBIC, AQM), Days follows the same high-level rules:
+Rows use stable component/flow/packet IDs, finite `kind` tags, integer unit
+suffixes (`*_ns`, `*_bps`, `*_bytes`), and fixed-point values such as
+`*_ppb`. Inapplicable kind-specific columns are empty; the checker enforces the
+required subset for each kind.
 
-- **One row per semantic transition**: each row corresponds to one protocol transition (send/recv/timer/decision/enqueue/schedule/…).
-- **Canonicalization key**: acceptance is defined over a canonical order rather than raw file order.
-  - In the current checkers, the key is `(time_ns, event_id)`.
-  - Duplicate keys are rejected to avoid ambiguous replay.
-- **Stable identifiers**: rows include stable IDs (endpoint/scheduler/port id, flow id, packet id, priority/class id) so the checker can enforce pairing and accounting obligations (no spurious receives, no phantom dequeues, etc.).
-- **Kind-specific optional columns**: traces are emitted as a single CSV schema per family. Fields not applicable to a given `kind` are left empty; the checker parses them as optional values and enforces kind-specific required-field constraints.
-- **Diagnostics refer to file line numbers**: checkers keep track of original CSV line numbers for error reporting (line numbers include the header, so the first data row is line 2).
+## Exact executor certificates
 
-## Field naming and encoding conventions
-
-Traces avoid floating-point printing and language-dependent formatting by encoding key quantities as integers with explicit units. Common patterns:
-
-| Pattern | Meaning | Encoding / notes |
-|---|---|---|
-| `time_ns`, `*_ns` | time and intervals | integer nanoseconds (rounded from internal `f64` times under explicit rules) |
-| `*_bps` | rates | integer bits per second |
-| `*_bytes`, `*_b` | sizes | integer bytes (`*_b` often used for packet/frame sizes) |
-| `*_ppb` | fixed-point probabilities / gains | "parts per billion": `round(x * 1e9)` (typically in `[0, 1e9]`) |
-| `kind` | event tag | finite vocabulary string; determines required fields and replay rule |
-| booleans | flags | `true` / `false` |
-
-## Trace family overview (schematic)
-
-This table is intentionally schematic: it highlights the certificate *shape* (identifiers, event kinds, witnesses/snapshots) rather than prescribing a single global schema across all protocols.
-
-| Trace file | Representative kinds | Key identifiers | Witness / snapshot fields (examples) |
-|---|---|---|---|
-| `dcqcn_events.csv` | `cnp_sent`, `cnp_recv`, `timer_tick` | `endpoint_id`, `flow_id`, `pkt_id` | source snapshot (`alpha_ppb`, `rate_bps`, `cnp_seen`, `last_cnp_ns`); CNP header fields; gate parameters |
-| `aqm_events.csv` | `decision` | `scheduler_id`, `queue_id`, `packet_id` | occupancy/capacity context; action (`enqueue`/`drop`/`mark_ecn`); optional randomness witness |
-| `pfc_events.csv` | `pfc_sent`, `pfc_recv` | sender/receiver id, `priority` | pause/resume intent; pause-time encoding; optional occupancy/threshold context; refresh/drain timing |
-| `wfq_events.csv` | `enqueue`, `schedule`, `depart` | `scheduler_id`, `packet_id`, `class_id` | virtual-time and finish-tag witnesses (`vtime_ns`, `finish_time_ns`), schedule/depart witnesses |
-| `drr_events.csv` | `enqueue`, `schedule` | `scheduler_id`, `class_id`, `packet_id` | deficit/pointer witnesses (`deficit_bytes`, `scan_steps`, `batch_id`), quantum parameters |
-| `cubic_events.csv` | `ack`, `congestion`, `timeout` | `endpoint_id`, `flow_id` | congestion-control snapshot (`cwnd_bytes`, `ssthresh_bytes`, …) and encoded parameters |
-
-## Example: DCQCN header and one `timer_tick` row
-
-Line breaks are inserted for readability. Different `kind` values populate different subsets of the columns.
+Exact executor events already carry integer nanosecond time. TCP and P10c
+certificate projections use the complete canonical key:
 
 ```text
-time_ns,event_id,kind,endpoint_id,flow_id,pkt_id,pkt_flow_id,trigger_ecn,cnp_priority,
-cnp_size_b,cnp_ecn,cnp_cwr,cnp_last_packet,cnp_interval_ns,g_ppb,mi_ppb,
-init_rate_bps,min_rate_bps,max_rate_bps,ai_rate_bps,hai_rate_bps,
-alpha_ppb,rate_bps,cnp_seen,last_cnp_ns
-100000,0,timer_tick,2,0,,,,,,,,,10000,500000000,500000000,10000000000,
-1000000000,10000000000,500000000,1000000000,0,10000000000,false,
+(time_ns, event_phase, event_origin_node, event_origin_sequence)
 ```
+
+Exact TCP serialization sorts by this key and rejects duplicates. P10c
+checkers can instead require the input to be in strict canonical order and
+reject an out-of-order row. Exact families cover TCP Reno/CUBIC, SP,
+rate/PFC/DRR/WRR mechanisms, AQM, DCQCN, and collectives.
+
+## Diagnostics
+
+Checkers retain original CSV line numbers for errors. The first data record is
+line 2 because line 1 is the header. Acceptance is always defined by the
+family's Lean row parser and transition function, not by physical write order
+alone.
+
+Mechanical sources include `executor/src/tcp_trace.rs`,
+`executor/src/aqm_trace.rs`, `executor/src/mechanism_trace.rs`, and
+`lean/LeanGuard/`.

@@ -1,0 +1,5 @@
+# LeanGuard CSV fixtures are source-controlled test inputs despite the repository-wide log rule.
+!p10c/*.csv
+!sp/*.csv
+!wfq/wfq_exact_subnanosecond_order_accept.csv
+!wfq/wfq_exact_subnanosecond_order_mutation_reject.csv

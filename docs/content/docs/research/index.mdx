@@ -1,9 +1,23 @@
 ---
 title: Verification & Research
-description: Research narrative around LeanGuard and test generation.
+description: The proof surfaces, trace certificates, and evaluation narrative behind Days.
 ---
 
-This section contains research-oriented documentation; if you want to *use* LeanGuard, start with [/docs/verification](/docs/verification).
+This section is the research-oriented documentation. If you want to *use*
+the verification tooling, start with [/docs/verification](/docs/verification).
+
+Three distinct verification surfaces coexist in this repository, and it
+helps to know which one a page is about:
+
+1. **Execution-model proofs** (`lean/DaysExecutor*`): five Lean theorems
+   about the exact engine's machinery — the safe-horizon bound family,
+   round and run serializability, the service-start discipline, and the
+   intra-round reordering license. These govern the executor itself.
+2. **Exact P10c certificates**: trace-level conformance for the exact
+   engine's protocols, keyed by the full `EventKey` order.
+3. **Legacy LeanGuard CSV replay**: the original certificate machinery for
+   the legacy engine's floating-point protocols, keyed by
+   `(time_ns, event_id)`.
 
 <Cards>
   <Card title="Paper summary" href="/docs/research/paper-summary" />
@@ -13,3 +27,10 @@ This section contains research-oriented documentation; if you want to *use* Lean
   <Card title="Test generation (semantic coverage)" href="/docs/research/test-generation" />
   <Card title="LeanGuard overview (use)" href="/docs/verification" />
 </Cards>
+
+A note on evaluation claims in this section: pages distinguish **shipped
+code** (buildable from this tree), **committed fixtures** (runnable
+benchmarks such as the E5 and E6 families and the 262,144-flow frontier),
+and **external campaign evidence** (measured results recorded in the
+project's evidence archive, machine-qualified where cited). Results from
+fixtures not present in this tree are labeled as external.

@@ -20,7 +20,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Cache Lean toolchain and build artifacts
         uses: actions/cache@v4
@@ -48,8 +48,20 @@ jobs:
             cubic_check \
             drr_check \
             wfq_check \
+            p10c_collective_check \
             aqm_check \
             aqm_dcqcn_check
+
+      - name: Install ripgrep
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+
+      - name: Audit DaysExecutor axioms and placeholders
+        run: bash lean/scripts/audit-days-executor-axioms.sh
+
+      - name: Run P10c collective progress checks
+        run: bash lean/scripts/run-p10c-collective-campaign.sh
 
       - name: Run AQM fixture checks
         run: bash lean/scripts/run-aqm-fixtures.sh
@@ -117,7 +129,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -148,9 +160,11 @@ jobs:
         env:
           SUMMARY_PATH: leanguard-${{ matrix.protocol }}.json
         run: |
+          cargo build -p days-legacy --features "${{ matrix.features }}" --bin days
           set +e
           cargo run --features "${{ matrix.features }}" --bin leanguard-run -- \
             --config "${{ matrix.config }}" \
+            --legacy-runner target/debug/days \
             --checker-dir lean/.lake/build/bin \
             > "$SUMMARY_PATH"
           status=$?

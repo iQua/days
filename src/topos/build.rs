@@ -5,10 +5,276 @@ use std::fs;
 use log::{debug, info};
 
 use petgraph::graph::{NodeIndex, UnGraph};
+use rand::prelude::{IndexedRandom, SliceRandom};
+use rand::rngs::SmallRng;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::topos::topo::{Config, FatTreeConfig, TopoCategory, TorusConfig};
+use crate::topos::config::{Config, DragonflyConfig, FatTreeConfig, TopoCategory, TorusConfig};
+
+/// Structural identity of a built topology.
+///
+/// Lowering needs more than the bare graph to answer structural questions — which layer a link
+/// belongs to, how many groups a dragonfly has. The builder is the only place that knows, so it
+/// says so rather than letting later stages re-derive it from node numbering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TopologyProfile {
+    FatTree {
+        edge_switches: u64,
+        aggregation_switches: u64,
+        core_switches: u64,
+    },
+    Torus,
+    Dragonfly {
+        groups: u64,
+        routers_per_group: u64,
+    },
+    Custom,
+}
+
+/// Deterministic endpoint-pairing policy for a flow set (T21/P12).
+///
+/// `Random` is the standing behaviour: endpoints are drawn from the scenario's endpoint RNG. The
+/// structural policies draw nothing — they are pure functions of the host attachment grid — and so
+/// leave the RNG stream of any later `Random` flow set exactly where they found it.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+pub enum PairingPolicy {
+    #[default]
+    Random,
+    /// Host at rack ordinal *o* of attachment switch *s* sends to ordinal *o* of switch
+    /// *(s + S/2) mod S*. On a fat tree this is the cross-pod permutation matrix GeDES's
+    /// `BuildTCPConnections` builds (host *i* to host *i + N/2* under its switch-major numbering).
+    SwitchOffsetHalf,
+    /// Host at rack ordinal *o* of attachment switch *s* sends to ordinal *(o + 1) mod H* of the
+    /// same switch: a rack-local permutation that never leaves the top-of-rack switch.
+    SameSwitchNext,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostAttachment {
+    pub host_id: usize,
+    pub switch_id: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostAttachments {
+    entries: Vec<HostAttachment>,
+    host_ids: Vec<usize>,
+    distinct_source_sampling: bool,
+}
+
+impl HostAttachments {
+    fn new(entries: Vec<HostAttachment>, distinct_source_sampling: bool) -> Result<Self> {
+        let host_ids = entries.iter().map(|entry| entry.host_id).collect();
+        Ok(Self {
+            entries,
+            host_ids,
+            distinct_source_sampling,
+        })
+    }
+
+    pub fn identity(host_ids: Vec<usize>) -> Result<Self> {
+        Self::new(
+            host_ids
+                .into_iter()
+                .map(|host_id| HostAttachment {
+                    host_id,
+                    switch_id: host_id,
+                })
+                .collect(),
+            false,
+        )
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &HostAttachment> {
+        self.entries.iter()
+    }
+
+    pub fn host_ids(&self) -> &[usize] {
+        &self.host_ids
+    }
+
+    pub fn contains(&self, host_id: &usize) -> bool {
+        self.switch_for(*host_id).is_some()
+    }
+
+    pub fn switch_for(&self, host_id: usize) -> Option<usize> {
+        self.entries
+            .iter()
+            .find(|entry| entry.host_id == host_id)
+            .map(|entry| entry.switch_id)
+    }
+
+    pub fn sample_flow_pairs(
+        &self,
+        rng: &mut SmallRng,
+        count: usize,
+    ) -> std::result::Result<Vec<(usize, usize)>, String> {
+        Self::sample_flow_pairs_from(&self.host_ids, self.distinct_source_sampling, rng, count)
+    }
+
+    pub(crate) fn sample_canonical_flow_pairs(
+        &self,
+        rng: &mut SmallRng,
+        count: usize,
+    ) -> std::result::Result<Vec<(usize, usize)>, String> {
+        if self.distinct_source_sampling {
+            return self.sample_flow_pairs(rng, count);
+        }
+        let mut host_ids = self.host_ids.clone();
+        host_ids.sort_unstable();
+        Self::sample_flow_pairs_from(&host_ids, false, rng, count)
+    }
+
+    /// Deterministic structural endpoint pairs, drawn from the attachment grid rather than the RNG.
+    ///
+    /// Members are enumerated in ascending host topology identity, so member *m* sources at the
+    /// *m*-th host. Both policies are permutations, so a flow set may not request more members
+    /// than there are hosts.
+    pub fn structural_flow_pairs(
+        &self,
+        policy: PairingPolicy,
+        count: usize,
+    ) -> std::result::Result<Vec<(usize, usize)>, String> {
+        let grid = self.attachment_grid()?;
+        let switches = grid.len();
+        let ordinals = grid[0].len();
+        if count > switches * ordinals {
+            return Err(format!(
+                "structural flow-set count {count} exceeds the {} configured host attachments",
+                switches * ordinals
+            ));
+        }
+        match policy {
+            PairingPolicy::Random => {
+                return Err("random pairing is not a structural policy".to_owned());
+            }
+            PairingPolicy::SwitchOffsetHalf if !switches.is_multiple_of(2) => {
+                return Err(format!(
+                    "SwitchOffsetHalf pairing requires an even attachment-switch count, got {switches}"
+                ));
+            }
+            PairingPolicy::SameSwitchNext if ordinals < 2 => {
+                return Err(
+                    "SameSwitchNext pairing requires at least two hosts per attachment switch"
+                        .to_owned(),
+                );
+            }
+            _ => {}
+        }
+
+        let mut sources = self.host_ids.clone();
+        sources.sort_unstable();
+        sources.truncate(count);
+        let position = self.grid_positions(&grid);
+        sources
+            .into_iter()
+            .map(|source| {
+                let (switch, ordinal) = position[&source];
+                let target = match policy {
+                    PairingPolicy::Random => unreachable!("refused above"),
+                    PairingPolicy::SwitchOffsetHalf => {
+                        grid[(switch + switches / 2) % switches][ordinal]
+                    }
+                    PairingPolicy::SameSwitchNext => grid[switch][(ordinal + 1) % ordinals],
+                };
+                Ok((source, target))
+            })
+            .collect()
+    }
+
+    /// Hosts arranged as `[attachment switch rank][rack ordinal]`, both in ascending identity.
+    ///
+    /// Structural pairings are only well defined on a uniform grid, so a ragged attachment map is
+    /// refused here rather than silently pairing across differently populated racks.
+    fn attachment_grid(&self) -> std::result::Result<Vec<Vec<usize>>, String> {
+        let mut by_switch = std::collections::BTreeMap::<usize, Vec<usize>>::new();
+        for entry in &self.entries {
+            by_switch
+                .entry(entry.switch_id)
+                .or_default()
+                .push(entry.host_id);
+        }
+        if by_switch.is_empty() {
+            return Err("structural pairing requires at least one host attachment".to_owned());
+        }
+        let grid = by_switch
+            .into_values()
+            .map(|mut hosts| {
+                hosts.sort_unstable();
+                hosts
+            })
+            .collect::<Vec<_>>();
+        let ordinals = grid[0].len();
+        if grid.iter().any(|hosts| hosts.len() != ordinals) {
+            return Err(
+                "structural pairing requires the same host count on every attachment switch"
+                    .to_owned(),
+            );
+        }
+        Ok(grid)
+    }
+
+    fn grid_positions(
+        &self,
+        grid: &[Vec<usize>],
+    ) -> std::collections::BTreeMap<usize, (usize, usize)> {
+        grid.iter()
+            .enumerate()
+            .flat_map(|(switch, hosts)| {
+                hosts
+                    .iter()
+                    .enumerate()
+                    .map(move |(ordinal, host)| (*host, (switch, ordinal)))
+            })
+            .collect()
+    }
+
+    fn sample_flow_pairs_from(
+        host_ids: &[usize],
+        distinct_source_sampling: bool,
+        rng: &mut SmallRng,
+        count: usize,
+    ) -> std::result::Result<Vec<(usize, usize)>, String> {
+        if host_ids.len() < 2 {
+            return Err("flow sets require at least two configured host attachments".to_owned());
+        }
+        if !distinct_source_sampling {
+            return Ok((0..count)
+                .map(|_| {
+                    let pair = host_ids.sample(rng, 2).copied().collect::<Vec<_>>();
+                    (pair[0], pair[1])
+                })
+                .collect());
+        }
+        if count > host_ids.len() {
+            return Err(format!(
+                "flow count {count} exceeds the {} distinct source hosts available",
+                host_ids.len()
+            ));
+        }
+
+        let mut sources = host_ids.to_vec();
+        sources.shuffle(rng);
+        let target_offset = sources.len() / 2;
+        Ok((0..count)
+            .map(|index| {
+                (
+                    sources[index],
+                    sources[(index + target_offset) % sources.len()],
+                )
+            })
+            .collect())
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum TopologyError {
@@ -51,16 +317,21 @@ impl NetworkGraph {
 }
 
 trait TopologyBuilder {
-    fn build(&self) -> Result<(UnGraph<usize, ()>, Vec<usize>)>;
+    fn build(&self) -> Result<(UnGraph<usize, ()>, HostAttachments, TopologyProfile)>;
 }
 
 impl TopologyBuilder for FatTreeConfig {
-    fn build(&self) -> Result<(UnGraph<usize, ()>, Vec<usize>)> {
+    fn build(&self) -> Result<(UnGraph<usize, ()>, HostAttachments, TopologyProfile)> {
         let k = u32::try_from(self.k)
             .map_err(|_| TopologyError::NumericOverflow("FatTree k parameter overflow".into()))?;
 
         validate_fattree_params(k)?;
-        info!("Building a FatTree topology with k = {}.", k);
+        let hosts_per_edge = self.hosts_per_edge.unwrap_or(1);
+        validate_hosts_per_edge(k, hosts_per_edge)?;
+        info!(
+            "Building a FatTree topology with k = {} and {} host(s) per edge switch.",
+            k, hosts_per_edge
+        );
 
         let (num_layer_switches, layer_switches_per_pod, core_switches_per_agg) =
             calculate_fattree_params(k)?;
@@ -72,14 +343,102 @@ impl TopologyBuilder for FatTreeConfig {
         );
 
         let graph = UnGraph::<usize, ()>::from_edges(&edges);
-        let hosts = create_host_list(num_layer_switches)?;
+        let hosts = create_fattree_host_list(num_layer_switches, hosts_per_edge)?;
 
-        Ok((graph, hosts))
+        Ok((
+            graph,
+            hosts,
+            TopologyProfile::FatTree {
+                edge_switches: u64::from(num_layer_switches),
+                aggregation_switches: u64::from(num_layer_switches),
+                core_switches: u64::from(k.pow(2) / 4),
+            },
+        ))
+    }
+}
+
+impl TopologyBuilder for DragonflyConfig {
+    fn build(&self) -> Result<(UnGraph<usize, ()>, HostAttachments, TopologyProfile)> {
+        let routers_per_group = self.routers_per_group;
+        let global_ports = self.global_ports_per_router;
+        let hosts_per_router = self.hosts_per_router.unwrap_or(1);
+        if routers_per_group < 2 {
+            return Err(TopologyError::InvalidConfig(
+                "dragonfly routers_per_group must be at least 2".into(),
+            ));
+        }
+        if global_ports == 0 {
+            return Err(TopologyError::InvalidConfig(
+                "dragonfly global_ports_per_router must be positive".into(),
+            ));
+        }
+        if hosts_per_router == 0 {
+            return Err(TopologyError::InvalidConfig(
+                "dragonfly hosts_per_router must be positive".into(),
+            ));
+        }
+        // Balanced group count: with g = a*h + 1 every pair of groups is joined by exactly one
+        // global link, so the global-port budget is exactly consumed and no group pair is
+        // multiply connected (parallel physical links are refused by lowering).
+        let groups = routers_per_group
+            .checked_mul(global_ports)
+            .and_then(|ports| ports.checked_add(1))
+            .ok_or_else(|| {
+                TopologyError::NumericOverflow("dragonfly group count overflow".into())
+            })?;
+        let router_count = groups.checked_mul(routers_per_group).ok_or_else(|| {
+            TopologyError::NumericOverflow("dragonfly router count overflow".into())
+        })?;
+        u32::try_from(router_count).map_err(|_| {
+            TopologyError::NumericOverflow("dragonfly router identity overflow".into())
+        })?;
+        info!(
+            "Building a Dragonfly topology with {groups} group(s), {routers_per_group} router(s) \
+             per group, {global_ports} global port(s) per router, and {hosts_per_router} \
+             host(s) per router."
+        );
+
+        let router = |group: usize, index: usize| (group * routers_per_group + index) as u32;
+        let mut edges = Vec::new();
+        for group in 0..groups {
+            for left in 0..routers_per_group {
+                for right in (left + 1)..routers_per_group {
+                    edges.push((router(group, left), router(group, right)));
+                }
+            }
+        }
+        // Absolute (circulant) global arrangement: global port `port` of group `group` reaches
+        // group `(group + port + 1) mod groups`, and the partner's matching port is
+        // `groups - port - 2`. Emitting only the `group < partner` half writes each group pair once.
+        for group in 0..groups {
+            for port in 0..(groups - 1) {
+                let partner = (group + port + 1) % groups;
+                if group >= partner {
+                    continue;
+                }
+                let partner_port = groups - port - 2;
+                edges.push((
+                    router(group, port / global_ports),
+                    router(partner, partner_port / global_ports),
+                ));
+            }
+        }
+
+        let graph = UnGraph::<usize, ()>::from_edges(&edges);
+        let hosts = create_uniform_host_list(router_count, hosts_per_router)?;
+        Ok((
+            graph,
+            hosts,
+            TopologyProfile::Dragonfly {
+                groups: groups as u64,
+                routers_per_group: routers_per_group as u64,
+            },
+        ))
     }
 }
 
 impl TopologyBuilder for TorusConfig {
-    fn build(&self) -> Result<(UnGraph<usize, ()>, Vec<usize>)> {
+    fn build(&self) -> Result<(UnGraph<usize, ()>, HostAttachments, TopologyProfile)> {
         let dimension = self.dim as u32;
         let nodes_per_dim = self.n as u32;
 
@@ -93,13 +452,21 @@ impl TopologyBuilder for TorusConfig {
 
         let edges = build_torus_edges(dimension, nodes_per_dim)?;
         let graph = UnGraph::<usize, ()>::from_edges(&edges);
-        let hosts: Vec<usize> = (0..total_nodes).collect();
+        let hosts = HostAttachments::identity((0..total_nodes).collect())?;
 
-        Ok((graph, hosts))
+        Ok((graph, hosts, TopologyProfile::Torus))
     }
 }
 
-pub fn build_graph(file_path: &str) -> Result<(UnGraph<usize, ()>, Vec<usize>)> {
+pub fn build_graph(file_path: &str) -> Result<(UnGraph<usize, ()>, HostAttachments)> {
+    let (graph, hosts, _) = build_graph_with_profile(file_path)?;
+    Ok((graph, hosts))
+}
+
+/// [`build_graph`] with the structural profile lowering needs for layer-keyed questions.
+pub fn build_graph_with_profile(
+    file_path: &str,
+) -> Result<(UnGraph<usize, ()>, HostAttachments, TopologyProfile)> {
     let content = fs::read_to_string(file_path)?;
 
     let config: Config = match toml::from_str::<Config>(&content) {
@@ -126,17 +493,27 @@ pub fn build_graph(file_path: &str) -> Result<(UnGraph<usize, ()>, Vec<usize>)> 
                     .ok_or_else(|| TopologyError::InvalidConfig("Missing Torus config".into()))?
                     .build()
             }
+            TopoCategory::Dragonfly => {
+                debug!("Initializing Dragonfly graph");
+                topo_config
+                    .dragonfly
+                    .ok_or_else(|| TopologyError::InvalidConfig("Missing Dragonfly config".into()))?
+                    .build()
+            }
         },
         None => build_custom_graph(&content),
     }
 }
 
-fn build_custom_graph(content: &str) -> Result<(UnGraph<usize, ()>, Vec<usize>)> {
+fn build_custom_graph(
+    content: &str,
+) -> Result<(UnGraph<usize, ()>, HostAttachments, TopologyProfile)> {
     let graph_config: NetworkGraph = toml::from_str(content)?;
     graph_config.validate()?;
     Ok((
         UnGraph::<usize, ()>::from_edges(&graph_config.edges),
-        graph_config.hosts,
+        HostAttachments::identity(graph_config.hosts)?,
+        TopologyProfile::Custom,
     ))
 }
 
@@ -146,6 +523,17 @@ fn validate_fattree_params(k: u32) -> Result<()> {
     }
     if k == 0 {
         return Err(TopologyError::InvalidConfig("k must be positive".into()));
+    }
+    Ok(())
+}
+
+fn validate_hosts_per_edge(k: u32, hosts_per_edge: usize) -> Result<()> {
+    let maximum = usize::try_from(k / 2)
+        .map_err(|_| TopologyError::NumericOverflow("FatTree k/2 overflow".into()))?;
+    if !(1..=maximum).contains(&hosts_per_edge) {
+        return Err(TopologyError::InvalidConfig(format!(
+            "hosts_per_edge must be in 1..={maximum} for k = {k}, got {hosts_per_edge}"
+        )));
     }
     Ok(())
 }
@@ -230,10 +618,43 @@ fn calculate_total_nodes(dimension: u32, nodes_per_dim: u32) -> Result<usize> {
         .map_err(|_| TopologyError::NumericOverflow("Total node count overflow".into()))
 }
 
-fn create_host_list(count: u32) -> Result<Vec<usize>> {
-    let count_usize = usize::try_from(count)
-        .map_err(|_| TopologyError::NumericOverflow("Host count overflow".into()))?;
-    Ok((0..count_usize).collect())
+fn create_fattree_host_list(
+    edge_switch_count: u32,
+    hosts_per_edge: usize,
+) -> Result<HostAttachments> {
+    let edge_switch_count = usize::try_from(edge_switch_count)
+        .map_err(|_| TopologyError::NumericOverflow("Edge switch count overflow".into()))?;
+    create_uniform_host_list(edge_switch_count, hosts_per_edge)
+}
+
+/// Ordinal-major host attachment: `host = ordinal * switch_count + switch`.
+///
+/// Shared by every builder that attaches a uniform number of hosts to a set of leaf switches, so
+/// the fat tree and the dragonfly number their hosts by the same rule and a structural pairing
+/// means the same thing on both.
+fn create_uniform_host_list(
+    switch_count: usize,
+    hosts_per_switch: usize,
+) -> Result<HostAttachments> {
+    let host_count = switch_count
+        .checked_mul(hosts_per_switch)
+        .ok_or_else(|| TopologyError::NumericOverflow("Host count overflow".into()))?;
+    let mut hosts = Vec::new();
+    hosts.try_reserve_exact(host_count).map_err(|error| {
+        TopologyError::NumericOverflow(format!("Host list allocation: {error}"))
+    })?;
+    for host_ordinal in 0..hosts_per_switch {
+        let host_base = host_ordinal
+            .checked_mul(switch_count)
+            .ok_or_else(|| TopologyError::NumericOverflow("Host identity overflow".into()))?;
+        for switch_id in 0..switch_count {
+            let host_id = host_base
+                .checked_add(switch_id)
+                .ok_or_else(|| TopologyError::NumericOverflow("Host identity overflow".into()))?;
+            hosts.push(HostAttachment { host_id, switch_id });
+        }
+    }
+    HostAttachments::new(hosts, hosts_per_switch > 1)
 }
 
 fn build_torus_edges(dimension: u32, nodes_per_dim: u32) -> Result<Vec<(u32, u32)>> {
@@ -329,17 +750,23 @@ mod tests {
     use super::*;
     use petgraph::graph::NodeIndex;
     use petgraph::visit::EdgeRef;
+    use rand::SeedableRng;
     use std::collections::HashSet;
 
     // Helper functions for tests
-    fn create_fattree(k: usize) -> (UnGraph<usize, ()>, Vec<usize>) {
-        let config = FatTreeConfig { k };
-        config.build().unwrap()
+    fn create_fattree(
+        k: usize,
+        hosts_per_edge: Option<usize>,
+    ) -> (UnGraph<usize, ()>, HostAttachments) {
+        let config = FatTreeConfig { k, hosts_per_edge };
+        let (graph, hosts, _) = config.build().unwrap();
+        (graph, hosts)
     }
 
-    fn create_torus(dim: usize, n: usize) -> (UnGraph<usize, ()>, Vec<usize>) {
+    fn create_torus(dim: usize, n: usize) -> (UnGraph<usize, ()>, HostAttachments) {
         let config = TorusConfig { dim, n };
-        config.build().unwrap()
+        let (graph, hosts, _) = config.build().unwrap();
+        (graph, hosts)
     }
 
     // FatTree Tests
@@ -349,7 +776,7 @@ mod tests {
         #[test]
         fn test_fattree_node_counts() {
             let k = 4;
-            let (graph, hosts) = create_fattree(k);
+            let (graph, hosts) = create_fattree(k, None);
 
             let expected_edge_switches = k * k / 2;
             let expected_agg_switches = k * k / 2;
@@ -364,7 +791,7 @@ mod tests {
         #[test]
         fn test_fattree_edge_counts() {
             let k = 4;
-            let (graph, _) = create_fattree(k);
+            let (graph, _) = create_fattree(k, None);
 
             // Each edge switch connects to k/2 aggregation switches
             // Each aggregation switch connects to k/2 core switches
@@ -380,7 +807,7 @@ mod tests {
         #[test]
         fn test_fattree_pod_connectivity() {
             let k = 4;
-            let (graph, _) = create_fattree(k);
+            let (graph, _) = create_fattree(k, None);
 
             for pod in 0..k / 2 {
                 let pod_edge_switches: Vec<u32> =
@@ -406,7 +833,7 @@ mod tests {
         #[test]
         fn test_fattree_core_connectivity() {
             let k = 4;
-            let (graph, _) = create_fattree(k);
+            let (graph, _) = create_fattree(k, None);
 
             let agg_start = k * k / 2;
             let agg_end = k * k;
@@ -420,6 +847,111 @@ mod tests {
                     .collect();
 
                 assert_eq!(core_neighbors.len(), k / 2);
+            }
+        }
+
+        #[test]
+        fn test_fattree_multiple_hosts_per_edge_at_small_k() {
+            let k = 4;
+            let hosts_per_edge = k / 2;
+            let (graph, hosts) = create_fattree(k, Some(hosts_per_edge));
+            let edge_switches = k * k / 2;
+
+            assert_eq!(hosts.len(), edge_switches * hosts_per_edge);
+            assert_eq!(graph.edge_count(), k * k * k / 2);
+            for edge_switch in 0..edge_switches {
+                assert_eq!(
+                    hosts
+                        .iter()
+                        .filter(|host| host.switch_id == edge_switch)
+                        .count(),
+                    hosts_per_edge
+                );
+                assert_eq!(
+                    graph.edges(NodeIndex::new(edge_switch)).count(),
+                    k / 2,
+                    "host attachments must not alter the physical switch graph degree"
+                );
+            }
+        }
+
+        #[test]
+        fn test_fattree_canonical_k32_host_population() {
+            let k = 32;
+            let hosts_per_edge = k / 2;
+            let (graph, hosts) = create_fattree(k, Some(hosts_per_edge));
+            let edge_switches = k * k / 2;
+
+            assert_eq!(hosts.len(), k * k * k / 4);
+            assert_eq!(graph.edge_count(), k * k * k / 2);
+            assert_eq!(
+                hosts
+                    .iter()
+                    .map(|host| host.host_id)
+                    .collect::<HashSet<_>>()
+                    .len(),
+                hosts.len()
+            );
+            assert!(hosts.iter().all(|host| host.switch_id < edge_switches));
+            assert!((0..edge_switches).all(|edge_switch| {
+                hosts
+                    .iter()
+                    .filter(|host| host.switch_id == edge_switch)
+                    .count()
+                    == hosts_per_edge
+            }));
+            assert!(
+                (0..edge_switches)
+                    .all(|edge_switch| graph.edges(NodeIndex::new(edge_switch)).count() == k / 2)
+            );
+        }
+
+        #[test]
+        fn test_fattree_multiple_host_flow_pairs_are_nested_and_non_oversubscribed() {
+            let (_, hosts) = create_fattree(4, Some(2));
+            let mut small_rng = SmallRng::seed_from_u64(13_032);
+            let small = hosts.sample_flow_pairs(&mut small_rng, 3).unwrap();
+            let mut large_rng = SmallRng::seed_from_u64(13_032);
+            let large = hosts.sample_flow_pairs(&mut large_rng, 7).unwrap();
+
+            assert_eq!(small, large[..small.len()]);
+            assert_eq!(
+                large
+                    .iter()
+                    .map(|pair| pair.0)
+                    .collect::<HashSet<_>>()
+                    .len(),
+                large.len()
+            );
+            assert_eq!(
+                large
+                    .iter()
+                    .map(|pair| pair.1)
+                    .collect::<HashSet<_>>()
+                    .len(),
+                large.len()
+            );
+            assert!(large.iter().all(|(source, target)| source != target));
+        }
+
+        #[test]
+        fn test_fattree_hosts_per_edge_range_is_validated() {
+            for invalid in [0, 3] {
+                let error = FatTreeConfig {
+                    k: 4,
+                    hosts_per_edge: Some(invalid),
+                }
+                .build()
+                .expect_err("hosts_per_edge outside 1..=k/2 must fail");
+
+                assert!(
+                    error.to_string().contains("hosts_per_edge"),
+                    "range error must name hosts_per_edge: {error}"
+                );
+                assert!(
+                    error.to_string().contains("1..=2"),
+                    "range error must state the accepted bounds: {error}"
+                );
             }
         }
     }

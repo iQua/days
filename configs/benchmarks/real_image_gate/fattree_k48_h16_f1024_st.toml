@@ -1,0 +1,31 @@
+# T17b wide canonical-host correctness point: 147,456 LPs with a small flow set.
+seed = 17048
+duration = 0.0000001
+threading = "single"
+log_path = "logs/fattree"
+
+[topology]
+category = "FatTree"
+
+[topology.fat_tree]
+k = 48
+hosts_per_edge = 16
+
+[switch]
+port_rate = 100000000000
+capacity = 1024
+weights = [1]
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link]
+propagation_ns = 1000
+
+[[flow_set]]
+flow_type = "PacketDistribution"
+flow_count = 1024
+[flow_set.traffic]
+initial_delay = 0.0
+size = 4096
+arr_dist = { type = "Uniform", low = 0.000000021, high = 0.000000021 }
+pkt_size_dist = { type = "Uniform", low = 256, high = 256 }

@@ -1,0 +1,115 @@
+# P12 F-BURST: phased coflow bursts separated by protocol silences (wave-4 amendment).
+#
+# WHY PHASED COFLOWS AND NOT SYNCHRONISED-RTO INCAST. Both were on the table. Phased coflows win on
+# vocabulary: a byte-terminated closed-loop flow set goes silent ON ITS OWN once the last segment
+# is acknowledged, so "burst, then silence, then burst" is stated directly with no new generator
+# and no executor change. Synchronised-RTO incast is expressible too (explicit many-to-one flows),
+# but its showcase value rests on whether Days' Reno actually synchronises its retransmission
+# timers at a chosen incast degree. That is an empirical property to be measured, not a property of
+# the generator vocabulary, and a fixture must not depend on a measurement it cannot make.
+#
+# WHY TCP AND NOT `RingAllReduce`. A ring-allreduce phrasing was authored first and rejected on a
+# hard capability boundary: image validation refuses collective generators on the device backends
+# ("backend Metal does not support collective generators; use Scalar or Cpu"), so a collective
+# fixture can only ever be a two-backend row. The wave-4 brief requires four-backend identity as
+# standard, and byte-terminated TCP delivers the closed-loop depth the brief asks for -- congestion
+# window, ACK clocking, retransmission -- on every backend. The collective-generator device gap is
+# recorded as a P12 finding; it is not worked around here.
+#
+# WHAT IT SHOWS. Four coflows of 16 flows each, launched 250 us apart. Inside a phase the flows are
+# dense and mutually congesting; between phases every generator has finished, every segment is
+# acknowledged and the fabric is empty. A slot pipeline ticks through every one of those empty
+# slots. Days' safe horizon jumps the silence.
+#
+# THE MATRIX. `SwitchOffsetHalf` on k = 4 with two hosts per edge switch pairs each host with the
+# same rack ordinal four edge switches away, i.e. two pods away: every flow crosses aggregation and
+# core, six hops each way, so the closed loop has a real round-trip time (~12 us) to work against.
+#
+# SIZING. 146,000 bytes per flow = 100 segments of 1,460 B. At a ~12 us RTT that is a handful of
+# round trips, comfortably inside the 250 us phase period, so every phase drains before the next
+# one starts and every gap is a real silence. The anchor run confirms it: sourced == received and
+# zero pending events at the horizon.
+#
+# HONESTY. Sparse by construction. Per the wave-4 honesty constraint this demonstrates the
+# fewer-rounds mechanism; it is not a wall-clock claim.
+seed = 21016
+duration = 0.001000
+threading = "single"
+log_path = "logs/p12/f_burst_coflow_phases"
+
+[topology]
+category = "FatTree"
+
+[topology.fat_tree]
+k = 4
+hosts_per_edge = 2
+
+[switch]
+port_rate = 100_000_000_000
+capacity = 1024
+weights = [1]
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link]
+propagation_ns = 1000
+
+# Coflow phase starting at 0.
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 16
+pairing = "SwitchOffsetHalf"
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 146_000
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1460, high = 1460 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+# Coflow phase starting at 250 us.
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 16
+pairing = "SwitchOffsetHalf"
+
+[flow_set.traffic]
+initial_delay = 0.000250
+size = 146_000
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1460, high = 1460 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+# Coflow phase starting at 500 us.
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 16
+pairing = "SwitchOffsetHalf"
+
+[flow_set.traffic]
+initial_delay = 0.000500
+size = 146_000
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1460, high = 1460 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+# Coflow phase starting at 750 us.
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 16
+pairing = "SwitchOffsetHalf"
+
+[flow_set.traffic]
+initial_delay = 0.000750
+size = 146_000
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1460, high = 1460 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"

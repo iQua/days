@@ -5,6 +5,9 @@ description: Coverage-guided test generation on top of leanguard-run (fuzz, mini
 
 `leanguard-testgen` drives the coverage-guided test generation pipeline described in the Days research notes.
 
+Supported campaign protocols are `dcqcn`, `aqm`, `pfc`, `wfq`, `drr`, and
+`cubic`.
+
 Source: `days/src/bin/leanguard-testgen.rs`
 
 ## Top-level options
@@ -13,6 +16,8 @@ Source: `days/src/bin/leanguard-testgen.rs`
 - `--checker-dir <dir>` (default: `lean/.lake/build/bin`)
 - `--leanguard-run <path>` (optional)
   - If omitted, `leanguard-testgen` will try to execute `leanguard-run` (either as a sibling binary or via `$PATH`).
+- `--legacy-runner <path>` (optional)
+  - Forwarded to `leanguard-run`; point it at the separately built `days-legacy` binary for simulate-and-check campaigns.
 - `--allow-nondeterministic` (default: false)
 
 ## Subcommands

@@ -1,23 +1,10 @@
 ---
 title: Trace Manifest (traces.json)
-description: How Days records which per-transition traces were produced in a run.
+description: Legacy trace discovery manifest and csv_logging behavior.
 ---
 
-When built with the appropriate features, Days can emit per-transition protocol traces such as:
-
-- `dcqcn_events.csv`
-- `pfc_events.csv`
-- `cubic_events.csv`
-- `wfq_events.csv`
-- ...
-
-At the end of a run, Days writes a JSON manifest file under `log_path`:
-
-- `<log_path>/traces.json`
-
-Source: `days/src/utils/trace_manifest.rs`
-
-## Schema (v1)
+At the end of a legacy run with `csv_logging=true`, Days records the nonempty
+protocol certificate files under `log_path`:
 
 ```json
 {
@@ -26,9 +13,13 @@ Source: `days/src/utils/trace_manifest.rs`
 }
 ```
 
-- `version`: currently always `1`
-- `traces`: list of trace filenames (relative to `log_path`) that are present and non-empty
+`version` is currently `1`; every `traces` entry is a filename relative to
+`log_path`. Candidate families include PFC, AQM, DCQCN, WFQ, DRR, CUBIC, and
+TCP discovery surfaces.
 
-## Why it exists
+With `csv_logging=false`, the logger does not create `log_path`, CSVs, or the
+manifest. `leanguard-run` prefers a valid manifest and otherwise scans its
+known filenames for nonempty files.
 
-Tools like [/docs/reference/cli/leanguard-run](/docs/reference/cli/leanguard-run) use `traces.json` to decide which checkers to invoke, without having to guess based on the experiment configuration.
+The schema is implemented in `src/utils/trace_manifest.rs`; logger emission is
+in `src/utils/logger.rs`.

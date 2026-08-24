@@ -1,179 +1,93 @@
 ---
 title: Logging & Runtime
-description: Seed, duration, threading, mailbox sizing, CSV reports, and tracing.
+description: Legacy runtime, CSV output, and application-source configuration.
 ---
 
-This page documents “general” configuration keys that are not specific to flows/topology.
+The keys on this page configure the legacy actor runtime. Exact lowering reads `seed`, `duration`, and `time_quantum_ns`; it does not use the Nexosim threading, UI, mailbox, or CSV settings.
 
-Implementation notes:
+## Simulation and runtime
 
-- `CsvLogger` reads logging keys from `src/utils/logger.rs`.
-- Runtime/UI/tracing keys are read from small config structs in `src/topos/topo.rs` and `src/utils/`.
+| Key | Type | Default | Constraint |
+| --- | --- | --- | --- |
+| `seed` | integer | required | Legacy rejects `0`; positive values seed endpoint selection, traffic distributions, and legacy RED. |
+| `duration` | seconds | `1500.0` | Finite and non-negative. |
+| `threading` | `"single"` or `"multiple"` | Nexosim default | `single` uses one worker. `multiple` uses `num_threads` or the logical CPU count. |
+| `num_threads` | positive integer | runtime-selected | Requires `threading`; must be `1` with `single`. |
+| `hot_workers` | integer | runtime default | Invalid for a one-worker runtime and cannot exceed the worker count. |
+| `concurrency_level` | `"default"` or `"accelerated"` | runtime default | Controls Nexosim groups per step task. |
+| `time_quantum_ns` | integer nanoseconds | unset | Passed to Nexosim. Exact lowering rejects nonzero values. |
+| `mailbox_capacity` | integer | `16` | Must be at least 1 and within Nexosim's representable capacity. |
 
-## `seed` (required)
-
-Random seed used for reproducibility (flow-set endpoint selection, random distributions, RED randomness).
+If `threading` is absent, the vendored Nexosim `SimInit::new()` uses the logical CPU count.
 
 ```toml
 seed = 1000
-```
-
-## `duration` (optional)
-
-Total simulated time in seconds.
-
-- Default (topology): `1500.0`
-
-```toml
 duration = 20.0
-```
-
-Note: `duration` is parsed by multiple subsystems (topology, UI, tracing). For consistency, prefer setting it explicitly.
-
-## `threading` (optional)
-
-Threading model for the simulation runtime.
-
-```toml
-threading = "single"
-```
-
-- Allowed values: `single`, `multiple`
-- `single` uses a single-threaded runtime.
-- `multiple` uses one worker per CPU core by default.
-- If omitted, Days calls `SimInit::new()`, which uses all logical CPU threads by default in the current Nexosim port.
-
-## `num_threads` (optional)
-
-Overrides the number of runtime worker threads when `threading = "multiple"`.
-
-```toml
 threading = "multiple"
 num_threads = 4
-```
-
-## `hot_workers` (optional)
-
-Number of hot standby worker threads. Hot workers remain active and ready to pick up tasks, reducing latency for bursty workloads.
-
-```toml
-hot_workers = 2
-```
-
-## `concurrency_level` (optional)
-
-Concurrency acceleration mode for the simulation runtime.
-
-- Allowed values: `default`, `accelerated`
-
-```toml
+hot_workers = 1
 concurrency_level = "accelerated"
-```
-
-## `time_quantum_ns` (optional)
-
-Simulation time quantum in nanoseconds. Controls the granularity of time-based scheduling in the simulation engine.
-
-```toml
-time_quantum_ns = 1000
-```
-
-## `mailbox_capacity` (optional)
-
-Mailbox capacity for most models (bounded message queues).
-
-- Default: `16`
-
-```toml
 mailbox_capacity = 32
-```
-
-## CSV reporting
-
-### `log_path` (optional)
-
-Output directory for CSV files.
-
-- Default: `./output`
-
-```toml
-log_path = "./logs/run1"
-```
-
-Days will create the directory if needed and will write:
-
-- `sources.csv`, `sinks.csv`, `switches.csv`
-- plus optional `pfc.csv` depending on features.
-- plus optional per-transition protocol traces for LeanGuard (`*_events.csv`) depending on features:
-  - `aqm_events.csv` (`--features lean`)
-  - `dcqcn_events.csv` (`--features dcqcn,lean`)
-  - `pfc_events.csv` (`--features l2_pfc,lean`)
-  - `cubic_events.csv` (`--features lean`)
-  - `drr_events.csv` (`--features lean`)
-  - `wfq_events.csv` (`--features lean`)
- - `traces.json`: a manifest listing which `*_events.csv` traces are non-empty (written at the end of a run).
-
-### `report_interval` (optional)
-
-Interval in seconds between periodic report rows.
-
-- Default: `f64::MAX` (effectively “no periodic reports”; data is flushed at the end)
-
-```toml
-report_interval = 1.0
 ```
 
 ## Progress UI
 
-### `ui_interval` (optional)
-
-UI refresh interval in seconds.
-
-- Default: `duration / 100`
+`ui_interval` sets the refresh interval in seconds. It must be finite and positive. The default is one hundredth of the configured UI duration, clamped to at least one nanosecond.
 
 ```toml
-ui_interval = 1.0
+ui_interval = 0.2
 ```
 
-## Concurrency tracing (optional)
-
-Enable lightweight concurrency sampling:
+## CSV output
 
 ```toml
-tracing_active = true
-tracing_interval = 1.0
+log_path = "./logs/run1"
+csv_logging = true
+report_interval = 1.0
 ```
 
-- `tracing_active` (default: `false`)
-- `tracing_interval` (default: `duration / 100`)
+| Key | Type | Default | Behavior |
+| --- | --- | --- | --- |
+| `log_path` | string | `"./output"` | Directory for legacy CSV output. |
+| `csv_logging` | boolean | `true` | Controls all logger filesystem output. |
+| `report_interval` | seconds | `f64::MAX` | Positive, nanosecond-representable interval for periodic report events. |
 
-When enabled, Days installs a tracing subscriber layer and computes a wall-clock average concurrency during `Simulation::step_until` (and logs the peak observed by the tracing layer).
+With `csv_logging = false`, the logger does not create `log_path`, CSV files, or `traces.json`. It also discards report rows instead of retaining them in its in-memory vectors. Test-only correctness accounting and aggregate sink totals still update.
 
-## Application-level sources for TCP collectives (optional)
+With CSV logging enabled, initialization creates these base files:
 
-For certain TCP collectives (broadcast, ring allreduce), Days can back TCP flows with actor-managed byte buffers (`src/flows/app_source.rs`).
+- `sources.csv`
+- `sinks.csv`
+- `switches.csv`
+- `pfc.csv` with `l2_pfc`
 
-- `Broadcast` uses one shared buffer per collective.
-- `RingAllReduce` uses one buffer per collective per directed ring link.
-- These buffers are synthetic byte stores used for traffic generation only; Days does not model payload mutation or reduction.
+The `lean` feature adds `aqm_events.csv`, `cubic_events.csv`, `drr_events.csv`, and `wfq_events.csv`. `dcqcn,lean` adds `dcqcn_events.csv`; `l2_pfc,lean` adds `pfc_events.csv`.
 
-Configure the actor under `[app_source]`:
+At final flush, `traces.json` lists the non-empty `*_events.csv` files. Empty trace files do not appear in the manifest.
+
+## E5 TCP correctness rows
+
+`legacy_e5_metrics = true` enables final per-flow TCP correctness reports for the E5 fixture family. When TCP sources emit those reports, the logger creates `tcp_metrics.csv`. Leave this key unset for ordinary simulations.
+
+```toml
+legacy_e5_metrics = true
+```
+
+## TCP collective application sources
+
+Legacy TCP Broadcast and RingAllReduce collectives can pull bytes from actor-managed buffers. The table is valid only when the scenario contains at least one such TCP collective.
 
 ```toml
 [app_source]
 req_channel_capacity = 256
-chunk_size = 512
 initial_delay = 1
 run_interval = 50
 ```
 
-Fields and defaults:
+| Field | Unit | Default when `[app_source]` exists | Purpose |
+| --- | --- | --- | --- |
+| `req_channel_capacity` | requests | `128` | Request-channel capacity. |
+| `initial_delay` | microseconds | `1` | Delay before the actor's first poll. |
+| `run_interval` | microseconds | `50` | Delay between polls. |
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `req_channel_capacity` | `usize` | `256` | Channel capacity for buffer requests |
-| `chunk_size` | `usize` | `512` | Parsed app-source setting; currently not used for TCP packetization or ring chunk sizing |
-| `initial_delay` | `u64` | `1` | Actor start delay (microseconds) |
-| `run_interval` | `u64` | `50` | Actor polling interval (microseconds) |
-
-If `[app_source]` is omitted entirely, Days uses `AppBufferConfig::default()` with the defaults above.
+If the entire table is absent, `AppBufferConfig::default()` uses request capacity `256`, initial delay `1`, and run interval `50`. The strict loader rejects `app_source.chunk_size`; legacy does not implement configurable application chunking.

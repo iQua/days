@@ -1,0 +1,35 @@
+# Small deterministic scenario for executor CI smoke tests.
+
+seed = 1000
+edges = [[0, 1], [0, 2]]
+hosts = [0, 1, 2]
+duration = 0.01
+threading = "single"
+log_path = "logs/ci/executor_smoke"
+
+[switch]
+port_rate = 8000000
+capacity = 100
+weights = [1]
+discipline = "FIFO"
+drop = "TailDrop"
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[0, 1]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 4096
+arr_dist = { type = "Uniform", low = 0.0001, high = 0.0001 }
+pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[1, 0]]
+
+[flow.traffic]
+initial_delay = 0.00005
+size = 4096
+arr_dist = { type = "Uniform", low = 0.0001, high = 0.0001 }
+pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 }

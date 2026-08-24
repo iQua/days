@@ -1,6 +1,7 @@
 {
   "index": "Overview",
   "days": "days",
+  "t20f-frontier": "t20f_frontier",
   "leanguard-run": "leanguard-run",
   "leanguard-testgen": "leanguard-testgen"
 }

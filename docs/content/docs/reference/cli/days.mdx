@@ -3,22 +3,25 @@ title: days
 description: Run a simulation from a single TOML configuration file.
 ---
 
-The default binary (built from `src/main.rs`) runs a simulation described by a TOML configuration file.
+The legacy-only binary (built from `legacy/src/main.rs`) runs a Nexosim
+simulation described by one TOML configuration file. It does not select the
+exact Scalar, CPU, Metal, or CUDA executor; use the root examples or
+[`t20f_frontier`](/docs/reference/cli/t20f-frontier) for those paths.
 
 ## Usage
 
 ```bash
-RUST_LOG=info cargo run --release --bin days -- <path/to/config.toml>
+RUST_LOG=info cargo run --release -p days-legacy --bin days -- <path/to/config.toml>
 ```
 
 Examples:
 
 ```bash
 # Minimal example
-RUST_LOG=info cargo run --release --bin days -- configs/simple.toml
+RUST_LOG=info cargo run --release -p days-legacy --bin days -- configs/simple.toml
 
 # TCP example
-RUST_LOG=info cargo run --release --bin days -- configs/tcp_simple.toml
+RUST_LOG=info cargo run --release -p days-legacy --bin days -- configs/tcp_simple.toml
 ```
 
 ## Arguments
@@ -33,7 +36,3 @@ Days uses `RUST_LOG` for runtime logging.
 
 - Default level if unset: `info`
 - Increase verbosity: `RUST_LOG=debug ...`
-
-## Concurrency tracing
-
-If `tracing_active = true` in the config (see [/docs/configuration/logging](/docs/configuration/logging)), Days will install a `tracing_subscriber` pipeline (including a lightweight concurrency tracker). Otherwise it falls back to `env_logger`.

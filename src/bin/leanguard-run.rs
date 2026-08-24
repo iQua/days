@@ -1,5 +1,5 @@
 use clap::{Parser, ValueEnum};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -27,6 +27,10 @@ struct Cli {
 
     #[arg(long, default_value_t = false)]
     allow_nondeterministic: bool,
+
+    /// Path to the separately built legacy engine used for trace generation.
+    #[arg(long)]
+    legacy_runner: Option<PathBuf>,
 
     #[arg(long, default_value_t = false)]
     coverage: bool,
@@ -201,19 +205,33 @@ fn main() {
     let required_features_hint = required_features_hint(&config_toml);
 
     if matches!(cli.mode, Mode::SimulateAndCheck) {
-        let run_result =
-            std::panic::catch_unwind(|| days::run_simulation_from_config(&summary.config_path));
-        match run_result {
-            Ok(Ok(())) => {
+        let legacy_runner = resolve_legacy_runner(cli.legacy_runner.as_deref());
+        match Command::new(&legacy_runner)
+            .arg(&summary.config_path)
+            .output()
+        {
+            Ok(output) if output.status.success() => {
                 summary.days = DaysStatus::Ok;
             }
-            Ok(Err(e)) => {
-                summary.days = DaysStatus::Error;
-                summary.days_error = Some(e);
-            }
-            Err(_) => {
+            Ok(output) if output.status.code() == Some(101) => {
                 summary.days = DaysStatus::Panic;
                 summary.days_error = Some("Days panicked".to_string());
+            }
+            Ok(output) => {
+                summary.days = DaysStatus::Error;
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                summary.days_error = Some(if stderr.is_empty() {
+                    format!("legacy runner exited with status {}", output.status)
+                } else {
+                    stderr
+                });
+            }
+            Err(error) => {
+                summary.days = DaysStatus::Error;
+                summary.days_error = Some(format!(
+                    "failed to execute legacy runner `{}`: {error}",
+                    legacy_runner.display()
+                ));
             }
         }
     } else {
@@ -268,6 +286,21 @@ fn main() {
     emit_and_exit(summary, exit_code);
 }
 
+fn resolve_legacy_runner(configured: Option<&Path>) -> PathBuf {
+    if let Some(path) = configured {
+        return path.to_owned();
+    }
+    if let Some(path) = std::env::var_os("DAYS_LEGACY_RUNNER") {
+        return PathBuf::from(path);
+    }
+
+    let executable_name = if cfg!(windows) { "days.exe" } else { "days" };
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join(executable_name)))
+        .unwrap_or_else(|| PathBuf::from(executable_name))
+}
+
 fn emit_and_exit(summary: RunSummaryV1, exit_code: i32) -> ! {
     let content = serde_json::to_string_pretty(&summary).unwrap_or_else(|e| {
         format!(
@@ -305,6 +338,7 @@ fn scan_for_traces(log_path: &Path) -> Vec<String> {
         "wfq_events.csv",
         "drr_events.csv",
         "cubic_events.csv",
+        "tcp_events.csv",
     ];
 
     let mut traces = Vec::new();
@@ -375,6 +409,12 @@ fn select_checkers(log_path: &Path, traces: &[String]) -> Vec<CheckerInvocation>
         invocations.push(CheckerInvocation::One {
             exe: "cubic_check",
             args: vec![log_path.join("cubic_events.csv")],
+        });
+    }
+    if has("tcp_events.csv") {
+        invocations.push(CheckerInvocation::One {
+            exe: "tcp_check",
+            args: vec![log_path.join("tcp_events.csv")],
         });
     }
 
@@ -458,8 +498,18 @@ fn run_checker(
 }
 
 fn read_coverage_points(path: &Path) -> Option<Vec<String>> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum CoverageFile {
+        Points(Vec<String>),
+        Report { cover: Vec<String> },
+    }
+
     let content = fs::read_to_string(path).ok()?;
-    if let Ok(mut points) = serde_json::from_str::<Vec<String>>(&content) {
+    if let Ok(parsed) = serde_json::from_str::<CoverageFile>(&content) {
+        let mut points = match parsed {
+            CoverageFile::Points(points) | CoverageFile::Report { cover: points } => points,
+        };
         points.sort();
         points.dedup();
         return Some(points);
@@ -555,4 +605,25 @@ fn required_features_hint(config: &toml::Value) -> String {
     features.dedup();
 
     format!("`--features {}`", features.join(","))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_coverage_points;
+
+    #[test]
+    fn coverage_report_object_extracts_sorted_unique_coverpoints() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("coverage.json");
+        std::fs::write(
+            &path,
+            r#"{"checker":"tcp_check","accept":true,"cover":["reno_timeout","reno_new_ack","reno_timeout"],"stats":{"rows":3,"processed_rows":3}}"#,
+        )
+        .expect("write coverage report");
+
+        assert_eq!(
+            read_coverage_points(&path),
+            Some(vec!["reno_new_ack".to_string(), "reno_timeout".to_string()])
+        );
+    }
 }

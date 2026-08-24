@@ -440,7 +440,7 @@ Stop when the property is preserved:
 
 Add a CI job that:
 
-1. Builds Days with tracing enabled
+1. Builds Days with the required Lean protocol-trace features
 2. Builds Lean checkers
 3. Runs `leanguard-run` on every config in `leanguard_corpus/accepted/`
 4. Requires all ACCEPT
@@ -512,4 +512,3 @@ If you want the fastest path to traction with the configs you already have, do t
 ---
 
 If you want, I can also propose an explicit first set of **~20 “hand-designed” seed configs** (tiny topologies, 1–3 flows, each crafted to target one coverpoint) derived from your current TOMLs—those become the seed corpus that the mutational generator expands.
-

@@ -1,11 +1,96 @@
 ---
 title: Internals
-description: Deeper implementation notes for contributors (Days + Nexosim).
+description: Exact-executor internals and the boundary with the legacy Nexosim engine.
 ---
 
-This section is for contributors who want to extend Days, add new protocols, or understand performance-critical design choices.
+Days contains two execution stacks:
+
+- The **exact executor** compiles a scenario into a `SimulationImage` and runs it with the scalar, CPU, Metal, or CUDA backend. This is the current byte-identity and cross-backend verification path.
+- The **legacy executor** builds actor-like models on the vendored Nexosim runtime. Its internals are documented separately because its model, time, and scheduling APIs do not apply to the exact executor.
 
 <Cards>
-  <Card title="Nexosim (simulation engine)" href="/docs/internals/nexosim" />
-  <Card title="Architecture (high level)" href="/docs/architecture/overview" />
+  <Card title="Exact executor map" href="#exact-executor-map" />
+  <Card title="Nexosim legacy engine" href="/docs/internals/nexosim" />
+  <Card title="Architecture overview" href="/docs/architecture/overview" />
 </Cards>
+
+## Exact executor map
+
+The exact path has four stages:
+
+1. `src/scenario/compile.rs` lowers supported configuration into a `SimulationImage` with stable semantic IDs.
+2. `executor/src/validate.rs` checks image invariants and rejects mechanisms that the selected backend cannot execute.
+3. One of `scalar.rs`, `safe_horizon.rs`, `cpu.rs`, `metal.rs`, or `cuda.rs` applies the shared transition semantics.
+4. The backend returns a normalized `RunResult` containing canonical final state and observations.
+
+The exact executor is an **LP executor**, not an actor runtime. A logical process (LP) owns one host or one switch egress queue. Events have fixed payloads and a canonical key ordered by `(time_ns, phase, origin_node, origin_seq)`; there are no callbacks in the event image. See `executor/src/image.rs` and `executor/src/event.rs`.
+
+## Scalar and parallel execution
+
+| Path | Scheduling model | Primary entrypoint |
+| --- | --- | --- |
+| Global scalar | One global ordered event calendar. This reference path can execute zero-delay channels. | `run_scalar` |
+| Round scalar | One thread, per-LP future queues and outboxes, using the same safe-horizon protocol as the parallel paths. | `run_scalar_rounds` |
+| CPU | A persistent worker pool with static ownership of whole LPs. Workers exchange cross-owner events only at round barriers. | `run_cpu` |
+| Metal / CUDA | A planned, bounded device image with per-LP work and canonical exchange between rounds. | `run_metal` / `run_cuda` |
+
+Round execution starts at the minimum pending LP frontier. Its exclusive horizon is the smaller of the run boundary and `frontier + minimum_channel_lookahead`. Every active LP drains events strictly before that horizon. Cross-LP outboxes are then sorted by the canonical event key and merged at the barrier before the next frontier is chosen.
+
+This rule is implemented in `executor/src/safe_horizon.rs`. A zero-delay channel is valid for global scalar execution but is rejected by scalar-round, CPU, Metal, and CUDA execution because it provides no positive safe horizon.
+
+## Device planning and bounded arenas
+
+Metal and CUDA plan storage before launching kernels. `executor/src/device_sizing.rs` derives arena layouts from the compiled image, configured caps and floors, and the run boundary. Record arenas are striped by the entity that owns them—for example an LP, channel stream, TCP receiver class, or flow—so one busy entity does not force every row to use the same capacity.
+
+Device capacity is **refuse or run**. If a kernel reports that an arena is too small, that attempt produces no result. The host records the fault, raises the relevant plane, stream, class, or flow floor from the reported demand, rebuilds the plan, and retries up to the configured limit. Caps remain hard limits. The retry types and growth rules live in `executor/src/device_capacity.rs`.
+
+A successful device run returns a `CapacityWarmStart`. Despite the name, this is only a **sizing hint** for a later run of the same image: it seeds the capacity floors that a previous retry chain learned. It does not contain simulated state, resume an interrupted run, or represent a compiled-pipeline cache. Passing the hint to `run_with_observations_warm_started` can avoid repeating known failed sizing attempts without changing simulation semantics.
+
+## Compact readback
+
+Large striped record arenas are not copied back at their full planned capacity. Metal and CUDA first read the arena metadata, build a unique plan from each entity's offset, capacity, ring head, and live count, and run a gather kernel into a compact buffer. The destination offsets follow the same entity order and ring-slot arithmetic as the canonical decoder.
+
+Compaction is lossless: it changes transfer size, not record order or decoded bytes. Invalid metadata produces a typed refusal instead of truncated output. The shared planning and validation logic is in `executor/src/device_compaction.rs`; each device backend owns its gather and readback implementation.
+
+## Device event records and the drain path
+
+Device future-event storage does not pay one fixed record size for every
+event kind. The fallback record is 14 `u64` words, and each proven-monotone
+stream class stores a compact per-kind encoding: channel events in 11 words,
+generator events in 10, service events in 5, and remote staging records
+in 12. On the benchmark mix this roughly halves record traffic. The
+encodings are lossless by construction — every slim record decodes to the
+same bytes as its wide form, and the round-trip is a tested control — with
+the shared encoder in `executor/src/device_event_record.rs` and matching
+device-side codecs in both kernel files.
+
+The drain kernels themselves carry three measured optimizations, selected
+per backend rather than assumed portable:
+
+- a restrict-qualified kernel ABI with explicit launch bounds (CUDA);
+- a same-time continuation fast path, guarded by its own conformance
+  oracle (`same_time_continuations` in the device record) so the fast and
+  general paths are provably interchangeable (CUDA);
+- worklist compaction for the round's active-LP set (Metal and CUDA).
+
+Metal keeps only the compaction lever: the other two, profitable on
+NVIDIA hardware, measured as regressions on Apple GPUs and are compiled
+out there. The parallel launch width is likewise never chosen by the
+engine — it is a per-fixture parameter the measurement harness records
+beside each result (`--round-threads-per-block` on `t20f_frontier`), so a
+reported time always names the geometry that produced it.
+
+## Backend capability validation
+
+`validate(image, backend)` runs before execution. Compilation may accept a mechanism that a particular backend then rejects deliberately.
+
+| Exact capability | Scalar | CPU | Metal | CUDA |
+| --- | --- | --- | --- | --- |
+| FIFO, strict priority, WFQ, DRR, WRR | Yes | Yes | Yes | Yes |
+| TailDrop, ECN threshold | Yes | Yes | Yes | Yes |
+| RED, RED with ECN | Yes | Yes | Rejected | Rejected |
+| TCP Reno, TCP CUBIC | Yes | Yes | Yes | Yes |
+| PFC, DCQCN | Yes | Yes | Rejected | Rejected |
+| Collective generators | Yes | Yes | Rejected | Rejected |
+
+Metal and CUDA also require their feature, platform, and device runtime to be available. Device runs return the canonical state and measurement surface, but diagnostic-only observation planes remain a scalar/CPU facility. See `executor/src/validate.rs` and `executor/src/scalar.rs` for the authoritative checks and result contract.

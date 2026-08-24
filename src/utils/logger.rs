@@ -12,21 +12,105 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use crate::flows::sink::PacketSinkReport;
-use crate::flows::source::PacketSourceReport;
-#[cfg(feature = "l2_pfc")]
-use crate::l2::pfc::PfcPortReport;
-use crate::schedulers::SchedulerReport;
-
-#[cfg(feature = "lean")]
-use crate::flows::packet::EcnField;
-#[cfg(feature = "lean")]
-use crate::schedulers::drop::{CapacityUnit, DropAction, DropStrategyKind};
 use crate::utils::trace_manifest;
+
+#[derive(Clone, Default, Debug, Serialize)]
+pub struct PacketSourceReport {
+    pub id: usize,
+    pub flow_id: usize,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub sent_packets: usize,
+    pub packet_sizes: usize,
+    pub ack_bytes: usize,
+}
+
+/// Final opt-in counters for the legacy E5 TCP correctness arm.
+#[derive(Clone, Default, Debug, Deserialize, Serialize)]
+pub struct TcpMetricsReport {
+    pub flow_id: usize,
+    pub original_packets: usize,
+    pub original_bytes: usize,
+    pub final_original_segment_bytes: usize,
+    pub retransmissions: usize,
+    pub retransmitted_bytes: usize,
+    pub acked_bytes: usize,
+    pub completed: bool,
+    pub completion_time_ns: Option<u64>,
+    pub outstanding_bytes: usize,
+    pub pending_timeouts: usize,
+    pub timer_ticks: usize,
+    pub timer_cancelled: bool,
+}
+
+#[derive(Clone, Default, Debug, Serialize)]
+pub struct PacketSinkReport {
+    pub id: usize,
+    pub flow_id: usize,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub received_packets: usize,
+    pub received_sizes: usize,
+    pub queueing_delay_mean: f64,
+    pub one_way_delay_mean: f64,
+}
+
+#[derive(Clone, Default, Debug, Serialize)]
+pub struct SchedulerReport {
+    pub id: usize,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub received_packets: usize,
+    pub dropped_packets: usize,
+    pub forwarded_packets: usize,
+    pub queue_length: usize,
+    pub received_sizes: usize,
+    pub forwarded_sizes: usize,
+    pub throughput_mean: f64,
+    pub queueing_delay_mean: f64,
+}
+
+#[cfg(feature = "l2_pfc")]
+#[derive(Clone, Debug, Serialize)]
+pub struct PfcPortReport {
+    pub id: usize,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub pause_frames: usize,
+    pub resume_frames: usize,
+    pub dropped_packets: usize,
+    pub max_occupancy: usize,
+    pub current_occupancy: usize,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacityUnit {
+    Bytes,
+    Packets,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DropAction {
+    Enqueue,
+    Drop,
+    MarkEcn,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DropStrategyKind {
+    TailDrop,
+    Red,
+    RedEcn,
+    EcnThreshold,
+}
 
 #[derive(Deserialize)]
 struct LogConfig {
     log_path: Option<String>,
+    csv_logging: Option<bool>,
     report_interval: Option<f64>,
 }
 
@@ -112,18 +196,6 @@ pub enum DcqcnLoggedEcnField {
 }
 
 #[cfg(all(feature = "lean", feature = "dcqcn"))]
-impl From<EcnField> for DcqcnLoggedEcnField {
-    fn from(field: EcnField) -> Self {
-        match field {
-            EcnField::NotEct => DcqcnLoggedEcnField::NotEct,
-            EcnField::Ect0 => DcqcnLoggedEcnField::Ect0,
-            EcnField::Ect1 => DcqcnLoggedEcnField::Ect1,
-            EcnField::Ce => DcqcnLoggedEcnField::Ce,
-        }
-    }
-}
-
-#[cfg(all(feature = "lean", feature = "dcqcn"))]
 #[derive(Clone, Debug, Serialize)]
 pub struct DcqcnEventRow {
     pub time_ns: u64,
@@ -168,18 +240,6 @@ pub enum AqmLoggedEcnField {
     Ect0,
     Ect1,
     Ce,
-}
-
-#[cfg(feature = "lean")]
-impl From<EcnField> for AqmLoggedEcnField {
-    fn from(field: EcnField) -> Self {
-        match field {
-            EcnField::NotEct => AqmLoggedEcnField::NotEct,
-            EcnField::Ect0 => AqmLoggedEcnField::Ect0,
-            EcnField::Ect1 => AqmLoggedEcnField::Ect1,
-            EcnField::Ce => AqmLoggedEcnField::Ce,
-        }
-    }
 }
 
 #[cfg(feature = "lean")]
@@ -290,6 +350,7 @@ static NEXT_PFC_FRAME_ID: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Debug)]
 pub enum Report {
     PacketSourceReport(PacketSourceReport),
+    TcpMetricsReport(TcpMetricsReport),
     SchedulerReport(SchedulerReport),
     PacketSinkReport(PacketSinkReport),
     #[cfg(feature = "l2_pfc")]
@@ -314,10 +375,58 @@ pub enum ReportTiming {
     Final,
 }
 
+/// Constant-size correctness counters used by legacy non-regression gates.
+#[cfg(feature = "test")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CorrectnessSnapshot {
+    pub source_rows: usize,
+    pub sink_rows: usize,
+    pub sent_packets: u128,
+    pub sent_bytes: u128,
+    pub received_packets: u128,
+    pub received_bytes: u128,
+    pub tcp_metrics_rows: usize,
+    pub completed_tcp_flows: usize,
+    pub tcp_demand_bytes: u128,
+    pub tcp_acked_bytes: u128,
+    pub tcp_outstanding_bytes: u128,
+    pub tcp_pending_timeouts: u128,
+    pub tcp_cancelled_timers: usize,
+}
+
+#[cfg(feature = "test")]
+impl CorrectnessSnapshot {
+    fn record(&mut self, report: &Report) {
+        match report {
+            Report::PacketSourceReport(report) => {
+                self.source_rows += 1;
+                self.sent_packets += report.sent_packets as u128;
+                self.sent_bytes += report.packet_sizes as u128;
+            }
+            Report::PacketSinkReport(report) => {
+                self.sink_rows += 1;
+                self.received_packets += report.received_packets as u128;
+                self.received_bytes += report.received_sizes as u128;
+            }
+            Report::TcpMetricsReport(report) => {
+                self.tcp_metrics_rows += 1;
+                self.completed_tcp_flows += usize::from(report.completed);
+                self.tcp_demand_bytes += report.original_bytes as u128;
+                self.tcp_acked_bytes += report.acked_bytes as u128;
+                self.tcp_outstanding_bytes += report.outstanding_bytes as u128;
+                self.tcp_pending_timeouts += report.pending_timeouts as u128;
+                self.tcp_cancelled_timers += usize::from(report.timer_cancelled);
+            }
+            _ => {}
+        }
+    }
+}
+
 // Shared state structure
 #[derive(Default, Debug)]
 struct SharedState {
     source_reports: Vec<PacketSourceReport>,
+    tcp_metrics_reports: Vec<TcpMetricsReport>,
     scheduler_reports: Vec<SchedulerReport>,
     sink_reports: Vec<PacketSinkReport>,
     #[cfg(feature = "l2_pfc")]
@@ -335,11 +444,14 @@ struct SharedState {
     #[cfg(feature = "lean")]
     aqm_events: Vec<AqmEventRow>,
     total_delay: f64,
+    #[cfg(feature = "test")]
+    correctness: CorrectnessSnapshot,
 }
 
 /// Enum to represent the type of log element
 enum ElementType {
     Source,
+    TcpMetrics,
     Scheduler,
     Sink,
     #[cfg(feature = "l2_pfc")]
@@ -363,6 +475,7 @@ pub struct CsvLogger {
     max_log_len: usize,
     log_path: OnceLock<String>,
     report_interval: OnceLock<f64>,
+    csv_logging: OnceLock<bool>,
     // Shared state protected by locks
     shared_state: Arc<RwLock<SharedState>>,
     total_packets: Arc<AtomicUsize>,
@@ -381,6 +494,7 @@ impl CsvLogger {
             max_log_len: 10000,
             log_path: OnceLock::new(),
             report_interval: OnceLock::new(),
+            csv_logging: OnceLock::new(),
             shared_state: Arc::new(RwLock::new(SharedState::default())),
             total_packets: Arc::new(AtomicUsize::new(0)),
         }
@@ -408,6 +522,9 @@ impl CsvLogger {
         self.report_interval
             .set(f64::MAX)
             .map_err(|_| "The report interval has already been set.".to_string())?;
+        self.csv_logging
+            .set(true)
+            .map_err(|_| "CSV logging has already been configured.".to_string())?;
 
         self.init_output_files(&log_path)
             .expect("Error initializing output files.");
@@ -433,8 +550,14 @@ impl CsvLogger {
         self.report_interval
             .set(log_config.report_interval.unwrap_or(f64::MAX))
             .map_err(|_| "The report interval has already been set.".to_string())?;
+        let csv_logging = log_config.csv_logging.unwrap_or(true);
+        self.csv_logging
+            .set(csv_logging)
+            .map_err(|_| "CSV logging has already been configured.".to_string())?;
 
-        self.init_output_files(&log_path)?;
+        if csv_logging {
+            self.init_output_files(&log_path)?;
+        }
 
         Ok(())
     }
@@ -464,7 +587,7 @@ impl CsvLogger {
         for element in elements {
             let file_name = format!("{}{}.csv", log_path, element);
             if let Err(e) = fs::File::create(&file_name) {
-                return Err(format!("Error creating log file {}: {}", &file_name, e));
+                return Err(format!("Error creating log file {}: {}", file_name, e));
             }
         }
 
@@ -480,6 +603,10 @@ impl CsvLogger {
     /// Retrieves the report interval.
     pub fn get_report_interval(&self) -> f64 {
         *self.report_interval.get().unwrap_or(&f64::MAX)
+    }
+
+    fn csv_logging_enabled(&self) -> bool {
+        self.csv_logging.get().copied().unwrap_or(true)
     }
 
     #[cfg(all(feature = "lean", feature = "dcqcn"))]
@@ -521,9 +648,24 @@ impl CsvLogger {
         // Acquire the lock to modify shared state
         let mut state = self.shared_state.write();
 
+        #[cfg(feature = "test")]
+        state.correctness.record(&report);
+
+        if !self.csv_logging_enabled() {
+            if let Report::PacketSinkReport(report) = report {
+                self.total_packets
+                    .fetch_add(report.received_packets, Ordering::SeqCst);
+                state.total_delay += report.one_way_delay_mean * report.received_packets as f64;
+            }
+            return;
+        }
+
         match report {
             Report::PacketSourceReport(report) => {
                 state.source_reports.push(report);
+            }
+            Report::TcpMetricsReport(report) => {
+                state.tcp_metrics_reports.push(report);
             }
             Report::SchedulerReport(report) => {
                 state.scheduler_reports.push(report);
@@ -592,8 +734,13 @@ impl CsvLogger {
     where
         T: Serialize,
     {
+        if !self.csv_logging_enabled() {
+            return Ok(());
+        }
+
         let csv_file_name = match element {
             ElementType::Source => format!("{}sources.csv", self.log_path.get().unwrap()),
+            ElementType::TcpMetrics => format!("{}tcp_metrics.csv", self.log_path.get().unwrap()),
             ElementType::Scheduler => format!("{}switches.csv", self.log_path.get().unwrap()),
             ElementType::Sink => format!("{}sinks.csv", self.log_path.get().unwrap()),
             #[cfg(feature = "l2_pfc")]
@@ -615,6 +762,7 @@ impl CsvLogger {
         };
 
         let csv_file = fs::OpenOptions::new()
+            .create(true)
             .append(true)
             .open(&csv_file_name)
             .map_err(|e| format!("Failed to open {}: {}", csv_file_name, e))?;
@@ -656,6 +804,11 @@ impl CsvLogger {
         total_packets_sent
     }
 
+    #[cfg(feature = "test")]
+    pub fn correctness_snapshot(&self) -> CorrectnessSnapshot {
+        self.shared_state.read().correctness
+    }
+
     /// Computes sink statistics from sink reports.
     fn compute_sink_statistics(reports: &[PacketSinkReport]) -> (usize, f64) {
         let total_packets = reports
@@ -673,6 +826,10 @@ impl CsvLogger {
 
     /// Checks if reports exceed the maximum log length and flushes them if necessary.
     fn check_and_flush_reports(&self) {
+        if !self.csv_logging_enabled() {
+            return;
+        }
+
         // Acquire the lock to modify shared state
         let mut state = self.shared_state.write();
 
@@ -681,6 +838,13 @@ impl CsvLogger {
             let reports = std::mem::take(&mut state.source_reports);
             if let Err(e) = self.write_to_csv(ElementType::Source, &reports) {
                 eprintln!("Error writing source reports to CSV: {}", e);
+            }
+        }
+
+        if state.tcp_metrics_reports.len() >= self.max_log_len {
+            let reports = std::mem::take(&mut state.tcp_metrics_reports);
+            if let Err(e) = self.write_to_csv(ElementType::TcpMetrics, &reports) {
+                eprintln!("Error writing TCP metrics to CSV: {e}");
             }
         }
 
@@ -772,6 +936,12 @@ impl CsvLogger {
                 .expect("Error writing source reports to CSV");
         }
 
+        if !state.tcp_metrics_reports.is_empty() {
+            let reports = std::mem::take(&mut state.tcp_metrics_reports);
+            self.write_to_csv(ElementType::TcpMetrics, &reports)
+                .expect("Error writing TCP metrics to CSV");
+        }
+
         // Write remaining scheduler reports
         if !state.scheduler_reports.is_empty() {
             let reports = std::mem::take(&mut state.scheduler_reports);
@@ -852,8 +1022,10 @@ impl CsvLogger {
 
         drop(state);
 
-        if let Err(e) = self.write_trace_manifest_v1() {
-            log::warn!("{e}");
+        if self.csv_logging_enabled() {
+            if let Err(e) = self.write_trace_manifest_v1() {
+                log::warn!("{e}");
+            }
         }
     }
 
@@ -926,5 +1098,73 @@ mod tests {
         let (packets, delay) = CsvLogger::compute_sink_statistics(&reports);
         assert_eq!(packets, 5);
         assert!((delay - 9.0).abs() <= 1e-12);
+    }
+
+    #[cfg(feature = "test")]
+    #[test]
+    fn disabled_csv_logging_drops_reports_without_files_or_vector_growth() {
+        let directory = tempfile::tempdir().expect("temporary logger test");
+        let log_path = directory.path().join("must-stay-absent");
+        let config_path = directory.path().join("disabled.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "log_path = \"{}\"\ncsv_logging = false\nreport_interval = 1.0\n",
+                log_path.display()
+            ),
+        )
+        .expect("write disabled logger config");
+
+        let logger = CsvLogger::new();
+        logger
+            .init_from_config(config_path.to_str().expect("UTF-8 config path"))
+            .expect("initialize disabled logger");
+        assert!(!log_path.exists(), "disabled init must not create log_path");
+
+        for index in 0..(logger.max_log_len * 2 + 1) {
+            let timing = if index % 2 == 0 {
+                ReportTiming::InProgress
+            } else {
+                ReportTiming::Final
+            };
+            logger.log_report_inner(
+                Report::PacketSourceReport(PacketSourceReport {
+                    sent_packets: 2,
+                    packet_sizes: 2000,
+                    ..PacketSourceReport::default()
+                }),
+                timing,
+            );
+            logger.log_report_inner(
+                Report::PacketSinkReport(PacketSinkReport {
+                    received_packets: 2,
+                    received_sizes: 2000,
+                    one_way_delay_mean: 0.5,
+                    ..PacketSinkReport::default()
+                }),
+                timing,
+            );
+        }
+
+        let state = logger.shared_state.read();
+        assert!(state.source_reports.is_empty());
+        assert!(state.tcp_metrics_reports.is_empty());
+        assert!(state.scheduler_reports.is_empty());
+        assert!(state.sink_reports.is_empty());
+        drop(state);
+
+        let rows = logger.max_log_len * 2 + 1;
+        let snapshot = logger.correctness_snapshot();
+        assert_eq!(snapshot.source_rows, rows);
+        assert_eq!(snapshot.sink_rows, rows);
+        assert_eq!(snapshot.sent_packets, (rows * 2) as u128);
+        assert_eq!(snapshot.received_packets, (rows * 2) as u128);
+
+        logger.flush_reports();
+        assert_eq!(logger.total_packets.load(Ordering::SeqCst), rows * 2);
+        assert!(
+            !log_path.exists(),
+            "disabled threshold/final flush and manifest must perform no log-path I/O"
+        );
     }
 }

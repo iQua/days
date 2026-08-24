@@ -1,0 +1,79 @@
+---
+title: Exact Executor
+description: Implemented model coverage, safe-horizon execution, and backend capabilities.
+---
+
+The exact executor is implemented alongside the legacy Nexosim engine. `src/scenario/compile.rs` lowers supported TOML scenarios into `SimulationImage`; callers then select scalar, CPU, Metal, or CUDA explicitly.
+
+## Compiled model
+
+The current image supports:
+
+- static FatTree, Torus, Dragonfly, and custom topologies
+- one LP per host and one LP per switch egress queue
+- integer nanosecond time with no timestamp quantization
+- FIFO, strict priority, WFQ, DRR, and WRR scheduling
+- TailDrop, RED, RED with ECN, and ECN-threshold admission
+- constant-rate, non-preemptive links with uniform or tiered propagation
+- deterministic packet-distribution traffic, TCP Reno/CUBIC, and DCQCN
+- exact PFC per-priority pause state
+- RingAllReduce and AllGather over deterministic, byte-terminated packet-distribution traffic
+- shortest-path and semantic `FatTreeEcmp` routing
+
+Exact lowering retains host attachment LPs. Each host has an unbounded injection stage toward its switch and a bounded delivery queue in the reverse direction. The compiler assigns stable semantic node, link, flow, and payload IDs before constructing initial state and events.
+
+The image has a closed set of model and event kinds. Runtime callbacks, dynamic LP migration, multi-device placement, and automatic backend selection are not part of the contract.
+
+## Execution paths
+
+Global scalar uses one canonical event calendar and accepts zero-delay channels. The other paths use conservative safe-horizon rounds:
+
+- **Round scalar** is the single-threaded per-LP reference.
+- **CPU** uses persistent workers with static whole-LP ownership and barrier exchange.
+- **Metal and CUDA** execute the same LP/event contract from bounded device arenas.
+
+At each round, the executor finds the global frontier, adds the minimum channel lookahead, drains events below that exclusive horizon, canonically sorts remote outboxes, and merges them at the barrier. No parallel path speculates beyond the safe horizon.
+
+## Backend capability matrix
+
+| Capability | Scalar | CPU | Metal | CUDA |
+| --- | --- | --- | --- | --- |
+| FIFO, strict priority, WFQ, DRR, WRR | Yes | Yes | Yes | Yes |
+| TailDrop, ECN threshold | Yes | Yes | Yes | Yes |
+| RED, RED with ECN | Yes | Yes | Rejected | Rejected |
+| TCP Reno, TCP CUBIC | Yes | Yes | Yes | Yes |
+| PFC | Yes | Yes | Rejected | Rejected |
+| DCQCN | Yes | Yes | Rejected | Rejected |
+| Collective generators | Yes | Yes | Rejected | Rejected |
+| Zero-delay channels | Yes | Rejected | Rejected | Rejected |
+
+Metal and CUDA use checked 320-bit rational components for WFQ. Validation checks checkpoint widths and static weight bounds; runtime arithmetic faults rather than committing an overflowing result. Scalar and CPU use unbounded `BigUint` rational arithmetic.
+
+Device `RunResult` values contain the canonical state and measurement surface. Scalar and CPU can retain diagnostic-only observation planes; Metal and CUDA omit them. Byte comparisons normalize those reference-only fields first.
+
+## Device planning, retry, and readback
+
+The Metal and CUDA planners derive all arena sizes before a kernel attempt. Large record arenas are striped by their owning LP, stream, receiver class, or flow. Plane-wide and per-entity caps remain explicit and are checked before use.
+
+Capacity overflow is refuse-or-run: a failed attempt emits no partial result. The host records the reported demand, raises only the relevant capacity floor, replans, and retries up to `max_capacity_retries`. A successful run returns the converged floors as `CapacityWarmStart`.
+
+`CapacityWarmStart` is a sizing hint for a later run of the same image. It can skip known failed plans. It contains no simulated state, checkpoint, or device cache.
+
+Metal and CUDA plan readback after execution. They copy fixed planes directly. For variable striped arenas, they read metadata and run a gather kernel that copies live records in canonical entity and ring order. Invalid metadata returns an error, and compact readback decodes to the same bytes as full-capacity readback.
+
+The shipped `configs/benchmarks/p11/rq9_frontier_closed_k32.toml` fixture defines 32 groups of 8,192 resident flows, or 262,144 flows. `src/bin/t20f_frontier.rs` runs and fingerprints the frontier result for scalar and available device backends. The CUDA build contains device images for `sm_89` and `sm_121`.
+
+## Rejection boundaries
+
+Each layer reports errors once it has enough information:
+
+| Boundary | Examples |
+| --- | --- |
+| Scenario compilation | Nonzero `time_quantum_ns`; VirtualClock; BBR; unsupported flow dependencies or explicit per-flow routes; unsupported pairing/collective form |
+| Backend validation | Device RED, PFC, DCQCN, or collective state; zero-lookahead parallel channel; invalid device WFQ width |
+| Device planning | Arithmetic/memory-size overflow or an invalid arena layout |
+| Device attempt and retry | Capacity demand beyond the current plan or configured cap, invalid readback metadata, or checked arithmetic overflow |
+
+Compilation and validation errors name the rejected field, mechanism, or backend and, for device-only gaps, direct callers to scalar or CPU. Unsupported configuration is never silently ignored.
+
+See [/docs/internals](/docs/internals) for the code-level round, capacity, warm-start, and compaction paths.

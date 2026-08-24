@@ -1,30 +1,28 @@
 ---
 title: leanguard-run
-description: Run Days, discover trace files, and invoke LeanGuard checkers.
+description: Generate or discover legacy trace CSVs and invoke LeanGuard checkers.
 ---
 
-`leanguard-run` is the orchestration binary for **trace-certificate checking**:
+`leanguard-run` optionally launches the separately built legacy `days` binary,
+discovers nonempty certificate CSVs, invokes matching Lean executables, and
+prints one `RunSummaryV1` JSON document.
 
-- (optionally) runs Days on a config
-- discovers which `*_events.csv` traces were produced
-- runs the matching LeanGuard checker executables
-- prints a machine-readable JSON summary to stdout
-
-Source: `days/src/bin/leanguard-run.rs`
-
-## Basic usage
+## Build and run
 
 ```bash
-# Build the Lean checkers once
 cd lean && lake build && cd ..
-
-# Run simulation + checkers
-cargo run --bin leanguard-run -- \
+cargo build -p days-legacy --features dcqcn,l2_pfc,lean --bin days
+cargo run --features dcqcn,l2_pfc,lean --bin leanguard-run -- \
   --config configs/dcqcn_simple.toml \
+  --legacy-runner target/debug/days \
   --checker-dir lean/.lake/build/bin
 ```
 
-Re-check an existing run directory (no simulation rerun):
+The scenario must leave `csv_logging` enabled. With `csv_logging=false`, the
+legacy run creates no CSVs or `traces.json`, so there are no certificates to
+discover.
+
+Check an existing log directory without rerunning the simulator:
 
 ```bash
 cargo run --bin leanguard-run -- \
@@ -35,41 +33,30 @@ cargo run --bin leanguard-run -- \
 
 ## Flags
 
-- `--config <path>` (**required**)
-- `--mode <simulate-and-check|check-only>` (default: `simulate-and-check`)
-- `--checker-dir <path>` (default: `lean/.lake/build/bin`)
-- `--allow-nondeterministic` (default: false)
-  - Refuses to run when the config contains `threading = "multiple"` unless this flag is set.
-- `--coverage` (default: false)
-  - Enable semantic coverage collection (if supported by the checker binaries).
-- `--coverage-dir <path>` (optional)
-  - If set (or if `--coverage` is set), `leanguard-run` writes per-checker coverage files under this directory.
-  - Default when coverage is enabled: `<log_path>/coverage/`
+- `--config <path>`: required TOML path; `log_path` is read from it.
+- `--mode <simulate-and-check|check-only>`: default `simulate-and-check`.
+- `--checker-dir <path>`: default `lean/.lake/build/bin`.
+- `--legacy-runner <path>`: explicit legacy trace generator. If omitted, the
+  runner checks `DAYS_LEGACY_RUNNER`, then a sibling `days` executable.
+- `--allow-nondeterministic`: permit `threading="multiple"`; otherwise that
+  simulation mode is refused.
+- `--coverage` and `--coverage-dir <path>`: request checker coverpoints and
+  include their union/per-checker sets in the JSON summary.
 
-When coverage is enabled, `leanguard-run` passes a `--coverage-out <file>` argument to each checker and reads the resulting JSON coverage list back into the final run summary (`coverage.union` and `coverage.per_checker`).
+## Discovery and checker selection
 
-## How traces are discovered
-
-`leanguard-run` prefers the trace manifest written by Days at:
-
-- `<log_path>/traces.json`
-
-If the manifest is missing or invalid, it falls back to scanning for known filenames such as `pfc_events.csv`, `dcqcn_events.csv`, etc.
-
-See [/docs/reference/traces/manifest](/docs/reference/traces/manifest).
+The runner prefers `<log_path>/traces.json`, then scans for nonempty PFC, AQM,
+DCQCN, WFQ, DRR, CUBIC, and TCP event files. It selects `pfc_check`,
+`aqm_check`, `dcqcn_check`, `wfq_check`, `drr_check`, `cubic_check`, or
+`tcp_check`; when both AQM and DCQCN exist it also runs `aqm_dcqcn_check`.
 
 ## Output and exit codes
 
-`leanguard-run` always prints a JSON document (RunSummaryV1) to stdout.
+`RunSummaryV1` includes version/mode, config and log paths, determinism status,
+simulator status/error, trace-discovery mode/list, checker results, optional
+coverage, and final `accept`.
 
-- exit code `0`: overall `accept=true`
-- exit code `1`: `accept=false` (some checker rejected / simulation failed)
-
-The JSON summary includes (among other fields):
-
-- `days`: `ok|panic|error|skipped`
-- `checker_results[]`: one entry per invoked checker
-- `coverage` (optional)
-- `accept`: final boolean
-
-This makes it suitable for CI pipelines.
+- `0`: `accept=true`.
+- `1`: the simulation/checking workflow completed but did not accept.
+- `2`: input/refusal/discovery failure, such as invalid config, refused
+  multithreading, or no trace in check-only mode.
