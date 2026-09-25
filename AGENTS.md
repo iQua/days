@@ -1,6 +1,21 @@
 # Description
 
-In this project, a new discrete-event network simulator, called Days, has been implemented. It uses process-based simulation, and models each process to be simulated as a coroutine in Rust.
+Days is an exact, parallel discrete-event network simulator. Its executor,
+Days AGO, compiles a TOML scenario into a simulation image, splits the network
+into logical processes, and advances them concurrently in rounds bounded by a
+safe horizon; Lean proofs (`lean/DaysExecutor/`) show round execution reaches
+the serial result. Four backends (Scalar, CPU,
+Metal, CUDA) must produce byte-identical complete state for every scenario
+they accept. The original actor-model simulator (Nexosim coroutines) is frozen
+in `legacy/`.
+
+Standing invariants for any change:
+- Byte identity with the Scalar oracle on every backend that runs a model;
+  a backend that cannot run a model rejects it at validation, never falls back
+  silently.
+- No shared mutable state between logical processes: communication is by
+  events (messages); no mutexes in simulation paths.
+- Evidence and measurement records live in the separate days-gpu repository.
 
 # Repository Guidelines
 
@@ -10,14 +25,12 @@ In this project, a new discrete-event network simulator, called Days, has been i
 - `legacy/src/main.rs` is the legacy CLI entry point; `src/lib.rs` exposes shared/current APIs.
 - `tests/`, `legacy/tests/`, and `validation/tests/` hold current, legacy, and cross-engine integration tests respectively.
 - `configs/` stores example simulation configs; `legacy/examples/` and the documentation show runnable scenarios.
-- `docs/` contains the MkDocs site (`docs/mkdocs.yml`, content under `docs/docs/`, e.g. `docs/docs/design-notes/l2.md`).
+- `docs/` contains the Fumadocs site (Vite + bun; content under `docs/content/docs/`).
 - `logs/` and `target/` are generated artifacts and should stay uncommitted.
 
 ## Build, Test, and Development Commands
-- `cargo build -p days-legacy` builds the legacy simulator.
-- `cargo build -p days-legacy --features l2,l2_pfc` enables legacy L2/PFC support (still controlled by config at runtime).
-- `cargo run --release -p days-legacy --bin days -- configs/simple.toml` runs a sample simulation from the repo.
-- `RUST_LOG=debug days configs/simple.toml` runs the installed binary with verbose logging.
+- `cargo run --release --example scalar_benchmark -- <config.toml>` runs the Scalar oracle; `--example round_benchmark -- <config.toml> --workers N` runs the CPU executor; `cargo run --release --features metal-spike --bin t20f_frontier -- <config.toml> --engine device` runs on Metal (`--features cuda` on NVIDIA). See `README.md`.
+- `cargo run --release -p days-legacy --bin days -- configs/simple.toml` runs the frozen legacy simulator (`--features l2,l2_pfc` for its L2/PFC support).
 - `cargo fmt --all` formats Rust code. Run Clippy with warnings denied for executor default (`cargo clippy -p days-executor -- -D warnings`), executor Metal (`cargo clippy -p days-executor --features metal-spike -- -D warnings`), the LeanGuard runner (`cargo clippy --bin leanguard-run -- -D warnings`), and the shared/current Metal surface (`cargo clippy --features test,metal-spike -- -D warnings`).
 - The four-package default matrix in `README.md` runs executor, shared/current, legacy, and validation tests.
 - `cargo nextest run --workspace --all-features --no-capture` is the preferred faster test runner if installed.
