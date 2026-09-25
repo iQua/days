@@ -241,7 +241,7 @@ fn main() {
     if matches!(cli.mode, Mode::SimulateAndCheck) && summary.days != DaysStatus::Ok {
         if summary.days_error.is_some() && !required_features_hint.is_empty() {
             summary.days_error = Some(format!(
-                "{}\nHint: you may need to build Days with {}",
+                "{}\nHint: you may need to build days-legacy with {}",
                 summary.days_error.take().unwrap(),
                 required_features_hint
             ));

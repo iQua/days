@@ -27,6 +27,6 @@ retains four balanced-order samples and prints `workload=tcp rq=RQ9` on protocol
 summary records. Example:
 
 ```text
-cargo run --release --features metal-spike --bin sustained-benchmark -- configs/benchmarks/tcp/fattree_k16_tcp_reno_f1024.toml
+cargo run --release --features metal --bin sustained-benchmark -- configs/benchmarks/tcp/fattree_k16_tcp_reno_f1024.toml
 cargo run --release --features cuda --bin sustained-benchmark -- configs/benchmarks/tcp/fattree_k16_tcp_reno_f1024.toml
 ```
