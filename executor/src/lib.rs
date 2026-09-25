@@ -23,8 +23,6 @@ pub mod image;
 mod mechanism_trace;
 #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
 pub mod metal;
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-pub mod metal_spike;
 pub mod model;
 #[cfg(any(
     feature = "cuda",
@@ -46,8 +44,6 @@ pub use cpu::{
     LpExecutionTiming, LpWorkEstimate, StaticPartitionPolicy, WorkClass, WorkPartition,
     WorkerRoundTiming, run_cpu, run_cpu_with_observations,
 };
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-pub use cpu::{WindowedCpuRun, run_cpu_with_metrics_window};
 #[cfg(all(feature = "cuda", feature = "planner-test-hooks"))]
 #[doc(hidden)]
 pub use cuda::assert_cuda_planner_bit_equal_for_testing;
@@ -116,23 +112,14 @@ pub use metal::{
     MetalArena, MetalConfig, MetalError, MetalExecutor, MetalInitializationTimings,
     MetalMemoryLayout, MetalRun, run_metal, run_metal_with_observations,
 };
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-pub use metal_spike::{RealReplayTrace, ReplayStep, ReplayTraceCapture};
 pub use model::{
     DropMarkPolicy, DrrSchedulerState, EcnThresholdPolicy, ExactRational, NodeKind, QueueDepthUnit,
     RedPolicyState, SchedulerKind, TransitionHandler, WfqSchedulerState, WrrSchedulerState,
     resolve_transition,
 };
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-pub use safe_horizon::run_scalar_rounds_with_replay_trace;
 pub use safe_horizon::{
     LpRoundWork, RoundMetrics, ScalarRoundRun, run_scalar_rounds,
     run_scalar_rounds_with_observations,
-};
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-pub use safe_horizon::{
-    RoundMetricsWindow, RoundRunTotals, WindowedRunTotals, WindowedScalarRoundRun,
-    run_scalar_rounds_with_windowed_replay_trace,
 };
 pub use scalar::{
     AqmTransitionAction, AqmTransitionRecord, ArrivalDisposition, DiagnosticPlanes, ExecutionError,

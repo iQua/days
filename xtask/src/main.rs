@@ -21,7 +21,7 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "lib.rs",
         predicate: r#"all(feature = "metal-spike", target_vendor = "apple")"#,
-        count: 7,
+        count: 2,
         purpose: "Metal modules and public APIs require the Apple Metal toolchain",
     },
     AllowedFeatureGate {
@@ -89,24 +89,6 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
         predicate: r#"any(test, all(feature = "planner-test-hooks", feature = "cuda"), all(feature = "planner-test-hooks", feature = "metal-spike", target_vendor = "apple"))"#,
         count: 1,
         purpose: "exact production-layout reports exist only for the crate's own unit test and the two device planner probes (`cuda::size_cuda_plan_for_testing`, `metal::size_metal_plan_for_testing`), which are `planner-test-hooks` items inside `cuda` / `metal-spike` modules",
-    },
-    AllowedFeatureGate {
-        path: "cpu.rs",
-        predicate: r#"all(feature = "metal-spike", target_vendor = "apple")"#,
-        count: 9,
-        purpose: "CPU replay/window instrumentation consumed by the Apple Metal harness",
-    },
-    AllowedFeatureGate {
-        path: "safe_horizon.rs",
-        predicate: r#"all(feature = "metal-spike", target_vendor = "apple")"#,
-        count: 39,
-        purpose: "replay and window capture instrumentation for Apple Metal profiling",
-    },
-    AllowedFeatureGate {
-        path: "scalar.rs",
-        predicate: r#"all(feature = "metal-spike", target_vendor = "apple")"#,
-        count: 1,
-        purpose: "queue occupancy observation used by Apple Metal replay capture",
     },
     AllowedFeatureGate {
         path: "device_scheduler.rs",
