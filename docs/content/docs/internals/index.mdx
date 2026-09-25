@@ -3,27 +3,24 @@ title: Internals
 description: Exact-executor internals and the boundary with the legacy Nexosim engine.
 ---
 
-Days contains two execution stacks:
-
-- The **exact executor** compiles a scenario into a `SimulationImage` and runs it with the scalar, CPU, Metal, or CUDA backend. This is the current byte-identity and cross-backend verification path.
-- The **legacy executor** builds actor-like models on the vendored Nexosim runtime. Its internals are documented separately because its model, time, and scheduling APIs do not apply to the exact executor.
+**Scope: Days AGO.** This page covers the Days AGO executor, which compiles a scenario into a `SimulationImage` and runs it with the Scalar, CPU, Metal, or CUDA backend. The legacy Nexosim runtime is documented separately under [Legacy Days](/docs/legacy/nexosim) because its model, time, and scheduling APIs do not apply to Days AGO.
 
 <Cards>
-  <Card title="Exact executor map" href="#exact-executor-map" />
+  <Card title="Executor map" href="#executor-map" />
   <Card title="Nexosim legacy engine" href="/docs/legacy/nexosim" />
   <Card title="Architecture overview" href="/docs/architecture/overview" />
 </Cards>
 
-## Exact executor map
+## Executor map
 
-The exact path has four stages:
+The Days AGO path has four stages:
 
 1. `src/scenario/compile.rs` lowers supported configuration into a `SimulationImage` with stable semantic IDs.
 2. `executor/src/validate.rs` checks image invariants and rejects mechanisms that the selected backend cannot execute.
 3. One of `scalar.rs`, `safe_horizon.rs`, `cpu.rs`, `metal.rs`, or `cuda.rs` applies the shared transition semantics.
 4. The backend returns a normalized `RunResult` containing canonical final state and observations.
 
-The exact executor is an **LP executor**, not an actor runtime. A logical process (LP) owns one host or one switch egress queue. Events have fixed payloads and a canonical key ordered by `(time_ns, phase, origin_node, origin_seq)`; there are no callbacks in the event image. See `executor/src/image.rs` and `executor/src/event.rs`.
+Days AGO is an **LP executor**, not an actor runtime. A logical process (LP) owns one host or one switch egress queue. Events have fixed payloads and a canonical key ordered by `(time_ns, phase, origin_node, origin_seq)`; there are no callbacks in the event image. See `executor/src/image.rs` and `executor/src/event.rs`.
 
 ## Scalar and parallel execution
 
@@ -40,7 +37,7 @@ This rule is implemented in `executor/src/safe_horizon.rs`. A zero-delay channel
 
 ## Device planning and bounded arenas
 
-Metal and CUDA plan storage before launching kernels. `executor/src/device_sizing.rs` derives arena layouts from the compiled image, configured caps and floors, and the run boundary. Record arenas are striped by the entity that owns them—for example an LP, channel stream, TCP receiver class, or flow—so one busy entity does not force every row to use the same capacity.
+Metal and CUDA plan storage before launching kernels. `executor/src/device_sizing.rs` derives arena layouts from the compiled image, configured caps and floors, and the run boundary. Record arenas are striped by the entity that owns them (for example an LP, channel stream, TCP receiver class, or flow), so one busy entity does not force every row to use the same capacity.
 
 Device capacity is **refuse or run**. If a kernel reports that an arena is too small, that attempt produces no result. The host records the fault, raises the relevant plane, stream, class, or flow floor from the reported demand, rebuilds the plan, and retries up to the configured limit. Caps remain hard limits. The retry types and growth rules live in `executor/src/device_capacity.rs`.
 
@@ -59,10 +56,10 @@ event kind. The fallback record is 14 `u64` words, and each proven-monotone
 stream class stores a compact per-kind encoding: channel events in 11 words,
 generator events in 10, service events in 5, and remote staging records
 in 12. On the benchmark mix this roughly halves record traffic. The
-encodings are lossless by construction — every slim record decodes to the
-same bytes as its wide form, and the round-trip is a tested control — with
-the shared encoder in `executor/src/device_event_record.rs` and matching
-device-side codecs in both kernel files.
+encodings are lossless: every slim record decodes to the same bytes as its
+wide form, and a test checks the round trip. The shared encoder is in
+`executor/src/device_event_record.rs`, with matching device-side codecs in
+both kernel files.
 
 The drain kernels themselves carry three measured optimizations, selected
 per backend rather than assumed portable:
@@ -73,18 +70,19 @@ per backend rather than assumed portable:
   general paths are provably interchangeable (CUDA);
 - worklist compaction for the round's active-LP set (Metal and CUDA).
 
-Metal keeps only the compaction lever: the other two, profitable on
-NVIDIA hardware, measured as regressions on Apple GPUs and are compiled
-out there. The parallel launch width is likewise never chosen by the
-engine — it is a per-fixture parameter the measurement harness records
-beside each result (`--round-threads-per-block` on `t20f_frontier`), so a
-reported time always names the geometry that produced it.
+Metal keeps only worklist compaction. The other two optimizations,
+faster on NVIDIA hardware, measured as regressions on Apple GPUs and are
+compiled out there. The engine does not choose the parallel launch width
+either: it is a per-run parameter (`--round-threads-per-block` on the
+[`days` CLI](/docs/reference/cli/days)), and the `days_protocol` record
+prints the value used, so a reported time names the geometry that
+produced it.
 
 ## Backend capability validation
 
 `validate(image, backend)` runs before execution. Compilation may accept a mechanism that a particular backend then rejects deliberately.
 
-| Exact capability | Scalar | CPU | Metal | CUDA |
+| Capability | Scalar | CPU | Metal | CUDA |
 | --- | --- | --- | --- | --- |
 | FIFO, strict priority, WFQ, DRR, WRR | Yes | Yes | Yes | Yes |
 | TailDrop, ECN threshold | Yes | Yes | Yes | Yes |

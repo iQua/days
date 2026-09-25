@@ -3,7 +3,7 @@ title: Topology Build Pipeline
 description: How shared graph configuration becomes an exact image or legacy model graph.
 ---
 
-Both engines start with the shared topology builder, then diverge into different runtime representations.
+**Scope: Days AGO and Legacy Days.** Both engines start with the shared topology builder, then diverge into different runtime representations.
 
 ## 1. Build the shared graph
 
@@ -15,7 +15,7 @@ Both engines start with the shared topology builder, then diverge into different
 
 Supported inputs are FatTree, Torus, Dragonfly, and custom `edges`/`hosts` graphs. Host IDs are not assumed to be switch IDs; all flow pairing and routing resolves them through `HostAttachments`.
 
-## 2A. Compile an exact image
+## 2A. Compile a Days AGO image
 
 `compile_config` in `src/scenario/compile.rs` validates the exact-model vocabulary and creates stable semantic IDs. It lowers:
 
@@ -27,11 +27,11 @@ Supported inputs are FatTree, Torus, Dragonfly, and custom `edges`/`hosts` graph
 
 Exact scheduling supports FIFO, strict priority, WFQ, DRR, and WRR. The exact compiler rejects VirtualClock. Exact routing supports shortest path and `FatTreeEcmp`; the latter requires a canonical FatTree and derives a stable semantic flow hash rather than using construction order.
 
-Flow sets support `Random`, `SwitchOffsetHalf`, and `SameSwitchNext` pairing. Exact collectives support RingAllReduce and AllGather only with deterministic byte-terminated packet-distribution traffic.
+Flow sets support `Random`, `SwitchOffsetHalf`, and `SameSwitchNext` pairing. Days AGO collectives support RingAllReduce and AllGather only, with deterministic byte-terminated `PacketDistribution` traffic; see [Collectives](/docs/configuration/collectives).
 
 Callers pass the completed `SimulationImage` to `executor::validate(image, backend)`. Image invariants are backend-independent; capability checks then reject mechanisms not ported to the selected device.
 
-## 2B. Assemble legacy actors
+## 2B. Assemble Legacy Days actors
 
 The legacy CLI validates the complete TOML surface before `Topology::new` in `legacy/src/topos/topo.rs` assembles Nexosim models. It:
 
@@ -42,7 +42,7 @@ The legacy CLI validates the complete TOML surface before `Topology::new` in `le
 5. computes routes and installs forward and reverse FIB entries
 6. initializes the simulation, injects start events, runs to the stop time, and flushes enabled logs
 
-Legacy scheduling additionally supports VirtualClock. Legacy routing supports shortest path, per-flow ECMP, explicit paths, and the shared semantic `FatTreeEcmp` policy, subject to each policy's validation rules. Legacy collective expansion supports RingAllReduce.
+Legacy scheduling additionally supports VirtualClock. Legacy routing supports shortest path, per-flow ECMP, explicit paths, and the shared semantic `FatTreeEcmp` policy, subject to each policy's validation rules. Legacy collective expansion supports Broadcast, Gather, a fan-in AllReduce (Gather's endpoint pattern: many sources, one sink), and RingAllReduce.
 
 ## Host attachment and link stages
 

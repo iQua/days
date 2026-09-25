@@ -1,12 +1,12 @@
 ---
 title: Architecture Overview
-description: The shared scenario layer, exact LP executor, and legacy Nexosim actor engine.
+description: The shared scenario layer, the Days AGO LP executor, and the legacy Nexosim actor engine.
 ---
 
-Days has two simulation engines over a shared topology and configuration vocabulary:
+**Scope: Days AGO and Legacy Days.** The repository has two simulation engines over a shared topology and configuration vocabulary:
 
-- The **exact engine** compiles a scenario into fixed logical-process (LP) state and canonical events, then runs it on scalar, CPU, Metal, or CUDA.
-- The **legacy engine** instantiates actor-like Rust models on the vendored Nexosim runtime.
+- **Days AGO** (the exact engine) compiles a scenario into fixed logical-process (LP) state and canonical events, then runs it on Scalar, CPU, Metal, or CUDA.
+- **Legacy Days** instantiates actor-like Rust models on the vendored Nexosim runtime. It is frozen in `legacy/`; see [Legacy Days](/docs/legacy).
 
 “Actor” refers only to the legacy Nexosim models. Exact hosts and switch egress queues are LPs with explicit owned state; they are not coroutines or mailboxes.
 
@@ -35,7 +35,7 @@ flowchart LR
   ACTORS --> REPORTS[Statistics and optional CSV files]
 ```
 
-## Exact engine
+## Days AGO
 
 `src/scenario/compile.rs` lowers supported configuration into `executor::SimulationImage`. The image contains stable node, link, flow, and packet IDs; one LP for each host and switch egress queue; fixed event payloads; owned protocol state; and channel delay bounds.
 
@@ -43,7 +43,7 @@ Events use integer nanosecond time and a canonical `(time_ns, phase, origin_node
 
 See [/docs/architecture/executor-scope](/docs/architecture/executor-scope) for the implemented mechanism and backend matrix.
 
-## Legacy engine
+## Legacy Days
 
 `legacy/src/topos/topo.rs` creates Nexosim models and connects their typed ports and bounded mailboxes. Sources, sinks, switches, schedulers, optional wire/L2 stages, and the UI are stateful actor-like models.
 
