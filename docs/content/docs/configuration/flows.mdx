@@ -3,7 +3,7 @@ title: Flows
 description: Point-to-point traffic, routing, transport, and exact-lowering limits.
 ---
 
-Days accepts explicit `[[flow]]` entries and generated `[[flow_set]]` entries. The legacy actor runtime supports the full schema below. Exact lowering accepts a deterministic subset and returns a specific error for unsupported fields or mechanisms.
+**Scope: Days AGO and Legacy Days.** Days accepts explicit `[[flow]]` entries and generated `[[flow_set]]` entries. Legacy Days supports the full schema below. Days AGO accepts a deterministic subset and returns a specific error for unsupported fields or mechanisms.
 
 ## Explicit flow
 
@@ -121,7 +121,7 @@ Rates must satisfy `min_rate_gbps <= rate_gbps <= max_rate_gbps`. `g` and `mi_fa
 
 DCQCN sources emit ECN-capable data. Use `RED_ECN` or `ECN_THRESHOLD` to create CE feedback. Exact Scalar and CPU execute lowered DCQCN; Metal and CUDA reject its controller and CNP state planes before execution.
 
-## Exact-lowering field limits
+## Days AGO field limits
 
 Exact lowering rejects non-empty dependencies, explicit flow IDs, per-flow routing, and explicit paths. It derives scenario-local IDs and deterministic routes. Root `[routing]` remains available for `ShortestPath` and `FatTreeEcmp`.
 

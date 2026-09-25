@@ -1,16 +1,16 @@
 ---
 title: Link Layer (L2 / PFC)
-description: Legacy and exact PFC configuration with backend limits.
+description: Days AGO and legacy PFC configuration with backend limits.
 ---
 
-`link.mode` accepts `None` and `Pfc`:
+**Scope: Days AGO and Legacy Days.** `link.mode` accepts `None` and `Pfc`:
 
 ```toml
 [link]
 mode = "Pfc"
 ```
 
-`None` is the default. Legacy `Pfc` requires `cargo build -p days-legacy --features l2_pfc`. Exact Scalar and CPU support lowered PFC without that legacy feature; Metal and CUDA reject PFC before execution with a message directing you to Scalar or CPU.
+`None` is the default. Legacy `Pfc` requires `cargo build -p days-legacy --features l2_pfc`. Days AGO Scalar and CPU support lowered PFC without that legacy feature; Metal and CUDA reject PFC before execution with a message directing you to Scalar or CPU.
 
 ## Legacy PFC
 
@@ -39,9 +39,9 @@ Every vector must contain eight entries, one for each 802.1Q priority.
 
 The gate converts pause quanta to seconds as `pause_quanta * 512 / link_rate_bps`.
 
-## Exact PFC
+## Days AGO PFC
 
-Exact lowering requires `[link.pfc]` with eight-entry `xoff`, `xon`, and `buffer_capacity` arrays. It implements edge-triggered XOFF/XON. Omit `refresh_interval` and `drain_interval`, or set them to zero; nonzero timer values produce this rejection:
+Days AGO requires `[link.pfc]` with eight-entry `xoff`, `xon`, and `buffer_capacity` arrays. It implements edge-triggered XOFF/XON. Omit `refresh_interval` and `drain_interval`, or set them to zero; nonzero timer values produce this rejection:
 
 ```text
 PFC refresh/drain timers are outside the T25 executor mechanism; use edge-triggered XOFF/XON
