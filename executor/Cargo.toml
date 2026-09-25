@@ -1,0 +1,59 @@
+[package]
+name = "days-executor"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+
+[lib]
+name = "days_executor"
+
+[features]
+default = []
+cuda = ["dep:cudarc"]
+cuda-planner-test = ["cuda", "planner-test-hooks"]
+planner-test-hooks = []
+cuda-test-hooks = ["cuda", "planner-test-hooks"]
+metal-spike = [
+    "dep:cubecl",
+    "cubecl/metal-native",
+    "dep:cubecl-cpp",
+    "cubecl-cpp/metal",
+    "dep:objc2",
+    "dep:objc2-foundation",
+    "dep:objc2-metal",
+]
+metal-test-hooks = ["metal-spike", "planner-test-hooks"]
+
+[dependencies]
+crossbeam = "0.8.4"
+num-bigint = "0.4.8"
+num-rational = "0.4.2"
+cudarc = { version = "0.19.8", default-features = false, features = [
+    "std",
+    "driver",
+    "nvrtc",
+    "fallback-dynamic-loading",
+    "cuda-13000",
+], optional = true }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+cubecl = { version = "=0.11.0-pre.1", default-features = false, optional = true }
+cubecl-cpp = { version = "=0.11.0-pre.1", default-features = false, optional = true }
+objc2 = { version = "=0.6.4", default-features = false, features = ["std"], optional = true }
+objc2-foundation = { version = "=0.3.2", default-features = false, features = ["NSError", "NSString", "std"], optional = true }
+objc2-metal = { version = "=0.3.2", default-features = false, features = [
+    "MTLBuffer",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLCommandQueue",
+    "MTLComputeCommandEncoder",
+    "MTLComputePipeline",
+    "MTLDevice",
+    "MTLTypes",
+    "objc2-core-foundation",
+    "std",
+], optional = true }
+
+[[example]]
+name = "t13_metal_spike"
+required-features = ["metal-spike"]

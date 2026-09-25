@@ -1,17 +1,23 @@
 ---
 title: Conformance Verification (LeanGuard)
-description: Trace-certificate checking against executable Lean reference models.
+description: Trace-certificate checking and executable Lean models for both Days engines.
 ---
 
-Days ships with an optional Lean-based conformance checker suite called **LeanGuard**.
-LeanGuard is meant to answer a narrow, protocol-level question:
+Days ships a Lean 4 verification tree under `lean/`. It has two related surfaces:
 
-> Given a simulator-produced *per-transition event trace* (CSV), does every logged transition match an executable reference model?
+- **Legacy protocol certificates**: `days-legacy`, built with the `lean` Cargo feature, writes
+  `*_events.csv` files. LeanGuard canonicalizes and replays those traces.
+- **Exact executor certificates and proofs**: the current executor exposes exact-integer transition
+  records for TCP, AQM, DCQCN, PFC, schedulers, rate sources, and collectives. The P10c checkers
+  replay their CSV projections using the executor's complete `EventKey`, while `lean/DaysExecutor/`
+  formalizes the image, transition, safe-horizon, and round-execution model.
 
-If the trace is consistent with the model, the checker prints `ACCEPT`.
-Otherwise it prints `REJECT: ...` with the first failing row and a diagnostic.
+An accepted certificate means every recorded transition satisfies that checker's executable
+reference semantics. It does not, by itself, prove code that was not represented in the trace.
 
 This section covers:
 
-- [Use guide](/docs/verification/leanguard): how to emit traces from Days and run the Lean checkers.
-- [Design sketch](/docs/verification/design): how the trace-checking pipeline is structured and how to extend it to new protocols.
+- [Use guide](/docs/verification/leanguard): emit legacy traces, build the Lean targets, and run
+  legacy or exact-executor checkers.
+- [Design sketch](/docs/verification/design): canonical keys, replay contracts, and the separate
+  `DaysExecutor` theorem surface.

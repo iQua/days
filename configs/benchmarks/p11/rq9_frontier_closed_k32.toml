@@ -1,0 +1,453 @@
+# P11 T20a RQ9 FRONTIER rung, closed-loop arm (SELECTED).
+#
+# Topology, seed, propagation, port rate, switch capacity and stop time are IDENTICAL to the
+# canonical open frontier fixture configs/benchmarks/width_via_load_full/fattree_k32_load_90_sustained.toml.
+# Only the traffic model differs: fully closed-loop TCP Reno instead of open-loop packet
+# distribution. The 256-byte segment size matches the open arm's 256-byte packets, so the two arms
+# are packet-size-matched and the comparison isolates the closed loop rather than packet granularity.
+#
+# WIDTH CONTROL. A single flow_set may not exceed the 8,192 distinct source hosts, so additional
+# flows per host require stacked flow_sets. 32 stacked sets = 262,144 TCP flows = 32 per host and
+# yields 9,417.69 mean active LPs, 93.0% of the open arm's 10,131.95. See
+# raw/t20a-frontier-width-calibration-20260803.txt for the full width ladder and for why climbing
+# past this point was stopped.
+#
+# Transfers are sized so that no flow completes before the stop time, keeping the closed-loop
+# population resident for the whole measured window.
+seed = 13032
+duration = 0.001152
+threading = "single"
+log_path = "logs/p11/rq9_frontier_closed_k32"
+
+[topology]
+category = "FatTree"
+
+[topology.fat_tree]
+k = 32
+hosts_per_edge = 16
+
+[switch]
+port_rate = 100_000_000_000
+capacity = 1024
+weights = [1]
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link]
+propagation_ns = 1000
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 8192
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 16_777_216
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 256, high = 256 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"

@@ -1,70 +1,99 @@
 ---
-title: Trace-certificate checking (design)
-description: More formal design notes on canonicalize-and-replay, trust boundaries, and reusable obligations.
+title: Verification design
+description: The exact execution model, its proof surface, and the canonicalize-and-replay certificate design.
 ---
 
-If you are looking for a practical guide, start with:
+If you are looking for a practical guide, start with
+[/docs/verification/design](/docs/verification/design). This page covers
+three designs that are related but distinct: the exact engine's execution
+model and its Lean proof surface, and the trace-certificate machinery that
+checks protocols on both engines.
 
-- [/docs/verification/design](/docs/verification/design)
+## The exact execution model, mechanically
 
-## Workflow and trust boundary
+The exact engine's unit of state is the logical process (LP). Every event
+carries the key `(time_ns, phase, origin_node, origin_sequence)`: time
+first, then a phase that orders event kinds at equal times, then the
+creator's identity and per-origin sequence number. Keys are totally
+ordered, and canonical serial execution — repeatedly execute the least
+pending key — defines the reference semantics.
 
-LeanGuard follows an **untrusted producer / trusted checker** model:
+Parallel execution proceeds in **safe-horizon rounds**: each round computes
+a horizon from certified channel delay bounds, every active LP drains its
+own pending events below that half-open horizon in key order, remote events
+are exchanged at a barrier, and the exchange merges them canonically. The
+implementation lives in `executor/src/event.rs` and
+`executor/src/safe_horizon.rs`.
 
-- **Days** is an *untrusted* trace producer.
-- The **checker** (Lean executable + Lean kernel) is the trusted consumer.
+Terminology is deliberate throughout these docs: **actor / model / mailbox**
+describe the legacy Nexosim engine; **LP / image / event / transition**
+describe the exact executor. The exact engine is not an actor runtime — its
+protocols are compiled state machines over an immutable image.
 
-This dramatically shrinks the trusted computing base (TCB): you do not need to verify the simulator runtime (event queue, executor, parallel scheduling), only that the emitted trace certificate matches the reference semantics.
+## The proof surface
 
-## Canonical order is part of the specification
+Trace replay is not the only mechanized story. The `lean/DaysExecutor*`
+development proves five theorems about the execution machinery itself — the
+validity of the shipped horizon policy, serializability of each round and
+of whole runs, the service-start discipline those equalities require (with
+executable countermodels showing each clause necessary), and the
+intra-round reordering license that lets device backends batch work. An
+audit driver checks that every declaration these theorems reach rests only
+on Lean's three standard axioms.
 
-Trace rows can be emitted in a nondeterministic file order due to concurrency, buffering, or parallel execution.
+## Trace certificates: workflow and trust boundary
 
-LeanGuard therefore defines acceptance over a **canonicalized** trace:
+LeanGuard follows an **untrusted producer / trusted checker** model: Days
+(either engine) is an untrusted trace producer; the checker (Lean
+executable + Lean kernel) is the trusted consumer. This shrinks the trusted
+computing base: you do not need to verify the simulator runtime, only that
+the emitted certificate matches the reference semantics.
 
-- Each row has a deterministic key.
-- Rows are sorted by the key.
-- Duplicate keys are rejected.
+## Canonical order is part of the specification — two lineages
 
-In the current Days tooling, the canonical key is `(time_ns, event_id)`.
+Trace rows can be emitted in nondeterministic file order due to
+concurrency and buffering, so acceptance is defined over a canonicalized
+trace. The canonical key differs by lineage:
+
+- **Legacy protocol families** sort rows by `(time_ns, event_id)` and
+  reject duplicate keys. Canonicalization costs `O(n log n)` before the
+  linear replay.
+- **Exact-engine (P10c) families** key on the full `EventKey`
+  `(time_ns, phase, origin_node, origin_sequence)`; several strict-order
+  checkers require the trace to arrive already in canonical order and
+  reject otherwise, so the sort-based cost model does not apply to them.
 
 See also: [/docs/reference/traces/schema](/docs/reference/traces/schema).
 
 ## Trace certificate contract
 
-A trace family is designed to be a **self-contained replay certificate**:
+A trace family is a **self-contained replay certificate**: each semantic
+transition point emits exactly one row containing enough information to
+deterministically replay that transition and, when applicable, compare the
+checker-computed post-state to a logged snapshot. A row carries:
 
-Each semantic transition point emits exactly one row containing enough information to deterministically replay that transition, and (when applicable) compare the checker-computed post-state to a logged post-state snapshot.
+- **When/where**: simulation time and stable component identity.
+- **What happened**: an event kind selecting the transition rule.
+- **Guards and parameters**: values needed to evaluate gates/thresholds;
+  the checker rejects parameter drift.
+- **Witness/snapshot**: a compact legality witness, or an explicit
+  post-state snapshot for deterministic replay.
 
-Concretely, a row should contain:
-
-- **When/where**: simulation time and stable component identity (endpoint/port/scheduler instance).
-- **What happened**: an event kind (`kind`) selecting the transition rule.
-- **Guards and parameters**: values needed to evaluate gates/thresholds; the checker rejects parameter drift.
-- **Witness/snapshot**:
-  - either a compact witness that the chosen action is legal,
-  - or an explicit snapshot of post-state needed for deterministic replay.
-
-## Acceptance by canonicalize-and-replay
-
-At a high level:
-
-1. Parse rows (and keep original CSV line numbers for diagnostics).
-2. Canonicalize by sorting on the key and rejecting duplicates.
-3. Fold a partial `step` function over the canonicalized rows.
-4. Return `ACCEPT` if every step succeeds; otherwise `REJECT` with the first failing row.
-
-This yields linear-time replay after the sort (`O(n log n)` canonicalization + `O(n)` replay).
+Acceptance is canonicalize-and-replay: parse (keeping line numbers for
+diagnostics), canonicalize per the family's lineage, fold a partial `step`
+function, and return `ACCEPT` or `REJECT` with the first failing row.
 
 ## Reusable obligation patterns
 
-Across protocol families, the same classes of obligations recur. In the paper’s terminology, these are reusable combinators/templates:
+Across protocol families the same obligation classes recur, and they are
+what make new checkers cheap to add:
 
-- **ParamFreeze**: record per-component parameters on first use; reject mismatches later.
-- **MonotoneTime**: enforce per-component time monotonicity under canonical order.
-- **PendingMatch**: maintain pending maps for paired events (send/recv, enqueue/dequeue).
-- **Gate**: enforce interval/cooldown/refresh/epoch gating rules.
-- **Accounting**: enforce nonnegativity and conservation for counters (queue occupancy, credits, etc.).
-- **SnapshotEq**: recompute post-state under explicit encodings and compare to logged snapshot.
-
-These patterns are what make it feasible to add new checkers with relatively little duplicated structure.
+- **ParamFreeze**: record per-component parameters on first use; reject
+  later mismatches.
+- **MonotoneTime**: per-component time monotonicity under canonical order.
+- **PendingMatch**: pending maps for paired events (send/recv,
+  enqueue/dequeue).
+- **Gate**: interval/cooldown/refresh/epoch gating rules.
+- **Accounting**: nonnegativity and conservation for counters.
+- **SnapshotEq**: recompute post-state under explicit encodings and compare
+  to the logged snapshot.

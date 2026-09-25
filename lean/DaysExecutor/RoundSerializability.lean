@@ -1,0 +1,101 @@
+import DaysExecutor.ExecutionCanonical
+import DaysExecutor.Statements
+
+namespace DaysExecutor
+
+/--
+Internal strengthening of F2: the serial endpoint retains exact owner provenance and allocation
+ghosts, so a later round can be replayed from it.
+-/
+theorem roundSerializabilityOverCut_strong
+    (image : SimulationImage State)
+    (transition : TransitionRelation State) :
+    AcceptedModel image transition →
+    ∀ bounds cut start drainedEvents finish,
+      SafeHorizonRound image transition bounds cut
+        start drainedEvents finish →
+      ∃ serialOrder serialFinish,
+        CanonicalSerialRestricted image transition cut
+          start.machine serialOrder serialFinish ∧
+        (∀ event, event ∈ serialOrder ↔ event ∈ drainedEvents) ∧
+        StrongMachineReplay image serialFinish finish.machine := by
+  intro haccepted bounds cut start drainedEvents finish hround
+  rcases haccepted with
+    ⟨⟨hunique, _, _, _, _, _, _, _, _, horacle, _, _, _, _, _, _, _⟩,
+      _, haxioms, _⟩
+  rcases haxioms with
+    ⟨hdeterministic, _, hgenerated, hadvance, _, _, _, _, _,
+      hdescriptors, hobservations⟩
+  rcases hround with
+    ⟨hstart, _, _, _, afterDrain, hdrain, roundEmissions, _,
+      hcut, hexchange, hfinish⟩
+  obtain ⟨scalarDrainFinish, hscalarDrain, hscalarFinish⟩ :=
+    sequentialRoundDrain_materializes_scalar image transition
+      hunique horacle hgenerated hdescriptors hdeterministic
+      bounds start afterDrain finish drainedEvents
+      hstart hdrain hexchange hfinish
+  have htargetOrdered :=
+    sequentialRoundDrain_targetKeyOrdered image transition
+      hunique horacle hgenerated hdescriptors hdeterministic hadvance
+      bounds start afterDrain drainedEvents hstart hdrain
+  obtain ⟨serialOrder, serialFinish, hserialExecution,
+      hserialOrdered, hserialPerm, hsortReplay⟩ :=
+    executionInOrder_sort image transition
+      hunique horacle hgenerated hdescriptors hdeterministic
+      hadvance hobservations start.machine scalarDrainFinish
+      drainedEvents hstart.2.1 htargetOrdered hscalarDrain
+  have hserialEventsAbsent :=
+    executionInOrder_events_not_pending image transition
+      hunique horacle hgenerated hdescriptors
+      start.machine serialFinish serialOrder hstart.2.1 hserialExecution
+  have hnoFinal : NoEligibleEvent cut serialFinish.pending := by
+    intro event heventPending heventCut
+    have heventDrained : event ∈ drainedEvents :=
+      (hcut.2.1 event).mpr heventCut
+    have heventSerial : event ∈ serialOrder :=
+      hserialPerm.mem_iff.mpr heventDrained
+    exact hserialEventsAbsent event heventSerial heventPending
+  have hcanonical :=
+    executionInOrder_to_canonicalRestricted image transition
+      hunique horacle hgenerated hdescriptors cut
+      start.machine serialFinish serialOrder hstart.2.1
+      hserialOrdered
+      (fun event hevent =>
+        (hcut.2.1 event).mp (hserialPerm.mem_iff.mp hevent))
+      hnoFinal hserialExecution
+  refine ⟨serialOrder, serialFinish, hcanonical, ?_, ?_⟩
+  · intro event
+    exact hserialPerm.mem_iff
+  · exact strongMachineReplay_trans image
+      (strongMachineReplay_symm image hsortReplay)
+      hscalarFinish
+
+/-- One valid sequential LP drain/exchange round has a canonical scalar replay of the same cut. -/
+theorem roundSerializabilityOverCut_proved
+    (image : SimulationImage State)
+    (transition : TransitionRelation State) :
+    RoundSerializabilityOverCut image transition := by
+  intro haccepted _ bounds cut start drainedEvents finish _ hround
+  obtain ⟨serialOrder, serialFinish, hserial, hmembership, hreplay⟩ :=
+    roundSerializabilityOverCut_strong image transition haccepted
+      bounds cut start drainedEvents finish hround
+  exact ⟨serialOrder, serialFinish, hserial, hmembership,
+    strongMachineReplay_implies_result image serialFinish finish.machine hreplay⟩
+
+theorem f2GlobalTimePrefixCorollary_core :
+    F2GlobalTimePrefixCorollary := by
+  intro emissions startPending drainedEvents bounds horizon cut
+      hconstant hdrained event
+  subst bounds
+  rw [hdrained.2.2 event]
+  unfold TimePrefix
+  rw [belowConstantTimeBound_iff]
+
+theorem f2RoundSerializability_core
+    (image : SimulationImage State)
+    (transition : TransitionRelation State) :
+    F2RoundSerializability image transition :=
+  ⟨roundSerializabilityOverCut_proved image transition,
+    f2GlobalTimePrefixCorollary_core⟩
+
+end DaysExecutor

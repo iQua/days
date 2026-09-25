@@ -1,0 +1,57 @@
+---
+title: t20f_frontier
+description: Run a Scalar or device exact-executor fixture and fingerprint complete state.
+---
+
+`t20f_frontier` compiles one TOML scenario, runs the exact executor, serializes
+the complete result, and prints its byte length and FNV-1a-64 fingerprint.
+
+## Usage
+
+```text
+t20f_frontier [OPTIONS] --engine <scalar|device> <FIXTURE>
+```
+
+Scalar smoke run:
+
+```bash
+cargo run --bin t20f_frontier -- \
+  configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml \
+  --engine scalar
+```
+
+Device execution requires exactly one compiled production backend: Metal on an
+Apple target or CUDA on an NVIDIA host.
+
+```bash
+cargo run --features metal-spike --bin t20f_frontier -- \
+  configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml \
+  --engine device
+```
+
+## Options
+
+- `--exclusive-horizon-ns <u64>`: optional half-open stop for a shorter
+  identity probe.
+- `--max-capacity-retries <usize>`: maximum device capacity retries; default
+  `16`; `0` requests strict single-shot execution.
+- `--capacity-warm-start <path>`: load a validated capacity snapshot as the
+  first-attempt sizing hint.
+- `--dump-capacity-warm-start <path>`: after a successful device run, write the
+  converged sizing snapshot.
+- `--channel-events-per-stream <usize>`: override the plane-wide
+  channel-stream starting cap for a recorded identity configuration. The
+  full frontier fixture is anchored at 256 because the stock 2,048 cap
+  exceeds a 24 GB device; capacity is refuse-or-run, never simulation
+  semantics.
+- `--round-threads-per-block <usize>`: override the parallel round and
+  exchange launch width. Measurement campaigns select this per fixture and
+  record it beside every timed sample; it changes geometry, never bytes.
+
+A warm start contains capacities, not simulation state or compiled kernels.
+Devices use refuse-or-run capacity checks: an insufficient attempt is discarded
+and retried, so successful retries and warm starts preserve the result bytes.
+
+Metal/CUDA support FIFO, SP, WFQ, DRR, and WRR with TailDrop or
+ECN-threshold, including exact TCP Reno/CUBIC. They reject RED, PFC,
+DCQCN/CNP state, and collective generators before execution.

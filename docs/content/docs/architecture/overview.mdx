@@ -1,106 +1,68 @@
 ---
 title: Architecture Overview
-description: Core concepts and how Days is assembled on top of Nexosim.
+description: The shared scenario layer, exact LP executor, and legacy Nexosim actor engine.
 ---
 
-Days is built around a small set of concepts:
+Days has two simulation engines over a shared topology and configuration vocabulary:
 
-- **Discrete-event simulation**: all progression happens by processing scheduled events in timestamp order.
-- **Actor model**: each simulated component is an actor that owns its state and communicates via message passing.
-- **Packets carry time**: most components avoid querying the global simulation clock by reading the timestamp stored in the message itself.
+- The **exact engine** compiles a scenario into fixed logical-process (LP) state and canonical events, then runs it on scalar, CPU, Metal, or CUDA.
+- The **legacy engine** instantiates actor-like Rust models on the vendored Nexosim runtime.
 
-Days uses the `nexosim` crate as the simulation engine. Each actor implements `nexosim::model::Model` and receives messages through connected `Output<T>` ports and model mailboxes (`Mailbox<M>`).
+“Actor” refers only to the legacy Nexosim models. Exact hosts and switch egress queues are LPs with explicit owned state; they are not coroutines or mailboxes.
 
-## Bird's-eye architecture
-
-The following diagram shows the high-level structure of Days and how the major runtime pieces interact.
+## System map
 
 ```mermaid
 flowchart LR
-  CFG[Simulation config TOML]
-  CLI[days CLI or binary]
-  OUT[CSV reports and protocol traces]
+  CFG[Scenario TOML]
+  GRAPH[Shared topology and routing]
 
-  subgraph REPO[Days repository]
-    direction TB
-    TOP[Topology builder src/topos]
-    FLO[Flows src/flows]
-    SW[Switches src/switches]
-    SCH[Schedulers src/schedulers]
-    L2[Optional L2/PFC src/l2]
-    OBS[Observability src/utils]
-    SIM[nexosim simulation engine]
-  end
+  CFG --> GRAPH
+  GRAPH --> LOWER[Exact scenario compiler]
+  LOWER --> IMAGE[SimulationImage]
+  IMAGE --> VALIDATE[Backend validation]
+  VALIDATE --> SCALAR[Global or round scalar]
+  VALIDATE --> CPU[CPU workers]
+  VALIDATE --> METAL[Metal]
+  VALIDATE --> CUDA[CUDA]
+  SCALAR --> RESULT[Canonical RunResult]
+  CPU --> RESULT
+  METAL --> RESULT
+  CUDA --> RESULT
 
-  CFG --> TOP
-  CLI --> TOP
-  TOP -->|instantiate and wire models| SIM
-
-  SIM --> FLO
-  SIM --> SW
-  SIM --> SCH
-  SIM --> L2
-
-  FLO -->|packets and control| SW
-  SW -->|per-hop forwarding| SCH
-  SCH -->|next hop| SW
-
-  SCH -->|when PFC enabled| L2
-  L2 --> SW
-
-  SIM -->|periodic report events| OBS
-  OBS --> OUT
+  GRAPH --> TOPO[Legacy Topology builder]
+  TOPO --> ACTORS[Nexosim actors and ports]
+  ACTORS --> REPORTS[Statistics and optional CSV files]
 ```
 
-## Main components
+## Exact engine
 
-- **Topology builder** (`src/topos/`): parses the TOML config, builds the network graph, instantiates models, wires ports, and runs the simulation.
-- **Switch** (`src/switches/`): `PacketSwitch` demultiplexes packets using a per-flow forwarding table (FIB).
-- **Schedulers** (`src/schedulers/`): model per-port queueing, drop/ECN policies, and transmission delay.
-- **Flows** (`src/flows/`): model sources/sinks (packet distributions, TCP, DCQCN) and collectives.
-- **Optional L2** (`src/l2/`, feature-gated): link-layer frames and PFC (802.1Qbb-style pause).
-- **Logging/UI** (`src/utils/`): progress UI, concurrency tracing, and CSV report logging.
+`src/scenario/compile.rs` lowers supported configuration into `executor::SimulationImage`. The image contains stable node, link, flow, and packet IDs; one LP for each host and switch egress queue; fixed event payloads; owned protocol state; and channel delay bounds.
 
-## Message flow (L3/L4-only)
+Events use integer nanosecond time and a canonical `(time_ns, phase, origin_node, origin_seq)` key. `executor/src/validate.rs` checks the complete image and the selected backend before execution. The global scalar path uses one ordered event calendar. Scalar-round, CPU, Metal, and CUDA use conservative safe-horizon rounds and canonical cross-LP exchange.
 
-When L2 is disabled (default), each network hop looks like:
+See [/docs/architecture/executor-scope](/docs/architecture/executor-scope) for the implemented mechanism and backend matrix.
 
-```
-PacketSwitch (upstream) -> Scheduler (per edge) -> PacketSwitch (downstream)
-```
+## Legacy engine
 
-For an end-to-end flow, the path is:
+`legacy/src/topos/topo.rs` creates Nexosim models and connects their typed ports and bounded mailboxes. Sources, sinks, switches, schedulers, optional wire/L2 stages, and the UI are stateful actor-like models.
 
-```
-PacketSource -> (host) PacketSwitch -> [Scheduler+Switch]* -> PacketSink
-```
+Nexosim owns the authoritative event clock. The legacy boundary converts scenario times and model delays to integer nanoseconds in `legacy/src/utils/exact_time.rs`. `Packet.time` and other `f64` fields remain compatibility, controller, and report views; they are not a separate clock.
 
-Where:
+Legacy execution can use Nexosim's single-threaded or multithreaded executor. Ready actors at one simulated timestamp may run concurrently, so wall-clock task order is not a protocol guarantee.
 
-- the switch chooses the next hop using `fib[flow_id]` for data packets and `r_fib[flow_id]` for reverse traffic (ACKs and control packets),
-- the scheduler models queueing + serialization delay and forwards the packet with an updated timestamp.
+## Shared topology, different assembly
 
-## Optional L2/PFC pipeline
+`src/topos/build.rs` constructs FatTree, Torus, Dragonfly, or custom graphs and returns both the switch graph and semantic host attachments. The engines consume that shared structure differently:
 
-When `link.mode="Pfc"` and the binary is built with `--features l2_pfc`, each edge becomes a small pipeline:
+| Concern | Exact engine | Legacy engine |
+| --- | --- | --- |
+| Component | Host or switch-egress LP | Nexosim model |
+| Communication | Fixed `Event` values and LP outboxes | `Output<T>`, mailboxes, and scheduled handlers |
+| Time | `u64` nanoseconds in `EventKey` | `MonotonicTime` with an integer-ns Days boundary |
+| Parallel safety | Positive-lookahead safe horizons | Nexosim timestamp stepping and task execution |
+| Result | Normalized state and observations | Sink statistics and optional CSV reports |
 
-```
-Scheduler -> PfcEgressGate -> Link (serializer) -> PfcIngressPort -> PacketSwitch
-```
+## Legacy logging
 
-This keeps the default path lean: when L2 is disabled, none of the extra models exist.
-
-## Reports and observability
-
-Days periodically emits CSV reports (configurable by `report_interval`) for:
-
-- sources (`sources.csv`)
-- sinks (`sinks.csv`)
-- schedulers (`switches.csv`)
-- optional PFC ports (`pfc.csv`)
-- optional per-event protocol traces for the Lean checker:
-  - `dcqcn_events.csv` (with `--features dcqcn,lean`)
-  - `pfc_events.csv` (with `--features l2_pfc,lean`)
-  - `cubic_events.csv` (with `--features lean`)
-  - `drr_events.csv` (with `--features lean`)
-  - `wfq_events.csv` (with `--features lean`)
+Legacy runs can write source, sink, switch, PFC, TCP metric, and protocol/AQM trace files based on configuration and enabled features. `csv_logging` defaults to `true`; setting it to `false` suppresses all CSV filesystem output while simulation and in-memory correctness accounting continue. `report_interval` controls periodic reporting. See [/docs/configuration/logging](/docs/configuration/logging).

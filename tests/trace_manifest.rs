@@ -1,7 +1,6 @@
 use std::fs;
 
-use days::flows::source::PacketSourceReport;
-use days::utils::logger::{CsvLogger, Report, ReportTiming};
+use days::utils::logger::{CsvLogger, PacketSourceReport, Report, ReportTiming};
 
 #[test]
 fn writes_trace_manifest_even_without_lean_traces() {

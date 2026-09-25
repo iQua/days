@@ -1,0 +1,46 @@
+# P11 T20a RQ9 rung 1: calibrated mixed traffic, with long-lived forward-only generators occupying
+# a small forward-only share and TCP Reno occupying the rest.
+seed = 2416
+duration = 0.001152
+threading = "single"
+log_path = "logs/p11/rq9_mixed_k16"
+
+[topology]
+category = "FatTree"
+
+[topology.fat_tree]
+k = 16
+hosts_per_edge = 8
+
+[switch]
+port_rate = 100_000_000_000
+capacity = 64
+weights = [1]
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link]
+propagation_ns = 0
+
+[[flow_set]]
+flow_type = "PacketDistribution"
+flow_count = 8
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 500_000
+arr_dist = { type = "Uniform", low = 0.000000117, high = 0.000000117 }
+pkt_size_dist = { type = "Uniform", low = 512, high = 512 }
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 1016
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 500_000
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1460, high = 1460 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"

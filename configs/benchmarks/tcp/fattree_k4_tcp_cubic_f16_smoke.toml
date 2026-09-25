@@ -1,0 +1,40 @@
+# T24 RQ9 machinery smoke: canonical k^3/4 TCP flows, intentionally not a formal ladder point.
+seed = 2404
+duration = 0.001152
+threading = "single"
+log_path = "logs/tcp/fattree_k4_tcp_cubic_f16_smoke"
+
+[topology]
+category = "FatTree"
+
+[topology.fat_tree]
+k = 4
+hosts_per_edge = 2
+
+[switch]
+port_rate = 100_000_000_000
+capacity = 64
+weights = [1]
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link]
+propagation_ns = 1000
+
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 16
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 23_360
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1460, high = 1460 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "CUBIC"
+
+[flow_set.traffic.tcp.cubic]
+beta = 0.7
+c = 0.4
+fast_convergence = true

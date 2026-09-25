@@ -1,0 +1,5 @@
+time_ns,event_phase,event_origin_node,event_origin_sequence,ordinal,node_id,flow_id,cause,cause_flow_id,arrival_bytes,collective_id,algorithm,group_size,declared_total_bytes,rank,collective_phase,step,chunk_offset_bytes,chunk_bytes,packet_size_bytes,interval_ns,stop_time_ns,local_predecessor_flow_id,inbound_predecessor_flow_id,inbound_predecessor_bytes,before_local_complete,before_inbound_complete,before_inbound_bytes,activated,after_local_complete,after_inbound_complete,after_inbound_bytes,after_packets_emitted,after_bytes_emitted,after_status,after_next_time_ns
+0,0,3,0,0,3,10,local_completion,9,0,0,allgather,4,1,3,allgather,2,0,0,3,1,100000,9,6,0,0,1,0,0,1,1,0,0,0,finished,0
+4,0,4,2,0,0,1,inbound_arrival,9,1,0,allgather,4,1,0,allgather,2,0,1,3,1,100000,0,9,1,1,0,0,1,1,1,1,1,1,finished,4
+4,0,4,2,1,0,2,local_completion,1,0,0,allgather,4,1,0,allgather,3,0,0,3,1,100000,1,10,0,0,1,0,0,1,1,0,0,0,finished,0
+8,0,6,2,0,1,5,inbound_arrival,1,1,0,allgather,4,1,1,allgather,3,0,1,3,1,100000,4,1,1,1,0,0,1,1,1,1,1,1,finished,8

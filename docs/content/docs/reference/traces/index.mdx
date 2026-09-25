@@ -1,14 +1,15 @@
 ---
 title: Traces
-description: Trace manifest and schema conventions for per-transition trace files.
+description: Legacy on-disk traces and exact-executor certificate projections.
 ---
 
-Days produces two broad kinds of output:
+Days has two distinct trace surfaces:
 
-1. **Periodic reports** (e.g., `sources.csv`, `switches.csv`)
-2. **Per-transition traces** (`*_events.csv`) used by LeanGuard checkers
-
-This section focuses on per-transition traces and the conventions around them.
+1. The legacy logger writes periodic report CSVs and feature-gated
+   `*_events.csv` certificates under `log_path` when `csv_logging=true`.
+2. The exact executor exposes canonical TCP, AQM, and mechanism certificate
+   serializers from `days-executor`. These projections use exact `EventKey`
+   fields and are not automatically written by the legacy logger.
 
 <Cards>
   <Card title="Trace schema conventions" href="/docs/reference/traces/schema" />

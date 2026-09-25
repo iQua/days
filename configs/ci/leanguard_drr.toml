@@ -13,7 +13,6 @@ capacity = 100
 weights = [1]
 discipline = "DRR"
 drop = "TailDrop"
-run_batch_size = 64
 
 [[flow]]
 flow_id = 0

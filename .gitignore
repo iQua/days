@@ -2,12 +2,25 @@
 **/.vscode/
 **/target/
 **/Cargo.lock
+# The workspace-root lockfile is TRACKED: it is the reproducibility record for the
+# frozen `days-legacy` baseline crate (legacy/README.md). Nested/worktree lockfiles
+# stay ignored.
+!/Cargo.lock
 **/uv.lock
 **/.lake/
+.claude/
 
 # These are files related to logged outputs
 **/*.csv
-logs/**
+# ...with one exception: GeDES's own emitted flow table is E4's WORKLOAD DEFINITION, not a
+# logged output. `configs/benchmarks/p12/e4_gedes_native_k32.toml` is generated from it and
+# `tests/t21_p12_e4.rs` gates its md5, so a clone without it cannot build the fixture or run
+# a single E4 test.
+!/configs/benchmarks/p12/gedes_k32_seed41_flows.csv
+# E5's per-flow protocol golden is an endpoint/work contract, not a logged measurement. The Full
+# observation gate in `tests/t21_p12_e5.rs` regenerates and compares it byte-for-byte.
+!/configs/benchmarks/p12/e5_wide_k32_q200_protocol_golden.csv
+**/logs/**
 
 # RepoPrompt
 .repoprompt/**

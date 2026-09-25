@@ -1,0 +1,83 @@
+# P12 E1 open-loop k=32 fat tree, nominal 90% offered host load.
+#
+# CROSS-ARM CONTRACT (arms 5-8 of the P12 roster). This family is authored to be the ONE fixture
+# every arm can express, and its parameters are taken from the GeDES paced-UDP arm that fixes the
+# tightest constraints (evidence/dc-baselines/b7-gedes-udp/dc-b7-gedes-boston.md):
+#   * on-wire packet 1540 B = 1460 B payload + 80 B header. This is the quantity that drives link
+#     occupancy in every arm, so it is matched EXACTLY rather than rounded to "1500 B".
+#   * per-host NIC line rate 100 Gbit/s; fabric k = 32, 16 hosts per edge switch = 8,192 hosts.
+#   * traffic matrix: EVERY host is a source, paired with the host at the same rack ordinal on the
+#     attachment switch half the fabric away (`pairing = "SwitchOffsetHalf"`). GeDES's
+#     `BuildTCPConnections` pairs host i with host i + N/2 under a switch-major host numbering;
+#     Days numbers hosts ordinal-major, so the same FABRIC-level permutation has to be stated on
+#     the (switch, ordinal) grid. Both are the cross-pod permutation (pod p -> pod p+16 mod 32).
+#   * horizon 20 us = 20 quanta of GeDES's 1,000 ns timeslot. This is a SHORT-SPAN probe of
+#     GeDES's fabric, NOT a match to GeDES's 20,000-timeslot runs; see the correction below.
+#
+# CORRECTION (2026-08-08), quoting what this header said before it:
+#     "horizon 20 us, matching GeDES's 20,000 x 1,000 ns timeslot smoke run."
+# That is WRONG, and the error is OURS: 20,000 x 1,000 ns is 20,000,000 ns = 20 ms, not 20 us. We
+# mis-multiplied by 1000. GeDES did not misprint anything -- `paced_udp.cu:155` computes
+# `executed_timeslots * timeslot_ns / 1e9` and a live 2,000-slot run prints
+# `simulated_seconds 0.002000000`, i.e. 2 ms, correctly. Any reading of this file that treated
+# GeDES's `simulated_seconds` or `Simulated Span` output as untrustworthy should be discarded.
+# This fixture's own horizon of 20 us is unchanged and correct; what was wrong was the claim that
+# it matches GeDES's span. It does not -- it is 1/1000 of it. The fixture family that DOES span
+# GeDES's 20 ms is `e1long_open_k32_load_*.toml`, which also re-authors the per-flow byte budget,
+# because raising `duration` alone would only add an empty fabric: at 137 ns this file's
+# 1,000-packet budget stops emitting at 0.137 ms.
+#
+# OFFERED LOAD, disclosed. Days requires an exact integer nanosecond inter-packet interval, and
+# 1540 B at 100 Gbit/s is 123.2 ns of serialisation, so only the 10% point is exactly expressible.
+# Each point uses the nearest integer interval and states what it achieves:
+#   nominal 10% -> 1232 ns -> 10.0000000%   nominal 30% -> 411 ns -> 29.9756691%
+#   nominal 60% ->  205 ns -> 60.0975610%   nominal 90% -> 137 ns -> 89.9270073%
+# Worst-case deviation is 0.098 percentage points, at the 60% point (0.163% relative). GeDES's own
+# token bucket lands within 0.005% relative of nominal, so the residual difference is a
+# fixture-comparability caveat that belongs in every E1 table -- not a defect. THIS POINT: interval 137 ns, achieved offered host load 89.9270073%.
+#
+# `size` is 1,000 packets per flow, far more than the ~146 a flow emits in 20 us at 90%, so no
+# generator terminates inside the horizon at any of the four points and the four fixtures differ
+# in exactly one parameter: the interval.
+seed = 21032
+duration = 0.000020
+threading = "single"
+log_path = "logs/p12/e1_open_k32_load_90"
+
+[topology]
+category = "FatTree"
+
+[topology.fat_tree]
+k = 32
+hosts_per_edge = 16
+
+[switch]
+port_rate = 100_000_000_000
+capacity = 1024
+weights = [1]
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link]
+propagation_ns = 1000
+
+# Equal-cost multipath. MANDATORY for this family. Days' single-path table returns one path per
+# switch pair, and equal-cost successors tie on score -- `MinScoredNode::cmp` returns Equal and
+# never looks at node identity -- so the winner is BinaryHeap sift order, an implementation
+# artifact rather than a stated rule. ON THIS MATRIX, the offset permutation s -> (s+256) mod 512,
+# that collapses each source pod onto ONE aggregation group and ONE core switch. Fabric-wide it is
+# a minority, not a single switch: 6 distinct cores of 256, per-pair histogram
+# {1025: 144, 1121: 32, 1152: 272, 1217: 16, 1233: 16, 1264: 32}, the busiest core taking 272 of
+# 512 pairs (53%, roughly 4,352 of the 8,192 flows). Enough to wreck the fixture -- measured at the
+# nominal 10% point before the policy existed: 36,384 drops out of 139,264 sourced packets, 26.1%.
+# Zero drops with the policy, at all four points. GeDES reports NO queue overflow at 90% on the
+# same matrix and Unison exposes `--ecmp`, so a single-path Days row would not be the same fabric
+# as the arms it is compared with.
+[routing]
+policy = "FatTreeEcmp"
+
+[[flow_set]]
+flow_type = "PacketDistribution"
+flow_count = 8192
+pairing = "SwitchOffsetHalf"
+traffic = { initial_delay = 0.0, size = 1_540_000, arr_dist = { type = "Uniform", low = 0.000000137, high = 0.000000137 }, pkt_size_dist = { type = "DiscreteUniform", low = 1540, high = 1540 } }

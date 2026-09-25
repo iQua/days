@@ -1,29 +1,28 @@
 ---
-title: Nexosim
-description: The discrete-event simulation engine that powers Days.
+title: Nexosim legacy engine
+description: The actor-like discrete-event runtime used by the legacy Days simulator.
 ---
 
-Days is built on top of **Nexosim**, a Rust discrete-event simulation engine (vendored under `crates/nexosim`).
+The legacy Days simulator is built on **Nexosim**, vendored under `crates/nexosim`. The current exact executor does not run Nexosim models; it uses the LP and fixed-event machinery described in [/docs/internals](/docs/internals).
 
-At a high level, Nexosim provides:
+Nexosim provides the legacy engine with:
 
-- an **actor-like model API** (`trait Model`)
-- **mailboxes** for delivering events/requests to models
-- typed **output ports** (`Output<T>`) for message passing
-- a **scheduler + executor** that advances simulation time in discrete steps
+- an actor-like `Model` API
+- mailboxes for delivering events and queries to models
+- typed `Output<T>` ports
+- single-threaded and multithreaded executors
+- a scheduler and monotonic simulation clock
 
-If you only want a conceptual picture, start with [/docs/architecture/simulation-engine](/docs/architecture/simulation-engine).
+Start with [/docs/architecture/simulation-engine](/docs/architecture/simulation-engine) for the legacy topology-level view.
 
-## Where to read in the code
+## Code map
 
-- Core crate root: `crates/nexosim/src/lib.rs`
-- Simulation lifecycle + stepping: `crates/nexosim/src/simulation.rs`
+- Crate root: `crates/nexosim/src/lib.rs`
+- Simulation lifecycle and stepping: `crates/nexosim/src/simulation.rs`
+- Bench construction: `crates/nexosim/src/simulation/sim_init.rs`
 - Ports and message delivery: `crates/nexosim/src/ports.rs`
-- Executors (ST/MT): `crates/nexosim/src/executor.rs`
+- Single-threaded and multithreaded executors: `crates/nexosim/src/executor.rs`
 - Time types: `crates/nexosim/src/time.rs`
+- Legacy Days assembly and execution: `legacy/src/topos/topo.rs`
 
-## Documentation
-
-Upstream API docs for the 1.0 line are available at `https://docs.rs/nexosim/1.0.0/nexosim/`.
-
-The vendored version in this repo tracks that API surface and includes a few Days compatibility shims in `SimInit` (for example `set_hot_worker_count`, `set_max_groups_per_step_task`, `set_time_quantum_ns`).
+The vendored crate is version 1.0.0. Its `SimInit` includes three Days compatibility shims: `set_hot_worker_count`, `set_max_groups_per_step_task`, and `set_time_quantum_ns`.

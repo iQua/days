@@ -1,0 +1,66 @@
+# P12 F-TOPO: one non-fat-tree fabric (wave-4 amendment capability row).
+#
+# WHY DRAGONFLY AND NOT A JELLYFISH EXPANDER. Days' topology builders are deterministic structural
+# constructions (fat tree, torus) plus an explicit edge list. A canonical Kim dragonfly is exactly
+# that kind of construction -- groups, all-to-all inside a group, one global link per group pair,
+# no randomness anywhere -- so it drops into the existing builder discipline and is reproducible
+# from its three parameters alone. A Jellyfish expander is a RANDOM regular graph: it would need a
+# seeded generator inside topology construction, and its reproducibility would then rest on the
+# exact RNG draw order rather than on arithmetic. For a capability row whose whole claim is "this
+# fabric is representable at all", the deterministic construction is the honest one. The expander
+# remains available later through the explicit `edges`/`hosts` path.
+#
+# THE FABRIC. a = 8 routers per group, h = 4 global ports per router, so the balanced group count
+# is g = a*h + 1 = 33 and every one of the C(33,2) = 528 group pairs is joined by exactly one
+# global link. 264 routers, 4 hosts each = 1,056 hosts. Router degree is (a-1) + h = 11 fabric
+# ports plus 4 host ports. Global links use the absolute (circulant) arrangement: global port `q`
+# of group `i` reaches group `(i + q + 1) mod g`.
+#
+# WHY IT IS A CAPABILITY ROW. GeDES's fat-tree arithmetic addresses hosts, switches and channels by
+# closed-form k-ary-fat-tree index expressions; it cannot express a fabric whose diameter, degree
+# and group structure are not those of a fat tree. Days lowers this image through the same path it
+# lowers every other one.
+#
+# ROUTING. Minimal dragonfly routing, obtained from the standing shortest-path table rather than
+# from a new policy: with one global link per group pair, the minimal path is
+# `source router -> router owning the global link -> partner group router -> target router`, and
+# it is essentially forced, so there is no equal-cost set to spread over and `FatTreeEcmp` (which
+# is fat-tree-only by definition) is neither applicable nor needed.
+#
+# TRAFFIC. A uniform-random FIXED-POINT-FREE INVOLUTION over all 1,056 hosts, not a draw from the
+# full symmetric group: with more than one host per router the endpoint sampler shuffles the host
+# list and pairs index i with index (i + n/2) mod n, and at n = 1,056 that offset is exactly n/2, so
+# the permutation is its own inverse -- 528 mutually exchanging host pairs. It is a permutation, it
+# is uniformly drawn from that family, and it exercises global links rather than staying inside a
+# group, which is what this row needs; it is simply less random than "uniform-random permutation"
+# would imply. 1,540-byte packets at
+# 1,232 ns give 10 Gbit/s per host, i.e. 10% of line rate: a group offers 320 Gbit/s spread over
+# its 32 global links, well clear of saturation, so this row reports the fabric and not a
+# congestion artefact.
+seed = 21033
+duration = 0.000020
+threading = "single"
+log_path = "logs/p12/f_topo_dragonfly_g33"
+
+[topology]
+category = "Dragonfly"
+
+[topology.dragonfly]
+routers_per_group = 8
+global_ports_per_router = 4
+hosts_per_router = 4
+
+[switch]
+port_rate = 100_000_000_000
+capacity = 1024
+weights = [1]
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link]
+propagation_ns = 1000
+
+[[flow_set]]
+flow_type = "PacketDistribution"
+flow_count = 1056
+traffic = { initial_delay = 0.0, size = 1_540_000, arr_dist = { type = "Uniform", low = 0.000001232, high = 0.000001232 }, pkt_size_dist = { type = "DiscreteUniform", low = 1540, high = 1540 } }

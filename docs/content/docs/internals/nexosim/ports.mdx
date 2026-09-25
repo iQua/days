@@ -1,39 +1,34 @@
 ---
 title: Ports & mailboxes
-description: Message passing in Nexosim (Output<T>, Mailbox<M>, event sinks).
+description: Communication between models in the legacy Nexosim engine.
 ---
 
-Nexosim models communicate via typed message passing:
+This page describes the **legacy** simulator. Exact-executor LPs exchange fixed `Event` values through per-LP queues and round outboxes instead.
 
-- `Mailbox<M>`: the inbound queue for a model instance
-- `Output<T>`: a typed, connectable output port
-- `event_slot(...)` / `event_queue(...)`: bench sinks that return writer/reader handle pairs for observing outputs
+Most Nexosim model communication uses typed message passing:
 
-Source: `crates/nexosim/src/ports.rs`
+- `Mailbox<M>` is the bounded inbound queue for a model instance.
+- `Output<T>` is a typed output port that can connect to one or more model inputs.
+- `event_slot(...)` and `event_queue(...)` are compatibility sinks that expose writer/reader handle pairs for tests and benches.
+
+The main definitions are under `crates/nexosim/src/ports.rs` and `crates/nexosim/src/simulation/mailbox.rs`.
 
 ## Connecting models
 
-During bench assembly, an `Output<T>` is connected to a handler method on another model:
+Legacy topology assembly connects an output to a handler and the target model's mailbox:
 
 ```rust
 producer.output.connect(Consumer::handle, &consumer_mailbox);
 ```
 
-When the producer sends:
+Sending on that output invokes connected consumers at the current simulation time:
 
 ```rust
-producer.output.send(msg).await;
+producer.output.send(message).await;
 ```
 
-Nexosim delivers the message to connected consumers at the current simulation time. Delayed delivery is achieved by scheduling future events via the simulation scheduler APIs.
+Delayed delivery uses the scheduler available through a model `Context`.
 
-## How Days uses this
+In the network model, a `PacketSwitch` output connects to an egress scheduler or endpoint handler. Scheduler output then connects to the downstream switch or endpoint, with optional wire and layer-2 stages inserted by topology construction. The concrete assembly is in `legacy/src/topos/topo.rs`.
 
-Days builds a graph of models where, for example:
-
-- `PacketSwitch.outputs[next_id]` connects to either
-  - a scheduler’s `packet_received`, or
-  - a sink/source endpoint handler
-- schedulers connect their `output` to downstream switches (optionally through an L2 pipeline)
-
-The important architectural property is that **models own their state** and only communicate through these ports, which makes it feasible to run many models concurrently.
+Ports are the normal model boundary, but not the only coordination mechanism in the legacy engine. The application source uses Tachyonix channels, and scheduler/PFC bookkeeping shares atomic `QueueState`. See `legacy/src/flows/app_source.rs` and `legacy/src/schedulers/state.rs`. Models still own their protocol state; these explicit shared facilities should not be confused with the exact executor's LP ownership model.

@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main, feat/days-executor]
+    paths-ignore:
+      - "docs/**"
+      - "ideas/**"
+      - "logs/**"
+      - "**.md"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "ideas/**"
+      - "logs/**"
+      - "**.md"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "ci-${{ github.ref }}"
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Audit crate and feature boundaries
+        run: cargo xtask audit
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: lint
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run partitioned default test matrix
+        run: |
+          cargo test -p days-executor -- --show-output
+          cargo test -p days --features test -- --show-output
+          cargo test -p days-legacy --features test -- --show-output
+          cargo test -p days-validation --features test -- --show-output
+
+  examples:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: lint
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run executor smoke examples
+        run: |
+          cargo run --release --example scalar_benchmark -- configs/ci/executor_smoke.toml
+          cargo run --release --example round_benchmark -- configs/ci/executor_smoke.toml --repetitions 1
+
+      - name: Run representative legacy examples
+        run: |
+          cargo run --release -p days-legacy --example basic
+          cargo run --release -p days-legacy --example ecn
+          cargo run --release -p days-legacy --example switch
+
+  metal-check:
+    runs-on: macos-15
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check Metal backend
+        run: cargo check -p days-executor --features metal-spike

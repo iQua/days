@@ -1,38 +1,45 @@
 ---
 title: Logging & Reports
-description: How CSV reports and per-transition protocol traces are emitted.
+description: Legacy CSV output and exact executor result planes.
 ---
 
-Days writes periodic CSV reports through `CsvLogger` (`src/utils/logger.rs`).
+The legacy actor runtime writes CSV files through `CsvLogger`. The exact executor returns structured state and observations to its caller and does not use `CsvLogger`.
 
-## How reporting works
+## Legacy CSV lifecycle
 
-- Components construct report structs (e.g., `PacketSourceReport`, `SchedulerReport`).
-- Reports are appended to an in-memory buffer (guarded by a lock).
-- When buffers grow beyond a threshold, the logger flushes a batch to disk.
-- At the end of the run, `CsvLogger::flush_reports()` flushes all remaining data.
+`Topology::run` initializes the process-wide logger from the scenario before it activates the simulation. Sources, sinks, schedulers, and optional protocol actors submit typed `Report` values. The logger buffers rows, flushes a report family when its buffer reaches the batch limit, and flushes the remaining rows after `step_until` finishes.
 
-The logger is initialized once from config at the start of `Topology::run`.
+`report_interval` controls periodic actor reports. Its default is `f64::MAX`, so ordinary runs rely on final reports and the final flush.
 
-## Output files
+`csv_logging` defaults to `true`. With `csv_logging = false`, the logger creates no directory, CSV file, or `traces.json`, and it discards report rows before they grow the report vectors. Aggregate sink totals and test-only correctness accounting still update.
 
-All files are written under `log_path` (default: `./output/`):
+## Legacy output inventory
 
-- `sources.csv`: source reports (`PacketSourceReport`)
-- `sinks.csv`: sink reports (`PacketSinkReport`)
-- `switches.csv`: scheduler reports (`SchedulerReport`)
-- `pfc.csv`: PFC ingress port reports (`PfcPortReport`, only with `l2_pfc`)
-- `dcqcn_events.csv`: per-event DCQCN trace rows (only with `dcqcn` + `lean`)
-- `pfc_events.csv`: per-event PFC trace rows (only with `l2_pfc` + `lean`)
-- `cubic_events.csv`: per-event TCP CUBIC trace rows (only with `lean`)
-- `drr_events.csv`: per-event DRR trace rows (only with `lean`)
-- `wfq_events.csv`: per-event WFQ trace rows (only with `lean`)
+With CSV logging enabled, initialization creates:
 
-## Report interval
+| File | Condition | Contents |
+| --- | --- | --- |
+| `sources.csv` | always | Source counters and rates. |
+| `sinks.csv` | always | Delivery counts and delay summaries. |
+| `switches.csv` | always | Scheduler queue and drop summaries. |
+| `pfc.csv` | `l2_pfc` | PFC ingress-port summaries. |
+| `aqm_events.csv` | `lean` | Per-decision AQM trace rows. |
+| `cubic_events.csv` | `lean` | Legacy CUBIC transition rows. |
+| `drr_events.csv` | `lean` | DRR enqueue and selection rows. |
+| `wfq_events.csv` | `lean` | WFQ enqueue, selection, and departure rows. |
+| `dcqcn_events.csv` | `lean,dcqcn` | DCQCN controller and CNP rows. |
+| `pfc_events.csv` | `lean,l2_pfc` | PFC threshold, frame, and gate rows. |
 
-Set `report_interval` in the TOML config:
+`legacy_e5_metrics = true` enables final TCP correctness reports. The logger creates `tcp_metrics.csv` when it flushes those rows; it does not create that file during normal initialization.
 
-- if omitted, it defaults to `f64::MAX` (effectively “only final flush”),
-- if set, many models schedule periodic events to emit reports.
+Final flush writes `traces.json`. Its trace list contains only nonempty feature-enabled `*_events.csv` files. LeanGuard can also discover a caller-provided `tcp_events.csv` through its directory-scan fallback, but the legacy logger does not create that file or list it in the manifest.
 
-See [/docs/configuration/logging](/docs/configuration/logging) for configuration details.
+## Exact result planes
+
+Every exact backend returns a normalized `RunResult` with final host state, switch state, constant-space `RunSummary` counters, resident packets needed to resume, canonical pending events, and the requested packet observations.
+
+`ObservationMode::Summary` keeps aggregate counters without full per-packet history. `ObservationMode::Full` retains departures and arrivals. Scalar and CPU also return `DiagnosticPlanes` for exact TCP, AQM, rate, PFC, DRR, WRR, DCQCN, and collective transitions. Metal and CUDA return complete state and measurement planes but set `diagnostics` to `None`.
+
+The executor library exposes CSV serializers for TCP, rate, PFC, DRR, WRR, DCQCN, and collective transition certificates. Callers choose where to write those strings. Exact AQM transitions remain available as structured records.
+
+See [Logging configuration](/docs/configuration/logging) for `log_path`, `csv_logging`, and report settings.

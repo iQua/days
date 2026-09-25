@@ -1,0 +1,3 @@
+time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,payload_id,stop_time_ns,current_packet_size_bytes,pacing_interval_ns,packet_size_bytes,total_bytes,rate_numerator_bits_per_second,rate_denominator,before_packets_emitted,before_bytes_emitted,before_credit_quanta,before_status,before_next_time_ns,after_packets_emitted,after_bytes_emitted,after_credit_quanta,after_status,after_next_time_ns
+1,1,0,0,0,0,0,20,1,1,1,2,10000000000,3,0,0,0,blocked,1,0,0,10000000000,blocked,2
+2,1,0,1,0,0,0,20,1,1,1,2,10000000000,3,0,0,0,blocked,2,0,0,10000000000,blocked,3

@@ -228,7 +228,7 @@ A fair comparison paper section usually needs **at least**:
 
 * trace size on disk
 * number of logged fields / rows
-* runtime overhead of instrumentation (run Days with tracing off vs on)
+* runtime overhead of protocol-trace instrumentation (compare builds with and without the relevant Lean trace features)
 
 ### 4) Engineering effort
 
@@ -611,4 +611,3 @@ If you want, I can also sketch what the **DCQCN trace wrapper** should look like
 
 [1]: https://docs.tlapl.us/using%3Atlc%3Atrace_validation "using:tlc:trace_validation - TLA+ Wiki"
 [2]: https://arxiv.org/html/2404.16075v2 "Validating Traces of Distributed Programs Against \tlaplusSpecificationsThis work was partly supported by a grant from Oracle Corporation."
-

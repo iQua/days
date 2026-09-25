@@ -1,0 +1,4 @@
+time_ns,event_phase,origin_node,origin_seq,kind,scheduler_id,class_count,packet_id,flow_id,class_id,priority,size_bytes,departure_time_ns
+0,0,10,0,enqueue,1,2,1,1,1,3,100,
+0,0,11,0,enqueue,1,2,2,3,1,3,100,
+0,2,1,0,schedule,1,2,2,3,1,3,100,100

@@ -3,9 +3,24 @@ title: What ACCEPT certifies (DCQCN)
 description: Representative DCQCN-specific consequences of trace acceptance (pairing, gates, parameter stability, bounds).
 ---
 
-It records DCQCN-specific consequences of **trace acceptance**. These are instances of the generic obligation templates described in [/docs/research/design](/docs/research/design) (pairing, gates, parameter stability, bounded state), specialized to the DCQCN event vocabulary (`cnp_sent`, `cnp_recv`, `timer_tick`).
+This page documents the **legacy floating-point DCQCN certificate**
+(`lean/LeanGuard/DcqcnEventLog.lean`): DCQCN-specific consequences of
+**trace acceptance**, as instances of the generic obligation templates in
+[/docs/research/design](/docs/research/design) (pairing, gates, parameter
+stability, bounded state), specialized to the DCQCN event vocabulary
+(`cnp_sent`, `cnp_recv`, `timer_tick`). Its pairing, gate, freeze, and
+bound claims below remain current.
 
-The statements below are with respect to the **canonicalized** trace order (sorted by `(time_ns, event_id)`), not raw CSV file order.
+The statements below are with respect to the **canonicalized** trace order
+(sorted by `(time_ns, event_id)`), not raw CSV file order.
+
+A separate **exact P10c DCQCN certificate family** covers the exact
+engine's DCQCN, whose controller runs in exact integer arithmetic
+(parts-per-billion scale, one floor per complete rational expression). It
+keys on the full `EventKey` order and is **not interchangeable** with the
+legacy `(time_ns, event_id)` CSV family documented here. Exact DCQCN runs
+on the Scalar and CPU backends; the Metal/CUDA capability validator rejects
+it before execution, so device runs produce no DCQCN certificates.
 
 ## No spurious CNP receptions (pairing)
 

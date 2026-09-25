@@ -20,6 +20,7 @@ fn test_campaign_dcqcn_targeted_mutations_in_dry_run() {
         corpus_root,
         checker_dir: PathBuf::from("lean/.lake/build/bin"),
         leanguard_run: None,
+        legacy_runner: None,
         allow_nondeterministic: false,
     };
 

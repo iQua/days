@@ -1,0 +1,32 @@
+# T13e empirical target ~1,000 mean active LPs: 2 x 240-flow cohorts, 40 us apart.
+# Measured full-run offered host load: 33.0% of 512 x 100 Gbps.
+seed = 13001
+duration = 0.000119
+threading = "single"
+log_path = "logs/width_via_load/fattree_k32_target_w01000"
+
+[topology]
+category = "FatTree"
+
+[topology.fat_tree]
+k = 32
+
+[switch]
+port_rate = 100_000_000_000
+capacity = 1024
+weights = [1]
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link]
+propagation_ns = 1000
+
+[[flow_set]]
+flow_type = "PacketDistribution"
+flow_count = 240
+traffic = { initial_delay = 0.0, size = 524_288, arr_dist = { type = "Uniform", low = 0.000000021, high = 0.000000021 }, pkt_size_dist = { type = "Uniform", low = 256, high = 256 } }
+
+[[flow_set]]
+flow_type = "PacketDistribution"
+flow_count = 240
+traffic = { initial_delay = 0.000040, size = 524_288, arr_dist = { type = "Uniform", low = 0.000000021, high = 0.000000021 }, pkt_size_dist = { type = "Uniform", low = 256, high = 256 } }

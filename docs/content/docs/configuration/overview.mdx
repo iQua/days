@@ -1,38 +1,70 @@
 ---
 title: Overview
-description: TOML schema basics, units, and feature-gated keys.
+description: TOML schema, units, runtime scope, and backend boundaries.
 ---
 
-Days simulations are configured using a single TOML file. The CLI entry point (`src/main.rs`) expects the path to that file as its only argument:
+Days uses one TOML scenario format with two consumers:
+
+- The **legacy actor runtime** validates the complete legacy vocabulary in `legacy/src/config.rs` and runs the scenario with Nexosim.
+- The **exact executor** lowers the supported subset in `src/scenario/compile.rs` into a `SimulationImage`, then runs it on Scalar, CPU, Metal, or CUDA.
+
+The legacy CLI takes one configuration path:
 
 ```bash
-RUST_LOG=info cargo run --bin days -- configs/simple.toml
+RUST_LOG=info cargo run -p days-legacy --bin days -- configs/simple.toml
 ```
 
-## Units and types
+## Units
 
-The most common conventions in the TOML schema:
+| Value | Unit |
+| --- | --- |
+| Times such as `duration`, `initial_delay`, and `report_interval` | seconds unless the key ends in `_ns` or the page says otherwise |
+| `switch.port_rate` | bits per second |
+| DCQCN `*_rate_gbps` values | gigabits per second |
+| Traffic sizes, packet sizes, and most buffers | bytes |
+| Topology and flow identifiers | non-negative integers |
 
-- **Time**: seconds as floating point (`f64`) unless otherwise noted.
-- **Rates**: bits per second (`port_rate`, `rate_gbps`, …).
-- **Sizes**: bytes for traffic sizes, packet sizes, and most buffers.
-- **Topology node IDs**: integers (`usize`), used consistently across graph edges, hosts, paths, and endpoints.
+The exact executor represents time in integer nanoseconds. It rejects values that cannot be represented exactly in the field's integer scale.
 
-## Minimal example
+## Root keys
 
-This is a minimal, custom-topology run: one link, one packet-distribution flow.
+The strict legacy loader accepts the following root keys. Unknown root keys fail validation.
+
+| Keys | Purpose | Scope |
+| --- | --- | --- |
+| `seed`, `duration` | Determinism and stop time | Legacy and exact executor |
+| `ui_interval` | Progress refresh interval | Legacy |
+| `threading`, `num_threads`, `hot_workers`, `concurrency_level` | Nexosim runtime selection | Legacy |
+| `time_quantum_ns` | Nexosim time quantization | Legacy; exact executor requires zero or omission |
+| `mailbox_capacity` | Actor mailbox capacity | Legacy |
+| `log_path`, `csv_logging`, `report_interval` | CSV reports and protocol traces | Legacy logger |
+| `legacy_e5_metrics` | Opt-in E5 TCP correctness rows | Legacy |
+| `edges`, `hosts`, `topology` | Network graph and host attachments | Legacy and exact executor |
+| `switch` | Port rate, queue, scheduler, and AQM policy | Legacy and exact executor, with capability differences |
+| `link` | PFC and propagation | Legacy and exact executor, with capability differences |
+| `model_host_attachment` | Explicit host injection/delivery stages | Legacy |
+| `routing` | Scenario-wide `ShortestPath` or `FatTreeEcmp` | Legacy and exact executor |
+| `flow`, `flow_set` | Point-to-point traffic | Legacy and exact executor, with a smaller exact subset |
+| `collective`, `collective_set` | Collective traffic | Different algorithm sets in legacy and exact lowering |
+| `app_source` | Actor-managed byte buffers for TCP Broadcast/RingAllReduce | Legacy |
+
+See the pages in this section for field-level constraints. A key can belong to the vocabulary and still fail when its value or combination is inactive. The strict loader rejects examples such as `switch.ecn_threshold` without `drop = "ECN_THRESHOLD"`, `[link.pfc]` without `link.mode = "Pfc"`, and `[app_source]` without a supported TCP collective.
+
+## Minimal scenario
+
+This custom topology runs in the legacy actor runtime and lowers into the exact executor:
 
 ```toml
 seed = 1
 duration = 2.0
 threading = "single"
-log_path = "./output/minimal"
+csv_logging = false
 
 edges = [[0, 1]]
 hosts = [0, 1]
 
 [switch]
-port_rate = 1e9
+port_rate = 1000000000
 capacity = 100
 discipline = "FIFO"
 drop = "TailDrop"
@@ -40,32 +72,31 @@ drop = "TailDrop"
 [[flow]]
 flow_type = "PacketDistribution"
 graph = [[0, 1]]
+
 [flow.traffic]
-  initial_delay = 0.0
-  size = 10000
-  arr_dist = { type = "Uniform", low = 0.001, high = 0.001 }
-  pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 }
+initial_delay = 0.0
+size = 10000
+arr_dist = { type = "Uniform", low = 0.001, high = 0.001 }
+pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 }
 ```
 
-## Sections at a glance
+`threading` and `csv_logging` affect the legacy run. Exact lowering ignores those runtime fields; the caller selects an exact backend through the executor API.
 
-- General / runtime: [/docs/configuration/logging](/docs/configuration/logging)
-- Topology: [/docs/configuration/topology](/docs/configuration/topology)
-- Switches, schedulers, and drop/ECN: [/docs/configuration/switches](/docs/configuration/switches)
-- Flows and traffic: [/docs/configuration/flows](/docs/configuration/flows)
-- Collectives: [/docs/configuration/collectives](/docs/configuration/collectives)
-- Optional L2/PFC: [/docs/configuration/l2](/docs/configuration/l2)
+## Cargo features and backend capabilities
 
-## Feature-gated configuration
+Legacy protocol models use Cargo features:
 
-Some config values are only valid when the binary is built with the right Cargo features:
+- `flow_type = "DCQCN"` requires `-p days-legacy --features dcqcn`.
+- `link.mode = "Pfc"` requires `-p days-legacy --features l2_pfc`.
+- LeanGuard event CSVs require `lean` plus the protocol feature where applicable.
 
-- `link.mode = "Pfc"` requires `--features l2_pfc`
-- `flow_type = "DCQCN"` and `[traffic.dcqcn]` require `--features dcqcn`
-- Protocol event traces for the Lean checker:
-  - `dcqcn_events.csv` requires `--features dcqcn,lean`
-  - `pfc_events.csv` requires `--features l2_pfc,lean`
-  - `cubic_events.csv` requires `--features lean`
-  - `drr_events.csv` requires `--features lean`
-  - `wfq_events.csv` requires `--features lean`
-- `--features perf_stats` enables internal performance statistics from the `nexosim` simulation engine
+Exact Scalar and CPU execute the full lowered mechanism set. Metal and CUDA reject collective generators, DCQCN, PFC, and RED/RED_ECN before execution. They accept deterministic packet traffic, exact TCP Reno/CUBIC, FIFO/SP/WFQ/DRR/WRR, TailDrop, and ECN threshold subject to device capacity checks. The error names the unsupported mechanism and directs you to Scalar or CPU.
+
+## Reference pages
+
+- [Logging and runtime](/docs/configuration/logging)
+- [Topology and routing](/docs/configuration/topology)
+- [Switches and queues](/docs/configuration/switches)
+- [Flows](/docs/configuration/flows)
+- [Collectives](/docs/configuration/collectives)
+- [L2 and PFC](/docs/configuration/l2)

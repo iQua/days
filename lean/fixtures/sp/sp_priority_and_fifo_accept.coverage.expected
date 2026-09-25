@@ -1,0 +1,1 @@
+{"checker":"sp_check","accept":true,"cover":["class_count_ge_2","depart","enqueue","equal_priority_fifo_tie","higher_priority_preempts","queue_drained","schedule_nonempty"],"stats":{"rows":9,"processed_rows":9}}

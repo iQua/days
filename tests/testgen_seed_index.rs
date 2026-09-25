@@ -20,6 +20,7 @@ fn test_seed_index_creates_corpus() {
         corpus_root: corpus_root.clone(),
         checker_dir: PathBuf::from("lean/.lake/build/bin"),
         leanguard_run: None,
+        legacy_runner: None,
         allow_nondeterministic: false,
     };
 

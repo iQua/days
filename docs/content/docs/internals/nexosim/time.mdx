@@ -1,20 +1,23 @@
 ---
 title: Time model
-description: MonotonicTime and how simulation time advances in Nexosim (and Days).
+description: The exact nanosecond boundary around Nexosim's legacy simulation clock.
 ---
 
-Nexosim represents simulation time using `MonotonicTime` (a monotonic timestamp type).
+This page describes time in the **legacy Nexosim engine**. The exact executor represents event time directly as `u64` nanoseconds in `EventKey`.
 
-Source: `crates/nexosim/src/time.rs`
+Nexosim stores its monotonic simulation clock as `MonotonicTime`. A `Simulation` exposes it through `time()`, and model handlers can read it through `Context::time()`. The type is defined in `crates/nexosim/src/time.rs`.
 
-## Days convention: seconds as f64
+## Legacy integer-nanosecond boundary
 
-Although Nexosim uses a dedicated time type internally, Days largely exposes time as **seconds (`f64`)** in its model logic and configuration:
+Legacy configuration still expresses many durations as seconds, but the simulator converts them at the event-clock boundary in `legacy/src/utils/exact_time.rs`:
 
-- config fields like `duration` and distribution parameters are `f64` seconds
-- packets carry a `Packet.time: f64` timestamp
-- scheduling uses `Duration::from_secs_f64(...)`
+- Scenario-level values must resolve to a finite, nonnegative integer number of nanoseconds. Positive sub-nanosecond and fractional-nanosecond values are rejected.
+- Positive sampled or controller delays are rounded up to the earliest non-early nanosecond tick.
+- Packet serialization uses checked integer arithmetic and rounds positive delay up.
+- `clock_ns` reads the exact integer offset from the Nexosim epoch.
 
-This is a deliberate performance choice: most hot-path handlers avoid calling `cx.time()` and instead treat the incoming message timestamp as “now”.
+Some legacy model fields, including `Packet.time`, retain an `f64` seconds view for compatibility, controller calculations, and reports. That view is derived from the integer event clock; it is not a replacement for `Context::time()` or the authoritative event timestamp.
 
-See [/docs/architecture/time-concurrency](/docs/architecture/time-concurrency).
+The legacy `time_quantum` setting is implemented by a Nexosim compatibility shim. Exact scenario compilation rejects a nonzero `time_quantum`; exact parallelism instead depends on positive channel lookahead and safe-horizon rounds.
+
+See [/docs/architecture/time-concurrency](/docs/architecture/time-concurrency) for the architecture-level comparison and [/docs/internals](/docs/internals) for exact round execution.

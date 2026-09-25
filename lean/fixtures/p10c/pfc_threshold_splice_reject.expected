@@ -1,0 +1,2 @@
+exit=1
+REJECT: line 3: PFC threshold state discontinuity for monitor (node_id=2, queue_id=0, controlled_link=1, priority=3)

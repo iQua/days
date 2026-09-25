@@ -1,0 +1,523 @@
+import DaysExecutor.Event
+
+namespace DaysExecutor
+
+/--
+Closed semantic LP role mirroring `executor/src/model.rs:5-11` (`NodeKind`).
+-/
+inductive NodeKind where
+  | host
+  | switch
+  deriving DecidableEq, Repr, Ord
+
+/-- Stable flow identifier used by immutable packet descriptors. -/
+abbrev FlowId := Nat
+
+/-- PFC control data carried by an ordinary reverse-channel `RemoteArrival`. -/
+structure PfcHeader where
+  controlledLink : LinkId
+  priority : Nat
+  pause : Bool
+  deriving DecidableEq, Repr, Ord
+
+/--
+Packet payload category at the abstraction used by the executor proofs. PFC remains a typed packet
+payload and deliberately does not extend `EventKind`.
+-/
+inductive PacketKind where
+  | data
+  | feedback
+  | pfc (header : PfcHeader)
+  deriving DecidableEq, Repr, Ord
+
+/--
+Immutable packet data carried alongside remote events by the CPU backend, mirroring
+`executor/src/image.rs:162-173` (`PacketDescriptor`).
+-/
+structure PacketDescriptor where
+  id : PayloadId
+  flow : FlowId
+  sizeBytes : Nat
+  ecnMarked : Bool
+  kind : PacketKind
+  deriving DecidableEq, Repr
+
+/--
+The structural holder of one descriptor reference. Rust's pending futures are keyed by
+`EventKey` (`executor/src/cpu.rs:563-569,619-625`), queue and in-service residency are explicit
+state slots (`executor/src/image.rs:25-54`) transferred by the host/switch paths at
+`executor/src/scalar.rs:869-956,999-1015,1105-1218`, and a remote child is owned by its exact
+envelope until exchange
+(`executor/src/cpu.rs:649-698,4453-4500`).
+
+Only the in-service case corresponds literally to `ResidentPacket.transmitters`; the other tags
+make Rust's container ownership proof-relevant without pretending those containers share one
+anonymous counter.
+-/
+inductive ReferenceOwner where
+  | pendingEvent (key : EventKey)
+  | queueEntry (node : NodeId) (payload : PayloadId)
+  | inService (node : NodeId) (payload : PayloadId)
+  | envelope (source : NodeId) (key : EventKey)
+  deriving DecidableEq, Repr, Ord
+
+/-- One immutable descriptor reference paired with its exact structural holder. -/
+structure OwnedPacketReference where
+  descriptor : PacketDescriptor
+  owner : ReferenceOwner
+  deriving DecidableEq, Repr
+
+/--
+One resident descriptor together with the multiset of its live owners. The derived owner-list
+length has the same aggregate meaning as the former reference count, while exact owner membership
+prevents a transition from consuming another event's hold.
+-/
+structure PacketStoreEntry where
+  descriptor : PacketDescriptor
+  owners : List ReferenceOwner
+  deriving DecidableEq, Repr
+
+/-- Aggregate compatibility projection of an owned resident entry. -/
+def PacketStoreEntry.references (entry : PacketStoreEntry) : Nat :=
+  entry.owners.length
+
+/--
+Kind-indexed mutable-state family formalizing Rust's separate host and switch arenas at
+`executor/src/image.rs:247-260`.
+-/
+abbrev StateFamily := NodeKind → Type
+
+/--
+Role state with the queue and committed non-preemptive service slots exposed as first-class
+semantic fields. `serviceQueue` is the ordered packet view consulted at service start, while
+`committedService` represents the host/switch `in_service` slots. Both are semantic projections of
+the role-specific state at `executor/src/image.rs:25-69`; `privateState` contains only data that
+cannot influence service selection except by an explicit `serviceQueue` mutation.
+-/
+structure RoleState (State : StateFamily) (kind : NodeKind) where
+  privateState : State kind
+  serviceQueue : List PayloadId
+  committedService : List PayloadId
+
+/--
+Semantic LP identity and role-specific state slot mirroring
+`executor/src/image.rs:15-23` (`NodeDescriptor`).
+-/
+structure NodeDescriptor where
+  id : NodeId
+  kind : NodeKind
+  stateSlot : Nat
+  deriving DecidableEq, Repr
+
+/--
+Kind-indexed state arenas mirroring `SimulationImage.host_states` and `switch_states` at
+`executor/src/image.rs:252-254`.
+-/
+abbrev StateArena (State : StateFamily) := (kind : NodeKind) → List (RoleState State kind)
+
+/--
+One constant-rate directed link mirroring `executor/src/image.rs:183-195`
+(`LinkDescriptor`).
+-/
+structure LinkDescriptor where
+  id : LinkId
+  source : NodeId
+  physicalTarget : NodeId
+  rateBps : Nat
+  propagationNs : Nat
+  deriving DecidableEq, Repr
+
+/--
+Exact ceiling division used on Rust's successful checked-arithmetic path at
+`executor/src/time.rs:36-51`.
+-/
+def ceilDiv (numerator denominator : Nat) : Nat :=
+  numerator / denominator + if numerator % denominator = 0 then 0 else 1
+
+/--
+Exact integer serialization delay `ceil(8 * bytes * 10^9 / rate)` mirroring
+`executor/src/time.rs:36-51`; image validity separately excludes a zero rate.
+-/
+def serializationTimeNs (bytes rateBps : Nat) : Nat :=
+  ceilDiv (8 * bytes * 1_000_000_000) rateBps
+
+/--
+Successful-path serialization-plus-propagation delay mirroring
+`executor/src/image.rs:197-205` and `executor/src/time.rs:54-66`.
+
+Lean's unbounded `Nat` deliberately models only executions for which Rust's checked `u64`
+arithmetic succeeds.
+-/
+def linkDelayNs (link : LinkDescriptor) (bytes : Nat) : Nat :=
+  serializationTimeNs bytes link.rateBps + link.propagationNs
+
+/--
+Successful-path directed-link arrival time mirroring `executor/src/time.rs:54-66`
+(`link_arrival_time_ns`).
+-/
+def linkArrivalTimeNs (link : LinkDescriptor) (startTimeNs bytes : Nat) : Nat :=
+  startTimeNs + linkDelayNs link bytes
+
+/--
+Declared cross-LP event channel mirroring `executor/src/image.rs:209-220`
+(`RemoteChannel`).
+-/
+structure RemoteChannel where
+  source : NodeId
+  target : NodeId
+  link : LinkId
+  eventKind : EventKind
+  minDelayNs : Nat
+  deriving DecidableEq, Repr
+
+/--
+One heterogeneous accepted-image candidate mirroring
+`executor/src/image.rs:247-262` (`SimulationImage`).
+-/
+structure SimulationImage (State : StateFamily) where
+  stopTimeNs : Nat
+  nodes : List NodeDescriptor
+  stateArena : StateArena State
+  links : List LinkDescriptor
+  channels : List RemoteChannel
+  initialEvents : List Event
+  /--
+  Immutable semantic descriptor oracle. Rust materializes generated descriptors on demand and
+  transports them in `RemoteEnvelope`; the model uses this total oracle to state descriptor
+  identity without pretending `initial_packets` is a whole-run table.
+  -/
+  packetDescriptor : PayloadId → PacketDescriptor
+  /--
+  Per-LP initial descriptor owners derived from futures, queues, and in-service state by the CPU
+  constructor at `executor/src/cpu.rs:3053-3166`; this is semantic prepared-image data, not an
+  added Rust field.
+  -/
+  initialPacketStore : NodeId → List PacketStoreEntry
+  /-- Initial per-origin allocation cursor derived from role state during image preparation. -/
+  initialNextOriginSeq : NodeId → Nat
+  payloadBytes : PayloadId → Nat
+
+/--
+Small total list lookup used for Rust's checked state-slot indexing at
+`executor/src/scalar.rs:1321-1362`.
+-/
+def listGet? (items : List α) (index : Nat) : Option α :=
+  match items, index with
+  | [], _ => none
+  | head :: _, 0 => some head
+  | _ :: tail, index + 1 => listGet? tail index
+
+/--
+Role-selected state lookup corresponding to `state_slot` indexing at
+`executor/src/scalar.rs:1321-1362`.
+-/
+def stateAt?
+    (image : SimulationImage State)
+    (node : NodeDescriptor) : Option (RoleState State node.kind) :=
+  listGet? (image.stateArena node.kind) node.stateSlot
+
+/--
+Unique semantic LP identities required by the validator and indexed lookup at
+`executor/src/validate.rs:196-230` and `executor/src/scalar.rs:1315-1319`.
+-/
+def UniqueNodeIds (image : SimulationImage State) : Prop :=
+  (image.nodes.map NodeDescriptor.id).Nodup
+
+/--
+Every descriptor indexes an existing state slot in its selected role arena, mirroring
+`executor/src/validate.rs:200-210`.
+-/
+def DescriptorSlotsValid (image : SimulationImage State) : Prop :=
+  ∀ node ∈ image.nodes, node.stateSlot < (image.stateArena node.kind).length
+
+/--
+Every mutable role-state slot has exactly one LP owner, mirroring
+`executor/src/validate.rs:196-230`.
+-/
+def ExactStateOwnership (image : SimulationImage State) : Prop :=
+  DescriptorSlotsValid image ∧
+    ∀ (kind : NodeKind) (slot : Nat),
+      slot < (image.stateArena kind).length ↔
+        ∃ node,
+          node ∈ image.nodes ∧
+          node.kind = kind ∧
+          node.stateSlot = slot ∧
+          ∀ other,
+            other ∈ image.nodes →
+            other.kind = kind →
+            other.stateSlot = slot →
+            other = node
+
+/--
+Every prepared initial role state has a duplicate-free committed-service projection. Rust stores
+each host or switch-queue service slot as an `Option` at `executor/src/image.rs:25-69`, while
+`executor/src/validate.rs:1379-1511` rejects duplicate mutable payload ownership.
+-/
+def InitialCommittedServicesNodup (image : SimulationImage State) : Prop :=
+  ∀ kind, ∀ state ∈ image.stateArena kind, state.committedService.Nodup
+
+/--
+Unique initial persistent event keys, matching validation at
+`executor/src/validate.rs:1097-1115`.
+-/
+def UniqueEventKeys (events : List Event) : Prop :=
+  (events.map Event.key).Nodup
+
+/--
+Initial events are stored in strict canonical-key order before executor construction, mirroring
+validation at `executor/src/validate.rs:1097-1115`.
+-/
+def InitialEventsOrdered (image : SimulationImage State) : Prop :=
+  image.initialEvents.Pairwise (fun left right => left.key < right.key)
+
+/--
+Unique directed-link identifiers required by checked Rust lookup at
+`executor/src/scalar.rs:1365-1368`.
+-/
+def UniqueLinkIds (image : SimulationImage State) : Prop :=
+  (image.links.map LinkDescriptor.id).Nodup
+
+/--
+Unique `(link, route-selected target)` channel declarations, mirroring duplicate rejection at
+`executor/src/validate.rs:1047-1051`.
+-/
+def UniqueChannelRoutes (image : SimulationImage State) : Prop :=
+  (image.channels.map fun channel => (channel.link, channel.target)).Nodup
+
+/--
+Every initial event targets a declared LP, matching validation at
+`executor/src/validate.rs:1123-1140`.
+-/
+def InitialTargetsDeclared (image : SimulationImage State) : Prop :=
+  ∀ event ∈ image.initialEvents, ∃ node ∈ image.nodes, node.id = event.target
+
+/--
+Initial event phases and origin LPs are canonical, mirroring validation at
+`executor/src/validate.rs:1117-1140`.
+-/
+def InitialKeysCanonical (image : SimulationImage State) : Prop :=
+  ∀ event ∈ image.initialEvents,
+    event.key.phase = eventPhase event.kind ∧
+    ∃ origin ∈ image.nodes, origin.id = event.key.originNode
+
+/--
+The immutable descriptor oracle is keyed by payload and agrees with the byte-size function used by
+link timing. This represents the descriptors created at `executor/src/scalar.rs:760-767` and
+transported at `executor/src/cpu.rs:664-667`.
+-/
+def DescriptorOracleWellFormed (image : SimulationImage State) : Prop :=
+  ∀ payload,
+    (image.packetDescriptor payload).id = payload ∧
+      (image.packetDescriptor payload).sizeBytes = image.payloadBytes payload
+
+/--
+An owned descriptor store is in the strict payload-key order exposed by Rust's
+`BTreeMap<PayloadId, ResidentPacket>` at `executor/src/scalar.rs:367`. Consequently its list
+projection is independent of descriptor insertion order.
+-/
+def DescriptorStoreSorted (store : List PacketStoreEntry) : Prop :=
+  store.Pairwise fun left right => left.descriptor.id < right.descriptor.id
+
+/--
+Derive one payload's aggregate live-reference count from its exact owner multiset.
+-/
+def descriptorReferenceCount (payload : PayloadId) : List PacketStoreEntry → Nat
+  | [] => 0
+  | entry :: tail =>
+      if entry.descriptor.id = payload then
+        entry.references
+      else
+        descriptorReferenceCount payload tail
+
+/-- Number of occurrences of one exact owner in the payload-indexed resident store. -/
+def ownedReferenceCount
+    (reference : OwnedPacketReference) : List PacketStoreEntry → Nat
+  | [] => 0
+  | entry :: tail =>
+      if entry.descriptor.id = reference.descriptor.id then
+        entry.owners.count reference.owner
+      else
+        ownedReferenceCount reference tail
+
+/-- The future-list hold owned by one exact pending event key. -/
+def ownedEventReference
+    (image : SimulationImage State)
+    (event : Event) : OwnedPacketReference :=
+  { descriptor := image.packetDescriptor event.payload
+    owner := .pendingEvent event.key }
+
+/-- The hold owned by one queue residency at an LP. -/
+def ownedQueueReference
+    (image : SimulationImage State)
+    (node : NodeId)
+    (payload : PayloadId) : OwnedPacketReference :=
+  { descriptor := image.packetDescriptor payload
+    owner := .queueEntry node payload }
+
+/-- The hold owned by one committed in-service slot at an LP. -/
+def ownedInServiceReference
+    (image : SimulationImage State)
+    (node : NodeId)
+    (payload : PayloadId) : OwnedPacketReference :=
+  { descriptor := image.packetDescriptor payload
+    owner := .inService node payload }
+
+/--
+Owned queue and in-service holds derived from the public mutable-state projection. Rust validation
+rejects duplicate mutable payload residency at `executor/src/validate.rs:1475-1573`, so the
+`(node,payload)` tags identify the corresponding queue entry or service slot.
+-/
+def ownedRoleStateReferences
+    (image : SimulationImage State)
+    (node : NodeDescriptor)
+    (state : RoleState State node.kind) : List OwnedPacketReference :=
+  state.serviceQueue.map (ownedQueueReference image node.id) ++
+    state.committedService.map (ownedInServiceReference image node.id)
+
+/-- Initial pending and mutable-state owners assigned to one LP. -/
+def initialOwnedReferencesFor
+    (image : SimulationImage State)
+    (node : NodeDescriptor)
+    (state : RoleState State node.kind) : List OwnedPacketReference :=
+  ((image.initialEvents.filter fun event => event.target = node.id).map
+      (ownedEventReference image)) ++
+    ownedRoleStateReferences image node state
+
+/--
+Exact correspondence between live structural holders and an owned resident store. The first
+direction rules out missing holds; the second rules out ghost owners that have no pending event,
+queue residency, in-service slot, or envelope.
+-/
+def OwnedReferencesMatchStore
+    (references : List OwnedPacketReference)
+    (store : List PacketStoreEntry) : Prop :=
+  (∀ reference ∈ references,
+    references.count reference = ownedReferenceCount reference store) ∧
+    ∀ entry ∈ store, ∀ owner ∈ entry.owners,
+      references.count { descriptor := entry.descriptor, owner } =
+        entry.owners.count owner
+
+/-- Exact finite owner/store correspondence is executable. -/
+instance
+    (references : List OwnedPacketReference)
+    (store : List PacketStoreEntry) :
+    Decidable (OwnedReferencesMatchStore references store) := by
+  unfold OwnedReferencesMatchStore
+  infer_instance
+
+/--
+Prepared initial descriptor stores are strictly payload-sorted, contain nonempty duplicate-free
+owner multisets and unique oracle values, and contain every future, queue, and in-service owner
+derived during CPU preparation (`executor/src/cpu.rs:3053-3166`). Aggregate per-payload counts are
+therefore derived from the owner multiset rather than supplied independently.
+-/
+def InitialPacketStoresWellFormed (image : SimulationImage State) : Prop :=
+  (∀ node ∈ image.nodes,
+    DescriptorStoreSorted (image.initialPacketStore node.id) ∧
+      ((image.initialPacketStore node.id).map
+        fun entry => entry.descriptor.id).Nodup ∧
+        ∀ entry ∈ image.initialPacketStore node.id,
+          entry.owners ≠ [] ∧
+            entry.owners.Nodup ∧
+            entry.descriptor = image.packetDescriptor entry.descriptor.id) ∧
+    ∀ node ∈ image.nodes, ∀ state,
+      stateAt? image node = some state →
+      OwnedReferencesMatchStore
+        (initialOwnedReferencesFor image node state)
+        (image.initialPacketStore node.id)
+
+/--
+Validated prepared arenas expose a strictly payload-sorted owned store at every LP, corresponding
+to `BTreeMap<PayloadId, ResidentPacket>` at `executor/src/scalar.rs:367-381`.
+-/
+theorem initialPacketStore_sorted_of_wellFormed
+    (image : SimulationImage State)
+    (hwellFormed : InitialPacketStoresWellFormed image)
+    (node : NodeDescriptor)
+    (hnode : node ∈ image.nodes) :
+    DescriptorStoreSorted (image.initialPacketStore node.id) :=
+  (hwellFormed.1 node hnode).1
+
+/--
+Every origin's prepared cursor lies above all of its initial event sequences, matching validation
+at `executor/src/validate.rs:1876-1927`.
+-/
+def InitialOriginSequencesReserved (image : SimulationImage State) : Prop :=
+  ∀ node ∈ image.nodes, ∀ event ∈ image.initialEvents,
+    event.key.originNode = node.id →
+    event.key.originSeq < image.initialNextOriginSeq node.id
+
+/--
+Every directed link has a positive serialization rate, mirroring the checked error at
+`executor/src/time.rs:41-44`.
+-/
+def PositiveLinkRates (image : SimulationImage State) : Prop :=
+  ∀ link ∈ image.links, 0 < link.rateBps
+
+/--
+Every directed link endpoint names a declared LP, mirroring link validation at
+`executor/src/validate.rs:240-260`.
+-/
+def DeclaredLinkEndpoints (image : SimulationImage State) : Prop :=
+  ∀ link ∈ image.links,
+    (∃ source ∈ image.nodes, source.id = link.source) ∧
+    (∃ target ∈ image.nodes, target.id = link.physicalTarget)
+
+/--
+Every channel used by a safe-horizon backend has positive certified lookahead. Load-time validation
+rejects zero specifically for parallel backends at `executor/src/validate.rs:1059-1062`; the
+single-threaded safe-horizon constructor independently rejects it at
+`executor/src/safe_horizon.rs:200-207` (the CPU constructors do likewise at
+`executor/src/cpu.rs:247-255,366-374,462-470`).
+-/
+def PositiveChannelBounds (image : SimulationImage State) : Prop :=
+  ∀ channel ∈ image.channels, 0 < channel.minDelayNs
+
+/--
+Every channel endpoint names a declared LP, mirroring target/source validation at
+`executor/src/validate.rs:1023-1039`.
+-/
+def DeclaredChannelEndpoints (image : SimulationImage State) : Prop :=
+  ∀ channel ∈ image.channels,
+    (∃ source ∈ image.nodes, source.id = channel.source) ∧
+    (∃ target ∈ image.nodes, target.id = channel.target)
+
+/--
+Channel/link source consistency mirroring `executor/src/validate.rs:1015-1045`.
+
+The channel target is intentionally not equated with `LinkDescriptor.physicalTarget`: after the
+port-LP split, Rust permits a route-selected egress LP behind the physical receiving node
+(`executor/src/image.rs:188-192`).
+-/
+def ChannelsReferenceDirectedLinks (image : SimulationImage State) : Prop :=
+  ∀ channel ∈ image.channels,
+    ∃ link ∈ image.links,
+      link.id = channel.link ∧
+      link.source = channel.source ∧
+      channel.eventKind = .remoteArrival
+
+/--
+Static accepted-image assumptions checked independently of transition bodies: the load-time checks
+around `executor/src/validate.rs:196-245,1010-1080,1379-1511`, including the duplicate-free semantic
+projection of Rust's initial `in_service` slots at `executor/src/image.rs:25-69`.
+-/
+def StaticImageWellFormed (image : SimulationImage State) : Prop :=
+  UniqueNodeIds image ∧
+    ExactStateOwnership image ∧
+    InitialCommittedServicesNodup image ∧
+    UniqueEventKeys image.initialEvents ∧
+    InitialEventsOrdered image ∧
+    UniqueLinkIds image ∧
+    UniqueChannelRoutes image ∧
+    InitialTargetsDeclared image ∧
+    InitialKeysCanonical image ∧
+    DescriptorOracleWellFormed image ∧
+    InitialPacketStoresWellFormed image ∧
+    InitialOriginSequencesReserved image ∧
+    PositiveLinkRates image ∧
+    DeclaredLinkEndpoints image ∧
+    PositiveChannelBounds image ∧
+    DeclaredChannelEndpoints image ∧
+    ChannelsReferenceDirectedLinks image
+
+end DaysExecutor

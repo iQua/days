@@ -1,0 +1,28 @@
+seed = 1000
+duration = 0.1
+threading = "single"
+model_host_attachment = true
+report_interval = 0.01
+log_path = "logs/small_lookahead/open_loop_100g_1us_st"
+edges = [[0, 1]]
+hosts = [0, 1]
+
+[switch]
+port_rate = 100_000_000_000
+capacity = 1024
+weights = [1]
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link]
+propagation_ns = 1000
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[0, 1]]
+
+[flow.traffic]
+initial_delay = 0.0
+duration = 0.099
+arr_dist = { type = "Uniform", low = 0.000001, high = 0.000001 }
+pkt_size_dist = { type = "Uniform", low = 1000, high = 1000 }

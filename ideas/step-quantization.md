@@ -289,7 +289,7 @@ This avoids 309k full worker deactivate/activate cycles.
 
    * this often reduces step count significantly with minimal semantic damage
 2. **TCP pacing floor tied to quantum**
-3. Re-run perf stats. If `steps` drops meaningfully and MT improves, stop here.
+3. Re-run the workload. If MT runtime improves meaningfully, stop here.
 4. If `steps` is still huge:
 
    * implement a **hot pool / linger** mode in executor to reduce park/unpark overhead
@@ -298,4 +298,3 @@ This avoids 309k full worker deactivate/activate cycles.
 ---
 
 If you share (or paste) your `flows/wire.rs` scheduling code and the Port rate representation (is it always integer from config?), I can give you a very tight patch sketch for (2.2) and the exact “integer-ns Port::run” edit that keeps your existing interfaces but removes float drift + adds quantization cleanly.
-

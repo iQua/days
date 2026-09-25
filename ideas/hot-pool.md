@@ -303,7 +303,7 @@ This will catch any accidental “worker executed tasks out of band”.
 
 ### 2) Assert tasks don’t run without `run()` (optional)
 
-Temporarily add a debug-only `run_epoch` capture to task poll spans (if you have tracing hooks) or in `schedule_task` to ensure `run_epoch` progressed since last idle. Not mandatory, but useful during development.
+Temporarily add a debug-only `run_epoch` check in `schedule_task` to ensure `run_epoch` progressed since last idle. Not mandatory, but useful during development.
 
 ---
 
@@ -368,4 +368,3 @@ Right now, I’ve kept PoolManager changes optional/minimal because we didn’t 
 
 * the exact hot-worker activation diff (Layer 3) that matches your bitset logic, and
 * a cleaner linger loop that avoids a fallback `park()` when we already know activation happened.
-

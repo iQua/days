@@ -1,32 +1,33 @@
 ---
 title: Simulation lifecycle
-description: SimInit, Simulation, and stepping semantics in Nexosim.
+description: SimInit, Simulation, and stepping in the legacy Nexosim engine.
 ---
 
-Nexosim runs a discrete-event simulation by repeatedly:
+This lifecycle applies to the **legacy** simulator. Its `Topology::new` builds a Nexosim bench, and `Topology::run` drives the resulting `Simulation`.
 
-1. executing all events scheduled for the current simulation time
-2. advancing to the next time at which at least one event is scheduled
+## Construction and execution
 
-In Days, the main entrypoint is `Topology::run`, which:
+`SimInit::with_num_threads` selects Nexosim's single-threaded executor for one worker and its multithreaded executor otherwise. Legacy topology construction then:
 
-- builds a `SimInit`
-- registers all models and mailboxes
-- calls `init(...)` to obtain a `Simulation`
-- runs `sim.step_until(Duration::from_secs_f64(duration))`
+1. creates model values and bounded mailboxes
+2. registers the models and connects their ports
+3. calls `SimInit::init` to create a `Simulation`
+4. injects the initial source events
+5. advances through the configured stop time with `step_until`
+
+The Days assembly is in `legacy/src/topos/topo.rs`; the runtime is in `crates/nexosim/src/simulation.rs` and `crates/nexosim/src/simulation/sim_init.rs`.
 
 ## Key APIs
 
-Source: `crates/nexosim/src/simulation.rs`
+- `process_event(&EventId, value)` immediately processes a registered event source without advancing simulation time.
+- `process_event_fn(handler, value, address)` is the Days compatibility helper that targets a model input function and address directly.
+- `process_query(&QueryId, value)` immediately processes a registered query and waits for its reply without advancing time.
+- `step()` advances to the next scheduled event or ticker time and processes the work at that time.
+- `step_until(deadline)` repeats that process through the deadline and leaves the clock at the requested time.
+- `run()` processes the queue until it is empty in tickless mode. With a ticker configured, it waits until the scheduler is halted.
 
-- `SimInit`: builder for assembling a bench (models, mailboxes, runtime knobs)
-- `Simulation`:
-  - `process_event(...)`: inject an event into a model (often used for “start” actions)
-  - `process_query(...)`: inject a request/reply query into a model and wait for the reply
-  - `step()`: advance to the next event time and process all events at that time
-  - `step_until(Duration)`: run until a target time
-  - `run()`: run until the simulation is halted
+## Concurrency and ordering
 
-## Ordering and determinism
+Nexosim can execute ready model tasks concurrently at the same simulated timestamp. Wall-clock task order is therefore not a protocol guarantee. Legacy verification compares canonicalized traces where ordering is semantically irrelevant.
 
-Within a given simulated timestamp, Nexosim may execute ready tasks in parallel (depending on executor configuration). Days therefore avoids treating wall-clock execution order as semantically meaningful and relies on deterministic *trace canonicalization* for verification (see [/docs/verification/design](/docs/verification/design)).
+This is separate from exact execution. The exact scalar, CPU, Metal, and CUDA paths use their own canonical `EventKey` ordering and safe-horizon exchange protocol; see [/docs/internals](/docs/internals).
