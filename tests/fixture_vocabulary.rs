@@ -11,7 +11,7 @@
 //! 3. **A non-fat-tree, non-torus topology.** F-TOPO's capability row needs one.
 //!
 //! All three are host-side lowering vocabulary. No executor semantics change, and every default
-//! path is byte-identical to `89ec7c4` — the frozen anchors in `t21_p12_fixtures.rs` are the gate.
+//! path is byte-identical to `89ec7c4` — the frozen anchors in `evaluation_fixture_anchors.rs` are the gate.
 
 use std::fs;
 use std::path::PathBuf;

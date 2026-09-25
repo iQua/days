@@ -19,7 +19,7 @@ All fixtures use 100 Gbit/s links, 1 us propagation, 1,460-byte MSS, 23,360-byte
 convergence enabled). The `k4` fixture (`fattree_k4_tcp_cubic_f16_smoke.toml`) is only an RQ9
 harness smoke and is deliberately not a ladder point, so it is absent from the table above. It is
 still a canonical TCP image, so it is a full member of the lowering and four-backend byte-identity
-campaigns in `validation/tests/t24_tcp_corpora.rs`, which run five corpora and reject a
+campaigns in `validation/tests/tcp_corpora.rs`, which run five corpora and reject a
 `T24_CORPUS` filter that selects none of them.
 
 Run a corpus through the sustained harness by passing its path as the first argument. The harness
@@ -27,6 +27,6 @@ retains four balanced-order samples and prints `workload=tcp rq=RQ9` on protocol
 summary records. Example:
 
 ```text
-cargo run --release --features metal-spike --bin t15e_sustained_benchmark -- configs/benchmarks/tcp/fattree_k16_tcp_reno_f1024.toml
-cargo run --release --features cuda --bin t15e_sustained_benchmark -- configs/benchmarks/tcp/fattree_k16_tcp_reno_f1024.toml
+cargo run --release --features metal-spike --bin sustained-benchmark -- configs/benchmarks/tcp/fattree_k16_tcp_reno_f1024.toml
+cargo run --release --features cuda --bin sustained-benchmark -- configs/benchmarks/tcp/fattree_k16_tcp_reno_f1024.toml
 ```

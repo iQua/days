@@ -1,6 +1,6 @@
-# P12 E3 legacy-comparability fixture, mt arm. GENERATED -- do not hand-edit.
+# P12 E3 legacy-comparability fixture, st arm. GENERATED -- do not hand-edit.
 #
-# Regenerate with: python3 configs/benchmarks/p12/gen_e3_rack_local.py
+# Regenerate with: python3 configs/benchmarks/evaluation/gen_e3_rack_local.py
 # The generator carries the full rationale; the three load-bearing facts are:
 #   * every flow is BYTE-terminated (legacy emits one extra packet per duration-terminated flow);
 #   * the traffic matrix is explicit and rack-local-dominant (the executor rejects non-constant
@@ -17,10 +17,8 @@
 #   C cross-pod                 512 flows, 20 pkt/s, 300000 B
 seed = 1000
 duration = 18
-threading = "multiple"
-concurrency_level = "accelerated"
-hot_workers = 2
-log_path = "logs/p12/e3_legacy_rack_local_mt"
+threading = "single"
+log_path = "logs/p12/e3_legacy_rack_local_st"
 
 [topology]
     category = "FatTree"

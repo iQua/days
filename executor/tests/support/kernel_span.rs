@@ -1,7 +1,7 @@
 //! Kernel-span extraction shared by the two T21 source gates.
 //!
-//! **Why this exists as a shared module.** Both `t21_fel_root_cache.rs` and
-//! `t21_control_regrid.rs` assert over the *body of one kernel*, and both originally carried their
+//! **Why this exists as a shared module.** Both `fel_root_cache.rs` and
+//! `control_phase_grid.rs` assert over the *body of one kernel*, and both originally carried their
 //! own copy of a helper that split the source on the literal opener
 //! `extern "C" __global__ void `. That literal does not match
 //!

@@ -39,10 +39,10 @@ const FIXTURES: &[&str] = &[
     "configs/benchmarks/baseline/fattree_k8_f64_st.toml",
     "configs/benchmarks/baseline/fattree_k16_f512_st.toml",
     // Closed-loop TCP, open-loop rate, and the mixed RQ9 cohort.
-    "configs/benchmarks/p11/rq9_closed_k16.toml",
-    "configs/benchmarks/p11/rq9_open_k16.toml",
-    "configs/benchmarks/p11/rq9_open_k16_matched.toml",
-    "configs/benchmarks/p11/rq9_mixed_k16.toml",
+    "configs/benchmarks/lookahead/rq9_closed_k16.toml",
+    "configs/benchmarks/lookahead/rq9_open_k16.toml",
+    "configs/benchmarks/lookahead/rq9_open_k16_matched.toml",
+    "configs/benchmarks/lookahead/rq9_mixed_k16.toml",
     // Exact-rate pacing at a one-microsecond lookahead.
     "configs/benchmarks/small_lookahead/open_loop_100g_1us_st.toml",
     "configs/benchmarks/small_lookahead/open_loop_100g_1us_mt.toml",
@@ -63,8 +63,8 @@ const FIXTURES: &[&str] = &[
 /// timers — the state that makes the flow-keyed groups and the ACK counts non-trivial.
 const CHECKPOINT_FIXTURES: &[&str] = &[
     "configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml",
-    "configs/benchmarks/p11/rq9_closed_k16.toml",
-    "configs/benchmarks/p11/rq9_mixed_k16.toml",
+    "configs/benchmarks/lookahead/rq9_closed_k16.toml",
+    "configs/benchmarks/lookahead/rq9_mixed_k16.toml",
     "configs/benchmarks/baseline/fattree_k4_f8_st.toml",
 ];
 

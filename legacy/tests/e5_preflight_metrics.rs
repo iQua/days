@@ -137,7 +137,7 @@ fn q_high_e5_analogue_exports_exact_final_metrics_and_stops_timer_work() {
 fn frozen_e5_completes_every_flow_and_acks_every_demand_byte() {
     let directory = TempDir::new().unwrap();
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../configs/benchmarks/p12/e5_wide_k32_q200.toml");
+        .join("../configs/benchmarks/evaluation/e5_wide_k32_q200.toml");
     let original = fs::read_to_string(&source).unwrap();
     let logs = directory.path().join("e5-logs");
     let body = original.replacen(

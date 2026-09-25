@@ -48,7 +48,7 @@ image, which is itself part of the comparison.
 
 Usage (from the repository root, output is byte-identical for identical arguments):
 
-    python3 configs/benchmarks/p12/gen_e3_rack_local.py
+    python3 configs/benchmarks/evaluation/gen_e3_rack_local.py
 """
 
 import argparse
@@ -62,7 +62,7 @@ PACKET_BYTES = 1000
 
 HEADER = '''# P12 E3 legacy-comparability fixture, %(arm)s arm. GENERATED -- do not hand-edit.
 #
-# Regenerate with: python3 configs/benchmarks/p12/gen_e3_rack_local.py
+# Regenerate with: python3 configs/benchmarks/evaluation/gen_e3_rack_local.py
 # The generator carries the full rationale; the three load-bearing facts are:
 #   * every flow is BYTE-terminated (legacy emits one extra packet per duration-terminated flow);
 #   * the traffic matrix is explicit and rack-local-dominant (the executor rejects non-constant

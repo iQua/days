@@ -154,7 +154,7 @@ const CORPORA: [Corpus; 4] = [
 
 /// The k4 harness smoke fixture.
 ///
-/// It is deliberately not a ladder point (`configs/benchmarks/tcp/t24-corpus-manifest.md`), which
+/// It is deliberately not a ladder point (`configs/benchmarks/tcp/tcp-corpus-manifest.md`), which
 /// is why it stays out of `CORPORA` and out of the k16/k32 manifest assertions. It is still a real
 /// canonical TCP image, so it is a full member of the lowering and four-backend execution
 /// campaigns below.

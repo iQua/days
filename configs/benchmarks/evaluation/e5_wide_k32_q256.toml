@@ -1,6 +1,6 @@
 # P12 E5 BACKUP: frozen wide TCP, k=32, queue 256. GENERATED -- do not hand-edit.
 #
-# Regenerate with: python3 configs/benchmarks/p12/gen_e5_wide_tcp.py
+# Regenerate with: python3 configs/benchmarks/evaluation/gen_e5_wide_tcp.py
 # The generator preserves the design probe's single `[[flow_set]]`; the test suite
 # compares regenerated files byte-for-byte and pins the ruled semantic form.
 #

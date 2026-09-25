@@ -955,7 +955,7 @@ fn strict_validation_accepts_every_tracked_legacy_fixture_except_tiered_delays()
     assert!(
         rejected[0]
             .0
-            .ends_with("configs/benchmarks/p12/f_het_k8_tiered_delays.toml"),
+            .ends_with("configs/benchmarks/evaluation/f_het_k8_tiered_delays.toml"),
         "only the known unsupported tiered-delay fixture may be rejected: {rejected:#?}"
     );
     assert!(rejected[0].1.contains("link.propagation_tiers"));
@@ -965,7 +965,7 @@ fn strict_validation_accepts_every_tracked_legacy_fixture_except_tiered_delays()
 fn strict_validation_accepts_the_e1_family() {
     for load in ["10", "30", "60", "90"] {
         let path = format!(
-            "{}/../configs/benchmarks/p12/e1_open_k32_load_{load}.toml",
+            "{}/../configs/benchmarks/evaluation/e1_open_k32_load_{load}.toml",
             env!("CARGO_MANIFEST_DIR")
         );
         days_legacy::validate_config(&path)

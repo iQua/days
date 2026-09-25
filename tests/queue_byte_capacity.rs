@@ -87,7 +87,7 @@ fn apply_probe_byte_policy(
 #[test]
 fn k16_probe_policy_is_derived_exactly() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("configs/benchmarks/p11/rq9_closed_k16.toml");
+        .join("configs/benchmarks/lookahead/rq9_closed_k16.toml");
     let mut image = compile_config(&path).expect("K16 fixture must lower");
     let transform = apply_probe_byte_policy(&mut image, 1_460).expect("transform must succeed");
 

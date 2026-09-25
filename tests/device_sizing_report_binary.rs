@@ -4,8 +4,8 @@ use assert_cmd::cargo::cargo_bin_cmd;
 fn k48_wide_sizing_dry_run_is_host_only_and_reproduces_load30_arenas() {
     let fixture = "configs/benchmarks/width_via_load_k48_h16/\
                    fattree_k48_h16_load_30_sustained.toml";
-    let output = cargo_bin_cmd!("t17c_wide_corpus")
-        .args(["--sizing-dry-run", fixture])
+    let output = cargo_bin_cmd!("device-sizing-report")
+        .arg(fixture)
         .output()
         .expect("sizing dry-run must launch");
     assert!(

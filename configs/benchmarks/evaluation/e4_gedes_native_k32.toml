@@ -1,6 +1,6 @@
 # P12 E4: GeDES's OWN native k=32 workload, run to completion. GENERATED -- do not hand-edit.
 #
-# Regenerate with: python3 configs/benchmarks/p12/gen_e4_gedes_native.py
+# Regenerate with: python3 configs/benchmarks/evaluation/gen_e4_gedes_native.py
 # The generator carries the full parameter-by-parameter mapping and the list of GeDES
 # behaviours that deliberately do NOT map. The load-bearing facts are:
 #
@@ -39,7 +39,7 @@
 #     0 dropped packets and 0 retransmitted bytes; DRAIN at 96,054,393 ns over 78,999
 #     rounds, against the 4,000,000,000 ns horizon -- a margin of 3,903,945,607 ns.
 #
-# WORKLOAD SHAPE (measured over the committed table, asserted in tests/t21_p12_e4.rs):
+# WORKLOAD SHAPE (measured over the committed table, asserted in tests/e4_gedes_native_fixtures.rs):
 #   flows                              8,192
 #   total payload            104,063,174,620 B   (71,276,147 segments)
 #   smallest / largest                 1,460 B / 29,200,000 B  (1 and 20,000 segments)

@@ -3,8 +3,8 @@
 
 Run from any directory:
 
-    python3 configs/benchmarks/p12/gen_e5_wide_tcp.py
-    python3 configs/benchmarks/p12/gen_e5_wide_tcp.py --controller cubic
+    python3 configs/benchmarks/evaluation/gen_e5_wide_tcp.py
+    python3 configs/benchmarks/evaluation/gen_e5_wide_tcp.py --controller cubic
 
 The authored fixtures preserve the design probe's single `[[flow_set]]`. This is intentional:
 `FatTreeEcmp` hashes semantic flow identity, and round 1 proved that expanding the same endpoints
@@ -58,7 +58,7 @@ def render(
     write = out.append
     write(f"# P12 E5 {role}: frozen wide TCP, k=32, queue {queue_packets}. GENERATED -- do not hand-edit.")
     write("#")
-    regenerate = "python3 configs/benchmarks/p12/gen_e5_wide_tcp.py"
+    regenerate = "python3 configs/benchmarks/evaluation/gen_e5_wide_tcp.py"
     if controller == "cubic":
         regenerate += " --controller cubic"
     write(f"# Regenerate with: {regenerate}")

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Generate the P12 E4 fixture: GeDES's OWN native k=32 workload, expressed for Days.
 
-    python3 configs/benchmarks/p12/gen_e4_gedes_native.py
+    python3 configs/benchmarks/evaluation/gen_e4_gedes_native.py
 
-Writes `configs/benchmarks/p12/e4_gedes_native_k32.toml`. A test
-(`tests/t21_p12_e4.rs::the_generator_reproduces_the_committed_fixture`) regenerates and compares
+Writes `configs/benchmarks/evaluation/e4_gedes_native_k32.toml`. A test
+(`tests/e4_gedes_native_fixtures.rs::the_generator_reproduces_the_committed_fixture`) regenerates and compares
 byte-for-byte, so this script and the fixture cannot drift apart.
 
 ===============================================================================================
@@ -297,7 +297,7 @@ def render(flows) -> str:
     w = out.append
     w("# P12 E4: GeDES's OWN native k=32 workload, run to completion. GENERATED -- do not hand-edit.")
     w("#")
-    w("# Regenerate with: python3 configs/benchmarks/p12/gen_e4_gedes_native.py")
+    w("# Regenerate with: python3 configs/benchmarks/evaluation/gen_e4_gedes_native.py")
     w("# The generator carries the full parameter-by-parameter mapping and the list of GeDES")
     w("# behaviours that deliberately do NOT map. The load-bearing facts are:")
     w("#")
@@ -336,7 +336,7 @@ def render(flows) -> str:
     w("#     0 dropped packets and 0 retransmitted bytes; DRAIN at 96,054,393 ns over 78,999")
     w("#     rounds, against the 4,000,000,000 ns horizon -- a margin of 3,903,945,607 ns.")
     w("#")
-    w("# WORKLOAD SHAPE (measured over the committed table, asserted in tests/t21_p12_e4.rs):")
+    w("# WORKLOAD SHAPE (measured over the committed table, asserted in tests/e4_gedes_native_fixtures.rs):")
     w(f"#   flows                 {len(flows):>18,}")
     w(f"#   total payload         {total_bytes:>18,} B   ({total_bytes / SEGMENT_BYTES:,.0f} segments)")
     w(f"#   smallest / largest    {smallest:>18,} B / {largest:,} B  (1 and 20,000 segments)")

@@ -81,7 +81,7 @@ fn e3_integer_totals_match_pre_e5_tag() {
     let directory = TempDir::new().unwrap();
     for mode in ["st", "mt"] {
         let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
-            "../configs/benchmarks/p12/e3_legacy_rack_local_{mode}.toml"
+            "../configs/benchmarks/evaluation/e3_legacy_rack_local_{mode}.toml"
         ));
         let config = directory
             .path()

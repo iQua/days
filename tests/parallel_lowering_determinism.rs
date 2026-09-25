@@ -48,7 +48,7 @@ const DEFAULT_CORPUS: &[(&str, usize, Option<u64>)] = &[
 ];
 
 const K32_TCP_FIXTURE: &str = "configs/benchmarks/tcp/fattree_k32_tcp_reno_f8192.toml";
-const FRONTIER_FIXTURE: &str = "configs/benchmarks/p11/rq9_frontier_closed_k32.toml";
+const FRONTIER_FIXTURE: &str = "configs/benchmarks/lookahead/rq9_frontier_closed_k32.toml";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ImageFingerprint {

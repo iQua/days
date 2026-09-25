@@ -1250,7 +1250,7 @@ fn main() {
 }
 
 #[cfg(all(feature = "cuda", not(all(feature = "metal", target_vendor = "apple"))))]
-#[path = "t15e_sustained_benchmark/cuda_app.rs"]
+#[path = "sustained_benchmark/cuda_app.rs"]
 mod cuda_app;
 
 #[cfg(all(feature = "cuda", not(all(feature = "metal", target_vendor = "apple"))))]
@@ -1260,7 +1260,7 @@ fn main() {
 
 #[cfg(not(any(feature = "cuda", all(feature = "metal", target_vendor = "apple"))))]
 fn main() {
-    eprintln!("t15e_sustained_benchmark requires --features metal on Apple or --features cuda");
+    eprintln!("sustained-benchmark requires --features metal on Apple or --features cuda");
     std::process::exit(2);
 }
 

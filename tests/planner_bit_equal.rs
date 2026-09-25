@@ -33,7 +33,7 @@ const FIXTURES: &[&str] = &[
     "configs/benchmarks/baseline/fattree_k4_f8_st.toml",
     // Sustained closed-loop TCP and the short TCP corpus.
     "configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml",
-    "configs/benchmarks/p11/rq9_closed_k16.toml",
+    "configs/benchmarks/lookahead/rq9_closed_k16.toml",
     // Multi-cohort width-via-load planning.
     "configs/benchmarks/width_via_load/fattree_k32_target_w01000.toml",
 ];

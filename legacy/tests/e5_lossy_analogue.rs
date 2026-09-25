@@ -12,7 +12,7 @@ use tempfile::TempDir;
 fn k4_lossy_analogue_completes_exact_demand_after_real_drops_and_retransmissions() {
     let directory = TempDir::new().unwrap();
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../configs/benchmarks/p12/e5_legacy_k4_loss.toml");
+        .join("../configs/benchmarks/evaluation/e5_legacy_k4_loss.toml");
     let config = directory.path().join("e5-legacy-k4-loss.toml");
     let logs = directory.path().join("logs");
     let body = fs::read_to_string(source).unwrap().replace(

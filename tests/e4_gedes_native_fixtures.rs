@@ -131,7 +131,7 @@ fn fingerprint(value: &impl Debug) -> Fingerprint {
 
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("configs/benchmarks/p12")
+        .join("configs/benchmarks/evaluation")
         .join(name)
 }
 
@@ -377,7 +377,7 @@ fn the_generator_reproduces_the_committed_fixture() {
     let directory = std::env::temp_dir().join(format!("days-t21-e4-{}", std::process::id()));
     std::fs::create_dir_all(&directory).expect("temporary output directory");
     let generator = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("configs/benchmarks/p12/gen_e4_gedes_native.py");
+        .join("configs/benchmarks/evaluation/gen_e4_gedes_native.py");
     let status = std::process::Command::new("python3")
         .arg(&generator)
         .arg("--out-dir")

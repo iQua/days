@@ -5,7 +5,7 @@
 //! four-backend byte-identity suites do that — but it pins the recompute count the analysis
 //! measured the cost of, so a later change cannot silently reintroduce the two redundant sweeps.
 //!
-//! **Item 3(b), the re-grid of the control phases, is gated in `t21_control_regrid.rs`**, not
+//! **Item 3(b), the re-grid of the control phases, is gated in `control_phase_grid.rs`**, not
 //! here. This file keeps only the recompute count, because that count is the thing the re-grid
 //! must not disturb: after the re-grid the single evaluation lives in `days_horizon_sweep` rather
 //! than `days_horizon_sweep`; O1.4's reset/count and prepare/write dispatches read it once each.
@@ -131,10 +131,10 @@ fn the_fel_root_query_is_evaluated_once_per_node_per_round() {
 
 /// The cache is two words per LP — the root event's time and a validity flag — and nothing else.
 /// A single-word encoding would have to spend a sentinel, and `u64::MAX` is a legal event time on
-/// this simulator (`t21_p12_fixtures` runs a real event at the inclusive stop), so validity is
+/// this simulator (`evaluation_fixture_anchors` runs a real event at the inclusive stop), so validity is
 /// carried separately rather than folded into the value.
 ///
-/// The round scratch region's *total* size is gated in `t21_control_regrid.rs`: fix 1 appends the
+/// The round scratch region's *total* size is gated in `control_phase_grid.rs`: fix 1 appends the
 /// per-block reduction partials to the same region.
 #[test]
 fn the_cache_is_two_words_per_lp() {

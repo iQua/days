@@ -67,7 +67,7 @@
 # drop-free long-span cross-arm row today. Closing this point needs a BALANCED fat-tree path
 # assignment -- one uplink per source ordinal instead of a hash -- which is a routing-policy change,
 # not a fixture change. Gated by `static_ecmp_cannot_sustain_this_matrix_above_the_ten_percent_point`
-# in `tests/t21_p12_e1long.rs`. E1's four frozen 20 us anchors are drop-free only because the fabric
+# in `tests/e1long_fixtures.rs`. E1's four frozen 20 us anchors are drop-free only because the fabric
 # has not finished filling at 20 us; the property belongs to the horizon, not to the fabric.
 seed = 21032
 duration = 0.020000

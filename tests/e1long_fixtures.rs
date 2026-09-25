@@ -9,7 +9,7 @@
 //! per-flow byte budget from the pacing arithmetic, and these gates pin that arithmetic rather
 //! than the resulting constants alone.
 //!
-//! Three kinds of gate here, matching `t21_p12_fixtures.rs`:
+//! Three kinds of gate here, matching `evaluation_fixture_anchors.rs`:
 //!
 //! 1. **Contract** — E1-LONG differs from E1 in exactly `duration`, `size` and `log_path`, and its
 //!    budget is the unique minimal-and-sufficient one for a 20 ms horizon.
@@ -103,7 +103,7 @@ fn fingerprint(value: &impl Debug) -> Fingerprint {
 
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("configs/benchmarks/p12")
+        .join("configs/benchmarks/evaluation")
         .join(name)
 }
 
@@ -206,7 +206,7 @@ fn assert_anchor(name: &str, actual: Fingerprint, bytes: u64, fnv1a64: u64) {
 /// below; if it were wrong, the E1-LONG budgets would be wrong in a way no other assertion here
 /// could see, because they would be self-consistent. At E1's 20,000 ns horizon the same function
 /// must produce 17/49/98/146 packets per flow and therefore exactly the four `sourced_packets`
-/// values frozen in `t21_p12_fixtures.rs`.
+/// values frozen in `evaluation_fixture_anchors.rs`.
 #[test]
 fn the_emission_model_reproduces_the_frozen_e1_sourced_anchors() {
     for (name, interval_ns, frozen_sourced) in E1_POINTS {

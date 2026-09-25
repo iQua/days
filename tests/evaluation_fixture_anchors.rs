@@ -1,6 +1,6 @@
 //! T21 (P12 wave-4) fixture gates: contract, cross-backend identity, frozen anchors.
 //!
-//! Every fixture in `configs/benchmarks/p12/` is pinned three ways here:
+//! Every fixture in `configs/benchmarks/evaluation/` is pinned three ways here:
 //!
 //! 1. **Contract** — the parameters a cross-arm or showcase claim rests on (packet size, load,
 //!    matrix, tiers, thresholds) are asserted against the file, so an edit that changes what the
@@ -62,7 +62,7 @@ fn fingerprint(value: &impl Debug) -> Fingerprint {
 
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("configs/benchmarks/p12")
+        .join("configs/benchmarks/evaluation")
         .join(name)
 }
 
@@ -611,7 +611,7 @@ fn e3_generator_reproduces_the_committed_fixtures_byte_for_byte() {
     let directory = std::env::temp_dir().join(format!("days-t21-e3-{}", std::process::id()));
     std::fs::create_dir_all(&directory).expect("temporary output directory");
     let generator = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("configs/benchmarks/p12/gen_e3_rack_local.py");
+        .join("configs/benchmarks/evaluation/gen_e3_rack_local.py");
     let status = std::process::Command::new("python3")
         .arg(&generator)
         .arg("--out-dir")

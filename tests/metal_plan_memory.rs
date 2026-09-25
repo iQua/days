@@ -26,9 +26,9 @@ fn smoke_image() -> days_executor::SimulationImage {
     compile_config(&path).unwrap_or_else(|error| panic!("{} must lower: {error}", path.display()))
 }
 
-fn p12_image(name: &str) -> days_executor::SimulationImage {
+fn evaluation_image(name: &str) -> days_executor::SimulationImage {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("configs/benchmarks/p12")
+        .join("configs/benchmarks/evaluation")
         .join(name);
     compile_config(&path).unwrap_or_else(|error| panic!("{} must lower: {error}", path.display()))
 }
@@ -100,7 +100,7 @@ fn print_arena(label: &str, occupancy: &ArenaOccupancyHighWater) {
 }
 
 fn measure_full_fixture(name: &str) {
-    let image = p12_image(name);
+    let image = evaluation_image(name);
     let expected = run_scalar_with_observations(&image, None, ObservationMode::Summary)
         .expect("scalar completion run must succeed");
     let executor = MetalExecutor::new().expect("Metal executor must initialize");
@@ -215,11 +215,17 @@ fn dominant_arena_high_water_is_test_only_and_fingerprint_neutral() {
 #[test]
 #[ignore = "explicit P12 before/after capped plan-size table"]
 fn capped_plan_size_table() {
-    print_plan("E4", "configs/benchmarks/p12/e4_gedes_native_k32.toml");
-    print_plan("E2", "configs/benchmarks/p12/e2_closed_k32_tcp_reno.toml");
+    print_plan(
+        "E4",
+        "configs/benchmarks/evaluation/e4_gedes_native_k32.toml",
+    );
+    print_plan(
+        "E2",
+        "configs/benchmarks/evaluation/e2_closed_k32_tcp_reno.toml",
+    );
     print_plan(
         "frontier",
-        "configs/benchmarks/p11/rq9_frontier_closed_k32.toml",
+        "configs/benchmarks/lookahead/rq9_frontier_closed_k32.toml",
     );
 }
 

@@ -16,7 +16,7 @@
 //! cross-block memory ordering *within* a dispatch appears anywhere in either kernel source.
 //!
 //! These are *source* gates. They cannot prove device semantics — the frozen fixture anchors, the
-//! four-backend byte-identity suites and `t20b3_queue_bytes`'
+//! four-backend byte-identity suites and `tests/queue_byte_capacity.rs`'
 //! `k32_byte_policy_strict_run_is_retry_free` (the only gate that caught the first attempt) do
 //! that. They pin the shape, so the single-block geometry cannot creep back and a future edit
 //! cannot reintroduce in-dispatch cross-block synchronization without this file going red.

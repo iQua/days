@@ -164,7 +164,7 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     },
 ];
 
-const T13F_FULL_LOAD_TESTS: &[&str] = &[
+const WIDTH_VIA_LOAD_FULL_TESTS: &[&str] = &[
     "width_via_load_full_load_10_holds_runtime_contract",
     "width_via_load_full_load_30_holds_runtime_contract",
     "width_via_load_full_load_50_holds_runtime_contract",
@@ -188,7 +188,7 @@ fn main() {
 
     match command.as_str() {
         "audit" => run_audits(workspace),
-        "t13f-full-load" => run_t13f_full_load(workspace),
+        "width-via-load-full" => run_width_via_load_full(workspace),
         _ => {
             print_usage();
             std::process::exit(2);
@@ -197,7 +197,7 @@ fn main() {
 }
 
 fn print_usage() {
-    eprintln!("usage: cargo xtask <audit|t13f-full-load>");
+    eprintln!("usage: cargo xtask <audit|width-via-load-full>");
 }
 
 fn run_audits(workspace: &Path) {
@@ -234,7 +234,7 @@ fn run_audits(workspace: &Path) {
     }
 }
 
-fn run_t13f_full_load(workspace: &Path) {
+fn run_width_via_load_full(workspace: &Path) {
     let status = Command::new("cargo")
         .args([
             "nextest",
@@ -244,11 +244,11 @@ fn run_t13f_full_load(workspace: &Path) {
             "--features",
             "metal",
             "--test",
-            "t13f_width_via_load_full",
+            "width_via_load_full",
             "--test-threads",
             "5",
         ])
-        .args(T13F_FULL_LOAD_TESTS)
+        .args(WIDTH_VIA_LOAD_FULL_TESTS)
         .current_dir(workspace)
         .status()
         .unwrap_or_else(|error| {

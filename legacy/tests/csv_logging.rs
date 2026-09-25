@@ -152,11 +152,11 @@ fn csv_logging_mode_preserves_e3_and_e5_outcomes() {
     let config = directory.path().join(format!("{case}-{csv_logging}.toml"));
     let source = match case.as_str() {
         "e3-st" => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../configs/benchmarks/p12/e3_legacy_rack_local_st.toml"),
+            .join("../configs/benchmarks/evaluation/e3_legacy_rack_local_st.toml"),
         "e3-mt" => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../configs/benchmarks/p12/e3_legacy_rack_local_mt.toml"),
+            .join("../configs/benchmarks/evaluation/e3_legacy_rack_local_mt.toml"),
         "e5" => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../configs/benchmarks/p12/e5_wide_k32_q200.toml"),
+            .join("../configs/benchmarks/evaluation/e5_wide_k32_q200.toml"),
         _ => panic!("unsupported DAYS_T30_CASE={case}"),
     };
     let original = fs::read_to_string(&source).expect("read canonical fixture");
