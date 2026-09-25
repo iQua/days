@@ -1,26 +1,15 @@
 ---
 title: Switches and logical processes
-description: Legacy packet demultiplexing and exact switch-egress ownership.
+description: Days AGO switch-egress ownership and backend capability checks.
 ---
 
-Legacy and exact execution place the switch boundary at different points. Legacy has one demultiplexer actor per physical topology switch. Exact execution makes each directed switch egress port a logical process.
+**Scope: Days AGO.** The legacy `PacketSwitch` demultiplexer actor is described in [Legacy switch](/docs/legacy/components/switch).
 
-## Legacy `PacketSwitch`
+Days AGO makes each directed switch egress port a logical process (LP).
 
-`PacketSwitch` does not queue packets or serialize links. Its `outputs` map connects the demultiplexer to schedulers, endpoint actors, or host-attachment models.
+## LP model
 
-Each switch stores two flow tables:
-
-- `fib: flow_id -> next_id` routes data toward the sink.
-- `r_fib: flow_id -> previous_id` routes TCP ACKs and control packets toward the source.
-
-`packet_received` classifies packets with neither `ack` nor `control` as forward data. It sends ACK and control packets through `r_fib`. `Topology::route_flows` installs both tables after it computes all paths.
-
-The Nexosim event clock drives the handler. `PacketSwitch::time` is a seconds view of `Context::time()`. Test assertions permit `packet.time` to precede the current event, so the packet field is a compatibility timestamp rather than a second clock.
-
-## Exact LP model
-
-Exact lowering assigns one LP to each host and one LP to each semantic `(physical switch, directed egress link)` pair. It sorts those semantic keys before assigning dense `NodeId` values, which removes construction order and hash-map iteration from identity.
+Lowering assigns one LP to each host and one LP to each semantic `(physical switch, directed egress link)` pair. It sorts those semantic keys before assigning dense `NodeId` values, which removes construction order and hash-map iteration from identity.
 
 A lowered switch LP owns:
 
@@ -28,13 +17,13 @@ A lowered switch LP owns:
 - one `SwitchQueueState` with its egress link, scheduler, admission policy, optional PFC state, waiting queue, and in-service packet
 - a local child-event sequence and packet counters
 
-The exact image has no standalone FIB actor. Each `FlowDescriptor` carries canonical forward and reverse `LinkId` routes. On `RemoteArrival`, the transition finds the packet's next directed link and therefore the destination egress LP. The owning LP performs admission, service selection, and completion without shared mutable switch state.
+The image has no forwarding-table actor. Each `FlowDescriptor` carries canonical forward and reverse `LinkId` routes. On `RemoteArrival`, the transition finds the packet's next directed link and therefore the destination egress LP. The owning LP performs admission, service selection, and completion without shared mutable switch state.
 
 This ownership is the unit used by Scalar, persistent CPU workers, Metal, and CUDA. Safe-horizon rounds drain each active LP below the exclusive horizon, buffer remote events, then merge those events at the round barrier in canonical order.
 
 ## Capability checks
 
-The lowerer rejects mechanisms outside the exact model, such as VirtualClock. Backend validation then checks device-specific state before launch. Metal and CUDA reject:
+The compiler rejects mechanisms outside the Days AGO model, such as VirtualClock. Backend validation then checks device-specific state before launch. Metal and CUDA reject:
 
 - collective generators
 - DCQCN controller and CNP state

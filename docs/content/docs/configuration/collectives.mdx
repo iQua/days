@@ -108,4 +108,4 @@ backend Metal does not support collective generators; use Scalar or Cpu
 
 Legacy TCP Broadcast shares one collective-wide byte buffer across receivers. TCP RingAllReduce creates one buffer per directed ring link and gives each hop a byte-range handle. The actors bound and pace traffic; they do not mutate or reduce payload data.
 
-Configure polling under `[app_source]` as described in [Logging and runtime](/docs/configuration/logging).
+Configure polling under `[app_source]` as described in [Legacy runtime and CSV configuration](/docs/legacy/runtime).

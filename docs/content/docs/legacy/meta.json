@@ -1,0 +1,8 @@
+{
+  "title": "Legacy Days",
+  "pages": ["index", "runtime", "components", "nexosim"],
+  "index": "Overview",
+  "runtime": "Runtime & CSV Configuration",
+  "components": "Components",
+  "nexosim": "Nexosim"
+}

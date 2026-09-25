@@ -1,0 +1,60 @@
+---
+title: Legacy Days
+description: The frozen Nexosim actor-model simulator kept in legacy/ as a running baseline.
+---
+
+**Scope: Legacy Days only.** Legacy Days is the original Days simulator: an actor-model engine on the vendored Nexosim runtime, in which each network element is a model with private state that communicates by message passing. Days AGO superseded it. The crate `days-legacy` (version 0.4.3) is frozen in `legacy/` and kept as a running baseline: CI still builds, tests, and runs it, but it receives no new features. Its last commit on `main` before Days AGO is tagged `legacy-main-final`.
+
+## Run it
+
+The legacy binary takes exactly one TOML path:
+
+```bash
+RUST_LOG=info cargo run --release -p days-legacy --bin days-legacy -- configs/simple.toml
+```
+
+See the [`days-legacy` CLI reference](/docs/reference/cli/days-legacy) for arguments and logging.
+
+## Cargo features
+
+| Feature | Enables |
+| --- | --- |
+| `l2` | The link-frame and `Link` serializer modules in `legacy/src/l2/`; the topology inserts them only for PFC. |
+| `l2_pfc` | The PFC gate, link, and ingress pipeline (implies `l2`). |
+| `dcqcn` | DCQCN sources and sinks (`flow_type = "DCQCN"`). |
+| `lean` | LeanGuard certificate CSVs (`*_events.csv`). |
+
+```bash
+cargo build -p days-legacy --features l2,l2_pfc
+cargo build -p days-legacy --features dcqcn,l2_pfc,lean
+```
+
+## Examples and tests
+
+The crate has six Rust examples: `basic`, `ecn`, `switch`, `tcp`, `tcp_test`, and `wire`.
+
+```bash
+cargo run -p days-legacy --example basic
+cargo test -p days-legacy --features test
+cargo test -p days-legacy --features test,l2_pfc
+cargo test -p days-legacy --features test,dcqcn
+```
+
+## What only Legacy Days models
+
+Legacy Days accepts parts of the TOML vocabulary that Days AGO rejects at compilation:
+
+- the VirtualClock scheduler and TCP BBR;
+- sampled arrival and packet-size distributions;
+- the Broadcast, Gather, and fan-in AllReduce collectives, and TCP collectives with actor-managed application buffers;
+- flow dependencies, explicit flow IDs, per-flow ECMP, and explicit paths;
+- TCP ECN and non-default CUBIC parameters;
+- PFC refresh and drain timers.
+
+The [configuration pages](/docs/configuration/overview) mark each key's support in both engines.
+
+## Pages in this section
+
+- [Runtime and CSV configuration](/docs/legacy/runtime)
+- Components: [flows](/docs/legacy/components/flows), [packet](/docs/legacy/components/packet), [schedulers](/docs/legacy/components/schedulers), [switch](/docs/legacy/components/switch), [L2 and PFC](/docs/legacy/components/l2), [logging and reports](/docs/legacy/components/logging)
+- [Nexosim runtime](/docs/legacy/nexosim)

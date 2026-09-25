@@ -1,0 +1,46 @@
+---
+title: Schedulers
+description: Legacy Days scheduler actors, disciplines, ECN threshold, and RED arithmetic.
+---
+
+**Scope: Legacy Days.** For the Days AGO scheduler state and backend limits, see [Schedulers](/docs/components/schedulers).
+
+Legacy uses one Nexosim scheduler actor per directed topology edge.
+
+## Service sequence
+
+Scheduler actors handle packet arrival, apply a `PacketDrop` policy, enqueue admitted packets, and schedule transmission from the Nexosim event clock. At service start they update accumulated queueing delay. The completion handler stamps the packet from the current engine time and forwards it.
+
+## Disciplines
+
+| Config value | Legacy actor |
+| --- | --- |
+| `FIFO` | `Port` |
+| `SP` | `SPServer` |
+| `WFQ` | `WFQServer` |
+| `DRR` | `DRRServer` |
+| `WRR` | `WRRServer` |
+| `VirtualClock` | `VirtualClockServer` |
+
+Classed schedulers use `flow_id % class_count`. VirtualClock exists only in Legacy Days.
+
+## ECN threshold
+
+Legacy ECN threshold compares post-admission depth with `floor(fraction * capacity)` and marks only ECN-capable packets; a threshold action drops `NotEct`.
+
+## RED arithmetic
+
+Legacy RED uses an EWMA weight of `2^-9`, selects the threshold region from average occupancy, and computes:
+
+```text
+p_b = max_p * (avg - min) / (max - min)
+p_a = p_b / (1 - count * p_b)
+```
+
+It clamps `p_a` to one at the singularity, resets spacing state after a congestion action, and takes a certain action at or above the maximum threshold. `RED_ECN` uses the same state but requests CE marking; physical overflow still drops. The reusable legacy policy keeps byte and packet occupancy in matching units, although the TOML topology path constructs packet-capacity schedulers.
+
+Legacy RED does not implement idle-period EWMA decay or packet-size probability weighting. Both require inputs absent from the current drop-policy interface.
+
+## PFC queue state
+
+Legacy schedulers expose shared packet and byte occupancy to PFC ingress actors. See [Legacy L2 and PFC](/docs/legacy/components/l2).
