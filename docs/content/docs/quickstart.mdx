@@ -1,66 +1,55 @@
 ---
 title: Quickstart
-description: Run a legacy simulation and the exact Scalar and CPU executors.
+description: Run one scenario on the Days AGO Scalar, CPU, Metal, and CUDA engines.
 ---
 
-Run commands from the repository root.
+**Scope: Days AGO.** Run commands from the repository root. Every run below uses the small TCP smoke fixture `configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml`.
 
-## Legacy config-driven run
+## Scalar
 
-```bash
-RUST_LOG=info cargo run -p days-legacy --bin days -- configs/simple.toml
-```
-
-The legacy CLI accepts exactly one TOML path. With the default
-`csv_logging = true`, it creates `log_path` (default `./output`) and initializes
-`sources.csv`, `sinks.csv`, and `switches.csv`. Feature-gated report and
-certificate files may also be created. Set this root key when filesystem output
-is unwanted:
-
-```toml
-csv_logging = false
-```
-
-That setting suppresses directory creation, CSV rows, traces, and
-`traces.json`; it does not skip simulation accounting.
-
-## Exact Scalar run
-
-The root example compiles TOML to an exact `SimulationImage` and runs the
-global Scalar oracle:
+The Scalar engine is the reference oracle: one thread, one global event calendar in canonical order.
 
 ```bash
-cargo run --example scalar_benchmark -- \
+cargo run --release --bin days -- --engine scalar \
   configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml
 ```
 
-## Exact safe-horizon CPU run
+It prints one `record=days_scalar` line with the stop time, pending events, processed event count, and packet and byte counters.
+
+## CPU
+
+The CPU engine runs safe-horizon rounds on a worker pool. Each logical process (LP) is owned by one worker for the whole run. Each round drains active LPs below an exclusive safe horizon, exchanges remote events at a barrier, and merges them in canonical order for the next round.
 
 ```bash
-cargo run --example round_benchmark -- \
-  configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml \
-  --workers 2 --repetitions 1
+cargo run --release --bin days -- --engine cpu --workers 2 \
+  configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml
 ```
 
-The CPU executor owns each logical process (LP) on one worker for a run. Each
-round drains active LPs below an exclusive safe horizon, exchanges remote
-events at a barrier, and canonically merges those events for the next round.
+It prints one `record=days_cpu` line per repetition with round, event, and pool counters.
 
-## Device smoke run
+## Metal and CUDA
 
-On Apple Metal:
+Device engines need their Cargo feature. On Apple Metal:
 
 ```bash
-cargo run --features metal-spike --bin t20f_frontier -- \
-  configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml \
-  --engine device
+cargo run --release --features metal --bin days -- --engine metal \
+  configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml
 ```
 
-On a CUDA host, replace `--features metal-spike` with `--features cuda`.
-The production runner prints a complete-state byte length and FNV-1a
-fingerprint. It also supports capacity retry and warm-start flags; see
-[`t20f_frontier`](/docs/reference/cli/t20f-frontier).
+On an NVIDIA host with a CUDA 13 toolkit, use `--features cuda` and `--engine cuda`. Asking for a device engine in a build without its feature is an error that names the missing feature; `days` never picks a device for you.
 
-Metal/CUDA reject images containing RED, PFC, DCQCN/CNP state, or collective
-generators. The error names the backend and recommends Scalar or CPU. This is a
-capability rejection, not a silent fallback.
+A device run prints a `record=days_result` line with the complete-state byte length and its FNV-1a-64 fingerprint. For this fixture it reports `result_bytes=101690 result_fnv1a64=d7de73ee33579682`, the same bytes as the Scalar oracle.
+
+## Rejected mechanisms
+
+Metal and CUDA reject images containing RED, PFC, DCQCN/CNP state, or collective generators before execution. The error names the backend and recommends Scalar or CPU:
+
+```text
+backend Metal does not support RED admission; use Scalar or Cpu
+```
+
+This is a capability rejection, not a silent fallback. See the [`days` CLI reference](/docs/reference/cli/days) for every option and record field.
+
+## Legacy Days
+
+To run the frozen actor-model simulator instead, see [Legacy Days](/docs/legacy).
