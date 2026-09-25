@@ -92,3 +92,6 @@ jobs:
 
       - name: Check Metal backend
         run: cargo check -p days-executor --features metal
+
+      - name: Check Metal-gated targets across the workspace
+        run: cargo check --workspace --all-targets --features metal

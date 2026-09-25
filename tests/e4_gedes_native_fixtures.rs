@@ -781,7 +781,7 @@ fn arr_dist_does_not_reach_e4s_lowered_image() {
 /// ledger records = `+2,821,658,040 B`, and NOTHING else in the plane moves: receiver ranges
 /// deliberately keep the encoded-window form.
 #[test]
-#[cfg(all(feature = "metal", target_vendor = "apple"))]
+#[cfg(all(feature = "test", feature = "metal", target_vendor = "apple"))]
 fn e4_metal_plan_sizes_every_flows_ledger_at_its_finite_data_cap() {
     use days_executor::{MetalConfig, size_metal_plan_for_testing};
 
