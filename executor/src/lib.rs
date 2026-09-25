@@ -12,7 +12,7 @@ mod device_capacity;
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 mod device_compaction;
 mod device_event_record;
@@ -21,13 +21,10 @@ pub mod device_sizing;
 pub mod event;
 pub mod image;
 mod mechanism_trace;
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 pub mod metal;
 pub mod model;
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 mod planner_capacity;
 pub mod safe_horizon;
 pub mod scalar;
@@ -89,14 +86,14 @@ pub use mechanism_trace::{
     drr_transitions_csv, pfc_transitions_csv, rate_transitions_csv, wrr_transitions_csv,
 };
 #[cfg(all(
-    feature = "metal-spike",
+    feature = "metal",
     feature = "planner-test-hooks",
     target_vendor = "apple"
 ))]
 #[doc(hidden)]
 pub use metal::assert_metal_planner_bit_equal_for_testing;
 #[cfg(all(
-    feature = "metal-spike",
+    feature = "metal",
     feature = "planner-test-hooks",
     target_vendor = "apple"
 ))]
@@ -107,7 +104,7 @@ pub use metal::size_metal_plan_for_testing;
 pub use metal::{
     ArenaOccupancyHighWater, DominantArenaHighWater, take_dominant_arena_high_water_for_testing,
 };
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 pub use metal::{
     MetalArena, MetalConfig, MetalError, MetalExecutor, MetalInitializationTimings,
     MetalMemoryLayout, MetalRun, run_metal, run_metal_with_observations,

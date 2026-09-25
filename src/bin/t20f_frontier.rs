@@ -6,7 +6,7 @@ use clap::{Parser, ValueEnum};
 use days::scenario::compile_config;
 #[cfg(any(
     test,
-    all(feature = "metal-spike", target_vendor = "apple"),
+    all(feature = "metal", target_vendor = "apple"),
     feature = "cuda"
 ))]
 use days_executor::CapacityRetryRecord;
@@ -87,7 +87,7 @@ fn effective_round_threads(cli: &Cli, default: usize) -> usize {
 /// so a snapshot round-trips and two runs of the same fixture write the same bytes.
 #[cfg(any(
     test,
-    all(feature = "metal-spike", target_vendor = "apple"),
+    all(feature = "metal", target_vendor = "apple"),
     feature = "cuda"
 ))]
 mod warm_start {
@@ -316,20 +316,14 @@ mod warm_start {
             .map_err(|_| format!("`{line}` names a capacity that does not fit this target's usize"))
     }
 
-    #[cfg(any(
-        all(feature = "metal-spike", target_vendor = "apple"),
-        feature = "cuda"
-    ))]
+    #[cfg(any(all(feature = "metal", target_vendor = "apple"), feature = "cuda"))]
     pub(super) fn load(path: &std::path::Path) -> CapacityWarmStart {
         let text = std::fs::read_to_string(path)
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
         decode(&text).unwrap_or_else(|error| panic!("failed to parse {}: {error}", path.display()))
     }
 
-    #[cfg(any(
-        all(feature = "metal-spike", target_vendor = "apple"),
-        feature = "cuda"
-    ))]
+    #[cfg(any(all(feature = "metal", target_vendor = "apple"), feature = "cuda"))]
     pub(super) fn dump(path: &std::path::Path, warm_start: &CapacityWarmStart) {
         std::fs::write(path, encode(warm_start))
             .unwrap_or_else(|error| panic!("failed to write {}: {error}", path.display()));
@@ -377,7 +371,7 @@ fn fingerprint(value: &impl Debug) -> Fingerprint {
 
 #[cfg(any(
     test,
-    all(feature = "metal-spike", target_vendor = "apple"),
+    all(feature = "metal", target_vendor = "apple"),
     feature = "cuda"
 ))]
 fn capacity_retry_counts<A>(trace: &[CapacityRetryRecord<A>]) -> (usize, usize) {
@@ -389,10 +383,7 @@ fn capacity_retry_counts<A>(trace: &[CapacityRetryRecord<A>]) -> (usize, usize) 
     (trace.len(), grown_stream_count)
 }
 
-#[cfg(any(
-    all(feature = "metal-spike", target_vendor = "apple"),
-    feature = "cuda"
-))]
+#[cfg(any(all(feature = "metal", target_vendor = "apple"), feature = "cuda"))]
 fn channel_capacity_distribution(levels: &[days_executor::ChannelStreamCapacityLevel]) -> String {
     levels
         .iter()
@@ -460,7 +451,7 @@ fn main() {
     }
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 fn run_device(cli: &Cli, image: &days_executor::SimulationImage, lowering_ns: u128) {
     use days_executor::{MetalConfig, MetalExecutor};
 
@@ -515,10 +506,7 @@ fn run_device(cli: &Cli, image: &days_executor::SimulationImage, lowering_ns: u1
     print_result("metal", &run.result, lowering_ns, run_ns);
 }
 
-#[cfg(all(
-    feature = "cuda",
-    not(all(feature = "metal-spike", target_vendor = "apple"))
-))]
+#[cfg(all(feature = "cuda", not(all(feature = "metal", target_vendor = "apple"))))]
 fn run_device(cli: &Cli, image: &days_executor::SimulationImage, lowering_ns: u128) {
     use days_executor::{CudaConfig, CudaExecutor};
 
@@ -573,14 +561,11 @@ fn run_device(cli: &Cli, image: &days_executor::SimulationImage, lowering_ns: u1
 }
 
 #[cfg(not(any(
-    all(feature = "metal-spike", target_vendor = "apple"),
-    all(
-        feature = "cuda",
-        not(all(feature = "metal-spike", target_vendor = "apple"))
-    )
+    all(feature = "metal", target_vendor = "apple"),
+    all(feature = "cuda", not(all(feature = "metal", target_vendor = "apple")))
 )))]
 fn run_device(_cli: &Cli, _image: &days_executor::SimulationImage, _lowering_ns: u128) {
-    panic!("device mode requires --features metal-spike on Apple or --features cuda")
+    panic!("device mode requires --features metal on Apple or --features cuda")
 }
 
 #[cfg(test)]

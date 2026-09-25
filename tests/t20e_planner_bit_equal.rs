@@ -3,11 +3,7 @@
 //! without making this gate fail, so those primitives require focused independent tests.
 #![cfg(all(
     feature = "test",
-    any(
-        feature = "cuda",
-        feature = "cuda-planner-test",
-        all(feature = "metal-spike", target_vendor = "apple")
-    )
+    any(feature = "cuda", all(feature = "metal", target_vendor = "apple"))
 ))]
 
 use std::collections::VecDeque;
@@ -22,11 +18,11 @@ use days_executor::{
     ObservationMode, PacketDescriptor, PacketKind, PayloadId, RateGenerator, RemoteChannel,
     ScheduledEmission, SimulationImage, event_phase,
 };
-#[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
+#[cfg(feature = "cuda")]
 use days_executor::{
     CudaConfig, assert_cuda_planner_bit_equal_for_testing, size_cuda_plan_for_testing,
 };
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 use days_executor::{
     MetalConfig, assert_metal_planner_bit_equal_for_testing, size_metal_plan_for_testing,
 };
@@ -214,7 +210,7 @@ fn compile_dcqcn_rejection_fixture() -> SimulationImage {
         .unwrap_or_else(|error| panic!("failed to lower DCQCN rejection fixture: {error}"))
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 fn metal_config(streams_enabled: bool, capped: bool) -> MetalConfig {
     if !capped {
         return MetalConfig {
@@ -234,7 +230,7 @@ fn metal_config(streams_enabled: bool, capped: bool) -> MetalConfig {
     }
 }
 
-#[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
+#[cfg(feature = "cuda")]
 fn cuda_config(streams_enabled: bool, capped: bool) -> CudaConfig {
     if !capped {
         return CudaConfig {
@@ -261,7 +257,7 @@ fn assert_planners_equal(
     observation_mode: ObservationMode,
     capped: bool,
 ) {
-    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    #[cfg(all(feature = "metal", target_vendor = "apple"))]
     assert_metal_planner_bit_equal_for_testing(
         image,
         None,
@@ -270,7 +266,7 @@ fn assert_planners_equal(
     )
     .unwrap_or_else(|error| panic!("Metal planner differs for {label}: {error}"));
 
-    #[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
+    #[cfg(feature = "cuda")]
     assert_cuda_planner_bit_equal_for_testing(
         image,
         None,
@@ -410,7 +406,7 @@ fn channel_starting_cap_preserves_the_0695f02_initial_plan_bytes() {
         ..DeviceCapacityCaps::default()
     };
 
-    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    #[cfg(all(feature = "metal", target_vendor = "apple"))]
     assert_0695_initial_plan(
         "Metal",
         &image,
@@ -452,7 +448,7 @@ fn channel_starting_cap_preserves_the_0695f02_initial_plan_bytes() {
         1_269_928 + 128 - 435_344 - 75_440,
     );
 
-    #[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
+    #[cfg(feature = "cuda")]
     assert_0695_initial_plan(
         "CUDA",
         &image,
@@ -500,7 +496,7 @@ fn streams_enabled_plans_carry_one_outbox_record_and_legacy_plans_carry_the_aren
     for relative in FIXTURES {
         let image = compile_fixture(relative);
 
-        #[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
+        #[cfg(feature = "cuda")]
         {
             let streams = size_cuda_plan_for_testing(
                 &image,
@@ -519,7 +515,7 @@ fn streams_enabled_plans_carry_one_outbox_record_and_legacy_plans_carry_the_aren
             assert_outbox_partition("CUDA", relative, &streams, &legacy, ONE_RECORD_WORDS);
         }
 
-        #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+        #[cfg(all(feature = "metal", target_vendor = "apple"))]
         {
             let streams = size_metal_plan_for_testing(
                 &image,
@@ -540,11 +536,7 @@ fn streams_enabled_plans_carry_one_outbox_record_and_legacy_plans_carry_the_aren
     }
 }
 
-#[cfg(any(
-    feature = "cuda",
-    feature = "cuda-planner-test",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 fn assert_outbox_partition(
     backend: &str,
     fixture: &str,
@@ -622,7 +614,7 @@ fn unsupported_device_families_are_rejected_before_planning() {
         };
         planner_rejections += 1;
 
-        #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+        #[cfg(all(feature = "metal", target_vendor = "apple"))]
         assert!(
             assert_metal_planner_bit_equal_for_testing(
                 &image,
@@ -635,7 +627,7 @@ fn unsupported_device_families_are_rejected_before_planning() {
             path.display()
         );
 
-        #[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
+        #[cfg(feature = "cuda")]
         assert!(
             assert_cuda_planner_bit_equal_for_testing(
                 &image,
@@ -652,7 +644,7 @@ fn unsupported_device_families_are_rejected_before_planning() {
     let dcqcn = compile_dcqcn_rejection_fixture();
     planner_rejections += 1;
 
-    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    #[cfg(all(feature = "metal", target_vendor = "apple"))]
     assert!(
         assert_metal_planner_bit_equal_for_testing(
             &dcqcn,
@@ -664,7 +656,7 @@ fn unsupported_device_families_are_rejected_before_planning() {
         "Metal must reject DCQCN before planning"
     );
 
-    #[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
+    #[cfg(feature = "cuda")]
     assert!(
         assert_cuda_planner_bit_equal_for_testing(
             &dcqcn,

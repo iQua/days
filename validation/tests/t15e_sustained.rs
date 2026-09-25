@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 use days::topos::build::build_graph;
 use days_legacy::flows::flow::Flow;
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 use days::scenario::compile_config;
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 use days_executor::{
     FlowGeneratorKind, GeneratorStatus, GeneratorTermination, MetalConfig, RunResult, run_metal,
     run_scalar,
@@ -221,7 +221,7 @@ fn sustained_fixtures_hold_the_t15e_design_invariants() {
     }
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 fn assert_terminal_source_state(fixture: SustainedFixture, result: &RunResult) {
     let generators = result
         .host_states
@@ -261,7 +261,7 @@ fn assert_terminal_source_state(fixture: SustainedFixture, result: &RunResult) {
     }
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 #[test]
 #[ignore = "estimated ~54s W4 plus scalar runtime for ~1.35B transitions"]
 fn sustained_load_30_matches_scalar_complete_result() {
@@ -298,7 +298,7 @@ fn sustained_load_30_matches_scalar_complete_result() {
     }
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 #[test]
 #[ignore = "large k32 fixtures; validates terminal state and default Metal capacity"]
 fn sustained_fixtures_reach_expected_rounds_and_terminal_source_state() {

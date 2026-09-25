@@ -10,7 +10,7 @@ use days_executor::{
 };
 #[cfg(feature = "cuda")]
 use days_executor::{CudaConfig, run_cuda, run_cuda_with_observations};
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 use days_executor::{MetalConfig, run_metal, run_metal_with_observations};
 use days_legacy::flows::flow::Flow;
 
@@ -96,10 +96,7 @@ fn assert_result_eq(
     );
 }
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 fn assert_device_full_result_eq(
     label: &str,
     actual: &days_executor::RunResult,
@@ -325,7 +322,7 @@ fn tcp_smoke_fixture_lowers_and_is_scalar_cpu_byte_identical() {
     .result;
     assert_eq!(cpu, scalar);
 
-    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    #[cfg(all(feature = "metal", target_vendor = "apple"))]
     {
         let metal = run_metal(&image, None, MetalConfig::default())
             .expect("Metal TCP corpus smoke should run");
@@ -470,7 +467,7 @@ fn full_tcp_corpora_are_byte_identical_across_available_backends() {
         assert_result_eq(&format!("{} CPU", corpus.file), &cpu.result, &scalar);
         backends.push("CPU");
 
-        #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+        #[cfg(all(feature = "metal", target_vendor = "apple"))]
         {
             let metal = run_metal_with_observations(
                 &image,

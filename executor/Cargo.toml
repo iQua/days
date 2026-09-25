@@ -10,15 +10,14 @@ name = "days_executor"
 [features]
 default = []
 cuda = ["dep:cudarc"]
-cuda-planner-test = ["cuda", "planner-test-hooks"]
 planner-test-hooks = []
 cuda-test-hooks = ["cuda", "planner-test-hooks"]
-metal-spike = [
+metal = [
     "dep:objc2",
     "dep:objc2-foundation",
     "dep:objc2-metal",
 ]
-metal-test-hooks = ["metal-spike", "planner-test-hooks"]
+metal-test-hooks = ["metal", "planner-test-hooks"]
 
 [dependencies]
 crossbeam = "0.8.4"

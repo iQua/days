@@ -130,10 +130,7 @@ fn run_sizing_dry_run_if_requested() -> bool {
     true
 }
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 mod app {
     use std::path::PathBuf;
     use std::time::Instant;
@@ -640,7 +637,7 @@ mod app {
         measurement
     }
 
-    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    #[cfg(all(feature = "metal", target_vendor = "apple"))]
     pub fn metal_main() {
         use days_executor::{MetalConfig, MetalExecutor};
 
@@ -755,11 +752,7 @@ fn main() {
     app::cuda_main();
 }
 
-#[cfg(all(
-    not(feature = "cuda"),
-    feature = "metal-spike",
-    target_vendor = "apple"
-))]
+#[cfg(all(not(feature = "cuda"), feature = "metal", target_vendor = "apple"))]
 fn main() {
     if run_sizing_dry_run_if_requested() {
         return;
@@ -767,15 +760,12 @@ fn main() {
     app::metal_main();
 }
 
-#[cfg(not(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-)))]
+#[cfg(not(any(feature = "cuda", all(feature = "metal", target_vendor = "apple"))))]
 fn main() {
     if run_sizing_dry_run_if_requested() {
         return;
     }
-    panic!("t17c_wide_corpus requires --features cuda or Apple metal-spike");
+    panic!("t17c_wide_corpus requires --features cuda or Apple metal");
 }
 
 #[cfg(test)]

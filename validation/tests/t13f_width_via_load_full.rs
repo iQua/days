@@ -316,7 +316,7 @@ fn smallest_width_via_load_full_fixture_lowers_and_truncates_pending_tail() {
     assert!(!run.result.resident_packets.is_empty());
 }
 
-#[cfg(feature = "metal-spike")]
+#[cfg(feature = "metal")]
 fn assert_runtime_contract(fixture: Fixture) {
     let path = fixture_path(fixture.name);
     let image = compile_config(&path)
@@ -355,31 +355,31 @@ fn assert_runtime_contract(fixture: Fixture) {
     );
 }
 
-#[cfg(feature = "metal-spike")]
+#[cfg(feature = "metal")]
 #[test]
 fn width_via_load_full_load_10_holds_runtime_contract() {
     assert_runtime_contract(FIXTURES[0]);
 }
 
-#[cfg(feature = "metal-spike")]
+#[cfg(feature = "metal")]
 #[test]
 fn width_via_load_full_load_30_holds_runtime_contract() {
     assert_runtime_contract(FIXTURES[1]);
 }
 
-#[cfg(feature = "metal-spike")]
+#[cfg(feature = "metal")]
 #[test]
 fn width_via_load_full_load_50_holds_runtime_contract() {
     assert_runtime_contract(FIXTURES[2]);
 }
 
-#[cfg(feature = "metal-spike")]
+#[cfg(feature = "metal")]
 #[test]
 fn width_via_load_full_load_70_holds_runtime_contract() {
     assert_runtime_contract(FIXTURES[3]);
 }
 
-#[cfg(feature = "metal-spike")]
+#[cfg(feature = "metal")]
 #[test]
 fn width_via_load_full_load_90_holds_runtime_contract() {
     assert_runtime_contract(FIXTURES[4]);

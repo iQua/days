@@ -173,7 +173,7 @@ impl CapacityWarmStart {
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 fn warm_start_map(pairs: &[(usize, usize)]) -> BTreeMap<usize, usize> {
     let mut merged = BTreeMap::new();
@@ -195,7 +195,7 @@ fn warm_start_map(pairs: &[(usize, usize)]) -> BTreeMap<usize, usize> {
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ChannelCapacityFloors {
@@ -206,7 +206,7 @@ pub(crate) struct ChannelCapacityFloors {
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 impl ChannelCapacityFloors {
     /// Starts from a warm start's per-stream capacities instead of from nothing.
@@ -283,7 +283,7 @@ impl ChannelCapacityFloors {
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct TcpCapacityFloors {
@@ -296,7 +296,7 @@ pub(crate) struct TcpCapacityFloors {
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 impl TcpCapacityFloors {
     /// Starts from a warm start's receiver classes and per-flow ledger capacities.
@@ -487,7 +487,7 @@ pub struct CapacityRetryRecord<A> {
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 // TCP retries deliberately use tight additive growth (+64 receiver ranges, +256 ledger
 // segments), rather than the design's arena-wide geometric 2x policy. The 2x policy was measured
@@ -497,7 +497,7 @@ pub(crate) const TCP_RECEIVER_RETRY_SLACK: usize = 64;
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 pub(crate) const TCP_LEDGER_RETRY_SLACK: usize = 256;
 
@@ -526,7 +526,7 @@ pub(crate) const TCP_LEDGER_RETRY_SLACK: usize = 256;
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 pub(crate) const TCP_LEDGER_OCCUPANCY_SLACK_FACTOR: usize = 8;
 
@@ -541,7 +541,7 @@ pub(crate) const TCP_LEDGER_OCCUPANCY_SLACK_FACTOR: usize = 8;
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 pub(crate) const TCP_LEDGER_OCCUPANCY_SLACK_RECORDS: usize = 8;
 
@@ -549,7 +549,7 @@ pub(crate) const TCP_LEDGER_OCCUPANCY_SLACK_RECORDS: usize = 8;
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 pub(crate) fn ledger_capacity_from_high_water(high_water: usize) -> usize {
     high_water
@@ -561,7 +561,7 @@ pub(crate) fn ledger_capacity_from_high_water(high_water: usize) -> usize {
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 pub(crate) fn observed_ledger_high_water(
     high_water: Option<&[u32]>,
@@ -581,7 +581,7 @@ pub(crate) fn observed_ledger_high_water(
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 pub(crate) fn grown_ledger_capacity(
     capacity: usize,
@@ -599,7 +599,7 @@ pub(crate) fn grown_ledger_capacity(
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 pub(crate) fn grown_capacity(capacity: usize, demand: usize) -> usize {
     let basis = demand.max(capacity.saturating_add(1));
@@ -609,7 +609,7 @@ pub(crate) fn grown_capacity(capacity: usize, demand: usize) -> usize {
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 pub(crate) fn grown_capacity_with_slack(capacity: usize, demand: usize, slack: usize) -> usize {
     demand.max(capacity.saturating_add(1)).saturating_add(slack)
@@ -618,7 +618,7 @@ pub(crate) fn grown_capacity_with_slack(capacity: usize, demand: usize, slack: u
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 pub(crate) fn raise_cap_or_floor(
     cap: &mut Option<usize>,
@@ -643,7 +643,7 @@ pub(crate) fn raise_cap_or_floor(
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 pub(crate) fn raise_override_cap_or_floor(
     override_capacity: &mut Option<usize>,
@@ -663,7 +663,7 @@ pub(crate) fn raise_override_cap_or_floor(
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 pub(crate) fn cap_derived_capacity(derived: usize, cap: Option<usize>, resident: usize) -> usize {
     cap.map_or(derived, |cap| derived.min(cap)).max(resident)
@@ -672,7 +672,7 @@ pub(crate) fn cap_derived_capacity(derived: usize, cap: Option<usize>, resident:
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 pub(crate) fn bound_derived_capacity(
     derived: usize,

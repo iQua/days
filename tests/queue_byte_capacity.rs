@@ -103,7 +103,7 @@ fn k16_probe_policy_is_derived_exactly() {
     }
 }
 
-#[cfg(all(feature = "test", feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "test", feature = "metal", target_vendor = "apple"))]
 #[test]
 fn k32_byte_policy_strict_run_is_retry_free() {
     use days_executor::{DeviceCapacityCaps, MetalConfig, MetalExecutor, ObservationMode};

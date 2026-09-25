@@ -10,7 +10,7 @@ use days_executor::{
 };
 #[cfg(feature = "cuda")]
 use days_executor::{CudaConfig, run_cuda_with_observations};
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 use days_executor::{MetalConfig, run_metal_with_observations};
 
 const SOURCE: NodeId = NodeId(0);
@@ -711,10 +711,7 @@ fn device_backends_accept_ecn_and_reject_red_exactly() {
     }
 }
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 fn adversarial_device_ecn_images() -> Vec<SimulationImage> {
     let packet_threshold = aqm_image(
         DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
@@ -762,7 +759,7 @@ fn adversarial_device_ecn_images() -> Vec<SimulationImage> {
     ]
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 #[test]
 fn metal_ecn_threshold_and_persistent_marks_match_scalar() {
     for (image_index, image) in adversarial_device_ecn_images().into_iter().enumerate() {

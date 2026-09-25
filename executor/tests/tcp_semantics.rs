@@ -12,17 +12,14 @@ use days_executor::{
     run_cpu_with_observations, run_scalar_rounds_with_observations, run_scalar_with_observations,
     size_default_device_plan, validate,
 };
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 use days_executor::{
     CapacityWarmStart, DeviceCapacityCaps, DropMarkPolicy, EcnThresholdPolicy,
     MechanismTransitionRecord, QueueDepthUnit, RunResult,
 };
 #[cfg(feature = "cuda")]
 use days_executor::{CudaArena, CudaConfig, CudaError, CudaExecutor, run_cuda_with_observations};
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 use days_executor::{
     MetalArena, MetalConfig, MetalError, MetalExecutor, run_metal_with_observations,
 };
@@ -41,10 +38,7 @@ const ACK_BYTES: u64 = 40;
 /// Two flows are the smallest fixture that can distinguish first-offender growth from
 /// vector-informed growth: both flows overflow the same under-capped arena, so a policy that
 /// repairs only the flow named by the fault needs one retry per flow.
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 fn tcp_two_flow_image(control: TcpCongestionControl, total_bytes: u64) -> SimulationImage {
     let mut image = tcp_image(control, total_bytes);
     let second_flow = FlowId(1);
@@ -85,10 +79,7 @@ fn tcp_two_flow_image(control: TcpCongestionControl, total_bytes: u64) -> Simula
     image
 }
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 fn assert_device_full_result_eq(actual: &RunResult, scalar: &RunResult, context: &str) {
     assert!(
         scalar.diagnostics.is_some(),
@@ -825,7 +816,7 @@ fn cubic_wide_magnitude_transition_is_byte_identical_on_all_available_backends()
         .expect("wide CUBIC CPU checkpoint should run");
     assert_eq!(cpu.result, scalar);
 
-    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    #[cfg(all(feature = "metal", target_vendor = "apple"))]
     {
         let metal = run_metal_with_observations(
             &image,
@@ -949,7 +940,7 @@ fn tcp_cartesian_matrix_is_byte_identical_across_all_available_backends() {
         ("WFQ", SchedulerKind::weighted_fair_queue(vec![1]), 0),
     ];
     let mut comparisons = 0;
-    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    #[cfg(all(feature = "metal", target_vendor = "apple"))]
     let mut metal_comparisons = 0;
     #[cfg(feature = "cuda")]
     let mut cuda_comparisons = 0;
@@ -1009,7 +1000,7 @@ fn tcp_cartesian_matrix_is_byte_identical_across_all_available_backends() {
                     }
                 }
             }
-            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+            #[cfg(all(feature = "metal", target_vendor = "apple"))]
             for streams_enabled in [false, true] {
                 for round_threads_per_threadgroup in [32, 256] {
                     for (horizon, expected) in [(None, &full), (partial_horizon, &partial)] {
@@ -1088,7 +1079,7 @@ fn tcp_cartesian_matrix_is_byte_identical_across_all_available_backends() {
         }
     }
     assert_eq!(comparisons, 2 * 4 * 2 * 3 * 2 * 2);
-    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    #[cfg(all(feature = "metal", target_vendor = "apple"))]
     assert_eq!(metal_comparisons, 2 * 4 * 2 * 2 * 2);
     #[cfg(feature = "cuda")]
     assert_eq!(cuda_comparisons, 2 * 4 * 2 * 2 * 2);
@@ -1129,7 +1120,7 @@ fn tcp_device_semantic_gap_probes_are_byte_identical() {
         ("maximum accepted RTO", maximum_rto),
     ];
     let mut cpu_comparisons = 0;
-    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    #[cfg(all(feature = "metal", target_vendor = "apple"))]
     let mut metal_comparisons = 0;
     #[cfg(feature = "cuda")]
     let mut cuda_comparisons = 0;
@@ -1169,7 +1160,7 @@ fn tcp_device_semantic_gap_probes_are_byte_identical() {
             assert_eq!(retransmission.size_bytes, MSS - 1);
         }
 
-        #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+        #[cfg(all(feature = "metal", target_vendor = "apple"))]
         {
             validate(&image, Backend::Metal)
                 .unwrap_or_else(|error| panic!("{name} Metal validation failed: {error}"));
@@ -1209,13 +1200,13 @@ fn tcp_device_semantic_gap_probes_are_byte_identical() {
     }
 
     assert_eq!(cpu_comparisons, PROBE_COMPARISONS_PER_BACKEND);
-    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    #[cfg(all(feature = "metal", target_vendor = "apple"))]
     assert_eq!(metal_comparisons, PROBE_COMPARISONS_PER_BACKEND);
     #[cfg(feature = "cuda")]
     assert_eq!(cuda_comparisons, PROBE_COMPARISONS_PER_BACKEND);
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 #[test]
 fn metal_tcp_reno_and_cubic_literal_smoke_is_byte_identical() {
     for control in [
@@ -1240,7 +1231,7 @@ fn metal_tcp_reno_and_cubic_literal_smoke_is_byte_identical() {
     }
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 #[test]
 fn metal_tcp_ledger_capacity_retry_is_typed_and_byte_identical() {
     let image = tcp_image(TcpCongestionControl::reno(MSS), 2 * MSS);
@@ -1529,7 +1520,7 @@ fn cuda_tcp_ledger_capacity_retry_is_typed_and_byte_identical() {
 /// this fixture needs two retries, and at frontier scale the same argument needs 377. The
 /// occupancy vector turns it into one replan: the fault reports every flow's high-water, so the
 /// single replacement plan sizes both flows at once and the budget of one suffices.
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 #[test]
 fn metal_tcp_ledger_occupancy_vector_sizes_every_flow_in_one_replan() {
     let image = tcp_two_flow_image(TcpCongestionControl::reno(MSS), 2 * MSS);
@@ -1670,7 +1661,7 @@ fn cuda_tcp_ledger_occupancy_vector_sizes_every_flow_in_one_replan() {
 ///    so the hint can only move a run between refusing once and running immediately;
 /// 3. the warm run re-derives the same snapshot, so the mechanism has a fixed point and the hint's
 ///    provenance really is the retry chain's own output.
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 #[test]
 fn metal_capacity_warm_start_plans_the_converged_capacity_in_one_attempt() {
     let image = tcp_two_flow_image(TcpCongestionControl::reno(MSS), 2 * MSS);
@@ -1824,7 +1815,7 @@ fn cuda_capacity_warm_start_plans_the_converged_capacity_in_one_attempt() {
     assert_eq!(stock.capacity_warm_start, cold.capacity_warm_start);
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 #[test]
 fn metal_tcp_timer_checkpoint_is_byte_identical() {
     let image = tcp_image(TcpCongestionControl::reno(MSS), 2 * MSS);
@@ -1925,7 +1916,7 @@ fn stale_different_timer_checkpoint_is_byte_identical_on_all_available_backends(
     .expect("CPU stale-timer checkpoint must resume");
     assert_eq!(cpu.result, scalar, "stale-timer Scalar/CPU identity");
 
-    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    #[cfg(all(feature = "metal", target_vendor = "apple"))]
     {
         let metal = run_metal_with_observations(
             &checkpoint,
@@ -2172,7 +2163,7 @@ fn device_validators_accept_stale_rto_horizon_multiplicity_and_resident_boundari
     }
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 #[test]
 fn metal_executes_reclaimed_stale_rto_as_a_scalar_identical_noop() {
     let checkpoint = scalar_checkpoint_with_reclaimed_stale_rto_payload(10_000);
@@ -2403,10 +2394,7 @@ fn dcqcn_cnp_and_non_data_ecn_state_cannot_hide_in_a_tcp_checkpoint() {
     }
 }
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 fn reachable_tcp_ack_ecn_image() -> SimulationImage {
     let mut image = switched_tcp_image(TcpCongestionControl::reno(MSS), SchedulerKind::Fifo, 64);
     let FlowGeneratorKind::Tcp(ref mut tcp) = image.host_states[0].generators[0].kind else {
@@ -2421,10 +2409,7 @@ fn reachable_tcp_ack_ecn_image() -> SimulationImage {
     image
 }
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 fn reachable_tcp_ack_scheduler_image(scheduler: SchedulerKind) -> SimulationImage {
     let mut image = reachable_tcp_ack_ecn_image();
     image.switch_states[1].queues[0].drop_mark = DropMarkPolicy::TailDrop;
@@ -2432,10 +2417,7 @@ fn reachable_tcp_ack_scheduler_image(scheduler: SchedulerKind) -> SimulationImag
     image
 }
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 fn ack_descendant_forward_ecn_checkpoint() -> SimulationImage {
     let mut image = switched_tcp_image(TcpCongestionControl::cubic(MSS), SchedulerKind::Fifo, 64);
     let FlowGeneratorKind::Tcp(ref mut tcp) = image.host_states[0].generators[0].kind else {
@@ -2461,10 +2443,7 @@ fn ack_descendant_forward_ecn_checkpoint() -> SimulationImage {
     checkpoint
 }
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 fn data_descendant_chain_forward_ecn_checkpoint() -> SimulationImage {
     let mut image = switched_tcp_image(TcpCongestionControl::cubic(MSS), SchedulerKind::Fifo, 64);
     let FlowGeneratorKind::Tcp(ref mut tcp) = image.host_states[0].generators[0].kind else {
@@ -2491,10 +2470,7 @@ fn data_descendant_chain_forward_ecn_checkpoint() -> SimulationImage {
     checkpoint
 }
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 fn ack_descendant_chain_reverse_ecn_checkpoint() -> SimulationImage {
     let mut image = switched_tcp_image(TcpCongestionControl::cubic(MSS), SchedulerKind::Fifo, 64);
     let FlowGeneratorKind::Tcp(ref mut tcp) = image.host_states[0].generators[0].kind else {
@@ -2521,10 +2497,7 @@ fn ack_descendant_chain_reverse_ecn_checkpoint() -> SimulationImage {
     checkpoint
 }
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 #[derive(Clone, Copy)]
 enum ReachableDeviceMechanism {
     Ecn,
@@ -2532,10 +2505,7 @@ enum ReachableDeviceMechanism {
     Wrr,
 }
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 fn reachable_tcp_measurement_cases() -> Vec<(
     &'static str,
     SimulationImage,
@@ -2582,10 +2552,7 @@ fn reachable_tcp_measurement_cases() -> Vec<(
     ]
 }
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 fn scalar_device_measurement_oracle(
     case: &str,
     image: &SimulationImage,
@@ -2631,7 +2598,7 @@ fn scalar_device_measurement_oracle(
     scalar
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 #[test]
 fn metal_reachable_tcp_ecn_drr_wrr_measurements_match_full_scalar_result() {
     for (case, image, horizon, mechanism) in reachable_tcp_measurement_cases() {
@@ -2747,10 +2714,7 @@ fn device_sizing_derives_a_tcp_plan() {
     assert!(report.total_device_bytes > 0);
     assert!(report.event_arenas.fallback_heap_event_slots > image.nodes.len());
 
-    #[cfg(any(
-        feature = "cuda",
-        all(feature = "metal-spike", target_vendor = "apple")
-    ))]
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
     let checkpoint = {
         let completed = run_scalar_with_observations(&image, None, ObservationMode::Full)
             .expect("single-segment TCP fixture must finish");
@@ -2761,16 +2725,13 @@ fn device_sizing_derives_a_tcp_plan() {
     // also replaces four 14-word channel slots with 11-word slots (96 fewer bytes) and 22 staging
     // slots with 12-word records (352 fewer bytes), for a 448-byte exact reduction. Scratch stays
     // image-derived.
-    #[cfg(any(
-        feature = "cuda",
-        all(feature = "metal-spike", target_vendor = "apple")
-    ))]
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
     let t21_round_scratch_bytes =
         days_executor::device_sizing::round_scratch_words(checkpoint.nodes.len())
             .expect("round scratch must size")
             * std::mem::size_of::<u64>();
 
-    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    #[cfg(all(feature = "metal", target_vendor = "apple"))]
     {
         let metal = run_metal_with_observations(
             &checkpoint,
@@ -3136,7 +3097,7 @@ fn rearm_trace_checkpoint_keeps_only_the_live_timer_event() {
     validate(&checkpoint, Backend::Cpu { workers: 2 })
         .expect("re-arm checkpoint must validate for CPU");
 
-    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    #[cfg(all(feature = "metal", target_vendor = "apple"))]
     {
         let metal = run_metal_with_observations(
             &image,

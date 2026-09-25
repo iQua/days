@@ -65,14 +65,14 @@ pub(crate) const LEDGER_META_TIMER_SLOT: usize = 3;
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 pub(crate) const LEDGER_META_HEAD: usize = 4;
 /// Metadata word holding the per-flow occupancy high-water mark.
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 pub(crate) const LEDGER_META_HIGH_WATER: usize = 5;
 
@@ -134,7 +134,7 @@ pub(crate) fn ledger_record_slot(
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 #[inline]
 pub(crate) fn ledger_high_water_vector(meta: &[u64], meta_offset: usize, flows: usize) -> Vec<u32> {

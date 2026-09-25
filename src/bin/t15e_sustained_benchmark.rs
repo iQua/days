@@ -1,7 +1,7 @@
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 fn median(values: impl Iterator<Item = u128>) -> u128 {
     let mut values = values.collect::<Vec<_>>();
@@ -21,7 +21,7 @@ fn median(values: impl Iterator<Item = u128>) -> u128 {
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ActiveLpStats {
@@ -35,7 +35,7 @@ struct ActiveLpStats {
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 impl ActiveLpStats {
     fn mean(self) -> f64 {
@@ -50,7 +50,7 @@ impl ActiveLpStats {
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 fn active_lp_stats(active_lps: impl IntoIterator<Item = usize>) -> ActiveLpStats {
     let mut active_lps = active_lps.into_iter().collect::<Vec<_>>();
@@ -83,7 +83,7 @@ fn active_lp_stats(active_lps: impl IntoIterator<Item = usize>) -> ActiveLpStats
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BenchmarkWorkload {
@@ -96,7 +96,7 @@ enum BenchmarkWorkload {
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 impl BenchmarkWorkload {
     const fn workload(self) -> &'static str {
@@ -120,7 +120,7 @@ impl BenchmarkWorkload {
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 const fn classify_workload(has_tcp: bool, has_open_loop: bool) -> BenchmarkWorkload {
     match (has_tcp, has_open_loop) {
@@ -131,10 +131,7 @@ const fn classify_workload(has_tcp: bool, has_open_loop: bool) -> BenchmarkWorkl
     }
 }
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 fn benchmark_workload(image: &days_executor::SimulationImage) -> BenchmarkWorkload {
     let mut has_tcp = false;
     let mut has_open_loop = false;
@@ -153,7 +150,7 @@ fn benchmark_workload(image: &days_executor::SimulationImage) -> BenchmarkWorklo
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ComparisonOutcome {
@@ -165,7 +162,7 @@ enum ComparisonOutcome {
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 impl ComparisonOutcome {
     fn as_str(self) -> &'static str {
@@ -180,7 +177,7 @@ impl ComparisonOutcome {
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RetainedSampleComparison {
@@ -197,7 +194,7 @@ struct RetainedSampleComparison {
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 fn retained_range(values: &[u128]) -> u128 {
     let minimum = values
@@ -214,7 +211,7 @@ fn retained_range(values: &[u128]) -> u128 {
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 fn compare_retained_samples(
     candidate_samples: &[u128],
@@ -263,7 +260,7 @@ fn compare_retained_samples(
     }
 }
 
-#[cfg(any(test, all(feature = "metal-spike", target_vendor = "apple")))]
+#[cfg(any(test, all(feature = "metal", target_vendor = "apple")))]
 fn crossover_summary(w4: ComparisonOutcome, w18: ComparisonOutcome) -> &'static str {
     match (w4, w18) {
         (ComparisonOutcome::Beats, ComparisonOutcome::Beats) => "metal_beats_w4_and_w18",
@@ -280,10 +277,7 @@ fn crossover_summary(w4: ComparisonOutcome, w18: ComparisonOutcome) -> &'static 
 
 #[cfg(any(
     test,
-    all(
-        feature = "cuda",
-        not(all(feature = "metal-spike", target_vendor = "apple"))
-    )
+    all(feature = "cuda", not(all(feature = "metal", target_vendor = "apple")))
 ))]
 fn cuda_crossover_summary(w4: ComparisonOutcome, wbest: ComparisonOutcome) -> &'static str {
     match (w4, wbest) {
@@ -301,10 +295,7 @@ fn cuda_crossover_summary(w4: ComparisonOutcome, wbest: ComparisonOutcome) -> &'
 
 #[cfg(any(
     test,
-    all(
-        feature = "cuda",
-        not(all(feature = "metal-spike", target_vendor = "apple"))
-    )
+    all(feature = "cuda", not(all(feature = "metal", target_vendor = "apple")))
 ))]
 fn cpu_engine_name(workers: usize, best_workers: usize) -> &'static str {
     if workers == 4 {
@@ -318,10 +309,7 @@ fn cpu_engine_name(workers: usize, best_workers: usize) -> &'static str {
 
 #[cfg(any(
     test,
-    all(
-        feature = "cuda",
-        not(all(feature = "metal-spike", target_vendor = "apple"))
-    )
+    all(feature = "cuda", not(all(feature = "metal", target_vendor = "apple")))
 ))]
 fn parse_worker_sweep(value: &str) -> Result<Vec<usize>, String> {
     let workers = value
@@ -350,7 +338,7 @@ fn parse_worker_sweep(value: &str) -> Result<Vec<usize>, String> {
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 fn split_fixed(total_ns: u128, marginal_ns: u128) -> (u128, u128) {
     let fixed_ns = total_ns
@@ -367,7 +355,7 @@ fn split_fixed(total_ns: u128, marginal_ns: u128) -> (u128, u128) {
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 fn order_for_sample(sample: usize) -> &'static str {
     if sample.is_multiple_of(2) {
@@ -380,14 +368,14 @@ fn order_for_sample(sample: usize) -> &'static str {
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 const SCALAR_SAMPLES: usize = 2;
 
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 fn recorded_predecessor_for_engine(engine: &str) -> &'static str {
     if engine == "scalar" {
@@ -397,7 +385,7 @@ fn recorded_predecessor_for_engine(engine: &str) -> &'static str {
     }
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 fn main() {
     use std::path::PathBuf;
     use std::time::Instant;
@@ -1261,29 +1249,18 @@ fn main() {
     );
 }
 
-#[cfg(all(
-    feature = "cuda",
-    not(all(feature = "metal-spike", target_vendor = "apple"))
-))]
+#[cfg(all(feature = "cuda", not(all(feature = "metal", target_vendor = "apple"))))]
 #[path = "t15e_sustained_benchmark/cuda_app.rs"]
 mod cuda_app;
 
-#[cfg(all(
-    feature = "cuda",
-    not(all(feature = "metal-spike", target_vendor = "apple"))
-))]
+#[cfg(all(feature = "cuda", not(all(feature = "metal", target_vendor = "apple"))))]
 fn main() {
     cuda_app::main();
 }
 
-#[cfg(not(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-)))]
+#[cfg(not(any(feature = "cuda", all(feature = "metal", target_vendor = "apple"))))]
 fn main() {
-    eprintln!(
-        "t15e_sustained_benchmark requires --features metal-spike on Apple or --features cuda"
-    );
+    eprintln!("t15e_sustained_benchmark requires --features metal on Apple or --features cuda");
     std::process::exit(2);
 }
 

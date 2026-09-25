@@ -289,7 +289,7 @@ fn identical_across_local_backends(
         assert_eq!(fingerprint(&cpu.result), reference);
     }
 
-    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    #[cfg(all(feature = "metal", target_vendor = "apple"))]
     {
         use days_executor::{MetalConfig, MetalExecutor};
         let executor = MetalExecutor::new().expect("Metal executor must initialize");
@@ -781,7 +781,7 @@ fn arr_dist_does_not_reach_e4s_lowered_image() {
 /// ledger records = `+2,821,658,040 B`, and NOTHING else in the plane moves: receiver ranges
 /// deliberately keep the encoded-window form.
 #[test]
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 fn e4_metal_plan_sizes_every_flows_ledger_at_its_finite_data_cap() {
     use days_executor::{MetalConfig, size_metal_plan_for_testing};
 
@@ -1097,7 +1097,7 @@ fn e4_runs_to_completion_and_drains() {
 /// Metal is now pinned against the SAME frozen completion fingerprint scalar, CPU×2 and CPU×4 are
 /// pinned against, so E4's completion identity claim is four backends, not three.
 #[test]
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 #[ignore = "explicit P12 E4 Metal completion anchor: full 4 s horizon, 104 GB of payload"]
 fn e4_completion_on_metal_matches_the_frozen_scalar_anchor() {
     use days_executor::{MetalConfig, MetalExecutor};

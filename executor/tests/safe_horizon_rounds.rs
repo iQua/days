@@ -12,14 +12,11 @@ use days_executor::{
 };
 // The only unqualified uses of this type are in `assert_device_full_result_eq`, which is
 // device-gated; the two remaining uses spell out `days_executor::RunResult`.
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 use days_executor::RunResult;
 #[cfg(feature = "cuda")]
 use days_executor::{CudaConfig, run_cuda_with_observations};
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 use days_executor::{MetalConfig, run_metal_with_observations};
 
 const SOURCE: NodeId = NodeId(0);
@@ -28,10 +25,7 @@ const LINK: LinkId = LinkId(0);
 const FLOW: FlowId = FlowId(0);
 const PACKET: PayloadId = PayloadId(0);
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 fn assert_device_full_result_eq(actual: &RunResult, scalar: &RunResult, context: &str) {
     assert!(
         scalar.diagnostics.is_some(),
@@ -414,7 +408,7 @@ fn backends_preserve_accepted_orphan_packet_snapshots() {
             assert_device_full_result_eq(&actual.result, &expected, "CUDA orphan snapshot");
         }
 
-        #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+        #[cfg(all(feature = "metal", target_vendor = "apple"))]
         {
             let actual = run_metal_with_observations(
                 &image,
@@ -2639,7 +2633,7 @@ fn randomized_small_heterogeneous_images_match_complete_global_state() {
     assert_eq!(comparisons, 128 * 3 * 2);
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 #[test]
 fn production_metal_matches_representative_cartesian_images() {
     // Metal has no CPU worker/partition axes. Sixteen stable seeds at full and partial horizons
@@ -2970,7 +2964,7 @@ fn incast_image(sender_count: usize) -> SimulationImage {
     }
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 fn high_lp_only_image(node_count: usize) -> SimulationImage {
     assert!(node_count > 1_024);
     let source = NodeId(node_count as u64 - 2);
@@ -3117,7 +3111,7 @@ fn high_lp_only_image(node_count: usize) -> SimulationImage {
     }
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 fn multiple_high_lp_image(node_count: usize) -> SimulationImage {
     assert!(node_count > 1_026);
     let mut image = high_lp_only_image(node_count);
@@ -3165,7 +3159,7 @@ fn multiple_high_lp_image(node_count: usize) -> SimulationImage {
     image
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 #[test]
 fn production_metal_horizon_scans_active_lps_beyond_1024_lanes() {
     let image = high_lp_only_image(2_000);
@@ -3189,7 +3183,7 @@ fn production_metal_horizon_scans_active_lps_beyond_1024_lanes() {
     }
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 #[test]
 fn production_metal_horizon_scans_multiple_active_lps_beyond_1024_lanes() {
     let image = multiple_high_lp_image(2_000);

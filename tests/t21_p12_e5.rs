@@ -90,7 +90,7 @@ const PRIMARY_ANCHOR_FNV1A64: u64 = 0x56f7_b241_57e2_e852;
 const CUBIC_ANCHOR_BYTES: u64 = 52_532_113;
 const CUBIC_ANCHOR_FNV1A64: u64 = 0xc9b7_5b2b_b56f_6a78;
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal-test-hooks", target_vendor = "apple"))]
 const E5_CAPACITY_CAPS: days_executor::DeviceCapacityCaps = days_executor::DeviceCapacityCaps {
     fallback_fel_events_per_lp: Some(16_384),
     queue_packets_per_lp: Some(2_048),

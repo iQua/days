@@ -118,7 +118,7 @@ fn identical_across_local_backends(
         assert_eq!(fingerprint(&cpu.result), reference);
     }
 
-    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+    #[cfg(all(feature = "metal", target_vendor = "apple"))]
     {
         use days_executor::{MetalConfig, MetalExecutor};
         let executor = MetalExecutor::new().expect("Metal executor must initialize");
