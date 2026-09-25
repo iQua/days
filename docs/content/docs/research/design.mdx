@@ -58,7 +58,7 @@ trace. The canonical key differs by lineage:
 - **Legacy protocol families** sort rows by `(time_ns, event_id)` and
   reject duplicate keys. Canonicalization costs `O(n log n)` before the
   linear replay.
-- **Exact-engine (P10c) families** key on the full `EventKey`
+- **Days AGO families** (`tcp_check`, `sp_check`, `p10c_*`) key on the full `EventKey`
   `(time_ns, phase, origin_node, origin_sequence)`; several strict-order
   checkers require the trace to arrive already in canonical order and
   reject otherwise, so the sort-based cost model does not apply to them.
