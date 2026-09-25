@@ -313,7 +313,7 @@ impl TcpCapacityFloors {
     /// safety bound.** A single seeded value is still whatever the caller supplies, and the planner
     /// will size an arena from it; one 13-digit entry priced a 400 TB plan and aborted the
     /// allocator. Magnitudes are bounded where the untrusted input is — at the point a snapshot
-    /// **file** is parsed, in `t20f_frontier`'s `warm_start::decode`, which refuses any capacity
+    /// **file** is parsed, in `src/bin/days.rs`'s `warm_start::decode`, which refuses any capacity
     /// larger than a device in the fleet could hold before anything is allocated. A
     /// [`CapacityWarmStart`] built in process has exactly the standing [`DeviceCapacityFloors`] and
     /// the backends' `max_*` overrides already have: its magnitudes are the caller's

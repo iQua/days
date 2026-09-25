@@ -26,8 +26,8 @@
 //!    actually defined on.
 //!
 //! The fingerprint is FNV-1a64 over the pretty `Debug` rendering of the whole `RunResult`, the same
-//! function `src/bin/t20f_frontier.rs` prints, so a fingerprint here and one from that binary are
-//! directly comparable.
+//! function `src/bin/days.rs` prints in its `record=days_result` line, so a fingerprint here and
+//! one from that binary are directly comparable.
 
 use std::collections::BTreeMap;
 use std::fmt::{self, Debug, Write as _};

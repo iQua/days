@@ -12,8 +12,8 @@
 //!    authored, so any later change to lowering or semantics that moves these images is visible.
 //!
 //! The fingerprint is FNV-1a64 over the pretty `Debug` rendering of the whole `RunResult`, the
-//! same function `src/bin/t20f_frontier.rs` prints, so a fingerprint here and a fingerprint from
-//! that binary are directly comparable.
+//! same function `src/bin/days.rs` prints in its `record=days_result` line, so a fingerprint here
+//! and a fingerprint from that binary are directly comparable.
 //!
 //! Heavy fixtures carry `#[ignore]`; the anchor horizon each one was frozen at is named on it.
 

@@ -72,8 +72,8 @@ jobs:
 
       - name: Run executor smoke examples
         run: |
-          cargo run --release --example scalar_benchmark -- configs/ci/executor_smoke.toml
-          cargo run --release --example round_benchmark -- configs/ci/executor_smoke.toml --repetitions 1
+          cargo run --release --bin days -- configs/ci/executor_smoke.toml --engine scalar
+          cargo run --release --bin days -- configs/ci/executor_smoke.toml --engine cpu --workers 1 --repetitions 1
 
       - name: Run representative legacy examples
         run: |
