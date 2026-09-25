@@ -86,7 +86,7 @@ The original actor-model simulator (Nexosim coroutines, versions up to 0.4.3)
 is frozen in `legacy/` as the `days-legacy` crate and still runs:
 
 ```bash
-cargo run --release -p days-legacy --bin days -- configs/simple.toml
+cargo run --release -p days-legacy --bin days-legacy -- configs/simple.toml
 ```
 
 Its last commit on `main` before Days AGO is tagged `legacy-main-final`.

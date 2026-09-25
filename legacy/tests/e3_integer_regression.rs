@@ -98,7 +98,7 @@ fn e3_integer_totals_match_pre_e5_tag() {
         println!(
             "E3_TRIPWIRES_ARMED mode={mode} tcp_source=1 fast_retransmit=1 cumulative_ack_jump=1 unsupported_config_input=1"
         );
-        cargo_bin_cmd!("days")
+        cargo_bin_cmd!("days-legacy")
             .env("RUST_LOG", "error")
             .env("DAYS_E3_ASSERT_NO_TCP_SOURCE", "1")
             .env("DAYS_E3_ASSERT_NO_FAST_RETRANSMIT", "1")

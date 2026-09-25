@@ -34,7 +34,7 @@ fn k4_lossy_analogue_completes_exact_demand_after_real_drops_and_retransmissions
             .unwrap()
     );
 
-    cargo_bin_cmd!("days")
+    cargo_bin_cmd!("days-legacy")
         .env("RUST_LOG", "error")
         .arg(&config)
         .assert()

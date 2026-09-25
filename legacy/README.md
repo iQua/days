@@ -204,9 +204,9 @@ done
 
 # 4. The LeanGuard legacy runner builds under every protocol feature set
 #    (.github/workflows/leanguard.yml drives these three combinations).
-cargo build -p days-legacy --features lean --bin days
-cargo build -p days-legacy --features l2_pfc,lean --bin days
-cargo build -p days-legacy --features dcqcn,l2_pfc,lean --bin days
+cargo build -p days-legacy --features lean --bin days-legacy
+cargo build -p days-legacy --features l2_pfc,lean --bin days-legacy
+cargo build -p days-legacy --features dcqcn,l2_pfc,lean --bin days-legacy
 
 # 5. Nothing outside legacy/ may depend on days-legacy (one test-only exception,
 #    days-validation, is allow-listed in xtask/src/main.rs).
@@ -219,7 +219,7 @@ from a **clean clone**, not the working tree:
 ```bash
 git clone --no-hardlinks --branch feat/days-executor <repo> /tmp/legacy-repro
 cd /tmp/legacy-repro
-cargo build --locked --release -p days-legacy --bin days
+cargo build --locked --release -p days-legacy --bin days-legacy
 cargo test  --locked -p days-legacy --features test -- --show-output
 git status --porcelain    # must be empty: --locked must not have rewritten Cargo.lock
 ```
@@ -260,8 +260,8 @@ runs:
 ### 6.2 Build
 
 ```bash
-cargo build --release --locked -p days-legacy --bin days
-# binary: target/release/days   (the root crate has no src/main.rs; this name is legacy's)
+cargo build --release --locked -p days-legacy --bin days-legacy
+# binary: target/release/days-legacy
 ```
 
 Record `rustc --version`, `cargo --version`, and the git commit for every machine.
@@ -283,8 +283,8 @@ Run one CSV-on verification first. It is correctness evidence only; none of its 
 timing sample set:
 
 ```bash
-env RUST_LOG=info ./target/release/days /tmp/e3-st-csv-on.toml > verify-st.log 2>&1
-env RUST_LOG=info ./target/release/days /tmp/e3-mt-csv-on.toml > verify-mt.log 2>&1
+env RUST_LOG=info ./target/release/days-legacy /tmp/e3-st-csv-on.toml > verify-st.log 2>&1
+env RUST_LOG=info ./target/release/days-legacy /tmp/e3-mt-csv-on.toml > verify-mt.log 2>&1
 ```
 
 Timed samples, per arm, under the standing quiet-machine gate, use only the corresponding
@@ -293,12 +293,12 @@ Timed samples, per arm, under the standing quiet-machine gate, use only the corr
 ```bash
 # ST
 /usr/bin/time -p -o wall-st-<n>.txt \
-  env RUST_LOG=info ./target/release/days \
+  env RUST_LOG=info ./target/release/days-legacy \
   /tmp/e3-st-csv-off.toml > run-st-<n>.log 2>&1
 
 # MT
 /usr/bin/time -p -o wall-mt-<n>.txt \
-  env RUST_LOG=info ./target/release/days \
+  env RUST_LOG=info ./target/release/days-legacy \
   /tmp/e3-mt-csv-off.toml > run-mt-<n>.log 2>&1
 ```
 
@@ -644,3 +644,4 @@ to anything else under `legacy/` always do.
 | 2026-08-11 | `T30: Configure legacy CSV logging from TOML` | (f) | Added default-on `csv_logging`; false mode performs no CSV or trace-manifest filesystem work and drops reports after constant-size correctness reduction, while temporary true/false overlays prove identical E3/E5 outcomes. | The user-authorized T30 legacy CSV logging implementation and correctness task. |
 | 2026-08-12 | `Fix instrumentation cleanup review findings` | (g) | Removed legacy concurrency sampling and its tracing/config/CLI/model-span plumbing, plus Nexosim `perf_stats` counters, features, accounting, reporters, and references. Preserved the native `step_until`, `Nexosim total`, and elapsed wall-clock calculations and output formats byte-for-byte. | The user-authorized instrumentation-removal review follow-up, Findings 3 and 4. |
 | 2026-09-25 | `P13c T3: Give phase-numbered targets descriptive names; rename fixture directories` | (h) | Updated ten fixture paths in seven legacy tests (`config_hardening`, `csv_logging`, `e1_expression`, `e1_packet_arithmetic`, `e3_integer_regression`, `e5_lossy_analogue`, `e5_preflight_metrics`) from `configs/benchmarks/p12/` to `configs/benchmarks/evaluation/`. Only the path strings changed. The fixtures themselves changed in comment lines only (the generator path they cite); their parsed content and `log_path` values are unchanged. No behaviour change. | The shared fixture directory rename (P13c ruling 6). |
+| 2026-09-25 | `P13c T5: Rename the legacy binary to days-legacy` | (h) | Renamed the `[[bin]]` target in `Cargo.toml` from `days` to `days-legacy` and updated the 19 `cargo_bin_cmd!`/`Command::cargo_bin` sites in 11 tests to the new name. The binary's source, arguments, and output are unchanged. No behaviour change. | The root crate's new `days` CLI (P13c ruling 4); two workspace binaries may not share a name. |

@@ -73,7 +73,7 @@ fn e1_source_packet_arithmetic_matches_the_frozen_family() {
         ("90", 146, 1_196_032),
     ] {
         let (config, logs) = materialize(&fixture(load), &directory, load);
-        cargo_bin_cmd!("days")
+        cargo_bin_cmd!("days-legacy")
             .env("RUST_LOG", "error")
             .arg(&config)
             .assert()

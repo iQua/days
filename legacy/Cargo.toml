@@ -12,7 +12,7 @@ publish = false
 name = "days_legacy"
 
 [[bin]]
-name = "days"
+name = "days-legacy"
 path = "src/main.rs"
 
 [features]

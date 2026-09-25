@@ -92,7 +92,7 @@ fn csv_logging_defaults_on_and_explicit_modes_control_all_filesystem_output() {
     let (disabled_config, disabled_logs) = fixture(&directory, "disabled", Some("false"));
 
     for config in [&default_config, &enabled_config, &disabled_config] {
-        cargo_bin_cmd!("days")
+        cargo_bin_cmd!("days-legacy")
             .env("RUST_LOG", "error")
             .arg(config)
             .assert()

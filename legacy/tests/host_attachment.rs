@@ -48,7 +48,7 @@ pkt_size_dist = {{ type = "Uniform", low = 2, high = 2 }}
 }
 
 fn run(config: &Path) {
-    let mut command = cargo_bin_cmd!("days");
+    let mut command = cargo_bin_cmd!("days-legacy");
     command.env("RUST_LOG", "error").arg(config);
     command.assert().success().stdout("").stderr("");
 }
@@ -99,7 +99,7 @@ fn key_off_conflicting_with_scalar_propagation_is_rejected() {
     );
 
     run(&historical);
-    cargo_bin_cmd!("days")
+    cargo_bin_cmd!("days-legacy")
         .env("RUST_LOG", "error")
         .arg(explicit_off)
         .assert()

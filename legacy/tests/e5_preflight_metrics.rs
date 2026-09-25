@@ -103,7 +103,7 @@ fn q_high_e5_analogue_exports_exact_final_metrics_and_stops_timer_work() {
     let directory = TempDir::new().unwrap();
     let config = fixture(&directory, "metrics", Some(true));
 
-    cargo_bin_cmd!("days")
+    cargo_bin_cmd!("days-legacy")
         .env("RUST_LOG", "error")
         .arg(&config)
         .assert()
@@ -152,7 +152,7 @@ fn frozen_e5_completes_every_flow_and_acks_every_demand_byte() {
     let config = directory.path().join("e5.toml");
     fs::write(&config, body).unwrap();
 
-    cargo_bin_cmd!("days")
+    cargo_bin_cmd!("days-legacy")
         .env("RUST_LOG", "error")
         .arg(&config)
         .assert()

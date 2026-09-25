@@ -294,7 +294,11 @@ fn resolve_legacy_runner(configured: Option<&Path>) -> PathBuf {
         return PathBuf::from(path);
     }
 
-    let executable_name = if cfg!(windows) { "days.exe" } else { "days" };
+    let executable_name = if cfg!(windows) {
+        "days-legacy.exe"
+    } else {
+        "days-legacy"
+    };
     std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().map(|parent| parent.join(executable_name)))
