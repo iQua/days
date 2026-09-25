@@ -16,9 +16,6 @@ resolver = "2"
 
 [features]
 test = ["days-executor/planner-test-hooks"]
-l2_pfc = []
-dcqcn = []
-lean = []
 metal = ["days-executor/metal"]
 cuda = ["days-executor/cuda"]
 metal-test-hooks = ["metal", "days-executor/metal-test-hooks"]

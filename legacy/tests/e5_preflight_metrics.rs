@@ -111,7 +111,7 @@ fn q_high_e5_analogue_exports_exact_final_metrics_and_stops_timer_work() {
 
     let mut reader = csv::Reader::from_path(log_dir(&config).join("tcp_metrics.csv")).unwrap();
     let rows = reader
-        .deserialize::<days::utils::logger::TcpMetricsReport>()
+        .deserialize::<days_legacy::utils::logger::TcpMetricsReport>()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(rows.len(), 16);
@@ -160,7 +160,7 @@ fn frozen_e5_completes_every_flow_and_acks_every_demand_byte() {
 
     let rows = csv::Reader::from_path(logs.join("tcp_metrics.csv"))
         .unwrap()
-        .deserialize::<days::utils::logger::TcpMetricsReport>()
+        .deserialize::<days_legacy::utils::logger::TcpMetricsReport>()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     let flows = rows.iter().map(|row| row.flow_id).collect::<BTreeSet<_>>();

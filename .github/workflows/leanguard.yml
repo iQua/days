@@ -162,7 +162,7 @@ jobs:
         run: |
           cargo build -p days-legacy --features "${{ matrix.features }}" --bin days-legacy
           set +e
-          cargo run --features "${{ matrix.features }}" --bin leanguard-run -- \
+          cargo run --bin leanguard-run -- \
             --config "${{ matrix.config }}" \
             --legacy-runner target/debug/days-legacy \
             --checker-dir lean/.lake/build/bin \

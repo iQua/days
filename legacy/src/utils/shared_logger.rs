@@ -12,7 +12,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use crate::utils::trace_manifest;
+use days::utils::trace_manifest;
 
 #[derive(Clone, Default, Debug, Serialize)]
 pub struct PacketSourceReport {

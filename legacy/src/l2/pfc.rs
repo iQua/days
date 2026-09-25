@@ -52,7 +52,7 @@ pub struct PfcConfig {
     pub drain_interval: Option<f64>,
 }
 
-pub use days::utils::logger::PfcPortReport;
+pub use crate::utils::logger::PfcPortReport;
 
 impl PfcFrame {
     pub fn new(

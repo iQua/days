@@ -3,24 +3,24 @@
 use std::sync::{Arc, OnceLock};
 
 #[cfg(feature = "test")]
-pub use days::utils::logger::CorrectnessSnapshot;
+pub use super::shared_logger::CorrectnessSnapshot;
 #[cfg(feature = "l2_pfc")]
-pub use days::utils::logger::PfcPortReport;
+pub use super::shared_logger::PfcPortReport;
 #[cfg(feature = "lean")]
-pub use days::utils::logger::{
+pub use super::shared_logger::{
     AqmEventKind, AqmEventRow, AqmLoggedEcnField, CubicEventKind, CubicEventRow, DrrEventKind,
     DrrEventRow, WfqEventKind, WfqEventRow,
 };
-pub use days::utils::logger::{
+pub use super::shared_logger::{
     CapacityUnit, DropAction, DropStrategyKind, PacketSinkReport, PacketSourceReport, Report,
     ReportTiming, SchedulerReport, TcpMetricsReport,
 };
 #[cfg(all(feature = "lean", feature = "dcqcn"))]
-pub use days::utils::logger::{DcqcnEventKind, DcqcnEventRow, DcqcnLoggedEcnField};
+pub use super::shared_logger::{DcqcnEventKind, DcqcnEventRow, DcqcnLoggedEcnField};
 #[cfg(all(feature = "lean", feature = "l2_pfc"))]
-pub use days::utils::logger::{PfcEventKind, PfcEventRow};
+pub use super::shared_logger::{PfcEventKind, PfcEventRow};
 
-use days::utils::logger::CsvLogger as SharedCsvLogger;
+use super::shared_logger::CsvLogger as SharedCsvLogger;
 
 /// Shared logger with strict legacy validation on configuration-file initialization.
 #[derive(Clone, Debug)]

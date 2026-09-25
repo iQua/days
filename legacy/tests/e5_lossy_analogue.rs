@@ -42,7 +42,7 @@ fn k4_lossy_analogue_completes_exact_demand_after_real_drops_and_retransmissions
 
     let metrics = csv::Reader::from_path(logs.join("tcp_metrics.csv"))
         .unwrap()
-        .deserialize::<days::utils::logger::TcpMetricsReport>()
+        .deserialize::<days_legacy::utils::logger::TcpMetricsReport>()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(metrics.len(), 16);

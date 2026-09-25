@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use log::debug;
 
-pub use days::utils::logger::PacketSinkReport;
+pub use crate::utils::logger::PacketSinkReport;
 use nexosim::model::{
     BuildContext, Context, InitializedModel, Model, ModelRegistry, ProtoModel, SchedulableId,
 };
