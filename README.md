@@ -1,18 +1,54 @@
-# Days: A Performant Discrete-Event Simulator for Network Simulations
+# Days: A Fast and Exact Discrete-Event Network Simulator on CPUs and GPUs
 
-Days is a discrete-event network simulator written in Rust. It models network components as actors (async coroutines) that communicate via message passing, with pluggable schedulers, flow models (packet distributions, TCP, optional DCQCN), and optional link-layer PFC support.
+Days simulates packet networks exactly and in parallel. Its executor, Days AGO,
+compiles a TOML scenario into a simulation image, splits the network into
+logical processes, and advances them concurrently in rounds bounded by a safe
+horizon. Lean proofs (`lean/DaysExecutor/`) show that this round execution
+reaches the same result as serial execution, and every backend that runs a
+scenario produces byte-identical complete state.
+
+Four backends run the same image:
+
+| Backend | Where it runs |
+|---|---|
+| Scalar | one CPU thread; the reference oracle |
+| CPU | a multicore worker pool |
+| Metal | Apple GPUs |
+| CUDA | NVIDIA GPUs (built for sm_89 and sm_121) |
+
+Modeled mechanisms: closed-loop TCP Reno and CUBIC, DCQCN with CNP, PFC, ECN,
+RED, strict-priority, DRR, and exact-rational WFQ scheduling, and ring
+all-reduce and all-gather collectives, over fat-tree, torus, and dragonfly
+topologies. DCQCN control, PFC, RED, and collectives run on the Scalar and CPU
+backends for now; Metal and CUDA reject those scenarios at validation with a
+message naming the backend, never with a silent fallback.
 
 ## Quick start
 
+Run from the repository root.
+
 ```bash
-cargo run --release -p days-legacy --bin days -- configs/simple.toml
+# Scalar reference run
+cargo run --release --example scalar_benchmark -- \
+  configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml
+
+# Multicore CPU run
+cargo run --release --example round_benchmark -- \
+  configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml \
+  --workers 2 --repetitions 1
+
+# GPU run on Apple Metal (use --features cuda on an NVIDIA host)
+cargo run --release --features metal-spike --bin t20f_frontier -- \
+  configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml --engine device
 ```
 
-Simulation outputs are written under `log_path` (default: `./output/`) as CSV files.
+The GPU runner prints the complete-state byte length and its FNV-1a
+fingerprint, which match the Scalar result for the same scenario.
 
 ## Documentation
 
-All design and configuration documentation lives under `docs/`:
+The documentation site is at [days.sh/docs](https://days.sh/docs/). To build it
+locally:
 
 ```bash
 cd docs/
@@ -20,14 +56,9 @@ bun install
 bun dev
 ```
 
-Alternatively, one can directly visit the [documentation website](https://days.sh/docs/).
-
-## Examples
-
-- Config-driven runs: `cargo run --release -p days-legacy --bin days -- configs/tcp_simple.toml`
-- Rust examples: `cargo run --release -p days-legacy --example basic`
-
 ## Tests
+
+The four-package default matrix:
 
 ```bash
 cargo test -p days-executor -- --show-output
@@ -36,31 +67,40 @@ cargo test -p days-legacy --features test -- --show-output
 cargo test -p days-validation --features test -- --show-output
 ```
 
-The device-planner equality gate also runs in the standard backend test surfaces:
-
-```bash
-# Apple Metal toolchain
-cargo test -p days --features test,metal-spike --test t20e_planner_bit_equal -- --show-output
-
-# Host-only CUDA planner; does not require nvcc or execute a GPU
-cargo test -p days --features cuda-planner-test --test t20e_planner_bit_equal -- --show-output
-```
-
-The normal `test,cuda` CUDA-toolchain surface registers the same gate. The host-only surface writes
-an empty kernel placeholder because these tests never initialize or execute the CUDA backend.
-
-The Apple Metal surface also registers the strict K32 byte-policy regression. It allocates the
-standard 10 GiB production plan, so run this long gate in release mode:
-
-```bash
-cargo test --release -p days --features test,metal-spike --test t20b3_queue_bytes \
-  k32_byte_policy_strict_run_is_retry_free -- --show-output
-```
+GPU surfaces add `--features test,metal-spike` (Apple) or `--features test,cuda`
+(NVIDIA, CUDA 13 toolkit). See the testing page in the documentation for the
+long-running gates.
 
 ## Feature flags
 
-- `l2` / `l2_pfc`: optional legacy L2/PFC pipeline
-- `dcqcn`: DCQCN flow type and models
-- `lean`: additional DCQCN event logging for the Lean checker
+- `cuda`: the CUDA backend (requires a CUDA 13 `nvcc`)
+- `metal-spike`: the Metal backend
 - `test`: extra assertions and test helpers
-- `cuda-planner-test`: host-only CUDA plan equality tests without kernel compilation
+- `cuda-planner-test`: host-only CUDA plan-equality tests, no kernel compilation
+- `metal-test-hooks`, `cuda-test-hooks`: device conformance hooks
+- `dcqcn`, `l2_pfc`, `lean`: legacy-era switches still used by the scenario layer
+
+## Legacy Days
+
+The original actor-model simulator (Nexosim coroutines, versions up to 0.4.3)
+is frozen in `legacy/` as the `days-legacy` crate and still runs:
+
+```bash
+cargo run --release -p days-legacy --bin days -- configs/simple.toml
+```
+
+Its last commit on `main` before Days AGO is tagged `legacy-main-final`.
+
+## Repository layout
+
+- `src/`: scenario compiler, topologies, and runners
+- `executor/`: the Days AGO executor and its four backends
+- `lean/`: executor theorems and LeanGuard protocol checkers
+- `legacy/`: the frozen actor-model simulator
+- `validation/`: cross-engine tests against legacy Days
+- `configs/`: scenarios, benchmarks, and fixtures
+- `docs/`: the documentation site
+
+## License
+
+AGPL-3.0-only.
