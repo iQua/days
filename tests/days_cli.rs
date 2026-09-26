@@ -100,6 +100,95 @@ fn misuse_is_refused_with_an_explicit_error() {
     assert!(!ok, "the retired `device` engine must not parse");
 }
 
+fn days_exit_code(arguments: &[&str]) -> Option<i32> {
+    cargo_bin_cmd!("days")
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args(arguments)
+        .output()
+        .expect("days must launch")
+        .status
+        .code()
+}
+
+/// The exit-code contract: 2 for every argument or availability error (clap's own code for
+/// argument errors), 1 for a failure while lowering or running, 0 for success.
+#[test]
+fn exit_codes_separate_argument_errors_from_run_failures() {
+    let argument_errors: &[&[&str]] = &[
+        &[SMOKE, "--engine", "bogus"],
+        &[SMOKE],
+        &[SMOKE, "--engine", "cpu", "--workers", "1", "--chunk", "big"],
+        &[SMOKE, "--engine", "cpu"],
+        &[SMOKE, "--engine", "cpu", "--workers", "0"],
+        &[
+            SMOKE,
+            "--engine",
+            "cpu",
+            "--workers",
+            "1",
+            "--repetitions",
+            "0",
+        ],
+        &[SMOKE, "--engine", "scalar", "--workers", "2"],
+        &[
+            SMOKE,
+            "--engine",
+            "scalar",
+            "--round-threads-per-block",
+            "64",
+        ],
+        &[
+            SMOKE,
+            "--engine",
+            "cpu",
+            "--workers",
+            "1",
+            "--max-capacity-retries",
+            "0",
+        ],
+        &[SMOKE, "--engine", "metal", "--repetitions", "2"],
+        &[SMOKE, "--engine", "cuda", "--workers", "2"],
+    ];
+    for arguments in argument_errors {
+        assert_eq!(
+            days_exit_code(arguments),
+            Some(2),
+            "argument error: {arguments:?}"
+        );
+    }
+    if !cfg!(all(feature = "metal", target_vendor = "apple")) {
+        assert_eq!(days_exit_code(&[SMOKE, "--engine", "metal"]), Some(2));
+    }
+    if !cfg!(feature = "cuda") {
+        assert_eq!(days_exit_code(&[SMOKE, "--engine", "cuda"]), Some(2));
+    }
+
+    assert_eq!(
+        days_exit_code(&["configs/does_not_exist.toml", "--engine", "scalar"]),
+        Some(1),
+        "a missing fixture is a run-time failure"
+    );
+    assert_eq!(
+        days_exit_code(&[
+            SMOKE,
+            "--engine",
+            "cpu",
+            "--workers",
+            "2",
+            "--dedicated",
+            "0",
+            "--straggler-threshold",
+            "5",
+        ]),
+        Some(1),
+        "a configuration the executor refuses at run time is a run-time failure"
+    );
+    assert_eq!(
+        days_exit_code(&["configs/ci/executor_smoke.toml", "--engine", "scalar"]),
+        Some(0)
+    );
+}
+
 #[test]
 fn an_unbuilt_device_engine_is_an_error_that_names_its_feature() {
     if !cfg!(all(feature = "metal", target_vendor = "apple")) {

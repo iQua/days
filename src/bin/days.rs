@@ -210,9 +210,13 @@ impl Cli {
             Engine::Cpu => {
                 refuse(&self.device_options(), "device-engine")?;
                 match self.workers {
-                    None => Err("--engine cpu requires --workers N (N >= 1)".to_owned()),
-                    Some(0) => Err("--workers must be at least 1".to_owned()),
-                    Some(_) => Ok(()),
+                    None => return Err("--engine cpu requires --workers N (N >= 1)".to_owned()),
+                    Some(0) => return Err("--workers must be at least 1".to_owned()),
+                    Some(_) => {}
+                }
+                match self.repetitions {
+                    Some(0) => Err("--repetitions must be at least 1".to_owned()),
+                    _ => Ok(()),
                 }
             }
             Engine::Metal | Engine::Cuda => refuse(&self.cpu_options(), "CPU-engine"),
@@ -564,8 +568,20 @@ fn print_result(engine: &str, result: &RunResult, lowering_ns: u128, run_ns: u12
     );
 }
 
+/// Exit status for an argument or availability error, the code clap uses for its own argument
+/// errors. A failure while lowering or running exits 1.
+const EXIT_ARGUMENT_ERROR: u8 = 2;
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // Refuse a wrong invocation, including an unbuilt device engine, before doing any work.
+    if let Err(error) = cli
+        .check_options()
+        .and_then(|()| engine_available(cli.engine))
+    {
+        eprintln!("error: {error}");
+        return ExitCode::from(EXIT_ARGUMENT_ERROR);
+    }
     match run(&cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -575,14 +591,15 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: &Cli) -> Result<(), String> {
-    cli.check_options()?;
-    // Refuse an unbuilt device engine before doing any work.
-    match cli.engine {
-        Engine::Metal => metal_available()?,
-        Engine::Cuda => cuda_available()?,
-        Engine::Scalar | Engine::Cpu => {}
+fn engine_available(engine: Engine) -> Result<(), String> {
+    match engine {
+        Engine::Metal => metal_available(),
+        Engine::Cuda => cuda_available(),
+        Engine::Scalar | Engine::Cpu => Ok(()),
     }
+}
+
+fn run(cli: &Cli) -> Result<(), String> {
     let lowering_started = Instant::now();
     let image = compile_config(&cli.config)
         .map_err(|error| format!("failed to lower {}: {error}", cli.config.display()))?;
@@ -1304,6 +1321,12 @@ mod tests {
 
     #[test]
     fn the_cpu_engine_requires_at_least_one_worker() {
+        assert!(
+            parse(&["--engine", "cpu", "--workers", "1", "--repetitions", "0"])
+                .check_options()
+                .is_err(),
+            "zero repetitions would run nothing and exit successfully"
+        );
         assert!(parse(&["--engine", "cpu"]).check_options().is_err());
         assert!(
             parse(&["--engine", "cpu", "--workers", "0"])
