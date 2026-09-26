@@ -15,4 +15,4 @@ Every backend returns a normalized `RunResult` with final host state, switch sta
 
 The executor library exposes CSV serializers for TCP, AQM, rate, PFC, DRR, WRR, DCQCN, and collective transition records (`executor/src/tcp_trace.rs`, `executor/src/aqm_trace.rs`, and `executor/src/mechanism_trace.rs`). Callers choose where to write those strings. The LeanGuard checkers for these families are listed in [LeanGuard (Use Guide)](/docs/verification/leanguard).
 
-The [`days` CLI](/docs/reference/cli) prints summary records and a complete-state fingerprint; it does not write transition CSVs.
+The [`days` CLI](/docs/reference/cli/days) prints summary records and a complete-state fingerprint; it does not write transition CSVs.

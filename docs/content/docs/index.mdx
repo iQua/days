@@ -43,7 +43,7 @@ DCQCN, PFC, RED, and collectives run on the Scalar and CPU backends. Metal and C
 
 ## Quick start
 
-From the repository root, run the Scalar oracle on the smoke fixture:
+From the repository root, run the Scalar oracle on the smoke fixture. The last line it prints, `record=days_result`, fingerprints the complete result. Every other engine that accepts the scenario must print the same fingerprint; the [TCP corpus gate](/docs/testing#tcp-corpus-byte-identity) checks this fixture on each available backend.
 
 ```bash
 cargo run --release --bin days -- --engine scalar \

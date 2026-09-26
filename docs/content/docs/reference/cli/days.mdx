@@ -1,0 +1,143 @@
+---
+title: days
+description: Compile one scenario and run it on the Scalar, CPU, Metal, or CUDA engine.
+---
+
+**Scope: Days AGO.** `days` compiles one TOML scenario into a `SimulationImage`, runs it on the engine you name, and prints `key=value` records on standard output. Every engine ends with a `record=days_result` line that carries a fingerprint of the complete result, so results from different engines compare directly: equal `result_bytes` and `result_fnv1a64` mean byte-identical complete state.
+
+## Usage
+
+```text
+days --engine <scalar|cpu|metal|cuda> [OPTIONS] <CONFIG>
+```
+
+Through Cargo, from the repository root:
+
+```bash
+cargo run --release --bin days -- --engine scalar \
+  configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml
+```
+
+## Engines
+
+| Engine | Runs | Build |
+| --- | --- | --- |
+| `scalar` | The global Scalar oracle: one thread, one event calendar in canonical order. | default |
+| `cpu` | The safe-horizon CPU executor on a worker pool. `--workers 1` is its serial round path. | default |
+| `metal` | The Metal device executor. | `--features metal`, Apple targets only |
+| `cuda` | The CUDA device executor. | `--features cuda`, CUDA 13 `nvcc` |
+
+`days` never picks an engine for you. Asking for a device engine that the binary was not built with is an error that names the missing feature:
+
+```text
+error: --engine metal requires a build with `--features metal` on an Apple target; this binary was built without it
+error: --engine cuda requires a build with `--features cuda`; this binary was built without it
+```
+
+Errors go to standard error with an `error:` prefix, and the exit status is 1. A scenario that uses a mechanism the selected backend does not implement fails validation with a message naming the backend.
+
+## Options
+
+Options that do not apply to the selected engine are refused, not ignored:
+
+```text
+error: --workers is a CPU-engine option and does not apply to --engine scalar
+```
+
+### Every engine
+
+- `<CONFIG>` (required): the scenario TOML.
+- `--engine <scalar|cpu|metal|cuda>` (required).
+- `--exclusive-horizon-ns <u64>`: stop at this exclusive time instead of the scenario end, for a shorter partial run.
+
+### CPU engine
+
+- `--workers <N>`: worker threads, `N >= 1`. Required with `--engine cpu`.
+- `--chunk <static|N>`: bulk chunking; default `static`.
+- `--straggler-threshold <none|N>`: straggler threshold in events; default `none`.
+- `--dedicated <N>`: workers dedicated to stragglers; default `1`.
+- `--spin-before-park <N>`: spin iterations before an idle worker parks; default `4096`.
+- `--static-partition <modulo|route-load>`: how LPs are assigned to workers; default `route-load`.
+- `--repetitions <N>`: run the scenario `N` times; default `1`. Each repetition prints its own records.
+
+### Metal and CUDA engines
+
+- `--max-capacity-retries <N>`: capacity retry budget; default `16`. `0` selects strict single-shot execution.
+- `--capacity-warm-start <PATH>`: plan the first attempt from a snapshot that `--dump-capacity-warm-start` wrote for the same fixture.
+- `--dump-capacity-warm-start <PATH>`: after a successful run, write the capacities the run converged on.
+- `--channel-events-per-stream <N>`: override the plane-wide channel-stream starting cap (stock: 2,048 events).
+- `--round-threads-per-block <N>`: override the round and exchange launch width; default `256`.
+
+Device capacity is refuse-or-run. An attempt that runs out of capacity is discarded, the host raises the relevant floor, and the run retries. A warm-start snapshot holds capacities only, not simulation state or compiled kernels, so retries, cap overrides, and warm starts change memory use and the number of attempts, never the result bytes. The snapshot file starts with the header `days-capacity-warm-start v2` and ends with a record count; a truncated or corrupt snapshot is refused.
+
+## Output records
+
+Each engine prints its records in this order:
+
+| Engine | Records |
+| --- | --- |
+| `scalar` | `days_scalar`, then `days_result` |
+| `cpu` | per repetition: `days_cpu`, then `days_result` |
+| `metal`, `cuda` | `days_protocol`, then `days_capacity_warm_start` (only with `--dump-capacity-warm-start`), `days_device`, `days_result` |
+
+Fields ending in `_ns` that measure elapsed time (`wall_ns`, `run_ns`, `lowering_ns`, `device_ns`, and the CPU timing fields) are wall-clock measurements and vary between runs. Every other field is determined by the scenario and options.
+
+### `days_result`
+
+The complete-state fingerprint, printed by every engine.
+
+| Field | Meaning |
+| --- | --- |
+| `engine` | `scalar`, `cpu`, `metal`, or `cuda` |
+| `lowering_ns` | time to compile the TOML into an image |
+| `run_ns` | time to run the image |
+| `result_bytes` | length in bytes of the complete `RunResult` rendered with Rust's pretty `Debug` format (`{:#?}`) |
+| `result_fnv1a64` | FNV-1a-64 hash of that rendering, as 16 hex digits |
+| `pending_events` | live unprocessed events at the stop time |
+| `resident_packets` | packets retained to resume execution |
+| `sourced_packets`, `departed_packets`, `received_packets`, `dropped_packets` | run summary counters |
+
+### `days_scalar`
+
+Fields, in order: `config`, `stop_time_ns` (the scenario's stop time, even when `--exclusive-horizon-ns` ends the run earlier), `next_pending_ns` (the earliest pending event time, or `None`), `pending_events`, `certified_lookahead_ns` (the minimum channel delay), `events` (processed events), `sourced_packets`, `sourced_bytes`, `received_packets`, `received_bytes`, `dropped_packets`, `dropped_bytes`, `wall_ns`.
+
+### `days_cpu`
+
+Configuration fields: `config`, `repetition`, `mode=cpu`, `workers`, `chunk`, `static_partition`, `straggler_threshold`.
+
+Round fields: `rounds`, `events`, `mean_events_per_round`, `max_events_per_round`, `mean_active_lps`, `max_active_lps`, `max_lp_events`, `mean_horizon_advance_ns`, `mean_parallel_efficiency`, `min_parallel_efficiency`, `remote_events`, `same_time_continuations`, `physical_lp_probes`.
+
+Worker-pool fields: `spin_before_park`, efficiency and utilization means, straggler and chunk counts, per-kind pool message counts (`owner_batches`, `worker_wakes`, `worker_completions`, `chunk_requests`, the three `classification_*_messages`, `owner_deliveries`, `owner_batches_merged`, `early_owner_batches_merged`, `legacy_protocol_messages_estimate`, `pool_messages_actual`, `mean_pool_messages_per_round`), and wall-clock timing breakdowns (`owner_merge_ns`, `timed_rounds`, `lp_busy_ns`, `worker_machinery_ns`, `worker_busy_ns`, `worker_idle_ns`, `coordinator_partition_ns`, `worker_wait_ns`, `coordinator_exchange_ns`, and their per-round or per-probe means).
+
+Final fields: `sourced_packets`, `received_packets`, `dropped_packets`, `wall_ns`.
+
+### `days_protocol`
+
+The device run configuration, printed before the run: `fixture`, `engine` (`Metal` or `Cuda`), `exclusive_horizon_ns`, `observation_mode=Summary`, `capacity_caps` (the effective caps), `max_capacity_retries`, `capacity_warm_start` and `dump_capacity_warm_start` (paths or `none`), `channel_events_per_stream_override`, and `round_threads_per_block`.
+
+### `days_capacity_warm_start`
+
+Printed after writing a snapshot: `path`, and the number of per-entity records it holds, as `channels`, `tcp_receiver_classes`, and `tcp_ledger_flows`.
+
+### `days_device`
+
+| Field | Meaning |
+| --- | --- |
+| `engine` | `metal` or `cuda` |
+| `wall_ns`, `device_ns` | wall time from the first encode through final device completion, and the summed device (GPU) time; planning and result normalization are outside both |
+| `rounds`, `transitions` | safe-horizon rounds and event transitions executed |
+| `continuation_relaunches` | round-kernel continuation dispatches beyond the first launch per round |
+| `retry_count`, `grown_stream_count`, `retry_trace` | capacity retries, the number of channel streams they grew, and the retry records |
+| `channel_capacity_distribution` | `capacity:stream_count` pairs for the final channel-stream capacities |
+| `same_time_continuations` | local `TxComplete` to same-time `TxReady` continuations taken through the device bypass; an optimization diagnostic, zero where the bypass is compiled out (Metal) |
+
+## Example
+
+```bash
+cargo run --release --features metal --bin days -- --engine metal \
+  configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml
+```
+
+The final record reports `result_bytes=101690 result_fnv1a64=d7de73ee33579682`, the same values that `--engine scalar` and `--engine cpu` report for this fixture.
+
+See [Examples](/docs/examples) for larger fixtures and the warm-start workflow.

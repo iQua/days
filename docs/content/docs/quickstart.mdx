@@ -14,7 +14,7 @@ cargo run --release --bin days -- --engine scalar \
   configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml
 ```
 
-It prints one `record=days_scalar` line with the stop time, pending events, processed event count, and packet and byte counters.
+It prints a `record=days_scalar` line with the stop time, pending events, processed event count, and packet and byte counters, then a `record=days_result` line with the complete-state byte length and its FNV-1a-64 fingerprint. For this fixture the result line reports `result_bytes=101690 result_fnv1a64=d7de73ee33579682`.
 
 ## CPU
 
@@ -25,7 +25,7 @@ cargo run --release --bin days -- --engine cpu --workers 2 \
   configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml
 ```
 
-It prints one `record=days_cpu` line per repetition with round, event, and pool counters.
+`--workers` is required. The engine prints a `record=days_cpu` line with round, event, and worker-pool counters, then a `record=days_result` line whose fingerprint matches the Scalar run.
 
 ## Metal and CUDA
 
@@ -38,7 +38,7 @@ cargo run --release --features metal --bin days -- --engine metal \
 
 On an NVIDIA host with a CUDA 13 toolkit, use `--features cuda` and `--engine cuda`. Asking for a device engine in a build without its feature is an error that names the missing feature; `days` never picks a device for you.
 
-A device run prints a `record=days_result` line with the complete-state byte length and its FNV-1a-64 fingerprint. For this fixture it reports `result_bytes=101690 result_fnv1a64=d7de73ee33579682`, the same bytes as the Scalar oracle.
+A device run prints `record=days_protocol` (the run configuration), `record=days_device` (rounds, transitions, and capacity retries), and `record=days_result`. Its fingerprint must equal the Scalar run's; on Metal it reports the same `result_bytes=101690 result_fnv1a64=d7de73ee33579682`.
 
 ## Rejected mechanisms
 

@@ -3,7 +3,7 @@ title: Trace schema conventions
 description: Canonical keys and integer encodings for legacy and exact certificates.
 ---
 
-There is no single global CSV schema. Each certificate family defines its own
+**Scope: Days AGO and Legacy Days.** There is no single global CSV schema. Each certificate family defines its own
 row type, required fields, event vocabulary, and replay rule.
 
 ## Legacy LeanGuard CSVs
@@ -19,18 +19,18 @@ suffixes (`*_ns`, `*_bps`, `*_bytes`), and fixed-point values such as
 `*_ppb`. Inapplicable kind-specific columns are empty; the checker enforces the
 required subset for each kind.
 
-## Exact executor certificates
+## Days AGO certificates
 
-Exact executor events already carry integer nanosecond time. TCP and P10c
-certificate projections use the complete canonical key:
+Days AGO events already carry integer nanosecond time. Its certificate
+projections use the complete canonical key:
 
 ```text
 (time_ns, event_phase, event_origin_node, event_origin_sequence)
 ```
 
-Exact TCP serialization sorts by this key and rejects duplicates. P10c
-checkers can instead require the input to be in strict canonical order and
-reject an out-of-order row. Exact families cover TCP Reno/CUBIC, SP,
+The TCP serializer sorts by this key and rejects duplicates. Some `p10c_*`
+checkers instead require the input to be in strict canonical order and
+reject an out-of-order row. Days AGO families cover TCP Reno/CUBIC, SP,
 rate/PFC/DRR/WRR mechanisms, AQM, DCQCN, and collectives.
 
 ## Diagnostics

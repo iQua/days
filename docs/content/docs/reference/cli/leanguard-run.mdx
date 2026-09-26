@@ -3,18 +3,22 @@ title: leanguard-run
 description: Generate or discover legacy trace CSVs and invoke LeanGuard checkers.
 ---
 
-`leanguard-run` optionally launches the separately built legacy `days` binary,
+**Scope: Legacy Days traces and the Lean checkers.** `leanguard-run` optionally launches the separately built `days-legacy` binary,
 discovers nonempty certificate CSVs, invokes matching Lean executables, and
 prints one `RunSummaryV1` JSON document.
 
 ## Build and run
 
+A bare `lake build` builds only the default targets (`DaysExecutor` and `dcqcn_check`), so name
+the checkers the runner may select:
+
 ```bash
-cd lean && lake build && cd ..
-cargo build -p days-legacy --features dcqcn,l2_pfc,lean --bin days
-cargo run --features dcqcn,l2_pfc,lean --bin leanguard-run -- \
+cd lean && lake build dcqcn_check pfc_check cubic_check tcp_check drr_check wfq_check \
+  aqm_check aqm_dcqcn_check && cd ..
+cargo build -p days-legacy --features dcqcn,l2_pfc,lean --bin days-legacy
+cargo run --bin leanguard-run -- \
   --config configs/dcqcn_simple.toml \
-  --legacy-runner target/debug/days \
+  --legacy-runner target/debug/days-legacy \
   --checker-dir lean/.lake/build/bin
 ```
 
@@ -37,7 +41,7 @@ cargo run --bin leanguard-run -- \
 - `--mode <simulate-and-check|check-only>`: default `simulate-and-check`.
 - `--checker-dir <path>`: default `lean/.lake/build/bin`.
 - `--legacy-runner <path>`: explicit legacy trace generator. If omitted, the
-  runner checks `DAYS_LEGACY_RUNNER`, then a sibling `days` executable.
+  runner checks `DAYS_LEGACY_RUNNER`, then a `days-legacy` executable next to `leanguard-run`.
 - `--allow-nondeterministic`: permit `threading="multiple"`; otherwise that
   simulation mode is refused.
 - `--coverage` and `--coverage-dir <path>`: request checker coverpoints and

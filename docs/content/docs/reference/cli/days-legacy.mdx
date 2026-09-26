@@ -1,38 +1,40 @@
 ---
-title: days
-description: Run a simulation from a single TOML configuration file.
+title: days-legacy
+description: Run a Legacy Days simulation from a single TOML configuration file.
 ---
 
-The legacy-only binary (built from `legacy/src/main.rs`) runs a Nexosim
-simulation described by one TOML configuration file. It does not select the
-exact Scalar, CPU, Metal, or CUDA executor; use the root examples or
-[`t20f_frontier`](/docs/reference/cli/t20f-frontier) for those paths.
+**Scope: Legacy Days.** The `days-legacy` binary (built from `legacy/src/main.rs`) runs a Nexosim
+simulation described by one TOML configuration file. It does not run the Days AGO Scalar, CPU,
+Metal, or CUDA engines; use [`days`](/docs/reference/cli/days) for those.
 
 ## Usage
 
 ```bash
-RUST_LOG=info cargo run --release -p days-legacy --bin days -- <path/to/config.toml>
+RUST_LOG=info cargo run --release -p days-legacy --bin days-legacy -- <path/to/config.toml>
 ```
 
 Examples:
 
 ```bash
 # Minimal example
-RUST_LOG=info cargo run --release -p days-legacy --bin days -- configs/simple.toml
+RUST_LOG=info cargo run --release -p days-legacy --bin days-legacy -- configs/simple.toml
 
 # TCP example
-RUST_LOG=info cargo run --release -p days-legacy --bin days -- configs/tcp_simple.toml
+RUST_LOG=info cargo run --release -p days-legacy --bin days-legacy -- configs/tcp_simple.toml
 ```
 
 ## Arguments
 
 - **`<path/to/config.toml>`** (required): path to the configuration file.
 
-If you do not pass exactly one argument, the binary will `panic!` with a usage message.
+If you do not pass exactly one argument, the binary panics with a usage message. A configuration
+that fails validation prints `Simulation failed: <reason>` and exits with status 1. Build with the legacy Cargo
+features (`l2`, `l2_pfc`, `dcqcn`, `lean`) listed on the [Legacy Days](/docs/legacy#cargo-features)
+page to enable those models.
 
 ## Logging
 
-Days uses `RUST_LOG` for runtime logging.
+`days-legacy` uses `RUST_LOG` for runtime logging.
 
 - Default level if unset: `info`
 - Increase verbosity: `RUST_LOG=debug ...`

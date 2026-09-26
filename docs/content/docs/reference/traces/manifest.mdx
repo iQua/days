@@ -3,7 +3,7 @@ title: Trace Manifest (traces.json)
 description: Legacy trace discovery manifest and csv_logging behavior.
 ---
 
-At the end of a legacy run with `csv_logging=true`, Days records the nonempty
+**Scope: Legacy Days.** At the end of a legacy run with `csv_logging=true`, the legacy logger records the nonempty
 protocol certificate files under `log_path`:
 
 ```json
@@ -21,5 +21,5 @@ With `csv_logging=false`, the logger does not create `log_path`, CSVs, or the
 manifest. `leanguard-run` prefers a valid manifest and otherwise scans its
 known filenames for nonempty files.
 
-The schema is implemented in `src/utils/trace_manifest.rs`; logger emission is
-in `src/utils/logger.rs`.
+The schema is implemented in `src/utils/trace_manifest.rs`; the legacy logger in
+`legacy/src/utils/shared_logger.rs` writes it.
