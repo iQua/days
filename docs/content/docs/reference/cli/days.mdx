@@ -34,7 +34,7 @@ error: --engine metal requires a build with `--features metal` on an Apple targe
 error: --engine cuda requires a build with `--features cuda`; this binary was built without it
 ```
 
-Run-time errors (an unbuilt engine, an option for another engine, a scenario that fails to compile, or a failed run) go to standard error with an `error:` prefix, and the exit status is 1. A missing or malformed argument is reported by the argument parser with a usage line, and the exit status is 2. A scenario that uses a mechanism the selected backend does not implement fails validation with a message naming the backend.
+Argument errors exit with status 2: a missing or malformed argument, an option that does not apply to the selected engine, `--engine cpu` without `--workers`, a zero `--workers` or `--repetitions`, and an engine this binary was not built with. Run-time errors exit with status 1: a scenario file that is missing or fails to compile, a configuration the executor refuses, or a failed run. Every error prints an `error:` line to standard error; errors from the argument parser also print a usage line or a pointer to `--help`. A scenario that uses a mechanism the selected backend does not implement fails validation with a message naming the backend.
 
 ## Options
 
@@ -58,7 +58,7 @@ error: --workers is a CPU-engine option and does not apply to --engine scalar
 - `--dedicated <N>`: workers dedicated to stragglers; default `1`.
 - `--spin-before-park <N>`: spin iterations before an idle worker parks; default `4096`.
 - `--static-partition <modulo|route-load>`: how LPs are assigned to workers; default `route-load`.
-- `--repetitions <N>`: run the scenario `N` times; default `1`. Each repetition prints its own records.
+- `--repetitions <N>`: run the scenario `N` times, `N >= 1`; default `1`. Each repetition prints its own records.
 
 ### Metal and CUDA engines
 
@@ -113,7 +113,7 @@ Final fields: `sourced_packets`, `received_packets`, `dropped_packets`, `wall_ns
 
 ### `days_protocol`
 
-The device run configuration, printed before the run: `fixture`, `engine` (`Metal` or `Cuda`), `exclusive_horizon_ns`, `observation_mode=Summary`, `capacity_caps` (the effective caps), `max_capacity_retries`, `capacity_warm_start` and `dump_capacity_warm_start` (paths or `none`), `channel_events_per_stream_override`, and `round_threads_per_block`.
+The device run configuration, printed before the run: `fixture`, `engine` (`metal` or `cuda`), `exclusive_horizon_ns`, `observation_mode=Summary`, `capacity_caps` (the effective caps), `max_capacity_retries`, `capacity_warm_start` and `dump_capacity_warm_start` (paths or `none`), `channel_events_per_stream_override`, and `round_threads_per_block`.
 
 ### `days_capacity_warm_start`
 
