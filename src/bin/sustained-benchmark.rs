@@ -738,7 +738,7 @@ fn main() {
         measurement: Measurement,
     ) {
         println!(
-            "record=t15e_{kind} config={fixture} workload={} rq={} sample={} order={} predecessor={} \
+            "record=sustained_{kind} config={fixture} workload={} rq={} sample={} order={} predecessor={} \
              engine={} backend={} stream_mode={} metal_mode_order={} workers={} \
              threadgroup_width={} rounds={} transitions={} active_lp_denominator=all_rounds \
              mean_active_lps={:.6} min_active_lps={} max_active_lps={} median_active_lps={:.6} \
@@ -815,7 +815,7 @@ fn main() {
         let (warm_fixed_ns, _) = split_fixed(end_to_end_ns, marginal_ns);
         let (fixed_ns, _) = split_fixed(cold_end_to_end_ns, marginal_ns);
         println!(
-            "record=t15e_{kind} statistic=median \
+            "record=sustained_{kind} statistic=median \
              aggregation=component_medians_with_derived_fixed_closure config={fixture} workload={} rq={} \
              order={order} predecessor={} engine={} \
              backend={} stream_mode={} workers={} samples={} threadgroup_width={} rounds={} transitions={} \
@@ -960,7 +960,7 @@ fn main() {
     let device_queue_setup_ns = u128::from(initialization.device_queue_setup_ns);
     let pipeline_creation_ns = u128::from(initialization.pipeline_creation_ns);
     println!(
-        "record=t15e_protocol workload={} rq={} scalar_samples={} scalar_predecessor=none \
+        "record=sustained_protocol workload={} rq={} scalar_samples={} scalar_predecessor=none \
          comparison_samples={samples} comparison_predecessor=same_kind_discarded \
          order_schedule=balanced_cpu_first_gpu_first_and_heap_streams \
          comparison_outcome_values=beats,parity,trails \
@@ -989,7 +989,7 @@ fn main() {
         },
     );
     println!(
-        "record=t15e_initialization config={relative} workload={} rq={} engine=metal device_queue_setup_ns={} \
+        "record=sustained_initialization config={relative} workload={} rq={} engine=metal device_queue_setup_ns={} \
          pipeline_creation_ns={} in_process_reuse=1 archive_saving_status=unmeasured \
          archive_upper_bound_ns={}",
         workload.workload(),
@@ -1207,7 +1207,7 @@ fn main() {
     let w18_over_metal = w18_marginal_ns as f64 / metal_marginal_ns as f64;
     let crossover = crossover_summary(metal_vs_w4.outcome, metal_vs_w18.outcome);
     println!(
-        "record=t15e_pooled_summary statistic=median config={relative} workload={} rq={} \
+        "record=sustained_pooled_summary statistic=median config={relative} workload={} rq={} \
          scalar_samples={scalar_samples} comparison_samples={samples} \
          threadgroup_width={threadgroup_width} rounds={} transitions={} \
          active_lp_denominator=all_rounds mean_active_lps={:.6} min_active_lps={} \

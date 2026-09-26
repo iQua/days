@@ -15,19 +15,19 @@ fn k48_wide_sizing_dry_run_is_host_only_and_reproduces_load30_arenas() {
     );
     let stdout = String::from_utf8(output.stdout).expect("sizing report must be UTF-8");
     assert!(stdout.contains(
-        "record=t17c_wide_sizing_protocol \
+        "record=device_sizing_protocol \
          mode=host_arithmetic_only allocates_device=false executes_simulation=false plane_count=28"
     ));
     assert_eq!(
         stdout
             .lines()
-            .filter(|line| line.starts_with("record=t17c_wide_sizing_plane "))
+            .filter(|line| line.starts_with("record=device_sizing_plane "))
             .count(),
         28
     );
     let plane_names = stdout
         .lines()
-        .filter(|line| line.starts_with("record=t17c_wide_sizing_plane "))
+        .filter(|line| line.starts_with("record=device_sizing_plane "))
         .map(|line| {
             line.split_whitespace()
                 .find_map(|field| field.strip_prefix("name="))
@@ -75,7 +75,7 @@ fn k48_wide_sizing_dry_run_is_host_only_and_reproduces_load30_arenas() {
         .expect("round scratch must size")
         * std::mem::size_of::<u64>();
     assert!(stdout.contains(&format!(
-        "record=t17c_wide_sizing_arena \
+        "record=device_sizing_arena \
          legacy_heap_event_slots=32775270 fallback_heap_event_slots=152986 \
          channel_stream_event_slots=2355300 service_stream_event_slots=294912 \
          generator_stream_event_slots=11060 heap_arena_bytes=21853024 \
@@ -84,5 +84,5 @@ fn k48_wide_sizing_dry_run_is_host_only_and_reproduces_load30_arenas() {
         490_621_544_usize + round_scratch_bytes,
         512_474_568_usize + round_scratch_bytes,
     )));
-    assert!(stdout.contains("record=t17c_wide_sizing_total plane_count=28 total_device_bytes="));
+    assert!(stdout.contains("record=device_sizing_total plane_count=28 total_device_bytes="));
 }

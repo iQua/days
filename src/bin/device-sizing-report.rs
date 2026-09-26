@@ -27,19 +27,19 @@ fn main() {
         .unwrap_or_else(|error| panic!("failed to size {}: {error}", path.display()));
 
     println!(
-        "record=t17c_wide_sizing_protocol mode=host_arithmetic_only allocates_device=false \
+        "record=device_sizing_protocol mode=host_arithmetic_only allocates_device=false \
          executes_simulation=false plane_count={} fixture={fixture}",
         report.planes.len()
     );
     for plane in &report.planes {
         println!(
-            "record=t17c_wide_sizing_plane index={} name={} words={} bytes={} fixture={fixture}",
+            "record=device_sizing_plane index={} name={} words={} bytes={} fixture={fixture}",
             plane.index, plane.name, plane.words, plane.bytes,
         );
     }
     let arenas = report.event_arenas;
     println!(
-        "record=t17c_wide_sizing_arena legacy_heap_event_slots={} \
+        "record=device_sizing_arena legacy_heap_event_slots={} \
          fallback_heap_event_slots={} channel_stream_event_slots={} \
          service_stream_event_slots={} generator_stream_event_slots={} heap_arena_bytes={} \
          stream_arena_bytes={} total_event_arena_bytes={} legacy_heap_arena_bytes={} \
@@ -55,7 +55,7 @@ fn main() {
         arenas.legacy_heap_arena_bytes,
     );
     println!(
-        "record=t17c_wide_sizing_total plane_count={} total_device_bytes={} \
+        "record=device_sizing_total plane_count={} total_device_bytes={} \
          total_device_mib={:.6} total_device_gib={:.9} fixture={fixture}",
         report.planes.len(),
         report.total_device_bytes,
