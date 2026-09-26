@@ -1,6 +1,6 @@
 ---
 title: Protocol instantiations
-description: The checker inventory across both engines — trace families, replay state, and core obligations.
+description: The checker inventory across both engines, with trace families, replay state, and core obligations.
 ---
 
 All protocol instantiations share the same acceptance semantics
@@ -43,7 +43,7 @@ are produced by CPU-side runs only.
 | WFQ scheduler | `wfq_events.csv`: `enqueue`, `schedule`, `depart` | queued packets + virtual time + pending scheduled packet | Accounting, PendingMatch, SnapshotEq (tags/time), choice rule (min finish tag) |
 | DRR scheduler | `drr_events.csv`: `enqueue`, `schedule` | per-class FIFO queues + deficit counters + RR pointer | Accounting, SnapshotEq (deficit/pointer), choice rule (deficit eligibility), ParamFreeze |
 | CUBIC microbench | `cubic_events.csv`: CC micro-events | per-endpoint CC state + frozen parameters | SnapshotEq, ParamFreeze, MonotoneTime |
-| DCQCN | `dcqcn_events.csv`: `cnp_sent`, `cnp_recv`, `timer_tick` | per-endpoint gate/rate state + pending CNP map | PendingMatch, Gate, ParamFreeze, bounds — see [the DCQCN page](/docs/research/dcqcn-certificates) |
+| DCQCN | `dcqcn_events.csv`: `cnp_sent`, `cnp_recv`, `timer_tick` | per-endpoint gate/rate state + pending CNP map | PendingMatch, Gate, ParamFreeze, bounds; see [the DCQCN page](/docs/research/dcqcn-certificates) |
 
 ## Notes by instantiation
 
