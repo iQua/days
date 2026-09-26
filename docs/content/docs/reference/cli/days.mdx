@@ -34,7 +34,7 @@ error: --engine metal requires a build with `--features metal` on an Apple targe
 error: --engine cuda requires a build with `--features cuda`; this binary was built without it
 ```
 
-Errors go to standard error with an `error:` prefix, and the exit status is 1. A scenario that uses a mechanism the selected backend does not implement fails validation with a message naming the backend.
+Run-time errors (an unbuilt engine, an option for another engine, a scenario that fails to compile, or a failed run) go to standard error with an `error:` prefix, and the exit status is 1. A missing or malformed argument is reported by the argument parser with a usage line, and the exit status is 2. A scenario that uses a mechanism the selected backend does not implement fails validation with a message naming the backend.
 
 ## Options
 
