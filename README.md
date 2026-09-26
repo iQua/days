@@ -81,6 +81,7 @@ long-running gates.
 - `cuda`: the CUDA backend (requires a CUDA 13 `nvcc`)
 - `metal`: the Metal backend
 - `test`: extra assertions and test helpers
+- `cuda-planner-test`: host-only CUDA plan-equality tests; builds without `nvcc` (no kernels)
 - `metal-test-hooks`, `cuda-test-hooks`: device conformance hooks
 
 The legacy crate has its own `l2`, `l2_pfc`, `dcqcn`, and `lean` features.

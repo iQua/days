@@ -18,6 +18,7 @@ resolver = "2"
 test = ["days-executor/planner-test-hooks"]
 metal = ["days-executor/metal"]
 cuda = ["days-executor/cuda"]
+cuda-planner-test = ["test", "days-executor/cuda-planner-test"]
 metal-test-hooks = ["metal", "days-executor/metal-test-hooks"]
 cuda-test-hooks = ["cuda", "days-executor/cuda-test-hooks"]
 

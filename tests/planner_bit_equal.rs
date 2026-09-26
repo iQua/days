@@ -3,7 +3,11 @@
 //! without making this gate fail, so those primitives require focused independent tests.
 #![cfg(all(
     feature = "test",
-    any(feature = "cuda", all(feature = "metal", target_vendor = "apple"))
+    any(
+        feature = "cuda",
+        feature = "cuda-planner-test",
+        all(feature = "metal", target_vendor = "apple")
+    )
 ))]
 
 use std::collections::VecDeque;
@@ -18,7 +22,7 @@ use days_executor::{
     ObservationMode, PacketDescriptor, PacketKind, PayloadId, RateGenerator, RemoteChannel,
     ScheduledEmission, SimulationImage, event_phase,
 };
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
 use days_executor::{
     CudaConfig, assert_cuda_planner_bit_equal_for_testing, size_cuda_plan_for_testing,
 };
@@ -230,7 +234,7 @@ fn metal_config(streams_enabled: bool, capped: bool) -> MetalConfig {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
 fn cuda_config(streams_enabled: bool, capped: bool) -> CudaConfig {
     if !capped {
         return CudaConfig {
@@ -266,7 +270,7 @@ fn assert_planners_equal(
     )
     .unwrap_or_else(|error| panic!("Metal planner differs for {label}: {error}"));
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
     assert_cuda_planner_bit_equal_for_testing(
         image,
         None,
@@ -448,7 +452,7 @@ fn channel_starting_cap_preserves_the_0695f02_initial_plan_bytes() {
         1_269_928 + 128 - 435_344 - 75_440,
     );
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
     assert_0695_initial_plan(
         "CUDA",
         &image,
@@ -496,7 +500,7 @@ fn streams_enabled_plans_carry_one_outbox_record_and_legacy_plans_carry_the_aren
     for relative in FIXTURES {
         let image = compile_fixture(relative);
 
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
         {
             let streams = size_cuda_plan_for_testing(
                 &image,
@@ -536,7 +540,11 @@ fn streams_enabled_plans_carry_one_outbox_record_and_legacy_plans_carry_the_aren
     }
 }
 
-#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
+#[cfg(any(
+    feature = "cuda",
+    feature = "cuda-planner-test",
+    all(feature = "metal", target_vendor = "apple")
+))]
 fn assert_outbox_partition(
     backend: &str,
     fixture: &str,
@@ -627,7 +635,7 @@ fn unsupported_device_families_are_rejected_before_planning() {
             path.display()
         );
 
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
         assert!(
             assert_cuda_planner_bit_equal_for_testing(
                 &image,
@@ -656,7 +664,7 @@ fn unsupported_device_families_are_rejected_before_planning() {
         "Metal must reject DCQCN before planning"
     );
 
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
     assert!(
         assert_cuda_planner_bit_equal_for_testing(
             &dcqcn,
