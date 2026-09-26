@@ -95,3 +95,6 @@ jobs:
 
       - name: Check Metal-gated targets across the workspace
         run: cargo check --workspace --all-targets --features metal
+
+      - name: Check test-gated Metal targets across the workspace
+        run: cargo check --workspace --all-targets --features test,metal
