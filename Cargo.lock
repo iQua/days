@@ -359,7 +359,6 @@ dependencies = [
  "days-executor",
  "log",
  "num-bigint",
- "parking_lot",
  "petgraph",
  "predicates",
  "rand",
