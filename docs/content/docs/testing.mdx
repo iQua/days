@@ -32,6 +32,14 @@ cargo test -p days --features test,cuda \
   --test planner_bit_equal -- --show-output
 ```
 
+On a host without `nvcc`, the `cuda-planner-test` feature runs the same test for the CUDA planner. It enables `test`, and the executor's build script writes an empty placeholder instead of compiling CUDA kernels, so the test only builds plans on the host:
+
+```bash
+cargo test -p days --features cuda-planner-test --test planner_bit_equal
+```
+
+Adding `cuda-test-hooks` to that build compiles the kernels again, so it needs `nvcc`.
+
 ## TCP corpus byte identity
 
 This ignored test lowers the committed TCP corpus and compares the CPU engine and each compiled device backend with the Scalar oracle:

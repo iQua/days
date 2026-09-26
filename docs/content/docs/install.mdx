@@ -37,6 +37,7 @@ Without `nvcc`, a `cuda` build fails in the executor's build script with a messa
 | --- | --- |
 | `metal` | the Metal backend (Apple only) |
 | `cuda` | the CUDA backend (requires a CUDA 13 `nvcc`) |
+| `cuda-planner-test` | the host-only CUDA planner equality test; enables `test`, builds without `nvcc`, and compiles no CUDA kernels |
 | `test` | test-only helpers, including the executor's planner test hooks |
 | `metal-test-hooks`, `cuda-test-hooks` | device conformance hooks for the device test surfaces |
 
