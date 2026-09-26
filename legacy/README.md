@@ -53,9 +53,10 @@ Frozen **by reference**, not copied here:
 **Not** frozen, and this is the freeze's one real exposure:
 
 - `days` (the root crate) is a **live** dependency of `days-legacy`. It supplies configuration
-  parsing, topology construction, routing tables, and the CSV logger. Freezing `legacy/src/`
+  parsing, topology construction, and routing tables. Freezing `legacy/src/`
   therefore does not by itself freeze legacy's *observable behaviour*: a change to shared
-  routing or logging code can move what this engine outputs without any diff under `legacy/`.
+  parsing, topology, or routing code can move what this engine outputs without any diff under
+  `legacy/`.
   That is also why change class **(a)** below has to exist.
 
 Where each shared surface is actually covered — read this before assuming a green gate means a
@@ -66,7 +67,7 @@ stable baseline:
 | configuration parsing | `days-validation` (`days::scenario::compile_config`, 5 of 6 binaries; incl. a TOML-key-ordering differential test) | — |
 | topology construction | `days-validation` (`days::topos::build::build_graph`, 4 binaries, consumed by legacy via `Flow::flows_from_config_with_attachments`) | — |
 | routing tables | this crate's own suite — `tests/scenario_lowering.rs::assert_legacy_physical_routes` walks the routes legacy installs against the lowered image on real fat trees | **`days-validation` — zero references to `days::topos::route`** |
-| CSV logger | this crate's own suite — `tests/{scenario_lowering,host_attachment,ring_allreduce_coverage,dcqcn_event_id,pfc_event_id}.rs` read the CSVs back; root crate `tests/trace_manifest.rs` | **`days-validation` — zero references to the logger or its CSVs** |
+| CSV logger (inside the freeze since P13c T6: `src/utils/shared_logger.rs`, no longer shared) | this crate's own suite — `tests/{scenario_lowering,host_attachment,ring_allreduce_coverage,dcqcn_event_id,pfc_event_id}.rs` read the CSVs back; `legacy/tests/trace_manifest.rs` | **`days-validation` — zero references to the logger or its CSVs** |
 
 `days-validation` (`validation/tests/`: 24 tests — 22 executed, 2 `#[ignore]`d — across
 `service_start_selection` (7), `tcp_corpora` (6), `wide_corpus_fixtures` (4),
@@ -645,4 +646,4 @@ to anything else under `legacy/` always do.
 | 2026-08-12 | `Fix instrumentation cleanup review findings` | (g) | Removed legacy concurrency sampling and its tracing/config/CLI/model-span plumbing, plus Nexosim `perf_stats` counters, features, accounting, reporters, and references. Preserved the native `step_until`, `Nexosim total`, and elapsed wall-clock calculations and output formats byte-for-byte. | The user-authorized instrumentation-removal review follow-up, Findings 3 and 4. |
 | 2026-09-25 | `P13c T3: Give phase-numbered targets descriptive names; rename fixture directories` | (h) | Updated ten fixture paths in seven legacy tests (`config_hardening`, `csv_logging`, `e1_expression`, `e1_packet_arithmetic`, `e3_integer_regression`, `e5_lossy_analogue`, `e5_preflight_metrics`) from `configs/benchmarks/p12/` to `configs/benchmarks/evaluation/`. Only the path strings changed. The fixtures themselves changed in comment lines only (the generator path they cite); their parsed content and `log_path` values are unchanged. No behaviour change. | The shared fixture directory rename (P13c ruling 6). |
 | 2026-09-25 | `P13c T5: Rename the legacy binary to days-legacy` | (h) | Renamed the `[[bin]]` target in `Cargo.toml` from `days` to `days-legacy` and updated the 19 `cargo_bin_cmd!`/`Command::cargo_bin` sites in 11 tests to the new name. The binary's source, arguments, and output are unchanged. No behaviour change. | The root crate's new `days` CLI (P13c ruling 4); two workspace binaries may not share a name. |
-| 2026-09-25 | `P13c T6: Move the legacy CSV logger and its l2_pfc/dcqcn/lean gates into legacy` | (h) | Moved the shared CSV logger (`src/utils/logger.rs` in the root crate, 1,170 lines, unchanged apart from its `trace_manifest` import path) to the private module `src/utils/shared_logger.rs`; the facade `src/utils/logger.rs` and six direct users now import it from this crate. `l2_pfc`, `dcqcn`, and `lean` no longer forward to root features (which are removed), so the same `cfg` gates now read this crate's own features. Moved the root `trace_manifest` logger test to `tests/trace_manifest.rs`. No behaviour change: all six LeanGuard certificates are byte-identical. | P13c ruling 5: the root crate no longer carries legacy/LeanGuard-only features. |
+| 2026-09-25 | `P13c T6: Move the legacy CSV logger and its l2_pfc/dcqcn/lean gates into legacy` | (h) | Moved the shared CSV logger (`src/utils/logger.rs` in the root crate, 1,170 lines, unchanged apart from its `trace_manifest` import path) to the private module `src/utils/shared_logger.rs`; the facade `src/utils/logger.rs` and six direct users now import it from this crate. `l2_pfc`, `dcqcn`, and `lean` no longer forward to root features (which are removed), so the same `cfg` gates now read this crate's own features. Moved the root `trace_manifest` logger test to `tests/trace_manifest.rs`. No behaviour change: all six LeanGuard certificates are byte-identical. The logger is now inside the freeze: it is no longer a live root-crate surface (§1). | P13c ruling 5: the root crate no longer carries legacy/LeanGuard-only features. |
