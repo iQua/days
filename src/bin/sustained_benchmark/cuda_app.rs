@@ -340,7 +340,7 @@ fn print_record(
     measurement: Measurement,
 ) {
     println!(
-        "record=sustained_{kind} config={fixture} workload={} rq={} sample={} order={} predecessor={} \
+        "record=sustained_cuda_{kind} config={fixture} workload={} rq={} sample={} order={} predecessor={} \
          engine={} backend={} workers={} round_threads_per_block={} rounds={} transitions={} \
          active_lp_denominator=all_rounds mean_active_lps={:.6} min_active_lps={} \
          max_active_lps={} median_active_lps={:.6} \
@@ -417,7 +417,7 @@ fn print_summary(
     let (warm_fixed_ns, _) = split_fixed(end_to_end_ns, marginal_ns);
     let (fixed_ns, _) = split_fixed(cold_end_to_end_ns, marginal_ns);
     println!(
-        "record=sustained_{kind} statistic=median \
+        "record=sustained_cuda_{kind} statistic=median \
          aggregation=component_medians_with_derived_fixed_closure config={fixture} workload={} rq={} order={order} \
          predecessor={} engine={} backend={} workers={} samples={} round_threads_per_block={} \
          rounds={} transitions={} active_lp_denominator=all_rounds mean_active_lps={:.6} \
@@ -556,7 +556,7 @@ fn run_worker_sweep(
         });
         let (fixed_ns, marginal_ns) = split_fixed(end_to_end_ns, marginal_ns);
         println!(
-            "record=sustained_worker_sweep config={fixture} workload={} rq={} workers={worker_count} samples=1 \
+            "record=sustained_cuda_worker_sweep config={fixture} workload={} rq={} workers={worker_count} samples=1 \
              predecessor=none rounds={rounds} transitions={transitions} \
              active_lp_denominator=all_rounds mean_active_lps={:.6} min_active_lps={} \
              max_active_lps={} median_active_lps={:.6} \
@@ -664,7 +664,7 @@ pub fn main() {
         .expect("CUDA initialization time must fit in u128");
 
     println!(
-        "record=sustained_protocol workload={} rq={} scalar_samples={SCALAR_SAMPLES} scalar_predecessor=none \
+        "record=sustained_cuda_protocol workload={} rq={} scalar_samples={SCALAR_SAMPLES} scalar_predecessor=none \
          comparison_samples={samples} comparison_predecessor=same_kind_discarded \
          order_schedule=balanced_cpu_first_gpu_first comparison_outcome_values=beats,parity,trails \
          comparison_dispersion=maximum_retained_sample_range \
@@ -676,7 +676,7 @@ pub fn main() {
         workload.rq(),
     );
     println!(
-        "record=sustained_initialization config={fixture} workload={} rq={} engine=cuda \
+        "record=sustained_cuda_initialization config={fixture} workload={} rq={} engine=cuda \
          context_stream_setup_ns={} module_function_load_ns={} initialization_ns={} \
          graph_capture_treatment=per_run_marginal_backend_wall",
         workload.workload(),
@@ -835,7 +835,7 @@ pub fn main() {
     let wbest_over_cuda = wbest_marginal_ns as f64 / cuda_marginal_ns as f64;
     let crossover = cuda_crossover_summary(cuda_vs_w4.outcome, cuda_vs_wbest.outcome);
     println!(
-        "record=sustained_pooled_summary statistic=median config={fixture} workload={} rq={} \
+        "record=sustained_cuda_pooled_summary statistic=median config={fixture} workload={} rq={} \
          scalar_samples={scalar_samples} comparison_samples={samples} best_workers={best_workers} \
          round_threads_per_block={round_threads_per_block} rounds={} transitions={} \
          active_lp_denominator=all_rounds mean_active_lps={:.6} min_active_lps={} \
