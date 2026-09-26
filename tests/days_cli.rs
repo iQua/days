@@ -121,7 +121,13 @@ fn an_unbuilt_device_engine_is_an_error_that_names_its_feature() {
 fn metal_matches_the_scalar_fingerprint() {
     let (ok, stdout, stderr) = days(&[SMOKE, "--engine", "metal"]);
     assert!(ok, "{stderr}");
-    assert_eq!(record(&stdout, "days_protocol").len(), 1, "{stdout}");
+    let protocol = record(&stdout, "days_protocol");
+    assert_eq!(protocol.len(), 1, "{stdout}");
+    assert!(
+        protocol[0].contains(" engine=metal "),
+        "every record names the engine in lowercase: {}",
+        protocol[0]
+    );
     assert_eq!(record(&stdout, "days_device").len(), 1, "{stdout}");
     let result = record(&stdout, "days_result");
     assert_eq!(result.len(), 1);
@@ -134,7 +140,13 @@ fn metal_matches_the_scalar_fingerprint() {
 fn cuda_matches_the_scalar_fingerprint() {
     let (ok, stdout, stderr) = days(&[SMOKE, "--engine", "cuda"]);
     assert!(ok, "{stderr}");
-    assert_eq!(record(&stdout, "days_protocol").len(), 1, "{stdout}");
+    let protocol = record(&stdout, "days_protocol");
+    assert_eq!(protocol.len(), 1, "{stdout}");
+    assert!(
+        protocol[0].contains(" engine=cuda "),
+        "every record names the engine in lowercase: {}",
+        protocol[0]
+    );
     assert_eq!(record(&stdout, "days_device").len(), 1, "{stdout}");
     let result = record(&stdout, "days_result");
     assert_eq!(result.len(), 1);

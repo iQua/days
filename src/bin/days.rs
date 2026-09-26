@@ -971,12 +971,12 @@ fn mean(values: impl Iterator<Item = f64>) -> f64 {
 
 fn print_protocol(cli: &Cli) {
     println!(
-        "record=days_protocol fixture={} engine={:?} \
+        "record=days_protocol fixture={} engine={} \
          exclusive_horizon_ns={:?} observation_mode=Summary capacity_caps={:?} \
          max_capacity_retries={} capacity_warm_start={} dump_capacity_warm_start={} \
          channel_events_per_stream_override={:?} round_threads_per_block={}",
         cli.config.display(),
-        cli.engine,
+        cli.engine_name(),
         cli.exclusive_horizon_ns,
         effective_caps(cli),
         cli.max_capacity_retries(),
