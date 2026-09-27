@@ -1,6 +1,5 @@
 {
   "pages": [
-    "index",
     "paper-summary",
     "design",
     "instantiations",

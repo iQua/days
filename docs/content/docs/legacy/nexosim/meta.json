@@ -1,5 +1,5 @@
 {
-  "pages": ["index", "simulation", "ports", "time"],
+  "pages": ["simulation", "ports", "time"],
   "index": "Overview",
   "simulation": "Simulation lifecycle",
   "ports": "Ports & mailboxes",

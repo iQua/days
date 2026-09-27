@@ -1,5 +1,5 @@
 {
-  "pages": ["index", "leanguard", "design"],
+  "pages": ["leanguard", "design"],
   "index": "Overview",
   "leanguard": "LeanGuard (Use Guide)",
   "design": "LeanGuard (Design)"
