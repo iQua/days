@@ -53,9 +53,10 @@ Frozen **by reference**, not copied here:
 **Not** frozen, and this is the freeze's one real exposure:
 
 - `days` (the root crate) is a **live** dependency of `days-legacy`. It supplies configuration
-  parsing, topology construction, routing tables, and the CSV logger. Freezing `legacy/src/`
+  parsing, topology construction, and routing tables. Freezing `legacy/src/`
   therefore does not by itself freeze legacy's *observable behaviour*: a change to shared
-  routing or logging code can move what this engine outputs without any diff under `legacy/`.
+  parsing, topology, or routing code can move what this engine outputs without any diff under
+  `legacy/`.
   That is also why change class **(a)** below has to exist.
 
 Where each shared surface is actually covered — read this before assuming a green gate means a
@@ -66,11 +67,11 @@ stable baseline:
 | configuration parsing | `days-validation` (`days::scenario::compile_config`, 5 of 6 binaries; incl. a TOML-key-ordering differential test) | — |
 | topology construction | `days-validation` (`days::topos::build::build_graph`, 4 binaries, consumed by legacy via `Flow::flows_from_config_with_attachments`) | — |
 | routing tables | this crate's own suite — `tests/scenario_lowering.rs::assert_legacy_physical_routes` walks the routes legacy installs against the lowered image on real fat trees | **`days-validation` — zero references to `days::topos::route`** |
-| CSV logger | this crate's own suite — `tests/{scenario_lowering,host_attachment,ring_allreduce_coverage,dcqcn_event_id,pfc_event_id}.rs` read the CSVs back; root crate `tests/trace_manifest.rs` | **`days-validation` — zero references to the logger or its CSVs** |
+| CSV logger (inside the freeze since P13c T6: `src/utils/shared_logger.rs`, no longer shared) | this crate's own suite — `tests/{scenario_lowering,host_attachment,ring_allreduce_coverage,dcqcn_event_id,pfc_event_id}.rs` read the CSVs back; `legacy/tests/trace_manifest.rs` | **`days-validation` — zero references to the logger or its CSVs** |
 
 `days-validation` (`validation/tests/`: 24 tests — 22 executed, 2 `#[ignore]`d — across
-`service_start_selection` (7), `t24_tcp_corpora` (6), `t17c_wide_corpus` (4),
-`t13f_width_via_load_full` (3), `tcp_executor_legacy` (3), `t15e_sustained` (1)) is the only
+`service_start_selection` (7), `tcp_corpora` (6), `wide_corpus_fixtures` (4),
+`width_via_load_full` (3), `tcp_executor_legacy` (3), `sustained_fixtures` (1)) is the only
 allow-listed dependant of this crate (`xtask/src/main.rs`) and is a **standing gate**, listed in
 [§5](#standing-gates). What it guards is **legacy↔executor agreement** — that and no more.
 
@@ -99,7 +100,7 @@ outside the anchor under the exact-time erratum in [§6.9](#69-exact-time-erratu
 
 ## 3. Freeze policy
 
-**No changes. Seven narrow exceptions, each requiring a changelog row in
+**No changes. Eight narrow exceptions, each requiring a changelog row in
 [§8](#8-freeze-changelog).**
 
 | # | Allowed change | Why it must be allowed |
@@ -111,8 +112,9 @@ outside the anchor under the exact-time erratum in [§6.9](#69-exact-time-erratu
 | **(e)** | **The T28 E1 expression and configuration-integrity repair.** Minimal scalar-propagation activation, a strict legacy-owned configuration vocabulary, and correctness gates for the frozen E1 family, E3, and E5. | Explicit user authority in the T28 legacy E1 task (August 10, 2026). This exception is limited to exact E1 semantics and refusal of unimplemented input; it does not authorize a new protocol, controller, output field, or performance work. |
 | **(f)** | **The T30 configurable CSV suppression repair.** A default-on root TOML boolean may suppress CSV initialization, threshold/final writes, and trace-manifest work while retaining simulation semantics and bounded correctness bookkeeping. | Explicit user authority in the T30 legacy CSV logging task (August 11, 2026). This exception is limited to the configuration key, output suppression, its correctness gates, and the timed-quiet/untimed-verify contract. |
 | **(g)** | **The user-authorized instrumentation cleanup.** Remove measurement-only legacy concurrency task/peak sampling, its tracing/config/CLI/model-span plumbing, and Nexosim `perf_stats` counters, features, reporters, and documentation. | Explicit user authority in the instrumentation-removal review follow-up (August 12, 2026). This exception is limited to Findings 3 and 4 and must preserve the native `step_until`, `Nexosim total`, and elapsed wall-clock calculations and output formats byte-for-byte. |
+| **(h)** | **The P13c repository cleanup.** Path updates forced by renamed shared fixture directories, the rename of the legacy binary from `days` to `days-legacy`, and the move of the legacy/LeanGuard-only CSV logger (with its `l2_pfc`, `dcqcn`, and `lean` gates) from the root crate into `legacy/`. | Explicit user rulings in the P13c cleanup task (September 25, 2026). This exception is limited to renames and code moves: it does not authorize a behaviour, output, configuration, or protocol change, and every legacy test and LeanGuard certificate must stay byte-identical. |
 
-**Never, under exceptions (a)–(c), and outside the exact bounds of exceptions (d)–(g):**
+**Never, under exceptions (a)–(c), and outside the exact bounds of exceptions (d)–(h):**
 
 - no new protocols, mechanisms, schedulers, queue disciplines, or congestion-control variants;
 - no new configuration keys, no new output fields, no new features in `[features]`;
@@ -120,7 +122,7 @@ outside the anchor under the exact-time erratum in [§6.9](#69-exact-time-erratu
 - no behaviour change of any kind. If a change would alter what any existing fixture
   produces, it is out of policy — stop and escalate rather than proceed.
 
-**Every** change under (a), (b), (c), (d), (e), (f), or (g) adds a row to
+**Every** change under (a), (b), (c), (d), (e), (f), (g), or (h) adds a row to
 [§8](#8-freeze-changelog) in the same commit. A change to `legacy/` without a changelog row is a
 policy violation regardless of how small it is.
 
@@ -203,9 +205,9 @@ done
 
 # 4. The LeanGuard legacy runner builds under every protocol feature set
 #    (.github/workflows/leanguard.yml drives these three combinations).
-cargo build -p days-legacy --features lean --bin days
-cargo build -p days-legacy --features l2_pfc,lean --bin days
-cargo build -p days-legacy --features dcqcn,l2_pfc,lean --bin days
+cargo build -p days-legacy --features lean --bin days-legacy
+cargo build -p days-legacy --features l2_pfc,lean --bin days-legacy
+cargo build -p days-legacy --features dcqcn,l2_pfc,lean --bin days-legacy
 
 # 5. Nothing outside legacy/ may depend on days-legacy (one test-only exception,
 #    days-validation, is allow-listed in xtask/src/main.rs).
@@ -218,7 +220,7 @@ from a **clean clone**, not the working tree:
 ```bash
 git clone --no-hardlinks --branch feat/days-executor <repo> /tmp/legacy-repro
 cd /tmp/legacy-repro
-cargo build --locked --release -p days-legacy --bin days
+cargo build --locked --release -p days-legacy --bin days-legacy
 cargo test  --locked -p days-legacy --features test -- --show-output
 git status --porcelain    # must be empty: --locked must not have rewritten Cargo.lock
 ```
@@ -234,10 +236,10 @@ measurer who does should reproduce another measurer's fields without further ins
 The P12 legacy-comparability fixture, `E3`, is the only fixture the paper's legacy ST/MT arms
 run:
 
-- `configs/benchmarks/p12/e3_legacy_rack_local_st.toml` — single-threaded arm
-- `configs/benchmarks/p12/e3_legacy_rack_local_mt.toml` — multi-threaded arm
+- `configs/benchmarks/evaluation/e3_legacy_rack_local_st.toml` — single-threaded arm
+- `configs/benchmarks/evaluation/e3_legacy_rack_local_mt.toml` — multi-threaded arm
 
-Both are **generated** by `configs/benchmarks/p12/gen_e3_rack_local.py` and must not be
+Both are **generated** by `configs/benchmarks/evaluation/gen_e3_rack_local.py` and must not be
 hand-edited. k = 32 fat-tree, 16 hosts per edge switch (8,192 hosts, 1,280 switches), 16,896
 explicit **byte-terminated** flows in three permutation components (8,192 intra-rack, 8,192
 intra-pod cross-rack, 512 cross-pod), 1,000 B packets, `port_rate` 3,200,000, FIFO/TailDrop
@@ -259,8 +261,8 @@ runs:
 ### 6.2 Build
 
 ```bash
-cargo build --release --locked -p days-legacy --bin days
-# binary: target/release/days   (the root crate has no src/main.rs; this name is legacy's)
+cargo build --release --locked -p days-legacy --bin days-legacy
+# binary: target/release/days-legacy
 ```
 
 Record `rustc --version`, `cargo --version`, and the git commit for every machine.
@@ -282,8 +284,8 @@ Run one CSV-on verification first. It is correctness evidence only; none of its 
 timing sample set:
 
 ```bash
-env RUST_LOG=info ./target/release/days /tmp/e3-st-csv-on.toml > verify-st.log 2>&1
-env RUST_LOG=info ./target/release/days /tmp/e3-mt-csv-on.toml > verify-mt.log 2>&1
+env RUST_LOG=info ./target/release/days-legacy /tmp/e3-st-csv-on.toml > verify-st.log 2>&1
+env RUST_LOG=info ./target/release/days-legacy /tmp/e3-mt-csv-on.toml > verify-mt.log 2>&1
 ```
 
 Timed samples, per arm, under the standing quiet-machine gate, use only the corresponding
@@ -292,12 +294,12 @@ Timed samples, per arm, under the standing quiet-machine gate, use only the corr
 ```bash
 # ST
 /usr/bin/time -p -o wall-st-<n>.txt \
-  env RUST_LOG=info ./target/release/days \
+  env RUST_LOG=info ./target/release/days-legacy \
   /tmp/e3-st-csv-off.toml > run-st-<n>.log 2>&1
 
 # MT
 /usr/bin/time -p -o wall-mt-<n>.txt \
-  env RUST_LOG=info ./target/release/days \
+  env RUST_LOG=info ./target/release/days-legacy \
   /tmp/e3-mt-csv-off.toml > run-mt-<n>.log 2>&1
 ```
 
@@ -642,3 +644,6 @@ to anything else under `legacy/` always do.
 | 2026-08-10 | `T28: Express legacy E1 fixtures exactly` | (e) | Activated the configured scalar propagation model, added strict rejection of unowned or unimplemented legacy input, and added direct E1 expression, E3 inertness, and E5 non-regression gates. | The user-authorized T28 legacy E1 implementation and correctness task. |
 | 2026-08-11 | `T30: Configure legacy CSV logging from TOML` | (f) | Added default-on `csv_logging`; false mode performs no CSV or trace-manifest filesystem work and drops reports after constant-size correctness reduction, while temporary true/false overlays prove identical E3/E5 outcomes. | The user-authorized T30 legacy CSV logging implementation and correctness task. |
 | 2026-08-12 | `Fix instrumentation cleanup review findings` | (g) | Removed legacy concurrency sampling and its tracing/config/CLI/model-span plumbing, plus Nexosim `perf_stats` counters, features, accounting, reporters, and references. Preserved the native `step_until`, `Nexosim total`, and elapsed wall-clock calculations and output formats byte-for-byte. | The user-authorized instrumentation-removal review follow-up, Findings 3 and 4. |
+| 2026-09-25 | `P13c T3: Give phase-numbered targets descriptive names; rename fixture directories` | (h) | Updated ten fixture paths in seven legacy tests (`config_hardening`, `csv_logging`, `e1_expression`, `e1_packet_arithmetic`, `e3_integer_regression`, `e5_lossy_analogue`, `e5_preflight_metrics`) from `configs/benchmarks/p12/` to `configs/benchmarks/evaluation/`. Only the path strings changed. The fixtures themselves changed in comment lines only (the generator path they cite); their parsed content and `log_path` values are unchanged. No behaviour change. | The shared fixture directory rename (P13c ruling 6). |
+| 2026-09-25 | `P13c T5: Rename the legacy binary to days-legacy` | (h) | Renamed the `[[bin]]` target in `Cargo.toml` from `days` to `days-legacy` and updated the 19 `cargo_bin_cmd!`/`Command::cargo_bin` sites in 11 tests to the new name. The binary's source, arguments, and output are unchanged. No behaviour change. | The root crate's new `days` CLI (P13c ruling 4); two workspace binaries may not share a name. |
+| 2026-09-25 | `P13c T6: Move the legacy CSV logger and its l2_pfc/dcqcn/lean gates into legacy` | (h) | Moved the shared CSV logger (`src/utils/logger.rs` in the root crate, 1,170 lines, unchanged apart from its `trace_manifest` import path) to the private module `src/utils/shared_logger.rs`; the facade `src/utils/logger.rs` and six direct users now import it from this crate. `l2_pfc`, `dcqcn`, and `lean` no longer forward to root features (which are removed), so the same `cfg` gates now read this crate's own features. Moved the root `trace_manifest` logger test to `tests/trace_manifest.rs`. No behaviour change: all six LeanGuard certificates are byte-identical. The logger is now inside the freeze: it is no longer a live root-crate surface (§1). | P13c ruling 5: the root crate no longer carries legacy/LeanGuard-only features. |

@@ -1210,12 +1210,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         fs::write(
             temp.path().join("lib.rs"),
-            "#[cfg(all(\n    feature = \"metal-spike\",\n    target_vendor = \"apple\"\n))]\npub mod metal;\n",
+            "#[cfg(all(\n    feature = \"metal\",\n    target_vendor = \"apple\"\n))]\npub mod metal;\n",
         )
         .unwrap();
         let allow = [AllowedFeatureGate {
             path: "lib.rs",
-            predicate: r#"all(feature = "metal-spike", target_vendor = "apple")"#,
+            predicate: r#"all(feature = "metal", target_vendor = "apple")"#,
             count: 1,
             purpose: "Metal toolchain availability on Apple targets",
         }];

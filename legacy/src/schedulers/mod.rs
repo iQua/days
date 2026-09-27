@@ -11,7 +11,7 @@ pub mod wrr;
 
 use crate::flows::packet::Packet;
 
-pub use days::utils::logger::SchedulerReport;
+pub use crate::utils::logger::SchedulerReport;
 
 /// Defines the interface for all schedulers to update statistics in their periodic
 /// reports.

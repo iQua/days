@@ -29,21 +29,26 @@ Run from the repository root.
 
 ```bash
 # Scalar reference run
-cargo run --release --example scalar_benchmark -- \
-  configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml
+cargo run --release --bin days -- \
+  configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml --engine scalar
 
 # Multicore CPU run
-cargo run --release --example round_benchmark -- \
+cargo run --release --bin days -- \
   configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml \
-  --workers 2 --repetitions 1
+  --engine cpu --workers 2 --repetitions 1
 
-# GPU run on Apple Metal (use --features cuda on an NVIDIA host)
-cargo run --release --features metal-spike --bin t20f_frontier -- \
-  configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml --engine device
+# GPU run on Apple Metal
+cargo run --release --features metal --bin days -- \
+  configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml --engine metal
+
+# GPU run on NVIDIA
+cargo run --release --features cuda --bin days -- \
+  configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml --engine cuda
 ```
 
-The GPU runner prints the complete-state byte length and its FNV-1a
-fingerprint, which match the Scalar result for the same scenario.
+Every engine ends with a `record=days_result` line carrying the complete-state
+byte length and its FNV-1a fingerprint; equal fingerprints mean byte-identical
+results. `--engine metal` or `--engine cuda` without its feature is an error.
 
 ## Documentation
 
@@ -67,18 +72,19 @@ cargo test -p days-legacy --features test -- --show-output
 cargo test -p days-validation --features test -- --show-output
 ```
 
-GPU surfaces add `--features test,metal-spike` (Apple) or `--features test,cuda`
+GPU surfaces add `--features test,metal` (Apple) or `--features test,cuda`
 (NVIDIA, CUDA 13 toolkit). See the testing page in the documentation for the
 long-running gates.
 
 ## Feature flags
 
 - `cuda`: the CUDA backend (requires a CUDA 13 `nvcc`)
-- `metal-spike`: the Metal backend
+- `metal`: the Metal backend
 - `test`: extra assertions and test helpers
-- `cuda-planner-test`: host-only CUDA plan-equality tests, no kernel compilation
+- `cuda-planner-test`: host-only CUDA plan-equality tests; builds without `nvcc` (no kernels)
 - `metal-test-hooks`, `cuda-test-hooks`: device conformance hooks
-- `dcqcn`, `l2_pfc`, `lean`: legacy-era switches still used by the scenario layer
+
+The legacy crate has its own `l2`, `l2_pfc`, `dcqcn`, and `lean` features.
 
 ## Legacy Days
 
@@ -86,7 +92,7 @@ The original actor-model simulator (Nexosim coroutines, versions up to 0.4.3)
 is frozen in `legacy/` as the `days-legacy` crate and still runs:
 
 ```bash
-cargo run --release -p days-legacy --bin days -- configs/simple.toml
+cargo run --release -p days-legacy --bin days-legacy -- configs/simple.toml
 ```
 
 Its last commit on `main` before Days AGO is tagged `legacy-main-final`.

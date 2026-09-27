@@ -80,7 +80,7 @@ fn zero_start_and_one_second_arrival_land_on_exact_boundaries() {
     let logs = directory.path().join("logs");
     let config = write_packet_config(&directory, &logs, "1.1");
 
-    Command::cargo_bin("days")
+    Command::cargo_bin("days-legacy")
         .unwrap()
         .env("RUST_LOG", "error")
         .arg(config)
@@ -101,7 +101,7 @@ fn fractional_nanosecond_horizon_is_a_clean_cli_failure() {
     let logs = directory.path().join("logs");
     let config = write_packet_config(&directory, &logs, "0.0000000005");
 
-    Command::cargo_bin("days")
+    Command::cargo_bin("days-legacy")
         .unwrap()
         .env("RUST_LOG", "error")
         .arg(config)

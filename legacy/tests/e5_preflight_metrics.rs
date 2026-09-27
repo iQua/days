@@ -103,7 +103,7 @@ fn q_high_e5_analogue_exports_exact_final_metrics_and_stops_timer_work() {
     let directory = TempDir::new().unwrap();
     let config = fixture(&directory, "metrics", Some(true));
 
-    cargo_bin_cmd!("days")
+    cargo_bin_cmd!("days-legacy")
         .env("RUST_LOG", "error")
         .arg(&config)
         .assert()
@@ -111,7 +111,7 @@ fn q_high_e5_analogue_exports_exact_final_metrics_and_stops_timer_work() {
 
     let mut reader = csv::Reader::from_path(log_dir(&config).join("tcp_metrics.csv")).unwrap();
     let rows = reader
-        .deserialize::<days::utils::logger::TcpMetricsReport>()
+        .deserialize::<days_legacy::utils::logger::TcpMetricsReport>()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(rows.len(), 16);
@@ -137,7 +137,7 @@ fn q_high_e5_analogue_exports_exact_final_metrics_and_stops_timer_work() {
 fn frozen_e5_completes_every_flow_and_acks_every_demand_byte() {
     let directory = TempDir::new().unwrap();
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../configs/benchmarks/p12/e5_wide_k32_q200.toml");
+        .join("../configs/benchmarks/evaluation/e5_wide_k32_q200.toml");
     let original = fs::read_to_string(&source).unwrap();
     let logs = directory.path().join("e5-logs");
     let body = original.replacen(
@@ -152,7 +152,7 @@ fn frozen_e5_completes_every_flow_and_acks_every_demand_byte() {
     let config = directory.path().join("e5.toml");
     fs::write(&config, body).unwrap();
 
-    cargo_bin_cmd!("days")
+    cargo_bin_cmd!("days-legacy")
         .env("RUST_LOG", "error")
         .arg(&config)
         .assert()
@@ -160,7 +160,7 @@ fn frozen_e5_completes_every_flow_and_acks_every_demand_byte() {
 
     let rows = csv::Reader::from_path(logs.join("tcp_metrics.csv"))
         .unwrap()
-        .deserialize::<days::utils::logger::TcpMetricsReport>()
+        .deserialize::<days_legacy::utils::logger::TcpMetricsReport>()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     let flows = rows.iter().map(|row| row.flow_id).collect::<BTreeSet<_>>();

@@ -29,9 +29,9 @@ Standing invariants for any change:
 - `logs/` and `target/` are generated artifacts and should stay uncommitted.
 
 ## Build, Test, and Development Commands
-- `cargo run --release --example scalar_benchmark -- <config.toml>` runs the Scalar oracle; `--example round_benchmark -- <config.toml> --workers N` runs the CPU executor; `cargo run --release --features metal-spike --bin t20f_frontier -- <config.toml> --engine device` runs on Metal (`--features cuda` on NVIDIA). See `README.md`.
-- `cargo run --release -p days-legacy --bin days -- configs/simple.toml` runs the frozen legacy simulator (`--features l2,l2_pfc` for its L2/PFC support).
-- `cargo fmt --all` formats Rust code. Run Clippy with warnings denied for executor default (`cargo clippy -p days-executor -- -D warnings`), executor Metal (`cargo clippy -p days-executor --features metal-spike -- -D warnings`), the LeanGuard runner (`cargo clippy --bin leanguard-run -- -D warnings`), and the shared/current Metal surface (`cargo clippy --features test,metal-spike -- -D warnings`).
+- `cargo run --release --bin days -- <config.toml> --engine scalar` runs the Scalar oracle; `--engine cpu --workers N` runs the CPU executor (`--workers 1` is its serial round path); `cargo run --release --features metal --bin days -- <config.toml> --engine metal` runs on Metal (`--features cuda` and `--engine cuda` on NVIDIA). Every engine prints a `record=days_result` complete-state fingerprint. See `README.md`.
+- `cargo run --release -p days-legacy --bin days-legacy -- configs/simple.toml` runs the frozen legacy simulator (`--features l2,l2_pfc` for its L2/PFC support).
+- `cargo fmt --all` formats Rust code. Run Clippy with warnings denied for executor default (`cargo clippy -p days-executor -- -D warnings`), executor Metal (`cargo clippy -p days-executor --features metal -- -D warnings`), the LeanGuard runner (`cargo clippy --bin leanguard-run -- -D warnings`), and the shared/current Metal surface (`cargo clippy --features test,metal -- -D warnings`).
 - The four-package default matrix in `README.md` runs executor, shared/current, legacy, and validation tests.
 - `cargo nextest run --workspace --all-features --no-capture` is the preferred faster test runner if installed.
 

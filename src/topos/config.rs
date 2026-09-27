@@ -70,7 +70,6 @@ pub enum LinkMode {
     Pfc,
 }
 
-#[cfg_attr(not(feature = "l2_pfc"), allow(dead_code))]
 #[derive(Clone, Debug, Deserialize, Default)]
 pub struct PfcLinkConfig {
     pub xoff: Option<Vec<usize>>,
@@ -94,7 +93,6 @@ pub struct PropagationTierConfig {
     pub aggregation_to_core_ns: u64,
 }
 
-#[cfg_attr(not(feature = "l2_pfc"), allow(dead_code))]
 #[derive(Clone, Debug, Deserialize, Default)]
 pub struct LinkConfig {
     pub mode: Option<LinkMode>,

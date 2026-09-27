@@ -1,10 +1,7 @@
 //! Shared host codec for the bounded device scheduler plane.
 
 #![cfg_attr(
-    not(any(
-        feature = "cuda",
-        all(feature = "metal-spike", target_vendor = "apple")
-    )),
+    not(any(feature = "cuda", all(feature = "metal", target_vendor = "apple"))),
     allow(dead_code)
 )]
 

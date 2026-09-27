@@ -7,8 +7,8 @@ use rand::rngs::SmallRng;
 
 use crate::get_seed;
 
+pub use crate::utils::logger::{CapacityUnit, DropAction, DropStrategyKind};
 pub use days::topos::config::DropStrategy;
-pub use days::utils::logger::{CapacityUnit, DropAction, DropStrategyKind};
 
 #[derive(Clone, Debug)]
 pub struct DropWitness {

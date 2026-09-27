@@ -20,8 +20,8 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     },
     AllowedFeatureGate {
         path: "lib.rs",
-        predicate: r#"all(feature = "metal-spike", target_vendor = "apple")"#,
-        count: 7,
+        predicate: r#"all(feature = "metal", target_vendor = "apple")"#,
+        count: 2,
         purpose: "Metal modules and public APIs require the Apple Metal toolchain",
     },
     AllowedFeatureGate {
@@ -56,67 +56,49 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     },
     AllowedFeatureGate {
         path: "lib.rs",
-        predicate: r#"any(test, feature = "cuda", all(feature = "metal-spike", target_vendor = "apple"))"#,
+        predicate: r#"any(test, feature = "cuda", all(feature = "metal", target_vendor = "apple"))"#,
         count: 1,
         purpose: "T20l fix 2's readback-compaction sizing module compiles only for the crate's own unit tests and the two device backends that gather with it",
     },
     AllowedFeatureGate {
         path: "device_capacity.rs",
-        predicate: r#"any(test, feature = "cuda", all(feature = "metal-spike", target_vendor = "apple"))"#,
+        predicate: r#"any(test, feature = "cuda", all(feature = "metal", target_vendor = "apple"))"#,
         count: 18,
         purpose: "shared device-arena cap, per-entity retry, and T20l warm-start replay helpers compile only for tests and device backends",
     },
     AllowedFeatureGate {
         path: "device_event_record.rs",
-        predicate: r#"any(test, feature = "cuda", all(feature = "metal-spike", target_vendor = "apple"))"#,
+        predicate: r#"any(test, feature = "cuda", all(feature = "metal", target_vendor = "apple"))"#,
         count: 5,
         purpose: "O2.12 compact event-record classes and codecs compile only for unit tests and the two device backends that store those records",
     },
     AllowedFeatureGate {
         path: "tcp_ledger.rs",
-        predicate: r#"any(feature = "cuda", all(feature = "metal-spike", target_vendor = "apple"))"#,
+        predicate: r#"any(feature = "cuda", all(feature = "metal", target_vendor = "apple"))"#,
         count: 1,
         purpose: "O2.12 device readback retains non-TCP orphan packet descriptors only for the two device backends that reconstruct compact records",
     },
     AllowedFeatureGate {
         path: "tcp_ledger_ring.rs",
-        predicate: r#"any(test, feature = "cuda", all(feature = "metal-spike", target_vendor = "apple"))"#,
+        predicate: r#"any(test, feature = "cuda", all(feature = "metal", target_vendor = "apple"))"#,
         count: 3,
         purpose: "T20i ledger-ring metadata indices and occupancy readback exist only for tests and device backends; T20l fix 2 moved the readback's own ring walk onto the device, so `ledger_record_slot` narrowed to `cfg(test)` and left this group",
     },
     AllowedFeatureGate {
         path: "device_sizing.rs",
-        predicate: r#"any(test, all(feature = "planner-test-hooks", feature = "cuda"), all(feature = "planner-test-hooks", feature = "metal-spike", target_vendor = "apple"))"#,
+        predicate: r#"any(test, all(feature = "planner-test-hooks", feature = "cuda"), all(feature = "planner-test-hooks", feature = "metal", target_vendor = "apple"))"#,
         count: 1,
-        purpose: "exact production-layout reports exist only for the crate's own unit test and the two device planner probes (`cuda::size_cuda_plan_for_testing`, `metal::size_metal_plan_for_testing`), which are `planner-test-hooks` items inside `cuda` / `metal-spike` modules",
-    },
-    AllowedFeatureGate {
-        path: "cpu.rs",
-        predicate: r#"all(feature = "metal-spike", target_vendor = "apple")"#,
-        count: 9,
-        purpose: "CPU replay/window instrumentation consumed by the Apple Metal harness",
-    },
-    AllowedFeatureGate {
-        path: "safe_horizon.rs",
-        predicate: r#"all(feature = "metal-spike", target_vendor = "apple")"#,
-        count: 39,
-        purpose: "replay and window capture instrumentation for Apple Metal profiling",
-    },
-    AllowedFeatureGate {
-        path: "scalar.rs",
-        predicate: r#"all(feature = "metal-spike", target_vendor = "apple")"#,
-        count: 1,
-        purpose: "queue occupancy observation used by Apple Metal replay capture",
+        purpose: "exact production-layout reports exist only for the crate's own unit test and the two device planner probes (`cuda::size_cuda_plan_for_testing`, `metal::size_metal_plan_for_testing`), which are `planner-test-hooks` items inside `cuda` / `metal` modules",
     },
     AllowedFeatureGate {
         path: "device_scheduler.rs",
-        predicate: r#"not(any(feature = "cuda", all(feature = "metal-spike", target_vendor = "apple")))"#,
+        predicate: r#"not(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))"#,
         count: 1,
         purpose: "suppress dead-code warnings when neither device toolchain backend is built",
     },
     AllowedFeatureGate {
         path: "lib.rs",
-        predicate: r#"any(feature = "cuda", all(feature = "metal-spike", target_vendor = "apple"))"#,
+        predicate: r#"any(feature = "cuda", all(feature = "metal", target_vendor = "apple"))"#,
         count: 1,
         purpose: "shared planner lookup tables exist only when a device planner is built",
     },
@@ -134,13 +116,13 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     },
     AllowedFeatureGate {
         path: "lib.rs",
-        predicate: r#"all(feature = "metal-spike", feature = "planner-test-hooks", target_vendor = "apple")"#,
+        predicate: r#"all(feature = "metal", feature = "planner-test-hooks", target_vendor = "apple")"#,
         count: 2,
         purpose: "Metal full-plan equality hook requires standard test helpers and Apple Metal",
     },
     AllowedFeatureGate {
         path: "planner_capacity.rs",
-        predicate: r#"any(feature = "cuda", all(feature = "metal-spike", target_vendor = "apple"))"#,
+        predicate: r#"any(feature = "cuda", all(feature = "metal", target_vendor = "apple"))"#,
         count: 5,
         purpose: "both device planners use the one-byte minimum possible TCP tail segment",
     },
@@ -158,7 +140,7 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     },
     AllowedFeatureGate {
         path: "planner_capacity.rs",
-        predicate: r#"all(feature = "planner-test-hooks", any(feature = "cuda", all(feature = "metal-spike", target_vendor = "apple")))"#,
+        predicate: r#"all(feature = "planner-test-hooks", any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))"#,
         count: 1,
         purpose: "the precomputed-versus-legacy planner equality check has no host consumer: its only callers are `cuda::assert_cuda_planner_bit_equal_for_testing` and `metal::assert_metal_planner_bit_equal_for_testing`, so it carries no `test` arm",
     },
@@ -182,7 +164,7 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     },
 ];
 
-const T13F_FULL_LOAD_TESTS: &[&str] = &[
+const WIDTH_VIA_LOAD_FULL_TESTS: &[&str] = &[
     "width_via_load_full_load_10_holds_runtime_contract",
     "width_via_load_full_load_30_holds_runtime_contract",
     "width_via_load_full_load_50_holds_runtime_contract",
@@ -206,7 +188,7 @@ fn main() {
 
     match command.as_str() {
         "audit" => run_audits(workspace),
-        "t13f-full-load" => run_t13f_full_load(workspace),
+        "width-via-load-full" => run_width_via_load_full(workspace),
         _ => {
             print_usage();
             std::process::exit(2);
@@ -215,7 +197,7 @@ fn main() {
 }
 
 fn print_usage() {
-    eprintln!("usage: cargo xtask <audit|t13f-full-load>");
+    eprintln!("usage: cargo xtask <audit|width-via-load-full>");
 }
 
 fn run_audits(workspace: &Path) {
@@ -252,7 +234,7 @@ fn run_audits(workspace: &Path) {
     }
 }
 
-fn run_t13f_full_load(workspace: &Path) {
+fn run_width_via_load_full(workspace: &Path) {
     let status = Command::new("cargo")
         .args([
             "nextest",
@@ -260,13 +242,13 @@ fn run_t13f_full_load(workspace: &Path) {
             "--package",
             "days-validation",
             "--features",
-            "metal-spike",
+            "metal",
             "--test",
-            "t13f_width_via_load_full",
+            "width_via_load_full",
             "--test-threads",
             "5",
         ])
-        .args(T13F_FULL_LOAD_TESTS)
+        .args(WIDTH_VIA_LOAD_FULL_TESTS)
         .current_dir(workspace)
         .status()
         .unwrap_or_else(|error| {

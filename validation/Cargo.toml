@@ -7,7 +7,7 @@ publish = false
 
 [features]
 test = ["days/test", "days-legacy/test"]
-metal-spike = ["days/metal-spike", "days-executor/metal-spike"]
+metal = ["days/metal", "days-executor/metal"]
 cuda = ["days/cuda", "days-executor/cuda"]
 
 [dev-dependencies]

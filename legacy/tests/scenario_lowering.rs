@@ -1850,7 +1850,7 @@ pkt_size_dist = {{ type = "Uniform", low = 1000, high = 1000 }}
     let exact = run_scalar_with_observations(&image, None, ObservationMode::Full)
         .expect("multi-host fixture should run exactly");
 
-    let mut command = cargo_bin_cmd!("days");
+    let mut command = cargo_bin_cmd!("days-legacy");
     command
         .env("RUST_LOG", "error")
         .arg(&path)

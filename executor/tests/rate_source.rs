@@ -11,7 +11,7 @@ use days_executor::{
 };
 #[cfg(feature = "cuda")]
 use days_executor::{CudaConfig, run_cuda_with_observations};
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 use days_executor::{MetalConfig, run_metal_with_observations};
 
 const SOURCE: NodeId = NodeId(0);
@@ -847,10 +847,7 @@ fn device_backends_accept_rate_sources() {
     }
 }
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 fn adversarial_device_rate_images() -> Vec<SimulationImage> {
     let blocked = rate_image(
         RateGenerator {
@@ -898,7 +895,7 @@ fn adversarial_device_rate_images() -> Vec<SimulationImage> {
     vec![blocked, partial, time_zero, checkpoint]
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 #[test]
 fn metal_rate_pacing_and_checkpoints_match_scalar() {
     for (image_index, image) in adversarial_device_rate_images().into_iter().enumerate() {

@@ -1080,20 +1080,6 @@ impl<'image> TransitionState<'image> {
         }
     }
 
-    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-    pub(crate) fn queue_occupancy(&self, node_id: NodeId) -> Result<usize, ExecutionError> {
-        let node = self.node(node_id)?;
-        match node.kind {
-            NodeKind::Host => Ok(self.host_state(node)?.queue.len()),
-            NodeKind::Switch => Ok(self
-                .switch_state(node)?
-                .queues
-                .iter()
-                .map(|queue| queue.queue.len())
-                .sum()),
-        }
-    }
-
     pub(crate) fn dispatch(
         &mut self,
         event: Event,

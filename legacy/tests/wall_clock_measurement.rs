@@ -18,7 +18,7 @@ fn reports_step_until_wall_clock_time_separately() {
     );
     fs::write(&config_path, config).expect("write temporary config");
 
-    let mut cmd = cargo_bin_cmd!("days");
+    let mut cmd = cargo_bin_cmd!("days-legacy");
     cmd.arg(config_path);
 
     cmd.assert()

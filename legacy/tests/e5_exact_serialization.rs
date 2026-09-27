@@ -46,7 +46,7 @@ fn positive_behavior_delays_round_up_to_a_future_tick() {
 fn four_byte_tcp_residue_no_longer_panics_at_100_gbps() {
     let fixture = Fixture::new("fine-arrival", 1, 516);
 
-    Command::cargo_bin("days")
+    Command::cargo_bin("days-legacy")
         .unwrap()
         .env("RUST_LOG", "info")
         .arg(&fixture.config_path)
@@ -65,7 +65,7 @@ fn runtime_scheduling_failure_is_a_nonzero_cli_exit_without_completion_claim() {
         .replace("low = 1.0, high = 1.0", "low = 0.0, high = 0.0");
     fs::write(&fixture.config_path, content).unwrap();
 
-    Command::cargo_bin("days")
+    Command::cargo_bin("days-legacy")
         .unwrap()
         .env("RUST_LOG", "info")
         .arg(&fixture.config_path)
@@ -84,7 +84,7 @@ fn varying_tcp_packet_size_is_a_clean_cli_refusal() {
         .replace("low = 512, high = 512", "low = 512, high = 1460");
     fs::write(&fixture.config_path, content).unwrap();
 
-    Command::cargo_bin("days")
+    Command::cargo_bin("days-legacy")
         .unwrap()
         .env("RUST_LOG", "info")
         .arg(&fixture.config_path)

@@ -12,24 +12,15 @@ use days_executor::{
     validate, wrr_transitions_csv,
 };
 // Only `assert_device_full_result_eq` names this type, and that helper is device-gated.
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 use days_executor::RunResult;
 #[cfg(feature = "cuda")]
 use days_executor::{CudaConfig, CudaError, run_cuda_with_observations};
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 use days_executor::{MetalConfig, MetalError, run_metal_with_observations};
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 use num_bigint::BigUint;
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 use num_rational::Ratio;
 
 const SOURCE: NodeId = NodeId(0);
@@ -39,10 +30,7 @@ const SOURCE_LINK: LinkId = LinkId(0);
 const SWITCH_LINK: LinkId = LinkId(1);
 const SINK_EGRESS: LinkId = LinkId(2);
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 fn assert_device_full_result_eq(actual: &RunResult, scalar: &RunResult) {
     assert!(scalar.diagnostics.is_some());
     assert!(actual.diagnostics.is_none());
@@ -792,10 +780,7 @@ fn adversarial_scheduler_images() -> [SimulationImage; 3] {
     ]
 }
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 fn adversarial_drr_wrr_images() -> [SimulationImage; 3] {
     let mut drr_wrap = image(
         SchedulerKind::deficit_round_robin(vec![2, 7, 2]),
@@ -837,10 +822,7 @@ fn adversarial_drr_wrr_images() -> [SimulationImage; 3] {
     [drr_wrap, drr_skip, wrr]
 }
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 fn drr_legal_maximum_image() -> SimulationImage {
     let mut image = image(
         SchedulerKind::deficit_round_robin(vec![1]),
@@ -854,10 +836,7 @@ fn drr_legal_maximum_image() -> SimulationImage {
     image
 }
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 fn wrr_legal_maximum_image() -> SimulationImage {
     let mut image = image(
         SchedulerKind::weighted_round_robin(vec![u64::MAX]),
@@ -900,10 +879,7 @@ fn cpu_is_byte_identical_for_adversarial_sp_wfq_and_in_service_checkpoints() {
     }
 }
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 fn wfq_multilimb_checkpoint() -> (SimulationImage, Ratio<BigUint>) {
     let mut checkpoint = image(
         SchedulerKind::weighted_fair_queue(vec![1_000_000_000, 2_000_000_000]),
@@ -935,10 +911,7 @@ fn wfq_multilimb_checkpoint() -> (SimulationImage, Ratio<BigUint>) {
     (checkpoint, expected_finish)
 }
 
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 fn wfq_overflow_checkpoint() -> SimulationImage {
     let mut checkpoint = image(
         SchedulerKind::weighted_fair_queue(vec![1]),
@@ -967,7 +940,7 @@ fn wfq_overflow_checkpoint() -> SimulationImage {
     checkpoint
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 #[test]
 fn metal_is_byte_identical_for_adversarial_sp_wfq_and_in_service_checkpoints() {
     for image in adversarial_scheduler_images() {
@@ -999,7 +972,7 @@ fn metal_is_byte_identical_for_adversarial_sp_wfq_and_in_service_checkpoints() {
     }
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 #[test]
 fn metal_drr_wrr_full_measurements_and_state_match_scalar() {
     for image in adversarial_drr_wrr_images() {
@@ -1034,7 +1007,7 @@ fn metal_drr_wrr_full_measurements_and_state_match_scalar() {
     }
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 #[test]
 fn metal_drr_skips_the_exact_legal_maximum_round_count() {
     let image = drr_legal_maximum_image();
@@ -1059,7 +1032,7 @@ fn metal_drr_skips_the_exact_legal_maximum_round_count() {
     assert_eq!(state.current_class, 0);
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 #[test]
 fn metal_wrr_restores_the_maximum_legal_counter() {
     let image = wrr_legal_maximum_image();
@@ -1080,7 +1053,7 @@ fn metal_wrr_restores_the_maximum_legal_counter() {
     assert_eq!(state.current_class, 0);
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 #[test]
 fn metal_wfq_overflow_faults_instead_of_wrapping() {
     let image = wfq_overflow_checkpoint();
@@ -1102,7 +1075,7 @@ fn metal_wfq_overflow_faults_instead_of_wrapping() {
     }
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 #[test]
 fn metal_wfq_multilimb_cross_cancel_and_comparison_match_scalar() {
     let (image, expected_finish) = wfq_multilimb_checkpoint();

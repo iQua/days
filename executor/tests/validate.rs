@@ -6,9 +6,9 @@ use days_executor::{
     SchedulerKind, SimulationImage, SwitchQueueState, SwitchState, WfqSchedulerState, event_phase,
     run_scalar_with_observations, validate,
 };
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 use days_executor::{DropMarkPolicy, EcnThresholdPolicy, QueueDepthUnit};
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 use days_executor::{MetalConfig, run_metal_with_observations};
 use num_bigint::BigUint;
 use num_rational::Ratio;
@@ -206,7 +206,7 @@ fn wfq_in_service_image() -> SimulationImage {
     checkpoint
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 fn empty_host_state(egress_link: LinkId) -> HostState {
     HostState {
         egress_link,
@@ -224,7 +224,7 @@ fn empty_host_state(egress_link: LinkId) -> HostState {
     }
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 fn switch_state(
     physical_switch: u64,
     egress_link: LinkId,
@@ -250,7 +250,7 @@ fn switch_state(
     }
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 fn checkpoint_image(source: &SimulationImage, horizon_ns: u64) -> SimulationImage {
     let prefix = run_scalar_with_observations(source, Some(horizon_ns), ObservationMode::Full)
         .expect("resident-waiter prefix must execute");
@@ -262,7 +262,7 @@ fn checkpoint_image(source: &SimulationImage, horizon_ns: u64) -> SimulationImag
     checkpoint
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 fn host_resident_waiter_image(
     scheduler: SchedulerKind,
     drop_mark: DropMarkPolicy,
@@ -419,7 +419,7 @@ fn host_resident_waiter_image(
     checkpoint
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 fn idle_host_resident_waiter_image(
     scheduler: SchedulerKind,
     drop_mark: DropMarkPolicy,
@@ -450,7 +450,7 @@ fn idle_host_resident_waiter_image(
     checkpoint
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 fn switch_resident_waiter_image(
     scheduler: SchedulerKind,
     drop_mark: DropMarkPolicy,
@@ -624,7 +624,7 @@ fn switch_resident_waiter_image(
     checkpoint
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 fn resident_waiter_cases() -> Vec<(SimulationImage, u64, NodeId, PayloadId, bool)> {
     let ecn = DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
         unit: QueueDepthUnit::Packets,
@@ -671,7 +671,7 @@ fn resident_waiter_cases() -> Vec<(SimulationImage, u64, NodeId, PayloadId, bool
     cases
 }
 
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
 #[test]
 fn metal_summary_observation_matches_reachable_unported_planes() {
     for (image, _, _, _, _) in resident_waiter_cases() {
