@@ -262,6 +262,93 @@ const ATTEMPT_DISPATCHES: [(AttemptKernel, DispatchGeometry); 13] = [
     ),
     (AttemptKernel::FinalControl, DispatchGeometry::FixedControl),
 ];
+
+impl AttemptKernel {
+    const fn metal_kernel(self) -> MetalKernel {
+        match self {
+            Self::HorizonSweep => MetalKernel::HorizonSweep,
+            Self::Horizon => MetalKernel::Horizon,
+            Self::RoundReset => MetalKernel::RoundReset,
+            Self::Compaction => MetalKernel::RoundPrepare,
+            Self::DrainExecute => MetalKernel::Round,
+            Self::ContinuationControlSweep => MetalKernel::ControlSweep,
+            Self::ContinuationControl => MetalKernel::Control,
+            Self::ExchangePrefixSweep => MetalKernel::ExchangePrefixSweep,
+            Self::ExchangePrefix => MetalKernel::ExchangePrefix,
+            Self::ExchangeScatter => MetalKernel::ExchangeScatter,
+            Self::TargetMerge => MetalKernel::ExchangeMerge,
+            Self::FinalControlSweep => MetalKernel::FinalizeSweep,
+            Self::FinalControl => MetalKernel::Finalize,
+        }
+    }
+}
+
+/// Every Metal entry point. [`DirectMetal`] compiles the source into one library and creates
+/// exactly these pipelines from it, stored at `kernel as usize`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MetalKernel {
+    /// T21 fix 1: the Θ(N) FEL-root sweep, on the full grid.
+    HorizonSweep,
+    Horizon,
+    /// T21 fix 1: `days_round_prepare`'s Θ(N) + Θ(C) resets, on the full grid.
+    RoundReset,
+    RoundPrepare,
+    Round,
+    /// T21 fix 1: the round-control scans, on the full grid.
+    ControlSweep,
+    Control,
+    /// T21 fix 1: the exchange-prefix streams scan, on the full grid.
+    ExchangePrefixSweep,
+    ExchangePrefix,
+    ExchangeScatter,
+    ExchangeMerge,
+    /// T21 fix 1: the finalize scans, on the full grid.
+    FinalizeSweep,
+    Finalize,
+    /// T20l fix 2: the readback gather. Not part of an attempt; encoded only by
+    /// [`DirectMetal::compact`], after the attempt has been screened as successful.
+    CompactGather,
+}
+
+impl MetalKernel {
+    /// In discriminant order, so `ALL[kernel as usize] == kernel`.
+    const ALL: [Self; 14] = [
+        Self::HorizonSweep,
+        Self::Horizon,
+        Self::RoundReset,
+        Self::RoundPrepare,
+        Self::Round,
+        Self::ControlSweep,
+        Self::Control,
+        Self::ExchangePrefixSweep,
+        Self::ExchangePrefix,
+        Self::ExchangeScatter,
+        Self::ExchangeMerge,
+        Self::FinalizeSweep,
+        Self::Finalize,
+        Self::CompactGather,
+    ];
+
+    const fn entry_point(self) -> &'static str {
+        match self {
+            Self::HorizonSweep => "days_horizon_sweep",
+            Self::Horizon => "days_horizon",
+            Self::RoundReset => "days_round_reset",
+            Self::RoundPrepare => "days_round_prepare",
+            Self::Round => "days_round",
+            Self::ControlSweep => "days_round_control_sweep",
+            Self::Control => "days_round_control",
+            Self::ExchangePrefixSweep => "days_exchange_prefix_sweep",
+            Self::ExchangePrefix => "days_exchange_prefix",
+            Self::ExchangeScatter => "days_exchange_scatter",
+            Self::ExchangeMerge => "days_exchange_merge",
+            Self::FinalizeSweep => "days_round_finalize_sweep",
+            Self::Finalize => "days_round_finalize",
+            Self::CompactGather => "days_compact_gather",
+        }
+    }
+}
+
 const CONTROL_THREADGROUP_BYTES: usize =
     LANES * (std::mem::size_of::<u64>() + std::mem::size_of::<u32>());
 const NONE: u64 = u64::MAX;
@@ -802,9 +889,13 @@ impl MetalExecutor {
         }
         let execution_width = self
             .direct
-            .reset_pipeline
+            .pipeline(MetalKernel::RoundReset)
             .threadExecutionWidth()
-            .max(self.direct.prepare_pipeline.threadExecutionWidth());
+            .max(
+                self.direct
+                    .pipeline(MetalKernel::RoundPrepare)
+                    .threadExecutionWidth(),
+            );
         if !threads_per_threadgroup.is_multiple_of(execution_width) {
             return Err(MetalError::Validation(format!(
                 "worklist test threads per threadgroup must be a multiple of execution width \
@@ -813,9 +904,13 @@ impl MetalExecutor {
         }
         let supported = self
             .direct
-            .reset_pipeline
+            .pipeline(MetalKernel::RoundReset)
             .maxTotalThreadsPerThreadgroup()
-            .min(self.direct.prepare_pipeline.maxTotalThreadsPerThreadgroup());
+            .min(
+                self.direct
+                    .pipeline(MetalKernel::RoundPrepare)
+                    .maxTotalThreadsPerThreadgroup(),
+            );
         if threads_per_threadgroup > supported {
             return Err(MetalError::Validation(format!(
                 "worklist test threads per threadgroup {threads_per_threadgroup} exceeds supported \
@@ -882,7 +977,10 @@ impl MetalExecutor {
             height: 1,
             depth: 1,
         };
-        for pipeline in [&self.direct.reset_pipeline, &self.direct.prepare_pipeline] {
+        for pipeline in [
+            self.direct.pipeline(MetalKernel::RoundReset),
+            self.direct.pipeline(MetalKernel::RoundPrepare),
+        ] {
             encoder.setComputePipelineState(pipeline);
             encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, group);
         }
@@ -4762,27 +4860,8 @@ struct DirectMetal {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     initialization_timings: MetalInitializationTimings,
-    /// T21 fix 1: the Θ(N) FEL-root sweep, on the full grid.
-    horizon_sweep_pipeline: MetalPipeline,
-    horizon_pipeline: MetalPipeline,
-    /// T21 fix 1: `days_round_prepare`'s Θ(N) + Θ(C) resets, on the full grid.
-    reset_pipeline: MetalPipeline,
-    prepare_pipeline: MetalPipeline,
-    round_pipeline: MetalPipeline,
-    /// T21 fix 1: the round-control scans, on the full grid.
-    control_sweep_pipeline: MetalPipeline,
-    control_pipeline: MetalPipeline,
-    /// T21 fix 1: the exchange-prefix streams scan, on the full grid.
-    exchange_prefix_sweep_pipeline: MetalPipeline,
-    exchange_prefix_pipeline: MetalPipeline,
-    exchange_scatter_pipeline: MetalPipeline,
-    exchange_merge_pipeline: MetalPipeline,
-    /// T21 fix 1: the finalize scans, on the full grid.
-    finalize_sweep_pipeline: MetalPipeline,
-    finalize_pipeline: MetalPipeline,
-    /// T20l fix 2: the readback gather. Not part of an attempt; encoded only by
-    /// [`DirectMetal::compact`], after the attempt has been screened as successful.
-    compact_pipeline: MetalPipeline,
+    /// One pipeline per [`MetalKernel`], at `kernel as usize`.
+    pipelines: [MetalPipeline; MetalKernel::ALL.len()],
 }
 
 impl DirectMetal {
@@ -4804,39 +4883,36 @@ impl DirectMetal {
         #[cfg(not(feature = "metal-test-hooks"))]
         let source = include_str!("metal_kernels.metal");
         let pipeline_started = Instant::now();
-        let horizon_sweep_pipeline = create_pipeline(&device, source, "days_horizon_sweep")?;
-        let horizon_pipeline = create_pipeline(&device, source, "days_horizon")?;
-        let reset_pipeline = create_pipeline(&device, source, "days_round_reset")?;
-        let prepare_pipeline = create_pipeline(&device, source, "days_round_prepare")?;
-        let round_pipeline = create_pipeline(&device, source, "days_round")?;
-        let control_sweep_pipeline = create_pipeline(&device, source, "days_round_control_sweep")?;
-        let control_pipeline = create_pipeline(&device, source, "days_round_control")?;
-        let exchange_prefix_sweep_pipeline =
-            create_pipeline(&device, source, "days_exchange_prefix_sweep")?;
-        let exchange_prefix_pipeline = create_pipeline(&device, source, "days_exchange_prefix")?;
-        let exchange_scatter_pipeline = create_pipeline(&device, source, "days_exchange_scatter")?;
-        if exchange_scatter_pipeline.threadExecutionWidth() < SCATTER_COPY_LANES {
+        let library = compile_library(&device, source)?;
+        let pipelines = MetalKernel::ALL
+            .iter()
+            .map(|kernel| create_pipeline(&device, &library, kernel.entry_point()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let Ok(pipelines) = <[MetalPipeline; MetalKernel::ALL.len()]>::try_from(pipelines) else {
+            unreachable!("one pipeline is created per kernel");
+        };
+        let scatter_width = pipelines[MetalKernel::ExchangeScatter as usize].threadExecutionWidth();
+        if scatter_width < SCATTER_COPY_LANES {
             return Err(MetalError::Unavailable(format!(
-                "exchange-scatter pipeline has SIMD width {}, but paired record copies require {SCATTER_COPY_LANES} lanes",
-                exchange_scatter_pipeline.threadExecutionWidth()
+                "exchange-scatter pipeline has SIMD width {scatter_width}, but paired record copies require {SCATTER_COPY_LANES} lanes"
             )));
         }
-        let exchange_merge_pipeline = create_pipeline(&device, source, "days_exchange_merge")?;
-        let finalize_sweep_pipeline =
-            create_pipeline(&device, source, "days_round_finalize_sweep")?;
-        let finalize_pipeline = create_pipeline(&device, source, "days_round_finalize")?;
-        let compact_pipeline = create_pipeline(&device, source, "days_compact_gather")?;
         let pipeline_creation_ns = duration_ns(pipeline_started.elapsed());
-        for (name, pipeline) in [
-            ("horizon-sweep", &horizon_sweep_pipeline),
-            ("horizon", &horizon_pipeline),
-            ("round-control-sweep", &control_sweep_pipeline),
-            ("round-control", &control_pipeline),
-            ("exchange-prefix-sweep", &exchange_prefix_sweep_pipeline),
-            ("exchange-prefix", &exchange_prefix_pipeline),
-            ("round-finalize-sweep", &finalize_sweep_pipeline),
-            ("round-finalize", &finalize_pipeline),
-        ] {
+        for kernel in MetalKernel::ALL.into_iter().filter(|kernel| {
+            matches!(
+                kernel,
+                MetalKernel::HorizonSweep
+                    | MetalKernel::Horizon
+                    | MetalKernel::ControlSweep
+                    | MetalKernel::Control
+                    | MetalKernel::ExchangePrefixSweep
+                    | MetalKernel::ExchangePrefix
+                    | MetalKernel::FinalizeSweep
+                    | MetalKernel::Finalize
+            )
+        }) {
+            let pipeline = &pipelines[kernel as usize];
+            let name = kernel.entry_point();
             if pipeline.maxTotalThreadsPerThreadgroup() < LANES {
                 return Err(MetalError::Unavailable(format!(
                     "{name} pipeline supports only {} threads per threadgroup",
@@ -4859,20 +4935,7 @@ impl DirectMetal {
                 pipeline_creation_ns,
                 reused_cached_executor: false,
             },
-            horizon_sweep_pipeline,
-            horizon_pipeline,
-            reset_pipeline,
-            prepare_pipeline,
-            round_pipeline,
-            control_sweep_pipeline,
-            control_pipeline,
-            exchange_prefix_sweep_pipeline,
-            exchange_prefix_pipeline,
-            exchange_scatter_pipeline,
-            exchange_merge_pipeline,
-            finalize_sweep_pipeline,
-            finalize_pipeline,
-            compact_pipeline,
+            pipelines,
         })
     }
 
@@ -4917,7 +4980,7 @@ impl DirectMetal {
             let Some((destination, plan_buffer, argument_buffer)) = resource else {
                 continue;
             };
-            encoder.setComputePipelineState(&self.compact_pipeline);
+            encoder.setComputePipelineState(self.pipeline(MetalKernel::CompactGather));
             unsafe {
                 encoder.setBuffer_offset_atIndex(Some(&destination.raw), 0, 0);
                 encoder.setBuffer_offset_atIndex(Some(&source.raw), 0, 1);
@@ -4966,14 +5029,16 @@ impl DirectMetal {
 
     fn run(&self, buffers: &MetalBuffers, config: MetalConfig) -> Result<MetalTiming, MetalError> {
         let round_threads = config.round_threads_per_threadgroup;
-        let execution_width = self.round_pipeline.threadExecutionWidth();
+        let execution_width = self.pipeline(MetalKernel::Round).threadExecutionWidth();
         if !round_threads.is_multiple_of(execution_width) {
             return Err(MetalError::Validation(format!(
                 "round_threads_per_threadgroup must be a multiple of the device execution width \
                  {execution_width}"
             )));
         }
-        let scatter_execution_width = self.exchange_scatter_pipeline.threadExecutionWidth();
+        let scatter_execution_width = self
+            .pipeline(MetalKernel::ExchangeScatter)
+            .threadExecutionWidth();
         if !round_threads.is_multiple_of(scatter_execution_width) {
             return Err(MetalError::Validation(format!(
                 "round_threads_per_threadgroup must be a multiple of the exchange-scatter \
@@ -4981,11 +5046,11 @@ impl DirectMetal {
             )));
         }
         let parallel_pipelines = [
-            &self.reset_pipeline,
-            &self.prepare_pipeline,
-            &self.round_pipeline,
-            &self.exchange_scatter_pipeline,
-            &self.exchange_merge_pipeline,
+            self.pipeline(MetalKernel::RoundReset),
+            self.pipeline(MetalKernel::RoundPrepare),
+            self.pipeline(MetalKernel::Round),
+            self.pipeline(MetalKernel::ExchangeScatter),
+            self.pipeline(MetalKernel::ExchangeMerge),
         ];
         let supported_threads = parallel_pipelines
             .iter()
@@ -5134,7 +5199,7 @@ impl DirectMetal {
             if !buffers.finalize_sweep_required && kernel == AttemptKernel::FinalControlSweep {
                 continue;
             }
-            encoder.setComputePipelineState(self.pipeline(kernel));
+            encoder.setComputePipelineState(self.pipeline(kernel.metal_kernel()));
             match geometry {
                 DispatchGeometry::FixedControl => {
                     encoder.dispatchThreadgroups_threadsPerThreadgroup(control_grid, control_group);
@@ -5158,39 +5223,32 @@ impl DirectMetal {
         }
     }
 
-    fn pipeline(&self, kernel: AttemptKernel) -> &ProtocolObject<dyn MTLComputePipelineState> {
-        match kernel {
-            AttemptKernel::HorizonSweep => &self.horizon_sweep_pipeline,
-            AttemptKernel::Horizon => &self.horizon_pipeline,
-            AttemptKernel::RoundReset => &self.reset_pipeline,
-            AttemptKernel::Compaction => &self.prepare_pipeline,
-            AttemptKernel::DrainExecute => &self.round_pipeline,
-            AttemptKernel::ContinuationControlSweep => &self.control_sweep_pipeline,
-            AttemptKernel::ContinuationControl => &self.control_pipeline,
-            AttemptKernel::ExchangePrefixSweep => &self.exchange_prefix_sweep_pipeline,
-            AttemptKernel::ExchangePrefix => &self.exchange_prefix_pipeline,
-            AttemptKernel::ExchangeScatter => &self.exchange_scatter_pipeline,
-            AttemptKernel::TargetMerge => &self.exchange_merge_pipeline,
-            AttemptKernel::FinalControlSweep => &self.finalize_sweep_pipeline,
-            AttemptKernel::FinalControl => &self.finalize_pipeline,
-        }
+    fn pipeline(&self, kernel: MetalKernel) -> &ProtocolObject<dyn MTLComputePipelineState> {
+        &self.pipelines[kernel as usize]
     }
+}
+
+/// Compiles the MSL source once; every pipeline is created from this one library.
+fn compile_library(
+    device: &ProtocolObject<dyn MTLDevice>,
+    source: &str,
+) -> Result<Retained<ProtocolObject<dyn MTLLibrary>>, MetalError> {
+    let source = NSString::from_str(source);
+    device
+        .newLibraryWithSource_options_error(&source, None)
+        .map_err(|error| {
+            MetalError::Unavailable(format!(
+                "MSL compilation failed: {}",
+                error.localizedDescription()
+            ))
+        })
 }
 
 fn create_pipeline(
     device: &ProtocolObject<dyn MTLDevice>,
-    source: &str,
+    library: &ProtocolObject<dyn MTLLibrary>,
     entrypoint: &str,
 ) -> Result<MetalPipeline, MetalError> {
-    let source = NSString::from_str(source);
-    let library = device
-        .newLibraryWithSource_options_error(&source, None)
-        .map_err(|error| {
-            MetalError::Unavailable(format!(
-                "MSL compilation failed for {entrypoint}: {}",
-                error.localizedDescription()
-            ))
-        })?;
     let name = NSString::from_str(entrypoint);
     let function = library.newFunctionWithName(&name).ok_or_else(|| {
         MetalError::Unavailable(format!("MSL entry point `{entrypoint}` was not found"))
@@ -5229,7 +5287,7 @@ mod tests {
     use super::{
         ATTEMPT_DISPATCHES, AttemptKernel, DispatchGeometry, LANES,
         MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER, MAX_ENCODED_PAIRS_PER_WAVE, MetalConfig, MetalError,
-        decode_device_error, encoding_limits,
+        MetalKernel, decode_device_error, encoding_limits,
     };
     use crate::CapacityRetryRecord;
 
@@ -5426,5 +5484,31 @@ mod tests {
             encoding_limits(MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER),
             (MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER, 64)
         );
+    }
+
+    #[test]
+    fn every_source_kernel_has_exactly_one_pipeline() {
+        for (index, kernel) in MetalKernel::ALL.into_iter().enumerate() {
+            assert_eq!(
+                kernel as usize, index,
+                "{kernel:?} is out of discriminant order"
+            );
+        }
+        let mut source_kernels = include_str!("metal_kernels.metal")
+            .lines()
+            .filter_map(|line| line.strip_prefix("kernel void "))
+            .map(|rest| {
+                rest.split('(')
+                    .next()
+                    .expect("split yields a first piece")
+                    .trim()
+            })
+            .collect::<Vec<_>>();
+        source_kernels.sort_unstable();
+        let mut pipeline_kernels = MetalKernel::ALL.map(MetalKernel::entry_point).to_vec();
+        pipeline_kernels.sort_unstable();
+        pipeline_kernels.dedup();
+        assert_eq!(pipeline_kernels.len(), MetalKernel::ALL.len());
+        assert_eq!(source_kernels, pipeline_kernels);
     }
 }
