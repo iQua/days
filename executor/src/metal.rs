@@ -347,10 +347,99 @@ impl MetalKernel {
             Self::CompactGather => "days_compact_gather",
         }
     }
+
+    /// The width every dispatch of this kernel uses; [`ATTEMPT_DISPATCHES`] must agree.
+    const fn threadgroup_width(self) -> ThreadgroupWidth {
+        match self {
+            Self::HorizonSweep
+            | Self::Horizon
+            | Self::ControlSweep
+            | Self::Control
+            | Self::ExchangePrefixSweep
+            | Self::ExchangePrefix
+            | Self::FinalizeSweep
+            | Self::Finalize => ThreadgroupWidth::Lanes,
+            Self::RoundReset
+            | Self::RoundPrepare
+            | Self::Round
+            | Self::ExchangeScatter
+            | Self::ExchangeMerge => ThreadgroupWidth::Round,
+            Self::CompactGather => ThreadgroupWidth::Compact,
+        }
+    }
+
+    /// Checks this kernel's pipeline against the threadgroup it is dispatched with.
+    ///
+    /// The host sets no dynamic threadgroup memory, so the pipeline's static allocation is its
+    /// whole threadgroup-memory demand. `round_threads` is `None` at pipeline creation, when only
+    /// the fixed widths are known; every run checks again with its configured width. A fixed
+    /// width or memory demand the device cannot meet is `Unavailable`; a configured round width a
+    /// pipeline cannot run is a `Validation` error.
+    fn check_limits(
+        self,
+        limits: PipelineLimits,
+        round_threads: Option<usize>,
+    ) -> Result<(), MetalError> {
+        let name = self.entry_point();
+        if limits.static_threadgroup_memory > limits.device_threadgroup_memory {
+            return Err(MetalError::Unavailable(format!(
+                "{name} pipeline needs {} bytes of threadgroup memory, but the device exposes \
+                 only {}",
+                limits.static_threadgroup_memory, limits.device_threadgroup_memory
+            )));
+        }
+        let width = self.threadgroup_width();
+        let Some(threads) = width.threads(round_threads) else {
+            return Ok(());
+        };
+        if threads <= limits.max_total_threads {
+            return Ok(());
+        }
+        Err(match width {
+            ThreadgroupWidth::Round => MetalError::Validation(format!(
+                "round_threads_per_threadgroup {threads} exceeds the supported maximum {} of the \
+                 {name} pipeline",
+                limits.max_total_threads
+            )),
+            ThreadgroupWidth::Lanes | ThreadgroupWidth::Compact => {
+                MetalError::Unavailable(format!(
+                    "{name} pipeline supports only {} threads per threadgroup, but is dispatched \
+                     with {threads}",
+                    limits.max_total_threads
+                ))
+            }
+        })
+    }
 }
 
-const CONTROL_THREADGROUP_BYTES: usize =
-    LANES * (std::mem::size_of::<u64>() + std::mem::size_of::<u32>());
+/// The threadgroup width a pipeline is dispatched with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ThreadgroupWidth {
+    /// [`LANES`]: the control scans and their full-grid sweeps.
+    Lanes,
+    /// [`MetalConfig::round_threads_per_threadgroup`], known only per run.
+    Round,
+    /// [`COMPACT_THREADS_PER_THREADGROUP`]: the readback gather.
+    Compact,
+}
+
+impl ThreadgroupWidth {
+    const fn threads(self, round_threads: Option<usize>) -> Option<usize> {
+        match self {
+            Self::Lanes => Some(LANES),
+            Self::Round => round_threads,
+            Self::Compact => Some(COMPACT_THREADS_PER_THREADGROUP),
+        }
+    }
+}
+
+/// What Metal reports for one pipeline on one device.
+#[derive(Clone, Copy, Debug)]
+struct PipelineLimits {
+    max_total_threads: usize,
+    static_threadgroup_memory: usize,
+    device_threadgroup_memory: usize,
+}
 const NONE: u64 = u64::MAX;
 const PACKET_ECN_FLAG: u64 = 1_u64 << 63;
 const PACKET_KIND_MASK: u64 = !PACKET_ECN_FLAG;
@@ -4898,36 +4987,8 @@ impl DirectMetal {
             )));
         }
         let pipeline_creation_ns = duration_ns(pipeline_started.elapsed());
-        for kernel in MetalKernel::ALL.into_iter().filter(|kernel| {
-            matches!(
-                kernel,
-                MetalKernel::HorizonSweep
-                    | MetalKernel::Horizon
-                    | MetalKernel::ControlSweep
-                    | MetalKernel::Control
-                    | MetalKernel::ExchangePrefixSweep
-                    | MetalKernel::ExchangePrefix
-                    | MetalKernel::FinalizeSweep
-                    | MetalKernel::Finalize
-            )
-        }) {
-            let pipeline = &pipelines[kernel as usize];
-            let name = kernel.entry_point();
-            if pipeline.maxTotalThreadsPerThreadgroup() < LANES {
-                return Err(MetalError::Unavailable(format!(
-                    "{name} pipeline supports only {} threads per threadgroup",
-                    pipeline.maxTotalThreadsPerThreadgroup()
-                )));
-            }
-        }
-        if device.maxThreadgroupMemoryLength() < CONTROL_THREADGROUP_BYTES {
-            return Err(MetalError::Unavailable(format!(
-                "device exposes only {} bytes of threadgroup memory",
-                device.maxThreadgroupMemoryLength()
-            )));
-        }
         let initialization_ns = duration_ns(initialization_started.elapsed());
-        Ok(Self {
+        let direct = Self {
             device,
             queue,
             initialization_timings: MetalInitializationTimings {
@@ -4936,7 +4997,24 @@ impl DirectMetal {
                 reused_cached_executor: false,
             },
             pipelines,
-        })
+        };
+        direct.check_limits(None)?;
+        Ok(direct)
+    }
+
+    /// Checks every pipeline with [`MetalKernel::check_limits`].
+    fn check_limits(&self, round_threads: Option<usize>) -> Result<(), MetalError> {
+        let device_threadgroup_memory = self.device.maxThreadgroupMemoryLength();
+        for kernel in MetalKernel::ALL {
+            let pipeline = self.pipeline(kernel);
+            let limits = PipelineLimits {
+                max_total_threads: pipeline.maxTotalThreadsPerThreadgroup(),
+                static_threadgroup_memory: pipeline.staticThreadgroupMemoryLength(),
+                device_threadgroup_memory,
+            };
+            kernel.check_limits(limits, round_threads)?;
+        }
+        Ok(())
     }
 
     /// T20l fix 2: gathers each arena's live records into a dense buffer and reads that back.
@@ -5045,24 +5123,7 @@ impl DirectMetal {
                  execution width {scatter_execution_width}"
             )));
         }
-        let parallel_pipelines = [
-            self.pipeline(MetalKernel::RoundReset),
-            self.pipeline(MetalKernel::RoundPrepare),
-            self.pipeline(MetalKernel::Round),
-            self.pipeline(MetalKernel::ExchangeScatter),
-            self.pipeline(MetalKernel::ExchangeMerge),
-        ];
-        let supported_threads = parallel_pipelines
-            .iter()
-            .map(|pipeline| pipeline.maxTotalThreadsPerThreadgroup())
-            .min()
-            .unwrap_or(0);
-        if round_threads > supported_threads {
-            return Err(MetalError::Validation(format!(
-                "round_threads_per_threadgroup {round_threads} exceeds the supported maximum \
-                 {supported_threads}"
-            )));
-        }
+        self.check_limits(Some(round_threads))?;
         let wall_started = Instant::now();
         let mut host_encode_submit_ns = 0_u64;
         let mut device_ns = 0_u64;
@@ -5285,11 +5346,12 @@ fn seconds_ns(seconds: f64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ATTEMPT_DISPATCHES, AttemptKernel, DispatchGeometry, LANES,
-        MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER, MAX_ENCODED_PAIRS_PER_WAVE, MetalConfig, MetalError,
-        MetalKernel, decode_device_error, encoding_limits,
+        ATTEMPT_DISPATCHES, AttemptKernel, DEFAULT_ROUND_THREADS_PER_THREADGROUP, DispatchGeometry,
+        LANES, MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER, MAX_ENCODED_PAIRS_PER_WAVE, MetalConfig,
+        MetalError, MetalKernel, PipelineLimits, decode_device_error, encoding_limits,
     };
     use crate::CapacityRetryRecord;
+    use std::collections::BTreeSet;
 
     #[test]
     fn tcp_capacity_fault_identity_decodes_as_a_flow() {
@@ -5510,5 +5572,130 @@ mod tests {
         pipeline_kernels.dedup();
         assert_eq!(pipeline_kernels.len(), MetalKernel::ALL.len());
         assert_eq!(source_kernels, pipeline_kernels);
+    }
+
+    #[test]
+    fn every_pipeline_is_checked_against_its_dispatch_width() {
+        let round_threads = 96;
+        for (attempt, geometry) in ATTEMPT_DISPATCHES {
+            assert_eq!(
+                attempt
+                    .metal_kernel()
+                    .threadgroup_width()
+                    .threads(Some(round_threads)),
+                Some(geometry.threads_per_threadgroup(round_threads)),
+                "{attempt:?} is dispatched with a width its limit check does not use",
+            );
+        }
+        let dispatched = ATTEMPT_DISPATCHES
+            .iter()
+            .map(|(attempt, _)| attempt.metal_kernel().entry_point())
+            .chain([MetalKernel::CompactGather.entry_point()])
+            .collect::<BTreeSet<_>>();
+        let created = MetalKernel::ALL
+            .map(MetalKernel::entry_point)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(dispatched, created);
+
+        for kernel in MetalKernel::ALL {
+            let name = kernel.entry_point();
+            let width = kernel.threadgroup_width();
+            let threads = width
+                .threads(Some(round_threads))
+                .expect("a run knows every width");
+            let fits = PipelineLimits {
+                max_total_threads: threads,
+                static_threadgroup_memory: 32_768,
+                device_threadgroup_memory: 32_768,
+            };
+            assert_eq!(kernel.check_limits(fits, None), Ok(()));
+            assert_eq!(kernel.check_limits(fits, Some(round_threads)), Ok(()));
+
+            let narrow = PipelineLimits {
+                max_total_threads: threads - 1,
+                ..fits
+            };
+            let error = kernel
+                .check_limits(narrow, Some(round_threads))
+                .expect_err("a pipeline narrower than its dispatch must be rejected");
+            assert!(error.to_string().contains(name), "{error}");
+            // Fixed widths are rejected when the pipeline is created.
+            assert_eq!(
+                kernel.check_limits(narrow, None).is_err(),
+                width.threads(None).is_some(),
+                "{name}",
+            );
+
+            let small_memory = PipelineLimits {
+                device_threadgroup_memory: 32_767,
+                ..fits
+            };
+            let error = kernel
+                .check_limits(small_memory, None)
+                .expect_err("threadgroup memory beyond the device limit must be rejected");
+            assert!(
+                matches!(&error, MetalError::Unavailable(message) if message.contains(name)),
+                "{error}",
+            );
+        }
+    }
+
+    #[test]
+    fn apple_m1_limits_accept_the_default_round_width() {
+        // maxTotalThreadsPerThreadgroup and staticThreadgroupMemoryLength per pipeline, measured on
+        // an Apple M1 Max (32 KiB of threadgroup memory).
+        let measured = [
+            (MetalKernel::HorizonSweep, 1_024, 12_288),
+            (MetalKernel::Horizon, 1_024, 12_288),
+            (MetalKernel::RoundReset, 1_024, 8_192),
+            (MetalKernel::RoundPrepare, 1_024, 8_208),
+            (MetalKernel::Round, 384, 0),
+            (MetalKernel::ControlSweep, 1_024, 12_288),
+            (MetalKernel::Control, 1_024, 12_288),
+            (MetalKernel::ExchangePrefixSweep, 1_024, 20_480),
+            (MetalKernel::ExchangePrefix, 1_024, 20_480),
+            (MetalKernel::ExchangeScatter, 1_024, 0),
+            (MetalKernel::ExchangeMerge, 832, 0),
+            (MetalKernel::FinalizeSweep, 1_024, 12_288),
+            (MetalKernel::Finalize, 1_024, 12_288),
+            (MetalKernel::CompactGather, 1_024, 0),
+        ];
+        assert_eq!(measured.map(|(kernel, _, _)| kernel), MetalKernel::ALL);
+        let check_all = |device_threadgroup_memory, round_threads| {
+            measured.into_iter().try_for_each(
+                |(kernel, max_total_threads, static_threadgroup_memory)| {
+                    kernel.check_limits(
+                        PipelineLimits {
+                            max_total_threads,
+                            static_threadgroup_memory,
+                            device_threadgroup_memory,
+                        },
+                        round_threads,
+                    )
+                },
+            )
+        };
+
+        assert_eq!(check_all(32_768, None), Ok(()));
+        assert_eq!(
+            check_all(32_768, Some(DEFAULT_ROUND_THREADS_PER_THREADGROUP)),
+            Ok(())
+        );
+        assert_eq!(check_all(32_768, Some(384)), Ok(()));
+        let error = check_all(32_768, Some(512)).expect_err("days_round supports only 384");
+        assert!(
+            matches!(&error, MetalError::Validation(message) if message.contains("days_round pipeline")),
+            "{error}",
+        );
+        // 16 KiB covers the 12 KiB control scans but not the 20 KiB exchange-prefix scans.
+        let error = check_all(16_384, None).expect_err("the exchange prefix needs 20 KiB");
+        assert!(
+            matches!(
+                &error,
+                MetalError::Unavailable(message) if message.contains("days_exchange_prefix_sweep")
+            ),
+            "{error}",
+        );
     }
 }
