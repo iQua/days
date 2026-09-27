@@ -108,6 +108,12 @@ const CONTROL_ERROR_ARENA: usize = 1;
 const CONTROL_ERROR_NODE: usize = 2;
 const CONTROL_ERROR_CAPACITY: usize = 3;
 const CONTROL_ERROR_DEMAND: usize = 19;
+/// The kernels store a semantic fault as `ERROR_SEMANTIC + code` in the error word.
+const ERROR_SEMANTIC: u64 = 3;
+/// Semantic code 42 (raw word 45): the exchange-prefix channel-order diagnostic, whose identity
+/// slot carries a channel stream index, and the TCP ledger sequence overflow, which records no
+/// identity. Neither names an LP.
+const ERROR_CHANNEL_ORDER: u64 = ERROR_SEMANTIC + 42;
 const CONTROL_DONE: usize = 4;
 const CONTROL_RUN_END_LO: usize = 7;
 const CONTROL_RUN_END_HI: usize = 8;
@@ -352,8 +358,8 @@ fn decode_device_error(control: &[u64]) -> CudaError {
         },
         // The channel-order diagnostic shares the channel capacity identity slot, which carries
         // an immutable stream index rather than an LP after targeted retry plumbing.
-        142 => CudaError::DeviceExecution {
-            code: 142,
+        ERROR_CHANNEL_ORDER => CudaError::DeviceExecution {
+            code: ERROR_CHANNEL_ORDER,
             node: None,
         },
         code => CudaError::DeviceExecution {
@@ -5119,14 +5125,50 @@ mod tests {
             }
         );
 
-        control[0] = 142;
+        // The kernels write `ERROR_SEMANTIC + 42` = 45 for the order diagnostic.
+        control[0] = 45;
         assert_eq!(
             decode_device_error(&control),
             CudaError::DeviceExecution {
-                code: 142,
+                code: 45,
                 node: None,
             },
             "a channel index must not be displayed as an LP for the order diagnostic",
+        );
+    }
+
+    #[test]
+    fn cuda_semantic_fault_decodes_the_word_the_kernels_write() {
+        let source = include_str!("cuda_kernels.cu");
+        assert!(source.contains("constexpr ulong ERROR_SEMANTIC = 3;"));
+        assert!(source.contains("control[C_ERROR] = ERROR_SEMANTIC + 42;"));
+
+        let mut control = vec![0_u64; 20];
+        // An LP semantic fault (here semantic 25, raw 28) keeps the LP it names.
+        control[0] = 28;
+        assert_eq!(
+            decode_device_error(&control),
+            CudaError::DeviceExecution {
+                code: 28,
+                node: Some(crate::NodeId(0)),
+            },
+        );
+        // Raw 45 is semantic 42: its identity slot is never an LP.
+        control[0] = 45;
+        assert_eq!(
+            decode_device_error(&control),
+            CudaError::DeviceExecution {
+                code: 45,
+                node: None,
+            },
+        );
+        control[2] = u64::MAX;
+        assert_eq!(
+            decode_device_error(&control),
+            CudaError::DeviceExecution {
+                code: 45,
+                node: None,
+            },
         );
     }
 
