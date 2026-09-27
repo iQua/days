@@ -75,7 +75,7 @@ pub fn compile_text(label: &str, config: &str) -> SimulationImage {
     image.unwrap_or_else(|error| panic!("{label} must lower: {error}"))
 }
 
-fn progress(result: &RunResult) -> Vec<CollectiveProgressRecord> {
+pub fn progress(result: &RunResult) -> Vec<CollectiveProgressRecord> {
     result
         .diagnostics
         .as_ref()
@@ -89,7 +89,7 @@ fn progress(result: &RunResult) -> Vec<CollectiveProgressRecord> {
         .collect()
 }
 
-fn tcp_total_bytes(image: &SimulationImage) -> BTreeMap<FlowId, u64> {
+pub fn tcp_total_bytes(image: &SimulationImage) -> BTreeMap<FlowId, u64> {
     image
         .host_states
         .iter()
@@ -104,7 +104,10 @@ fn tcp_total_bytes(image: &SimulationImage) -> BTreeMap<FlowId, u64> {
 }
 
 /// Sender-side completion: the event time of the new ACK that reaches the flow's total.
-fn acknowledged_at(result: &RunResult, totals: &BTreeMap<FlowId, u64>) -> BTreeMap<FlowId, u64> {
+pub fn acknowledged_at(
+    result: &RunResult,
+    totals: &BTreeMap<FlowId, u64>,
+) -> BTreeMap<FlowId, u64> {
     let mut completed = BTreeMap::new();
     for record in &result.diagnostics.as_ref().unwrap().tcp_transitions {
         if let TcpTransitionInput::NewAck { acknowledgment, .. } = record.input {
@@ -118,7 +121,7 @@ fn acknowledged_at(result: &RunResult, totals: &BTreeMap<FlowId, u64>) -> BTreeM
 
 /// Receiver-side completion: replays delivered TCP data and returns when the in-order frontier
 /// first reaches the flow's total.
-fn delivered_at(result: &RunResult, totals: &BTreeMap<FlowId, u64>) -> BTreeMap<FlowId, u64> {
+pub fn delivered_at(result: &RunResult, totals: &BTreeMap<FlowId, u64>) -> BTreeMap<FlowId, u64> {
     let packets = result
         .observed_packets
         .iter()
@@ -151,7 +154,7 @@ fn delivered_at(result: &RunResult, totals: &BTreeMap<FlowId, u64>) -> BTreeMap<
     completed
 }
 
-fn run_everywhere(image: &SimulationImage, label: &str) -> RunResult {
+pub fn run_everywhere(image: &SimulationImage, label: &str) -> RunResult {
     validate(image, Backend::Scalar).unwrap();
     let scalar = run_scalar_with_observations(image, None, ObservationMode::Full).unwrap();
     for workers in [1, 2, 4] {
