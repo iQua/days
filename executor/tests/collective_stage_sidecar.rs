@@ -1,15 +1,13 @@
 //! P14 T1: a collective stage is a dependency record attached to an ordinary generator.
 //!
-//! The paced `Collective` generator keeps its embedded dependency fields; wrapped transports carry
-//! the same dependency state in the `stage` sidecar. Both representations answer the same
-//! accessor, and the sidecar is invisible in the complete-state rendering when absent.
+//! The dependency state lives in the `stage` sidecar, is read and written through one accessor
+//! pair, and is invisible in the complete-state rendering when absent.
 
 use days_executor::{
-    CollectiveAlgorithm, CollectiveChannelPolicy, CollectiveChunkPolicy, CollectiveGenerator,
-    CollectivePhase, CollectiveStage, CollectiveStageIdentity, ConstantGenerator,
-    FlowGeneratorKind, FlowGeneratorState, FlowId, GeneratorFeedbackState, GeneratorStatus,
-    GeneratorTermination, PayloadId, ScheduledEmission, StageDependencies, StageRole,
-    TcpCongestionControl, TcpGenerator,
+    CollectiveAlgorithm, CollectiveChannelPolicy, CollectiveChunkPolicy, CollectivePhase,
+    CollectiveStage, CollectiveStageIdentity, ConstantGenerator, FlowGeneratorKind,
+    FlowGeneratorState, FlowId, GeneratorFeedbackState, GeneratorStatus, GeneratorTermination,
+    PayloadId, ScheduledEmission, StageDependencies, StageRole, TcpCongestionControl, TcpGenerator,
 };
 
 fn generator(kind: FlowGeneratorKind, stage: Option<CollectiveStage>) -> FlowGeneratorState {
@@ -91,34 +89,8 @@ fn absent_sidecar_is_invisible_in_the_complete_state_rendering() {
 }
 
 #[test]
-fn both_stage_representations_answer_one_dependency_accessor() {
-    let paced = generator(
-        FlowGeneratorKind::Collective(CollectiveGenerator {
-            collective_id: 0,
-            algorithm: CollectiveAlgorithm::RingAllReduce,
-            topology_level: 0,
-            topology_group: 0,
-            group_size: 3,
-            declared_total_bytes: 9,
-            rank: 1,
-            phase: CollectivePhase::ReduceScatter,
-            step: 2,
-            chunk_policy: CollectiveChunkPolicy::EqualRemainderLast,
-            channel_policy: CollectiveChannelPolicy::RingNext,
-            chunk_offset_bytes: 0,
-            chunk_bytes: 3,
-            packet_size_bytes: 1,
-            interval_ns: 1,
-            local_predecessor: Some(FlowId(4)),
-            inbound_predecessor: Some(FlowId(2)),
-            inbound_predecessor_bytes: 3,
-            local_predecessor_complete: false,
-            inbound_predecessor_complete: false,
-            inbound_bytes_received: 0,
-        }),
-        None,
-    );
-    let wrapped = generator(
+fn stage_dependencies_round_trip_through_the_sidecar() {
+    let mut wrapped = generator(
         FlowGeneratorKind::Tcp(TcpGenerator::new(3, 1, 1, TcpCongestionControl::reno(1))),
         Some(CollectiveStage {
             role: StageRole::Collective(identity()),
@@ -126,29 +98,20 @@ fn both_stage_representations_answer_one_dependency_accessor() {
             activated: false,
         }),
     );
-    assert_eq!(paced.stage_dependencies(), Some(dependencies()));
     assert_eq!(wrapped.stage_dependencies(), Some(dependencies()));
-
     let mut updated = dependencies();
     updated.local_predecessor_complete = true;
     updated.inbound_bytes_received = 3;
     updated.inbound_predecessor_complete = true;
-    for mut stage in [paced, wrapped] {
-        stage.set_stage_dependencies(updated);
-        assert_eq!(stage.stage_dependencies(), Some(updated));
-        assert!(updated.prerequisites_complete());
-    }
-    let FlowGeneratorKind::Collective(after) = ({
-        let mut stage = paced;
-        stage.set_stage_dependencies(updated);
-        stage
-    })
-    .kind
-    else {
-        unreachable!()
-    };
-    assert!(after.local_predecessor_complete && after.inbound_predecessor_complete);
-    assert_eq!(after.inbound_bytes_received, 3);
+    assert!(!dependencies().prerequisites_complete());
+    assert!(updated.prerequisites_complete());
+    wrapped.set_stage_dependencies(updated);
+    assert_eq!(wrapped.stage_dependencies(), Some(updated));
+    assert_eq!(
+        wrapped.stage.unwrap().role,
+        StageRole::Collective(identity())
+    );
+    assert!(!wrapped.stage.unwrap().activated);
 
     let plain = generator(
         FlowGeneratorKind::Constant(ConstantGenerator {

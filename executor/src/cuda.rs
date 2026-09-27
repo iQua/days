@@ -2140,7 +2140,7 @@ impl CudaPlan {
                                 generators[offset + 18] = rate.credit_quanta as u64;
                                 generators[offset + 19] = (rate.credit_quanta >> 64) as u64;
                             }
-                            FlowGeneratorKind::Collective(_) | FlowGeneratorKind::Dcqcn(_) => {
+                            FlowGeneratorKind::Dcqcn(_) => {
                                 unreachable!("CUDA capability validation rejects this generator")
                             }
                         }
@@ -4294,7 +4294,7 @@ impl CudaBuffers {
                                 rate.credit_quanta = u128::from(generators[offset + 18])
                                     | (u128::from(generators[offset + 19]) << 64);
                             }
-                            FlowGeneratorKind::Collective(_) | FlowGeneratorKind::Dcqcn(_) => {
+                            FlowGeneratorKind::Dcqcn(_) => {
                                 return Err(CudaError::DeviceExecution {
                                     code: 96,
                                     node: Some(node.id),

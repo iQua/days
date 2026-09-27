@@ -757,20 +757,6 @@ impl CapacityContext {
                             generator_intervals[index].push(rate.pacing_interval_ns);
                         }
                     }
-                    FlowGeneratorKind::Collective(collective) => {
-                        minimum_data_sizes[index] =
-                            minimum_data_sizes[index].min(finite_generator_minimum_packet_size(
-                                collective.chunk_bytes,
-                                generator.bytes_emitted,
-                                collective.packet_size_bytes,
-                            ));
-                        if matches!(
-                            generator.next_emission.status,
-                            GeneratorStatus::Scheduled | GeneratorStatus::Blocked
-                        ) {
-                            generator_intervals[index].push(collective.interval_ns);
-                        }
-                    }
                     FlowGeneratorKind::Dcqcn(dcqcn) => {
                         minimum_data_sizes[index] =
                             minimum_data_sizes[index].min(finite_generator_minimum_packet_size(
@@ -912,22 +898,6 @@ fn flow_packet_counts(
                         data_counts[index] = data_counts[index].saturating_sub(1);
                     }
                     data_counts[index] = data_counts[index].saturating_add(work.packets);
-                }
-                FlowGeneratorKind::Collective(collective) => {
-                    if matches!(
-                        generator.next_emission.status,
-                        GeneratorStatus::Finished | GeneratorStatus::Stopped
-                    ) {
-                        continue;
-                    }
-                    let remaining = collective
-                        .chunk_bytes
-                        .saturating_sub(generator.bytes_emitted);
-                    let packets = remaining.div_ceil(collective.packet_size_bytes) as usize;
-                    let resident =
-                        usize::from(generator.next_emission.status == GeneratorStatus::Scheduled);
-                    data_counts[index] =
-                        data_counts[index].saturating_add(packets.saturating_sub(resident));
                 }
                 FlowGeneratorKind::Dcqcn(dcqcn) => {
                     if !matches!(

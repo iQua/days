@@ -311,7 +311,6 @@ fn smallest_width_via_load_fixture_lowers_and_truncates_pending_tail() {
                     FlowGeneratorKind::Constant(constant) => constant.first_departure_ns,
                     FlowGeneratorKind::Tcp(_)
                     | FlowGeneratorKind::Rate(_)
-                    | FlowGeneratorKind::Collective(_)
                     | FlowGeneratorKind::Dcqcn(_) => {
                         panic!("fixture uses constant generators")
                     }

@@ -3,16 +3,16 @@ use std::fs;
 use std::path::Path;
 
 use days_executor::{
-    Backend, CollectiveAlgorithm, CollectiveChannelPolicy, CollectiveChunkPolicy,
-    CollectiveGenerator, CollectivePhase, CollectiveStage, CollectiveStageIdentity,
-    ConstantGenerator, DcqcnController, DcqcnControllerConfig, DcqcnGenerator, DcqcnReceiverState,
-    DropMarkPolicy, EcnThresholdPolicy, Event, EventKey, EventKind, FlowDescriptor,
-    FlowGeneratorKind, FlowGeneratorState, FlowId, GeneratorFeedbackState, GeneratorStatus,
-    GeneratorTermination, HostState, LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind,
-    PacketDescriptor, PacketKind, PayloadId, PfcIngressState, PfcQueueState, QueueDepthUnit,
-    RateGenerator, RedPolicyState, RemoteChannel, ScheduledEmission, SchedulerKind,
-    SimulationImage, StageDependencies, StageRole, SwitchQueueState, SwitchState,
-    TcpCongestionControl, TcpDataHeader, TcpGenerator, TcpReceiverState, event_phase, validate,
+    Backend, CollectiveAlgorithm, CollectiveChannelPolicy, CollectiveChunkPolicy, CollectivePhase,
+    CollectiveStage, CollectiveStageIdentity, ConstantGenerator, DcqcnController,
+    DcqcnControllerConfig, DcqcnGenerator, DcqcnReceiverState, DropMarkPolicy, EcnThresholdPolicy,
+    Event, EventKey, EventKind, FlowDescriptor, FlowGeneratorKind, FlowGeneratorState, FlowId,
+    GeneratorFeedbackState, GeneratorStatus, GeneratorTermination, HostState, LinkDescriptor,
+    LinkId, NodeDescriptor, NodeId, NodeKind, PacketDescriptor, PacketKind, PayloadId,
+    PfcIngressState, PfcQueueState, QueueDepthUnit, RateGenerator, RedPolicyState, RemoteChannel,
+    ScheduledEmission, SchedulerKind, SimulationImage, StageDependencies, StageRole,
+    SwitchQueueState, SwitchState, TcpCongestionControl, TcpDataHeader, TcpGenerator,
+    TcpReceiverState, event_phase, validate,
 };
 use num_bigint::BigUint;
 use petgraph::graph::NodeIndex;
@@ -154,7 +154,7 @@ struct SourceFlowSet {
 struct SourceCollective {
     collective_type: String,
     first_flow_id: Option<u64>,
-    flow_type: String,
+    flow_type: Option<String>,
     flow_count: u64,
     graph: Option<Vec<(u64, u64)>>,
     paths: Option<Vec<Vec<u64>>>,
@@ -170,7 +170,7 @@ struct SourceCollectiveSet {
     collective_type: String,
     collective_count: u64,
     first_flow_id: Option<u64>,
-    flow_type: String,
+    flow_type: Option<String>,
     flow_count: u64,
     sources: Option<Vec<Vec<u64>>>,
     sinks: Option<Vec<Vec<u64>>>,
@@ -1036,24 +1036,25 @@ fn collective_algorithm(name: &str) -> Result<CollectiveAlgorithm, CompileError>
     }
 }
 
-fn validate_collective_transport(flow_type: &str) -> Result<SourceFlowKind, CompileError> {
+/// Collectives run over TCP only; fixed-rate streams cannot model a collective's completion, and
+/// RoCE queue pairs arrive in P15.
+fn validate_collective_transport(flow_type: Option<&str>) -> Result<SourceFlowKind, CompileError> {
     match flow_type {
-        "PacketDistribution" => Ok(SourceFlowKind::PacketDistribution),
-        "TCP" => Ok(SourceFlowKind::Tcp),
-        "DCQCN" => Err(CompileError::Unsupported(
-            "unsupported collective flow type `DCQCN`; collectives support PacketDistribution and TCP, and DCQCN collectives wait for RoCE queue pairs (P15)"
+        Some("TCP") => Ok(SourceFlowKind::Tcp),
+        Some(unsupported) => Err(CompileError::Unsupported(format!(
+            "unsupported collective flow type `{unsupported}`; collectives require flow_type = \"TCP\" (RoCE queue pairs arrive in P15)"
+        ))),
+        None => Err(CompileError::Unsupported(
+            "collective flow_type is missing; collectives require flow_type = \"TCP\" (RoCE queue pairs arrive in P15)"
                 .to_owned(),
         )),
-        unsupported => Err(CompileError::Unsupported(format!(
-            "unsupported collective flow type `{unsupported}`; collectives support PacketDistribution and TCP"
-        ))),
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn collective_key(
     collective_type: &str,
-    flow_type: &str,
+    flow_type: Option<&str>,
     flow_count: u64,
     sources: Vec<u64>,
     sinks: Vec<u64>,
@@ -1065,8 +1066,8 @@ fn collective_key(
     traffic: SourceTraffic,
     scenario_text: &str,
 ) -> Result<CollectiveKey, CompileError> {
-    let flow_kind = validate_collective_transport(flow_type)?;
     let algorithm = collective_algorithm(collective_type)?;
+    let flow_kind = validate_collective_transport(flow_type)?;
     if first_flow_id.is_some() {
         return Err(CompileError::Unsupported(
             "unsupported explicit collective flow IDs; scenario-local flow identity is derived from the collective stage key"
@@ -1156,7 +1157,7 @@ fn validate_collective(
 ) -> Result<CollectiveKey, CompileError> {
     collective_key(
         &source.collective_type,
-        &source.flow_type,
+        source.flow_type.as_deref(),
         source.flow_count,
         source.sources.unwrap_or_default(),
         source.sinks.unwrap_or_default(),
@@ -1174,7 +1175,8 @@ fn validate_collective_set(
     source: SourceCollectiveSet,
     scenario_text: &str,
 ) -> Result<Vec<CollectiveKey>, CompileError> {
-    validate_collective_transport(&source.flow_type)?;
+    collective_algorithm(&source.collective_type)?;
+    validate_collective_transport(source.flow_type.as_deref())?;
     let count = usize::try_from(source.collective_count).map_err(|_| {
         CompileError::Invalid("collective_count exceeds the platform index domain".to_owned())
     })?;
@@ -1190,7 +1192,7 @@ fn validate_collective_set(
     for (collective_sources, collective_sinks) in sources.into_iter().zip(sinks) {
         result.push(collective_key(
             &source.collective_type,
-            &source.flow_type,
+            source.flow_type.as_deref(),
             source.flow_count,
             collective_sources,
             collective_sinks,
@@ -2239,15 +2241,6 @@ fn lower(
                 departure_time_ns: 0,
                 payload: PayloadId(0),
             }
-        } else if flow.collective.is_some()
-            && flow.traffic.kind == TrafficKind::Constant
-            && flow.traffic.initial_delay_ns > model.stop_time_ns
-        {
-            ScheduledEmission {
-                status: GeneratorStatus::Stopped,
-                departure_time_ns: flow.traffic.initial_delay_ns,
-                payload: PayloadId(0),
-            }
         } else {
             let sequence = payload_sequences.entry(source).or_default();
             let payload = allocate_payload_id(
@@ -2261,11 +2254,6 @@ fn lower(
             })?;
             let initial_size_bytes = match (flow.traffic.kind, &flow.traffic.termination) {
                 (TrafficKind::Tcp(_) | TrafficKind::Dcqcn(_), Termination::Bytes(total_bytes)) => {
-                    flow.traffic.packet_size_bytes.min(*total_bytes)
-                }
-                (TrafficKind::Constant, Termination::Bytes(total_bytes))
-                    if flow.collective.is_some() =>
-                {
                     flow.traffic.packet_size_bytes.min(*total_bytes)
                 }
                 _ => flow.traffic.packet_size_bytes,
@@ -2394,14 +2382,11 @@ fn lower(
             .push(FlowGeneratorState {
                 // Paced stages embed their dependencies in the frozen `Collective` kind; every
                 // other transport carries them in the sidecar.
-                stage: match (collective_stage, flow.traffic.kind) {
-                    (Some(_), TrafficKind::Constant) | (None, _) => None,
-                    (Some((identity, dependencies)), _) => Some(CollectiveStage {
-                        role: StageRole::Collective(identity),
-                        dependencies,
-                        activated: collective_ready && emission_count != 0,
-                    }),
-                },
+                stage: collective_stage.map(|(identity, dependencies)| CollectiveStage {
+                    role: StageRole::Collective(identity),
+                    dependencies,
+                    activated: collective_ready && emission_count != 0,
+                }),
                 flow: descriptor.id,
                 packets_emitted: 0,
                 bytes_emitted: 0,
@@ -2412,33 +2397,7 @@ fn lower(
                     outstanding_bytes: 0,
                     unacknowledged_bytes: 0,
                 },
-                kind: if let (Some((identity, dependencies)), TrafficKind::Constant) =
-                    (collective_stage, flow.traffic.kind)
-                {
-                    FlowGeneratorKind::Collective(CollectiveGenerator {
-                        collective_id: identity.collective_id,
-                        algorithm: identity.algorithm,
-                        topology_level: identity.topology_level,
-                        topology_group: identity.topology_group,
-                        group_size: identity.group_size,
-                        declared_total_bytes: identity.declared_total_bytes,
-                        rank: identity.rank,
-                        phase: identity.phase,
-                        step: identity.step,
-                        chunk_policy: identity.chunk_policy,
-                        channel_policy: identity.channel_policy,
-                        chunk_offset_bytes: identity.chunk_offset_bytes,
-                        chunk_bytes: identity.chunk_bytes,
-                        packet_size_bytes: flow.traffic.packet_size_bytes,
-                        interval_ns: flow.traffic.interval_ns,
-                        local_predecessor: dependencies.local_predecessor,
-                        inbound_predecessor: dependencies.inbound_predecessor,
-                        inbound_predecessor_bytes: dependencies.inbound_predecessor_bytes,
-                        local_predecessor_complete: dependencies.local_predecessor_complete,
-                        inbound_predecessor_complete: dependencies.inbound_predecessor_complete,
-                        inbound_bytes_received: dependencies.inbound_bytes_received,
-                    })
-                } else {
+                kind: {
                     match flow.traffic.kind {
                         TrafficKind::Constant => FlowGeneratorKind::Constant(ConstantGenerator {
                             first_departure_ns: flow.traffic.initial_delay_ns,
@@ -2645,16 +2604,6 @@ fn lower(
             // Both controllers may fill the exact remaining congestion-window bytes, so even a
             // byte-aligned total/MSS pair can legally produce a one-byte intermediate segment.
             1
-        } else if input.collective.is_some() {
-            let Termination::Bytes(bytes) = input.traffic.termination else {
-                unreachable!("collective lowering requires byte termination")
-            };
-            let remainder = bytes % input.traffic.packet_size_bytes;
-            if remainder == 0 {
-                input.traffic.packet_size_bytes
-            } else {
-                remainder
-            }
         } else {
             input.traffic.packet_size_bytes
         };

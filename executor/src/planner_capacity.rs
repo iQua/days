@@ -138,13 +138,6 @@ impl PlannerCapacityContext {
                             rate.packet_size_bytes,
                         )
                     }
-                    FlowGeneratorKind::Collective(collective) => {
-                        crate::device_sizing::finite_generator_minimum_packet_size(
-                            collective.chunk_bytes,
-                            generator.bytes_emitted,
-                            collective.packet_size_bytes,
-                        )
-                    }
                     FlowGeneratorKind::Dcqcn(dcqcn) => {
                         crate::device_sizing::finite_generator_minimum_packet_size(
                             dcqcn.rate.total_bytes,
@@ -175,9 +168,7 @@ impl PlannerCapacityContext {
                     FlowGeneratorKind::Rate(rate) => {
                         interval_burst(packet_count, rate.pacing_interval_ns, lookahead)
                     }
-                    FlowGeneratorKind::Tcp(_)
-                    | FlowGeneratorKind::Collective(_)
-                    | FlowGeneratorKind::Dcqcn(_) => packet_count,
+                    FlowGeneratorKind::Tcp(_) | FlowGeneratorKind::Dcqcn(_) => packet_count,
                 };
                 generator_round_bursts[flow] = generator_round_bursts[flow].saturating_add(burst);
             }
@@ -423,7 +414,6 @@ impl PlannerCapacityContext {
             FlowGeneratorKind::Tcp(tcp) => Some(tcp),
             FlowGeneratorKind::Constant(_)
             | FlowGeneratorKind::Rate(_)
-            | FlowGeneratorKind::Collective(_)
             | FlowGeneratorKind::Dcqcn(_) => None,
         }
     }
@@ -640,13 +630,6 @@ fn precompute_minimum_packet_sizes(
                     rate.packet_size_bytes,
                 )
             }
-            FlowGeneratorKind::Collective(collective) => {
-                crate::device_sizing::finite_generator_minimum_packet_size(
-                    collective.chunk_bytes,
-                    generator.bytes_emitted,
-                    collective.packet_size_bytes,
-                )
-            }
             FlowGeneratorKind::Dcqcn(dcqcn) => {
                 crate::device_sizing::finite_generator_minimum_packet_size(
                     dcqcn.rate.total_bytes,
@@ -729,7 +712,6 @@ fn legacy_minimum_packet_size(
                             FlowGeneratorKind::Tcp(tcp) => Some(tcp.ack_size_bytes),
                             FlowGeneratorKind::Constant(_)
                             | FlowGeneratorKind::Rate(_)
-                            | FlowGeneratorKind::Collective(_)
                             | FlowGeneratorKind::Dcqcn(_) => None,
                         })
                 })
@@ -764,13 +746,6 @@ fn legacy_minimum_packet_size(
                                     rate.packet_size_bytes,
                                 )
                             }
-                            FlowGeneratorKind::Collective(collective) => {
-                                crate::device_sizing::finite_generator_minimum_packet_size(
-                                    collective.chunk_bytes,
-                                    generator.bytes_emitted,
-                                    collective.packet_size_bytes,
-                                )
-                            }
                             FlowGeneratorKind::Dcqcn(dcqcn) => {
                                 crate::device_sizing::finite_generator_minimum_packet_size(
                                     dcqcn.rate.total_bytes,
@@ -798,7 +773,6 @@ fn legacy_tcp_generator(image: &SimulationImage, flow: usize) -> Option<TcpGener
             FlowGeneratorKind::Tcp(tcp) => Some(tcp),
             FlowGeneratorKind::Constant(_)
             | FlowGeneratorKind::Rate(_)
-            | FlowGeneratorKind::Collective(_)
             | FlowGeneratorKind::Dcqcn(_) => None,
         })
 }
@@ -828,9 +802,7 @@ fn legacy_generator_round_burst(
             FlowGeneratorKind::Rate(rate) => {
                 interval_burst(packet_count, rate.pacing_interval_ns, lookahead)
             }
-            FlowGeneratorKind::Tcp(_)
-            | FlowGeneratorKind::Collective(_)
-            | FlowGeneratorKind::Dcqcn(_) => packet_count,
+            FlowGeneratorKind::Tcp(_) | FlowGeneratorKind::Dcqcn(_) => packet_count,
         })
         .fold(0, usize::saturating_add)
 }

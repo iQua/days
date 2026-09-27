@@ -267,57 +267,6 @@ pub enum CollectiveChannelPolicy {
     RingNext = 0,
 }
 
-/// One fixed-width stage of a parametric collective program.
-///
-/// The lowerer resolves algorithms, topology hierarchy, chunks, channels, and dependencies into
-/// these records. A source LP needs no shared mutable collective object: ordinary packet delivery
-/// satisfies the inbound prerequisite of the next local stage.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CollectiveGenerator {
-    pub collective_id: u64,
-    pub algorithm: CollectiveAlgorithm,
-    pub topology_level: u32,
-    pub topology_group: u32,
-    pub group_size: u32,
-    /// Immutable source-declared byte total from which every owner partition is derived.
-    pub declared_total_bytes: u64,
-    pub rank: u32,
-    pub phase: CollectivePhase,
-    /// One-based phase step.
-    pub step: u32,
-    pub chunk_policy: CollectiveChunkPolicy,
-    pub channel_policy: CollectiveChannelPolicy,
-    pub chunk_offset_bytes: u64,
-    pub chunk_bytes: u64,
-    pub packet_size_bytes: u64,
-    pub interval_ns: u64,
-    pub local_predecessor: Option<FlowId>,
-    pub inbound_predecessor: Option<FlowId>,
-    pub inbound_predecessor_bytes: u64,
-    pub local_predecessor_complete: bool,
-    pub inbound_predecessor_complete: bool,
-    pub inbound_bytes_received: u64,
-}
-
-impl CollectiveGenerator {
-    pub const fn prerequisites_complete(self) -> bool {
-        (self.local_predecessor.is_none() || self.local_predecessor_complete)
-            && (self.inbound_predecessor.is_none() || self.inbound_predecessor_complete)
-    }
-
-    const fn dependencies(self) -> StageDependencies {
-        StageDependencies {
-            local_predecessor: self.local_predecessor,
-            inbound_predecessor: self.inbound_predecessor,
-            inbound_predecessor_bytes: self.inbound_predecessor_bytes,
-            local_predecessor_complete: self.local_predecessor_complete,
-            inbound_predecessor_complete: self.inbound_predecessor_complete,
-            inbound_bytes_received: self.inbound_bytes_received,
-        }
-    }
-}
-
 /// Prerequisite state of one dependency-gated stage, owned by the stage's source host LP.
 ///
 /// The local predecessor runs on the same host. The inbound predecessor is a stage on another host
@@ -343,10 +292,11 @@ impl StageDependencies {
     }
 }
 
-/// Resolved position and chunk of one collective stage carried by a wrapped transport generator.
+/// Resolved position and chunk of one collective stage carried by a transport generator.
 ///
-/// The fields mean exactly what the same-named `CollectiveGenerator` fields mean; pacing
-/// parameters are absent because the wrapped transport owns its own sending discipline.
+/// The transport owns the sending discipline; the stage fixes which chunk
+/// `[chunk_offset_bytes, chunk_offset_bytes + chunk_bytes)` of the `declared_total_bytes` buffer
+/// rank `rank` sends to its ring successor at one-based `step` of `phase`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CollectiveStageIdentity {
@@ -389,8 +339,9 @@ pub enum StageRole {
 
 /// Dependency record attached to an ordinary transport or timer generator.
 ///
-/// Paced open-loop collective stages keep their frozen `FlowGeneratorKind::Collective`
-/// representation and never carry this record.
+/// The lowerer resolves algorithms, chunks, channels, and dependencies into these records. A
+/// source LP needs no shared mutable collective object: ordinary delivery at this host satisfies
+/// the inbound prerequisite of the next local stage.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CollectiveStage {
@@ -410,7 +361,6 @@ pub enum FlowGeneratorKind {
     Constant(ConstantGenerator),
     Tcp(TcpGenerator),
     Rate(RateGenerator),
-    Collective(CollectiveGenerator),
     Dcqcn(DcqcnGenerator),
 }
 
@@ -462,40 +412,30 @@ pub struct FlowGeneratorState {
     pub rng_state: u64,
     pub feedback: GeneratorFeedbackState,
     pub kind: FlowGeneratorKind,
-    /// Collective or compute dependency record for a wrapped generator. Always `None` for the
-    /// paced `Collective` kind, which embeds its own dependency fields.
+    /// Collective or compute dependency record of a dependency-gated generator.
     pub stage: Option<CollectiveStage>,
 }
 
 impl FlowGeneratorState {
-    /// Dependency state of a stage in either representation, or `None` for an ungated generator.
+    /// Dependency state of a stage, or `None` for an ungated generator.
     pub const fn stage_dependencies(&self) -> Option<StageDependencies> {
-        match (&self.kind, &self.stage) {
-            (FlowGeneratorKind::Collective(collective), _) => Some(collective.dependencies()),
-            (_, Some(stage)) => Some(stage.dependencies),
-            _ => None,
+        match &self.stage {
+            Some(stage) => Some(stage.dependencies),
+            None => None,
         }
     }
 
-    /// Writes dependency state back into whichever representation this stage uses.
+    /// Writes dependency state back into the stage record.
     ///
     /// # Panics
     ///
     /// Panics when the generator is not a stage; callers obtain `dependencies` from
     /// [`Self::stage_dependencies`].
     pub fn set_stage_dependencies(&mut self, dependencies: StageDependencies) {
-        match (&mut self.kind, &mut self.stage) {
-            (FlowGeneratorKind::Collective(collective), _) => {
-                collective.local_predecessor = dependencies.local_predecessor;
-                collective.inbound_predecessor = dependencies.inbound_predecessor;
-                collective.inbound_predecessor_bytes = dependencies.inbound_predecessor_bytes;
-                collective.local_predecessor_complete = dependencies.local_predecessor_complete;
-                collective.inbound_predecessor_complete = dependencies.inbound_predecessor_complete;
-                collective.inbound_bytes_received = dependencies.inbound_bytes_received;
-            }
-            (_, Some(stage)) => stage.dependencies = dependencies,
-            _ => panic!("set_stage_dependencies requires a collective or wrapped stage"),
-        }
+        self.stage
+            .as_mut()
+            .expect("set_stage_dependencies requires a stage record")
+            .dependencies = dependencies;
     }
 }
 

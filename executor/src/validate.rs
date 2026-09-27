@@ -425,7 +425,7 @@ fn validate_backend_capabilities(
         )));
     }
     for generator in image.host_states.iter().flat_map(|state| &state.generators) {
-        if matches!(generator.kind, FlowGeneratorKind::Collective(_)) || generator.stage.is_some() {
+        if generator.stage.is_some() {
             return Err(ValidationError::new(format!(
                 "backend {backend} does not support collective generators; use Scalar or Cpu"
             )));
@@ -808,9 +808,6 @@ fn derived_pfc_max_frame_bytes(
                 FlowGeneratorKind::Rate(rate) => rate
                     .packet_size_bytes
                     .min(rate.total_bytes - generator.bytes_emitted),
-                FlowGeneratorKind::Collective(collective) => collective
-                    .packet_size_bytes
-                    .min(collective.chunk_bytes - generator.bytes_emitted),
                 FlowGeneratorKind::Dcqcn(dcqcn) => dcqcn
                     .rate
                     .packet_size_bytes
@@ -830,9 +827,7 @@ fn derived_pfc_max_frame_bytes(
                         maximum[priority] = maximum[priority].max(dcqcn.cnp_size_bytes);
                     }
                 }
-                FlowGeneratorKind::Constant(_)
-                | FlowGeneratorKind::Rate(_)
-                | FlowGeneratorKind::Collective(_) => {}
+                FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => {}
             }
         }
     }
@@ -1415,6 +1410,17 @@ fn validate_generators(
                 )));
             }
 
+            if let Some(stage) = generator.stage {
+                validate_collective_stage(
+                    image,
+                    state,
+                    flow,
+                    generator,
+                    stage,
+                    &mut collective_positions,
+                )?;
+            }
+
             if let FlowGeneratorKind::Tcp(tcp) = generator.kind {
                 if tcp.total_bytes == 0 || tcp.mss_bytes == 0 || tcp.ack_size_bytes == 0 {
                     return Err(ValidationError::new(format!(
@@ -1762,294 +1768,6 @@ fn validate_generators(
                         "flow {:?} rate source is Stopped at {}, which is not beyond stop time {}",
                         flow.id, generator.next_emission.departure_time_ns, image.stop_time_ns
                     )));
-                }
-                continue;
-            }
-
-            if let FlowGeneratorKind::Collective(collective) = generator.kind {
-                let position = (
-                    collective.collective_id,
-                    collective.phase,
-                    collective.rank,
-                    collective.step,
-                );
-                if let Some(previous_flow) = collective_positions.insert(position, flow.id) {
-                    return Err(ValidationError::new(format!(
-                        "flow {:?} has duplicate collective stage position ({}, {:?}, {}, {}), already owned by flow {:?}",
-                        flow.id,
-                        collective.collective_id,
-                        collective.phase,
-                        collective.rank,
-                        collective.step,
-                        previous_flow
-                    )));
-                }
-                if collective.chunk_policy != crate::CollectiveChunkPolicy::EqualRemainderLast
-                    || collective.channel_policy != crate::CollectiveChannelPolicy::RingNext
-                    || collective.algorithm == crate::CollectiveAlgorithm::AllGather
-                        && collective.phase != crate::CollectivePhase::AllGather
-                {
-                    return Err(ValidationError::new(format!(
-                        "flow {:?} collective policy or phase is inconsistent with its algorithm",
-                        flow.id
-                    )));
-                }
-                if collective.group_size < 2
-                    || collective.rank >= collective.group_size
-                    || collective.step == 0
-                    || collective.step >= collective.group_size
-                    || collective.declared_total_bytes == 0
-                    || collective.chunk_bytes == 0
-                        && collective.algorithm != crate::CollectiveAlgorithm::AllGather
-                    || collective.packet_size_bytes == 0
-                    || collective.interval_ns == 0
-                {
-                    return Err(ValidationError::new(format!(
-                        "flow {:?} collective dimensions, chunk, packet size, and interval must be in range",
-                        flow.id
-                    )));
-                }
-                collective
-                    .chunk_offset_bytes
-                    .checked_add(collective.chunk_bytes)
-                    .ok_or_else(|| {
-                        ValidationError::new(format!(
-                            "flow {:?} collective chunk endpoint exceeds u64",
-                            flow.id
-                        ))
-                    })?;
-                if collective.inbound_bytes_received > collective.inbound_predecessor_bytes {
-                    return Err(ValidationError::new(format!(
-                        "flow {:?} collective inbound bytes {} exceed required bytes {}",
-                        flow.id,
-                        collective.inbound_bytes_received,
-                        collective.inbound_predecessor_bytes
-                    )));
-                }
-
-                let final_step = collective.group_size - 1;
-                let root = collective.step == 1
-                    && (collective.algorithm == crate::CollectiveAlgorithm::AllGather
-                        || collective.phase == crate::CollectivePhase::ReduceScatter);
-                let expected_local = if root {
-                    None
-                } else {
-                    let (phase, step) = if collective.step > 1 {
-                        (collective.phase, collective.step - 1)
-                    } else {
-                        (crate::CollectivePhase::ReduceScatter, final_step)
-                    };
-                    image
-                        .host_states
-                        .iter()
-                        .flat_map(|state| &state.generators)
-                        .find(|candidate| {
-                            matches!(candidate.kind, FlowGeneratorKind::Collective(stage)
-                                if stage.collective_id == collective.collective_id
-                                    && stage.phase == phase
-                                    && stage.rank == collective.rank
-                                    && stage.step == step)
-                        })
-                        .map(|candidate| candidate.flow)
-                };
-                let previous_rank = if collective.rank == 0 {
-                    collective.group_size - 1
-                } else {
-                    collective.rank - 1
-                };
-                let expected_inbound = if root {
-                    None
-                } else {
-                    let (phase, step) = if collective.step > 1 {
-                        (collective.phase, collective.step - 1)
-                    } else {
-                        (crate::CollectivePhase::ReduceScatter, final_step)
-                    };
-                    image
-                        .host_states
-                        .iter()
-                        .flat_map(|state| &state.generators)
-                        .find(|candidate| {
-                            matches!(candidate.kind, FlowGeneratorKind::Collective(stage)
-                                if stage.collective_id == collective.collective_id
-                                    && stage.phase == phase
-                                    && stage.rank == previous_rank
-                                    && stage.step == step)
-                        })
-                        .map(|candidate| candidate.flow)
-                };
-                if collective.local_predecessor != expected_local
-                    || collective.inbound_predecessor != expected_inbound
-                {
-                    return Err(ValidationError::new(format!(
-                        "flow {:?} collective predecessor identities do not match the declared algorithm recurrence",
-                        flow.id
-                    )));
-                }
-                if root {
-                    if !collective.local_predecessor_complete
-                        || !collective.inbound_predecessor_complete
-                        || collective.inbound_predecessor_bytes != collective.chunk_bytes
-                        || collective.inbound_bytes_received != 0
-                    {
-                        return Err(ValidationError::new(format!(
-                            "flow {:?} collective root prerequisite state is inconsistent",
-                            flow.id
-                        )));
-                    }
-                } else {
-                    let local = expected_local
-                        .and_then(|id| collective_generator(image, id))
-                        .ok_or_else(|| {
-                            ValidationError::new(format!(
-                                "flow {:?} collective local predecessor is missing",
-                                flow.id
-                            ))
-                        })?;
-                    if collective.local_predecessor_complete
-                        != (local.next_emission.status == GeneratorStatus::Finished)
-                    {
-                        return Err(ValidationError::new(format!(
-                            "flow {:?} collective local completion flag disagrees with predecessor state",
-                            flow.id
-                        )));
-                    }
-                    let inbound = expected_inbound
-                        .and_then(|id| {
-                            image
-                                .host_states
-                                .iter()
-                                .flat_map(|state| &state.generators)
-                                .find(|candidate| candidate.flow == id)
-                        })
-                        .and_then(|candidate| match candidate.kind {
-                            FlowGeneratorKind::Collective(stage) => Some((candidate, stage)),
-                            _ => None,
-                        })
-                        .ok_or_else(|| {
-                            ValidationError::new(format!(
-                                "flow {:?} collective inbound predecessor is missing",
-                                flow.id
-                            ))
-                        })?;
-                    if inbound.1.chunk_bytes != collective.inbound_predecessor_bytes
-                        || inbound.1.chunk_offset_bytes != collective.chunk_offset_bytes
-                        || image
-                            .flows
-                            .iter()
-                            .find(|candidate| candidate.id == inbound.0.flow)
-                            .is_none_or(|predecessor_flow| predecessor_flow.target != flow.source)
-                    {
-                        return Err(ValidationError::new(format!(
-                            "flow {:?} collective inbound predecessor does not deliver the declared chunk to its source",
-                            flow.id
-                        )));
-                    }
-                    if collective.inbound_predecessor_complete
-                        != (collective.inbound_bytes_received
-                            == collective.inbound_predecessor_bytes)
-                    {
-                        return Err(ValidationError::new(format!(
-                            "flow {:?} collective inbound completion flag disagrees with received bytes",
-                            flow.id
-                        )));
-                    }
-                    if collective.inbound_predecessor_complete
-                        && inbound.0.next_emission.status != GeneratorStatus::Finished
-                    {
-                        return Err(ValidationError::new(format!(
-                            "flow {:?} collective inbound dependency completed before its predecessor finished",
-                            flow.id
-                        )));
-                    }
-                }
-
-                let remaining = remaining_generator_packets(generator)?;
-                if generator.next_emission.status == GeneratorStatus::Blocked
-                    && (generator.packets_emitted != 0 || generator.bytes_emitted != 0)
-                {
-                    return Err(ValidationError::new(format!(
-                        "flow {:?} collective is dependency-blocked after emitting {} packets and {} bytes",
-                        flow.id, generator.packets_emitted, generator.bytes_emitted
-                    )));
-                }
-                match generator.next_emission.status {
-                    GeneratorStatus::Scheduled
-                        if remaining == 0 || !collective.prerequisites_complete() =>
-                    {
-                        return Err(ValidationError::new(format!(
-                            "flow {:?} has an invalid scheduled collective emission",
-                            flow.id
-                        )));
-                    }
-                    GeneratorStatus::Blocked
-                        if remaining == 0 || collective.prerequisites_complete() =>
-                    {
-                        return Err(ValidationError::new(format!(
-                            "flow {:?} has an invalid blocked collective emission",
-                            flow.id
-                        )));
-                    }
-                    GeneratorStatus::Finished if remaining != 0 => {
-                        return Err(ValidationError::new(format!(
-                            "flow {:?} collective is Finished with {remaining} packets remaining",
-                            flow.id
-                        )));
-                    }
-                    GeneratorStatus::Stopped
-                        if generator.next_emission.departure_time_ns <= image.stop_time_ns =>
-                    {
-                        return Err(ValidationError::new(format!(
-                            "flow {:?} collective is Stopped at {}, which is not beyond stop time {}",
-                            flow.id, generator.next_emission.departure_time_ns, image.stop_time_ns
-                        )));
-                    }
-                    GeneratorStatus::Scheduled
-                    | GeneratorStatus::Blocked
-                    | GeneratorStatus::Finished
-                    | GeneratorStatus::Stopped => {}
-                }
-                if generator.next_emission.status == GeneratorStatus::Scheduled {
-                    let packet = packet(image, generator.next_emission.payload).ok_or_else(|| {
-                        ValidationError::new(format!(
-                            "flow {:?} scheduled collective emission references unknown packet {:?}",
-                            flow.id, generator.next_emission.payload
-                        ))
-                    })?;
-                    let expected_size = collective
-                        .packet_size_bytes
-                        .min(collective.chunk_bytes - generator.bytes_emitted);
-                    if packet.flow != flow.id
-                        || packet.kind != PacketKind::Data
-                        || packet.size_bytes != expected_size
-                    {
-                        return Err(ValidationError::new(format!(
-                            "flow {:?} scheduled collective packet {:?} does not match the next chunk packet",
-                            flow.id, packet.id
-                        )));
-                    }
-                    let matching_events = arrival_counts
-                        .get(&(
-                            owner.id,
-                            packet.id,
-                            generator.next_emission.departure_time_ns,
-                        ))
-                        .copied()
-                        .unwrap_or(0);
-                    if matching_events != 1 {
-                        return Err(ValidationError::new(format!(
-                            "flow {:?} scheduled collective emission has {matching_events} matching PacketArrival events; expected 1",
-                            flow.id
-                        )));
-                    }
-                    validate_scheduled_payload_sequence(
-                        image,
-                        owner,
-                        state,
-                        packet.id,
-                        flow.id,
-                        generator.packets_emitted,
-                    )?;
                 }
                 continue;
             }
@@ -2501,7 +2219,11 @@ struct CollectivePartitionState {
 fn validate_collective_partitions(image: &SimulationImage) -> Result<(), ValidationError> {
     let mut collectives = BTreeMap::<u64, CollectivePartitionState>::new();
     for generator in image.host_states.iter().flat_map(|state| &state.generators) {
-        let FlowGeneratorKind::Collective(stage) = generator.kind else {
+        let Some(crate::CollectiveStage {
+            role: crate::StageRole::Collective(stage),
+            ..
+        }) = generator.stage
+        else {
             continue;
         };
         let group_size = u64::from(stage.group_size);
@@ -2718,6 +2440,237 @@ fn incomplete_tcp_segment_ledger(
     ValidationError::new(format!(
         "flow {flow:?} TCP segment ledger does not cover unacknowledged byte range {highest_ack}..{next_sequence}; expected segment at sequence {expected_sequence}"
     ))
+}
+
+fn stage_generator(
+    image: &SimulationImage,
+    id: crate::FlowId,
+) -> Option<&crate::FlowGeneratorState> {
+    image
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .find(|generator| generator.flow == id)
+}
+
+/// Collective identity of a stage, when the generator carries one.
+fn collective_identity(
+    generator: &crate::FlowGeneratorState,
+) -> Option<crate::CollectiveStageIdentity> {
+    match generator.stage?.role {
+        crate::StageRole::Collective(identity) => Some(identity),
+        crate::StageRole::Compute(_) => None,
+    }
+}
+
+/// Dependency-structure invariants of one dependency-gated stage.
+///
+/// A collective stage's predecessors follow the ring recurrence of its declared algorithm. The
+/// local predecessor is complete exactly when its generator has finished (TCP: all bytes
+/// acknowledged). The inbound byte count equals this host's in-order TCP frontier for the inbound
+/// flow, so the inbound flag is complete exactly when that frontier reaches the chunk.
+fn validate_collective_stage(
+    image: &SimulationImage,
+    state: &crate::HostState,
+    flow: &crate::FlowDescriptor,
+    generator: &crate::FlowGeneratorState,
+    stage: crate::CollectiveStage,
+    positions: &mut BTreeMap<(u64, crate::CollectivePhase, u32, u32), crate::FlowId>,
+) -> Result<(), ValidationError> {
+    let dependencies = stage.dependencies;
+    let crate::StageRole::Collective(collective) = stage.role else {
+        return Err(ValidationError::new(format!(
+            "flow {:?} compute stages are not supported",
+            flow.id
+        )));
+    };
+    let FlowGeneratorKind::Tcp(tcp) = generator.kind else {
+        return Err(ValidationError::new(format!(
+            "flow {:?} collective stage record requires a TCP generator",
+            flow.id
+        )));
+    };
+    let position = (
+        collective.collective_id,
+        collective.phase,
+        collective.rank,
+        collective.step,
+    );
+    if let Some(previous_flow) = positions.insert(position, flow.id) {
+        return Err(ValidationError::new(format!(
+            "flow {:?} has duplicate collective stage position ({}, {:?}, {}, {}), already owned by flow {:?}",
+            flow.id,
+            collective.collective_id,
+            collective.phase,
+            collective.rank,
+            collective.step,
+            previous_flow
+        )));
+    }
+    if collective.chunk_policy != crate::CollectiveChunkPolicy::EqualRemainderLast
+        || collective.channel_policy != crate::CollectiveChannelPolicy::RingNext
+        || collective.algorithm == crate::CollectiveAlgorithm::AllGather
+            && collective.phase != crate::CollectivePhase::AllGather
+    {
+        return Err(ValidationError::new(format!(
+            "flow {:?} collective policy or phase is inconsistent with its algorithm",
+            flow.id
+        )));
+    }
+    if collective.group_size < 2
+        || collective.rank >= collective.group_size
+        || collective.step == 0
+        || collective.step >= collective.group_size
+        || collective.declared_total_bytes == 0
+        || collective.chunk_bytes == 0
+    {
+        return Err(ValidationError::new(format!(
+            "flow {:?} collective dimensions and chunk must be in range",
+            flow.id
+        )));
+    }
+    collective
+        .chunk_offset_bytes
+        .checked_add(collective.chunk_bytes)
+        .ok_or_else(|| {
+            ValidationError::new(format!(
+                "flow {:?} collective chunk endpoint exceeds u64",
+                flow.id
+            ))
+        })?;
+    if tcp.total_bytes != collective.chunk_bytes {
+        return Err(ValidationError::new(format!(
+            "flow {:?} TCP collective stage carries {} bytes for a {}-byte chunk",
+            flow.id, tcp.total_bytes, collective.chunk_bytes
+        )));
+    }
+    if dependencies.inbound_bytes_received > dependencies.inbound_predecessor_bytes {
+        return Err(ValidationError::new(format!(
+            "flow {:?} collective inbound bytes {} exceed required bytes {}",
+            flow.id, dependencies.inbound_bytes_received, dependencies.inbound_predecessor_bytes
+        )));
+    }
+
+    let final_step = collective.group_size - 1;
+    let root = collective.step == 1
+        && (collective.algorithm == crate::CollectiveAlgorithm::AllGather
+            || collective.phase == crate::CollectivePhase::ReduceScatter);
+    let find_stage = |rank: u32| {
+        let (phase, step) = if collective.step > 1 {
+            (collective.phase, collective.step - 1)
+        } else {
+            (crate::CollectivePhase::ReduceScatter, final_step)
+        };
+        image
+            .host_states
+            .iter()
+            .flat_map(|state| &state.generators)
+            .find(|candidate| {
+                collective_identity(candidate).is_some_and(|stage| {
+                    stage.collective_id == collective.collective_id
+                        && stage.phase == phase
+                        && stage.rank == rank
+                        && stage.step == step
+                })
+            })
+            .map(|candidate| candidate.flow)
+    };
+    let previous_rank = if collective.rank == 0 {
+        collective.group_size - 1
+    } else {
+        collective.rank - 1
+    };
+    let (expected_local, expected_inbound) = if root {
+        (None, None)
+    } else {
+        (find_stage(collective.rank), find_stage(previous_rank))
+    };
+    if dependencies.local_predecessor != expected_local
+        || dependencies.inbound_predecessor != expected_inbound
+    {
+        return Err(ValidationError::new(format!(
+            "flow {:?} collective predecessor identities do not match the declared algorithm recurrence",
+            flow.id
+        )));
+    }
+    if root {
+        if !dependencies.local_predecessor_complete
+            || !dependencies.inbound_predecessor_complete
+            || dependencies.inbound_predecessor_bytes != collective.chunk_bytes
+            || dependencies.inbound_bytes_received != 0
+        {
+            return Err(ValidationError::new(format!(
+                "flow {:?} collective root prerequisite state is inconsistent",
+                flow.id
+            )));
+        }
+    } else {
+        let local = expected_local
+            .and_then(|id| stage_generator(image, id))
+            .ok_or_else(|| {
+                ValidationError::new(format!(
+                    "flow {:?} collective local predecessor is missing",
+                    flow.id
+                ))
+            })?;
+        if dependencies.local_predecessor_complete
+            != (local.next_emission.status == GeneratorStatus::Finished)
+        {
+            return Err(ValidationError::new(format!(
+                "flow {:?} collective local completion flag disagrees with predecessor state",
+                flow.id
+            )));
+        }
+        let inbound = expected_inbound
+            .and_then(|id| stage_generator(image, id))
+            .and_then(|candidate| collective_identity(candidate).map(|stage| (candidate, stage)))
+            .ok_or_else(|| {
+                ValidationError::new(format!(
+                    "flow {:?} collective inbound predecessor is missing",
+                    flow.id
+                ))
+            })?;
+        if inbound.1.chunk_bytes != dependencies.inbound_predecessor_bytes
+            || inbound.1.chunk_offset_bytes != collective.chunk_offset_bytes
+            || image
+                .flows
+                .iter()
+                .find(|candidate| candidate.id == inbound.0.flow)
+                .is_none_or(|predecessor_flow| predecessor_flow.target != flow.source)
+        {
+            return Err(ValidationError::new(format!(
+                "flow {:?} collective inbound predecessor does not deliver the declared chunk to its source",
+                flow.id
+            )));
+        }
+        if dependencies.inbound_predecessor_complete
+            != (dependencies.inbound_bytes_received == dependencies.inbound_predecessor_bytes)
+        {
+            return Err(ValidationError::new(format!(
+                "flow {:?} collective inbound completion flag disagrees with received bytes",
+                flow.id
+            )));
+        }
+        let frontier = state
+            .tcp_receivers
+            .iter()
+            .find(|receiver| receiver.flow == inbound.0.flow)
+            .map(|receiver| receiver.next_expected_sequence);
+        if frontier != Some(dependencies.inbound_bytes_received) {
+            return Err(ValidationError::new(format!(
+                "flow {:?} collective inbound bytes {} disagree with the in-order TCP frontier {:?} of flow {:?}",
+                flow.id, dependencies.inbound_bytes_received, frontier, inbound.0.flow
+            )));
+        }
+    }
+    let prerequisites_complete = dependencies.prerequisites_complete();
+    if stage.activated != prerequisites_complete {
+        return Err(ValidationError::new(format!(
+            "flow {:?} collective release flag disagrees with its prerequisites",
+            flow.id
+        )));
+    }
+    Ok(())
 }
 
 /// A TCP stage that its prerequisites have not released yet holds the pristine sender state that
@@ -2991,10 +2944,6 @@ fn validate_packets_and_derive_delays(
     }
     for state in &image.host_states {
         for generator in &state.generators {
-            if matches!(generator.kind, FlowGeneratorKind::Collective(collective) if collective.chunk_bytes == 0)
-            {
-                continue;
-            }
             let flow = flow(image, generator.flow).expect("generator validation established flow");
             let generator_can_emit = matches!(
                 generator.next_emission.status,
@@ -3038,15 +2987,6 @@ fn validate_packets_and_derive_delays(
                     let tail = remaining % rate.packet_size_bytes;
                     let minimum = if remaining == 0 || tail == 0 {
                         rate.packet_size_bytes
-                    } else {
-                        tail
-                    };
-                    (minimum, flow.route.as_slice(), flow.target)
-                }
-                FlowGeneratorKind::Collective(collective) => {
-                    let tail = collective.chunk_bytes % collective.packet_size_bytes;
-                    let minimum = if tail == 0 {
-                        collective.packet_size_bytes
                     } else {
                         tail
                     };
@@ -3702,15 +3642,6 @@ fn maximum_drr_frame_bytes(
                 }
                 if reverse_reaches && (future_data != 0 || tcp.bytes_in_flight != 0) {
                     maximum = maximum.max(tcp.ack_size_bytes);
-                }
-            }
-            FlowGeneratorKind::Collective(collective) => {
-                if forward_reaches && executable_generator_packets(image, generator)? != 0 {
-                    maximum = maximum.max(
-                        collective
-                            .packet_size_bytes
-                            .min(collective.chunk_bytes - generator.bytes_emitted),
-                    );
                 }
             }
             FlowGeneratorKind::Dcqcn(dcqcn) => {
@@ -4807,9 +4738,6 @@ fn validate_global_time_capacity(
             FlowGeneratorKind::Rate(rate) => rate
                 .packet_size_bytes
                 .min(rate.total_bytes - generator.bytes_emitted),
-            FlowGeneratorKind::Collective(collective) => collective
-                .packet_size_bytes
-                .min(collective.chunk_bytes - generator.bytes_emitted),
             FlowGeneratorKind::Dcqcn(dcqcn) => dcqcn
                 .rate
                 .packet_size_bytes
@@ -4898,9 +4826,7 @@ fn validate_global_time_capacity(
                 || generator.next_emission.status == GeneratorStatus::Blocked
                     && matches!(
                         generator.kind,
-                        FlowGeneratorKind::Rate(_)
-                            | FlowGeneratorKind::Collective(_)
-                            | FlowGeneratorKind::Dcqcn(_)
+                        FlowGeneratorKind::Rate(_) | FlowGeneratorKind::Dcqcn(_)
                     )
                 || matches!(
                     generator.kind,
@@ -4930,25 +4856,6 @@ fn validate_global_time_capacity(
             }
             FlowGeneratorKind::Tcp(_) => Ok(image.stop_time_ns),
             FlowGeneratorKind::Rate(_) => latest_rate_pacing_time(image, generator),
-            FlowGeneratorKind::Collective(collective) => {
-                let remaining = executable_generator_packets(image, generator)?;
-                let intervals = remaining.saturating_sub(1);
-                collective
-                    .interval_ns
-                    .checked_mul(intervals)
-                    .and_then(|offset| {
-                        generator
-                            .next_emission
-                            .departure_time_ns
-                            .checked_add(offset)
-                    })
-                    .ok_or_else(|| {
-                        ValidationError::new(format!(
-                            "flow {:?} latest collective departure time exceeds u64",
-                            generator.flow
-                        ))
-                    })
-            }
             FlowGeneratorKind::Dcqcn(_) => {
                 let pacing = if matches!(
                     generator.next_emission.status,
@@ -5397,10 +5304,6 @@ fn future_work(
                 &mut data_by_flow[generator.flow.0 as usize],
                 executable_generator_packets(image, generator)?,
             )?,
-            FlowGeneratorKind::Collective(_) => add_packet_count(
-                &mut data_by_flow[generator.flow.0 as usize],
-                executable_generator_packets(image, generator)?,
-            )?,
             FlowGeneratorKind::Dcqcn(_) => {
                 let count = executable_generator_packets(image, generator)?;
                 let index = generator.flow.0 as usize;
@@ -5610,49 +5513,6 @@ fn validate_counters(image: &SimulationImage, work: &FutureWork) -> Result<(), V
 fn remaining_generator_packets(
     generator: &crate::FlowGeneratorState,
 ) -> Result<u64, ValidationError> {
-    if let FlowGeneratorKind::Collective(collective) = generator.kind {
-        if collective.packet_size_bytes == 0 {
-            return Err(ValidationError::new(format!(
-                "flow {:?} collective packet size must be positive",
-                generator.flow
-            )));
-        }
-        if collective.chunk_bytes == 0 {
-            if collective.algorithm == crate::CollectiveAlgorithm::AllGather
-                && generator.packets_emitted == 0
-                && generator.bytes_emitted == 0
-            {
-                return Ok(0);
-            }
-            return Err(ValidationError::new(format!(
-                "flow {:?} collective zero chunk is not a canonical AllGather no-op",
-                generator.flow
-            )));
-        }
-        if generator.bytes_emitted > collective.chunk_bytes {
-            return Err(ValidationError::new(format!(
-                "flow {:?} collective emitted byte state exceeds chunk bytes {}",
-                generator.flow, collective.chunk_bytes
-            )));
-        }
-        let expected_bytes = u128::from(generator.packets_emitted)
-            .checked_mul(u128::from(collective.packet_size_bytes))
-            .map(|bytes| bytes.min(u128::from(collective.chunk_bytes)))
-            .ok_or_else(|| {
-                ValidationError::new(format!(
-                    "flow {:?} collective byte bookkeeping exceeds u128",
-                    generator.flow
-                ))
-            })?;
-        if u128::from(generator.bytes_emitted) != expected_bytes {
-            return Err(ValidationError::new(format!(
-                "flow {:?} collective records {} emitted bytes, expected {expected_bytes}",
-                generator.flow, generator.bytes_emitted
-            )));
-        }
-        return Ok((collective.chunk_bytes - generator.bytes_emitted)
-            .div_ceil(collective.packet_size_bytes));
-    }
     if let FlowGeneratorKind::Rate(rate) = generator.kind {
         if generator.bytes_emitted > rate.total_bytes {
             return Err(ValidationError::new(format!(
@@ -5792,14 +5652,6 @@ fn executable_generator_packets(
     {
         return executable_dcqcn_packets(image, generator);
     }
-    if matches!(generator.kind, FlowGeneratorKind::Collective(_))
-        && matches!(
-            generator.next_emission.status,
-            GeneratorStatus::Scheduled | GeneratorStatus::Blocked
-        )
-    {
-        return executable_collective_packets(image, generator);
-    }
     match generator.next_emission.status {
         GeneratorStatus::Scheduled => remaining_generator_packets(generator),
         GeneratorStatus::Blocked if matches!(generator.kind, FlowGeneratorKind::Tcp(_)) => {
@@ -5807,164 +5659,6 @@ fn executable_generator_packets(
         }
         GeneratorStatus::Blocked | GeneratorStatus::Finished | GeneratorStatus::Stopped => Ok(0),
     }
-}
-
-fn collective_generator(
-    image: &SimulationImage,
-    id: crate::FlowId,
-) -> Option<&crate::FlowGeneratorState> {
-    image
-        .host_states
-        .iter()
-        .flat_map(|state| &state.generators)
-        .find(|generator| generator.flow == id)
-}
-
-fn collective_generation_completion_time(
-    image: &SimulationImage,
-    generator: &crate::FlowGeneratorState,
-    visiting: &mut BTreeSet<crate::FlowId>,
-) -> Result<Option<u64>, ValidationError> {
-    let FlowGeneratorKind::Collective(collective) = generator.kind else {
-        return Err(ValidationError::new(format!(
-            "flow {:?} collective dependency names a non-collective generator",
-            generator.flow
-        )));
-    };
-    let remaining = remaining_generator_packets(generator)?;
-    if remaining == 0 {
-        return Ok(Some(0));
-    }
-    if !visiting.insert(generator.flow) {
-        return Err(ValidationError::new(format!(
-            "flow {:?} collective dependency graph contains a cycle",
-            generator.flow
-        )));
-    }
-    let first_time = match generator.next_emission.status {
-        GeneratorStatus::Scheduled => Some(generator.next_emission.departure_time_ns),
-        GeneratorStatus::Blocked => {
-            collective_blocked_activation_time(image, collective, visiting)?
-        }
-        GeneratorStatus::Finished | GeneratorStatus::Stopped => None,
-    };
-    visiting.remove(&generator.flow);
-    let Some(first_time) = first_time else {
-        return Ok(None);
-    };
-    let completion = collective
-        .interval_ns
-        .checked_mul(remaining - 1)
-        .and_then(|offset| first_time.checked_add(offset))
-        .ok_or_else(|| {
-            ValidationError::new(format!(
-                "flow {:?} collective completion time exceeds u64",
-                generator.flow
-            ))
-        })?;
-    Ok((completion <= image.stop_time_ns).then_some(completion))
-}
-
-fn collective_blocked_activation_time(
-    image: &SimulationImage,
-    collective: crate::CollectiveGenerator,
-    visiting: &mut BTreeSet<crate::FlowId>,
-) -> Result<Option<u64>, ValidationError> {
-    let mut activation = 0_u64;
-    if !collective.local_predecessor_complete {
-        let predecessor_id = collective.local_predecessor.ok_or_else(|| {
-            ValidationError::new("collective local completion flag is false without a predecessor")
-        })?;
-        let predecessor = collective_generator(image, predecessor_id).ok_or_else(|| {
-            ValidationError::new(format!(
-                "collective local predecessor {predecessor_id:?} has no generator"
-            ))
-        })?;
-        let Some(completion) = collective_generation_completion_time(image, predecessor, visiting)?
-        else {
-            return Ok(None);
-        };
-        activation = activation.max(completion);
-    }
-    if !collective.inbound_predecessor_complete {
-        let predecessor_id = collective.inbound_predecessor.ok_or_else(|| {
-            ValidationError::new(
-                "collective inbound completion flag is false without a predecessor",
-            )
-        })?;
-        let predecessor = collective_generator(image, predecessor_id).ok_or_else(|| {
-            ValidationError::new(format!(
-                "collective inbound predecessor {predecessor_id:?} has no generator"
-            ))
-        })?;
-        let Some(mut completion) =
-            collective_generation_completion_time(image, predecessor, visiting)?
-        else {
-            return Ok(None);
-        };
-        let predecessor_flow = flow(image, predecessor_id).ok_or_else(|| {
-            ValidationError::new(format!(
-                "collective inbound predecessor {predecessor_id:?} has no flow"
-            ))
-        })?;
-        let FlowGeneratorKind::Collective(predecessor_stage) = predecessor.kind else {
-            unreachable!("collective completion rejected a non-collective predecessor")
-        };
-        let tail = predecessor_stage.chunk_bytes % predecessor_stage.packet_size_bytes;
-        let final_size = if tail == 0 {
-            predecessor_stage.packet_size_bytes
-        } else {
-            tail
-        };
-        for link_id in &predecessor_flow.route {
-            let route_link = link(image, *link_id)
-                .expect("flow validation established collective predecessor links");
-            completion = completion
-                .checked_add(route_link.delay_ns(final_size).map_err(|error| {
-                    ValidationError::new(format!(
-                        "flow {predecessor_id:?} collective final-packet delay overflows: {error}"
-                    ))
-                })?)
-                .ok_or_else(|| {
-                    ValidationError::new(format!(
-                        "flow {predecessor_id:?} collective delivery time exceeds u64"
-                    ))
-                })?;
-        }
-        if completion > image.stop_time_ns {
-            return Ok(None);
-        }
-        activation = activation.max(completion);
-    }
-    Ok(Some(activation))
-}
-
-fn executable_collective_packets(
-    image: &SimulationImage,
-    generator: &crate::FlowGeneratorState,
-) -> Result<u64, ValidationError> {
-    let FlowGeneratorKind::Collective(collective) = generator.kind else {
-        unreachable!("collective executable count requires collective state")
-    };
-    let remaining = remaining_generator_packets(generator)?;
-    if remaining == 0 {
-        return Ok(0);
-    }
-    let first_time = match generator.next_emission.status {
-        GeneratorStatus::Scheduled => Some(generator.next_emission.departure_time_ns),
-        GeneratorStatus::Blocked => {
-            collective_blocked_activation_time(image, collective, &mut BTreeSet::new())?
-        }
-        GeneratorStatus::Finished | GeneratorStatus::Stopped => None,
-    };
-    let Some(first_time) = first_time.filter(|time| *time <= image.stop_time_ns) else {
-        return Ok(0);
-    };
-    // The mathematical count can be u64::MAX + 1 for the full [0, u64::MAX]
-    // horizon. Saturation is exact here because `remaining` is itself a u64.
-    let horizon_count =
-        ((image.stop_time_ns - first_time) / collective.interval_ns).saturating_add(1);
-    Ok(remaining.min(horizon_count))
 }
 
 /// Conservative bound on timer installations reachable during the configured run.
@@ -6163,10 +5857,6 @@ fn validate_origin_sequences(
                         })?
                     }
                 }
-                FlowGeneratorKind::Collective(_) => {
-                    let remaining = executable_generator_packets(image, generator)?;
-                    remaining.saturating_sub(1)
-                }
                 FlowGeneratorKind::Dcqcn(dcqcn) => {
                     let pacing_ticks = executable_dcqcn_pacing_ticks(image, generator)?;
                     let pacing_successors = if pacing_ticks == BigUint::from(0_u8) {
@@ -6327,7 +6017,6 @@ fn validate_payload_sequences(
                 FlowGeneratorKind::Constant(_) => executable_generator_packets(image, generator)?,
                 FlowGeneratorKind::Tcp(_) => tcp_attempt_upper_bound(image, flow_index, generator)?,
                 FlowGeneratorKind::Rate(_) => rate_payload_allocations(image, generator)?,
-                FlowGeneratorKind::Collective(_) => executable_generator_packets(image, generator)?,
                 FlowGeneratorKind::Dcqcn(_) => dcqcn_payload_allocations(image, generator)?,
             };
             let already_scheduled = u64::from(

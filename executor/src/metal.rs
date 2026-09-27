@@ -1718,11 +1718,6 @@ impl MetalPlan {
                                 generators[offset + 18] = rate.credit_quanta as u64;
                                 generators[offset + 19] = (rate.credit_quanta >> 64) as u64;
                             }
-                            FlowGeneratorKind::Collective(_) => {
-                                unreachable!(
-                                    "Metal capability validation rejects collective generators"
-                                )
-                            }
                             FlowGeneratorKind::Dcqcn(_) => {
                                 unreachable!("Metal capability validation rejects DCQCN generators")
                             }

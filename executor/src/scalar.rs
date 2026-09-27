@@ -310,26 +310,6 @@ fn collective_progress_record(
     let dependencies = generator.stage_dependencies()?;
     let (identity, packet_size_bytes, interval_ns, stage_kind) =
         match (generator.kind, generator.stage) {
-            (FlowGeneratorKind::Collective(collective), _) => (
-                crate::CollectiveStageIdentity {
-                    collective_id: collective.collective_id,
-                    algorithm: collective.algorithm,
-                    topology_level: collective.topology_level,
-                    topology_group: collective.topology_group,
-                    group_size: collective.group_size,
-                    declared_total_bytes: collective.declared_total_bytes,
-                    rank: collective.rank,
-                    phase: collective.phase,
-                    step: collective.step,
-                    chunk_policy: collective.chunk_policy,
-                    channel_policy: collective.channel_policy,
-                    chunk_offset_bytes: collective.chunk_offset_bytes,
-                    chunk_bytes: collective.chunk_bytes,
-                },
-                collective.packet_size_bytes,
-                collective.interval_ns,
-                crate::CollectiveStageKind::PacketDistribution,
-            ),
             (
                 FlowGeneratorKind::Tcp(tcp),
                 Some(crate::CollectiveStage {
@@ -381,11 +361,9 @@ fn collective_progress_record(
 /// Whether a dependency-blocked stage has just had both prerequisites satisfied.
 fn stage_ready_to_activate(generator: &crate::FlowGeneratorState) -> bool {
     generator.next_emission.status == GeneratorStatus::Blocked
-        && match (generator.kind, generator.stage) {
-            (FlowGeneratorKind::Collective(stage), _) => stage.prerequisites_complete(),
-            (_, Some(stage)) => !stage.activated && stage.dependencies.prerequisites_complete(),
-            _ => false,
-        }
+        && generator
+            .stage
+            .is_some_and(|stage| !stage.activated && stage.dependencies.prerequisites_complete())
 }
 
 /// Marks every stage whose local predecessor is `completed` as locally complete.
@@ -422,8 +400,6 @@ fn complete_local_successors(
 /// How delivery of an inbound predecessor's bytes was observed at this host.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InboundProgress {
-    /// One open-loop data packet of this many bytes arrived.
-    Arrival(u64),
     /// The receiver's in-order TCP frontier advanced by this many bytes. Retransmitted or
     /// out-of-order bytes count only once the frontier covers them.
     InOrderAdvance(u64),
@@ -447,8 +423,7 @@ fn record_inbound_progress(
             continue;
         }
         let before_inbound_bytes = dependencies.inbound_bytes_received;
-        let (InboundProgress::Arrival(arrival_bytes)
-        | InboundProgress::InOrderAdvance(arrival_bytes)) = progress;
+        let InboundProgress::InOrderAdvance(arrival_bytes) = progress;
         causes.push(PendingCollectiveProgress {
             flow: generator.flow,
             cause: crate::CollectiveActivationCause::InboundArrival,
@@ -1257,15 +1232,6 @@ impl<'image> TransitionState<'image> {
         if let PacketKind::TcpData(header) = packet.kind {
             return self.host_tcp_initial_send(node, event, packet, header, children);
         }
-        if self
-            .host_state(node)?
-            .generators
-            .iter()
-            .find(|generator| generator.flow == packet.flow)
-            .is_some_and(|generator| matches!(generator.kind, FlowGeneratorKind::Collective(_)))
-        {
-            return self.host_collective_scheduled_send(node, event, packet, children);
-        }
         self.set_source_time(event.payload, event.key.time_ns)?;
         let (next_packet, next_departure_ns, schedule_ready) = {
             let stop_time_ns = self.image.stop_time_ns;
@@ -1413,151 +1379,6 @@ impl<'image> TransitionState<'image> {
         Ok(())
     }
 
-    fn host_collective_scheduled_send(
-        &mut self,
-        node: NodeDescriptor,
-        event: Event,
-        packet: PacketDescriptor,
-        children: &mut Vec<Event>,
-    ) -> Result<(), ExecutionError> {
-        self.set_source_time(packet.id, event.key.time_ns)?;
-        let stop_time_ns = self.image.stop_time_ns;
-        let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
-        let mut progress_causes = Vec::new();
-        let (next_packet, next_time, schedule_ready) = {
-            let state = self.host_state_mut(node)?;
-            let generator_index = state
-                .generators
-                .iter()
-                .position(|generator| generator.flow == packet.flow)
-                .ok_or(ExecutionError::UnknownGenerator {
-                    node: node.id,
-                    flow: packet.flow,
-                })?;
-            let generator = &mut state.generators[generator_index];
-            let FlowGeneratorKind::Collective(collective) = generator.kind else {
-                return Err(ExecutionError::UnexpectedGeneratorEmission {
-                    node: node.id,
-                    flow: packet.flow,
-                    payload: packet.id,
-                });
-            };
-            if generator.next_emission.status != GeneratorStatus::Scheduled
-                || generator.next_emission.departure_time_ns != event.key.time_ns
-                || generator.next_emission.payload != packet.id
-                || !collective.prerequisites_complete()
-            {
-                return Err(ExecutionError::UnexpectedGeneratorEmission {
-                    node: node.id,
-                    flow: packet.flow,
-                    payload: packet.id,
-                });
-            }
-            generator.packets_emitted = generator
-                .packets_emitted
-                .checked_add(1)
-                .ok_or(ExecutionError::CounterOverflow(node.id))?;
-            generator.bytes_emitted = generator
-                .bytes_emitted
-                .checked_add(packet.size_bytes)
-                .ok_or(ExecutionError::CounterOverflow(node.id))?;
-            let remaining = collective
-                .chunk_bytes
-                .checked_sub(generator.bytes_emitted)
-                .ok_or(ExecutionError::CounterOverflow(node.id))?;
-            let candidate = (remaining != 0)
-                .then(|| {
-                    event
-                        .key
-                        .time_ns
-                        .checked_add(collective.interval_ns)
-                        .ok_or(ExecutionError::GeneratorTimeOverflow(packet.flow))
-                })
-                .transpose()?;
-            let (next_packet, next_time) =
-                if let Some(next_time) = candidate.filter(|time| *time <= stop_time_ns) {
-                    let payload = allocate_payload_id(node.id, node_count, state.next_payload_seq)
-                        .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
-                    state.next_payload_seq = state
-                        .next_payload_seq
-                        .checked_add(1)
-                        .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
-                    generator.next_emission = crate::ScheduledEmission {
-                        status: GeneratorStatus::Scheduled,
-                        departure_time_ns: next_time,
-                        payload,
-                    };
-                    (
-                        Some(PacketDescriptor {
-                            id: payload,
-                            flow: packet.flow,
-                            size_bytes: collective.packet_size_bytes.min(remaining),
-                            ecn_marked: false,
-                            kind: PacketKind::Data,
-                        }),
-                        Some(next_time),
-                    )
-                } else {
-                    generator.next_emission.status = if remaining == 0 {
-                        GeneratorStatus::Finished
-                    } else {
-                        GeneratorStatus::Stopped
-                    };
-                    if let Some(candidate) = candidate {
-                        generator.next_emission.departure_time_ns = candidate;
-                    }
-                    (None, None)
-                };
-            if remaining == 0 {
-                complete_local_successors(&mut state.generators, packet.flow, &mut progress_causes);
-            }
-            state.sourced_packets = state
-                .sourced_packets
-                .checked_add(1)
-                .ok_or(ExecutionError::CounterOverflow(node.id))?;
-            let schedule_ready = state.in_service.is_none() && !state.tx_ready_pending;
-            if schedule_ready {
-                state.tx_ready_pending = true;
-            }
-            (next_packet, next_time, schedule_ready)
-        };
-
-        self.enqueue_source_packet(node, packet.id)?;
-        self.record_sourced(node.id, packet)?;
-        if let Some(next_packet) = next_packet {
-            self.insert_packet(
-                next_packet,
-                Some(next_time.expect("next packet has a time")),
-            )?;
-            self.emit_from_host(
-                node,
-                event,
-                ChildEmission {
-                    target: node.id,
-                    kind: EventKind::PacketArrival,
-                    payload: next_packet.id,
-                    time_ns: next_time.expect("next packet has a time"),
-                },
-                children,
-            )?;
-        }
-        self.activate_ready_collectives(node, event, progress_causes, children)?;
-        if schedule_ready {
-            self.emit_from_host(
-                node,
-                event,
-                ChildEmission {
-                    target: node.id,
-                    kind: EventKind::TxReady,
-                    payload: packet.id,
-                    time_ns: event.key.time_ns,
-                },
-                children,
-            )?;
-        }
-        Ok(())
-    }
-
     fn activate_ready_collectives(
         &mut self,
         node: NodeDescriptor,
@@ -1565,11 +1386,9 @@ impl<'image> TransitionState<'image> {
         mut causes: Vec<PendingCollectiveProgress>,
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
-        let stop_time_ns = self.image.stop_time_ns;
-        let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
         let mut ordinal = 0_u64;
         loop {
-            let wrapped = {
+            let flow = {
                 let state = self.host_state_mut(node)?;
                 let Some(generator) = state
                     .generators
@@ -1578,235 +1397,33 @@ impl<'image> TransitionState<'image> {
                 else {
                     break;
                 };
-                if let Some(stage) = generator.stage.as_mut() {
-                    stage.activated = true;
-                    Some(generator.flow)
-                } else {
-                    None
-                }
+                generator
+                    .stage
+                    .as_mut()
+                    .expect("a ready stage carries its record")
+                    .activated = true;
+                generator.flow
             };
-            if let Some(flow) = wrapped {
-                let Some(cause_index) = causes.iter().position(|cause| cause.flow == flow) else {
-                    return Err(ExecutionError::UnexpectedGeneratorEmission {
-                        node: node.id,
-                        flow,
-                        payload: parent.payload,
-                    });
-                };
-                let cause = causes.remove(cause_index);
-                self.activate_wrapped_stage(node, parent, flow, cause, ordinal, children)?;
-                ordinal = ordinal
-                    .checked_add(1)
-                    .ok_or(ExecutionError::CounterOverflow(node.id))?;
-                continue;
-            }
-            let activation = {
-                let state = self.host_state_mut(node)?;
-                let Some(generator_index) =
-                    state.generators.iter().position(stage_ready_to_activate)
-                else {
-                    break;
-                };
-                let flow = state.generators[generator_index].flow;
-                let Some(cause_index) = causes.iter().position(|cause| cause.flow == flow) else {
-                    return Err(ExecutionError::UnexpectedGeneratorEmission {
-                        node: node.id,
-                        flow,
-                        payload: parent.payload,
-                    });
-                };
-                let cause = causes.remove(cause_index);
-                let FlowGeneratorKind::Collective(collective) =
-                    state.generators[generator_index].kind
-                else {
-                    unreachable!("position selected a collective generator")
-                };
-                let first_payload =
-                    allocate_payload_id(node.id, node_count, state.next_payload_seq)
-                        .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
-                state.next_payload_seq = state
-                    .next_payload_seq
-                    .checked_add(1)
-                    .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
-                let first_size = collective.packet_size_bytes.min(collective.chunk_bytes);
-                let generator = &mut state.generators[generator_index];
-                generator.packets_emitted = generator
-                    .packets_emitted
-                    .checked_add(1)
-                    .ok_or(ExecutionError::CounterOverflow(node.id))?;
-                generator.bytes_emitted = generator
-                    .bytes_emitted
-                    .checked_add(first_size)
-                    .ok_or(ExecutionError::CounterOverflow(node.id))?;
-                let remaining = collective.chunk_bytes - generator.bytes_emitted;
-                let candidate = (remaining != 0)
-                    .then(|| {
-                        parent
-                            .key
-                            .time_ns
-                            .checked_add(collective.interval_ns)
-                            .ok_or(ExecutionError::GeneratorTimeOverflow(flow))
-                    })
-                    .transpose()?;
-                let (next_packet, next_time) = if let Some(next_time) =
-                    candidate.filter(|time| *time <= stop_time_ns)
-                {
-                    let payload = allocate_payload_id(node.id, node_count, state.next_payload_seq)
-                        .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
-                    state.next_payload_seq = state
-                        .next_payload_seq
-                        .checked_add(1)
-                        .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
-                    state.generators[generator_index].next_emission = crate::ScheduledEmission {
-                        status: GeneratorStatus::Scheduled,
-                        departure_time_ns: next_time,
-                        payload,
-                    };
-                    (
-                        Some(PacketDescriptor {
-                            id: payload,
-                            flow,
-                            size_bytes: collective.packet_size_bytes.min(remaining),
-                            ecn_marked: false,
-                            kind: PacketKind::Data,
-                        }),
-                        Some(next_time),
-                    )
-                } else {
-                    state.generators[generator_index].next_emission = crate::ScheduledEmission {
-                        status: if remaining == 0 {
-                            GeneratorStatus::Finished
-                        } else {
-                            GeneratorStatus::Stopped
-                        },
-                        departure_time_ns: candidate.unwrap_or(parent.key.time_ns),
-                        payload: first_payload,
-                    };
-                    (None, None)
-                };
-                if remaining == 0 {
-                    complete_local_successors(&mut state.generators, flow, &mut causes);
-                }
-                state.sourced_packets = state
-                    .sourced_packets
-                    .checked_add(1)
-                    .ok_or(ExecutionError::CounterOverflow(node.id))?;
-                let schedule_ready = state.in_service.is_none() && !state.tx_ready_pending;
-                if schedule_ready {
-                    state.tx_ready_pending = true;
-                }
-                let transition = collective_progress_record(
-                    CollectiveProgressContext {
-                        key: parent.key,
-                        ordinal,
-                        node: node.id,
-                        stop_time_ns,
-                        activated: true,
-                    },
-                    cause,
-                    &state.generators[generator_index],
-                )
-                .expect("collective activation retains its generator kind");
-                ordinal = ordinal
-                    .checked_add(1)
-                    .ok_or(ExecutionError::CounterOverflow(node.id))?;
-                (
-                    PacketDescriptor {
-                        id: first_payload,
-                        flow,
-                        size_bytes: first_size,
-                        ecn_marked: false,
-                        kind: PacketKind::Data,
-                    },
-                    next_packet,
-                    next_time,
-                    schedule_ready,
-                    transition,
-                )
+            let Some(cause_index) = causes.iter().position(|cause| cause.flow == flow) else {
+                return Err(ExecutionError::UnexpectedGeneratorEmission {
+                    node: node.id,
+                    flow,
+                    payload: parent.payload,
+                });
             };
-            let (first_packet, next_packet, next_time, schedule_ready, transition) = activation;
-            if self.observation_mode == ObservationMode::Full {
-                self.mechanism_transitions
-                    .push(crate::MechanismTransitionRecord::Collective(transition));
-            }
-            self.insert_packet(first_packet, Some(parent.key.time_ns))?;
-            self.enqueue_source_packet(node, first_packet.id)?;
-            self.record_sourced(node.id, first_packet)?;
-            if let Some(next_packet) = next_packet {
-                self.insert_packet(
-                    next_packet,
-                    Some(next_time.expect("next packet has a time")),
-                )?;
-                self.emit_from_host(
-                    node,
-                    parent,
-                    ChildEmission {
-                        target: node.id,
-                        kind: EventKind::PacketArrival,
-                        payload: next_packet.id,
-                        time_ns: next_time.expect("next packet has a time"),
-                    },
-                    children,
-                )?;
-            }
-            if schedule_ready {
-                self.emit_from_host(
-                    node,
-                    parent,
-                    ChildEmission {
-                        target: node.id,
-                        kind: EventKind::TxReady,
-                        payload: first_packet.id,
-                        time_ns: parent.key.time_ns,
-                    },
-                    children,
-                )?;
-            }
+            let cause = causes.remove(cause_index);
+            self.activate_wrapped_stage(node, parent, flow, cause, ordinal, children)?;
+            ordinal = ordinal
+                .checked_add(1)
+                .ok_or(ExecutionError::CounterOverflow(node.id))?;
         }
-        if self.observation_mode == ObservationMode::Full {
-            let transitions = {
-                let state = self.host_state(node)?;
-                let mut transitions = Vec::with_capacity(causes.len());
-                for cause in causes {
-                    let generator = state
-                        .generators
-                        .iter()
-                        .find(|generator| generator.flow == cause.flow)
-                        .ok_or(ExecutionError::UnknownGenerator {
-                            node: node.id,
-                            flow: cause.flow,
-                        })?;
-                    transitions.push(
-                        collective_progress_record(
-                            CollectiveProgressContext {
-                                key: parent.key,
-                                ordinal,
-                                node: node.id,
-                                stop_time_ns,
-                                activated: false,
-                            },
-                            cause,
-                            generator,
-                        )
-                        .ok_or(
-                            ExecutionError::UnexpectedGeneratorEmission {
-                                node: node.id,
-                                flow: cause.flow,
-                                payload: parent.payload,
-                            },
-                        )?,
-                    );
-                    ordinal = ordinal
-                        .checked_add(1)
-                        .ok_or(ExecutionError::CounterOverflow(node.id))?;
-                }
-                transitions
-            };
-            self.mechanism_transitions.extend(
-                transitions
-                    .into_iter()
-                    .map(crate::MechanismTransitionRecord::Collective),
-            );
+        // Progress that did not release a stage is recorded after every release of this event,
+        // in canonical cause order.
+        for cause in causes {
+            self.push_stage_progress(node, parent, cause.flow, cause, ordinal, false)?;
+            ordinal = ordinal
+                .checked_add(1)
+                .ok_or(ExecutionError::CounterOverflow(node.id))?;
         }
         Ok(())
     }
@@ -2531,7 +2148,7 @@ impl<'image> TransitionState<'image> {
         } else {
             flow_source
         };
-        let (disposition, feedback_action, collective_progress_causes) = {
+        let (disposition, feedback_action) = {
             let state = self.host_state_mut(node)?;
             let feedback_generator = packet
                 .kind
@@ -2547,7 +2164,6 @@ impl<'image> TransitionState<'image> {
                 (
                     ArrivalDisposition::Feedback,
                     apply_generator_feedback(generator, node.id)?,
-                    Vec::new(),
                 )
             } else {
                 if expected_target != node.id {
@@ -2560,26 +2176,11 @@ impl<'image> TransitionState<'image> {
                     .received_packets
                     .checked_add(1)
                     .ok_or(ExecutionError::CounterOverflow(node.id))?;
-                let mut collective_progress_causes = Vec::new();
-                record_inbound_progress(
-                    &mut state.generators,
-                    packet.flow,
-                    InboundProgress::Arrival(packet.size_bytes),
-                    node.id,
-                    &mut collective_progress_causes,
-                )?;
-                (
-                    ArrivalDisposition::Delivered,
-                    GeneratorFeedbackAction::None,
-                    collective_progress_causes,
-                )
+                (ArrivalDisposition::Delivered, GeneratorFeedbackAction::None)
             }
         };
         self.record_arrival(node.id, packet, event.key, disposition)?;
         self.mark_terminal(event.payload)?;
-        if !collective_progress_causes.is_empty() {
-            self.activate_ready_collectives(node, event, collective_progress_causes, children)?;
-        }
         if let GeneratorFeedbackAction::Emit { flow, size_bytes } = feedback_action {
             self.emit_feedback_driven_packet(node, event, flow, size_bytes, children)?;
         }
@@ -5336,7 +4937,6 @@ fn apply_generator_feedback(
         FlowGeneratorKind::Constant(_) => Ok(GeneratorFeedbackAction::None),
         FlowGeneratorKind::Tcp(_) => Ok(GeneratorFeedbackAction::None),
         FlowGeneratorKind::Rate(_) => Ok(GeneratorFeedbackAction::None),
-        FlowGeneratorKind::Collective(_) => Ok(GeneratorFeedbackAction::None),
         FlowGeneratorKind::Dcqcn(_) => Ok(GeneratorFeedbackAction::None),
     }
 }

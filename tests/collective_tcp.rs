@@ -269,15 +269,14 @@ fn tcp_collectives_are_scalar_cpu_byte_identical_and_complete() {
             )
             .unwrap();
             let header = csv.lines().next().unwrap();
-            if algorithm == "AllGather" && ranks == 2 {
-                // Two-rank AllGather has only root stages, so no prerequisite ever progresses.
-                assert_eq!(csv.lines().count(), 1, "{label}");
-                assert!(!header.contains("stage_kind"), "{header}");
-            } else {
-                assert!(header.ends_with(",stage_kind,duration_ns"), "{header}");
-                assert!(csv.lines().count() > 1, "{label}");
-                assert!(csv.lines().skip(1).all(|row| row.ends_with(",tcp,0")));
-            }
+            assert!(header.ends_with(",stage_kind,duration_ns"), "{header}");
+            // Two-rank AllGather has only root stages, so no prerequisite ever progresses.
+            assert_eq!(
+                csv.lines().count() == 1,
+                algorithm == "AllGather" && ranks == 2,
+                "{label}"
+            );
+            assert!(csv.lines().skip(1).all(|row| row.ends_with(",tcp,0")));
         }
     }
 }
@@ -414,7 +413,7 @@ fn dcqcn_collectives_stay_rejected_at_lowering() {
     fs::remove_file(path).unwrap();
     assert_eq!(
         error.to_string(),
-        "unsupported collective flow type `DCQCN`; collectives support PacketDistribution and TCP, and DCQCN collectives wait for RoCE queue pairs (P15)"
+        "unsupported collective flow type `DCQCN`; collectives require flow_type = \"TCP\" (RoCE queue pairs arrive in P15)"
     );
 }
 
@@ -462,7 +461,7 @@ fn validator_rejects_an_unreleased_tcp_stage_with_sending_state() {
         )
     );
 
-    // Releasing the record without sending leaves an ordinary Blocked TCP sender with no timer.
+    // A release flag set before both prerequisites complete is itself inconsistent.
     let mut released = image.clone();
     released.host_states[slot].generators[index]
         .stage
@@ -473,6 +472,6 @@ fn validator_rejects_an_unreleased_tcp_stage_with_sending_state() {
         validate(&released, Backend::Scalar)
             .unwrap_err()
             .to_string(),
-        format!("flow {flow:?} TCP generator is Blocked without an active retransmission timer")
+        format!("flow {flow:?} collective release flag disagrees with its prerequisites")
     );
 }

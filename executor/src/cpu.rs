@@ -3455,7 +3455,6 @@ fn route_offered_load(image: &SimulationImage) -> Vec<u128> {
                 image.stop_time_ns.max(1).div_ceil(packets)
             }
             FlowGeneratorKind::Rate(rate) => rate.pacing_interval_ns,
-            FlowGeneratorKind::Collective(collective) => collective.interval_ns,
             FlowGeneratorKind::Dcqcn(dcqcn) => dcqcn.rate.pacing_interval_ns,
         };
         let Ok(flow_slot) = usize::try_from(generator.flow.0) else {
