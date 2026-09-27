@@ -1,4 +1,11 @@
 {
+  "pages": [
+    "index",
+    "days",
+    "days-legacy",
+    "leanguard-run",
+    "leanguard-testgen"
+  ],
   "index": "Overview",
   "days": "days",
   "days-legacy": "days-legacy",

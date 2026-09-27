@@ -1,4 +1,5 @@
 {
+  "pages": ["index", "leanguard", "design"],
   "index": "Overview",
   "leanguard": "LeanGuard (Use Guide)",
   "design": "LeanGuard (Design)"
