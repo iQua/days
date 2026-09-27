@@ -145,12 +145,16 @@ pub struct CollectiveProgressRecord {
     pub cause: CollectiveActivationCause,
     pub cause_flow: FlowId,
     pub arrival_bytes: u64,
+    /// Collective identity; the compute-group identity for a compute stage.
     pub collective_id: u64,
-    pub algorithm: CollectiveAlgorithm,
+    /// `None` for a compute stage.
+    pub algorithm: Option<CollectiveAlgorithm>,
     pub group_size: u32,
     pub declared_total_bytes: u64,
     pub rank: u32,
-    pub phase: CollectivePhase,
+    /// `None` for a compute stage.
+    pub phase: Option<CollectivePhase>,
+    /// One-based collective step; zero for a compute stage.
     pub step: u32,
     pub chunk_offset_bytes: u64,
     pub chunk_bytes: u64,
@@ -254,11 +258,11 @@ pub fn collective_transitions_csv(
             record.cause_flow.0,
             record.arrival_bytes,
             record.collective_id,
-            collective_algorithm(record.algorithm),
+            record.algorithm.map_or("", collective_algorithm),
             record.group_size,
             record.declared_total_bytes,
             record.rank,
-            collective_phase(record.phase),
+            record.phase.map_or("", collective_phase),
             record.step,
             record.chunk_offset_bytes,
             record.chunk_bytes,

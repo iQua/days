@@ -308,18 +308,8 @@ fn collective_progress_record(
     generator: &crate::FlowGeneratorState,
 ) -> Option<crate::CollectiveProgressRecord> {
     let dependencies = generator.stage_dependencies()?;
-    let (identity, packet_size_bytes, interval_ns, stage_kind) =
-        match (generator.kind, generator.stage) {
-            (
-                FlowGeneratorKind::Tcp(tcp),
-                Some(crate::CollectiveStage {
-                    role: crate::StageRole::Collective(identity),
-                    ..
-                }),
-            ) => (identity, tcp.mss_bytes, 0, crate::CollectiveStageKind::Tcp),
-            _ => return None,
-        };
-    Some(crate::CollectiveProgressRecord {
+    let stage = generator.stage?;
+    let record = crate::CollectiveProgressRecord {
         key: context.key,
         ordinal: context.ordinal,
         node: context.node,
@@ -327,17 +317,17 @@ fn collective_progress_record(
         cause: cause.cause,
         cause_flow: cause.cause_flow,
         arrival_bytes: cause.arrival_bytes,
-        collective_id: identity.collective_id,
-        algorithm: identity.algorithm,
-        group_size: identity.group_size,
-        declared_total_bytes: identity.declared_total_bytes,
-        rank: identity.rank,
-        phase: identity.phase,
-        step: identity.step,
-        chunk_offset_bytes: identity.chunk_offset_bytes,
-        chunk_bytes: identity.chunk_bytes,
-        packet_size_bytes,
-        interval_ns,
+        collective_id: 0,
+        algorithm: None,
+        group_size: 0,
+        declared_total_bytes: 0,
+        rank: 0,
+        phase: None,
+        step: 0,
+        chunk_offset_bytes: 0,
+        chunk_bytes: 0,
+        packet_size_bytes: 0,
+        interval_ns: 0,
         stop_time_ns: context.stop_time_ns,
         local_predecessor: dependencies.local_predecessor,
         inbound_predecessor: dependencies.inbound_predecessor,
@@ -353,9 +343,37 @@ fn collective_progress_record(
         after_bytes_emitted: generator.bytes_emitted,
         after_status: generator.next_emission.status,
         after_next_time_ns: generator.next_emission.departure_time_ns,
-        stage_kind,
+        stage_kind: crate::CollectiveStageKind::Tcp,
         duration_ns: 0,
-    })
+    };
+    match (generator.kind, stage.role) {
+        (FlowGeneratorKind::Tcp(tcp), crate::StageRole::Collective(identity)) => {
+            Some(crate::CollectiveProgressRecord {
+                collective_id: identity.collective_id,
+                algorithm: Some(identity.algorithm),
+                group_size: identity.group_size,
+                declared_total_bytes: identity.declared_total_bytes,
+                rank: identity.rank,
+                phase: Some(identity.phase),
+                step: identity.step,
+                chunk_offset_bytes: identity.chunk_offset_bytes,
+                chunk_bytes: identity.chunk_bytes,
+                packet_size_bytes: tcp.mss_bytes,
+                ..record
+            })
+        }
+        (FlowGeneratorKind::Constant(_), crate::StageRole::Compute(compute)) => {
+            Some(crate::CollectiveProgressRecord {
+                collective_id: compute.compute_id,
+                group_size: compute.group_size,
+                rank: compute.rank,
+                stage_kind: crate::CollectiveStageKind::Compute,
+                duration_ns: compute.duration_ns,
+                ..record
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Whether a dependency-blocked stage has just had both prerequisites satisfied.
@@ -1441,16 +1459,35 @@ impl<'image> TransitionState<'image> {
         ordinal: u64,
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
-        let kind = self
+        let (kind, compute_duration) = self
             .host_state(node)?
             .generators
             .iter()
             .find(|generator| generator.flow == flow)
+            .map(|generator| {
+                (
+                    generator.kind,
+                    generator.stage.and_then(|stage| match stage.role {
+                        crate::StageRole::Compute(compute) => Some(compute.duration_ns),
+                        crate::StageRole::Collective(_) => None,
+                    }),
+                )
+            })
             .ok_or(ExecutionError::UnknownGenerator {
                 node: node.id,
                 flow,
-            })?
-            .kind;
+            })?;
+        if let (FlowGeneratorKind::Constant(_), Some(duration_ns)) = (kind, compute_duration) {
+            return self.start_compute_stage(
+                node,
+                parent,
+                flow,
+                duration_ns,
+                cause,
+                ordinal,
+                children,
+            );
+        }
         let FlowGeneratorKind::Tcp(_) = kind else {
             return Err(ExecutionError::UnexpectedGeneratorEmission {
                 node: node.id,
@@ -1461,6 +1498,126 @@ impl<'image> TransitionState<'image> {
         let plan = self.prepare_tcp_attempts(node, flow, parent.key.time_ns, None, true, false)?;
         self.push_stage_progress(node, parent, flow, cause, ordinal, true)?;
         self.install_tcp_attempts(node, parent, plan, children)
+    }
+
+    /// Starts a released compute interval: a source-local timer fires `duration_ns` later.
+    ///
+    /// The zero-byte token only names the timer event; it is never enqueued or transmitted. A
+    /// deadline beyond the stop time leaves the stage `Stopped` without an event.
+    #[allow(clippy::too_many_arguments)]
+    fn start_compute_stage(
+        &mut self,
+        node: NodeDescriptor,
+        parent: Event,
+        flow: FlowId,
+        duration_ns: u64,
+        cause: PendingCollectiveProgress,
+        ordinal: u64,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
+        let stop_time_ns = self.image.stop_time_ns;
+        let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
+        let deadline_ns = parent
+            .key
+            .time_ns
+            .checked_add(duration_ns)
+            .ok_or(ExecutionError::GeneratorTimeOverflow(flow))?;
+        let token = {
+            let state = self.host_state_mut(node)?;
+            let payload = if deadline_ns <= stop_time_ns {
+                let payload = allocate_payload_id(node.id, node_count, state.next_payload_seq)
+                    .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
+                state.next_payload_seq = state
+                    .next_payload_seq
+                    .checked_add(1)
+                    .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
+                Some(payload)
+            } else {
+                None
+            };
+            let generator = state
+                .generators
+                .iter_mut()
+                .find(|generator| generator.flow == flow)
+                .ok_or(ExecutionError::UnknownGenerator {
+                    node: node.id,
+                    flow,
+                })?;
+            generator.next_emission = crate::ScheduledEmission {
+                status: if payload.is_some() {
+                    GeneratorStatus::Scheduled
+                } else {
+                    GeneratorStatus::Stopped
+                },
+                departure_time_ns: deadline_ns,
+                payload: payload.unwrap_or(PayloadId(0)),
+            };
+            payload
+        };
+        self.push_stage_progress(node, parent, flow, cause, ordinal, true)?;
+        if let Some(payload) = token {
+            self.insert_packet(
+                PacketDescriptor {
+                    id: payload,
+                    flow,
+                    size_bytes: 0,
+                    ecn_marked: false,
+                    kind: PacketKind::Data,
+                },
+                Some(parent.key.time_ns),
+            )?;
+            self.emit_from_host(
+                node,
+                parent,
+                ChildEmission {
+                    target: node.id,
+                    kind: EventKind::PacingTimer,
+                    payload,
+                    time_ns: deadline_ns,
+                },
+                children,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// A compute interval ends: the stage finishes and releases its local successors.
+    fn host_compute_timer(
+        &mut self,
+        node: NodeDescriptor,
+        event: Event,
+        flow: FlowId,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
+        let mut causes = Vec::new();
+        {
+            let state = self.host_state_mut(node)?;
+            let generator = state
+                .generators
+                .iter_mut()
+                .find(|generator| generator.flow == flow)
+                .ok_or(ExecutionError::UnknownGenerator {
+                    node: node.id,
+                    flow,
+                })?;
+            if generator.next_emission.status != GeneratorStatus::Scheduled
+                || generator.next_emission.payload != event.payload
+                || generator.next_emission.departure_time_ns != event.key.time_ns
+            {
+                return Err(ExecutionError::UnexpectedGeneratorEmission {
+                    node: node.id,
+                    flow,
+                    payload: event.payload,
+                });
+            }
+            generator.next_emission.status = GeneratorStatus::Finished;
+            complete_local_successors(&mut state.generators, flow, &mut causes);
+        }
+        self.mark_terminal(event.payload)?;
+        if !causes.is_empty() {
+            self.activate_ready_collectives(node, event, causes, children)?;
+        }
+        Ok(())
     }
 
     /// Records one prerequisite transition of a wrapped stage under full observation.
@@ -2685,6 +2842,14 @@ impl<'image> TransitionState<'image> {
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
         let packet = self.packet(event.payload)?;
+        if self.host_state(node)?.generators.iter().any(|generator| {
+            generator.flow == packet.flow
+                && generator
+                    .stage
+                    .is_some_and(|stage| matches!(stage.role, crate::StageRole::Compute(_)))
+        }) {
+            return self.host_compute_timer(node, event, packet.flow, children);
+        }
         if packet.kind == PacketKind::DcqcnControlTimer {
             return self.host_dcqcn_control_timer(node, event, packet, children);
         }
