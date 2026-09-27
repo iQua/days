@@ -1,4 +1,11 @@
 {
+  "pages": [
+    "paper-summary",
+    "design",
+    "instantiations",
+    "dcqcn-certificates",
+    "test-generation"
+  ],
   "index": "Overview",
   "paper-summary": "Paper summary",
   "design": "Trace-certificate checking (design)",
