@@ -931,9 +931,13 @@ fn e5_exact_capped_metal_plans_match_the_frozen_classes() {
             + report.event_arenas.generator_stream_event_slots as u128 * 4
             + remote_staging_words / 12 * 2)
             * 8;
+        // P14 Lane B T4 appended one params word addressing the PFC region (`u64::MAX` here: E5
+        // carries no PFC state and plans no PFC words). No other plane moved.
+        let p14_pfc_params_bytes = 8;
         let expected_bytes = pre_o212_bytes
             .checked_sub(compact_reduction_bytes)
-            .expect("compact planes must fit the prior frozen plan");
+            .expect("compact planes must fit the prior frozen plan")
+            + p14_pfc_params_bytes;
         println!(
             "E5 exact capped Metal plan {fixture}: bytes={derived_total} gib={:.9} \
              channel_slots={} service_slots={} generator_slots={} remote_staging_words={} \
