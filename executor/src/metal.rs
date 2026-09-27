@@ -4980,10 +4980,11 @@ impl DirectMetal {
         let Ok(pipelines) = <[MetalPipeline; MetalKernel::ALL.len()]>::try_from(pipelines) else {
             unreachable!("one pipeline is created per kernel");
         };
-        let scatter_width = pipelines[MetalKernel::ExchangeScatter as usize].threadExecutionWidth();
-        if scatter_width < SCATTER_COPY_LANES {
+        let exchange_scatter_pipeline = &pipelines[MetalKernel::ExchangeScatter as usize];
+        if exchange_scatter_pipeline.threadExecutionWidth() < SCATTER_COPY_LANES {
             return Err(MetalError::Unavailable(format!(
-                "exchange-scatter pipeline has SIMD width {scatter_width}, but paired record copies require {SCATTER_COPY_LANES} lanes"
+                "exchange-scatter pipeline has SIMD width {}, but paired record copies require {SCATTER_COPY_LANES} lanes",
+                exchange_scatter_pipeline.threadExecutionWidth()
             )));
         }
         let pipeline_creation_ns = duration_ns(pipeline_started.elapsed());
