@@ -1,74 +1,48 @@
 ---
 title: Installation
-description: Build the legacy runtime and the exact Scalar, CPU, Metal, and CUDA surfaces.
+description: Build the Days AGO days CLI with the Scalar, CPU, Metal, and CUDA engines.
 ---
 
-Days is a Rust workspace. Use the current stable Rust toolchain and run commands
-from the repository root.
+Days is a Rust workspace. Use the current stable Rust toolchain and run commands from the repository root.
 
-## Legacy Nexosim CLI
+## Scalar and CPU
 
-Build the config-driven `days` binary:
-
-```bash
-cargo build -p days-legacy
-```
-
-Run the small checked-in fixture:
+The root `days` package compiles TOML into an integer-nanosecond `SimulationImage` and provides the `days` CLI; the `days-executor` package runs the image. The Scalar and CPU engines need no extra features:
 
 ```bash
-RUST_LOG=info cargo run -p days-legacy --bin days -- configs/simple.toml
+cargo build --release --bin days
 ```
-
-Legacy protocol features are opt-in:
-
-```bash
-cargo build -p days-legacy --features l2,l2_pfc
-cargo build -p days-legacy --features dcqcn,l2_pfc,lean
-```
-
-`l2_pfc` enables the legacy PFC pipeline, `dcqcn` enables legacy DCQCN models,
-and `lean` enables legacy protocol-certificate CSVs.
-
-## Exact Scalar and CPU executor
-
-The root `days` package compiles TOML into an exact integer-nanosecond
-`SimulationImage`; `days-executor` runs that image:
-
-```bash
-cargo build -p days -p days-executor
-```
-
-The checked-in root examples expose global Scalar and safe-horizon Scalar/CPU
-execution. See the [quickstart](/docs/quickstart).
 
 ## Metal
 
-On Apple platforms, enable the production Metal backend on the root package:
+On Apple platforms, the `metal` feature enables the Metal backend:
 
 ```bash
-cargo build -p days --features metal-spike --bin t20f_frontier
+cargo build --release --features metal --bin days
 ```
-
-The feature name is historical; it enables the current Metal executor.
 
 ## CUDA
 
-Enable the CUDA backend on a host with a compatible NVIDIA driver and CUDA
-toolkit. `nvcc` must be on `PATH` (or selected with `NVCC`):
+The `cuda` feature enables the CUDA backend. It needs a compatible NVIDIA driver and a CUDA 13 toolkit whose `nvcc` can compile `sm_89` and `sm_121`. `nvcc` must be on `PATH`, or named by the `NVCC` environment variable:
 
 ```bash
-cargo build -p days --features cuda --bin t20f_frontier
+cargo build --release --features cuda --bin days
 ```
 
-The host-only planner equality surface does not initialize a GPU:
+Without `nvcc`, a `cuda` build fails in the executor's build script with a message that names the missing compiler.
 
-```bash
-cargo test -p days --features cuda-planner-test \
-  --test t20e_planner_bit_equal -- --show-output
-```
+## Feature flags
 
-Metal and CUDA are exact executor backends, not features of the legacy `days`
-CLI. Images containing an unsupported device mechanism are rejected before
-execution; see
-[executor capabilities](/docs/internals#backend-capability-validation).
+| Feature | Enables |
+| --- | --- |
+| `metal` | the Metal backend (Apple only) |
+| `cuda` | the CUDA backend (requires a CUDA 13 `nvcc`) |
+| `cuda-planner-test` | the host-only CUDA planner equality test; enables `test`, builds without `nvcc`, and compiles no CUDA kernels |
+| `test` | test-only helpers, including the executor's planner test hooks |
+| `metal-test-hooks`, `cuda-test-hooks` | device conformance hooks for the device test surfaces |
+
+Images containing a mechanism a device backend does not implement are rejected before execution; see [backend capability validation](/docs/internals#backend-capability-validation).
+
+## Legacy Days
+
+The frozen legacy simulator builds as its own package, `days-legacy`, with its own feature flags. See [Legacy Days](/docs/legacy).

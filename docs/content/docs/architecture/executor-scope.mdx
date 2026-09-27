@@ -1,9 +1,9 @@
 ---
-title: Exact Executor
+title: Days AGO Executor
 description: Implemented model coverage, safe-horizon execution, and backend capabilities.
 ---
 
-The exact executor is implemented alongside the legacy Nexosim engine. `src/scenario/compile.rs` lowers supported TOML scenarios into `SimulationImage`; callers then select scalar, CPU, Metal, or CUDA explicitly.
+**Scope: Days AGO.** `src/scenario/compile.rs` lowers supported TOML scenarios into `SimulationImage`; callers then select Scalar, CPU, Metal, or CUDA explicitly, for example with `days --engine`.
 
 ## Compiled model
 
@@ -61,7 +61,7 @@ Capacity overflow is refuse-or-run: a failed attempt emits no partial result. Th
 
 Metal and CUDA plan readback after execution. They copy fixed planes directly. For variable striped arenas, they read metadata and run a gather kernel that copies live records in canonical entity and ring order. Invalid metadata returns an error, and compact readback decodes to the same bytes as full-capacity readback.
 
-The shipped `configs/benchmarks/p11/rq9_frontier_closed_k32.toml` fixture defines 32 groups of 8,192 resident flows, or 262,144 flows. `src/bin/t20f_frontier.rs` runs and fingerprints the frontier result for scalar and available device backends. The CUDA build contains device images for `sm_89` and `sm_121`.
+The `configs/benchmarks/lookahead/rq9_frontier_closed_k32.toml` fixture defines 32 groups of 8,192 resident flows, or 262,144 flows. The [`days` CLI](/docs/reference/cli/days) runs it on any engine and fingerprints the complete result of a device run. The CUDA build contains device images for `sm_89` and `sm_121`.
 
 ## Rejection boundaries
 

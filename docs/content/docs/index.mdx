@@ -1,29 +1,21 @@
 ---
 title: Days
-description: Discrete-event network simulation in Rust — a process-based legacy engine and an exact multi-backend executor.
+description: Days AGO, an exact safe-horizon network simulator whose Scalar, CPU, Metal, and CUDA backends produce byte-identical complete state.
 icon: Network
 ---
 
-Days is a discrete-event network simulator written in Rust. The repository
-ships **two engines** that share a lineage but make different guarantees:
+Days simulates packet networks exactly and in parallel. Its executor, **Days AGO** (Adaptive Guaranteed Ordering), compiles a TOML scenario into a `SimulationImage`, splits the network into logical processes (LPs), and advances them concurrently in rounds bounded by a safe horizon. Lean proofs in `lean/DaysExecutor/` show that round execution reaches the same result as serial execution in canonical event order.
 
-- **Days AGO (Adaptive Guaranteed Ordering), the exact engine.** A scenario
-  is compiled into a
-  `SimulationImage` — logical-process (LP) state plus canonical events — and
-  executed on any of four backends: a serial **Scalar** reference, a
-  multicore **CPU** pool, **Apple Metal**, or **NVIDIA CUDA**. Execution is
-  *exact*: simultaneous events have one canonical order, no float appears in
-  the semantics, and every backend reproduces the byte-identical complete
-  state of the serial reference. Protocols are written once, as sequential
-  per-entity state machines; the scalar and CPU backends execute that one
-  compiled implementation, and the Metal and CUDA transition planes are
-  ports of it, held byte-identical by the conformance matrix.
-- **Legacy Days, the process-based engine.** The original actor
-  implementation on Nexosim: each network element is a coroutine with
-  private state, communicating by message passing, on a single- or
-  multi-threaded runtime. It remains fully supported for CPU-only
-  simulation and is the reference point the exact engine is measured
-  against.
+Four backends run the same image:
+
+| Backend | Where it runs |
+| --- | --- |
+| Scalar | one CPU thread; the reference oracle |
+| CPU | a multicore worker pool |
+| Metal | Apple GPUs |
+| CUDA | NVIDIA GPUs (built for `sm_89` and `sm_121`) |
+
+Every backend that accepts a scenario produces byte-identical complete state. A backend that cannot run a mechanism rejects the scenario at validation with a message naming the backend; it never falls back silently.
 
 <Cards>
   <Card title="Install" href="/docs/install" />
@@ -31,61 +23,43 @@ ships **two engines** that share a lineage but make different guarantees:
   <Card title="Examples" href="/docs/examples" />
   <Card title="Configuration" href="/docs/configuration/overview" />
   <Card title="Architecture" href="/docs/architecture/overview" />
-  <Card title="Verification & Research" href="/docs/research" />
+  <Card title="days CLI" href="/docs/reference/cli/days" />
 </Cards>
 
-## What the exact engine guarantees
+## What Days AGO models
 
-- **Byte-identity across backends.** The shipped corpus gate compares the
-  CPU pool and every compiled device backend against the global Scalar
-  reference: with device-omitted diagnostics excluded, the remaining
-  complete result must be byte-for-byte identical, on every fixture in the
-  corpus.
-- **Scale with refuse-or-run capacity.** The device planner derives every
-  arena capacity from the image before execution; a plan either fits or the
-  attempt aborts with a typed fault — nothing is dropped silently. Compact
-  readback returns only live regions, and an opt-in warm start reuses a
-  prior run's converged sizing (sizing only; it cannot change an answer).
-  The largest committed fixture runs 262,144 closed-loop TCP flows;
-  campaign evidence records its complete state byte-identical across the
-  two CUDA architectures the project measures on.
-- **Capability honesty.** Metal and CUDA accept all five exact schedulers,
-  TailDrop and ECN-threshold marking, and TCP Reno/CUBIC; they reject RED,
-  PFC, DCQCN/CNP, and collective generators *before* execution with a
-  precise, tested error. Unsupported never means silently different.
+- **Topologies:** fat-tree, torus, dragonfly, and custom graphs.
+- **Transport:** deterministic packet-distribution sources, closed-loop TCP Reno and CUBIC, and DCQCN with CNP.
+- **Switches:** FIFO, strict-priority, DRR, WRR, and exact-rational WFQ scheduling; TailDrop, ECN-threshold, RED, and RED-with-ECN admission; PFC.
+- **Collectives:** ring all-reduce and all-gather.
 
-## What both engines offer
+DCQCN, PFC, RED, and collectives run on the Scalar and CPU backends. Metal and CUDA reject those scenarios at validation.
 
-- **Config-driven experiments**: one TOML file describes topology, traffic,
-  switch discipline, and logging.
-- **Pluggable queueing/scheduling**: FIFO, DRR, WRR, WFQ, Static Priority
-  (plus Virtual Clock in the legacy engine).
-- **Transport and congestion control**: packet-distribution sources, TCP
-  Reno/CUBIC (legacy additionally BBR), optional DCQCN, and feature-gated
-  PFC in the legacy engine.
-- **Structured outputs with `csv_logging`**: CSV reports default on; setting
-  `csv_logging = false` performs no CSV, trace, or manifest filesystem work
-  while preserving every correctness reduction — the configuration of choice
-  for benchmarking.
+## What makes it exact
+
+- **Integer time and canonical order.** Events carry integer-nanosecond time and a canonical key `(time_ns, phase, origin_node, origin_seq)`; no floating point appears in simulation semantics.
+- **Byte identity across backends.** The CPU pool and each compiled device backend must reproduce the Scalar oracle's complete result byte for byte. Device backends omit only diagnostic-only observation planes, which the comparison excludes.
+- **Refuse-or-run device capacity.** The device planner derives every arena capacity from the image before execution. An attempt that runs out of capacity is discarded and retried with larger floors; nothing is dropped silently. The largest committed fixture, `configs/benchmarks/lookahead/rq9_frontier_closed_k32.toml`, has 262,144 closed-loop TCP flows.
 
 ## Quick start
 
-Legacy engine, from the repo root:
+From the repository root, run the Scalar oracle on the smoke fixture. The last line it prints, `record=days_result`, fingerprints the complete result. Every other engine that accepts the scenario must print the same fingerprint; the [TCP corpus gate](/docs/testing#tcp-corpus-byte-identity) checks this fixture on each available backend.
 
 ```bash
-RUST_LOG=info cargo run --release -p days-legacy --bin days -- configs/simple.toml
+cargo run --release --bin days -- --engine scalar \
+  configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml
 ```
 
-For the exact engine's build, fixtures, and backend selection, start at
-[/docs/quickstart](/docs/quickstart); the CLI reference covers the
-production runners.
+The [quickstart](/docs/quickstart) covers the CPU, Metal, and CUDA engines.
+
+## Legacy Days
+
+The original actor-model simulator on the Nexosim runtime is frozen in `legacy/` as the `days-legacy` crate and still runs. It is documented in its own section: [Legacy Days](/docs/legacy).
 
 ## Where to go next
 
-- Run simulations on either engine: [/docs/quickstart](/docs/quickstart)
-- Configuration reference, including `csv_logging`:
-  [/docs/configuration/overview](/docs/configuration/overview)
-- The execution model and backends:
-  [/docs/architecture/overview](/docs/architecture/overview)
-- Proofs, certificates, and the research story:
-  [/docs/research](/docs/research)
+- Run simulations: [Quickstart](/docs/quickstart) and [Examples](/docs/examples)
+- Every `days` option and output record: [`days` CLI](/docs/reference/cli/days)
+- The scenario format: [Configuration](/docs/configuration/overview)
+- The execution model and backends: [Architecture](/docs/architecture/overview)
+- Proofs and trace certificates: [Verification and research](/docs/research)

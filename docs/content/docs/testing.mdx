@@ -1,10 +1,9 @@
 ---
 title: Testing
-description: Default, exactness, planner, and fixture test commands.
+description: The default test matrix, planner equality, and the byte-identity and fixture gates.
 ---
 
-Tests live under `executor/tests/`, `tests/`, `legacy/tests/`, and
-`validation/tests/`.
+**Scope: Days AGO**, plus the legacy and cross-engine packages in the default matrix. Tests live under `executor/tests/`, `tests/`, `legacy/tests/`, and `validation/tests/`.
 
 ## Default workspace matrix
 
@@ -15,60 +14,60 @@ cargo test -p days-legacy --features test -- --show-output
 cargo test -p days-validation --features test -- --show-output
 ```
 
-If `cargo-nextest` is installed, the same package surface can be selected with
-`cargo nextest run`; do not use `--all-features` on a machine that cannot build
-both device toolchains.
+If `cargo-nextest` is installed, the same package surface can be selected with `cargo nextest run`. Do not use `--all-features` on a machine that cannot build both device toolchains.
+
+`cargo xtask audit` runs two structural checks: only `days-validation` may depend on `days-legacy`, as a test-only dev-dependency; and every backend feature gate in `executor/src` must match a registered predicate and occurrence count.
 
 ## Planner equality
 
+The planner equality test compares the device planners' precomputed plans with the retained earlier planner. It builds plans on the host and needs `test` plus one device feature:
+
 ```bash
 # Apple Metal
-cargo test -p days --features test,metal-spike \
-  --test t20e_planner_bit_equal -- --show-output
+cargo test -p days --features test,metal \
+  --test planner_bit_equal -- --show-output
 
-# Host-only CUDA planner; no GPU execution
-cargo test -p days --features cuda-planner-test \
-  --test t20e_planner_bit_equal -- --show-output
+# CUDA (the build needs a CUDA 13 nvcc)
+cargo test -p days --features test,cuda \
+  --test planner_bit_equal -- --show-output
 ```
 
-## T24 byte-identity campaign
+On a host without `nvcc`, the `cuda-planner-test` feature runs the same test for the CUDA planner. It enables `test`, and the executor's build script writes an empty placeholder instead of compiling CUDA kernels, so the test only builds plans on the host:
 
-The explicit ignored test lowers the committed TCP corpus and compares CPU and
-each compiled device backend with the global Scalar oracle:
+```bash
+cargo test -p days --features cuda-planner-test --test planner_bit_equal
+```
+
+Adding `cuda-test-hooks` to that build compiles the kernels again, so it needs `nvcc`.
+
+## TCP corpus byte identity
+
+This ignored test lowers the committed TCP corpus and compares the CPU engine and each compiled device backend with the Scalar oracle:
 
 ```bash
 cargo test --release -p days-validation --features test \
-  --test t24_tcp_corpora \
+  --test tcp_corpora \
   full_tcp_corpora_are_byte_identical_across_available_backends \
   -- --ignored --exact --show-output
 ```
 
-Add `metal-spike` on Apple or `cuda` on a CUDA host to include that device. The
-comparison removes device-omitted diagnostic planes, then requires the complete
-remaining `RunResult` to be byte-identical.
+Add `metal` on Apple or `cuda` on a CUDA host to include that device, for example `--features test,metal`. The comparison removes device-omitted diagnostic planes, then requires the complete remaining `RunResult` to be byte-identical.
 
 ## E5 fixture gates
 
-Fast fixture/generator checks:
+The fast check regenerates the E5 flow sets and compares them with the committed fixtures:
 
 ```bash
-cargo test -p days --features test --test t21_p12_e5 \
+cargo test -p days --features test --test e5_wide_tcp_fixtures \
   e5_generator_reproduces_committed_flow_set_fixtures -- --exact --show-output
 ```
 
-The same test target contains ignored full Scalar, CPU, Metal, and protocol
-golden-vector gates. List their exact names before selecting a long campaign:
+The same test target contains ignored full-run gates: Scalar count and trajectory gates, CPU completion anchors, and a protocol golden-vector gate. Building it with `--features test,metal-test-hooks` adds ignored Metal completion gates. List the exact names before selecting a long run:
 
 ```bash
-cargo test -p days --features test --test t21_p12_e5 -- --list
+cargo test -p days --features test --test e5_wide_tcp_fixtures -- --list
 ```
 
-E6 fixtures are not present in this branch and therefore have no runnable E6
-command here.
+## Legacy Days
 
-## Legacy protocol features
-
-```bash
-cargo test -p days-legacy --features test,l2_pfc
-cargo test -p days-legacy --features test,dcqcn
-```
+The legacy crate's feature-gated tests are listed on the [Legacy Days](/docs/legacy#examples-and-tests) page.

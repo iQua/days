@@ -1,0 +1,29 @@
+---
+title: Packet
+description: The Legacy Days actor packet and its compatibility time fields.
+---
+
+**Scope: Legacy Days.** For Days AGO packet descriptors and event records, see [Packets and events](/docs/components/packet).
+
+`legacy/src/flows/packet.rs` defines the actor message. It contains no payload bytes; `size` supplies serialization cost.
+
+| Field | Purpose |
+| --- | --- |
+| `time` | Floating-point compatibility and report view of the latest component departure. |
+| `creation_time` | Source creation time used for delay reporting. |
+| `size` | Packet size in bytes. |
+| `packet_id`, `flow_id` | Per-flow packet identity and global legacy flow identity. |
+| `queueing_delay` | Accumulated time spent in scheduler queues. |
+| `priority` | 802.1Q priority in `0..=7`. |
+| `last_packet` | End marker used by basic and DCQCN delivery paths. TCP completion is source-owned. |
+| `ack` | Optional TCP ACK header. |
+| `control` | Optional DCQCN CNP marker. |
+| `ecn`, `cwr` | ECN codepoint and TCP CWR flag. |
+
+`mark_ce()` changes `Ect0` or `Ect1` to `Ce`. It returns `false` for `NotEct`, which lets legacy ECN-marking policies drop a packet that cannot carry CE.
+
+## Time
+
+The Nexosim event clock is authoritative. Current handlers read `Context::time()` at the integer-nanosecond boundary and convert it to seconds for the packet compatibility view. A switch accepts `packet.time` values no later than the current event; it does not use that field as the event clock.
+
+Schedulers call `queueing_delay_update(now)` when service starts and `departure_update(now)` when a scheduled transmission completes or when they stamp its planned departure. Those helpers maintain reporting fields, while Nexosim controls event order.

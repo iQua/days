@@ -1,0 +1,27 @@
+---
+title: Flows
+description: Legacy Days source and sink actors, flow types, dependencies, and routing tables.
+---
+
+**Scope: Legacy Days.** For the Days AGO flow model, see [Flows](/docs/components/flows).
+
+The legacy CLI builds Nexosim source and sink actors. Each `Flow` records its endpoints, type, traffic, route selection, priority, and dependency IDs. `Topology::attach_flows` creates one `PacketSource` and one `PacketSink` actor for every concrete flow.
+
+The source and sink implementations depend on `flow_type`:
+
+| Flow type | Source behavior | Sink behavior |
+| --- | --- | --- |
+| `PacketDistribution` | Samples arrival and packet-size distributions. | Counts delivery and owns last-packet completion. |
+| `TCP` | Owns congestion control, retransmission, ACK handling, and completion. | Builds ACKs and cumulative receive state. |
+| `DCQCN` | Owns pacing and reaction-point state. Requires the `dcqcn` feature. | Detects CE, rate-limits CNPs, and owns last-packet delivery state. |
+
+`starts_before` and `starts_after` become `FlowFinishMsg` connections. Distribution sinks signal completion; TCP and DCQCN sources signal completion after their feedback-driven work finishes.
+
+## Routing
+
+`Flow::compute_path` produces a path containing the source actor, switch IDs, and sink actor. `Topology::route_flows` installs two per-flow tables in each switch:
+
+- `fib` routes data toward the sink.
+- `r_fib` routes TCP ACKs and control packets toward the source.
+
+Legacy supports per-flow `ShortestPath`, `ECMP`, and `PathFromConfig`. Root `routing.policy = "FatTreeEcmp"` uses the shared canonical fat-tree policy. Flow sets can choose `Random`, `SwitchOffsetHalf`, or `SameSwitchNext` endpoint pairing.

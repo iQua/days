@@ -15,8 +15,8 @@ The exact engine's unit of state is the logical process (LP). Every event
 carries the key `(time_ns, phase, origin_node, origin_sequence)`: time
 first, then a phase that orders event kinds at equal times, then the
 creator's identity and per-origin sequence number. Keys are totally
-ordered, and canonical serial execution — repeatedly execute the least
-pending key — defines the reference semantics.
+ordered, and canonical serial execution (repeatedly execute the least
+pending key) defines the reference semantics.
 
 Parallel execution proceeds in **safe-horizon rounds**: each round computes
 a horizon from certified channel delay bounds, every active LP drains its
@@ -27,13 +27,13 @@ implementation lives in `executor/src/event.rs` and
 
 Terminology is deliberate throughout these docs: **actor / model / mailbox**
 describe the legacy Nexosim engine; **LP / image / event / transition**
-describe the exact executor. The exact engine is not an actor runtime — its
+describe the exact executor. The exact engine is not an actor runtime: its
 protocols are compiled state machines over an immutable image.
 
 ## The proof surface
 
 Trace replay is not the only mechanized story. The `lean/DaysExecutor*`
-development proves five theorems about the execution machinery itself — the
+development proves five theorems about the execution machinery itself: the
 validity of the shipped horizon policy, serializability of each round and
 of whole runs, the service-start discipline those equalities require (with
 executable countermodels showing each clause necessary), and the
@@ -49,7 +49,7 @@ executable + Lean kernel) is the trusted consumer. This shrinks the trusted
 computing base: you do not need to verify the simulator runtime, only that
 the emitted certificate matches the reference semantics.
 
-## Canonical order is part of the specification — two lineages
+## Canonical order is part of the specification
 
 Trace rows can be emitted in nondeterministic file order due to
 concurrency and buffering, so acceptance is defined over a canonicalized
@@ -58,7 +58,7 @@ trace. The canonical key differs by lineage:
 - **Legacy protocol families** sort rows by `(time_ns, event_id)` and
   reject duplicate keys. Canonicalization costs `O(n log n)` before the
   linear replay.
-- **Exact-engine (P10c) families** key on the full `EventKey`
+- **Days AGO families** (`tcp_check`, `sp_check`, `p10c_*`) key on the full `EventKey`
   `(time_ns, phase, origin_node, origin_sequence)`; several strict-order
   checkers require the trace to arrive already in canonical order and
   reject otherwise, so the sort-based cost model does not apply to them.

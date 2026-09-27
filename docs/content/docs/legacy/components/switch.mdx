@@ -1,0 +1,17 @@
+---
+title: Switch
+description: The Legacy Days PacketSwitch demultiplexer and its per-flow tables.
+---
+
+**Scope: Legacy Days.** For the Days AGO switch-egress LP model, see [Switches and logical processes](/docs/components/switch).
+
+Legacy has one demultiplexer actor per physical topology switch. `PacketSwitch` does not queue packets or serialize links. Its `outputs` map connects the demultiplexer to schedulers, endpoint actors, or host-attachment models.
+
+Each switch stores two flow tables:
+
+- `fib: flow_id -> next_id` routes data toward the sink.
+- `r_fib: flow_id -> previous_id` routes TCP ACKs and control packets toward the source.
+
+`packet_received` classifies packets with neither `ack` nor `control` as forward data. It sends ACK and control packets through `r_fib`. `Topology::route_flows` installs both tables after it computes all paths.
+
+The Nexosim event clock drives the handler. `PacketSwitch::time` is a seconds view of `Context::time()`. Test assertions permit `packet.time` to precede the current event, so the packet field is a compatibility timestamp rather than a second clock.

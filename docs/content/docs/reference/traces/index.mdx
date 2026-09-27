@@ -3,11 +3,11 @@ title: Traces
 description: Legacy on-disk traces and exact-executor certificate projections.
 ---
 
-Days has two distinct trace surfaces:
+**Scope: Days AGO and Legacy Days.** Days has two distinct trace surfaces:
 
 1. The legacy logger writes periodic report CSVs and feature-gated
    `*_events.csv` certificates under `log_path` when `csv_logging=true`.
-2. The exact executor exposes canonical TCP, AQM, and mechanism certificate
+2. Days AGO exposes canonical TCP, AQM, and mechanism certificate
    serializers from `days-executor`. These projections use exact `EventKey`
    fields and are not automatically written by the legacy logger.
 

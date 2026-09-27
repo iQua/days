@@ -10,11 +10,12 @@ Three distinct verification surfaces coexist in this repository, and it
 helps to know which one a page is about:
 
 1. **Execution-model proofs** (`lean/DaysExecutor*`): five Lean theorems
-   about the exact engine's machinery — the safe-horizon bound family,
-   round and run serializability, the service-start discipline, and the
-   intra-round reordering license. These govern the executor itself.
-2. **Exact P10c certificates**: trace-level conformance for the exact
-   engine's protocols, keyed by the full `EventKey` order.
+   about the Days AGO machinery: the safe-horizon bound family, round and
+   run serializability, the service-start discipline, and the intra-round
+   reordering license. These govern the executor itself.
+2. **Days AGO certificates**: trace-level conformance for the Days AGO
+   protocols (`tcp_check`, `sp_check`, and the `p10c_*` checkers), keyed by
+   the full `EventKey` order.
 3. **Legacy LeanGuard CSV replay**: the original certificate machinery for
    the legacy engine's floating-point protocols, keyed by
    `(time_ns, event_id)`.

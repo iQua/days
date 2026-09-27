@@ -1,6 +1,6 @@
 ---
 title: Paper summary
-description: The research narrative — LeanGuard trace certificates and the exact multi-backend executor.
+description: The research narrative behind LeanGuard trace certificates and the Days AGO multi-backend executor.
 ---
 
 Two research lines share this repository: **LeanGuard**, the trace-certificate
@@ -17,10 +17,10 @@ LeanGuard follows an "untrusted producer / trusted checker" workflow:
 
 1. **Days** emits a *per-transition* trace (one row per protocol transition),
    including a deterministic snapshot of post-state.
-2. A **Lean 4 checker** canonicalizes the trace — legacy protocol families
-   sort by `(time_ns, event_id)` and reject duplicates; exact-engine (P10c)
-   checkers key on the full `EventKey` and some require already-strict
-   canonical order.
+2. A **Lean 4 checker** canonicalizes the trace. Legacy protocol families
+   sort by `(time_ns, event_id)` and reject duplicates; Days AGO checkers
+   key on the full `EventKey`, and some require already-strict canonical
+   order.
 3. The checker **replays** an executable reference model and returns
    `ACCEPT` or `REJECT` with the first counterexample row.
 
@@ -31,14 +31,14 @@ conventions. The coverage-guided test-generation loop that builds on these
 checkers is summarized in
 [/docs/research/test-generation](/docs/research/test-generation).
 
-## The exact executor: proofs down, byte-identity across
+## Days AGO: proofs and byte identity
 
-The exact engine's claim is structural: five Lean theorems about the
-execution machinery (`lean/DaysExecutor*`) license safe-horizon rounds and
-intra-round reordering, and the shipped corpus gate then holds every backend
-to the theorems' promise — the CPU pool and each compiled device backend
-must reproduce the global Scalar reference's complete result byte-for-byte
-(device-omitted diagnostics excluded) on every corpus fixture.
+The Days AGO claim is structural. Five Lean theorems about the execution
+machinery (`lean/DaysExecutor*`) license safe-horizon rounds and
+intra-round reordering. The corpus gate then checks every backend against
+them: the CPU pool and each compiled device backend must reproduce the
+global Scalar reference's complete result byte for byte (device-omitted
+diagnostics excluded) on every corpus fixture.
 
 The device arc that made this practical at scale shipped in this tree:
 planner equality across backends, persistent arenas, per-entity capacity
@@ -46,31 +46,29 @@ derivation with refuse-or-run faults and bounded retry, ring and vector
 sizing, compact readback (only live regions return), and an opt-in capacity
 warm start that affects sizing only. The largest committed fixture runs
 **262,144 closed-loop TCP flows**
-(`configs/benchmarks/p11/rq9_frontier_closed_k32.toml`); campaign evidence
-records its complete state byte-identical across the two CUDA architectures
-the project measures on.
+(`configs/benchmarks/lookahead/rq9_frontier_closed_k32.toml`).
 
-Recent shipped work also includes: the exact TCP corpus/device gate (T24),
-CUDA upload provisioning for unified-memory hosts (T27), strict legacy
-configuration validation with exact fixture expression (T28), and
-TOML-configurable `csv_logging` (T30).
+The tree also ships the TCP corpus byte-identity gate
+(`validation/tests/tcp_corpora.rs`), CUDA upload provisioning for
+unified-memory hosts, strict legacy configuration validation, and the
+TOML `csv_logging` switch for legacy runs.
 
-## Runnable benchmarks and indicative figures
+## Runnable benchmarks
 
-The committed E5 fixture family — 8,192 byte-terminated TCP flows on a k32
-fat tree, Reno primary (`q200`), CUBIC, and a `q256` backup — is the
-recommended runnable benchmark set. Indicative native run-clock medians on
-one machine (`boston`: Intel i7-13700K, RTX 4090): **Scalar 126.2 s, CPU
-pool at 22 workers 5.007 s, CUDA 0.575 s** on the Reno fixture. These are
-machine-qualified measurements, not cross-platform guarantees.
+The committed E5 fixture family is the recommended runnable benchmark set:
+8,192 byte-terminated TCP flows on a k=32 fat tree, with a Reno primary
+(`q200`), a CUBIC variant, and a `q256` backup. See
+[Examples](/docs/examples#e5-wide-tcp). Measured run times are
+machine-qualified and live in the project's evidence archive, not in these
+pages.
 
 ## Measured negatives, kept on the record
 
 Two device optimizations were implemented, measured in paired A/B campaigns,
-and **not merged** — recorded here because the method is the point:
+and **not merged**. They are recorded here because the method is the point:
 
-- **Pinned staging (T31)**: exactness passed; process wall regressed
-  materially on the discrete-GPU host. Verdict: hold.
+- **Pinned host staging for CUDA uploads**: exactness passed; process wall
+  time regressed materially on the discrete-GPU host. Verdict: hold.
 - **Structure-of-arrays drain layout**: all seven identity anchors byte-exact;
   slower on the E5 and every E6 device clock in the paired A/B (one process
   wall at parity). Verdict: the shipped layout stands.

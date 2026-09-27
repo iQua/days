@@ -3,16 +3,12 @@ title: Overview
 description: TOML schema, units, runtime scope, and backend boundaries.
 ---
 
-Days uses one TOML scenario format with two consumers:
+**Scope: Days AGO and Legacy Days.** Days uses one TOML scenario format with two consumers:
 
-- The **legacy actor runtime** validates the complete legacy vocabulary in `legacy/src/config.rs` and runs the scenario with Nexosim.
-- The **exact executor** lowers the supported subset in `src/scenario/compile.rs` into a `SimulationImage`, then runs it on Scalar, CPU, Metal, or CUDA.
+- **Days AGO** lowers the supported subset in `src/scenario/compile.rs` into a `SimulationImage`, then runs it on Scalar, CPU, Metal, or CUDA. Its entry point is the [`days` CLI](/docs/reference/cli/days).
+- **Legacy Days** validates the complete legacy vocabulary in `legacy/src/config.rs` and runs the scenario with Nexosim, through the [`days-legacy` CLI](/docs/reference/cli/days-legacy).
 
-The legacy CLI takes one configuration path:
-
-```bash
-RUST_LOG=info cargo run -p days-legacy --bin days -- configs/simple.toml
-```
+The pages in this section mark which engine accepts each key.
 
 ## Units
 
@@ -24,7 +20,7 @@ RUST_LOG=info cargo run -p days-legacy --bin days -- configs/simple.toml
 | Traffic sizes, packet sizes, and most buffers | bytes |
 | Topology and flow identifiers | non-negative integers |
 
-The exact executor represents time in integer nanoseconds. It rejects values that cannot be represented exactly in the field's integer scale.
+Days AGO represents time in integer nanoseconds. It rejects values that cannot be represented exactly in the field's integer scale.
 
 ## Root keys
 
@@ -32,27 +28,27 @@ The strict legacy loader accepts the following root keys. Unknown root keys fail
 
 | Keys | Purpose | Scope |
 | --- | --- | --- |
-| `seed`, `duration` | Determinism and stop time | Legacy and exact executor |
+| `seed`, `duration` | Determinism and stop time | Both |
 | `ui_interval` | Progress refresh interval | Legacy |
 | `threading`, `num_threads`, `hot_workers`, `concurrency_level` | Nexosim runtime selection | Legacy |
-| `time_quantum_ns` | Nexosim time quantization | Legacy; exact executor requires zero or omission |
+| `time_quantum_ns` | Nexosim time quantization | Legacy; Days AGO requires zero or omission |
 | `mailbox_capacity` | Actor mailbox capacity | Legacy |
 | `log_path`, `csv_logging`, `report_interval` | CSV reports and protocol traces | Legacy logger |
 | `legacy_e5_metrics` | Opt-in E5 TCP correctness rows | Legacy |
-| `edges`, `hosts`, `topology` | Network graph and host attachments | Legacy and exact executor |
-| `switch` | Port rate, queue, scheduler, and AQM policy | Legacy and exact executor, with capability differences |
-| `link` | PFC and propagation | Legacy and exact executor, with capability differences |
+| `edges`, `hosts`, `topology` | Network graph and host attachments | Both |
+| `switch` | Port rate, queue, scheduler, and AQM policy | Both, with capability differences |
+| `link` | PFC and propagation | Both, with capability differences |
 | `model_host_attachment` | Explicit host injection/delivery stages | Legacy |
-| `routing` | Scenario-wide `ShortestPath` or `FatTreeEcmp` | Legacy and exact executor |
-| `flow`, `flow_set` | Point-to-point traffic | Legacy and exact executor, with a smaller exact subset |
-| `collective`, `collective_set` | Collective traffic | Different algorithm sets in legacy and exact lowering |
+| `routing` | Scenario-wide `ShortestPath` or `FatTreeEcmp` | Both |
+| `flow`, `flow_set` | Point-to-point traffic | Both, with a smaller exact subset |
+| `collective`, `collective_set` | Collective traffic | Both, with different algorithm sets |
 | `app_source` | Actor-managed byte buffers for TCP Broadcast/RingAllReduce | Legacy |
 
 See the pages in this section for field-level constraints. A key can belong to the vocabulary and still fail when its value or combination is inactive. The strict loader rejects examples such as `switch.ecn_threshold` without `drop = "ECN_THRESHOLD"`, `[link.pfc]` without `link.mode = "Pfc"`, and `[app_source]` without a supported TCP collective.
 
 ## Minimal scenario
 
-This custom topology runs in the legacy actor runtime and lowers into the exact executor:
+This custom topology runs in Legacy Days and lowers into Days AGO:
 
 ```toml
 seed = 1
@@ -80,7 +76,7 @@ arr_dist = { type = "Uniform", low = 0.001, high = 0.001 }
 pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 }
 ```
 
-`threading` and `csv_logging` affect the legacy run. Exact lowering ignores those runtime fields; the caller selects an exact backend through the executor API.
+`threading` and `csv_logging` affect only the legacy run. Days AGO ignores those runtime fields; the caller selects a backend, for example with `days --engine`.
 
 ## Cargo features and backend capabilities
 
@@ -90,11 +86,11 @@ Legacy protocol models use Cargo features:
 - `link.mode = "Pfc"` requires `-p days-legacy --features l2_pfc`.
 - LeanGuard event CSVs require `lean` plus the protocol feature where applicable.
 
-Exact Scalar and CPU execute the full lowered mechanism set. Metal and CUDA reject collective generators, DCQCN, PFC, and RED/RED_ECN before execution. They accept deterministic packet traffic, exact TCP Reno/CUBIC, FIFO/SP/WFQ/DRR/WRR, TailDrop, and ECN threshold subject to device capacity checks. The error names the unsupported mechanism and directs you to Scalar or CPU.
+Days AGO Scalar and CPU execute the full lowered mechanism set. Metal and CUDA reject collective generators, DCQCN, PFC, and RED/RED_ECN before execution. They accept deterministic packet traffic, exact TCP Reno/CUBIC, FIFO/SP/WFQ/DRR/WRR, TailDrop, and ECN threshold subject to device capacity checks. The error names the unsupported mechanism and directs you to Scalar or CPU.
 
 ## Reference pages
 
-- [Logging and runtime](/docs/configuration/logging)
+- [Legacy runtime and CSV configuration](/docs/legacy/runtime)
 - [Topology and routing](/docs/configuration/topology)
 - [Switches and queues](/docs/configuration/switches)
 - [Flows](/docs/configuration/flows)

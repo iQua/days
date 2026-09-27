@@ -1,18 +1,84 @@
 ---
 title: Collectives
-description: Legacy collective expansion and exact RingAllReduce/AllGather lowering.
+description: Days AGO RingAllReduce and AllGather lowering, and the legacy collective expansion.
 ---
 
-Days models collective traffic, not application payload arithmetic. Legacy expands collectives into ordinary flow actors before routing. Exact lowering creates deterministic collective generators in a `SimulationImage`.
+**Scope: Days AGO and Legacy Days.** Both engines model collective traffic, not application payload arithmetic, and they accept different algorithms.
 
-The two paths accept different algorithms.
+| Engine | Algorithms | Transport | Backends |
+| --- | --- | --- | --- |
+| Days AGO | `RingAllReduce`, `AllGather` | `PacketDistribution` only | Scalar and CPU; Metal and CUDA reject collectives at validation |
+| Legacy Days | `Broadcast`, `Gather`, `AllReduce`, `RingAllReduce` | `PacketDistribution`, `TCP`, or feature-gated `DCQCN` | Nexosim |
 
-| Runtime | Algorithms | Backends |
-| --- | --- | --- |
-| Legacy actor runtime | `Broadcast`, `Gather`, `AllReduce`, `RingAllReduce` | Nexosim |
-| Exact executor | `RingAllReduce`, `AllGather` | Scalar and CPU; Metal and CUDA reject collective generators |
+## Days AGO collectives
+
+Days AGO lowers each collective into deterministic collective generators in the `SimulationImage`. It implements `RingAllReduce` and `AllGather` only, over `flow_type = "PacketDistribution"` only.
+
+```toml
+[[collective]]
+collective_type = "RingAllReduce"
+flow_type = "PacketDistribution"
+flow_count = 4
+priority = 0
+sources = [0, 1, 2, 3]
+sinks = [1, 2, 3, 0]
+
+[collective.traffic]
+initial_delay = 0.0
+size = 1048576
+arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1024, high = 1024 }
+```
+
+| Field | Rule |
+| --- | --- |
+| `collective_type` | `RingAllReduce` or `AllGather`. |
+| `flow_type` | `PacketDistribution`. `TCP` and `DCQCN` are rejected. |
+| `flow_count` | The rank count. At least 2 for `RingAllReduce`, at least 1 for `AllGather`. |
+| `sources`, `sinks` | Optional. Supply both or neither; each must have `flow_count` entries. |
+| `priority` | Optional 802.1Q priority in `0..=7`; default `0`. |
+| `traffic` | A constant packet size, a constant arrival interval, and a byte `size`. Duration-terminated traffic is rejected. |
+
+Lowering rejects `first_flow_id`, `graph`, `routing`, and `paths`: flow identity comes from the collective stage key, and routes come from the topology.
+
+### Endpoints
+
+With explicit endpoints, the ring must be in ring-next order: `sinks[i] == sources[(i + 1) % n]`. Every participant must be a configured host, and the sources must be distinct.
+
+If `sources` and `sinks` are omitted, the ring uses every configured host in ascending host-ID order, and each host sends to the next one, wrapping around at the end. `flow_count` must then equal the number of configured hosts.
+
+### Stages and chunks
+
+The declared byte `size` is split into `flow_count` chunks of `size / flow_count` bytes each; the last chunk also carries the remainder. Each rank sends one chunk per step over `flow_count - 1` steps:
+
+- `RingAllReduce` runs a reduce-scatter phase and then an all-gather phase, so it lowers to `2 * n * (n - 1)` stage flows. It requires `size >= flow_count`.
+- `AllGather` runs one all-gather phase, `n * (n - 1)` stage flows. A one-rank or zero-byte `AllGather` lowers to no stages.
+
+A stage flow sends from `sources[rank]` to `sinks[rank]`, using the declared packet size and arrival interval.
+
+### When a stage starts
+
+A stage starts once both of its predecessors are complete:
+
+- The **local predecessor** is the same rank's previous step. For the first step of the all-gather phase of `RingAllReduce`, it is the rank's last reduce-scatter step. It is complete when it emits its last packet.
+- The **inbound predecessor** is the previous rank's previous step, which sends to this rank. It is complete when the bytes delivered to this host from that stage reach the stage's expected byte count.
+
+Step 1 of the first phase (reduce-scatter for `RingAllReduce`, all-gather for `AllGather`) has no predecessors, so it starts at the traffic's `initial_delay`. A predecessor whose chunk is zero bytes (possible for `AllGather` when `size` is smaller than `flow_count`) is complete at initialization.
+
+### Errors
+
+The compiler and the validator name the rejected field or backend:
+
+```text
+unsupported collective algorithm `...`; T26 supports RingAllReduce and AllGather
+unsupported collective flow type `...`; T26 collectives require deterministic byte-terminated PacketDistribution traffic
+collective flow_count 3 must match the 4 configured hosts when sources/sinks are omitted
+backend Metal does not support collective generators; use Scalar or Cpu
+```
 
 ## Legacy `[[collective]]`
+
+Legacy Days expands collectives into ordinary flow actors before routing.
 
 ```toml
 [[collective]]
@@ -47,6 +113,7 @@ Legacy endpoint rules are algorithm-specific:
 
 - Broadcast requires one repeated source.
 - Gather requires one repeated sink.
+- AllReduce is a fan-in: it uses Gather's endpoint pattern, many sources and one sink.
 - RingAllReduce requires `sources[i] == sinks[i - 1]` around the ring.
 - With no explicit endpoints, Broadcast and Gather/AllReduce sample endpoints from `hosts`. RingAllReduce uses every configured host and requires `flow_count == hosts.len()`.
 
@@ -70,42 +137,10 @@ arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
 pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 }
 ```
 
-`collective_count` gives the number of members in the set. Each nested source/sink list must contain `flow_count` endpoints. Legacy reserves a contiguous concrete-flow range for each member; RingAllReduce uses its expanded flow count for that reservation.
-
-## Exact collectives
-
-Exact collectives require `flow_type = "PacketDistribution"`, a positive constant packet size, and exact byte termination. They reject `first_flow_id`, `graph`, `paths`, source routing, TCP, and DCQCN.
-
-```toml
-[[collective]]
-collective_type = "RingAllReduce"
-flow_type = "PacketDistribution"
-flow_count = 4
-priority = 0
-sources = [0, 1, 2, 3]
-sinks = [1, 2, 3, 0]
-
-[collective.traffic]
-initial_delay = 0.0
-size = 1048576
-arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
-pkt_size_dist = { type = "DiscreteUniform", low = 1024, high = 1024 }
-```
-
-Both exact algorithms require ring-next endpoint order when endpoints are explicit: `sinks[i] == sources[(i + 1) % n]`. Omitted endpoint lists use deterministic topology selection.
-
-RingAllReduce requires at least two ranks and at least one byte per rank. AllGather requires at least one rank. A one-rank AllGather or zero-byte AllGather lowers to an empty propagation program; byte counts smaller than the rank count leave zero-byte partitions complete at initialization.
-
-The exact compiler emits clear capability errors, including:
-
-```text
-unsupported collective algorithm `...`; T26 supports RingAllReduce and AllGather
-unsupported collective flow type `...`; T26 collectives require deterministic byte-terminated PacketDistribution traffic
-backend Metal does not support collective generators; use Scalar or Cpu
-```
+`collective_count` gives the number of members in the set. Each nested source/sink list must contain `flow_count` endpoints. Legacy reserves a contiguous concrete-flow range for each member; RingAllReduce uses its expanded flow count for that reservation. Days AGO also accepts `[[collective_set]]` for its two algorithms, with the same per-member rules as `[[collective]]`.
 
 ## Legacy TCP application buffers
 
 Legacy TCP Broadcast shares one collective-wide byte buffer across receivers. TCP RingAllReduce creates one buffer per directed ring link and gives each hop a byte-range handle. The actors bound and pace traffic; they do not mutate or reduce payload data.
 
-Configure polling under `[app_source]` as described in [Logging and runtime](/docs/configuration/logging).
+Configure polling under `[app_source]` as described in [Legacy runtime and CSV configuration](/docs/legacy/runtime).

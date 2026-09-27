@@ -1,18 +1,16 @@
 ---
 title: CLI
-description: User-facing command-line entry points and retained validation binaries.
+description: The days CLI, the legacy CLI, the LeanGuard tools, and the retained measurement binaries.
 ---
 
-User-facing entry points are:
+User-facing entry points:
 
-- `days` (package `days-legacy`): run one legacy Nexosim TOML scenario.
-- `t20f_frontier` (package `days`): run an exact Scalar or compiled device
-  backend and emit a complete-state fingerprint.
-- `leanguard-run`: generate/discover legacy traces and invoke Lean checkers.
-- `leanguard-testgen`: generate, replay, and minimize checker corpora.
+- [`days`](/docs/reference/cli/days) (package `days`): compile one scenario and run it on the Scalar, CPU, Metal, or CUDA engine of Days AGO.
+- [`days-legacy`](/docs/reference/cli/days-legacy) (package `days-legacy`): run one scenario on the frozen Legacy Days simulator.
+- [`leanguard-run`](/docs/reference/cli/leanguard-run): generate or discover legacy traces and invoke the Lean checkers.
+- [`leanguard-testgen`](/docs/reference/cli/leanguard-testgen): generate, replay, and minimize checker corpora.
 
-The root package also retains campaign and gate binaries:
-`t13d_real_image_gate`, `t14_metal_gate`, `t15a_round_benchmark`,
-`t15e_sustained_benchmark`, `t16_cuda_gate`, `t17c_cuda_geometry`,
-`t17c_wide_corpus`, `t20a_round_timing`, and `t20b3_queue_bytes`. These are
-validation surfaces, not a stable general-purpose CLI.
+The root package also has two measurement binaries. They are validation tools, not a stable general-purpose CLI:
+
+- `device-sizing-report [FIXTURE]`: lowers one fixture and prints the default Metal and CUDA device plan, plane by plane, using host arithmetic only. It allocates no device memory and does not run the simulation.
+- `sustained-benchmark`: the timing harness for the sustained device fixtures. It builds only with `--features metal` or `--features cuda`.

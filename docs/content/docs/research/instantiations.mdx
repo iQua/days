@@ -1,16 +1,16 @@
 ---
 title: Protocol instantiations
-description: The checker inventory across both engines — trace families, replay state, and core obligations.
+description: The checker inventory across both engines, with trace families, replay state, and core obligations.
 ---
 
 All protocol instantiations share the same acceptance semantics
 (canonicalize-and-replay) and reuse the same obligation families
 (ParamFreeze, MonotoneTime, PendingMatch, Gate, Accounting, SnapshotEq).
 What differs is the **event vocabulary**, the **checker replay state**, the
-**canonical key** — legacy families use `(time_ns, event_id)`; exact and
-P10c families use the full `EventKey`
-`(time_ns, phase, origin_node, origin_sequence)`, and some P10c checkers
-require already-strict canonical order — and which obligations matter most.
+**canonical key**, and which obligations matter most. Legacy families use
+`(time_ns, event_id)`; Days AGO families use the full `EventKey`
+`(time_ns, phase, origin_node, origin_sequence)`, and some `p10c_*`
+checkers require already-strict canonical order.
 
 See also:
 
@@ -23,11 +23,11 @@ The Lean build (`lean/lakefile.lean`) currently carries:
 
 - **Legacy-engine families** (float protocols, `(time_ns, event_id)` key):
   DCQCN, PFC, CUBIC, DRR, WFQ, AQM/ECN.
-- **Exact-engine families** (full `EventKey`): exact TCP and Static
-  Priority.
-- **P10c families** (exact engine, protocol-parity program): mechanisms,
-  AQM, DCQCN, and collectives, plus the AQM/DCQCN cross-check that ties
-  the two vocabularies together.
+- **Days AGO families** (full `EventKey`): TCP (`tcp_check`), Static
+  Priority (`sp_check`), and the `p10c_*` checkers for mechanisms, AQM,
+  DCQCN, and collectives.
+- **Cross-check**: `aqm_dcqcn_check` ties the legacy AQM and DCQCN
+  vocabularies together.
 
 Backend capability boundaries apply to generation, not checking: PFC,
 DCQCN, RED, and collective generators run on Scalar/CPU and are rejected by
@@ -43,7 +43,7 @@ are produced by CPU-side runs only.
 | WFQ scheduler | `wfq_events.csv`: `enqueue`, `schedule`, `depart` | queued packets + virtual time + pending scheduled packet | Accounting, PendingMatch, SnapshotEq (tags/time), choice rule (min finish tag) |
 | DRR scheduler | `drr_events.csv`: `enqueue`, `schedule` | per-class FIFO queues + deficit counters + RR pointer | Accounting, SnapshotEq (deficit/pointer), choice rule (deficit eligibility), ParamFreeze |
 | CUBIC microbench | `cubic_events.csv`: CC micro-events | per-endpoint CC state + frozen parameters | SnapshotEq, ParamFreeze, MonotoneTime |
-| DCQCN | `dcqcn_events.csv`: `cnp_sent`, `cnp_recv`, `timer_tick` | per-endpoint gate/rate state + pending CNP map | PendingMatch, Gate, ParamFreeze, bounds — see [the DCQCN page](/docs/research/dcqcn-certificates) |
+| DCQCN | `dcqcn_events.csv`: `cnp_sent`, `cnp_recv`, `timer_tick` | per-endpoint gate/rate state + pending CNP map | PendingMatch, Gate, ParamFreeze, bounds; see [the DCQCN page](/docs/research/dcqcn-certificates) |
 
 ## Notes by instantiation
 
@@ -53,8 +53,8 @@ One row per marking/drop decision at a queue: queue identity, packet
 identity, occupancy context, policy parameters, chosen action. Checks:
 parameters stable per queue (freeze-on-first-use); the logged action legal
 under the policy and context; any probabilistic witness validated. The
-exact engine's ECN-threshold marking has its own P10c certificate schema
-under the full `EventKey`.
+Days AGO ECN-threshold marking has its own certificate schema
+(`p10c_aqm_check`) under the full `EventKey`.
 
 ### PFC (`pfc_events.csv`)
 
@@ -68,9 +68,9 @@ generator; the exact engine rejects PFC on device backends by validation.
 Correctness hinges on small local state and a choice rule. Checks:
 `schedule` chooses a packet with minimal finish tag; tags and virtual-time
 witnesses match the deterministic reference; scheduled packets depart
-exactly once. The exact engine computes WFQ in exact rational arithmetic,
-and its P10c mechanism certificates check the same discipline under strict
-`EventKey` order.
+exactly once. Days AGO computes WFQ in exact rational arithmetic but has
+no WFQ certificate family: `p10c_mechanisms_check` covers rate, PFC, DRR,
+and WRR transitions only.
 
 ### DRR scheduler (`drr_events.csv`)
 

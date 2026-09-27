@@ -1,19 +1,10 @@
 {
   "title": "Configuration Settings",
-  "pages": [
-    "overview",
-    "topology",
-    "switches",
-    "flows",
-    "collectives",
-    "l2",
-    "logging"
-  ],
+  "pages": ["overview", "topology", "switches", "flows", "collectives", "l2"],
   "overview": "Overview",
   "topology": "Topology",
   "switches": "Switches & Queues",
   "flows": "Flows",
   "collectives": "Collectives",
-  "l2": "Link Layer (L2 / PFC)",
-  "logging": "Logging & Runtime"
+  "l2": "Link Layer (L2 / PFC)"
 }

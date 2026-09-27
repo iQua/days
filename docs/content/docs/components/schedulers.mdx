@@ -1,36 +1,36 @@
 ---
 title: Schedulers
-description: Queue ownership, service disciplines, admission, and backend limits.
+description: Days AGO queue ownership, service disciplines, admission, and backend limits.
 ---
 
-Schedulers combine queue admission, packet selection, and non-preemptive link service. Legacy uses one Nexosim scheduler actor per directed topology edge. Exact lowering gives each switch-egress LP one queue and one closed `SchedulerKind` state value.
+**Scope: Days AGO.** The legacy scheduler actors, including VirtualClock and the floating-point RED policy, are described in [Legacy schedulers](/docs/legacy/components/schedulers).
+
+Schedulers combine queue admission, packet selection, and non-preemptive link service. Lowering gives each switch-egress LP one queue and one closed `SchedulerKind` state value.
 
 ## Service sequence
 
-Legacy scheduler actors handle packet arrival, apply a `PacketDrop` policy, enqueue admitted packets, and schedule transmission from the Nexosim event clock. At service start they update accumulated queueing delay. The completion handler stamps the packet from the current engine time and forwards it.
-
-The exact executor represents the same ownership with transitions:
+The executor represents service as three transitions:
 
 1. `RemoteArrival` applies admission and inserts the packet.
 2. `TxReady` selects one eligible packet and commits it to `in_service`.
 3. `TxComplete` releases the server, updates discipline state, forwards the transmitted packet as a remote arrival, and schedules another local selection when work remains.
 
-The exact event key gives arrivals phase 0, completions phase 1, and service selection phase 2 at equal nanosecond times. PFC eligibility is checked before selection, and service remains non-preemptive.
+The event key gives arrivals phase 0, completions phase 1, and service selection phase 2 at equal nanosecond times. PFC eligibility is checked before selection, and service remains non-preemptive.
 
 ## Disciplines
 
-| Config value | Legacy actor | Exact Scalar/CPU | Exact Metal/CUDA |
+| Config value | Executor state | Scalar/CPU | Metal/CUDA |
 | --- | --- | --- | --- |
-| `FIFO` | `Port` | `Fifo` | yes |
-| `SP` | `SPServer` | `StaticPriority` | yes |
-| `WFQ` | `WFQServer` | `WeightedFairQueue` | yes |
-| `DRR` | `DRRServer` | `DeficitRoundRobin` | yes |
-| `WRR` | `WRRServer` | `WeightedRoundRobin` | yes |
-| `VirtualClock` | `VirtualClockServer` | unsupported | unsupported |
+| `FIFO` | `Fifo` | yes | yes |
+| `SP` | `StaticPriority` | yes | yes |
+| `WFQ` | `WeightedFairQueue` | yes | yes |
+| `DRR` | `DeficitRoundRobin` | yes | yes |
+| `WRR` | `WeightedRoundRobin` | yes | yes |
+| `VirtualClock` | none | rejected at compilation | rejected at compilation |
 
-Classed schedulers use `flow_id % class_count`. SP orders larger configured priorities first. DRR stores byte quanta and deficits. WRR stores per-class packet counts. Exact WFQ stores virtual time and finish tags as reduced arbitrary-precision rationals; device validation requires each rational to fit the bounded device representation.
+Classed schedulers use `flow_id % class_count`. SP orders larger configured priorities first. DRR stores byte quanta and deficits; each class quantum is `1500 * weight / smallest_weight` bytes. WRR stores per-class packet counts. WFQ stores virtual time and finish tags as reduced arbitrary-precision rationals on Scalar and CPU; Metal and CUDA use checked 320-bit rational components, and device validation requires each rational to fit.
 
-Exact lowering rejects zero class weights. VirtualClock fails before image construction:
+Lowering rejects zero class weights. VirtualClock fails before image construction:
 
 ```text
 unsupported scheduler `VirtualClock`; Days executor supports FIFO, SP, WFQ, DRR, and WRR
@@ -38,29 +38,16 @@ unsupported scheduler `VirtualClock`; Days executor supports FIFO, SP, WFQ, DRR,
 
 ## Admission and ECN
 
-| Policy | Legacy | Exact Scalar/CPU | Exact Metal/CUDA |
-| --- | --- | --- | --- |
-| `TailDrop` | yes | yes | yes |
-| `ECN_THRESHOLD` | yes | yes | yes |
-| `RED` | yes | yes | rejected |
-| `RED_ECN` | yes | yes | rejected |
+| Policy | Scalar/CPU | Metal/CUDA |
+| --- | --- | --- |
+| `TailDrop` | yes | yes |
+| `ECN_THRESHOLD` | yes | yes |
+| `RED` | yes | rejected |
+| `RED_ECN` | yes | rejected |
 
-The configured topology uses packet capacity. Capacity zero means unlimited TailDrop. Legacy ECN threshold compares post-admission depth with `floor(fraction * capacity)` and marks only ECN-capable packets; a threshold action drops `NotEct`. Exact lowering stores `ceil(fraction * capacity)` and marks at or above that integer depth. Exact non-data control packets remain unmarked and admitted unless physical capacity overflows.
+The configured topology uses packet capacity. Capacity zero means unlimited TailDrop. ECN threshold stores `ceil(fraction * capacity)` and marks at or above that integer depth. Non-data control packets remain unmarked and admitted unless physical capacity overflows.
 
-### RED arithmetic
-
-Legacy RED uses an EWMA weight of `2^-9`, selects the threshold region from average occupancy, and computes:
-
-```text
-p_b = max_p * (avg - min) / (max - min)
-p_a = p_b / (1 - count * p_b)
-```
-
-It clamps `p_a` to one at the singularity, resets spacing state after a congestion action, and takes a certain action at or above the maximum threshold. `RED_ECN` uses the same state but requests CE marking; physical overflow still drops. The reusable legacy policy keeps byte and packet occupancy in matching units, although the TOML topology path constructs packet-capacity schedulers.
-
-Legacy RED does not implement idle-period EWMA decay or packet-size probability weighting. Both require inputs absent from the current drop-policy interface.
-
-Exact RED uses packet thresholds at 70% and 90% of capacity, maximum probability `4/5`, and a `2^32` fixed-point EWMA. It replaces the random draw with a deterministic counter and signals inside the open threshold region when `counter * p(avg) >= 1`. Exact RED requires capacity of at least ten packets.
+RED uses packet thresholds at 70% and 90% of capacity, maximum probability `4/5`, and a `2^32` fixed-point EWMA. It replaces the random draw with a deterministic counter and signals inside the open threshold region when `counter * p(avg) >= 1`. RED requires capacity of at least ten packets.
 
 Metal and CUDA reject RED during backend validation:
 
@@ -70,4 +57,4 @@ backend Metal does not support RED admission; use Scalar or Cpu
 
 ## PFC queue state
 
-Legacy schedulers expose shared packet/byte occupancy to PFC ingress actors. Exact queues store their PFC monitors and pause-controller sets beside scheduler state. Metal and CUDA reject exact PFC before execution. See [L2 mechanics](/docs/components/l2) and [Switch configuration](/docs/configuration/switches).
+Queues store their PFC monitors and pause-controller sets beside scheduler state. Metal and CUDA reject PFC before execution. See [PFC](/docs/components/l2) and [Switch configuration](/docs/configuration/switches).

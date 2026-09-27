@@ -3,7 +3,7 @@ title: Switches & Queues
 description: Scheduler, capacity, drop, ECN, and backend capability configuration.
 ---
 
-The global `[switch]` table configures every egress scheduler created from the topology.
+**Scope: Days AGO and Legacy Days.** The global `[switch]` table configures every egress scheduler created from the topology.
 
 ```toml
 [switch]
@@ -72,7 +72,7 @@ backend Cuda does not support RED admission; use Scalar or Cpu
 
 ## ECN-capable transports
 
-Legacy TCP emits `Ect0` only when `[flow.traffic.tcp] ecn = true`. Legacy and exact DCQCN data is ECN-capable. Exact TCP currently rejects ECN, so use loss feedback for exact TCP scenarios.
+Legacy TCP emits `Ect0` only when `[flow.traffic.tcp] ecn = true`. DCQCN data is ECN-capable in both engines. Days AGO TCP rejects ECN and models loss feedback only.
 
 ## PFC interaction
 

@@ -1,0 +1,24 @@
+---
+title: L2 (Frames + PFC)
+description: Legacy Days frame actors and the PFC gate, link, and ingress pipeline.
+---
+
+**Scope: Legacy Days.** For the Days AGO PFC state model, see [PFC](/docs/components/l2).
+
+Legacy PFC requires the `l2_pfc` Cargo feature and `link.mode = "Pfc"`. The topology inserts three actors on each directed fabric edge:
+
+```text
+Scheduler
+  -> PfcEgressGate
+  -> Link
+  -> PfcIngressPort
+  -> downstream PacketSwitch
+```
+
+The gate and ingress exchange `PfcFrame` values; data uses `LinkFrame::Data(Packet)`. The `Link` type can serialize either `LinkFrame` variant at the configured bit rate. The installed topology sends forward data through that actor, while the ingress sends pause and resume frames directly to the upstream gate through `pfc_output`.
+
+`PfcIngressPort` owns eight byte queues and tracks occupancy per 802.1Q priority. It asserts XOFF at or above `xoff`, clears it at or below `xon`, enforces optional ingress capacities, and can refresh pause frames or retry a blocked drain. Its `can_forward` closure reads the downstream scheduler's shared `QueueState` to avoid forwarding into a full queue.
+
+`PfcEgressGate` owns per-priority queues and `paused_until` deadlines derived from pause quanta. It starts service only for an unpaused priority.
+
+Legacy rejects configured propagation delay with PFC because this actor pipeline does not combine the two mechanisms.

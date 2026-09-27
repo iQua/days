@@ -3,7 +3,7 @@ title: LeanGuard (Design)
 description: Legacy and exact-executor trace certificates, canonicalization, and replay.
 ---
 
-LeanGuard checks an untrusted CSV certificate against executable Lean semantics. A checker parses
+**Scope: Days AGO and Legacy Days.** LeanGuard checks an untrusted CSV certificate against executable Lean semantics. A checker parses
 typed rows, establishes a deterministic order, replays a partial transition function, and prints
 `ACCEPT` or the first `REJECT` diagnostic.
 
@@ -22,9 +22,9 @@ state internally.
 These files are produced only when CSV logging is enabled. `csv_logging` defaults to `true`; setting
 it to `false` suppresses the CSV files and `traces.json`.
 
-### Exact executor certificates
+### Days AGO certificates
 
-The current executor represents time and protocol state with exact integers. Its certificates use
+Days AGO represents time and protocol state with exact integers. Its certificates use
 the complete canonical `EventKey`:
 
 ```text
@@ -33,12 +33,12 @@ the complete canonical `EventKey`:
 
 The TCP, Static Priority, AQM, rate, PFC, DRR, WRR, and collective checkers canonicalize by this key
 (the collective schema adds an activation ordinal where one executor event produces multiple
-rows). The exact DCQCN P10c checker instead requires the input to already be in strictly increasing
+rows). The Days AGO DCQCN checker, `p10c_dcqcn_check`, instead requires the input to already be in strictly increasing
 `EventKey` order. Duplicate keys are rejected in both cases.
 
 The Rust projections live in `executor/src/tcp_trace.rs`, `executor/src/aqm_trace.rs`, and
-`executor/src/mechanism_trace.rs`. They serialize observation records; they are separate from the
-legacy logger's automatic `*_events.csv` output.
+`executor/src/mechanism_trace.rs`. They serialize the full-observation diagnostic records that
+Scalar and CPU return; they are separate from the legacy logger's automatic `*_events.csv` output.
 
 ## Replay contract
 
@@ -66,12 +66,12 @@ reference transition.
 | `wfq_check` | legacy WFQ |
 | `aqm_check` | legacy AQM |
 | `aqm_dcqcn_check` | legacy cross-layer AQM to DCQCN causality |
-| `tcp_check` | exact executor TCP (Reno and CUBIC) |
-| `sp_check` | exact executor Static Priority |
-| `p10c_mechanisms_check` | exact rate, PFC, DRR, or WRR transitions |
-| `p10c_aqm_check` | exact executor AQM |
-| `p10c_dcqcn_check` | exact executor DCQCN |
-| `p10c_collective_check` | exact executor collective progress |
+| `tcp_check` | Days AGO TCP (Reno and CUBIC) |
+| `sp_check` | Days AGO Static Priority |
+| `p10c_mechanisms_check` | Days AGO rate, PFC, DRR, or WRR transitions |
+| `p10c_aqm_check` | Days AGO AQM |
+| `p10c_dcqcn_check` | Days AGO DCQCN |
+| `p10c_collective_check` | Days AGO collective progress |
 
 ## Executor proof surface
 

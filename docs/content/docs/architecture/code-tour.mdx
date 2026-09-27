@@ -3,16 +3,17 @@ title: Code Tour
 description: Map shared, exact-executor, and legacy subsystems to the Rust source tree.
 ---
 
-The repository contains shared scenario code plus two engine implementations. Start by deciding whether a file belongs to exact execution or the legacy Nexosim actor path.
+**Scope: Days AGO and Legacy Days.** The repository contains shared scenario code plus two engine implementations. Start by deciding whether a file belongs to Days AGO or the legacy Nexosim actor path.
 
 ## Workspace and entrypoints
 
 - `src/lib.rs`: shared/current library root.
+- `src/bin/days.rs`: the `days` CLI, which selects the Scalar, CPU, Metal, or CUDA engine.
 - `src/scenario/`: exact scenario parsing, semantic IDs, and image lowering.
 - `src/topos/`: shared topology construction and routing.
 - `executor/`: exact scalar, CPU, Metal, and CUDA engine crate.
 - `legacy/src/lib.rs`: legacy IDs, seed state, configuration, and simulation entrypoints.
-- `legacy/src/main.rs`: the `days` legacy CLI.
+- `legacy/src/main.rs`: the `days-legacy` CLI.
 - `validation/`: cross-engine and cross-backend validation tests.
 - `lean/`: offline protocol conformance models and proofs.
 
@@ -24,7 +25,7 @@ The repository contains shared scenario code plus two engine implementations. St
 - `src/scenario/compile.rs`: exact-model validation and lowering into `SimulationImage`.
 - `src/scenario/ids.rs`: stable semantic LP, link, flow, packet, and payload ID assignment.
 
-## Exact executor
+## Days AGO executor
 
 Core representation and semantics:
 
@@ -49,7 +50,7 @@ Parallel execution:
 
 Mechanism-specific exact state and traces live in `executor/src/tcp.rs`, `tcp_ledger.rs`, `dcqcn.rs`, `aqm_trace.rs`, `mechanism_trace.rs`, and `tcp_trace.rs`.
 
-The frontier harness is `src/bin/t20f_frontier.rs`; its closed 262,144-flow fixture is `configs/benchmarks/p11/rq9_frontier_closed_k32.toml`.
+The largest committed fixture, the closed 262,144-flow `configs/benchmarks/lookahead/rq9_frontier_closed_k32.toml`, runs through the same `days` CLI as every other scenario.
 
 ## Legacy Nexosim engine
 
@@ -69,7 +70,7 @@ Network actors:
 
 ## Logging and verification
 
-- `src/utils/logger.rs`: `csv_logging`, periodic reports, CSV file ownership, and trace manifest generation.
+- `CsvLogger`: the legacy CSV logger, which owns `csv_logging`, periodic reports, CSV files, and trace manifest generation. Days AGO does not use it.
 - `legacy/src/utils/ui.rs`: legacy progress UI.
 - `tests/`: shared lowering and exact integration tests.
 - `executor/tests/`: executor unit and backend contract tests.

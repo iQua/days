@@ -3,6 +3,8 @@ title: LeanGuard (Use Guide)
 description: Emit legacy traces and run legacy or exact-executor Lean checkers.
 ---
 
+**Scope: Days AGO and Legacy Days.** This guide builds the Lean checkers, emits Legacy Days traces, and runs the checkers for both engines.
+
 ## Prerequisites
 
 - Rust and Cargo.
@@ -32,27 +34,27 @@ The committed CI fixtures provide small deterministic runs:
 
 ```bash
 # DCQCN and AQM (with the PFC-capable link path enabled)
-RUST_LOG=info cargo run -p days-legacy --features dcqcn,lean,l2_pfc --bin days -- \
+RUST_LOG=info cargo run -p days-legacy --features dcqcn,lean,l2_pfc --bin days-legacy -- \
   configs/ci/leanguard_dcqcn.toml
 
 # PFC
-RUST_LOG=info cargo run -p days-legacy --features lean,l2_pfc --bin days -- \
+RUST_LOG=info cargo run -p days-legacy --features lean,l2_pfc --bin days-legacy -- \
   configs/ci/leanguard_pfc.toml
 
 # TCP CUBIC
-RUST_LOG=info cargo run -p days-legacy --features lean --bin days -- \
+RUST_LOG=info cargo run -p days-legacy --features lean --bin days-legacy -- \
   configs/ci/leanguard_cubic.toml
 
 # DRR
-RUST_LOG=info cargo run -p days-legacy --features lean --bin days -- \
+RUST_LOG=info cargo run -p days-legacy --features lean --bin days-legacy -- \
   configs/ci/leanguard_drr.toml
 
 # WFQ
-RUST_LOG=info cargo run -p days-legacy --features lean --bin days -- \
+RUST_LOG=info cargo run -p days-legacy --features lean --bin days-legacy -- \
   configs/ci/leanguard_wfq.toml
 
 # AQM
-RUST_LOG=info cargo run -p days-legacy --features lean --bin days -- \
+RUST_LOG=info cargo run -p days-legacy --features lean --bin days-legacy -- \
   configs/ci/leanguard_aqm.toml
 ```
 
@@ -61,14 +63,14 @@ mechanism executes; the examples above select the matching flow or scheduler.
 
 ## Simulate and check legacy traces
 
-`leanguard-run` runs the separately built legacy binary, discovers traces from `traces.json` (or a
+`leanguard-run` runs the separately built `days-legacy` binary, discovers traces from `traces.json` (or a
 known-filename fallback), and invokes the matching checkers:
 
 ```bash
-cargo build -p days-legacy --features dcqcn,lean,l2_pfc --bin days
+cargo build -p days-legacy --features dcqcn,lean,l2_pfc --bin days-legacy
 cargo run --bin leanguard-run -- \
   --config configs/ci/leanguard_dcqcn.toml \
-  --legacy-runner target/debug/days \
+  --legacy-runner target/debug/days-legacy \
   --checker-dir lean/.lake/build/bin
 ```
 
@@ -100,7 +102,7 @@ Legacy certificate checkers:
 ./.lake/build/bin/aqm_dcqcn_check <path/to/aqm_events.csv> <path/to/dcqcn_events.csv>
 ```
 
-Exact executor checkers:
+Days AGO checkers:
 
 ```bash
 ./.lake/build/bin/tcp_check <path/to/tcp_events.csv>
@@ -114,7 +116,7 @@ Exact executor checkers:
 ./.lake/build/bin/p10c_collective_check <path/to/collective_events.csv>
 ```
 
-Committed exact-executor fixtures can be checked directly, for example:
+Committed Days AGO certificate fixtures can be checked directly, for example:
 
 ```bash
 ./.lake/build/bin/p10c_aqm_check fixtures/p10c/aqm_executor_accept.csv
@@ -126,7 +128,7 @@ Committed exact-executor fixtures can be checked directly, for example:
 
 The legacy checkers, `tcp_check`, and `sp_check` also accept
 `--coverage-out <path>`. `leanguard-run --coverage` uses that option and aggregates returned
-coverpoints. The P10c executables do not expose the coverage flag.
+coverpoints. The `p10c_*` executables do not expose the coverage flag.
 
 ## Exit codes and diagnostics
 
@@ -135,7 +137,7 @@ coverpoints. The P10c executables do not expose the coverage flag.
 - `2`: invalid command-line usage
 
 Legacy checkers report failures in their canonical replay order, which may differ from physical CSV
-order. Exact executor diagnostics use the complete `EventKey`; the P10c DCQCN checker additionally
+order. Days AGO diagnostics use the complete `EventKey`; `p10c_dcqcn_check` additionally
 requires the input rows to arrive in strictly increasing key order.
 
 Common rejection causes include malformed or out-of-domain integers, duplicate keys, parameter or

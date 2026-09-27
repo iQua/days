@@ -1,46 +1,21 @@
 ---
-title: Packet
-description: Legacy actor packets and exact event payload records.
+title: Packets & Events
+description: Days AGO packet descriptors, event records, and canonical event order.
 ---
 
-The two runtimes use different packet representations.
+**Scope: Days AGO.** The legacy actor message is described in [Legacy packet](/docs/legacy/components/packet).
 
-## Legacy `Packet`
+## Packet and event records
 
-`legacy/src/flows/packet.rs` defines the actor message. It contains no payload bytes; `size` supplies serialization cost.
-
-| Field | Purpose |
-| --- | --- |
-| `time` | Floating-point compatibility and report view of the latest component departure. |
-| `creation_time` | Source creation time used for delay reporting. |
-| `size` | Packet size in bytes. |
-| `packet_id`, `flow_id` | Per-flow packet identity and global legacy flow identity. |
-| `queueing_delay` | Accumulated time spent in scheduler queues. |
-| `priority` | 802.1Q priority in `0..=7`. |
-| `last_packet` | End marker used by basic and DCQCN delivery paths. TCP completion is source-owned. |
-| `ack` | Optional TCP ACK header. |
-| `control` | Optional DCQCN CNP marker. |
-| `ecn`, `cwr` | ECN codepoint and TCP CWR flag. |
-
-`mark_ce()` changes `Ect0` or `Ect1` to `Ce`. It returns `false` for `NotEct`, which lets legacy ECN-marking policies drop a packet that cannot carry CE.
-
-### Legacy time
-
-The Nexosim event clock is authoritative. Current handlers read `Context::time()` at the integer-nanosecond boundary and convert it to seconds for the packet compatibility view. A switch accepts `packet.time` values no later than the current event; it does not use that field as the event clock.
-
-Schedulers call `queueing_delay_update(now)` when service starts and `departure_update(now)` when a scheduled transmission completes or when they stamp its planned departure. Those helpers maintain reporting fields, while Nexosim controls event order.
-
-## Exact packet and event records
-
-The exact executor separates immutable packet data from scheduling:
+Days AGO separates immutable packet data from scheduling:
 
 - `PacketDescriptor` stores `PayloadId`, `FlowId`, size, one congestion-experienced bit, and a typed `PacketKind`.
 - `Event` stores the target LP, event kind, payload ID, and canonical `EventKey`.
-- `FlowDescriptor` stores priority and forward/reverse routes, so priority is not repeated in each exact packet record.
+- `FlowDescriptor` stores priority and forward/reverse routes, so priority is not repeated in each packet record.
 
-`PacketKind` is closed over data, feedback, TCP data, TCP ACK, PFC, DCQCN CNP, and a source-local DCQCN control timer token. Exact data is `Ect0` until `ecn_marked` becomes true; feedback and control packets are `NotEct`. The exact image has no legacy `Packet.time`, `queueing_delay`, or `last_packet` fields.
+`PacketKind` is closed over data, feedback, TCP data, TCP ACK, PFC, DCQCN CNP, and a source-local DCQCN control timer token. Data is `Ect0` until `ecn_marked` becomes true; feedback and control packets are `NotEct`. The image has no legacy `Packet.time`, `queueing_delay`, or `last_packet` fields.
 
-### Exact time and order
+## Time and order
 
 `EventKey` orders events lexicographically by:
 

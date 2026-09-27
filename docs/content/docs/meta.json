@@ -4,15 +4,16 @@
     "index",
     "install",
     "quickstart",
-    "testing",
     "examples",
+    "testing",
     "configuration",
     "architecture",
     "components",
     "reference",
     "internals",
+    "verification",
     "research",
-    "verification"
+    "legacy"
   ],
   "index": "Home",
   "install": "Install",
@@ -25,5 +26,6 @@
   "components": "Components",
   "reference": "Reference",
   "internals": "Internals",
-  "research": "Verification and Research"
+  "research": "Verification and Research",
+  "legacy": "Legacy Days"
 }
