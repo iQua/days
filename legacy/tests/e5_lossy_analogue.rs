@@ -12,7 +12,7 @@ use tempfile::TempDir;
 fn k4_lossy_analogue_completes_exact_demand_after_real_drops_and_retransmissions() {
     let directory = TempDir::new().unwrap();
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../configs/benchmarks/p12/e5_legacy_k4_loss.toml");
+        .join("../configs/benchmarks/evaluation/e5_legacy_k4_loss.toml");
     let config = directory.path().join("e5-legacy-k4-loss.toml");
     let logs = directory.path().join("logs");
     let body = fs::read_to_string(source).unwrap().replace(
@@ -34,7 +34,7 @@ fn k4_lossy_analogue_completes_exact_demand_after_real_drops_and_retransmissions
             .unwrap()
     );
 
-    cargo_bin_cmd!("days")
+    cargo_bin_cmd!("days-legacy")
         .env("RUST_LOG", "error")
         .arg(&config)
         .assert()
@@ -42,7 +42,7 @@ fn k4_lossy_analogue_completes_exact_demand_after_real_drops_and_retransmissions
 
     let metrics = csv::Reader::from_path(logs.join("tcp_metrics.csv"))
         .unwrap()
-        .deserialize::<days::utils::logger::TcpMetricsReport>()
+        .deserialize::<days_legacy::utils::logger::TcpMetricsReport>()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(metrics.len(), 16);

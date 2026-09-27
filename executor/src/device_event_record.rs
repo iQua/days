@@ -1,7 +1,7 @@
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 use crate::EventKind;
 
@@ -14,7 +14,7 @@ pub(crate) const REMOTE_STAGING_EVENT_WORDS: usize = 12;
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 #[allow(dead_code)] // Fallback is exercised by the round-trip control; runtime heaps stay 14 words.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,7 +35,7 @@ pub(crate) struct EncodedEventRecord {
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 pub(crate) const fn stored_event_words(class: StoredEventClass) -> usize {
     match class {
@@ -49,7 +49,7 @@ pub(crate) const fn stored_event_words(class: StoredEventClass) -> usize {
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 pub(crate) const fn stream_event_class(
     stream: usize,
@@ -102,7 +102,7 @@ pub(crate) fn encode_event_record(
 #[cfg(any(
     test,
     feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
+    all(feature = "metal", target_vendor = "apple")
 ))]
 pub(crate) fn decode_event_record(
     encoded: &[u64],

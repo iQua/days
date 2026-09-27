@@ -27,7 +27,7 @@ impl EcnField {
 }
 
 #[cfg(feature = "lean")]
-impl From<EcnField> for days::utils::logger::AqmLoggedEcnField {
+impl From<EcnField> for crate::utils::logger::AqmLoggedEcnField {
     fn from(field: EcnField) -> Self {
         match field {
             EcnField::NotEct => Self::NotEct,
@@ -39,7 +39,7 @@ impl From<EcnField> for days::utils::logger::AqmLoggedEcnField {
 }
 
 #[cfg(all(feature = "lean", feature = "dcqcn"))]
-impl From<EcnField> for days::utils::logger::DcqcnLoggedEcnField {
+impl From<EcnField> for crate::utils::logger::DcqcnLoggedEcnField {
     fn from(field: EcnField) -> Self {
         match field {
             EcnField::NotEct => Self::NotEct,

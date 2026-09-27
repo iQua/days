@@ -9,10 +9,7 @@ use crate::{
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TcpMinimumPacketSize {
-    #[cfg(any(
-        feature = "cuda",
-        all(feature = "metal-spike", target_vendor = "apple")
-    ))]
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
     One,
 }
 
@@ -20,10 +17,7 @@ impl TcpMinimumPacketSize {
     #[cfg(any(test, feature = "planner-test-hooks"))]
     fn legacy_uses_precomputed_table(self) -> bool {
         match self {
-            #[cfg(any(
-                feature = "cuda",
-                all(feature = "metal-spike", target_vendor = "apple")
-            ))]
+            #[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
             Self::One => true,
         }
     }
@@ -130,7 +124,7 @@ impl PlannerCapacityContext {
                     FlowGeneratorKind::Tcp(tcp) => match tcp_minimum_packet_size {
                         #[cfg(any(
                             feature = "cuda",
-                            all(feature = "metal-spike", target_vendor = "apple")
+                            all(feature = "metal", target_vendor = "apple")
                         ))]
                         TcpMinimumPacketSize::One => {
                             let _ = tcp;
@@ -527,13 +521,10 @@ impl PlannerCapacityContext {
     /// Same gating story as `device_sizing::exact_plan_report`: the only callers are
     /// `cuda::assert_cuda_planner_bit_equal_for_testing` and
     /// `metal::assert_metal_planner_bit_equal_for_testing`, both `planner-test-hooks` functions in
-    /// modules that only exist under `cuda` / `metal-spike`.
+    /// modules that only exist under `cuda` / `metal`.
     #[cfg(all(
         feature = "planner-test-hooks",
-        any(
-            feature = "cuda",
-            all(feature = "metal-spike", target_vendor = "apple")
-        )
+        any(feature = "cuda", all(feature = "metal", target_vendor = "apple"))
     ))]
     pub(crate) fn matches_legacy(
         image: &SimulationImage,
@@ -636,10 +627,7 @@ fn precompute_minimum_packet_sizes(
         let size = match generator.kind {
             FlowGeneratorKind::Constant(constant) => constant.packet_size_bytes,
             FlowGeneratorKind::Tcp(tcp) => match tcp_minimum_packet_size {
-                #[cfg(any(
-                    feature = "cuda",
-                    all(feature = "metal-spike", target_vendor = "apple")
-                ))]
+                #[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
                 TcpMinimumPacketSize::One => {
                     let _ = tcp;
                     1
@@ -762,7 +750,7 @@ fn legacy_minimum_packet_size(
                             FlowGeneratorKind::Tcp(tcp) => match tcp_minimum_packet_size {
                                 #[cfg(any(
                                     feature = "cuda",
-                                    all(feature = "metal-spike", target_vendor = "apple")
+                                    all(feature = "metal", target_vendor = "apple")
                                 ))]
                                 TcpMinimumPacketSize::One => {
                                     let _ = tcp;

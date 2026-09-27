@@ -8,10 +8,6 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 use crate::event::{EventFelClass, event_fel_class, is_same_time_tx_ready_continuation};
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-use crate::metal_spike::{
-    RealReplayTrace, RealReplayTraceBuilder, RecordedReplayLp, ReplayStep, ReplayTraceCapture,
-};
 use crate::scalar::{ExecutionError, ObservationMode, RunResult, TransitionState};
 use crate::{Event, EventKey, NodeId, SimulationImage};
 
@@ -70,99 +66,6 @@ pub struct ScalarRoundRun {
     pub rounds: Vec<RoundMetrics>,
 }
 
-/// Contiguous safe-horizon round window retained by the T13e spike harness.
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RoundMetricsWindow {
-    pub start_round: usize,
-    pub rounds: usize,
-}
-
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-impl RoundMetricsWindow {
-    pub(crate) fn end_round(self) -> Result<usize, ExecutionError> {
-        if self.rounds == 0 {
-            return Err(ExecutionError::InvalidCpuConfig(
-                "round metrics window requires at least one round",
-            ));
-        }
-        self.start_round
-            .checked_add(self.rounds)
-            .ok_or(ExecutionError::InvalidCpuConfig(
-                "round metrics window end overflows usize",
-            ))
-    }
-
-    pub(crate) fn contains(self, round: usize) -> bool {
-        round >= self.start_round && round - self.start_round < self.rounds
-    }
-}
-
-/// Lightweight aggregate for one phase of a windowed full run.
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct RoundRunTotals {
-    pub rounds: usize,
-    pub events_processed: u128,
-    pub active_lp_rounds: u128,
-    pub maximum_active_lps: usize,
-}
-
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-impl RoundRunTotals {
-    fn observe(&mut self, events_processed: u64, active_lp_count: usize) {
-        self.rounds = self.rounds.saturating_add(1);
-        self.events_processed = self
-            .events_processed
-            .saturating_add(u128::from(events_processed));
-        self.active_lp_rounds = self
-            .active_lp_rounds
-            .saturating_add(active_lp_count as u128);
-        self.maximum_active_lps = self.maximum_active_lps.max(active_lp_count);
-    }
-}
-
-/// Whole-run and phase totals retained without keeping per-LP metrics outside the window.
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct WindowedRunTotals {
-    pub whole_run: RoundRunTotals,
-    pub before_window: RoundRunTotals,
-    pub retained_window: RoundRunTotals,
-    pub after_window: RoundRunTotals,
-}
-
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-impl WindowedRunTotals {
-    pub(crate) fn observe(
-        &mut self,
-        window: RoundMetricsWindow,
-        round: usize,
-        events_processed: u64,
-        active_lp_count: usize,
-    ) {
-        self.whole_run.observe(events_processed, active_lp_count);
-        if round < window.start_round {
-            self.before_window
-                .observe(events_processed, active_lp_count);
-        } else if window.contains(round) {
-            self.retained_window
-                .observe(events_processed, active_lp_count);
-        } else {
-            self.after_window.observe(events_processed, active_lp_count);
-        }
-    }
-}
-
-/// Scalar result with only one requested round-metrics window retained.
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-#[derive(Clone, Debug, PartialEq)]
-pub struct WindowedScalarRoundRun {
-    pub result: RunResult,
-    pub rounds: Vec<RoundMetrics>,
-    pub totals: WindowedRunTotals,
-}
-
 /// Runs the single-threaded safe-horizon executor through the configured inclusive stop.
 ///
 /// `exclusive_horizon_ns` is an optional half-open partial-run boundary, exactly as in
@@ -183,62 +86,21 @@ pub fn run_scalar_rounds_with_observations(
     RoundExecutor::new(image, observation_mode)?.run(exclusive_horizon_ns)
 }
 
-/// Records a bounded real-image window while executing the canonical safe-horizon CPU path.
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-pub fn run_scalar_rounds_with_replay_trace(
-    image: &SimulationImage,
-    exclusive_horizon_ns: Option<u64>,
-    capture: ReplayTraceCapture,
-) -> Result<(ScalarRoundRun, RealReplayTrace), ExecutionError> {
-    if capture.rounds == 0 {
-        return Err(ExecutionError::InvalidCpuConfig(
-            "real replay trace capture requires at least one round",
-        ));
-    }
-    let mut executor = RoundExecutor::new(image, ObservationMode::Summary)?;
-    executor.replay_trace = Some(RealReplayTraceBuilder::new(capture));
-    executor.run_with_replay_trace(exclusive_horizon_ns)
-}
-
-/// Records and retains only the requested real-image window while executing the full scalar run.
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-pub fn run_scalar_rounds_with_windowed_replay_trace(
-    image: &SimulationImage,
-    exclusive_horizon_ns: Option<u64>,
-    window: RoundMetricsWindow,
-) -> Result<(WindowedScalarRoundRun, RealReplayTrace), ExecutionError> {
-    window.end_round()?;
-    let mut executor = RoundExecutor::new(image, ObservationMode::Summary)?;
-    executor.replay_trace = Some(RealReplayTraceBuilder::new(ReplayTraceCapture {
-        start_round: window.start_round,
-        rounds: window.rounds,
-    }));
-    executor.run_with_windowed_replay_trace(exclusive_horizon_ns, window)
-}
-
 #[derive(Clone, Copy)]
 enum RoundRetention {
     All,
-    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-    Window(RoundMetricsWindow),
 }
 
 impl RoundRetention {
     fn retains(self, _round: usize) -> bool {
         match self {
             Self::All => true,
-            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-            Self::Window(window) => window.contains(_round),
         }
     }
 }
 
 struct ExecutedRounds {
     retained: Vec<RoundMetrics>,
-    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-    total_rounds: usize,
-    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-    window_totals: Option<WindowedRunTotals>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -332,15 +194,11 @@ struct RoundExecutor<'image> {
     pending_keys: BTreeSet<EventKey>,
     frontier: OwnerFrontierIndex,
     minimum_lookahead_ns: Option<u64>,
-    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-    replay_trace: Option<RealReplayTraceBuilder>,
 }
 
 struct DrainedLp {
     work: LpRoundWork,
     outbox: Vec<Event>,
-    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-    replay: Option<RecordedReplayLp>,
 }
 
 impl<'image> RoundExecutor<'image> {
@@ -395,8 +253,6 @@ impl<'image> RoundExecutor<'image> {
             pending_keys,
             frontier,
             minimum_lookahead_ns,
-            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-            replay_trace: None,
         })
     }
 
@@ -410,54 +266,6 @@ impl<'image> RoundExecutor<'image> {
         Ok(self.finish(rounds.retained))
     }
 
-    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-    fn run_with_replay_trace(
-        mut self,
-        exclusive_horizon_ns: Option<u64>,
-    ) -> Result<(ScalarRoundRun, RealReplayTrace), ExecutionError> {
-        let configured_stop = u128::from(self.image.stop_time_ns) + 1;
-        let run_end = exclusive_horizon_ns
-            .map(u128::from)
-            .unwrap_or(TIME_AFTER_U64_MAX)
-            .min(configured_stop);
-        let rounds = self.execute_rounds(run_end, RoundRetention::All)?;
-        let trace = self
-            .replay_trace
-            .take()
-            .expect("trace execution installs a trace builder")
-            .finish(rounds.total_rounds);
-        Ok((self.finish(rounds.retained), trace))
-    }
-
-    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-    fn run_with_windowed_replay_trace(
-        mut self,
-        exclusive_horizon_ns: Option<u64>,
-        window: RoundMetricsWindow,
-    ) -> Result<(WindowedScalarRoundRun, RealReplayTrace), ExecutionError> {
-        let configured_stop = u128::from(self.image.stop_time_ns) + 1;
-        let run_end = exclusive_horizon_ns
-            .map(u128::from)
-            .unwrap_or(TIME_AFTER_U64_MAX)
-            .min(configured_stop);
-        let rounds = self.execute_rounds(run_end, RoundRetention::Window(window))?;
-        let trace = self
-            .replay_trace
-            .take()
-            .expect("trace execution installs a trace builder")
-            .finish(rounds.total_rounds);
-        Ok((
-            WindowedScalarRoundRun {
-                result: self.finish_result(),
-                rounds: rounds.retained,
-                totals: rounds
-                    .window_totals
-                    .expect("windowed execution collects phase totals"),
-            },
-            trace,
-        ))
-    }
-
     fn execute_rounds(
         &mut self,
         run_end: u128,
@@ -466,11 +274,6 @@ impl<'image> RoundExecutor<'image> {
         let mut previous_horizon = None;
         let mut rounds = Vec::new();
         let mut total_rounds = 0_usize;
-        #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-        let mut window_totals = match retention {
-            RoundRetention::All => None,
-            RoundRetention::Window(_) => Some(WindowedRunTotals::default()),
-        };
 
         loop {
             let mut frontier_heap_pops = 0;
@@ -506,32 +309,15 @@ impl<'image> RoundExecutor<'image> {
             let mut children = Vec::new();
             let mut outboxes = Vec::with_capacity(active.len());
             let mut lp_work = Vec::with_capacity(active.len());
-            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-            let capture_replay = self
-                .replay_trace
-                .as_ref()
-                .is_some_and(|trace| trace.captures(total_rounds));
-            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-            let mut replay_rows = Vec::with_capacity(if capture_replay { active.len() } else { 0 });
             let mut events_processed = 0_u64;
             let mut frontier_updates = 0_u64;
             for entry in active {
                 physical_lp_probes = physical_lp_probes.saturating_add(1);
-                let drained = self.drain_lp(
-                    entry.lp_slot,
-                    horizon,
-                    &mut children,
-                    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-                    capture_replay,
-                )?;
+                let drained = self.drain_lp(entry.lp_slot, horizon, &mut children)?;
                 events_processed = events_processed.saturating_add(drained.work.events_processed);
                 lp_work.push(drained.work);
                 if !drained.outbox.is_empty() {
                     outboxes.push(drained.outbox);
-                }
-                #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-                if let Some(replay) = drained.replay {
-                    replay_rows.push(replay);
                 }
                 self.update_frontier(entry.lp_slot, &mut physical_lp_probes)?;
                 frontier_updates = frontier_updates.saturating_add(1);
@@ -593,20 +379,6 @@ impl<'image> RoundExecutor<'image> {
             } else {
                 events_processed as f64 / (active_lp_count as f64 * max_work as f64)
             };
-            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-            if capture_replay {
-                self.replay_trace
-                    .as_mut()
-                    .expect("capture flag requires a trace builder")
-                    .push_round(
-                        total_rounds,
-                        frontier_ns,
-                        horizon,
-                        events_processed,
-                        parallel_efficiency,
-                        replay_rows,
-                    );
-            }
             let metrics = RoundMetrics {
                 frontier_ns,
                 exclusive_horizon_ns: horizon,
@@ -620,17 +392,6 @@ impl<'image> RoundExecutor<'image> {
                 frontier_heap_pops,
                 physical_lp_probes,
             };
-            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-            if let (RoundRetention::Window(window), Some(totals)) =
-                (retention, window_totals.as_mut())
-            {
-                totals.observe(
-                    window,
-                    total_rounds,
-                    events_processed,
-                    metrics.active_lp_count,
-                );
-            }
             if retention.retains(total_rounds) {
                 rounds.push(metrics);
             }
@@ -640,13 +401,7 @@ impl<'image> RoundExecutor<'image> {
             previous_horizon = Some(horizon);
         }
 
-        Ok(ExecutedRounds {
-            retained: rounds,
-            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-            total_rounds,
-            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-            window_totals,
-        })
+        Ok(ExecutedRounds { retained: rounds })
     }
 
     fn finish(self, rounds: Vec<RoundMetrics>) -> ScalarRoundRun {
@@ -671,7 +426,6 @@ impl<'image> RoundExecutor<'image> {
         lp_slot: usize,
         exclusive_horizon_ns: u128,
         children: &mut Vec<Event>,
-        #[cfg(all(feature = "metal-spike", target_vendor = "apple"))] capture_replay: bool,
     ) -> Result<DrainedLp, ExecutionError> {
         let node = self.image.nodes[lp_slot].id;
         let mut events_processed = 0_u64;
@@ -680,27 +434,11 @@ impl<'image> RoundExecutor<'image> {
         let mut outbox = Vec::new();
         let mut superseded = Vec::new();
         let mut continuation = None;
-        #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-        let pending_events_below_horizon = if capture_replay {
-            u32::try_from(
-                self.futures[lp_slot]
-                    .values()
-                    .take_while(|event| u128::from(event.key.time_ns) < exclusive_horizon_ns)
-                    .count(),
-            )
-            .map_err(|_| ExecutionError::CounterOverflow(node))?
-        } else {
-            0
-        };
-        #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-        let mut replay_steps = Vec::new();
         while continuation.is_some()
             || self.futures[lp_slot]
                 .first_key_value()
                 .is_some_and(|(key, _)| u128::from(key.time_ns) < exclusive_horizon_ns)
         {
-            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-            let direct_continuation = continuation.is_some();
             let event = if let Some(event) = continuation.take() {
                 event
             } else {
@@ -712,15 +450,6 @@ impl<'image> RoundExecutor<'image> {
             let removed = self.pending_keys.remove(&event.key);
             debug_assert!(removed, "executing event must own a pending key");
 
-            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-            let queue_occupancy = if capture_replay && event.kind == crate::EventKind::TxReady {
-                Some(
-                    u16::try_from(self.transitions.queue_occupancy(node)?)
-                        .map_err(|_| ExecutionError::CounterOverflow(node))?,
-                )
-            } else {
-                None
-            };
             self.transitions.dispatch(event, children)?;
             // Live-state contract (T20g item 2): a source-owned retransmission timeout targets its
             // own host, so eager removal stays inside this LP's future map and its pending-key
@@ -746,10 +475,6 @@ impl<'image> RoundExecutor<'image> {
                 }
                 _ => None,
             };
-            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-            let mut local_fel_pushes = 0_u8;
-            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-            let mut remote_outbox_writes = 0_u8;
             for child in children.drain(..) {
                 if !self.pending_keys.insert(child.key) {
                     return Err(ExecutionError::DuplicateEventKey(child.key));
@@ -766,35 +491,10 @@ impl<'image> RoundExecutor<'image> {
                                 .checked_add(1)
                                 .ok_or(ExecutionError::CounterOverflow(node))?;
                         }
-                        #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-                        if capture_replay {
-                            local_fel_pushes = local_fel_pushes
-                                .checked_add(1)
-                                .ok_or(ExecutionError::CounterOverflow(node))?;
-                        }
                     }
                 } else {
-                    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-                    if capture_replay {
-                        remote_outbox_writes = remote_outbox_writes
-                            .checked_add(1)
-                            .ok_or(ExecutionError::CounterOverflow(node))?;
-                    }
                     outbox.push(child);
                 }
-            }
-            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-            if capture_replay {
-                replay_steps.push(
-                    ReplayStep::new(
-                        event.kind,
-                        direct_continuation,
-                        local_fel_pushes,
-                        remote_outbox_writes,
-                        queue_occupancy,
-                    )
-                    .map_err(|_| ExecutionError::CounterOverflow(node))?,
-                );
             }
             events_processed = events_processed.saturating_add(1);
         }
@@ -807,15 +507,6 @@ impl<'image> RoundExecutor<'image> {
                 fallback_classified_pushes,
             },
             outbox,
-            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-            replay: capture_replay.then(|| RecordedReplayLp {
-                node,
-                pending_events_below_horizon,
-                next_time_ns_after_local_drain: self.futures[lp_slot]
-                    .first_key_value()
-                    .map_or(u64::MAX, |(key, _)| key.time_ns),
-                steps: replay_steps,
-            }),
         })
     }
 

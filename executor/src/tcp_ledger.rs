@@ -38,10 +38,7 @@ pub(crate) fn initial_live_payloads(image: &SimulationImage) -> BTreeSet<Payload
 /// Non-TCP descriptors whose initial placement is only a control token or whose in-service copy
 /// will disappear when its completion fires. Device readback cannot recover these descriptors
 /// from the TCP ledger, so retain exactly the same orphan set that the CPU state pins.
-#[cfg(any(
-    feature = "cuda",
-    all(feature = "metal-spike", target_vendor = "apple")
-))]
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 pub(crate) fn initial_non_tcp_orphan_packets(image: &SimulationImage) -> Vec<PacketDescriptor> {
     let meaningful_event_payloads = image
         .initial_events

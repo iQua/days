@@ -16,23 +16,18 @@ resolver = "2"
 
 [features]
 test = ["days-executor/planner-test-hooks"]
-l2_pfc = []
-dcqcn = []
-lean = []
-metal-spike = ["days-executor/metal-spike"]
+metal = ["days-executor/metal"]
 cuda = ["days-executor/cuda"]
 cuda-planner-test = ["test", "days-executor/cuda-planner-test"]
-metal-test-hooks = ["metal-spike", "days-executor/metal-test-hooks"]
+metal-test-hooks = ["metal", "days-executor/metal-test-hooks"]
 cuda-test-hooks = ["cuda", "days-executor/cuda-test-hooks"]
 
 [dependencies]
 csv = "1.4"
 days-executor = { path = "executor" }
-env_logger = "0.11"
 clap = { version = "4.5", features = ["derive"] }
 log = "0.4"
 num-bigint = "0.4.8"
-parking_lot = "0.12"
 petgraph = "0.8"
 rand = "0.10"
 serde = { version = "1.0", features = ["derive"] }

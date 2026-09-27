@@ -5,14 +5,12 @@ on:
     branches: [main, feat/days-executor]
     paths-ignore:
       - "docs/**"
-      - "ideas/**"
       - "logs/**"
       - "**.md"
   pull_request:
     branches: [main]
     paths-ignore:
       - "docs/**"
-      - "ideas/**"
       - "logs/**"
       - "**.md"
 
@@ -74,8 +72,8 @@ jobs:
 
       - name: Run executor smoke examples
         run: |
-          cargo run --release --example scalar_benchmark -- configs/ci/executor_smoke.toml
-          cargo run --release --example round_benchmark -- configs/ci/executor_smoke.toml --repetitions 1
+          cargo run --release --bin days -- configs/ci/executor_smoke.toml --engine scalar
+          cargo run --release --bin days -- configs/ci/executor_smoke.toml --engine cpu --workers 1 --repetitions 1
 
       - name: Run representative legacy examples
         run: |
@@ -93,4 +91,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Check Metal backend
-        run: cargo check -p days-executor --features metal-spike
+        run: cargo check -p days-executor --features metal
+
+      - name: Check Metal-gated targets across the workspace
+        run: cargo check --workspace --all-targets --features metal
+
+      - name: Check test-gated Metal targets across the workspace
+        run: cargo check --workspace --all-targets --features test,metal

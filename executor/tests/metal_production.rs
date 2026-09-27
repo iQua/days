@@ -1,4 +1,4 @@
-#![cfg(all(feature = "metal-spike", target_vendor = "apple"))]
+#![cfg(all(feature = "metal", target_vendor = "apple"))]
 
 #[path = "support/continuation.rs"]
 mod continuation;

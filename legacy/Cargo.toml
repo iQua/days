@@ -12,15 +12,15 @@ publish = false
 name = "days_legacy"
 
 [[bin]]
-name = "days"
+name = "days-legacy"
 path = "src/main.rs"
 
 [features]
 test = ["days/test"]
 l2 = []
-l2_pfc = ["l2", "days/l2_pfc"]
-dcqcn = ["days/dcqcn"]
-lean = ["days/lean"]
+l2_pfc = ["l2"]
+dcqcn = []
+lean = []
 
 # FROZEN CRATE -- every version below is an EXACT pin (`=x.y.z`), not a range.
 # See legacy/README.md ("Dependency pinning"). Changing any pin requires a

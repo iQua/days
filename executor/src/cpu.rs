@@ -9,8 +9,6 @@ use crossbeam::channel::{Receiver, RecvError, Select, Sender, TryRecvError, boun
 
 use crate::event::{EventFelClass, event_fel_class, is_same_time_tx_ready_continuation};
 use crate::safe_horizon::{LpRoundWork, RoundMetrics};
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-use crate::safe_horizon::{RoundMetricsWindow, WindowedRunTotals};
 use crate::scalar::{
     DiagnosticPlanes, ExecutionError, LocalNodeState, LocalTransitionResult, ObservationMode,
     PacketArrivalObservation, PacketDeparture, RunResult, RunSummary, TransitionState,
@@ -205,28 +203,15 @@ pub struct CpuRun {
     pub rounds: Vec<CpuRoundMetrics>,
 }
 
-/// CPU result with only one requested round-metrics window retained.
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-#[derive(Clone, Debug, PartialEq)]
-pub struct WindowedCpuRun {
-    pub result: RunResult,
-    pub rounds: Vec<CpuRoundMetrics>,
-    pub totals: WindowedRunTotals,
-}
-
 #[derive(Clone, Copy)]
 enum CpuMetricsRetention {
     All,
-    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-    Window(RoundMetricsWindow),
 }
 
 impl CpuMetricsRetention {
     fn retains(self, _round: usize) -> bool {
         match self {
             Self::All => true,
-            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-            Self::Window(window) => window.contains(_round),
         }
     }
 
@@ -236,8 +221,6 @@ impl CpuMetricsRetention {
         }
         match self {
             Self::All => Some(round),
-            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-            Self::Window(window) => Some(round - window.start_round),
         }
     }
 }
@@ -246,8 +229,6 @@ struct CpuMetricsCollector {
     retention: CpuMetricsRetention,
     rounds: Vec<CpuRoundMetrics>,
     total_rounds: usize,
-    #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-    window_totals: Option<WindowedRunTotals>,
 }
 
 impl CpuMetricsCollector {
@@ -256,11 +237,6 @@ impl CpuMetricsCollector {
             retention,
             rounds: Vec::new(),
             total_rounds: 0,
-            #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-            window_totals: match retention {
-                CpuMetricsRetention::All => None,
-                CpuMetricsRetention::Window(_) => Some(WindowedRunTotals::default()),
-            },
         }
     }
 
@@ -269,17 +245,6 @@ impl CpuMetricsCollector {
             usize::try_from(round).map_err(|_| ExecutionError::CounterOverflow(NodeId(0)))?;
         if round != self.total_rounds {
             return Err(ExecutionError::WorkerChannelDisconnected);
-        }
-        #[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-        if let (CpuMetricsRetention::Window(window), Some(totals)) =
-            (self.retention, self.window_totals.as_mut())
-        {
-            totals.observe(
-                window,
-                round,
-                metrics.semantic.events_processed,
-                metrics.semantic.active_lp_count,
-            );
         }
         if self.retention.retains(round) {
             self.rounds.push(metrics);
@@ -334,32 +299,6 @@ pub fn run_cpu_with_observations(
     Ok(CpuRun {
         result: run.result,
         rounds: run.metrics.rounds,
-    })
-}
-
-/// Runs the full CPU path while retaining only one contiguous metrics window.
-#[cfg(all(feature = "metal-spike", target_vendor = "apple"))]
-pub fn run_cpu_with_metrics_window(
-    image: &SimulationImage,
-    exclusive_horizon_ns: Option<u64>,
-    config: CpuConfig,
-    window: RoundMetricsWindow,
-) -> Result<WindowedCpuRun, ExecutionError> {
-    window.end_round()?;
-    let run = run_cpu_collecting_metrics(
-        image,
-        exclusive_horizon_ns,
-        config,
-        ObservationMode::Summary,
-        CpuMetricsRetention::Window(window),
-    )?;
-    Ok(WindowedCpuRun {
-        result: run.result,
-        rounds: run.metrics.rounds,
-        totals: run
-            .metrics
-            .window_totals
-            .expect("windowed CPU execution collects phase totals"),
     })
 }
 

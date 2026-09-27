@@ -790,7 +790,7 @@ fn collective_graph_is_executable_endpoint_input() {
 fn cli_hard_errors_name_silent_semantic_substitutions() {
     for (body, key) in silent_substitution_cases() {
         let file = config(&body);
-        cargo_bin_cmd!("days")
+        cargo_bin_cmd!("days-legacy")
             .env("RUST_LOG", "error")
             .arg(file.path())
             .assert()
@@ -804,7 +804,7 @@ fn cli_hard_errors_name_silent_semantic_substitutions() {
 fn cli_hard_errors_name_remaining_root_control_substitutions() {
     for (body, key) in remaining_root_control_cases() {
         let file = config(&body);
-        cargo_bin_cmd!("days")
+        cargo_bin_cmd!("days-legacy")
             .env("RUST_LOG", "error")
             .arg(file.path())
             .assert()
@@ -955,7 +955,7 @@ fn strict_validation_accepts_every_tracked_legacy_fixture_except_tiered_delays()
     assert!(
         rejected[0]
             .0
-            .ends_with("configs/benchmarks/p12/f_het_k8_tiered_delays.toml"),
+            .ends_with("configs/benchmarks/evaluation/f_het_k8_tiered_delays.toml"),
         "only the known unsupported tiered-delay fixture may be rejected: {rejected:#?}"
     );
     assert!(rejected[0].1.contains("link.propagation_tiers"));
@@ -965,7 +965,7 @@ fn strict_validation_accepts_every_tracked_legacy_fixture_except_tiered_delays()
 fn strict_validation_accepts_the_e1_family() {
     for load in ["10", "30", "60", "90"] {
         let path = format!(
-            "{}/../configs/benchmarks/p12/e1_open_k32_load_{load}.toml",
+            "{}/../configs/benchmarks/evaluation/e1_open_k32_load_{load}.toml",
             env!("CARGO_MANIFEST_DIR")
         );
         days_legacy::validate_config(&path)
@@ -1001,7 +1001,7 @@ fn cli_hard_error_names_the_unclaimed_key() {
         1,
     );
     let file = config(&body);
-    cargo_bin_cmd!("days")
+    cargo_bin_cmd!("days-legacy")
         .env("RUST_LOG", "error")
         .arg(file.path())
         .assert()
@@ -1019,7 +1019,7 @@ fn e3_inertness_tripwire_has_red_capability() {
         1,
     );
     let file = config(&body);
-    cargo_bin_cmd!("days")
+    cargo_bin_cmd!("days-legacy")
         .env("RUST_LOG", "error")
         .env("DAYS_E3_ASSERT_NO_UNSUPPORTED_CONFIG_INPUT", "1")
         .arg(file.path())
