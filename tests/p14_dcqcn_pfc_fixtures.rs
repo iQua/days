@@ -229,3 +229,44 @@ fn p14_fixtures_exercise_their_mechanisms_and_match_their_frozen_anchors() {
         );
     }
 }
+
+/// Acceptance 1: every P14 fixture reproduces its frozen Scalar anchor on each built device.
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
+#[test]
+fn p14_fixtures_match_their_anchors_on_every_built_device() {
+    for fixture in &FIXTURES {
+        let image = lower(fixture.name);
+        #[cfg(all(feature = "metal", target_vendor = "apple"))]
+        {
+            let run = days_executor::run_metal_with_observations(
+                &image,
+                None,
+                days_executor::MetalConfig::default(),
+                ObservationMode::Summary,
+            )
+            .unwrap_or_else(|error| panic!("{} Metal: {error}", fixture.name));
+            assert_eq!(
+                fingerprint(&run.result),
+                fixture.anchor,
+                "{} Metal",
+                fixture.name
+            );
+        }
+        #[cfg(feature = "cuda")]
+        {
+            let run = days_executor::run_cuda_with_observations(
+                &image,
+                None,
+                days_executor::CudaConfig::default(),
+                ObservationMode::Summary,
+            )
+            .unwrap_or_else(|error| panic!("{} CUDA: {error}", fixture.name));
+            assert_eq!(
+                fingerprint(&run.result),
+                fixture.anchor,
+                "{} CUDA",
+                fixture.name
+            );
+        }
+    }
+}

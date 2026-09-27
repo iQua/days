@@ -130,6 +130,20 @@ constexpr uint P_TCP_LEDGER_META_OFFSET = 29;
 // The region is device scratch: written and consumed inside one attempt, never decoded by the
 // readback (which reads only `stream_state`'s metadata prefix), never part of complete state.
 constexpr uint P_ROUND_SCRATCH_OFFSET = 30;
+// P14 Lane B T4: absolute offset of the PFC region in `scheduler_state`, or NONE when the image
+// carries no PFC state. Layout in `executor/src/device_pfc.rs`.
+constexpr uint P_PFC_OFFSET = 31;
+constexpr uint PFC_ROW_HEADER_WORDS = 5;
+constexpr uint PFC_INGRESS_WORDS = 43;
+constexpr uint PI_LINK = 0;
+constexpr uint PI_TARGET = 1;
+constexpr uint PI_DELAY = 2;
+constexpr uint PI_CAPACITY = 3;
+constexpr uint PI_XOFF = 11;
+constexpr uint PI_XON = 19;
+constexpr uint PI_OCCUPANCY = 27;
+constexpr uint PI_ASSERTED = 35;
+constexpr ulong PFC_FRAME_BYTES = 64;
 constexpr uint ROUND_SCRATCH_CACHE_WORDS = 2;
 
 // T21 fix 1 — the re-gridded control sweeps. `evidence/P12/aterm-fixes.md` §3.4.
@@ -2779,12 +2793,17 @@ __device__ __forceinline__ bool scheduler_active_weight_sum(
     return true;
 }
 
+// P14 Lane B T4: a nonzero `paused_mask` hides the packets of paused PFC priorities, so DRR and WRR
+// select over exactly the scalar eligible-packet list. Zero leaves every packet eligible.
 __device__ __forceinline__ bool scheduler_first_packet_for_class(
     ulong node,
     ulong class_count,
     ulong class_index,
     const ulong *queue_meta,
     const ulong *queue_records,
+    const ulong *params,
+    const ulong *scheduler_state,
+    ulong paused_mask,
     ulong &position,
     ulong &size
 ) {
@@ -2796,6 +2815,12 @@ __device__ __forceinline__ bool scheduler_first_packet_for_class(
     for (ulong logical = 0; logical < count; ++logical) {
         ulong physical = (head + logical) % max(capacity, 1ul);
         ulong record_base = (offset + physical) * EVENT_WORDS;
+        if (paused_mask != 0 &&
+            ((paused_mask >> scheduler_state[
+                params[P_PFC_OFFSET] + params[P_NODE_COUNT] + queue_records[record_base + PK_FLOW]
+            ]) & 1ul) != 0) {
+            continue;
+        }
         if (queue_records[record_base + PK_FLOW] % class_count == class_index) {
             position = logical;
             size = queue_records[record_base + PK_SIZE];
@@ -2811,6 +2836,8 @@ __device__ __forceinline__ bool drr_select_position(
     const ulong *queue_meta,
     const ulong *queue_records,
     ulong *scheduler_state,
+    const ulong *params,
+    ulong paused_mask,
     ulong &position
 ) {
     ulong node_base = node * SCHEDULER_NODE_WORDS;
@@ -2836,6 +2863,9 @@ __device__ __forceinline__ bool drr_select_position(
                 class_index,
                 queue_meta,
                 queue_records,
+                params,
+                scheduler_state,
+                paused_mask,
                 candidate,
                 size
             ) &&
@@ -2864,6 +2894,9 @@ __device__ __forceinline__ bool drr_select_position(
             class_index,
             queue_meta,
             queue_records,
+            params,
+            scheduler_state,
+            paused_mask,
             candidate,
             size
         )) {
@@ -2906,6 +2939,9 @@ __device__ __forceinline__ bool drr_select_position(
             class_index,
             queue_meta,
             queue_records,
+            params,
+            scheduler_state,
+            paused_mask,
             ignored_position,
             ignored_size
         )) {
@@ -2938,6 +2974,8 @@ __device__ __forceinline__ bool wrr_select_position(
     const ulong *queue_meta,
     const ulong *queue_records,
     ulong *scheduler_state,
+    const ulong *params,
+    ulong paused_mask,
     ulong &position
 ) {
     ulong node_base = node * SCHEDULER_NODE_WORDS;
@@ -2968,6 +3006,9 @@ __device__ __forceinline__ bool wrr_select_position(
                     current,
                     queue_meta,
                     queue_records,
+                    params,
+                    scheduler_state,
+                    paused_mask,
                     candidate,
                     ignored_size
                 )
@@ -4370,6 +4411,294 @@ __device__ __forceinline__ bool dcqcn_data_arrival(
         tcp_state);
 }
 
+// ---------------------------------------------------------------------------------------------
+// PFC per-priority link pause (P14 Lane B T4). Transliterated from the scalar switch paths:
+// `switch_pfc_remote_arrival`, the PFC arms of `switch_remote_arrival` (overflow drop, XOFF),
+// `switch_tx_ready` (first-unpaused selection, XON on dequeue), `switch_tx_complete` and
+// `emit_pfc_frame`. Semantics are the T25 ones: edge-triggered XOFF/XON, no timed pause.
+//
+// Every PFC word of an LP's queue row is owned by that LP: the pause bitsets are written only by
+// the controlled upstream LP on frame arrival, and each ingress record only by the downstream LP
+// that monitors it. The flow-priority table is immutable image data.
+// ---------------------------------------------------------------------------------------------
+
+// The LP's PFC queue row, or NONE when the image or this queue carries no PFC state.
+__device__ __forceinline__ ulong pfc_queue_row(
+    ulong node,
+    const ulong *params,
+    const ulong *scheduler_state
+) {
+    ulong region = params[P_PFC_OFFSET];
+    return region == NONE ? NONE : scheduler_state[region + node];
+}
+
+__device__ __forceinline__ ulong pfc_flow_priority(
+    ulong flow,
+    const ulong *params,
+    const ulong *scheduler_state
+) {
+    return scheduler_state[params[P_PFC_OFFSET] + params[P_NODE_COUNT] + flow];
+}
+
+// Scalar `PfcQueueState::is_paused`: some controller still asserts pause for the priority.
+__device__ __forceinline__ bool pfc_priority_paused(
+    ulong row,
+    ulong priority,
+    const ulong *scheduler_state
+) {
+    ulong words = scheduler_state[row + 2];
+    ulong base = scheduler_state[row + 3] + priority * words;
+    for (ulong word = 0; word < words; ++word) {
+        if (scheduler_state[base + word] != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+__device__ __noinline__ ulong pfc_paused_mask(ulong row, const ulong *scheduler_state) {
+    ulong mask = 0;
+    for (ulong priority = 0; priority < 8; ++priority) {
+        if (pfc_priority_paused(row, priority, scheduler_state)) {
+            mask |= 1ul << priority;
+        }
+    }
+    return mask;
+}
+
+// Logical position of the first queued packet whose priority is not paused, or NONE.
+__device__ __noinline__ ulong pfc_first_eligible(
+    ulong node,
+    ulong paused_mask,
+    const ulong *queue_meta,
+    const ulong *queue_records,
+    const ulong *params,
+    const ulong *scheduler_state
+) {
+    ulong meta_base = node * QUEUE_META_WORDS;
+    ulong offset = queue_meta[meta_base];
+    ulong capacity = queue_meta[meta_base + 1];
+    ulong head = queue_meta[meta_base + 2];
+    ulong count = queue_meta[meta_base + 3];
+    for (ulong logical = 0; logical < count; ++logical) {
+        ulong record_base = (offset + (head + logical) % max(capacity, 1ul)) * EVENT_WORDS;
+        ulong priority =
+            pfc_flow_priority(queue_records[record_base + PK_FLOW], params, scheduler_state);
+        if (((paused_mask >> priority) & 1ul) == 0) {
+            return logical;
+        }
+    }
+    return NONE;
+}
+
+__device__ __forceinline__ void pfc_copy_queue_record(
+    ulong node,
+    ulong logical,
+    const ulong *queue_meta,
+    const ulong *queue_records,
+    ulong *record
+) {
+    ulong meta_base = node * QUEUE_META_WORDS;
+    ulong physical = (queue_meta[meta_base + 2] + logical) % max(queue_meta[meta_base + 1], 1ul);
+    copy_device_to_thread(queue_records, queue_meta[meta_base] + physical, record);
+}
+
+// Scalar `packet_incoming_link_at`: the route hop that delivers the packet to this LP.
+__device__ __noinline__ ulong packet_incoming_link(
+    ulong node,
+    const ulong *packet,
+    const ulong *flows,
+    const ulong *routes,
+    const ulong *links
+) {
+    ulong offset;
+    ulong length;
+    ulong terminal;
+    flow_route(packet, flows, offset, length, terminal);
+    for (ulong index = 0; index < length; ++index) {
+        ulong target = index + 1 < length
+            ? links[routes[offset + index + 1] * LINK_WORDS] : terminal;
+        if (target == node) {
+            return routes[offset + index];
+        }
+    }
+    return NONE;
+}
+
+// The row's ingress monitor for `link` when it controls `priority`, or NONE. A zero XOFF disables
+// the priority, which the scalar monitor treats exactly as no monitor.
+__device__ __noinline__ ulong pfc_enabled_ingress(
+    ulong row,
+    ulong link,
+    ulong priority,
+    const ulong *scheduler_state
+) {
+    ulong count = scheduler_state[row + 1];
+    ulong base = scheduler_state[row + 4];
+    for (ulong index = 0; index < count; ++index) {
+        ulong ingress = base + index * PFC_INGRESS_WORDS;
+        if (scheduler_state[ingress + PI_LINK] == link) {
+            return scheduler_state[ingress + PI_XOFF + priority] == 0 ? NONE : ingress;
+        }
+    }
+    return NONE;
+}
+
+// `emit_pfc_frame`: a 64-byte control payload whose identity is the emitting LP's next origin
+// sequence, delivered on the ingress monitor's reverse control lane after its exact delay.
+__device__ __forceinline__ bool emit_pfc_frame(
+    ulong node,
+    const ulong *parent,
+    ulong ingress,
+    ulong flow,
+    ulong priority,
+    ulong pause,
+    ulong *error,
+    const ulong *params,
+    ulong *node_state,
+    const ulong *scheduler_state,
+    ulong *fel_meta,
+    ulong *fel_records,
+    ulong *remote_meta,
+    ulong *remote_staging,
+    ulong *stream_state,
+    ulong *stream_records,
+    ulong *tcp_state
+) {
+    ulong sequence = node_state[node * NODE_WORDS + N_NEXT_ORIGIN];
+    ulong time;
+    if (sequence == NONE || sequence > (NONE - node) / params[P_NODE_COUNT] ||
+        !checked_add(parent[E_TIME], scheduler_state[ingress + PI_DELAY], time)) {
+        set_semantic_error(error, 76, node);
+        return false;
+    }
+    ulong frame[EVENT_WORDS];
+    packet_clear(frame);
+    frame[PK_ID] = sequence * params[P_NODE_COUNT] + node;
+    frame[PK_FLOW] = flow;
+    frame[PK_SIZE] = PFC_FRAME_BYTES;
+    frame[PK_KIND] = PFC_PACKET;
+    frame[PK_META_0] = scheduler_state[ingress + PI_LINK];
+    frame[PK_META_1] = priority;
+    frame[PK_META_2] = pause;
+    return emit_child(
+        node, parent, scheduler_state[ingress + PI_TARGET], REMOTE_ARRIVAL, time, frame, error,
+        params, node_state, fel_meta, fel_records, remote_meta, remote_staging, stream_state,
+        stream_records, tcp_state);
+}
+
+// `switch_pfc_remote_arrival`: assign one controller's pause bit; on the last resume, schedule
+// service for the first packet whose priority is no longer paused.
+__device__ __forceinline__ bool pfc_frame_arrival(
+    ulong node,
+    const ulong *event,
+    ulong *error,
+    const ulong *params,
+    ulong *node_state,
+    const ulong *queue_meta,
+    const ulong *queue_records,
+    ulong *scheduler_state,
+    ulong *fel_meta,
+    ulong *fel_records,
+    ulong *remote_meta,
+    ulong *remote_staging,
+    ulong *stream_state,
+    ulong *stream_records,
+    ulong *tcp_state
+) {
+    ulong node_base = node * NODE_WORDS;
+    ulong row = pfc_queue_row(node, params, scheduler_state);
+    ulong priority = event[PK_META_1];
+    if (row == NONE || node_state[node_base + N_EGRESS] != event[PK_META_0] || priority >= 8) {
+        set_semantic_error(error, 77, node);
+        return false;
+    }
+    ulong controllers = scheduler_state[row];
+    ulong bit = NONE;
+    for (ulong index = 0; index < controllers; ++index) {
+        if (scheduler_state[row + PFC_ROW_HEADER_WORDS + index] == event[E_ORIGIN]) {
+            bit = index;
+            break;
+        }
+    }
+    if (bit == NONE) {
+        set_semantic_error(error, 78, node);
+        return false;
+    }
+    ulong word = scheduler_state[row + 3] + priority * scheduler_state[row + 2] + bit / 64;
+    ulong mask_bit = 1ul << (bit % 64);
+    if (event[PK_META_2] != 0) {
+        scheduler_state[word] |= mask_bit;
+        return true;
+    }
+    // A duplicate or early resume is an idempotent no-op; another holder keeps the pause.
+    if ((scheduler_state[word] & mask_bit) == 0) {
+        return true;
+    }
+    scheduler_state[word] &= ~mask_bit;
+    if (pfc_priority_paused(row, priority, scheduler_state)) {
+        return true;
+    }
+    ulong position = pfc_first_eligible(
+        node, pfc_paused_mask(row, scheduler_state), queue_meta, queue_records, params,
+        scheduler_state);
+    if (position == NONE || node_state[node_base + N_SERVICE_VALID] != 0 ||
+        node_state[node_base + N_READY_PENDING] != 0) {
+        return true;
+    }
+    node_state[node_base + N_READY_PENDING] = 1;
+    ulong next[EVENT_WORDS];
+    pfc_copy_queue_record(node, position, queue_meta, queue_records, next);
+    return emit_child(
+        node, event, node, TX_READY, event[E_TIME], next, error, params, node_state, fel_meta,
+        fel_records, remote_meta, remote_staging, stream_state, stream_records, tcp_state);
+}
+
+// Removes the WFQ packet at `logical` together with its finish tag, which moves to the in-service
+// tag. Later records and their tags shift down one slot, as `queue_remove_at` shifts records, so
+// every tag stays with its packet.
+__device__ __forceinline__ bool wfq_remove_at(
+    ulong node,
+    ulong logical,
+    ulong *queue_meta,
+    ulong *queue_records,
+    ulong *scheduler_state,
+    ulong *record
+) {
+    ulong base = node * QUEUE_META_WORDS;
+    ulong offset = queue_meta[base];
+    ulong capacity = max(queue_meta[base + 1], 1ul);
+    ulong head = queue_meta[base + 2];
+    ulong count = queue_meta[base + 3];
+    if (logical >= count) {
+        return false;
+    }
+    ulong scheduler_base = node * SCHEDULER_NODE_WORDS;
+    ulong tag_offset = scheduler_state[scheduler_base + S_QUEUE_TAG_OFFSET];
+    ulong physical = (head + logical) % capacity;
+    copy_device_to_thread(queue_records, offset + physical, record);
+    rational_copy(
+        scheduler_state, tag_offset + physical * RATIONAL_WORDS,
+        scheduler_base + S_IN_SERVICE_TAG);
+    if (logical == 0) {
+        rational_zero(scheduler_state, tag_offset + physical * RATIONAL_WORDS);
+        queue_meta[base + 2] = (head + 1) % capacity;
+        queue_meta[base + 3] = count - 1;
+        return true;
+    }
+    for (ulong cursor = logical; cursor + 1 < count; ++cursor) {
+        ulong source = (head + cursor + 1) % capacity;
+        ulong target = (head + cursor) % capacity;
+        copy_device_record(queue_records, offset + source, queue_records, offset + target);
+        rational_copy(
+            scheduler_state, tag_offset + source * RATIONAL_WORDS,
+            tag_offset + target * RATIONAL_WORDS);
+    }
+    rational_zero(scheduler_state, tag_offset + ((head + count - 1) % capacity) * RATIONAL_WORDS);
+    queue_meta[base + 3] = count - 1;
+    return true;
+}
+
 __device__ __forceinline__ bool dispatch_event(
     ulong node,
     ulong *event,
@@ -4789,6 +5118,17 @@ __device__ __forceinline__ bool dispatch_event(
             : SCHED_FIFO;
         ulong selected_position = 0;
         bool selected_position_valid = true;
+        // PFC: while a priority is paused, selection runs over the eligible packets only, as the
+        // scalar eligible-packet plan does. With nothing eligible the decision point is a no-op.
+        ulong pfc_row = role == SWITCH ? pfc_queue_row(node, params, scheduler_state) : NONE;
+        ulong paused_mask = pfc_row == NONE ? 0 : pfc_paused_mask(pfc_row, scheduler_state);
+        if (paused_mask != 0) {
+            selected_position = pfc_first_eligible(
+                node, paused_mask, queue_meta, queue_records, params, scheduler_state);
+            if (selected_position == NONE) {
+                return true;
+            }
+        }
         if (scheduler_kind == SCHED_DRR) {
             selected_position_valid = drr_select_position(
                 node,
@@ -4796,6 +5136,8 @@ __device__ __forceinline__ bool dispatch_event(
                 queue_meta,
                 queue_records,
                 scheduler_state,
+                params,
+                paused_mask,
                 selected_position
             );
         } else if (scheduler_kind == SCHED_WRR) {
@@ -4805,13 +5147,21 @@ __device__ __forceinline__ bool dispatch_event(
                 queue_meta,
                 queue_records,
                 scheduler_state,
+                params,
+                paused_mask,
                 selected_position
             );
         }
         if (!selected_position_valid) {
             return false;
         }
-        bool removed = scheduler_kind == SCHED_DRR || scheduler_kind == SCHED_WRR
+        bool positional =
+            scheduler_kind == SCHED_DRR || scheduler_kind == SCHED_WRR || paused_mask != 0;
+        bool wfq_tagged_removal = scheduler_kind == SCHED_WFQ && paused_mask != 0;
+        bool removed = wfq_tagged_removal
+            ? wfq_remove_at(
+                node, selected_position, queue_meta, queue_records, scheduler_state, selected)
+            : positional
             ? queue_remove_at(
                 node,
                 selected_position,
@@ -4822,7 +5172,7 @@ __device__ __forceinline__ bool dispatch_event(
             )
             : queue_pop(node, queue_meta, queue_records, selected, selected_physical);
         if (!removed) {
-            if (scheduler_kind == SCHED_DRR || scheduler_kind == SCHED_WRR) {
+            if (positional) {
                 set_semantic_error(error, 35, node);
                 return false;
             }
@@ -4837,7 +5187,7 @@ __device__ __forceinline__ bool dispatch_event(
             }
             queue_meta[queue_base + 4] = queued_bytes - selected[PK_SIZE];
         }
-        if (role == SWITCH && scheduler_kind == SCHED_WFQ) {
+        if (role == SWITCH && scheduler_kind == SCHED_WFQ && !wfq_tagged_removal) {
             ulong tag_offset = scheduler_state[scheduler_base + S_QUEUE_TAG_OFFSET];
             rational_copy(
                 scheduler_state,
@@ -4848,6 +5198,30 @@ __device__ __forceinline__ bool dispatch_event(
                 scheduler_state,
                 tag_offset + selected_physical * RATIONAL_WORDS
             );
+        }
+        // PFC drain: the dequeued packet leaves its ingress monitor's occupancy, and crossing XON
+        // releases the pause with a resume frame, emitted before the transmission's children.
+        ulong resume_ingress = NONE;
+        ulong resume_priority = 0;
+        if (pfc_row != NONE) {
+            resume_priority = pfc_flow_priority(selected[PK_FLOW], params, scheduler_state);
+            ulong incoming = packet_incoming_link(node, selected, flows, routes, links);
+            ulong ingress = incoming == NONE
+                ? NONE : pfc_enabled_ingress(pfc_row, incoming, resume_priority, scheduler_state);
+            if (ingress != NONE) {
+                ulong occupancy = scheduler_state[ingress + PI_OCCUPANCY + resume_priority];
+                if (occupancy < selected[PK_SIZE]) {
+                    set_semantic_error(error, 79, node);
+                    return false;
+                }
+                occupancy -= selected[PK_SIZE];
+                scheduler_state[ingress + PI_OCCUPANCY + resume_priority] = occupancy;
+                if (scheduler_state[ingress + PI_ASSERTED + resume_priority] != 0 &&
+                    occupancy <= scheduler_state[ingress + PI_XON + resume_priority]) {
+                    scheduler_state[ingress + PI_ASSERTED + resume_priority] = 0;
+                    resume_ingress = ingress;
+                }
+            }
         }
         node_state[node_base + N_SERVICE_VALID] = 1;
         copy_thread_to_device(selected, in_service, node);
@@ -4878,6 +5252,12 @@ __device__ __forceinline__ bool dispatch_event(
         ulong target;
         if (!packet_remote_target(selected, egress, flows, routes, links, target)) {
             set_semantic_error(error, 14, node);
+            return false;
+        }
+        if (resume_ingress != NONE && !emit_pfc_frame(
+                node, event, resume_ingress, selected[PK_FLOW], resume_priority, 0, error,
+                params, node_state, scheduler_state, fel_meta, fel_records, remote_meta,
+                remote_staging, stream_state, stream_records, tcp_state)) {
             return false;
         }
         if (!emit_child(
@@ -4967,7 +5347,18 @@ __device__ __forceinline__ bool dispatch_event(
             node_state[node_base + N_READY_PENDING] == 0
         ) {
             ulong next[EVENT_WORDS];
-            if (!queue_front(node, queue_meta, queue_records, next)) {
+            ulong pfc_row = role == SWITCH ? pfc_queue_row(node, params, scheduler_state) : NONE;
+            if (pfc_row != NONE) {
+                // PFC: the next decision point serves the first packet whose priority is unpaused;
+                // with none eligible, service waits for a resume.
+                ulong position = pfc_first_eligible(
+                    node, pfc_paused_mask(pfc_row, scheduler_state), queue_meta, queue_records,
+                    params, scheduler_state);
+                if (position == NONE) {
+                    return true;
+                }
+                pfc_copy_queue_record(node, position, queue_meta, queue_records, next);
+            } else if (!queue_front(node, queue_meta, queue_records, next)) {
                 set_semantic_error(error, 17, node);
                 return false;
             }
@@ -5018,6 +5409,12 @@ __device__ __forceinline__ bool dispatch_event(
     }
 
     if (kind == REMOTE_ARRIVAL && role == SWITCH) {
+        if ((event[PK_KIND] & PK_KIND_MASK) == PFC_PACKET) {
+            return pfc_frame_arrival(
+                node, event, error, params, node_state, queue_meta, queue_records,
+                scheduler_state, fel_meta, fel_records, remote_meta, remote_staging,
+                stream_state, stream_records, tcp_state);
+        }
         if (node_state[node_base + N_COUNTER_0] == NONE) {
             set_semantic_error(error, 18, node);
             return false;
@@ -5034,8 +5431,25 @@ __device__ __forceinline__ bool dispatch_event(
         }
         ulong semantic_capacity = node_state[node_base + N_SEMANTIC_QUEUE_CAPACITY];
         ulong scheduler_base = node * SCHEDULER_NODE_WORDS;
+        // PFC: the monitor of the packet's incoming link, when it controls the packet's priority.
+        // Admission past its buffer capacity drops before any AQM decision.
+        ulong pfc_row = pfc_queue_row(node, params, scheduler_state);
+        ulong pfc_priority = 0;
+        ulong pfc_ingress = NONE;
+        if (pfc_row != NONE) {
+            pfc_priority = pfc_flow_priority(event[PK_FLOW], params, scheduler_state);
+            ulong incoming = packet_incoming_link(node, event, flows, routes, links);
+            pfc_ingress = incoming == NONE
+                ? NONE : pfc_enabled_ingress(pfc_row, incoming, pfc_priority, scheduler_state);
+        }
         ulong admission;
-        if (!switch_admission_action(
+        if (pfc_ingress != NONE &&
+            (scheduler_state[pfc_ingress + PI_OCCUPANCY + pfc_priority] >
+                NONE - event[PK_SIZE] ||
+             scheduler_state[pfc_ingress + PI_OCCUPANCY + pfc_priority] + event[PK_SIZE] >
+                scheduler_state[pfc_ingress + PI_CAPACITY + pfc_priority])) {
+            admission = 2;
+        } else if (!switch_admission_action(
             node,
             event,
             semantic_capacity,
@@ -5121,10 +5535,29 @@ __device__ __forceinline__ bool dispatch_event(
         )) {
             return false;
         }
+        if (pfc_ingress != NONE) {
+            // XOFF: the admitted bytes count against the monitor; reaching XOFF while unasserted
+            // pauses the upstream queue's priority, before this arrival's ready event.
+            ulong depth =
+                scheduler_state[pfc_ingress + PI_OCCUPANCY + pfc_priority] + event[PK_SIZE];
+            scheduler_state[pfc_ingress + PI_OCCUPANCY + pfc_priority] = depth;
+            if (depth >= scheduler_state[pfc_ingress + PI_XOFF + pfc_priority] &&
+                scheduler_state[pfc_ingress + PI_ASSERTED + pfc_priority] == 0) {
+                scheduler_state[pfc_ingress + PI_ASSERTED + pfc_priority] = 1;
+                if (!emit_pfc_frame(
+                        node, event, pfc_ingress, event[PK_FLOW], pfc_priority, 1, error,
+                        params, node_state, scheduler_state, fel_meta, fel_records,
+                        remote_meta, remote_staging, stream_state, stream_records,
+                        tcp_state)) {
+                    return false;
+                }
+            }
+        }
         if (
             egress != NONE &&
             node_state[node_base + N_SERVICE_VALID] == 0 &&
-            node_state[node_base + N_READY_PENDING] == 0
+            node_state[node_base + N_READY_PENDING] == 0 &&
+            (pfc_row == NONE || !pfc_priority_paused(pfc_row, pfc_priority, scheduler_state))
         ) {
             node_state[node_base + N_READY_PENDING] = 1;
             return emit_child(

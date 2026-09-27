@@ -390,18 +390,54 @@ fn run_scalar_cpu_inner(image: &SimulationImage, validate_input: bool) -> RunRes
         .unwrap_or_else(|error| panic!("CPU PFC fixture failed with {workers} workers: {error}"));
         assert_eq!(cpu.result, scalar, "PFC worker count {workers}");
     }
+    if validate_input {
+        assert_devices_match(image, &scalar);
+    }
     scalar
 }
 
+/// P14 Lane B: every validated PFC scenario here also runs on each built device backend, byte for
+/// byte against the Scalar full-observation result (devices omit the diagnostic planes).
+#[allow(unused_variables)]
+fn assert_devices_match(image: &SimulationImage, scalar: &RunResult) {
+    let mut expected = scalar.clone();
+    expected.diagnostics = None;
+    #[cfg(all(feature = "metal", target_vendor = "apple"))]
+    for streams_enabled in [true, false] {
+        let metal = days_executor::run_metal_with_observations(
+            image,
+            None,
+            days_executor::MetalConfig {
+                streams_enabled,
+                ..days_executor::MetalConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .unwrap_or_else(|error| panic!("Metal PFC run (streams={streams_enabled}): {error}"));
+        assert_eq!(metal.result, expected, "Metal streams={streams_enabled}");
+    }
+    #[cfg(feature = "cuda")]
+    for streams_enabled in [true, false] {
+        let cuda = days_executor::run_cuda_with_observations(
+            image,
+            None,
+            days_executor::CudaConfig {
+                streams_enabled,
+                ..days_executor::CudaConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .unwrap_or_else(|error| panic!("CUDA PFC run (streams={streams_enabled}): {error}"));
+        assert_eq!(cuda.result, expected, "CUDA streams={streams_enabled}");
+    }
+}
+
 #[test]
-fn devices_reject_pfc_before_packing() {
+fn devices_accept_pfc_state() {
     let image = path_image();
     for backend in [Backend::Metal, Backend::Cuda] {
-        let error = validate(&image, backend).unwrap_err().to_string();
-        assert!(
-            error.contains("does not support PFC per-priority link pause"),
-            "{backend}: {error}"
-        );
+        validate(&image, backend)
+            .unwrap_or_else(|error| panic!("{backend} must accept PFC state: {error}"));
     }
 }
 

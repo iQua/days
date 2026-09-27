@@ -194,6 +194,20 @@ impl DeviceEventArenaSizing {
 ///
 /// Open-loop images retain the established 28 planes. TCP images add one packed auxiliary plane
 /// for receiver ranges, segment ledgers, and full-observation transition state.
+/// Words a production device plan spends on the P14 DCQCN and PFC mechanism state.
+///
+/// Both are sized from image data: an image without DCQCN or PFC state spends nothing on them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MechanismPlaneWords {
+    /// Words of the PFC region appended to the scheduler plane; zero without PFC state.
+    pub pfc_region_words: usize,
+    /// Per-flow transport receiver rows that carry DCQCN notification-point state. The rows
+    /// already exist for every flow, so DCQCN itself adds no words.
+    pub dcqcn_receiver_rows: usize,
+    /// Params words holding the PFC region offset: one, holding `u64::MAX` without PFC state.
+    pub pfc_params_words: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceSizingReport {
     pub planes: Vec<DevicePlaneSizing>,
@@ -914,8 +928,12 @@ fn flow_packet_counts(
         if matches!(packet.kind, PacketKind::TcpData(_)) && !live_payloads.contains(&packet.id) {
             continue;
         }
-        // The zero-byte DCQCN control-timer token never enters a queue or crosses a link.
-        if packet.kind == PacketKind::DcqcnControlTimer {
+        // The zero-byte DCQCN control-timer token never enters a queue or crosses a link, and a PFC
+        // frame travels on its reverse control lane, never on its flow's route.
+        if matches!(
+            packet.kind,
+            PacketKind::DcqcnControlTimer | PacketKind::Pfc(_)
+        ) {
             continue;
         }
         let counts = if packet.kind.is_data() {
@@ -1896,6 +1914,9 @@ fn inbound_producer_words(image: &SimulationImage) -> usize {
                 inbound[target].insert(producer);
             }
         }
+    }
+    for (producer, target) in crate::device_pfc::pfc_control_lane_producers(image) {
+        inbound[target].insert(producer);
     }
     inbound.iter().map(BTreeSet::len).sum()
 }

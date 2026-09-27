@@ -271,6 +271,8 @@ const PACKET_KIND_MASK: u64 = !PACKET_ECN_FLAG;
 const PARAM_RECEIVER_OFFSET: usize = 28;
 /// Params word holding the absolute word offset of the per-flow ledger metadata in `tcp_state`.
 const PARAM_LEDGER_META_OFFSET: usize = 29;
+/// Params word holding the PFC region offset in `scheduler_state`, or `NONE` without PFC state.
+const PARAM_PFC_OFFSET: usize = 32;
 const PARAM_ROUND_THREADS: usize = 30;
 
 const CONTROL_ERROR: usize = 0;
@@ -1205,6 +1207,34 @@ pub fn assert_metal_planner_bit_equal_for_testing(
     Ok(())
 }
 
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+/// Measures the words the production plan spends on DCQCN and PFC state (P14 Lane B).
+pub fn mechanism_plane_words_metal_for_testing(
+    image: &SimulationImage,
+    config: MetalConfig,
+) -> Result<crate::MechanismPlaneWords, MetalError> {
+    validate(image, Backend::Metal).map_err(|error| MetalError::Validation(error.to_string()))?;
+    validate_config(config)?;
+    let plan = MetalPlan::new(image, None, config, ObservationMode::Summary)?;
+    let pfc_offset = plan.params[PARAM_PFC_OFFSET];
+    let receiver_offset = plan.params[PARAM_RECEIVER_OFFSET] as usize;
+    Ok(crate::MechanismPlaneWords {
+        pfc_region_words: if pfc_offset == NONE {
+            0
+        } else {
+            plan.scheduler_state.len() - pfc_offset as usize
+        },
+        dcqcn_receiver_rows: (0..image.flows.len())
+            .filter(|flow| {
+                plan.tcp_state[receiver_offset + flow * TCP_RECEIVER_WORDS]
+                    >= crate::device_mechanism::DCQCN_RECEIVER_NO_CNP
+            })
+            .count(),
+        pfc_params_words: 1,
+    })
+}
+
 /// Returns the exact production-plan plane lengths without creating a Metal device.
 #[cfg(feature = "planner-test-hooks")]
 #[doc(hidden)]
@@ -1776,8 +1806,10 @@ impl MetalPlan {
             }
         }
 
-        let scheduler_state =
+        let mut scheduler_state =
             prepare_device_schedulers(image, &queue_meta).map_err(MetalError::Validation)?;
+        let pfc_offset = crate::device_pfc::append_pfc_region(image, &mut scheduler_state)
+            .map_err(MetalError::Validation)?;
 
         for event in &image.initial_events {
             let packet = if event.kind == EventKind::RetransmissionTimeout {
@@ -1995,6 +2027,7 @@ impl MetalPlan {
             tcp_state.layout.ledger_meta_offset as u64,
             config.round_threads_per_threadgroup as u64,
             streams.layout.round_scratch_offset as u64,
+            pfc_offset.map_or(NONE, |offset| offset as u64),
         ];
 
         if node_count.div_ceil(config.round_threads_per_threadgroup) > u32::MAX as usize {
@@ -2063,8 +2096,12 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
         if matches!(packet.kind, PacketKind::TcpData(_)) && !live_payloads.contains(&packet.id) {
             continue;
         }
-        // The zero-byte DCQCN control-timer token never enters a queue or crosses a link.
-        if packet.kind == PacketKind::DcqcnControlTimer {
+        // The zero-byte DCQCN control-timer token never enters a queue or crosses a link, and a PFC
+        // frame travels on its reverse control lane, never on its flow's route.
+        if matches!(
+            packet.kind,
+            PacketKind::DcqcnControlTimer | PacketKind::Pfc(_)
+        ) {
             continue;
         }
         let counts = if packet.kind.is_data() {
@@ -2207,7 +2244,7 @@ fn add_flow_route_capacities(
             (flow.reverse_route.as_slice(), flow.source)
         }
         PacketKind::Pfc(_) => {
-            unreachable!("Metal capability validation rejects PFC payloads")
+            unreachable!("PFC frames travel on control lanes, never on a flow route")
         }
         PacketKind::DcqcnCnp(_) => (flow.reverse_route.as_slice(), flow.source),
         PacketKind::DcqcnControlTimer => {
@@ -2913,6 +2950,9 @@ fn remote_inbound_producers(image: &SimulationImage) -> (Vec<u64>, Vec<u64>) {
             }
         }
     }
+    for (producer, target) in crate::device_pfc::pfc_control_lane_producers(image) {
+        inbound[target].insert(producer);
+    }
     let mut meta = vec![0_u64; image.nodes.len() * INBOUND_META_WORDS];
     let mut producers = Vec::new();
     for (target, target_producers) in inbound.into_iter().enumerate() {
@@ -2938,7 +2978,11 @@ fn derived_transition_bound(
             ))
         })
         .fold(
-            image.initial_events.len().saturating_add(1),
+            image
+                .initial_events
+                .len()
+                .saturating_add(1)
+                .saturating_add(crate::device_pfc::pfc_frame_transition_bound(image, counts)),
             usize::saturating_add,
         );
     image
@@ -4220,6 +4264,15 @@ impl MetalBuffers {
                         switch_queue.tx_ready_pending = node_state[base + 3] != 0;
                         restore_device_scheduler(lp, &queue_meta, &scheduler_state, switch_queue)
                             .map_err(MetalError::Validation)?;
+                        if params[PARAM_PFC_OFFSET] != NONE {
+                            crate::device_pfc::restore_pfc_queue(
+                                &scheduler_state,
+                                params[PARAM_PFC_OFFSET] as usize,
+                                lp,
+                                switch_queue,
+                            )
+                            .map_err(MetalError::Validation)?;
+                        }
                     }
                     state.next_origin_seq = node_state[base + 5];
                     state.arrived_packets = node_state[base + 7];
@@ -4694,6 +4747,11 @@ fn decode_packet_kind(value: u64, metadata: &[u64]) -> Result<PacketKind, MetalE
             acknowledgment: metadata[0],
             acknowledged_bytes: metadata[1],
             echoed_sent_time_ns: metadata[2],
+        })),
+        4 if metadata[1] < 8 && metadata[2] <= 1 => Ok(PacketKind::Pfc(crate::PfcHeader {
+            controlled_link: crate::LinkId(metadata[0]),
+            priority: metadata[1] as u8,
+            pause: metadata[2] != 0,
         })),
         5 if metadata[1..] == [0, 0] => Ok(PacketKind::DcqcnCnp(crate::DcqcnCnpHeader {
             trigger_payload: PayloadId(metadata[0]),
