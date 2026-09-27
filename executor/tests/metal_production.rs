@@ -113,6 +113,7 @@ fn generator_image(termination: GeneratorTermination) -> SimulationImage {
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![FlowGeneratorState {
+                    stage: None,
                     flow: GENERATOR_FLOW,
                     packets_emitted: 0,
                     bytes_emitted: 0,
@@ -255,6 +256,7 @@ fn converging_generators_image() -> SimulationImage {
     first_constant.packet_size_bytes = 1;
     image.host_states[0].generators[0].kind = FlowGeneratorKind::Constant(first_constant);
     image.host_states[0].generators.push(FlowGeneratorState {
+        stage: None,
         flow: second_flow,
         packets_emitted: 0,
         bytes_emitted: 0,
@@ -367,6 +369,7 @@ fn reverse_switch_feedback_image() -> SimulationImage {
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![FlowGeneratorState {
+                    stage: None,
                     flow: FlowId(0),
                     packets_emitted: 0,
                     bytes_emitted: 0,
@@ -696,6 +699,7 @@ fn backlog_drain_image() -> SimulationImage {
                 in_service: None,
                 tx_ready_pending: true,
                 generators: vec![FlowGeneratorState {
+                    stage: None,
                     flow: GENERATOR_FLOW,
                     packets_emitted: 0,
                     bytes_emitted: 0,
@@ -828,6 +832,7 @@ fn uneven_multi_lp_backlog_image() -> SimulationImage {
                 in_service: None,
                 tx_ready_pending: true,
                 generators: vec![FlowGeneratorState {
+                    stage: None,
                     flow,
                     packets_emitted: 0,
                     bytes_emitted: 0,

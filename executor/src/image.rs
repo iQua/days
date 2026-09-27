@@ -305,6 +305,100 @@ impl CollectiveGenerator {
         (self.local_predecessor.is_none() || self.local_predecessor_complete)
             && (self.inbound_predecessor.is_none() || self.inbound_predecessor_complete)
     }
+
+    const fn dependencies(self) -> StageDependencies {
+        StageDependencies {
+            local_predecessor: self.local_predecessor,
+            inbound_predecessor: self.inbound_predecessor,
+            inbound_predecessor_bytes: self.inbound_predecessor_bytes,
+            local_predecessor_complete: self.local_predecessor_complete,
+            inbound_predecessor_complete: self.inbound_predecessor_complete,
+            inbound_bytes_received: self.inbound_bytes_received,
+        }
+    }
+}
+
+/// Prerequisite state of one dependency-gated stage, owned by the stage's source host LP.
+///
+/// The local predecessor runs on the same host. The inbound predecessor is a stage on another host
+/// whose flow targets this host; its completion is observed through ordinary delivery at this host,
+/// so no cross-LP state is shared.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StageDependencies {
+    pub local_predecessor: Option<FlowId>,
+    pub inbound_predecessor: Option<FlowId>,
+    /// Bytes the inbound predecessor must deliver to this host before it counts as complete.
+    pub inbound_predecessor_bytes: u64,
+    pub local_predecessor_complete: bool,
+    pub inbound_predecessor_complete: bool,
+    /// Delivered inbound bytes: arrivals for open-loop data, the in-order frontier for TCP.
+    pub inbound_bytes_received: u64,
+}
+
+impl StageDependencies {
+    pub const fn prerequisites_complete(self) -> bool {
+        (self.local_predecessor.is_none() || self.local_predecessor_complete)
+            && (self.inbound_predecessor.is_none() || self.inbound_predecessor_complete)
+    }
+}
+
+/// Resolved position and chunk of one collective stage carried by a wrapped transport generator.
+///
+/// The fields mean exactly what the same-named `CollectiveGenerator` fields mean; pacing
+/// parameters are absent because the wrapped transport owns its own sending discipline.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CollectiveStageIdentity {
+    pub collective_id: u64,
+    pub algorithm: CollectiveAlgorithm,
+    pub topology_level: u32,
+    pub topology_group: u32,
+    pub group_size: u32,
+    pub declared_total_bytes: u64,
+    pub rank: u32,
+    pub phase: CollectivePhase,
+    /// One-based phase step.
+    pub step: u32,
+    pub chunk_policy: CollectiveChunkPolicy,
+    pub channel_policy: CollectiveChannelPolicy,
+    pub chunk_offset_bytes: u64,
+    pub chunk_bytes: u64,
+}
+
+/// A delay-only stage: a compute interval of `duration_ns` that sends no bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ComputeStage {
+    /// Scenario-local identity of the compute group this stage belongs to.
+    pub compute_id: u64,
+    pub group_size: u32,
+    pub rank: u32,
+    pub duration_ns: u64,
+}
+
+/// What a dependency-gated generator does once its prerequisites complete.
+#[repr(C, u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StageRole {
+    /// One collective stage whose bytes are carried by the generator's transport.
+    Collective(CollectiveStageIdentity),
+    /// A timer-only compute interval.
+    Compute(ComputeStage),
+}
+
+/// Dependency record attached to an ordinary transport or timer generator.
+///
+/// Paced open-loop collective stages keep their frozen `FlowGeneratorKind::Collective`
+/// representation and never carry this record.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CollectiveStage {
+    pub role: StageRole,
+    pub dependencies: StageDependencies,
+    /// Whether the prerequisites have released the stage. Transport generators revisit `Blocked`
+    /// while waiting for feedback, so status alone cannot distinguish a stage that never started.
+    pub activated: bool,
 }
 
 /// Closed generator transition set. New traffic families require an explicit image variant.
@@ -358,7 +452,7 @@ pub enum GeneratorFeedbackAction {
 
 /// Mutable generator state owned exclusively by the source host LP.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct FlowGeneratorState {
     pub flow: FlowId,
     pub packets_emitted: u64,
@@ -368,6 +462,60 @@ pub struct FlowGeneratorState {
     pub rng_state: u64,
     pub feedback: GeneratorFeedbackState,
     pub kind: FlowGeneratorKind,
+    /// Collective or compute dependency record for a wrapped generator. Always `None` for the
+    /// paced `Collective` kind, which embeds its own dependency fields.
+    pub stage: Option<CollectiveStage>,
+}
+
+impl FlowGeneratorState {
+    /// Dependency state of a stage in either representation, or `None` for an ungated generator.
+    pub const fn stage_dependencies(&self) -> Option<StageDependencies> {
+        match (&self.kind, &self.stage) {
+            (FlowGeneratorKind::Collective(collective), _) => Some(collective.dependencies()),
+            (_, Some(stage)) => Some(stage.dependencies),
+            _ => None,
+        }
+    }
+
+    /// Writes dependency state back into whichever representation this stage uses.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the generator is not a stage; callers obtain `dependencies` from
+    /// [`Self::stage_dependencies`].
+    pub fn set_stage_dependencies(&mut self, dependencies: StageDependencies) {
+        match (&mut self.kind, &mut self.stage) {
+            (FlowGeneratorKind::Collective(collective), _) => {
+                collective.local_predecessor = dependencies.local_predecessor;
+                collective.inbound_predecessor = dependencies.inbound_predecessor;
+                collective.inbound_predecessor_bytes = dependencies.inbound_predecessor_bytes;
+                collective.local_predecessor_complete = dependencies.local_predecessor_complete;
+                collective.inbound_predecessor_complete = dependencies.inbound_predecessor_complete;
+                collective.inbound_bytes_received = dependencies.inbound_bytes_received;
+            }
+            (_, Some(stage)) => stage.dependencies = dependencies,
+            _ => panic!("set_stage_dependencies requires a collective or wrapped stage"),
+        }
+    }
+}
+
+impl fmt::Debug for FlowGeneratorState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("FlowGeneratorState");
+        debug
+            .field("flow", &self.flow)
+            .field("packets_emitted", &self.packets_emitted)
+            .field("bytes_emitted", &self.bytes_emitted)
+            .field("next_emission", &self.next_emission)
+            .field("rng_state", &self.rng_state)
+            .field("feedback", &self.feedback)
+            .field("kind", &self.kind);
+        // Omitting the absent additive field preserves every frozen pre-P14 image byte.
+        if self.stage.is_some() {
+            debug.field("stage", &self.stage);
+        }
+        debug.finish()
+    }
 }
 
 /// One active source-owned retransmission timer.

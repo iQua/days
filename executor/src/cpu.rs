@@ -4421,6 +4421,7 @@ fn route_load_estimator_uses_only_declared_routes_and_generator_rates() {
         .into_iter()
         .enumerate()
         .map(|(flow, interval_ns)| FlowGeneratorState {
+            stage: None,
             flow: FlowId(flow as u64),
             packets_emitted: 0,
             bytes_emitted: 0,

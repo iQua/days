@@ -345,6 +345,87 @@ fn collective_progress_record(
     }
 }
 
+/// Marks every stage whose local predecessor is `completed` as locally complete.
+///
+/// Causes are pushed in canonical `FlowId` order, the order of the host's generator table.
+fn complete_local_successors(
+    generators: &mut [crate::FlowGeneratorState],
+    completed: FlowId,
+    causes: &mut Vec<PendingCollectiveProgress>,
+) {
+    for successor in generators {
+        let Some(mut dependencies) = successor.stage_dependencies() else {
+            continue;
+        };
+        if dependencies.local_predecessor != Some(completed)
+            || dependencies.local_predecessor_complete
+        {
+            continue;
+        }
+        causes.push(PendingCollectiveProgress {
+            flow: successor.flow,
+            cause: crate::CollectiveActivationCause::LocalCompletion,
+            cause_flow: completed,
+            arrival_bytes: 0,
+            before_local_complete: dependencies.local_predecessor_complete,
+            before_inbound_complete: dependencies.inbound_predecessor_complete,
+            before_inbound_bytes: dependencies.inbound_bytes_received,
+        });
+        dependencies.local_predecessor_complete = true;
+        successor.set_stage_dependencies(dependencies);
+    }
+}
+
+/// How delivery of an inbound predecessor's bytes was observed at this host.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InboundProgress {
+    /// One open-loop data packet of this many bytes arrived.
+    Arrival(u64),
+}
+
+/// Advances every stage waiting on `inbound` as its inbound predecessor.
+fn record_inbound_progress(
+    generators: &mut [crate::FlowGeneratorState],
+    inbound: FlowId,
+    progress: InboundProgress,
+    node: NodeId,
+    causes: &mut Vec<PendingCollectiveProgress>,
+) -> Result<(), ExecutionError> {
+    for generator in generators {
+        let Some(mut dependencies) = generator.stage_dependencies() else {
+            continue;
+        };
+        if dependencies.inbound_predecessor != Some(inbound)
+            || dependencies.inbound_predecessor_complete
+        {
+            continue;
+        }
+        let before_inbound_bytes = dependencies.inbound_bytes_received;
+        let InboundProgress::Arrival(arrival_bytes) = progress;
+        causes.push(PendingCollectiveProgress {
+            flow: generator.flow,
+            cause: crate::CollectiveActivationCause::InboundArrival,
+            cause_flow: inbound,
+            arrival_bytes,
+            before_local_complete: dependencies.local_predecessor_complete,
+            before_inbound_complete: dependencies.inbound_predecessor_complete,
+            before_inbound_bytes,
+        });
+        dependencies.inbound_bytes_received = dependencies
+            .inbound_bytes_received
+            .checked_add(arrival_bytes)
+            .ok_or(ExecutionError::CounterOverflow(node))?;
+        if dependencies.inbound_bytes_received > dependencies.inbound_predecessor_bytes {
+            return Err(ExecutionError::CounterOverflow(node));
+        }
+        if dependencies.inbound_bytes_received == dependencies.inbound_predecessor_bytes {
+            dependencies.inbound_predecessor_complete = true;
+        }
+        generator.set_stage_dependencies(dependencies);
+    }
+    Ok(())
+}
+
 impl fmt::Display for ExecutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1381,25 +1462,7 @@ impl<'image> TransitionState<'image> {
                     (None, None)
                 };
             if remaining == 0 {
-                for successor in &mut state.generators {
-                    if let FlowGeneratorKind::Collective(mut stage) = successor.kind {
-                        if stage.local_predecessor == Some(packet.flow)
-                            && !stage.local_predecessor_complete
-                        {
-                            progress_causes.push(PendingCollectiveProgress {
-                                flow: successor.flow,
-                                cause: crate::CollectiveActivationCause::LocalCompletion,
-                                cause_flow: packet.flow,
-                                arrival_bytes: 0,
-                                before_local_complete: stage.local_predecessor_complete,
-                                before_inbound_complete: stage.inbound_predecessor_complete,
-                                before_inbound_bytes: stage.inbound_bytes_received,
-                            });
-                            stage.local_predecessor_complete = true;
-                            successor.kind = FlowGeneratorKind::Collective(stage);
-                        }
-                    }
-                }
+                complete_local_successors(&mut state.generators, packet.flow, &mut progress_causes);
             }
             state.sourced_packets = state
                 .sourced_packets
@@ -1546,25 +1609,7 @@ impl<'image> TransitionState<'image> {
                     (None, None)
                 };
                 if remaining == 0 {
-                    for successor in &mut state.generators {
-                        if let FlowGeneratorKind::Collective(mut stage) = successor.kind {
-                            if stage.local_predecessor == Some(flow)
-                                && !stage.local_predecessor_complete
-                            {
-                                causes.push(PendingCollectiveProgress {
-                                    flow: successor.flow,
-                                    cause: crate::CollectiveActivationCause::LocalCompletion,
-                                    cause_flow: flow,
-                                    arrival_bytes: 0,
-                                    before_local_complete: stage.local_predecessor_complete,
-                                    before_inbound_complete: stage.inbound_predecessor_complete,
-                                    before_inbound_bytes: stage.inbound_bytes_received,
-                                });
-                                stage.local_predecessor_complete = true;
-                                successor.kind = FlowGeneratorKind::Collective(stage);
-                            }
-                        }
-                    }
+                    complete_local_successors(&mut state.generators, flow, &mut causes);
                 }
                 state.sourced_packets = state
                     .sourced_packets
@@ -2364,37 +2409,13 @@ impl<'image> TransitionState<'image> {
                     .checked_add(1)
                     .ok_or(ExecutionError::CounterOverflow(node.id))?;
                 let mut collective_progress_causes = Vec::new();
-                for generator in &mut state.generators {
-                    let FlowGeneratorKind::Collective(mut collective) = generator.kind else {
-                        continue;
-                    };
-                    if collective.inbound_predecessor != Some(packet.flow)
-                        || collective.inbound_predecessor_complete
-                    {
-                        continue;
-                    }
-                    let before_inbound_bytes = collective.inbound_bytes_received;
-                    collective_progress_causes.push(PendingCollectiveProgress {
-                        flow: generator.flow,
-                        cause: crate::CollectiveActivationCause::InboundArrival,
-                        cause_flow: packet.flow,
-                        arrival_bytes: packet.size_bytes,
-                        before_local_complete: collective.local_predecessor_complete,
-                        before_inbound_complete: collective.inbound_predecessor_complete,
-                        before_inbound_bytes,
-                    });
-                    collective.inbound_bytes_received = collective
-                        .inbound_bytes_received
-                        .checked_add(packet.size_bytes)
-                        .ok_or(ExecutionError::CounterOverflow(node.id))?;
-                    if collective.inbound_bytes_received > collective.inbound_predecessor_bytes {
-                        return Err(ExecutionError::CounterOverflow(node.id));
-                    }
-                    if collective.inbound_bytes_received == collective.inbound_predecessor_bytes {
-                        collective.inbound_predecessor_complete = true;
-                    }
-                    generator.kind = FlowGeneratorKind::Collective(collective);
-                }
+                record_inbound_progress(
+                    &mut state.generators,
+                    packet.flow,
+                    InboundProgress::Arrival(packet.size_bytes),
+                    node.id,
+                    &mut collective_progress_causes,
+                )?;
                 (
                     ArrivalDisposition::Delivered,
                     GeneratorFeedbackAction::None,

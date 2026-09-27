@@ -142,6 +142,7 @@ fn tcp_image(control: TcpCongestionControl, total_bytes: u64) -> SimulationImage
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![FlowGeneratorState {
+                    stage: None,
                     flow: FLOW,
                     packets_emitted: 0,
                     bytes_emitted: 0,
@@ -297,6 +298,7 @@ fn switched_tcp_image(
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![FlowGeneratorState {
+                    stage: None,
                     flow: FLOW,
                     packets_emitted: 0,
                     bytes_emitted: 0,

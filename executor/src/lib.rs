@@ -70,13 +70,14 @@ pub use event::{
 };
 pub use image::{
     CollectiveAlgorithm, CollectiveChannelPolicy, CollectiveChunkPolicy, CollectiveGenerator,
-    CollectivePhase, ConstantGenerator, DcqcnCnpHeader, DcqcnGenerator, DcqcnReceiverState,
-    EcnCodepoint, FlowDescriptor, FlowGeneratorKind, FlowGeneratorState, GeneratorFeedbackAction,
-    GeneratorFeedbackState, GeneratorStatus, GeneratorTermination, HostState, LinkDescriptor,
-    NodeDescriptor, PacketDescriptor, PacketKind, PfcHeader, PfcIngressState, PfcQueueState,
-    RateGenerator, RemoteChannel, ScheduledEmission, SimulationImage, SwitchQueueState,
-    SwitchState, TcpAckHeader, TcpDataHeader, TcpGenerator, TcpReceiveRange, TcpReceiverState,
-    TcpTimerState, default_propagation_ns,
+    CollectivePhase, CollectiveStage, CollectiveStageIdentity, ComputeStage, ConstantGenerator,
+    DcqcnCnpHeader, DcqcnGenerator, DcqcnReceiverState, EcnCodepoint, FlowDescriptor,
+    FlowGeneratorKind, FlowGeneratorState, GeneratorFeedbackAction, GeneratorFeedbackState,
+    GeneratorStatus, GeneratorTermination, HostState, LinkDescriptor, NodeDescriptor,
+    PacketDescriptor, PacketKind, PfcHeader, PfcIngressState, PfcQueueState, RateGenerator,
+    RemoteChannel, ScheduledEmission, SimulationImage, StageDependencies, StageRole,
+    SwitchQueueState, SwitchState, TcpAckHeader, TcpDataHeader, TcpGenerator, TcpReceiveRange,
+    TcpReceiverState, TcpTimerState, default_propagation_ns,
 };
 pub use mechanism_trace::{
     CollectiveActivationCause, CollectiveProgressRecord, DrrTransitionRecord, MechanismTraceError,

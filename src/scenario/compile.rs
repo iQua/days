@@ -2333,6 +2333,7 @@ fn lower(
             .entry(source)
             .or_default()
             .push(FlowGeneratorState {
+                stage: None,
                 flow: descriptor.id,
                 packets_emitted: 0,
                 bytes_emitted: 0,
