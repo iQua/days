@@ -248,7 +248,16 @@ fn collective_activation_certificates_are_scalar_generated() {
 
 #[test]
 fn collective_transport_rejections_are_precise_and_flow_dependencies_stay_rejected() {
-    for flow_type in ["TCP", "DCQCN"] {
+    for (flow_type, expected) in [
+        (
+            "DCQCN",
+            "unsupported collective flow type `DCQCN`; collectives support PacketDistribution and TCP, and DCQCN collectives wait for RoCE queue pairs (P15)",
+        ),
+        (
+            "Rate",
+            "unsupported collective flow type `Rate`; collectives support PacketDistribution and TCP",
+        ),
+    ] {
         let config = collective_config("AllGather").replace(
             "flow_type = \"PacketDistribution\"",
             &format!("flow_type = \"{flow_type}\""),
@@ -260,12 +269,7 @@ fn collective_transport_rejections_are_precise_and_flow_dependencies_stay_reject
         fs::write(&path, config).unwrap();
         let error = compile_config(&path).expect_err("transport must be rejected");
         fs::remove_file(path).unwrap();
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "unsupported collective flow type `{flow_type}`; T26 collectives require deterministic byte-terminated PacketDistribution traffic"
-            )
-        );
+        assert_eq!(error.to_string(), expected);
     }
 
     let config = collective_config("AllGather").replace(

@@ -126,7 +126,18 @@ pub enum CollectiveActivationCause {
     InboundArrival,
 }
 
+/// Transport or timer that carries a dependency-gated stage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CollectiveStageKind {
+    /// A paced open-loop `Collective` generator.
+    PacketDistribution,
+    /// A collective stage carried by an ordinary TCP generator.
+    Tcp,
+    /// A delay-only compute stage.
+    Compute,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct CollectiveProgressRecord {
     pub key: EventKey,
     /// Distinguishes progress transitions caused by the same executor event.
@@ -163,6 +174,56 @@ pub struct CollectiveProgressRecord {
     pub after_bytes_emitted: u64,
     pub after_status: GeneratorStatus,
     pub after_next_time_ns: u64,
+    pub stage_kind: CollectiveStageKind,
+    /// Compute interval of a delay-only stage; zero for every data stage.
+    pub duration_ns: u64,
+}
+
+impl fmt::Debug for CollectiveProgressRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("CollectiveProgressRecord");
+        debug
+            .field("key", &self.key)
+            .field("ordinal", &self.ordinal)
+            .field("node", &self.node)
+            .field("flow", &self.flow)
+            .field("cause", &self.cause)
+            .field("cause_flow", &self.cause_flow)
+            .field("arrival_bytes", &self.arrival_bytes)
+            .field("collective_id", &self.collective_id)
+            .field("algorithm", &self.algorithm)
+            .field("group_size", &self.group_size)
+            .field("declared_total_bytes", &self.declared_total_bytes)
+            .field("rank", &self.rank)
+            .field("phase", &self.phase)
+            .field("step", &self.step)
+            .field("chunk_offset_bytes", &self.chunk_offset_bytes)
+            .field("chunk_bytes", &self.chunk_bytes)
+            .field("packet_size_bytes", &self.packet_size_bytes)
+            .field("interval_ns", &self.interval_ns)
+            .field("stop_time_ns", &self.stop_time_ns)
+            .field("local_predecessor", &self.local_predecessor)
+            .field("inbound_predecessor", &self.inbound_predecessor)
+            .field("inbound_predecessor_bytes", &self.inbound_predecessor_bytes)
+            .field("before_local_complete", &self.before_local_complete)
+            .field("before_inbound_complete", &self.before_inbound_complete)
+            .field("before_inbound_bytes", &self.before_inbound_bytes)
+            .field("activated", &self.activated)
+            .field("after_local_complete", &self.after_local_complete)
+            .field("after_inbound_complete", &self.after_inbound_complete)
+            .field("after_inbound_bytes", &self.after_inbound_bytes)
+            .field("after_packets_emitted", &self.after_packets_emitted)
+            .field("after_bytes_emitted", &self.after_bytes_emitted)
+            .field("after_status", &self.after_status)
+            .field("after_next_time_ns", &self.after_next_time_ns);
+        // Omitting the paced-stage defaults preserves every frozen pre-P14 observation byte.
+        if self.stage_kind != CollectiveStageKind::PacketDistribution {
+            debug
+                .field("stage_kind", &self.stage_kind)
+                .field("duration_ns", &self.duration_ns);
+        }
+        debug.finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -225,10 +286,20 @@ pub fn collective_transitions_csv(
     }
 
     let mut csv = String::from(
-        "time_ns,event_phase,event_origin_node,event_origin_sequence,ordinal,node_id,flow_id,cause,cause_flow_id,arrival_bytes,collective_id,algorithm,group_size,declared_total_bytes,rank,collective_phase,step,chunk_offset_bytes,chunk_bytes,packet_size_bytes,interval_ns,stop_time_ns,local_predecessor_flow_id,inbound_predecessor_flow_id,inbound_predecessor_bytes,before_local_complete,before_inbound_complete,before_inbound_bytes,activated,after_local_complete,after_inbound_complete,after_inbound_bytes,after_packets_emitted,after_bytes_emitted,after_status,after_next_time_ns\n",
+        "time_ns,event_phase,event_origin_node,event_origin_sequence,ordinal,node_id,flow_id,cause,cause_flow_id,arrival_bytes,collective_id,algorithm,group_size,declared_total_bytes,rank,collective_phase,step,chunk_offset_bytes,chunk_bytes,packet_size_bytes,interval_ns,stop_time_ns,local_predecessor_flow_id,inbound_predecessor_flow_id,inbound_predecessor_bytes,before_local_complete,before_inbound_complete,before_inbound_bytes,activated,after_local_complete,after_inbound_complete,after_inbound_bytes,after_packets_emitted,after_bytes_emitted,after_status,after_next_time_ns",
     );
+    // Wrapped transports and compute stages need two more columns. A paced-only trace omits them
+    // so every frozen pre-P14 certificate stays byte-identical.
+    let extended = records
+        .iter()
+        .any(|record| record.stage_kind != CollectiveStageKind::PacketDistribution);
+    csv.push_str(if extended {
+        ",stage_kind,duration_ns\n"
+    } else {
+        "\n"
+    });
     for record in records {
-        writeln!(
+        write!(
             csv,
             "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             record.key.time_ns,
@@ -269,8 +340,26 @@ pub fn collective_transitions_csv(
             record.after_next_time_ns,
         )
         .expect("writing to String cannot fail");
+        if extended {
+            write!(
+                csv,
+                ",{},{}",
+                collective_stage_kind(record.stage_kind),
+                record.duration_ns
+            )
+            .expect("writing to String cannot fail");
+        }
+        csv.push('\n');
     }
     Ok(csv)
+}
+
+const fn collective_stage_kind(kind: CollectiveStageKind) -> &'static str {
+    match kind {
+        CollectiveStageKind::PacketDistribution => "packet_distribution",
+        CollectiveStageKind::Tcp => "tcp",
+        CollectiveStageKind::Compute => "compute",
+    }
 }
 
 const fn collective_cause(cause: CollectiveActivationCause) -> &'static str {

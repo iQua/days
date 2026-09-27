@@ -4,13 +4,14 @@ use std::path::Path;
 
 use days_executor::{
     Backend, CollectiveAlgorithm, CollectiveChannelPolicy, CollectiveChunkPolicy,
-    CollectiveGenerator, CollectivePhase, ConstantGenerator, DcqcnController,
-    DcqcnControllerConfig, DcqcnGenerator, DcqcnReceiverState, DropMarkPolicy, EcnThresholdPolicy,
-    Event, EventKey, EventKind, FlowDescriptor, FlowGeneratorKind, FlowGeneratorState, FlowId,
-    GeneratorFeedbackState, GeneratorStatus, GeneratorTermination, HostState, LinkDescriptor,
-    LinkId, NodeDescriptor, NodeId, NodeKind, PacketDescriptor, PacketKind, PayloadId,
-    PfcIngressState, PfcQueueState, QueueDepthUnit, RateGenerator, RedPolicyState, RemoteChannel,
-    ScheduledEmission, SchedulerKind, SimulationImage, SwitchQueueState, SwitchState,
+    CollectiveGenerator, CollectivePhase, CollectiveStage, CollectiveStageIdentity,
+    ConstantGenerator, DcqcnController, DcqcnControllerConfig, DcqcnGenerator, DcqcnReceiverState,
+    DropMarkPolicy, EcnThresholdPolicy, Event, EventKey, EventKind, FlowDescriptor,
+    FlowGeneratorKind, FlowGeneratorState, FlowId, GeneratorFeedbackState, GeneratorStatus,
+    GeneratorTermination, HostState, LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind,
+    PacketDescriptor, PacketKind, PayloadId, PfcIngressState, PfcQueueState, QueueDepthUnit,
+    RateGenerator, RedPolicyState, RemoteChannel, ScheduledEmission, SchedulerKind,
+    SimulationImage, StageDependencies, StageRole, SwitchQueueState, SwitchState,
     TcpCongestionControl, TcpDataHeader, TcpGenerator, TcpReceiverState, event_phase, validate,
 };
 use num_bigint::BigUint;
@@ -1035,13 +1036,17 @@ fn collective_algorithm(name: &str) -> Result<CollectiveAlgorithm, CompileError>
     }
 }
 
-fn validate_collective_transport(flow_type: &str) -> Result<(), CompileError> {
-    if flow_type == "PacketDistribution" {
-        Ok(())
-    } else {
-        Err(CompileError::Unsupported(format!(
-            "unsupported collective flow type `{flow_type}`; T26 collectives require deterministic byte-terminated PacketDistribution traffic"
-        )))
+fn validate_collective_transport(flow_type: &str) -> Result<SourceFlowKind, CompileError> {
+    match flow_type {
+        "PacketDistribution" => Ok(SourceFlowKind::PacketDistribution),
+        "TCP" => Ok(SourceFlowKind::Tcp),
+        "DCQCN" => Err(CompileError::Unsupported(
+            "unsupported collective flow type `DCQCN`; collectives support PacketDistribution and TCP, and DCQCN collectives wait for RoCE queue pairs (P15)"
+                .to_owned(),
+        )),
+        unsupported => Err(CompileError::Unsupported(format!(
+            "unsupported collective flow type `{unsupported}`; collectives support PacketDistribution and TCP"
+        ))),
     }
 }
 
@@ -1060,7 +1065,7 @@ fn collective_key(
     traffic: SourceTraffic,
     scenario_text: &str,
 ) -> Result<CollectiveKey, CompileError> {
-    validate_collective_transport(flow_type)?;
+    let flow_kind = validate_collective_transport(flow_type)?;
     let algorithm = collective_algorithm(collective_type)?;
     if first_flow_id.is_some() {
         return Err(CompileError::Unsupported(
@@ -1117,7 +1122,7 @@ fn collective_key(
             }
         }
     }
-    let traffic = validate_traffic(traffic, SourceFlowKind::PacketDistribution, scenario_text)?;
+    let traffic = validate_traffic(traffic, flow_kind, scenario_text)?;
     let Termination::Bytes(total_bytes) = traffic.termination else {
         return Err(CompileError::Unsupported(
             "unsupported duration-terminated collective traffic; T26 collectives require an exact byte size"
@@ -1127,6 +1132,12 @@ fn collective_key(
     if algorithm == CollectiveAlgorithm::RingAllReduce && total_bytes < flow_count {
         return Err(CompileError::Invalid(format!(
             "RingAllReduce byte size {total_bytes} must be at least flow_count {flow_count}"
+        )));
+    }
+    if flow_kind == SourceFlowKind::Tcp && total_bytes < flow_count {
+        // EqualRemainderLast would leave an empty chunk, and a TCP flow must carry bytes.
+        return Err(CompileError::Invalid(format!(
+            "TCP collective byte size {total_bytes} must be at least flow_count {flow_count}"
         )));
     }
     Ok(CollectiveKey {
@@ -2228,7 +2239,10 @@ fn lower(
                 departure_time_ns: 0,
                 payload: PayloadId(0),
             }
-        } else if flow.collective.is_some() && flow.traffic.initial_delay_ns > model.stop_time_ns {
+        } else if flow.collective.is_some()
+            && flow.traffic.kind == TrafficKind::Constant
+            && flow.traffic.initial_delay_ns > model.stop_time_ns
+        {
             ScheduledEmission {
                 status: GeneratorStatus::Stopped,
                 departure_time_ns: flow.traffic.initial_delay_ns,
@@ -2329,11 +2343,65 @@ fn lower(
                 payload,
             }
         };
+        let collective_stage = flow.collective.as_ref().map(|stage| {
+            let FlowKey::CollectiveStage {
+                semantic,
+                duplicate_ordinal,
+                ..
+            } = &flow.key
+            else {
+                unreachable!("collective metadata requires a collective flow key")
+            };
+            let stage_flow = |position: CollectiveStagePosition| {
+                FlowId(
+                    flow_ids[&FlowKey::CollectiveStage {
+                        semantic: semantic.clone(),
+                        duplicate_ordinal: *duplicate_ordinal,
+                        stage: position,
+                    }],
+                )
+            };
+            (
+                CollectiveStageIdentity {
+                    collective_id: stage.collective_id,
+                    algorithm: semantic.algorithm,
+                    topology_level: 0,
+                    topology_group: 0,
+                    group_size: u32::try_from(semantic.flow_count)
+                        .expect("collective lowering checked group size"),
+                    declared_total_bytes: stage.declared_total_bytes,
+                    rank: stage.position.rank,
+                    phase: stage.position.phase,
+                    step: stage.position.step,
+                    chunk_policy: CollectiveChunkPolicy::EqualRemainderLast,
+                    channel_policy: CollectiveChannelPolicy::RingNext,
+                    chunk_offset_bytes: stage.chunk_offset_bytes,
+                    chunk_bytes: stage.chunk_bytes,
+                },
+                StageDependencies {
+                    local_predecessor: stage.local_predecessor.map(stage_flow),
+                    inbound_predecessor: stage.inbound_predecessor.map(stage_flow),
+                    inbound_predecessor_bytes: stage.inbound_predecessor_bytes,
+                    local_predecessor_complete: stage.local_predecessor_complete,
+                    inbound_predecessor_complete: stage.inbound_predecessor_complete,
+                    inbound_bytes_received: 0,
+                },
+            )
+        });
         generators_by_source
             .entry(source)
             .or_default()
             .push(FlowGeneratorState {
-                stage: None,
+                // Paced stages embed their dependencies in the frozen `Collective` kind; every
+                // other transport carries them in the sidecar.
+                stage: match (collective_stage, flow.traffic.kind) {
+                    (Some(_), TrafficKind::Constant) | (None, _) => None,
+                    (Some((identity, dependencies)), _) => Some(CollectiveStage {
+                        role: StageRole::Collective(identity),
+                        dependencies,
+                        activated: collective_ready && emission_count != 0,
+                    }),
+                },
                 flow: descriptor.id,
                 packets_emitted: 0,
                 bytes_emitted: 0,
@@ -2344,45 +2412,31 @@ fn lower(
                     outstanding_bytes: 0,
                     unacknowledged_bytes: 0,
                 },
-                kind: if let Some(stage) = &flow.collective {
-                    let FlowKey::CollectiveStage {
-                        semantic,
-                        duplicate_ordinal,
-                        ..
-                    } = &flow.key
-                    else {
-                        unreachable!("collective metadata requires a collective flow key")
-                    };
-                    let stage_flow = |position: CollectiveStagePosition| {
-                        flow_ids[&FlowKey::CollectiveStage {
-                            semantic: semantic.clone(),
-                            duplicate_ordinal: *duplicate_ordinal,
-                            stage: position,
-                        }]
-                    };
+                kind: if let (Some((identity, dependencies)), TrafficKind::Constant) =
+                    (collective_stage, flow.traffic.kind)
+                {
                     FlowGeneratorKind::Collective(CollectiveGenerator {
-                        collective_id: stage.collective_id,
-                        algorithm: semantic.algorithm,
-                        topology_level: 0,
-                        topology_group: 0,
-                        group_size: u32::try_from(semantic.flow_count)
-                            .expect("collective lowering checked group size"),
-                        declared_total_bytes: stage.declared_total_bytes,
-                        rank: stage.position.rank,
-                        phase: stage.position.phase,
-                        step: stage.position.step,
-                        chunk_policy: CollectiveChunkPolicy::EqualRemainderLast,
-                        channel_policy: CollectiveChannelPolicy::RingNext,
-                        chunk_offset_bytes: stage.chunk_offset_bytes,
-                        chunk_bytes: stage.chunk_bytes,
+                        collective_id: identity.collective_id,
+                        algorithm: identity.algorithm,
+                        topology_level: identity.topology_level,
+                        topology_group: identity.topology_group,
+                        group_size: identity.group_size,
+                        declared_total_bytes: identity.declared_total_bytes,
+                        rank: identity.rank,
+                        phase: identity.phase,
+                        step: identity.step,
+                        chunk_policy: identity.chunk_policy,
+                        channel_policy: identity.channel_policy,
+                        chunk_offset_bytes: identity.chunk_offset_bytes,
+                        chunk_bytes: identity.chunk_bytes,
                         packet_size_bytes: flow.traffic.packet_size_bytes,
                         interval_ns: flow.traffic.interval_ns,
-                        local_predecessor: stage.local_predecessor.map(stage_flow).map(FlowId),
-                        inbound_predecessor: stage.inbound_predecessor.map(stage_flow).map(FlowId),
-                        inbound_predecessor_bytes: stage.inbound_predecessor_bytes,
-                        local_predecessor_complete: stage.local_predecessor_complete,
-                        inbound_predecessor_complete: stage.inbound_predecessor_complete,
-                        inbound_bytes_received: 0,
+                        local_predecessor: dependencies.local_predecessor,
+                        inbound_predecessor: dependencies.inbound_predecessor,
+                        inbound_predecessor_bytes: dependencies.inbound_predecessor_bytes,
+                        local_predecessor_complete: dependencies.local_predecessor_complete,
+                        inbound_predecessor_complete: dependencies.inbound_predecessor_complete,
+                        inbound_bytes_received: dependencies.inbound_bytes_received,
                     })
                 } else {
                     match flow.traffic.kind {

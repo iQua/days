@@ -305,10 +305,41 @@ struct CollectiveProgressContext {
 fn collective_progress_record(
     context: CollectiveProgressContext,
     cause: PendingCollectiveProgress,
-    collective: crate::CollectiveGenerator,
     generator: &crate::FlowGeneratorState,
-) -> crate::CollectiveProgressRecord {
-    crate::CollectiveProgressRecord {
+) -> Option<crate::CollectiveProgressRecord> {
+    let dependencies = generator.stage_dependencies()?;
+    let (identity, packet_size_bytes, interval_ns, stage_kind) =
+        match (generator.kind, generator.stage) {
+            (FlowGeneratorKind::Collective(collective), _) => (
+                crate::CollectiveStageIdentity {
+                    collective_id: collective.collective_id,
+                    algorithm: collective.algorithm,
+                    topology_level: collective.topology_level,
+                    topology_group: collective.topology_group,
+                    group_size: collective.group_size,
+                    declared_total_bytes: collective.declared_total_bytes,
+                    rank: collective.rank,
+                    phase: collective.phase,
+                    step: collective.step,
+                    chunk_policy: collective.chunk_policy,
+                    channel_policy: collective.channel_policy,
+                    chunk_offset_bytes: collective.chunk_offset_bytes,
+                    chunk_bytes: collective.chunk_bytes,
+                },
+                collective.packet_size_bytes,
+                collective.interval_ns,
+                crate::CollectiveStageKind::PacketDistribution,
+            ),
+            (
+                FlowGeneratorKind::Tcp(tcp),
+                Some(crate::CollectiveStage {
+                    role: crate::StageRole::Collective(identity),
+                    ..
+                }),
+            ) => (identity, tcp.mss_bytes, 0, crate::CollectiveStageKind::Tcp),
+            _ => return None,
+        };
+    Some(crate::CollectiveProgressRecord {
         key: context.key,
         ordinal: context.ordinal,
         node: context.node,
@@ -316,33 +347,45 @@ fn collective_progress_record(
         cause: cause.cause,
         cause_flow: cause.cause_flow,
         arrival_bytes: cause.arrival_bytes,
-        collective_id: collective.collective_id,
-        algorithm: collective.algorithm,
-        group_size: collective.group_size,
-        declared_total_bytes: collective.declared_total_bytes,
-        rank: collective.rank,
-        phase: collective.phase,
-        step: collective.step,
-        chunk_offset_bytes: collective.chunk_offset_bytes,
-        chunk_bytes: collective.chunk_bytes,
-        packet_size_bytes: collective.packet_size_bytes,
-        interval_ns: collective.interval_ns,
+        collective_id: identity.collective_id,
+        algorithm: identity.algorithm,
+        group_size: identity.group_size,
+        declared_total_bytes: identity.declared_total_bytes,
+        rank: identity.rank,
+        phase: identity.phase,
+        step: identity.step,
+        chunk_offset_bytes: identity.chunk_offset_bytes,
+        chunk_bytes: identity.chunk_bytes,
+        packet_size_bytes,
+        interval_ns,
         stop_time_ns: context.stop_time_ns,
-        local_predecessor: collective.local_predecessor,
-        inbound_predecessor: collective.inbound_predecessor,
-        inbound_predecessor_bytes: collective.inbound_predecessor_bytes,
+        local_predecessor: dependencies.local_predecessor,
+        inbound_predecessor: dependencies.inbound_predecessor,
+        inbound_predecessor_bytes: dependencies.inbound_predecessor_bytes,
         before_local_complete: cause.before_local_complete,
         before_inbound_complete: cause.before_inbound_complete,
         before_inbound_bytes: cause.before_inbound_bytes,
         activated: context.activated,
-        after_local_complete: collective.local_predecessor_complete,
-        after_inbound_complete: collective.inbound_predecessor_complete,
-        after_inbound_bytes: collective.inbound_bytes_received,
+        after_local_complete: dependencies.local_predecessor_complete,
+        after_inbound_complete: dependencies.inbound_predecessor_complete,
+        after_inbound_bytes: dependencies.inbound_bytes_received,
         after_packets_emitted: generator.packets_emitted,
         after_bytes_emitted: generator.bytes_emitted,
         after_status: generator.next_emission.status,
         after_next_time_ns: generator.next_emission.departure_time_ns,
-    }
+        stage_kind,
+        duration_ns: 0,
+    })
+}
+
+/// Whether a dependency-blocked stage has just had both prerequisites satisfied.
+fn stage_ready_to_activate(generator: &crate::FlowGeneratorState) -> bool {
+    generator.next_emission.status == GeneratorStatus::Blocked
+        && match (generator.kind, generator.stage) {
+            (FlowGeneratorKind::Collective(stage), _) => stage.prerequisites_complete(),
+            (_, Some(stage)) => !stage.activated && stage.dependencies.prerequisites_complete(),
+            _ => false,
+        }
 }
 
 /// Marks every stage whose local predecessor is `completed` as locally complete.
@@ -381,6 +424,9 @@ fn complete_local_successors(
 enum InboundProgress {
     /// One open-loop data packet of this many bytes arrived.
     Arrival(u64),
+    /// The receiver's in-order TCP frontier advanced by this many bytes. Retransmitted or
+    /// out-of-order bytes count only once the frontier covers them.
+    InOrderAdvance(u64),
 }
 
 /// Advances every stage waiting on `inbound` as its inbound predecessor.
@@ -401,7 +447,8 @@ fn record_inbound_progress(
             continue;
         }
         let before_inbound_bytes = dependencies.inbound_bytes_received;
-        let InboundProgress::Arrival(arrival_bytes) = progress;
+        let (InboundProgress::Arrival(arrival_bytes)
+        | InboundProgress::InOrderAdvance(arrival_bytes)) = progress;
         causes.push(PendingCollectiveProgress {
             flow: generator.flow,
             cause: crate::CollectiveActivationCause::InboundArrival,
@@ -1522,13 +1569,42 @@ impl<'image> TransitionState<'image> {
         let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
         let mut ordinal = 0_u64;
         loop {
+            let wrapped = {
+                let state = self.host_state_mut(node)?;
+                let Some(generator) = state
+                    .generators
+                    .iter_mut()
+                    .find(|generator| stage_ready_to_activate(generator))
+                else {
+                    break;
+                };
+                if let Some(stage) = generator.stage.as_mut() {
+                    stage.activated = true;
+                    Some(generator.flow)
+                } else {
+                    None
+                }
+            };
+            if let Some(flow) = wrapped {
+                let Some(cause_index) = causes.iter().position(|cause| cause.flow == flow) else {
+                    return Err(ExecutionError::UnexpectedGeneratorEmission {
+                        node: node.id,
+                        flow,
+                        payload: parent.payload,
+                    });
+                };
+                let cause = causes.remove(cause_index);
+                self.activate_wrapped_stage(node, parent, flow, cause, ordinal, children)?;
+                ordinal = ordinal
+                    .checked_add(1)
+                    .ok_or(ExecutionError::CounterOverflow(node.id))?;
+                continue;
+            }
             let activation = {
                 let state = self.host_state_mut(node)?;
-                let Some(generator_index) = state.generators.iter().position(|generator| {
-                    generator.next_emission.status == GeneratorStatus::Blocked
-                        && matches!(generator.kind, FlowGeneratorKind::Collective(stage)
-                            if stage.prerequisites_complete())
-                }) else {
+                let Some(generator_index) =
+                    state.generators.iter().position(stage_ready_to_activate)
+                else {
                     break;
                 };
                 let flow = state.generators[generator_index].flow;
@@ -1619,10 +1695,6 @@ impl<'image> TransitionState<'image> {
                 if schedule_ready {
                     state.tx_ready_pending = true;
                 }
-                let generator = &state.generators[generator_index];
-                let FlowGeneratorKind::Collective(after_collective) = generator.kind else {
-                    unreachable!("collective activation retains its generator kind")
-                };
                 let transition = collective_progress_record(
                     CollectiveProgressContext {
                         key: parent.key,
@@ -1632,9 +1704,9 @@ impl<'image> TransitionState<'image> {
                         activated: true,
                     },
                     cause,
-                    after_collective,
-                    generator,
-                );
+                    &state.generators[generator_index],
+                )
+                .expect("collective activation retains its generator kind");
                 ordinal = ordinal
                     .checked_add(1)
                     .ok_or(ExecutionError::CounterOverflow(node.id))?;
@@ -1704,25 +1776,26 @@ impl<'image> TransitionState<'image> {
                             node: node.id,
                             flow: cause.flow,
                         })?;
-                    let FlowGeneratorKind::Collective(collective) = generator.kind else {
-                        return Err(ExecutionError::UnexpectedGeneratorEmission {
-                            node: node.id,
-                            flow: cause.flow,
-                            payload: parent.payload,
-                        });
-                    };
-                    transitions.push(collective_progress_record(
-                        CollectiveProgressContext {
-                            key: parent.key,
-                            ordinal,
-                            node: node.id,
-                            stop_time_ns,
-                            activated: false,
-                        },
-                        cause,
-                        collective,
-                        generator,
-                    ));
+                    transitions.push(
+                        collective_progress_record(
+                            CollectiveProgressContext {
+                                key: parent.key,
+                                ordinal,
+                                node: node.id,
+                                stop_time_ns,
+                                activated: false,
+                            },
+                            cause,
+                            generator,
+                        )
+                        .ok_or(
+                            ExecutionError::UnexpectedGeneratorEmission {
+                                node: node.id,
+                                flow: cause.flow,
+                                payload: parent.payload,
+                            },
+                        )?,
+                    );
                     ordinal = ordinal
                         .checked_add(1)
                         .ok_or(ExecutionError::CounterOverflow(node.id))?;
@@ -1735,6 +1808,85 @@ impl<'image> TransitionState<'image> {
                     .map(crate::MechanismTransitionRecord::Collective),
             );
         }
+        Ok(())
+    }
+
+    /// Releases a dependency-gated stage carried by an ordinary transport generator.
+    ///
+    /// A TCP stage starts exactly as a TCP flow whose first window opens at the release time: the
+    /// sender fills its initial congestion window from sequence zero and arms its timer.
+    fn activate_wrapped_stage(
+        &mut self,
+        node: NodeDescriptor,
+        parent: Event,
+        flow: FlowId,
+        cause: PendingCollectiveProgress,
+        ordinal: u64,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
+        let kind = self
+            .host_state(node)?
+            .generators
+            .iter()
+            .find(|generator| generator.flow == flow)
+            .ok_or(ExecutionError::UnknownGenerator {
+                node: node.id,
+                flow,
+            })?
+            .kind;
+        let FlowGeneratorKind::Tcp(_) = kind else {
+            return Err(ExecutionError::UnexpectedGeneratorEmission {
+                node: node.id,
+                flow,
+                payload: parent.payload,
+            });
+        };
+        let plan = self.prepare_tcp_attempts(node, flow, parent.key.time_ns, None, true, false)?;
+        self.push_stage_progress(node, parent, flow, cause, ordinal, true)?;
+        self.install_tcp_attempts(node, parent, plan, children)
+    }
+
+    /// Records one prerequisite transition of a wrapped stage under full observation.
+    fn push_stage_progress(
+        &mut self,
+        node: NodeDescriptor,
+        parent: Event,
+        flow: FlowId,
+        cause: PendingCollectiveProgress,
+        ordinal: u64,
+        activated: bool,
+    ) -> Result<(), ExecutionError> {
+        if self.observation_mode != ObservationMode::Full {
+            return Ok(());
+        }
+        let stop_time_ns = self.image.stop_time_ns;
+        let generator = self
+            .host_state(node)?
+            .generators
+            .iter()
+            .find(|generator| generator.flow == flow)
+            .ok_or(ExecutionError::UnknownGenerator {
+                node: node.id,
+                flow,
+            })?;
+        let record = collective_progress_record(
+            CollectiveProgressContext {
+                key: parent.key,
+                ordinal,
+                node: node.id,
+                stop_time_ns,
+                activated,
+            },
+            cause,
+            generator,
+        )
+        .ok_or(ExecutionError::UnexpectedGeneratorEmission {
+            node: node.id,
+            flow,
+            payload: parent.payload,
+        })?;
+        self.mechanism_transitions
+            .push(crate::MechanismTransitionRecord::Collective(record));
         Ok(())
     }
 
@@ -2598,7 +2750,7 @@ impl<'image> TransitionState<'image> {
             });
         }
         let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
-        let (ack_payload, acknowledgment, ack_size_bytes) = {
+        let (ack_payload, acknowledgment, ack_size_bytes, stage_causes) = {
             let state = self.host_state_mut(node)?;
             let receiver = state
                 .tcp_receivers
@@ -2612,7 +2764,19 @@ impl<'image> TransitionState<'image> {
                 .sequence
                 .checked_add(packet.size_bytes)
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
+            let frontier_before = receiver.next_expected_sequence;
             tcp_receive_range(receiver, header.sequence, end);
+            let advanced = receiver.next_expected_sequence - frontier_before;
+            let mut stage_causes = Vec::new();
+            if advanced != 0 {
+                record_inbound_progress(
+                    &mut state.generators,
+                    packet.flow,
+                    InboundProgress::InOrderAdvance(advanced),
+                    node.id,
+                    &mut stage_causes,
+                )?;
+            }
             let payload = allocate_payload_id(node.id, node_count, state.next_payload_seq)
                 .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
             state.next_payload_seq = state
@@ -2631,6 +2795,7 @@ impl<'image> TransitionState<'image> {
                 payload,
                 receiver.next_expected_sequence,
                 receiver.ack_size_bytes,
+                stage_causes,
             )
         };
         self.record_arrival(node.id, packet, event.key, ArrivalDisposition::Delivered)?;
@@ -2671,6 +2836,9 @@ impl<'image> TransitionState<'image> {
                 children,
             )?;
         }
+        if !stage_causes.is_empty() {
+            self.activate_ready_collectives(node, event, stage_causes, children)?;
+        }
         Ok(())
     }
 
@@ -2699,6 +2867,7 @@ impl<'image> TransitionState<'image> {
             transition,
             scheduled_send_pending,
             superseded_timer,
+            stage_completed,
         ) = {
             let state = self.host_state_mut(node)?;
             let generator = state
@@ -2796,6 +2965,10 @@ impl<'image> TransitionState<'image> {
                 before,
                 after: tcp.control,
             });
+            // A wrapped stage's local successors wait for its last byte to be acknowledged. Only
+            // the new ACK that first reaches the total advances `highest_ack` to it.
+            let stage_completed = generator.stage.is_some()
+                && acknowledged_through.is_some_and(|acknowledged| acknowledged >= tcp.total_bytes);
             (
                 retransmit,
                 fill,
@@ -2803,8 +2976,14 @@ impl<'image> TransitionState<'image> {
                 transition,
                 scheduled_send_pending,
                 superseded,
+                stage_completed,
             )
         };
+        let mut stage_causes = Vec::new();
+        if stage_completed {
+            let state = self.host_state_mut(node)?;
+            complete_local_successors(&mut state.generators, packet.flow, &mut stage_causes);
+        }
         if let Some(timer) = superseded_timer {
             self.cancel_superseded_timer(node.id, timer);
         }
@@ -2815,24 +2994,24 @@ impl<'image> TransitionState<'image> {
         if self.observation_mode == ObservationMode::Full {
             self.tcp_transitions.extend(transition);
         }
-        if !sender_transition {
-            return Ok(());
-        }
         // A Scheduled TCP descriptor already reserves next_sequence and owns its pending
         // PacketArrival. ACKs may update the sender and ledger, and loss recovery may retransmit
         // an older sequence, but fresh window fill must wait for the reserved event.
-        if scheduled_send_pending && retransmit_sequence.is_none() {
-            return Ok(());
+        if sender_transition && !(scheduled_send_pending && retransmit_sequence.is_none()) {
+            let plan = self.prepare_tcp_attempts(
+                node,
+                packet.flow,
+                event.key.time_ns,
+                retransmit_sequence,
+                fill_window && !scheduled_send_pending,
+                scheduled_send_pending,
+            )?;
+            self.install_tcp_attempts(node, event, plan, children)?;
         }
-        let plan = self.prepare_tcp_attempts(
-            node,
-            packet.flow,
-            event.key.time_ns,
-            retransmit_sequence,
-            fill_window && !scheduled_send_pending,
-            scheduled_send_pending,
-        )?;
-        self.install_tcp_attempts(node, event, plan, children)
+        if !stage_causes.is_empty() {
+            self.activate_ready_collectives(node, event, stage_causes, children)?;
+        }
+        Ok(())
     }
 
     fn host_retransmission_timeout(

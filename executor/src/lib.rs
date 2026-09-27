@@ -80,11 +80,12 @@ pub use image::{
     TcpReceiverState, TcpTimerState, default_propagation_ns,
 };
 pub use mechanism_trace::{
-    CollectiveActivationCause, CollectiveProgressRecord, DrrTransitionRecord, MechanismTraceError,
-    MechanismTransitionRecord, PfcControlAction, PfcControlTransitionRecord, PfcOccupancyAction,
-    PfcThresholdTransitionRecord, RateReplayConfig, RateReplayState, RateTransitionRecord,
-    SchedulerPacket, WrrTransitionRecord, collective_transitions_csv, dcqcn_transitions_csv,
-    drr_transitions_csv, pfc_transitions_csv, rate_transitions_csv, wrr_transitions_csv,
+    CollectiveActivationCause, CollectiveProgressRecord, CollectiveStageKind, DrrTransitionRecord,
+    MechanismTraceError, MechanismTransitionRecord, PfcControlAction, PfcControlTransitionRecord,
+    PfcOccupancyAction, PfcThresholdTransitionRecord, RateReplayConfig, RateReplayState,
+    RateTransitionRecord, SchedulerPacket, WrrTransitionRecord, collective_transitions_csv,
+    dcqcn_transitions_csv, drr_transitions_csv, pfc_transitions_csv, rate_transitions_csv,
+    wrr_transitions_csv,
 };
 #[cfg(all(
     feature = "metal",

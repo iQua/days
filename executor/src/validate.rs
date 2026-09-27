@@ -425,7 +425,7 @@ fn validate_backend_capabilities(
         )));
     }
     for generator in image.host_states.iter().flat_map(|state| &state.generators) {
-        if matches!(generator.kind, FlowGeneratorKind::Collective(_)) {
+        if matches!(generator.kind, FlowGeneratorKind::Collective(_)) || generator.stage.is_some() {
             return Err(ValidationError::new(format!(
                 "backend {backend} does not support collective generators; use Scalar or Cpu"
             )));
@@ -1496,6 +1496,11 @@ fn validate_generators(
                             "flow {:?} TCP generator cannot use the open-loop Stopped state",
                             flow.id
                         )));
+                    }
+                    GeneratorStatus::Blocked
+                        if generator.stage.is_some_and(|stage| !stage.activated) =>
+                    {
+                        validate_unreleased_tcp_stage(flow.id, generator, tcp)?;
                     }
                     GeneratorStatus::Blocked => {
                         validate_blocked_tcp_timer(image, flow_index, owner.id, flow.id, tcp)?;
@@ -2713,6 +2718,33 @@ fn incomplete_tcp_segment_ledger(
     ValidationError::new(format!(
         "flow {flow:?} TCP segment ledger does not cover unacknowledged byte range {highest_ack}..{next_sequence}; expected segment at sequence {expected_sequence}"
     ))
+}
+
+/// A TCP stage that its prerequisites have not released yet holds the pristine sender state that
+/// its first activation starts from: nothing sent, acknowledged, timed, or reserved.
+fn validate_unreleased_tcp_stage(
+    flow: crate::FlowId,
+    generator: &crate::FlowGeneratorState,
+    tcp: crate::TcpGenerator,
+) -> Result<(), ValidationError> {
+    if generator.packets_emitted != 0
+        || generator.bytes_emitted != 0
+        || tcp.next_sequence != 0
+        || tcp.highest_ack != 0
+        || tcp.bytes_in_flight != 0
+        || tcp.duplicate_acks != 0
+        || tcp.recovery_high_sequence != 0
+        || tcp.last_attempt != crate::PayloadId(0)
+        || tcp.timer_generation != 0
+        || tcp.active_timer.is_some()
+        || generator.next_emission.departure_time_ns != 0
+        || generator.next_emission.payload != crate::PayloadId(0)
+    {
+        return Err(ValidationError::new(format!(
+            "flow {flow:?} TCP collective stage is dependency-blocked after sending state changed"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_blocked_tcp_timer(
