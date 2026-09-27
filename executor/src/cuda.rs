@@ -116,8 +116,39 @@ const CONTROL_CONTINUATION: usize = 17;
 const CONTROL_RELAUNCHES: usize = 18;
 const CONTROL_WORDS: usize = 20;
 
-static CUDA_DEVICE_EXECUTION: Mutex<()> = Mutex::new(());
-static CUDA_DIRECT: OnceLock<Result<Arc<DirectCuda>, String>> = OnceLock::new();
+/// One lazily initialized context, stream and module per CUDA device ordinal.
+///
+/// The map lock only fetches or inserts a device's slot; initialization runs outside it, once per
+/// device, so a slow or failing device never blocks another device's first use. A failed
+/// initialization is cached like a successful one: the ordinal stays unavailable for the process.
+type CudaDeviceSlot = Arc<OnceLock<Result<Arc<DirectCuda>, String>>>;
+static CUDA_DEVICES: Mutex<BTreeMap<usize, CudaDeviceSlot>> = Mutex::new(BTreeMap::new());
+
+/// Returns the shared handle for one device ordinal, initializing it on first use.
+fn direct_cuda(device_index: usize) -> Result<Arc<DirectCuda>, CudaError> {
+    let slot = {
+        let mut devices = CUDA_DEVICES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(devices.entry(device_index).or_default())
+    };
+    slot.get_or_init(|| {
+        DirectCuda::new(device_index)
+            .map(Arc::new)
+            .map_err(|error| error.to_string())
+    })
+    .as_ref()
+    .map(Arc::clone)
+    .map_err(|error| CudaError::Unavailable(error.clone()))
+}
+
+/// Number of CUDA devices the driver reports.
+pub fn cuda_device_count() -> Result<usize, CudaError> {
+    let count =
+        CudaContext::device_count().map_err(|error| driver_error("CUDA device count", error))?;
+    usize::try_from(count)
+        .map_err(|_| CudaError::Unavailable(format!("driver reported {count} CUDA devices")))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CudaProvisioning {
@@ -142,19 +173,9 @@ std::thread_local! {
     static PANIC_AFTER_NEXT_EXECUTION: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Acquires the supported process-wide CUDA execution envelope.
-///
-/// The guard schedules device access rather than protecting Rust state, so a panic must not
-/// prevent later callers from executing.
-pub(crate) fn cuda_device_execution_guard() -> MutexGuard<'static, ()> {
-    CUDA_DEVICE_EXECUTION
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 /// Arms a one-shot panic after this thread's next successful CUDA graph execution.
 ///
-/// This test hook fires while the process-wide execution guard is still held.
+/// This test hook fires while the device's execution guard is still held.
 #[doc(hidden)]
 #[cfg(feature = "cuda-test-hooks")]
 pub fn panic_after_next_execution_for_testing() {
@@ -711,6 +732,9 @@ impl CudaError {
 /// Physical capacity and bounded CUDA Graph wave policy for one run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CudaConfig {
+    /// CUDA device ordinal the run executes on. Runs on different devices hold different
+    /// execution guards; runs on one device are serialized.
+    pub device_index: usize,
     /// Enables the stream-decomposed FEL. `false` retains the exact fallback heap path.
     pub streams_enabled: bool,
     /// Optional caps for large capacities derived from the complete image. Exact legacy
@@ -748,6 +772,7 @@ pub struct CudaConfig {
 impl Default for CudaConfig {
     fn default() -> Self {
         Self {
+            device_index: 0,
             streams_enabled: true,
             capacity_caps: DeviceCapacityCaps::default(),
             capacity_floors: DeviceCapacityFloors::default(),
@@ -942,9 +967,9 @@ pub struct CudaInitializationTimings {
 
 /// Runs the production CUDA executor through the inclusive scenario stop.
 ///
-/// CUDA execution is serialized process-wide: one executor executes at a time, and concurrent
-/// callers queue until execution and explicit readback complete. Executor construction may proceed
-/// concurrently.
+/// CUDA execution is serialized per device: one run executes on a device at a time, and
+/// concurrent callers of that device queue until execution and explicit readback complete. Runs on
+/// different devices proceed independently. Executor construction may proceed concurrently.
 pub fn run_cuda(
     image: &SimulationImage,
     exclusive_horizon_ns: Option<u64>,
@@ -965,7 +990,7 @@ pub fn run_cuda_with_observations(
     config: CudaConfig,
     observation_mode: ObservationMode,
 ) -> Result<CudaRun, CudaError> {
-    CudaExecutor::new()?.run_with_observations(
+    CudaExecutor::on_device(config.device_index)?.run_with_observations(
         image,
         exclusive_horizon_ns,
         config,
@@ -976,28 +1001,38 @@ pub fn run_cuda_with_observations(
 /// Reusable CUDA context, stream, embedded module, kernels, and graph-capture substrate.
 ///
 /// Each run allocates fresh explicit device buffers, so a device fault cannot contaminate a later
-/// run. CUDA execution is serialized process-wide: one executor executes at a time, and concurrent
-/// callers queue until execution and readback complete. Executor construction may proceed
+/// run. A run executes on [`CudaConfig::device_index`]; contexts are shared per device ordinal
+/// across the process, and execution is serialized per device. Executor construction may proceed
 /// concurrently.
 pub struct CudaExecutor {
+    device_index: usize,
     direct: Arc<DirectCuda>,
 }
 
 impl CudaExecutor {
-    /// Constructs an executor without acquiring the process-wide execution guard.
+    /// Constructs an executor on device 0 without acquiring its execution guard.
     pub fn new() -> Result<Self, CudaError> {
-        let direct = CUDA_DIRECT.get_or_init(|| {
-            DirectCuda::new()
-                .map(Arc::new)
-                .map_err(|error| error.to_string())
-        });
+        Self::on_device(0)
+    }
+
+    /// Constructs an executor whose initialization targets `device_index`.
+    ///
+    /// A run still executes on its own [`CudaConfig::device_index`]; a different ordinal resolves
+    /// that device's shared context on first use.
+    pub fn on_device(device_index: usize) -> Result<Self, CudaError> {
         Ok(Self {
-            direct: Arc::clone(
-                direct
-                    .as_ref()
-                    .map_err(|error| CudaError::Unavailable(error.clone()))?,
-            ),
+            device_index,
+            direct: direct_cuda(device_index)?,
         })
+    }
+
+    /// The shared handle for a run's device.
+    fn direct_for(&self, device_index: usize) -> Result<Arc<DirectCuda>, CudaError> {
+        if device_index == self.device_index {
+            Ok(Arc::clone(&self.direct))
+        } else {
+            direct_cuda(device_index)
+        }
     }
 
     pub fn initialization_timings(&self) -> CudaInitializationTimings {
@@ -1102,7 +1137,7 @@ impl CudaExecutor {
         host_planes[19] = vec![0; node_count.saturating_mul(ARENA_META_WORDS).max(1)];
         host_planes[25] = stream_state;
 
-        let _execution_guard = cuda_device_execution_guard();
+        let _execution_guard = self.direct.execution_guard();
         let planes = host_planes
             .into_iter()
             .enumerate()
@@ -1174,7 +1209,7 @@ impl CudaExecutor {
         )
     }
 
-    /// Executes and reads back under the process-wide CUDA execution envelope.
+    /// Executes and reads back under the run device's execution guard.
     pub fn run_with_observations(
         &self,
         image: &SimulationImage,
@@ -1213,6 +1248,7 @@ impl CudaExecutor {
     ) -> Result<CudaRun, CudaError> {
         validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
         validate_config(config)?;
+        let direct = self.direct_for(config.device_index)?;
 
         let retry_budget = config.max_capacity_retries;
         let mut attempt_config = config;
@@ -1237,13 +1273,12 @@ impl CudaExecutor {
                     &mut channel_capacity_floors,
                     &mut tcp_capacity_floors,
                 )?;
-                let _execution_guard = cuda_device_execution_guard();
-                let buffers =
-                    CudaBuffers::new(&self.direct.stream, plan, self.direct.provisioning)?;
-                let timing = self.direct.run(&buffers, attempt_config)?;
+                let _execution_guard = direct.execution_guard();
+                let buffers = CudaBuffers::new(&direct.stream, plan, direct.provisioning)?;
+                let timing = direct.run(&buffers, attempt_config)?;
                 #[cfg(feature = "cuda-test-hooks")]
                 panic_after_execution_if_requested();
-                buffers.finish(&self.direct, image, observation_mode, timing)
+                buffers.finish(&direct, image, observation_mode, timing)
             })();
             match attempt {
                 Ok(mut run) => {
@@ -4604,6 +4639,9 @@ const FINALIZE_SWEEP_KERNEL_INDEX: usize = 11;
 
 struct DirectCuda {
     _context: Arc<CudaContext>,
+    /// Serializes execution on this device. It schedules device access rather than protecting
+    /// Rust state, so a panic while it is held must not prevent later runs.
+    execution: Mutex<()>,
     stream: Arc<CudaStream>,
     functions: Vec<CudaFunction>,
     /// T20l fix 2: the readback gather, loaded beside the eight attempt kernels.
@@ -4613,15 +4651,21 @@ struct DirectCuda {
 }
 
 impl DirectCuda {
-    fn new() -> Result<Self, CudaError> {
+    fn execution_guard(&self) -> MutexGuard<'_, ()> {
+        self.execution
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn new(device_index: usize) -> Result<Self, CudaError> {
         let setup_started = Instant::now();
-        let context =
-            CudaContext::new(0).map_err(|error| driver_error("device 0 context", error))?;
+        let context = CudaContext::new(device_index)
+            .map_err(|error| driver_error(format!("device {device_index} context"), error))?;
         let stream = context
             .new_stream()
             .map_err(|error| driver_error("non-blocking execution stream", error))?;
-        // This backend owns one stream, retains every buffer until that stream is synchronized,
-        // and serializes all executions process-wide. Automatic cross-stream event tracking would
+        // This backend owns one stream per device, retains every buffer until that stream is
+        // synchronized, and serializes executions per device. Automatic cross-stream event tracking would
         // add event nodes to graph capture without providing any safety here.
         unsafe {
             context.disable_event_tracking();
@@ -4632,7 +4676,7 @@ impl DirectCuda {
         let fatbin = include_bytes!(concat!(env!("OUT_DIR"), "/days_cuda_kernels.fatbin"));
         let module = context
             .load_module(Ptx::from_binary(fatbin.to_vec()))
-            .map_err(|error| driver_error("embedded sm_121/sm_89 fatbin load", error))?;
+            .map_err(|error| driver_error("embedded sm_121/sm_89/sm_86 fatbin load", error))?;
         let functions = KERNEL_NAMES
             .iter()
             .map(|name| {
@@ -4663,9 +4707,10 @@ impl DirectCuda {
             != 0;
         let provisioning =
             select_cuda_provisioning(integrated, managed_memory, concurrent_managed_access);
-        if (major, minor) != (12, 1) && (major, minor) != (8, 9) {
+        if !matches!((major, minor), (12, 1) | (8, 9) | (8, 6)) {
             return Err(CudaError::Unavailable(format!(
-                "embedded kernels target sm_121 and sm_89, but device 0 reports sm_{major}{minor}"
+                "embedded kernels target sm_121, sm_89 and sm_86, but device {device_index} \
+                 reports sm_{major}{minor}"
             )));
         }
         for index in CONTROL_KERNELS {
@@ -4686,6 +4731,7 @@ impl DirectCuda {
 
         Ok(Self {
             _context: context,
+            execution: Mutex::new(()),
             stream,
             functions,
             compact_function,

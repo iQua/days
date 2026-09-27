@@ -153,6 +153,10 @@ struct Cli {
     /// Device: override the round/exchange launch width. Default 256.
     #[arg(long, help_heading = "Metal and CUDA engines")]
     round_threads_per_block: Option<usize>,
+
+    /// CUDA: device ordinal to run on. Default 0.
+    #[arg(long, help_heading = "CUDA engine")]
+    cuda_device: Option<usize>,
 }
 
 impl Cli {
@@ -190,6 +194,14 @@ impl Cli {
         ]
     }
 
+    fn cuda_options(&self) -> [(&'static str, bool); 1] {
+        [("--cuda-device", self.cuda_device.is_some())]
+    }
+
+    fn cuda_device(&self) -> usize {
+        self.cuda_device.unwrap_or(0)
+    }
+
     /// Refuses options that do not apply to the selected engine, rather than ignoring them.
     fn check_options(&self) -> Result<(), String> {
         let refuse = |options: &[(&'static str, bool)], family: &str| match options
@@ -205,10 +217,12 @@ impl Cli {
         match self.engine {
             Engine::Scalar => {
                 refuse(&self.cpu_options(), "CPU-engine")?;
-                refuse(&self.device_options(), "device-engine")
+                refuse(&self.device_options(), "device-engine")?;
+                refuse(&self.cuda_options(), "CUDA-engine")
             }
             Engine::Cpu => {
                 refuse(&self.device_options(), "device-engine")?;
+                refuse(&self.cuda_options(), "CUDA-engine")?;
                 match self.workers {
                     None => return Err("--engine cpu requires --workers N (N >= 1)".to_owned()),
                     Some(0) => return Err("--workers must be at least 1".to_owned()),
@@ -219,7 +233,11 @@ impl Cli {
                     _ => Ok(()),
                 }
             }
-            Engine::Metal | Engine::Cuda => refuse(&self.cpu_options(), "CPU-engine"),
+            Engine::Metal => {
+                refuse(&self.cpu_options(), "CPU-engine")?;
+                refuse(&self.cuda_options(), "CUDA-engine")
+            }
+            Engine::Cuda => refuse(&self.cpu_options(), "CPU-engine"),
         }
     }
 
@@ -987,11 +1005,21 @@ fn mean(values: impl Iterator<Item = f64>) -> f64 {
 }
 
 fn print_protocol(cli: &Cli) {
-    println!(
+    println!("{}", protocol_record(cli));
+}
+
+/// The `record=days_protocol` line for a device engine. `cuda_device` names the CUDA ordinal the
+/// run uses, and `none` on Metal.
+fn protocol_record(cli: &Cli) -> String {
+    let cuda_device = match cli.engine {
+        Engine::Cuda => cli.cuda_device().to_string(),
+        Engine::Scalar | Engine::Cpu | Engine::Metal => "none".to_owned(),
+    };
+    format!(
         "record=days_protocol fixture={} engine={} \
          exclusive_horizon_ns={:?} observation_mode=Summary capacity_caps={:?} \
          max_capacity_retries={} capacity_warm_start={} dump_capacity_warm_start={} \
-         channel_events_per_stream_override={:?} round_threads_per_block={}",
+         channel_events_per_stream_override={:?} round_threads_per_block={} cuda_device={cuda_device}",
         cli.config.display(),
         cli.engine_name(),
         cli.exclusive_horizon_ns,
@@ -1005,7 +1033,7 @@ fn print_protocol(cli: &Cli) {
             .map_or_else(|| "none".to_owned(), |path| path.display().to_string()),
         cli.channel_events_per_stream,
         effective_round_threads(cli, DEFAULT_ROUND_THREADS_PER_BLOCK),
-    );
+    )
 }
 
 #[cfg(any(
@@ -1128,14 +1156,15 @@ fn run_metal(_cli: &Cli, _image: &SimulationImage, _lowering_ns: u128) -> Result
 fn run_cuda(cli: &Cli, image: &SimulationImage, lowering_ns: u128) -> Result<(), String> {
     use days_executor::{CudaConfig, CudaExecutor, ObservationMode};
 
-    let executor =
-        CudaExecutor::new().map_err(|error| format!("CUDA executor failed: {error:?}"))?;
+    let executor = CudaExecutor::on_device(cli.cuda_device())
+        .map_err(|error| format!("CUDA executor failed: {error:?}"))?;
     let warm_start = cli
         .capacity_warm_start
         .as_deref()
         .map(warm_start::load)
         .transpose()?;
     let mut config = CudaConfig {
+        device_index: cli.cuda_device(),
         capacity_caps: effective_caps(cli),
         max_capacity_retries: cli.max_capacity_retries(),
         ..CudaConfig::default()
@@ -1199,7 +1228,7 @@ mod tests {
 
     use super::{
         CAPACITY_CAPS, Cli, capacity_retry_counts, effective_caps, effective_round_threads,
-        fingerprint, processed_event_count_from_parts, warm_start,
+        fingerprint, processed_event_count_from_parts, protocol_record, warm_start,
     };
 
     fn parse(arguments: &[&str]) -> Cli {
@@ -1375,6 +1404,47 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["days", "f.toml", "--engine", "device"]).is_err());
         assert!(Cli::try_parse_from(["days", "f.toml"]).is_err());
+    }
+
+    /// `--cuda-device` selects a CUDA device, defaults to 0, and is refused for every other
+    /// engine; the protocol record names it on both device engines (`none` on Metal).
+    #[test]
+    fn the_cuda_device_option_is_cuda_only_and_is_printed_in_the_protocol_record() {
+        let default = parse(&["--engine", "cuda"]);
+        assert_eq!(default.check_options(), Ok(()));
+        assert_eq!(default.cuda_device(), 0);
+        assert!(
+            protocol_record(&default).ends_with(" cuda_device=0"),
+            "{}",
+            protocol_record(&default)
+        );
+
+        let second = parse(&["--engine", "cuda", "--cuda-device", "2"]);
+        assert_eq!(second.check_options(), Ok(()));
+        assert_eq!(second.cuda_device(), 2);
+        assert!(protocol_record(&second).ends_with(" cuda_device=2"));
+
+        let metal = parse(&["--engine", "metal"]);
+        assert!(protocol_record(&metal).ends_with(" cuda_device=none"));
+
+        for engine in ["scalar", "metal"] {
+            let error = parse(&["--engine", engine, "--cuda-device", "1"])
+                .check_options()
+                .unwrap_err();
+            assert_eq!(
+                error,
+                format!(
+                    "--cuda-device is a CUDA-engine option and does not apply to --engine {engine}"
+                )
+            );
+        }
+        let error = parse(&["--engine", "cpu", "--workers", "1", "--cuda-device", "0"])
+            .check_options()
+            .unwrap_err();
+        assert!(
+            error.starts_with("--cuda-device is a CUDA-engine option"),
+            "{error}"
+        );
     }
 
     /// Without the feature, the device engine is an explicit error that names the feature.

@@ -50,7 +50,7 @@ pub use cuda::size_cuda_plan_for_testing;
 #[cfg(feature = "cuda")]
 pub use cuda::{
     CudaArena, CudaConfig, CudaError, CudaExecutor, CudaInitializationTimings, CudaMemoryLayout,
-    CudaRun, run_cuda, run_cuda_with_observations,
+    CudaRun, cuda_device_count, run_cuda, run_cuda_with_observations,
 };
 pub use dcqcn::{
     DCQCN_FRACTION_SCALE, DCQCN_STAGE_STEPS, DcqcnArithmeticError, DcqcnController,

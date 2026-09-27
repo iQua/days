@@ -14,7 +14,7 @@ Four backends run the same image:
 | Scalar | one CPU thread; the reference oracle |
 | CPU | a multicore worker pool |
 | Metal | Apple GPUs |
-| CUDA | NVIDIA GPUs (built for sm_89 and sm_121) |
+| CUDA | NVIDIA GPUs (built for sm_86, sm_89 and sm_121) |
 
 Modeled mechanisms: closed-loop TCP Reno and CUBIC, DCQCN with CNP, PFC, ECN,
 RED, strict-priority, DRR, and exact-rational WFQ scheduling, and ring

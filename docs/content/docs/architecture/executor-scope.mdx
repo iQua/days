@@ -61,7 +61,7 @@ Capacity overflow is refuse-or-run: a failed attempt emits no partial result. Th
 
 Metal and CUDA plan readback after execution. They copy fixed planes directly. For variable striped arenas, they read metadata and run a gather kernel that copies live records in canonical entity and ring order. Invalid metadata returns an error, and compact readback decodes to the same bytes as full-capacity readback.
 
-The `configs/benchmarks/lookahead/rq9_frontier_closed_k32.toml` fixture defines 32 groups of 8,192 resident flows, or 262,144 flows. The [`days` CLI](/docs/reference/cli/days) runs it on any engine and fingerprints the complete result of a device run. The CUDA build contains device images for `sm_89` and `sm_121`.
+The `configs/benchmarks/lookahead/rq9_frontier_closed_k32.toml` fixture defines 32 groups of 8,192 resident flows, or 262,144 flows. The [`days` CLI](/docs/reference/cli/days) runs it on any engine and fingerprints the complete result of a device run. The CUDA build contains device images for `sm_86`, `sm_89` and `sm_121`.
 
 ## Rejection boundaries
 

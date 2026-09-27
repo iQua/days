@@ -23,7 +23,7 @@ cargo build --release --features metal --bin days
 
 ## CUDA
 
-The `cuda` feature enables the CUDA backend. It needs a compatible NVIDIA driver and a CUDA 13 toolkit whose `nvcc` can compile `sm_89` and `sm_121`. `nvcc` must be on `PATH`, or named by the `NVCC` environment variable:
+The `cuda` feature enables the CUDA backend. It needs a compatible NVIDIA driver and a CUDA 13 toolkit whose `nvcc` can compile `sm_86`, `sm_89` and `sm_121`. `nvcc` must be on `PATH`, or named by the `NVCC` environment variable:
 
 ```bash
 cargo build --release --features cuda --bin days

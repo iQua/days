@@ -49,6 +49,7 @@ fn main() {
         .arg("--diag-suppress=177")
         .arg("--generate-code=arch=compute_121,code=sm_121")
         .arg("--generate-code=arch=compute_89,code=sm_89")
+        .arg("--generate-code=arch=compute_86,code=sm_86")
         .arg("-o")
         .arg(&output)
         .arg(&source)
@@ -59,7 +60,7 @@ fn main() {
                 nvcc.to_string_lossy()
             )
         });
-    require_success(&nvcc, "sm_121 + sm_89 fatbin compilation", compiled);
+    require_success(&nvcc, "sm_121 + sm_89 + sm_86 fatbin compilation", compiled);
 }
 
 fn require_success(nvcc: &OsString, operation: &str, output: Output) {
@@ -67,7 +68,7 @@ fn require_success(nvcc: &OsString, operation: &str, output: Output) {
         return;
     }
     panic!(
-        "the `cuda` feature requires a CUDA 13 nvcc capable of compiling sm_121 and sm_89; \
+        "the `cuda` feature requires a CUDA 13 nvcc capable of compiling sm_121, sm_89 and sm_86; \
          `{}` failed during {operation} with status {}.\nstdout:\n{}\nstderr:\n{}",
         nvcc.to_string_lossy(),
         output.status,

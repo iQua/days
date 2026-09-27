@@ -217,6 +217,11 @@ fn metal_matches_the_scalar_fingerprint() {
         "every record names the engine in lowercase: {}",
         protocol[0]
     );
+    assert!(
+        protocol[0].ends_with(" cuda_device=none"),
+        "the Metal protocol record names no CUDA device: {}",
+        protocol[0]
+    );
     assert_eq!(record(&stdout, "days_device").len(), 1, "{stdout}");
     let result = record(&stdout, "days_result");
     assert_eq!(result.len(), 1);
@@ -234,6 +239,11 @@ fn cuda_matches_the_scalar_fingerprint() {
     assert!(
         protocol[0].contains(" engine=cuda "),
         "every record names the engine in lowercase: {}",
+        protocol[0]
+    );
+    assert!(
+        protocol[0].ends_with(" cuda_device=0"),
+        "the protocol record names the default CUDA device: {}",
         protocol[0]
     );
     assert_eq!(record(&stdout, "days_device").len(), 1, "{stdout}");
