@@ -272,3 +272,100 @@ mod cuda {
         assert_eq!(run.result, expected);
     }
 }
+
+/// The Metal planner's DCQCN terms agree between the precomputed and legacy capacity modes.
+#[cfg(all(feature = "test", feature = "metal", target_vendor = "apple"))]
+#[test]
+fn metal_dcqcn_planner_is_bit_equal_to_legacy_planning() {
+    use days_executor::{MetalConfig, assert_metal_planner_bit_equal_for_testing};
+    let mut images = dcqcn_images();
+    images.push(("blocked checkpoint".to_owned(), blocked_dcqcn_checkpoint()));
+    for (name, image) in images {
+        for streams_enabled in [true, false] {
+            for observation_mode in [ObservationMode::Summary, ObservationMode::Full] {
+                assert_metal_planner_bit_equal_for_testing(
+                    &image,
+                    None,
+                    MetalConfig {
+                        streams_enabled,
+                        ..MetalConfig::default()
+                    },
+                    observation_mode,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("{name} streams={streams_enabled} {observation_mode:?}: {error}")
+                });
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
+mod metal {
+    use days_executor::{MetalArena, MetalConfig, ObservationMode, run_metal_with_observations};
+
+    use super::{blocked_dcqcn_checkpoint, dcqcn_images, scalar};
+
+    #[test]
+    fn metal_dcqcn_fixtures_and_checkpoints_match_scalar() {
+        for (name, image) in dcqcn_images() {
+            let heavy = name == "dcqcn_1s";
+            for horizon in [None, Some(image.stop_time_ns / 2)] {
+                let expected = scalar(&image, horizon);
+                let configs: &[(bool, usize)] = if heavy {
+                    &[(true, 256)]
+                } else {
+                    &[(true, 256), (true, 32), (false, 32)]
+                };
+                for &(streams_enabled, round_threads_per_threadgroup) in configs {
+                    let actual = run_metal_with_observations(
+                        &image,
+                        horizon,
+                        MetalConfig {
+                            streams_enabled,
+                            round_threads_per_threadgroup,
+                            ..MetalConfig::default()
+                        },
+                        ObservationMode::Full,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{name} horizon={horizon:?} streams={streams_enabled} \
+                             threads={round_threads_per_threadgroup}: {error}"
+                        )
+                    });
+                    assert_eq!(
+                        actual.result, expected,
+                        "{name} horizon={horizon:?} streams={streams_enabled} \
+                         threads={round_threads_per_threadgroup}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The Metal twin of the CUDA fallback-heap retry test.
+    #[test]
+    fn metal_dcqcn_control_timer_survives_a_fallback_heap_capacity_retry() {
+        let image = blocked_dcqcn_checkpoint();
+        let expected = scalar(&image, None);
+        let run = run_metal_with_observations(
+            &image,
+            None,
+            MetalConfig {
+                max_fel_events_per_lp: Some(1),
+                ..MetalConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .expect("the retried run must succeed");
+        assert!(
+            run.capacity_retry_trace
+                .iter()
+                .any(|record| record.arena == MetalArena::Fel),
+            "the one-record heap must fault and grow: {:?}",
+            run.capacity_retry_trace
+        );
+        assert_eq!(run.result, expected);
+    }
+}

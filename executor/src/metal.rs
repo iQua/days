@@ -1484,6 +1484,10 @@ impl MetalPlan {
                 capacity_context.source_queue_packet_bound(image, flow_index, data_count),
             );
             legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(4);
+            if capacity_context.dcqcn_generator(image, flow_index) {
+                // A DCQCN source owns two live timer chains, pacing and control.
+                legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(2);
+            }
             if capacity_context.tcp_generator(image, flow_index).is_some() {
                 // TCP timers remain fallback-heap events. Under the live-state contract
                 // (Mechanism API errata E5) a superseded timeout is removed at the invalidating
@@ -1605,6 +1609,10 @@ impl MetalPlan {
                 capacities[target] = capacities[target].saturating_add(1);
             }
             for (flow, descriptor) in image.flows.iter().enumerate() {
+                if capacity_context.dcqcn_generator(image, flow) {
+                    let source = descriptor.source.0 as usize;
+                    capacities[source] = capacities[source].saturating_add(2);
+                }
                 if capacity_context.tcp_generator(image, flow).is_some() {
                     let attempts = capacity_context.tcp_fallback_timer_bound(
                         image,
@@ -1723,8 +1731,11 @@ impl MetalPlan {
                                     "Metal capability validation rejects collective generators"
                                 )
                             }
-                            FlowGeneratorKind::Dcqcn(_) => {
-                                unreachable!("Metal capability validation rejects DCQCN generators")
+                            FlowGeneratorKind::Dcqcn(dcqcn) => {
+                                crate::device_mechanism::encode_dcqcn_generator(
+                                    &dcqcn,
+                                    &mut generators[offset..offset + GENERATOR_WORDS],
+                                );
                             }
                         }
                     }
@@ -2052,6 +2063,10 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
         if matches!(packet.kind, PacketKind::TcpData(_)) && !live_payloads.contains(&packet.id) {
             continue;
         }
+        // The zero-byte DCQCN control-timer token never enters a queue or crosses a link.
+        if packet.kind == PacketKind::DcqcnControlTimer {
+            continue;
+        }
         let counts = if packet.kind.is_data() {
             &mut data_counts
         } else {
@@ -2071,6 +2086,19 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
             if let FlowGeneratorKind::Rate(rate) = generator.kind {
                 let work = crate::device_sizing::rate_device_work(image, generator, rate)
                     .map_err(|error| MetalError::Validation(error.to_string()))?;
+                let owns_timer_token = pacing_timer_tokens.contains(&(
+                    image.flows[index].source,
+                    generator.next_emission.payload,
+                    generator.next_emission.departure_time_ns,
+                ));
+                if owns_timer_token {
+                    data_counts[index] = data_counts[index].saturating_sub(1);
+                }
+                data_counts[index] = data_counts[index].saturating_add(work.packets);
+                continue;
+            }
+            if let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind {
+                let work = crate::device_sizing::dcqcn_device_work(image, generator, dcqcn);
                 let owns_timer_token = pacing_timer_tokens.contains(&(
                     image.flows[index].source,
                     generator.next_emission.payload,
@@ -2135,7 +2163,11 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
     }
     for state in &image.host_states {
         for generator in &state.generators {
-            if matches!(generator.kind, FlowGeneratorKind::Tcp(_)) {
+            // One ACK (TCP) or at most one CNP (DCQCN) per data packet.
+            if matches!(
+                generator.kind,
+                FlowGeneratorKind::Tcp(_) | FlowGeneratorKind::Dcqcn(_)
+            ) {
                 let flow = generator.flow.0 as usize;
                 feedback_counts[flow] = feedback_counts[flow].saturating_add(data_counts[flow]);
             }
@@ -2179,7 +2211,7 @@ fn add_flow_route_capacities(
         }
         PacketKind::DcqcnCnp(_) => (flow.reverse_route.as_slice(), flow.source),
         PacketKind::DcqcnControlTimer => {
-            unreachable!("Metal capability validation rejects DCQCN timer payloads")
+            unreachable!("the zero-byte DCQCN control-timer token is never routed")
         }
     };
     for index in 0..route.len() {
@@ -2913,13 +2945,21 @@ fn derived_transition_bound(
         .host_states
         .iter()
         .flat_map(|state| &state.generators)
-        .try_fold(network, |bound, generator| {
-            let FlowGeneratorKind::Rate(rate) = generator.kind else {
-                return Ok(bound);
-            };
-            let work = crate::device_sizing::rate_device_work(image, generator, rate)
-                .map_err(|error| MetalError::Validation(error.to_string()))?;
-            Ok(bound.saturating_add(work.pacing_ticks))
+        .try_fold(network, |bound, generator| match generator.kind {
+            FlowGeneratorKind::Rate(rate) => {
+                let work = crate::device_sizing::rate_device_work(image, generator, rate)
+                    .map_err(|error| MetalError::Validation(error.to_string()))?;
+                Ok(bound.saturating_add(work.pacing_ticks))
+            }
+            FlowGeneratorKind::Dcqcn(dcqcn) => {
+                let work = crate::device_sizing::dcqcn_device_work(image, generator, dcqcn);
+                Ok(bound
+                    .saturating_add(work.pacing_ticks)
+                    .saturating_add(work.control_ticks))
+            }
+            FlowGeneratorKind::Constant(_)
+            | FlowGeneratorKind::Tcp(_)
+            | FlowGeneratorKind::Collective(_) => Ok(bound),
         })
 }
 
@@ -3217,6 +3257,17 @@ fn prepare_tcp_state(
             words[offset] = range.start;
             words[offset + 1] = range.end;
         }
+    }
+    for receiver in image
+        .host_states
+        .iter()
+        .flat_map(|host| &host.dcqcn_receivers)
+    {
+        let base = receiver_offset + receiver.flow.0 as usize * TCP_RECEIVER_WORDS;
+        crate::device_mechanism::encode_dcqcn_receiver(
+            receiver,
+            &mut words[base..base + TCP_RECEIVER_WORDS],
+        );
     }
     for (flow, &(record_offset, capacity)) in ledger_layout.iter().enumerate() {
         let base = ledger_meta_offset + flow * TCP_LEDGER_META_WORDS;
@@ -4096,6 +4147,25 @@ impl MetalBuffers {
                                     | (u128::from(generators[offset + 19]) << 64);
                                 generator.kind = FlowGeneratorKind::Rate(rate);
                             }
+                            crate::device_mechanism::GENERATOR_KIND_DCQCN => {
+                                let FlowGeneratorKind::Dcqcn(dcqcn) = &mut generator.kind else {
+                                    return Err(MetalError::DeviceExecution {
+                                        code: 96,
+                                        node: Some(node.id),
+                                    }
+                                    .into());
+                                };
+                                crate::device_mechanism::decode_dcqcn_generator(
+                                    &generators[offset..offset + GENERATOR_WORDS],
+                                    dcqcn,
+                                )
+                                .map_err(|_| {
+                                    MetalError::DeviceExecution {
+                                        code: 96,
+                                        node: Some(node.id),
+                                    }
+                                })?;
+                            }
                             _ => {
                                 return Err(MetalError::DeviceExecution {
                                     code: 96,
@@ -4129,6 +4199,17 @@ impl MetalBuffers {
                                 }
                             })
                             .collect();
+                    }
+                    for receiver in &mut state.dcqcn_receivers {
+                        let base = receiver.flow.0 as usize * TCP_RECEIVER_WORDS;
+                        crate::device_mechanism::decode_dcqcn_receiver(
+                            &receiver_state[base..base + TCP_RECEIVER_WORDS],
+                            receiver,
+                        )
+                        .map_err(|_| MetalError::DeviceExecution {
+                            code: 96,
+                            node: Some(node.id),
+                        })?;
                     }
                 }
                 NodeKind::Switch => {
@@ -4614,6 +4695,10 @@ fn decode_packet_kind(value: u64, metadata: &[u64]) -> Result<PacketKind, MetalE
             acknowledged_bytes: metadata[1],
             echoed_sent_time_ns: metadata[2],
         })),
+        5 if metadata[1..] == [0, 0] => Ok(PacketKind::DcqcnCnp(crate::DcqcnCnpHeader {
+            trigger_payload: PayloadId(metadata[0]),
+        })),
+        6 if metadata == [0, 0, 0] => Ok(PacketKind::DcqcnControlTimer),
         _ => Err(MetalError::DeviceExecution {
             code: 93,
             node: None,

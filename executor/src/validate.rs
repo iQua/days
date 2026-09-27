@@ -409,32 +409,12 @@ fn validate_backend_capabilities(
     if !matches!(backend, Backend::Metal | Backend::Cuda) {
         return Ok(());
     }
-    // P14 Lane B: CUDA runs the DCQCN reaction/notification points; Metal follows in T3.
-    let dcqcn_supported = backend == Backend::Cuda;
-    let dcqcn_state = image
-        .host_states
-        .iter()
-        .any(|state| !state.dcqcn_receivers.is_empty())
-        || image.initial_packets.iter().any(|packet| {
-            matches!(
-                packet.kind,
-                PacketKind::DcqcnCnp(_) | PacketKind::DcqcnControlTimer
-            )
-        });
-    if !dcqcn_supported && dcqcn_state {
-        return Err(ValidationError::new(format!(
-            "backend {backend} does not support DCQCN controller or CNP state planes; use Scalar or Cpu"
-        )));
-    }
+    // P14 Lane B: both device backends run the DCQCN reaction and notification points, so DCQCN
+    // receivers, CNPs, control-timer tokens and DCQCN generators need no refusal here.
     for generator in image.host_states.iter().flat_map(|state| &state.generators) {
         if matches!(generator.kind, FlowGeneratorKind::Collective(_)) {
             return Err(ValidationError::new(format!(
                 "backend {backend} does not support collective generators; use Scalar or Cpu"
-            )));
-        }
-        if !dcqcn_supported && matches!(generator.kind, FlowGeneratorKind::Dcqcn(_)) {
-            return Err(ValidationError::new(format!(
-                "backend {backend} does not support DCQCN controller or CNP state planes; use Scalar or Cpu"
             )));
         }
     }

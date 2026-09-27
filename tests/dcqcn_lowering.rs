@@ -729,10 +729,11 @@ fn dcqcn_closes_forward_and_reverse_channels_and_rejects_device_state_planes() {
         .retain(|channel| channel.link != reverse);
     assert!(validate(&unmarked_before_marker, Backend::Scalar).is_err());
 
-    // P14 Lane B: CUDA runs the DCQCN controller and CNP planes; Metal still refuses them.
-    validate(&image, Backend::Cuda).expect("CUDA accepts the DCQCN controller and CNP planes");
-    let error = validate(&image, Backend::Metal).unwrap_err().to_string();
-    assert!(error.contains("DCQCN controller or CNP state planes"));
+    // P14 Lane B: both device backends run the DCQCN controller and CNP planes.
+    for backend in [Backend::Metal, Backend::Cuda] {
+        validate(&image, backend)
+            .unwrap_or_else(|error| panic!("{backend} accepts DCQCN planes: {error}"));
+    }
 }
 
 #[test]

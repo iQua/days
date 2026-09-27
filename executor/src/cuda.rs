@@ -2665,7 +2665,7 @@ fn add_flow_route_capacities(
         }
         PacketKind::DcqcnCnp(_) => (flow.reverse_route.as_slice(), flow.source),
         PacketKind::DcqcnControlTimer => {
-            unreachable!("CUDA capability validation rejects DCQCN timer payloads")
+            unreachable!("the zero-byte DCQCN control-timer token is never routed")
         }
     };
     for index in 0..route.len() {

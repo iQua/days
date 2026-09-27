@@ -414,8 +414,6 @@ impl PlannerCapacityContext {
     }
 
     /// Whether the flow's source generator is a DCQCN reaction point.
-    // Metal's planner adopts this with its DCQCN port (P14 Lane B T3).
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     pub(crate) fn dcqcn_generator(&self, image: &SimulationImage, flow: usize) -> bool {
         #[cfg(any(test, feature = "planner-test-hooks"))]
         if self.mode == PlannerCapacityMode::Legacy {
