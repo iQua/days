@@ -203,6 +203,9 @@ constexpr ulong DATA_PACKET = 0;
 constexpr ulong FEEDBACK_PACKET = 1;
 constexpr ulong TCP_DATA_PACKET = 2;
 constexpr ulong TCP_ACK_PACKET = 3;
+constexpr ulong PFC_PACKET = 4;
+constexpr ulong DCQCN_CNP_PACKET = 5;
+constexpr ulong DCQCN_CONTROL_TIMER_PACKET = 6;
 constexpr ulong SCHED_FIFO = 0;
 constexpr ulong SCHED_SP = 1;
 constexpr ulong SCHED_WFQ = 2;
@@ -254,6 +257,47 @@ constexpr uint G_RATE_NUMERATOR = 16;
 constexpr uint G_RATE_DENOMINATOR = 17;
 constexpr uint G_RATE_CREDIT_LOW = 18;
 constexpr uint G_RATE_CREDIT_HIGH = 19;
+// DCQCN generator row (kind 3): words 12..19 keep the Rate layout above; the reaction-point
+// controller (`executor/src/dcqcn.rs`) follows. Configuration words are immutable image data the
+// transitions read; the initial rate and CNP size are not needed on device and stay host-side.
+constexpr ulong GENERATOR_KIND_DCQCN = 3;
+constexpr uint G_DCQCN_MIN_RATE = 20;
+constexpr uint G_DCQCN_MAX_RATE = 21;
+constexpr uint G_DCQCN_ADDITIVE_RATE = 22;
+constexpr uint G_DCQCN_HYPER_RATE = 23;
+constexpr uint G_DCQCN_G = 24;
+constexpr uint G_DCQCN_DECREASE = 25;
+constexpr uint G_DCQCN_CNP_INTERVAL = 26;
+constexpr uint G_DCQCN_CONTROL_INTERVAL = 27;
+constexpr uint G_DCQCN_BYTE_THRESHOLD = 28;
+constexpr uint G_DCQCN_ALPHA = 29;
+constexpr uint G_DCQCN_CURRENT_RATE = 30;
+constexpr uint G_DCQCN_TARGET_RATE = 31;
+constexpr uint G_DCQCN_CNP_SEEN = 32;
+constexpr uint G_DCQCN_LAST_CNP_VALID = 33;
+constexpr uint G_DCQCN_LAST_CNP = 34;
+constexpr uint G_DCQCN_STAGE = 35;
+constexpr uint G_DCQCN_STAGE_STEPS = 36;
+constexpr uint G_DCQCN_BYTES_SINCE_INCREASE = 37;
+constexpr uint G_DCQCN_NEXT_CONTROL = 38;
+constexpr uint G_DCQCN_CONTROL_PAYLOAD = 39;
+constexpr ulong DCQCN_SCALE = 1000000000ul;
+constexpr ulong DCQCN_SCALE_SQUARED = 1000000000000000000ul;
+constexpr ulong DCQCN_STAGE_FAST_RECOVERY = 0;
+constexpr ulong DCQCN_STAGE_ADDITIVE = 1;
+constexpr ulong DCQCN_STAGE_HYPER = 2;
+constexpr ulong DCQCN_STAGE_STEPS = 5;
+// A DCQCN flow's notification-point state lives in that flow's per-flow receiver row of
+// `tcp_state` (the row TCP uses for its cumulative-ACK receiver). Validation makes a flow's
+// receiver either TCP or DCQCN, so the row is free, and DCQCN adds no words to any plane. Words
+// 4..6 stay zero: they are the TCP receive-range metadata the readback compaction reads.
+//   +0 marker: 2 = no CNP sent yet, 3 = +1 holds the last CNP time
+//   +1 last CNP time  +2 CNP interval  +3 CNP size
+constexpr ulong DCQCN_RECEIVER_NO_CNP = 2;
+constexpr ulong DCQCN_RECEIVER_LAST_CNP = 3;
+constexpr uint DR_LAST_CNP = 1;
+constexpr uint DR_CNP_INTERVAL = 2;
+constexpr uint DR_CNP_SIZE = 3;
 
 constexpr uint CTL_KIND = 0;
 constexpr uint CTL_MSS = 1;
@@ -3908,6 +3952,424 @@ __device__ __forceinline__ bool prepare_tcp_attempts(
     return true;
 }
 
+// ---------------------------------------------------------------------------------------------
+// DCQCN reaction point and notification point (P14 Lane B). Transliterated from
+// `executor/src/dcqcn.rs` and the scalar drivers `host_dcqcn_{data,cnp}_arrival` and
+// `host_dcqcn_{pacing,control}_timer`. Every rational step evaluates its full numerator in 128 bits
+// and floors once, exactly as the scalar `u128` code does; a scalar `Err` is a semantic error here.
+//
+// Register gate (P14 Lane B T2, ptxas sm_89): the three controller transitions stay out of line;
+// the four driver paths are inlined. Out-of-line drivers, which take the full plane argument list,
+// pinned `days_round` to 128 registers with 504 B of spill stores. Inlined, `days_round` compiles
+// to 208 registers, zero spills and the unchanged 384 B stack frame.
+// ---------------------------------------------------------------------------------------------
+
+__device__ __forceinline__ void dcqcn_average_with_target(ulong *row) {
+    ulong current = row[G_DCQCN_CURRENT_RATE];
+    ulong target = row[G_DCQCN_TARGET_RATE];
+    // floor((current + target) / 2) without the 65-bit sum.
+    ulong average = (current >> 1) + (target >> 1) + (current & target & 1ul);
+    row[G_DCQCN_CURRENT_RATE] =
+        min(max(average, row[G_DCQCN_MIN_RATE]), row[G_DCQCN_MAX_RATE]);
+}
+
+// One staged increase opportunity. Returns false where the scalar stage counter would overflow.
+__device__ __forceinline__ bool dcqcn_apply_increase(ulong *row) {
+    ulong stage = row[G_DCQCN_STAGE];
+    if (stage != DCQCN_STAGE_FAST_RECOVERY) {
+        ulong step = stage == DCQCN_STAGE_ADDITIVE
+            ? row[G_DCQCN_ADDITIVE_RATE] : row[G_DCQCN_HYPER_RATE];
+        row[G_DCQCN_TARGET_RATE] = min(
+            saturating_add_u64(row[G_DCQCN_TARGET_RATE], step), row[G_DCQCN_MAX_RATE]);
+    }
+    dcqcn_average_with_target(row);
+    if (stage == DCQCN_STAGE_HYPER) {
+        return true;
+    }
+    if (row[G_DCQCN_STAGE_STEPS] >= 255) {
+        return false;
+    }
+    row[G_DCQCN_STAGE_STEPS] += 1;
+    if (row[G_DCQCN_STAGE_STEPS] == DCQCN_STAGE_STEPS) {
+        row[G_DCQCN_STAGE] = stage == DCQCN_STAGE_FAST_RECOVERY
+            ? DCQCN_STAGE_ADDITIVE : DCQCN_STAGE_HYPER;
+        row[G_DCQCN_STAGE_STEPS] = 0;
+    }
+    return true;
+}
+
+// `DcqcnController::on_cnp`. `applied` is false for an exact early-CNP no-op.
+__device__ __noinline__ bool dcqcn_on_cnp(ulong *row, ulong now, bool &applied) {
+    applied = false;
+    if (row[G_DCQCN_LAST_CNP_VALID] != 0) {
+        ulong earliest;
+        if (!checked_add(row[G_DCQCN_LAST_CNP], row[G_DCQCN_CNP_INTERVAL], earliest)) {
+            return false;
+        }
+        if (now < earliest) {
+            return true;
+        }
+    }
+    ulong g = row[G_DCQCN_G];
+    unsigned __int128 retained =
+        static_cast<unsigned __int128>(DCQCN_SCALE - g) * row[G_DCQCN_ALPHA];
+    unsigned __int128 next_alpha =
+        (retained + static_cast<unsigned __int128>(g) * DCQCN_SCALE) / DCQCN_SCALE;
+    if (next_alpha > static_cast<unsigned __int128>(NONE)) {
+        return false;
+    }
+    row[G_DCQCN_ALPHA] = static_cast<ulong>(next_alpha);
+    row[G_DCQCN_TARGET_RATE] = row[G_DCQCN_CURRENT_RATE];
+    unsigned __int128 reduction =
+        static_cast<unsigned __int128>(row[G_DCQCN_DECREASE]) * row[G_DCQCN_ALPHA];
+    if (reduction > static_cast<unsigned __int128>(DCQCN_SCALE_SQUARED)) {
+        return false;
+    }
+    ulong retained_factor = DCQCN_SCALE_SQUARED - static_cast<ulong>(reduction);
+    ulong decreased = static_cast<ulong>(
+        static_cast<unsigned __int128>(row[G_DCQCN_CURRENT_RATE]) * retained_factor /
+        DCQCN_SCALE_SQUARED);
+    row[G_DCQCN_CURRENT_RATE] = max(decreased, row[G_DCQCN_MIN_RATE]);
+    row[G_DCQCN_CNP_SEEN] = 1;
+    row[G_DCQCN_LAST_CNP_VALID] = 1;
+    row[G_DCQCN_LAST_CNP] = now;
+    row[G_DCQCN_STAGE] = DCQCN_STAGE_FAST_RECOVERY;
+    row[G_DCQCN_STAGE_STEPS] = 0;
+    row[G_DCQCN_BYTES_SINCE_INCREASE] = 0;
+    applied = true;
+    return true;
+}
+
+// `DcqcnController::on_control_timer` after the caller established `now == next_control`.
+__device__ __noinline__ bool dcqcn_on_control_timer(ulong *row, ulong now) {
+    ulong next;
+    if (!checked_add(now, row[G_DCQCN_CONTROL_INTERVAL], next)) {
+        return false;
+    }
+    row[G_DCQCN_NEXT_CONTROL] = next;
+    if (row[G_DCQCN_CNP_SEEN] != 0) {
+        row[G_DCQCN_CNP_SEEN] = 0;
+        return true;
+    }
+    // (SCALE - g) / SCALE <= 1, so the decayed alpha always fits.
+    row[G_DCQCN_ALPHA] = static_cast<ulong>(
+        static_cast<unsigned __int128>(DCQCN_SCALE - row[G_DCQCN_G]) * row[G_DCQCN_ALPHA] /
+        DCQCN_SCALE);
+    return dcqcn_apply_increase(row);
+}
+
+// `DcqcnController::on_bytes_emitted`.
+__device__ __noinline__ bool dcqcn_on_bytes_emitted(ulong *row, ulong bytes) {
+    ulong total;
+    if (!checked_add(row[G_DCQCN_BYTES_SINCE_INCREASE], bytes, total)) {
+        return false;
+    }
+    row[G_DCQCN_BYTES_SINCE_INCREASE] = total;
+    if (row[G_DCQCN_CNP_SEEN] != 0 || total < row[G_DCQCN_BYTE_THRESHOLD]) {
+        return true;
+    }
+    row[G_DCQCN_BYTES_SINCE_INCREASE] = 0;
+    return dcqcn_apply_increase(row);
+}
+
+// `host_dcqcn_pacing_timer`: the T25 rate tick paced at the controller's current rate, with the
+// byte-triggered increase applied to every emitted packet before the successor is classified.
+__device__ __forceinline__ bool dcqcn_pacing_timer(
+    ulong node,
+    const ulong *event,
+    ulong *error,
+    const ulong *params,
+    ulong *node_state,
+    ulong *generators,
+    ulong *fel_meta,
+    ulong *fel_records,
+    ulong *queue_meta,
+    ulong *queue_records,
+    ulong *remote_meta,
+    ulong *remote_staging,
+    ulong *stream_state,
+    ulong *stream_records,
+    ulong *summary,
+    ulong *observation_meta,
+    ulong *observed,
+    ulong *tcp_state
+) {
+    ulong node_base = node * NODE_WORDS;
+    ulong flow = event[PK_FLOW];
+    ulong *row = generators + flow * GENERATOR_WORDS;
+    ulong status = row[G_STATUS];
+    if ((status != 0 && status != 1) || row[G_PAYLOAD] != event[E_PAYLOAD] ||
+        row[G_DEPARTURE] != event[E_TIME]) {
+        return true;
+    }
+    ulong scale_low;
+    ulong scale_high;
+    ulong tick_low;
+    ulong tick_high;
+    ulong cost_low;
+    ulong cost_high;
+    u128_from_mul_u64(row[G_RATE_DENOMINATOR], 1000000000ul, scale_low, scale_high);
+    u128_from_mul_u64(row[G_DCQCN_CURRENT_RATE], row[G_RATE_INTERVAL], tick_low, tick_high);
+    if (!u128_mul(event[PK_SIZE] << 3, event[PK_SIZE] >> 61, scale_low, scale_high,
+            cost_low, cost_high)) {
+        set_semantic_error(error, 62, node);
+        return false;
+    }
+    ulong credit_low;
+    ulong credit_high;
+    if (!u128_add(row[G_RATE_CREDIT_LOW], row[G_RATE_CREDIT_HIGH], tick_low, tick_high,
+            credit_low, credit_high)) {
+        set_semantic_error(error, 62, node);
+        return false;
+    }
+    bool emitted = u128_at_least(credit_low, credit_high, cost_low, cost_high);
+    if (emitted) {
+        u128_sub(credit_low, credit_high, cost_low, cost_high, credit_low, credit_high);
+        if (row[G_PACKETS] == NONE || row[G_BYTES] > NONE - event[PK_SIZE] ||
+            node_state[node_base + N_COUNTER_0] == NONE) {
+            set_semantic_error(error, 62, node);
+            return false;
+        }
+        row[G_PACKETS] += 1;
+        row[G_BYTES] += event[PK_SIZE];
+        node_state[node_base + N_COUNTER_0] += 1;
+        if (!dcqcn_on_bytes_emitted(row, event[PK_SIZE])) {
+            set_semantic_error(error, 63, node);
+            return false;
+        }
+    }
+    row[G_RATE_CREDIT_LOW] = credit_low;
+    row[G_RATE_CREDIT_HIGH] = credit_high;
+    row[G_RATE_NUMERATOR] = row[G_DCQCN_CURRENT_RATE];
+
+    bool finished = row[G_BYTES] >= row[G_RATE_TOTAL];
+    ulong candidate = 0;
+    if (!finished && !checked_add(event[E_TIME], row[G_RATE_INTERVAL], candidate)) {
+        set_semantic_error(error, 62, node);
+        return false;
+    }
+    if (!finished && candidate <= params[P_STOP_TIME]) {
+        ulong payload = event[PK_ID];
+        ulong size = event[PK_SIZE];
+        if (emitted) {
+            if (!allocate_tcp_payload(node, node_state, params, payload)) {
+                set_semantic_error(error, 62, node);
+                return false;
+            }
+            size = min(row[G_RATE_PACKET_SIZE], row[G_RATE_TOTAL] - row[G_BYTES]);
+        }
+        ulong next_tick_low;
+        ulong next_tick_high;
+        u128_from_mul_u64(
+            row[G_DCQCN_CURRENT_RATE], row[G_RATE_INTERVAL], next_tick_low, next_tick_high);
+        ulong next_cost_low;
+        ulong next_cost_high;
+        if (!u128_mul(size << 3, size >> 61, scale_low, scale_high,
+                next_cost_low, next_cost_high)) {
+            set_semantic_error(error, 62, node);
+            return false;
+        }
+        ulong next_credit_low;
+        ulong next_credit_high;
+        bool next_scheduled = u128_add(
+                credit_low, credit_high, next_tick_low, next_tick_high,
+                next_credit_low, next_credit_high) &&
+            u128_at_least(next_credit_low, next_credit_high, next_cost_low, next_cost_high);
+        row[G_STATUS] = next_scheduled ? 0 : 1;
+        row[G_DEPARTURE] = candidate;
+        row[G_PAYLOAD] = payload;
+        ulong next_packet[EVENT_WORDS];
+        packet_clear(next_packet);
+        next_packet[PK_ID] = payload;
+        next_packet[PK_FLOW] = flow;
+        next_packet[PK_SIZE] = size;
+        next_packet[PK_KIND] = DATA_PACKET;
+        if (!emit_child(
+                node, event, node, PACING_TIMER, candidate, next_packet, error, params,
+                node_state, fel_meta, fel_records, remote_meta, remote_staging,
+                stream_state, stream_records, tcp_state)) {
+            return false;
+        }
+    } else {
+        row[G_STATUS] = finished ? 2 : 3;
+        if (!finished) {
+            row[G_DEPARTURE] = candidate;
+        }
+    }
+    if (!emitted) {
+        return true;
+    }
+    ulong sourced_packet[EVENT_WORDS];
+    for (uint word = 0; word < EVENT_WORDS; ++word) {
+        sourced_packet[word] = event[word];
+    }
+    sourced_packet[E_PHASE] = 1;
+    if (!source_queue_insert(node, sourced_packet, error, queue_meta, queue_records) ||
+        !record_sourced(node, event, error, params, summary, observation_meta, observed)) {
+        return false;
+    }
+    if (node_state[node_base + N_SERVICE_VALID] == 0 &&
+        node_state[node_base + N_READY_PENDING] == 0) {
+        node_state[node_base + N_READY_PENDING] = 1;
+        return emit_child(
+            node, event, node, TX_READY, event[E_TIME], event, error, params,
+            node_state, fel_meta, fel_records, remote_meta, remote_staging,
+            stream_state, stream_records, tcp_state);
+    }
+    return true;
+}
+
+// `host_dcqcn_control_timer`. The zero-byte token is re-armed with the controller's successor
+// deadline while it lies within the stop time; otherwise it simply leaves the live state.
+__device__ __forceinline__ bool dcqcn_control_timer(
+    ulong node,
+    const ulong *event,
+    ulong *error,
+    const ulong *params,
+    ulong *node_state,
+    ulong *generators,
+    ulong *fel_meta,
+    ulong *fel_records,
+    ulong *remote_meta,
+    ulong *remote_staging,
+    ulong *stream_state,
+    ulong *stream_records,
+    ulong *tcp_state
+) {
+    ulong flow = event[PK_FLOW];
+    ulong *row = generators + flow * GENERATOR_WORDS;
+    if (flow >= params[P_FLOW_COUNT] || row[G_VALID] == 0 || row[G_OWNER] != node) {
+        set_semantic_error(error, 64, node);
+        return false;
+    }
+    if (row[G_KIND] != GENERATOR_KIND_DCQCN ||
+        row[G_DCQCN_CONTROL_PAYLOAD] != event[PK_ID] ||
+        row[G_DCQCN_NEXT_CONTROL] != event[E_TIME]) {
+        return true;
+    }
+    if (!dcqcn_on_control_timer(row, event[E_TIME])) {
+        set_semantic_error(error, 65, node);
+        return false;
+    }
+    row[G_RATE_NUMERATOR] = row[G_DCQCN_CURRENT_RATE];
+    if (row[G_DCQCN_NEXT_CONTROL] > params[P_STOP_TIME]) {
+        return true;
+    }
+    return emit_child(
+        node, event, node, PACING_TIMER, row[G_DCQCN_NEXT_CONTROL], event, error, params,
+        node_state, fel_meta, fel_records, remote_meta, remote_staging, stream_state,
+        stream_records, tcp_state);
+}
+
+// `host_dcqcn_cnp_arrival`: the source-side, interval-gated multiplicative decrease.
+__device__ __forceinline__ bool dcqcn_cnp_arrival(
+    ulong node,
+    const ulong *event,
+    ulong *error,
+    const ulong *params,
+    ulong *generators,
+    const ulong *flows,
+    ulong *summary,
+    ulong *observation_meta,
+    ulong *observed,
+    ulong *arrivals
+) {
+    ulong flow = event[PK_FLOW];
+    ulong *row = generators + flow * GENERATOR_WORDS;
+    if (flow >= params[P_FLOW_COUNT] || flows[flow * FLOW_WORDS] != node ||
+        row[G_VALID] == 0 || row[G_OWNER] != node || row[G_FEEDBACK] == NONE) {
+        set_semantic_error(error, 66, node);
+        return false;
+    }
+    row[G_FEEDBACK] += 1;
+    bool applied;
+    if (row[G_KIND] != GENERATOR_KIND_DCQCN || !dcqcn_on_cnp(row, event[E_TIME], applied)) {
+        set_semantic_error(error, 67, node);
+        return false;
+    }
+    row[G_RATE_NUMERATOR] = row[G_DCQCN_CURRENT_RATE];
+    return record_arrival(
+        node, event, 3, error, params, summary, observation_meta, observed, arrivals);
+}
+
+// `host_dcqcn_data_arrival`: delivery at the notification point, which sources one CNP for a CE
+// packet once the per-flow CNP interval has elapsed. The CNP is ordinary reverse-route feedback.
+__device__ __forceinline__ bool dcqcn_data_arrival(
+    ulong node,
+    const ulong *event,
+    ulong *error,
+    const ulong *params,
+    ulong *node_state,
+    ulong *fel_meta,
+    ulong *fel_records,
+    ulong *queue_meta,
+    ulong *queue_records,
+    ulong *remote_meta,
+    ulong *remote_staging,
+    ulong *stream_state,
+    ulong *stream_records,
+    ulong *summary,
+    ulong *observation_meta,
+    ulong *observed,
+    ulong *arrivals,
+    ulong *tcp_state
+) {
+    ulong node_base = node * NODE_WORDS;
+    ulong *receiver = tcp_state + params[P_TCP_RECEIVER_OFFSET] +
+        event[PK_FLOW] * TCP_RECEIVER_WORDS;
+    if (node_state[node_base + N_COUNTER_2] == NONE) {
+        set_semantic_error(error, 68, node);
+        return false;
+    }
+    node_state[node_base + N_COUNTER_2] += 1;
+    ulong earliest;
+    bool interval_open = receiver[0] == DCQCN_RECEIVER_NO_CNP ||
+        (checked_add(receiver[DR_LAST_CNP], receiver[DR_CNP_INTERVAL], earliest) &&
+            event[E_TIME] >= earliest);
+    if ((event[PK_KIND] & PK_ECN_FLAG) == 0 || !interval_open) {
+        return record_arrival(
+            node, event, 2, error, params, summary, observation_meta, observed, arrivals);
+    }
+    ulong payload;
+    if (!allocate_tcp_payload(node, node_state, params, payload) ||
+        node_state[node_base + N_COUNTER_0] == NONE) {
+        set_semantic_error(error, 69, node);
+        return false;
+    }
+    node_state[node_base + N_COUNTER_0] += 1;
+    receiver[0] = DCQCN_RECEIVER_LAST_CNP;
+    receiver[DR_LAST_CNP] = event[E_TIME];
+    bool schedule_ready = node_state[node_base + N_SERVICE_VALID] == 0 &&
+        node_state[node_base + N_READY_PENDING] == 0;
+    if (schedule_ready) {
+        node_state[node_base + N_READY_PENDING] = 1;
+    }
+    if (!record_arrival(
+            node, event, 2, error, params, summary, observation_meta, observed, arrivals)) {
+        return false;
+    }
+    ulong cnp[EVENT_WORDS];
+    packet_clear(cnp);
+    cnp[E_TIME] = event[E_TIME];
+    cnp[E_PHASE] = 1;
+    cnp[PK_ID] = payload;
+    cnp[PK_FLOW] = event[PK_FLOW];
+    cnp[PK_SIZE] = receiver[DR_CNP_SIZE];
+    cnp[PK_KIND] = DCQCN_CNP_PACKET;
+    cnp[PK_META_0] = event[PK_ID];
+    if (!source_queue_insert(node, cnp, error, queue_meta, queue_records) ||
+        !record_sourced(node, cnp, error, params, summary, observation_meta, observed)) {
+        return false;
+    }
+    if (!schedule_ready) {
+        return true;
+    }
+    return emit_child(
+        node, event, node, TX_READY, event[E_TIME], cnp, error, params, node_state,
+        fel_meta, fel_records, remote_meta, remote_staging, stream_state, stream_records,
+        tcp_state);
+}
+
 __device__ __forceinline__ bool dispatch_event(
     ulong node,
     ulong *event,
@@ -3946,6 +4408,19 @@ __device__ __forceinline__ bool dispatch_event(
     if (kind == PACING_TIMER && role == HOST) {
         ulong flow = event[PK_FLOW];
         ulong generator = flow * GENERATOR_WORDS;
+        if ((event[PK_KIND] & PK_KIND_MASK) == DCQCN_CONTROL_TIMER_PACKET) {
+            return dcqcn_control_timer(
+                node, event, error, params, node_state, generators, fel_meta, fel_records,
+                remote_meta, remote_staging, stream_state, stream_records, tcp_state);
+        }
+        if (flow < params[P_FLOW_COUNT] && generators[generator + G_VALID] != 0 &&
+            generators[generator + G_OWNER] == node &&
+            generators[generator + G_KIND] == GENERATOR_KIND_DCQCN) {
+            return dcqcn_pacing_timer(
+                node, event, error, params, node_state, generators, fel_meta, fel_records,
+                queue_meta, queue_records, remote_meta, remote_staging, stream_state,
+                stream_records, summary, observation_meta, observed, tcp_state);
+        }
         if (flow >= params[P_FLOW_COUNT] || generators[generator + G_VALID] == 0 ||
             generators[generator + G_OWNER] != node || generators[generator + G_KIND] != 2) {
             return true;
@@ -4891,6 +5366,21 @@ __device__ __forceinline__ bool dispatch_event(
 
     if (kind == REMOTE_ARRIVAL && role == HOST) {
         ulong flow_base = event[PK_FLOW] * FLOW_WORDS;
+        ulong packet_kind = event[PK_KIND] & PK_KIND_MASK;
+        if (packet_kind == DCQCN_CNP_PACKET) {
+            return dcqcn_cnp_arrival(
+                node, event, error, params, generators, flows, summary, observation_meta,
+                observed, arrivals);
+        }
+        if (packet_kind == DATA_PACKET && event[PK_FLOW] < params[P_FLOW_COUNT] &&
+            flows[flow_base + 1] == node &&
+            tcp_state[params[P_TCP_RECEIVER_OFFSET] + event[PK_FLOW] * TCP_RECEIVER_WORDS] >=
+                DCQCN_RECEIVER_NO_CNP) {
+            return dcqcn_data_arrival(
+                node, event, error, params, node_state, fel_meta, fel_records, queue_meta,
+                queue_records, remote_meta, remote_staging, stream_state, stream_records,
+                summary, observation_meta, observed, arrivals, tcp_state);
+        }
         ulong disposition = 2;
         if (
             (event[PK_KIND] & PK_KIND_MASK) == FEEDBACK_PACKET &&

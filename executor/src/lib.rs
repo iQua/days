@@ -16,6 +16,8 @@ mod device_capacity;
 ))]
 mod device_compaction;
 mod device_event_record;
+#[cfg(any(test, feature = "cuda"))]
+mod device_mechanism;
 mod device_scheduler;
 pub mod device_sizing;
 pub mod event;

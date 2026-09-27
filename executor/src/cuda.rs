@@ -488,6 +488,10 @@ fn decode_packet_kind(value: u64, metadata: &[u64]) -> Result<PacketKind, CudaEr
             acknowledged_bytes: metadata[1],
             echoed_sent_time_ns: metadata[2],
         })),
+        5 if metadata[1..] == [0, 0] => Ok(PacketKind::DcqcnCnp(crate::DcqcnCnpHeader {
+            trigger_payload: PayloadId(metadata[0]),
+        })),
+        6 if metadata == [0, 0, 0] => Ok(PacketKind::DcqcnControlTimer),
         _ => Err(CudaError::DeviceExecution {
             code: 93,
             node: None,
@@ -1691,6 +1695,17 @@ fn prepare_tcp_state(
         .ok_or_else(|| CudaError::Validation("TCP ledger metadata size overflows usize".into()))?;
     let mut state = vec![0_u64; next.max(1)];
 
+    for receiver in image
+        .host_states
+        .iter()
+        .flat_map(|host| &host.dcqcn_receivers)
+    {
+        let row = receiver_offset + receiver.flow.0 as usize * TCP_RECEIVER_WORDS;
+        crate::device_mechanism::encode_dcqcn_receiver(
+            receiver,
+            &mut state[row..row + TCP_RECEIVER_WORDS],
+        );
+    }
     for (owner_slot, host) in image.host_states.iter().enumerate() {
         if host.tcp_receivers.is_empty() {
             continue;
@@ -1919,6 +1934,10 @@ impl CudaPlan {
                 capacity_context.source_queue_packet_bound(image, flow_index, data_count),
             );
             legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(4);
+            if capacity_context.dcqcn_generator(image, flow_index) {
+                // A DCQCN source owns two live timer chains, pacing and control.
+                legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(2);
+            }
             if capacity_context.tcp_generator(image, flow_index).is_some() {
                 // Timeout events are intentionally heap-class. Under the live-state contract
                 // (Mechanism API errata E5) a superseded timeout is removed at the invalidating
@@ -2040,6 +2059,10 @@ impl CudaPlan {
                 capacities[target] = capacities[target].saturating_add(1);
             }
             for (flow, descriptor) in image.flows.iter().enumerate() {
+                if capacity_context.dcqcn_generator(image, flow) {
+                    let source = descriptor.source.0 as usize;
+                    capacities[source] = capacities[source].saturating_add(2);
+                }
                 if capacity_context.tcp_generator(image, flow).is_some() {
                     let feedback = flow_feedback_counts[flow];
                     let attempts = capacity_context.tcp_fallback_timer_bound(
@@ -2175,7 +2198,13 @@ impl CudaPlan {
                                 generators[offset + 18] = rate.credit_quanta as u64;
                                 generators[offset + 19] = (rate.credit_quanta >> 64) as u64;
                             }
-                            FlowGeneratorKind::Collective(_) | FlowGeneratorKind::Dcqcn(_) => {
+                            FlowGeneratorKind::Dcqcn(dcqcn) => {
+                                crate::device_mechanism::encode_dcqcn_generator(
+                                    &dcqcn,
+                                    &mut generators[offset..offset + GENERATOR_WORDS],
+                                );
+                            }
+                            FlowGeneratorKind::Collective(_) => {
                                 unreachable!("CUDA capability validation rejects this generator")
                             }
                         }
@@ -2488,6 +2517,10 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
         if matches!(packet.kind, PacketKind::TcpData(_)) && !live_payloads.contains(&packet.id) {
             continue;
         }
+        // The zero-byte DCQCN control-timer token never enters a queue or crosses a link.
+        if packet.kind == PacketKind::DcqcnControlTimer {
+            continue;
+        }
         let counts = if packet.kind.is_data() {
             &mut data_counts
         } else {
@@ -2507,6 +2540,19 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
             if let FlowGeneratorKind::Rate(rate) = generator.kind {
                 let work = crate::device_sizing::rate_device_work(image, generator, rate)
                     .map_err(|error| CudaError::Validation(error.to_string()))?;
+                let owns_timer_token = pacing_timer_tokens.contains(&(
+                    image.flows[index].source,
+                    generator.next_emission.payload,
+                    generator.next_emission.departure_time_ns,
+                ));
+                if owns_timer_token {
+                    data_counts[index] = data_counts[index].saturating_sub(1);
+                }
+                data_counts[index] = data_counts[index].saturating_add(work.packets);
+                continue;
+            }
+            if let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind {
+                let work = crate::device_sizing::dcqcn_device_work(image, generator, dcqcn);
                 let owns_timer_token = pacing_timer_tokens.contains(&(
                     image.flows[index].source,
                     generator.next_emission.payload,
@@ -2571,7 +2617,11 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
     }
     for state in &image.host_states {
         for generator in &state.generators {
-            if matches!(generator.kind, FlowGeneratorKind::Tcp(_)) {
+            // One ACK (TCP) or at most one CNP (DCQCN) per data packet.
+            if matches!(
+                generator.kind,
+                FlowGeneratorKind::Tcp(_) | FlowGeneratorKind::Dcqcn(_)
+            ) {
                 let flow = generator.flow.0 as usize;
                 feedback_counts[flow] = feedback_counts[flow].saturating_add(data_counts[flow]);
             }
@@ -3355,13 +3405,21 @@ fn derived_transition_bound(image: &SimulationImage, counts: &[usize]) -> Result
         .host_states
         .iter()
         .flat_map(|state| &state.generators)
-        .try_fold(network, |bound, generator| {
-            let FlowGeneratorKind::Rate(rate) = generator.kind else {
-                return Ok(bound);
-            };
-            let work = crate::device_sizing::rate_device_work(image, generator, rate)
-                .map_err(|error| CudaError::Validation(error.to_string()))?;
-            Ok(bound.saturating_add(work.pacing_ticks))
+        .try_fold(network, |bound, generator| match generator.kind {
+            FlowGeneratorKind::Rate(rate) => {
+                let work = crate::device_sizing::rate_device_work(image, generator, rate)
+                    .map_err(|error| CudaError::Validation(error.to_string()))?;
+                Ok(bound.saturating_add(work.pacing_ticks))
+            }
+            FlowGeneratorKind::Dcqcn(dcqcn) => {
+                let work = crate::device_sizing::dcqcn_device_work(image, generator, dcqcn);
+                Ok(bound
+                    .saturating_add(work.pacing_ticks)
+                    .saturating_add(work.control_ticks))
+            }
+            FlowGeneratorKind::Constant(_)
+            | FlowGeneratorKind::Tcp(_)
+            | FlowGeneratorKind::Collective(_) => Ok(bound),
         })
 }
 
@@ -4329,7 +4387,19 @@ impl CudaBuffers {
                                 rate.credit_quanta = u128::from(generators[offset + 18])
                                     | (u128::from(generators[offset + 19]) << 64);
                             }
-                            FlowGeneratorKind::Collective(_) | FlowGeneratorKind::Dcqcn(_) => {
+                            FlowGeneratorKind::Dcqcn(dcqcn) => {
+                                crate::device_mechanism::decode_dcqcn_generator(
+                                    &generators[offset..offset + GENERATOR_WORDS],
+                                    dcqcn,
+                                )
+                                .map_err(|_| {
+                                    CudaError::DeviceExecution {
+                                        code: 96,
+                                        node: Some(node.id),
+                                    }
+                                })?;
+                            }
+                            FlowGeneratorKind::Collective(_) => {
                                 return Err(CudaError::DeviceExecution {
                                     code: 96,
                                     node: Some(node.id),
@@ -4355,6 +4425,17 @@ impl CudaBuffers {
                                 }
                             })
                             .collect();
+                    }
+                    for receiver in &mut state.dcqcn_receivers {
+                        let row = receiver.flow.0 as usize * TCP_RECEIVER_WORDS;
+                        crate::device_mechanism::decode_dcqcn_receiver(
+                            &receiver_state[row..row + TCP_RECEIVER_WORDS],
+                            receiver,
+                        )
+                        .map_err(|_| CudaError::DeviceExecution {
+                            code: 96,
+                            node: Some(node.id),
+                        })?;
                     }
                 }
                 NodeKind::Switch => {
