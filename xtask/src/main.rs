@@ -45,20 +45,20 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "cuda.rs",
         predicate: r#"feature = "planner-test-hooks""#,
-        count: 4,
-        purpose: "CUDA host-plan equality hook is enabled by the standard test feature",
+        count: 5,
+        purpose: "CUDA host-plan equality hook and P14 Lane B's mechanism-plane word probe are enabled by the standard test feature",
     },
     AllowedFeatureGate {
         path: "metal.rs",
         predicate: r#"feature = "planner-test-hooks""#,
-        count: 4,
-        purpose: "Metal host-plan equality hook is enabled by the standard test feature",
+        count: 5,
+        purpose: "Metal host-plan equality hook and P14 Lane B's mechanism-plane word probe are enabled by the standard test feature",
     },
     AllowedFeatureGate {
         path: "lib.rs",
         predicate: r#"any(test, feature = "cuda", all(feature = "metal", target_vendor = "apple"))"#,
-        count: 1,
-        purpose: "T20l fix 2's readback-compaction sizing module compiles only for the crate's own unit tests and the two device backends that gather with it",
+        count: 2,
+        purpose: "T20l fix 2's readback-compaction sizing module and P14 Lane B's DCQCN device-row codecs (`device_mechanism`) compile only for the crate's own unit tests and the two device backends that use them",
     },
     AllowedFeatureGate {
         path: "device_capacity.rs",
@@ -95,6 +95,12 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
         predicate: r#"not(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))"#,
         count: 1,
         purpose: "suppress dead-code warnings when neither device toolchain backend is built",
+    },
+    AllowedFeatureGate {
+        path: "device_pfc.rs",
+        predicate: r#"not(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))"#,
+        count: 1,
+        purpose: "P14 Lane B's PFC region codec packs and restores device planes; without a device backend only its sizing helpers are used, so suppress dead-code warnings",
     },
     AllowedFeatureGate {
         path: "lib.rs",
@@ -135,8 +141,8 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "planner_capacity.rs",
         predicate: r#"any(test, feature = "planner-test-hooks")"#,
-        count: 19,
-        purpose: "legacy quadratic helpers exist only for unit and standard full-plan equality tests. T21 added two: the retained `planning_horizon_ns` field and its literal, which is an INPUT the legacy ledger-bound arm recomputes from and the precomputed table has already baked in, so a production build must not carry it",
+        count: 20,
+        purpose: "legacy quadratic helpers exist only for unit and standard full-plan equality tests. T21 added two: the retained `planning_horizon_ns` field and its literal, which is an INPUT the legacy ledger-bound arm recomputes from and the precomputed table has already baked in, so a production build must not carry it. P14 Lane B added the legacy arm of `dcqcn_generator`",
     },
     AllowedFeatureGate {
         path: "planner_capacity.rs",
