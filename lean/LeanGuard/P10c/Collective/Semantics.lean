@@ -31,6 +31,14 @@ inductive Status
   | stopped
   deriving DecidableEq, Repr
 
+/-- The generator that carries a dependency-gated stage. -/
+inductive StageKind
+  /-- A collective stage carried by an ordinary TCP flow. -/
+  | tcp
+  /-- A delay-only compute interval. -/
+  | compute
+  deriving DecidableEq, Repr
+
 /-- The owner offset in the lowering recurrence. -/
 def ownerOffset : Algorithm → Phase → Nat
   | .ringAllReduce, .allGather => 2
@@ -54,60 +62,38 @@ def legalPosition
     | .allGather => phase = .allGather
     | .ringAllReduce => true
 
-/-- Roots are scheduled while the image is built; only dependency-unblocked stages are logged. -/
-def loggedActivationPosition (algorithm : Algorithm) (phase : Phase) (step : Nat) : Bool :=
-  match algorithm, phase with
-  | .allGather, .allGather => step > 1
-  | .ringAllReduce, .reduceScatter => step > 1
-  | .ringAllReduce, .allGather => true
-  | .allGather, .reduceScatter => false
+/-- A root stage has no collective predecessor: step one of the algorithm's first phase. -/
+def rootPosition (algorithm : Algorithm) (phase : Phase) (step : Nat) : Bool :=
+  step = 1 &&
+    match algorithm, phase with
+    | .allGather, .allGather => true
+    | .ringAllReduce, .reduceScatter => true
+    | _, _ => false
 
-/-- EqualRemainderLast has one nonempty owner below one byte per rank, otherwise all owners. -/
-def nonzeroOwnerCount (totalBytes groupSize : Nat) : Nat :=
-  if totalBytes < groupSize then 1 else groupSize
+/-- Non-root stages each rank runs: the ring's `2n - 3` or AllGather's `n - 2`. -/
+def nonRootStagesPerRank (algorithm : Algorithm) (groupSize : Nat) : Nat :=
+  match algorithm with
+  | .allGather => groupSize - 2
+  | .ringAllReduce => 2 * groupSize - 3
 
-/-- Number of nonempty dependency-unblocked stages in a complete scalar progress trace. -/
-def expectedActivationCount (algorithm : Algorithm) (groupSize totalBytes : Nat) : Nat :=
-  let stagesPerOwner :=
-    match algorithm with
-    | .allGather => groupSize - 2
-    | .ringAllReduce => 2 * groupSize - 3
-  nonzeroOwnerCount totalBytes groupSize * stagesPerOwner
+/-- Stages a complete TCP trace releases. TCP collectives carry at least one byte per rank, so
+every chunk is nonempty; a compute-gated collective also releases its `n` roots. -/
+def expectedActivationCount (algorithm : Algorithm) (groupSize : Nat) (gated : Bool) : Nat :=
+  groupSize * nonRootStagesPerRank algorithm groupSize + (if gated then groupSize else 0)
 
-/-- Stages needing progress have a nonempty own chunk or nonempty local predecessor chunk. -/
-def expectedProgressStageCount (algorithm : Algorithm) (groupSize totalBytes : Nat) : Nat :=
-  let stagesPerOwner :=
-    match algorithm with
-    | .allGather => groupSize - 2
-    | .ringAllReduce => 2 * groupSize - 3
-  let progressingOwners := if totalBytes < groupSize then 2 else groupSize
-  progressingOwners * stagesPerOwner
+/-- The largest initial congestion window of the executor's TCP controllers (Reno: two MSS). -/
+def maxInitialWindowSegments : Nat := 2
 
-def firstPacketBytes (packetSize chunkBytes : Nat) : Nat :=
-  min packetSize chunkBytes
+/-- A released TCP stage fills its first window from sequence zero with full-MSS segments, the
+last one trimmed to the chunk. The certificate omits the controller, so the window is bounded by
+the largest initial window rather than fixed. -/
+def tcpFirstWindow (mss chunkBytes packets bytes : Nat) : Bool :=
+  packets ≥ 1 && packets ≤ maxInitialWindowSegments && (packets - 1) * mss < chunkBytes &&
+    bytes = min chunkBytes (packets * mss)
 
-structure ActivationAfter where
-  packetsEmitted : Nat
-  bytesEmitted : Nat
-  status : Status
-  nextTimeNs : Nat
-  deriving DecidableEq, Repr
-
-/-- State written by the scalar executor after a blocked stage emits its first packet. -/
-def activationAfter
-    (timeNs packetSize chunkBytes intervalNs stopTimeNs : Nat) : ActivationAfter :=
-  let first := firstPacketBytes packetSize chunkBytes
-  let remaining := chunkBytes - first
-  if remaining = 0 then
-    { packetsEmitted := 1
-      bytesEmitted := first
-      status := .finished
-      nextTimeNs := timeNs }
-  else
-    let next := timeNs + intervalNs
-    { packetsEmitted := 1
-      bytesEmitted := first
-      status := if next ≤ stopTimeNs then .scheduled else .stopped
-      nextTimeNs := next }
+/-- Status and deadline written when a compute interval is released at `timeNs`. -/
+def computeTimerAfter (timeNs durationNs stopTimeNs : Nat) : Status × Nat :=
+  let deadline := timeNs + durationNs
+  (if deadline ≤ stopTimeNs then .scheduled else .stopped, deadline)
 
 end LeanGuard.P10c.Collective

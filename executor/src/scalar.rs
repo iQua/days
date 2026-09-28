@@ -291,6 +291,24 @@ struct PendingCollectiveProgress {
     before_local_complete: bool,
     before_inbound_complete: bool,
     before_inbound_bytes: u64,
+    /// Inbound rows: the arriving data segment `[segment_sequence, segment_sequence + segment_bytes)`.
+    segment_sequence: u64,
+    segment_bytes: u64,
+    /// Local rows: the signal that completed the local predecessor.
+    completion: CompletionSignal,
+}
+
+/// The event that completed a local predecessor, as certified in its successor's progress row.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CompletionSignal {
+    /// TCP: the completing ACK's cumulative acknowledgment. Zero for a compute timer.
+    ack_number: u64,
+    /// TCP: when the segment this ACK answers was sent (echoed by the ACK). Compute: when the
+    /// timer was armed.
+    origin_ns: u64,
+    /// TCP: that segment's and this ACK's unloaded round trip, a lower bound on the completion
+    /// time's distance from `origin_ns`. Compute: the timer duration, met exactly.
+    delay_ns: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -305,10 +323,11 @@ struct CollectiveProgressContext {
 fn collective_progress_record(
     context: CollectiveProgressContext,
     cause: PendingCollectiveProgress,
-    collective: crate::CollectiveGenerator,
     generator: &crate::FlowGeneratorState,
-) -> crate::CollectiveProgressRecord {
-    crate::CollectiveProgressRecord {
+) -> Option<crate::CollectiveProgressRecord> {
+    let dependencies = generator.stage_dependencies()?;
+    let stage = generator.stage?;
+    let record = crate::CollectiveProgressRecord {
         key: context.key,
         ordinal: context.ordinal,
         node: context.node,
@@ -316,33 +335,174 @@ fn collective_progress_record(
         cause: cause.cause,
         cause_flow: cause.cause_flow,
         arrival_bytes: cause.arrival_bytes,
-        collective_id: collective.collective_id,
-        algorithm: collective.algorithm,
-        group_size: collective.group_size,
-        declared_total_bytes: collective.declared_total_bytes,
-        rank: collective.rank,
-        phase: collective.phase,
-        step: collective.step,
-        chunk_offset_bytes: collective.chunk_offset_bytes,
-        chunk_bytes: collective.chunk_bytes,
-        packet_size_bytes: collective.packet_size_bytes,
-        interval_ns: collective.interval_ns,
+        collective_id: 0,
+        algorithm: None,
+        group_size: 0,
+        declared_total_bytes: 0,
+        rank: 0,
+        phase: None,
+        step: 0,
+        chunk_offset_bytes: 0,
+        chunk_bytes: 0,
+        packet_size_bytes: 0,
+        interval_ns: 0,
         stop_time_ns: context.stop_time_ns,
-        local_predecessor: collective.local_predecessor,
-        inbound_predecessor: collective.inbound_predecessor,
-        inbound_predecessor_bytes: collective.inbound_predecessor_bytes,
+        local_predecessor: dependencies.local_predecessor,
+        inbound_predecessor: dependencies.inbound_predecessor,
+        inbound_predecessor_bytes: dependencies.inbound_predecessor_bytes,
         before_local_complete: cause.before_local_complete,
         before_inbound_complete: cause.before_inbound_complete,
         before_inbound_bytes: cause.before_inbound_bytes,
         activated: context.activated,
-        after_local_complete: collective.local_predecessor_complete,
-        after_inbound_complete: collective.inbound_predecessor_complete,
-        after_inbound_bytes: collective.inbound_bytes_received,
+        after_local_complete: dependencies.local_predecessor_complete,
+        after_inbound_complete: dependencies.inbound_predecessor_complete,
+        after_inbound_bytes: dependencies.inbound_bytes_received,
         after_packets_emitted: generator.packets_emitted,
         after_bytes_emitted: generator.bytes_emitted,
         after_status: generator.next_emission.status,
         after_next_time_ns: generator.next_emission.departure_time_ns,
+        stage_kind: crate::CollectiveStageKind::Tcp,
+        duration_ns: 0,
+        segment_sequence: cause.segment_sequence,
+        segment_bytes: cause.segment_bytes,
+        ack_number: cause.completion.ack_number,
+        cause_origin_ns: cause.completion.origin_ns,
+        cause_delay_ns: cause.completion.delay_ns,
+    };
+    match (generator.kind, stage.role) {
+        (FlowGeneratorKind::Tcp(tcp), crate::StageRole::Collective(identity)) => {
+            Some(crate::CollectiveProgressRecord {
+                collective_id: identity.collective_id,
+                algorithm: Some(identity.algorithm),
+                group_size: identity.group_size,
+                declared_total_bytes: identity.declared_total_bytes,
+                rank: identity.rank,
+                phase: Some(identity.phase),
+                step: identity.step,
+                chunk_offset_bytes: identity.chunk_offset_bytes,
+                chunk_bytes: identity.chunk_bytes,
+                packet_size_bytes: tcp.mss_bytes,
+                ..record
+            })
+        }
+        (FlowGeneratorKind::Constant(_), crate::StageRole::Compute(compute)) => {
+            Some(crate::CollectiveProgressRecord {
+                collective_id: compute.compute_id,
+                group_size: compute.group_size,
+                rank: compute.rank,
+                stage_kind: crate::CollectiveStageKind::Compute,
+                duration_ns: compute.duration_ns,
+                ..record
+            })
+        }
+        _ => None,
     }
+}
+
+/// Whether a dependency-blocked stage has just had both prerequisites satisfied.
+fn stage_ready_to_activate(generator: &crate::FlowGeneratorState) -> bool {
+    generator.next_emission.status == GeneratorStatus::Blocked
+        && generator
+            .stage
+            .is_some_and(|stage| !stage.activated && stage.dependencies.prerequisites_complete())
+}
+
+/// Marks every stage whose local predecessor is `completed` as locally complete.
+///
+/// Causes are pushed in canonical `FlowId` order, the order of the host's generator table.
+fn complete_local_successors(
+    generators: &mut [crate::FlowGeneratorState],
+    completed: FlowId,
+    completion: CompletionSignal,
+    causes: &mut Vec<PendingCollectiveProgress>,
+) {
+    for successor in generators {
+        let Some(mut dependencies) = successor.stage_dependencies() else {
+            continue;
+        };
+        if dependencies.local_predecessor != Some(completed)
+            || dependencies.local_predecessor_complete
+        {
+            continue;
+        }
+        causes.push(PendingCollectiveProgress {
+            flow: successor.flow,
+            cause: crate::CollectiveActivationCause::LocalCompletion,
+            cause_flow: completed,
+            arrival_bytes: 0,
+            before_local_complete: dependencies.local_predecessor_complete,
+            before_inbound_complete: dependencies.inbound_predecessor_complete,
+            before_inbound_bytes: dependencies.inbound_bytes_received,
+            segment_sequence: 0,
+            segment_bytes: 0,
+            completion,
+        });
+        dependencies.local_predecessor_complete = true;
+        successor.set_stage_dependencies(dependencies);
+    }
+}
+
+/// How delivery of an inbound predecessor's bytes was observed at this host.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InboundProgress {
+    /// One data segment `[sequence, sequence + bytes)` arrived and the receiver's in-order TCP
+    /// frontier advanced by `advance` bytes (zero for a duplicate or out-of-order segment).
+    /// Retransmitted or out-of-order bytes count only once the frontier covers them.
+    Segment {
+        sequence: u64,
+        bytes: u64,
+        advance: u64,
+    },
+}
+
+/// Advances every stage waiting on `inbound` as its inbound predecessor.
+fn record_inbound_progress(
+    generators: &mut [crate::FlowGeneratorState],
+    inbound: FlowId,
+    progress: InboundProgress,
+    node: NodeId,
+    causes: &mut Vec<PendingCollectiveProgress>,
+) -> Result<(), ExecutionError> {
+    for generator in generators {
+        let Some(mut dependencies) = generator.stage_dependencies() else {
+            continue;
+        };
+        if dependencies.inbound_predecessor != Some(inbound)
+            || dependencies.inbound_predecessor_complete
+        {
+            continue;
+        }
+        let before_inbound_bytes = dependencies.inbound_bytes_received;
+        let InboundProgress::Segment {
+            sequence,
+            bytes,
+            advance: arrival_bytes,
+        } = progress;
+        causes.push(PendingCollectiveProgress {
+            flow: generator.flow,
+            cause: crate::CollectiveActivationCause::InboundArrival,
+            cause_flow: inbound,
+            arrival_bytes,
+            before_local_complete: dependencies.local_predecessor_complete,
+            before_inbound_complete: dependencies.inbound_predecessor_complete,
+            before_inbound_bytes,
+            segment_sequence: sequence,
+            segment_bytes: bytes,
+            completion: CompletionSignal::default(),
+        });
+        dependencies.inbound_bytes_received = dependencies
+            .inbound_bytes_received
+            .checked_add(arrival_bytes)
+            .ok_or(ExecutionError::CounterOverflow(node))?;
+        if dependencies.inbound_bytes_received > dependencies.inbound_predecessor_bytes {
+            return Err(ExecutionError::CounterOverflow(node));
+        }
+        if dependencies.inbound_bytes_received == dependencies.inbound_predecessor_bytes {
+            dependencies.inbound_predecessor_complete = true;
+        }
+        generator.set_stage_dependencies(dependencies);
+    }
+    Ok(())
 }
 
 impl fmt::Display for ExecutionError {
@@ -1129,15 +1289,6 @@ impl<'image> TransitionState<'image> {
         if let PacketKind::TcpData(header) = packet.kind {
             return self.host_tcp_initial_send(node, event, packet, header, children);
         }
-        if self
-            .host_state(node)?
-            .generators
-            .iter()
-            .find(|generator| generator.flow == packet.flow)
-            .is_some_and(|generator| matches!(generator.kind, FlowGeneratorKind::Collective(_)))
-        {
-            return self.host_collective_scheduled_send(node, event, packet, children);
-        }
         self.set_source_time(event.payload, event.key.time_ns)?;
         let (next_packet, next_departure_ns, schedule_ready) = {
             let stop_time_ns = self.image.stop_time_ns;
@@ -1285,169 +1436,6 @@ impl<'image> TransitionState<'image> {
         Ok(())
     }
 
-    fn host_collective_scheduled_send(
-        &mut self,
-        node: NodeDescriptor,
-        event: Event,
-        packet: PacketDescriptor,
-        children: &mut Vec<Event>,
-    ) -> Result<(), ExecutionError> {
-        self.set_source_time(packet.id, event.key.time_ns)?;
-        let stop_time_ns = self.image.stop_time_ns;
-        let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
-        let mut progress_causes = Vec::new();
-        let (next_packet, next_time, schedule_ready) = {
-            let state = self.host_state_mut(node)?;
-            let generator_index = state
-                .generators
-                .iter()
-                .position(|generator| generator.flow == packet.flow)
-                .ok_or(ExecutionError::UnknownGenerator {
-                    node: node.id,
-                    flow: packet.flow,
-                })?;
-            let generator = &mut state.generators[generator_index];
-            let FlowGeneratorKind::Collective(collective) = generator.kind else {
-                return Err(ExecutionError::UnexpectedGeneratorEmission {
-                    node: node.id,
-                    flow: packet.flow,
-                    payload: packet.id,
-                });
-            };
-            if generator.next_emission.status != GeneratorStatus::Scheduled
-                || generator.next_emission.departure_time_ns != event.key.time_ns
-                || generator.next_emission.payload != packet.id
-                || !collective.prerequisites_complete()
-            {
-                return Err(ExecutionError::UnexpectedGeneratorEmission {
-                    node: node.id,
-                    flow: packet.flow,
-                    payload: packet.id,
-                });
-            }
-            generator.packets_emitted = generator
-                .packets_emitted
-                .checked_add(1)
-                .ok_or(ExecutionError::CounterOverflow(node.id))?;
-            generator.bytes_emitted = generator
-                .bytes_emitted
-                .checked_add(packet.size_bytes)
-                .ok_or(ExecutionError::CounterOverflow(node.id))?;
-            let remaining = collective
-                .chunk_bytes
-                .checked_sub(generator.bytes_emitted)
-                .ok_or(ExecutionError::CounterOverflow(node.id))?;
-            let candidate = (remaining != 0)
-                .then(|| {
-                    event
-                        .key
-                        .time_ns
-                        .checked_add(collective.interval_ns)
-                        .ok_or(ExecutionError::GeneratorTimeOverflow(packet.flow))
-                })
-                .transpose()?;
-            let (next_packet, next_time) =
-                if let Some(next_time) = candidate.filter(|time| *time <= stop_time_ns) {
-                    let payload = allocate_payload_id(node.id, node_count, state.next_payload_seq)
-                        .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
-                    state.next_payload_seq = state
-                        .next_payload_seq
-                        .checked_add(1)
-                        .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
-                    generator.next_emission = crate::ScheduledEmission {
-                        status: GeneratorStatus::Scheduled,
-                        departure_time_ns: next_time,
-                        payload,
-                    };
-                    (
-                        Some(PacketDescriptor {
-                            id: payload,
-                            flow: packet.flow,
-                            size_bytes: collective.packet_size_bytes.min(remaining),
-                            ecn_marked: false,
-                            kind: PacketKind::Data,
-                        }),
-                        Some(next_time),
-                    )
-                } else {
-                    generator.next_emission.status = if remaining == 0 {
-                        GeneratorStatus::Finished
-                    } else {
-                        GeneratorStatus::Stopped
-                    };
-                    if let Some(candidate) = candidate {
-                        generator.next_emission.departure_time_ns = candidate;
-                    }
-                    (None, None)
-                };
-            if remaining == 0 {
-                for successor in &mut state.generators {
-                    if let FlowGeneratorKind::Collective(mut stage) = successor.kind {
-                        if stage.local_predecessor == Some(packet.flow)
-                            && !stage.local_predecessor_complete
-                        {
-                            progress_causes.push(PendingCollectiveProgress {
-                                flow: successor.flow,
-                                cause: crate::CollectiveActivationCause::LocalCompletion,
-                                cause_flow: packet.flow,
-                                arrival_bytes: 0,
-                                before_local_complete: stage.local_predecessor_complete,
-                                before_inbound_complete: stage.inbound_predecessor_complete,
-                                before_inbound_bytes: stage.inbound_bytes_received,
-                            });
-                            stage.local_predecessor_complete = true;
-                            successor.kind = FlowGeneratorKind::Collective(stage);
-                        }
-                    }
-                }
-            }
-            state.sourced_packets = state
-                .sourced_packets
-                .checked_add(1)
-                .ok_or(ExecutionError::CounterOverflow(node.id))?;
-            let schedule_ready = state.in_service.is_none() && !state.tx_ready_pending;
-            if schedule_ready {
-                state.tx_ready_pending = true;
-            }
-            (next_packet, next_time, schedule_ready)
-        };
-
-        self.enqueue_source_packet(node, packet.id)?;
-        self.record_sourced(node.id, packet)?;
-        if let Some(next_packet) = next_packet {
-            self.insert_packet(
-                next_packet,
-                Some(next_time.expect("next packet has a time")),
-            )?;
-            self.emit_from_host(
-                node,
-                event,
-                ChildEmission {
-                    target: node.id,
-                    kind: EventKind::PacketArrival,
-                    payload: next_packet.id,
-                    time_ns: next_time.expect("next packet has a time"),
-                },
-                children,
-            )?;
-        }
-        self.activate_ready_collectives(node, event, progress_causes, children)?;
-        if schedule_ready {
-            self.emit_from_host(
-                node,
-                event,
-                ChildEmission {
-                    target: node.id,
-                    kind: EventKind::TxReady,
-                    payload: packet.id,
-                    time_ns: event.key.time_ns,
-                },
-                children,
-            )?;
-        }
-        Ok(())
-    }
-
     fn activate_ready_collectives(
         &mut self,
         node: NodeDescriptor,
@@ -1455,241 +1443,278 @@ impl<'image> TransitionState<'image> {
         mut causes: Vec<PendingCollectiveProgress>,
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
-        let stop_time_ns = self.image.stop_time_ns;
-        let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
         let mut ordinal = 0_u64;
         loop {
-            let activation = {
+            let flow = {
                 let state = self.host_state_mut(node)?;
-                let Some(generator_index) = state.generators.iter().position(|generator| {
-                    generator.next_emission.status == GeneratorStatus::Blocked
-                        && matches!(generator.kind, FlowGeneratorKind::Collective(stage)
-                            if stage.prerequisites_complete())
-                }) else {
+                let Some(generator) = state
+                    .generators
+                    .iter_mut()
+                    .find(|generator| stage_ready_to_activate(generator))
+                else {
                     break;
                 };
-                let flow = state.generators[generator_index].flow;
-                let Some(cause_index) = causes.iter().position(|cause| cause.flow == flow) else {
-                    return Err(ExecutionError::UnexpectedGeneratorEmission {
-                        node: node.id,
-                        flow,
-                        payload: parent.payload,
-                    });
-                };
-                let cause = causes.remove(cause_index);
-                let FlowGeneratorKind::Collective(collective) =
-                    state.generators[generator_index].kind
-                else {
-                    unreachable!("position selected a collective generator")
-                };
-                let first_payload =
-                    allocate_payload_id(node.id, node_count, state.next_payload_seq)
-                        .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
+                generator
+                    .stage
+                    .as_mut()
+                    .expect("a ready stage carries its record")
+                    .activated = true;
+                generator.flow
+            };
+            let Some(cause_index) = causes.iter().position(|cause| cause.flow == flow) else {
+                return Err(ExecutionError::UnexpectedGeneratorEmission {
+                    node: node.id,
+                    flow,
+                    payload: parent.payload,
+                });
+            };
+            let cause = causes.remove(cause_index);
+            self.activate_wrapped_stage(node, parent, flow, cause, ordinal, children)?;
+            ordinal = ordinal
+                .checked_add(1)
+                .ok_or(ExecutionError::CounterOverflow(node.id))?;
+        }
+        // Progress that did not release a stage is recorded after every release of this event,
+        // in canonical cause order.
+        for cause in causes {
+            self.push_stage_progress(node, parent, cause.flow, cause, ordinal, false)?;
+            ordinal = ordinal
+                .checked_add(1)
+                .ok_or(ExecutionError::CounterOverflow(node.id))?;
+        }
+        Ok(())
+    }
+
+    /// Releases a dependency-gated stage carried by an ordinary transport generator.
+    ///
+    /// A TCP stage starts exactly as a TCP flow whose first window opens at the release time: the
+    /// sender fills its initial congestion window from sequence zero and arms its timer.
+    fn activate_wrapped_stage(
+        &mut self,
+        node: NodeDescriptor,
+        parent: Event,
+        flow: FlowId,
+        cause: PendingCollectiveProgress,
+        ordinal: u64,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
+        let (kind, compute_duration) = self
+            .host_state(node)?
+            .generators
+            .iter()
+            .find(|generator| generator.flow == flow)
+            .map(|generator| {
+                (
+                    generator.kind,
+                    generator.stage.and_then(|stage| match stage.role {
+                        crate::StageRole::Compute(compute) => Some(compute.duration_ns),
+                        crate::StageRole::Collective(_) => None,
+                    }),
+                )
+            })
+            .ok_or(ExecutionError::UnknownGenerator {
+                node: node.id,
+                flow,
+            })?;
+        if let (FlowGeneratorKind::Constant(_), Some(duration_ns)) = (kind, compute_duration) {
+            return self.start_compute_stage(
+                node,
+                parent,
+                flow,
+                duration_ns,
+                cause,
+                ordinal,
+                children,
+            );
+        }
+        let FlowGeneratorKind::Tcp(_) = kind else {
+            return Err(ExecutionError::UnexpectedGeneratorEmission {
+                node: node.id,
+                flow,
+                payload: parent.payload,
+            });
+        };
+        let plan = self.prepare_tcp_attempts(node, flow, parent.key.time_ns, None, true, false)?;
+        self.push_stage_progress(node, parent, flow, cause, ordinal, true)?;
+        self.install_tcp_attempts(node, parent, plan, children)
+    }
+
+    /// Starts a released compute interval: a source-local timer fires `duration_ns` later.
+    ///
+    /// The zero-byte token only names the timer event; it is never enqueued or transmitted. A
+    /// deadline beyond the stop time leaves the stage `Stopped` without an event.
+    #[allow(clippy::too_many_arguments)]
+    fn start_compute_stage(
+        &mut self,
+        node: NodeDescriptor,
+        parent: Event,
+        flow: FlowId,
+        duration_ns: u64,
+        cause: PendingCollectiveProgress,
+        ordinal: u64,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
+        let stop_time_ns = self.image.stop_time_ns;
+        let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
+        let deadline_ns = parent
+            .key
+            .time_ns
+            .checked_add(duration_ns)
+            .ok_or(ExecutionError::GeneratorTimeOverflow(flow))?;
+        let token = {
+            let state = self.host_state_mut(node)?;
+            let payload = if deadline_ns <= stop_time_ns {
+                let payload = allocate_payload_id(node.id, node_count, state.next_payload_seq)
+                    .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
                 state.next_payload_seq = state
                     .next_payload_seq
                     .checked_add(1)
                     .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
-                let first_size = collective.packet_size_bytes.min(collective.chunk_bytes);
-                let generator = &mut state.generators[generator_index];
-                generator.packets_emitted = generator
-                    .packets_emitted
-                    .checked_add(1)
-                    .ok_or(ExecutionError::CounterOverflow(node.id))?;
-                generator.bytes_emitted = generator
-                    .bytes_emitted
-                    .checked_add(first_size)
-                    .ok_or(ExecutionError::CounterOverflow(node.id))?;
-                let remaining = collective.chunk_bytes - generator.bytes_emitted;
-                let candidate = (remaining != 0)
-                    .then(|| {
-                        parent
-                            .key
-                            .time_ns
-                            .checked_add(collective.interval_ns)
-                            .ok_or(ExecutionError::GeneratorTimeOverflow(flow))
-                    })
-                    .transpose()?;
-                let (next_packet, next_time) = if let Some(next_time) =
-                    candidate.filter(|time| *time <= stop_time_ns)
-                {
-                    let payload = allocate_payload_id(node.id, node_count, state.next_payload_seq)
-                        .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
-                    state.next_payload_seq = state
-                        .next_payload_seq
-                        .checked_add(1)
-                        .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
-                    state.generators[generator_index].next_emission = crate::ScheduledEmission {
-                        status: GeneratorStatus::Scheduled,
-                        departure_time_ns: next_time,
-                        payload,
-                    };
-                    (
-                        Some(PacketDescriptor {
-                            id: payload,
-                            flow,
-                            size_bytes: collective.packet_size_bytes.min(remaining),
-                            ecn_marked: false,
-                            kind: PacketKind::Data,
-                        }),
-                        Some(next_time),
-                    )
+                Some(payload)
+            } else {
+                None
+            };
+            let generator = state
+                .generators
+                .iter_mut()
+                .find(|generator| generator.flow == flow)
+                .ok_or(ExecutionError::UnknownGenerator {
+                    node: node.id,
+                    flow,
+                })?;
+            generator.next_emission = crate::ScheduledEmission {
+                status: if payload.is_some() {
+                    GeneratorStatus::Scheduled
                 } else {
-                    state.generators[generator_index].next_emission = crate::ScheduledEmission {
-                        status: if remaining == 0 {
-                            GeneratorStatus::Finished
-                        } else {
-                            GeneratorStatus::Stopped
-                        },
-                        departure_time_ns: candidate.unwrap_or(parent.key.time_ns),
-                        payload: first_payload,
-                    };
-                    (None, None)
-                };
-                if remaining == 0 {
-                    for successor in &mut state.generators {
-                        if let FlowGeneratorKind::Collective(mut stage) = successor.kind {
-                            if stage.local_predecessor == Some(flow)
-                                && !stage.local_predecessor_complete
-                            {
-                                causes.push(PendingCollectiveProgress {
-                                    flow: successor.flow,
-                                    cause: crate::CollectiveActivationCause::LocalCompletion,
-                                    cause_flow: flow,
-                                    arrival_bytes: 0,
-                                    before_local_complete: stage.local_predecessor_complete,
-                                    before_inbound_complete: stage.inbound_predecessor_complete,
-                                    before_inbound_bytes: stage.inbound_bytes_received,
-                                });
-                                stage.local_predecessor_complete = true;
-                                successor.kind = FlowGeneratorKind::Collective(stage);
-                            }
-                        }
-                    }
-                }
-                state.sourced_packets = state
-                    .sourced_packets
-                    .checked_add(1)
-                    .ok_or(ExecutionError::CounterOverflow(node.id))?;
-                let schedule_ready = state.in_service.is_none() && !state.tx_ready_pending;
-                if schedule_ready {
-                    state.tx_ready_pending = true;
-                }
-                let generator = &state.generators[generator_index];
-                let FlowGeneratorKind::Collective(after_collective) = generator.kind else {
-                    unreachable!("collective activation retains its generator kind")
-                };
-                let transition = collective_progress_record(
-                    CollectiveProgressContext {
-                        key: parent.key,
-                        ordinal,
+                    GeneratorStatus::Stopped
+                },
+                departure_time_ns: deadline_ns,
+                payload: payload.unwrap_or(PayloadId(0)),
+            };
+            payload
+        };
+        self.push_stage_progress(node, parent, flow, cause, ordinal, true)?;
+        if let Some(payload) = token {
+            self.insert_packet(
+                PacketDescriptor {
+                    id: payload,
+                    flow,
+                    size_bytes: 0,
+                    ecn_marked: false,
+                    kind: PacketKind::Data,
+                },
+                Some(parent.key.time_ns),
+            )?;
+            self.emit_from_host(
+                node,
+                parent,
+                ChildEmission {
+                    target: node.id,
+                    kind: EventKind::PacingTimer,
+                    payload,
+                    time_ns: deadline_ns,
+                },
+                children,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// A compute interval ends: the stage finishes and releases its local successors.
+    fn host_compute_timer(
+        &mut self,
+        node: NodeDescriptor,
+        event: Event,
+        flow: FlowId,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
+        let mut causes = Vec::new();
+        {
+            let state = self.host_state_mut(node)?;
+            let generator = state
+                .generators
+                .iter_mut()
+                .find(|generator| generator.flow == flow)
+                .ok_or(ExecutionError::UnknownGenerator {
+                    node: node.id,
+                    flow,
+                })?;
+            if generator.next_emission.status != GeneratorStatus::Scheduled
+                || generator.next_emission.payload != event.payload
+                || generator.next_emission.departure_time_ns != event.key.time_ns
+            {
+                return Err(ExecutionError::UnexpectedGeneratorEmission {
+                    node: node.id,
+                    flow,
+                    payload: event.payload,
+                });
+            }
+            generator.next_emission.status = GeneratorStatus::Finished;
+            let duration_ns = match generator.stage.map(|stage| stage.role) {
+                Some(crate::StageRole::Compute(compute)) => compute.duration_ns,
+                _ => {
+                    return Err(ExecutionError::UnexpectedGeneratorEmission {
                         node: node.id,
-                        stop_time_ns,
-                        activated: true,
-                    },
-                    cause,
-                    after_collective,
-                    generator,
-                );
-                ordinal = ordinal
-                    .checked_add(1)
-                    .ok_or(ExecutionError::CounterOverflow(node.id))?;
-                (
-                    PacketDescriptor {
-                        id: first_payload,
                         flow,
-                        size_bytes: first_size,
-                        ecn_marked: false,
-                        kind: PacketKind::Data,
-                    },
-                    next_packet,
-                    next_time,
-                    schedule_ready,
-                    transition,
-                )
-            };
-            let (first_packet, next_packet, next_time, schedule_ready, transition) = activation;
-            if self.observation_mode == ObservationMode::Full {
-                self.mechanism_transitions
-                    .push(crate::MechanismTransitionRecord::Collective(transition));
-            }
-            self.insert_packet(first_packet, Some(parent.key.time_ns))?;
-            self.enqueue_source_packet(node, first_packet.id)?;
-            self.record_sourced(node.id, first_packet)?;
-            if let Some(next_packet) = next_packet {
-                self.insert_packet(
-                    next_packet,
-                    Some(next_time.expect("next packet has a time")),
-                )?;
-                self.emit_from_host(
-                    node,
-                    parent,
-                    ChildEmission {
-                        target: node.id,
-                        kind: EventKind::PacketArrival,
-                        payload: next_packet.id,
-                        time_ns: next_time.expect("next packet has a time"),
-                    },
-                    children,
-                )?;
-            }
-            if schedule_ready {
-                self.emit_from_host(
-                    node,
-                    parent,
-                    ChildEmission {
-                        target: node.id,
-                        kind: EventKind::TxReady,
-                        payload: first_packet.id,
-                        time_ns: parent.key.time_ns,
-                    },
-                    children,
-                )?;
-            }
-        }
-        if self.observation_mode == ObservationMode::Full {
-            let transitions = {
-                let state = self.host_state(node)?;
-                let mut transitions = Vec::with_capacity(causes.len());
-                for cause in causes {
-                    let generator = state
-                        .generators
-                        .iter()
-                        .find(|generator| generator.flow == cause.flow)
-                        .ok_or(ExecutionError::UnknownGenerator {
-                            node: node.id,
-                            flow: cause.flow,
-                        })?;
-                    let FlowGeneratorKind::Collective(collective) = generator.kind else {
-                        return Err(ExecutionError::UnexpectedGeneratorEmission {
-                            node: node.id,
-                            flow: cause.flow,
-                            payload: parent.payload,
-                        });
-                    };
-                    transitions.push(collective_progress_record(
-                        CollectiveProgressContext {
-                            key: parent.key,
-                            ordinal,
-                            node: node.id,
-                            stop_time_ns,
-                            activated: false,
-                        },
-                        cause,
-                        collective,
-                        generator,
-                    ));
-                    ordinal = ordinal
-                        .checked_add(1)
-                        .ok_or(ExecutionError::CounterOverflow(node.id))?;
+                        payload: event.payload,
+                    });
                 }
-                transitions
             };
-            self.mechanism_transitions.extend(
-                transitions
-                    .into_iter()
-                    .map(crate::MechanismTransitionRecord::Collective),
-            );
+            let completion = CompletionSignal {
+                ack_number: 0,
+                origin_ns: event.key.time_ns - duration_ns,
+                delay_ns: duration_ns,
+            };
+            complete_local_successors(&mut state.generators, flow, completion, &mut causes);
         }
+        self.mark_terminal(event.payload)?;
+        if !causes.is_empty() {
+            self.activate_ready_collectives(node, event, causes, children)?;
+        }
+        Ok(())
+    }
+
+    /// Records one prerequisite transition of a wrapped stage under full observation.
+    fn push_stage_progress(
+        &mut self,
+        node: NodeDescriptor,
+        parent: Event,
+        flow: FlowId,
+        cause: PendingCollectiveProgress,
+        ordinal: u64,
+        activated: bool,
+    ) -> Result<(), ExecutionError> {
+        if self.observation_mode != ObservationMode::Full {
+            return Ok(());
+        }
+        let stop_time_ns = self.image.stop_time_ns;
+        let generator = self
+            .host_state(node)?
+            .generators
+            .iter()
+            .find(|generator| generator.flow == flow)
+            .ok_or(ExecutionError::UnknownGenerator {
+                node: node.id,
+                flow,
+            })?;
+        let record = collective_progress_record(
+            CollectiveProgressContext {
+                key: parent.key,
+                ordinal,
+                node: node.id,
+                stop_time_ns,
+                activated,
+            },
+            cause,
+            generator,
+        )
+        .ok_or(ExecutionError::UnexpectedGeneratorEmission {
+            node: node.id,
+            flow,
+            payload: parent.payload,
+        })?;
+        self.mechanism_transitions
+            .push(crate::MechanismTransitionRecord::Collective(record));
         Ok(())
     }
 
@@ -2334,7 +2359,7 @@ impl<'image> TransitionState<'image> {
         } else {
             flow_source
         };
-        let (disposition, feedback_action, collective_progress_causes) = {
+        let (disposition, feedback_action) = {
             let state = self.host_state_mut(node)?;
             let feedback_generator = packet
                 .kind
@@ -2350,7 +2375,6 @@ impl<'image> TransitionState<'image> {
                 (
                     ArrivalDisposition::Feedback,
                     apply_generator_feedback(generator, node.id)?,
-                    Vec::new(),
                 )
             } else {
                 if expected_target != node.id {
@@ -2363,50 +2387,11 @@ impl<'image> TransitionState<'image> {
                     .received_packets
                     .checked_add(1)
                     .ok_or(ExecutionError::CounterOverflow(node.id))?;
-                let mut collective_progress_causes = Vec::new();
-                for generator in &mut state.generators {
-                    let FlowGeneratorKind::Collective(mut collective) = generator.kind else {
-                        continue;
-                    };
-                    if collective.inbound_predecessor != Some(packet.flow)
-                        || collective.inbound_predecessor_complete
-                    {
-                        continue;
-                    }
-                    let before_inbound_bytes = collective.inbound_bytes_received;
-                    collective_progress_causes.push(PendingCollectiveProgress {
-                        flow: generator.flow,
-                        cause: crate::CollectiveActivationCause::InboundArrival,
-                        cause_flow: packet.flow,
-                        arrival_bytes: packet.size_bytes,
-                        before_local_complete: collective.local_predecessor_complete,
-                        before_inbound_complete: collective.inbound_predecessor_complete,
-                        before_inbound_bytes,
-                    });
-                    collective.inbound_bytes_received = collective
-                        .inbound_bytes_received
-                        .checked_add(packet.size_bytes)
-                        .ok_or(ExecutionError::CounterOverflow(node.id))?;
-                    if collective.inbound_bytes_received > collective.inbound_predecessor_bytes {
-                        return Err(ExecutionError::CounterOverflow(node.id));
-                    }
-                    if collective.inbound_bytes_received == collective.inbound_predecessor_bytes {
-                        collective.inbound_predecessor_complete = true;
-                    }
-                    generator.kind = FlowGeneratorKind::Collective(collective);
-                }
-                (
-                    ArrivalDisposition::Delivered,
-                    GeneratorFeedbackAction::None,
-                    collective_progress_causes,
-                )
+                (ArrivalDisposition::Delivered, GeneratorFeedbackAction::None)
             }
         };
         self.record_arrival(node.id, packet, event.key, disposition)?;
         self.mark_terminal(event.payload)?;
-        if !collective_progress_causes.is_empty() {
-            self.activate_ready_collectives(node, event, collective_progress_causes, children)?;
-        }
         if let GeneratorFeedbackAction::Emit { flow, size_bytes } = feedback_action {
             self.emit_feedback_driven_packet(node, event, flow, size_bytes, children)?;
         }
@@ -2577,7 +2562,7 @@ impl<'image> TransitionState<'image> {
             });
         }
         let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
-        let (ack_payload, acknowledgment, ack_size_bytes) = {
+        let (ack_payload, acknowledgment, ack_size_bytes, stage_causes) = {
             let state = self.host_state_mut(node)?;
             let receiver = state
                 .tcp_receivers
@@ -2591,7 +2576,24 @@ impl<'image> TransitionState<'image> {
                 .sequence
                 .checked_add(packet.size_bytes)
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
+            let frontier_before = receiver.next_expected_sequence;
             tcp_receive_range(receiver, header.sequence, end);
+            let advanced = receiver.next_expected_sequence - frontier_before;
+            // Every segment of a pending inbound predecessor is certified, including duplicate and
+            // out-of-order ones that do not advance the frontier, so the certificate can replay
+            // the receiver exactly.
+            let mut stage_causes = Vec::new();
+            record_inbound_progress(
+                &mut state.generators,
+                packet.flow,
+                InboundProgress::Segment {
+                    sequence: header.sequence,
+                    bytes: packet.size_bytes,
+                    advance: advanced,
+                },
+                node.id,
+                &mut stage_causes,
+            )?;
             let payload = allocate_payload_id(node.id, node_count, state.next_payload_seq)
                 .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
             state.next_payload_seq = state
@@ -2610,6 +2612,7 @@ impl<'image> TransitionState<'image> {
                 payload,
                 receiver.next_expected_sequence,
                 receiver.ack_size_bytes,
+                stage_causes,
             )
         };
         self.record_arrival(node.id, packet, event.key, ArrivalDisposition::Delivered)?;
@@ -2650,6 +2653,9 @@ impl<'image> TransitionState<'image> {
                 children,
             )?;
         }
+        if !stage_causes.is_empty() {
+            self.activate_ready_collectives(node, event, stage_causes, children)?;
+        }
         Ok(())
     }
 
@@ -2678,6 +2684,7 @@ impl<'image> TransitionState<'image> {
             transition,
             scheduled_send_pending,
             superseded_timer,
+            stage_completed,
         ) = {
             let state = self.host_state_mut(node)?;
             let generator = state
@@ -2775,6 +2782,10 @@ impl<'image> TransitionState<'image> {
                 before,
                 after: tcp.control,
             });
+            // A wrapped stage's local successors wait for its last byte to be acknowledged. Only
+            // the new ACK that first reaches the total advances `highest_ack` to it.
+            let stage_completed = generator.stage.is_some()
+                && acknowledged_through.is_some_and(|acknowledged| acknowledged >= tcp.total_bytes);
             (
                 retransmit,
                 fill,
@@ -2782,8 +2793,46 @@ impl<'image> TransitionState<'image> {
                 transition,
                 scheduled_send_pending,
                 superseded,
+                stage_completed,
             )
         };
+        let mut stage_causes = Vec::new();
+        if stage_completed {
+            // The ACK echoes when its triggering segment was sent and how large it was, so the
+            // sender can certify the unloaded round trip that segment and this ACK needed: every
+            // link of both routes serializes and propagates them at least once.
+            let (route, reverse_route) = {
+                let descriptor = self.flow(packet.flow)?;
+                (descriptor.route.clone(), descriptor.reverse_route.clone())
+            };
+            let mut unloaded_round_trip_ns = 0_u64;
+            for (links, bytes) in [
+                (&route, header.acknowledged_bytes),
+                (&reverse_route, packet.size_bytes),
+            ] {
+                for link in links {
+                    let delay = self
+                        .link(*link)?
+                        .delay_ns(bytes)
+                        .map_err(|_| ExecutionError::GeneratorTimeOverflow(packet.flow))?;
+                    unloaded_round_trip_ns = unloaded_round_trip_ns
+                        .checked_add(delay)
+                        .ok_or(ExecutionError::GeneratorTimeOverflow(packet.flow))?;
+                }
+            }
+            let completion = CompletionSignal {
+                ack_number: acknowledged_through.expect("a completing ACK advances the sender"),
+                origin_ns: header.echoed_sent_time_ns,
+                delay_ns: unloaded_round_trip_ns,
+            };
+            let state = self.host_state_mut(node)?;
+            complete_local_successors(
+                &mut state.generators,
+                packet.flow,
+                completion,
+                &mut stage_causes,
+            );
+        }
         if let Some(timer) = superseded_timer {
             self.cancel_superseded_timer(node.id, timer);
         }
@@ -2794,24 +2843,24 @@ impl<'image> TransitionState<'image> {
         if self.observation_mode == ObservationMode::Full {
             self.tcp_transitions.extend(transition);
         }
-        if !sender_transition {
-            return Ok(());
-        }
         // A Scheduled TCP descriptor already reserves next_sequence and owns its pending
         // PacketArrival. ACKs may update the sender and ledger, and loss recovery may retransmit
         // an older sequence, but fresh window fill must wait for the reserved event.
-        if scheduled_send_pending && retransmit_sequence.is_none() {
-            return Ok(());
+        if sender_transition && !(scheduled_send_pending && retransmit_sequence.is_none()) {
+            let plan = self.prepare_tcp_attempts(
+                node,
+                packet.flow,
+                event.key.time_ns,
+                retransmit_sequence,
+                fill_window && !scheduled_send_pending,
+                scheduled_send_pending,
+            )?;
+            self.install_tcp_attempts(node, event, plan, children)?;
         }
-        let plan = self.prepare_tcp_attempts(
-            node,
-            packet.flow,
-            event.key.time_ns,
-            retransmit_sequence,
-            fill_window && !scheduled_send_pending,
-            scheduled_send_pending,
-        )?;
-        self.install_tcp_attempts(node, event, plan, children)
+        if !stage_causes.is_empty() {
+            self.activate_ready_collectives(node, event, stage_causes, children)?;
+        }
+        Ok(())
     }
 
     fn host_retransmission_timeout(
@@ -2884,6 +2933,14 @@ impl<'image> TransitionState<'image> {
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
         let packet = self.packet(event.payload)?;
+        if self.host_state(node)?.generators.iter().any(|generator| {
+            generator.flow == packet.flow
+                && generator
+                    .stage
+                    .is_some_and(|stage| matches!(stage.role, crate::StageRole::Compute(_)))
+        }) {
+            return self.host_compute_timer(node, event, packet.flow, children);
+        }
         if packet.kind == PacketKind::DcqcnControlTimer {
             return self.host_dcqcn_control_timer(node, event, packet, children);
         }
@@ -5136,7 +5193,6 @@ fn apply_generator_feedback(
         FlowGeneratorKind::Constant(_) => Ok(GeneratorFeedbackAction::None),
         FlowGeneratorKind::Tcp(_) => Ok(GeneratorFeedbackAction::None),
         FlowGeneratorKind::Rate(_) => Ok(GeneratorFeedbackAction::None),
-        FlowGeneratorKind::Collective(_) => Ok(GeneratorFeedbackAction::None),
         FlowGeneratorKind::Dcqcn(_) => Ok(GeneratorFeedbackAction::None),
     }
 }

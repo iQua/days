@@ -52,6 +52,7 @@ fn image(status: GeneratorStatus, bytes: u64, next_payload_seq: u64) -> Simulati
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![FlowGeneratorState {
+                    stage: None,
                     flow: FLOW,
                     packets_emitted: 0,
                     bytes_emitted: 0,
@@ -443,6 +444,7 @@ fn converging_emissions_keep_canonical_flow_order_at_the_source() {
         },
     ];
     let flow_zero = FlowGeneratorState {
+        stage: None,
         flow: FlowId(0),
         packets_emitted: 0,
         bytes_emitted: 0,
@@ -465,6 +467,7 @@ fn converging_emissions_keep_canonical_flow_order_at_the_source() {
         }),
     };
     let flow_one = FlowGeneratorState {
+        stage: None,
         flow: FlowId(1),
         packets_emitted: 0,
         bytes_emitted: 0,

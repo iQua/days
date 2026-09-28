@@ -148,6 +148,7 @@ fn generator_image(termination: GeneratorTermination) -> SimulationImage {
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![FlowGeneratorState {
+                    stage: None,
                     flow: FLOW,
                     packets_emitted: 0,
                     bytes_emitted: 0,

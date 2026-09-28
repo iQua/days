@@ -59,6 +59,7 @@ fn rate_image(rate: RateGenerator, status: GeneratorStatus, stop_time_ns: u64) -
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![FlowGeneratorState {
+                    stage: None,
                     flow: FLOW,
                     packets_emitted: 0,
                     bytes_emitted: 0,

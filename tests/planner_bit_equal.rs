@@ -122,6 +122,7 @@ fn rate_image() -> SimulationImage {
     };
     let mut source_state = empty_host(forward_id);
     source_state.generators.push(FlowGeneratorState {
+        stage: None,
         flow,
         packets_emitted: 0,
         bytes_emitted: 0,

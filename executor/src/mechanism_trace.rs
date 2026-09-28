@@ -126,6 +126,15 @@ pub enum CollectiveActivationCause {
     InboundArrival,
 }
 
+/// Transport or timer that carries a dependency-gated stage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CollectiveStageKind {
+    /// A collective stage carried by an ordinary TCP generator.
+    Tcp,
+    /// A delay-only compute stage.
+    Compute,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CollectiveProgressRecord {
     pub key: EventKey,
@@ -136,12 +145,16 @@ pub struct CollectiveProgressRecord {
     pub cause: CollectiveActivationCause,
     pub cause_flow: FlowId,
     pub arrival_bytes: u64,
+    /// Collective identity; the compute-group identity for a compute stage.
     pub collective_id: u64,
-    pub algorithm: CollectiveAlgorithm,
+    /// `None` for a compute stage.
+    pub algorithm: Option<CollectiveAlgorithm>,
     pub group_size: u32,
     pub declared_total_bytes: u64,
     pub rank: u32,
-    pub phase: CollectivePhase,
+    /// `None` for a compute stage.
+    pub phase: Option<CollectivePhase>,
+    /// One-based collective step; zero for a compute stage.
     pub step: u32,
     pub chunk_offset_bytes: u64,
     pub chunk_bytes: u64,
@@ -163,6 +176,25 @@ pub struct CollectiveProgressRecord {
     pub after_bytes_emitted: u64,
     pub after_status: GeneratorStatus,
     pub after_next_time_ns: u64,
+    pub stage_kind: CollectiveStageKind,
+    /// Compute interval of a delay-only stage; zero for every data stage.
+    pub duration_ns: u64,
+    /// Inbound rows: the arriving TCP data segment `[segment_sequence, segment_sequence +
+    /// segment_bytes)`. Every segment of a pending inbound predecessor is logged, including ones
+    /// that do not advance the receiver's in-order frontier. Zero on local rows.
+    pub segment_sequence: u64,
+    pub segment_bytes: u64,
+    /// Local rows caused by a TCP stage: the completing ACK's cumulative acknowledgment. Zero for
+    /// a compute cause and on inbound rows.
+    pub ack_number: u64,
+    /// Local rows: when the completing signal originated. TCP: when the segment answered by the
+    /// completing ACK was sent (the ACK echoes it). Compute: when the timer was armed. Zero on
+    /// inbound rows.
+    pub cause_origin_ns: u64,
+    /// Local rows: TCP, the unloaded round trip of that segment (forward route) and the ACK
+    /// (reverse route), a lower bound on `time - cause_origin_ns`; compute, the timer duration,
+    /// met exactly. Zero on inbound rows.
+    pub cause_delay_ns: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -225,12 +257,12 @@ pub fn collective_transitions_csv(
     }
 
     let mut csv = String::from(
-        "time_ns,event_phase,event_origin_node,event_origin_sequence,ordinal,node_id,flow_id,cause,cause_flow_id,arrival_bytes,collective_id,algorithm,group_size,declared_total_bytes,rank,collective_phase,step,chunk_offset_bytes,chunk_bytes,packet_size_bytes,interval_ns,stop_time_ns,local_predecessor_flow_id,inbound_predecessor_flow_id,inbound_predecessor_bytes,before_local_complete,before_inbound_complete,before_inbound_bytes,activated,after_local_complete,after_inbound_complete,after_inbound_bytes,after_packets_emitted,after_bytes_emitted,after_status,after_next_time_ns\n",
+        "time_ns,event_phase,event_origin_node,event_origin_sequence,ordinal,node_id,flow_id,cause,cause_flow_id,arrival_bytes,collective_id,algorithm,group_size,declared_total_bytes,rank,collective_phase,step,chunk_offset_bytes,chunk_bytes,packet_size_bytes,interval_ns,stop_time_ns,local_predecessor_flow_id,inbound_predecessor_flow_id,inbound_predecessor_bytes,before_local_complete,before_inbound_complete,before_inbound_bytes,activated,after_local_complete,after_inbound_complete,after_inbound_bytes,after_packets_emitted,after_bytes_emitted,after_status,after_next_time_ns,stage_kind,duration_ns,segment_sequence,segment_bytes,ack_number,cause_origin_ns,cause_delay_ns\n",
     );
     for record in records {
         writeln!(
             csv,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             record.key.time_ns,
             record.key.phase,
             record.key.origin_node.0,
@@ -242,11 +274,11 @@ pub fn collective_transitions_csv(
             record.cause_flow.0,
             record.arrival_bytes,
             record.collective_id,
-            collective_algorithm(record.algorithm),
+            record.algorithm.map_or("", collective_algorithm),
             record.group_size,
             record.declared_total_bytes,
             record.rank,
-            collective_phase(record.phase),
+            record.phase.map_or("", collective_phase),
             record.step,
             record.chunk_offset_bytes,
             record.chunk_bytes,
@@ -267,10 +299,24 @@ pub fn collective_transitions_csv(
             record.after_bytes_emitted,
             status(record.after_status),
             record.after_next_time_ns,
+            collective_stage_kind(record.stage_kind),
+            record.duration_ns,
+            record.segment_sequence,
+            record.segment_bytes,
+            record.ack_number,
+            record.cause_origin_ns,
+            record.cause_delay_ns,
         )
         .expect("writing to String cannot fail");
     }
     Ok(csv)
+}
+
+const fn collective_stage_kind(kind: CollectiveStageKind) -> &'static str {
+    match kind {
+        CollectiveStageKind::Tcp => "tcp",
+        CollectiveStageKind::Compute => "compute",
+    }
 }
 
 const fn collective_cause(cause: CollectiveActivationCause) -> &'static str {

@@ -69,21 +69,23 @@ pub use event::{
     event_phase,
 };
 pub use image::{
-    CollectiveAlgorithm, CollectiveChannelPolicy, CollectiveChunkPolicy, CollectiveGenerator,
-    CollectivePhase, ConstantGenerator, DcqcnCnpHeader, DcqcnGenerator, DcqcnReceiverState,
-    EcnCodepoint, FlowDescriptor, FlowGeneratorKind, FlowGeneratorState, GeneratorFeedbackAction,
-    GeneratorFeedbackState, GeneratorStatus, GeneratorTermination, HostState, LinkDescriptor,
-    NodeDescriptor, PacketDescriptor, PacketKind, PfcHeader, PfcIngressState, PfcQueueState,
-    RateGenerator, RemoteChannel, ScheduledEmission, SimulationImage, SwitchQueueState,
-    SwitchState, TcpAckHeader, TcpDataHeader, TcpGenerator, TcpReceiveRange, TcpReceiverState,
-    TcpTimerState, default_propagation_ns,
+    CollectiveAlgorithm, CollectiveChannelPolicy, CollectiveChunkPolicy, CollectivePhase,
+    CollectiveStage, CollectiveStageIdentity, ComputeStage, ConstantGenerator, DcqcnCnpHeader,
+    DcqcnGenerator, DcqcnReceiverState, EcnCodepoint, FlowDescriptor, FlowGeneratorKind,
+    FlowGeneratorState, GeneratorFeedbackAction, GeneratorFeedbackState, GeneratorStatus,
+    GeneratorTermination, HostState, LinkDescriptor, NodeDescriptor, PacketDescriptor, PacketKind,
+    PfcHeader, PfcIngressState, PfcQueueState, RateGenerator, RemoteChannel, ScheduledEmission,
+    SimulationImage, StageDependencies, StageRole, SwitchQueueState, SwitchState, TcpAckHeader,
+    TcpDataHeader, TcpGenerator, TcpReceiveRange, TcpReceiverState, TcpTimerState,
+    default_propagation_ns,
 };
 pub use mechanism_trace::{
-    CollectiveActivationCause, CollectiveProgressRecord, DrrTransitionRecord, MechanismTraceError,
-    MechanismTransitionRecord, PfcControlAction, PfcControlTransitionRecord, PfcOccupancyAction,
-    PfcThresholdTransitionRecord, RateReplayConfig, RateReplayState, RateTransitionRecord,
-    SchedulerPacket, WrrTransitionRecord, collective_transitions_csv, dcqcn_transitions_csv,
-    drr_transitions_csv, pfc_transitions_csv, rate_transitions_csv, wrr_transitions_csv,
+    CollectiveActivationCause, CollectiveProgressRecord, CollectiveStageKind, DrrTransitionRecord,
+    MechanismTraceError, MechanismTransitionRecord, PfcControlAction, PfcControlTransitionRecord,
+    PfcOccupancyAction, PfcThresholdTransitionRecord, RateReplayConfig, RateReplayState,
+    RateTransitionRecord, SchedulerPacket, WrrTransitionRecord, collective_transitions_csv,
+    dcqcn_transitions_csv, drr_transitions_csv, pfc_transitions_csv, rate_transitions_csv,
+    wrr_transitions_csv,
 };
 #[cfg(all(
     feature = "metal",

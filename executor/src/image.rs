@@ -267,20 +267,45 @@ pub enum CollectiveChannelPolicy {
     RingNext = 0,
 }
 
-/// One fixed-width stage of a parametric collective program.
+/// Prerequisite state of one dependency-gated stage, owned by the stage's source host LP.
 ///
-/// The lowerer resolves algorithms, topology hierarchy, chunks, channels, and dependencies into
-/// these records. A source LP needs no shared mutable collective object: ordinary packet delivery
-/// satisfies the inbound prerequisite of the next local stage.
+/// The local predecessor runs on the same host. The inbound predecessor is a stage on another host
+/// whose flow targets this host; its completion is observed through ordinary delivery at this host,
+/// so no cross-LP state is shared.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CollectiveGenerator {
+pub struct StageDependencies {
+    pub local_predecessor: Option<FlowId>,
+    pub inbound_predecessor: Option<FlowId>,
+    /// Bytes the inbound predecessor must deliver to this host before it counts as complete.
+    pub inbound_predecessor_bytes: u64,
+    pub local_predecessor_complete: bool,
+    pub inbound_predecessor_complete: bool,
+    /// Inbound bytes delivered so far: the receiver's in-order TCP frontier of the inbound
+    /// predecessor. Stages have no other inbound transport.
+    pub inbound_bytes_received: u64,
+}
+
+impl StageDependencies {
+    pub const fn prerequisites_complete(self) -> bool {
+        (self.local_predecessor.is_none() || self.local_predecessor_complete)
+            && (self.inbound_predecessor.is_none() || self.inbound_predecessor_complete)
+    }
+}
+
+/// Resolved position and chunk of one collective stage carried by a transport generator.
+///
+/// The transport owns the sending discipline; the stage fixes which chunk
+/// `[chunk_offset_bytes, chunk_offset_bytes + chunk_bytes)` of the `declared_total_bytes` buffer
+/// rank `rank` sends to its ring successor at one-based `step` of `phase`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CollectiveStageIdentity {
     pub collective_id: u64,
     pub algorithm: CollectiveAlgorithm,
     pub topology_level: u32,
     pub topology_group: u32,
     pub group_size: u32,
-    /// Immutable source-declared byte total from which every owner partition is derived.
     pub declared_total_bytes: u64,
     pub rank: u32,
     pub phase: CollectivePhase,
@@ -290,21 +315,42 @@ pub struct CollectiveGenerator {
     pub channel_policy: CollectiveChannelPolicy,
     pub chunk_offset_bytes: u64,
     pub chunk_bytes: u64,
-    pub packet_size_bytes: u64,
-    pub interval_ns: u64,
-    pub local_predecessor: Option<FlowId>,
-    pub inbound_predecessor: Option<FlowId>,
-    pub inbound_predecessor_bytes: u64,
-    pub local_predecessor_complete: bool,
-    pub inbound_predecessor_complete: bool,
-    pub inbound_bytes_received: u64,
 }
 
-impl CollectiveGenerator {
-    pub const fn prerequisites_complete(self) -> bool {
-        (self.local_predecessor.is_none() || self.local_predecessor_complete)
-            && (self.inbound_predecessor.is_none() || self.inbound_predecessor_complete)
-    }
+/// A delay-only stage: a compute interval of `duration_ns` that sends no bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ComputeStage {
+    /// Scenario-local identity of the compute group this stage belongs to.
+    pub compute_id: u64,
+    pub group_size: u32,
+    pub rank: u32,
+    pub duration_ns: u64,
+}
+
+/// What a dependency-gated generator does once its prerequisites complete.
+#[repr(C, u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StageRole {
+    /// One collective stage whose bytes are carried by the generator's transport.
+    Collective(CollectiveStageIdentity),
+    /// A timer-only compute interval.
+    Compute(ComputeStage),
+}
+
+/// Dependency record attached to an ordinary transport or timer generator.
+///
+/// The lowerer resolves algorithms, chunks, channels, and dependencies into these records. A
+/// source LP needs no shared mutable collective object: ordinary delivery at this host satisfies
+/// the inbound prerequisite of the next local stage.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CollectiveStage {
+    pub role: StageRole,
+    pub dependencies: StageDependencies,
+    /// Whether the prerequisites have released the stage. Transport generators revisit `Blocked`
+    /// while waiting for feedback, so status alone cannot distinguish a stage that never started.
+    pub activated: bool,
 }
 
 /// Closed generator transition set. New traffic families require an explicit image variant.
@@ -316,7 +362,6 @@ pub enum FlowGeneratorKind {
     Constant(ConstantGenerator),
     Tcp(TcpGenerator),
     Rate(RateGenerator),
-    Collective(CollectiveGenerator),
     Dcqcn(DcqcnGenerator),
 }
 
@@ -358,7 +403,7 @@ pub enum GeneratorFeedbackAction {
 
 /// Mutable generator state owned exclusively by the source host LP.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct FlowGeneratorState {
     pub flow: FlowId,
     pub packets_emitted: u64,
@@ -368,6 +413,50 @@ pub struct FlowGeneratorState {
     pub rng_state: u64,
     pub feedback: GeneratorFeedbackState,
     pub kind: FlowGeneratorKind,
+    /// Collective or compute dependency record of a dependency-gated generator.
+    pub stage: Option<CollectiveStage>,
+}
+
+impl FlowGeneratorState {
+    /// Dependency state of a stage, or `None` for an ungated generator.
+    pub const fn stage_dependencies(&self) -> Option<StageDependencies> {
+        match &self.stage {
+            Some(stage) => Some(stage.dependencies),
+            None => None,
+        }
+    }
+
+    /// Writes dependency state back into the stage record.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the generator is not a stage; callers obtain `dependencies` from
+    /// [`Self::stage_dependencies`].
+    pub fn set_stage_dependencies(&mut self, dependencies: StageDependencies) {
+        self.stage
+            .as_mut()
+            .expect("set_stage_dependencies requires a stage record")
+            .dependencies = dependencies;
+    }
+}
+
+impl fmt::Debug for FlowGeneratorState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("FlowGeneratorState");
+        debug
+            .field("flow", &self.flow)
+            .field("packets_emitted", &self.packets_emitted)
+            .field("bytes_emitted", &self.bytes_emitted)
+            .field("next_emission", &self.next_emission)
+            .field("rng_state", &self.rng_state)
+            .field("feedback", &self.feedback)
+            .field("kind", &self.kind);
+        // Omitting the absent additive field preserves every frozen pre-P14 image byte.
+        if self.stage.is_some() {
+            debug.field("stage", &self.stage);
+        }
+        debug.finish()
+    }
 }
 
 /// One active source-owned retransmission timer.
