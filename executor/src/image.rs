@@ -281,7 +281,8 @@ pub struct StageDependencies {
     pub inbound_predecessor_bytes: u64,
     pub local_predecessor_complete: bool,
     pub inbound_predecessor_complete: bool,
-    /// Delivered inbound bytes: arrivals for open-loop data, the in-order frontier for TCP.
+    /// Inbound bytes delivered so far: the receiver's in-order TCP frontier of the inbound
+    /// predecessor. Stages have no other inbound transport.
     pub inbound_bytes_received: u64,
 }
 

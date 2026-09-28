@@ -2563,8 +2563,8 @@ fn lower(
             .entry(source)
             .or_default()
             .push(FlowGeneratorState {
-                // Paced stages embed their dependencies in the frozen `Collective` kind; every
-                // other transport carries them in the sidecar.
+                // Every collective stage is a TCP generator whose dependencies live in this record;
+                // compute stages build theirs in the compute branch above.
                 stage: collective_stage.map(|(identity, dependencies)| CollectiveStage {
                     role: StageRole::Collective(identity),
                     dependencies,
