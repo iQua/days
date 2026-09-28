@@ -272,14 +272,22 @@ fn tcp_collectives_are_scalar_cpu_byte_identical_and_complete() {
             )
             .unwrap();
             let header = csv.lines().next().unwrap();
-            assert!(header.ends_with(",stage_kind,duration_ns"), "{header}");
+            let columns = header.split(',').collect::<Vec<_>>();
+            let stage_kind = columns
+                .iter()
+                .position(|name| *name == "stage_kind")
+                .unwrap();
             // Two-rank AllGather has only root stages, so no prerequisite ever progresses.
             assert_eq!(
                 csv.lines().count() == 1,
                 algorithm == "AllGather" && ranks == 2,
                 "{label}"
             );
-            assert!(csv.lines().skip(1).all(|row| row.ends_with(",tcp,0")));
+            assert!(
+                csv.lines()
+                    .skip(1)
+                    .all(|row| row.split(',').nth(stage_kind) == Some("tcp"))
+            );
         }
     }
 }
@@ -311,9 +319,20 @@ fn tcp_stage_completion_follows_ack_and_in_order_delivery() {
                 match row.cause {
                     CollectiveActivationCause::LocalCompletion => {
                         assert_eq!(row.key.time_ns, acknowledged[&row.cause_flow], "{label}");
+                        // The certificate names the completing ACK and a lower bound on its time.
+                        assert_eq!(row.ack_number, totals[&row.cause_flow], "{label}");
+                        assert!(row.cause_delay_ns > 0);
+                        assert!(row.cause_origin_ns + row.cause_delay_ns <= row.key.time_ns);
+                        assert_eq!((row.segment_sequence, row.segment_bytes), (0, 0));
                     }
                     CollectiveActivationCause::InboundArrival => {
+                        // Lossless: every certified segment advances the frontier.
                         assert!(row.arrival_bytes > 0);
+                        assert!(row.segment_bytes > 0);
+                        assert_eq!(
+                            (row.ack_number, row.cause_origin_ns, row.cause_delay_ns),
+                            (0, 0, 0)
+                        );
                         assert_eq!(
                             row.after_inbound_bytes,
                             row.before_inbound_bytes + row.arrival_bytes

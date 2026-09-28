@@ -189,11 +189,11 @@ mutate_case "deleted-progress-prefix" "$allgather" \
 mutate_case "deleted-final-progress" "$allgather" \
   'NR == 7 { next }' \
   'REJECT: line 2: incomplete collective activation coverage for collective_id=0: expected 8, found 7'
-# Row 43 closes a retransmission hole: the frontier jumps 2500 bytes at once, exactly the bytes
+# Row 47 closes a retransmission hole: the frontier jumps 2500 bytes at once, exactly the bytes
 # still undelivered. One more byte overshoots the chunk.
 mutate_case "lossy-frontier-jump-overshoot" "$lossy" \
-  'NR == 43 { $column["arrival_bytes"] = 2501; $column["after_inbound_bytes"] = $column["before_inbound_bytes"] + 2501; $column["after_inbound_complete"] = 0; $column["activated"] = 0; $column["after_packets_emitted"] = 0; $column["after_bytes_emitted"] = 0 }' \
-  'REJECT: line 43: inbound frontier advance exceeds the undelivered predecessor bytes'
+  'NR == 47 { $column["arrival_bytes"] = 2501; $column["after_inbound_bytes"] = $column["before_inbound_bytes"] + 2501; $column["after_inbound_complete"] = 0; $column["activated"] = 0; $column["after_packets_emitted"] = 0; $column["after_bytes_emitted"] = 0 }' \
+  'REJECT: line 47: inbound frontier advance exceeds the undelivered predecessor bytes'
 mutate_case "duplicate-stage-activation" "$allgather" \
   'NR == 6 { $column["activated"] = 1 }' \
   'REJECT: line 7: collective stage activated more than once'
@@ -218,6 +218,38 @@ mutate_case "progress-after-stop" "$allgather" \
 mutate_case "unknown-stage-kind" "$allgather" \
   'NR == 2 { $column["stage_kind"] = "packet_distribution" }' \
   "REJECT: line 2: invalid stage kind: 'packet_distribution'"
+
+# Review F3: certified segments and completing signals.
+# R2: rows 5 and 6 merged, so node 0's inbound completes at 12 ns with 4 bytes although the 12 ns
+# segment is [0, 3); the replayed frontier is 3 (the 1-byte segment arrives at 13 ns).
+mutate_case "inbound-early-completion" "$allgather" \
+  'NR == 5 { $column["arrival_bytes"] = 4; $column["after_inbound_complete"] = 1; $column["after_inbound_bytes"] = 4 } NR == 6 { next }' \
+  'REJECT: line 5: inbound progress does not match the receiver frontier replayed from the certified segments'
+# R3: row 7's local completion moved from 168 ns to 14 ns, before the answered segment (sent at
+# 0 ns) and its ACK could make the 168 ns unloaded round trip.
+mutate_case "local-completion-before-ack-return" "$allgather" \
+  'NR == 7 { $column["time_ns"] = 14 }' \
+  'REJECT: line 7: local completion precedes the earliest return of the completing acknowledgment'
+mutate_case "ack-number-short" "$allgather" \
+  'NR == 7 { $column["ack_number"] = 1 }' \
+  'REJECT: line 7: completing acknowledgment does not reach exactly the local predecessor'"'"'s byte total'
+mutate_case "segment-past-chunk" "$allgather" \
+  'NR == 2 { $column["segment_sequence"] = 1 }' \
+  'REJECT: line 2: inbound segment is empty or extends past the predecessor chunk'
+mutate_case "inbound-row-local-fields" "$allgather" \
+  'NR == 2 { $column["ack_number"] = 2 }' \
+  'REJECT: line 2: inbound row carries local completion fields'
+# Row 30 certifies an out-of-order segment of flow 4; without it the hole fill at row 47 (line 46
+# after the deletion) cannot reach the frontier it claims.
+mutate_case "deleted-out-of-order-segment" "$lossy" \
+  'NR == 30 { next }' \
+  'REJECT: line 46: inbound progress does not match the receiver frontier replayed from the certified segments'
+mutate_case "compute-arm-time" "$chain" \
+  'NR == 41 { $column["cause_origin_ns"] = 15641 }' \
+  'REJECT: line 41: compute timer completion does not occur at arm time plus duration'
+mutate_case "root-gate-arm-time" "$chain" \
+  'NR == 2 { $column["cause_origin_ns"] = 1; $column["cause_delay_ns"] = 4999 }' \
+  'REJECT: line 2: an unlogged root compute stage is armed at time zero'
 
 # Compute (delay-only) stages: timer-only rows whose release sets an exact deadline.
 mutate_case "compute-carries-collective-fields" "$chain" \

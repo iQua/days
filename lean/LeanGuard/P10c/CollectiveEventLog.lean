@@ -97,6 +97,15 @@ structure Row where
   afterNextTimeNs : Nat
   stageKind : Collective.StageKind
   durationNs : Nat
+  /-- Inbound rows: the arriving TCP segment `[segmentSequence, segmentSequence + segmentBytes)`. -/
+  segmentSequence : Nat
+  segmentBytes : Nat
+  /-- Local rows caused by TCP: the completing ACK's cumulative acknowledgment. -/
+  ackNumber : Nat
+  /-- Local rows: TCP, when the answered segment was sent; compute, when the timer was armed. -/
+  causeOriginNs : Nat
+  /-- Local rows: TCP, the unloaded round trip of that segment and its ACK; compute, the duration. -/
+  causeDelayNs : Nat
   srcLine : Nat
   deriving DecidableEq, Repr
 
@@ -146,6 +155,11 @@ def parseRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array Strin
         afterNextTimeNs := ← parseU64 (← getField idx fields "after_next_time_ns")
         stageKind := ← parseStageKind (← getField idx fields "stage_kind")
         durationNs := ← parseU64 (← getField idx fields "duration_ns")
+        segmentSequence := ← parseU64 (← getField idx fields "segment_sequence")
+        segmentBytes := ← parseU64 (← getField idx fields "segment_bytes")
+        ackNumber := ← parseU64 (← getField idx fields "ack_number")
+        causeOriginNs := ← parseU64 (← getField idx fields "cause_origin_ns")
+        causeDelayNs := ← parseU64 (← getField idx fields "cause_delay_ns")
         srcLine := lineNo }
   match result with
   | .ok row => pure row
@@ -213,8 +227,10 @@ def inboundDone (row : Row) (bytes : Nat) : Bool :=
 /-- Prerequisite transitions shared by TCP and compute stages.
 
 Local completion flips the local flag (TCP: last byte acknowledged; compute: timer fired). An
-inbound row advances the receiver's in-order TCP frontier, never raw arrivals, so it may cover
-several segments at once but never more than the bytes still undelivered. -/
+inbound row certifies one arriving TCP segment of the inbound predecessor and the resulting
+advance of the receiver's in-order frontier, which may be zero (duplicate or out-of-order
+segment) or cover several segments at once (a filled hole). `checkInboundReplay` replays the
+frontier from the certified segments; `checkLocalSignal` binds local completions to their cause. -/
 def checkProgress (row : Row) : Except String Unit := do
   require row.srcLine (row.beforeInboundComplete = inboundDone row row.beforeInboundBytes)
     "before inbound completion flag disagrees with the delivered total"
@@ -227,6 +243,8 @@ def checkProgress (row : Row) : Except String Unit := do
         "local completion cause does not match the local predecessor"
       require row.srcLine (row.arrivalBytes = 0)
         "local completion must not carry arrival bytes"
+      require row.srcLine (row.segmentSequence = 0 && row.segmentBytes = 0)
+        "local completion row carries an inbound segment"
       require row.srcLine (!row.beforeLocalComplete && row.afterLocalComplete)
         "local completion must change the local prerequisite from incomplete to complete"
       require row.srcLine
@@ -237,8 +255,13 @@ def checkProgress (row : Row) : Except String Unit := do
       require row.srcLine
         (row.inboundPredecessorFlowId = some row.causeFlowId)
         "inbound arrival cause does not match the inbound predecessor"
-      require row.srcLine (row.arrivalBytes > 0)
-        "inbound arrival must carry positive bytes"
+      require row.srcLine
+        (row.segmentBytes > 0 &&
+          row.segmentSequence + row.segmentBytes ≤ row.inboundPredecessorBytes)
+        "inbound segment is empty or extends past the predecessor chunk"
+      require row.srcLine
+        (row.ackNumber = 0 && row.causeOriginNs = 0 && row.causeDelayNs = 0)
+        "inbound row carries local completion fields"
       require row.srcLine (row.afterLocalComplete = row.beforeLocalComplete)
         "inbound arrival changed the local prerequisite"
       require row.srcLine (!row.beforeInboundComplete)
@@ -513,6 +536,102 @@ def checkPredecessors (rows : List Row) (row : Row) : Except String Unit := do
   | .tcp, none => pure ()
   | .compute, _ => checkComputePredecessors rows row
 
+/-- The receiver's in-order frontier after the half-open segments `[start, stop)` arrive, as
+`tcp_receive_range` computes it: sorted by start, extended from zero through every segment that
+begins at or before the frontier. -/
+def frontierOf (segments : List (Nat × Nat)) : Nat :=
+  let sorted :=
+    (segments.toArray.qsort fun a b => a.1 < b.1 || (a.1 = b.1 && a.2 < b.2)).toList
+  sorted.foldl (fun frontier segment =>
+    if segment.1 ≤ frontier then max frontier segment.2 else frontier) 0
+
+def segmentOf (row : Row) : Nat × Nat :=
+  (row.segmentSequence, row.segmentSequence + row.segmentBytes)
+
+/-- Every segment of a pending inbound predecessor is certified in order, so the before and after
+byte counts of each inbound row must equal the frontier replayed from that stage's segments. -/
+def checkInboundReplay (rows : List Row) (row : Row) : Except String Unit := do
+  if row.cause = .inboundArrival then
+    let prior :=
+      (rows.filter fun candidate =>
+        candidate.flowId = row.flowId && candidate.cause = .inboundArrival &&
+          compositeLT candidate row).map segmentOf
+    let before := frontierOf prior
+    let after := frontierOf (prior ++ [segmentOf row])
+    require row.srcLine
+      (row.beforeInboundBytes = before && row.afterInboundBytes = after &&
+        row.arrivalBytes = after - before)
+      "inbound progress does not match the receiver frontier replayed from the certified segments"
+
+/-- Whether a local completion is caused by a compute timer: a gated root's gate, or a compute
+stage that follows a compute group. Every other local cause is a TCP stage's completing ACK. -/
+def causeIsTimer (row : Row) : Bool :=
+  match row.stageKind with
+  | .tcp => isRoot row
+  | .compute => row.inboundPredecessorFlowId.isNone
+
+/-- The byte total of a TCP local predecessor: from the ring recurrence for a TCP stage, or from
+the rows of the stage that receives it (its inbound byte count) for a compute stage. -/
+def localPredecessorTotal (rows : List Row) (row : Row) : Option Nat :=
+  let received :=
+    (rows.find? fun candidate =>
+      candidate.inboundPredecessorFlowId = some row.causeFlowId).map (·.inboundPredecessorBytes)
+  match row.stageKind, row.algorithm, row.collectivePhase with
+  | .tcp, some algorithm, some phase =>
+      let position := localPredecessorPosition row phase
+      let owner :=
+        Collective.stageOwner algorithm position.phase row.groupSize position.rank position.step
+      some (Collective.chunkBounds row.declaredTotalBytes row.groupSize owner).2
+  | _, _, _ => received
+
+/-- Binds a local completion to the event that caused it.
+
+A compute timer completes its successor exactly at arm time + duration; a logged compute
+predecessor was armed at its release, an unlogged one (a root) at time zero. A TCP predecessor
+completes at the first ACK whose acknowledgment reaches its byte total: the row names that
+acknowledgment, which must equal the predecessor's total; the answered segment was sent after the
+predecessor's release; and the ACK arrives after the receiver's frontier completed and no sooner
+than the segment's send time plus the unloaded round trip of the segment and the ACK. -/
+def checkLocalSignal (rows : List Row) (row : Row) : Except String Unit := do
+  if row.cause = .localCompletion then
+    let released? := rows.find? fun candidate =>
+      candidate.flowId = row.causeFlowId && candidate.activated
+    if causeIsTimer row then
+      require row.srcLine
+        (row.ackNumber = 0 && row.causeDelayNs > 0 &&
+          row.key.timeNs = row.causeOriginNs + row.causeDelayNs)
+        "compute timer completion does not occur at arm time plus duration"
+      match released? with
+      | some predecessor =>
+          require row.srcLine
+            (predecessor.stageKind = .compute && row.causeOriginNs = predecessor.key.timeNs &&
+              row.causeDelayNs = predecessor.durationNs)
+            "compute timer completion does not match its predecessor's release and duration"
+      | none =>
+          require row.srcLine (row.causeOriginNs = 0)
+            "an unlogged root compute stage is armed at time zero"
+    else
+      let total ← requireSome row.srcLine "local predecessor byte total"
+        (localPredecessorTotal rows row)
+      require row.srcLine (row.ackNumber = total)
+        "completing acknowledgment does not reach exactly the local predecessor's byte total"
+      match released? with
+      | some predecessor =>
+          require row.srcLine (row.causeOriginNs ≥ predecessor.key.timeNs)
+            "acknowledged segment was sent before its stage was released"
+      | none => pure ()
+      let delivered? := rows.find? fun candidate =>
+        candidate.cause = .inboundArrival && candidate.causeFlowId = row.causeFlowId &&
+          candidate.afterInboundComplete && !candidate.beforeInboundComplete
+      match delivered? with
+      | some delivered =>
+          require row.srcLine (compositeLT delivered row && delivered.key.timeNs < row.key.timeNs)
+            "local completion precedes its predecessor's delivery at the receiver"
+      | none => pure ()
+      require row.srcLine
+        (row.causeDelayNs > 0 && row.key.timeNs ≥ row.causeOriginNs + row.causeDelayNs)
+        "local completion precedes the earliest return of the completing acknowledgment"
+
 def sameStageConfig (first second : Row) : Bool :=
   first.nodeId = second.nodeId && first.flowId = second.flowId &&
     first.chunkOffsetBytes = second.chunkOffsetBytes &&
@@ -595,5 +714,7 @@ def checkRows (rows : List Row) : Except String Unit := do
   for row in canonical do checkRow row
   checkCoverage canonical
   for row in canonical do checkPredecessors canonical row
+  for row in canonical do checkInboundReplay canonical row
+  for row in canonical do checkLocalSignal canonical row
 
 end LeanGuard.P10c.CollectiveEventLog

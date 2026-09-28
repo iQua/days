@@ -291,6 +291,24 @@ struct PendingCollectiveProgress {
     before_local_complete: bool,
     before_inbound_complete: bool,
     before_inbound_bytes: u64,
+    /// Inbound rows: the arriving data segment `[segment_sequence, segment_sequence + segment_bytes)`.
+    segment_sequence: u64,
+    segment_bytes: u64,
+    /// Local rows: the signal that completed the local predecessor.
+    completion: CompletionSignal,
+}
+
+/// The event that completed a local predecessor, as certified in its successor's progress row.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CompletionSignal {
+    /// TCP: the completing ACK's cumulative acknowledgment. Zero for a compute timer.
+    ack_number: u64,
+    /// TCP: when the segment this ACK answers was sent (echoed by the ACK). Compute: when the
+    /// timer was armed.
+    origin_ns: u64,
+    /// TCP: that segment's and this ACK's unloaded round trip, a lower bound on the completion
+    /// time's distance from `origin_ns`. Compute: the timer duration, met exactly.
+    delay_ns: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -345,6 +363,11 @@ fn collective_progress_record(
         after_next_time_ns: generator.next_emission.departure_time_ns,
         stage_kind: crate::CollectiveStageKind::Tcp,
         duration_ns: 0,
+        segment_sequence: cause.segment_sequence,
+        segment_bytes: cause.segment_bytes,
+        ack_number: cause.completion.ack_number,
+        cause_origin_ns: cause.completion.origin_ns,
+        cause_delay_ns: cause.completion.delay_ns,
     };
     match (generator.kind, stage.role) {
         (FlowGeneratorKind::Tcp(tcp), crate::StageRole::Collective(identity)) => {
@@ -390,6 +413,7 @@ fn stage_ready_to_activate(generator: &crate::FlowGeneratorState) -> bool {
 fn complete_local_successors(
     generators: &mut [crate::FlowGeneratorState],
     completed: FlowId,
+    completion: CompletionSignal,
     causes: &mut Vec<PendingCollectiveProgress>,
 ) {
     for successor in generators {
@@ -409,6 +433,9 @@ fn complete_local_successors(
             before_local_complete: dependencies.local_predecessor_complete,
             before_inbound_complete: dependencies.inbound_predecessor_complete,
             before_inbound_bytes: dependencies.inbound_bytes_received,
+            segment_sequence: 0,
+            segment_bytes: 0,
+            completion,
         });
         dependencies.local_predecessor_complete = true;
         successor.set_stage_dependencies(dependencies);
@@ -418,9 +445,14 @@ fn complete_local_successors(
 /// How delivery of an inbound predecessor's bytes was observed at this host.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InboundProgress {
-    /// The receiver's in-order TCP frontier advanced by this many bytes. Retransmitted or
-    /// out-of-order bytes count only once the frontier covers them.
-    InOrderAdvance(u64),
+    /// One data segment `[sequence, sequence + bytes)` arrived and the receiver's in-order TCP
+    /// frontier advanced by `advance` bytes (zero for a duplicate or out-of-order segment).
+    /// Retransmitted or out-of-order bytes count only once the frontier covers them.
+    Segment {
+        sequence: u64,
+        bytes: u64,
+        advance: u64,
+    },
 }
 
 /// Advances every stage waiting on `inbound` as its inbound predecessor.
@@ -441,7 +473,11 @@ fn record_inbound_progress(
             continue;
         }
         let before_inbound_bytes = dependencies.inbound_bytes_received;
-        let InboundProgress::InOrderAdvance(arrival_bytes) = progress;
+        let InboundProgress::Segment {
+            sequence,
+            bytes,
+            advance: arrival_bytes,
+        } = progress;
         causes.push(PendingCollectiveProgress {
             flow: generator.flow,
             cause: crate::CollectiveActivationCause::InboundArrival,
@@ -450,6 +486,9 @@ fn record_inbound_progress(
             before_local_complete: dependencies.local_predecessor_complete,
             before_inbound_complete: dependencies.inbound_predecessor_complete,
             before_inbound_bytes,
+            segment_sequence: sequence,
+            segment_bytes: bytes,
+            completion: CompletionSignal::default(),
         });
         dependencies.inbound_bytes_received = dependencies
             .inbound_bytes_received
@@ -1611,7 +1650,22 @@ impl<'image> TransitionState<'image> {
                 });
             }
             generator.next_emission.status = GeneratorStatus::Finished;
-            complete_local_successors(&mut state.generators, flow, &mut causes);
+            let duration_ns = match generator.stage.map(|stage| stage.role) {
+                Some(crate::StageRole::Compute(compute)) => compute.duration_ns,
+                _ => {
+                    return Err(ExecutionError::UnexpectedGeneratorEmission {
+                        node: node.id,
+                        flow,
+                        payload: event.payload,
+                    });
+                }
+            };
+            let completion = CompletionSignal {
+                ack_number: 0,
+                origin_ns: event.key.time_ns - duration_ns,
+                delay_ns: duration_ns,
+            };
+            complete_local_successors(&mut state.generators, flow, completion, &mut causes);
         }
         self.mark_terminal(event.payload)?;
         if !causes.is_empty() {
@@ -2525,16 +2579,21 @@ impl<'image> TransitionState<'image> {
             let frontier_before = receiver.next_expected_sequence;
             tcp_receive_range(receiver, header.sequence, end);
             let advanced = receiver.next_expected_sequence - frontier_before;
+            // Every segment of a pending inbound predecessor is certified, including duplicate and
+            // out-of-order ones that do not advance the frontier, so the certificate can replay
+            // the receiver exactly.
             let mut stage_causes = Vec::new();
-            if advanced != 0 {
-                record_inbound_progress(
-                    &mut state.generators,
-                    packet.flow,
-                    InboundProgress::InOrderAdvance(advanced),
-                    node.id,
-                    &mut stage_causes,
-                )?;
-            }
+            record_inbound_progress(
+                &mut state.generators,
+                packet.flow,
+                InboundProgress::Segment {
+                    sequence: header.sequence,
+                    bytes: packet.size_bytes,
+                    advance: advanced,
+                },
+                node.id,
+                &mut stage_causes,
+            )?;
             let payload = allocate_payload_id(node.id, node_count, state.next_payload_seq)
                 .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
             state.next_payload_seq = state
@@ -2739,8 +2798,40 @@ impl<'image> TransitionState<'image> {
         };
         let mut stage_causes = Vec::new();
         if stage_completed {
+            // The ACK echoes when its triggering segment was sent and how large it was, so the
+            // sender can certify the unloaded round trip that segment and this ACK needed: every
+            // link of both routes serializes and propagates them at least once.
+            let (route, reverse_route) = {
+                let descriptor = self.flow(packet.flow)?;
+                (descriptor.route.clone(), descriptor.reverse_route.clone())
+            };
+            let mut unloaded_round_trip_ns = 0_u64;
+            for (links, bytes) in [
+                (&route, header.acknowledged_bytes),
+                (&reverse_route, packet.size_bytes),
+            ] {
+                for link in links {
+                    let delay = self
+                        .link(*link)?
+                        .delay_ns(bytes)
+                        .map_err(|_| ExecutionError::GeneratorTimeOverflow(packet.flow))?;
+                    unloaded_round_trip_ns = unloaded_round_trip_ns
+                        .checked_add(delay)
+                        .ok_or(ExecutionError::GeneratorTimeOverflow(packet.flow))?;
+                }
+            }
+            let completion = CompletionSignal {
+                ack_number: acknowledged_through.expect("a completing ACK advances the sender"),
+                origin_ns: header.echoed_sent_time_ns,
+                delay_ns: unloaded_round_trip_ns,
+            };
             let state = self.host_state_mut(node)?;
-            complete_local_successors(&mut state.generators, packet.flow, &mut stage_causes);
+            complete_local_successors(
+                &mut state.generators,
+                packet.flow,
+                completion,
+                &mut stage_causes,
+            );
         }
         if let Some(timer) = superseded_timer {
             self.cancel_superseded_timer(node.id, timer);

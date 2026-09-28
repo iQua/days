@@ -253,9 +253,18 @@ fn compute_ring_compute_chain_has_exact_completion_times() {
         csv.lines()
             .next()
             .unwrap()
-            .ends_with(",stage_kind,duration_ns")
+            .contains(",stage_kind,duration_ns,")
     );
-    assert!(csv.lines().any(|row| row.ends_with(",compute,7000")));
+    assert!(csv.lines().any(|row| row.contains(",compute,7000,")));
+    // A compute timer completes its successor exactly at arm time + duration.
+    for row in &rows {
+        if row.cause == CollectiveActivationCause::LocalCompletion
+            && stages.values().any(|(flow, _)| *flow == row.cause_flow)
+        {
+            assert_eq!(row.cause_origin_ns + row.cause_delay_ns, row.key.time_ns);
+            assert_eq!(row.ack_number, 0);
+        }
+    }
 }
 
 #[test]

@@ -179,6 +179,22 @@ pub struct CollectiveProgressRecord {
     pub stage_kind: CollectiveStageKind,
     /// Compute interval of a delay-only stage; zero for every data stage.
     pub duration_ns: u64,
+    /// Inbound rows: the arriving TCP data segment `[segment_sequence, segment_sequence +
+    /// segment_bytes)`. Every segment of a pending inbound predecessor is logged, including ones
+    /// that do not advance the receiver's in-order frontier. Zero on local rows.
+    pub segment_sequence: u64,
+    pub segment_bytes: u64,
+    /// Local rows caused by a TCP stage: the completing ACK's cumulative acknowledgment. Zero for
+    /// a compute cause and on inbound rows.
+    pub ack_number: u64,
+    /// Local rows: when the completing signal originated. TCP: when the segment answered by the
+    /// completing ACK was sent (the ACK echoes it). Compute: when the timer was armed. Zero on
+    /// inbound rows.
+    pub cause_origin_ns: u64,
+    /// Local rows: TCP, the unloaded round trip of that segment (forward route) and the ACK
+    /// (reverse route), a lower bound on `time - cause_origin_ns`; compute, the timer duration,
+    /// met exactly. Zero on inbound rows.
+    pub cause_delay_ns: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -241,12 +257,12 @@ pub fn collective_transitions_csv(
     }
 
     let mut csv = String::from(
-        "time_ns,event_phase,event_origin_node,event_origin_sequence,ordinal,node_id,flow_id,cause,cause_flow_id,arrival_bytes,collective_id,algorithm,group_size,declared_total_bytes,rank,collective_phase,step,chunk_offset_bytes,chunk_bytes,packet_size_bytes,interval_ns,stop_time_ns,local_predecessor_flow_id,inbound_predecessor_flow_id,inbound_predecessor_bytes,before_local_complete,before_inbound_complete,before_inbound_bytes,activated,after_local_complete,after_inbound_complete,after_inbound_bytes,after_packets_emitted,after_bytes_emitted,after_status,after_next_time_ns,stage_kind,duration_ns\n",
+        "time_ns,event_phase,event_origin_node,event_origin_sequence,ordinal,node_id,flow_id,cause,cause_flow_id,arrival_bytes,collective_id,algorithm,group_size,declared_total_bytes,rank,collective_phase,step,chunk_offset_bytes,chunk_bytes,packet_size_bytes,interval_ns,stop_time_ns,local_predecessor_flow_id,inbound_predecessor_flow_id,inbound_predecessor_bytes,before_local_complete,before_inbound_complete,before_inbound_bytes,activated,after_local_complete,after_inbound_complete,after_inbound_bytes,after_packets_emitted,after_bytes_emitted,after_status,after_next_time_ns,stage_kind,duration_ns,segment_sequence,segment_bytes,ack_number,cause_origin_ns,cause_delay_ns\n",
     );
     for record in records {
         writeln!(
             csv,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             record.key.time_ns,
             record.key.phase,
             record.key.origin_node.0,
@@ -285,6 +301,11 @@ pub fn collective_transitions_csv(
             record.after_next_time_ns,
             collective_stage_kind(record.stage_kind),
             record.duration_ns,
+            record.segment_sequence,
+            record.segment_bytes,
+            record.ack_number,
+            record.cause_origin_ns,
+            record.cause_delay_ns,
         )
         .expect("writing to String cannot fail");
     }
