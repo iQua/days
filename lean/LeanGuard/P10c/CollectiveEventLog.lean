@@ -492,7 +492,22 @@ def checkComputePredecessors (rows : List Row) (row : Row) : Except String Unit 
       requireEarlierRelease row (inbound?.filter (·.activated))
         "inbound predecessor stage did not activate earlier"
 
-def checkPredecessors (rows : List Row) (row : Row) : Except String Unit :=
+/-- A compute stage completes only when its timer fires. When the completed compute stage is
+logged, its release row records the timer deadline (`after_next_time_ns` = release + duration), so
+the successor's local completion must happen exactly then, as a phase-1 timer event. -/
+def checkComputeTimerCause (rows : List Row) (row : Row) : Except String Unit := do
+  if row.cause = .localCompletion then
+    let released? := rows.find? fun candidate =>
+      candidate.flowId = row.causeFlowId && candidate.stageKind = .compute && candidate.activated
+    match released? with
+    | none => pure ()
+    | some predecessor =>
+        require row.srcLine
+          (row.key.timeNs = predecessor.afterNextTimeNs && row.key.phase = 1)
+          "compute local completion does not occur at its predecessor's timer deadline"
+
+def checkPredecessors (rows : List Row) (row : Row) : Except String Unit := do
+  checkComputeTimerCause rows row
   match row.stageKind, row.collectivePhase with
   | .tcp, some phase => checkTcpPredecessors rows row phase
   | .tcp, none => pure ()

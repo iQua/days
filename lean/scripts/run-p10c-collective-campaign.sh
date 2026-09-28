@@ -250,6 +250,11 @@ mutate_case "compute-local-predecessor-rank" "$chain" \
 mutate_case "compute-inbound-not-final" "$chain" \
   '$column["flow_id"] == 12 { $column["inbound_predecessor_flow_id"] = 6; if ($column["cause"] == "inbound_arrival") $column["cause_flow_id"] = 6 }' \
   'REJECT: line 32: compute inbound predecessor is not the previous rank'"'"'s final collective stage'
+# Review F2 (R1b): the optimizer releases 640 ns after backward's release instead of at its
+# 7000 ns timer deadline (22640); the release rows' own deadlines move consistently.
+mutate_case "compute-completion-before-timer" "$chain" \
+  'NR >= 41 && NR <= 43 { $column["time_ns"] = 16000; $column["after_next_time_ns"] = 19000 }' \
+  'REJECT: line 41: compute local completion does not occur at its predecessor'"'"'s timer deadline'
 mutate_case "compute-group-coverage" "$chain" \
   '$column["flow_id"] == 20 { next }' \
   'REJECT: line 41: incomplete collective progress coverage for collective_id=2: expected 3, found 2'
