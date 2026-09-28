@@ -100,6 +100,8 @@ const NONE: u64 = u64::MAX;
 /// Params word holding the absolute word offset of the per-flow receiver state in `tcp_state`.
 const PARAM_RECEIVER_OFFSET: usize = 28;
 const PARAM_LEDGER_META_OFFSET: usize = 29;
+/// Params word holding the PFC region offset in `scheduler_state`, or `NONE` without PFC state.
+const PARAM_PFC_OFFSET: usize = 31;
 const PACKET_ECN_FLAG: u64 = 1_u64 << 63;
 const PACKET_KIND_MASK: u64 = !PACKET_ECN_FLAG;
 
@@ -116,8 +118,39 @@ const CONTROL_CONTINUATION: usize = 17;
 const CONTROL_RELAUNCHES: usize = 18;
 const CONTROL_WORDS: usize = 20;
 
-static CUDA_DEVICE_EXECUTION: Mutex<()> = Mutex::new(());
-static CUDA_DIRECT: OnceLock<Result<Arc<DirectCuda>, String>> = OnceLock::new();
+/// One lazily initialized context, stream and module per CUDA device ordinal.
+///
+/// The map lock only fetches or inserts a device's slot; initialization runs outside it, once per
+/// device, so a slow or failing device never blocks another device's first use. A failed
+/// initialization is cached like a successful one: the ordinal stays unavailable for the process.
+type CudaDeviceSlot = Arc<OnceLock<Result<Arc<DirectCuda>, String>>>;
+static CUDA_DEVICES: Mutex<BTreeMap<usize, CudaDeviceSlot>> = Mutex::new(BTreeMap::new());
+
+/// Returns the shared handle for one device ordinal, initializing it on first use.
+fn direct_cuda(device_index: usize) -> Result<Arc<DirectCuda>, CudaError> {
+    let slot = {
+        let mut devices = CUDA_DEVICES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(devices.entry(device_index).or_default())
+    };
+    slot.get_or_init(|| {
+        DirectCuda::new(device_index)
+            .map(Arc::new)
+            .map_err(|error| error.to_string())
+    })
+    .as_ref()
+    .map(Arc::clone)
+    .map_err(|error| CudaError::Unavailable(error.clone()))
+}
+
+/// Number of CUDA devices the driver reports.
+pub fn cuda_device_count() -> Result<usize, CudaError> {
+    let count =
+        CudaContext::device_count().map_err(|error| driver_error("CUDA device count", error))?;
+    usize::try_from(count)
+        .map_err(|_| CudaError::Unavailable(format!("driver reported {count} CUDA devices")))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CudaProvisioning {
@@ -142,19 +175,9 @@ std::thread_local! {
     static PANIC_AFTER_NEXT_EXECUTION: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Acquires the supported process-wide CUDA execution envelope.
-///
-/// The guard schedules device access rather than protecting Rust state, so a panic must not
-/// prevent later callers from executing.
-pub(crate) fn cuda_device_execution_guard() -> MutexGuard<'static, ()> {
-    CUDA_DEVICE_EXECUTION
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
 /// Arms a one-shot panic after this thread's next successful CUDA graph execution.
 ///
-/// This test hook fires while the process-wide execution guard is still held.
+/// This test hook fires while the device's execution guard is still held.
 #[doc(hidden)]
 #[cfg(feature = "cuda-test-hooks")]
 pub fn panic_after_next_execution_for_testing() {
@@ -467,6 +490,15 @@ fn decode_packet_kind(value: u64, metadata: &[u64]) -> Result<PacketKind, CudaEr
             acknowledged_bytes: metadata[1],
             echoed_sent_time_ns: metadata[2],
         })),
+        4 if metadata[1] < 8 && metadata[2] <= 1 => Ok(PacketKind::Pfc(crate::PfcHeader {
+            controlled_link: crate::LinkId(metadata[0]),
+            priority: metadata[1] as u8,
+            pause: metadata[2] != 0,
+        })),
+        5 if metadata[1..] == [0, 0] => Ok(PacketKind::DcqcnCnp(crate::DcqcnCnpHeader {
+            trigger_payload: PayloadId(metadata[0]),
+        })),
+        6 if metadata == [0, 0, 0] => Ok(PacketKind::DcqcnControlTimer),
         _ => Err(CudaError::DeviceExecution {
             code: 93,
             node: None,
@@ -711,6 +743,9 @@ impl CudaError {
 /// Physical capacity and bounded CUDA Graph wave policy for one run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CudaConfig {
+    /// CUDA device ordinal the run executes on. Runs on different devices hold different
+    /// execution guards; runs on one device are serialized.
+    pub device_index: usize,
     /// Enables the stream-decomposed FEL. `false` retains the exact fallback heap path.
     pub streams_enabled: bool,
     /// Optional caps for large capacities derived from the complete image. Exact legacy
@@ -748,6 +783,7 @@ pub struct CudaConfig {
 impl Default for CudaConfig {
     fn default() -> Self {
         Self {
+            device_index: 0,
             streams_enabled: true,
             capacity_caps: DeviceCapacityCaps::default(),
             capacity_floors: DeviceCapacityFloors::default(),
@@ -942,9 +978,9 @@ pub struct CudaInitializationTimings {
 
 /// Runs the production CUDA executor through the inclusive scenario stop.
 ///
-/// CUDA execution is serialized process-wide: one executor executes at a time, and concurrent
-/// callers queue until execution and explicit readback complete. Executor construction may proceed
-/// concurrently.
+/// CUDA execution is serialized per device: one run executes on a device at a time, and
+/// concurrent callers of that device queue until execution and explicit readback complete. Runs on
+/// different devices proceed independently. Executor construction may proceed concurrently.
 pub fn run_cuda(
     image: &SimulationImage,
     exclusive_horizon_ns: Option<u64>,
@@ -965,7 +1001,7 @@ pub fn run_cuda_with_observations(
     config: CudaConfig,
     observation_mode: ObservationMode,
 ) -> Result<CudaRun, CudaError> {
-    CudaExecutor::new()?.run_with_observations(
+    CudaExecutor::on_device(config.device_index)?.run_with_observations(
         image,
         exclusive_horizon_ns,
         config,
@@ -976,28 +1012,38 @@ pub fn run_cuda_with_observations(
 /// Reusable CUDA context, stream, embedded module, kernels, and graph-capture substrate.
 ///
 /// Each run allocates fresh explicit device buffers, so a device fault cannot contaminate a later
-/// run. CUDA execution is serialized process-wide: one executor executes at a time, and concurrent
-/// callers queue until execution and readback complete. Executor construction may proceed
+/// run. A run executes on [`CudaConfig::device_index`]; contexts are shared per device ordinal
+/// across the process, and execution is serialized per device. Executor construction may proceed
 /// concurrently.
 pub struct CudaExecutor {
+    device_index: usize,
     direct: Arc<DirectCuda>,
 }
 
 impl CudaExecutor {
-    /// Constructs an executor without acquiring the process-wide execution guard.
+    /// Constructs an executor on device 0 without acquiring its execution guard.
     pub fn new() -> Result<Self, CudaError> {
-        let direct = CUDA_DIRECT.get_or_init(|| {
-            DirectCuda::new()
-                .map(Arc::new)
-                .map_err(|error| error.to_string())
-        });
+        Self::on_device(0)
+    }
+
+    /// Constructs an executor whose initialization targets `device_index`.
+    ///
+    /// A run still executes on its own [`CudaConfig::device_index`]; a different ordinal resolves
+    /// that device's shared context on first use.
+    pub fn on_device(device_index: usize) -> Result<Self, CudaError> {
         Ok(Self {
-            direct: Arc::clone(
-                direct
-                    .as_ref()
-                    .map_err(|error| CudaError::Unavailable(error.clone()))?,
-            ),
+            device_index,
+            direct: direct_cuda(device_index)?,
         })
+    }
+
+    /// The shared handle for a run's device.
+    fn direct_for(&self, device_index: usize) -> Result<Arc<DirectCuda>, CudaError> {
+        if device_index == self.device_index {
+            Ok(Arc::clone(&self.direct))
+        } else {
+            direct_cuda(device_index)
+        }
     }
 
     pub fn initialization_timings(&self) -> CudaInitializationTimings {
@@ -1081,7 +1127,8 @@ impl CudaExecutor {
 
         let mut control = vec![0_u64; CONTROL_WORDS];
         control[5] = 1;
-        let mut params = vec![0_u64; 31];
+        let mut params = vec![0_u64; 32];
+        params[PARAM_PFC_OFFSET] = NONE;
         params[0] = node_count as u64;
         params[4] = node_count.max(1) as u64;
         params[13] = 1;
@@ -1102,7 +1149,7 @@ impl CudaExecutor {
         host_planes[19] = vec![0; node_count.saturating_mul(ARENA_META_WORDS).max(1)];
         host_planes[25] = stream_state;
 
-        let _execution_guard = cuda_device_execution_guard();
+        let _execution_guard = self.direct.execution_guard();
         let planes = host_planes
             .into_iter()
             .enumerate()
@@ -1174,7 +1221,7 @@ impl CudaExecutor {
         )
     }
 
-    /// Executes and reads back under the process-wide CUDA execution envelope.
+    /// Executes and reads back under the run device's execution guard.
     pub fn run_with_observations(
         &self,
         image: &SimulationImage,
@@ -1213,6 +1260,7 @@ impl CudaExecutor {
     ) -> Result<CudaRun, CudaError> {
         validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
         validate_config(config)?;
+        let direct = self.direct_for(config.device_index)?;
 
         let retry_budget = config.max_capacity_retries;
         let mut attempt_config = config;
@@ -1237,13 +1285,12 @@ impl CudaExecutor {
                     &mut channel_capacity_floors,
                     &mut tcp_capacity_floors,
                 )?;
-                let _execution_guard = cuda_device_execution_guard();
-                let buffers =
-                    CudaBuffers::new(&self.direct.stream, plan, self.direct.provisioning)?;
-                let timing = self.direct.run(&buffers, attempt_config)?;
+                let _execution_guard = direct.execution_guard();
+                let buffers = CudaBuffers::new(&direct.stream, plan, direct.provisioning)?;
+                let timing = direct.run(&buffers, attempt_config)?;
                 #[cfg(feature = "cuda-test-hooks")]
                 panic_after_execution_if_requested();
-                buffers.finish(&self.direct, image, observation_mode, timing)
+                buffers.finish(&direct, image, observation_mode, timing)
             })();
             match attempt {
                 Ok(mut run) => {
@@ -1427,6 +1474,34 @@ pub fn assert_cuda_planner_bit_equal_for_testing(
         ));
     }
     Ok(())
+}
+
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+/// Measures the words the production plan spends on DCQCN and PFC state (P14 Lane B).
+pub fn mechanism_plane_words_cuda_for_testing(
+    image: &SimulationImage,
+    config: CudaConfig,
+) -> Result<crate::MechanismPlaneWords, CudaError> {
+    validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
+    validate_config(config)?;
+    let plan = CudaPlan::new(image, None, config, ObservationMode::Summary)?;
+    let pfc_offset = plan.params[PARAM_PFC_OFFSET];
+    let receiver_offset = plan.params[PARAM_RECEIVER_OFFSET] as usize;
+    Ok(crate::MechanismPlaneWords {
+        pfc_region_words: if pfc_offset == NONE {
+            0
+        } else {
+            plan.scheduler_state.len() - pfc_offset as usize
+        },
+        dcqcn_receiver_rows: (0..image.flows.len())
+            .filter(|flow| {
+                plan.tcp_state[receiver_offset + flow * TCP_RECEIVER_WORDS]
+                    >= crate::device_mechanism::DCQCN_RECEIVER_NO_CNP
+            })
+            .count(),
+        pfc_params_words: 1,
+    })
 }
 
 /// Returns the exact production-plan plane lengths without creating a CUDA device.
@@ -1656,6 +1731,17 @@ fn prepare_tcp_state(
         .ok_or_else(|| CudaError::Validation("TCP ledger metadata size overflows usize".into()))?;
     let mut state = vec![0_u64; next.max(1)];
 
+    for receiver in image
+        .host_states
+        .iter()
+        .flat_map(|host| &host.dcqcn_receivers)
+    {
+        let row = receiver_offset + receiver.flow.0 as usize * TCP_RECEIVER_WORDS;
+        crate::device_mechanism::encode_dcqcn_receiver(
+            receiver,
+            &mut state[row..row + TCP_RECEIVER_WORDS],
+        );
+    }
     for (owner_slot, host) in image.host_states.iter().enumerate() {
         if host.tcp_receivers.is_empty() {
             continue;
@@ -1884,6 +1970,10 @@ impl CudaPlan {
                 capacity_context.source_queue_packet_bound(image, flow_index, data_count),
             );
             legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(4);
+            if capacity_context.dcqcn_generator(image, flow_index) {
+                // A DCQCN source owns two live timer chains, pacing and control.
+                legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(2);
+            }
             if capacity_context.tcp_generator(image, flow_index).is_some() {
                 // Timeout events are intentionally heap-class. Under the live-state contract
                 // (Mechanism API errata E5) a superseded timeout is removed at the invalidating
@@ -2005,6 +2095,10 @@ impl CudaPlan {
                 capacities[target] = capacities[target].saturating_add(1);
             }
             for (flow, descriptor) in image.flows.iter().enumerate() {
+                if capacity_context.dcqcn_generator(image, flow) {
+                    let source = descriptor.source.0 as usize;
+                    capacities[source] = capacities[source].saturating_add(2);
+                }
                 if capacity_context.tcp_generator(image, flow).is_some() {
                     let feedback = flow_feedback_counts[flow];
                     let attempts = capacity_context.tcp_fallback_timer_bound(
@@ -2140,8 +2234,11 @@ impl CudaPlan {
                                 generators[offset + 18] = rate.credit_quanta as u64;
                                 generators[offset + 19] = (rate.credit_quanta >> 64) as u64;
                             }
-                            FlowGeneratorKind::Dcqcn(_) => {
-                                unreachable!("CUDA capability validation rejects this generator")
+                            FlowGeneratorKind::Dcqcn(dcqcn) => {
+                                crate::device_mechanism::encode_dcqcn_generator(
+                                    &dcqcn,
+                                    &mut generators[offset..offset + GENERATOR_WORDS],
+                                );
                             }
                         }
                     }
@@ -2182,8 +2279,10 @@ impl CudaPlan {
             }
         }
 
-        let scheduler_state =
+        let mut scheduler_state =
             prepare_device_schedulers(image, &queue_meta).map_err(CudaError::Validation)?;
+        let pfc_offset = crate::device_pfc::append_pfc_region(image, &mut scheduler_state)
+            .map_err(CudaError::Validation)?;
 
         for event in &image.initial_events {
             let packet = if event.kind == EventKind::RetransmissionTimeout {
@@ -2396,6 +2495,7 @@ impl CudaPlan {
             tcp_layout.receiver_offset as u64,
             tcp_layout.ledger_meta_offset as u64,
             streams.layout.round_scratch_offset as u64,
+            pfc_offset.map_or(NONE, |offset| offset as u64),
         ];
 
         Ok(Self {
@@ -2453,6 +2553,14 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
         if matches!(packet.kind, PacketKind::TcpData(_)) && !live_payloads.contains(&packet.id) {
             continue;
         }
+        // The zero-byte DCQCN control-timer token never enters a queue or crosses a link, and a PFC
+        // frame travels on its reverse control lane, never on its flow's route.
+        if matches!(
+            packet.kind,
+            PacketKind::DcqcnControlTimer | PacketKind::Pfc(_)
+        ) {
+            continue;
+        }
         let counts = if packet.kind.is_data() {
             &mut data_counts
         } else {
@@ -2472,6 +2580,19 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
             if let FlowGeneratorKind::Rate(rate) = generator.kind {
                 let work = crate::device_sizing::rate_device_work(image, generator, rate)
                     .map_err(|error| CudaError::Validation(error.to_string()))?;
+                let owns_timer_token = pacing_timer_tokens.contains(&(
+                    image.flows[index].source,
+                    generator.next_emission.payload,
+                    generator.next_emission.departure_time_ns,
+                ));
+                if owns_timer_token {
+                    data_counts[index] = data_counts[index].saturating_sub(1);
+                }
+                data_counts[index] = data_counts[index].saturating_add(work.packets);
+                continue;
+            }
+            if let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind {
+                let work = crate::device_sizing::dcqcn_device_work(image, generator, dcqcn);
                 let owns_timer_token = pacing_timer_tokens.contains(&(
                     image.flows[index].source,
                     generator.next_emission.payload,
@@ -2536,7 +2657,11 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
     }
     for state in &image.host_states {
         for generator in &state.generators {
-            if matches!(generator.kind, FlowGeneratorKind::Tcp(_)) {
+            // One ACK (TCP) or at most one CNP (DCQCN) per data packet.
+            if matches!(
+                generator.kind,
+                FlowGeneratorKind::Tcp(_) | FlowGeneratorKind::Dcqcn(_)
+            ) {
                 let flow = generator.flow.0 as usize;
                 feedback_counts[flow] = feedback_counts[flow].saturating_add(data_counts[flow]);
             }
@@ -2576,11 +2701,11 @@ fn add_flow_route_capacities(
             (flow.reverse_route.as_slice(), flow.source)
         }
         PacketKind::Pfc(_) => {
-            unreachable!("CUDA capability validation rejects PFC payloads")
+            unreachable!("PFC frames travel on control lanes, never on a flow route")
         }
         PacketKind::DcqcnCnp(_) => (flow.reverse_route.as_slice(), flow.source),
         PacketKind::DcqcnControlTimer => {
-            unreachable!("CUDA capability validation rejects DCQCN timer payloads")
+            unreachable!("the zero-byte DCQCN control-timer token is never routed")
         }
     };
     for index in 0..route.len() {
@@ -3291,6 +3416,9 @@ fn remote_inbound_producers(image: &SimulationImage) -> (Vec<u64>, Vec<u64>) {
             }
         }
     }
+    for (producer, target) in crate::device_pfc::pfc_control_lane_producers(image) {
+        inbound[target].insert(producer);
+    }
     let mut meta = vec![0_u64; image.nodes.len() * INBOUND_META_WORDS];
     let mut producers = Vec::new();
     for (target, target_producers) in inbound.into_iter().enumerate() {
@@ -3313,20 +3441,30 @@ fn derived_transition_bound(image: &SimulationImage, counts: &[usize]) -> Result
             ))
         })
         .fold(
-            image.initial_events.len().saturating_add(1),
+            image
+                .initial_events
+                .len()
+                .saturating_add(1)
+                .saturating_add(crate::device_pfc::pfc_frame_transition_bound(image, counts)),
             usize::saturating_add,
         );
     image
         .host_states
         .iter()
         .flat_map(|state| &state.generators)
-        .try_fold(network, |bound, generator| {
-            let FlowGeneratorKind::Rate(rate) = generator.kind else {
-                return Ok(bound);
-            };
-            let work = crate::device_sizing::rate_device_work(image, generator, rate)
-                .map_err(|error| CudaError::Validation(error.to_string()))?;
-            Ok(bound.saturating_add(work.pacing_ticks))
+        .try_fold(network, |bound, generator| match generator.kind {
+            FlowGeneratorKind::Rate(rate) => {
+                let work = crate::device_sizing::rate_device_work(image, generator, rate)
+                    .map_err(|error| CudaError::Validation(error.to_string()))?;
+                Ok(bound.saturating_add(work.pacing_ticks))
+            }
+            FlowGeneratorKind::Dcqcn(dcqcn) => {
+                let work = crate::device_sizing::dcqcn_device_work(image, generator, dcqcn);
+                Ok(bound
+                    .saturating_add(work.pacing_ticks)
+                    .saturating_add(work.control_ticks))
+            }
+            FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Tcp(_) => Ok(bound),
         })
 }
 
@@ -4294,12 +4432,17 @@ impl CudaBuffers {
                                 rate.credit_quanta = u128::from(generators[offset + 18])
                                     | (u128::from(generators[offset + 19]) << 64);
                             }
-                            FlowGeneratorKind::Dcqcn(_) => {
-                                return Err(CudaError::DeviceExecution {
-                                    code: 96,
-                                    node: Some(node.id),
-                                }
-                                .into());
+                            FlowGeneratorKind::Dcqcn(dcqcn) => {
+                                crate::device_mechanism::decode_dcqcn_generator(
+                                    &generators[offset..offset + GENERATOR_WORDS],
+                                    dcqcn,
+                                )
+                                .map_err(|_| {
+                                    CudaError::DeviceExecution {
+                                        code: 96,
+                                        node: Some(node.id),
+                                    }
+                                })?;
                             }
                         }
                     }
@@ -4321,6 +4464,17 @@ impl CudaBuffers {
                             })
                             .collect();
                     }
+                    for receiver in &mut state.dcqcn_receivers {
+                        let row = receiver.flow.0 as usize * TCP_RECEIVER_WORDS;
+                        crate::device_mechanism::decode_dcqcn_receiver(
+                            &receiver_state[row..row + TCP_RECEIVER_WORDS],
+                            receiver,
+                        )
+                        .map_err(|_| CudaError::DeviceExecution {
+                            code: 96,
+                            node: Some(node.id),
+                        })?;
+                    }
                 }
                 NodeKind::Switch => {
                     let state = &mut switch_states[node.state_slot as usize];
@@ -4330,6 +4484,15 @@ impl CudaBuffers {
                         switch_queue.tx_ready_pending = node_state[base + 3] != 0;
                         restore_device_scheduler(lp, &queue_meta, &scheduler_state, switch_queue)
                             .map_err(CudaError::Validation)?;
+                        if params[PARAM_PFC_OFFSET] != NONE {
+                            crate::device_pfc::restore_pfc_queue(
+                                &scheduler_state,
+                                params[PARAM_PFC_OFFSET] as usize,
+                                lp,
+                                switch_queue,
+                            )
+                            .map_err(CudaError::Validation)?;
+                        }
                     }
                     state.next_origin_seq = node_state[base + 5];
                     state.arrived_packets = node_state[base + 7];
@@ -4604,6 +4767,9 @@ const FINALIZE_SWEEP_KERNEL_INDEX: usize = 11;
 
 struct DirectCuda {
     _context: Arc<CudaContext>,
+    /// Serializes execution on this device. It schedules device access rather than protecting
+    /// Rust state, so a panic while it is held must not prevent later runs.
+    execution: Mutex<()>,
     stream: Arc<CudaStream>,
     functions: Vec<CudaFunction>,
     /// T20l fix 2: the readback gather, loaded beside the eight attempt kernels.
@@ -4613,15 +4779,21 @@ struct DirectCuda {
 }
 
 impl DirectCuda {
-    fn new() -> Result<Self, CudaError> {
+    fn execution_guard(&self) -> MutexGuard<'_, ()> {
+        self.execution
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn new(device_index: usize) -> Result<Self, CudaError> {
         let setup_started = Instant::now();
-        let context =
-            CudaContext::new(0).map_err(|error| driver_error("device 0 context", error))?;
+        let context = CudaContext::new(device_index)
+            .map_err(|error| driver_error(format!("device {device_index} context"), error))?;
         let stream = context
             .new_stream()
             .map_err(|error| driver_error("non-blocking execution stream", error))?;
-        // This backend owns one stream, retains every buffer until that stream is synchronized,
-        // and serializes all executions process-wide. Automatic cross-stream event tracking would
+        // This backend owns one stream per device, retains every buffer until that stream is
+        // synchronized, and serializes executions per device. Automatic cross-stream event tracking would
         // add event nodes to graph capture without providing any safety here.
         unsafe {
             context.disable_event_tracking();
@@ -4632,7 +4804,7 @@ impl DirectCuda {
         let fatbin = include_bytes!(concat!(env!("OUT_DIR"), "/days_cuda_kernels.fatbin"));
         let module = context
             .load_module(Ptx::from_binary(fatbin.to_vec()))
-            .map_err(|error| driver_error("embedded sm_121/sm_89 fatbin load", error))?;
+            .map_err(|error| driver_error("embedded sm_121/sm_89/sm_86 fatbin load", error))?;
         let functions = KERNEL_NAMES
             .iter()
             .map(|name| {
@@ -4663,9 +4835,10 @@ impl DirectCuda {
             != 0;
         let provisioning =
             select_cuda_provisioning(integrated, managed_memory, concurrent_managed_access);
-        if (major, minor) != (12, 1) && (major, minor) != (8, 9) {
+        if !matches!((major, minor), (12, 1) | (8, 9) | (8, 6)) {
             return Err(CudaError::Unavailable(format!(
-                "embedded kernels target sm_121 and sm_89, but device 0 reports sm_{major}{minor}"
+                "embedded kernels target sm_121, sm_89 and sm_86, but device {device_index} \
+                 reports sm_{major}{minor}"
             )));
         }
         for index in CONTROL_KERNELS {
@@ -4686,6 +4859,7 @@ impl DirectCuda {
 
         Ok(Self {
             _context: context,
+            execution: Mutex::new(()),
             stream,
             functions,
             compact_function,

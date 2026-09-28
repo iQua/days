@@ -101,7 +101,14 @@ impl PlannerCapacityContext {
         for packet in &image.initial_packets {
             let flow = packet.flow.0 as usize;
             let class = usize::from(!packet.kind.is_data());
-            update_minimum_packet_size(&mut minimum_packet_sizes[flow][class], packet.size_bytes);
+            // The DCQCN control-timer token is a zero-byte source-local timer, never a packet on
+            // a link, so it bounds no serialization interval.
+            if packet.kind != PacketKind::DcqcnControlTimer {
+                update_minimum_packet_size(
+                    &mut minimum_packet_sizes[flow][class],
+                    packet.size_bytes,
+                );
+            }
             if packet.kind == PacketKind::Data {
                 initial_data_count[flow] = initial_data_count[flow].saturating_add(1);
                 initial_data_payload[flow].get_or_insert(packet.id);
@@ -147,11 +154,8 @@ impl PlannerCapacityContext {
                     }
                 };
                 update_minimum_packet_size(&mut minimum_packet_sizes[flow][0], size);
-                if let FlowGeneratorKind::Tcp(tcp) = generator.kind {
-                    update_minimum_packet_size(
-                        &mut minimum_packet_sizes[flow][1],
-                        tcp.ack_size_bytes,
-                    );
+                if let Some(feedback) = generated_feedback_size(generator.kind) {
+                    update_minimum_packet_size(&mut minimum_packet_sizes[flow][1], feedback);
                 }
 
                 if !matches!(
@@ -400,6 +404,25 @@ impl PlannerCapacityContext {
         self.minimum_packet_sizes[flow][usize::from(!packet_kind.is_data())]
     }
 
+    /// Whether the flow's source generator is a DCQCN reaction point.
+    pub(crate) fn dcqcn_generator(&self, image: &SimulationImage, flow: usize) -> bool {
+        #[cfg(any(test, feature = "planner-test-hooks"))]
+        if self.mode == PlannerCapacityMode::Legacy {
+            return image
+                .host_states
+                .iter()
+                .flat_map(|state| &state.generators)
+                .find(|generator| generator.flow.0 as usize == flow)
+                .is_some_and(|generator| matches!(generator.kind, FlowGeneratorKind::Dcqcn(_)));
+        }
+        self.flow_to_generator[flow].is_some_and(|location| {
+            matches!(
+                image.host_states[location.host].generators[location.generator].kind,
+                FlowGeneratorKind::Dcqcn(_)
+            )
+        })
+    }
+
     pub(crate) fn tcp_generator(
         &self,
         image: &SimulationImage,
@@ -610,7 +633,9 @@ fn precompute_minimum_packet_sizes(
     for packet in &image.initial_packets {
         let flow = packet.flow.0 as usize;
         let class = usize::from(!packet.kind.is_data());
-        update_minimum_packet_size(&mut minimums[flow][class], packet.size_bytes);
+        if packet.kind != PacketKind::DcqcnControlTimer {
+            update_minimum_packet_size(&mut minimums[flow][class], packet.size_bytes);
+        }
     }
     for generator in image.host_states.iter().flat_map(|state| &state.generators) {
         let flow = generator.flow.0 as usize;
@@ -639,12 +664,22 @@ fn precompute_minimum_packet_sizes(
             }
         };
         update_minimum_packet_size(&mut minimums[flow][0], size);
-        if let FlowGeneratorKind::Tcp(tcp) = generator.kind {
-            update_minimum_packet_size(&mut minimums[flow][1], tcp.ack_size_bytes);
+        if let Some(feedback) = generated_feedback_size(generator.kind) {
+            update_minimum_packet_size(&mut minimums[flow][1], feedback);
         }
     }
     materialize_minimum_packet_sizes(&mut minimums);
     minimums
+}
+
+/// The size of the feedback packet a generator's flow creates at runtime: the TCP ACK or the DCQCN
+/// CNP. Open-loop generators create none.
+fn generated_feedback_size(kind: FlowGeneratorKind) -> Option<u64> {
+    match kind {
+        FlowGeneratorKind::Tcp(tcp) => Some(tcp.ack_size_bytes),
+        FlowGeneratorKind::Dcqcn(dcqcn) => Some(dcqcn.cnp_size_bytes),
+        FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => None,
+    }
 }
 
 fn update_minimum_packet_size(minimum: &mut u64, size: u64) {
@@ -697,7 +732,9 @@ fn legacy_minimum_packet_size(
         .initial_packets
         .iter()
         .filter(|packet| {
-            packet.flow.0 as usize == flow && packet.kind.is_data() == packet_kind.is_data()
+            packet.flow.0 as usize == flow
+                && packet.kind.is_data() == packet_kind.is_data()
+                && packet.kind != PacketKind::DcqcnControlTimer
         })
         .map(|packet| packet.size_bytes)
         .chain(
@@ -708,12 +745,7 @@ fn legacy_minimum_packet_size(
                         .iter()
                         .flat_map(|state| &state.generators)
                         .filter(move |generator| generator.flow.0 as usize == flow)
-                        .filter_map(|generator| match generator.kind {
-                            FlowGeneratorKind::Tcp(tcp) => Some(tcp.ack_size_bytes),
-                            FlowGeneratorKind::Constant(_)
-                            | FlowGeneratorKind::Rate(_)
-                            | FlowGeneratorKind::Dcqcn(_) => None,
-                        })
+                        .filter_map(|generator| generated_feedback_size(generator.kind))
                 })
                 .into_iter()
                 .flatten(),

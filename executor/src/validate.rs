@@ -409,46 +409,16 @@ fn validate_backend_capabilities(
     if !matches!(backend, Backend::Metal | Backend::Cuda) {
         return Ok(());
     }
-    if image
-        .host_states
-        .iter()
-        .any(|state| !state.dcqcn_receivers.is_empty())
-        || image.initial_packets.iter().any(|packet| {
-            matches!(
-                packet.kind,
-                PacketKind::DcqcnCnp(_) | PacketKind::DcqcnControlTimer
-            )
-        })
-    {
-        return Err(ValidationError::new(format!(
-            "backend {backend} does not support DCQCN controller or CNP state planes; use Scalar or Cpu"
-        )));
-    }
+    // P14 Lane B: both device backends run the DCQCN reaction and notification points and PFC
+    // per-priority link pause, so neither needs a refusal here.
     for generator in image.host_states.iter().flat_map(|state| &state.generators) {
         if generator.stage.is_some() {
             return Err(ValidationError::new(format!(
                 "backend {backend} does not support collective generators; use Scalar or Cpu"
             )));
         }
-        if matches!(generator.kind, FlowGeneratorKind::Dcqcn(_)) {
-            return Err(ValidationError::new(format!(
-                "backend {backend} does not support DCQCN controller or CNP state planes; use Scalar or Cpu"
-            )));
-        }
-    }
-    for packet in &image.initial_packets {
-        if matches!(packet.kind, PacketKind::Pfc(_)) {
-            return Err(ValidationError::new(format!(
-                "backend {backend} does not support PFC control payloads; use Scalar or Cpu"
-            )));
-        }
     }
     for queue in image.switch_states.iter().flat_map(|state| &state.queues) {
-        if queue.pfc.is_some() {
-            return Err(ValidationError::new(format!(
-                "backend {backend} does not support PFC per-priority link pause; use Scalar or Cpu"
-            )));
-        }
         match queue.drop_mark {
             crate::DropMarkPolicy::TailDrop | crate::DropMarkPolicy::EcnThreshold(_) => {}
             crate::DropMarkPolicy::Red(_) => {

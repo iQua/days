@@ -1,0 +1,44 @@
+# P14 Lane B executable fixture (2026-09-27 orchestrator ruling).
+# Derived from the T26 scenario in tests/dcqcn_lowering.rs.
+# Derivation: copied verbatim; it lowers as-is. Not a legacy config: its source is the executor test.
+# It exists for executor byte-identity gates.
+
+seed = 26
+duration = 0.0005
+edges = [[0, 1]]
+hosts = [0, 1]
+
+[switch]
+port_rate = 100_000_000_000
+capacity = 1
+discipline = "FIFO"
+drop = "ECN_THRESHOLD"
+ecn_threshold = 1.0
+
+[link]
+propagation_ns = 100
+
+[[flow]]
+flow_type = "DCQCN"
+priority = 0
+graph = [[0, 1]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 20_000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.dcqcn]
+rate_gbps = 10.0
+min_rate_gbps = 1.0
+max_rate_gbps = 20.0
+g = 0.5
+ai_rate_gbps = 0.5
+hai_rate_gbps = 1.0
+mi_factor = 0.5
+rtt_ns = 100000
+cnp_interval_ns = 10000
+pacing_interval_ns = 1000
+cnp_priority = 0
+increase_byte_threshold = 1000

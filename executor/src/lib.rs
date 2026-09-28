@@ -16,6 +16,13 @@ mod device_capacity;
 ))]
 mod device_compaction;
 mod device_event_record;
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal", target_vendor = "apple")
+))]
+mod device_mechanism;
+mod device_pfc;
 mod device_scheduler;
 pub mod device_sizing;
 pub mod event;
@@ -44,14 +51,14 @@ pub use cpu::{
 #[cfg(all(feature = "cuda", feature = "planner-test-hooks"))]
 #[doc(hidden)]
 pub use cuda::assert_cuda_planner_bit_equal_for_testing;
-#[cfg(all(feature = "cuda", feature = "planner-test-hooks"))]
-#[doc(hidden)]
-pub use cuda::size_cuda_plan_for_testing;
 #[cfg(feature = "cuda")]
 pub use cuda::{
     CudaArena, CudaConfig, CudaError, CudaExecutor, CudaInitializationTimings, CudaMemoryLayout,
-    CudaRun, run_cuda, run_cuda_with_observations,
+    CudaRun, cuda_device_count, run_cuda, run_cuda_with_observations,
 };
+#[cfg(all(feature = "cuda", feature = "planner-test-hooks"))]
+#[doc(hidden)]
+pub use cuda::{mechanism_plane_words_cuda_for_testing, size_cuda_plan_for_testing};
 pub use dcqcn::{
     DCQCN_FRACTION_SCALE, DCQCN_STAGE_STEPS, DcqcnArithmeticError, DcqcnController,
     DcqcnControllerConfig, DcqcnIncreaseStage, DcqcnTransitionKind, DcqcnTransitionRecord,
@@ -62,7 +69,7 @@ pub use device_capacity::{
 };
 pub use device_sizing::{
     DeviceEventArenaSizing, DevicePlaneSizing, DeviceSizingError, DeviceSizingReport,
-    size_default_device_plan,
+    MechanismPlaneWords, size_default_device_plan,
 };
 pub use event::{
     Event, EventFelClass, EventKey, EventKind, FlowId, LinkId, NodeId, PayloadId, event_fel_class,
@@ -94,13 +101,6 @@ pub use mechanism_trace::{
 ))]
 #[doc(hidden)]
 pub use metal::assert_metal_planner_bit_equal_for_testing;
-#[cfg(all(
-    feature = "metal",
-    feature = "planner-test-hooks",
-    target_vendor = "apple"
-))]
-#[doc(hidden)]
-pub use metal::size_metal_plan_for_testing;
 #[cfg(all(feature = "metal-test-hooks", target_vendor = "apple"))]
 #[doc(hidden)]
 pub use metal::{
@@ -111,6 +111,13 @@ pub use metal::{
     MetalArena, MetalConfig, MetalError, MetalExecutor, MetalInitializationTimings,
     MetalMemoryLayout, MetalRun, run_metal, run_metal_with_observations,
 };
+#[cfg(all(
+    feature = "metal",
+    feature = "planner-test-hooks",
+    target_vendor = "apple"
+))]
+#[doc(hidden)]
+pub use metal::{mechanism_plane_words_metal_for_testing, size_metal_plan_for_testing};
 pub use model::{
     DropMarkPolicy, DrrSchedulerState, EcnThresholdPolicy, ExactRational, NodeKind, QueueDepthUnit,
     RedPolicyState, SchedulerKind, TransitionHandler, WfqSchedulerState, WrrSchedulerState,

@@ -83,6 +83,9 @@ pub(crate) fn device_scheduler_word_count(
                 .ok_or_else(|| "device scheduler queue-tag arena overflows usize".to_owned())?;
         }
     }
+    words = words
+        .checked_add(crate::device_pfc::pfc_region_words(image))
+        .ok_or_else(|| "device PFC region size overflows usize".to_owned())?;
     Ok(words.max(1))
 }
 

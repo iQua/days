@@ -729,9 +729,10 @@ fn dcqcn_closes_forward_and_reverse_channels_and_rejects_device_state_planes() {
         .retain(|channel| channel.link != reverse);
     assert!(validate(&unmarked_before_marker, Backend::Scalar).is_err());
 
+    // P14 Lane B: both device backends run the DCQCN controller and CNP planes.
     for backend in [Backend::Metal, Backend::Cuda] {
-        let error = validate(&image, backend).unwrap_err().to_string();
-        assert!(error.contains("DCQCN controller or CNP state planes"));
+        validate(&image, backend)
+            .unwrap_or_else(|error| panic!("{backend} accepts DCQCN planes: {error}"));
     }
 }
 

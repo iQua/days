@@ -194,6 +194,20 @@ impl DeviceEventArenaSizing {
 ///
 /// Open-loop images retain the established 28 planes. TCP images add one packed auxiliary plane
 /// for receiver ranges, segment ledgers, and full-observation transition state.
+/// Words a production device plan spends on the P14 DCQCN and PFC mechanism state.
+///
+/// Both are sized from image data: an image without DCQCN or PFC state spends nothing on them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MechanismPlaneWords {
+    /// Words of the PFC region appended to the scheduler plane; zero without PFC state.
+    pub pfc_region_words: usize,
+    /// Per-flow transport receiver rows that carry DCQCN notification-point state. The rows
+    /// already exist for every flow, so DCQCN itself adds no words.
+    pub dcqcn_receiver_rows: usize,
+    /// Params words holding the PFC region offset: one, holding `u64::MAX` without PFC state.
+    pub pfc_params_words: usize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceSizingReport {
     pub planes: Vec<DevicePlaneSizing>,
@@ -263,6 +277,71 @@ pub(crate) struct RateDeviceWork {
     pub pacing_ticks: usize,
     pub packets: usize,
     pub payload_allocations: usize,
+}
+
+/// Upper bounds on the device work one DCQCN reaction point can still perform.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DcqcnDeviceWork {
+    /// Pacing-timer transitions until the flow finishes or the stop time passes.
+    pub pacing_ticks: usize,
+    /// Data packets the flow can still source.
+    pub packets: usize,
+    /// Control-timer transitions, which continue through the stop time after the flow finishes.
+    pub control_ticks: usize,
+}
+
+/// Bounds a DCQCN source's remaining work without simulating its controller.
+///
+/// The controller clamps the pacing rate to `[minimum, maximum]`, so every pacing tick adds at least
+/// `minimum_rate * interval` credit quanta and one packet needs at most
+/// `ceil(packet_bits * denominator * 1e9 / (minimum_rate * interval))` ticks. Pacing therefore ends
+/// within that many ticks per remaining packet, and never after the stop time. Every packet costs
+/// at least one tick, so `packets <= pacing_ticks`. The bounds are outward-safe: they size arenas
+/// and the round bound, and an over-estimate costs only memory.
+pub(crate) fn dcqcn_device_work(
+    image: &SimulationImage,
+    generator: &crate::FlowGeneratorState,
+    dcqcn: crate::DcqcnGenerator,
+) -> DcqcnDeviceWork {
+    let stop = image.stop_time_ns;
+    let control = &dcqcn.controller;
+    let control_ticks = if control.next_control_time_ns <= stop {
+        usize::try_from(
+            1 + (stop - control.next_control_time_ns) / control.config.control_interval_ns.max(1),
+        )
+        .unwrap_or(usize::MAX)
+    } else {
+        0
+    };
+    let rate = dcqcn.rate;
+    if !matches!(
+        generator.next_emission.status,
+        GeneratorStatus::Scheduled | GeneratorStatus::Blocked
+    ) || generator.bytes_emitted >= rate.total_bytes
+        || generator.next_emission.departure_time_ns > stop
+    {
+        return DcqcnDeviceWork {
+            control_ticks,
+            ..DcqcnDeviceWork::default()
+        };
+    }
+    let stop_ticks = 1 + u128::from(stop - generator.next_emission.departure_time_ns)
+        / u128::from(rate.pacing_interval_ns.max(1));
+    let remaining = rate.total_bytes - generator.bytes_emitted;
+    let packets = u128::from(remaining.div_ceil(rate.packet_size_bytes.max(1)));
+    let cost = u128::from(rate.packet_size_bytes)
+        .saturating_mul(8)
+        .saturating_mul(u128::from(rate.rate_denominator))
+        .saturating_mul(1_000_000_000);
+    let tick = u128::from(control.config.minimum_rate_bps.max(1))
+        .saturating_mul(u128::from(rate.pacing_interval_ns.max(1)));
+    let ticks_per_packet = cost.div_ceil(tick).max(1);
+    let pacing_ticks = stop_ticks.min(packets.saturating_mul(ticks_per_packet).saturating_add(1));
+    DcqcnDeviceWork {
+        pacing_ticks: usize::try_from(pacing_ticks).unwrap_or(usize::MAX),
+        packets: usize::try_from(packets.min(pacing_ticks)).unwrap_or(usize::MAX),
+        control_ticks,
+    }
 }
 
 pub(crate) fn rate_device_work(
@@ -548,16 +627,24 @@ pub fn size_default_device_plan(
     //
     // Outward safety of each term, at live-timer scale:
     //   * the `1` covers one pacing chain, which pops its predecessor before pushing its
-    //     successor. The general semantic bound is `rate + 2*dcqcn` and device validation still
-    //     rejects DCQCN images; restoring them must raise this term with them.
+    //     successor. A DCQCN source owns two chains, pacing and control, so each DCQCN
+    //     generator adds 2, exactly as both device planners do.
     //   * each source-owned TCP flow contributes at most one record, because the T20g live-state
     //     contract removes a superseded timeout at the transition that supersedes it and disarm
     //     always precedes re-arm inside a single transition.
     //   * imported events stay a hard floor: an image may supply legacy residue that no armed
     //     timer owns, and that residue is resident until its deadline.
+    let dcqcn_timer_slots = image
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .filter(|generator| matches!(generator.kind, FlowGeneratorKind::Dcqcn(_)))
+        .count()
+        .saturating_mul(2);
     let fallback_fel_event_slots = node_count
         .checked_add(image.initial_events.len())
         .and_then(|slots| slots.checked_add(runtime_tcp_timer_slots))
+        .and_then(|slots| slots.checked_add(dcqcn_timer_slots))
         .ok_or_else(|| sizing_error("fallback FEL slots overflow usize"))?;
     let legacy_heap_event_slots = checked_sum(&legacy_fel_capacities, "legacy FEL slots")?;
     let queue_slots = checked_sum(&queue_capacities, "queue slots")?;
@@ -827,6 +914,14 @@ fn flow_packet_counts(
         if matches!(packet.kind, PacketKind::TcpData(_)) && !live_payloads.contains(&packet.id) {
             continue;
         }
+        // The zero-byte DCQCN control-timer token never enters a queue or crosses a link, and a PFC
+        // frame travels on its reverse control lane, never on its flow's route.
+        if matches!(
+            packet.kind,
+            PacketKind::DcqcnControlTimer | PacketKind::Pfc(_)
+        ) {
+            continue;
+        }
         let counts = if packet.kind.is_data() {
             &mut data_counts
         } else {
@@ -900,24 +995,27 @@ fn flow_packet_counts(
                     data_counts[index] = data_counts[index].saturating_add(work.packets);
                 }
                 FlowGeneratorKind::Dcqcn(dcqcn) => {
-                    if !matches!(
-                        generator.next_emission.status,
-                        GeneratorStatus::Scheduled | GeneratorStatus::Blocked
-                    ) || generator.bytes_emitted >= dcqcn.rate.total_bytes
-                    {
-                        continue;
+                    let work = dcqcn_device_work(image, generator, dcqcn);
+                    let owns_timer_token = pacing_timer_tokens.contains(&(
+                        image.flows[index].source,
+                        generator.next_emission.payload,
+                        generator.next_emission.departure_time_ns,
+                    ));
+                    if owns_timer_token {
+                        data_counts[index] = data_counts[index].saturating_sub(1);
                     }
-                    let remaining = dcqcn.rate.total_bytes - generator.bytes_emitted;
-                    let count = remaining.div_ceil(dcqcn.rate.packet_size_bytes);
-                    data_counts[index] = data_counts[index]
-                        .saturating_add(usize::try_from(count).unwrap_or(usize::MAX));
+                    data_counts[index] = data_counts[index].saturating_add(work.packets);
                 }
             }
         }
     }
     for state in &image.host_states {
         for generator in &state.generators {
-            if matches!(generator.kind, FlowGeneratorKind::Tcp(_)) {
+            // One ACK (TCP) or at most one CNP (DCQCN) per data packet.
+            if matches!(
+                generator.kind,
+                FlowGeneratorKind::Tcp(_) | FlowGeneratorKind::Dcqcn(_)
+            ) {
                 let flow = generator.flow.0 as usize;
                 feedback_counts[flow] = feedback_counts[flow].saturating_add(data_counts[flow]);
             }
@@ -1786,6 +1884,9 @@ fn inbound_producer_words(image: &SimulationImage) -> usize {
                 inbound[target].insert(producer);
             }
         }
+    }
+    for (producer, target) in crate::device_pfc::pfc_control_lane_producers(image) {
+        inbound[target].insert(producer);
     }
     inbound.iter().map(BTreeSet::len).sum()
 }
