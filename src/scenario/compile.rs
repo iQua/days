@@ -3120,6 +3120,14 @@ fn canonical_flows(
         normalized.push(semantic);
     }
     let collectives = normalized;
+    for compute in &computes {
+        if let Some(host) = compute.hosts.iter().find(|host| !hosts.contains(host)) {
+            return Err(CompileError::Invalid(format!(
+                "compute `{}` host {host} must be a configured host attachment",
+                compute.name
+            )));
+        }
+    }
     let groups = resolve_stage_groups(&collectives, &computes)?;
 
     let mut collective_duplicates = BTreeMap::<CollectiveKey, u64>::new();

@@ -468,3 +468,44 @@ after = "a"
         assert_eq!(late.next_emission.departure_time_ns, 11_000);
     }
 }
+
+#[test]
+fn compute_hosts_must_be_configured_host_attachments() {
+    // Review F1: a root compute group naming a non-host must fail lowering, not panic.
+    let config = |hosts: &str| {
+        format!(
+            r#"
+seed = 26
+edges = [[0, 2], [1, 2]]
+hosts = [0, 1]
+duration = 0.00001
+
+[switch]
+port_rate = 8000000000
+capacity = 100
+discipline = "FIFO"
+drop = "TailDrop"
+
+[[compute]]
+name = "a"
+hosts = {hosts}
+duration_ns = 4000
+"#
+        )
+    };
+    for (hosts, bad) in [("[0, 7]", 7), ("[0, 2]", 2)] {
+        assert_eq!(
+            lowering_error(&config(hosts)),
+            format!(
+                "invalid scenario: compute `a` host {bad} must be a configured host attachment"
+            )
+        );
+    }
+    // A compute-after-compute chain whose root names a non-host is caught at the root.
+    let chained = config("[0, 7]")
+        + "\n[[compute]]\nname = \"b\"\nhosts = [0, 7]\nduration_ns = 1\nafter = \"a\"\n";
+    assert_eq!(
+        lowering_error(&chained),
+        "invalid scenario: compute `a` host 7 must be a configured host attachment"
+    );
+}
