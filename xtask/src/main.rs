@@ -2,7 +2,8 @@ use std::path::Path;
 use std::process::Command;
 
 use xtask::{
-    AllowedDevDependency, AllowedFeatureGate, audit_boundary_metadata, audit_semantic_feature_gates,
+    AllowedDevDependency, AllowedFeatureGate, audit_boundary_metadata,
+    audit_semantic_feature_gates, audit_stage_path_table_access,
 };
 
 const LEGACY_DEV_DEPENDENCIES: &[AllowedDevDependency] = &[AllowedDevDependency {
@@ -182,6 +183,27 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     },
 ];
 
+/// Functions of `executor/src/scalar.rs` on the collective and compute stage path: stage release
+/// and progress, and the TCP transport and compute timer that carry a stage's bytes and time.
+/// Each runs per event on a host holding up to 2(n - 1) stage generators, so each must reach the
+/// host's tables through the counted stage view (`audit_stage_path_table_access`).
+const STAGE_PATH_FUNCTIONS: &[&str] = &[
+    "complete_local_successors",
+    "record_inbound_progress",
+    "host_packet_arrival",
+    "activate_ready_collectives",
+    "activate_wrapped_stage",
+    "start_compute_stage",
+    "host_compute_timer",
+    "push_stage_progress",
+    "host_tcp_initial_send",
+    "host_tcp_data_arrival",
+    "host_tcp_ack_arrival",
+    "host_pacing_timer",
+    "prepare_tcp_attempts",
+    "install_tcp_attempts",
+];
+
 const WIDTH_VIA_LOAD_FULL_TESTS: &[&str] = &[
     "width_via_load_full_load_10_holds_runtime_contract",
     "width_via_load_full_load_30_holds_runtime_contract",
@@ -242,10 +264,17 @@ fn run_audits(workspace: &Path) {
     {
         failures.push(format!("semantic feature-gate audit failed:\n{error}"));
     }
+    if let Err(error) = audit_stage_path_table_access(
+        &workspace.join("executor/src/scalar.rs"),
+        STAGE_PATH_FUNCTIONS,
+    ) {
+        failures.push(format!("stage-path table-access audit failed:\n{error}"));
+    }
 
     if failures.is_empty() {
         println!("legacy boundary audit: PASS");
         println!("semantic feature-gate audit: PASS");
+        println!("stage-path table-access audit: PASS");
     } else {
         eprintln!("{}", failures.join("\n\n"));
         std::process::exit(1);

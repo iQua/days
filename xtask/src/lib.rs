@@ -945,6 +945,235 @@ fn canonical_expr(expression: &Expr) -> syn::Result<String> {
     }
 }
 
+/// Host tables a stage-path function may read only through the stage view's counted accessors.
+///
+/// `generators` and `tcp_receivers` are the view's `ProbedTable`s, and `causes`/`stage_causes`
+/// the event's `PendingCauses`. The names are the bindings the executor uses for them.
+pub const STAGE_PATH_TABLES: &[&str] = &["generators", "tcp_receivers", "causes", "stage_causes"];
+
+/// Methods that begin a scan of a collection.
+const SCAN_METHODS: &[&str] = &["iter", "iter_mut", "into_iter"];
+
+/// Accessors that return a host's raw `HostState`, whose tables no probe counts.
+const RAW_HOST_ACCESSORS: &[&str] = &["host_state", "host_state_mut"];
+
+/// Element types of the raw host tables and of the raw pending-cause list.
+const RAW_TABLE_ELEMENTS: &[&str] = &["FlowGeneratorState", "TcpReceiverState"];
+const RAW_CAUSE_ELEMENT: &str = "PendingCollectiveProgress";
+
+/// P14 scan audit: the named stage-path functions of `scalar.rs` reach host tables only through
+/// the counted stage view, and never scan a table directly.
+///
+/// The rule rejects, inside each listed function (signature and body):
+/// - a scan of a stage-path table: `<table>.iter()`, `.iter_mut()`, `.into_iter()`, or a `for`
+///   loop over `<table>`, `&<table>` or `&mut <table>`, where `<table>` is a field or binding
+///   named in [`STAGE_PATH_TABLES`]. Keyed lookups through the stage index are the only per-event
+///   way into these tables;
+/// - raw host access that would bypass the view's counters: a call of `host_state` or
+///   `host_state_mut`, the `host_states` field, or the `HostState` type;
+/// - raw table types that would let a table escape the view: a slice of `FlowGeneratorState` or
+///   `TcpReceiverState`, or a `Vec` of `PendingCollectiveProgress`.
+///
+/// Every listed function must exist, so a rename cannot silently drop one from the audit. The
+/// rule is syntactic; a scan written through an alias it cannot see is still counted by the
+/// view's probe, which the scaling budget in `tests/scalar_stage_scaling.rs` gates.
+pub fn audit_stage_path_table_access(scalar_rs: &Path, functions: &[&str]) -> Result<(), String> {
+    let source = fs::read_to_string(scalar_rs)
+        .map_err(|error| format!("failed to read {}: {error}", scalar_rs.display()))?;
+    let violations = stage_path_table_violations(&source, functions)?;
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations.join("\n"))
+    }
+}
+
+/// The violations of [`audit_stage_path_table_access`] in `source`, one line each.
+pub fn stage_path_table_violations(
+    source: &str,
+    functions: &[&str],
+) -> Result<Vec<String>, String> {
+    let syntax = syn::parse_file(source).map_err(|error| format!("failed to parse: {error}"))?;
+    let mut finder = StageFunctionFinder {
+        functions,
+        found: BTreeSet::new(),
+        violations: Vec::new(),
+    };
+    finder.visit_file(&syntax);
+    let mut violations = finder.violations;
+    for function in functions {
+        if !finder.found.contains(*function) {
+            violations.push(format!(
+                "stage-path function `{function}` is listed for the table-access audit but not found"
+            ));
+        }
+    }
+    Ok(violations)
+}
+
+struct StageFunctionFinder<'a> {
+    functions: &'a [&'a str],
+    found: BTreeSet<String>,
+    violations: Vec<String>,
+}
+
+impl StageFunctionFinder<'_> {
+    fn check(&mut self, name: &syn::Ident, signature: &syn::Signature, block: &syn::Block) {
+        let name = name.to_string();
+        if !self.functions.contains(&name.as_str()) {
+            return;
+        }
+        self.found.insert(name.clone());
+        let mut checker = StageBodyChecker {
+            function: name,
+            violations: &mut self.violations,
+        };
+        checker.visit_signature(signature);
+        checker.visit_block(block);
+    }
+}
+
+impl<'ast> Visit<'ast> for StageFunctionFinder<'_> {
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        self.check(&item.sig.ident, &item.sig, &item.block);
+        syn::visit::visit_item_fn(self, item);
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        self.check(&item.sig.ident, &item.sig, &item.block);
+        syn::visit::visit_impl_item_fn(self, item);
+    }
+}
+
+struct StageBodyChecker<'a> {
+    function: String,
+    violations: &'a mut Vec<String>,
+}
+
+impl StageBodyChecker<'_> {
+    fn violation(&mut self, span: Span, message: String) {
+        self.violations.push(format!(
+            "scalar.rs:{}: in stage-path function `{}`: {message}",
+            span.start().line,
+            self.function
+        ));
+    }
+}
+
+/// The stage-path table an expression names, looking through references and parentheses.
+fn stage_path_table(expression: &Expr) -> Option<String> {
+    match expression {
+        Expr::Reference(reference) => stage_path_table(&reference.expr),
+        Expr::Paren(paren) => stage_path_table(&paren.expr),
+        Expr::Field(field) => match &field.member {
+            syn::Member::Named(ident) => Some(ident.to_string()),
+            syn::Member::Unnamed(_) => None,
+        },
+        Expr::Path(path) => path
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string()),
+        _ => None,
+    }
+    .filter(|name| STAGE_PATH_TABLES.contains(&name.as_str()))
+}
+
+/// Whether a type is, or is a path ending in, `name`.
+fn type_names(ty: &syn::Type, name: &str) -> bool {
+    match ty {
+        syn::Type::Path(path) => path
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == name),
+        syn::Type::Reference(reference) => type_names(&reference.elem, name),
+        syn::Type::Paren(paren) => type_names(&paren.elem, name),
+        _ => false,
+    }
+}
+
+impl<'ast> Visit<'ast> for StageBodyChecker<'_> {
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        let method = call.method.to_string();
+        if SCAN_METHODS.contains(&method.as_str()) {
+            if let Some(table) = stage_path_table(&call.receiver) {
+                self.violation(
+                    call.method.span(),
+                    format!("scans `{table}` with `.{method}()`; use a keyed stage-index lookup"),
+                );
+            }
+        }
+        if RAW_HOST_ACCESSORS.contains(&method.as_str()) {
+            self.violation(
+                call.method.span(),
+                format!("reaches the raw host state through `{method}`; use the stage view"),
+            );
+        }
+        syn::visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_expr_for_loop(&mut self, for_loop: &'ast syn::ExprForLoop) {
+        if let Some(table) = stage_path_table(&for_loop.expr) {
+            self.violation(
+                for_loop.for_token.span,
+                format!("scans `{table}` with a `for` loop; use a keyed stage-index lookup"),
+            );
+        }
+        syn::visit::visit_expr_for_loop(self, for_loop);
+    }
+
+    fn visit_expr_field(&mut self, field: &'ast syn::ExprField) {
+        if let syn::Member::Named(ident) = &field.member {
+            if ident == "host_states" {
+                self.violation(
+                    ident.span(),
+                    "reaches the raw host states; use the stage view".to_owned(),
+                );
+            }
+        }
+        syn::visit::visit_expr_field(self, field);
+    }
+
+    fn visit_type_slice(&mut self, slice: &'ast syn::TypeSlice) {
+        if let Some(element) = RAW_TABLE_ELEMENTS
+            .iter()
+            .find(|element| type_names(&slice.elem, element))
+        {
+            self.violation(
+                slice.bracket_token.span.join(),
+                format!("takes a raw `[{element}]` table, which bypasses the view's counters"),
+            );
+        }
+        syn::visit::visit_type_slice(self, slice);
+    }
+
+    fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
+        if let Some(last) = path.path.segments.last() {
+            if last.ident == "HostState" {
+                self.violation(
+                    last.ident.span(),
+                    "names the raw `HostState`; use the stage view".to_owned(),
+                );
+            }
+            if last.ident == "Vec" {
+                if let syn::PathArguments::AngleBracketed(arguments) = &last.arguments {
+                    let raw_causes = arguments.args.iter().any(|argument| {
+                        matches!(argument, syn::GenericArgument::Type(ty) if type_names(ty, RAW_CAUSE_ELEMENT))
+                    });
+                    if raw_causes {
+                        self.violation(
+                            last.ident.span(),
+                            format!("holds causes in a raw `Vec<{RAW_CAUSE_ELEMENT}>`; use `PendingCauses`"),
+                        );
+                    }
+                }
+            }
+        }
+        syn::visit::visit_type_path(self, path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1708,5 +1937,143 @@ mod tests {
             audit_semantic_feature_gates(Path::new("definitely-missing-executor-src"), &[])
                 .is_err()
         );
+    }
+
+    const STAGE_FUNCTIONS: &[&str] = &["record_inbound_progress", "host_tcp_data_arrival"];
+
+    fn stage_violations(body: &str) -> Vec<String> {
+        stage_path_table_violations(body, STAGE_FUNCTIONS).unwrap()
+    }
+
+    /// The indexed shape of the two functions probe A rewrote.
+    const INDEXED: &str = r#"
+fn record_inbound_progress(generators: &mut ProbedTable<'_, crate::FlowGeneratorState>, index: &mut HostStageIndex, inbound: FlowId, causes: &mut PendingCauses) {
+    let (successors, releasable) = index.inbound_successors_of(inbound);
+    for &position in successors {
+        let generator = &mut generators[position];
+        releasable.refresh(position, generator);
+    }
+}
+impl TransitionState<'_> {
+    fn host_tcp_data_arrival(&mut self, node: NodeDescriptor) {
+        let (mut state, index) = self.host_parts_mut(node).unwrap();
+        let receiver = &mut state.tcp_receivers[index.first_receiver(flow).unwrap()];
+        let mut stage_causes = PendingCauses::default();
+        record_inbound_progress(&mut state.generators, index, flow, &mut stage_causes);
+    }
+}
+"#;
+
+    #[test]
+    fn stage_table_audit_accepts_keyed_access_through_the_view() {
+        assert_eq!(stage_violations(INDEXED), Vec::<String>::new());
+    }
+
+    #[test]
+    fn stage_table_audit_rejects_probe_a_scans() {
+        // Probe A of the P14 scan review: the receiver found by a linear scan, and the inbound
+        // walk over every generator, in each form such a scan can take.
+        for (scan, expected) in [
+            (
+                "let position = state.tcp_receivers.iter().position(|receiver| receiver.flow == flow).unwrap();",
+                "scans `tcp_receivers` with `.iter()`",
+            ),
+            (
+                "let receiver = state.tcp_receivers.iter_mut().find(|receiver| receiver.flow == flow).unwrap();",
+                "scans `tcp_receivers` with `.iter_mut()`",
+            ),
+            (
+                "for (position, generator) in generators.iter_mut().enumerate() {}",
+                "scans `generators` with `.iter_mut()`",
+            ),
+            (
+                "for generator in generators {}",
+                "scans `generators` with a `for` loop",
+            ),
+            (
+                "for generator in &mut state.generators {}",
+                "scans `generators` with a `for` loop",
+            ),
+            (
+                "let first = stage_causes.iter().position(|cause| cause.flow == flow);",
+                "scans `stage_causes` with `.iter()`",
+            ),
+        ] {
+            let source = INDEXED.replace(
+                "let mut stage_causes = PendingCauses::default();",
+                &format!("let mut stage_causes = PendingCauses::default(); {scan}"),
+            );
+            let violations = stage_violations(&source);
+            assert_eq!(violations.len(), 1, "{scan}: {violations:?}");
+            assert!(violations[0].contains(expected), "{scan}: {violations:?}");
+            assert!(
+                violations[0].contains("`host_tcp_data_arrival`"),
+                "{violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn stage_table_audit_rejects_raw_host_access_and_raw_tables() {
+        for (raw, expected) in [
+            (
+                "let state = self.host_state_mut(node).unwrap();",
+                "through `host_state_mut`",
+            ),
+            (
+                "let flows = self.host_state(node).unwrap().generators.len();",
+                "through `host_state`",
+            ),
+            (
+                "let states = &self.host_states;",
+                "reaches the raw host states",
+            ),
+            (
+                "let state: &HostState = todo!();",
+                "names the raw `HostState`",
+            ),
+            (
+                "let table: &mut [crate::FlowGeneratorState] = todo!();",
+                "raw `[FlowGeneratorState]`",
+            ),
+            (
+                "let table: &[TcpReceiverState] = todo!();",
+                "raw `[TcpReceiverState]`",
+            ),
+            (
+                "let causes: Vec<PendingCollectiveProgress> = Vec::new();",
+                "raw `Vec<PendingCollectiveProgress>`",
+            ),
+        ] {
+            let source = INDEXED.replace(
+                "let mut stage_causes = PendingCauses::default();",
+                &format!("let mut stage_causes = PendingCauses::default(); {raw}"),
+            );
+            let violations = stage_violations(&source);
+            assert_eq!(violations.len(), 1, "{raw}: {violations:?}");
+            assert!(violations[0].contains(expected), "{raw}: {violations:?}");
+        }
+        // Probe A's original signature: the inbound walk over a raw generator slice.
+        let raw_signature = INDEXED.replace(
+            "generators: &mut ProbedTable<'_, crate::FlowGeneratorState>",
+            "generators: &mut [crate::FlowGeneratorState]",
+        );
+        let violations = stage_violations(&raw_signature);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].contains("`record_inbound_progress`: takes a raw `[FlowGeneratorState]`")
+        );
+    }
+
+    #[test]
+    fn stage_table_audit_ignores_unlisted_functions_and_requires_listed_ones() {
+        let source = format!(
+            "{INDEXED}\nfn host_retransmission_timeout(state: &mut HostState) {{ for generator in &mut state.generators {{}} }}"
+        );
+        assert_eq!(stage_violations(&source), Vec::<String>::new());
+        let violations =
+            stage_path_table_violations(INDEXED, &["record_inbound_progress", "renamed"]).unwrap();
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("`renamed` is listed"));
     }
 }
