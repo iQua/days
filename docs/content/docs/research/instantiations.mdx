@@ -29,10 +29,12 @@ The Lean build (`lean/lakefile.lean`) currently carries:
 - **Cross-check**: `aqm_dcqcn_check` ties the legacy AQM and DCQCN
   vocabularies together.
 
-Backend capability boundaries apply to generation, not checking: PFC,
-DCQCN, RED, and collective generators run on Scalar/CPU and are rejected by
-the Metal/CUDA validator before execution, so those certificate families
-are produced by CPU-side runs only.
+Backend capability boundaries apply to generation, not checking. Device
+runs do not return the diagnostic planes that hold transition records, so
+every Days AGO certificate family is produced by Scalar or CPU runs. PFC and
+DCQCN also run on Metal and CUDA, byte-identical to Scalar; RED and
+collective generators run on Scalar and CPU only and are rejected by the
+Metal/CUDA validator before execution.
 
 ## Summary table (legacy families)
 
@@ -61,7 +63,7 @@ Days AGO ECN-threshold marking has its own certificate schema
 PFC frames at emission and reception, with refresh/cooldown rows. Checks:
 each `pfc_recv` matches a distinct earlier `pfc_sent`; refresh/cooldown
 gates respected; per-port parameters constant. Legacy engine only as a
-generator; the exact engine rejects PFC on device backends by validation.
+generator.
 
 ### WFQ scheduler (`wfq_events.csv`)
 
