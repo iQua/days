@@ -771,3 +771,30 @@ pub struct SimulationImage {
     pub initial_events: Vec<Event>,
     pub seed: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::FlowGeneratorState;
+
+    /// `FlowGeneratorState` is held once per flow in the image and in every Scalar and CPU host
+    /// state, so each byte is a per-flow cost at lowering and at run time: at the 262,144-flow
+    /// frontier every 16 B is 4.2 MB. Before P14 (`main` at 948a0e9) it was 352 B. P14 carried the
+    /// collective or compute stage record inline as `stage: Option<CollectiveStage>` (136 B, padded
+    /// to 144 B by the type's 16-byte alignment), 496 B for every generator though most are not
+    /// stages. The record now lives in the host's parallel `HostState::stages` table, so the
+    /// generator is back to `main`'s layout. `repr(C)` with the 16-byte alignment `u128` credit
+    /// forces gives no spare bytes, so any field added here rounds up to 368 B.
+    ///
+    /// Layout is the compiler's choice, so the bound is an upper bound on 64-bit targets.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn flow_generator_state_keeps_main_size() {
+        const FLOW_GENERATOR_STATE_MAX_BYTES: usize = 352;
+        let size = std::mem::size_of::<FlowGeneratorState>();
+        assert!(
+            size <= FLOW_GENERATOR_STATE_MAX_BYTES,
+            "FlowGeneratorState grew to {size} B, above {FLOW_GENERATOR_STATE_MAX_BYTES} B: keep \
+             per-generator stage data in the host's `stages` table"
+        );
+    }
+}
