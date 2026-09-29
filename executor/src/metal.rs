@@ -1282,6 +1282,11 @@ impl MetalExecutor {
                     &mut channel_capacity_floors,
                     &mut tcp_capacity_floors,
                 )?;
+                // The plain kernel has no device-side stop: the host refuses it, before upload, on
+                // any plan holding state a mechanism transition would act on.
+                if round_kernel == RoundKernel::Plain {
+                    plan.refuse_plain_round_kernel()?;
+                }
                 let buffers = MetalBuffers::new(&self.direct.device, plan)?;
                 let _execution_guard = metal_device_execution_guard();
                 let timing = self.direct.run(&buffers, attempt_config, round_kernel)?;
@@ -1587,6 +1592,41 @@ fn encoding_limits(rounds_per_command_buffer: usize) -> (usize, usize) {
         .saturating_mul(MAX_COMMAND_BUFFERS)
         .min(MAX_ENCODED_PAIRS_PER_WAVE);
     (pairs_per_command_buffer, pairs_per_wave)
+}
+
+impl MetalPlan {
+    /// Refuses the plain round kernel on this plan, before it is uploaded, if the plan holds any
+    /// state a `MECHANISMS`-guarded kernel branch would act on
+    /// ([`crate::device_mechanism::plain_round_kernel_refusal`]).
+    fn refuse_plain_round_kernel(&self) -> Result<(), MetalError> {
+        let plan = crate::device_mechanism::UploadedPlan {
+            pfc_offset: self.params[PARAM_PFC_OFFSET],
+            receiver_offset: self.params[PARAM_RECEIVER_OFFSET],
+            // `P_NODE_COUNT` and `P_FLOW_COUNT`.
+            node_count: self.params[0] as usize,
+            flow_count: self.params[1] as usize,
+            node_state: &self.node_state,
+            generators: &self.generators,
+            flows: &self.flows,
+            fel_meta: &self.fel_meta,
+            fel_records: &self.fel_records,
+            queue_meta: &self.queue_meta,
+            queue_records: &self.queue_records,
+            in_service: &self.in_service,
+            stream_state: &self.stream_state,
+            stream_records: &self.stream_records,
+            stream_count: self.stream_layout.stream_count,
+            service_stream_base: self.stream_layout.service_stream_base,
+            generator_stream_base: self.stream_layout.generator_stream_base,
+            tcp_state: &self.tcp_state,
+        };
+        match crate::device_mechanism::plain_round_kernel_refusal(&plan) {
+            None => Ok(()),
+            Some(refusal) => Err(MetalError::MechanismsKernelRequired {
+                node: refusal.node(),
+            }),
+        }
+    }
 }
 
 #[derive(Eq, PartialEq)]

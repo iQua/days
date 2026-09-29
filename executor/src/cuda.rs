@@ -1324,6 +1324,11 @@ impl CudaExecutor {
                     &mut channel_capacity_floors,
                     &mut tcp_capacity_floors,
                 )?;
+                // The plain kernel has no device-side stop: the host refuses it, before upload, on
+                // any plan holding state a mechanism transition would act on.
+                if round_kernel == RoundKernel::Plain {
+                    plan.refuse_plain_round_kernel()?;
+                }
                 let _execution_guard = direct.execution_guard();
                 let buffers = CudaBuffers::new(&direct.stream, plan, direct.provisioning)?;
                 let timing = direct.run(&buffers, attempt_config, round_kernel)?;
@@ -1660,6 +1665,41 @@ fn injected_capacity(config: CudaConfig, arena: CudaArena, default: usize) -> us
     }
     let _ = (config, arena);
     default
+}
+
+impl CudaPlan {
+    /// Refuses the plain round kernel on this plan, before it is uploaded, if the plan holds any
+    /// state a `MECHANISMS`-guarded kernel branch would act on
+    /// ([`crate::device_mechanism::plain_round_kernel_refusal`]).
+    fn refuse_plain_round_kernel(&self) -> Result<(), CudaError> {
+        let plan = crate::device_mechanism::UploadedPlan {
+            pfc_offset: self.params[PARAM_PFC_OFFSET],
+            receiver_offset: self.params[PARAM_RECEIVER_OFFSET],
+            // `P_NODE_COUNT` and `P_FLOW_COUNT`.
+            node_count: self.params[0] as usize,
+            flow_count: self.params[1] as usize,
+            node_state: &self.node_state,
+            generators: &self.generators,
+            flows: &self.flows,
+            fel_meta: &self.fel_meta,
+            fel_records: &self.fel_records,
+            queue_meta: &self.queue_meta,
+            queue_records: &self.queue_records,
+            in_service: &self.in_service,
+            stream_state: &self.stream_state,
+            stream_records: &self.stream_records,
+            stream_count: self.stream_layout.stream_count,
+            service_stream_base: self.stream_layout.service_stream_base,
+            generator_stream_base: self.stream_layout.generator_stream_base,
+            tcp_state: &self.tcp_state,
+        };
+        match crate::device_mechanism::plain_round_kernel_refusal(&plan) {
+            None => Ok(()),
+            Some(refusal) => Err(CudaError::MechanismsKernelRequired {
+                node: refusal.node(),
+            }),
+        }
+    }
 }
 
 #[derive(Eq, PartialEq)]
