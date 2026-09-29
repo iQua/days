@@ -1,8 +1,12 @@
 //! P14 spec: every Lane B entry point in both round kernels is guarded by the specialization
-//! constant, so the plain `days_round` build compiles the DCQCN and PFC code out.
+//! constant, so the plain `days_round` build compiles the DCQCN and PFC code out, and the plain
+//! build carries no mechanism code of its own: no device-side stop (the host refuses the plain
+//! kernel on mechanism plans, `device_mechanism::plain_round_kernel_refusal`) and no forwarding
+//! function (round 2, `evidence/P14/zero-cost-diagnosis.md` §3.2).
 //!
-//! The constant is the `MECHANISMS` template parameter in `cuda_kernels.cu` and the
-//! `DAYS_MECHANISMS` function constant in `metal_kernels.metal`. A Lane B entry point is a call
+//! The constant is `MECHANISMS` in CUDA (a block-scope `constexpr bool` in each round kernel, ahead
+//! of the included round body, and the template parameter of the helpers it calls) and the
+//! `DAYS_MECHANISMS` function constant in Metal. A Lane B entry point is a call
 //! into one of the functions Lane B added (listed below, from `git diff 948a0e9 b912af6`), or a
 //! read of the PFC region offset or of a DCQCN receiver-row marker, made from code outside those
 //! functions. Each must sit in a statement, or under an enclosing condition, that tests the
@@ -12,6 +16,20 @@
 
 const CUDA: &str = include_str!("../src/cuda_kernels.cu");
 const METAL: &str = include_str!("../src/metal_kernels.metal");
+/// The CUDA round body, included by both round kernels.
+const CUDA_ROUND_BODY: &str = "src/cuda_round_body.inc";
+
+/// The CUDA round body's text, read at run time so a missing file fails as a test.
+fn cuda_round_body() -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(CUDA_ROUND_BODY);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("{} must exist: {error}", path.display()))
+}
+
+/// The CUDA source as the compiler sees the round kernels: the kernel file and the round body.
+fn cuda_source() -> String {
+    format!("{CUDA}\n{}", cuda_round_body())
+}
 
 /// The functions P14 Lane B added to both kernels.
 const LANE_B_FUNCTIONS: [&str; 21] = [
@@ -41,10 +59,10 @@ const LANE_B_FUNCTIONS: [&str; 21] = [
 /// Plane reads that exist only for Lane B: the PFC region offset and the DCQCN receiver marker.
 const LANE_B_READS: [&str; 2] = ["params[P_PFC_OFFSET]", "DCQCN_RECEIVER_NO_CNP"];
 
-fn kernels() -> [(&'static str, &'static str, &'static str); 2] {
+fn kernels() -> [(&'static str, String, &'static str); 2] {
     [
-        ("CUDA", CUDA, "MECHANISMS"),
-        ("Metal", METAL, "DAYS_MECHANISMS"),
+        ("CUDA", cuda_source(), "MECHANISMS"),
+        ("Metal", METAL.to_owned(), "DAYS_MECHANISMS"),
     ]
 }
 
@@ -178,7 +196,7 @@ fn entry_points(source: &str) -> Vec<(usize, String)> {
 fn every_lane_b_entry_point_tests_the_specialization_constant() {
     for (backend, source, constant) in kernels() {
         let lines = source.lines().collect::<Vec<_>>();
-        let sites = entry_points(source);
+        let sites = entry_points(&source);
         assert!(
             sites.len() >= 20,
             "{backend}: the entry-point scan found only {} sites",
@@ -199,13 +217,13 @@ fn every_lane_b_entry_point_tests_the_specialization_constant() {
 
 #[test]
 fn both_kernels_guard_the_same_entry_points() {
-    let tokens = |source| {
+    let tokens = |source: &str| {
         entry_points(source)
             .into_iter()
             .map(|(_, token)| token)
             .collect::<Vec<_>>()
     };
-    let mut cuda = tokens(CUDA);
+    let mut cuda = tokens(&cuda_source());
     let mut metal = tokens(METAL);
     cuda.sort_unstable();
     metal.sort_unstable();
@@ -215,14 +233,16 @@ fn both_kernels_guard_the_same_entry_points() {
     );
 }
 
+/// One round body, included verbatim by both CUDA round kernels, each preceded by its own
+/// `constexpr bool MECHANISMS`: no forwarding function. Compiled through a forwarding function, the
+/// body lost the hoisting of launch-constant `params` loads, and neither kernel matched its
+/// reference byte for byte (`evidence/P14/zero-cost-diagnosis.md` §1.4, §2.2).
 #[test]
-fn the_constant_selects_between_two_builds_of_one_round_body() {
-    assert_eq!(
-        CUDA.matches(
-            "template <bool MECHANISMS>\n__device__ __forceinline__ void days_round_body("
-        )
-        .count(),
-        1
+fn both_cuda_round_kernels_include_one_body_without_a_forwarding_function() {
+    assert!(!CUDA.contains("days_round_body"), "no forwarding function");
+    assert!(
+        !CUDA.contains("DAYS_BUFFER_ARGS"),
+        "no forwarded argument list"
     );
     // The mechanisms build states one resident block per SM: under `__launch_bounds__(256)` alone,
     // CUDA 13.0's ptxas targets 128 registers on sm_121 for it and spills (evidence/P14/spec.md
@@ -234,34 +254,41 @@ fn the_constant_selects_between_two_builds_of_one_round_body() {
         assert!(
             CUDA.contains(&format!(
                 "extern \"C\" __global__ __launch_bounds__({bounds}) void {build}(DAYS_BUFFERS) {{\n    \
-                 days_round_body<{value}>(DAYS_BUFFER_ARGS);\n}}"
+                 constexpr bool MECHANISMS = {value};\n#include \"cuda_round_body.inc\"\n}}"
             )),
             "{build}"
         );
     }
+    assert_eq!(CUDA.matches("#include \"cuda_round_body.inc\"").count(), 2);
+    let body = cuda_round_body();
+    assert!(body.contains("dispatch_event<MECHANISMS>("));
+    assert!(
+        !body.contains("#include") && !body.contains("__global__"),
+        "the body is statements only"
+    );
+    let build = include_str!("../build.rs");
+    assert!(build.contains("cargo:rerun-if-changed=src/cuda_round_body.inc"));
     assert!(METAL.contains("constant bool DAYS_MECHANISMS [[function_constant(0)]];"));
     assert_eq!(METAL.matches("[[function_constant(").count(), 1);
 }
 
-/// The plain build fails closed on every DCQCN or PFC source it can meet, with the one error the
-/// hosts decode as `MechanismsKernelRequired`.
+/// The plain build carries no mechanism code: every Lane B entry point is guarded by the constant
+/// (above), and nothing tests its negation. There is no device-side stop and no mechanism error
+/// code; the host check of the uploaded plan is the plain kernel's only fail-closed path.
 #[test]
-fn the_plain_build_fails_closed_with_one_error_code() {
+fn the_plain_build_has_no_device_side_stop() {
     for (backend, source, constant) in kernels() {
-        let raise = "set_semantic_error(state, ERROR_MECHANISMS_REQUIRED";
-        let raise_error = "set_semantic_error(error, ERROR_MECHANISMS_REQUIRED";
-        let sites = source.matches(raise).count() + source.matches(raise_error).count();
-        // The round-entry PFC check, the DCQCN generator timer, and the three packet kinds.
-        assert_eq!(sites, 5, "{backend}");
-        let lines = source.lines().collect::<Vec<_>>();
-        for (index, line) in lines.iter().enumerate() {
-            if line.contains(raise) || line.contains(raise_error) {
-                assert!(
-                    guarded(&lines, index, &format!("!{constant}")),
-                    "{backend}:{}: the fail-closed stop must test !{constant}",
-                    index + 1
-                );
-            }
-        }
+        let negated = format!("!{constant}");
+        let lines = source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| code(line).contains(&negated))
+            .map(|(index, line)| format!("{}: {}", index + 1, line.trim()))
+            .collect::<Vec<_>>();
+        assert!(lines.is_empty(), "{backend}: {}", lines.join("\n"));
+        assert!(
+            !source.contains("ERROR_MECHANISMS_REQUIRED"),
+            "{backend}: no mechanism error code"
+        );
     }
 }
