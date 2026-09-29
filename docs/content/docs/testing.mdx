@@ -70,7 +70,7 @@ cargo test -p days --features test --test e5_wide_tcp_fixtures -- --list
 
 ## Metal on Apple7-family GPUs
 
-The Metal backend refuses Apple M1-family GPUs (Apple7); see [Installation](/docs/install#metal). To investigate the miscompilation, `DAYS_METAL_ALLOW_APPLE7=1` skips the refusal and prints a warning on standard error. Results on such a GPU are known to be wrong, and a cold build of the `days_round` pipeline takes about ten minutes.
+The Metal backend refuses Apple M1-family GPUs (Apple7); see [Installation](/docs/install#metal). To investigate the incorrect code generation, `DAYS_METAL_ALLOW_APPLE7=1` skips the refusal and prints a warning on standard error. Results on such a GPU are known to be wrong, and a cold build of the `days_round` pipeline takes about ten minutes.
 
 ## Legacy Days
 

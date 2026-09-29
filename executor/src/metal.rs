@@ -5293,7 +5293,7 @@ impl DirectMetal {
 }
 
 /// Environment variable that lets the backend run on an Apple7-family GPU anyway, when set to
-/// `1`. It exists only to investigate the miscompilation [`GpuFamilyVerdict::of`] describes:
+/// `1`. It exists only to investigate the incorrect code [`GpuFamilyVerdict::of`] describes:
 /// results on such a GPU are known to be wrong, and a warning says so on standard error.
 const ALLOW_APPLE7_ENV: &str = "DAYS_METAL_ALLOW_APPLE7";
 
@@ -5314,10 +5314,10 @@ impl GpuFamilyVerdict {
     ///
     /// Apple7-only GPUs (AGX G13, the Apple M1 family) are refused. On them the Metal compiler
     /// takes about ten minutes on macOS 27.0, and more than fifteen on macOS 15.8, to build the
-    /// `days_round` pipeline, whose compiled code is then wrong: an LP's second transition in round
-    /// 0 reads a stale value from its first and faults with semantic error 25, and with streams
-    /// disabled the run completes with bytes that differ from the Scalar oracle. The same kernel
-    /// source run on the CPU matches Scalar, and removing never-executed handlers from
+    /// `days_round` pipeline, and the code it produces is incorrect: an LP's second transition in
+    /// round 0 reads a stale value from its first and faults with semantic error 25, and with
+    /// streams disabled the run completes with bytes that differ from the Scalar oracle. The same
+    /// kernel source run on the CPU matches Scalar, and removing never-executed handlers from
     /// `dispatch_event` makes the GPU result correct, which points to the compiler. Measured on an
     /// Apple M1 Max under macOS 15.8 and 27.0; an Apple M3 (Apple9) and the Apple M5 Max are
     /// correct. Apple8 (the M2 family) is untested and currently runs.
@@ -5349,15 +5349,15 @@ fn gpu_family_outcome(verdict: GpuFamilyVerdict, device_name: &str) -> Result<()
         GpuFamilyVerdict::RunKnownWrong => {
             eprintln!(
                 "warning: {ALLOW_APPLE7_ENV}=1: running Metal on {device_name}, an Apple7-family \
-                 GPU whose Metal compiler miscompiles the Days kernels; results are known to be \
-                 wrong"
+                 GPU whose Metal compiler produces incorrect code for the Days kernels; results \
+                 are known to be wrong"
             );
             Ok(())
         }
         GpuFamilyVerdict::Refuse => Err(MetalError::Unavailable(format!(
             "{device_name} is an Apple7-family GPU (the Apple M1 family); the Metal compiler for \
-             this GPU family miscompiles the Days kernels, so the Metal backend refuses it; use \
-             --engine scalar or --engine cpu"
+             this GPU family produces incorrect code for the Days kernels, so the Metal backend \
+             refuses it; use --engine scalar or --engine cpu"
         ))),
     }
 }
@@ -5805,7 +5805,7 @@ mod tests {
         for expected in [
             "Apple M1 Max",
             "Apple7",
-            "miscompiles the Days kernels",
+            "produces incorrect code for the Days kernels",
             "--engine scalar",
             "--engine cpu",
         ] {

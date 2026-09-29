@@ -21,7 +21,7 @@ On Apple platforms, the `metal` feature enables the Metal backend:
 cargo build --release --features metal --bin days
 ```
 
-The Metal backend is tested on the Apple M5 Max and M3. It refuses Apple M1-family GPUs (GPU family Apple7) before compiling any kernel, because the Metal compiler for that family miscompiles the Days kernels; use `--engine scalar` or `--engine cpu` there. M2-family GPUs (Apple8) are untested.
+The Metal backend is tested on the Apple M5 Max and M3. It refuses Apple M1-family GPUs (GPU family Apple7) before compiling any kernel, because the Metal compiler for that family produces incorrect code for the Days kernels; use `--engine scalar` or `--engine cpu` there. M2-family GPUs (Apple8) are untested.
 
 ## CUDA
 
