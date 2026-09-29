@@ -48,3 +48,41 @@ fn the_receiver_marker_is_read_only_when_the_image_has_dcqcn_receivers() {
         );
     }
 }
+
+#[test]
+fn pfc_rows_are_looked_up_only_when_the_image_has_a_pfc_region() {
+    for (backend, source) in kernels() {
+        // TX_READY and TX_COMPLETE at a switch, and a switch's data arrival.
+        assert_eq!(
+            source
+                .matches("(mechanisms & MECHANISM_PFC_REGION) != 0\n")
+                .count(),
+            3,
+            "{backend}: the three per-transition PFC row lookups must test the launch-uniform \
+             PFC bit before they read params[P_PFC_OFFSET]"
+        );
+        assert!(
+            !source.contains("ulong pfc_row = role == SWITCH ? pfc_queue_row(")
+                && !source.contains("ulong pfc_row = pfc_queue_row("),
+            "{backend}: the ungated PFC row lookups must be gone"
+        );
+    }
+}
+
+#[test]
+fn dcqcn_branches_are_taken_only_when_the_image_has_dcqcn_state() {
+    for (backend, source) in kernels() {
+        for gated in [
+            "if ((mechanisms & MECHANISM_DCQCN) != 0 &&\n            \
+             (event[PK_KIND] & PK_KIND_MASK) == DCQCN_CONTROL_TIMER_PACKET) {",
+            "if ((mechanisms & MECHANISM_DCQCN) != 0 &&\n            \
+             flow < params[P_FLOW_COUNT] && generators[generator + G_VALID] != 0 &&",
+            "if ((mechanisms & MECHANISM_DCQCN) != 0 && packet_kind == DCQCN_CNP_PACKET) {",
+        ] {
+            assert!(
+                source.contains(gated),
+                "{backend}: missing the launch-uniform DCQCN gate `{gated}`"
+            );
+        }
+    }
+}
