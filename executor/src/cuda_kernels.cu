@@ -138,6 +138,16 @@ constexpr uint P_PFC_OFFSET = 31;
 constexpr uint P_MECHANISMS = 32;
 constexpr ulong MECHANISM_DCQCN_RECEIVERS = 1;
 constexpr ulong MECHANISM_DCQCN = 2;
+// Kernel-only bit of the launch-uniform mechanisms value: the image carries a PFC region.
+constexpr ulong MECHANISM_PFC_REGION = 4;
+
+// The launch-uniform mechanisms value: read once by the round kernel, before its transition loop,
+// and passed down, so the transition code tests a register instead of re-reading params.
+__device__ __forceinline__ uint launch_mechanisms(const ulong *params) {
+    return static_cast<uint>(
+        params[P_MECHANISMS] | (params[P_PFC_OFFSET] != NONE ? MECHANISM_PFC_REGION : 0)
+    );
+}
 constexpr uint PFC_ROW_HEADER_WORDS = 5;
 constexpr uint PFC_INGRESS_WORDS = 43;
 constexpr uint PI_LINK = 0;
@@ -4733,7 +4743,8 @@ __device__ __forceinline__ bool dispatch_event(
     ulong *tcp_state,
     bool retain_continuation,
     bool &has_continuation,
-    bool &counted_continuation
+    bool &counted_continuation,
+    uint mechanisms
 ) {
     ulong node_base = node * NODE_WORDS;
     ulong role = node_state[node_base + N_KIND];
@@ -4742,12 +4753,15 @@ __device__ __forceinline__ bool dispatch_event(
     if (kind == PACING_TIMER && role == HOST) {
         ulong flow = event[PK_FLOW];
         ulong generator = flow * GENERATOR_WORDS;
-        if ((event[PK_KIND] & PK_KIND_MASK) == DCQCN_CONTROL_TIMER_PACKET) {
+        // P14 perf: an image without DCQCN state has no control timers and no DCQCN generators.
+        if ((mechanisms & MECHANISM_DCQCN) != 0 &&
+            (event[PK_KIND] & PK_KIND_MASK) == DCQCN_CONTROL_TIMER_PACKET) {
             return dcqcn_control_timer(
                 node, event, error, params, node_state, generators, fel_meta, fel_records,
                 remote_meta, remote_staging, stream_state, stream_records, tcp_state);
         }
-        if (flow < params[P_FLOW_COUNT] && generators[generator + G_VALID] != 0 &&
+        if ((mechanisms & MECHANISM_DCQCN) != 0 &&
+            flow < params[P_FLOW_COUNT] && generators[generator + G_VALID] != 0 &&
             generators[generator + G_OWNER] == node &&
             generators[generator + G_KIND] == GENERATOR_KIND_DCQCN) {
             return dcqcn_pacing_timer(
@@ -5125,7 +5139,9 @@ __device__ __forceinline__ bool dispatch_event(
         bool selected_position_valid = true;
         // PFC: while a priority is paused, selection runs over the eligible packets only, as the
         // scalar eligible-packet plan does. With nothing eligible the decision point is a no-op.
-        ulong pfc_row = role == SWITCH ? pfc_queue_row(node, params, scheduler_state) : NONE;
+        // P14 perf: an image without a PFC region skips the params and row reads.
+        ulong pfc_row = role == SWITCH && (mechanisms & MECHANISM_PFC_REGION) != 0
+            ? pfc_queue_row(node, params, scheduler_state) : NONE;
         ulong paused_mask = pfc_row == NONE ? 0 : pfc_paused_mask(pfc_row, scheduler_state);
         if (paused_mask != 0) {
             selected_position = pfc_first_eligible(
@@ -5352,7 +5368,8 @@ __device__ __forceinline__ bool dispatch_event(
             node_state[node_base + N_READY_PENDING] == 0
         ) {
             ulong next[EVENT_WORDS];
-            ulong pfc_row = role == SWITCH ? pfc_queue_row(node, params, scheduler_state) : NONE;
+            ulong pfc_row = role == SWITCH && (mechanisms & MECHANISM_PFC_REGION) != 0
+                ? pfc_queue_row(node, params, scheduler_state) : NONE;
             if (pfc_row != NONE) {
                 // PFC: the next decision point serves the first packet whose priority is unpaused;
                 // with none eligible, service waits for a resume.
@@ -5438,7 +5455,8 @@ __device__ __forceinline__ bool dispatch_event(
         ulong scheduler_base = node * SCHEDULER_NODE_WORDS;
         // PFC: the monitor of the packet's incoming link, when it controls the packet's priority.
         // Admission past its buffer capacity drops before any AQM decision.
-        ulong pfc_row = pfc_queue_row(node, params, scheduler_state);
+        ulong pfc_row = (mechanisms & MECHANISM_PFC_REGION) != 0
+            ? pfc_queue_row(node, params, scheduler_state) : NONE;
         ulong pfc_priority = 0;
         ulong pfc_ingress = NONE;
         if (pfc_row != NONE) {
@@ -5805,7 +5823,8 @@ __device__ __forceinline__ bool dispatch_event(
     if (kind == REMOTE_ARRIVAL && role == HOST) {
         ulong flow_base = event[PK_FLOW] * FLOW_WORDS;
         ulong packet_kind = event[PK_KIND] & PK_KIND_MASK;
-        if (packet_kind == DCQCN_CNP_PACKET) {
+        // P14 perf: a CNP exists only in an image with DCQCN state.
+        if ((mechanisms & MECHANISM_DCQCN) != 0 && packet_kind == DCQCN_CNP_PACKET) {
             return dcqcn_cnp_arrival(
                 node, event, error, params, generators, flows, summary, observation_meta,
                 observed, arrivals);
@@ -6304,6 +6323,7 @@ extern "C" __global__ __launch_bounds__(256) void days_round(DAYS_BUFFERS) {
     ulong event[EVENT_WORDS];
     bool has_continuation = false;
     ulong dispatch_transitions = 0;
+    const uint mechanisms = launch_mechanisms(params);
     while (dispatch_transitions < params[P_TRANSITION_CAPACITY]) {
         ulong popped_timer_owner = NONE;
         if (has_continuation) {
@@ -6375,7 +6395,8 @@ extern "C" __global__ __launch_bounds__(256) void days_round(DAYS_BUFFERS) {
             tcp_state,
             dispatch_transitions + 1 < params[P_TRANSITION_CAPACITY],
             has_continuation,
-            counted_continuation
+            counted_continuation,
+            mechanisms
         )) {
             return;
         }
