@@ -6449,8 +6449,11 @@ extern "C" __global__ __launch_bounds__(256) void days_round(DAYS_BUFFERS) {
     days_round_body<false>(DAYS_BUFFER_ARGS);
 }
 
-// The mechanisms build: every image, including DCQCN and PFC state.
-extern "C" __global__ __launch_bounds__(256) void days_round_mechanisms(DAYS_BUFFERS) {
+// The mechanisms build: every image, including DCQCN and PFC state. It states one resident block
+// per SM: with `__launch_bounds__(256)` alone, CUDA 13.0's ptxas targets 128 registers on sm_121
+// for this body and spills; with the minimum stated it allocates 232 and does not (sm_86 and sm_89
+// are unchanged).
+extern "C" __global__ __launch_bounds__(256, 1) void days_round_mechanisms(DAYS_BUFFERS) {
     days_round_body<true>(DAYS_BUFFER_ARGS);
 }
 
