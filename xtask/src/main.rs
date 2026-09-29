@@ -28,14 +28,14 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "cuda.rs",
         predicate: r#"feature = "cuda-test-hooks""#,
-        count: 11,
-        purpose: "CUDA-only fault injection, capacity, and worklist-compaction hooks",
+        count: 14,
+        purpose: "CUDA-only fault injection, capacity, and worklist-compaction hooks, and the P14 round-kernel override that forces either `days_round` build (the config field, its default, and its one read)",
     },
     AllowedFeatureGate {
         path: "metal.rs",
         predicate: r#"feature = "metal-test-hooks""#,
-        count: 19,
-        purpose: "Metal-only panic, fault-injection, T21 occupancy, and worklist-compaction hooks",
+        count: 22,
+        purpose: "Metal-only panic, fault-injection, T21 occupancy, and worklist-compaction hooks, and the P14 round-kernel override that forces either `days_round` pipeline (the config field, its default, and its one read)",
     },
     AllowedFeatureGate {
         path: "metal.rs",
@@ -106,8 +106,8 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "lib.rs",
         predicate: r#"any(feature = "cuda", all(feature = "metal", target_vendor = "apple"))"#,
-        count: 1,
-        purpose: "shared planner lookup tables exist only when a device planner is built",
+        count: 2,
+        purpose: "shared planner lookup tables exist only when a device planner is built; P14's `RoundKernel` selection type is exported only with a device backend, the only builds with two `days_round` builds to select between",
     },
     AllowedFeatureGate {
         path: "lib.rs",

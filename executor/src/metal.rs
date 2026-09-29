@@ -19,8 +19,9 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSString;
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
-    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLDispatchType, MTLGPUFamily, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDataType,
+    MTLDevice, MTLDispatchType, MTLFunctionConstantValues, MTLGPUFamily, MTLLibrary,
+    MTLResourceOptions, MTLSize,
 };
 
 use crate::device_compaction::{
@@ -31,6 +32,7 @@ use crate::device_event_record::{
     SERVICE_EVENT_WORDS, StoredEventClass, decode_event_record, stored_event_words,
     stream_event_class,
 };
+use crate::device_mechanism::RoundKernel;
 use crate::device_scheduler::{
     QUEUE_META_WORDS, prepare_device_schedulers, restore_device_scheduler,
 };
@@ -281,10 +283,19 @@ impl AttemptKernel {
             Self::FinalControl => MetalKernel::Finalize,
         }
     }
+
+    /// The pipeline this dispatch uses in a run whose round kernel build is `round_kernel`.
+    const fn metal_kernel_for(self, round_kernel: RoundKernel) -> MetalKernel {
+        match (self.metal_kernel(), round_kernel) {
+            (MetalKernel::Round, RoundKernel::Mechanisms) => MetalKernel::RoundMechanisms,
+            (kernel, _) => kernel,
+        }
+    }
 }
 
-/// Every Metal entry point. [`DirectMetal`] compiles the source into one library and creates
-/// exactly these pipelines from it, stored at `kernel as usize`.
+/// Every Metal pipeline. [`DirectMetal`] compiles the source into one library and creates exactly
+/// these pipelines from it, stored at `kernel as usize`. `days_round` yields two pipelines, one per
+/// value of the `DAYS_MECHANISMS` function constant.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MetalKernel {
     /// T21 fix 1: the Θ(N) FEL-root sweep, on the full grid.
@@ -293,6 +304,7 @@ enum MetalKernel {
     /// T21 fix 1: `days_round_prepare`'s Θ(N) + Θ(C) resets, on the full grid.
     RoundReset,
     RoundPrepare,
+    /// `days_round` with `DAYS_MECHANISMS = false`: DCQCN and PFC compiled out.
     Round,
     /// T21 fix 1: the round-control scans, on the full grid.
     ControlSweep,
@@ -308,11 +320,14 @@ enum MetalKernel {
     /// T20l fix 2: the readback gather. Not part of an attempt; encoded only by
     /// [`DirectMetal::compact`], after the attempt has been screened as successful.
     CompactGather,
+    /// P14: `days_round` with `DAYS_MECHANISMS = true`, dispatched in place of [`Self::Round`]
+    /// when the run's image holds DCQCN or PFC state ([`RoundKernel::Mechanisms`]).
+    RoundMechanisms,
 }
 
 impl MetalKernel {
     /// In discriminant order, so `ALL[kernel as usize] == kernel`.
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 15] = [
         Self::HorizonSweep,
         Self::Horizon,
         Self::RoundReset,
@@ -327,6 +342,7 @@ impl MetalKernel {
         Self::FinalizeSweep,
         Self::Finalize,
         Self::CompactGather,
+        Self::RoundMechanisms,
     ];
 
     const fn entry_point(self) -> &'static str {
@@ -335,7 +351,7 @@ impl MetalKernel {
             Self::Horizon => "days_horizon",
             Self::RoundReset => "days_round_reset",
             Self::RoundPrepare => "days_round_prepare",
-            Self::Round => "days_round",
+            Self::Round | Self::RoundMechanisms => "days_round",
             Self::ControlSweep => "days_round_control_sweep",
             Self::Control => "days_round_control",
             Self::ExchangePrefixSweep => "days_exchange_prefix_sweep",
@@ -345,6 +361,33 @@ impl MetalKernel {
             Self::FinalizeSweep => "days_round_finalize_sweep",
             Self::Finalize => "days_round_finalize",
             Self::CompactGather => "days_compact_gather",
+        }
+    }
+
+    /// The `DAYS_MECHANISMS` function-constant value this pipeline is specialized with, for the
+    /// `days_round` builds; `None` for every entry point that does not read the constant.
+    const fn mechanisms_constant(self) -> Option<bool> {
+        match self {
+            Self::Round => Some(false),
+            Self::RoundMechanisms => Some(true),
+            _ => None,
+        }
+    }
+
+    /// Whether a run whose round kernel build is `round_kernel` can dispatch this pipeline.
+    const fn dispatched_by(self, round_kernel: RoundKernel) -> bool {
+        !matches!(
+            (self, round_kernel),
+            (Self::Round, RoundKernel::Mechanisms) | (Self::RoundMechanisms, RoundKernel::Plain)
+        )
+    }
+
+    /// The pipeline's name in diagnostics: its entry point, and for the mechanisms build of
+    /// `days_round` the function constant as well.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::RoundMechanisms => "days_round[DAYS_MECHANISMS]",
+            _ => self.entry_point(),
         }
     }
 
@@ -362,6 +405,7 @@ impl MetalKernel {
             Self::RoundReset
             | Self::RoundPrepare
             | Self::Round
+            | Self::RoundMechanisms
             | Self::ExchangeScatter
             | Self::ExchangeMerge => ThreadgroupWidth::Round,
             Self::CompactGather => ThreadgroupWidth::Compact,
@@ -380,7 +424,7 @@ impl MetalKernel {
         limits: PipelineLimits,
         round_threads: Option<usize>,
     ) -> Result<(), MetalError> {
-        let name = self.entry_point();
+        let name = self.label();
         if limits.static_threadgroup_memory > limits.device_threadgroup_memory {
             return Err(MetalError::Unavailable(format!(
                 "{name} pipeline needs {} bytes of threadgroup memory, but the device exposes \
@@ -462,6 +506,9 @@ const ERROR_SEMANTIC: u64 = 3;
 /// slot carries a channel stream index, and the TCP ledger sequence overflow, which records no
 /// identity. Neither names an LP.
 const ERROR_CHANNEL_ORDER: u64 = ERROR_SEMANTIC + 42;
+/// P14: the plain `days_round` build met DCQCN or PFC state, which it does not compile in: a
+/// DCQCN or PFC packet event, a DCQCN generator's timer, or (at round entry) a planned PFC region.
+const ERROR_MECHANISMS_REQUIRED: u64 = ERROR_SEMANTIC + 80;
 const CONTROL_DONE: usize = 4;
 const CONTROL_RUN_END_LO: usize = 7;
 const CONTROL_RUN_END_HI: usize = 8;
@@ -540,6 +587,12 @@ pub enum MetalError {
     WfqArithmeticOverflow {
         node: NodeId,
     },
+    /// The plain round kernel met DCQCN or PFC state and stopped rather than continue without the
+    /// mechanism. Only a round-kernel selection error (or a test forcing the plain build) reaches
+    /// it; the run produces no result.
+    MechanismsKernelRequired {
+        node: Option<NodeId>,
+    },
     DeviceExecution {
         code: u64,
         node: Option<NodeId>,
@@ -603,6 +656,16 @@ impl fmt::Display for MetalError {
                 formatter,
                 "Metal WFQ arithmetic at LP {node:?} exceeds the exact 320-bit device limit; use Scalar or Cpu for this image"
             ),
+            Self::MechanismsKernelRequired { node } => {
+                write!(formatter, "Metal plain round kernel met DCQCN or PFC state")?;
+                if let Some(node) = node {
+                    write!(formatter, " at LP {node:?}")?;
+                }
+                write!(
+                    formatter,
+                    "; the image requires the mechanisms round kernel"
+                )
+            }
             Self::DeviceExecution { code, node } => {
                 write!(
                     formatter,
@@ -682,6 +745,11 @@ pub struct MetalConfig {
     pub rounds_per_command_buffer: usize,
     /// Optional hard cap overriding the conservative encoded round bound.
     pub max_rounds: Option<usize>,
+    /// Test-only: dispatch this round kernel build instead of the one the image selects. Forcing
+    /// [`RoundKernel::Plain`] onto an image with DCQCN or PFC state must fail closed.
+    #[doc(hidden)]
+    #[cfg(feature = "metal-test-hooks")]
+    pub round_kernel_override: Option<RoundKernel>,
 }
 
 impl Default for MetalConfig {
@@ -700,6 +768,8 @@ impl Default for MetalConfig {
             round_threads_per_threadgroup: DEFAULT_ROUND_THREADS_PER_THREADGROUP,
             rounds_per_command_buffer: DEFAULT_ROUNDS_PER_COMMAND_BUFFER,
             max_rounds: None,
+            #[cfg(feature = "metal-test-hooks")]
+            round_kernel_override: None,
         }
     }
 }
@@ -873,6 +943,8 @@ pub struct MetalRun {
     pub wall_ns: u64,
     /// Exact record and metadata bytes planned for the fallback heap and monotone streams.
     pub memory_layout: MetalMemoryLayout,
+    /// P14: the round kernel build this run dispatched, selected from the image.
+    pub round_kernel: RoundKernel,
 }
 
 /// Runs the production Metal executor through the inclusive scenario stop.
@@ -1185,6 +1257,7 @@ impl MetalExecutor {
         validate(image, Backend::Metal)
             .map_err(|error| MetalError::Validation(error.to_string()))?;
         validate_config(config)?;
+        let round_kernel = selected_round_kernel(image, config);
 
         let retry_budget = config.max_capacity_retries;
         let mut attempt_config = config;
@@ -1211,7 +1284,7 @@ impl MetalExecutor {
                 )?;
                 let buffers = MetalBuffers::new(&self.direct.device, plan)?;
                 let _execution_guard = metal_device_execution_guard();
-                let timing = self.direct.run(&buffers, attempt_config)?;
+                let timing = self.direct.run(&buffers, attempt_config, round_kernel)?;
                 #[cfg(feature = "metal-test-hooks")]
                 panic_after_execution_if_requested();
                 buffers.finish(&self.direct, image, observation_mode, timing)
@@ -4690,6 +4763,7 @@ impl MetalBuffers {
             device_ns: timing.device_ns,
             wall_ns: timing.wall_ns,
             memory_layout: self.memory_layout,
+            round_kernel: timing.round_kernel,
         })
     }
 }
@@ -4764,6 +4838,16 @@ fn stream_compaction_plan(
     .map_err(compaction_error)
 }
 
+/// The round kernel build for this run: from the image, unless a test forces one.
+fn selected_round_kernel(image: &SimulationImage, config: MetalConfig) -> RoundKernel {
+    #[cfg(feature = "metal-test-hooks")]
+    if let Some(forced) = config.round_kernel_override {
+        return forced;
+    }
+    let _ = config;
+    RoundKernel::for_image(image)
+}
+
 fn decode_device_error(control: &[u64]) -> MetalError {
     let identity = (control[CONTROL_ERROR_NODE] != NONE).then_some(control[CONTROL_ERROR_NODE]);
     let capacity = control[CONTROL_ERROR_CAPACITY] as usize;
@@ -4799,6 +4883,9 @@ fn decode_device_error(control: &[u64]) -> MetalError {
         },
         100 => MetalError::WfqArithmeticOverflow {
             node: identity.map(NodeId).unwrap_or(NodeId(0)),
+        },
+        ERROR_MECHANISMS_REQUIRED => MetalError::MechanismsKernelRequired {
+            node: identity.map(NodeId),
         },
         // The channel-order diagnostic shares the channel capacity identity slot, which carries
         // an immutable stream index rather than an LP after targeted retry plumbing.
@@ -5111,10 +5198,22 @@ impl DirectMetal {
         let source = include_str!("metal_kernels.metal");
         let pipeline_started = Instant::now();
         let library = compile_library(&device, source)?;
-        let pipelines = MetalKernel::ALL
-            .iter()
-            .map(|kernel| create_pipeline(&device, &library, kernel.entry_point()))
-            .collect::<Result<Vec<_>, _>>()?;
+        // Each pipeline is compiled on its own scoped thread, which returns it through its join
+        // handle: the two `days_round` builds dominate creation and compile concurrently. The
+        // result, including which error is reported first, is in `MetalKernel::ALL` order.
+        let pipelines = std::thread::scope(|scope| {
+            let compiling = MetalKernel::ALL.map(|kernel| {
+                let (device, library) = (&device, &library);
+                scope.spawn(move || create_pipeline(device, library, kernel))
+            });
+            compiling.map(|thread| {
+                thread
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
         let Ok(pipelines) = <[MetalPipeline; MetalKernel::ALL.len()]>::try_from(pipelines) else {
             unreachable!("one pipeline is created per kernel");
         };
@@ -5137,14 +5236,23 @@ impl DirectMetal {
             },
             pipelines,
         };
-        direct.check_limits(None)?;
+        direct.check_limits(None, None)?;
         Ok(direct)
     }
 
-    /// Checks every pipeline with [`MetalKernel::check_limits`].
-    fn check_limits(&self, round_threads: Option<usize>) -> Result<(), MetalError> {
+    /// Checks pipelines with [`MetalKernel::check_limits`]: every pipeline at creation
+    /// (`round_kernel` `None`), and at a run's start every pipeline that run can dispatch, which is
+    /// all of them except the other `days_round` build.
+    fn check_limits(
+        &self,
+        round_threads: Option<usize>,
+        round_kernel: Option<RoundKernel>,
+    ) -> Result<(), MetalError> {
         let device_threadgroup_memory = self.device.maxThreadgroupMemoryLength();
         for kernel in MetalKernel::ALL {
+            if round_kernel.is_some_and(|round_kernel| !kernel.dispatched_by(round_kernel)) {
+                continue;
+            }
             let pipeline = self.pipeline(kernel);
             let limits = PipelineLimits {
                 max_total_threads: pipeline.maxTotalThreadsPerThreadgroup(),
@@ -5244,9 +5352,16 @@ impl DirectMetal {
             .collect())
     }
 
-    fn run(&self, buffers: &MetalBuffers, config: MetalConfig) -> Result<MetalTiming, MetalError> {
+    fn run(
+        &self,
+        buffers: &MetalBuffers,
+        config: MetalConfig,
+        round_kernel: RoundKernel,
+    ) -> Result<MetalTiming, MetalError> {
         let round_threads = config.round_threads_per_threadgroup;
-        let execution_width = self.pipeline(MetalKernel::Round).threadExecutionWidth();
+        let execution_width = self
+            .pipeline(AttemptKernel::DrainExecute.metal_kernel_for(round_kernel))
+            .threadExecutionWidth();
         if !round_threads.is_multiple_of(execution_width) {
             return Err(MetalError::Validation(format!(
                 "round_threads_per_threadgroup must be a multiple of the device execution width \
@@ -5262,7 +5377,7 @@ impl DirectMetal {
                  execution width {scatter_execution_width}"
             )));
         }
-        self.check_limits(Some(round_threads))?;
+        self.check_limits(Some(round_threads), Some(round_kernel))?;
         let wall_started = Instant::now();
         let mut host_encode_submit_ns = 0_u64;
         let mut device_ns = 0_u64;
@@ -5320,6 +5435,7 @@ impl DirectMetal {
                     self.encode_attempt(
                         &encoder,
                         buffers,
+                        round_kernel,
                         control_grid,
                         sweep_grid,
                         control_group,
@@ -5381,6 +5497,7 @@ impl DirectMetal {
             wave_boundary_syncs,
             mid_round_wave_boundary_syncs,
             encoded_attempts,
+            round_kernel,
         })
     }
 
@@ -5389,6 +5506,7 @@ impl DirectMetal {
         &self,
         encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
         buffers: &MetalBuffers,
+        round_kernel: RoundKernel,
         control_grid: MTLSize,
         sweep_grid: MTLSize,
         control_group: MTLSize,
@@ -5399,7 +5517,7 @@ impl DirectMetal {
             if !buffers.finalize_sweep_required && kernel == AttemptKernel::FinalControlSweep {
                 continue;
             }
-            encoder.setComputePipelineState(self.pipeline(kernel.metal_kernel()));
+            encoder.setComputePipelineState(self.pipeline(kernel.metal_kernel_for(round_kernel)));
             match geometry {
                 DispatchGeometry::FixedControl => {
                     encoder.dispatchThreadgroups_threadsPerThreadgroup(control_grid, control_group);
@@ -5514,26 +5632,58 @@ fn compile_library(
         })
 }
 
+/// Creates `kernel`'s pipeline. The `days_round` builds are specialized with their
+/// `DAYS_MECHANISMS` function-constant value; every other entry point reads no constant.
 fn create_pipeline(
     device: &ProtocolObject<dyn MTLDevice>,
     library: &ProtocolObject<dyn MTLLibrary>,
-    entrypoint: &str,
+    kernel: MetalKernel,
 ) -> Result<MetalPipeline, MetalError> {
+    let entrypoint = kernel.entry_point();
+    let label = kernel.label();
     let name = NSString::from_str(entrypoint);
-    let function = library.newFunctionWithName(&name).ok_or_else(|| {
-        MetalError::Unavailable(format!("MSL entry point `{entrypoint}` was not found"))
-    })?;
+    let function = match kernel.mechanisms_constant() {
+        None => library.newFunctionWithName(&name).ok_or_else(|| {
+            MetalError::Unavailable(format!("MSL entry point `{entrypoint}` was not found"))
+        })?,
+        Some(mechanisms) => {
+            let values = MTLFunctionConstantValues::new();
+            let value = mechanisms;
+            // SAFETY: `value` is a live `bool`, which is Metal's `MTLDataTypeBool` layout, and
+            // index 0 is `DAYS_MECHANISMS [[function_constant(0)]]` in the MSL source.
+            unsafe {
+                values.setConstantValue_type_atIndex(
+                    std::ptr::NonNull::from(&value).cast(),
+                    MTLDataType::Bool,
+                    DAYS_MECHANISMS_CONSTANT_INDEX,
+                );
+            }
+            library
+                .newFunctionWithName_constantValues_error(&name, &values)
+                .map_err(|error| {
+                    MetalError::Unavailable(format!(
+                        "MSL entry point `{label}` specialization failed: {}",
+                        error.localizedDescription()
+                    ))
+                })?
+        }
+    };
     device
         .newComputePipelineStateWithFunction_error(&function)
         .map_err(|error| {
             MetalError::Unavailable(format!(
-                "pipeline creation failed for {entrypoint}: {}",
+                "pipeline creation failed for {label}: {}",
                 error.localizedDescription()
             ))
         })
 }
 
+/// The index of `constant bool DAYS_MECHANISMS [[function_constant(0)]]` in `metal_kernels.metal`.
+const DAYS_MECHANISMS_CONSTANT_INDEX: usize = 0;
+
 struct MetalTiming {
+    /// The round kernel build every attempt of this run dispatched.
+    round_kernel: RoundKernel,
     host_encode_submit_ns: u64,
     device_ns: u64,
     wall_ns: u64,
@@ -5561,7 +5711,30 @@ mod tests {
         gpu_family_outcome,
     };
     use crate::CapacityRetryRecord;
+    use crate::device_mechanism::RoundKernel;
     use std::collections::BTreeSet;
+
+    /// P14: the plain round kernel's fail-closed stop decodes to its own error, naming the LP.
+    #[test]
+    fn mechanisms_required_decodes_with_the_lp_it_names() {
+        let source = include_str!("metal_kernels.metal");
+        assert!(source.contains("constant ulong ERROR_MECHANISMS_REQUIRED = 80;"));
+        let mut control = vec![0_u64; 20];
+        control[0] = super::ERROR_MECHANISMS_REQUIRED;
+        control[2] = 7;
+        assert_eq!(super::ERROR_MECHANISMS_REQUIRED, 83);
+        assert_eq!(
+            super::decode_device_error(&control),
+            MetalError::MechanismsKernelRequired {
+                node: Some(crate::NodeId(7)),
+            },
+        );
+        control[2] = u64::MAX;
+        assert_eq!(
+            super::decode_device_error(&control),
+            MetalError::MechanismsKernelRequired { node: None },
+        );
+    }
 
     #[test]
     fn tcp_capacity_fault_identity_decodes_as_a_flow() {
@@ -5780,8 +5953,24 @@ mod tests {
         let mut pipeline_kernels = MetalKernel::ALL.map(MetalKernel::entry_point).to_vec();
         pipeline_kernels.sort_unstable();
         pipeline_kernels.dedup();
-        assert_eq!(pipeline_kernels.len(), MetalKernel::ALL.len());
+        // P14: `days_round` is the one entry point with two pipelines, one per value of the
+        // `DAYS_MECHANISMS` function constant; every other entry point has exactly one.
+        assert_eq!(pipeline_kernels.len() + 1, MetalKernel::ALL.len());
         assert_eq!(source_kernels, pipeline_kernels);
+        let specialized = MetalKernel::ALL
+            .into_iter()
+            .filter_map(|kernel| {
+                kernel
+                    .mechanisms_constant()
+                    .map(|constant| (kernel.entry_point(), constant))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(specialized, [("days_round", false), ("days_round", true)]);
+        let labels = MetalKernel::ALL
+            .map(MetalKernel::label)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(labels.len(), MetalKernel::ALL.len());
     }
 
     #[test]
@@ -5797,16 +5986,34 @@ mod tests {
                 "{attempt:?} is dispatched with a width its limit check does not use",
             );
         }
-        let dispatched = ATTEMPT_DISPATCHES
-            .iter()
-            .map(|(attempt, _)| attempt.metal_kernel().entry_point())
-            .chain([MetalKernel::CompactGather.entry_point()])
+        let dispatched = [RoundKernel::Plain, RoundKernel::Mechanisms]
+            .into_iter()
+            .flat_map(|round_kernel| {
+                ATTEMPT_DISPATCHES
+                    .iter()
+                    .map(move |(attempt, _)| attempt.metal_kernel_for(round_kernel).label())
+            })
+            .chain([MetalKernel::CompactGather.label()])
             .collect::<BTreeSet<_>>();
         let created = MetalKernel::ALL
-            .map(MetalKernel::entry_point)
+            .map(MetalKernel::label)
             .into_iter()
             .collect::<BTreeSet<_>>();
         assert_eq!(dispatched, created);
+        // A run dispatches exactly one `days_round` build, and its limits are the ones checked.
+        for round_kernel in [RoundKernel::Plain, RoundKernel::Mechanisms] {
+            let rounds = ATTEMPT_DISPATCHES
+                .iter()
+                .map(|(attempt, _)| attempt.metal_kernel_for(round_kernel))
+                .filter(|kernel| kernel.mechanisms_constant().is_some())
+                .collect::<Vec<_>>();
+            assert_eq!(rounds.len(), 1, "{round_kernel:?}");
+            assert!(rounds[0].dispatched_by(round_kernel));
+            assert_eq!(
+                rounds[0].mechanisms_constant(),
+                Some(round_kernel == RoundKernel::Mechanisms)
+            );
+        }
 
         for kernel in MetalKernel::ALL {
             let name = kernel.entry_point();
@@ -5871,7 +6078,13 @@ mod tests {
             (MetalKernel::Finalize, 1_024, 12_288),
             (MetalKernel::CompactGather, 1_024, 0),
         ];
-        assert_eq!(measured.map(|(kernel, _, _)| kernel), MetalKernel::ALL);
+        // The M1 Max measurement predates the P14 split of `days_round` into two builds, and the
+        // backend refuses Apple7 GPUs, so the mechanisms build has no M1 row.
+        assert_eq!(
+            measured.map(|(kernel, _, _)| kernel)[..],
+            MetalKernel::ALL[..MetalKernel::ALL.len() - 1]
+        );
+        assert_eq!(MetalKernel::ALL.last(), Some(&MetalKernel::RoundMechanisms));
         let check_all = |device_threadgroup_memory, round_threads| {
             measured.into_iter().try_for_each(
                 |(kernel, max_total_threads, static_threadgroup_memory)| {

@@ -32,6 +32,7 @@ use crate::device_event_record::{
     SERVICE_EVENT_WORDS, StoredEventClass, decode_event_record, stored_event_words,
     stream_event_class,
 };
+use crate::device_mechanism::RoundKernel;
 use crate::device_scheduler::{
     QUEUE_META_WORDS, prepare_device_schedulers, restore_device_scheduler,
 };
@@ -116,6 +117,9 @@ const ERROR_SEMANTIC: u64 = 3;
 /// slot carries a channel stream index, and the TCP ledger sequence overflow, which records no
 /// identity. Neither names an LP.
 const ERROR_CHANNEL_ORDER: u64 = ERROR_SEMANTIC + 42;
+/// P14: the plain `days_round` build met DCQCN or PFC state, which it does not compile in: a
+/// DCQCN or PFC packet event, a DCQCN generator's timer, or (at round entry) a planned PFC region.
+const ERROR_MECHANISMS_REQUIRED: u64 = ERROR_SEMANTIC + 80;
 const CONTROL_DONE: usize = 4;
 const CONTROL_RUN_END_LO: usize = 7;
 const CONTROL_RUN_END_HI: usize = 8;
@@ -378,6 +382,9 @@ fn decode_device_error(control: &[u64]) -> CudaError {
         },
         100 => CudaError::WfqArithmeticOverflow {
             node: identity.map(NodeId).unwrap_or(NodeId(0)),
+        },
+        ERROR_MECHANISMS_REQUIRED => CudaError::MechanismsKernelRequired {
+            node: identity.map(NodeId),
         },
         // The channel-order diagnostic shares the channel capacity identity slot, which carries
         // an immutable stream index rather than an LP after targeted retry plumbing.
@@ -647,6 +654,12 @@ pub enum CudaError {
     WfqArithmeticOverflow {
         node: NodeId,
     },
+    /// The plain round kernel met DCQCN or PFC state and stopped rather than continue without the
+    /// mechanism. Only a round-kernel selection error (or a test forcing the plain build) reaches
+    /// it; the run produces no result.
+    MechanismsKernelRequired {
+        node: Option<NodeId>,
+    },
     DeviceExecution {
         code: u64,
         node: Option<NodeId>,
@@ -710,6 +723,16 @@ impl fmt::Display for CudaError {
                 formatter,
                 "CUDA WFQ arithmetic at LP {node:?} exceeds the exact 320-bit device limit; use Scalar or Cpu for this image"
             ),
+            Self::MechanismsKernelRequired { node } => {
+                write!(formatter, "CUDA plain round kernel met DCQCN or PFC state")?;
+                if let Some(node) = node {
+                    write!(formatter, " at LP {node:?}")?;
+                }
+                write!(
+                    formatter,
+                    "; the image requires the mechanisms round kernel"
+                )
+            }
             Self::DeviceExecution { code, node } => {
                 write!(
                     formatter,
@@ -784,6 +807,11 @@ pub struct CudaConfig {
     #[doc(hidden)]
     #[cfg(feature = "cuda-test-hooks")]
     pub fault_injection: Option<CudaArena>,
+    /// Test-only: launch this round kernel build instead of the one the image selects. Forcing
+    /// [`RoundKernel::Plain`] onto an image with DCQCN or PFC state must fail closed.
+    #[doc(hidden)]
+    #[cfg(feature = "cuda-test-hooks")]
+    pub round_kernel_override: Option<RoundKernel>,
 }
 
 impl Default for CudaConfig {
@@ -805,6 +833,8 @@ impl Default for CudaConfig {
             max_rounds: None,
             #[cfg(feature = "cuda-test-hooks")]
             fault_injection: None,
+            #[cfg(feature = "cuda-test-hooks")]
+            round_kernel_override: None,
         }
     }
 }
@@ -973,6 +1003,8 @@ pub struct CudaRun {
     /// Wall time from graph capture through final wave completion.
     pub wall_ns: u64,
     pub memory_layout: CudaMemoryLayout,
+    /// P14: the round kernel build this run launched, selected from the image.
+    pub round_kernel: RoundKernel,
 }
 
 /// One-time CUDA context, stream, module, and kernel initialization costs.
@@ -1267,6 +1299,7 @@ impl CudaExecutor {
         validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
         validate_config(config)?;
         let direct = self.direct_for(config.device_index)?;
+        let round_kernel = selected_round_kernel(image, config);
 
         let retry_budget = config.max_capacity_retries;
         let mut attempt_config = config;
@@ -1293,7 +1326,7 @@ impl CudaExecutor {
                 )?;
                 let _execution_guard = direct.execution_guard();
                 let buffers = CudaBuffers::new(&direct.stream, plan, direct.provisioning)?;
-                let timing = direct.run(&buffers, attempt_config)?;
+                let timing = direct.run(&buffers, attempt_config, round_kernel)?;
                 #[cfg(feature = "cuda-test-hooks")]
                 panic_after_execution_if_requested();
                 buffers.finish(&direct, image, observation_mode, timing)
@@ -1608,6 +1641,16 @@ fn validate_config(config: CudaConfig) -> Result<(), CudaError> {
         ));
     }
     Ok(())
+}
+
+/// The round kernel build for this run: from the image, unless a test forces one.
+fn selected_round_kernel(image: &SimulationImage, config: CudaConfig) -> RoundKernel {
+    #[cfg(feature = "cuda-test-hooks")]
+    if let Some(forced) = config.round_kernel_override {
+        return forced;
+    }
+    let _ = config;
+    RoundKernel::for_image(image)
 }
 
 fn injected_capacity(config: CudaConfig, arena: CudaArena, default: usize) -> usize {
@@ -4727,6 +4770,7 @@ impl CudaBuffers {
             device_ns: timing.device_ns,
             wall_ns: timing.wall_ns,
             memory_layout: self.memory_layout,
+            round_kernel: timing.round_kernel,
         })
     }
 }
@@ -4759,6 +4803,12 @@ const KERNEL_NAMES: [&str; 13] = [
 /// captured attempt DAG, does not take the uniform 29-plane ABI, and is launched only after an
 /// attempt has been screened as successful.
 const COMPACT_KERNEL_NAME: &str = "days_compact_gather";
+/// The position of the round kernel in [`KERNEL_NAMES`]. `days_round` there is the plain build; a
+/// run whose image holds DCQCN or PFC state launches [`MECHANISMS_ROUND_KERNEL_NAME`] in its place.
+const ROUND_KERNEL_INDEX: usize = 4;
+/// P14: the round kernel with the DCQCN and PFC transitions compiled in. See
+/// [`crate::RoundKernel`].
+const MECHANISMS_ROUND_KERNEL_NAME: &str = "days_round_mechanisms";
 // T20l fix 2: one thread per entity, and an entity's work is bounded by its own live count. 256
 // keeps the launch a whole number of warps without reserving the maximum block footprint; the
 // gather's output does not depend on it.
@@ -4778,6 +4828,9 @@ struct DirectCuda {
     execution: Mutex<()>,
     stream: Arc<CudaStream>,
     functions: Vec<CudaFunction>,
+    /// P14: `days_round_mechanisms`, launched at [`ROUND_KERNEL_INDEX`] instead of `days_round`
+    /// when the run's image holds DCQCN or PFC state.
+    mechanisms_round_function: CudaFunction,
     /// T20l fix 2: the readback gather, loaded beside the eight attempt kernels.
     compact_function: CudaFunction,
     initialization_timings: CudaInitializationTimings,
@@ -4819,6 +4872,14 @@ impl DirectCuda {
                     .map_err(|error| driver_error(format!("kernel `{name}` load"), error))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let mechanisms_round_function = module
+            .load_function(MECHANISMS_ROUND_KERNEL_NAME)
+            .map_err(|error| {
+                driver_error(
+                    format!("kernel `{MECHANISMS_ROUND_KERNEL_NAME}` load"),
+                    error,
+                )
+            })?;
         let compact_function = module
             .load_function(COMPACT_KERNEL_NAME)
             .map_err(|error| driver_error(format!("kernel `{COMPACT_KERNEL_NAME}` load"), error))?;
@@ -4868,6 +4929,7 @@ impl DirectCuda {
             execution: Mutex::new(()),
             stream,
             functions,
+            mechanisms_round_function,
             compact_function,
             initialization_timings: CudaInitializationTimings {
                 context_stream_setup_ns,
@@ -4971,17 +5033,38 @@ impl DirectCuda {
         Ok(gathered)
     }
 
-    fn run(&self, buffers: &CudaBuffers, config: CudaConfig) -> Result<CudaTiming, CudaError> {
+    /// The attempt DAG's functions in [`KERNEL_NAMES`] order, with the round kernel `round_kernel`
+    /// at [`ROUND_KERNEL_INDEX`]. A run launches exactly one of the two round builds.
+    fn attempt_functions(&self, round_kernel: RoundKernel) -> [&CudaFunction; KERNEL_NAMES.len()] {
+        std::array::from_fn(|index| {
+            if index == ROUND_KERNEL_INDEX && round_kernel == RoundKernel::Mechanisms {
+                &self.mechanisms_round_function
+            } else {
+                &self.functions[index]
+            }
+        })
+    }
+
+    fn run(
+        &self,
+        buffers: &CudaBuffers,
+        config: CudaConfig,
+        round_kernel: RoundKernel,
+    ) -> Result<CudaTiming, CudaError> {
+        let functions = self.attempt_functions(round_kernel);
         let parallel_threads = config.round_threads_per_block;
         let supported_parallel_threads = PARALLEL_KERNELS
             .iter()
             .map(|index| {
-                self.functions[*index]
+                functions[*index]
                     .max_threads_per_block()
                     .map(|value| value as usize)
                     .map_err(|error| {
                         driver_error(
-                            format!("kernel `{}` thread limit query", KERNEL_NAMES[*index]),
+                            format!(
+                                "kernel `{}` thread limit query",
+                                round_kernel_name(*index, round_kernel)
+                            ),
                             error,
                         )
                     })
@@ -5008,7 +5091,13 @@ impl DirectCuda {
 
         let wall_started = Instant::now();
         let capture_started = Instant::now();
-        let graph = self.capture_graph(buffers, &configs, config.attempts_per_graph_wave)?;
+        let graph = self.capture_graph(
+            buffers,
+            &functions,
+            round_kernel,
+            &configs,
+            config.attempts_per_graph_wave,
+        )?;
         let graph_capture_ns = duration_ns(capture_started.elapsed());
 
         let maximum_replays = buffers
@@ -5072,12 +5161,15 @@ impl DirectCuda {
             host_submit_ns,
             device_ns,
             wall_ns: duration_ns(wall_started.elapsed()),
+            round_kernel,
         })
     }
 
     fn capture_graph(
         &self,
         buffers: &CudaBuffers,
+        functions: &[&CudaFunction; KERNEL_NAMES.len()],
+        round_kernel: RoundKernel,
         configs: &[LaunchConfig; KERNEL_NAMES.len()],
         attempts: usize,
     ) -> Result<CudaGraph, CudaError> {
@@ -5087,18 +5179,19 @@ impl DirectCuda {
 
         let captured = (|| {
             for _ in 0..attempts {
-                for (index, ((function, config), name)) in self
-                    .functions
-                    .iter()
-                    .zip(configs)
-                    .zip(KERNEL_NAMES)
-                    .enumerate()
-                {
+                for (index, (function, config)) in functions.iter().zip(configs).enumerate() {
                     if !buffers.finalize_sweep_required && index == FINALIZE_SWEEP_KERNEL_INDEX {
                         continue;
                     }
-                    launch_uniform(&self.stream, function, buffers, *config)
-                        .map_err(|error| driver_error(format!("capture `{name}` launch"), error))?;
+                    launch_uniform(&self.stream, function, buffers, *config).map_err(|error| {
+                        driver_error(
+                            format!(
+                                "capture `{}` launch",
+                                round_kernel_name(index, round_kernel)
+                            ),
+                            error,
+                        )
+                    })?;
                 }
             }
             Ok(())
@@ -5120,6 +5213,15 @@ impl DirectCuda {
             .upload()
             .map_err(|error| driver_error("CUDA Graph upload", error))?;
         Ok(graph)
+    }
+}
+
+/// The entry point launched at `index` of the attempt DAG for `round_kernel`.
+fn round_kernel_name(index: usize, round_kernel: RoundKernel) -> &'static str {
+    if index == ROUND_KERNEL_INDEX && round_kernel == RoundKernel::Mechanisms {
+        MECHANISMS_ROUND_KERNEL_NAME
+    } else {
+        KERNEL_NAMES[index]
     }
 }
 
@@ -5173,6 +5275,8 @@ fn launch_uniform(
 }
 
 struct CudaTiming {
+    /// The round kernel build every attempt of this run launched.
+    round_kernel: RoundKernel,
     encoded_attempts: u64,
     graph_replays: u64,
     wave_boundary_syncs: u64,
@@ -5308,6 +5412,28 @@ mod tests {
                 node: None,
             },
             "a channel index must not be displayed as an LP for the order diagnostic",
+        );
+    }
+
+    /// P14: the plain round kernel's fail-closed stop decodes to its own error, naming the LP.
+    #[test]
+    fn mechanisms_required_decodes_with_the_lp_it_names() {
+        let source = include_str!("cuda_kernels.cu");
+        assert!(source.contains("constexpr ulong ERROR_MECHANISMS_REQUIRED = 80;"));
+        let mut control = vec![0_u64; 20];
+        control[0] = super::ERROR_MECHANISMS_REQUIRED;
+        control[2] = 7;
+        assert_eq!(super::ERROR_MECHANISMS_REQUIRED, 83);
+        assert_eq!(
+            super::decode_device_error(&control),
+            CudaError::MechanismsKernelRequired {
+                node: Some(crate::NodeId(7)),
+            },
+        );
+        control[2] = u64::MAX;
+        assert_eq!(
+            super::decode_device_error(&control),
+            CudaError::MechanismsKernelRequired { node: None },
         );
     }
 

@@ -15,7 +15,79 @@
 //! is otherwise unused and DCQCN adds no words to any plane. Words 4..6 remain zero because the
 //! readback reads them as the TCP receive-range metadata.
 
-use crate::{DcqcnGenerator, DcqcnIncreaseStage, DcqcnReceiverState};
+use crate::{
+    DcqcnGenerator, DcqcnIncreaseStage, DcqcnReceiverState, FlowGeneratorKind, PacketKind,
+    SimulationImage,
+};
+
+/// Mechanism bit: some host holds a DCQCN notification point, so a receiver row can carry a
+/// DCQCN marker. Without it every receiver-row marker is a TCP `1` or an unused `0` for the whole
+/// run: only image receivers create the markers `2` and `3`, and no transition writes one.
+pub(crate) const MECHANISM_DCQCN_RECEIVERS: u64 = 1;
+/// Mechanism bit: the image holds DCQCN state of any kind (a reaction-point generator, a
+/// notification point, or a resident CNP or control-timer packet). Without it no DCQCN packet
+/// exists or can be created, so every DCQCN transition branch is dead for the whole run.
+pub(crate) const MECHANISM_DCQCN: u64 = 2;
+/// Mechanism bit: the image holds PFC state, the condition under which the planner allocates the
+/// PFC region and its params offset is not `NONE` ([`crate::device_pfc::image_has_pfc`]), or a
+/// resident PFC frame.
+pub(crate) const MECHANISM_PFC: u64 = 4;
+
+/// The two builds of the device round kernel (`days_round`), selected per run from the image.
+///
+/// Both builds come from one source: a CUDA template parameter and a Metal function constant.
+/// A selection error can only ever cost time, never bytes: the mechanisms build runs every image,
+/// and the plain build stops with a semantic error on any DCQCN or PFC state it meets.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RoundKernel {
+    /// DCQCN and PFC compiled out.
+    Plain,
+    /// DCQCN and PFC compiled in.
+    Mechanisms,
+}
+
+impl RoundKernel {
+    /// The mechanisms build if and only if the image holds any DCQCN or PFC state.
+    pub fn for_image(image: &SimulationImage) -> Self {
+        if mechanism_flags(image) == 0 {
+            Self::Plain
+        } else {
+            Self::Mechanisms
+        }
+    }
+}
+
+/// The P14 mechanisms a device run can exercise, derived from the image alone. Host-side only:
+/// it selects the round kernel and is never planned into a device plane.
+pub(crate) fn mechanism_flags(image: &SimulationImage) -> u64 {
+    let receivers = image
+        .host_states
+        .iter()
+        .any(|state| !state.dcqcn_receivers.is_empty());
+    let dcqcn = receivers
+        || image
+            .host_states
+            .iter()
+            .flat_map(|state| &state.generators)
+            .any(|generator| matches!(generator.kind, FlowGeneratorKind::Dcqcn(_)))
+        || image.initial_packets.iter().any(|packet| {
+            matches!(
+                packet.kind,
+                PacketKind::DcqcnCnp(_) | PacketKind::DcqcnControlTimer
+            )
+        });
+    let pfc = crate::device_pfc::image_has_pfc(image)
+        || image
+            .initial_packets
+            .iter()
+            .any(|packet| matches!(packet.kind, PacketKind::Pfc(_)));
+    (if receivers {
+        MECHANISM_DCQCN_RECEIVERS
+    } else {
+        0
+    }) | (if dcqcn { MECHANISM_DCQCN } else { 0 })
+        | (if pfc { MECHANISM_PFC } else { 0 })
+}
 
 pub(crate) const GENERATOR_KIND_DCQCN: u64 = 3;
 
@@ -228,6 +300,253 @@ mod tests {
             controller,
             control_timer_payload: PayloadId(21),
             cnp_size_bytes: 22,
+        }
+    }
+
+    fn host(generators: Vec<crate::FlowGeneratorState>) -> crate::HostState {
+        crate::HostState {
+            egress_link: crate::LinkId(0),
+            queue: std::collections::VecDeque::new(),
+            in_service: None,
+            tx_ready_pending: false,
+            generators,
+            tcp_receivers: Vec::new(),
+            dcqcn_receivers: Vec::new(),
+            next_origin_seq: 0,
+            next_payload_seq: 0,
+            sourced_packets: 0,
+            departed_packets: 0,
+            received_packets: 0,
+        }
+    }
+
+    fn generator_state(kind: FlowGeneratorKind) -> crate::FlowGeneratorState {
+        crate::FlowGeneratorState {
+            flow: FlowId(0),
+            packets_emitted: 0,
+            bytes_emitted: 0,
+            next_emission: crate::ScheduledEmission {
+                status: crate::GeneratorStatus::Finished,
+                departure_time_ns: 0,
+                payload: PayloadId(0),
+            },
+            rng_state: 0,
+            feedback: crate::GeneratorFeedbackState {
+                arrivals: 0,
+                outstanding_bytes: 0,
+                unacknowledged_bytes: 0,
+            },
+            kind,
+            stage: None,
+        }
+    }
+
+    fn image(host_states: Vec<crate::HostState>, packets: Vec<PacketKind>) -> SimulationImage {
+        SimulationImage {
+            stop_time_ns: 0,
+            nodes: Vec::new(),
+            host_states,
+            switch_states: Vec::new(),
+            flows: Vec::new(),
+            initial_packets: packets
+                .into_iter()
+                .enumerate()
+                .map(|(index, kind)| crate::PacketDescriptor {
+                    id: PayloadId(index as u64),
+                    flow: FlowId(0),
+                    size_bytes: 0,
+                    ecn_marked: false,
+                    kind,
+                })
+                .collect(),
+            links: Vec::new(),
+            channels: Vec::new(),
+            initial_events: Vec::new(),
+            seed: 0,
+        }
+    }
+
+    /// Each source of DCQCN state sets exactly its bits; an image without any plans zero.
+    #[test]
+    fn mechanism_flags_follow_the_image_dcqcn_state() {
+        let rate = generator().rate;
+        assert_eq!(
+            mechanism_flags(&image(vec![host(Vec::new())], Vec::new())),
+            0
+        );
+        assert_eq!(
+            mechanism_flags(&image(
+                vec![host(vec![generator_state(FlowGeneratorKind::Rate(rate))])],
+                vec![PacketKind::Data, PacketKind::Feedback],
+            )),
+            0
+        );
+
+        let mut receiver_host = host(Vec::new());
+        receiver_host.dcqcn_receivers.push(DcqcnReceiverState {
+            flow: FlowId(0),
+            cnp_interval_ns: 1,
+            cnp_size_bytes: 64,
+            last_cnp_time_ns: None,
+        });
+        assert_eq!(
+            mechanism_flags(&image(vec![host(Vec::new()), receiver_host], Vec::new())),
+            MECHANISM_DCQCN_RECEIVERS | MECHANISM_DCQCN
+        );
+
+        assert_eq!(
+            mechanism_flags(&image(
+                vec![host(vec![generator_state(FlowGeneratorKind::Dcqcn(
+                    generator()
+                ))])],
+                Vec::new(),
+            )),
+            MECHANISM_DCQCN
+        );
+        for resident in [
+            PacketKind::DcqcnCnp(crate::DcqcnCnpHeader {
+                trigger_payload: PayloadId(0),
+            }),
+            PacketKind::DcqcnControlTimer,
+        ] {
+            assert_eq!(
+                mechanism_flags(&image(vec![host(Vec::new())], vec![resident])),
+                MECHANISM_DCQCN,
+                "{resident:?}"
+            );
+        }
+    }
+
+    fn pfc_queue() -> crate::SwitchQueueState {
+        crate::SwitchQueueState {
+            egress_link: Some(crate::LinkId(0)),
+            scheduler: crate::SchedulerKind::Fifo,
+            queue_capacity_packets: 0,
+            drop_mark: crate::DropMarkPolicy::TailDrop,
+            pfc: Some(crate::PfcQueueState {
+                paused_by_controller: Default::default(),
+                ingresses: Vec::new(),
+            }),
+            queue: std::collections::VecDeque::new(),
+            in_service: None,
+            tx_ready_pending: false,
+        }
+    }
+
+    /// One switch LP whose only queue is `queue`.
+    fn switch_image(queue: crate::SwitchQueueState) -> SimulationImage {
+        let mut image = image(Vec::new(), Vec::new());
+        image.nodes.push(crate::NodeDescriptor {
+            id: crate::NodeId(0),
+            kind: crate::NodeKind::Switch,
+            state_slot: 0,
+        });
+        image.switch_states.push(crate::SwitchState {
+            physical_switch: 0,
+            queues: vec![queue],
+            next_origin_seq: 0,
+            arrived_packets: 0,
+            dropped_packets: 0,
+            departed_packets: 0,
+        });
+        image
+    }
+
+    /// PFC state is exactly the planner's PFC-region condition; a resident PFC frame also counts.
+    #[test]
+    fn mechanism_flags_follow_the_image_pfc_state() {
+        let mut plain = pfc_queue();
+        plain.pfc = None;
+        assert_eq!(mechanism_flags(&switch_image(plain.clone())), 0);
+        assert!(!crate::device_pfc::image_has_pfc(&switch_image(plain)));
+
+        let pfc = switch_image(pfc_queue());
+        assert!(crate::device_pfc::image_has_pfc(&pfc));
+        assert_eq!(mechanism_flags(&pfc), MECHANISM_PFC);
+
+        let frame = image(
+            vec![host(Vec::new())],
+            vec![PacketKind::Pfc(crate::PfcHeader {
+                controlled_link: crate::LinkId(0),
+                priority: 3,
+                pause: true,
+            })],
+        );
+        assert_eq!(mechanism_flags(&frame), MECHANISM_PFC);
+    }
+
+    /// Every source of DCQCN or PFC state selects the mechanisms kernel; nothing else does.
+    #[test]
+    fn every_mechanism_source_selects_the_mechanisms_round_kernel() {
+        let rate = generator().rate;
+        let plain = [
+            image(vec![host(Vec::new())], Vec::new()),
+            image(
+                vec![host(vec![generator_state(FlowGeneratorKind::Rate(rate))])],
+                vec![PacketKind::Data, PacketKind::Feedback],
+            ),
+            switch_image(crate::SwitchQueueState {
+                pfc: None,
+                ..pfc_queue()
+            }),
+        ];
+        for image in &plain {
+            assert_eq!(RoundKernel::for_image(image), RoundKernel::Plain);
+        }
+
+        let mut receiver_host = host(Vec::new());
+        receiver_host.dcqcn_receivers.push(DcqcnReceiverState {
+            flow: FlowId(0),
+            cnp_interval_ns: 1,
+            cnp_size_bytes: 64,
+            last_cnp_time_ns: Some(5),
+        });
+        let sources = [
+            (
+                "DCQCN generator",
+                image(
+                    vec![host(vec![generator_state(FlowGeneratorKind::Dcqcn(
+                        generator(),
+                    ))])],
+                    Vec::new(),
+                ),
+            ),
+            (
+                "DCQCN receiver only",
+                image(vec![host(Vec::new()), receiver_host], Vec::new()),
+            ),
+            (
+                "resident CNP",
+                image(
+                    vec![host(Vec::new())],
+                    vec![PacketKind::DcqcnCnp(crate::DcqcnCnpHeader {
+                        trigger_payload: PayloadId(0),
+                    })],
+                ),
+            ),
+            (
+                "resident control timer",
+                image(vec![host(Vec::new())], vec![PacketKind::DcqcnControlTimer]),
+            ),
+            ("PFC queue state", switch_image(pfc_queue())),
+            (
+                "resident PFC frame",
+                image(
+                    vec![host(Vec::new())],
+                    vec![PacketKind::Pfc(crate::PfcHeader {
+                        controlled_link: crate::LinkId(0),
+                        priority: 0,
+                        pause: false,
+                    })],
+                ),
+            ),
+        ];
+        for (name, image) in &sources {
+            assert_eq!(
+                RoundKernel::for_image(image),
+                RoundKernel::Mechanisms,
+                "{name}"
+            );
         }
     }
 

@@ -68,6 +68,8 @@ pub use device_capacity::{
     CapacityRetryRecord, CapacityWarmStart, ChannelStreamCapacityLevel, DeviceCapacityCaps,
     DeviceCapacityFloors,
 };
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
+pub use device_mechanism::RoundKernel;
 pub use device_sizing::{
     DeviceEventArenaSizing, DevicePlaneSizing, DeviceSizingError, DeviceSizingReport,
     MechanismPlaneWords, size_default_device_plan,
