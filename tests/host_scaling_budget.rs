@@ -35,10 +35,12 @@
 //! The regression is a quadratic term beside a linear one, `T(n) = a n + b n^2`. With `q = b n / a`
 //! at the small size and a size step `k`, the ratio is `(k + k^2 q) / (1 + q)`: it rises from `k`
 //! towards `k^2` as the quadratic share grows, so the gate needs a small size where that share is
-//! already large. The CI case steps 2 to 16 sets (16,384 to 131,072 flows). In one probe run on
-//! an Apple M-series host with the regression (`c1ec354`), lowering gave 57.8 and CUDA validation
-//! 69.3 at that step, against 25.8 and 34.8 at 1 to 8 sets; the fixed tree gave 7.6 and 8.8
-//! (`evidence/P14/ci-scaling.md`). The full case steps 4 to 32 sets (the whole frontier).
+//! already large. The gate catches the term when `q` reaches about `1 / sqrt(k)`, so a larger step
+//! also lowers the share it needs. The CI case steps 2 to 32 sets (16,384 to 262,144 flows, the
+//! whole frontier), a 16x step with bound 64. At 2 to 16 sets (8x, bound 22.6) the regression
+//! (`c1ec354`) cleared the bound by only 1.4x in lowering on an x86 host, whose scan is cheaper
+//! relative to its linear work than on Apple M-series hosts (`evidence/P14/ci-scaling.md`). The
+//! full case steps 4 to 32 sets.
 //!
 //! # Collective case
 //!
@@ -73,6 +75,9 @@ const FLOWS_PER_SET: usize = 8_192;
 /// Stacked flow sets in the frontier fixture.
 const FIXTURE_SETS: usize = 32;
 
+/// Geometric midpoint of the linear (16x) and quadratic (256x) ratios for a 16x size step, in
+/// thousandths.
+const SIXTEENFOLD_STEP_MAX_RATIO_MILLI: u128 = 64_000;
 /// Geometric midpoint of the linear (8x) and quadratic (64x) ratios for an 8x size step, in
 /// thousandths.
 const EIGHTFOLD_STEP_MAX_RATIO_MILLI: u128 = 22_600;
@@ -95,17 +100,17 @@ struct Case {
     max_ratio_milli: u128,
 }
 
-/// The CI-sized frontier case: 16,384 and 131,072 flows. The large size runs twice: one run can
+/// The CI-sized frontier case: 16,384 and 262,144 flows. The large size runs twice: one run can
 /// land in a burst of load from other processes, and on a loaded host a single large lowering
 /// once took 2.7x its usual time (`evidence/P14/ci-scaling.md`).
 const CI_FRONTIER: Case = Case {
     name: "frontier_ci",
     unit: "flow_sets",
     small: 2,
-    large: 16,
+    large: FIXTURE_SETS,
     small_repetitions: 5,
     large_repetitions: 2,
-    max_ratio_milli: EIGHTFOLD_STEP_MAX_RATIO_MILLI,
+    max_ratio_milli: SIXTEENFOLD_STEP_MAX_RATIO_MILLI,
 };
 
 /// The full frontier case: 32,768 and 262,144 flows.
