@@ -238,30 +238,51 @@ fn evaluation_cells_and_plain_scheduler_images_select_the_plain_round_kernel() {
 }
 
 /// The receiver-only gap (see `evidence/P14/spec.md`): a checkpoint in which DCQCN data is still
-/// in flight to its notification point after the flow's generator has finished. On the plain
-/// build nothing but a later control timer would stop such a run, so selection must pick the
+/// in flight to its notification point after the flow's generator has finished. Until the next
+/// control timer nothing stops the plain build on such an image, and with CE-marked data it
+/// silently omits the CNPs (measured on the bottleneck variant below), so selection must pick the
 /// mechanisms build from the notification point alone.
 #[test]
-fn a_dcqcn_tail_checkpoint_selects_the_mechanisms_round_kernel() {
-    let tails = dcqcn_tail_checkpoints();
-    assert!(
-        !tails.is_empty(),
-        "dcqcn_t26 must have a finished-generator tail"
-    );
-    for (horizon, tail) in &tails {
-        assert_eq!(
-            RoundKernel::for_image(tail),
-            RoundKernel::Mechanisms,
-            "@{horizon}"
+fn dcqcn_tail_checkpoints_select_the_mechanisms_round_kernel() {
+    for (fixture_name, image) in [
+        ("dcqcn_t26", fixture("dcqcn_t26.toml")),
+        ("dcqcn_t26 bottleneck", dcqcn_t26_bottleneck()),
+    ] {
+        let tails = dcqcn_tail_checkpoints(&image);
+        assert!(
+            !tails.is_empty(),
+            "{fixture_name} must have a finished-generator tail"
         );
+        for (horizon, tail) in &tails {
+            assert_eq!(
+                RoundKernel::for_image(tail),
+                RoundKernel::Mechanisms,
+                "{fixture_name}@{horizon}"
+            );
+        }
     }
 }
 
-/// Checkpoints of `dcqcn_t26` taken at each packet arrival of its Scalar run, keeping those in
-/// which the DCQCN generator no longer has a pacing timer and DCQCN data is still in flight.
-fn dcqcn_tail_checkpoints() -> Vec<(u64, SimulationImage)> {
-    let image = fixture("dcqcn_t26.toml");
-    let full = run_scalar_with_observations(&image, None, ObservationMode::Full)
+/// `dcqcn_t26` behind a 1 Gbps bottleneck with a one-packet ECN threshold: CE-marked data keeps
+/// arriving at the notification point after the 10 Gbps generator finishes.
+fn dcqcn_t26_bottleneck() -> SimulationImage {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("configs/p14/dcqcn_t26.toml");
+    let source = fs::read_to_string(&path).expect("fixture must be readable");
+    let variant = source
+        .replace("port_rate = 100_000_000_000", "port_rate = 1_000_000_000")
+        .replace("capacity = 1\n", "capacity = 100\n")
+        .replace("ecn_threshold = 1.0", "ecn_threshold = 0.01");
+    assert_ne!(variant, source, "the variant must change the fixture");
+    let directory = tempfile::TempDir::new().expect("temporary directory");
+    let stripped = directory.path().join("dcqcn_t26_bottleneck.toml");
+    fs::write(&stripped, variant).expect("scenario must be written");
+    compile_config(&stripped).unwrap_or_else(|error| panic!("the variant must lower: {error}"))
+}
+
+/// Checkpoints of `image` taken at each packet arrival of its Scalar run, keeping those in which
+/// no DCQCN generator has a pacing timer left and DCQCN data is still in flight.
+fn dcqcn_tail_checkpoints(image: &SimulationImage) -> Vec<(u64, SimulationImage)> {
+    let full = run_scalar_with_observations(image, None, ObservationMode::Full)
         .expect("scalar oracle must run");
     let mut horizons = full
         .arrivals
@@ -273,7 +294,7 @@ fn dcqcn_tail_checkpoints() -> Vec<(u64, SimulationImage)> {
     horizons
         .into_iter()
         .filter_map(|horizon| {
-            let prefix = run_scalar_with_observations(&image, Some(horizon), ObservationMode::Full)
+            let prefix = run_scalar_with_observations(image, Some(horizon), ObservationMode::Full)
                 .expect("checkpoint prefix must run");
             let timers_done = prefix
                 .host_states
@@ -290,7 +311,7 @@ fn dcqcn_tail_checkpoints() -> Vec<(u64, SimulationImage)> {
                 .iter()
                 .any(|packet| packet.kind.is_data());
             if timers_done && data_in_flight {
-                Some((horizon, checkpoint_image(&image, &prefix)))
+                Some((horizon, checkpoint_image(image, &prefix)))
             } else {
                 None
             }
