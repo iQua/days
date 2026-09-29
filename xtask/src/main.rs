@@ -178,8 +178,8 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "stage_index.rs",
         predicate: r#"not(feature = "planner-test-hooks")"#,
-        count: 3,
-        purpose: "without the test hooks a counted iterator carries a zero-sized marker instead of its read counter, so a probed table is exactly the slice it wraps",
+        count: 4,
+        purpose: "without the test hooks a counted iterator carries a zero-sized marker instead of its read counter, and a compile-time check pins the probe to zero size and the probed table, counted iterator and host slot to the size of what they wrap",
     },
     AllowedFeatureGate {
         path: "lib.rs",

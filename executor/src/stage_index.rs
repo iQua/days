@@ -339,6 +339,24 @@ impl<T> IndexMut<usize> for ProbedTable<'_, T> {
     }
 }
 
+// Without the test hooks the stage view costs nothing: the probe is zero-sized, a probed table is
+// exactly the slice reference it wraps, a counted iterator is exactly the slice iterator, and a
+// host's slot is exactly its index. Checked at compile time in every production build.
+#[cfg(not(feature = "planner-test-hooks"))]
+const _: () = {
+    use std::mem::size_of;
+    assert!(size_of::<StageScanProbe>() == 0);
+    assert!(
+        size_of::<ProbedTable<'static, FlowGeneratorState>>()
+            == size_of::<&mut [FlowGeneratorState]>()
+    );
+    assert!(
+        size_of::<CountedIter<'static, std::slice::IterMut<'static, FlowGeneratorState>>>()
+            == size_of::<std::slice::IterMut<'static, FlowGeneratorState>>()
+    );
+    assert!(size_of::<HostStageSlot>() == size_of::<HostStageIndex>());
+};
+
 /// A slice iterator that counts each element it yields into a table's read counter.
 pub(crate) struct CountedIter<'r, I> {
     inner: I,
