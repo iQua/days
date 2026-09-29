@@ -18,9 +18,10 @@ Four backends run the same image:
 
 Modeled mechanisms: closed-loop TCP Reno and CUBIC, DCQCN with CNP, PFC, ECN,
 RED, strict-priority, DRR, and exact-rational WFQ scheduling, and ring
-all-reduce and all-gather collectives, over fat-tree, torus, and dragonfly
-topologies. DCQCN control, PFC, RED, and collectives run on the Scalar and CPU
-backends for now; Metal and CUDA reject those scenarios at validation with a
+all-reduce and all-gather collectives over TCP with delay-only compute stages,
+over fat-tree, torus, and dragonfly topologies. DCQCN and PFC run on all four
+backends. RED, collectives, and compute stages run on the Scalar and CPU
+backends only; Metal and CUDA reject those scenarios at validation with a
 message naming the backend, never with a silent fallback.
 
 ## Quick start
