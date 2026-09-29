@@ -2309,6 +2309,15 @@ impl TransitionState<'_> {
                 "let first = stage_causes.iter().position(|cause| cause.flow == flow);",
                 "scans `stage_causes` with `.iter()`",
             ),
+            // P14 slim round 2: the host's stage table is a stage-path table too.
+            (
+                "let first = state.stages.iter().position(Option::is_some);",
+                "scans `stages` with `.iter()`",
+            ),
+            (
+                "for stage in &mut state.stages {}",
+                "scans `stages` with a `for` loop",
+            ),
         ] {
             let source = INDEXED.replace(
                 "let mut stage_causes = PendingCauses::default();",
@@ -2350,6 +2359,10 @@ impl TransitionState<'_> {
             (
                 "let table: &[TcpReceiverState] = todo!();",
                 "raw `[TcpReceiverState]`",
+            ),
+            (
+                "let table: &mut [Option<crate::CollectiveStage>] = todo!();",
+                "raw `[Option<CollectiveStage>]`",
             ),
             (
                 "let causes: Vec<PendingCollectiveProgress> = Vec::new();",
@@ -2469,6 +2482,10 @@ impl TransitionState<'_> {
             (
                 "let table = &self.host_state(node).unwrap().generators; let found = table.iter().position(|generator| generator.flow == flow);",
                 "a field expression",
+            ),
+            (
+                "let (mut state, index) = self.host_parts_mut(node).unwrap(); let staged = state.stages.iter().flatten().count();",
+                "`.iter()`",
             ),
         ] {
             let source = CLEAN_SCALAR.replace(
