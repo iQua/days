@@ -20,7 +20,7 @@ use objc2_foundation::NSString;
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
     MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLDispatchType, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLDispatchType, MTLGPUFamily, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 
 use crate::device_compaction::{
@@ -4959,6 +4959,8 @@ impl DirectMetal {
         let device = MTLCreateSystemDefaultDevice().ok_or_else(|| {
             MetalError::Unavailable("system default device is unavailable".into())
         })?;
+        // Before any compilation: on a refused GPU, `days_round` alone takes about ten minutes.
+        check_gpu_family(&device)?;
         let queue = device
             .newCommandQueue()
             .ok_or_else(|| MetalError::Unavailable("command queue creation failed".into()))?;
@@ -5290,6 +5292,76 @@ impl DirectMetal {
     }
 }
 
+/// Environment variable that lets the backend run on an Apple7-family GPU anyway, when set to
+/// `1`. It exists only to investigate the incorrect code [`GpuFamilyVerdict::of`] describes:
+/// results on such a GPU are known to be wrong, and a warning says so on standard error.
+const ALLOW_APPLE7_ENV: &str = "DAYS_METAL_ALLOW_APPLE7";
+
+/// What the backend does on a GPU, decided from its Apple GPU family.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GpuFamilyVerdict {
+    /// A GPU the backend runs on.
+    Run,
+    /// A refused GPU, run anyway because [`ALLOW_APPLE7_ENV`] is set; results are known wrong.
+    RunKnownWrong,
+    /// A refused GPU: construction fails before any compilation.
+    Refuse,
+}
+
+impl GpuFamilyVerdict {
+    /// Decides from `supportsFamily` answers, which are cumulative: a device of family N also
+    /// supports every older Apple family.
+    ///
+    /// Apple7-only GPUs (AGX G13, the Apple M1 family) are refused. On them the Metal compiler
+    /// takes about ten minutes on macOS 27.0, and more than fifteen on macOS 15.8, to build the
+    /// `days_round` pipeline, and the code it produces is incorrect: an LP's second transition in
+    /// round 0 reads a stale value from its first and faults with semantic error 25, and with
+    /// streams disabled the run completes with bytes that differ from the Scalar oracle. The same
+    /// kernel source run on the CPU matches Scalar, and removing never-executed handlers from
+    /// `dispatch_event` makes the GPU result correct, which points to the compiler. Measured on an
+    /// Apple M1 Max under macOS 15.8 and 27.0; an Apple M3 (Apple9) and the Apple M5 Max are
+    /// correct. Apple8 (the M2 family) is untested and currently runs.
+    fn of(supports_apple7: bool, supports_apple8: bool, allow_apple7: bool) -> Self {
+        let refused = supports_apple7 && !supports_apple8;
+        match (refused, allow_apple7) {
+            (false, _) => Self::Run,
+            (true, true) => Self::RunKnownWrong,
+            (true, false) => Self::Refuse,
+        }
+    }
+}
+
+/// Refuses an Apple7-family GPU per [`GpuFamilyVerdict::of`], unless [`ALLOW_APPLE7_ENV`] is `1`.
+fn check_gpu_family(device: &ProtocolObject<dyn MTLDevice>) -> Result<(), MetalError> {
+    let allow_apple7 = std::env::var_os(ALLOW_APPLE7_ENV).is_some_and(|value| value == "1");
+    let verdict = GpuFamilyVerdict::of(
+        device.supportsFamily(MTLGPUFamily::Apple7),
+        device.supportsFamily(MTLGPUFamily::Apple8),
+        allow_apple7,
+    );
+    gpu_family_outcome(verdict, &device.name().to_string())
+}
+
+/// Turns a verdict into the construction result, printing the override warning.
+fn gpu_family_outcome(verdict: GpuFamilyVerdict, device_name: &str) -> Result<(), MetalError> {
+    match verdict {
+        GpuFamilyVerdict::Run => Ok(()),
+        GpuFamilyVerdict::RunKnownWrong => {
+            eprintln!(
+                "warning: {ALLOW_APPLE7_ENV}=1: running Metal on {device_name}, an Apple7-family \
+                 GPU whose Metal compiler produces incorrect code for the Days kernels; results \
+                 are known to be wrong"
+            );
+            Ok(())
+        }
+        GpuFamilyVerdict::Refuse => Err(MetalError::Unavailable(format!(
+            "{device_name} is an Apple7-family GPU (the Apple M1 family); the Metal compiler for \
+             this GPU family produces incorrect code for the Days kernels, so the Metal backend \
+             refuses it; use --engine scalar or --engine cpu"
+        ))),
+    }
+}
+
 /// Compiles the MSL source once; every pipeline is created from this one library.
 fn compile_library(
     device: &ProtocolObject<dyn MTLDevice>,
@@ -5348,8 +5420,9 @@ fn seconds_ns(seconds: f64) -> u64 {
 mod tests {
     use super::{
         ATTEMPT_DISPATCHES, AttemptKernel, DEFAULT_ROUND_THREADS_PER_THREADGROUP, DispatchGeometry,
-        LANES, MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER, MAX_ENCODED_PAIRS_PER_WAVE, MetalConfig,
-        MetalError, MetalKernel, PipelineLimits, decode_device_error, encoding_limits,
+        GpuFamilyVerdict, LANES, MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER, MAX_ENCODED_PAIRS_PER_WAVE,
+        MetalConfig, MetalError, MetalKernel, PipelineLimits, decode_device_error, encoding_limits,
+        gpu_family_outcome,
     };
     use crate::CapacityRetryRecord;
     use std::collections::BTreeSet;
@@ -5698,5 +5771,45 @@ mod tests {
             ),
             "{error}",
         );
+    }
+
+    #[test]
+    fn apple7_only_gpus_are_refused_before_compilation() {
+        use GpuFamilyVerdict::{Refuse, Run, RunKnownWrong};
+
+        // (supports Apple7, supports Apple8) for: a non-Apple GPU, Apple7 (M1), Apple8 (M2), and
+        // Apple9 or Apple10 (M3 and later), which also answer yes for every older family.
+        let non_apple = (false, false);
+        let apple7 = (true, false);
+        let apple8_or_newer = (true, true);
+        for allow in [false, true] {
+            assert_eq!(GpuFamilyVerdict::of(non_apple.0, non_apple.1, allow), Run);
+            assert_eq!(
+                GpuFamilyVerdict::of(apple8_or_newer.0, apple8_or_newer.1, allow),
+                Run
+            );
+        }
+        assert_eq!(GpuFamilyVerdict::of(apple7.0, apple7.1, false), Refuse);
+        assert_eq!(
+            GpuFamilyVerdict::of(apple7.0, apple7.1, true),
+            RunKnownWrong
+        );
+
+        assert_eq!(gpu_family_outcome(Run, "Apple M5 Max"), Ok(()));
+        assert_eq!(gpu_family_outcome(RunKnownWrong, "Apple M1 Max"), Ok(()));
+        let error = gpu_family_outcome(Refuse, "Apple M1 Max")
+            .expect_err("an Apple7-family GPU must be refused");
+        let MetalError::Unavailable(message) = &error else {
+            panic!("expected Unavailable, got {error:?}");
+        };
+        for expected in [
+            "Apple M1 Max",
+            "Apple7",
+            "produces incorrect code for the Days kernels",
+            "--engine scalar",
+            "--engine cpu",
+        ] {
+            assert!(message.contains(expected), "{message}");
+        }
     }
 }
