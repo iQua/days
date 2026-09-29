@@ -157,6 +157,40 @@ struct Cli {
     /// CUDA: device ordinal to run on. Default 0.
     #[arg(long, help_heading = "CUDA engine")]
     cuda_device: Option<usize>,
+
+    /// Test hook: run this `days_round` build instead of the one the image selects. The plain
+    /// build fails closed on an image with DCQCN or PFC state; the mechanisms build runs every
+    /// image.
+    #[cfg(any(feature = "metal-test-hooks", feature = "cuda-test-hooks"))]
+    #[arg(long, value_enum, hide = true)]
+    round_kernel: Option<RoundKernelArg>,
+}
+
+/// The `--round-kernel` test-hook values.
+#[cfg(any(feature = "metal-test-hooks", feature = "cuda-test-hooks"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+enum RoundKernelArg {
+    Plain,
+    Mechanisms,
+}
+
+#[cfg(any(feature = "metal-test-hooks", feature = "cuda-test-hooks"))]
+impl From<RoundKernelArg> for days_executor::RoundKernel {
+    fn from(value: RoundKernelArg) -> Self {
+        match value {
+            RoundKernelArg::Plain => Self::Plain,
+            RoundKernelArg::Mechanisms => Self::Mechanisms,
+        }
+    }
+}
+
+/// The `round_kernel` value of a `record=days_device` line.
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
+fn round_kernel_name(round_kernel: days_executor::RoundKernel) -> &'static str {
+    match round_kernel {
+        days_executor::RoundKernel::Plain => "plain",
+        days_executor::RoundKernel::Mechanisms => "mechanisms",
+    }
 }
 
 impl Cli {
@@ -1104,6 +1138,10 @@ fn run_metal(cli: &Cli, image: &SimulationImage, lowering_ns: u128) -> Result<()
     };
     config.round_threads_per_threadgroup =
         effective_round_threads(cli, config.round_threads_per_threadgroup);
+    #[cfg(feature = "metal-test-hooks")]
+    {
+        config.round_kernel_override = cli.round_kernel.map(Into::into);
+    }
     let started = Instant::now();
     // With no `--capacity-warm-start` this is the stock entry point, unchanged.
     let run = match &warm_start {
@@ -1134,7 +1172,7 @@ fn run_metal(cli: &Cli, image: &SimulationImage, lowering_ns: u128) -> Result<()
          transitions={} continuation_relaunches={} retry_count={retry_count} \
          grown_stream_count={grown_stream_count} \
          channel_capacity_distribution={channel_capacity_distribution} retry_trace={:?} \
-         same_time_continuations={}",
+         same_time_continuations={} round_kernel={}",
         run.wall_ns,
         run.device_ns,
         run.rounds,
@@ -1142,6 +1180,7 @@ fn run_metal(cli: &Cli, image: &SimulationImage, lowering_ns: u128) -> Result<()
         run.continuation_relaunches,
         run.capacity_retry_trace,
         run.same_time_continuations,
+        round_kernel_name(run.round_kernel),
     );
     print_result("metal", &run.result, lowering_ns, run_ns);
     Ok(())
@@ -1170,6 +1209,10 @@ fn run_cuda(cli: &Cli, image: &SimulationImage, lowering_ns: u128) -> Result<(),
         ..CudaConfig::default()
     };
     config.round_threads_per_block = effective_round_threads(cli, config.round_threads_per_block);
+    #[cfg(feature = "cuda-test-hooks")]
+    {
+        config.round_kernel_override = cli.round_kernel.map(Into::into);
+    }
     let started = Instant::now();
     // With no `--capacity-warm-start` this is the stock entry point, unchanged.
     let run = match &warm_start {
@@ -1200,7 +1243,7 @@ fn run_cuda(cli: &Cli, image: &SimulationImage, lowering_ns: u128) -> Result<(),
          transitions={} continuation_relaunches={} retry_count={retry_count} \
          grown_stream_count={grown_stream_count} \
          channel_capacity_distribution={channel_capacity_distribution} retry_trace={:?} \
-         same_time_continuations={}",
+         same_time_continuations={} round_kernel={}",
         run.wall_ns,
         run.device_ns,
         run.rounds,
@@ -1208,6 +1251,7 @@ fn run_cuda(cli: &Cli, image: &SimulationImage, lowering_ns: u128) -> Result<(),
         run.continuation_relaunches,
         run.capacity_retry_trace,
         run.same_time_continuations,
+        round_kernel_name(run.round_kernel),
     );
     print_result("cuda", &run.result, lowering_ns, run_ns);
     Ok(())

@@ -31,6 +31,13 @@ using ulong = uint64_t;
     ulong *__restrict__ stream_records, ulong *__restrict__ scheduler_state, \
     ulong *__restrict__ tcp_state
 
+// The argument list matching `DAYS_BUFFERS`, for entry points that forward to a template body.
+#define DAYS_BUFFER_ARGS \
+    control, params, node_state, generators, flows, routes, links, fel_meta, fel_records, \
+    queue_meta, queue_records, in_service, outbox, worklist, summary, observed, departures, \
+    arrivals, lp_state, remote_meta, remote_staging, observation_meta, inbound_meta, \
+    inbound_producers, merge_cursors, stream_state, stream_records, scheduler_state, tcp_state
+
 constexpr uint EVENT_WORDS = 14;
 constexpr uint CHANNEL_EVENT_WORDS = 11;
 constexpr uint SERVICE_EVENT_WORDS = 5;
@@ -4699,6 +4706,7 @@ __device__ __forceinline__ bool wfq_remove_at(
     return true;
 }
 
+template <bool MECHANISMS>
 __device__ __forceinline__ bool dispatch_event(
     ulong node,
     ulong *event,
@@ -6280,7 +6288,13 @@ extern "C" __global__ void days_round_prepare(DAYS_BUFFERS) {
     }
 }
 
-extern "C" __global__ __launch_bounds__(256) void days_round(DAYS_BUFFERS) {
+// P14: the round body, built twice. `MECHANISMS` selects whether the DCQCN and PFC transitions are
+// compiled in. The host launches exactly one build per run, chosen from the image
+// (`RoundKernel::for_image`): `days_round_mechanisms` when the image holds any DCQCN or PFC state,
+// `days_round` otherwise. Every Lane B entry point is guarded by `MECHANISMS`, so in the plain
+// build the compiler proves each mechanism branch dead.
+template <bool MECHANISMS>
+__device__ __forceinline__ void days_round_body(DAYS_BUFFERS) {
     uint active_index = blockIdx.x * blockDim.x + threadIdx.x;
     if (
         control[C_ERROR] != 0 ||
@@ -6341,7 +6355,7 @@ extern "C" __global__ __launch_bounds__(256) void days_round(DAYS_BUFFERS) {
         if (!hydrate_tx_complete_event(node, event, state, in_service)) {
             return;
         }
-        if (!dispatch_event(
+        if (!dispatch_event<MECHANISMS>(
             node,
             event,
             popped_timer_owner,
@@ -6385,6 +6399,16 @@ extern "C" __global__ __launch_bounds__(256) void days_round(DAYS_BUFFERS) {
         dispatch_transitions += 1;
     }
 
+}
+
+// The plain build: images without DCQCN or PFC state.
+extern "C" __global__ __launch_bounds__(256) void days_round(DAYS_BUFFERS) {
+    days_round_body<false>(DAYS_BUFFER_ARGS);
+}
+
+// The mechanisms build: every image, including DCQCN and PFC state.
+extern "C" __global__ __launch_bounds__(256) void days_round_mechanisms(DAYS_BUFFERS) {
+    days_round_body<true>(DAYS_BUFFER_ARGS);
 }
 
 // T21 fix 1 — the round-control scans, on the whole grid.

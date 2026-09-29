@@ -1,6 +1,13 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// P14: whether the DCQCN and PFC transitions are compiled into `days_round`. The host builds two
+// `days_round` pipelines from this one library, specialized with false and true, and dispatches
+// exactly one per run, chosen from the image (`RoundKernel::for_image`): true when the image holds
+// any DCQCN or PFC state. Every Lane B entry point is guarded by it, mirroring the `MECHANISMS`
+// template parameter of `cuda_kernels.cu`.
+constant bool DAYS_MECHANISMS [[function_constant(0)]];
+
 constant uint EVENT_WORDS = 14;
 constant uint CHANNEL_EVENT_WORDS = 11;
 constant uint SERVICE_EVENT_WORDS = 5;
