@@ -44,7 +44,7 @@
 //!
 //! # Collective case
 //!
-//! Scalar stage validation of one ring all-reduce at 96 and 192 ranks (see
+//! Scalar stage validation and lowering of one ring all-reduce at 96 and 192 ranks (see
 //! [`ci_scaling_collective_stage_validation`]).
 //!
 //! # Running
@@ -651,16 +651,19 @@ cc_algorithm = "TCPReno"
     )
 }
 
-/// The stage validators look up predecessors by collective position and by flow. A per-stage scan
-/// of every generator makes validation quadratic in the stage count, which grows as the square
-/// of the rank count: doubling the ranks quadruples the stages, so linear work gives about 4x and
-/// a quadratic term 16x. The bound is their geometric midpoint.
+/// Scalar stage validation and collective lowering, as the stage count grows with the square of
+/// the rank count: doubling the ranks quadruples the stages, so linear work gives about 4x and a
+/// term quadratic in stages 16x. The bound, 8, is their geometric midpoint.
 ///
-/// Only validation is gated. Collective lowering is recorded beside it (`gated=false`) but not
-/// bounded: every stage's flow key embeds a clone of its collective's key, rank-length source and
-/// sink lists included, so the canonical flow sort and the predecessor lookups cost O(ranks) per
-/// comparison and lowering grows as stages x ranks (`evidence/P14/perf-fix.md`, open finding).
-/// Being informational, it is timed once per size.
+/// The stage validators look up predecessors by collective position and by flow; a per-stage scan
+/// of every generator would make validation quadratic in stages. Lowering builds, sorts and links
+/// every stage; a per-stage scan of the stages lowered so far would make it quadratic in stages.
+///
+/// Lowering's gate is coarse. A stages x ranks cost, such as the collective-key clones `p14/coll`
+/// removed, grows exactly 8x at this step, on the bound itself, and sits below what this case can
+/// see on x86: the pre-fix tree measured 6.53 to 6.88 on four x86 cores, and 8.1 to 10.3 on an
+/// Apple M-series host (`evidence/P14/ci-scaling.md`). The deterministic heap and allocation check
+/// in `tests/collective_lowering_budget.rs`, in the default test matrix, guards that cost exactly.
 #[test]
 #[ignore = "CI scaling gate (the `scaling` job): run with --release --test-threads=1"]
 fn ci_scaling_collective_stage_validation() {
@@ -668,7 +671,7 @@ fn ci_scaling_collective_stage_validation() {
     let small = Scenario::ring_all_reduce(case.small);
     let large = Scenario::ring_all_reduce(case.large);
     let mut failures = Vec::new();
-    for phase in [(Phase::Lowering, false), (Phase::ScalarValidation, true)] {
+    for phase in [(Phase::Lowering, true), (Phase::ScalarValidation, true)] {
         gate(case, phase, &small, &large, &mut failures);
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
