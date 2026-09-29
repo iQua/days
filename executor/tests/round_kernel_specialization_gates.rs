@@ -108,17 +108,20 @@ fn guarded(lines: &[&str], index: usize, constant: &str) -> bool {
     }
     loop {
         let depth = indent(lines[start]);
+        // The enclosing block: the nearest header above whose first line is shallower. A
+        // multi-line condition's continuation lines sit at the body's depth, so the header's depth
+        // is its first line's.
         let Some(opener) = (0..start).rev().find(|&at| {
-            let line = code(lines[at]);
-            !line.trim().is_empty() && indent(line) < depth && line.trim_end().ends_with('{')
+            code(lines[at]).trim_end().ends_with('{')
+                && indent(lines[statement_start(lines, at)]) < depth
         }) else {
             return false;
         };
-        if indent(lines[opener]) == 0 {
+        let header = statement_start(lines, opener);
+        if indent(lines[header]) == 0 {
             // The function header: nothing on the way up tested the constant.
             return false;
         }
-        let header = statement_start(lines, opener);
         let text = lines[header..=opener]
             .iter()
             .map(|line| code(line))
@@ -137,16 +140,18 @@ fn entry_points(source: &str) -> Vec<(usize, String)> {
     let mut sites = Vec::new();
     for (index, line) in lines.iter().enumerate() {
         let text = code(line);
+        // A call is the name followed by `(`, or by template arguments (`name<MECHANISMS>(`).
         let calls = LANE_B_FUNCTIONS.iter().filter_map(|function| {
-            let call = format!("{function}(");
-            text.match_indices(&call)
+            text.match_indices(function)
                 .any(|(at, _)| {
-                    !text[..at]
+                    let before = text[..at]
                         .chars()
                         .next_back()
-                        .is_some_and(|previous| previous.is_alphanumeric() || previous == '_')
+                        .is_some_and(|previous| previous.is_alphanumeric() || previous == '_');
+                    let after = text[at + function.len()..].chars().next();
+                    !before && matches!(after, Some('(' | '<'))
                 })
-                .then(|| call.clone())
+                .then(|| format!("{function}("))
         });
         let reads = LANE_B_READS
             .iter()

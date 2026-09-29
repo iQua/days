@@ -320,6 +320,8 @@ mod metal {
                 "{name}: {error}"
             );
         }
+        // A checkpoint with work left must stop; one with no pending event runs no transition,
+        // so the plain build's result is the unchanged image, which is Scalar's.
         for (name, image) in mechanism_images() {
             match run_metal_with_observations(
                 &image,
@@ -328,6 +330,10 @@ mod metal {
                 ObservationMode::Full,
             ) {
                 Err(MetalError::MechanismsKernelRequired { .. }) => {}
+                Ok(run) if image.initial_events.is_empty() => {
+                    assert_eq!(run.transitions, 0, "{name}");
+                    assert_eq!(run.result, scalar(&image, None), "{name}");
+                }
                 other => panic!("{name}: expected a fail-closed stop, got {other:?}"),
             }
         }
@@ -396,6 +402,8 @@ mod cuda {
                 "{name}: {error}"
             );
         }
+        // A checkpoint with work left must stop; one with no pending event runs no transition,
+        // so the plain build's result is the unchanged image, which is Scalar's.
         for (name, image) in mechanism_images() {
             match run_cuda_with_observations(
                 &image,
@@ -404,6 +412,10 @@ mod cuda {
                 ObservationMode::Full,
             ) {
                 Err(CudaError::MechanismsKernelRequired { .. }) => {}
+                Ok(run) if image.initial_events.is_empty() => {
+                    assert_eq!(run.transitions, 0, "{name}");
+                    assert_eq!(run.result, scalar(&image, None), "{name}");
+                }
                 other => panic!("{name}: expected a fail-closed stop, got {other:?}"),
             }
         }
