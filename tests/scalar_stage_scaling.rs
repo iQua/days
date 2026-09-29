@@ -6,13 +6,30 @@
 //! each segment and ACK of a stage's TCP transport found its generator and receiver by a linear
 //! `find`. The work per event therefore grew with the rank count, and a run with it.
 //!
-//! The measure is deterministic: a test-only probe
-//! (`days_executor::scalar::run_scalar_counting_stage_scans_for_testing`) counts the
-//! generator-table, TCP-receiver-table and pending-cause entries the stage path examines, and the
-//! events the run dispatched. The gate is the ratio of visits per dispatched event between
-//! [`LARGE_RANKS`] and [`SMALL_RANKS`], a 4x step: a per-event scan of the host's table grows with
-//! the rank count (about 4x), a keyed lookup does not (about 1x). The bound [`MAX_RATIO`] is their
-//! geometric midpoint, 2.
+//! The measure is deterministic. A test-only probe
+//! (`days_executor::scalar::run_scalar_counting_stage_scans_for_testing`) counts the events the
+//! run dispatched and the stage-path *visits*, which are exactly:
+//! * every element yielded by an iteration of a host's generator or TCP-receiver table. The
+//!   stage-path functions reach a host only through the stage view, whose two tables count every
+//!   element an `iter`, `iter_mut` or `for` loop yields, so any scan of them is counted, whether
+//!   or not it uses the stage index. Positional access (`table[i]`) is O(1) and is not counted;
+//! * every entry the stage index reads: one per keyed lookup (the O(log G) comparisons of a
+//!   binary search or B-tree descent are not counted), plus each successor-list entry and each
+//!   releasable-set member examined;
+//! * every pending-cause entry examined by a take, plus the causes left for the progress-only
+//!   records.
+//!
+//! Which functions are on the stage path is fixed by `STAGE_PATH_FUNCTIONS` in `xtask/src/main.rs`.
+//! `cargo xtask audit` rejects, inside them, any table scan and any raw access that would bypass
+//! the view (`host_state`, `host_state_mut`, `host_states`, `HostState`, raw table slices, a raw
+//! `Vec` of causes). The audit is syntactic; this budget counts any scan the audit cannot see.
+//! Work outside those functions (switch transitions, retransmission timeouts, DCQCN) is not
+//! counted.
+//!
+//! The gate is the ratio of visits per dispatched event between [`LARGE_RANKS`] and
+//! [`SMALL_RANKS`], a 4x step: a per-event scan of the host's table grows with the rank count
+//! (about 4x), a keyed lookup does not (about 1x). The bound [`MAX_RATIO`] is their geometric
+//! midpoint, 2.
 //!
 //! How to run each case (both are fast, un-ignored and need the `test` feature):
 //! * `cargo test -p days --features test --test scalar_stage_scaling ring_all_reduce`
