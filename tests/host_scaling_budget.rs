@@ -1,4 +1,5 @@
-//! P14 perf budget contract: host lowering and planning stay near-linear in the flow count.
+//! P14 perf budget contract: host lowering, validation and planning stay near-linear in the flow
+//! and stage counts.
 //!
 //! Twice now a per-flow linear scan inside the load-time validator made the host path quadratic at
 //! frontier scale: T20j removed ten per-generator rescans of the initial tables, and P14 added a
@@ -7,30 +8,58 @@
 //! backends validated the image again. Byte-identity gates cannot see this regression: the output
 //! is unchanged, only its cost grows.
 //!
-//! The contract is a scaling ratio, not a wall-clock threshold. Two frontier-shaped scenarios are
-//! derived from the frontier fixture itself: the same topology, seed, switch, link and traffic
-//! block, with 4 and with all 32 of its stacked 8,192-flow sets (32,768 and 262,144 TCP flows, an
-//! 8x step). Each host phase is timed at both sizes, taking the minimum of a few repetitions, and
-//! the large/small ratio must stay below [`MAX_RATIO`]. The large size runs once: its phases take
-//! seconds, so their relative noise is far smaller than the small size's. Linear work gives about 8x and `n log n`
-//! work about 9.6x (log2 262,144 / log2 32,768 = 18/15); a quadratic term gives 64x. The bound
-//! sits at the geometric midpoint, so machine speed cancels and a factor-2 noise swing on either
-//! side still separates the two regimes.
+//! The contract is a scaling ratio, not a wall-clock threshold. Each case measures a phase at a
+//! small and a large size, taking the minimum of a few repetitions, and the large/small ratio must
+//! stay below the case's bound. Machine speed cancels in the ratio. The bound is the geometric
+//! midpoint of the ratios a linear and a quadratic phase give for the case's size step, so a
+//! factor-of-two noise swing on either side still separates the two regimes.
 //!
-//! Phases:
-//! * **lowering**: `compile_config`, which includes the Scalar-backend `validate`;
-//! * **device validation**: `validate` for the CUDA backend, which every device run repeats at
-//!   executor entry (the Metal plan construction below validates for Metal the same way);
-//! * **host planning**: `size_default_device_plan`, and the full Metal plan construction
-//!   (`size_metal_plan_for_testing`) where that hook is compiled, under the frontier run
-//!   protocol's capacity caps.
+//! A ratio at or above the bound is measured once more, at both sizes, and the phase fails only if
+//! the second measurement breaches the bound too. Every measurement, the re-measure included,
+//! prints one `record=host_scaling_budget` line.
 //!
-//! The frontier sizes are expensive in an unoptimized build, so the gate is explicit:
-//! `cargo test --release -p days --features test --test host_scaling_budget -- --ignored`
-//! (add `metal` on Apple hardware to include the Metal plan construction).
+//! # Frontier cases
+//!
+//! Scenarios derived from the frontier fixture itself: the same topology, seed, switch, link and
+//! traffic block, keeping only the first few of its 32 identical 8,192-flow sets. Phases:
+//! * `lowering`: `compile_config`, which includes the Scalar-backend `validate`;
+//! * `device_validation`: `validate` for the CUDA backend, which every device run repeats at
+//!   executor entry (the Metal plan construction validates for Metal the same way);
+//! * `default_sizing`: `size_default_device_plan`;
+//! * `metal_plan`: the full Metal plan construction (`size_metal_plan_for_testing`) under the
+//!   frontier run protocol's capacity caps. It needs the `metal` feature on Apple hardware; the
+//!   hook builds the plan on the host and never creates a Metal device. It is not in CI: its
+//!   per-logical-process arenas on the k=32 topology peak above 10 GB at either CI size, beyond a
+//!   hosted `macos-15` runner's 7 GB (`evidence/P14/ci-scaling.md`).
+//!
+//! The regression is a quadratic term beside a linear one, `T(n) = a n + b n^2`. With `q = b n / a`
+//! at the small size and a size step `k`, the ratio is `(k + k^2 q) / (1 + q)`: it rises from `k`
+//! towards `k^2` as the quadratic share grows, so the gate needs a small size where that share is
+//! already large. The CI case steps 2 to 16 sets (16,384 to 131,072 flows). In one probe run on
+//! an Apple M-series host with the regression (`c1ec354`), lowering gave 57.8 and CUDA validation
+//! 69.3 at that step, against 25.8 and 34.8 at 1 to 8 sets; the fixed tree gave 7.6 and 8.8
+//! (`evidence/P14/ci-scaling.md`). The full case steps 4 to 32 sets (the whole frontier).
+//!
+//! # Collective case
+//!
+//! Scalar stage validation of one ring all-reduce at 48 and 96 ranks (see
+//! [`ci_scaling_collective_stage_validation`]).
+//!
+//! # Running
+//!
+//! Every timing case is `#[ignore]`d, so the default debug matrix runs only the derivation check.
+//! The CI-sized cases run in the `scaling` CI job:
+//! `cargo test --release -p days --features test --test host_scaling_budget -- --ignored --exact
+//! --test-threads=1 --nocapture ci_scaling_frontier_host_phases ci_scaling_collective_stage_validation`
+//! On Apple hardware, `--features test,metal` and `frontier_metal_plan_at_ci_sizes` time the Metal
+//! plan at the CI sizes. The full frontier case is an explicit run only:
+//! `cargo test --release -p days --features test,metal --test host_scaling_budget -- --ignored
+//! --exact --nocapture full_frontier_host_phases`.
+//! Timing cases must run one at a time (`--test-threads=1`), or they time each other.
 #![cfg(feature = "test")]
 
 use std::fs;
+use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -41,99 +70,172 @@ const FRONTIER_FIXTURE: &str = "configs/benchmarks/lookahead/rq9_frontier_closed
 const FLOW_SET_HEADER: &str = "[[flow_set]]";
 /// Flows per stacked set in the frontier fixture.
 const FLOWS_PER_SET: usize = 8_192;
-const SMALL_SETS: usize = 4;
-const LARGE_SETS: usize = 32;
-/// Geometric midpoint of the linear (8x) and quadratic (64x) ratios for an 8x size step.
-const MAX_RATIO: f64 = 22.6;
-const SMALL_REPETITIONS: usize = 3;
-const LARGE_REPETITIONS: usize = 1;
+/// Stacked flow sets in the frontier fixture.
+const FIXTURE_SETS: usize = 32;
 
-/// The frontier fixture with only its first `sets` stacked flow sets.
-fn frontier_with_flow_sets(sets: usize) -> String {
-    let text = fs::read_to_string(repo_path(FRONTIER_FIXTURE)).expect("read the frontier fixture");
-    let mut blocks = text.split(FLOW_SET_HEADER);
-    let prefix = blocks.next().expect("the fixture has a prefix");
-    let blocks = blocks.collect::<Vec<_>>();
-    assert_eq!(
-        blocks.len(),
-        LARGE_SETS,
-        "the frontier fixture must stack exactly {LARGE_SETS} flow sets"
-    );
-    assert!(
-        blocks
-            .windows(2)
-            .all(|pair| pair[0].trim_end() == pair[1].trim_end()),
-        "the frontier fixture's stacked flow sets must be identical"
-    );
-    let mut derived = prefix.to_owned();
-    for block in &blocks[..sets] {
-        derived.push_str(FLOW_SET_HEADER);
-        derived.push_str(block);
+/// Geometric midpoint of the linear (8x) and quadratic (64x) ratios for an 8x size step, in
+/// thousandths.
+const EIGHTFOLD_STEP_MAX_RATIO_MILLI: u128 = 22_600;
+/// Geometric midpoint of the linear (4x) and quadratic (16x) ratios for a 4x size step, in
+/// thousandths.
+const FOURFOLD_STEP_MAX_RATIO_MILLI: u128 = 8_000;
+
+/// A phase effectively free at the small size must not divide by noise.
+const RATIO_FLOOR: Duration = Duration::from_millis(1);
+
+/// One scaling case: the two sizes, their repetitions, and the ratio bound.
+struct Case {
+    name: &'static str,
+    /// What `small` and `large` count.
+    unit: &'static str,
+    small: usize,
+    large: usize,
+    small_repetitions: usize,
+    large_repetitions: usize,
+    max_ratio_milli: u128,
+}
+
+/// The CI-sized frontier case: 16,384 and 131,072 flows. The large size runs once: its phases take
+/// about a second, so their relative noise is far smaller than the small size's.
+const CI_FRONTIER: Case = Case {
+    name: "frontier_ci",
+    unit: "flow_sets",
+    small: 2,
+    large: 16,
+    small_repetitions: 5,
+    large_repetitions: 1,
+    max_ratio_milli: EIGHTFOLD_STEP_MAX_RATIO_MILLI,
+};
+
+/// The full frontier case: 32,768 and 262,144 flows.
+const FULL_FRONTIER: Case = Case {
+    name: "frontier_full",
+    unit: "flow_sets",
+    small: 4,
+    large: FIXTURE_SETS,
+    small_repetitions: 3,
+    large_repetitions: 1,
+    max_ratio_milli: EIGHTFOLD_STEP_MAX_RATIO_MILLI,
+};
+
+/// The collective case: one ring all-reduce at 48 and 96 ranks, 4,512 and 18,240 stages.
+const CI_COLLECTIVE: Case = Case {
+    name: "collective_ci",
+    unit: "ranks",
+    small: 48,
+    large: 96,
+    small_repetitions: 3,
+    large_repetitions: 3,
+    max_ratio_milli: FOURFOLD_STEP_MAX_RATIO_MILLI,
+};
+
+/// A lowered scenario and the config it came from.
+struct Scenario {
+    path: PathBuf,
+    image: SimulationImage,
+}
+
+impl Scenario {
+    /// Writes and lowers `config`; this untimed lowering also warms the allocator and caches.
+    fn lower(name: &str, config: String) -> Self {
+        let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}.toml"));
+        fs::write(&path, config).expect("write the derived scenario");
+        let image = compile_config(&path).unwrap_or_else(|error| panic!("lower {name}: {error}"));
+        Self { path, image }
     }
-    derived
+
+    fn frontier(sets: usize) -> Self {
+        let scenario = Self::lower(
+            &format!("host_scaling_budget_frontier_{sets}_sets"),
+            frontier_with_flow_sets(sets),
+        );
+        assert_eq!(
+            scenario.image.flows.len(),
+            sets * FLOWS_PER_SET,
+            "{sets} sets: flow count"
+        );
+        scenario
+    }
+
+    fn ring_all_reduce(ranks: usize) -> Self {
+        let scenario = Self::lower(
+            &format!("host_scaling_budget_ring_{ranks}_ranks"),
+            ring_all_reduce_config(ranks),
+        );
+        let stages = scenario
+            .image
+            .host_states
+            .iter()
+            .flat_map(|state| &state.generators)
+            .filter(|generator| generator.stage.is_some())
+            .count();
+        assert_eq!(
+            stages,
+            2 * ranks * (ranks - 1),
+            "{ranks} ranks: stage count"
+        );
+        scenario
+    }
 }
 
-fn repo_path(relative: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
+#[derive(Clone, Copy)]
+enum Phase {
+    Lowering,
+    DeviceValidation,
+    ScalarValidation,
+    DefaultSizing,
+    #[cfg(all(feature = "metal", target_vendor = "apple"))]
+    MetalPlan,
 }
 
-fn write_scenario(sets: usize) -> PathBuf {
-    let path = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("host_scaling_budget_frontier_{sets}_sets.toml"));
-    fs::write(&path, frontier_with_flow_sets(sets)).expect("write the derived scenario");
-    path
+impl Phase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Lowering => "lowering",
+            Self::DeviceValidation => "device_validation",
+            Self::ScalarValidation => "scalar_validation",
+            Self::DefaultSizing => "default_sizing",
+            #[cfg(all(feature = "metal", target_vendor = "apple"))]
+            Self::MetalPlan => "metal_plan",
+        }
+    }
+
+    /// Minimum wall time of `repetitions` runs of this phase on `scenario`.
+    fn time(self, scenario: &Scenario, repetitions: usize) -> Duration {
+        match self {
+            Self::Lowering => min_time(repetitions, || {
+                compile_config(&scenario.path).expect("lower the scenario")
+            }),
+            Self::DeviceValidation => min_time(repetitions, || {
+                validate(&scenario.image, Backend::Cuda).expect("CUDA validation")
+            }),
+            Self::ScalarValidation => min_time(repetitions, || {
+                validate(&scenario.image, Backend::Scalar).expect("Scalar validation")
+            }),
+            Self::DefaultSizing => min_time(repetitions, || {
+                size_default_device_plan(&scenario.image).expect("default device plan")
+            }),
+            #[cfg(all(feature = "metal", target_vendor = "apple"))]
+            Self::MetalPlan => metal_plan_time(&scenario.image, repetitions),
+        }
+    }
 }
 
-/// Minimum wall time of `repetitions` calls, and the last call's value.
-fn min_time<T>(repetitions: usize, mut phase: impl FnMut() -> T) -> (Duration, T) {
+/// Minimum wall time of `repetitions` calls; each result is dropped outside the timed region.
+fn min_time<T>(repetitions: usize, mut phase: impl FnMut() -> T) -> Duration {
+    assert!(repetitions > 0, "at least one repetition");
     let mut best = Duration::MAX;
-    let mut value = None;
     for _ in 0..repetitions {
         let started = Instant::now();
-        let result = phase();
+        let result = black_box(phase());
         best = best.min(started.elapsed());
-        value = Some(result);
+        drop(result);
     }
-    (best, value.expect("at least one repetition"))
-}
-
-struct Phases {
-    lowering: Duration,
-    device_validation: Duration,
-    sizing: Duration,
-    metal_plan: Option<Duration>,
-}
-
-fn measure(sets: usize, repetitions: usize) -> (Phases, SimulationImage) {
-    let path = write_scenario(sets);
-    let (lowering, image) = min_time(repetitions, || {
-        compile_config(&path).unwrap_or_else(|error| panic!("lower {sets} sets: {error}"))
-    });
-    assert_eq!(
-        image.flows.len(),
-        sets * FLOWS_PER_SET,
-        "{sets} sets: flow count"
-    );
-    let (device_validation, ()) = min_time(repetitions, || {
-        validate(&image, Backend::Cuda).expect("CUDA validation");
-    });
-    let (sizing, _) = min_time(repetitions, || {
-        size_default_device_plan(&image).expect("default device plan")
-    });
-    let metal_plan = metal_plan_time(&image, repetitions);
-    (
-        Phases {
-            lowering,
-            device_validation,
-            sizing,
-            metal_plan,
-        },
-        image,
-    )
+    best
 }
 
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
-fn metal_plan_time(image: &SimulationImage, repetitions: usize) -> Option<Duration> {
+fn metal_plan_time(image: &SimulationImage, repetitions: usize) -> Duration {
     use days_executor::{
         DeviceCapacityCaps, MetalConfig, ObservationMode, size_metal_plan_for_testing,
     };
@@ -154,69 +256,167 @@ fn metal_plan_time(image: &SimulationImage, repetitions: usize) -> Option<Durati
         },
         ..MetalConfig::default()
     };
-    let (time, _) = min_time(repetitions, || {
+    min_time(repetitions, || {
         size_metal_plan_for_testing(image, None, config, ObservationMode::Summary)
             .expect("Metal plan")
-    });
-    Some(time)
+    })
 }
 
-#[cfg(not(all(feature = "metal", target_vendor = "apple")))]
-fn metal_plan_time(_image: &SimulationImage, _repetitions: usize) -> Option<Duration> {
-    None
-}
-
-fn check(label: &str, small: Duration, large: Duration, failures: &mut Vec<String>) {
-    // A floor keeps a phase that is effectively free at the small size from dividing by noise.
-    let floor = Duration::from_millis(1);
-    let ratio = large.as_secs_f64() / small.max(floor).as_secs_f64();
+/// Prints one measurement's record and returns whether it breaches the case's bound.
+fn record(
+    case: &Case,
+    phase: &str,
+    attempt: u32,
+    gated: bool,
+    (small, large): (Duration, Duration),
+) -> bool {
+    let ratio_milli = large.as_nanos() * 1_000 / small.max(RATIO_FLOOR).as_nanos();
+    let breach = ratio_milli >= case.max_ratio_milli;
     println!(
-        "record=host_scaling_budget phase={label} small_sets={SMALL_SETS} large_sets={LARGE_SETS} \
-         small_ns={} large_ns={} ratio={ratio:.3} max_ratio={MAX_RATIO}",
+        "record=host_scaling_budget case={} phase={phase} attempt={attempt} unit={} small={} \
+         large={} small_ns={} large_ns={} ratio={} max_ratio={} gated={gated} breach={breach}",
+        case.name,
+        case.unit,
+        case.small,
+        case.large,
         small.as_nanos(),
         large.as_nanos(),
+        milli(ratio_milli),
+        milli(case.max_ratio_milli),
     );
-    if ratio >= MAX_RATIO {
+    breach
+}
+
+fn milli(value: u128) -> String {
+    format!("{}.{:03}", value / 1_000, value % 1_000)
+}
+
+/// Gates one phase: a breach is measured once more at both sizes, and only a repeated breach
+/// records a failure.
+fn gate(case: &Case, phase: Phase, small: &Scenario, large: &Scenario, failures: &mut Vec<String>) {
+    let mut measure = || {
+        (
+            phase.time(small, case.small_repetitions),
+            phase.time(large, case.large_repetitions),
+        )
+    };
+    let first = measure();
+    if !record(case, phase.label(), 1, true, first) {
+        return;
+    }
+    let second = measure();
+    if record(case, phase.label(), 2, true, second) {
         failures.push(format!(
-            "{label}: {LARGE_SETS}/{SMALL_SETS} flow-set time ratio {ratio:.1} >= {MAX_RATIO} \
-             ({} ms -> {} ms); the phase is super-linear in the flow count",
-            small.as_millis(),
-            large.as_millis(),
+            "{} {}: {}/{} {} time ratio breached {} twice ({} ms -> {} ms, then {} ms -> {} ms); \
+             the phase is super-linear",
+            case.name,
+            phase.label(),
+            case.large,
+            case.small,
+            case.unit,
+            milli(case.max_ratio_milli),
+            first.0.as_millis(),
+            first.1.as_millis(),
+            second.0.as_millis(),
+            second.1.as_millis(),
         ));
     }
+}
+
+fn run_frontier(case: &Case, phases: &[Phase]) {
+    let small = Scenario::frontier(case.small);
+    let large = Scenario::frontier(case.large);
+    let mut failures = Vec::new();
+    for &phase in phases {
+        gate(case, phase, &small, &large, &mut failures);
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+const FRONTIER_HOST_PHASES: [Phase; 3] = [
+    Phase::Lowering,
+    Phase::DeviceValidation,
+    Phase::DefaultSizing,
+];
+
+/// The frontier fixture with only its first `sets` stacked flow sets.
+fn frontier_with_flow_sets(sets: usize) -> String {
+    let text = fs::read_to_string(repo_path(FRONTIER_FIXTURE)).expect("read the frontier fixture");
+    let mut blocks = text.split(FLOW_SET_HEADER);
+    let prefix = blocks.next().expect("the fixture has a prefix");
+    let blocks = blocks.collect::<Vec<_>>();
+    assert_eq!(
+        blocks.len(),
+        FIXTURE_SETS,
+        "the frontier fixture must stack exactly {FIXTURE_SETS} flow sets"
+    );
+    assert!(
+        blocks
+            .windows(2)
+            .all(|pair| pair[0].trim_end() == pair[1].trim_end()),
+        "the frontier fixture's stacked flow sets must be identical"
+    );
+    let mut derived = prefix.to_owned();
+    for block in &blocks[..sets] {
+        derived.push_str(FLOW_SET_HEADER);
+        derived.push_str(block);
+    }
+    derived
+}
+
+fn repo_path(relative: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
 }
 
 #[test]
 fn derived_scenarios_are_the_frontier_with_fewer_flow_sets() {
     let full = fs::read_to_string(repo_path(FRONTIER_FIXTURE)).expect("read the frontier fixture");
-    assert_eq!(frontier_with_flow_sets(LARGE_SETS), full);
-    let small = frontier_with_flow_sets(SMALL_SETS);
-    assert_eq!(small.matches(FLOW_SET_HEADER).count(), SMALL_SETS);
-    assert!(full.starts_with(&small));
+    assert_eq!(frontier_with_flow_sets(FIXTURE_SETS), full);
+    for sets in [
+        CI_FRONTIER.small,
+        CI_FRONTIER.large,
+        FULL_FRONTIER.small,
+        FULL_FRONTIER.large,
+    ] {
+        let derived = frontier_with_flow_sets(sets);
+        assert_eq!(derived.matches(FLOW_SET_HEADER).count(), sets);
+        assert!(
+            full.starts_with(&derived),
+            "{sets} sets: a prefix of the fixture"
+        );
+    }
+}
+
+#[test]
+#[ignore = "CI scaling gate (the `scaling` job): run with --release --test-threads=1"]
+fn ci_scaling_frontier_host_phases() {
+    run_frontier(&CI_FRONTIER, &FRONTIER_HOST_PHASES);
+}
+
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
+#[test]
+#[ignore = "explicit Metal-plan scaling budget on Apple hardware: run with --release"]
+fn frontier_metal_plan_at_ci_sizes() {
+    run_frontier(&CI_FRONTIER, &[Phase::MetalPlan]);
 }
 
 #[test]
 #[ignore = "explicit P14 perf frontier-scale host budget: run with --release"]
-fn frontier_host_lowering_and_planning_scale_near_linearly_in_flows() {
-    let (small, _) = measure(SMALL_SETS, SMALL_REPETITIONS);
-    let (large, _) = measure(LARGE_SETS, LARGE_REPETITIONS);
-    let mut failures = Vec::new();
-    check("lowering", small.lowering, large.lowering, &mut failures);
-    check(
-        "device_validation",
-        small.device_validation,
-        large.device_validation,
-        &mut failures,
+fn full_frontier_host_phases() {
+    run_frontier(
+        &FULL_FRONTIER,
+        &[
+            Phase::Lowering,
+            Phase::DeviceValidation,
+            Phase::DefaultSizing,
+            #[cfg(all(feature = "metal", target_vendor = "apple"))]
+            Phase::MetalPlan,
+        ],
     );
-    check("default_sizing", small.sizing, large.sizing, &mut failures);
-    if let (Some(small_plan), Some(large_plan)) = (small.metal_plan, large.metal_plan) {
-        check("metal_plan", small_plan, large_plan, &mut failures);
-    }
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// One ring all-reduce over `ranks` hosts on a single switch: `2 * ranks * (ranks - 1)` TCP stages.
-fn ring_all_reduce_scenario(ranks: u64) -> PathBuf {
+fn ring_all_reduce_config(ranks: usize) -> String {
     let switch = ranks;
     let edges = (0..ranks)
         .map(|host| format!("[{host}, {switch}]"))
@@ -230,7 +430,7 @@ fn ring_all_reduce_scenario(ranks: u64) -> PathBuf {
         .map(|host| ((host + 1) % ranks).to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    let config = format!(
+    format!(
         r#"
 seed = 26
 edges = [{edges}]
@@ -260,78 +460,35 @@ pkt_size_dist = {{ type = "DiscreteUniform", low = 500, high = 500 }}
 cc_algorithm = "TCPReno"
 "#,
         size = ranks * 1_000,
-    );
-    let path = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("host_scaling_budget_ring_{ranks}_ranks.toml"));
-    fs::write(&path, config).expect("write the derived scenario");
-    path
+    )
 }
-
-const SMALL_RANKS: u64 = 48;
-const LARGE_RANKS: u64 = 96;
 
 /// The stage validators look up predecessors by collective position and by flow. A per-stage scan
 /// of every generator makes validation quadratic in the stage count, which grows as the square
 /// of the rank count: doubling the ranks quadruples the stages, so linear work gives about 4x and
 /// a quadratic term 16x. The bound is their geometric midpoint.
 ///
-/// Only validation is gated. Collective lowering is reported beside it but not bounded: every
-/// stage's flow key embeds a clone of its collective's key, rank-length source and sink lists
-/// included, so the canonical flow sort and the predecessor lookups cost O(ranks) per comparison
-/// and lowering grows as stages x ranks (`evidence/P14/perf-fix.md`, open finding).
+/// Only validation is gated. Collective lowering is recorded beside it (`gated=false`) but not
+/// bounded: every stage's flow key embeds a clone of its collective's key, rank-length source and
+/// sink lists included, so the canonical flow sort and the predecessor lookups cost O(ranks) per
+/// comparison and lowering grows as stages x ranks (`evidence/P14/perf-fix.md`, open finding).
 #[test]
-#[ignore = "explicit P14 perf collective-scale host budget: run with --release"]
-fn collective_stage_validation_scales_near_linearly_in_stages() {
-    const MAX_STAGE_RATIO: f64 = 8.0;
-    let measure_ranks = |ranks: u64| {
-        let path = ring_all_reduce_scenario(ranks);
-        let (lowering, image) = min_time(SMALL_REPETITIONS, || {
-            compile_config(&path).unwrap_or_else(|error| panic!("lower {ranks} ranks: {error}"))
-        });
-        let stages = image
-            .host_states
-            .iter()
-            .flat_map(|state| &state.generators)
-            .filter(|generator| generator.stage.is_some())
-            .count() as u64;
-        assert_eq!(
-            stages,
-            2 * ranks * (ranks - 1),
-            "{ranks} ranks: stage count"
-        );
-        let (validation, ()) = min_time(SMALL_REPETITIONS, || {
-            validate(&image, Backend::Scalar).expect("Scalar validation");
-        });
-        (lowering, validation)
-    };
-    let (small_lowering, small_validation) = measure_ranks(SMALL_RANKS);
-    let (large_lowering, large_validation) = measure_ranks(LARGE_RANKS);
-    let mut failures = Vec::new();
-    for (label, small, large, gated) in [
-        ("collective_lowering", small_lowering, large_lowering, false),
+#[ignore = "CI scaling gate (the `scaling` job): run with --release --test-threads=1"]
+fn ci_scaling_collective_stage_validation() {
+    let case = &CI_COLLECTIVE;
+    let small = Scenario::ring_all_reduce(case.small);
+    let large = Scenario::ring_all_reduce(case.large);
+    record(
+        case,
+        Phase::Lowering.label(),
+        1,
+        false,
         (
-            "collective_validation",
-            small_validation,
-            large_validation,
-            true,
+            Phase::Lowering.time(&small, case.small_repetitions),
+            Phase::Lowering.time(&large, case.large_repetitions),
         ),
-    ] {
-        let ratio = large.as_secs_f64() / small.max(Duration::from_millis(1)).as_secs_f64();
-        println!(
-            "record=host_scaling_budget phase={label} small_ranks={SMALL_RANKS} \
-             large_ranks={LARGE_RANKS} small_ns={} large_ns={} ratio={ratio:.3} \
-             max_ratio={MAX_STAGE_RATIO} gated={gated}",
-            small.as_nanos(),
-            large.as_nanos(),
-        );
-        if gated && ratio >= MAX_STAGE_RATIO {
-            failures.push(format!(
-                "{label}: {LARGE_RANKS}/{SMALL_RANKS}-rank time ratio {ratio:.1} >= \
-                 {MAX_STAGE_RATIO} ({} ms -> {} ms); the phase is super-linear in the stage count",
-                small.as_millis(),
-                large.as_millis(),
-            ));
-        }
-    }
+    );
+    let mut failures = Vec::new();
+    gate(case, Phase::ScalarValidation, &small, &large, &mut failures);
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
