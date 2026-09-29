@@ -2541,6 +2541,7 @@ fn collective_identity(
 /// local predecessor is complete exactly when its generator has finished (TCP: all bytes
 /// acknowledged). The inbound byte count equals this host's in-order TCP frontier for the inbound
 /// flow, so the inbound flag is complete exactly when that frontier reaches the chunk.
+#[allow(clippy::too_many_arguments)]
 fn validate_collective_stage(
     image: &SimulationImage,
     flow_index: &FlowIndex,
@@ -2783,6 +2784,7 @@ fn host_tcp_receiver(
 /// collective together with the previous rank's final stage as the inbound predecessor. A released
 /// stage is timed (`Scheduled` with its token and one `PacingTimer`), beyond the stop (`Stopped`),
 /// or complete (`Finished`).
+#[allow(clippy::too_many_arguments)]
 fn validate_compute_stage(
     image: &SimulationImage,
     flow_index: &FlowIndex,

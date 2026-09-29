@@ -159,8 +159,8 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "validate.rs",
         predicate: r#"feature = "planner-test-hooks""#,
-        count: 2,
-        purpose: "pre-index validator scans and their equality hook exist only for standard tests",
+        count: 3,
+        purpose: "pre-index validator scans and their two equality hooks exist only for standard tests",
     },
     AllowedFeatureGate {
         path: "lib.rs",
