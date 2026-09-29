@@ -224,10 +224,16 @@ fn the_constant_selects_between_two_builds_of_one_round_body() {
         .count(),
         1
     );
-    for (build, value) in [("days_round", "false"), ("days_round_mechanisms", "true")] {
+    // The mechanisms build states one resident block per SM: under `__launch_bounds__(256)` alone,
+    // CUDA 13.0's ptxas targets 128 registers on sm_121 for it and spills (evidence/P14/spec.md
+    // §4). The plain build keeps the allocation the probe measured.
+    for (build, bounds, value) in [
+        ("days_round", "256", "false"),
+        ("days_round_mechanisms", "256, 1", "true"),
+    ] {
         assert!(
             CUDA.contains(&format!(
-                "extern \"C\" __global__ __launch_bounds__(256) void {build}(DAYS_BUFFERS) {{\n    \
+                "extern \"C\" __global__ __launch_bounds__({bounds}) void {build}(DAYS_BUFFERS) {{\n    \
                  days_round_body<{value}>(DAYS_BUFFER_ARGS);\n}}"
             )),
             "{build}"
