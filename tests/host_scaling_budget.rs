@@ -240,9 +240,11 @@ fn metal_plan_time(image: &SimulationImage, repetitions: usize) -> Duration {
         DeviceCapacityCaps, MetalConfig, ObservationMode, size_metal_plan_for_testing,
     };
     // The frontier run protocol's caps: the `days` CLI's defaults with
-    // `--channel-events-per-stream 256`. Uncapped channel streams (the executor-level default)
-    // grow the stream arena itself faster than the flow count, which is a property of the
-    // requested plan size, not of the planner's work per flow.
+    // `--channel-events-per-stream 256`. Without caps (the executor-level default),
+    // `derived_remote_capacities` reserves remote staging per flow and per route link, and
+    // `prepare_streams` writes one state word per staging slot. That plan is linear in the flow
+    // count but hundreds of GB at the frontier, so its planning time then most likely depends on
+    // memory pressure rather than on the planner's work per flow. The gate plans under the caps.
     let config = MetalConfig {
         capacity_caps: DeviceCapacityCaps {
             fallback_fel_events_per_lp: Some(16_384),
