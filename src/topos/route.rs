@@ -752,7 +752,12 @@ fn source_group_parts(
     let mut current_part = 0;
     let mut before = 0;
     for index in 0..grouped.len() {
-        let part = before * parts / total;
+        // The part is `floor(before * parts / total)`. It never decreases, so it advances by
+        // comparison instead of a division per position.
+        let mut part = current_part;
+        while (part + 1) * total <= before * parts {
+            part += 1;
+        }
         if part != current_part {
             if part_start < index {
                 ranges.push(part_start..index);
@@ -1632,6 +1637,27 @@ mod tests {
             for pair in parts.windows(2) {
                 assert_eq!(pair[0].end, pair[1].start, "parts must be contiguous");
             }
+            // Each position lies in part `floor(w * parts / total)`, `w` the weight before it.
+            let budget = workers.get().min(grouped.len()) as u128;
+            let mut before = 0;
+            let mut expected = Vec::<u128>::new();
+            for index in 0..grouped.len() {
+                expected.push(before * budget / total);
+                before += weight(index);
+            }
+            let mut boundaries = expected
+                .windows(2)
+                .enumerate()
+                .filter(|(_, pair)| pair[0] != pair[1])
+                .map(|(index, _)| index + 1)
+                .collect::<Vec<_>>();
+            boundaries.insert(0, 0);
+            boundaries.push(grouped.len());
+            let expected_parts = boundaries
+                .windows(2)
+                .map(|pair| pair[0]..pair[1])
+                .collect::<Vec<_>>();
+            assert_eq!(parts, expected_parts, "{} workers", workers.get());
             let share = total / parts.len() as u128;
             for part in &parts {
                 assert!(!part.is_empty());
