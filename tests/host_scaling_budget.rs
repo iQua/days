@@ -214,3 +214,124 @@ fn frontier_host_lowering_and_planning_scale_near_linearly_in_flows() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// One ring all-reduce over `ranks` hosts on a single switch: `2 * ranks * (ranks - 1)` TCP stages.
+fn ring_all_reduce_scenario(ranks: u64) -> PathBuf {
+    let switch = ranks;
+    let edges = (0..ranks)
+        .map(|host| format!("[{host}, {switch}]"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let hosts = (0..ranks)
+        .map(|host| host.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sinks = (0..ranks)
+        .map(|host| ((host + 1) % ranks).to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let config = format!(
+        r#"
+seed = 26
+edges = [{edges}]
+hosts = [{hosts}]
+duration = 0.05
+
+[switch]
+port_rate = 8000000000
+capacity = 100
+discipline = "FIFO"
+drop = "TailDrop"
+
+[[collective]]
+collective_type = "RingAllReduce"
+flow_type = "TCP"
+flow_count = {ranks}
+sources = [{hosts}]
+sinks = [{sinks}]
+
+[collective.traffic]
+initial_delay = 0.0
+size = {size}
+arr_dist = {{ type = "Uniform", low = 0.000001, high = 0.000001 }}
+pkt_size_dist = {{ type = "DiscreteUniform", low = 500, high = 500 }}
+
+[collective.traffic.tcp]
+cc_algorithm = "TCPReno"
+"#,
+        size = ranks * 1_000,
+    );
+    let path = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("host_scaling_budget_ring_{ranks}_ranks.toml"));
+    fs::write(&path, config).expect("write the derived scenario");
+    path
+}
+
+const SMALL_RANKS: u64 = 48;
+const LARGE_RANKS: u64 = 96;
+
+/// The stage validators look up predecessors by collective position and by flow. A per-stage scan
+/// of every generator makes validation quadratic in the stage count, which grows as the square
+/// of the rank count: doubling the ranks quadruples the stages, so linear work gives about 4x and
+/// a quadratic term 16x. The bound is their geometric midpoint.
+///
+/// Only validation is gated. Collective lowering is reported beside it but not bounded: every
+/// stage's flow key embeds a clone of its collective's key, rank-length source and sink lists
+/// included, so the canonical flow sort and the predecessor lookups cost O(ranks) per comparison
+/// and lowering grows as stages x ranks (`evidence/P14/perf-fix.md`, open finding).
+#[test]
+#[ignore = "explicit P14 perf collective-scale host budget: run with --release"]
+fn collective_stage_validation_scales_near_linearly_in_stages() {
+    const MAX_STAGE_RATIO: f64 = 8.0;
+    let measure_ranks = |ranks: u64| {
+        let path = ring_all_reduce_scenario(ranks);
+        let (lowering, image) = min_time(SMALL_REPETITIONS, || {
+            compile_config(&path).unwrap_or_else(|error| panic!("lower {ranks} ranks: {error}"))
+        });
+        let stages = image
+            .host_states
+            .iter()
+            .flat_map(|state| &state.generators)
+            .filter(|generator| generator.stage.is_some())
+            .count() as u64;
+        assert_eq!(
+            stages,
+            2 * ranks * (ranks - 1),
+            "{ranks} ranks: stage count"
+        );
+        let (validation, ()) = min_time(SMALL_REPETITIONS, || {
+            validate(&image, Backend::Scalar).expect("Scalar validation");
+        });
+        (lowering, validation)
+    };
+    let (small_lowering, small_validation) = measure_ranks(SMALL_RANKS);
+    let (large_lowering, large_validation) = measure_ranks(LARGE_RANKS);
+    let mut failures = Vec::new();
+    for (label, small, large, gated) in [
+        ("collective_lowering", small_lowering, large_lowering, false),
+        (
+            "collective_validation",
+            small_validation,
+            large_validation,
+            true,
+        ),
+    ] {
+        let ratio = large.as_secs_f64() / small.max(Duration::from_millis(1)).as_secs_f64();
+        println!(
+            "record=host_scaling_budget phase={label} small_ranks={SMALL_RANKS} \
+             large_ranks={LARGE_RANKS} small_ns={} large_ns={} ratio={ratio:.3} \
+             max_ratio={MAX_STAGE_RATIO} gated={gated}",
+            small.as_nanos(),
+            large.as_nanos(),
+        );
+        if gated && ratio >= MAX_STAGE_RATIO {
+            failures.push(format!(
+                "{label}: {LARGE_RANKS}/{SMALL_RANKS}-rank time ratio {ratio:.1} >= \
+                 {MAX_STAGE_RATIO} ({} ms -> {} ms); the phase is super-linear in the stage count",
+                small.as_millis(),
+                large.as_millis(),
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
