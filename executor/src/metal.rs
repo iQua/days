@@ -2222,6 +2222,11 @@ impl MetalPlan {
             pfc_offset.map_or(NONE, |offset| offset as u64),
             crate::device_mechanism::mechanism_flags(image),
         ];
+        debug_assert_eq!(
+            params.len(),
+            PARAM_MECHANISMS + 1,
+            "the mechanisms flags are the last production params word"
+        );
 
         if node_count.div_ceil(config.round_threads_per_threadgroup) > u32::MAX as usize {
             return Err(MetalError::Validation(
