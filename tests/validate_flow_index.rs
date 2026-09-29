@@ -16,13 +16,15 @@
 #![cfg(feature = "test")]
 
 use std::collections::BTreeSet;
+use std::fs;
 use std::path::PathBuf;
 
 use days::scenario::compile_config;
 use days_executor::{
     Backend, Event, EventKey, EventKind, FlowGeneratorKind, FlowId, GeneratorStatus,
     ObservationMode, PacketDescriptor, PacketKind, PayloadId, SchedulerKind, SimulationImage,
-    TcpAckHeader, assert_validate_flow_index_equivalent_for_testing, event_phase,
+    TcpAckHeader, assert_validate_flow_index_equivalent_for_testing,
+    assert_validate_generator_index_equivalent_for_testing, event_phase,
     run_scalar_with_observations, validate,
 };
 
@@ -366,4 +368,125 @@ fn flow_indexed_walks_match_the_scans_for_flows_outside_the_dense_table() {
     assert_validate_flow_index_equivalent_for_testing(&image)
         .expect("unindexed flow groups must match the scanned walks");
     validate(&image, Backend::Scalar).expect_err("an unknown packet flow must still reject");
+}
+
+/// A compute -> collective -> compute chain: every P14 stage role and both dependency slots.
+fn stage_chain_image() -> SimulationImage {
+    // Three hosts on one switch, a ring all-reduce named `grad` gated on the `forward` compute
+    // group, and a `backward` compute group gated on the collective: the shape of
+    // `tests/collective_compute.rs`'s chain, inlined so this file does not import that suite.
+    let config = r#"
+seed = 26
+edges = [[0, 3], [1, 3], [2, 3]]
+hosts = [0, 1, 2]
+duration = 0.05
+
+[switch]
+port_rate = 8000000000
+capacity = 100
+discipline = "FIFO"
+drop = "TailDrop"
+
+[[collective]]
+name = "grad"
+after = "forward"
+collective_type = "RingAllReduce"
+flow_type = "TCP"
+flow_count = 3
+sources = [0, 1, 2]
+sinks = [1, 2, 0]
+
+[collective.traffic]
+initial_delay = 0.0
+size = 9001
+arr_dist = { type = "Uniform", low = 0.000001, high = 0.000001 }
+pkt_size_dist = { type = "DiscreteUniform", low = 500, high = 500 }
+
+[collective.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[compute]]
+name = "forward"
+hosts = [0, 1, 2]
+duration_ns = 5000
+
+[[compute]]
+name = "backward"
+hosts = [0, 1, 2]
+duration_ns = 7000
+after = "grad"
+"#;
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("validate_flow_index_stage_chain.toml");
+    fs::write(&path, config).expect("write the stage-chain scenario");
+    compile_config(&path).unwrap_or_else(|error| panic!("failed to lower the stage chain: {error}"))
+}
+
+/// P14 perf: the flow-keyed generator lookup that replaced `stage_generator`'s per-query scan
+/// returns the very generator the scan returned, on a stage image and on running checkpoints of
+/// it, where stages are blocked, released, timed and finished.
+#[test]
+fn flow_indexed_generator_lookup_matches_the_scan_on_stage_images() {
+    let source = stage_chain_image();
+    let stages = source
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .filter(|generator| generator.stage.is_some())
+        .count();
+    assert!(
+        stages >= 12,
+        "the chain must lower to compute and collective stages"
+    );
+    assert_validate_flow_index_equivalent_for_testing(&source)
+        .unwrap_or_else(|mismatch| panic!("stage chain: {mismatch}"));
+    for events in [1_u64, 16, 256, 4096] {
+        let checkpoint = checkpoint_after(&source, "stage chain", events);
+        assert_validate_flow_index_equivalent_for_testing(&checkpoint)
+            .unwrap_or_else(|mismatch| panic!("stage chain after {events} events: {mismatch}"));
+        validate(&checkpoint, Backend::Scalar)
+            .unwrap_or_else(|error| panic!("stage chain after {events} events: {error}"));
+    }
+}
+
+/// The generator lookup keeps the scan's first-occurrence answer on images the validator rejects:
+/// two generators naming one flow (the scan returned the first in host order), and generators
+/// naming flows outside the dense table (the scan's equality `find` over them).
+#[test]
+fn flow_indexed_generator_lookup_matches_the_scan_on_duplicate_and_outside_flows() {
+    let mut image = stage_chain_image();
+    let locations = image
+        .host_states
+        .iter()
+        .enumerate()
+        .flat_map(|(host, state)| (0..state.generators.len()).map(move |index| (host, index)))
+        .collect::<Vec<_>>();
+    assert!(
+        locations.len() >= 6,
+        "the chain must have generators to rename"
+    );
+    // A later generator duplicates an earlier generator's flow.
+    let duplicated = generator_at(&mut image, &locations, 0).flow;
+    let last = locations.len() - 1;
+    generator_at(&mut image, &locations, last).flow = duplicated;
+    // Two generators share one outside identifier, a third has another: with two sharing it, the
+    // fallback's equality `find` must pick the first of them, not merely any.
+    let first_outside = FlowId(image.flows.len() as u64 + 5);
+    let second_outside = FlowId(image.flows.len() as u64 + 9);
+    generator_at(&mut image, &locations, 1).flow = first_outside;
+    generator_at(&mut image, &locations, 3).flow = first_outside;
+    generator_at(&mut image, &locations, 2).flow = second_outside;
+
+    assert_validate_generator_index_equivalent_for_testing(&image)
+        .expect("duplicate and outside generator lookups must match the scan");
+    validate(&image, Backend::Scalar).expect_err("renamed generators must still reject");
+}
+
+fn generator_at<'a>(
+    image: &'a mut SimulationImage,
+    locations: &[(usize, usize)],
+    at: usize,
+) -> &'a mut days_executor::FlowGeneratorState {
+    let (host, index) = locations[at];
+    &mut image.host_states[host].generators[index]
 }

@@ -111,7 +111,8 @@ struct PreloadedTcpAcks {
     within_stop_time: u64,
 }
 
-/// Generator-keyed views of the initial packet and event tables, built once per `validate` call.
+/// Generator-keyed views of the initial packet and event tables, and a flow-keyed view of the
+/// generators, built once per `validate` call.
 ///
 /// The validator asks "which initial packets, or preloaded ACK arrivals, belong to this flow?" —
 /// and "how many initial timeout events carry this timer's executable identity?" — once per
@@ -122,6 +123,10 @@ struct PreloadedTcpAcks {
 /// All are built by a single forward pass over each table, so every group lists its members in
 /// initial-table order and an indexed walk visits exactly the elements the filter visited, in
 /// exactly the same order — the diagnostics that name the first offending element are unchanged.
+///
+/// P14's stages added one more such question, "which generator owns this flow?", asked once per
+/// flow, once per initial packet and at every stage predecessor. It is answered by a first-
+/// occurrence slot per dense flow, so it too costs one pass instead of one scan per query.
 struct FlowIndex {
     /// CSR offsets into `packet_items`; one entry per dense flow slot plus a terminator.
     packet_offsets: Vec<usize>,
@@ -139,6 +144,15 @@ struct FlowIndex {
     retransmission_timeouts: BTreeMap<(NodeId, PayloadId, u64), u64>,
     /// Smallest initial event time at or below the stop time; invariant across generators.
     first_admissible_event_time_ns: Option<u64>,
+    /// The first generator of each dense flow slot, as `(host_states index, generators index)`.
+    ///
+    /// "First" is in `host_states`-then-`generators` order, the order the linear
+    /// `flat_map(..).find(|generator| generator.flow == id)` it replaces visits them in, so a
+    /// lookup returns the very generator the scan returned even when an invalid image lists two
+    /// generators for one flow.
+    generator_slots: Vec<Option<(usize, usize)>>,
+    /// Generators whose flow falls outside the dense flow table, in the same order.
+    unindexed_generators: Vec<(usize, usize)>,
 }
 
 /// Returns the dense flow-table slot of `id`, exactly when `flow(image, id)` resolves.
@@ -212,6 +226,19 @@ impl FlowIndex {
             }
         }
 
+        let mut generator_slots = vec![None; flow_count];
+        let mut unindexed_generators = Vec::new();
+        for (host, state) in image.host_states.iter().enumerate() {
+            for (index, generator) in state.generators.iter().enumerate() {
+                match dense_flow_slot(image, generator.flow) {
+                    Some(slot) => {
+                        generator_slots[slot].get_or_insert((host, index));
+                    }
+                    None => unindexed_generators.push((host, index)),
+                }
+            }
+        }
+
         Self {
             packet_offsets,
             packet_items,
@@ -219,7 +246,38 @@ impl FlowIndex {
             preloaded_tcp_acks,
             retransmission_timeouts,
             first_admissible_event_time_ns,
+            generator_slots,
+            unindexed_generators,
         }
+    }
+
+    /// Returns the first generator, in `host_states`-then-`generators` order, whose flow is `id`.
+    ///
+    /// Exactly equivalent to `image.host_states.iter().flat_map(|state| &state.generators)
+    /// .find(|generator| generator.flow == id)`: a dense slot records the first generator that
+    /// resolves to it, and an identifier outside the dense table falls back to the same `find`
+    /// over the unindexed generators, which keep their relative order.
+    fn generator_for_flow<'a>(
+        &self,
+        image: &'a SimulationImage,
+        id: crate::FlowId,
+    ) -> Option<&'a crate::FlowGeneratorState> {
+        let at = |(host, index): (usize, usize)| &image.host_states[host].generators[index];
+        match dense_flow_slot(image, id) {
+            Some(slot) => self.generator_slots[slot].map(at),
+            None => self
+                .unindexed_generators
+                .iter()
+                .copied()
+                .map(at)
+                .find(|generator| generator.flow == id),
+        }
+    }
+
+    /// Whether a compute (delay-only) stage owns this flow.
+    fn is_compute_flow(&self, image: &SimulationImage, id: crate::FlowId) -> bool {
+        self.generator_for_flow(image, id)
+            .is_some_and(is_compute_generator)
     }
 
     /// Yields the initial packets of `id`, in `initial_packets` order.
@@ -373,15 +431,15 @@ pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), Validat
     validate_link_ids(image)?;
     validate_flow_ids(image)?;
     validate_packet_ids(image)?;
-    validate_state_ownership(image)?;
-    validate_links(image)?;
-    validate_flows(image)?;
     // Dense flow identifiers and strictly ascending payload identifiers are established above,
     // which is everything the flow index needs; it reads the image and cannot itself reject.
     let flow_index = FlowIndex::build(image);
+    validate_state_ownership(image)?;
+    validate_links(image)?;
+    validate_flows(image, &flow_index)?;
     validate_generators(image, &flow_index)?;
     validate_backend_capabilities(image, backend)?;
-    let derived_delays = validate_packets_and_derive_delays(image)?;
+    let derived_delays = validate_packets_and_derive_delays(image, &flow_index)?;
     validate_tcp_segment_ledger(image, &flow_index)?;
     validate_owned_service_state(image, &flow_index, backend)?;
     let pfc_channels = validate_pfc(image)?;
@@ -611,7 +669,7 @@ fn validate_links(image: &SimulationImage) -> Result<(), ValidationError> {
     Ok(())
 }
 
-fn validate_flows(image: &SimulationImage) -> Result<(), ValidationError> {
+fn validate_flows(image: &SimulationImage, flow_index: &FlowIndex) -> Result<(), ValidationError> {
     for flow in &image.flows {
         if flow.priority > 7 {
             return Err(ValidationError::new(format!(
@@ -637,7 +695,7 @@ fn validate_flows(image: &SimulationImage) -> Result<(), ValidationError> {
                 flow.id, source.kind, target.kind
             )));
         }
-        if is_compute_flow(image, flow.id) {
+        if flow_index.is_compute_flow(image, flow.id) {
             // A compute stage is a timer on its own host: it sends nothing and has no route.
             if flow.source != flow.target
                 || !flow.route.is_empty()
@@ -1397,6 +1455,7 @@ fn validate_generators(
             if let Some(stage) = generator.stage {
                 validate_collective_stage(
                     image,
+                    flow_index,
                     state,
                     flow,
                     generator,
@@ -2431,26 +2490,10 @@ fn incomplete_tcp_segment_ledger(
     ))
 }
 
-/// Whether a compute (delay-only) stage owns this flow.
-fn is_compute_flow(image: &SimulationImage, id: crate::FlowId) -> bool {
-    stage_generator(image, id).is_some_and(is_compute_generator)
-}
-
 fn is_compute_generator(generator: &crate::FlowGeneratorState) -> bool {
     generator
         .stage
         .is_some_and(|stage| matches!(stage.role, crate::StageRole::Compute(_)))
-}
-
-fn stage_generator(
-    image: &SimulationImage,
-    id: crate::FlowId,
-) -> Option<&crate::FlowGeneratorState> {
-    image
-        .host_states
-        .iter()
-        .flat_map(|state| &state.generators)
-        .find(|generator| generator.flow == id)
 }
 
 /// Collective identity of a stage, when the generator carries one.
@@ -2471,6 +2514,7 @@ fn collective_identity(
 /// flow, so the inbound flag is complete exactly when that frontier reaches the chunk.
 fn validate_collective_stage(
     image: &SimulationImage,
+    flow_index: &FlowIndex,
     state: &crate::HostState,
     flow: &crate::FlowDescriptor,
     generator: &crate::FlowGeneratorState,
@@ -2484,6 +2528,7 @@ fn validate_collective_stage(
         crate::StageRole::Compute(compute) => {
             return validate_compute_stage(
                 image,
+                flow_index,
                 state,
                 flow,
                 generator,
@@ -2593,7 +2638,7 @@ fn validate_collective_stage(
     let entry = dependencies
         .local_predecessor
         .filter(|_| root)
-        .and_then(|id| stage_generator(image, id))
+        .and_then(|id| flow_index.generator_for_flow(image, id))
         .filter(|candidate| {
             matches!(candidate.stage.map(|stage| stage.role),
                 Some(crate::StageRole::Compute(compute))
@@ -2628,7 +2673,7 @@ fn validate_collective_stage(
         }
     } else {
         let local = expected_local
-            .and_then(|id| stage_generator(image, id))
+            .and_then(|id| flow_index.generator_for_flow(image, id))
             .ok_or_else(|| {
                 ValidationError::new(format!(
                     "flow {:?} collective local predecessor is missing",
@@ -2644,7 +2689,7 @@ fn validate_collective_stage(
             )));
         }
         let inbound = expected_inbound
-            .and_then(|id| stage_generator(image, id))
+            .and_then(|id| flow_index.generator_for_flow(image, id))
             .and_then(|candidate| collective_identity(candidate).map(|stage| (candidate, stage)))
             .ok_or_else(|| {
                 ValidationError::new(format!(
@@ -2712,6 +2757,7 @@ fn flow_source(image: &SimulationImage, id: crate::FlowId) -> Option<NodeId> {
 /// or complete (`Finished`).
 fn validate_compute_stage(
     image: &SimulationImage,
+    flow_index: &FlowIndex,
     state: &crate::HostState,
     flow: &crate::FlowDescriptor,
     generator: &crate::FlowGeneratorState,
@@ -2755,7 +2801,8 @@ fn validate_compute_stage(
     let local = dependencies
         .local_predecessor
         .map(|id| {
-            stage_generator(image, id)
+            flow_index
+                .generator_for_flow(image, id)
                 .filter(|candidate| flow_source(image, candidate.flow) == Some(flow.source))
                 .ok_or_else(|| {
                     ValidationError::new(format!(
@@ -2779,7 +2826,8 @@ fn validate_compute_stage(
                 && final_stage.step + 1 == final_stage.group_size =>
         {
             let previous_rank = (compute.rank + compute.group_size - 1) % compute.group_size;
-            let inbound = stage_generator(image, inbound_id)
+            let inbound = flow_index
+                .generator_for_flow(image, inbound_id)
                 .and_then(|candidate| collective_identity(candidate).map(|stage| (candidate, stage)))
                 .filter(|(candidate, stage)| {
                     stage.collective_id == final_stage.collective_id
@@ -3025,6 +3073,7 @@ fn insert_derived_delay(
 
 fn validate_packets_and_derive_delays(
     image: &SimulationImage,
+    flow_index: &FlowIndex,
 ) -> Result<DerivedChannelDelays, ValidationError> {
     let live_payloads = crate::tcp_ledger::initial_live_payloads(image);
     let live_tcp_data_flows = image
@@ -3046,7 +3095,7 @@ fn validate_packets_and_derive_delays(
     let mut possible = BTreeMap::<(LinkId, NodeId), u64>::new();
     let mut required = BTreeSet::<(LinkId, NodeId)>::new();
     for packet in &image.initial_packets {
-        if is_compute_flow(image, packet.flow) {
+        if flow_index.is_compute_flow(image, packet.flow) {
             // A compute timer token names its timer event; it is never enqueued or transmitted.
             if packet.size_bytes != 0 || packet.kind != PacketKind::Data || packet.ecn_marked {
                 return Err(ValidationError::new(format!(
@@ -6645,6 +6694,20 @@ mod legacy_scans {
         fresh.max(retransmission)
     }
 
+    /// P14's `stage_generator` before the P14 perf fix — the first generator whose flow is `id`,
+    /// in `host_states`-then-`generators` order. It ran once per flow in `validate_flows`, once
+    /// per initial packet in `validate_packets_and_derive_delays`, and at every stage predecessor.
+    pub(super) fn generator_for_flow(
+        image: &SimulationImage,
+        id: crate::FlowId,
+    ) -> Option<&crate::FlowGeneratorState> {
+        image
+            .host_states
+            .iter()
+            .flat_map(|state| &state.generators)
+            .find(|generator| generator.flow == id)
+    }
+
     /// `validate.rs:5316` and `validate.rs:5337` before the fix — the flow's executable residents.
     ///
     /// The two sites differ only in the data/feedback lane filter they apply afterwards, which is
@@ -6730,6 +6793,58 @@ mod legacy_scans {
             )),
         }
     }
+}
+
+/// P14 perf equality gate for the flow-keyed generator lookup alone.
+///
+/// Compares [`FlowIndex::generator_for_flow`] with the scan it replaced. Unlike the full
+/// [`assert_validate_flow_index_equivalent_for_testing`], it reads nothing but the generator
+/// tables, so it can be pointed at images the validator rejects: duplicate generators for one
+/// flow, and generators naming flows outside the dense table.
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+pub fn assert_validate_generator_index_equivalent_for_testing(
+    image: &SimulationImage,
+) -> Result<(), String> {
+    let flow_index = FlowIndex::build(image);
+    // The generator lookup must return the very generator the scan found (pointer identity, not
+    // value equality), for every dense flow and for every identifier outside the dense table that
+    // a generator or a stage dependency names: those are the only queries that reach the
+    // unindexed fallback.
+    let mut generator_queries = image
+        .flows
+        .iter()
+        .map(|descriptor| descriptor.id)
+        .collect::<Vec<_>>();
+    for generator in image.host_states.iter().flat_map(|state| &state.generators) {
+        generator_queries.push(generator.flow);
+        if let Some(stage) = generator.stage {
+            generator_queries.extend(stage.dependencies.local_predecessor);
+            generator_queries.extend(stage.dependencies.inbound_predecessor);
+        }
+    }
+    for packet in &image.initial_packets {
+        generator_queries.push(packet.flow);
+    }
+    generator_queries.sort_unstable();
+    generator_queries.dedup();
+    for id in generator_queries {
+        let indexed = flow_index.generator_for_flow(image, id);
+        let scanned = legacy_scans::generator_for_flow(image, id);
+        let same = match (indexed, scanned) {
+            (Some(indexed), Some(scanned)) => std::ptr::eq(indexed, scanned),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            return Err(format!(
+                "flow {id:?} indexed generator {:?} differs from the scanned generator {:?}",
+                indexed.map(|generator| generator.flow),
+                scanned.map(|generator| generator.flow)
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Proves that the flow-indexed validator answers every per-generator query exactly as the
@@ -6873,6 +6988,8 @@ pub fn assert_validate_flow_index_equivalent_for_testing(
             }
         }
     }
+
+    assert_validate_generator_index_equivalent_for_testing(image)?;
 
     // The timeout buckets must partition exactly the timeout events, the same way the flow-keyed
     // packet groups must partition the resolvable packets. Without this an index that admitted
