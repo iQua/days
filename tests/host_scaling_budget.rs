@@ -588,8 +588,13 @@ fn full_frontier_host_phases() {
 /// **Lowering** is gated at the same bound: its work is per flow, per node and per link, plus route
 /// search. Route search used to search the switch graph once per flow, allocating and scanning
 /// O(switches) each time, which made lowering O(flows x switches); `p14/route` builds one search
-/// tree per source instead, and `tests/route_scaling_budget.rs` bounds that search
-/// deterministically.
+/// tree per source instead. That pre-route cost grows 32x at this step (flows 8x, switches 4x), not
+/// 64x, and sits below this case's floor: before the fix, lowering measured 18.97 on four x86
+/// cores and 14.73 on an Apple M-series host, both under the bound (`evidence/P14/ci-scaling.md`).
+/// `tests/route_scaling_budget.rs` guards it exactly. What this gate catches in lowering is a
+/// per-flow cost growing with hosts, nodes or links (64x) once it is large enough: a scratch
+/// mutant repeating a per-flow scan over hosts in lowering failed it at about 11 s added to a
+/// frontier lowering on four x86 cores (10 s passed), and passed the flow-only case.
 #[test]
 #[ignore = "CI scaling gate (the `scaling` job): run with --release --test-threads=1"]
 fn ci_scaling_topology_host_phases() {
