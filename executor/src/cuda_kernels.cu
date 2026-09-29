@@ -138,6 +138,16 @@ constexpr uint P_PFC_OFFSET = 31;
 constexpr uint P_MECHANISMS = 32;
 constexpr ulong MECHANISM_DCQCN_RECEIVERS = 1;
 constexpr ulong MECHANISM_DCQCN = 2;
+// Kernel-only bit of the launch-uniform mechanisms value: the image carries a PFC region.
+constexpr ulong MECHANISM_PFC_REGION = 4;
+
+// The launch-uniform mechanisms value: read once by the round kernel, before its transition loop,
+// and passed down, so the transition code tests a register instead of re-reading params.
+__device__ __forceinline__ uint launch_mechanisms(const ulong *params) {
+    return static_cast<uint>(
+        params[P_MECHANISMS] | (params[P_PFC_OFFSET] != NONE ? MECHANISM_PFC_REGION : 0)
+    );
+}
 constexpr uint PFC_ROW_HEADER_WORDS = 5;
 constexpr uint PFC_INGRESS_WORDS = 43;
 constexpr uint PI_LINK = 0;
@@ -4733,7 +4743,8 @@ __device__ __forceinline__ bool dispatch_event(
     ulong *tcp_state,
     bool retain_continuation,
     bool &has_continuation,
-    bool &counted_continuation
+    bool &counted_continuation,
+    uint mechanisms
 ) {
     ulong node_base = node * NODE_WORDS;
     ulong role = node_state[node_base + N_KIND];
@@ -5810,7 +5821,9 @@ __device__ __forceinline__ bool dispatch_event(
                 node, event, error, params, generators, flows, summary, observation_meta,
                 observed, arrivals);
         }
-        if (packet_kind == DATA_PACKET && event[PK_FLOW] < params[P_FLOW_COUNT] &&
+        // P14 perf: without an image DCQCN receiver no marker can be 2 or 3, so skip the read.
+        if ((mechanisms & MECHANISM_DCQCN_RECEIVERS) != 0 &&
+            packet_kind == DATA_PACKET && event[PK_FLOW] < params[P_FLOW_COUNT] &&
             flows[flow_base + 1] == node &&
             tcp_state[params[P_TCP_RECEIVER_OFFSET] + event[PK_FLOW] * TCP_RECEIVER_WORDS] >=
                 DCQCN_RECEIVER_NO_CNP) {
@@ -6304,6 +6317,7 @@ extern "C" __global__ __launch_bounds__(256) void days_round(DAYS_BUFFERS) {
     ulong event[EVENT_WORDS];
     bool has_continuation = false;
     ulong dispatch_transitions = 0;
+    const uint mechanisms = launch_mechanisms(params);
     while (dispatch_transitions < params[P_TRANSITION_CAPACITY]) {
         ulong popped_timer_owner = NONE;
         if (has_continuation) {
@@ -6375,7 +6389,8 @@ extern "C" __global__ __launch_bounds__(256) void days_round(DAYS_BUFFERS) {
             tcp_state,
             dispatch_transitions + 1 < params[P_TRANSITION_CAPACITY],
             has_continuation,
-            counted_continuation
+            counted_continuation,
+            mechanisms
         )) {
             return;
         }
