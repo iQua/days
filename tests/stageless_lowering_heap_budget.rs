@@ -29,10 +29,24 @@
 //!
 //! Per-host generator vectors do not appear in this marginal: `Vec` allocates at least four slots
 //! for elements of at most 1,024 B, so one and two generators per host occupy the same capacity.
-//! `FlowGeneratorState` is guarded by nothing here.
 //!
 //! Before the slimming (6cc395c) the marginal is 1,821 B per flow and this test fails; after it,
 //! 973 B. Raw logs are in `days-gpu/evidence/P14/slim/`.
+//!
+//! # Retained image bytes per flow
+//!
+//! The second test closes that blind spot. It bounds the bytes the lowered image itself retains
+//! per flow, the marginal between four and eight stacked flow sets of one flow per host on a
+//! k = 16 fat-tree (1,024 hosts; 4,096 and 8,192 flows). From four generators per host on, a
+//! per-host vector's capacity doubles as its length does, so every per-host vector holds exactly
+//! one more slot per added flow and each per-flow image type appears in the marginal at its full
+//! size, `FlowGeneratorState` included. Per-host fixed costs cancel.
+//!
+//! **The cap**, per flow: `FlowGeneratorState` at main's 352 B (the bound
+//! `executor/src/image.rs` asserts), 421 B of the rest of the retained image (measured as the
+//! marginal minus `FlowGeneratorState`, 917 - 496 at 32dafb3; descriptors, routes, receivers, the
+//! initial packet and events), and 64 B of headroom, below the 144 B the inline stage record cost.
+//! With the stage record inline (32dafb3) the marginal is 917 B per flow and this test fails.
 //!
 //! Run: `cargo test -p days --test stageless_lowering_heap_budget` (default matrix, any profile).
 #![allow(unsafe_code)]
@@ -124,9 +138,60 @@ const HEADROOM_BYTES_PER_FLOW: u64 = 128;
 const MAX_PEAK_BYTES_PER_FLOW: u64 =
     FLOW_INPUT_BYTES + OTHER_PEAK_BYTES_PER_FLOW + HEADROOM_BYTES_PER_FLOW;
 
+/// `FlowGeneratorState`'s bound, asserted in `executor/src/image.rs`.
+const FLOW_GENERATOR_STATE_BYTES: u64 = 352;
+/// Every other retained image byte per flow, measured with the stage record inline.
+const OTHER_RETAINED_BYTES_PER_FLOW: u64 = 421;
+/// Headroom for container-layout drift; below the inline stage record's 144 B.
+const RETAINED_HEADROOM_BYTES_PER_FLOW: u64 = 64;
+/// The cap on the marginal retained image bytes per stageless flow: 837 B.
+const MAX_RETAINED_BYTES_PER_FLOW: u64 =
+    FLOW_GENERATOR_STATE_BYTES + OTHER_RETAINED_BYTES_PER_FLOW + RETAINED_HEADROOM_BYTES_PER_FLOW;
+/// Fat-tree arity of the retained-bytes scenarios, and its host count.
+const RETAINED_K: usize = 16;
+const RETAINED_HOSTS: usize = RETAINED_K * RETAINED_K * RETAINED_K / 4;
+
 /// The frontier fixture with only its first `sets` stacked flow sets, written to a file private to
 /// this process.
 fn frontier_with_flow_sets(sets: usize) -> PathBuf {
+    write_scenario(&format!("{sets}_sets"), frontier_text(sets))
+}
+
+/// The frontier fixture on a k = 16 fat-tree with `sets` stacked flow sets of one flow per host.
+fn fat_tree_k16_with_flow_sets(sets: usize) -> PathBuf {
+    let substitutions = [
+        ("k = 32\n".to_owned(), format!("k = {RETAINED_K}\n"), 1),
+        (
+            "hosts_per_edge = 16\n".to_owned(),
+            format!("hosts_per_edge = {}\n", RETAINED_K / 2),
+            1,
+        ),
+        (
+            format!("flow_count = {FLOWS_PER_SET}\n"),
+            format!("flow_count = {RETAINED_HOSTS}\n"),
+            sets,
+        ),
+    ];
+    let text = substitutions
+        .iter()
+        .fold(frontier_text(sets), |text, (from, to, expected)| {
+            assert_eq!(text.matches(from.as_str()).count(), *expected, "{from:?}");
+            text.replace(from.as_str(), to)
+        });
+    write_scenario(&format!("k{RETAINED_K}_{sets}_sets"), text)
+}
+
+fn write_scenario(label: &str, text: String) -> PathBuf {
+    let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "stageless_lowering_heap_budget_{label}_{}.toml",
+        std::process::id()
+    ));
+    fs::write(&path, text).expect("write the derived frontier scenario");
+    path
+}
+
+/// The frontier fixture's text with only its first `sets` stacked flow sets.
+fn frontier_text(sets: usize) -> String {
     let text = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(FRONTIER_FIXTURE))
         .expect("read the frontier fixture");
     let mut blocks = text.split(FLOW_SET_HEADER);
@@ -142,12 +207,7 @@ fn frontier_with_flow_sets(sets: usize) -> PathBuf {
         derived.push_str(FLOW_SET_HEADER);
         derived.push_str(block);
     }
-    let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "stageless_lowering_heap_budget_{sets}_sets_{}.toml",
-        std::process::id()
-    ));
-    fs::write(&path, derived).expect("write the derived frontier scenario");
-    path
+    derived
 }
 
 /// Peak live heap bytes of one serial lowering of the first `sets` frontier flow sets, above the
@@ -191,5 +251,52 @@ fn stageless_lowering_peak_heap_per_flow_stays_within_the_slim_flow_input_budget
         "lowering a stageless flow peaks at {per_flow} heap bytes, above the {MAX_PEAK_BYTES_PER_FLOW} B \
          budget ({FLOW_INPUT_BYTES} B FlowInput + {OTHER_PEAK_BYTES_PER_FLOW} B else live at the \
          peak + {HEADROOM_BYTES_PER_FLOW} B headroom): a per-flow lowering structure grew"
+    );
+}
+
+/// Bytes the lowered image retains, and its flow count, for `sets` flow sets on the k = 16 tree.
+fn retained_image_bytes(sets: usize) -> (u64, u64) {
+    let path = fat_tree_k16_with_flow_sets(sets);
+    let baseline = LIVE_BYTES.with(Cell::get);
+    let image = compile_config_with_route_workers(&path, RouteWorkers::serial())
+        .unwrap_or_else(|error| panic!("lower {sets} k={RETAINED_K} sets: {error}"));
+    let retained = LIVE_BYTES.with(Cell::get) - baseline;
+    let flows = image.flows.len() as u64;
+    assert_eq!(
+        flows,
+        (sets * RETAINED_HOSTS) as u64,
+        "{sets} sets: flow count"
+    );
+    assert!(
+        image
+            .host_states
+            .iter()
+            .flat_map(|state| &state.generators)
+            .all(|generator| generator.stage.is_none()),
+        "the derived scenario has no stages"
+    );
+    drop(image);
+    (
+        u64::try_from(retained).expect("the image retains a non-negative byte count"),
+        flows,
+    )
+}
+
+#[test]
+fn stageless_image_retains_at_most_main_generator_size_per_flow() {
+    let (four_bytes, four_flows) = retained_image_bytes(4);
+    let (eight_bytes, eight_flows) = retained_image_bytes(8);
+    let per_flow = eight_bytes.saturating_sub(four_bytes) / (eight_flows - four_flows);
+    println!(
+        "record=stageless_lowering_heap_budget four_sets_retained_bytes={four_bytes} \
+         eight_sets_retained_bytes={eight_bytes} marginal_retained_bytes_per_flow={per_flow} \
+         max_retained_bytes_per_flow={MAX_RETAINED_BYTES_PER_FLOW}"
+    );
+    assert!(
+        per_flow <= MAX_RETAINED_BYTES_PER_FLOW,
+        "a stageless lowered image retains {per_flow} bytes per flow, above the \
+         {MAX_RETAINED_BYTES_PER_FLOW} B budget ({FLOW_GENERATOR_STATE_BYTES} B FlowGeneratorState + \
+         {OTHER_RETAINED_BYTES_PER_FLOW} B rest of the image + {RETAINED_HEADROOM_BYTES_PER_FLOW} B \
+         headroom): a per-flow image type grew"
     );
 }
