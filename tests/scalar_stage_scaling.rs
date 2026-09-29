@@ -90,7 +90,10 @@ fn probe(label: &str, image: &SimulationImage, expected_stages: u64) -> Probe {
     // The probe only counts: the run is the ordinary Scalar run.
     let plain = run_scalar_with_observations(image, None, ObservationMode::Full)
         .unwrap_or_else(|error| panic!("{label}: {error}"));
-    assert!(result == plain, "{label}: the counting run changed the result");
+    assert!(
+        result == plain,
+        "{label}: the counting run changed the result"
+    );
     let unfinished = result
         .host_states
         .iter()
