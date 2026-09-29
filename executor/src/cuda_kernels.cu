@@ -31,13 +31,6 @@ using ulong = uint64_t;
     ulong *__restrict__ stream_records, ulong *__restrict__ scheduler_state, \
     ulong *__restrict__ tcp_state
 
-// The argument list matching `DAYS_BUFFERS`, for entry points that forward to a template body.
-#define DAYS_BUFFER_ARGS \
-    control, params, node_state, generators, flows, routes, links, fel_meta, fel_records, \
-    queue_meta, queue_records, in_service, outbox, worklist, summary, observed, departures, \
-    arrivals, lp_state, remote_meta, remote_staging, observation_meta, inbound_meta, \
-    inbound_producers, merge_cursors, stream_state, stream_records, scheduler_state, tcp_state
-
 constexpr uint EVENT_WORDS = 14;
 constexpr uint CHANNEL_EVENT_WORDS = 11;
 constexpr uint SERVICE_EVENT_WORDS = 5;
@@ -345,10 +338,6 @@ constexpr ulong TCP_RTO_GRANULARITY = 1000000ul;
 constexpr ulong ERROR_CAPACITY = 1;
 constexpr ulong ERROR_TRANSITION_CAPACITY = 2;
 constexpr ulong ERROR_SEMANTIC = 3;
-// P14: the plain `days_round` build met DCQCN or PFC state it does not compile in. The hosts decode
-// `ERROR_SEMANTIC + 80` as `MechanismsKernelRequired`; only a round-kernel selection error (or a
-// test forcing the plain build) reaches it.
-constexpr ulong ERROR_MECHANISMS_REQUIRED = 80;
 constexpr ulong ERROR_WFQ_ARITHMETIC = 100;
 constexpr ulong ARENA_FEL = 1;
 constexpr ulong ARENA_QUEUE = 2;
@@ -4753,10 +4742,6 @@ __device__ __forceinline__ bool dispatch_event(
     if (kind == PACING_TIMER && role == HOST) {
         ulong flow = event[PK_FLOW];
         ulong generator = flow * GENERATOR_WORDS;
-        if (!MECHANISMS && (event[PK_KIND] & PK_KIND_MASK) == DCQCN_CONTROL_TIMER_PACKET) {
-            set_semantic_error(error, ERROR_MECHANISMS_REQUIRED, node);
-            return false;
-        }
         if (MECHANISMS &&
             (event[PK_KIND] & PK_KIND_MASK) == DCQCN_CONTROL_TIMER_PACKET) {
             return dcqcn_control_timer(
@@ -4773,14 +4758,6 @@ __device__ __forceinline__ bool dispatch_event(
         }
         if (flow >= params[P_FLOW_COUNT] || generators[generator + G_VALID] == 0 ||
             generators[generator + G_OWNER] != node || generators[generator + G_KIND] != 2) {
-            // The plain build: a DCQCN generator's timer is where the mechanisms build would
-            // enter `dcqcn_pacing_timer`. Only this non-rate path pays for the test.
-            if (!MECHANISMS && flow < params[P_FLOW_COUNT] &&
-                generators[generator + G_VALID] != 0 && generators[generator + G_OWNER] == node &&
-                generators[generator + G_KIND] == GENERATOR_KIND_DCQCN) {
-                set_semantic_error(error, ERROR_MECHANISMS_REQUIRED, node);
-                return false;
-            }
             return true;
         }
         ulong status = generators[generator + G_STATUS];
@@ -5442,10 +5419,6 @@ __device__ __forceinline__ bool dispatch_event(
     }
 
     if (kind == REMOTE_ARRIVAL && role == SWITCH) {
-        if (!MECHANISMS && (event[PK_KIND] & PK_KIND_MASK) == PFC_PACKET) {
-            set_semantic_error(error, ERROR_MECHANISMS_REQUIRED, node);
-            return false;
-        }
         if (MECHANISMS && (event[PK_KIND] & PK_KIND_MASK) == PFC_PACKET) {
             return pfc_frame_arrival<MECHANISMS>(
                 node, event, error, params, node_state, queue_meta, queue_records,
@@ -5839,10 +5812,6 @@ __device__ __forceinline__ bool dispatch_event(
     if (kind == REMOTE_ARRIVAL && role == HOST) {
         ulong flow_base = event[PK_FLOW] * FLOW_WORDS;
         ulong packet_kind = event[PK_KIND] & PK_KIND_MASK;
-        if (!MECHANISMS && packet_kind == DCQCN_CNP_PACKET) {
-            set_semantic_error(error, ERROR_MECHANISMS_REQUIRED, node);
-            return false;
-        }
         if (MECHANISMS && packet_kind == DCQCN_CNP_PACKET) {
             return dcqcn_cnp_arrival(
                 node, event, error, params, generators, flows, summary, observation_meta,
@@ -6023,126 +5992,6 @@ static __device__ inline ulong load_compaction_count(
     ulong block
 ) {
     return stream_state[round_scratch_compaction_counts(params) + block];
-}
-
-// P14: the round body, built twice. `MECHANISMS` selects whether the DCQCN and PFC transitions are
-// compiled in. The host launches exactly one build per run, chosen from the image
-// (`RoundKernel::for_image`): `days_round_mechanisms` when the image holds any DCQCN or PFC state,
-// `days_round` otherwise. Every Lane B entry point is guarded by `MECHANISMS`, so in the plain
-// build the compiler proves each mechanism branch dead.
-template <bool MECHANISMS>
-__device__ __forceinline__ void days_round_body(DAYS_BUFFERS) {
-    uint active_index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (
-        control[C_ERROR] != 0 ||
-        control[C_DONE] != 0 ||
-        control[C_CONTINUATION] != 1 ||
-        active_index >= control[C_ACTIVE]
-    ) {
-        return;
-    }
-    ulong node = worklist[active_index];
-    ulong *state = lp_state + node * LP_STATE_WORDS;
-    if (state[L_FINISHED] != 0 || state[L_ERROR] != 0) {
-        return;
-    }
-    // The plain build compiles PFC out, so a planned PFC region stops the run before any transition.
-    // One uniform read per thread per launch; the per-event PFC reads stay compiled out. The region
-    // is the planner's, not the host selection's, so this cross-checks the selection.
-    if (!MECHANISMS && params[P_PFC_OFFSET] != NONE) {
-        set_semantic_error(state, ERROR_MECHANISMS_REQUIRED, node);
-        return;
-    }
-
-    ulong event[EVENT_WORDS];
-    bool has_continuation = false;
-    ulong dispatch_transitions = 0;
-    while (dispatch_transitions < params[P_TRANSITION_CAPACITY]) {
-        ulong popped_timer_owner = NONE;
-        if (has_continuation) {
-            has_continuation = false;
-        } else {
-            ulong selected_active;
-            ulong selected_stream;
-            if (!fel_peek(
-                node,
-                params,
-                fel_meta,
-                fel_records,
-                stream_state,
-                stream_records,
-                event,
-                selected_active,
-                selected_stream
-            ) || !before_horizon(event[E_TIME], control)) {
-                state[L_FINISHED] = 1;
-                return;
-            }
-            if (!fel_pop_selected(
-                node,
-                selected_active,
-                selected_stream,
-                params,
-                fel_meta,
-                fel_records,
-                stream_state,
-                stream_records,
-                tcp_state,
-                event,
-                popped_timer_owner
-            )) {
-                set_semantic_error(state, 26, node);
-                return;
-            }
-        }
-        bool counted_continuation = false;
-        if (!hydrate_tx_complete_event(node, event, state, in_service)) {
-            return;
-        }
-        if (!dispatch_event<MECHANISMS>(
-            node,
-            event,
-            popped_timer_owner,
-            state,
-            params,
-            node_state,
-            generators,
-            flows,
-            routes,
-            links,
-            fel_meta,
-            fel_records,
-            queue_meta,
-            queue_records,
-            in_service,
-            scheduler_state,
-            remote_meta,
-            remote_staging,
-            stream_state,
-            stream_records,
-            summary,
-            observation_meta,
-            observed,
-            departures,
-            arrivals,
-            tcp_state,
-            dispatch_transitions + 1 < params[P_TRANSITION_CAPACITY],
-            has_continuation,
-            counted_continuation
-        )) {
-            return;
-        }
-        if (counted_continuation && state[L_SAME_TIME_CONTINUATIONS] != NONE) {
-            state[L_SAME_TIME_CONTINUATIONS] += 1;
-        }
-        if (state[L_TRANSITIONS] == NONE) {
-            set_semantic_error(state, 27, node);
-            return;
-        }
-        state[L_TRANSITIONS] += 1;
-        dispatch_transitions += 1;
-    }
-
 }
 
 // T21 fix 1 — the horizon's Θ(N) FEL-root sweep, on the whole grid.
@@ -6444,9 +6293,22 @@ extern "C" __global__ void days_round_prepare(DAYS_BUFFERS) {
     }
 }
 
+// P14: the round kernel, built twice from one body (`cuda_round_body.inc`, included verbatim).
+// `MECHANISMS` selects whether the DCQCN and PFC transitions are compiled in; every Lane B entry
+// point is guarded by it, so in the plain build the compiler proves each mechanism branch dead. The
+// host launches exactly one build per run, chosen from the image (`RoundKernel::for_image`), and
+// refuses the plain build on any plan holding DCQCN or PFC state
+// (`device_mechanism::plain_round_kernel_refusal`); the plain build has no device-side stop.
+//
+// The body is included, not called: compiled through a forwarding function it loses the hoisting
+// of launch-constant `params` loads, and neither build matches its reference's machine code
+// (`evidence/P14/zero-cost-diagnosis.md` §1.4, §2.2). Included, the plain build is `main`'s
+// `days_round` and the mechanisms build is the P14 control's, instruction for instruction on sm_89.
+
 // The plain build: images without DCQCN or PFC state.
 extern "C" __global__ __launch_bounds__(256) void days_round(DAYS_BUFFERS) {
-    days_round_body<false>(DAYS_BUFFER_ARGS);
+    constexpr bool MECHANISMS = false;
+#include "cuda_round_body.inc"
 }
 
 // The mechanisms build: every image, including DCQCN and PFC state. It states one resident block
@@ -6454,7 +6316,8 @@ extern "C" __global__ __launch_bounds__(256) void days_round(DAYS_BUFFERS) {
 // for this body and spills; with the minimum stated it allocates 232 and does not (sm_86 and sm_89
 // are unchanged).
 extern "C" __global__ __launch_bounds__(256, 1) void days_round_mechanisms(DAYS_BUFFERS) {
-    days_round_body<true>(DAYS_BUFFER_ARGS);
+    constexpr bool MECHANISMS = true;
+#include "cuda_round_body.inc"
 }
 
 // T21 fix 1 — the round-control scans, on the whole grid.

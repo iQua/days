@@ -117,9 +117,6 @@ const ERROR_SEMANTIC: u64 = 3;
 /// slot carries a channel stream index, and the TCP ledger sequence overflow, which records no
 /// identity. Neither names an LP.
 const ERROR_CHANNEL_ORDER: u64 = ERROR_SEMANTIC + 42;
-/// P14: the plain `days_round` build met DCQCN or PFC state, which it does not compile in: a
-/// DCQCN or PFC packet event, a DCQCN generator's timer, or (at round entry) a planned PFC region.
-const ERROR_MECHANISMS_REQUIRED: u64 = ERROR_SEMANTIC + 80;
 const CONTROL_DONE: usize = 4;
 const CONTROL_RUN_END_LO: usize = 7;
 const CONTROL_RUN_END_HI: usize = 8;
@@ -382,9 +379,6 @@ fn decode_device_error(control: &[u64]) -> CudaError {
         },
         100 => CudaError::WfqArithmeticOverflow {
             node: identity.map(NodeId).unwrap_or(NodeId(0)),
-        },
-        ERROR_MECHANISMS_REQUIRED => CudaError::MechanismsKernelRequired {
-            node: identity.map(NodeId),
         },
         // The channel-order diagnostic shares the channel capacity identity slot, which carries
         // an immutable stream index rather than an LP after targeted retry plumbing.
@@ -654,9 +648,10 @@ pub enum CudaError {
     WfqArithmeticOverflow {
         node: NodeId,
     },
-    /// The plain round kernel met DCQCN or PFC state and stopped rather than continue without the
-    /// mechanism. Only a round-kernel selection error (or a test forcing the plain build) reaches
-    /// it; the run produces no result.
+    /// The host refused to launch the plain round kernel: the plan about to be uploaded holds DCQCN
+    /// or PFC state, which the plain kernel compiles out
+    /// (`device_mechanism::plain_round_kernel_refusal`). Only a round-kernel selection error (or a
+    /// test forcing the plain kernel) reaches it; nothing is launched and no result is produced.
     MechanismsKernelRequired {
         node: Option<NodeId>,
     },
@@ -724,7 +719,10 @@ impl fmt::Display for CudaError {
                 "CUDA WFQ arithmetic at LP {node:?} exceeds the exact 320-bit device limit; use Scalar or Cpu for this image"
             ),
             Self::MechanismsKernelRequired { node } => {
-                write!(formatter, "CUDA plain round kernel met DCQCN or PFC state")?;
+                write!(
+                    formatter,
+                    "CUDA plain round kernel refused: the plan holds DCQCN or PFC state"
+                )?;
                 if let Some(node) = node {
                     write!(formatter, " at LP {node:?}")?;
                 }
@@ -5455,26 +5453,22 @@ mod tests {
         );
     }
 
-    /// P14: the plain round kernel's fail-closed stop decodes to its own error, naming the LP.
+    /// P14 round 2: the kernels carry no mechanism error code, so a device word never decodes as a
+    /// host refusal; `MechanismsKernelRequired` comes only from the host's plan check.
     #[test]
-    fn mechanisms_required_decodes_with_the_lp_it_names() {
-        let source = include_str!("cuda_kernels.cu");
-        assert!(source.contains("constexpr ulong ERROR_MECHANISMS_REQUIRED = 80;"));
+    fn no_device_word_decodes_as_a_plain_kernel_refusal() {
         let mut control = vec![0_u64; 20];
-        control[0] = super::ERROR_MECHANISMS_REQUIRED;
         control[2] = 7;
-        assert_eq!(super::ERROR_MECHANISMS_REQUIRED, 83);
-        assert_eq!(
-            super::decode_device_error(&control),
-            CudaError::MechanismsKernelRequired {
-                node: Some(crate::NodeId(7)),
-            },
-        );
-        control[2] = u64::MAX;
-        assert_eq!(
-            super::decode_device_error(&control),
-            CudaError::MechanismsKernelRequired { node: None },
-        );
+        for code in 3..=200 {
+            control[0] = code;
+            assert!(
+                !matches!(
+                    decode_device_error(&control),
+                    CudaError::MechanismsKernelRequired { .. }
+                ),
+                "raw code {code}"
+            );
+        }
     }
 
     #[test]

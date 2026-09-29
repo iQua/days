@@ -7,6 +7,7 @@ use std::process::{Command, Output};
 fn main() {
     println!("cargo:rerun-if-env-changed=NVCC");
     println!("cargo:rerun-if-changed=src/cuda_kernels.cu");
+    println!("cargo:rerun-if-changed=src/cuda_round_body.inc");
 
     if env::var_os("CARGO_FEATURE_CUDA").is_none() {
         return;
