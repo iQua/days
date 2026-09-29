@@ -217,7 +217,7 @@ fn stage_index_matches_the_scans_on_running_checkpoints() {
 #[test]
 fn stage_index_matches_the_scans_on_a_non_collective_tcp_fixture() {
     let relative = "configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml";
-    let image = compile_config(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative))
+    let image = compile_config(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative))
         .unwrap_or_else(|error| panic!("{relative}: {error}"));
     check(relative, &image).unwrap_or_else(|error| panic!("{relative}: {error}"));
 }
