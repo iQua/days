@@ -164,11 +164,10 @@ const CI_TOPOLOGY: Case = Case {
 /// Flows per host in the topology case, at both fabric sizes.
 const TOPOLOGY_FLOWS_PER_HOST: usize = 16;
 
-/// The topology case's phases and whether each is gated. Lowering is recorded but not gated
-/// until per-flow route search stops being O(flows x switches) (the `p14/route` lane and
-/// `tests/route_scaling_budget.rs`); gating it then is a one-line change here.
+/// The topology case's phases and whether each is gated. All three are: lowering joined once
+/// route search stopped searching the fabric for every flow (`p14/route`).
 const TOPOLOGY_PHASES: [(Phase, bool); 3] = [
-    (Phase::Lowering, false),
+    (Phase::Lowering, true),
     (Phase::DeviceValidation, true),
     (Phase::DefaultSizing, true),
 ];
@@ -586,10 +585,11 @@ fn full_frontier_host_phases() {
 /// (`scalar_stage_scaling`, `collective_lowering_budget` and `route_scaling_budget`) are the
 /// fine-grained guards.
 ///
-/// **Lowering** is recorded (`gated=false`) but not gated: lowering routes every flow with its own
-/// search over the switch graph, which allocates and scans O(switches) per flow, so it grows 17
-/// to 18x here today, and 30x from k=32 to k=64. The `p14/route` lane fixes that; gating lowering
-/// afterwards is a one-line change in [`TOPOLOGY_PHASES`].
+/// **Lowering** is gated at the same bound: its work is per flow, per node and per link, plus route
+/// search. Route search used to search the switch graph once per flow, allocating and scanning
+/// O(switches) each time, which made lowering O(flows x switches); `p14/route` builds one search
+/// tree per source instead, and `tests/route_scaling_budget.rs` bounds that search
+/// deterministically.
 #[test]
 #[ignore = "CI scaling gate (the `scaling` job): run with --release --test-threads=1"]
 fn ci_scaling_topology_host_phases() {
