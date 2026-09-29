@@ -7,12 +7,12 @@ on:
       - "docs/**"
       - "logs/**"
       - "**.md"
+  # Pull requests run on every change, docs-only included: the `changes` job below skips the real
+  # jobs when only docs/**, logs/** or **.md changed. A job skipped by its `if:` reports Success,
+  # so docs-only PRs stay fast and never wait on a required check; a workflow skipped by path
+  # filtering would leave its required checks Pending forever.
   pull_request:
     branches: [main]
-    paths-ignore:
-      - "docs/**"
-      - "logs/**"
-      - "**.md"
 
 permissions:
   contents: read
@@ -25,9 +25,49 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Decides whether a pull request changes anything outside docs/**, logs/** and **.md, the paths
+  # the push trigger ignores. The real jobs skip only on an explicit `code=false`: if this job
+  # fails or reports nothing, they run.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+
+    steps:
+      - uses: actions/checkout@v5
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 2
+
+      - name: Classify changed paths
+        id: classify
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" != pull_request ]; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # HEAD is the pull request's test merge; its first parent is the base branch head, so
+          # this lists exactly what the merge changes. --no-renames lists both sides of a move.
+          changed=$(git diff --no-renames --name-only HEAD^1 HEAD)
+          code=false
+          while IFS= read -r path; do
+            case "$path" in
+              "" | docs/* | logs/* | *.md) ;;
+              *) code=true ;;
+            esac
+          done <<< "$changed"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          printf 'code=%s\n%s\n' "$code" "$changed"
+
   lint:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
 
     steps:
       - uses: actions/checkout@v5
@@ -49,7 +89,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    needs: lint
+    needs: [changes, lint]
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.lint.result == 'success' }}
 
     steps:
       - uses: actions/checkout@v5
@@ -66,7 +107,8 @@ jobs:
   examples:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: lint
+    needs: [changes, lint]
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.lint.result == 'success' }}
 
     steps:
       - uses: actions/checkout@v5
@@ -91,7 +133,8 @@ jobs:
     # x86 cores (evidence/P14/ci-scaling.md in days-gpu); this leaves about twice that, plus the
     # build, for a slower runner.
     timeout-minutes: 90
-    needs: lint
+    needs: [changes, lint]
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.lint.result == 'success' }}
 
     steps:
       - uses: actions/checkout@v5
@@ -137,6 +180,8 @@ jobs:
 
   metal-check:
     runs-on: macos-15
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     timeout-minutes: 15
 
     steps:
