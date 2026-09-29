@@ -947,9 +947,16 @@ fn canonical_expr(expression: &Expr) -> syn::Result<String> {
 
 /// Host tables a stage-path function may read only through the stage view's counted accessors.
 ///
-/// `generators` and `tcp_receivers` are the view's `ProbedTable`s, and `causes`/`stage_causes`
-/// the event's `PendingCauses`. The names are the bindings the executor uses for them.
-pub const STAGE_PATH_TABLES: &[&str] = &["generators", "tcp_receivers", "causes", "stage_causes"];
+/// `generators`, `stages` and `tcp_receivers` are the view's `ProbedTable`s, and
+/// `causes`/`stage_causes` the event's `PendingCauses`. The names are the bindings the executor
+/// uses for them.
+pub const STAGE_PATH_TABLES: &[&str] = &[
+    "generators",
+    "stages",
+    "tcp_receivers",
+    "causes",
+    "stage_causes",
+];
 
 /// Methods that begin a scan of a collection.
 const SCAN_METHODS: &[&str] = &["iter", "iter_mut", "into_iter"];
@@ -959,6 +966,8 @@ const RAW_HOST_ACCESSORS: &[&str] = &["host_state", "host_state_mut"];
 
 /// Element types of the raw host tables and of the raw pending-cause list.
 const RAW_TABLE_ELEMENTS: &[&str] = &["FlowGeneratorState", "TcpReceiverState"];
+/// The record type of the raw host stage table, whose elements are `Option<CollectiveStage>`.
+const RAW_STAGE_RECORD: &str = "CollectiveStage";
 const RAW_CAUSE_ELEMENT: &str = "PendingCollectiveProgress";
 
 /// P14 scan audit: the named stage-path functions of `scalar.rs` reach host tables only through
@@ -1070,6 +1079,22 @@ fn stage_path_table(expression: &Expr) -> Option<String> {
 }
 
 /// Whether a type is, or is a path ending in, `name`.
+/// Whether `ty` is `Option<T>` (through references and parentheses) with `T` named `name`.
+fn type_is_option_of(ty: &syn::Type, name: &str) -> bool {
+    match ty {
+        syn::Type::Path(path) => path.path.segments.last().is_some_and(|segment| {
+            segment.ident == "Option"
+                && matches!(&segment.arguments, syn::PathArguments::AngleBracketed(arguments)
+                if arguments.args.iter().any(|argument| {
+                    matches!(argument, syn::GenericArgument::Type(inner) if type_names(inner, name))
+                }))
+        }),
+        syn::Type::Reference(reference) => type_is_option_of(&reference.elem, name),
+        syn::Type::Paren(paren) => type_is_option_of(&paren.elem, name),
+        _ => false,
+    }
+}
+
 fn type_names(ty: &syn::Type, name: &str) -> bool {
     match ty {
         syn::Type::Path(path) => path
@@ -1133,6 +1158,15 @@ impl<'ast> Visit<'ast> for StageBodyChecker<'_> {
             self.violation(
                 slice.bracket_token.span.join(),
                 format!("takes a raw `[{element}]` table, which bypasses the view's counters"),
+            );
+        }
+        if type_is_option_of(&slice.elem, RAW_STAGE_RECORD) {
+            self.violation(
+                slice.bracket_token.span.join(),
+                format!(
+                    "takes a raw `[Option<{RAW_STAGE_RECORD}>]` table, which bypasses the view's \
+                     counters"
+                ),
             );
         }
         syn::visit::visit_type_slice(self, slice);
@@ -1200,9 +1234,9 @@ pub fn audit_scalar_table_access(
     }
 }
 
-/// Host tables no function may scan unless it is allowlisted: a host's generator table and its
-/// TCP-receiver table, whether raw `Vec`s or the stage view's `ProbedTable`s.
-pub const HOST_TABLES: &[&str] = &["generators", "tcp_receivers"];
+/// Host tables no function may scan unless it is allowlisted: a host's generator table, its stage
+/// table and its TCP-receiver table, whether raw `Vec`s or the stage view's `ProbedTable`s.
+pub const HOST_TABLES: &[&str] = &["generators", "stages", "tcp_receivers"];
 
 /// The function of `scalar.rs` that builds the stage view by destructuring a `HostState`.
 const VIEW_CONSTRUCTOR: &str = "host_parts_mut";
