@@ -42,6 +42,7 @@ The strict legacy loader accepts the following root keys. Unknown root keys fail
 | `routing` | Scenario-wide `ShortestPath` or `FatTreeEcmp` | Both |
 | `flow`, `flow_set` | Point-to-point traffic | Both, with a smaller exact subset |
 | `collective`, `collective_set` | Collective traffic | Both, with different algorithm sets |
+| `compute` | Delay-only compute stages that collectives can wait for | Days AGO; the legacy loader rejects the key |
 | `app_source` | Actor-managed byte buffers for TCP Broadcast/RingAllReduce | Legacy |
 
 See the pages in this section for field-level constraints. A key can belong to the vocabulary and still fail when its value or combination is inactive. The strict loader rejects examples such as `switch.ecn_threshold` without `drop = "ECN_THRESHOLD"`, `[link.pfc]` without `link.mode = "Pfc"`, and `[app_source]` without a supported TCP collective.
