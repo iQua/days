@@ -94,7 +94,9 @@ const RATIO_FLOOR: Duration = Duration::from_millis(1);
 /// samples taken, and the record line reports how many there were. No passing sample comes near
 /// it: the longest in the verification runs, the whole frontier's lowering on four x86 cores,
 /// took 14.8 s, a quarter of the budget. On a regressed tree a large-size sample takes minutes,
-/// so the cap bounds how long the failing job runs.
+/// so the cap bounds how long the failing job runs. Capping only drops samples, so the kept
+/// minimum can only rise: at a large size that raises the ratio, towards failing, so the cap can
+/// never turn a failure into a pass. The small sizes take about a second and never reach it.
 const SAMPLE_BUDGET: Duration = Duration::from_secs(60);
 
 /// One scaling case: the two sizes, their repetitions, and the ratio bound.
