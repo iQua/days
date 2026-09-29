@@ -108,6 +108,10 @@ jobs:
       #
       # To gate another test file, add one line, for example:
       #   scaling -p days --features test --test <file> -- <case> [<case>...]
+      # Only wall-clock ratio cases belong here. Deterministic budgets (scalar_stage_scaling,
+      # collective_lowering_budget's heap case, route_scaling_budget) run in the default test
+      # matrix; collective_lowering_budget's ignored time case is deliberately not wired in, since
+      # it does not reliably catch the route cost.
       # The Metal-plan phase is not gated here: it peaks above 10 GB at the CI sizes, beyond a
       # hosted macos-15 runner's 7 GB (evidence/P14/ci-scaling.md in days-gpu).
       - name: Run CI-sized host scaling gates
@@ -127,7 +131,8 @@ jobs:
             fi
           }
           scaling -p days --features test --test host_scaling_budget -- \
-            ci_scaling_frontier_host_phases ci_scaling_collective_stage_validation
+            ci_scaling_frontier_host_phases ci_scaling_topology_host_phases \
+            ci_scaling_collective_stage_validation
 
   metal-check:
     runs-on: macos-15
