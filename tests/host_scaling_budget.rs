@@ -88,6 +88,12 @@ const FOURFOLD_STEP_MAX_RATIO_MILLI: u128 = 8_000;
 /// A phase effectively free at the small size must not divide by noise.
 const RATIO_FLOOR: Duration = Duration::from_millis(1);
 
+/// A sample longer than this ends the repetitions at its size; the phase keeps the minimum of the
+/// samples taken, and the record line reports how many there were. No passing sample comes near
+/// it: the longest in the verification runs took about 16 s. On a regressed tree a
+/// large-size sample takes minutes, so the cap bounds how long the failing job runs.
+const SAMPLE_BUDGET: Duration = Duration::from_secs(60);
+
 /// One scaling case: the two sizes, their repetitions, and the ratio bound.
 struct Case {
     name: &'static str,
@@ -208,19 +214,19 @@ impl Phase {
         }
     }
 
-    /// Minimum wall time of `repetitions` runs of this phase on `scenario`.
-    fn time(self, scenario: &Scenario, repetitions: usize) -> Duration {
+    /// Up to `repetitions` runs of this phase on `scenario` (see [`SAMPLE_BUDGET`]).
+    fn time(self, scenario: &Scenario, repetitions: usize) -> Timing {
         match self {
-            Self::Lowering => min_time(repetitions, || {
+            Self::Lowering => sample(repetitions, || {
                 compile_config(&scenario.path).expect("lower the scenario")
             }),
-            Self::DeviceValidation => min_time(repetitions, || {
+            Self::DeviceValidation => sample(repetitions, || {
                 validate(&scenario.image, Backend::Cuda).expect("CUDA validation")
             }),
-            Self::ScalarValidation => min_time(repetitions, || {
+            Self::ScalarValidation => sample(repetitions, || {
                 validate(&scenario.image, Backend::Scalar).expect("Scalar validation")
             }),
-            Self::DefaultSizing => min_time(repetitions, || {
+            Self::DefaultSizing => sample(repetitions, || {
                 size_default_device_plan(&scenario.image).expect("default device plan")
             }),
             #[cfg(all(feature = "metal", target_vendor = "apple"))]
@@ -229,21 +235,40 @@ impl Phase {
     }
 }
 
-/// Minimum wall time of `repetitions` calls; each result is dropped outside the timed region.
-fn min_time<T>(repetitions: usize, mut phase: impl FnMut() -> T) -> Duration {
+/// The samples of one phase at one size.
+#[derive(Clone, Copy)]
+struct Timing {
+    min: Duration,
+    max: Duration,
+    samples: usize,
+}
+
+/// Times up to `repetitions` calls, stopping after the first sample longer than
+/// [`SAMPLE_BUDGET`]; each result is dropped outside the timed region.
+fn sample<T>(repetitions: usize, mut phase: impl FnMut() -> T) -> Timing {
     assert!(repetitions > 0, "at least one repetition");
-    let mut best = Duration::MAX;
-    for _ in 0..repetitions {
+    let mut timing = Timing {
+        min: Duration::MAX,
+        max: Duration::ZERO,
+        samples: 0,
+    };
+    while timing.samples < repetitions {
         let started = Instant::now();
         let result = black_box(phase());
-        best = best.min(started.elapsed());
+        let elapsed = started.elapsed();
         drop(result);
+        timing.min = timing.min.min(elapsed);
+        timing.max = timing.max.max(elapsed);
+        timing.samples += 1;
+        if elapsed > SAMPLE_BUDGET {
+            break;
+        }
     }
-    best
+    timing
 }
 
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
-fn metal_plan_time(image: &SimulationImage, repetitions: usize) -> Duration {
+fn metal_plan_time(image: &SimulationImage, repetitions: usize) -> Timing {
     use days_executor::{
         DeviceCapacityCaps, MetalConfig, ObservationMode, size_metal_plan_for_testing,
     };
@@ -266,7 +291,7 @@ fn metal_plan_time(image: &SimulationImage, repetitions: usize) -> Duration {
         },
         ..MetalConfig::default()
     };
-    min_time(repetitions, || {
+    sample(repetitions, || {
         size_metal_plan_for_testing(image, None, config, ObservationMode::Summary)
             .expect("Metal plan")
     })
@@ -278,21 +303,26 @@ fn record(
     phase: &str,
     attempt: u32,
     gated: bool,
-    (small, large): (Duration, Duration),
+    (small, large): (Timing, Timing),
 ) -> bool {
-    let ratio_milli = large.as_nanos() * 1_000 / small.max(RATIO_FLOOR).as_nanos();
+    let ratio_milli = large.min.as_nanos() * 1_000 / small.min.max(RATIO_FLOOR).as_nanos();
     let breach = ratio_milli >= case.max_ratio_milli;
     println!(
         "record=host_scaling_budget case={} phase={phase} attempt={attempt} unit={} small={} \
-         large={} small_ns={} large_ns={} ratio={} max_ratio={} gated={gated} breach={breach}",
+         large={} small_ns={} large_ns={} ratio={} max_ratio={} gated={gated} breach={breach} \
+         small_samples={} large_samples={} small_max_ns={} large_max_ns={}",
         case.name,
         case.unit,
         case.small,
         case.large,
-        small.as_nanos(),
-        large.as_nanos(),
+        small.min.as_nanos(),
+        large.min.as_nanos(),
         milli(ratio_milli),
         milli(case.max_ratio_milli),
+        small.samples,
+        large.samples,
+        small.max.as_nanos(),
+        large.max.as_nanos(),
     );
     breach
 }
@@ -302,8 +332,24 @@ fn milli(value: u128) -> String {
 }
 
 /// Gates one phase: a breach is measured once more at both sizes, and only a repeated breach
-/// records a failure.
-fn gate(case: &Case, phase: Phase, small: &Scenario, large: &Scenario, failures: &mut Vec<String>) {
+/// records a failure. An ungated phase is timed once per size and only recorded.
+fn gate(
+    case: &Case,
+    (phase, gated): (Phase, bool),
+    small: &Scenario,
+    large: &Scenario,
+    failures: &mut Vec<String>,
+) {
+    if !gated {
+        record(
+            case,
+            phase.label(),
+            1,
+            false,
+            (phase.time(small, 1), phase.time(large, 1)),
+        );
+        return;
+    }
     let measure = || {
         (
             phase.time(small, case.small_repetitions),
@@ -325,10 +371,10 @@ fn gate(case: &Case, phase: Phase, small: &Scenario, large: &Scenario, failures:
             case.small,
             case.unit,
             milli(case.max_ratio_milli),
-            first.0.as_millis(),
-            first.1.as_millis(),
-            second.0.as_millis(),
-            second.1.as_millis(),
+            first.0.min.as_millis(),
+            first.1.min.as_millis(),
+            second.0.min.as_millis(),
+            second.1.min.as_millis(),
         ));
     }
 }
@@ -338,7 +384,7 @@ fn run_frontier(case: &Case, phases: &[Phase]) {
     let large = Scenario::frontier(case.large);
     let mut failures = Vec::new();
     for &phase in phases {
-        gate(case, phase, &small, &large, &mut failures);
+        gate(case, (phase, true), &small, &large, &mut failures);
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
@@ -489,17 +535,9 @@ fn ci_scaling_collective_stage_validation() {
     let case = &CI_COLLECTIVE;
     let small = Scenario::ring_all_reduce(case.small);
     let large = Scenario::ring_all_reduce(case.large);
-    record(
-        case,
-        Phase::Lowering.label(),
-        1,
-        false,
-        (
-            Phase::Lowering.time(&small, 1),
-            Phase::Lowering.time(&large, 1),
-        ),
-    );
     let mut failures = Vec::new();
-    gate(case, Phase::ScalarValidation, &small, &large, &mut failures);
+    for phase in [(Phase::Lowering, false), (Phase::ScalarValidation, true)] {
+        gate(case, phase, &small, &large, &mut failures);
+    }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
