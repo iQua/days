@@ -5198,10 +5198,22 @@ impl DirectMetal {
         let source = include_str!("metal_kernels.metal");
         let pipeline_started = Instant::now();
         let library = compile_library(&device, source)?;
-        let pipelines = MetalKernel::ALL
-            .iter()
-            .map(|kernel| create_pipeline(&device, &library, *kernel))
-            .collect::<Result<Vec<_>, _>>()?;
+        // Each pipeline is compiled on its own scoped thread, which returns it through its join
+        // handle: the two `days_round` builds dominate creation and compile concurrently. The
+        // result, including which error is reported first, is in `MetalKernel::ALL` order.
+        let pipelines = std::thread::scope(|scope| {
+            let compiling = MetalKernel::ALL.map(|kernel| {
+                let (device, library) = (&device, &library);
+                scope.spawn(move || create_pipeline(device, library, kernel))
+            });
+            compiling.map(|thread| {
+                thread
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
         let Ok(pipelines) = <[MetalPipeline; MetalKernel::ALL.len()]>::try_from(pipelines) else {
             unreachable!("one pipeline is created per kernel");
         };
