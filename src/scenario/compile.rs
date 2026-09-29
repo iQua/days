@@ -527,6 +527,13 @@ struct ComputeStageInput {
     inbound_predecessor_bytes: u64,
 }
 
+/// One flow to lower, before the canonical sort assigns its dense identifier.
+///
+/// The stage sidecars are boxed: most flows have neither, and a sidecar held by value (448 B for a
+/// collective stage, 416 B for a compute stage, each with its predecessors' full `FlowKey`s) would
+/// be paid by every flow and moved by every step of the flow sort. Boxed, a flow without stages
+/// pays one null pointer per sidecar; `tests::flow_input_carries_its_stage_sidecars_out_of_line`
+/// bounds the size.
 #[derive(Clone, Debug)]
 struct FlowInput {
     key: FlowKey,
@@ -534,8 +541,8 @@ struct FlowInput {
     target: u64,
     priority: u8,
     traffic: TrafficKey,
-    collective: Option<CollectiveStageInput>,
-    compute: Option<ComputeStageInput>,
+    collective: Option<Box<CollectiveStageInput>>,
+    compute: Option<Box<ComputeStageInput>>,
 }
 
 /// Lowers one Days configuration file into one heterogeneous semantic image.
@@ -3367,7 +3374,7 @@ fn expand_collective(
                     target: semantic.sinks[rank_u64 as usize],
                     priority: semantic.priority,
                     traffic,
-                    collective: Some(CollectiveStageInput {
+                    collective: Some(Box::new(CollectiveStageInput {
                         collective_id,
                         algorithm: semantic.algorithm,
                         group_size,
@@ -3380,7 +3387,7 @@ fn expand_collective(
                         inbound_predecessor_bytes: chunk_bytes,
                         local_predecessor_complete,
                         inbound_predecessor_complete,
-                    }),
+                    })),
                     compute: None,
                 });
             }
@@ -3578,7 +3585,7 @@ fn expand_compute(
                 kind: TrafficKind::Constant,
             },
             collective: None,
-            compute: Some(ComputeStageInput {
+            compute: Some(Box::new(ComputeStageInput {
                 compute_id,
                 group_size,
                 rank,
@@ -3586,7 +3593,7 @@ fn expand_compute(
                 local_predecessor,
                 inbound_predecessor,
                 inbound_predecessor_bytes,
-            }),
+            })),
         });
     }
     Ok(())
