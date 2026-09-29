@@ -25,9 +25,7 @@ This ownership is the unit used by Scalar, persistent CPU workers, Metal, and CU
 
 The compiler rejects mechanisms outside the Days AGO model, such as VirtualClock. Backend validation then checks device-specific state before launch. Metal and CUDA reject:
 
-- collective generators
-- DCQCN controller and CNP state
-- PFC control payloads and per-priority pause state
+- collective and compute stages
 - RED admission state
 
 Errors name the backend and direct the caller to Scalar or CPU. A capability failure returns no partial run result.
