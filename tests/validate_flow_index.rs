@@ -25,7 +25,7 @@ use days_executor::{
     ObservationMode, PacketDescriptor, PacketKind, PayloadId, SchedulerKind, SimulationImage,
     StageRole, TcpAckHeader, assert_validate_flow_index_equivalent_for_testing,
     assert_validate_generator_index_equivalent_for_testing, event_phase,
-    run_scalar_with_observations, validate,
+    run_scalar_with_observations, validate, validate_flow_index_builds_stage_lookups_for_testing,
 };
 
 /// Every fixture family under `configs/` that the executor scenario lowering accepts, biased to
@@ -453,6 +453,34 @@ fn flow_indexed_generator_lookup_matches_the_scan_on_stage_images() {
         validate(&checkpoint, Backend::Scalar)
             .unwrap_or_else(|error| panic!("stage chain after {events} events: {error}"));
     }
+}
+
+/// P14 slim: only stage validation asks which generator owns a flow or sits at a collective
+/// position, so the index builds those lookups only for an image with a stage generator. Every
+/// other image skips the extra walk over its generators, and `is_compute_flow` answers `false`
+/// without a lookup; the equality gates above pin both answers against the scans on every fixture.
+#[test]
+fn flow_index_builds_stage_lookups_only_for_images_with_stages() {
+    for fixture in FIXTURES {
+        let image = compile_fixture(fixture);
+        assert!(
+            image
+                .host_states
+                .iter()
+                .flat_map(|state| &state.generators)
+                .all(|generator| generator.stage.is_none()),
+            "{fixture}: the fixture corpus has no stages"
+        );
+        assert!(
+            !validate_flow_index_builds_stage_lookups_for_testing(&image),
+            "{fixture}: an image without stages must not build the stage lookups"
+        );
+    }
+    let chain = stage_chain_image("stage_lookups");
+    assert!(
+        validate_flow_index_builds_stage_lookups_for_testing(&chain),
+        "the stage chain must build the stage lookups"
+    );
 }
 
 /// The generator lookups keep the scans' first-occurrence answers on images the validator rejects:

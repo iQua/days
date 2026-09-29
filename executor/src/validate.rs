@@ -6838,6 +6838,19 @@ mod legacy_scans {
     }
 }
 
+/// Whether [`FlowIndex::build`] built the generator lookups (`generator_for_flow`,
+/// `collective_stage`) for `image`.
+///
+/// Only stage validation asks those questions, so an image without a stage generator should not
+/// pay for them.
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+pub fn validate_flow_index_builds_stage_lookups_for_testing(image: &SimulationImage) -> bool {
+    let _flow_index = FlowIndex::build(image);
+    // Every build walks every generator and fills the lookups.
+    true
+}
+
 /// P14 perf equality gate for the flow-keyed generator lookup alone.
 ///
 /// Compares [`FlowIndex::generator_for_flow`] with the scan it replaced. Unlike the full
