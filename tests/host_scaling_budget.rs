@@ -44,7 +44,7 @@
 //!
 //! # Collective case
 //!
-//! Scalar stage validation of one ring all-reduce at 48 and 96 ranks (see
+//! Scalar stage validation of one ring all-reduce at 96 and 192 ranks (see
 //! [`ci_scaling_collective_stage_validation`]).
 //!
 //! # Running
@@ -124,15 +124,16 @@ const FULL_FRONTIER: Case = Case {
     max_ratio_milli: EIGHTFOLD_STEP_MAX_RATIO_MILLI,
 };
 
-/// The collective case: one ring all-reduce at 48 and 96 ranks, 4,512 and 18,240 stages. Its
-/// phases take milliseconds, so both sizes take the minimum of five runs.
+/// The collective case: one ring all-reduce at 96 and 192 ranks, 18,240 and 73,152 stages. At 48
+/// ranks validation took only 3 to 10 ms, so a millisecond of scheduler noise moved the ratio; at
+/// 96 ranks it takes tens of milliseconds on a 4-core x86 host (`evidence/P14/ci-scaling.md`).
 const CI_COLLECTIVE: Case = Case {
     name: "collective_ci",
     unit: "ranks",
-    small: 48,
-    large: 96,
+    small: 96,
+    large: 192,
     small_repetitions: 5,
-    large_repetitions: 5,
+    large_repetitions: 3,
     max_ratio_milli: FOURFOLD_STEP_MAX_RATIO_MILLI,
 };
 
@@ -481,6 +482,7 @@ cc_algorithm = "TCPReno"
 /// bounded: every stage's flow key embeds a clone of its collective's key, rank-length source and
 /// sink lists included, so the canonical flow sort and the predecessor lookups cost O(ranks) per
 /// comparison and lowering grows as stages x ranks (`evidence/P14/perf-fix.md`, open finding).
+/// Being informational, it is timed once per size.
 #[test]
 #[ignore = "CI scaling gate (the `scaling` job): run with --release --test-threads=1"]
 fn ci_scaling_collective_stage_validation() {
@@ -493,8 +495,8 @@ fn ci_scaling_collective_stage_validation() {
         1,
         false,
         (
-            Phase::Lowering.time(&small, case.small_repetitions),
-            Phase::Lowering.time(&large, case.large_repetitions),
+            Phase::Lowering.time(&small, 1),
+            Phase::Lowering.time(&large, 1),
         ),
     );
     let mut failures = Vec::new();
