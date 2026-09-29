@@ -126,7 +126,9 @@ struct PreloadedTcpAcks {
 ///
 /// P14's stages added one more such question, "which generator owns this flow?", asked once per
 /// flow, once per initial packet and at every stage predecessor. It is answered by a first-
-/// occurrence slot per dense flow, so it too costs one pass instead of one scan per query.
+/// occurrence slot per dense flow, so it too costs one pass instead of one scan per query. Only
+/// stages ask it, or ask for the stage at a collective position, so [`StageLookups`] is built only
+/// for an image with a stage generator; any other image skips the walk that fills it.
 struct FlowIndex {
     /// CSR offsets into `packet_items`; one entry per dense flow slot plus a terminator.
     packet_offsets: Vec<usize>,
@@ -144,6 +146,12 @@ struct FlowIndex {
     retransmission_timeouts: BTreeMap<(NodeId, PayloadId, u64), u64>,
     /// Smallest initial event time at or below the stop time; invariant across generators.
     first_admissible_event_time_ns: Option<u64>,
+    /// The generator lookups; `None` exactly when no generator carries a stage.
+    stage_lookups: Option<StageLookups>,
+}
+
+/// The generator lookups of a [`FlowIndex`] over an image with at least one stage generator.
+struct StageLookups {
     /// The first generator of each dense flow slot, as `(host_states index, generators index)`.
     ///
     /// "First" is in `host_states`-then-`generators` order, the order the linear
@@ -232,24 +240,12 @@ impl FlowIndex {
             }
         }
 
-        let mut generator_slots = vec![None; flow_count];
-        let mut unindexed_generators = Vec::new();
-        let mut collective_stages = BTreeMap::new();
-        for (host, state) in image.host_states.iter().enumerate() {
-            for (index, generator) in state.generators.iter().enumerate() {
-                match dense_flow_slot(image, generator.flow) {
-                    Some(slot) => {
-                        generator_slots[slot].get_or_insert((host, index));
-                    }
-                    None => unindexed_generators.push((host, index)),
-                }
-                if let Some(stage) = collective_identity(generator) {
-                    collective_stages
-                        .entry((stage.collective_id, stage.phase, stage.rank, stage.step))
-                        .or_insert((host, index));
-                }
-            }
-        }
+        let stage_lookups = image
+            .host_states
+            .iter()
+            .flat_map(|state| &state.generators)
+            .any(|generator| generator.stage.is_some())
+            .then(|| StageLookups::build(image));
 
         Self {
             packet_offsets,
@@ -258,10 +254,13 @@ impl FlowIndex {
             preloaded_tcp_acks,
             retransmission_timeouts,
             first_admissible_event_time_ns,
-            generator_slots,
-            unindexed_generators,
-            collective_stages,
+            stage_lookups,
         }
+    }
+
+    /// Whether any generator carries a stage.
+    const fn has_stage_generators(&self) -> bool {
+        self.stage_lookups.is_some()
     }
 
     /// Returns the first collective stage generator, in `host_states`-then-`generators` order, at
@@ -270,12 +269,16 @@ impl FlowIndex {
     /// Exactly equivalent to the `flat_map(..).find(..)` over every generator whose collective
     /// identity matches all four components: the build pass keeps the first generator it meets at
     /// each position, and it meets them in that order.
+    ///
+    /// Without stage lookups no generator has a collective identity, so the scan finds none.
     fn collective_stage<'a>(
         &self,
         image: &'a SimulationImage,
         position: CollectivePosition,
     ) -> Option<&'a crate::FlowGeneratorState> {
-        self.collective_stages
+        self.stage_lookups
+            .as_ref()?
+            .collective_stages
             .get(&position)
             .map(|&(host, index)| &image.host_states[host].generators[index])
     }
@@ -286,15 +289,26 @@ impl FlowIndex {
     /// .find(|generator| generator.flow == id)`: a dense slot records the first generator that
     /// resolves to it, and an identifier outside the dense table falls back to the same `find`
     /// over the unindexed generators, which keep their relative order.
+    ///
+    /// Without stage lookups it is that scan itself. Validation queries it only from stage
+    /// validators, which run only when a generator has a stage; the equality gates query it on
+    /// every image.
     fn generator_for_flow<'a>(
         &self,
         image: &'a SimulationImage,
         id: crate::FlowId,
     ) -> Option<&'a crate::FlowGeneratorState> {
+        let Some(lookups) = &self.stage_lookups else {
+            return image
+                .host_states
+                .iter()
+                .flat_map(|state| &state.generators)
+                .find(|generator| generator.flow == id);
+        };
         let at = |(host, index): (usize, usize)| &image.host_states[host].generators[index];
         match dense_flow_slot(image, id) {
-            Some(slot) => self.generator_slots[slot].map(at),
-            None => self
+            Some(slot) => lookups.generator_slots[slot].map(at),
+            None => lookups
                 .unindexed_generators
                 .iter()
                 .copied()
@@ -304,9 +318,14 @@ impl FlowIndex {
     }
 
     /// Whether a compute (delay-only) stage owns this flow.
+    ///
+    /// Without stage lookups no generator is a compute stage, so the answer is `false` without a
+    /// lookup, exactly as the lookup would answer.
     fn is_compute_flow(&self, image: &SimulationImage, id: crate::FlowId) -> bool {
-        self.generator_for_flow(image, id)
-            .is_some_and(is_compute_generator)
+        self.has_stage_generators()
+            && self
+                .generator_for_flow(image, id)
+                .is_some_and(is_compute_generator)
     }
 
     /// Yields the initial packets of `id`, in `initial_packets` order.
@@ -355,6 +374,36 @@ impl FlowIndex {
             .get(&(owner, attempt, deadline_ns))
             .copied()
             .unwrap_or(0)
+    }
+}
+
+impl StageLookups {
+    /// One pass over the generators in `host_states`-then-`generators` order, keeping the first
+    /// generator met at each dense flow slot and at each collective position.
+    fn build(image: &SimulationImage) -> Self {
+        let mut generator_slots = vec![None; image.flows.len()];
+        let mut unindexed_generators = Vec::new();
+        let mut collective_stages = BTreeMap::new();
+        for (host, state) in image.host_states.iter().enumerate() {
+            for (index, generator) in state.generators.iter().enumerate() {
+                match dense_flow_slot(image, generator.flow) {
+                    Some(slot) => {
+                        generator_slots[slot].get_or_insert((host, index));
+                    }
+                    None => unindexed_generators.push((host, index)),
+                }
+                if let Some(stage) = collective_identity(generator) {
+                    collective_stages
+                        .entry((stage.collective_id, stage.phase, stage.rank, stage.step))
+                        .or_insert((host, index));
+                }
+            }
+        }
+        Self {
+            generator_slots,
+            unindexed_generators,
+            collective_stages,
+        }
     }
 }
 
@@ -6846,9 +6895,7 @@ mod legacy_scans {
 #[cfg(feature = "planner-test-hooks")]
 #[doc(hidden)]
 pub fn validate_flow_index_builds_stage_lookups_for_testing(image: &SimulationImage) -> bool {
-    let _flow_index = FlowIndex::build(image);
-    // Every build walks every generator and fills the lookups.
-    true
+    FlowIndex::build(image).has_stage_generators()
 }
 
 /// P14 perf equality gate for the flow-keyed generator lookup alone.
@@ -6897,6 +6944,15 @@ pub fn assert_validate_generator_index_equivalent_for_testing(
                 "flow {id:?} indexed generator {:?} differs from the scanned generator {:?}",
                 indexed.map(|generator| generator.flow),
                 scanned.map(|generator| generator.flow)
+            ));
+        }
+        // `is_compute_flow` answers `false` without a lookup when the image has no stage.
+        let indexed_compute = flow_index.is_compute_flow(image, id);
+        let scanned_compute = scanned.is_some_and(is_compute_generator);
+        if indexed_compute != scanned_compute {
+            return Err(format!(
+                "flow {id:?} indexed compute answer {indexed_compute} differs from the scanned \
+                 answer {scanned_compute}"
             ));
         }
     }
