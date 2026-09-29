@@ -298,7 +298,7 @@ fn milli(value: u128) -> String {
 /// Gates one phase: a breach is measured once more at both sizes, and only a repeated breach
 /// records a failure.
 fn gate(case: &Case, phase: Phase, small: &Scenario, large: &Scenario, failures: &mut Vec<String>) {
-    let mut measure = || {
+    let measure = || {
         (
             phase.time(small, case.small_repetitions),
             phase.time(large, case.large_repetitions),
