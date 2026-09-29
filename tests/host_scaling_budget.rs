@@ -22,7 +22,8 @@
 //! * **device validation**: `validate` for the CUDA backend, which every device run repeats at
 //!   executor entry (the Metal plan construction below validates for Metal the same way);
 //! * **host planning**: `size_default_device_plan`, and the full Metal plan construction
-//!   (`size_metal_plan_for_testing`) where that hook is compiled.
+//!   (`size_metal_plan_for_testing`) where that hook is compiled, under the frontier run
+//!   protocol's capacity caps.
 //!
 //! The frontier sizes are expensive in an unoptimized build, so the gate is explicit:
 //! `cargo test --release -p days --features test --test host_scaling_budget -- --ignored`
@@ -133,15 +134,29 @@ fn measure(sets: usize, repetitions: usize) -> (Phases, SimulationImage) {
 
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 fn metal_plan_time(image: &SimulationImage, repetitions: usize) -> Option<Duration> {
-    use days_executor::{MetalConfig, ObservationMode, size_metal_plan_for_testing};
+    use days_executor::{
+        DeviceCapacityCaps, MetalConfig, ObservationMode, size_metal_plan_for_testing,
+    };
+    // The frontier run protocol's caps: the `days` CLI's defaults with
+    // `--channel-events-per-stream 256`. Uncapped channel streams (the executor-level default)
+    // grow the stream arena itself faster than the flow count, which is a property of the
+    // requested plan size, not of the planner's work per flow.
+    let config = MetalConfig {
+        capacity_caps: DeviceCapacityCaps {
+            fallback_fel_events_per_lp: Some(16_384),
+            queue_packets_per_lp: Some(2_048),
+            channel_events_per_stream: Some(256),
+            remote_staging_events_per_lp: Some(2_048),
+            outbox_events_total: Some(2_000_000),
+            tcp_receiver_ranges_per_flow: Some(64),
+            tcp_ledger_segments_per_flow: Some(4_096),
+            observation_events_per_lp: Some(512),
+        },
+        ..MetalConfig::default()
+    };
     let (time, _) = min_time(repetitions, || {
-        size_metal_plan_for_testing(
-            image,
-            None,
-            MetalConfig::default(),
-            ObservationMode::Summary,
-        )
-        .expect("Metal plan")
+        size_metal_plan_for_testing(image, None, config, ObservationMode::Summary)
+            .expect("Metal plan")
     });
     Some(time)
 }
