@@ -1025,6 +1025,155 @@ impl RoutingProtocol for ECMP {
     }
 }
 
+/// The early-stopping fat-tree search as it stood at `7348a73`, retained verbatim as the oracle of
+/// the per-source search tree's identity gate (the T20j pattern).
+///
+/// Production builds one exhaustive search tree per source and reads every route from it. These
+/// two functions are the per-flow search it replaced: `compute_fat_tree_route_with_params` stops
+/// when it pops `end`, and `try_compute_route_in_classified_canonical_graph` falls back to the
+/// `petgraph` A* search exactly as the table did. They exist only in unit-test builds, so the
+/// equality tests below can compare every route production selects against the route this search
+/// selects, on the same graph and endpoints.
+#[cfg(test)]
+mod reference_search {
+    use std::collections::BinaryHeap;
+
+    use petgraph::algo::astar;
+    use petgraph::graph::{NodeIndex, UnGraph};
+
+    use super::MinScoredNode;
+
+    pub(super) fn compute_fat_tree_route_with_params(
+        graph: &UnGraph<usize, ()>,
+        start: NodeIndex,
+        end: NodeIndex,
+        (num_layer_switches, switches_per_pod, num_pods): (usize, usize, usize),
+    ) -> Option<Vec<NodeIndex>> {
+        let core_start = 2 * num_layer_switches;
+
+        let start_idx = start.index();
+        let end_idx = end.index();
+        if start_idx >= num_layer_switches || end_idx >= num_layer_switches {
+            return None;
+        }
+
+        let node_count = graph.node_count();
+        let mut visit_next = BinaryHeap::new();
+        let mut scores = vec![None; node_count];
+        let mut came_from = vec![usize::MAX; node_count];
+
+        let start_idx = start.index();
+        scores[start_idx] = Some((0, 0, 0));
+        visit_next.push(MinScoredNode {
+            score: (0, 0, 0),
+            node: start,
+        });
+
+        while let Some(MinScoredNode {
+            score: (f, h, g),
+            node,
+        }) = visit_next.pop()
+        {
+            if node == end {
+                let mut path = vec![node];
+                let mut current = node.index();
+                while current != start_idx {
+                    let previous = came_from[current];
+                    if previous == usize::MAX {
+                        break;
+                    }
+                    path.push(NodeIndex::new(previous));
+                    current = previous;
+                }
+                path.reverse();
+                return Some(path);
+            }
+
+            let node_idx = node.index();
+            if let Some((_, _, old_g)) = scores[node_idx] {
+                if old_g < g {
+                    continue;
+                }
+            }
+            scores[node_idx] = Some((f, h, g));
+
+            let mut push_neighbor = |neigh: NodeIndex| {
+                let neigh_g = g + 1;
+                let neigh_score = (neigh_g, 0, neigh_g);
+                let neigh_idx = neigh.index();
+
+                if let Some((_, _, old_neigh_g)) = scores[neigh_idx] {
+                    if neigh_g >= old_neigh_g {
+                        return;
+                    }
+                }
+
+                scores[neigh_idx] = Some(neigh_score);
+                came_from[neigh_idx] = node_idx;
+                visit_next.push(MinScoredNode {
+                    score: neigh_score,
+                    node: neigh,
+                });
+            };
+
+            if node_idx < num_layer_switches {
+                let pod = node_idx / switches_per_pod;
+                let agg_base = num_layer_switches + pod * switches_per_pod;
+                for agg_offset in (0..switches_per_pod).rev() {
+                    push_neighbor(NodeIndex::new(agg_base + agg_offset));
+                }
+            } else if node_idx < core_start {
+                let agg_rel = node_idx - num_layer_switches;
+                let pod = agg_rel / switches_per_pod;
+                let group = agg_rel % switches_per_pod;
+
+                for core_offset in (0..switches_per_pod).rev() {
+                    push_neighbor(NodeIndex::new(
+                        core_start + group * switches_per_pod + core_offset,
+                    ));
+                }
+
+                let edge_base = pod * switches_per_pod;
+                for edge_offset in (0..switches_per_pod).rev() {
+                    push_neighbor(NodeIndex::new(edge_base + edge_offset));
+                }
+            } else {
+                let core_rel = node_idx - core_start;
+                let group = core_rel / switches_per_pod;
+
+                for pod in (0..num_pods).rev() {
+                    push_neighbor(NodeIndex::new(
+                        num_layer_switches + pod * switches_per_pod + group,
+                    ));
+                }
+            }
+        }
+
+        None
+    }
+
+    pub(super) fn try_compute_route_in_classified_canonical_graph(
+        graph: &UnGraph<usize, ()>,
+        start: NodeIndex,
+        end: NodeIndex,
+        fat_tree_params: Option<(usize, usize, usize)>,
+    ) -> Option<Vec<NodeIndex>> {
+        if let Some(params) = fat_tree_params {
+            if let Some(path) = compute_fat_tree_route_with_params(graph, start, end, params) {
+                return Some(path);
+            }
+        }
+        astar(
+            graph,
+            start,
+            |n| n == end,
+            |_| 1, // Uniform cost
+            |_| 0, // Heuristic ignored for uniform cost
+        )
+        .map(|(_, path)| path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1059,6 +1208,122 @@ mod tests {
             }
         }
         graph
+    }
+
+    /// The canonical k-ary fat tree's switch graph: edge switches, then aggregation, then core.
+    fn canonical_fat_tree(k: usize) -> UnGraph<usize, ()> {
+        let edge_switches = k * k / 2;
+        let per_pod = k / 2;
+        let mut graph = UnGraph::with_capacity(5 * k * k / 4, k * k * k / 2);
+        for node in 0..5 * k * k / 4 {
+            graph.add_node(node);
+        }
+        for edge in 0..edge_switches {
+            let aggregation_base = edge_switches + (edge / per_pod) * per_pod;
+            for offset in 0..per_pod {
+                graph.add_edge(
+                    NodeIndex::new(edge),
+                    NodeIndex::new(aggregation_base + offset),
+                    (),
+                );
+            }
+        }
+        for aggregation in edge_switches..2 * edge_switches {
+            let group = (aggregation - edge_switches) % per_pod;
+            for offset in 0..per_pod {
+                graph.add_edge(
+                    NodeIndex::new(aggregation),
+                    NodeIndex::new(2 * edge_switches + group * per_pod + offset),
+                    (),
+                );
+            }
+        }
+        graph
+    }
+
+    /// The route the pre-tree table selected for one flow: the early-stopping search, or A*.
+    fn reference_route(
+        graph: &UnGraph<usize, ()>,
+        source: NodeIndex,
+        target: NodeIndex,
+    ) -> Option<Vec<NodeIndex>> {
+        let graph = canonical_routing_graph(graph);
+        let params = ShortestPath::fat_tree_params(&graph);
+        reference_search::try_compute_route_in_classified_canonical_graph(
+            &graph, source, target, params,
+        )
+    }
+
+    /// Every ordered pair of `endpoints` routed through the table under each budget, and one at a
+    /// time, compared against the reference search.
+    fn assert_pairs_route_as_the_reference(
+        k: usize,
+        endpoints: usize,
+        budgets: &[RouteWorkers],
+        label: &str,
+    ) {
+        let graph = canonical_fat_tree(k);
+        let flows = (0..endpoints)
+            .flat_map(|source| {
+                (0..endpoints).map(move |target| {
+                    (
+                        (source, target),
+                        NodeIndex::new(source),
+                        NodeIndex::new(target),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let reference = flows
+            .iter()
+            .map(|&(key, source, target)| {
+                let route = reference_route(&graph, source, target)
+                    .expect("a canonical fat tree is connected");
+                (key, route)
+            })
+            .collect::<BTreeMap<_, _>>();
+        for &workers in budgets {
+            let table =
+                compute_shortest_path_route_table_with(&graph, flows.iter().copied(), workers)
+                    .expect("a canonical fat tree is connected");
+            assert!(
+                table == reference,
+                "k={k}, {} workers: the route table must select the reference route for every \
+                 {label} pair",
+                workers.get()
+            );
+        }
+        for &(key, source, target) in &flows {
+            assert_eq!(
+                ShortestPath::try_compute_route_in(&graph, source, target).as_ref(),
+                reference.get(&key),
+                "k={k}: the one-off route {key:?} must be the reference route"
+            );
+        }
+    }
+
+    /// Every ordered pair of edge switches at k = 4, 8 and 16 (64 + 1,024 + 16,384 pairs): the
+    /// route table and the one-off route select exactly the route the early-stopping reference
+    /// search selects, for every worker budget.
+    #[test]
+    fn every_edge_switch_pair_routes_as_the_reference_search() {
+        assert_pairs_route_as_the_reference(4, 8, &BUDGETS, "edge-switch");
+        assert_pairs_route_as_the_reference(8, 32, &BUDGETS, "edge-switch");
+        assert_pairs_route_as_the_reference(
+            16,
+            128,
+            &[RouteWorkers::serial(), RouteWorkers::new(7)],
+            "edge-switch",
+        );
+    }
+
+    /// Every ordered pair of switches at k = 4 and 8, aggregation and core switches included: an
+    /// endpoint outside the edge layer leaves the fat-tree search for A*, and the table must still
+    /// select the reference route, for every worker budget.
+    #[test]
+    fn every_switch_pair_routes_as_the_reference_search() {
+        assert_pairs_route_as_the_reference(4, 20, &BUDGETS, "switch");
+        assert_pairs_route_as_the_reference(8, 80, &BUDGETS, "switch");
     }
 
     #[test]
