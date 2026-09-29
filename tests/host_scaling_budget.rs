@@ -28,9 +28,9 @@
 //! * `default_sizing`: `size_default_device_plan`;
 //! * `metal_plan`: the full Metal plan construction (`size_metal_plan_for_testing`) under the
 //!   frontier run protocol's capacity caps. It needs the `metal` feature on Apple hardware; the
-//!   hook builds the plan on the host and never creates a Metal device. It is not in CI: its
-//!   per-logical-process arenas on the k=32 topology peak above 10 GB at either CI size, beyond a
-//!   hosted `macos-15` runner's 7 GB (`evidence/P14/ci-scaling.md`).
+//!   hook builds the plan on the host and never creates a Metal device. It is not in CI: the test
+//!   process peaked above 10 GB resident at either candidate CI size (1 to 8 and 2 to 16 sets),
+//!   beyond a hosted `macos-15` runner's 7 GB (`evidence/P14/ci-scaling.md`).
 //!
 //! The regression is a quadratic term beside a linear one, `T(n) = a n + b n^2`. With `q = b n / a`
 //! at the small size and a size step `k`, the ratio is `(k + k^2 q) / (1 + q)`: it rises from `k`
