@@ -73,15 +73,22 @@ impl Drop for RouteFillScope {
 
 /// Work counter for the fat-tree search, carried by value from each route worker to the submitter.
 ///
-/// In test builds it counts neighbour examinations: one per candidate successor the search
-/// considers, whether or not that successor is pushed. It is the search's unit of work, and a
-/// pure function of the graph and the sources searched. Without the test hooks it is zero-sized
-/// and its methods are empty, so production search carries no counter (checked at compile time
-/// below).
+/// In test builds it counts two things, each a pure function of the graph and the sources
+/// searched:
+/// * neighbour examinations: one per candidate successor the search considers, whether or not
+///   that successor is pushed. It is the search's unit of work.
+/// * scratch cells written: every write to a node-indexed scratch cell (`scores`, `came_from`),
+///   including the reset that clears both arrays before each search. It is the search's
+///   initialisation and bookkeeping work, which an examination count cannot see.
+///
+/// Without the test hooks it is zero-sized and its methods are empty, so production search carries
+/// no counter (checked at compile time below).
 #[derive(Clone, Copy, Debug, Default)]
 struct SearchProbe {
     #[cfg(any(test, feature = "test"))]
     neighbour_examinations: u64,
+    #[cfg(any(test, feature = "test"))]
+    scratch_cells_written: u64,
 }
 
 impl SearchProbe {
@@ -93,21 +100,34 @@ impl SearchProbe {
         }
     }
 
-    /// Adds another worker's count, received with that worker's routes.
+    #[inline(always)]
+    fn write_scratch_cells(&mut self, _cells: usize) {
+        #[cfg(any(test, feature = "test"))]
+        {
+            self.scratch_cells_written += _cells as u64;
+        }
+    }
+
+    /// Adds another worker's counts, received with that worker's routes.
     #[inline(always)]
     fn absorb(&mut self, _other: SearchProbe) {
         #[cfg(any(test, feature = "test"))]
         {
             self.neighbour_examinations += _other.neighbour_examinations;
+            self.scratch_cells_written += _other.scratch_cells_written;
         }
     }
 
-    /// Adds this route table's count to the submitting thread's running total.
+    /// Adds this route table's counts to the submitting thread's running totals.
     #[inline(always)]
     fn record_on_submitting_thread(self) {
         #[cfg(any(test, feature = "test"))]
-        ROUTE_TABLE_NEIGHBOUR_EXAMINATIONS
-            .with(|total| total.set(total.get() + self.neighbour_examinations));
+        {
+            ROUTE_TABLE_NEIGHBOUR_EXAMINATIONS
+                .with(|total| total.set(total.get() + self.neighbour_examinations));
+            ROUTE_TABLE_SCRATCH_CELLS_WRITTEN
+                .with(|total| total.set(total.get() + self.scratch_cells_written));
+        }
     }
 }
 
@@ -123,6 +143,9 @@ std::thread_local! {
     /// Route workers never touch it: each returns its own count with its routes, and the
     /// submitting thread adds the sum here after the join.
     static ROUTE_TABLE_NEIGHBOUR_EXAMINATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Scratch cells written by every shortest-path route table submitted from this thread,
+    /// gathered the same way.
+    static ROUTE_TABLE_SCRATCH_CELLS_WRITTEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Neighbour examinations the fat-tree search has made for every shortest-path route table
@@ -133,6 +156,19 @@ std::thread_local! {
 #[cfg(any(test, feature = "test"))]
 pub fn route_table_neighbour_examinations_for_testing() -> u64 {
     ROUTE_TABLE_NEIGHBOUR_EXAMINATIONS.with(std::cell::Cell::get)
+}
+
+/// Node-indexed scratch cells (`scores`, `came_from`) the fat-tree search has written, resets
+/// included, for every shortest-path route table submitted from the calling thread, cumulative
+/// since the thread started (test hooks only).
+///
+/// An exhaustive search over `N` switches writes exactly `5N - 1` cells: `2N` to reset both arrays,
+/// one for the source's score, two for each of the `N - 1` pushes (score and predecessor), and one
+/// for each of the `N` pops (every node is pushed once, so no pop is stale). Scratch owned outside
+/// the search state is not counted.
+#[cfg(any(test, feature = "test"))]
+pub fn route_table_scratch_cells_written_for_testing() -> u64 {
+    ROUTE_TABLE_SCRATCH_CELLS_WRITTEN.with(std::cell::Cell::get)
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -449,12 +485,14 @@ impl FatTreeSearch {
         } = self;
         scores.fill(None);
         came_from.fill(usize::MAX);
+        probe.write_scratch_cells(scores.len() + came_from.len());
         visit_next.clear();
         *tree_source = None;
 
         let core_start = 2 * num_layer_switches;
         let start_idx = start.index();
         scores[start_idx] = Some((0, 0, 0));
+        probe.write_scratch_cells(1);
         visit_next.push(MinScoredNode {
             score: (0, 0, 0),
             node: start,
@@ -476,6 +514,7 @@ impl FatTreeSearch {
                 }
             }
             scores[node_idx] = Some((f, h, g));
+            probe.write_scratch_cells(1);
 
             let mut push_neighbor = |neigh: NodeIndex| {
                 probe.examine_neighbour();
@@ -491,6 +530,7 @@ impl FatTreeSearch {
 
                 scores[neigh_idx] = Some(neigh_score);
                 came_from[neigh_idx] = node_idx;
+                probe.write_scratch_cells(2);
                 visit_next.push(MinScoredNode {
                     score: neigh_score,
                     node: neigh,
@@ -1589,7 +1629,8 @@ mod tests {
     }
 
     /// With one worker the search runs exactly one exhaustive tree per distinct source edge switch:
-    /// every switch popped once, each of its neighbours examined once, `2E` examinations a tree.
+    /// every switch popped once, each of its neighbours examined once, `2E` examinations and
+    /// `5N - 1` scratch-cell writes a tree.
     #[test]
     fn one_route_worker_searches_once_per_source_edge_switch() {
         let k = 8;
@@ -1603,13 +1644,22 @@ mod tests {
             .map(|(key, (source, target))| (key, NodeIndex::new(source), NodeIndex::new(target)))
             .collect::<Vec<_>>();
         let before = route_table_neighbour_examinations_for_testing();
+        let written_before = route_table_scratch_cells_written_for_testing();
         compute_shortest_path_route_table_with(&graph, flows, RouteWorkers::serial())
             .expect("a canonical fat tree is connected");
         let examinations = route_table_neighbour_examinations_for_testing() - before;
+        let written = route_table_scratch_cells_written_for_testing() - written_before;
         assert_eq!(
             examinations,
             (sources.len() * 2 * graph.edge_count()) as u64,
             "one exhaustive tree per distinct source"
+        );
+        // Per tree: reset 2N, the source's score 1, two per push over N - 1 pushes, one per pop
+        // over N pops.
+        assert_eq!(
+            written,
+            (sources.len() * (5 * graph.node_count() - 1)) as u64,
+            "each tree writes 5N - 1 scratch cells, its reset included"
         );
     }
 
