@@ -35,6 +35,8 @@
 //!   `cargo test -p days --test collective_lowering_budget`
 //! * time (explicit; release, one test thread so the memory case cannot share the CPU):
 //!   `cargo test --release -p days --test collective_lowering_budget -- --ignored --test-threads=1`
+//! * path identity (default matrix): `serial_route_lowering_is_the_compile_config_image` checks
+//!   that the serial-route image equals `compile_config`'s for both budget scenarios.
 //! * both, as a scaling job runs them:
 //!   `cargo test --release -p days --test collective_lowering_budget -- --include-ignored --test-threads=1`
 #![allow(unsafe_code)]
@@ -45,7 +47,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use days::scenario::compile_config_with_route_workers;
+use days::scenario::{compile_config, compile_config_with_route_workers};
 use days::topos::route::RouteWorkers;
 
 /// Live and peak heap bytes allocated by the current thread.
@@ -120,8 +122,9 @@ static ALLOCATOR: ThreadCountingAllocator = ThreadCountingAllocator;
 
 /// One ring all-reduce over `ranks` hosts on a single switch: `2 * ranks * (ranks - 1)` TCP stages.
 ///
-/// The same scenario as `tests/host_scaling_budget.rs`'s ring case.
-fn ring_all_reduce_scenario(ranks: u64) -> PathBuf {
+/// The same scenario as `tests/host_scaling_budget.rs`'s ring case. Each test passes its own
+/// `test` label, so tests running in parallel never write the same file.
+fn ring_all_reduce_scenario(test: &str, ranks: u64) -> PathBuf {
     let switch = ranks;
     let edges = (0..ranks)
         .map(|host| format!("[{host}, {switch}]"))
@@ -167,7 +170,7 @@ cc_algorithm = "TCPReno"
         size = ranks * 1_000,
     );
     let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "collective_lowering_budget_ring_{ranks}_ranks.toml"
+        "collective_lowering_budget_{test}_ring_{ranks}_ranks.toml"
     ));
     fs::write(&path, config).expect("write the ring scenario");
     path
@@ -186,7 +189,7 @@ struct HeapUse {
 }
 
 fn lowering_heap_use(ranks: u64) -> HeapUse {
-    let path = ring_all_reduce_scenario(ranks);
+    let path = ring_all_reduce_scenario("heap", ranks);
     let baseline = LIVE_BYTES.with(Cell::get);
     PEAK_BYTES.with(|peak| peak.set(baseline));
     let allocated_before = ALLOCATED_BYTES.with(Cell::get);
@@ -265,7 +268,7 @@ fn collective_lowering_heap_scales_linearly_in_stages() {
 
 /// Minimum serial-route lowering wall time over [`TIME_REPETITIONS`] lowerings.
 fn lowering_time(ranks: u64) -> Duration {
-    let path = ring_all_reduce_scenario(ranks);
+    let path = ring_all_reduce_scenario("time", ranks);
     (0..TIME_REPETITIONS)
         .map(|_| {
             let started = Instant::now();
@@ -291,5 +294,23 @@ fn collective_lowering_time_scales_linearly_in_stages() {
         large.as_nanos() as f64,
     ) {
         panic!("{failure}");
+    }
+}
+
+/// The measured path is production's: for each budget scenario, the serial-route lowering the
+/// cases above measure produces the same image as `compile_config`, which uses the host's route
+/// workers.
+#[test]
+fn serial_route_lowering_is_the_compile_config_image() {
+    for ranks in [SMALL_RANKS, LARGE_RANKS] {
+        let path = ring_all_reduce_scenario("path_identity", ranks);
+        let production =
+            compile_config(&path).unwrap_or_else(|error| panic!("lower {ranks} ranks: {error}"));
+        let measured = compile_config_with_route_workers(&path, RouteWorkers::serial())
+            .unwrap_or_else(|error| panic!("lower {ranks} ranks serially: {error}"));
+        assert!(
+            production == measured,
+            "{ranks} ranks: the serial-route image differs from compile_config's"
+        );
     }
 }
