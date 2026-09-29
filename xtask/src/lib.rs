@@ -977,18 +977,8 @@ const RAW_CAUSE_ELEMENT: &str = "PendingCollectiveProgress";
 /// Every listed function must exist, so a rename cannot silently drop one from the audit. The
 /// rule is syntactic; a scan written through an alias it cannot see is still counted by the
 /// view's probe, which the scaling budget in `tests/scalar_stage_scaling.rs` gates.
-pub fn audit_stage_path_table_access(scalar_rs: &Path, functions: &[&str]) -> Result<(), String> {
-    let source = fs::read_to_string(scalar_rs)
-        .map_err(|error| format!("failed to read {}: {error}", scalar_rs.display()))?;
-    let violations = stage_path_table_violations(&source, functions)?;
-    if violations.is_empty() {
-        Ok(())
-    } else {
-        Err(violations.join("\n"))
-    }
-}
-
-/// The violations of [`audit_stage_path_table_access`] in `source`, one line each.
+///
+/// Returns the violations in `source`, one line each.
 pub fn stage_path_table_violations(
     source: &str,
     functions: &[&str],
@@ -1172,6 +1162,42 @@ impl<'ast> Visit<'ast> for StageBodyChecker<'_> {
         }
         syn::visit::visit_type_path(self, path);
     }
+}
+
+/// Both halves of the `scalar.rs` table audit, as `cargo xtask audit` runs them: the stage-path
+/// view rule over `stage_functions` ([`stage_path_table_violations`]) and the default-deny
+/// host-table scan rule over every function ([`table_scan_violations`]).
+pub fn scalar_table_violations(
+    source: &str,
+    stage_functions: &[&str],
+    scanners: &[AllowedTableScanner],
+) -> Result<Vec<String>, String> {
+    let _ = scanners;
+    stage_path_table_violations(source, stage_functions)
+}
+
+/// [`scalar_table_violations`] over the file at `scalar_rs`.
+pub fn audit_scalar_table_access(
+    scalar_rs: &Path,
+    stage_functions: &[&str],
+    scanners: &[AllowedTableScanner],
+) -> Result<(), String> {
+    let source = fs::read_to_string(scalar_rs)
+        .map_err(|error| format!("failed to read {}: {error}", scalar_rs.display()))?;
+    let violations = scalar_table_violations(&source, stage_functions, scanners)?;
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations.join("\n"))
+    }
+}
+
+/// One function (or inline module) of a file that may scan a host table, and why.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct AllowedTableScanner {
+    /// The function's name, or the name of an inline module all of whose functions may scan.
+    pub scope: &'static str,
+    pub reason: &'static str,
 }
 
 #[cfg(test)]
@@ -2075,5 +2101,121 @@ impl TransitionState<'_> {
             stage_path_table_violations(INDEXED, &["record_inbound_progress", "renamed"]).unwrap();
         assert_eq!(violations.len(), 1);
         assert!(violations[0].contains("`renamed` is listed"));
+    }
+
+    const SCANNERS: &[AllowedTableScanner] = &[AllowedTableScanner {
+        scope: "host_retransmission_timeout",
+        reason: "per timeout, keyed by timer identity",
+    }];
+
+    /// The indexed data-arrival shape, plus an allow-listed non-stage scanner.
+    const CLEAN_SCALAR: &str = r#"
+fn record_inbound_progress(generators: &mut ProbedTable<'_, crate::FlowGeneratorState>, index: &mut HostStageIndex, inbound: FlowId, causes: &mut PendingCauses) {
+    let (successors, releasable) = index.inbound_successors_of(inbound);
+    for &position in successors {
+        let generator = &mut generators[position];
+        releasable.refresh(position, generator);
+    }
+}
+impl TransitionState<'_> {
+    fn host_tcp_data_arrival(&mut self, node: NodeDescriptor) {
+        let (mut state, index) = self.host_parts_mut(node).unwrap();
+        let receiver = &mut state.tcp_receivers[index.first_receiver(flow).unwrap()];
+    }
+    fn host_retransmission_timeout(&mut self, node: NodeDescriptor) {
+        let state = self.host_state_mut(node).unwrap();
+        for generator in &mut state.generators {}
+    }
+}
+"#;
+
+    fn scalar_violations(source: &str) -> Vec<String> {
+        scalar_table_violations(source, STAGE_FUNCTIONS, SCANNERS).unwrap()
+    }
+
+    #[test]
+    fn scalar_table_audit_accepts_the_indexed_path_and_allow_listed_scanners() {
+        assert_eq!(scalar_violations(CLEAN_SCALAR), Vec::<String>::new());
+    }
+
+    #[test]
+    fn scalar_table_audit_rejects_probe_r2_helper() {
+        // Review probe R2 (fix round 1): the receiver scan moved into a helper outside the
+        // stage-path functions, over the raw host state, called from the data-arrival handler.
+        let source = CLEAN_SCALAR
+            .replace(
+                "let receiver = &mut state.tcp_receivers[index.first_receiver(flow).unwrap()];",
+                "let receiver = &mut state.tcp_receivers[scanned.unwrap()];",
+            )
+            .replace(
+                "        let (mut state, index) = self.host_parts_mut(node).unwrap();",
+                "        let scanned = self.receiver_position(node, flow).unwrap();\n        let (mut state, index) = self.host_parts_mut(node).unwrap();",
+            )
+            .replace(
+                "    fn host_retransmission_timeout(",
+                "    fn receiver_position(&self, node: NodeDescriptor, flow: FlowId) -> Result<Option<usize>, ExecutionError> {\n        Ok(self.host_state(node)?.tcp_receivers.iter().position(|receiver| receiver.flow == flow))\n    }\n    fn host_retransmission_timeout(",
+            );
+        let violations = scalar_violations(&source);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0]
+                .contains("`receiver_position` scans host table `tcp_receivers` with `.iter()`"),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn scalar_table_audit_rejects_an_unlisted_handler_that_scans() {
+        // A new stage-path handler, not added to the stage-function list, scanning through the
+        // stage view and through the raw state, and walking a table without iterating.
+        for (body, form) in [
+            (
+                "let (mut state, index) = self.host_parts_mut(node).unwrap(); for generator in &mut state.generators {}",
+                "a `for` loop",
+            ),
+            (
+                "let (mut state, index) = self.host_parts_mut(node).unwrap(); let found = state.generators.iter_mut().find(|generator| generator.flow == flow);",
+                "`.iter_mut()`",
+            ),
+            (
+                "let state = self.host_state(node).unwrap(); let known = state.tcp_receivers.contains(&receiver);",
+                "`.contains()`",
+            ),
+            (
+                "let table = &self.host_state(node).unwrap().generators; let found = table.iter().position(|generator| generator.flow == flow);",
+                "a field expression",
+            ),
+        ] {
+            let source = CLEAN_SCALAR.replace(
+                "    fn host_retransmission_timeout(",
+                &format!("    fn host_tcp_resend_timer(&mut self, node: NodeDescriptor) {{ {body} }}\n    fn host_retransmission_timeout("),
+            );
+            let violations = scalar_violations(&source);
+            assert_eq!(violations.len(), 1, "{body}: {violations:?}");
+            assert!(
+                violations[0].contains("`host_tcp_resend_timer` ")
+                    && violations[0].contains("host table")
+                    && violations[0].contains(form),
+                "{body}: {violations:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_table_audit_rejects_a_table_destructured_out_of_the_raw_state() {
+        // Only the view's constructor may take a host table out of a `HostState` by pattern.
+        let helper = "    fn receiver_position(&self, node: NodeDescriptor, flow: FlowId) -> Option<usize> {\n        let HostState { tcp_receivers: receivers, .. } = self.host_state(node).unwrap();\n        receivers.iter().position(|receiver| receiver.flow == flow)\n    }\n    fn host_retransmission_timeout(";
+        let source = CLEAN_SCALAR.replace("    fn host_retransmission_timeout(", helper);
+        let violations = scalar_violations(&source);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].contains(
+                "`receiver_position` reaches host table `tcp_receivers` through a struct pattern"
+            ),
+            "{violations:?}"
+        );
+        let constructor = "    fn host_parts_mut(&mut self, node: NodeDescriptor) {\n        let HostState { generators, tcp_receivers, .. } = self.raw(node);\n    }\n    fn host_retransmission_timeout(";
+        let source = CLEAN_SCALAR.replace("    fn host_retransmission_timeout(", constructor);
+        assert_eq!(scalar_violations(&source), Vec::<String>::new());
     }
 }

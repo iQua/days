@@ -2,8 +2,8 @@ use std::path::Path;
 use std::process::Command;
 
 use xtask::{
-    AllowedDevDependency, AllowedFeatureGate, audit_boundary_metadata,
-    audit_semantic_feature_gates, audit_stage_path_table_access,
+    AllowedDevDependency, AllowedFeatureGate, audit_boundary_metadata, audit_scalar_table_access,
+    audit_semantic_feature_gates,
 };
 
 const LEGACY_DEV_DEPENDENCIES: &[AllowedDevDependency] = &[AllowedDevDependency {
@@ -192,7 +192,7 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
 /// Functions of `executor/src/scalar.rs` on the collective and compute stage path: stage release
 /// and progress, and the TCP transport and compute timer that carry a stage's bytes and time.
 /// Each runs per event on a host holding up to 2(n - 1) stage generators, so each must reach the
-/// host's tables through the counted stage view (`audit_stage_path_table_access`).
+/// host's tables through the counted stage view (`audit_scalar_table_access`).
 const STAGE_PATH_FUNCTIONS: &[&str] = &[
     "complete_local_successors",
     "record_inbound_progress",
@@ -270,17 +270,18 @@ fn run_audits(workspace: &Path) {
     {
         failures.push(format!("semantic feature-gate audit failed:\n{error}"));
     }
-    if let Err(error) = audit_stage_path_table_access(
+    if let Err(error) = audit_scalar_table_access(
         &workspace.join("executor/src/scalar.rs"),
         STAGE_PATH_FUNCTIONS,
+        &[],
     ) {
-        failures.push(format!("stage-path table-access audit failed:\n{error}"));
+        failures.push(format!("scalar.rs table-access audit failed:\n{error}"));
     }
 
     if failures.is_empty() {
         println!("legacy boundary audit: PASS");
         println!("semantic feature-gate audit: PASS");
-        println!("stage-path table-access audit: PASS");
+        println!("scalar.rs table-access audit (stage-path view): PASS");
     } else {
         eprintln!("{}", failures.join("\n\n"));
         std::process::exit(1);
