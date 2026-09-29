@@ -40,6 +40,9 @@ jobs:
       - name: Lint workspace
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Lint test-feature targets across the workspace
+        run: cargo clippy --workspace --all-targets --features test -- -D warnings
+
       - name: Audit crate and feature boundaries
         run: cargo xtask audit
 
@@ -80,6 +83,57 @@ jobs:
           cargo run --release -p days-legacy --example basic
           cargo run --release -p days-legacy --example ecn
           cargo run --release -p days-legacy --example switch
+
+  scaling:
+    runs-on: ubuntu-latest
+    # A passing run takes minutes. On a tree with a quadratic regression, where the test caps
+    # each size at one sample once a sample exceeds 60 s, the test step ran 42 minutes on four
+    # x86 cores (evidence/P14/ci-scaling.md in days-gpu); this leaves about twice that, plus the
+    # build, for a slower runner.
+    timeout-minutes: 90
+    needs: lint
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Complexity gate for host-side work. Each case times a phase at two sizes and bounds the
+      # ratio, so machine speed cancels; a breach is re-measured once before the case fails
+      # (tests/host_scaling_budget.rs). Constant-factor costs are out of scope.
+      #
+      # Each line is `scaling <cargo test selection> -- <exact case names>`. The cases run one at a
+      # time, in release, with their `record=host_scaling_budget` lines in the log. `--exact` with
+      # a stale name would run nothing and pass, so the function also requires every named case to
+      # have run and passed.
+      #
+      # To gate another test file, add one line, for example:
+      #   scaling -p days --features test --test <file> -- <case> [<case>...]
+      # Only wall-clock ratio cases belong here. Deterministic budgets (scalar_stage_scaling,
+      # collective_lowering_budget's heap case, route_scaling_budget) run in the default test
+      # matrix; collective_lowering_budget's ignored time case is deliberately not wired in, since
+      # it does not reliably catch the route cost.
+      # The Metal-plan phase is not gated here: it peaks above 10 GB at the CI sizes, beyond a
+      # hosted macos-15 runner's 7 GB (evidence/P14/ci-scaling.md in days-gpu).
+      - name: Run CI-sized host scaling gates
+        shell: bash
+        run: |
+          scaling() {
+            local selection=()
+            while [ "$1" != "--" ]; do selection+=("$1"); shift; done
+            shift
+            cargo test --release "${selection[@]}" -- \
+              --ignored --exact --test-threads=1 --nocapture "$@" | tee scaling.log
+            local passed
+            passed=$(sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' scaling.log)
+            if [ "$passed" != "$#" ]; then
+              echo "::error::expected $# scaling cases to pass, ${passed:-0} ran"
+              exit 1
+            fi
+          }
+          scaling -p days --features test --test host_scaling_budget -- \
+            ci_scaling_frontier_host_phases ci_scaling_topology_host_phases \
+            ci_scaling_collective_stage_validation
 
   metal-check:
     runs-on: macos-15
