@@ -516,7 +516,7 @@ pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), Validat
     validate_links(image)?;
     validate_flows(image, &flow_index)?;
     validate_generators(image, &flow_index)?;
-    validate_backend_capabilities(image, backend)?;
+    validate_backend_capabilities(image, &flow_index, backend)?;
     let derived_delays = validate_packets_and_derive_delays(image, &flow_index)?;
     validate_tcp_segment_ledger(image, &flow_index)?;
     validate_owned_service_state(image, &flow_index, backend)?;
@@ -540,19 +540,19 @@ pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), Validat
 
 fn validate_backend_capabilities(
     image: &SimulationImage,
+    flow_index: &FlowIndex,
     backend: Backend,
 ) -> Result<(), ValidationError> {
     if !matches!(backend, Backend::Metal | Backend::Cuda) {
         return Ok(());
     }
     // P14 Lane B: both device backends run the DCQCN reaction and notification points and PFC
-    // per-priority link pause, so neither needs a refusal here.
-    for generator in image.host_states.iter().flat_map(|state| &state.generators) {
-        if generator.stage.is_some() {
-            return Err(ValidationError::new(format!(
-                "backend {backend} does not support collective generators; use Scalar or Cpu"
-            )));
-        }
+    // per-priority link pause, so neither needs a refusal here. The flow index already knows
+    // whether any generator carries a stage, so this refusal does not walk the generators again.
+    if flow_index.has_stage_generators() {
+        return Err(ValidationError::new(format!(
+            "backend {backend} does not support collective generators; use Scalar or Cpu"
+        )));
     }
     for queue in image.switch_states.iter().flat_map(|state| &state.queues) {
         match queue.drop_mark {
