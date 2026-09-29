@@ -4117,9 +4117,11 @@ impl<'image> TransitionState<'image> {
             })
     }
 
-    /// A host's state together with its keyed table views, borrowed disjointly.
+    /// The stage view of a host, and the host's stage index, borrowed disjointly.
     ///
-    /// Fails exactly where `host_state_mut` fails: the views are built one per host state.
+    /// Fails exactly where `host_state_mut` fails: the indices are built one per host state. Always
+    /// inlined, so the view is taken apart at each call site into the field accesses it names.
+    #[inline(always)]
     fn host_parts_mut(
         &mut self,
         node: NodeDescriptor,
