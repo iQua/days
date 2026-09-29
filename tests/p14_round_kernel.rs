@@ -284,7 +284,11 @@ fn dcqcn_tail_checkpoints() -> Vec<(u64, SimulationImage)> {
                 .resident_packets
                 .iter()
                 .any(|packet| packet.kind.is_data());
-            (timers_done && data_in_flight).then(|| (horizon, checkpoint_image(&image, &prefix)))
+            if timers_done && data_in_flight {
+                Some((horizon, checkpoint_image(&image, &prefix)))
+            } else {
+                None
+            }
         })
         .collect()
 }

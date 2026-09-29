@@ -141,9 +141,10 @@ fn entry_points(source: &str) -> Vec<(usize, String)> {
     for (index, line) in lines.iter().enumerate() {
         let text = code(line);
         // A call is the name followed by `(`, or by template arguments (`name<MECHANISMS>(`).
-        let calls = LANE_B_FUNCTIONS.iter().filter_map(|function| {
-            text.match_indices(function)
-                .any(|(at, _)| {
+        let calls = LANE_B_FUNCTIONS
+            .iter()
+            .filter(|function| {
+                text.match_indices(**function).any(|(at, _)| {
                     let before = text[..at]
                         .chars()
                         .next_back()
@@ -151,8 +152,8 @@ fn entry_points(source: &str) -> Vec<(usize, String)> {
                     let after = text[at + function.len()..].chars().next();
                     !before && matches!(after, Some('(' | '<'))
                 })
-                .then(|| format!("{function}("))
-        });
+            })
+            .map(|function| format!("{function}("));
         let reads = LANE_B_READS
             .iter()
             .filter(|read| text.contains(**read))

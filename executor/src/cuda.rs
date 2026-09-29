@@ -5419,7 +5419,7 @@ mod tests {
     #[test]
     fn mechanisms_required_decodes_with_the_lp_it_names() {
         let source = include_str!("cuda_kernels.cu");
-        assert!(source.contains("constantexpr ulong ERROR_MECHANISMS_REQUIRED = 80;"));
+        assert!(source.contains("constexpr ulong ERROR_MECHANISMS_REQUIRED = 80;"));
         let mut control = vec![0_u64; 20];
         control[0] = super::ERROR_MECHANISMS_REQUIRED;
         control[2] = 7;
