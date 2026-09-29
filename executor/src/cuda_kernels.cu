@@ -133,6 +133,11 @@ constexpr uint P_ROUND_SCRATCH_OFFSET = 30;
 // P14 Lane B T4: absolute offset of the PFC region in `scheduler_state`, or NONE when the image
 // carries no PFC state. Layout in `executor/src/device_pfc.rs`.
 constexpr uint P_PFC_OFFSET = 31;
+// P14 perf: image-derived mechanisms flags, `device_mechanism::mechanism_flags` on the host.
+// Bit 0: some host holds a DCQCN notification point. Bit 1: the image holds any DCQCN state.
+constexpr uint P_MECHANISMS = 32;
+constexpr ulong MECHANISM_DCQCN_RECEIVERS = 1;
+constexpr ulong MECHANISM_DCQCN = 2;
 constexpr uint PFC_ROW_HEADER_WORDS = 5;
 constexpr uint PFC_INGRESS_WORDS = 43;
 constexpr uint PI_LINK = 0;

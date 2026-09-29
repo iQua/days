@@ -104,6 +104,11 @@ constant uint ROUND_SCRATCH_CACHE_WORDS = 2;
 // P14 Lane B T4: absolute offset of the PFC region in `scheduler_state`, or NONE when the image
 // carries no PFC state. Layout in `executor/src/device_pfc.rs`.
 constant uint P_PFC_OFFSET = 32;
+// P14 perf: image-derived mechanisms flags, `device_mechanism::mechanism_flags` on the host.
+// Bit 0: some host holds a DCQCN notification point. Bit 1: the image holds any DCQCN state.
+constant uint P_MECHANISMS = 33;
+constant ulong MECHANISM_DCQCN_RECEIVERS = 1;
+constant ulong MECHANISM_DCQCN = 2;
 constant uint PFC_ROW_HEADER_WORDS = 5;
 constant uint PFC_INGRESS_WORDS = 43;
 constant uint PI_LINK = 0;
@@ -118,11 +123,11 @@ constant ulong PFC_FRAME_BYTES = 64;
 
 // Test-hook-only vector offsets appended to the physical metadata buffers after planning. Each
 // entity owns its own slot, so ordinary max writes preserve the actor model and need no atomics.
-// They follow every production params word, P14 Lane B's PFC offset (32) included.
+// They follow every production params word, the P14 mechanisms flags (33) included.
 #ifdef DAYS_DOMINANT_ARENA_HIGH_WATER
-constant uint P_STREAM_HIGH_WATER_OFFSET = 33;
-constant uint P_REMOTE_HIGH_WATER_OFFSET = 34;
-constant uint P_QUEUE_HIGH_WATER_OFFSET = 35;
+constant uint P_STREAM_HIGH_WATER_OFFSET = 34;
+constant uint P_REMOTE_HIGH_WATER_OFFSET = 35;
+constant uint P_QUEUE_HIGH_WATER_OFFSET = 36;
 #define RECORD_STREAM_HIGH_WATER(params, state, entity, occupancy) \
     (state)[(params)[P_STREAM_HIGH_WATER_OFFSET] + (entity)] = max( \
         (state)[(params)[P_STREAM_HIGH_WATER_OFFSET] + (entity)], \
