@@ -76,11 +76,17 @@ pub(crate) fn mechanism_flags(image: &SimulationImage) -> u64 {
                 PacketKind::DcqcnCnp(_) | PacketKind::DcqcnControlTimer
             )
         });
+    let pfc = crate::device_pfc::image_has_pfc(image)
+        || image
+            .initial_packets
+            .iter()
+            .any(|packet| matches!(packet.kind, PacketKind::Pfc(_)));
     (if receivers {
         MECHANISM_DCQCN_RECEIVERS
     } else {
         0
     }) | (if dcqcn { MECHANISM_DCQCN } else { 0 })
+        | (if pfc { MECHANISM_PFC } else { 0 })
 }
 
 pub(crate) const GENERATOR_KIND_DCQCN: u64 = 3;
