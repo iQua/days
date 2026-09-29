@@ -23,7 +23,7 @@ use days::scenario::compile_config;
 use days_executor::{
     Backend, Event, EventKey, EventKind, FlowGeneratorKind, FlowId, GeneratorStatus,
     ObservationMode, PacketDescriptor, PacketKind, PayloadId, SchedulerKind, SimulationImage,
-    TcpAckHeader, assert_validate_flow_index_equivalent_for_testing,
+    StageRole, TcpAckHeader, assert_validate_flow_index_equivalent_for_testing,
     assert_validate_generator_index_equivalent_for_testing, event_phase,
     run_scalar_with_observations, validate,
 };
@@ -449,9 +449,10 @@ fn flow_indexed_generator_lookup_matches_the_scan_on_stage_images() {
     }
 }
 
-/// The generator lookup keeps the scan's first-occurrence answer on images the validator rejects:
-/// two generators naming one flow (the scan returned the first in host order), and generators
-/// naming flows outside the dense table (the scan's equality `find` over them).
+/// The generator lookups keep the scans' first-occurrence answers on images the validator rejects:
+/// two generators naming one flow (the scan returned the first in host order), generators naming
+/// flows outside the dense table (the scan's equality `find` over them), and two collective
+/// stages at one position (`find_stage` returned the first).
 #[test]
 fn flow_indexed_generator_lookup_matches_the_scan_on_duplicate_and_outside_flows() {
     let mut image = stage_chain_image();
@@ -476,6 +477,26 @@ fn flow_indexed_generator_lookup_matches_the_scan_on_duplicate_and_outside_flows
     generator_at(&mut image, &locations, 1).flow = first_outside;
     generator_at(&mut image, &locations, 3).flow = first_outside;
     generator_at(&mut image, &locations, 2).flow = second_outside;
+
+    // A later collective stage duplicates an earlier one's position: the scan's `find_stage`
+    // answered with the earlier of the two.
+    let collective_locations = locations
+        .iter()
+        .copied()
+        .filter(|&(host, index)| {
+            image.host_states[host].generators[index]
+                .stage
+                .is_some_and(|stage| matches!(stage.role, StageRole::Collective(_)))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        collective_locations.len() >= 2,
+        "the chain must have collective stages"
+    );
+    let (first_host, first_index) = collective_locations[0];
+    let earlier_stage = image.host_states[first_host].generators[first_index].stage;
+    let (last_host, last_index) = collective_locations[collective_locations.len() - 1];
+    image.host_states[last_host].generators[last_index].stage = earlier_stage;
 
     assert_validate_generator_index_equivalent_for_testing(&image)
         .expect("duplicate and outside generator lookups must match the scan");
