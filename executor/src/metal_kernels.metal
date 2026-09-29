@@ -341,6 +341,10 @@ constant ulong TCP_RTO_GRANULARITY = 1000000ul;
 constant ulong ERROR_CAPACITY = 1;
 constant ulong ERROR_TRANSITION_CAPACITY = 2;
 constant ulong ERROR_SEMANTIC = 3;
+// P14: the plain `days_round` build met DCQCN or PFC state it does not compile in. The host decodes
+// `ERROR_SEMANTIC + 80` as `MechanismsKernelRequired`; only a round-kernel selection error (or a
+// test forcing the plain build) reaches it.
+constant ulong ERROR_MECHANISMS_REQUIRED = 80;
 constant ulong ERROR_WFQ_ARITHMETIC = 100;
 constant ulong ARENA_FEL = 1;
 constant ulong ARENA_QUEUE = 2;
@@ -2825,7 +2829,7 @@ inline bool scheduler_first_packet_for_class(
     for (ulong logical = 0; logical < count; ++logical) {
         ulong physical = (head + logical) % max(capacity, 1ul);
         ulong record_base = (offset + physical) * EVENT_WORDS;
-        if (paused_mask != 0 &&
+        if (DAYS_MECHANISMS && paused_mask != 0 &&
             ((paused_mask >> scheduler_state[
                 params[P_PFC_OFFSET] + params[P_NODE_COUNT] + queue_records[record_base + PK_FLOW]
             ]) & 1ul) != 0) {
@@ -4710,7 +4714,7 @@ inline bool pfc_frame_arrival(
     device ulong *tcp_state
 ) {
     ulong node_base = node * NODE_WORDS;
-    ulong row = pfc_queue_row(node, params, scheduler_state);
+    ulong row = DAYS_MECHANISMS ? pfc_queue_row(node, params, scheduler_state) : NONE;
     ulong priority = event[PK_META_1];
     if (row == NONE || node_state[node_base + N_EGRESS] != event[PK_META_0] || priority >= 8) {
         set_semantic_error(error, 77, node);
@@ -4837,13 +4841,18 @@ inline bool dispatch_event(
     if (kind == PACING_TIMER && role == HOST) {
         ulong flow = event[PK_FLOW];
         ulong generator = flow * GENERATOR_WORDS;
-        if ((event[PK_KIND] & PK_KIND_MASK) == DCQCN_CONTROL_TIMER_PACKET) {
+        if (!DAYS_MECHANISMS && (event[PK_KIND] & PK_KIND_MASK) == DCQCN_CONTROL_TIMER_PACKET) {
+            set_semantic_error(error, ERROR_MECHANISMS_REQUIRED, node);
+            return false;
+        }
+        if (DAYS_MECHANISMS &&
+            (event[PK_KIND] & PK_KIND_MASK) == DCQCN_CONTROL_TIMER_PACKET) {
             return dcqcn_control_timer(
                 node, event, error, params, node_state, generators, fel_meta, fel_records,
                 remote_meta, remote_staging, stream_state, stream_records, tcp_state);
         }
-        if (flow < params[P_FLOW_COUNT] && generators[generator + G_VALID] != 0 &&
-            generators[generator + G_OWNER] == node &&
+        if (DAYS_MECHANISMS && flow < params[P_FLOW_COUNT] &&
+            generators[generator + G_VALID] != 0 && generators[generator + G_OWNER] == node &&
             generators[generator + G_KIND] == GENERATOR_KIND_DCQCN) {
             return dcqcn_pacing_timer(
                 node, event, error, params, node_state, generators, fel_meta, fel_records,
@@ -4852,6 +4861,14 @@ inline bool dispatch_event(
         }
         if (flow >= params[P_FLOW_COUNT] || generators[generator + G_VALID] == 0 ||
             generators[generator + G_OWNER] != node || generators[generator + G_KIND] != 2) {
+            // The plain build: a DCQCN generator's timer is where the mechanisms build would
+            // enter `dcqcn_pacing_timer`. Only this non-rate path pays for the test.
+            if (!DAYS_MECHANISMS && flow < params[P_FLOW_COUNT] &&
+                generators[generator + G_VALID] != 0 && generators[generator + G_OWNER] == node &&
+                generators[generator + G_KIND] == GENERATOR_KIND_DCQCN) {
+                set_semantic_error(error, ERROR_MECHANISMS_REQUIRED, node);
+                return false;
+            }
             return true;
         }
         ulong status = generators[generator + G_STATUS];
@@ -5259,9 +5276,11 @@ inline bool dispatch_event(
         bool selected_position_valid = true;
         // PFC: while a priority is paused, selection runs over the eligible packets only, as the
         // scalar eligible-packet plan does. With nothing eligible the decision point is a no-op.
-        ulong pfc_row = role == SWITCH ? pfc_queue_row(node, params, scheduler_state) : NONE;
-        ulong paused_mask = pfc_row == NONE ? 0 : pfc_paused_mask(pfc_row, scheduler_state);
-        if (paused_mask != 0) {
+        ulong pfc_row = DAYS_MECHANISMS && role == SWITCH
+            ? pfc_queue_row(node, params, scheduler_state) : NONE;
+        ulong paused_mask = DAYS_MECHANISMS && pfc_row != NONE
+            ? pfc_paused_mask(pfc_row, scheduler_state) : 0;
+        if (DAYS_MECHANISMS && paused_mask != 0) {
             selected_position = pfc_first_eligible(
                 node, paused_mask, queue_meta, queue_records, params, scheduler_state);
             if (selected_position == NONE) {
@@ -5294,10 +5313,11 @@ inline bool dispatch_event(
         if (!selected_position_valid) {
             return false;
         }
-        bool positional =
-            scheduler_kind == SCHED_DRR || scheduler_kind == SCHED_WRR || paused_mask != 0;
-        bool wfq_tagged_removal = scheduler_kind == SCHED_WFQ && paused_mask != 0;
-        bool removed = wfq_tagged_removal
+        bool positional = scheduler_kind == SCHED_DRR || scheduler_kind == SCHED_WRR ||
+            (DAYS_MECHANISMS && paused_mask != 0);
+        bool wfq_tagged_removal =
+            DAYS_MECHANISMS && scheduler_kind == SCHED_WFQ && paused_mask != 0;
+        bool removed = DAYS_MECHANISMS && wfq_tagged_removal
             ? wfq_remove_at(
                 node, selected_position, queue_meta, queue_records, scheduler_state, selected)
             : positional
@@ -5342,7 +5362,7 @@ inline bool dispatch_event(
         // releases the pause with a resume frame, emitted before the transmission's children.
         ulong resume_ingress = NONE;
         ulong resume_priority = 0;
-        if (pfc_row != NONE) {
+        if (DAYS_MECHANISMS && pfc_row != NONE) {
             resume_priority = pfc_flow_priority(selected[PK_FLOW], params, scheduler_state);
             ulong incoming = packet_incoming_link(node, selected, flows, routes, links);
             ulong ingress = incoming == NONE
@@ -5393,7 +5413,7 @@ inline bool dispatch_event(
             set_semantic_error(error, 14, node);
             return false;
         }
-        if (resume_ingress != NONE && !emit_pfc_frame(
+        if (DAYS_MECHANISMS && resume_ingress != NONE && !emit_pfc_frame(
                 node, event, resume_ingress, selected[PK_FLOW], resume_priority, 0, error,
                 params, node_state, scheduler_state, fel_meta, fel_records, remote_meta,
                 remote_staging, stream_state, stream_records, tcp_state)) {
@@ -5488,8 +5508,9 @@ inline bool dispatch_event(
             node_state[node_base + N_READY_PENDING] == 0
         ) {
             ulong next[EVENT_WORDS];
-            ulong pfc_row = role == SWITCH ? pfc_queue_row(node, params, scheduler_state) : NONE;
-            if (pfc_row != NONE) {
+            ulong pfc_row = DAYS_MECHANISMS && role == SWITCH
+                ? pfc_queue_row(node, params, scheduler_state) : NONE;
+            if (DAYS_MECHANISMS && pfc_row != NONE) {
                 // PFC: the next decision point serves the first packet whose priority is unpaused;
                 // with none eligible, service waits for a resume.
                 ulong position = pfc_first_eligible(
@@ -5527,7 +5548,11 @@ inline bool dispatch_event(
     }
 
     if (kind == REMOTE_ARRIVAL && role == SWITCH) {
-        if ((event[PK_KIND] & PK_KIND_MASK) == PFC_PACKET) {
+        if (!DAYS_MECHANISMS && (event[PK_KIND] & PK_KIND_MASK) == PFC_PACKET) {
+            set_semantic_error(error, ERROR_MECHANISMS_REQUIRED, node);
+            return false;
+        }
+        if (DAYS_MECHANISMS && (event[PK_KIND] & PK_KIND_MASK) == PFC_PACKET) {
             return pfc_frame_arrival(
                 node, event, error, params, node_state, queue_meta, queue_records,
                 scheduler_state, fel_meta, fel_records, remote_meta, remote_staging,
@@ -5551,17 +5576,18 @@ inline bool dispatch_event(
         ulong scheduler_base = node * SCHEDULER_NODE_WORDS;
         // PFC: the monitor of the packet's incoming link, when it controls the packet's priority.
         // Admission past its buffer capacity drops before any AQM decision.
-        ulong pfc_row = pfc_queue_row(node, params, scheduler_state);
+        ulong pfc_row =
+            DAYS_MECHANISMS ? pfc_queue_row(node, params, scheduler_state) : NONE;
         ulong pfc_priority = 0;
         ulong pfc_ingress = NONE;
-        if (pfc_row != NONE) {
+        if (DAYS_MECHANISMS && pfc_row != NONE) {
             pfc_priority = pfc_flow_priority(event[PK_FLOW], params, scheduler_state);
             ulong incoming = packet_incoming_link(node, event, flows, routes, links);
             pfc_ingress = incoming == NONE
                 ? NONE : pfc_enabled_ingress(pfc_row, incoming, pfc_priority, scheduler_state);
         }
         ulong admission;
-        if (pfc_ingress != NONE &&
+        if (DAYS_MECHANISMS && pfc_ingress != NONE &&
             (scheduler_state[pfc_ingress + PI_OCCUPANCY + pfc_priority] >
                 NONE - event[PK_SIZE] ||
              scheduler_state[pfc_ingress + PI_OCCUPANCY + pfc_priority] + event[PK_SIZE] >
@@ -5655,7 +5681,7 @@ inline bool dispatch_event(
         )) {
             return false;
         }
-        if (pfc_ingress != NONE) {
+        if (DAYS_MECHANISMS && pfc_ingress != NONE) {
             // XOFF: the admitted bytes count against the monitor; reaching XOFF while unasserted
             // pauses the upstream queue's priority, before this arrival's ready event.
             ulong depth =
@@ -5677,7 +5703,8 @@ inline bool dispatch_event(
             egress != NONE &&
             node_state[node_base + N_SERVICE_VALID] == 0 &&
             node_state[node_base + N_READY_PENDING] == 0 &&
-            (pfc_row == NONE || !pfc_priority_paused(pfc_row, pfc_priority, scheduler_state))
+            !(DAYS_MECHANISMS && pfc_row != NONE &&
+                pfc_priority_paused(pfc_row, pfc_priority, scheduler_state))
         ) {
             node_state[node_base + N_READY_PENDING] = 1;
             return emit_child(
@@ -6042,12 +6069,17 @@ inline bool dispatch_event(
     if (kind == REMOTE_ARRIVAL && role == HOST) {
         ulong flow_base = event[PK_FLOW] * FLOW_WORDS;
         ulong packet_kind = event[PK_KIND] & PK_KIND_MASK;
-        if (packet_kind == DCQCN_CNP_PACKET) {
+        if (!DAYS_MECHANISMS && packet_kind == DCQCN_CNP_PACKET) {
+            set_semantic_error(error, ERROR_MECHANISMS_REQUIRED, node);
+            return false;
+        }
+        if (DAYS_MECHANISMS && packet_kind == DCQCN_CNP_PACKET) {
             return dcqcn_cnp_arrival(
                 node, event, error, params, generators, flows, summary, observation_meta,
                 observed, arrivals);
         }
-        if (packet_kind == DATA_PACKET && event[PK_FLOW] < params[P_FLOW_COUNT] &&
+        if (DAYS_MECHANISMS && packet_kind == DATA_PACKET &&
+            event[PK_FLOW] < params[P_FLOW_COUNT] &&
             flows[flow_base + 1] == node &&
             tcp_state[params[P_TCP_RECEIVER_OFFSET] + event[PK_FLOW] * TCP_RECEIVER_WORDS] >=
                 DCQCN_RECEIVER_NO_CNP) {
@@ -6579,6 +6611,13 @@ kernel void days_round(
     ulong node = worklist[active_index];
     device ulong *state = lp_state + node * LP_STATE_WORDS;
     if (state[L_FINISHED] != 0 || state[L_ERROR] != 0) {
+        return;
+    }
+    // The plain build compiles PFC out, so a planned PFC region stops the run before any transition.
+    // One uniform read per thread per launch; the per-event PFC reads stay compiled out. The region
+    // is the planner's, not the host selection's, so this cross-checks the selection.
+    if (!DAYS_MECHANISMS && params[P_PFC_OFFSET] != NONE) {
+        set_semantic_error(state, ERROR_MECHANISMS_REQUIRED, node);
         return;
     }
 
