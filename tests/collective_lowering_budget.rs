@@ -1,28 +1,34 @@
-//! P14 coll budget contract: collective lowering grows linearly in its stage count, in memory and
-//! in time.
+//! P14 coll budget contract: collective lowering grows linearly in its stage count, in memory, in
+//! allocation work and in time.
 //!
-//! One ring all-reduce over `n` ranks lowers to `2n(n - 1)` stages. Before P14 coll, every stage's
-//! flow key embedded a clone of its collective's key, rank-length `sources` and `sinks` included,
-//! and each stage held about four such keys (its own, two predecessors, and the dense-id map's
-//! copy). Key storage therefore grew as stages x ranks, i.e. as `n^3`, and the canonical flow sort
-//! and the predecessor lookups compared `O(n)` bytes per comparison.
+//! One ring all-reduce over `n` ranks lowers to `2n(n - 1)` stages. Two costs used to grow as
+//! stages x ranks, i.e. as `n^3`:
+//! * every stage's flow key embedded a clone of its collective's key, rank-length `sources` and
+//!   `sinks` included, and each stage held about four such keys (its own, two predecessors, and the
+//!   dense-id map's copy), so key storage and every flow-sort comparison and predecessor lookup
+//!   scaled with the rank count;
+//! * every stage searched for its route, and the search on the ring's star topology expands every
+//!   leaf, so routing cost O(ranks) per stage although a rank's stages all share one endpoint pair.
 //!
 //! The contract is a scaling ratio between two sizes, 32 and 256 ranks: 1,984 and 130,560 stages,
 //! a 65.8x stage step for an 8x rank step. Linear-in-stages growth gives 65.8x; stages x ranks
 //! gives 526x. [`max_ratio`] is their geometric midpoint, 186x, the convention of
-//! `tests/host_scaling_budget.rs`. Fixed per-stage costs (about 2.3 kB of flow inputs, routes and
-//! generator state) dilute the super-linear term at small rank counts, which is why the small size
-//! is not smaller: at `e39d3fa` the measured ratios were 258x (memory) and 341x (time), against
-//! 60x and 82x after the fix (`days-gpu/evidence/P14/coll-lowering.md`).
+//! `tests/host_scaling_budget.rs`. Fixed per-stage costs (flow inputs, routes, generator state)
+//! dilute a super-linear term at small rank counts, which is why the small size is not smaller.
+//! Measured ratios before and after each fix are in `days-gpu/evidence/P14/coll-lowering.md`.
 //!
-//! * **Memory** is the headline and runs in the default test matrix. It is the peak of live heap
-//!   bytes during one lowering, counted by this binary's global allocator on the lowering thread
-//!   only. Lowering uses `RouteWorkers::serial()`, which computes routes inline on the calling
-//!   thread and lowers the same image bytes as every other route budget, so every allocation of the
-//!   lowering is counted and no other test in the binary can perturb the count. The value is
-//!   deterministic: it is a pure function of the code and the scenario.
-//! * **Time** is `compile_config` wall time, the minimum of a few repetitions at each size. It is
-//!   noisy on a shared machine, so it is an explicit case.
+//! Every case lowers with `RouteWorkers::serial()`, which computes routes inline on the calling
+//! thread and lowers the same image bytes as every other route budget (`RouteWorkers`). Parallel
+//! route workers divide per-flow work by the core count, which would hide a per-flow super-linear
+//! term and make the ratio depend on the machine.
+//!
+//! * **Memory** runs in the default test matrix and is deterministic: a pure function of the code
+//!   and the scenario. This binary's global allocator counts, on the lowering thread only, the peak
+//!   of live heap bytes and the cumulative bytes allocated. Serial routes put every allocation of
+//!   the lowering on that thread, and no other test in the binary can perturb the thread-local
+//!   counts. The cumulative count tracks work that allocates as it goes, such as route searches.
+//! * **Time** is lowering wall time, the minimum of a few repetitions at each size. It is noisy on a
+//!   shared machine, so it is an explicit case.
 //!
 //! How to run each case:
 //! * memory (deterministic; default matrix, any profile):
@@ -39,7 +45,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use days::scenario::{compile_config, compile_config_with_route_workers};
+use days::scenario::compile_config_with_route_workers;
 use days::topos::route::RouteWorkers;
 
 /// Live and peak heap bytes allocated by the current thread.
@@ -51,6 +57,11 @@ struct ThreadCountingAllocator;
 thread_local! {
     static LIVE_BYTES: Cell<isize> = const { Cell::new(0) };
     static PEAK_BYTES: Cell<isize> = const { Cell::new(0) };
+    static ALLOCATED_BYTES: Cell<usize> = const { Cell::new(0) };
+}
+
+fn record_allocation(bytes: usize) {
+    let _ = ALLOCATED_BYTES.try_with(|total| total.set(total.get().wrapping_add(bytes)));
 }
 
 fn record(delta: isize) {
@@ -72,6 +83,7 @@ unsafe impl GlobalAlloc for ThreadCountingAllocator {
         let pointer = unsafe { System.alloc(layout) };
         if !pointer.is_null() {
             record(layout.size() as isize);
+            record_allocation(layout.size());
         }
         pointer
     }
@@ -81,6 +93,7 @@ unsafe impl GlobalAlloc for ThreadCountingAllocator {
         let pointer = unsafe { System.alloc_zeroed(layout) };
         if !pointer.is_null() {
             record(layout.size() as isize);
+            record_allocation(layout.size());
         }
         pointer
     }
@@ -96,6 +109,7 @@ unsafe impl GlobalAlloc for ThreadCountingAllocator {
         let resized = unsafe { System.realloc(pointer, layout, new_size) };
         if !resized.is_null() {
             record(new_size as isize - layout.size() as isize);
+            record_allocation(new_size);
         }
         resized
     }
@@ -163,14 +177,23 @@ fn stages(ranks: u64) -> u64 {
     2 * ranks * (ranks - 1)
 }
 
-/// Peak live heap bytes of one serial lowering, above the bytes live when it starts.
-fn lowering_peak_bytes(ranks: u64) -> u64 {
+/// Heap use of one serial lowering.
+struct HeapUse {
+    /// Peak live bytes above the bytes live when the lowering starts.
+    peak_bytes: u64,
+    /// Bytes requested by every allocation and reallocation, freed or not.
+    allocated_bytes: u64,
+}
+
+fn lowering_heap_use(ranks: u64) -> HeapUse {
     let path = ring_all_reduce_scenario(ranks);
     let baseline = LIVE_BYTES.with(Cell::get);
     PEAK_BYTES.with(|peak| peak.set(baseline));
+    let allocated_before = ALLOCATED_BYTES.with(Cell::get);
     let image = compile_config_with_route_workers(&path, RouteWorkers::serial())
         .unwrap_or_else(|error| panic!("lower {ranks} ranks: {error}"));
     let peak = PEAK_BYTES.with(Cell::get);
+    let allocated = ALLOCATED_BYTES.with(Cell::get) - allocated_before;
     let generators = image
         .host_states
         .iter()
@@ -179,7 +202,10 @@ fn lowering_peak_bytes(ranks: u64) -> u64 {
         .count() as u64;
     assert_eq!(generators, stages(ranks), "{ranks} ranks: stage count");
     drop(image);
-    u64::try_from(peak - baseline).expect("the peak is at least the baseline")
+    HeapUse {
+        peak_bytes: u64::try_from(peak - baseline).expect("the peak is at least the baseline"),
+        allocated_bytes: allocated as u64,
+    }
 }
 
 const SMALL_RANKS: u64 = 32;
@@ -193,7 +219,8 @@ fn max_ratio() -> f64 {
     stage_ratio * rank_ratio.sqrt()
 }
 
-fn check(label: &str, unit: &str, small: f64, large: f64) {
+/// Records one phase's ratio and returns a failure message when it reaches [`max_ratio`].
+fn check(label: &str, unit: &str, small: f64, large: f64) -> Option<String> {
     let ratio = large / small;
     let max_ratio = max_ratio();
     println!(
@@ -203,27 +230,46 @@ fn check(label: &str, unit: &str, small: f64, large: f64) {
         stages(SMALL_RANKS),
         stages(LARGE_RANKS),
     );
-    assert!(
-        ratio < max_ratio,
-        "{label}: {LARGE_RANKS}/{SMALL_RANKS}-rank ratio {ratio:.1} >= {max_ratio:.1} \
-         ({small:.0} -> {large:.0} {unit}); collective lowering is super-linear in its stage count"
-    );
+    (ratio >= max_ratio).then(|| {
+        format!(
+            "{label}: {LARGE_RANKS}/{SMALL_RANKS}-rank ratio {ratio:.1} >= {max_ratio:.1} \
+             ({small:.0} -> {large:.0} {unit}); collective lowering is super-linear in its stage \
+             count"
+        )
+    })
 }
 
 #[test]
-fn collective_lowering_peak_heap_scales_linearly_in_stages() {
-    let small = lowering_peak_bytes(SMALL_RANKS);
-    let large = lowering_peak_bytes(LARGE_RANKS);
-    check("lowering_peak_heap", "bytes", small as f64, large as f64);
+fn collective_lowering_heap_scales_linearly_in_stages() {
+    let small = lowering_heap_use(SMALL_RANKS);
+    let large = lowering_heap_use(LARGE_RANKS);
+    let failures = [
+        check(
+            "lowering_peak_heap",
+            "bytes",
+            small.peak_bytes as f64,
+            large.peak_bytes as f64,
+        ),
+        check(
+            "lowering_allocated",
+            "bytes",
+            small.allocated_bytes as f64,
+            large.allocated_bytes as f64,
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// Minimum `compile_config` wall time over [`TIME_REPETITIONS`] lowerings.
+/// Minimum serial-route lowering wall time over [`TIME_REPETITIONS`] lowerings.
 fn lowering_time(ranks: u64) -> Duration {
     let path = ring_all_reduce_scenario(ranks);
     (0..TIME_REPETITIONS)
         .map(|_| {
             let started = Instant::now();
-            let image = compile_config(&path)
+            let image = compile_config_with_route_workers(&path, RouteWorkers::serial())
                 .unwrap_or_else(|error| panic!("lower {ranks} ranks: {error}"));
             let elapsed = started.elapsed();
             drop(image);
@@ -238,10 +284,12 @@ fn lowering_time(ranks: u64) -> Duration {
 fn collective_lowering_time_scales_linearly_in_stages() {
     let small = lowering_time(SMALL_RANKS);
     let large = lowering_time(LARGE_RANKS);
-    check(
+    if let Some(failure) = check(
         "lowering_time",
         "ns",
         small.as_nanos() as f64,
         large.as_nanos() as f64,
-    );
+    ) {
+        panic!("{failure}");
+    }
 }
