@@ -72,6 +72,8 @@ fn evaluation_fixtures_plan_no_dcqcn_or_pfc_words() {
                     pfc_region_words: 0,
                     dcqcn_receiver_rows: 0,
                     pfc_params_words: 1,
+                    mechanism_params_words: 1,
+                    mechanism_flags: 0,
                 },
                 "{backend} {name}"
             );
@@ -81,11 +83,13 @@ fn evaluation_fixtures_plan_no_dcqcn_or_pfc_words() {
 
 #[test]
 fn p14_fixtures_plan_their_mechanism_state() {
-    for (name, pfc, dcqcn) in [
-        ("dcqcn_t26.toml", false, 1),
-        ("dcqcn_t26_pfc.toml", true, 1),
-        ("leanguard_pfc_executable.toml", true, 0),
-        ("dcqcn_multi_zero_xoff.toml", true, 2),
+    // P14 perf: the mechanisms params word carries bit 0 when some host holds a DCQCN
+    // notification point and bit 1 when the image holds any DCQCN state at all.
+    for (name, pfc, dcqcn, flags) in [
+        ("dcqcn_t26.toml", false, 1, 0b11),
+        ("dcqcn_t26_pfc.toml", true, 1, 0b11),
+        ("leanguard_pfc_executable.toml", true, 0, 0b00),
+        ("dcqcn_multi_zero_xoff.toml", true, 2, 0b11),
     ] {
         let image = lower(&format!("configs/p14/{name}"));
         for (backend, words) in measure(&image) {
@@ -95,6 +99,8 @@ fn p14_fixtures_plan_their_mechanism_state() {
                 "{backend} {name}: {words:?}"
             );
             assert_eq!(words.dcqcn_receiver_rows, dcqcn, "{backend} {name}");
+            assert_eq!(words.mechanism_params_words, 1, "{backend} {name}");
+            assert_eq!(words.mechanism_flags, flags, "{backend} {name}");
         }
     }
 }
