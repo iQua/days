@@ -371,7 +371,11 @@ fn flow_indexed_walks_match_the_scans_for_flows_outside_the_dense_table() {
 }
 
 /// A compute -> collective -> compute chain: every P14 stage role and both dependency slots.
-fn stage_chain_image() -> SimulationImage {
+///
+/// `test` names the calling test. The scenario file is private to that test and to this process,
+/// so tests running in parallel, or two test processes sharing the target directory, never read a
+/// file another writer has just truncated.
+fn stage_chain_image(test: &str) -> SimulationImage {
     // Three hosts on one switch, a ring all-reduce named `grad` gated on the `forward` compute
     // group, and a `backward` compute group gated on the collective: the shape of
     // `tests/collective_compute.rs`'s chain, inlined so this file does not import that suite.
@@ -416,8 +420,10 @@ hosts = [0, 1, 2]
 duration_ns = 7000
 after = "grad"
 "#;
-    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("validate_flow_index_stage_chain.toml");
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "validate_flow_index_stage_chain_{test}_{}.toml",
+        std::process::id()
+    ));
     fs::write(&path, config).expect("write the stage-chain scenario");
     compile_config(&path).unwrap_or_else(|error| panic!("failed to lower the stage chain: {error}"))
 }
@@ -427,7 +433,7 @@ after = "grad"
 /// it, where stages are blocked, released, timed and finished.
 #[test]
 fn flow_indexed_generator_lookup_matches_the_scan_on_stage_images() {
-    let source = stage_chain_image();
+    let source = stage_chain_image("generator_lookup");
     let stages = source
         .host_states
         .iter()
@@ -455,7 +461,7 @@ fn flow_indexed_generator_lookup_matches_the_scan_on_stage_images() {
 /// stages at one position (`find_stage` returned the first).
 #[test]
 fn flow_indexed_generator_lookup_matches_the_scan_on_duplicate_and_outside_flows() {
-    let mut image = stage_chain_image();
+    let mut image = stage_chain_image("duplicate_and_outside_flows");
     let locations = image
         .host_states
         .iter()
