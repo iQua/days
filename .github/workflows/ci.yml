@@ -40,6 +40,9 @@ jobs:
       - name: Lint workspace
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Lint test-feature targets across the workspace
+        run: cargo clippy --workspace --all-targets --features test -- -D warnings
+
       - name: Audit crate and feature boundaries
         run: cargo xtask audit
 
