@@ -19,8 +19,8 @@ covers the Days AGO DCQCN, whose controller runs in exact integer arithmetic
 (parts-per-billion scale, one floor per complete rational expression). It
 keys on the full `EventKey` order and is **not interchangeable** with the
 legacy `(time_ns, event_id)` CSV family documented here. Exact DCQCN runs
-on the Scalar and CPU backends; the Metal/CUDA capability validator rejects
-it before execution, so device runs produce no DCQCN certificates.
+on all four backends, but device runs do not return the transition records,
+so DCQCN certificates come from Scalar and CPU runs.
 
 ## No spurious CNP receptions (pairing)
 

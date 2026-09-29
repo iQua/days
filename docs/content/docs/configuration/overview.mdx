@@ -42,6 +42,7 @@ The strict legacy loader accepts the following root keys. Unknown root keys fail
 | `routing` | Scenario-wide `ShortestPath` or `FatTreeEcmp` | Both |
 | `flow`, `flow_set` | Point-to-point traffic | Both, with a smaller exact subset |
 | `collective`, `collective_set` | Collective traffic | Both, with different algorithm sets |
+| `compute` | Delay-only compute stages that collectives can wait for | Days AGO; the legacy loader rejects the key |
 | `app_source` | Actor-managed byte buffers for TCP Broadcast/RingAllReduce | Legacy |
 
 See the pages in this section for field-level constraints. A key can belong to the vocabulary and still fail when its value or combination is inactive. The strict loader rejects examples such as `switch.ecn_threshold` without `drop = "ECN_THRESHOLD"`, `[link.pfc]` without `link.mode = "Pfc"`, and `[app_source]` without a supported TCP collective.
@@ -86,7 +87,7 @@ Legacy protocol models use Cargo features:
 - `link.mode = "Pfc"` requires `-p days-legacy --features l2_pfc`.
 - LeanGuard event CSVs require `lean` plus the protocol feature where applicable.
 
-Days AGO Scalar and CPU execute the full lowered mechanism set. Metal and CUDA reject collective generators, DCQCN, PFC, and RED/RED_ECN before execution. They accept deterministic packet traffic, exact TCP Reno/CUBIC, FIFO/SP/WFQ/DRR/WRR, TailDrop, and ECN threshold subject to device capacity checks. The error names the unsupported mechanism and directs you to Scalar or CPU.
+Days AGO Scalar and CPU execute the full lowered mechanism set. Metal and CUDA reject collective stages, compute stages, and RED/RED_ECN before execution. They accept deterministic packet traffic, exact TCP Reno/CUBIC, DCQCN, PFC, FIFO/SP/WFQ/DRR/WRR, TailDrop, and ECN threshold subject to device capacity checks. The error names the unsupported mechanism and directs you to Scalar or CPU.
 
 ## Reference pages
 

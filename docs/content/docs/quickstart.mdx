@@ -42,7 +42,7 @@ A device run prints `record=days_protocol` (the run configuration), `record=days
 
 ## Rejected mechanisms
 
-Metal and CUDA reject images containing RED, PFC, DCQCN/CNP state, or collective generators before execution. The error names the backend and recommends Scalar or CPU:
+Metal and CUDA reject images containing RED, collective stages, or compute stages before execution. The error names the backend and recommends Scalar or CPU:
 
 ```text
 backend Metal does not support RED admission; use Scalar or Cpu

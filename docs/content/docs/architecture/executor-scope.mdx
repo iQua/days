@@ -42,9 +42,9 @@ At each round, the executor finds the global frontier, adds the minimum channel 
 | TailDrop, ECN threshold | Yes | Yes | Yes | Yes |
 | RED, RED with ECN | Yes | Yes | Rejected | Rejected |
 | TCP Reno, TCP CUBIC | Yes | Yes | Yes | Yes |
-| PFC | Yes | Yes | Rejected | Rejected |
-| DCQCN | Yes | Yes | Rejected | Rejected |
-| Collective generators | Yes | Yes | Rejected | Rejected |
+| PFC | Yes | Yes | Yes | Yes |
+| DCQCN | Yes | Yes | Yes | Yes |
+| Collective and compute stages | Yes | Yes | Rejected | Rejected |
 | Zero-delay channels | Yes | Rejected | Rejected | Rejected |
 
 Metal and CUDA use checked 320-bit rational components for WFQ. Validation checks checkpoint widths and static weight bounds; runtime arithmetic faults rather than committing an overflowing result. Scalar and CPU use unbounded `BigUint` rational arithmetic.
@@ -70,7 +70,7 @@ Each layer reports errors once it has enough information:
 | Boundary | Examples |
 | --- | --- |
 | Scenario compilation | Nonzero `time_quantum_ns`; VirtualClock; BBR; unsupported flow dependencies or explicit per-flow routes; unsupported pairing/collective form |
-| Backend validation | Device RED, PFC, DCQCN, or collective state; zero-lookahead parallel channel; invalid device WFQ width |
+| Backend validation | Device RED, collective-stage, or compute-stage state; zero-lookahead parallel channel; invalid device WFQ width |
 | Device planning | Arithmetic/memory-size overflow or an invalid arena layout |
 | Device attempt and retry | Capacity demand beyond the current plan or configured cap, invalid readback metadata, or checked arithmetic overflow |
 

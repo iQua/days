@@ -76,4 +76,4 @@ Legacy TCP emits `Ect0` only when `[flow.traffic.tcp] ecn = true`. DCQCN data is
 
 ## PFC interaction
 
-PFC monitors per-priority byte occupancy while the scheduler retains packet-capacity admission. Legacy schedulers expose shared queue state to their PFC ingress actors. Exact PFC runs on Scalar and CPU; Metal and CUDA reject it. See [L2 and PFC](/docs/configuration/l2).
+PFC monitors per-priority byte occupancy while the scheduler retains packet-capacity admission. Legacy schedulers expose shared queue state to their PFC ingress actors. Exact PFC runs on Scalar, CPU, Metal, and CUDA. See [L2 and PFC](/docs/configuration/l2).

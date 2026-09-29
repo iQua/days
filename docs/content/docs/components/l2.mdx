@@ -16,12 +16,8 @@ Admission increases monitored occupancy. Service selection decreases it. Crossin
 
 The mechanism is edge-triggered. Nonzero refresh and drain timers are rejected during lowering. A zero XOFF or pause-quanta entry disables that priority. PFC can coexist with lowered propagation delay because the reverse control channel carries the exact 64-byte serialization and propagation delay.
 
-## Backend limits
+## Backends
 
-Scalar and CPU execute PFC. Metal and CUDA reject its state planes before allocating device work:
-
-```text
-backend Cuda does not support PFC per-priority link pause; use Scalar or Cpu
-```
+Scalar, CPU, Metal, and CUDA execute PFC, and every device run produces the same complete state as Scalar.
 
 See [L2 and PFC configuration](/docs/configuration/l2) for thresholds and validation rules.
