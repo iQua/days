@@ -6025,6 +6025,126 @@ static __device__ inline ulong load_compaction_count(
     return stream_state[round_scratch_compaction_counts(params) + block];
 }
 
+// P14: the round body, built twice. `MECHANISMS` selects whether the DCQCN and PFC transitions are
+// compiled in. The host launches exactly one build per run, chosen from the image
+// (`RoundKernel::for_image`): `days_round_mechanisms` when the image holds any DCQCN or PFC state,
+// `days_round` otherwise. Every Lane B entry point is guarded by `MECHANISMS`, so in the plain
+// build the compiler proves each mechanism branch dead.
+template <bool MECHANISMS>
+__device__ __forceinline__ void days_round_body(DAYS_BUFFERS) {
+    uint active_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (
+        control[C_ERROR] != 0 ||
+        control[C_DONE] != 0 ||
+        control[C_CONTINUATION] != 1 ||
+        active_index >= control[C_ACTIVE]
+    ) {
+        return;
+    }
+    ulong node = worklist[active_index];
+    ulong *state = lp_state + node * LP_STATE_WORDS;
+    if (state[L_FINISHED] != 0 || state[L_ERROR] != 0) {
+        return;
+    }
+    // The plain build compiles PFC out, so a planned PFC region stops the run before any transition.
+    // One uniform read per thread per launch; the per-event PFC reads stay compiled out. The region
+    // is the planner's, not the host selection's, so this cross-checks the selection.
+    if (!MECHANISMS && params[P_PFC_OFFSET] != NONE) {
+        set_semantic_error(state, ERROR_MECHANISMS_REQUIRED, node);
+        return;
+    }
+
+    ulong event[EVENT_WORDS];
+    bool has_continuation = false;
+    ulong dispatch_transitions = 0;
+    while (dispatch_transitions < params[P_TRANSITION_CAPACITY]) {
+        ulong popped_timer_owner = NONE;
+        if (has_continuation) {
+            has_continuation = false;
+        } else {
+            ulong selected_active;
+            ulong selected_stream;
+            if (!fel_peek(
+                node,
+                params,
+                fel_meta,
+                fel_records,
+                stream_state,
+                stream_records,
+                event,
+                selected_active,
+                selected_stream
+            ) || !before_horizon(event[E_TIME], control)) {
+                state[L_FINISHED] = 1;
+                return;
+            }
+            if (!fel_pop_selected(
+                node,
+                selected_active,
+                selected_stream,
+                params,
+                fel_meta,
+                fel_records,
+                stream_state,
+                stream_records,
+                tcp_state,
+                event,
+                popped_timer_owner
+            )) {
+                set_semantic_error(state, 26, node);
+                return;
+            }
+        }
+        bool counted_continuation = false;
+        if (!hydrate_tx_complete_event(node, event, state, in_service)) {
+            return;
+        }
+        if (!dispatch_event<MECHANISMS>(
+            node,
+            event,
+            popped_timer_owner,
+            state,
+            params,
+            node_state,
+            generators,
+            flows,
+            routes,
+            links,
+            fel_meta,
+            fel_records,
+            queue_meta,
+            queue_records,
+            in_service,
+            scheduler_state,
+            remote_meta,
+            remote_staging,
+            stream_state,
+            stream_records,
+            summary,
+            observation_meta,
+            observed,
+            departures,
+            arrivals,
+            tcp_state,
+            dispatch_transitions + 1 < params[P_TRANSITION_CAPACITY],
+            has_continuation,
+            counted_continuation
+        )) {
+            return;
+        }
+        if (counted_continuation && state[L_SAME_TIME_CONTINUATIONS] != NONE) {
+            state[L_SAME_TIME_CONTINUATIONS] += 1;
+        }
+        if (state[L_TRANSITIONS] == NONE) {
+            set_semantic_error(state, 27, node);
+            return;
+        }
+        state[L_TRANSITIONS] += 1;
+        dispatch_transitions += 1;
+    }
+
+}
+
 // T21 fix 1 — the horizon's Θ(N) FEL-root sweep, on the whole grid.
 //
 // This is the most expensive of the five re-gridded phases: it is the one that pays `fel_peek` per
@@ -6322,126 +6442,6 @@ extern "C" __global__ void days_round_prepare(DAYS_BUFFERS) {
         control[C_OUTBOX] = 0;
         control[C_CONTINUATION] = 1;
     }
-}
-
-// P14: the round body, built twice. `MECHANISMS` selects whether the DCQCN and PFC transitions are
-// compiled in. The host launches exactly one build per run, chosen from the image
-// (`RoundKernel::for_image`): `days_round_mechanisms` when the image holds any DCQCN or PFC state,
-// `days_round` otherwise. Every Lane B entry point is guarded by `MECHANISMS`, so in the plain
-// build the compiler proves each mechanism branch dead.
-template <bool MECHANISMS>
-__device__ __forceinline__ void days_round_body(DAYS_BUFFERS) {
-    uint active_index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (
-        control[C_ERROR] != 0 ||
-        control[C_DONE] != 0 ||
-        control[C_CONTINUATION] != 1 ||
-        active_index >= control[C_ACTIVE]
-    ) {
-        return;
-    }
-    ulong node = worklist[active_index];
-    ulong *state = lp_state + node * LP_STATE_WORDS;
-    if (state[L_FINISHED] != 0 || state[L_ERROR] != 0) {
-        return;
-    }
-    // The plain build compiles PFC out, so a planned PFC region stops the run before any transition.
-    // One uniform read per thread per launch; the per-event PFC reads stay compiled out. The region
-    // is the planner's, not the host selection's, so this cross-checks the selection.
-    if (!MECHANISMS && params[P_PFC_OFFSET] != NONE) {
-        set_semantic_error(state, ERROR_MECHANISMS_REQUIRED, node);
-        return;
-    }
-
-    ulong event[EVENT_WORDS];
-    bool has_continuation = false;
-    ulong dispatch_transitions = 0;
-    while (dispatch_transitions < params[P_TRANSITION_CAPACITY]) {
-        ulong popped_timer_owner = NONE;
-        if (has_continuation) {
-            has_continuation = false;
-        } else {
-            ulong selected_active;
-            ulong selected_stream;
-            if (!fel_peek(
-                node,
-                params,
-                fel_meta,
-                fel_records,
-                stream_state,
-                stream_records,
-                event,
-                selected_active,
-                selected_stream
-            ) || !before_horizon(event[E_TIME], control)) {
-                state[L_FINISHED] = 1;
-                return;
-            }
-            if (!fel_pop_selected(
-                node,
-                selected_active,
-                selected_stream,
-                params,
-                fel_meta,
-                fel_records,
-                stream_state,
-                stream_records,
-                tcp_state,
-                event,
-                popped_timer_owner
-            )) {
-                set_semantic_error(state, 26, node);
-                return;
-            }
-        }
-        bool counted_continuation = false;
-        if (!hydrate_tx_complete_event(node, event, state, in_service)) {
-            return;
-        }
-        if (!dispatch_event<MECHANISMS>(
-            node,
-            event,
-            popped_timer_owner,
-            state,
-            params,
-            node_state,
-            generators,
-            flows,
-            routes,
-            links,
-            fel_meta,
-            fel_records,
-            queue_meta,
-            queue_records,
-            in_service,
-            scheduler_state,
-            remote_meta,
-            remote_staging,
-            stream_state,
-            stream_records,
-            summary,
-            observation_meta,
-            observed,
-            departures,
-            arrivals,
-            tcp_state,
-            dispatch_transitions + 1 < params[P_TRANSITION_CAPACITY],
-            has_continuation,
-            counted_continuation
-        )) {
-            return;
-        }
-        if (counted_continuation && state[L_SAME_TIME_CONTINUATIONS] != NONE) {
-            state[L_SAME_TIME_CONTINUATIONS] += 1;
-        }
-        if (state[L_TRANSITIONS] == NONE) {
-            set_semantic_error(state, 27, node);
-            return;
-        }
-        state[L_TRANSITIONS] += 1;
-        dispatch_transitions += 1;
-    }
-
 }
 
 // The plain build: images without DCQCN or PFC state.
