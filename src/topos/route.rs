@@ -438,8 +438,10 @@ pub const MAX_ROUTE_WORKERS: usize = 64;
 ///
 /// A route is a pure function of the canonical topology graph and the flow endpoints: the
 /// pathfinder reads an immutable graph, allocates its own search state, consults no cache, draws
-/// no randomness, and never iterates a hash map. The budget therefore changes only how much wall
-/// clock the route table costs, never which path a flow receives. `RouteWorkers::serial()` keeps
+/// no randomness, and never iterates a hash map. The only state shared across flows is inside one
+/// worker's slice, where a flow whose endpoints equal the previous flow's copies that route; by
+/// purity the copy equals a fresh search. The budget therefore changes only how much wall clock
+/// the route table costs, never which path a flow receives. `RouteWorkers::serial()` keeps
 /// the single-threaded reference available so equality gates can pin the parallel scatter against
 /// it.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -502,6 +504,11 @@ pub const fn route_chunk_count(flow_count: usize, workers: RouteWorkers) -> usiz
 ///
 /// The two slices are the same contiguous index range of the flow list, so this is an
 /// index-addressed scatter: no worker can observe or reach another worker's slot.
+///
+/// A route is a pure function of the graph and the endpoints, so a flow whose endpoints equal the
+/// previous flow's in the same slice copies that route instead of searching again. Canonical flow
+/// order makes such runs common: every stage of one collective rank sends from the same source to
+/// the same sink, and a search can cost O(hosts) (the A* fallback on a star expands every leaf).
 fn fill_route_chunk(
     graph: &UnGraph<usize, ()>,
     fat_tree_params: Option<(usize, usize, usize)>,
@@ -511,13 +518,18 @@ fn fill_route_chunk(
     #[cfg(test)]
     let _route_fill_scope = RouteFillScope::enter();
 
-    for (&(source, target), slot) in endpoints.iter().zip(routes.iter_mut()) {
-        *slot = ShortestPath::try_compute_route_in_classified_canonical_graph(
-            graph,
-            source,
-            target,
-            fat_tree_params,
-        );
+    for index in 0..endpoints.len() {
+        let (source, target) = endpoints[index];
+        routes[index] = if index > 0 && endpoints[index - 1] == (source, target) {
+            routes[index - 1].clone()
+        } else {
+            ShortestPath::try_compute_route_in_classified_canonical_graph(
+                graph,
+                source,
+                target,
+                fat_tree_params,
+            )
+        };
     }
 }
 
