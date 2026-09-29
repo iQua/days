@@ -95,15 +95,16 @@ struct Case {
     max_ratio_milli: u128,
 }
 
-/// The CI-sized frontier case: 16,384 and 131,072 flows. The large size runs once: its phases take
-/// about a second, so their relative noise is far smaller than the small size's.
+/// The CI-sized frontier case: 16,384 and 131,072 flows. The large size runs twice: one run can
+/// land in a burst of load from other processes, and on a loaded host a single large lowering
+/// once took 2.7x its usual time (`evidence/P14/ci-scaling.md`).
 const CI_FRONTIER: Case = Case {
     name: "frontier_ci",
     unit: "flow_sets",
     small: 2,
     large: 16,
     small_repetitions: 5,
-    large_repetitions: 1,
+    large_repetitions: 2,
     max_ratio_milli: EIGHTFOLD_STEP_MAX_RATIO_MILLI,
 };
 
@@ -118,14 +119,15 @@ const FULL_FRONTIER: Case = Case {
     max_ratio_milli: EIGHTFOLD_STEP_MAX_RATIO_MILLI,
 };
 
-/// The collective case: one ring all-reduce at 48 and 96 ranks, 4,512 and 18,240 stages.
+/// The collective case: one ring all-reduce at 48 and 96 ranks, 4,512 and 18,240 stages. Its
+/// phases take milliseconds, so both sizes take the minimum of five runs.
 const CI_COLLECTIVE: Case = Case {
     name: "collective_ci",
     unit: "ranks",
     small: 48,
     large: 96,
-    small_repetitions: 3,
-    large_repetitions: 3,
+    small_repetitions: 5,
+    large_repetitions: 5,
     max_ratio_milli: FOURFOLD_STEP_MAX_RATIO_MILLI,
 };
 
