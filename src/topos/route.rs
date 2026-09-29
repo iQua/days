@@ -68,6 +68,70 @@ impl Drop for RouteFillScope {
     }
 }
 
+/// Work counter for the fat-tree search, carried by value from each route worker to the submitter.
+///
+/// In test builds it counts neighbour examinations: one per candidate successor the search
+/// considers, whether or not that successor is pushed. It is the search's unit of work, and a
+/// pure function of the graph and the sources searched. Without the test hooks it is zero-sized
+/// and its methods are empty, so production search carries no counter (checked at compile time
+/// below).
+#[derive(Clone, Copy, Debug, Default)]
+struct SearchProbe {
+    #[cfg(any(test, feature = "test"))]
+    neighbour_examinations: u64,
+}
+
+impl SearchProbe {
+    #[inline(always)]
+    fn examine_neighbour(&mut self) {
+        #[cfg(any(test, feature = "test"))]
+        {
+            self.neighbour_examinations += 1;
+        }
+    }
+
+    /// Adds another worker's count, received with that worker's routes.
+    #[inline(always)]
+    fn absorb(&mut self, _other: SearchProbe) {
+        #[cfg(any(test, feature = "test"))]
+        {
+            self.neighbour_examinations += _other.neighbour_examinations;
+        }
+    }
+
+    /// Adds this route table's count to the submitting thread's running total.
+    #[inline(always)]
+    fn record_on_submitting_thread(self) {
+        #[cfg(any(test, feature = "test"))]
+        ROUTE_TABLE_NEIGHBOUR_EXAMINATIONS
+            .with(|total| total.set(total.get() + self.neighbour_examinations));
+    }
+}
+
+// Without the test hooks the probe costs nothing: it is zero-sized. Giving it a field that
+// production builds keep fails the build.
+#[cfg(not(any(test, feature = "test")))]
+const _: () = assert!(std::mem::size_of::<SearchProbe>() == 0);
+
+#[cfg(any(test, feature = "test"))]
+std::thread_local! {
+    /// Neighbour examinations of every shortest-path route table submitted from this thread.
+    ///
+    /// Route workers never touch it: each returns its own count with its routes, and the
+    /// submitting thread adds the sum here after the join.
+    static ROUTE_TABLE_NEIGHBOUR_EXAMINATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Neighbour examinations the fat-tree search has made for every shortest-path route table
+/// submitted from the calling thread, cumulative since the thread started (test hooks only).
+///
+/// The count covers Days' own fat-tree search. The `petgraph` A* fallback is third-party code and
+/// is not counted.
+#[cfg(any(test, feature = "test"))]
+pub fn route_table_neighbour_examinations_for_testing() -> u64 {
+    ROUTE_TABLE_NEIGHBOUR_EXAMINATIONS.with(std::cell::Cell::get)
+}
+
 #[derive(Copy, Clone, Debug)]
 struct MinScoredNode {
     score: (usize, usize, usize),
@@ -245,6 +309,7 @@ impl ShortestPath {
         start: NodeIndex,
         end: NodeIndex,
         (num_layer_switches, switches_per_pod, num_pods): (usize, usize, usize),
+        probe: &mut SearchProbe,
     ) -> Option<Vec<NodeIndex>> {
         let core_start = 2 * num_layer_switches;
 
@@ -295,6 +360,7 @@ impl ShortestPath {
             scores[node_idx] = Some((f, h, g));
 
             let mut push_neighbor = |neigh: NodeIndex| {
+                probe.examine_neighbour();
                 let neigh_g = g + 1;
                 let neigh_score = (neigh_g, 0, neigh_g);
                 let neigh_idx = neigh.index();
@@ -355,7 +421,13 @@ impl ShortestPath {
         end: NodeIndex,
     ) -> Option<Vec<NodeIndex>> {
         let fat_tree_params = Self::fat_tree_params(graph);
-        Self::try_compute_route_in_classified_canonical_graph(graph, start, end, fat_tree_params)
+        Self::try_compute_route_in_classified_canonical_graph(
+            graph,
+            start,
+            end,
+            fat_tree_params,
+            &mut SearchProbe::default(),
+        )
     }
 
     fn try_compute_route_in_classified_canonical_graph(
@@ -363,9 +435,11 @@ impl ShortestPath {
         start: NodeIndex,
         end: NodeIndex,
         fat_tree_params: Option<(usize, usize, usize)>,
+        probe: &mut SearchProbe,
     ) -> Option<Vec<NodeIndex>> {
         if let Some(params) = fat_tree_params {
-            if let Some(path) = Self::compute_fat_tree_route_with_params(graph, start, end, params)
+            if let Some(path) =
+                Self::compute_fat_tree_route_with_params(graph, start, end, params, probe)
             {
                 return Some(path);
             }
@@ -514,10 +588,11 @@ fn fill_route_chunk(
     fat_tree_params: Option<(usize, usize, usize)>,
     endpoints: &[(NodeIndex, NodeIndex)],
     routes: &mut [Option<Vec<NodeIndex>>],
-) {
+) -> SearchProbe {
     #[cfg(test)]
     let _route_fill_scope = RouteFillScope::enter();
 
+    let mut probe = SearchProbe::default();
     for index in 0..endpoints.len() {
         let (source, target) = endpoints[index];
         routes[index] = if index > 0 && endpoints[index - 1] == (source, target) {
@@ -528,9 +603,11 @@ fn fill_route_chunk(
                 source,
                 target,
                 fat_tree_params,
+                &mut probe,
             )
         };
     }
+    probe
 }
 
 /// Computes one route per endpoint pair into an index-addressed buffer.
@@ -541,28 +618,34 @@ fn scatter_routes(
     fat_tree_params: Option<(usize, usize, usize)>,
     endpoints: &[(NodeIndex, NodeIndex)],
     workers: RouteWorkers,
-) -> Vec<Option<Vec<NodeIndex>>> {
+) -> (Vec<Option<Vec<NodeIndex>>>, SearchProbe) {
     let mut routes = vec![None; endpoints.len()];
     let chunk_len = route_chunk_len(endpoints.len(), workers);
     if route_chunk_count(endpoints.len(), workers) < 2 {
-        fill_route_chunk(graph, fat_tree_params, endpoints, &mut routes);
-        return routes;
+        let probe = fill_route_chunk(graph, fat_tree_params, endpoints, &mut routes);
+        return (routes, probe);
     }
 
-    thread::scope(|scope| {
-        for (endpoints, routes) in endpoints
+    let probe = thread::scope(|scope| {
+        let workers = endpoints
             .chunks(chunk_len)
             .zip(routes.chunks_mut(chunk_len))
-        {
-            scope.spawn(move || {
-                #[cfg(test)]
-                let _route_fill_scope = RouteFillScope::enter();
+            .map(|(endpoints, routes)| {
+                scope.spawn(move || {
+                    #[cfg(test)]
+                    let _route_fill_scope = RouteFillScope::enter();
 
-                fill_route_chunk(graph, fat_tree_params, endpoints, routes)
-            });
+                    fill_route_chunk(graph, fat_tree_params, endpoints, routes)
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut probe = SearchProbe::default();
+        for worker in workers {
+            probe.absorb(worker.join().expect("a route worker panicked"));
         }
+        probe
     });
-    routes
+    (routes, probe)
 }
 
 /// One flow's routing request under [`compute_fat_tree_ecmp_route_table`].
@@ -740,7 +823,8 @@ where
     // error identical and stops the scatter from routing flows the caller never sees.
     let first_duplicate = first_repeated_key(&keys);
     let routed = first_duplicate.unwrap_or(keys.len());
-    let routes = scatter_routes(&graph, fat_tree_params, &endpoints[..routed], workers);
+    let (routes, probe) = scatter_routes(&graph, fat_tree_params, &endpoints[..routed], workers);
+    probe.record_on_submitting_thread();
 
     if let Some(index) = routes.iter().position(Option::is_none) {
         return Err(RouteTableError::Unreachable(keys.swap_remove(index)));
