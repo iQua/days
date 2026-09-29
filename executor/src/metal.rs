@@ -506,6 +506,9 @@ const ERROR_SEMANTIC: u64 = 3;
 /// slot carries a channel stream index, and the TCP ledger sequence overflow, which records no
 /// identity. Neither names an LP.
 const ERROR_CHANNEL_ORDER: u64 = ERROR_SEMANTIC + 42;
+/// P14: the plain `days_round` build met DCQCN or PFC state, which it does not compile in: a
+/// DCQCN or PFC packet event, a DCQCN generator's timer, or (at round entry) a planned PFC region.
+const ERROR_MECHANISMS_REQUIRED: u64 = ERROR_SEMANTIC + 80;
 const CONTROL_DONE: usize = 4;
 const CONTROL_RUN_END_LO: usize = 7;
 const CONTROL_RUN_END_HI: usize = 8;
@@ -584,6 +587,12 @@ pub enum MetalError {
     WfqArithmeticOverflow {
         node: NodeId,
     },
+    /// The plain round kernel met DCQCN or PFC state and stopped rather than continue without the
+    /// mechanism. Only a round-kernel selection error (or a test forcing the plain build) reaches
+    /// it; the run produces no result.
+    MechanismsKernelRequired {
+        node: Option<NodeId>,
+    },
     DeviceExecution {
         code: u64,
         node: Option<NodeId>,
@@ -647,6 +656,16 @@ impl fmt::Display for MetalError {
                 formatter,
                 "Metal WFQ arithmetic at LP {node:?} exceeds the exact 320-bit device limit; use Scalar or Cpu for this image"
             ),
+            Self::MechanismsKernelRequired { node } => {
+                write!(formatter, "Metal plain round kernel met DCQCN or PFC state")?;
+                if let Some(node) = node {
+                    write!(formatter, " at LP {node:?}")?;
+                }
+                write!(
+                    formatter,
+                    "; the image requires the mechanisms round kernel"
+                )
+            }
             Self::DeviceExecution { code, node } => {
                 write!(
                     formatter,
@@ -4865,6 +4884,9 @@ fn decode_device_error(control: &[u64]) -> MetalError {
         100 => MetalError::WfqArithmeticOverflow {
             node: identity.map(NodeId).unwrap_or(NodeId(0)),
         },
+        ERROR_MECHANISMS_REQUIRED => MetalError::MechanismsKernelRequired {
+            node: identity.map(NodeId),
+        },
         // The channel-order diagnostic shares the channel capacity identity slot, which carries
         // an immutable stream index rather than an LP after targeted retry plumbing.
         ERROR_CHANNEL_ORDER => MetalError::DeviceExecution {
@@ -5679,6 +5701,28 @@ mod tests {
     use crate::CapacityRetryRecord;
     use crate::device_mechanism::RoundKernel;
     use std::collections::BTreeSet;
+
+    /// P14: the plain round kernel's fail-closed stop decodes to its own error, naming the LP.
+    #[test]
+    fn mechanisms_required_decodes_with_the_lp_it_names() {
+        let source = include_str!("metal_kernels.metal");
+        assert!(source.contains("constant ulong ERROR_MECHANISMS_REQUIRED = 80;"));
+        let mut control = vec![0_u64; 20];
+        control[0] = super::ERROR_MECHANISMS_REQUIRED;
+        control[2] = 7;
+        assert_eq!(super::ERROR_MECHANISMS_REQUIRED, 83);
+        assert_eq!(
+            super::decode_device_error(&control),
+            MetalError::MechanismsKernelRequired {
+                node: Some(crate::NodeId(7)),
+            },
+        );
+        control[2] = u64::MAX;
+        assert_eq!(
+            super::decode_device_error(&control),
+            MetalError::MechanismsKernelRequired { node: None },
+        );
+    }
 
     #[test]
     fn tcp_capacity_fault_identity_decodes_as_a_flow() {
