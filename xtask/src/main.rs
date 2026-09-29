@@ -172,8 +172,14 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "stage_index.rs",
         predicate: r#"feature = "planner-test-hooks""#,
-        count: 9,
-        purpose: "the stage-scan probe's counters (empty in production builds), the pre-index stage scans and their per-host equality check exist only for standard tests",
+        count: 18,
+        purpose: "the stage-scan probe's counters (empty in production builds), the probed tables' read counters and their counting in iterators, the pre-index stage scans and their per-host equality check exist only for standard tests",
+    },
+    AllowedFeatureGate {
+        path: "stage_index.rs",
+        predicate: r#"not(feature = "planner-test-hooks")"#,
+        count: 3,
+        purpose: "without the test hooks a counted iterator carries a zero-sized marker instead of its read counter, so a probed table is exactly the slice it wraps",
     },
     AllowedFeatureGate {
         path: "lib.rs",

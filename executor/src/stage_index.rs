@@ -9,6 +9,7 @@
 //! `crate::scalar` hold the two to that.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::{Index, IndexMut};
 
 use crate::{FlowGeneratorState, FlowId, GeneratorStatus, HostState};
 
@@ -174,7 +175,14 @@ impl HostStageIndex {
     }
 
     /// The position `generators.iter().position(stage_ready_to_activate)` returns.
-    pub(crate) fn first_ready(&mut self, generators: &[FlowGeneratorState]) -> Option<usize> {
+    pub(crate) fn first_ready(
+        &mut self,
+        generators: &ProbedTable<'_, FlowGeneratorState>,
+    ) -> Option<usize> {
+        self.first_ready_in(generators.items)
+    }
+
+    fn first_ready_in(&mut self, generators: &[FlowGeneratorState]) -> Option<usize> {
         let mut examined = 0_usize;
         let ready = self.releasable.0.iter().copied().find(|position| {
             examined += 1;
@@ -200,6 +208,178 @@ impl HostStageIndex {
         self.probe.visits()
     }
 }
+
+/// One host's stage index together with the read counters of the host's two tables.
+///
+/// Stored per host in `TransitionState::host_indices`. The counters sit beside the index, not
+/// inside it, so the stage view can borrow the index and both counters at once.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct HostStageSlot {
+    index: HostStageIndex,
+    generator_reads: StageScanProbe,
+    receiver_reads: StageScanProbe,
+}
+
+impl HostStageSlot {
+    pub(crate) fn build(state: &HostState) -> Self {
+        Self {
+            index: HostStageIndex::build(state),
+            generator_reads: StageScanProbe::default(),
+            receiver_reads: StageScanProbe::default(),
+        }
+    }
+
+    /// The index, and the generator-table and TCP-receiver-table read counters.
+    pub(crate) fn parts_mut(
+        &mut self,
+    ) -> (
+        &mut HostStageIndex,
+        &mut StageScanProbe,
+        &mut StageScanProbe,
+    ) {
+        (
+            &mut self.index,
+            &mut self.generator_reads,
+            &mut self.receiver_reads,
+        )
+    }
+
+    /// Entries this host's stage path read: index entries and scanned table entries.
+    #[cfg(feature = "planner-test-hooks")]
+    pub(crate) fn visits(&self) -> u64 {
+        self.index
+            .visits()
+            .saturating_add(self.generator_reads.visits())
+            .saturating_add(self.receiver_reads.visits())
+    }
+
+    #[cfg(feature = "planner-test-hooks")]
+    pub(crate) fn index(&self) -> &HostStageIndex {
+        &self.index
+    }
+}
+
+/// One of a host's tables as the stage path sees it: every element a scan yields is counted.
+///
+/// The stage view hands out host tables only as `ProbedTable`s. Positional access (`table[i]`) is
+/// one O(1) element read and is not counted. Every iteration (`iter`, `iter_mut`, or a `for`
+/// loop over `&mut table`) counts each element it yields. There is no `Deref` to the slice and no
+/// length accessor, so a table cannot be walked without counting. Without the test hooks the
+/// counter field does not exist and every method is an inlined slice operation, so the table has
+/// the size and code of the `&mut [T]` it wraps.
+pub(crate) struct ProbedTable<'a, T> {
+    items: &'a mut [T],
+    #[cfg(feature = "planner-test-hooks")]
+    reads: &'a mut StageScanProbe,
+}
+
+impl<'a, T> ProbedTable<'a, T> {
+    #[inline(always)]
+    pub(crate) fn new(items: &'a mut [T], reads: &'a mut StageScanProbe) -> Self {
+        let _ = &reads;
+        Self {
+            items,
+            #[cfg(feature = "planner-test-hooks")]
+            reads,
+        }
+    }
+
+    /// A counted scan. No stage-path function scans a table (the `xtask` stage-path audit
+    /// rejects it); a scan the syntactic audit cannot see is still counted here, and the scaling
+    /// budget fails on it.
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub(crate) fn iter(&mut self) -> CountedIter<'_, std::slice::Iter<'_, T>> {
+        CountedIter {
+            inner: self.items.iter(),
+            #[cfg(feature = "planner-test-hooks")]
+            reads: &mut *self.reads,
+            #[cfg(not(feature = "planner-test-hooks"))]
+            reads: std::marker::PhantomData,
+        }
+    }
+
+    /// A counted mutable scan; see [`Self::iter`].
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub(crate) fn iter_mut(&mut self) -> CountedIter<'_, std::slice::IterMut<'_, T>> {
+        CountedIter {
+            inner: self.items.iter_mut(),
+            #[cfg(feature = "planner-test-hooks")]
+            reads: &mut *self.reads,
+            #[cfg(not(feature = "planner-test-hooks"))]
+            reads: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<'b, 'a, T> IntoIterator for &'b mut ProbedTable<'a, T> {
+    type Item = &'b mut T;
+    type IntoIter = CountedIter<'b, std::slice::IterMut<'b, T>>;
+
+    #[inline(always)]
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
+impl<T> Index<usize> for ProbedTable<'_, T> {
+    type Output = T;
+
+    #[inline(always)]
+    fn index(&self, position: usize) -> &T {
+        &self.items[position]
+    }
+}
+
+impl<T> IndexMut<usize> for ProbedTable<'_, T> {
+    #[inline(always)]
+    fn index_mut(&mut self, position: usize) -> &mut T {
+        &mut self.items[position]
+    }
+}
+
+/// A slice iterator that counts each element it yields into a table's read counter.
+pub(crate) struct CountedIter<'r, I> {
+    inner: I,
+    #[cfg(feature = "planner-test-hooks")]
+    reads: &'r mut StageScanProbe,
+    #[cfg(not(feature = "planner-test-hooks"))]
+    reads: std::marker::PhantomData<&'r mut StageScanProbe>,
+}
+
+impl<I: Iterator> Iterator for CountedIter<'_, I> {
+    type Item = I::Item;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<I::Item> {
+        let item = self.inner.next();
+        #[cfg(feature = "planner-test-hooks")]
+        if item.is_some() {
+            self.reads.note(1);
+        }
+        item
+    }
+
+    #[inline(always)]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<I: DoubleEndedIterator> DoubleEndedIterator for CountedIter<'_, I> {
+    #[inline(always)]
+    fn next_back(&mut self) -> Option<I::Item> {
+        let item = self.inner.next_back();
+        #[cfg(feature = "planner-test-hooks")]
+        if item.is_some() {
+            self.reads.note(1);
+        }
+        item
+    }
+}
+
+impl<I: ExactSizeIterator> ExactSizeIterator for CountedIter<'_, I> {}
 
 /// Test-only count of the table entries the stage path examines.
 ///
@@ -414,7 +594,7 @@ pub(crate) fn check_host_index(
             return mismatch("inbound successors", &indexed, &scanned);
         }
     }
-    let indexed = index.first_ready(&state.generators);
+    let indexed = index.first_ready_in(&state.generators);
     let scanned = legacy_scans::first_ready(state);
     if indexed != scanned {
         return Err(format!(
