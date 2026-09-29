@@ -166,13 +166,13 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
         path: "scalar.rs",
         predicate: r#"feature = "planner-test-hooks""#,
         count: 2,
-        purpose: "the stage-scan probe's counting run and its host-table sampler exist only for standard tests",
+        purpose: "the stage-scan counting run and the stage-index equality hook exist only for standard tests",
     },
     AllowedFeatureGate {
         path: "stage_index.rs",
         predicate: r#"feature = "planner-test-hooks""#,
-        count: 6,
-        purpose: "the stage-scan probe's counters are empty in production builds and exist only for standard tests",
+        count: 9,
+        purpose: "the stage-scan probe's counters (empty in production builds), the pre-index stage scans and their per-host equality check exist only for standard tests",
     },
     AllowedFeatureGate {
         path: "lib.rs",
