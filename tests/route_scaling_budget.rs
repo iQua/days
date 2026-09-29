@@ -40,8 +40,43 @@
 //!   a shared machine, so it is an explicit case. Its bound is the allocated-bytes midpoint, 16x,
 //!   between flows-linear growth (8x) and flows x switches (32x).
 //!
+//! **The route table alone** (`fat_tree_route_table_allocates_and_writes_per_source_not_per_flow`).
+//! The whole lowering allocates about 27 MB at k=16 and 216 MB at k=32 besides routing, which
+//! dilutes a per-flow term: a per-flow allocation below about 42 B per switch still kept the
+//! lowering ratio under 16x. This case therefore calls `compute_shortest_path_route_table_with`
+//! directly, serially, on the switch graph `build_graph` builds for the same scenario, with one flow
+//! per host: the host at rack ordinal `o` of edge switch `s` sends to edge switch
+//! `(s + S/2 + o) mod S` (`S = k^2/2`), which is always in another pod. It checks two
+//! deterministic measures against their models:
+//! * **scratch cells written** by the search (the test-only probe): every write to the search's
+//!   node-indexed `scores` and `came_from`, the reset that clears them included. One exhaustive
+//!   tree writes exactly `5N - 1` cells (`2N` reset, one for the source, two per push over `N - 1`
+//!   pushes, one per pop over `N` pops), so the table writes at most `S x (5N - 1)`, the cap; per
+//!   routed flow that grows as `S N / F ~ k`, **2x**, while any per-flow reset or search of the
+//!   scratch grows as `N`, **4x**; the ratio bound is `sqrt(2 x 4) = 2.83`;
+//! * **allocated bytes** of the table: per flow a route (52 B for five hops), its slots in the
+//!   grouping, part, result and key vectors, and the result and duplicate-key B-trees, about
+//!   207 B in all; once per table the canonical graph and its sorted edge list (`16N + 32E`) and one
+//!   worker's search state (`40N` of `scores` and `came_from`, at most `128N` of heap growth). The
+//!   absolute cap allows `384 B` per routed flow, `256 B` per switch and `64 B` per link, about
+//!   1.9x, 1.4x and 2x the model (measured: 348 and 331 B per flow in all, at k=16 and k=32).
+//!   The ratio bound is again the midpoint of flows-linear growth (8x: flows and links grow 8x) and
+//!   flows x switches (32x): 16x. A per-flow allocation of `b` bytes per switch breaks the cap once
+//!   `b N` exceeds the cap's per-flow slack, about 0.8 B per switch at k=16 and 0.2 B at k=32.
+//!
+//! **Known limit.** Both counters see only the search's own state and the allocator. A separate
+//! node-length buffer, allocated once per worker and cleared for every flow, allocates nothing per
+//! flow and is not the search's scratch, so neither counter sees it, and it is far below what the
+//! time case can resolve. At the frontier (k=32: 1,280 switches, 262,144 routes) one byte per switch
+//! cleared per route is 335.5 MB of stores summed over all route workers, against the 29,584
+//! neighbour examinations per inter-pod route that per-flow search cost. Closing the gap would take
+//! a structural guard: a counted wrapper type for every node-length routing buffer (zero-sized in
+//! production, as `p14/scan` pinned its stage view) plus an `xtask audit` rule that rejects
+//! node-count-sized buffers in `src/topos/route.rs` outside that type.
+//!
 //! How to run each case:
-//! * examinations and allocated bytes (deterministic; default matrix, any profile):
+//! * examinations, lowering allocated bytes, and the route table's scratch writes and allocated
+//!   bytes (deterministic; default matrix, any profile):
 //!   `cargo test -p days --features test --test route_scaling_budget`
 //! * time (explicit; release, one test thread so the deterministic cases cannot share the CPU):
 //!   `cargo test --release -p days --features test --test route_scaling_budget -- --ignored --test-threads=1`
@@ -56,8 +91,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use std::collections::BTreeMap;
+
 use days::scenario::{compile_config, compile_config_with_route_workers};
-use days::topos::route::{RouteWorkers, route_table_neighbour_examinations_for_testing};
+use days::topos::build::build_graph;
+use days::topos::route::{
+    RouteWorkers, compute_shortest_path_route_table_with,
+    route_table_neighbour_examinations_for_testing, route_table_scratch_cells_written_for_testing,
+};
+use petgraph::graph::NodeIndex;
 
 /// Bytes allocated by the current thread.
 ///
@@ -267,6 +309,132 @@ fn fat_tree_route_search_scales_with_sources_not_flows_times_fabric() {
     ));
     failures.extend(check(
         "lowering_allocated",
+        "bytes",
+        small.allocated_bytes as f64,
+        large.allocated_bytes as f64,
+        max_allocation_ratio(),
+    ));
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Scratch writes and allocation of one serial route table, on the switch graph of the scenario.
+struct RouteTableWork {
+    flows: u64,
+    switches: u64,
+    links: u64,
+    scratch_cells_written: u64,
+    allocated_bytes: u64,
+}
+
+/// Per-flow bytes the absolute cap allows: about 1.9x the modelled 207 B.
+const TABLE_BYTES_PER_FLOW: u64 = 384;
+/// Per-switch bytes the absolute cap allows: about 1.4x the modelled 184 B (graph and one search).
+const TABLE_BYTES_PER_SWITCH: u64 = 256;
+/// Per-link bytes the absolute cap allows: 2x the modelled 32 B (graph and sorted edge list).
+const TABLE_BYTES_PER_LINK: u64 = 64;
+
+fn route_table_work(k: u64) -> RouteTableWork {
+    let path = frontier_traffic_scenario("table", k);
+    let (graph, attachments) = build_graph(path.to_str().expect("a UTF-8 scenario path"))
+        .unwrap_or_else(|error| panic!("build the k={k} switch graph: {error}"));
+    let edge_switch_count = edge_switches(k) as usize;
+    let mut ordinals = BTreeMap::<usize, usize>::new();
+    let flows = attachments
+        .iter()
+        .enumerate()
+        .map(|(key, attachment)| {
+            assert!(
+                attachment.switch_id < edge_switch_count,
+                "k={k}: hosts attach to edge switches"
+            );
+            let ordinal = ordinals.entry(attachment.switch_id).or_insert(0);
+            let target =
+                (attachment.switch_id + edge_switch_count / 2 + *ordinal) % edge_switch_count;
+            *ordinal += 1;
+            (
+                key,
+                NodeIndex::new(attachment.switch_id),
+                NodeIndex::new(target),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(flows.len() as u64, hosts(k), "k={k}: one flow per host");
+
+    let written_before = route_table_scratch_cells_written_for_testing();
+    let allocated_before = ALLOCATED_BYTES.with(Cell::get);
+    let table = compute_shortest_path_route_table_with(
+        &graph,
+        flows.iter().copied(),
+        RouteWorkers::serial(),
+    )
+    .unwrap_or_else(|error| panic!("route k={k}: {error:?}"));
+    let allocated = ALLOCATED_BYTES.with(Cell::get) - allocated_before;
+    let written = route_table_scratch_cells_written_for_testing() - written_before;
+    assert!(
+        table.values().all(|route| route.len() == 5),
+        "k={k}: every flow crosses pods"
+    );
+    drop(table);
+    RouteTableWork {
+        flows: flows.len() as u64,
+        switches: graph.node_count() as u64,
+        links: graph.edge_count() as u64,
+        scratch_cells_written: written,
+        allocated_bytes: allocated as u64,
+    }
+}
+
+#[test]
+fn fat_tree_route_table_allocates_and_writes_per_source_not_per_flow() {
+    let small = route_table_work(SMALL_K);
+    let large = route_table_work(LARGE_K);
+    let mut failures = Vec::new();
+    for (k, work) in [(SMALL_K, &small), (LARGE_K, &large)] {
+        assert!(
+            work.scratch_cells_written > 0,
+            "k={k}: the probe saw no scratch write; the gate would pass vacuously"
+        );
+        // One exhaustive tree per edge switch, 5N - 1 cells each.
+        let one_tree_per_edge_switch = edge_switches(k) * (5 * work.switches - 1);
+        let byte_cap = TABLE_BYTES_PER_FLOW * work.flows
+            + TABLE_BYTES_PER_SWITCH * work.switches
+            + TABLE_BYTES_PER_LINK * work.links;
+        println!(
+            "record=route_scaling_budget phase=route_table k={k} flows={} switches={} links={} \
+             scratch_cells_written={} one_tree_per_edge_switch={one_tree_per_edge_switch} \
+             allocated_bytes={} bytes_per_flow={:.1} byte_cap={byte_cap}",
+            work.flows,
+            work.switches,
+            work.links,
+            work.scratch_cells_written,
+            work.allocated_bytes,
+            work.allocated_bytes as f64 / work.flows as f64,
+        );
+        if work.scratch_cells_written > one_tree_per_edge_switch {
+            failures.push(format!(
+                "k={k}: {} scratch cells written exceed one exhaustive search tree per edge \
+                 switch ({one_tree_per_edge_switch})",
+                work.scratch_cells_written
+            ));
+        }
+        if work.allocated_bytes > byte_cap {
+            failures.push(format!(
+                "k={k}: the route table allocated {} bytes, over the cap of {byte_cap} \
+                 ({TABLE_BYTES_PER_FLOW} per flow, {TABLE_BYTES_PER_SWITCH} per switch, \
+                 {TABLE_BYTES_PER_LINK} per link)",
+                work.allocated_bytes
+            ));
+        }
+    }
+    failures.extend(check(
+        "route_table_scratch_writes_per_flow",
+        "cells",
+        small.scratch_cells_written as f64 / small.flows as f64,
+        large.scratch_cells_written as f64 / large.flows as f64,
+        (2.0_f64 * 4.0).sqrt(),
+    ));
+    failures.extend(check(
+        "route_table_allocated",
         "bytes",
         small.allocated_bytes as f64,
         large.allocated_bytes as f64,
