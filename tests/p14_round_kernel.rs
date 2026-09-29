@@ -107,6 +107,11 @@ fn checkpoint_image(original: &SimulationImage, checkpoint: &RunResult) -> Simul
     image
 }
 
+/// The Scalar oracle's result, for the device tests that run only under the test hooks.
+#[cfg(any(
+    all(feature = "metal-test-hooks", target_vendor = "apple"),
+    feature = "cuda-test-hooks"
+))]
 fn scalar(image: &SimulationImage, horizon: Option<u64>) -> RunResult {
     let mut expected = run_scalar_with_observations(image, horizon, ObservationMode::Full)
         .expect("scalar oracle must run");
