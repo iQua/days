@@ -2,8 +2,8 @@ use std::path::Path;
 use std::process::Command;
 
 use xtask::{
-    AllowedDevDependency, AllowedFeatureGate, audit_boundary_metadata, audit_scalar_table_access,
-    audit_semantic_feature_gates,
+    AllowedDevDependency, AllowedFeatureGate, AllowedTableScanner, audit_boundary_metadata,
+    audit_scalar_table_access, audit_semantic_feature_gates, audit_table_scans,
 };
 
 const LEGACY_DEV_DEPENDENCIES: &[AllowedDevDependency] = &[AllowedDevDependency {
@@ -210,6 +210,67 @@ const STAGE_PATH_FUNCTIONS: &[&str] = &[
     "install_tcp_attempts",
 ];
 
+/// The only functions of `executor/src/scalar.rs` that may scan a host's generator or TCP-receiver
+/// table (`audit_scalar_table_access`, default-deny). None is on the stage path; every other
+/// function reads those tables by key through the stage index.
+const SCALAR_TABLE_SCANNERS: &[AllowedTableScanner] = &[
+    AllowedTableScanner {
+        scope: "host_remote_arrival",
+        reason: "non-TCP feedback for constant and rate generators; TCP stage segments and ACKs dispatch to their own handlers first",
+    },
+    AllowedTableScanner {
+        scope: "host_retransmission_timeout",
+        reason: "runs per timeout firing and matches by timer identity, not flow; keying it needs a timer map refreshed at every active_timer store",
+    },
+    AllowedTableScanner {
+        scope: "host_dcqcn_cnp_arrival",
+        reason: "DCQCN only; DCQCN flows cannot be stages (collectives lower only over TCP)",
+    },
+    AllowedTableScanner {
+        scope: "host_dcqcn_pacing_timer",
+        reason: "DCQCN only; DCQCN flows cannot be stages (collectives lower only over TCP)",
+    },
+    AllowedTableScanner {
+        scope: "host_dcqcn_control_timer",
+        reason: "DCQCN only; DCQCN flows cannot be stages (collectives lower only over TCP)",
+    },
+];
+
+/// `executor/src/cpu.rs` runs the same transitions through `scalar::TransitionState`; its own
+/// host-table reads are pool setup and a unit test. Default-deny keeps a CPU-only helper from
+/// reintroducing a per-event scan.
+const CPU_TABLE_SCANNERS: &[AllowedTableScanner] = &[
+    AllowedTableScanner {
+        scope: "route_offered_load",
+        reason: "image-only load estimate for the static route-load partition, computed once when the worker pool is built",
+    },
+    AllowedTableScanner {
+        scope: "route_load_estimator_uses_only_declared_routes_and_generator_rates",
+        reason: "unit test that installs a fixture generator table",
+    },
+];
+
+/// `executor/src/stage_index.rs` derives the index from the tables and keeps the retired scans as
+/// test oracles; a lookup helper added there must be keyed like the rest.
+const STAGE_INDEX_TABLE_SCANNERS: &[AllowedTableScanner] = &[
+    AllowedTableScanner {
+        scope: "build",
+        reason: "derives a host's index once, when the transition state is constructed, not per event",
+    },
+    AllowedTableScanner {
+        scope: "first_ready_by_scan",
+        reason: "debug-build oracle of the indexed activation choice (debug_assert_eq! only)",
+    },
+    AllowedTableScanner {
+        scope: "legacy_scans",
+        reason: "the retired scans, compiled only for the test hooks, as the equality gate's oracle",
+    },
+    AllowedTableScanner {
+        scope: "check_host_index",
+        reason: "the equality gate's per-host checker, compiled only for the test hooks",
+    },
+];
+
 const WIDTH_VIA_LOAD_FULL_TESTS: &[&str] = &[
     "width_via_load_full_load_10_holds_runtime_contract",
     "width_via_load_full_load_30_holds_runtime_contract",
@@ -273,15 +334,24 @@ fn run_audits(workspace: &Path) {
     if let Err(error) = audit_scalar_table_access(
         &workspace.join("executor/src/scalar.rs"),
         STAGE_PATH_FUNCTIONS,
-        &[],
+        SCALAR_TABLE_SCANNERS,
     ) {
         failures.push(format!("scalar.rs table-access audit failed:\n{error}"));
+    }
+    for (file, allow_list) in [
+        ("executor/src/cpu.rs", CPU_TABLE_SCANNERS),
+        ("executor/src/stage_index.rs", STAGE_INDEX_TABLE_SCANNERS),
+    ] {
+        if let Err(error) = audit_table_scans(&workspace.join(file), allow_list) {
+            failures.push(format!("host-table scan audit of {file} failed:\n{error}"));
+        }
     }
 
     if failures.is_empty() {
         println!("legacy boundary audit: PASS");
         println!("semantic feature-gate audit: PASS");
-        println!("scalar.rs table-access audit (stage-path view): PASS");
+        println!("scalar.rs table-access audit (stage-path view, host-table scans): PASS");
+        println!("host-table scan audit (cpu.rs, stage_index.rs): PASS");
     } else {
         eprintln!("{}", failures.join("\n\n"));
         std::process::exit(1);

@@ -1172,8 +1172,16 @@ pub fn scalar_table_violations(
     stage_functions: &[&str],
     scanners: &[AllowedTableScanner],
 ) -> Result<Vec<String>, String> {
-    let _ = scanners;
-    stage_path_table_violations(source, stage_functions)
+    let mut violations = stage_path_table_violations(source, stage_functions)?;
+    let mut access_scopes = stage_functions.to_vec();
+    access_scopes.push(VIEW_CONSTRUCTOR);
+    violations.extend(table_access_violations(
+        source,
+        "scalar.rs",
+        scanners,
+        &access_scopes,
+    )?);
+    Ok(violations)
 }
 
 /// [`scalar_table_violations`] over the file at `scalar_rs`.
@@ -1192,12 +1200,289 @@ pub fn audit_scalar_table_access(
     }
 }
 
+/// Host tables no function may scan unless it is allowlisted: a host's generator table and its
+/// TCP-receiver table, whether raw `Vec`s or the stage view's `ProbedTable`s.
+pub const HOST_TABLES: &[&str] = &["generators", "tcp_receivers"];
+
+/// The function of `scalar.rs` that builds the stage view by destructuring a `HostState`.
+const VIEW_CONSTRUCTOR: &str = "host_parts_mut";
+
+/// Slice and `Vec` methods that walk a table: iteration, and the read-only linear searches a raw
+/// `Vec` offers without one (`contains`, `windows`, `chunks`, `to_vec`).
+const TABLE_WALK_METHODS: &[&str] = &[
+    "iter",
+    "iter_mut",
+    "into_iter",
+    "contains",
+    "windows",
+    "chunks",
+    "to_vec",
+];
+
 /// One function (or inline module) of a file that may scan a host table, and why.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct AllowedTableScanner {
     /// The function's name, or the name of an inline module all of whose functions may scan.
     pub scope: &'static str,
     pub reason: &'static str,
+}
+
+/// P14 scan audit, default-deny half: no function of the file scans a host table
+/// ([`HOST_TABLES`]), or reaches one at all, unless its scope is allowlisted.
+///
+/// - A *scan* is a call of a `TABLE_WALK_METHODS` method on, or a `for` loop over, a field or
+///   binding named in [`HOST_TABLES`] (through `&`, `&mut` and parentheses). Only the allow-listed
+///   scanners may scan.
+/// - An *access* is a field expression `<expr>.generators` / `<expr>.tcp_receivers`, or a struct
+///   pattern that binds one of those fields. Only the scanners and the access scopes may access a
+///   host table (for `scalar.rs`, the stage-path functions, which reach it through the counted
+///   view, and the view's constructor). This closes a helper that aliases a raw table under
+///   another name before scanning it, which the scan rule alone cannot see.
+///
+/// Both are attributed to the innermost enclosing function and to every enclosing inline module;
+/// closures belong to their function. Every allowlist entry must have a reason and must still
+/// reach a host table, so the list cannot go stale.
+pub fn audit_table_scans(file: &Path, allow_list: &[AllowedTableScanner]) -> Result<(), String> {
+    let source = fs::read_to_string(file)
+        .map_err(|error| format!("failed to read {}: {error}", file.display()))?;
+    let label = file.file_name().map_or_else(
+        || file.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let violations = table_access_violations(&source, &label, allow_list, &[])?;
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations.join("\n"))
+    }
+}
+
+/// The violations of [`audit_table_scans`] in `source`, with no access scopes beyond the scanners.
+pub fn table_scan_violations(
+    source: &str,
+    label: &str,
+    allow_list: &[AllowedTableScanner],
+) -> Result<Vec<String>, String> {
+    table_access_violations(source, label, allow_list, &[])
+}
+
+/// The violations of the default-deny rule in `source`, one line each; `access_scopes` may reach
+/// host tables but not scan them.
+pub fn table_access_violations(
+    source: &str,
+    label: &str,
+    allow_list: &[AllowedTableScanner],
+    access_scopes: &[&str],
+) -> Result<Vec<String>, String> {
+    let syntax =
+        syn::parse_file(source).map_err(|error| format!("failed to parse {label}: {error}"))?;
+    let mut violations = Vec::new();
+    for entry in allow_list {
+        if entry.reason.trim().is_empty() {
+            violations.push(format!(
+                "{label}: table-scan allow-list entry `{}` has no documented reason",
+                entry.scope
+            ));
+        }
+    }
+    let mut finder = TableScanFinder {
+        label,
+        allow_list,
+        access_scopes,
+        reported_fields: BTreeSet::new(),
+        functions: Vec::new(),
+        modules: Vec::new(),
+        used: BTreeSet::new(),
+        violations: Vec::new(),
+    };
+    finder.visit_file(&syntax);
+    violations.extend(finder.violations);
+    for entry in allow_list {
+        if !finder.used.contains(entry.scope) {
+            violations.push(format!(
+                "{label}: `{}` is allow-listed to reach a host table but reaches none; remove the entry",
+                entry.scope
+            ));
+        }
+    }
+    Ok(violations)
+}
+
+struct TableScanFinder<'a> {
+    label: &'a str,
+    allow_list: &'a [AllowedTableScanner],
+    access_scopes: &'a [&'a str],
+    /// Source positions of table fields already reported as scanned, so a scan is one violation.
+    reported_fields: BTreeSet<(usize, usize)>,
+    functions: Vec<String>,
+    modules: Vec<String>,
+    used: BTreeSet<String>,
+    violations: Vec<String>,
+}
+
+impl TableScanFinder<'_> {
+    fn function_label(&self) -> String {
+        self.functions.last().map_or_else(
+            || "(outside any function)".to_owned(),
+            |name| format!("`{name}`"),
+        )
+    }
+
+    fn access(&mut self, span: Span, table: &str, form: &str) {
+        let position = (span.start().line, span.start().column);
+        if self.reported_fields.contains(&position) {
+            return;
+        }
+        let scopes = self
+            .functions
+            .last()
+            .into_iter()
+            .chain(self.modules.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        let listed = scopes
+            .iter()
+            .filter(|scope| {
+                self.allow_list
+                    .iter()
+                    .any(|entry| entry.scope == scope.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let allowed = !listed.is_empty()
+            || scopes
+                .iter()
+                .any(|scope| self.access_scopes.contains(&scope.as_str()));
+        self.used.extend(listed);
+        if !allowed {
+            let function = self.function_label();
+            self.violations.push(format!(
+                "{}:{}: {function} reaches host table `{table}` through {form}; outside the \
+                 stage-path functions and the table-scan allow-list, host tables are reached \
+                 only through the stage index",
+                self.label,
+                span.start().line
+            ));
+        }
+    }
+
+    /// Records the table field a reported scan read, so it is not reported again as an access.
+    fn mark_reported(&mut self, expression: &Expr) {
+        match expression {
+            Expr::Reference(reference) => self.mark_reported(&reference.expr),
+            Expr::Paren(paren) => self.mark_reported(&paren.expr),
+            Expr::Field(field) => {
+                if let syn::Member::Named(ident) = &field.member {
+                    let start = ident.span().start();
+                    self.reported_fields.insert((start.line, start.column));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn scan(&mut self, span: Span, table: &str, form: String) {
+        let scopes = self.functions.last().into_iter().chain(self.modules.iter());
+        let allowed = scopes
+            .filter(|scope| {
+                self.allow_list
+                    .iter()
+                    .any(|entry| entry.scope == scope.as_str())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if allowed.is_empty() {
+            let function = self.function_label();
+            self.violations.push(format!(
+                "{}:{}: {function} scans host table `{table}` with {form}; host tables are \
+                 read by key (the stage index) outside the table-scan allow-list",
+                self.label,
+                span.start().line
+            ));
+        } else {
+            self.used.extend(allowed);
+        }
+    }
+}
+
+/// The host table an expression names, looking through references and parentheses.
+fn host_table(expression: &Expr) -> Option<String> {
+    match expression {
+        Expr::Reference(reference) => host_table(&reference.expr),
+        Expr::Paren(paren) => host_table(&paren.expr),
+        Expr::Field(field) => match &field.member {
+            syn::Member::Named(ident) => Some(ident.to_string()),
+            syn::Member::Unnamed(_) => None,
+        },
+        Expr::Path(path) => path
+            .path
+            .segments
+            .last()
+            .map(|segment| segment.ident.to_string()),
+        _ => None,
+    }
+    .filter(|name| HOST_TABLES.contains(&name.as_str()))
+}
+
+impl<'ast> Visit<'ast> for TableScanFinder<'_> {
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        self.modules.push(item.ident.to_string());
+        syn::visit::visit_item_mod(self, item);
+        self.modules.pop();
+    }
+
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        self.functions.push(item.sig.ident.to_string());
+        syn::visit::visit_item_fn(self, item);
+        self.functions.pop();
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        self.functions.push(item.sig.ident.to_string());
+        syn::visit::visit_impl_item_fn(self, item);
+        self.functions.pop();
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        let method = call.method.to_string();
+        if TABLE_WALK_METHODS.contains(&method.as_str()) {
+            if let Some(table) = host_table(&call.receiver) {
+                self.scan(call.method.span(), &table, format!("`.{method}()`"));
+                self.mark_reported(&call.receiver);
+            }
+        }
+        syn::visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_expr_for_loop(&mut self, for_loop: &'ast syn::ExprForLoop) {
+        if let Some(table) = host_table(&for_loop.expr) {
+            self.scan(for_loop.for_token.span, &table, "a `for` loop".to_owned());
+            self.mark_reported(&for_loop.expr);
+        }
+        syn::visit::visit_expr_for_loop(self, for_loop);
+    }
+
+    fn visit_expr_field(&mut self, field: &'ast syn::ExprField) {
+        if let syn::Member::Named(ident) = &field.member {
+            let name = ident.to_string();
+            if HOST_TABLES.contains(&name.as_str()) {
+                self.access(ident.span(), &name, "a field expression");
+            }
+        }
+        syn::visit::visit_expr_field(self, field);
+    }
+
+    fn visit_pat_struct(&mut self, pattern: &'ast syn::PatStruct) {
+        for field in &pattern.fields {
+            if let syn::Member::Named(ident) = &field.member {
+                let name = ident.to_string();
+                if HOST_TABLES.contains(&name.as_str()) {
+                    self.access(ident.span(), &name, "a struct pattern");
+                }
+            }
+        }
+        syn::visit::visit_pat_struct(self, pattern);
+    }
 }
 
 #[cfg(test)]
@@ -2199,6 +2484,46 @@ impl TransitionState<'_> {
                 "{body}: {violations:?}"
             );
         }
+    }
+
+    #[test]
+    fn table_scan_audit_attributes_closures_and_allows_whole_modules() {
+        let source = r#"
+fn outer(state: &HostState) { let find = |flow| state.generators.iter().position(|g| g.flow == flow); }
+mod legacy_scans { fn first(state: &HostState) -> Option<usize> { state.generators.iter().position(|g| g.flow == flow) } }
+"#;
+        let modules = [AllowedTableScanner {
+            scope: "legacy_scans",
+            reason: "test-only oracle",
+        }];
+        let violations = table_scan_violations(source, "x.rs", &modules).unwrap();
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(
+            violations[0].contains("x.rs:2: `outer` scans host table `generators`"),
+            "{violations:?}"
+        );
+    }
+
+    #[test]
+    fn table_scan_audit_rejects_stale_and_undocumented_entries() {
+        let entries = [
+            AllowedTableScanner {
+                scope: "host_retransmission_timeout",
+                reason: " ",
+            },
+            AllowedTableScanner {
+                scope: "no_longer_scans",
+                reason: "was a scanner",
+            },
+        ];
+        let violations = scalar_table_violations(CLEAN_SCALAR, STAGE_FUNCTIONS, &entries).unwrap();
+        assert_eq!(violations.len(), 2, "{violations:?}");
+        assert!(violations[0].contains("`host_retransmission_timeout` has no documented reason"));
+        assert!(
+            violations[1].contains(
+                "`no_longer_scans` is allow-listed to reach a host table but reaches none"
+            )
+        );
     }
 
     #[test]
