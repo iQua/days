@@ -237,18 +237,22 @@ fn evaluation_cells_and_plain_scheduler_images_select_the_plain_round_kernel() {
     }
 }
 
-/// The receiver-only gap (see `evidence/P14/spec.md`): a checkpoint in which DCQCN data is still
-/// in flight to its notification point after the flow's generator has finished. Until the next
-/// control timer nothing stops the plain build on such an image, and with CE-marked data it
-/// silently omits the CNPs (measured on the bottleneck variant below), so selection must pick the
-/// mechanisms build from the notification point alone.
+/// The receiver-only gap (see `evidence/P14/spec.md`): on the plain build, only a DCQCN timer event
+/// (a pacing tick or a control timer) or a CNP arrival fails closed. Any run window that holds none
+/// of them, but in which CE-marked data reaches a notification point, runs to completion on the
+/// plain build and silently omits the CNPs. Such windows exist whenever the run's horizon falls
+/// inside one pacing interval of an active generator, or after the generator finishes and before
+/// the next control timer. Both were measured to diverge from Scalar on the bottleneck variants
+/// below. The only guard is static, image-level selection: every checkpoint of a DCQCN image keeps
+/// its notification points, so it selects the mechanisms build. These tests pin that for
+/// checkpoints taken while the generator is active and after it has finished.
 #[test]
 fn dcqcn_tail_checkpoints_select_the_mechanisms_round_kernel() {
     for (fixture_name, image) in [
         ("dcqcn_t26", fixture("dcqcn_t26.toml")),
-        ("dcqcn_t26 bottleneck", dcqcn_t26_bottleneck()),
+        ("dcqcn_t26 bottleneck", dcqcn_t26_bottleneck(None)),
     ] {
-        let tails = dcqcn_tail_checkpoints(&image);
+        let tails = dcqcn_checkpoints(&image, CheckpointPhase::GeneratorFinished);
         assert!(
             !tails.is_empty(),
             "{fixture_name} must have a finished-generator tail"
@@ -263,15 +267,43 @@ fn dcqcn_tail_checkpoints_select_the_mechanisms_round_kernel() {
     }
 }
 
+/// Checkpoints between the ticks of an active DCQCN generator: the lengthened bottleneck variant,
+/// checkpointed at every packet arrival and 1 ns before it while the generator is `Scheduled` and
+/// data is in flight. These are the windows in which the plain build was measured to return wrong
+/// bytes without failing closed (the review's probe, reproduced in `evidence/P14/spec`).
+#[test]
+fn active_dcqcn_generator_checkpoints_select_the_mechanisms_round_kernel() {
+    let image = dcqcn_t26_bottleneck(Some("size = 200_000"));
+    let active = dcqcn_checkpoints(&image, CheckpointPhase::GeneratorActive);
+    // The variant keeps its generator active across most of its arrivals.
+    assert!(
+        active.len() >= 100,
+        "only {} active-generator checkpoints",
+        active.len()
+    );
+    for (horizon, checkpoint) in &active {
+        assert_eq!(
+            RoundKernel::for_image(checkpoint),
+            RoundKernel::Mechanisms,
+            "@{horizon}"
+        );
+    }
+}
+
 /// `dcqcn_t26` behind a 1 Gbps bottleneck with a one-packet ECN threshold: CE-marked data keeps
-/// arriving at the notification point after the 10 Gbps generator finishes.
-fn dcqcn_t26_bottleneck() -> SimulationImage {
+/// arriving at the notification point, between the 10 Gbps generator's ticks and after it
+/// finishes. `flow_size` replaces the flow's 20,000 B `size` line, to lengthen the active phase.
+fn dcqcn_t26_bottleneck(flow_size: Option<&str>) -> SimulationImage {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("configs/p14/dcqcn_t26.toml");
     let source = fs::read_to_string(&path).expect("fixture must be readable");
-    let variant = source
+    let mut variant = source
         .replace("port_rate = 100_000_000_000", "port_rate = 1_000_000_000")
         .replace("capacity = 1\n", "capacity = 100\n")
         .replace("ecn_threshold = 1.0", "ecn_threshold = 0.01");
+    if let Some(size) = flow_size {
+        assert!(variant.contains("size = 20_000"));
+        variant = variant.replace("size = 20_000", size);
+    }
     assert_ne!(variant, source, "the variant must change the fixture");
     let directory = tempfile::TempDir::new().expect("temporary directory");
     let stripped = directory.path().join("dcqcn_t26_bottleneck.toml");
@@ -279,15 +311,32 @@ fn dcqcn_t26_bottleneck() -> SimulationImage {
     compile_config(&stripped).unwrap_or_else(|error| panic!("the variant must lower: {error}"))
 }
 
-/// Checkpoints of `image` taken at each packet arrival of its Scalar run, keeping those in which
-/// no DCQCN generator has a pacing timer left and DCQCN data is still in flight.
-fn dcqcn_tail_checkpoints(image: &SimulationImage) -> Vec<(u64, SimulationImage)> {
+/// Which DCQCN checkpoints [`dcqcn_checkpoints`] keeps.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CheckpointPhase {
+    /// A DCQCN generator is still `Scheduled`: windows between its pacing ticks.
+    GeneratorActive,
+    /// No generator has a pacing timer left: windows before the next control timer.
+    GeneratorFinished,
+}
+
+/// Checkpoints of `image` taken at each packet arrival of its Scalar run (and, for the active
+/// phase, 1 ns before it), keeping those in `phase` with DCQCN data still in flight.
+fn dcqcn_checkpoints(
+    image: &SimulationImage,
+    phase: CheckpointPhase,
+) -> Vec<(u64, SimulationImage)> {
     let full = run_scalar_with_observations(image, None, ObservationMode::Full)
         .expect("scalar oracle must run");
     let mut horizons = full
         .arrivals
         .iter()
-        .map(|arrival| arrival.time_ns)
+        .flat_map(|arrival| match phase {
+            CheckpointPhase::GeneratorActive => {
+                vec![arrival.time_ns.saturating_sub(1), arrival.time_ns]
+            }
+            CheckpointPhase::GeneratorFinished => vec![arrival.time_ns],
+        })
         .collect::<Vec<_>>();
     horizons.sort_unstable();
     horizons.dedup();
@@ -296,21 +345,27 @@ fn dcqcn_tail_checkpoints(image: &SimulationImage) -> Vec<(u64, SimulationImage)
         .filter_map(|horizon| {
             let prefix = run_scalar_with_observations(image, Some(horizon), ObservationMode::Full)
                 .expect("checkpoint prefix must run");
-            let timers_done = prefix
+            let mut statuses = prefix
                 .host_states
                 .iter()
                 .flat_map(|state| &state.generators)
-                .all(|generator| {
+                .map(|generator| generator.next_emission.status);
+            let in_phase = match phase {
+                CheckpointPhase::GeneratorActive => {
+                    statuses.any(|status| status == GeneratorStatus::Scheduled)
+                }
+                CheckpointPhase::GeneratorFinished => statuses.all(|status| {
                     !matches!(
-                        generator.next_emission.status,
+                        status,
                         GeneratorStatus::Scheduled | GeneratorStatus::Blocked
                     )
-                });
+                }),
+            };
             let data_in_flight = prefix
                 .resident_packets
                 .iter()
                 .any(|packet| packet.kind.is_data());
-            if timers_done && data_in_flight {
+            if in_phase && data_in_flight {
                 Some((horizon, checkpoint_image(image, &prefix)))
             } else {
                 None
