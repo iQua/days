@@ -86,10 +86,11 @@ jobs:
 
   scaling:
     runs-on: ubuntu-latest
-    # A passing run takes minutes. On a tree with a quadratic regression the test step ran
-    # 63 minutes on four x86 cores (evidence/P14/ci-scaling.md in days-gpu); this leaves about
-    # twice that for a slower runner.
-    timeout-minutes: 150
+    # A passing run takes minutes. On a tree with a quadratic regression, where the test caps
+    # each size at one sample once a sample exceeds 60 s, the test step ran 42 minutes on four
+    # x86 cores (evidence/P14/ci-scaling.md in days-gpu); this leaves about twice that, plus the
+    # build, for a slower runner.
+    timeout-minutes: 90
     needs: lint
 
     steps:
