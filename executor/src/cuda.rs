@@ -102,6 +102,8 @@ const PARAM_RECEIVER_OFFSET: usize = 28;
 const PARAM_LEDGER_META_OFFSET: usize = 29;
 /// Params word holding the PFC region offset in `scheduler_state`, or `NONE` without PFC state.
 const PARAM_PFC_OFFSET: usize = 31;
+// P14 perf: the image-derived mechanisms flags (`device_mechanism::mechanism_flags`).
+const PARAM_MECHANISMS: usize = 32;
 const PACKET_ECN_FLAG: u64 = 1_u64 << 63;
 const PACKET_KIND_MASK: u64 = !PACKET_ECN_FLAG;
 
@@ -1133,7 +1135,7 @@ impl CudaExecutor {
 
         let mut control = vec![0_u64; CONTROL_WORDS];
         control[5] = 1;
-        let mut params = vec![0_u64; 32];
+        let mut params = vec![0_u64; PARAM_MECHANISMS + 1];
         params[PARAM_PFC_OFFSET] = NONE;
         params[0] = node_count as u64;
         params[4] = node_count.max(1) as u64;
@@ -1507,6 +1509,8 @@ pub fn mechanism_plane_words_cuda_for_testing(
             })
             .count(),
         pfc_params_words: 1,
+        mechanism_params_words: 1,
+        mechanism_flags: plan.params[PARAM_MECHANISMS],
     })
 }
 
@@ -2502,6 +2506,7 @@ impl CudaPlan {
             tcp_layout.ledger_meta_offset as u64,
             streams.layout.round_scratch_offset as u64,
             pfc_offset.map_or(NONE, |offset| offset as u64),
+            crate::device_mechanism::mechanism_flags(image),
         ];
 
         Ok(Self {

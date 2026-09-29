@@ -449,6 +449,8 @@ const PARAM_RECEIVER_OFFSET: usize = 28;
 const PARAM_LEDGER_META_OFFSET: usize = 29;
 /// Params word holding the PFC region offset in `scheduler_state`, or `NONE` without PFC state.
 const PARAM_PFC_OFFSET: usize = 32;
+// P14 perf: the image-derived mechanisms flags (`device_mechanism::mechanism_flags`).
+const PARAM_MECHANISMS: usize = 33;
 const PARAM_ROUND_THREADS: usize = 30;
 
 const CONTROL_ERROR: usize = 0;
@@ -1425,6 +1427,8 @@ pub fn mechanism_plane_words_metal_for_testing(
             })
             .count(),
         pfc_params_words: 1,
+        mechanism_params_words: 1,
+        mechanism_flags: plan.params[PARAM_MECHANISMS],
     })
 }
 
@@ -2216,6 +2220,7 @@ impl MetalPlan {
             config.round_threads_per_threadgroup as u64,
             streams.layout.round_scratch_offset as u64,
             pfc_offset.map_or(NONE, |offset| offset as u64),
+            crate::device_mechanism::mechanism_flags(image),
         ];
 
         if node_count.div_ceil(config.round_threads_per_threadgroup) > u32::MAX as usize {

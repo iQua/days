@@ -206,6 +206,11 @@ pub struct MechanismPlaneWords {
     pub dcqcn_receiver_rows: usize,
     /// Params words holding the PFC region offset: one, holding `u64::MAX` without PFC state.
     pub pfc_params_words: usize,
+    /// Params words holding the mechanisms flags: one, holding zero without DCQCN state.
+    pub mechanism_params_words: usize,
+    /// The planned mechanisms flags word (bit 0: a DCQCN notification point exists; bit 1: any
+    /// DCQCN state exists).
+    pub mechanism_flags: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
