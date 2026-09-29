@@ -70,6 +70,20 @@ error: --workers is a CPU-engine option and does not apply to --engine scalar
 
 Device capacity is refuse-or-run. An attempt that runs out of capacity is discarded, the host raises the relevant floor, and the run retries. A warm-start snapshot holds capacities only, not simulation state or compiled kernels, so retries, cap overrides, and warm starts change memory use and the number of attempts, never the result bytes. The snapshot file starts with the header `days-capacity-warm-start v2` and ends with a record count; a truncated or corrupt snapshot is refused.
 
+### CUDA engine
+
+- `--cuda-device <N>`: the CUDA device ordinal to run on; default `0`. Each device has its own CUDA context. An ordinal the host does not have fails when its context is created; on a one-GPU host:
+
+```text
+error: CUDA executor failed: Unavailable("CUDA backend unavailable: device 1 context failed: DriverError(CUDA_ERROR_INVALID_DEVICE, \"invalid device ordinal\")")
+```
+
+Any other engine refuses the option:
+
+```text
+error: --cuda-device is a CUDA-engine option and does not apply to --engine metal
+```
+
 ## Output records
 
 Each engine prints its records in this order:
@@ -113,7 +127,7 @@ Final fields: `sourced_packets`, `received_packets`, `dropped_packets`, `wall_ns
 
 ### `days_protocol`
 
-The device run configuration, printed before the run: `fixture`, `engine` (`metal` or `cuda`), `exclusive_horizon_ns`, `observation_mode=Summary`, `capacity_caps` (the effective caps), `max_capacity_retries`, `capacity_warm_start` and `dump_capacity_warm_start` (paths or `none`), `channel_events_per_stream_override`, and `round_threads_per_block`.
+The device run configuration, printed before the run: `fixture`, `engine` (`metal` or `cuda`), `exclusive_horizon_ns`, `observation_mode=Summary`, `capacity_caps` (the effective caps), `max_capacity_retries`, `capacity_warm_start` and `dump_capacity_warm_start` (paths or `none`), `channel_events_per_stream_override`, `round_threads_per_block`, and `cuda_device` (the device ordinal on CUDA, `none` on Metal).
 
 ### `days_capacity_warm_start`
 
