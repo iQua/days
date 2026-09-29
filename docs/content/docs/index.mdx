@@ -12,7 +12,7 @@ Four backends run the same image:
 | --- | --- |
 | Scalar | one CPU thread; the reference oracle |
 | CPU | a multicore worker pool |
-| Metal | Apple GPUs |
+| Metal | Apple GPUs (not the M1 family) |
 | CUDA | NVIDIA GPUs (built for `sm_86`, `sm_89` and `sm_121`) |
 
 Every backend that accepts a scenario produces byte-identical complete state. A backend that cannot run a mechanism rejects the scenario at validation with a message naming the backend; it never falls back silently.

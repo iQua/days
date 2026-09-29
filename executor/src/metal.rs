@@ -20,7 +20,7 @@ use objc2_foundation::NSString;
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
     MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLDispatchType, MTLLibrary, MTLResourceOptions, MTLSize,
+    MTLDispatchType, MTLGPUFamily, MTLLibrary, MTLResourceOptions, MTLSize,
 };
 
 use crate::device_compaction::{
@@ -262,8 +262,184 @@ const ATTEMPT_DISPATCHES: [(AttemptKernel, DispatchGeometry); 13] = [
     ),
     (AttemptKernel::FinalControl, DispatchGeometry::FixedControl),
 ];
-const CONTROL_THREADGROUP_BYTES: usize =
-    LANES * (std::mem::size_of::<u64>() + std::mem::size_of::<u32>());
+
+impl AttemptKernel {
+    const fn metal_kernel(self) -> MetalKernel {
+        match self {
+            Self::HorizonSweep => MetalKernel::HorizonSweep,
+            Self::Horizon => MetalKernel::Horizon,
+            Self::RoundReset => MetalKernel::RoundReset,
+            Self::Compaction => MetalKernel::RoundPrepare,
+            Self::DrainExecute => MetalKernel::Round,
+            Self::ContinuationControlSweep => MetalKernel::ControlSweep,
+            Self::ContinuationControl => MetalKernel::Control,
+            Self::ExchangePrefixSweep => MetalKernel::ExchangePrefixSweep,
+            Self::ExchangePrefix => MetalKernel::ExchangePrefix,
+            Self::ExchangeScatter => MetalKernel::ExchangeScatter,
+            Self::TargetMerge => MetalKernel::ExchangeMerge,
+            Self::FinalControlSweep => MetalKernel::FinalizeSweep,
+            Self::FinalControl => MetalKernel::Finalize,
+        }
+    }
+}
+
+/// Every Metal entry point. [`DirectMetal`] compiles the source into one library and creates
+/// exactly these pipelines from it, stored at `kernel as usize`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MetalKernel {
+    /// T21 fix 1: the Θ(N) FEL-root sweep, on the full grid.
+    HorizonSweep,
+    Horizon,
+    /// T21 fix 1: `days_round_prepare`'s Θ(N) + Θ(C) resets, on the full grid.
+    RoundReset,
+    RoundPrepare,
+    Round,
+    /// T21 fix 1: the round-control scans, on the full grid.
+    ControlSweep,
+    Control,
+    /// T21 fix 1: the exchange-prefix streams scan, on the full grid.
+    ExchangePrefixSweep,
+    ExchangePrefix,
+    ExchangeScatter,
+    ExchangeMerge,
+    /// T21 fix 1: the finalize scans, on the full grid.
+    FinalizeSweep,
+    Finalize,
+    /// T20l fix 2: the readback gather. Not part of an attempt; encoded only by
+    /// [`DirectMetal::compact`], after the attempt has been screened as successful.
+    CompactGather,
+}
+
+impl MetalKernel {
+    /// In discriminant order, so `ALL[kernel as usize] == kernel`.
+    const ALL: [Self; 14] = [
+        Self::HorizonSweep,
+        Self::Horizon,
+        Self::RoundReset,
+        Self::RoundPrepare,
+        Self::Round,
+        Self::ControlSweep,
+        Self::Control,
+        Self::ExchangePrefixSweep,
+        Self::ExchangePrefix,
+        Self::ExchangeScatter,
+        Self::ExchangeMerge,
+        Self::FinalizeSweep,
+        Self::Finalize,
+        Self::CompactGather,
+    ];
+
+    const fn entry_point(self) -> &'static str {
+        match self {
+            Self::HorizonSweep => "days_horizon_sweep",
+            Self::Horizon => "days_horizon",
+            Self::RoundReset => "days_round_reset",
+            Self::RoundPrepare => "days_round_prepare",
+            Self::Round => "days_round",
+            Self::ControlSweep => "days_round_control_sweep",
+            Self::Control => "days_round_control",
+            Self::ExchangePrefixSweep => "days_exchange_prefix_sweep",
+            Self::ExchangePrefix => "days_exchange_prefix",
+            Self::ExchangeScatter => "days_exchange_scatter",
+            Self::ExchangeMerge => "days_exchange_merge",
+            Self::FinalizeSweep => "days_round_finalize_sweep",
+            Self::Finalize => "days_round_finalize",
+            Self::CompactGather => "days_compact_gather",
+        }
+    }
+
+    /// The width every dispatch of this kernel uses; [`ATTEMPT_DISPATCHES`] must agree.
+    const fn threadgroup_width(self) -> ThreadgroupWidth {
+        match self {
+            Self::HorizonSweep
+            | Self::Horizon
+            | Self::ControlSweep
+            | Self::Control
+            | Self::ExchangePrefixSweep
+            | Self::ExchangePrefix
+            | Self::FinalizeSweep
+            | Self::Finalize => ThreadgroupWidth::Lanes,
+            Self::RoundReset
+            | Self::RoundPrepare
+            | Self::Round
+            | Self::ExchangeScatter
+            | Self::ExchangeMerge => ThreadgroupWidth::Round,
+            Self::CompactGather => ThreadgroupWidth::Compact,
+        }
+    }
+
+    /// Checks this kernel's pipeline against the threadgroup it is dispatched with.
+    ///
+    /// The host sets no dynamic threadgroup memory, so the pipeline's static allocation is its
+    /// whole threadgroup-memory demand. `round_threads` is `None` at pipeline creation, when only
+    /// the fixed widths are known; every run checks again with its configured width. A fixed
+    /// width or memory demand the device cannot meet is `Unavailable`; a configured round width a
+    /// pipeline cannot run is a `Validation` error.
+    fn check_limits(
+        self,
+        limits: PipelineLimits,
+        round_threads: Option<usize>,
+    ) -> Result<(), MetalError> {
+        let name = self.entry_point();
+        if limits.static_threadgroup_memory > limits.device_threadgroup_memory {
+            return Err(MetalError::Unavailable(format!(
+                "{name} pipeline needs {} bytes of threadgroup memory, but the device exposes \
+                 only {}",
+                limits.static_threadgroup_memory, limits.device_threadgroup_memory
+            )));
+        }
+        let width = self.threadgroup_width();
+        let Some(threads) = width.threads(round_threads) else {
+            return Ok(());
+        };
+        if threads <= limits.max_total_threads {
+            return Ok(());
+        }
+        Err(match width {
+            ThreadgroupWidth::Round => MetalError::Validation(format!(
+                "round_threads_per_threadgroup {threads} exceeds the supported maximum {} of the \
+                 {name} pipeline",
+                limits.max_total_threads
+            )),
+            ThreadgroupWidth::Lanes | ThreadgroupWidth::Compact => {
+                MetalError::Unavailable(format!(
+                    "{name} pipeline supports only {} threads per threadgroup, but is dispatched \
+                     with {threads}",
+                    limits.max_total_threads
+                ))
+            }
+        })
+    }
+}
+
+/// The threadgroup width a pipeline is dispatched with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ThreadgroupWidth {
+    /// [`LANES`]: the control scans and their full-grid sweeps.
+    Lanes,
+    /// [`MetalConfig::round_threads_per_threadgroup`], known only per run.
+    Round,
+    /// [`COMPACT_THREADS_PER_THREADGROUP`]: the readback gather.
+    Compact,
+}
+
+impl ThreadgroupWidth {
+    const fn threads(self, round_threads: Option<usize>) -> Option<usize> {
+        match self {
+            Self::Lanes => Some(LANES),
+            Self::Round => round_threads,
+            Self::Compact => Some(COMPACT_THREADS_PER_THREADGROUP),
+        }
+    }
+}
+
+/// What Metal reports for one pipeline on one device.
+#[derive(Clone, Copy, Debug)]
+struct PipelineLimits {
+    max_total_threads: usize,
+    static_threadgroup_memory: usize,
+    device_threadgroup_memory: usize,
+}
 const NONE: u64 = u64::MAX;
 const PACKET_ECN_FLAG: u64 = 1_u64 << 63;
 const PACKET_KIND_MASK: u64 = !PACKET_ECN_FLAG;
@@ -280,6 +456,12 @@ const CONTROL_ERROR_ARENA: usize = 1;
 const CONTROL_ERROR_NODE: usize = 2;
 const CONTROL_ERROR_CAPACITY: usize = 3;
 const CONTROL_ERROR_DEMAND: usize = 19;
+/// The kernels store a semantic fault as `ERROR_SEMANTIC + code` in the error word.
+const ERROR_SEMANTIC: u64 = 3;
+/// Semantic code 42 (raw word 45): the exchange-prefix channel-order diagnostic, whose identity
+/// slot carries a channel stream index, and the TCP ledger sequence overflow, which records no
+/// identity. Neither names an LP.
+const ERROR_CHANNEL_ORDER: u64 = ERROR_SEMANTIC + 42;
 const CONTROL_DONE: usize = 4;
 const CONTROL_RUN_END_LO: usize = 7;
 const CONTROL_RUN_END_HI: usize = 8;
@@ -798,9 +980,13 @@ impl MetalExecutor {
         }
         let execution_width = self
             .direct
-            .reset_pipeline
+            .pipeline(MetalKernel::RoundReset)
             .threadExecutionWidth()
-            .max(self.direct.prepare_pipeline.threadExecutionWidth());
+            .max(
+                self.direct
+                    .pipeline(MetalKernel::RoundPrepare)
+                    .threadExecutionWidth(),
+            );
         if !threads_per_threadgroup.is_multiple_of(execution_width) {
             return Err(MetalError::Validation(format!(
                 "worklist test threads per threadgroup must be a multiple of execution width \
@@ -809,9 +995,13 @@ impl MetalExecutor {
         }
         let supported = self
             .direct
-            .reset_pipeline
+            .pipeline(MetalKernel::RoundReset)
             .maxTotalThreadsPerThreadgroup()
-            .min(self.direct.prepare_pipeline.maxTotalThreadsPerThreadgroup());
+            .min(
+                self.direct
+                    .pipeline(MetalKernel::RoundPrepare)
+                    .maxTotalThreadsPerThreadgroup(),
+            );
         if threads_per_threadgroup > supported {
             return Err(MetalError::Validation(format!(
                 "worklist test threads per threadgroup {threads_per_threadgroup} exceeds supported \
@@ -878,7 +1068,10 @@ impl MetalExecutor {
             height: 1,
             depth: 1,
         };
-        for pipeline in [&self.direct.reset_pipeline, &self.direct.prepare_pipeline] {
+        for pipeline in [
+            self.direct.pipeline(MetalKernel::RoundReset),
+            self.direct.pipeline(MetalKernel::RoundPrepare),
+        ] {
             encoder.setComputePipelineState(pipeline);
             encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, group);
         }
@@ -4609,8 +4802,8 @@ fn decode_device_error(control: &[u64]) -> MetalError {
         },
         // The channel-order diagnostic shares the channel capacity identity slot, which carries
         // an immutable stream index rather than an LP after targeted retry plumbing.
-        142 => MetalError::DeviceExecution {
-            code: 142,
+        ERROR_CHANNEL_ORDER => MetalError::DeviceExecution {
+            code: ERROR_CHANNEL_ORDER,
             node: None,
         },
         code => MetalError::DeviceExecution {
@@ -4892,27 +5085,8 @@ struct DirectMetal {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     initialization_timings: MetalInitializationTimings,
-    /// T21 fix 1: the Θ(N) FEL-root sweep, on the full grid.
-    horizon_sweep_pipeline: MetalPipeline,
-    horizon_pipeline: MetalPipeline,
-    /// T21 fix 1: `days_round_prepare`'s Θ(N) + Θ(C) resets, on the full grid.
-    reset_pipeline: MetalPipeline,
-    prepare_pipeline: MetalPipeline,
-    round_pipeline: MetalPipeline,
-    /// T21 fix 1: the round-control scans, on the full grid.
-    control_sweep_pipeline: MetalPipeline,
-    control_pipeline: MetalPipeline,
-    /// T21 fix 1: the exchange-prefix streams scan, on the full grid.
-    exchange_prefix_sweep_pipeline: MetalPipeline,
-    exchange_prefix_pipeline: MetalPipeline,
-    exchange_scatter_pipeline: MetalPipeline,
-    exchange_merge_pipeline: MetalPipeline,
-    /// T21 fix 1: the finalize scans, on the full grid.
-    finalize_sweep_pipeline: MetalPipeline,
-    finalize_pipeline: MetalPipeline,
-    /// T20l fix 2: the readback gather. Not part of an attempt; encoded only by
-    /// [`DirectMetal::compact`], after the attempt has been screened as successful.
-    compact_pipeline: MetalPipeline,
+    /// One pipeline per [`MetalKernel`], at `kernel as usize`.
+    pipelines: [MetalPipeline; MetalKernel::ALL.len()],
 }
 
 impl DirectMetal {
@@ -4921,6 +5095,8 @@ impl DirectMetal {
         let device = MTLCreateSystemDefaultDevice().ok_or_else(|| {
             MetalError::Unavailable("system default device is unavailable".into())
         })?;
+        // Before any compilation: on a refused GPU, `days_round` alone takes about ten minutes.
+        check_gpu_family(&device)?;
         let queue = device
             .newCommandQueue()
             .ok_or_else(|| MetalError::Unavailable("command queue creation failed".into()))?;
@@ -4934,54 +5110,24 @@ impl DirectMetal {
         #[cfg(not(feature = "metal-test-hooks"))]
         let source = include_str!("metal_kernels.metal");
         let pipeline_started = Instant::now();
-        let horizon_sweep_pipeline = create_pipeline(&device, source, "days_horizon_sweep")?;
-        let horizon_pipeline = create_pipeline(&device, source, "days_horizon")?;
-        let reset_pipeline = create_pipeline(&device, source, "days_round_reset")?;
-        let prepare_pipeline = create_pipeline(&device, source, "days_round_prepare")?;
-        let round_pipeline = create_pipeline(&device, source, "days_round")?;
-        let control_sweep_pipeline = create_pipeline(&device, source, "days_round_control_sweep")?;
-        let control_pipeline = create_pipeline(&device, source, "days_round_control")?;
-        let exchange_prefix_sweep_pipeline =
-            create_pipeline(&device, source, "days_exchange_prefix_sweep")?;
-        let exchange_prefix_pipeline = create_pipeline(&device, source, "days_exchange_prefix")?;
-        let exchange_scatter_pipeline = create_pipeline(&device, source, "days_exchange_scatter")?;
+        let library = compile_library(&device, source)?;
+        let pipelines = MetalKernel::ALL
+            .iter()
+            .map(|kernel| create_pipeline(&device, &library, kernel.entry_point()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let Ok(pipelines) = <[MetalPipeline; MetalKernel::ALL.len()]>::try_from(pipelines) else {
+            unreachable!("one pipeline is created per kernel");
+        };
+        let exchange_scatter_pipeline = &pipelines[MetalKernel::ExchangeScatter as usize];
         if exchange_scatter_pipeline.threadExecutionWidth() < SCATTER_COPY_LANES {
             return Err(MetalError::Unavailable(format!(
                 "exchange-scatter pipeline has SIMD width {}, but paired record copies require {SCATTER_COPY_LANES} lanes",
                 exchange_scatter_pipeline.threadExecutionWidth()
             )));
         }
-        let exchange_merge_pipeline = create_pipeline(&device, source, "days_exchange_merge")?;
-        let finalize_sweep_pipeline =
-            create_pipeline(&device, source, "days_round_finalize_sweep")?;
-        let finalize_pipeline = create_pipeline(&device, source, "days_round_finalize")?;
-        let compact_pipeline = create_pipeline(&device, source, "days_compact_gather")?;
         let pipeline_creation_ns = duration_ns(pipeline_started.elapsed());
-        for (name, pipeline) in [
-            ("horizon-sweep", &horizon_sweep_pipeline),
-            ("horizon", &horizon_pipeline),
-            ("round-control-sweep", &control_sweep_pipeline),
-            ("round-control", &control_pipeline),
-            ("exchange-prefix-sweep", &exchange_prefix_sweep_pipeline),
-            ("exchange-prefix", &exchange_prefix_pipeline),
-            ("round-finalize-sweep", &finalize_sweep_pipeline),
-            ("round-finalize", &finalize_pipeline),
-        ] {
-            if pipeline.maxTotalThreadsPerThreadgroup() < LANES {
-                return Err(MetalError::Unavailable(format!(
-                    "{name} pipeline supports only {} threads per threadgroup",
-                    pipeline.maxTotalThreadsPerThreadgroup()
-                )));
-            }
-        }
-        if device.maxThreadgroupMemoryLength() < CONTROL_THREADGROUP_BYTES {
-            return Err(MetalError::Unavailable(format!(
-                "device exposes only {} bytes of threadgroup memory",
-                device.maxThreadgroupMemoryLength()
-            )));
-        }
         let initialization_ns = duration_ns(initialization_started.elapsed());
-        Ok(Self {
+        let direct = Self {
             device,
             queue,
             initialization_timings: MetalInitializationTimings {
@@ -4989,21 +5135,25 @@ impl DirectMetal {
                 pipeline_creation_ns,
                 reused_cached_executor: false,
             },
-            horizon_sweep_pipeline,
-            horizon_pipeline,
-            reset_pipeline,
-            prepare_pipeline,
-            round_pipeline,
-            control_sweep_pipeline,
-            control_pipeline,
-            exchange_prefix_sweep_pipeline,
-            exchange_prefix_pipeline,
-            exchange_scatter_pipeline,
-            exchange_merge_pipeline,
-            finalize_sweep_pipeline,
-            finalize_pipeline,
-            compact_pipeline,
-        })
+            pipelines,
+        };
+        direct.check_limits(None)?;
+        Ok(direct)
+    }
+
+    /// Checks every pipeline with [`MetalKernel::check_limits`].
+    fn check_limits(&self, round_threads: Option<usize>) -> Result<(), MetalError> {
+        let device_threadgroup_memory = self.device.maxThreadgroupMemoryLength();
+        for kernel in MetalKernel::ALL {
+            let pipeline = self.pipeline(kernel);
+            let limits = PipelineLimits {
+                max_total_threads: pipeline.maxTotalThreadsPerThreadgroup(),
+                static_threadgroup_memory: pipeline.staticThreadgroupMemoryLength(),
+                device_threadgroup_memory,
+            };
+            kernel.check_limits(limits, round_threads)?;
+        }
+        Ok(())
     }
 
     /// T20l fix 2: gathers each arena's live records into a dense buffer and reads that back.
@@ -5047,7 +5197,7 @@ impl DirectMetal {
             let Some((destination, plan_buffer, argument_buffer)) = resource else {
                 continue;
             };
-            encoder.setComputePipelineState(&self.compact_pipeline);
+            encoder.setComputePipelineState(self.pipeline(MetalKernel::CompactGather));
             unsafe {
                 encoder.setBuffer_offset_atIndex(Some(&destination.raw), 0, 0);
                 encoder.setBuffer_offset_atIndex(Some(&source.raw), 0, 1);
@@ -5096,38 +5246,23 @@ impl DirectMetal {
 
     fn run(&self, buffers: &MetalBuffers, config: MetalConfig) -> Result<MetalTiming, MetalError> {
         let round_threads = config.round_threads_per_threadgroup;
-        let execution_width = self.round_pipeline.threadExecutionWidth();
+        let execution_width = self.pipeline(MetalKernel::Round).threadExecutionWidth();
         if !round_threads.is_multiple_of(execution_width) {
             return Err(MetalError::Validation(format!(
                 "round_threads_per_threadgroup must be a multiple of the device execution width \
                  {execution_width}"
             )));
         }
-        let scatter_execution_width = self.exchange_scatter_pipeline.threadExecutionWidth();
+        let scatter_execution_width = self
+            .pipeline(MetalKernel::ExchangeScatter)
+            .threadExecutionWidth();
         if !round_threads.is_multiple_of(scatter_execution_width) {
             return Err(MetalError::Validation(format!(
                 "round_threads_per_threadgroup must be a multiple of the exchange-scatter \
                  execution width {scatter_execution_width}"
             )));
         }
-        let parallel_pipelines = [
-            &self.reset_pipeline,
-            &self.prepare_pipeline,
-            &self.round_pipeline,
-            &self.exchange_scatter_pipeline,
-            &self.exchange_merge_pipeline,
-        ];
-        let supported_threads = parallel_pipelines
-            .iter()
-            .map(|pipeline| pipeline.maxTotalThreadsPerThreadgroup())
-            .min()
-            .unwrap_or(0);
-        if round_threads > supported_threads {
-            return Err(MetalError::Validation(format!(
-                "round_threads_per_threadgroup {round_threads} exceeds the supported maximum \
-                 {supported_threads}"
-            )));
-        }
+        self.check_limits(Some(round_threads))?;
         let wall_started = Instant::now();
         let mut host_encode_submit_ns = 0_u64;
         let mut device_ns = 0_u64;
@@ -5264,7 +5399,7 @@ impl DirectMetal {
             if !buffers.finalize_sweep_required && kernel == AttemptKernel::FinalControlSweep {
                 continue;
             }
-            encoder.setComputePipelineState(self.pipeline(kernel));
+            encoder.setComputePipelineState(self.pipeline(kernel.metal_kernel()));
             match geometry {
                 DispatchGeometry::FixedControl => {
                     encoder.dispatchThreadgroups_threadsPerThreadgroup(control_grid, control_group);
@@ -5288,39 +5423,102 @@ impl DirectMetal {
         }
     }
 
-    fn pipeline(&self, kernel: AttemptKernel) -> &ProtocolObject<dyn MTLComputePipelineState> {
-        match kernel {
-            AttemptKernel::HorizonSweep => &self.horizon_sweep_pipeline,
-            AttemptKernel::Horizon => &self.horizon_pipeline,
-            AttemptKernel::RoundReset => &self.reset_pipeline,
-            AttemptKernel::Compaction => &self.prepare_pipeline,
-            AttemptKernel::DrainExecute => &self.round_pipeline,
-            AttemptKernel::ContinuationControlSweep => &self.control_sweep_pipeline,
-            AttemptKernel::ContinuationControl => &self.control_pipeline,
-            AttemptKernel::ExchangePrefixSweep => &self.exchange_prefix_sweep_pipeline,
-            AttemptKernel::ExchangePrefix => &self.exchange_prefix_pipeline,
-            AttemptKernel::ExchangeScatter => &self.exchange_scatter_pipeline,
-            AttemptKernel::TargetMerge => &self.exchange_merge_pipeline,
-            AttemptKernel::FinalControlSweep => &self.finalize_sweep_pipeline,
-            AttemptKernel::FinalControl => &self.finalize_pipeline,
+    fn pipeline(&self, kernel: MetalKernel) -> &ProtocolObject<dyn MTLComputePipelineState> {
+        &self.pipelines[kernel as usize]
+    }
+}
+
+/// Environment variable that lets the backend run on an Apple7-family GPU anyway, when set to
+/// `1`. It exists only to investigate the incorrect code [`GpuFamilyVerdict::of`] describes:
+/// results on such a GPU are known to be wrong, and a warning says so on standard error.
+const ALLOW_APPLE7_ENV: &str = "DAYS_METAL_ALLOW_APPLE7";
+
+/// What the backend does on a GPU, decided from its Apple GPU family.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GpuFamilyVerdict {
+    /// A GPU the backend runs on.
+    Run,
+    /// A refused GPU, run anyway because [`ALLOW_APPLE7_ENV`] is set; results are known wrong.
+    RunKnownWrong,
+    /// A refused GPU: construction fails before any compilation.
+    Refuse,
+}
+
+impl GpuFamilyVerdict {
+    /// Decides from `supportsFamily` answers, which are cumulative: a device of family N also
+    /// supports every older Apple family.
+    ///
+    /// Apple7-only GPUs (AGX G13, the Apple M1 family) are refused. On them the Metal compiler
+    /// takes about ten minutes on macOS 27.0, and more than fifteen on macOS 15.8, to build the
+    /// `days_round` pipeline, and the code it produces is incorrect: an LP's second transition in
+    /// round 0 reads a stale value from its first and faults with semantic error 25, and with
+    /// streams disabled the run completes with bytes that differ from the Scalar oracle. The same
+    /// kernel source run on the CPU matches Scalar, and removing never-executed handlers from
+    /// `dispatch_event` makes the GPU result correct, which points to the compiler. Measured on an
+    /// Apple M1 Max under macOS 15.8 and 27.0; an Apple M3 (Apple9) and the Apple M5 Max are
+    /// correct. Apple8 (the M2 family) is untested and currently runs.
+    fn of(supports_apple7: bool, supports_apple8: bool, allow_apple7: bool) -> Self {
+        let refused = supports_apple7 && !supports_apple8;
+        match (refused, allow_apple7) {
+            (false, _) => Self::Run,
+            (true, true) => Self::RunKnownWrong,
+            (true, false) => Self::Refuse,
         }
     }
 }
 
-fn create_pipeline(
+/// Refuses an Apple7-family GPU per [`GpuFamilyVerdict::of`], unless [`ALLOW_APPLE7_ENV`] is `1`.
+fn check_gpu_family(device: &ProtocolObject<dyn MTLDevice>) -> Result<(), MetalError> {
+    let allow_apple7 = std::env::var_os(ALLOW_APPLE7_ENV).is_some_and(|value| value == "1");
+    let verdict = GpuFamilyVerdict::of(
+        device.supportsFamily(MTLGPUFamily::Apple7),
+        device.supportsFamily(MTLGPUFamily::Apple8),
+        allow_apple7,
+    );
+    gpu_family_outcome(verdict, &device.name().to_string())
+}
+
+/// Turns a verdict into the construction result, printing the override warning.
+fn gpu_family_outcome(verdict: GpuFamilyVerdict, device_name: &str) -> Result<(), MetalError> {
+    match verdict {
+        GpuFamilyVerdict::Run => Ok(()),
+        GpuFamilyVerdict::RunKnownWrong => {
+            eprintln!(
+                "warning: {ALLOW_APPLE7_ENV}=1: running Metal on {device_name}, an Apple7-family \
+                 GPU whose Metal compiler produces incorrect code for the Days kernels; results \
+                 are known to be wrong"
+            );
+            Ok(())
+        }
+        GpuFamilyVerdict::Refuse => Err(MetalError::Unavailable(format!(
+            "{device_name} is an Apple7-family GPU (the Apple M1 family); the Metal compiler for \
+             this GPU family produces incorrect code for the Days kernels, so the Metal backend \
+             refuses it; use --engine scalar or --engine cpu"
+        ))),
+    }
+}
+
+/// Compiles the MSL source once; every pipeline is created from this one library.
+fn compile_library(
     device: &ProtocolObject<dyn MTLDevice>,
     source: &str,
-    entrypoint: &str,
-) -> Result<MetalPipeline, MetalError> {
+) -> Result<Retained<ProtocolObject<dyn MTLLibrary>>, MetalError> {
     let source = NSString::from_str(source);
-    let library = device
+    device
         .newLibraryWithSource_options_error(&source, None)
         .map_err(|error| {
             MetalError::Unavailable(format!(
-                "MSL compilation failed for {entrypoint}: {}",
+                "MSL compilation failed: {}",
                 error.localizedDescription()
             ))
-        })?;
+        })
+}
+
+fn create_pipeline(
+    device: &ProtocolObject<dyn MTLDevice>,
+    library: &ProtocolObject<dyn MTLLibrary>,
+    entrypoint: &str,
+) -> Result<MetalPipeline, MetalError> {
     let name = NSString::from_str(entrypoint);
     let function = library.newFunctionWithName(&name).ok_or_else(|| {
         MetalError::Unavailable(format!("MSL entry point `{entrypoint}` was not found"))
@@ -5357,11 +5555,13 @@ fn seconds_ns(seconds: f64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ATTEMPT_DISPATCHES, AttemptKernel, DispatchGeometry, LANES,
-        MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER, MAX_ENCODED_PAIRS_PER_WAVE, MetalConfig, MetalError,
-        decode_device_error, encoding_limits,
+        ATTEMPT_DISPATCHES, AttemptKernel, DEFAULT_ROUND_THREADS_PER_THREADGROUP, DispatchGeometry,
+        GpuFamilyVerdict, LANES, MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER, MAX_ENCODED_PAIRS_PER_WAVE,
+        MetalConfig, MetalError, MetalKernel, PipelineLimits, decode_device_error, encoding_limits,
+        gpu_family_outcome,
     };
     use crate::CapacityRetryRecord;
+    use std::collections::BTreeSet;
 
     #[test]
     fn tcp_capacity_fault_identity_decodes_as_a_flow() {
@@ -5406,14 +5606,50 @@ mod tests {
             }
         );
 
-        control[0] = 142;
+        // The kernels write `ERROR_SEMANTIC + 42` = 45 for the order diagnostic.
+        control[0] = 45;
         assert_eq!(
             decode_device_error(&control),
             MetalError::DeviceExecution {
-                code: 142,
+                code: 45,
                 node: None,
             },
             "a channel index must not be displayed as an LP for the order diagnostic",
+        );
+    }
+
+    #[test]
+    fn semantic_fault_decodes_the_word_the_kernels_write() {
+        let source = include_str!("metal_kernels.metal");
+        assert!(source.contains("constant ulong ERROR_SEMANTIC = 3;"));
+        assert!(source.contains("control[C_ERROR] = ERROR_SEMANTIC + 42;"));
+
+        let mut control = vec![0_u64; 20];
+        // An LP semantic fault (here semantic 25, raw 28) keeps the LP it names.
+        control[0] = 28;
+        assert_eq!(
+            decode_device_error(&control),
+            MetalError::DeviceExecution {
+                code: 28,
+                node: Some(crate::NodeId(0)),
+            },
+        );
+        // Raw 45 is semantic 42: its identity slot is never an LP.
+        control[0] = 45;
+        assert_eq!(
+            decode_device_error(&control),
+            MetalError::DeviceExecution {
+                code: 45,
+                node: None,
+            },
+        );
+        control[2] = u64::MAX;
+        assert_eq!(
+            decode_device_error(&control),
+            MetalError::DeviceExecution {
+                code: 45,
+                node: None,
+            },
         );
     }
 
@@ -5520,5 +5756,196 @@ mod tests {
             encoding_limits(MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER),
             (MAX_ENCODED_PAIRS_PER_COMMAND_BUFFER, 64)
         );
+    }
+
+    #[test]
+    fn every_source_kernel_has_exactly_one_pipeline() {
+        for (index, kernel) in MetalKernel::ALL.into_iter().enumerate() {
+            assert_eq!(
+                kernel as usize, index,
+                "{kernel:?} is out of discriminant order"
+            );
+        }
+        let mut source_kernels = include_str!("metal_kernels.metal")
+            .lines()
+            .filter_map(|line| line.strip_prefix("kernel void "))
+            .map(|rest| {
+                rest.split('(')
+                    .next()
+                    .expect("split yields a first piece")
+                    .trim()
+            })
+            .collect::<Vec<_>>();
+        source_kernels.sort_unstable();
+        let mut pipeline_kernels = MetalKernel::ALL.map(MetalKernel::entry_point).to_vec();
+        pipeline_kernels.sort_unstable();
+        pipeline_kernels.dedup();
+        assert_eq!(pipeline_kernels.len(), MetalKernel::ALL.len());
+        assert_eq!(source_kernels, pipeline_kernels);
+    }
+
+    #[test]
+    fn every_pipeline_is_checked_against_its_dispatch_width() {
+        let round_threads = 96;
+        for (attempt, geometry) in ATTEMPT_DISPATCHES {
+            assert_eq!(
+                attempt
+                    .metal_kernel()
+                    .threadgroup_width()
+                    .threads(Some(round_threads)),
+                Some(geometry.threads_per_threadgroup(round_threads)),
+                "{attempt:?} is dispatched with a width its limit check does not use",
+            );
+        }
+        let dispatched = ATTEMPT_DISPATCHES
+            .iter()
+            .map(|(attempt, _)| attempt.metal_kernel().entry_point())
+            .chain([MetalKernel::CompactGather.entry_point()])
+            .collect::<BTreeSet<_>>();
+        let created = MetalKernel::ALL
+            .map(MetalKernel::entry_point)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(dispatched, created);
+
+        for kernel in MetalKernel::ALL {
+            let name = kernel.entry_point();
+            let width = kernel.threadgroup_width();
+            let threads = width
+                .threads(Some(round_threads))
+                .expect("a run knows every width");
+            let fits = PipelineLimits {
+                max_total_threads: threads,
+                static_threadgroup_memory: 32_768,
+                device_threadgroup_memory: 32_768,
+            };
+            assert_eq!(kernel.check_limits(fits, None), Ok(()));
+            assert_eq!(kernel.check_limits(fits, Some(round_threads)), Ok(()));
+
+            let narrow = PipelineLimits {
+                max_total_threads: threads - 1,
+                ..fits
+            };
+            let error = kernel
+                .check_limits(narrow, Some(round_threads))
+                .expect_err("a pipeline narrower than its dispatch must be rejected");
+            assert!(error.to_string().contains(name), "{error}");
+            // Fixed widths are rejected when the pipeline is created.
+            assert_eq!(
+                kernel.check_limits(narrow, None).is_err(),
+                width.threads(None).is_some(),
+                "{name}",
+            );
+
+            let small_memory = PipelineLimits {
+                device_threadgroup_memory: 32_767,
+                ..fits
+            };
+            let error = kernel
+                .check_limits(small_memory, None)
+                .expect_err("threadgroup memory beyond the device limit must be rejected");
+            assert!(
+                matches!(&error, MetalError::Unavailable(message) if message.contains(name)),
+                "{error}",
+            );
+        }
+    }
+
+    #[test]
+    fn apple_m1_limits_accept_the_default_round_width() {
+        // maxTotalThreadsPerThreadgroup and staticThreadgroupMemoryLength per pipeline, measured on
+        // an Apple M1 Max (32 KiB of threadgroup memory).
+        let measured = [
+            (MetalKernel::HorizonSweep, 1_024, 12_288),
+            (MetalKernel::Horizon, 1_024, 12_288),
+            (MetalKernel::RoundReset, 1_024, 8_192),
+            (MetalKernel::RoundPrepare, 1_024, 8_208),
+            (MetalKernel::Round, 384, 0),
+            (MetalKernel::ControlSweep, 1_024, 12_288),
+            (MetalKernel::Control, 1_024, 12_288),
+            (MetalKernel::ExchangePrefixSweep, 1_024, 20_480),
+            (MetalKernel::ExchangePrefix, 1_024, 20_480),
+            (MetalKernel::ExchangeScatter, 1_024, 0),
+            (MetalKernel::ExchangeMerge, 832, 0),
+            (MetalKernel::FinalizeSweep, 1_024, 12_288),
+            (MetalKernel::Finalize, 1_024, 12_288),
+            (MetalKernel::CompactGather, 1_024, 0),
+        ];
+        assert_eq!(measured.map(|(kernel, _, _)| kernel), MetalKernel::ALL);
+        let check_all = |device_threadgroup_memory, round_threads| {
+            measured.into_iter().try_for_each(
+                |(kernel, max_total_threads, static_threadgroup_memory)| {
+                    kernel.check_limits(
+                        PipelineLimits {
+                            max_total_threads,
+                            static_threadgroup_memory,
+                            device_threadgroup_memory,
+                        },
+                        round_threads,
+                    )
+                },
+            )
+        };
+
+        assert_eq!(check_all(32_768, None), Ok(()));
+        assert_eq!(
+            check_all(32_768, Some(DEFAULT_ROUND_THREADS_PER_THREADGROUP)),
+            Ok(())
+        );
+        assert_eq!(check_all(32_768, Some(384)), Ok(()));
+        let error = check_all(32_768, Some(512)).expect_err("days_round supports only 384");
+        assert!(
+            matches!(&error, MetalError::Validation(message) if message.contains("days_round pipeline")),
+            "{error}",
+        );
+        // 16 KiB covers the 12 KiB control scans but not the 20 KiB exchange-prefix scans.
+        let error = check_all(16_384, None).expect_err("the exchange prefix needs 20 KiB");
+        assert!(
+            matches!(
+                &error,
+                MetalError::Unavailable(message) if message.contains("days_exchange_prefix_sweep")
+            ),
+            "{error}",
+        );
+    }
+
+    #[test]
+    fn apple7_only_gpus_are_refused_before_compilation() {
+        use GpuFamilyVerdict::{Refuse, Run, RunKnownWrong};
+
+        // (supports Apple7, supports Apple8) for: a non-Apple GPU, Apple7 (M1), Apple8 (M2), and
+        // Apple9 or Apple10 (M3 and later), which also answer yes for every older family.
+        let non_apple = (false, false);
+        let apple7 = (true, false);
+        let apple8_or_newer = (true, true);
+        for allow in [false, true] {
+            assert_eq!(GpuFamilyVerdict::of(non_apple.0, non_apple.1, allow), Run);
+            assert_eq!(
+                GpuFamilyVerdict::of(apple8_or_newer.0, apple8_or_newer.1, allow),
+                Run
+            );
+        }
+        assert_eq!(GpuFamilyVerdict::of(apple7.0, apple7.1, false), Refuse);
+        assert_eq!(
+            GpuFamilyVerdict::of(apple7.0, apple7.1, true),
+            RunKnownWrong
+        );
+
+        assert_eq!(gpu_family_outcome(Run, "Apple M5 Max"), Ok(()));
+        assert_eq!(gpu_family_outcome(RunKnownWrong, "Apple M1 Max"), Ok(()));
+        let error = gpu_family_outcome(Refuse, "Apple M1 Max")
+            .expect_err("an Apple7-family GPU must be refused");
+        let MetalError::Unavailable(message) = &error else {
+            panic!("expected Unavailable, got {error:?}");
+        };
+        for expected in [
+            "Apple M1 Max",
+            "Apple7",
+            "produces incorrect code for the Days kernels",
+            "--engine scalar",
+            "--engine cpu",
+        ] {
+            assert!(message.contains(expected), "{message}");
+        }
     }
 }
