@@ -3808,7 +3808,30 @@ fn mix_seed(mut value: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::parsed_decimal;
+    use super::{FlowInput, parsed_decimal};
+
+    /// `FlowInput` is held once per flow, sorted and moved through lowering, so its size is a
+    /// per-flow memory and memory-movement cost: at the 262,144-flow frontier every 100 B is
+    /// 26 MB. Before P14 (`main` at 948a0e9) it was 480 B, carrying the stage sidecar inline as an
+    /// 80 B `Option<CollectiveStageInput>`. P14's collective and compute sidecars, inline and
+    /// holding their predecessors' full `FlowKey`s by value, grew it to 1,224 B at 6cc395c
+    /// (1,656 B before P14 coll keyed stages by ordinal) although most flows have neither sidecar.
+    /// Each sidecar is now one boxed pointer, so a flow without stages pays 16 B for both:
+    /// `FlowKey` 192 + source and target 16 + `TrafficKey` 144 + two sidecar pointers 16 +
+    /// priority 1 = 369, padded to 376 B.
+    ///
+    /// Layout is the compiler's choice, so the bound is an upper bound on 64-bit targets.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn flow_input_carries_its_stage_sidecars_out_of_line() {
+        const FLOW_INPUT_MAX_BYTES: usize = 376;
+        let size = std::mem::size_of::<FlowInput>();
+        assert!(
+            size <= FLOW_INPUT_MAX_BYTES,
+            "FlowInput grew to {size} B, above {FLOW_INPUT_MAX_BYTES} B: keep per-flow sidecars \
+             boxed so flows without stages do not pay for them"
+        );
+    }
 
     #[test]
     fn nonzero_decimal_exponents_outside_i64_keep_directional_errors() {
