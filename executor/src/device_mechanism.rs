@@ -15,7 +15,45 @@
 //! is otherwise unused and DCQCN adds no words to any plane. Words 4..6 remain zero because the
 //! readback reads them as the TCP receive-range metadata.
 
-use crate::{DcqcnGenerator, DcqcnIncreaseStage, DcqcnReceiverState};
+use crate::{
+    DcqcnGenerator, DcqcnIncreaseStage, DcqcnReceiverState, FlowGeneratorKind, PacketKind,
+    SimulationImage,
+};
+
+/// Mechanism bit: some host holds a DCQCN notification point, so a receiver row can carry a
+/// DCQCN marker. Without it every receiver-row marker is a TCP `1` or an unused `0` for the whole
+/// run: only image receivers create the markers `2` and `3`, and no transition writes one.
+pub(crate) const MECHANISM_DCQCN_RECEIVERS: u64 = 1;
+/// Mechanism bit: the image holds DCQCN state of any kind (a reaction-point generator, a
+/// notification point, or a resident CNP or control-timer packet). Without it no DCQCN packet
+/// exists or can be created, so every DCQCN transition branch is dead for the whole run.
+pub(crate) const MECHANISM_DCQCN: u64 = 2;
+
+/// The P14 mechanisms a device run can exercise, derived from the image alone. Host-side only:
+/// it selects the round kernel and is never planned into a device plane.
+pub(crate) fn mechanism_flags(image: &SimulationImage) -> u64 {
+    let receivers = image
+        .host_states
+        .iter()
+        .any(|state| !state.dcqcn_receivers.is_empty());
+    let dcqcn = receivers
+        || image
+            .host_states
+            .iter()
+            .flat_map(|state| &state.generators)
+            .any(|generator| matches!(generator.kind, FlowGeneratorKind::Dcqcn(_)))
+        || image.initial_packets.iter().any(|packet| {
+            matches!(
+                packet.kind,
+                PacketKind::DcqcnCnp(_) | PacketKind::DcqcnControlTimer
+            )
+        });
+    (if receivers {
+        MECHANISM_DCQCN_RECEIVERS
+    } else {
+        0
+    }) | (if dcqcn { MECHANISM_DCQCN } else { 0 })
+}
 
 pub(crate) const GENERATOR_KIND_DCQCN: u64 = 3;
 
@@ -228,6 +266,120 @@ mod tests {
             controller,
             control_timer_payload: PayloadId(21),
             cnp_size_bytes: 22,
+        }
+    }
+
+    fn host(generators: Vec<crate::FlowGeneratorState>) -> crate::HostState {
+        crate::HostState {
+            egress_link: crate::LinkId(0),
+            queue: std::collections::VecDeque::new(),
+            in_service: None,
+            tx_ready_pending: false,
+            generators,
+            tcp_receivers: Vec::new(),
+            dcqcn_receivers: Vec::new(),
+            next_origin_seq: 0,
+            next_payload_seq: 0,
+            sourced_packets: 0,
+            departed_packets: 0,
+            received_packets: 0,
+        }
+    }
+
+    fn generator_state(kind: FlowGeneratorKind) -> crate::FlowGeneratorState {
+        crate::FlowGeneratorState {
+            flow: FlowId(0),
+            packets_emitted: 0,
+            bytes_emitted: 0,
+            next_emission: crate::ScheduledEmission {
+                status: crate::GeneratorStatus::Finished,
+                departure_time_ns: 0,
+                payload: PayloadId(0),
+            },
+            rng_state: 0,
+            feedback: crate::GeneratorFeedbackState {
+                arrivals: 0,
+                outstanding_bytes: 0,
+                unacknowledged_bytes: 0,
+            },
+            kind,
+            stage: None,
+        }
+    }
+
+    fn image(host_states: Vec<crate::HostState>, packets: Vec<PacketKind>) -> SimulationImage {
+        SimulationImage {
+            stop_time_ns: 0,
+            nodes: Vec::new(),
+            host_states,
+            switch_states: Vec::new(),
+            flows: Vec::new(),
+            initial_packets: packets
+                .into_iter()
+                .enumerate()
+                .map(|(index, kind)| crate::PacketDescriptor {
+                    id: PayloadId(index as u64),
+                    flow: FlowId(0),
+                    size_bytes: 0,
+                    ecn_marked: false,
+                    kind,
+                })
+                .collect(),
+            links: Vec::new(),
+            channels: Vec::new(),
+            initial_events: Vec::new(),
+            seed: 0,
+        }
+    }
+
+    /// Each source of DCQCN state sets exactly its bits; an image without any plans zero.
+    #[test]
+    fn mechanism_flags_follow_the_image_dcqcn_state() {
+        let rate = generator().rate;
+        assert_eq!(
+            mechanism_flags(&image(vec![host(Vec::new())], Vec::new())),
+            0
+        );
+        assert_eq!(
+            mechanism_flags(&image(
+                vec![host(vec![generator_state(FlowGeneratorKind::Rate(rate))])],
+                vec![PacketKind::Data, PacketKind::Feedback],
+            )),
+            0
+        );
+
+        let mut receiver_host = host(Vec::new());
+        receiver_host.dcqcn_receivers.push(DcqcnReceiverState {
+            flow: FlowId(0),
+            cnp_interval_ns: 1,
+            cnp_size_bytes: 64,
+            last_cnp_time_ns: None,
+        });
+        assert_eq!(
+            mechanism_flags(&image(vec![host(Vec::new()), receiver_host], Vec::new())),
+            MECHANISM_DCQCN_RECEIVERS | MECHANISM_DCQCN
+        );
+
+        assert_eq!(
+            mechanism_flags(&image(
+                vec![host(vec![generator_state(FlowGeneratorKind::Dcqcn(
+                    generator()
+                ))])],
+                Vec::new(),
+            )),
+            MECHANISM_DCQCN
+        );
+        for resident in [
+            PacketKind::DcqcnCnp(crate::DcqcnCnpHeader {
+                trigger_payload: PayloadId(0),
+            }),
+            PacketKind::DcqcnControlTimer,
+        ] {
+            assert_eq!(
+                mechanism_flags(&image(vec![host(Vec::new())], vec![resident])),
+                MECHANISM_DCQCN,
+                "{resident:?}"
+            );
         }
     }
 
