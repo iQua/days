@@ -1002,10 +1002,12 @@ where
 
 /// [`compute_shortest_path_route_table`] with an explicit host-thread budget.
 ///
-/// The budget is invisible in the result. Flows are partitioned by submission index into at most
-/// `workers` contiguous chunks, each worker writes only its own disjoint slice, and the reported
-/// error is still the first failing submission position rather than the first one a thread happens
-/// to reach.
+/// The budget is invisible in the result. On a canonical fat tree, flow positions are grouped by
+/// source switch and cut into at most `workers` contiguous parts of equal estimated work; each
+/// worker returns its part's routes and the submitter writes them to their positions. On any other
+/// graph, flows are partitioned by submission index into at most `workers` contiguous chunks and
+/// each worker writes only its own disjoint slice. Either way the reported error is still the
+/// first failing submission position rather than the first one a thread happens to reach.
 pub fn compute_shortest_path_route_table_with<K>(
     graph: &UnGraph<usize, ()>,
     flows: impl IntoIterator<Item = (K, NodeIndex, NodeIndex)>,
@@ -1851,11 +1853,20 @@ mod tests {
             .map(|target| (target, NodeIndex::new(0), NodeIndex::new(target)))
             .collect::<Vec<_>>();
         let workers = RouteWorkers::new(MAX_ROUTE_WORKERS);
-        // Without this the assertions below could hold vacuously on a serial partition.
+        // Without this the assertions below could hold vacuously on a serial partition. A
+        // canonical fat tree's table cuts the source-grouped flows with `source_group_parts`: all
+        // eight share source 0, so the tree (20 + 2 x 32 = 84) and eight route reads (5 each) cut
+        // at weights 0, 89, 94..119 into parts {0}, {1}, {2, 3, 4}, {5, 6, 7}.
+        let endpoints = flows
+            .iter()
+            .map(|&(_, source, target)| (source, target))
+            .collect::<Vec<_>>();
+        let grouped = (0..endpoints.len()).collect::<Vec<_>>();
+        let tree_weight = graph.node_count() as u128 + 2 * graph.edge_count() as u128;
         assert_eq!(
-            route_chunk_count(flows.len(), workers),
-            8,
-            "this budget must actually spread the eight flows over eight worker threads"
+            source_group_parts(&endpoints, &grouped, tree_weight, workers).len(),
+            4,
+            "this budget must actually spread the eight flows over four worker threads"
         );
         FAT_TREE_LAYOUT_CHECKS.with(|checks| checks.set(0));
 
