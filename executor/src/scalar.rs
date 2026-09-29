@@ -7,6 +7,7 @@ use std::fmt;
 use num_bigint::BigUint;
 use num_rational::Ratio;
 
+use crate::stage_index::{HostStageIndex, HostStageSlot, ProbedTable, StageScanProbe};
 use crate::{
     Event, EventKey, EventKind, FlowGeneratorKind, FlowId, GeneratorFeedbackAction,
     GeneratorStatus, GeneratorTermination, HostState, LinkId, NodeDescriptor, NodeId, NodeKind,
@@ -399,24 +400,100 @@ fn collective_progress_record(
     }
 }
 
-/// Whether a dependency-blocked stage has just had both prerequisites satisfied.
-fn stage_ready_to_activate(generator: &crate::FlowGeneratorState) -> bool {
-    generator.next_emission.status == GeneratorStatus::Blocked
-        && generator
-            .stage
-            .is_some_and(|stage| !stage.activated && stage.dependencies.prerequisites_complete())
+/// A host's state as the stage path may touch it.
+///
+/// The stage-path functions (listed in `xtask`'s `STAGE_PATH_FUNCTIONS`) receive this view from
+/// `host_parts_mut`, never the raw `HostState`: its two tables are `ProbedTable`s, so any scan of
+/// them is counted by the stage-scan probe, and the `xtask` stage-path audit rejects raw access.
+/// The other fields are the host's own, borrowed in place.
+struct HostView<'a> {
+    generators: ProbedTable<'a, crate::FlowGeneratorState>,
+    tcp_receivers: ProbedTable<'a, crate::TcpReceiverState>,
+    queue: &'a mut std::collections::VecDeque<PayloadId>,
+    in_service: &'a mut Option<PayloadId>,
+    tx_ready_pending: &'a mut bool,
+    next_payload_seq: &'a mut u64,
+    sourced_packets: &'a mut u64,
+    received_packets: &'a mut u64,
+}
+
+/// The collective progress one event produced, taken by flow in push order.
+///
+/// The stage path pushes causes here as it records them, and reads them back only through `take`
+/// and `into_remaining`, which count what they examine. `take` replaces
+/// `causes.iter().position(|cause| cause.flow == flow)` followed by `causes.remove`: it returns the
+/// first cause for `flow` not yet taken, which is the first match the shrinking vector held.
+/// `into_remaining` yields the causes never taken in push order, the order the shrinking vector
+/// kept.
+#[derive(Default)]
+struct PendingCauses {
+    causes: Vec<Option<PendingCollectiveProgress>>,
+    /// `(flow, push position)` of every cause; sorted by flow and then push position before the
+    /// first `take` after a push.
+    by_flow: Vec<(FlowId, usize)>,
+    sorted: bool,
+}
+
+impl PendingCauses {
+    fn push(&mut self, cause: PendingCollectiveProgress) {
+        self.by_flow.push((cause.flow, self.causes.len()));
+        self.causes.push(Some(cause));
+        self.sorted = false;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.causes.is_empty()
+    }
+
+    fn take(
+        &mut self,
+        flow: FlowId,
+        probe: &mut StageScanProbe,
+    ) -> Option<PendingCollectiveProgress> {
+        if !self.sorted {
+            // Push positions are unique, so the unstable sort is deterministic.
+            self.by_flow.sort_unstable();
+            self.sorted = true;
+        }
+        let start = self.by_flow.partition_point(|(key, _)| *key < flow);
+        let mut examined = 1_usize;
+        for &(key, position) in &self.by_flow[start..] {
+            if key != flow {
+                break;
+            }
+            if let Some(cause) = self.causes[position].take() {
+                probe.note(examined);
+                return Some(cause);
+            }
+            examined += 1;
+        }
+        probe.note(examined);
+        None
+    }
+
+    fn into_remaining(
+        self,
+        probe: &mut StageScanProbe,
+    ) -> impl Iterator<Item = PendingCollectiveProgress> {
+        probe.note(self.causes.len());
+        self.causes.into_iter().flatten()
+    }
 }
 
 /// Marks every stage whose local predecessor is `completed` as locally complete.
 ///
-/// Causes are pushed in canonical `FlowId` order, the order of the host's generator table.
+/// Causes are pushed in canonical `FlowId` order, the order of the host's generator table: the
+/// index lists exactly the stages naming `completed` as their local predecessor, in table order.
 fn complete_local_successors(
-    generators: &mut [crate::FlowGeneratorState],
+    generators: &mut ProbedTable<'_, crate::FlowGeneratorState>,
+    index: &mut HostStageIndex,
     completed: FlowId,
     completion: CompletionSignal,
-    causes: &mut Vec<PendingCollectiveProgress>,
+    causes: &mut PendingCauses,
 ) {
-    for successor in generators {
+    let (successors, releasable) = index.local_successors_of(completed);
+    for &position in successors {
+        let successor = &mut generators[position];
         let Some(mut dependencies) = successor.stage_dependencies() else {
             continue;
         };
@@ -439,6 +516,7 @@ fn complete_local_successors(
         });
         dependencies.local_predecessor_complete = true;
         successor.set_stage_dependencies(dependencies);
+        releasable.refresh(position, successor);
     }
 }
 
@@ -455,15 +533,18 @@ enum InboundProgress {
     },
 }
 
-/// Advances every stage waiting on `inbound` as its inbound predecessor.
+/// Advances every stage waiting on `inbound` as its inbound predecessor, in table order.
 fn record_inbound_progress(
-    generators: &mut [crate::FlowGeneratorState],
+    generators: &mut ProbedTable<'_, crate::FlowGeneratorState>,
+    index: &mut HostStageIndex,
     inbound: FlowId,
     progress: InboundProgress,
     node: NodeId,
-    causes: &mut Vec<PendingCollectiveProgress>,
+    causes: &mut PendingCauses,
 ) -> Result<(), ExecutionError> {
-    for generator in generators {
+    let (successors, releasable) = index.inbound_successors_of(inbound);
+    for &position in successors {
+        let generator = &mut generators[position];
         let Some(mut dependencies) = generator.stage_dependencies() else {
             continue;
         };
@@ -501,6 +582,7 @@ fn record_inbound_progress(
             dependencies.inbound_predecessor_complete = true;
         }
         generator.set_stage_dependencies(dependencies);
+        releasable.refresh(position, generator);
     }
     Ok(())
 }
@@ -715,6 +797,18 @@ pub fn run_scalar_with_observations(
     exclusive_horizon_ns: Option<u64>,
     observation_mode: ObservationMode,
 ) -> Result<RunResult, ExecutionError> {
+    let (transitions, pending_events) =
+        run_scalar_events(image, exclusive_horizon_ns, observation_mode, |_, _| {})?;
+    Ok(transitions.finish(pending_events))
+}
+
+/// The Scalar event loop, handing `after_dispatch` the transition state after every event.
+fn run_scalar_events<'image>(
+    image: &'image SimulationImage,
+    exclusive_horizon_ns: Option<u64>,
+    observation_mode: ObservationMode,
+    mut after_dispatch: impl FnMut(&TransitionState<'image>, Event),
+) -> Result<(TransitionState<'image>, Vec<Event>), ExecutionError> {
     let mut transitions = TransitionState::new(image, observation_mode)?;
     let mut events = initial_event_queue(image)?;
     let mut children = Vec::new();
@@ -728,6 +822,7 @@ pub fn run_scalar_with_observations(
             .pop_first()
             .expect("first_key_value established a pending event");
         transitions.dispatch(event, &mut children)?;
+        after_dispatch(&transitions, event);
         transitions.take_superseded_timers(&mut superseded);
         for timer in superseded.drain(..) {
             remove_superseded_timer(&mut events, timer)?;
@@ -739,7 +834,94 @@ pub fn run_scalar_with_observations(
         }
     }
 
-    Ok(transitions.finish(events.into_values().collect()))
+    Ok((transitions, events.into_values().collect()))
+}
+
+/// Test hook: a Scalar run with the number of events it dispatched and the number of
+/// generator-table, TCP-receiver-table, index and pending-cause entries its stage path examined.
+///
+/// The run itself is `run_scalar_with_observations`; the probe only counts.
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+pub fn run_scalar_counting_stage_scans_for_testing(
+    image: &SimulationImage,
+    observation_mode: ObservationMode,
+) -> Result<(RunResult, u64, u64), ExecutionError> {
+    let (transitions, pending_events) =
+        run_scalar_events(image, None, observation_mode, |_, _| {})?;
+    let dispatches = transitions.stage_probe.dispatches();
+    let visits = transitions
+        .host_indices
+        .iter()
+        .map(HostStageSlot::visits)
+        .fold(transitions.stage_probe.visits(), u64::saturating_add);
+    Ok((transitions.finish(pending_events), dispatches, visits))
+}
+
+/// Proves that the keyed stage path answers every query as the retired scans did, on `image`
+/// and after every event of a Scalar run over it.
+///
+/// This is the P14 scan equality gate. On the image, every host's index is compared with the
+/// retained scans (`stage_index::legacy_scans`) for every flow of the image; after each event, the
+/// index of the host the event targeted — the only host a transition mutates — must equal a fresh
+/// derivation from that host's state, and answer every flow its tables name as the scans do. The
+/// run stops at `exclusive_horizon_ns` when given. The images need not validate: a run the executor
+/// rejects part-way is checked up to its failing event. Returns the first disagreement, or else
+/// the run's own outcome, which the caller compares with `run_scalar_with_observations`.
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+pub fn assert_scalar_stage_index_equivalent_for_testing(
+    image: &SimulationImage,
+    exclusive_horizon_ns: Option<u64>,
+) -> Result<Result<RunResult, ExecutionError>, String> {
+    use crate::stage_index::check_host_index;
+
+    let image_flows = image.flows.iter().map(|flow| flow.id).collect::<Vec<_>>();
+    let initial = match TransitionState::new(image, ObservationMode::Full) {
+        Ok(initial) => initial,
+        Err(error) => return Ok(Err(error)),
+    };
+    for (slot, (state, index)) in initial
+        .host_states
+        .iter()
+        .zip(&initial.host_indices)
+        .enumerate()
+    {
+        check_host_index(state, index.index(), image_flows.iter().copied())
+            .map_err(|mismatch| format!("host slot {slot} of the image: {mismatch}"))?;
+    }
+    let mut first_mismatch = None;
+    let run = run_scalar_events(
+        image,
+        exclusive_horizon_ns,
+        ObservationMode::Full,
+        |transitions, event| {
+            if first_mismatch.is_some() {
+                return;
+            }
+            let Ok(node) = transitions.node(event.target) else {
+                return;
+            };
+            if node.kind != NodeKind::Host {
+                return;
+            }
+            let slot = node.state_slot as usize;
+            if let Err(mismatch) = check_host_index(
+                &transitions.host_states[slot],
+                transitions.host_indices[slot].index(),
+                [],
+            ) {
+                first_mismatch = Some(format!(
+                    "host {:?} after event {:?}: {mismatch}",
+                    node.id, event.key
+                ));
+            }
+        },
+    );
+    if let Some(mismatch) = first_mismatch {
+        return Err(mismatch);
+    }
+    Ok(run.map(|(transitions, pending_events)| transitions.finish(pending_events)))
 }
 
 pub(crate) struct TransitionState<'image> {
@@ -765,6 +947,11 @@ pub(crate) struct TransitionState<'image> {
     /// buffer carries the eager-removal obligation across that boundary and is drained by the
     /// queue owner immediately after every dispatch.
     superseded_timers: Vec<SupersededTimer>,
+    /// Executor-local keyed views of each host's generator and TCP-receiver tables, parallel to
+    /// `host_states`; derived on construction and never serialized.
+    host_indices: Vec<HostStageSlot>,
+    /// Test-only dispatch and pending-cause counts; empty in production builds.
+    stage_probe: StageScanProbe,
 }
 
 /// Identity of a retransmission-timeout event that stopped being a flow's armed timer.
@@ -976,6 +1163,7 @@ impl<'image> TransitionState<'image> {
         }
 
         let host_states = image.host_states.clone();
+        let host_indices = host_states.iter().map(HostStageSlot::build).collect();
         let switch_states = image.switch_states.clone();
         let switch_queue_bytes = derive_switch_queue_bytes(image, &switch_states, None, &packets)?;
 
@@ -996,6 +1184,8 @@ impl<'image> TransitionState<'image> {
             mechanism_transitions: Vec::new(),
             tcp_sent_segments,
             superseded_timers: Vec::new(),
+            host_indices,
+            stage_probe: StageScanProbe::default(),
         })
     }
 
@@ -1072,6 +1262,7 @@ impl<'image> TransitionState<'image> {
 
         let switch_queue_bytes =
             derive_switch_queue_bytes(image, &switch_states, Some(node), &resident)?;
+        let host_indices = host_states.iter().map(HostStageSlot::build).collect();
 
         Ok(Self {
             image,
@@ -1090,6 +1281,8 @@ impl<'image> TransitionState<'image> {
             mechanism_transitions: Vec::new(),
             tcp_sent_segments,
             superseded_timers: Vec::new(),
+            host_indices,
+            stage_probe: StageScanProbe::default(),
         })
     }
 
@@ -1253,6 +1446,7 @@ impl<'image> TransitionState<'image> {
                 event_kind: event.kind,
             },
         )?;
+        self.stage_probe.note_dispatch();
 
         match handler {
             TransitionHandler::HostPacketArrival => self.host_packet_arrival(node, event, children),
@@ -1278,11 +1472,10 @@ impl<'image> TransitionState<'image> {
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
         let packet = self.packet(event.payload)?;
-        let owns_generator = self
-            .host_state(node)?
-            .generators
-            .iter()
-            .any(|generator| generator.flow == packet.flow);
+        let owns_generator = {
+            let (_, index) = self.host_parts_mut(node)?;
+            index.first_generator(packet.flow).is_some()
+        };
         if !owns_generator {
             return self.host_preloaded_packet_arrival(node, event, children);
         }
@@ -1293,15 +1486,14 @@ impl<'image> TransitionState<'image> {
         let (next_packet, next_departure_ns, schedule_ready) = {
             let stop_time_ns = self.image.stop_time_ns;
             let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
-            let state = self.host_state_mut(node)?;
-            let generator_index = state
-                .generators
-                .iter()
-                .position(|generator| generator.flow == packet.flow)
-                .ok_or(ExecutionError::UnknownGenerator {
-                    node: node.id,
-                    flow: packet.flow,
-                })?;
+            let (mut state, index) = self.host_parts_mut(node)?;
+            let generator_index =
+                index
+                    .first_generator(packet.flow)
+                    .ok_or(ExecutionError::UnknownGenerator {
+                        node: node.id,
+                        flow: packet.flow,
+                    })?;
             let (constant, candidate_departure_ns, next_departure_ns, next_status) = {
                 let generator = &mut state.generators[generator_index];
                 if generator.next_emission.status != GeneratorStatus::Scheduled
@@ -1362,9 +1554,9 @@ impl<'image> TransitionState<'image> {
                 )
             };
             let next_packet = if let Some(next_departure_ns) = next_departure_ns {
-                let payload = allocate_payload_id(node.id, node_count, state.next_payload_seq)
+                let payload = allocate_payload_id(node.id, node_count, *state.next_payload_seq)
                     .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
-                state.next_payload_seq = state
+                *state.next_payload_seq = state
                     .next_payload_seq
                     .checked_add(1)
                     .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
@@ -1390,12 +1582,12 @@ impl<'image> TransitionState<'image> {
                 None
             };
 
-            state.sourced_packets = state
+            *state.sourced_packets = state
                 .sourced_packets
                 .checked_add(1)
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
-            let schedule_ready = if state.in_service.is_none() && !state.tx_ready_pending {
-                state.tx_ready_pending = true;
+            let schedule_ready = if state.in_service.is_none() && !*state.tx_ready_pending {
+                *state.tx_ready_pending = true;
                 true
             } else {
                 false
@@ -1440,35 +1632,33 @@ impl<'image> TransitionState<'image> {
         &mut self,
         node: NodeDescriptor,
         parent: Event,
-        mut causes: Vec<PendingCollectiveProgress>,
+        mut causes: PendingCauses,
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
         let mut ordinal = 0_u64;
         loop {
             let flow = {
-                let state = self.host_state_mut(node)?;
-                let Some(generator) = state
-                    .generators
-                    .iter_mut()
-                    .find(|generator| stage_ready_to_activate(generator))
-                else {
+                let (mut state, index) = self.host_parts_mut(node)?;
+                // The first stage in table order that is ready to activate.
+                let Some(position) = index.first_ready(&state.generators) else {
                     break;
                 };
+                let generator = &mut state.generators[position];
                 generator
                     .stage
                     .as_mut()
                     .expect("a ready stage carries its record")
                     .activated = true;
+                index.refresh_releasable(position, generator);
                 generator.flow
             };
-            let Some(cause_index) = causes.iter().position(|cause| cause.flow == flow) else {
+            let Some(cause) = causes.take(flow, &mut self.stage_probe) else {
                 return Err(ExecutionError::UnexpectedGeneratorEmission {
                     node: node.id,
                     flow,
                     payload: parent.payload,
                 });
             };
-            let cause = causes.remove(cause_index);
             self.activate_wrapped_stage(node, parent, flow, cause, ordinal, children)?;
             ordinal = ordinal
                 .checked_add(1)
@@ -1476,7 +1666,7 @@ impl<'image> TransitionState<'image> {
         }
         // Progress that did not release a stage is recorded after every release of this event,
         // in canonical cause order.
-        for cause in causes {
+        for cause in causes.into_remaining(&mut self.stage_probe) {
             self.push_stage_progress(node, parent, cause.flow, cause, ordinal, false)?;
             ordinal = ordinal
                 .checked_add(1)
@@ -1498,24 +1688,22 @@ impl<'image> TransitionState<'image> {
         ordinal: u64,
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
-        let (kind, compute_duration) = self
-            .host_state(node)?
-            .generators
-            .iter()
-            .find(|generator| generator.flow == flow)
-            .map(|generator| {
-                (
-                    generator.kind,
-                    generator.stage.and_then(|stage| match stage.role {
-                        crate::StageRole::Compute(compute) => Some(compute.duration_ns),
-                        crate::StageRole::Collective(_) => None,
-                    }),
-                )
-            })
-            .ok_or(ExecutionError::UnknownGenerator {
-                node: node.id,
-                flow,
-            })?;
+        let (kind, compute_duration) = {
+            let (state, index) = self.host_parts_mut(node)?;
+            let generator = &state.generators[index.first_generator(flow).ok_or(
+                ExecutionError::UnknownGenerator {
+                    node: node.id,
+                    flow,
+                },
+            )?];
+            (
+                generator.kind,
+                generator.stage.and_then(|stage| match stage.role {
+                    crate::StageRole::Compute(compute) => Some(compute.duration_ns),
+                    crate::StageRole::Collective(_) => None,
+                }),
+            )
+        };
         if let (FlowGeneratorKind::Constant(_), Some(duration_ns)) = (kind, compute_duration) {
             return self.start_compute_stage(
                 node,
@@ -1562,11 +1750,11 @@ impl<'image> TransitionState<'image> {
             .checked_add(duration_ns)
             .ok_or(ExecutionError::GeneratorTimeOverflow(flow))?;
         let token = {
-            let state = self.host_state_mut(node)?;
+            let (mut state, index) = self.host_parts_mut(node)?;
             let payload = if deadline_ns <= stop_time_ns {
-                let payload = allocate_payload_id(node.id, node_count, state.next_payload_seq)
+                let payload = allocate_payload_id(node.id, node_count, *state.next_payload_seq)
                     .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
-                state.next_payload_seq = state
+                *state.next_payload_seq = state
                     .next_payload_seq
                     .checked_add(1)
                     .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
@@ -1574,14 +1762,12 @@ impl<'image> TransitionState<'image> {
             } else {
                 None
             };
-            let generator = state
-                .generators
-                .iter_mut()
-                .find(|generator| generator.flow == flow)
-                .ok_or(ExecutionError::UnknownGenerator {
+            let generator = &mut state.generators[index.first_generator(flow).ok_or(
+                ExecutionError::UnknownGenerator {
                     node: node.id,
                     flow,
-                })?;
+                },
+            )?];
             generator.next_emission = crate::ScheduledEmission {
                 status: if payload.is_some() {
                     GeneratorStatus::Scheduled
@@ -1628,17 +1814,15 @@ impl<'image> TransitionState<'image> {
         flow: FlowId,
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
-        let mut causes = Vec::new();
+        let mut causes = PendingCauses::default();
         {
-            let state = self.host_state_mut(node)?;
-            let generator = state
-                .generators
-                .iter_mut()
-                .find(|generator| generator.flow == flow)
-                .ok_or(ExecutionError::UnknownGenerator {
+            let (mut state, index) = self.host_parts_mut(node)?;
+            let generator = &mut state.generators[index.first_generator(flow).ok_or(
+                ExecutionError::UnknownGenerator {
                     node: node.id,
                     flow,
-                })?;
+                },
+            )?];
             if generator.next_emission.status != GeneratorStatus::Scheduled
                 || generator.next_emission.payload != event.payload
                 || generator.next_emission.departure_time_ns != event.key.time_ns
@@ -1665,7 +1849,7 @@ impl<'image> TransitionState<'image> {
                 origin_ns: event.key.time_ns - duration_ns,
                 delay_ns: duration_ns,
             };
-            complete_local_successors(&mut state.generators, flow, completion, &mut causes);
+            complete_local_successors(&mut state.generators, index, flow, completion, &mut causes);
         }
         self.mark_terminal(event.payload)?;
         if !causes.is_empty() {
@@ -1688,15 +1872,13 @@ impl<'image> TransitionState<'image> {
             return Ok(());
         }
         let stop_time_ns = self.image.stop_time_ns;
-        let generator = self
-            .host_state(node)?
-            .generators
-            .iter()
-            .find(|generator| generator.flow == flow)
-            .ok_or(ExecutionError::UnknownGenerator {
+        let (state, index) = self.host_parts_mut(node)?;
+        let generator = &state.generators[index.first_generator(flow).ok_or(
+            ExecutionError::UnknownGenerator {
                 node: node.id,
                 flow,
-            })?;
+            },
+        )?];
         let record = collective_progress_record(
             CollectiveProgressContext {
                 key: parent.key,
@@ -1728,15 +1910,13 @@ impl<'image> TransitionState<'image> {
     ) -> Result<(), ExecutionError> {
         self.set_source_time(event.payload, event.key.time_ns)?;
         {
-            let state = self.host_state_mut(node)?;
-            let generator = state
-                .generators
-                .iter_mut()
-                .find(|generator| generator.flow == packet.flow)
-                .ok_or(ExecutionError::UnknownGenerator {
+            let (mut state, index) = self.host_parts_mut(node)?;
+            let generator = &mut state.generators[index.first_generator(packet.flow).ok_or(
+                ExecutionError::UnknownGenerator {
                     node: node.id,
                     flow: packet.flow,
-                })?;
+                },
+            )?];
             let FlowGeneratorKind::Tcp(mut tcp) = generator.kind else {
                 return Err(ExecutionError::UnexpectedGeneratorEmission {
                     node: node.id,
@@ -1778,7 +1958,7 @@ impl<'image> TransitionState<'image> {
             generator.feedback.unacknowledged_bytes = tcp.bytes_in_flight;
             generator.next_emission.status = GeneratorStatus::Blocked;
             generator.kind = FlowGeneratorKind::Tcp(tcp);
-            state.sourced_packets = state
+            *state.sourced_packets = state
                 .sourced_packets
                 .checked_add(1)
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
@@ -2563,15 +2743,13 @@ impl<'image> TransitionState<'image> {
         }
         let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
         let (ack_payload, acknowledgment, ack_size_bytes, stage_causes) = {
-            let state = self.host_state_mut(node)?;
-            let receiver = state
-                .tcp_receivers
-                .iter_mut()
-                .find(|receiver| receiver.flow == packet.flow)
-                .ok_or(ExecutionError::UnknownGenerator {
+            let (mut state, index) = self.host_parts_mut(node)?;
+            let receiver = &mut state.tcp_receivers[index.first_receiver(packet.flow).ok_or(
+                ExecutionError::UnknownGenerator {
                     node: node.id,
                     flow: packet.flow,
-                })?;
+                },
+            )?];
             let end = header
                 .sequence
                 .checked_add(packet.size_bytes)
@@ -2582,9 +2760,10 @@ impl<'image> TransitionState<'image> {
             // Every segment of a pending inbound predecessor is certified, including duplicate and
             // out-of-order ones that do not advance the frontier, so the certificate can replay
             // the receiver exactly.
-            let mut stage_causes = Vec::new();
+            let mut stage_causes = PendingCauses::default();
             record_inbound_progress(
                 &mut state.generators,
+                index,
                 packet.flow,
                 InboundProgress::Segment {
                     sequence: header.sequence,
@@ -2594,17 +2773,17 @@ impl<'image> TransitionState<'image> {
                 node.id,
                 &mut stage_causes,
             )?;
-            let payload = allocate_payload_id(node.id, node_count, state.next_payload_seq)
+            let payload = allocate_payload_id(node.id, node_count, *state.next_payload_seq)
                 .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
-            state.next_payload_seq = state
+            *state.next_payload_seq = state
                 .next_payload_seq
                 .checked_add(1)
                 .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
-            state.received_packets = state
+            *state.received_packets = state
                 .received_packets
                 .checked_add(1)
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
-            state.sourced_packets = state
+            *state.sourced_packets = state
                 .sourced_packets
                 .checked_add(1)
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
@@ -2632,9 +2811,9 @@ impl<'image> TransitionState<'image> {
         self.enqueue_source_packet(node, ack.id)?;
         self.record_sourced(node.id, ack)?;
         let ready = {
-            let state = self.host_state_mut(node)?;
-            if state.in_service.is_none() && !state.tx_ready_pending {
-                state.tx_ready_pending = true;
+            let (state, _) = self.host_parts_mut(node)?;
+            if state.in_service.is_none() && !*state.tx_ready_pending {
+                *state.tx_ready_pending = true;
                 true
             } else {
                 false
@@ -2686,15 +2865,13 @@ impl<'image> TransitionState<'image> {
             superseded_timer,
             stage_completed,
         ) = {
-            let state = self.host_state_mut(node)?;
-            let generator = state
-                .generators
-                .iter_mut()
-                .find(|generator| generator.flow == packet.flow)
-                .ok_or(ExecutionError::UnknownGenerator {
+            let (mut state, index) = self.host_parts_mut(node)?;
+            let generator = &mut state.generators[index.first_generator(packet.flow).ok_or(
+                ExecutionError::UnknownGenerator {
                     node: node.id,
                     flow: packet.flow,
-                })?;
+                },
+            )?];
             let FlowGeneratorKind::Tcp(mut tcp) = generator.kind else {
                 return Err(ExecutionError::UnknownGenerator {
                     node: node.id,
@@ -2796,7 +2973,7 @@ impl<'image> TransitionState<'image> {
                 stage_completed,
             )
         };
-        let mut stage_causes = Vec::new();
+        let mut stage_causes = PendingCauses::default();
         if stage_completed {
             // The ACK echoes when its triggering segment was sent and how large it was, so the
             // sender can certify the unloaded round trip that segment and this ACK needed: every
@@ -2825,9 +3002,10 @@ impl<'image> TransitionState<'image> {
                 origin_ns: header.echoed_sent_time_ns,
                 delay_ns: unloaded_round_trip_ns,
             };
-            let state = self.host_state_mut(node)?;
+            let (mut state, index) = self.host_parts_mut(node)?;
             complete_local_successors(
                 &mut state.generators,
+                index,
                 packet.flow,
                 completion,
                 &mut stage_causes,
@@ -2933,20 +3111,36 @@ impl<'image> TransitionState<'image> {
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
         let packet = self.packet(event.payload)?;
-        if self.host_state(node)?.generators.iter().any(|generator| {
-            generator.flow == packet.flow
-                && generator
-                    .stage
-                    .is_some_and(|stage| matches!(stage.role, crate::StageRole::Compute(_)))
-        }) {
+        let compute_stage_owns = {
+            let (state, index) = self.host_parts_mut(node)?;
+            index
+                .generators_of(packet.flow)
+                .iter()
+                .any(|(_, position)| {
+                    state.generators[*position]
+                        .stage
+                        .is_some_and(|stage| matches!(stage.role, crate::StageRole::Compute(_)))
+                })
+        };
+        if compute_stage_owns {
             return self.host_compute_timer(node, event, packet.flow, children);
         }
         if packet.kind == PacketKind::DcqcnControlTimer {
             return self.host_dcqcn_control_timer(node, event, packet, children);
         }
-        if self.host_state(node)?.generators.iter().any(|generator| {
-            generator.flow == packet.flow && matches!(generator.kind, FlowGeneratorKind::Dcqcn(_))
-        }) {
+        let dcqcn_owns = {
+            let (state, index) = self.host_parts_mut(node)?;
+            index
+                .generators_of(packet.flow)
+                .iter()
+                .any(|(_, position)| {
+                    matches!(
+                        state.generators[*position].kind,
+                        FlowGeneratorKind::Dcqcn(_)
+                    )
+                })
+        };
+        if dcqcn_owns {
             return self.host_dcqcn_pacing_timer(node, event, packet, children);
         }
         let stop_time_ns = self.image.stop_time_ns;
@@ -2958,12 +3152,8 @@ impl<'image> TransitionState<'image> {
         let transition;
 
         {
-            let state = self.host_state_mut(node)?;
-            let Some(generator_index) = state
-                .generators
-                .iter()
-                .position(|generator| generator.flow == packet.flow)
-            else {
+            let (mut state, index) = self.host_parts_mut(node)?;
+            let Some(generator_index) = index.first_generator(packet.flow) else {
                 return Ok(());
             };
             let generator = &mut state.generators[generator_index];
@@ -3018,7 +3208,7 @@ impl<'image> TransitionState<'image> {
                     .bytes_emitted
                     .checked_add(packet.size_bytes)
                     .ok_or(ExecutionError::CounterOverflow(node.id))?;
-                state.sourced_packets = state
+                *state.sourced_packets = state
                     .sourced_packets
                     .checked_add(1)
                     .ok_or(ExecutionError::CounterOverflow(node.id))?;
@@ -3037,9 +3227,9 @@ impl<'image> TransitionState<'image> {
                 .transpose()?;
             if let Some(next_time) = candidate_time.filter(|time| *time <= stop_time_ns) {
                 let (payload, size_bytes) = if emitted {
-                    let payload = allocate_payload_id(node.id, node_count, state.next_payload_seq)
+                    let payload = allocate_payload_id(node.id, node_count, *state.next_payload_seq)
                         .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
-                    state.next_payload_seq = state
+                    *state.next_payload_seq = state
                         .next_payload_seq
                         .checked_add(1)
                         .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
@@ -3135,9 +3325,9 @@ impl<'image> TransitionState<'image> {
         }
         if emitted {
             let ready_payload = {
-                let state = self.host_state_mut(node)?;
-                if state.in_service.is_none() && !state.tx_ready_pending {
-                    state.tx_ready_pending = true;
+                let (state, _) = self.host_parts_mut(node)?;
+                if state.in_service.is_none() && !*state.tx_ready_pending {
+                    *state.tx_ready_pending = true;
                     Some(packet.id)
                 } else {
                     None
@@ -3927,6 +4117,51 @@ impl<'image> TransitionState<'image> {
             })
     }
 
+    /// The stage view of a host, and the host's stage index, borrowed disjointly.
+    ///
+    /// Fails exactly where `host_state_mut` fails: the indices are built one per host state. Always
+    /// inlined, so the view is taken apart at each call site into the field accesses it names.
+    #[inline(always)]
+    fn host_parts_mut(
+        &mut self,
+        node: NodeDescriptor,
+    ) -> Result<(HostView<'_>, &mut HostStageIndex), ExecutionError> {
+        let state_slot = self.local_state_slot(node)?;
+        let invalid = || ExecutionError::InvalidStateSlot {
+            node: node.id,
+            kind: node.kind,
+            state_slot: node.state_slot,
+        };
+        let state = self.host_states.get_mut(state_slot).ok_or_else(invalid)?;
+        let (index, generator_reads, receiver_reads) = self
+            .host_indices
+            .get_mut(state_slot)
+            .ok_or_else(invalid)?
+            .parts_mut();
+        let HostState {
+            queue,
+            in_service,
+            tx_ready_pending,
+            generators,
+            tcp_receivers,
+            next_payload_seq,
+            sourced_packets,
+            received_packets,
+            ..
+        } = state;
+        let view = HostView {
+            generators: ProbedTable::new(generators, generator_reads),
+            tcp_receivers: ProbedTable::new(tcp_receivers, receiver_reads),
+            queue,
+            in_service,
+            tx_ready_pending,
+            next_payload_seq,
+            sourced_packets,
+            received_packets,
+        };
+        Ok((view, index))
+    }
+
     fn switch_state_mut(
         &mut self,
         node: NodeDescriptor,
@@ -4335,15 +4570,14 @@ impl<'image> TransitionState<'image> {
                     .ok_or(ExecutionError::MissingTcpSegment { flow, sequence })
             })
             .transpose()?;
-        let state = self.host_state_mut(node)?;
-        let generator_index = state
-            .generators
-            .iter()
-            .position(|generator| generator.flow == flow)
-            .ok_or(ExecutionError::UnknownGenerator {
-                node: node.id,
-                flow,
-            })?;
+        let (mut state, index) = self.host_parts_mut(node)?;
+        let generator_index =
+            index
+                .first_generator(flow)
+                .ok_or(ExecutionError::UnknownGenerator {
+                    node: node.id,
+                    flow,
+                })?;
         let FlowGeneratorKind::Tcp(mut tcp) = state.generators[generator_index].kind else {
             return Err(ExecutionError::UnknownGenerator {
                 node: node.id,
@@ -4355,9 +4589,9 @@ impl<'image> TransitionState<'image> {
         if let Some((sequence, size_bytes)) =
             retransmit_segment.filter(|(sequence, _)| *sequence < tcp.total_bytes)
         {
-            let payload = allocate_payload_id(node.id, node_count, state.next_payload_seq)
+            let payload = allocate_payload_id(node.id, node_count, *state.next_payload_seq)
                 .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
-            state.next_payload_seq = state
+            *state.next_payload_seq = state
                 .next_payload_seq
                 .checked_add(1)
                 .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
@@ -4389,9 +4623,9 @@ impl<'image> TransitionState<'image> {
                 if size_bytes == 0 {
                     break;
                 }
-                let payload = allocate_payload_id(node.id, node_count, state.next_payload_seq)
+                let payload = allocate_payload_id(node.id, node_count, *state.next_payload_seq)
                     .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
-                state.next_payload_seq = state
+                *state.next_payload_seq = state
                     .next_payload_seq
                     .checked_add(1)
                     .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
@@ -4461,7 +4695,7 @@ impl<'image> TransitionState<'image> {
             };
         }
         generator.kind = FlowGeneratorKind::Tcp(tcp);
-        state.sourced_packets = state
+        *state.sourced_packets = state
             .sourced_packets
             .checked_add(u64::try_from(packets.len()).unwrap_or(u64::MAX))
             .ok_or(ExecutionError::CounterOverflow(node.id))?;
@@ -4484,11 +4718,11 @@ impl<'image> TransitionState<'image> {
             self.record_sourced(node.id, packet)?;
         }
         let ready_payload = {
-            let state = self.host_state_mut(node)?;
-            if state.in_service.is_none() && !state.tx_ready_pending {
+            let (state, _) = self.host_parts_mut(node)?;
+            if state.in_service.is_none() && !*state.tx_ready_pending {
                 let ready = state.queue.front().copied();
                 if ready.is_some() {
-                    state.tx_ready_pending = true;
+                    *state.tx_ready_pending = true;
                 }
                 ready
             } else {
