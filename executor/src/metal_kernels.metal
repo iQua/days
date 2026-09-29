@@ -109,6 +109,16 @@ constant uint P_PFC_OFFSET = 32;
 constant uint P_MECHANISMS = 33;
 constant ulong MECHANISM_DCQCN_RECEIVERS = 1;
 constant ulong MECHANISM_DCQCN = 2;
+// Kernel-only bit of the launch-uniform mechanisms value: the image carries a PFC region.
+constant ulong MECHANISM_PFC_REGION = 4;
+
+// The launch-uniform mechanisms value: read once by the round kernel, before its transition loop,
+// and passed down, so the transition code tests a register instead of re-reading params.
+inline uint launch_mechanisms(const device ulong *params) {
+    return uint(
+        params[P_MECHANISMS] | (params[P_PFC_OFFSET] != NONE ? MECHANISM_PFC_REGION : 0)
+    );
+}
 constant uint PFC_ROW_HEADER_WORDS = 5;
 constant uint PFC_INGRESS_WORDS = 43;
 constant uint PI_LINK = 0;
@@ -4826,7 +4836,8 @@ inline bool dispatch_event(
     device ulong *observed,
     device ulong *departures,
     device ulong *arrivals,
-    device ulong *tcp_state
+    device ulong *tcp_state,
+    uint mechanisms
 ) {
     ulong node_base = node * NODE_WORDS;
     ulong role = node_state[node_base + N_KIND];
@@ -6045,7 +6056,9 @@ inline bool dispatch_event(
                 node, event, error, params, generators, flows, summary, observation_meta,
                 observed, arrivals);
         }
-        if (packet_kind == DATA_PACKET && event[PK_FLOW] < params[P_FLOW_COUNT] &&
+        // P14 perf: without an image DCQCN receiver no marker can be 2 or 3, so skip the read.
+        if ((mechanisms & MECHANISM_DCQCN_RECEIVERS) != 0 &&
+            packet_kind == DATA_PACKET && event[PK_FLOW] < params[P_FLOW_COUNT] &&
             flows[flow_base + 1] == node &&
             tcp_state[params[P_TCP_RECEIVER_OFFSET] + event[PK_FLOW] * TCP_RECEIVER_WORDS] >=
                 DCQCN_RECEIVER_NO_CNP) {
@@ -6581,6 +6594,7 @@ kernel void days_round(
     }
 
     ulong dispatch_transitions = 0;
+    const uint mechanisms = launch_mechanisms(params);
     while (dispatch_transitions < params[P_TRANSITION_CAPACITY]) {
         ulong event[EVENT_WORDS];
         ulong selected_active;
@@ -6645,7 +6659,8 @@ kernel void days_round(
             observed,
             departures,
             arrivals,
-            tcp_state
+            tcp_state,
+            mechanisms
         )) {
             return;
         }
