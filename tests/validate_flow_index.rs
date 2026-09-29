@@ -25,7 +25,7 @@ use days_executor::{
     ObservationMode, PacketDescriptor, PacketKind, PayloadId, SchedulerKind, SimulationImage,
     StageRole, TcpAckHeader, assert_validate_flow_index_equivalent_for_testing,
     assert_validate_generator_index_equivalent_for_testing, event_phase,
-    run_scalar_with_observations, validate,
+    run_scalar_with_observations, validate, validate_flow_index_builds_stage_lookups_for_testing,
 };
 
 /// Every fixture family under `configs/` that the executor scenario lowering accepts, biased to
@@ -371,7 +371,11 @@ fn flow_indexed_walks_match_the_scans_for_flows_outside_the_dense_table() {
 }
 
 /// A compute -> collective -> compute chain: every P14 stage role and both dependency slots.
-fn stage_chain_image() -> SimulationImage {
+///
+/// `test` names the calling test. The scenario file is private to that test and to this process,
+/// so tests running in parallel, or two test processes sharing the target directory, never read a
+/// file another writer has just truncated.
+fn stage_chain_image(test: &str) -> SimulationImage {
     // Three hosts on one switch, a ring all-reduce named `grad` gated on the `forward` compute
     // group, and a `backward` compute group gated on the collective: the shape of
     // `tests/collective_compute.rs`'s chain, inlined so this file does not import that suite.
@@ -416,8 +420,10 @@ hosts = [0, 1, 2]
 duration_ns = 7000
 after = "grad"
 "#;
-    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("validate_flow_index_stage_chain.toml");
+    let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "validate_flow_index_stage_chain_{test}_{}.toml",
+        std::process::id()
+    ));
     fs::write(&path, config).expect("write the stage-chain scenario");
     compile_config(&path).unwrap_or_else(|error| panic!("failed to lower the stage chain: {error}"))
 }
@@ -427,7 +433,7 @@ after = "grad"
 /// it, where stages are blocked, released, timed and finished.
 #[test]
 fn flow_indexed_generator_lookup_matches_the_scan_on_stage_images() {
-    let source = stage_chain_image();
+    let source = stage_chain_image("generator_lookup");
     let stages = source
         .host_states
         .iter()
@@ -449,13 +455,41 @@ fn flow_indexed_generator_lookup_matches_the_scan_on_stage_images() {
     }
 }
 
+/// P14 slim: only stage validation asks which generator owns a flow or sits at a collective
+/// position, so the index builds those lookups only for an image with a stage generator. Every
+/// other image skips the extra walk over its generators, and `is_compute_flow` answers `false`
+/// without a lookup; the equality gates above pin both answers against the scans on every fixture.
+#[test]
+fn flow_index_builds_stage_lookups_only_for_images_with_stages() {
+    for fixture in FIXTURES {
+        let image = compile_fixture(fixture);
+        assert!(
+            image
+                .host_states
+                .iter()
+                .flat_map(|state| &state.generators)
+                .all(|generator| generator.stage.is_none()),
+            "{fixture}: the fixture corpus has no stages"
+        );
+        assert!(
+            !validate_flow_index_builds_stage_lookups_for_testing(&image),
+            "{fixture}: an image without stages must not build the stage lookups"
+        );
+    }
+    let chain = stage_chain_image("stage_lookups");
+    assert!(
+        validate_flow_index_builds_stage_lookups_for_testing(&chain),
+        "the stage chain must build the stage lookups"
+    );
+}
+
 /// The generator lookups keep the scans' first-occurrence answers on images the validator rejects:
 /// two generators naming one flow (the scan returned the first in host order), generators naming
 /// flows outside the dense table (the scan's equality `find` over them), and two collective
 /// stages at one position (`find_stage` returned the first).
 #[test]
 fn flow_indexed_generator_lookup_matches_the_scan_on_duplicate_and_outside_flows() {
-    let mut image = stage_chain_image();
+    let mut image = stage_chain_image("duplicate_and_outside_flows");
     let locations = image
         .host_states
         .iter()
