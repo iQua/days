@@ -310,6 +310,7 @@ mod tests {
             in_service: None,
             tx_ready_pending: false,
             generators,
+            stages: Vec::new(),
             tcp_receivers: Vec::new(),
             dcqcn_receivers: Vec::new(),
             next_origin_seq: 0,
@@ -337,7 +338,6 @@ mod tests {
                 unacknowledged_bytes: 0,
             },
             kind,
-            stage: None,
         }
     }
 

@@ -117,6 +117,7 @@ fn image(
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![],
+                stages: Vec::new(),
                 tcp_receivers: vec![],
                 dcqcn_receivers: vec![],
                 next_origin_seq: packets.len() as u64,
@@ -131,6 +132,7 @@ fn image(
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![],
+                stages: Vec::new(),
                 tcp_receivers: vec![],
                 dcqcn_receivers: vec![],
                 next_origin_seq: 0,
@@ -585,7 +587,6 @@ fn drr_future_tcp_image() -> SimulationImage {
     });
     tcp.rto_ns = 100;
     image.host_states[0].generators.push(FlowGeneratorState {
-        stage: None,
         flow: FlowId(2),
         packets_emitted: 1,
         bytes_emitted: 1,

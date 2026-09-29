@@ -200,8 +200,8 @@ fn lowering_heap_use(ranks: u64) -> HeapUse {
     let generators = image
         .host_states
         .iter()
-        .flat_map(|state| &state.generators)
-        .filter(|generator| generator.stage.is_some())
+        .flat_map(|state| &state.stages)
+        .flatten()
         .count() as u64;
     assert_eq!(generators, stages(ranks), "{ranks} ranks: stage count");
     drop(image);

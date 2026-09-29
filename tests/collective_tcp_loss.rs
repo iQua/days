@@ -7,8 +7,8 @@
 mod tcp;
 
 use days_executor::{
-    ArrivalDisposition, CollectiveActivationCause, FlowGeneratorKind, GeneratorStatus, PacketKind,
-    TcpTransitionInput,
+    ArrivalDisposition, CollectiveActivationCause, FlowGeneratorKind, GeneratorStatus, HostState,
+    PacketKind, TcpTransitionInput,
 };
 
 /// Hosts 0 and 1 hang off switch 4, hosts 2 and 3 off switch 5. The ring order 0 -> 2 -> 1 ->
@@ -73,17 +73,17 @@ fn lossy_tcp_ring_completes_identically_through_retransmission() {
     );
 
     assert!(result.pending_events.is_empty());
-    for generator in result
+    for (generator, stage) in result
         .host_states
         .iter()
-        .flat_map(|state| &state.generators)
+        .flat_map(HostState::generators_with_stages)
     {
         assert_eq!(generator.next_emission.status, GeneratorStatus::Finished);
         let FlowGeneratorKind::Tcp(tcp) = generator.kind else {
             unreachable!()
         };
         assert_eq!(tcp.highest_ack, tcp.total_bytes);
-        assert!(generator.stage.unwrap().activated);
+        assert!(stage.unwrap().activated);
     }
 
     // Retransmitted and duplicate bytes never advance the inbound count: every inbound row adds

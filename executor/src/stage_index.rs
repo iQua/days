@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Index, IndexMut};
 
-use crate::{FlowGeneratorState, FlowId, GeneratorStatus, HostState};
+use crate::{CollectiveStage, FlowGeneratorState, FlowId, GeneratorStatus, HostState};
 
 /// Executor-local keyed views of one host's generator and TCP-receiver tables.
 ///
@@ -46,9 +46,10 @@ pub(crate) struct HostStageIndex {
 pub(crate) struct ReleasableStages(BTreeSet<usize>);
 
 impl ReleasableStages {
-    /// Re-evaluates `generator`'s membership after its dependencies or release flag were written.
-    pub(crate) fn refresh(&mut self, position: usize, generator: &FlowGeneratorState) {
-        if releasable(generator) {
+    /// Re-evaluates the membership of the stage at `position` after its dependencies or release
+    /// flag were written.
+    pub(crate) fn refresh(&mut self, position: usize, stage: Option<CollectiveStage>) {
+        if releasable(stage) {
             self.0.insert(position);
         } else {
             self.0.remove(&position);
@@ -56,20 +57,31 @@ impl ReleasableStages {
     }
 }
 
-/// Whether `generator` is a stage its prerequisites have released but that has not activated.
-fn releasable(generator: &FlowGeneratorState) -> bool {
-    generator
-        .stage
-        .is_some_and(|stage| !stage.activated && stage.dependencies.prerequisites_complete())
+/// Whether `stage` is a stage its prerequisites have released but that has not activated.
+fn releasable(stage: Option<CollectiveStage>) -> bool {
+    stage.is_some_and(|stage| !stage.activated && stage.dependencies.prerequisites_complete())
+}
+
+/// The stage record at `position` of a host's stage table, which is empty on a host without
+/// stages.
+fn stage_at(stages: &[Option<CollectiveStage>], position: usize) -> Option<CollectiveStage> {
+    stages.get(position).copied().flatten()
 }
 
 /// The retired activation scan: the first stage in table order that is ready to activate.
 ///
 /// Debug builds compare every indexed answer with it, as the switch queue byte counters are.
-fn first_ready_by_scan(generators: &[FlowGeneratorState]) -> Option<usize> {
-    generators.iter().position(|generator| {
-        generator.next_emission.status == GeneratorStatus::Blocked && releasable(generator)
-    })
+fn first_ready_by_scan(
+    generators: &[FlowGeneratorState],
+    stages: &[Option<CollectiveStage>],
+) -> Option<usize> {
+    generators
+        .iter()
+        .enumerate()
+        .position(|(position, generator)| {
+            generator.next_emission.status == GeneratorStatus::Blocked
+                && releasable(stage_at(stages, position))
+        })
 }
 
 /// The contiguous entries of `flow` in a `(flow, position)` list sorted by flow then position.
@@ -94,8 +106,8 @@ impl HostStageIndex {
         let mut local_successors = BTreeMap::<FlowId, Vec<usize>>::new();
         let mut inbound_successors = BTreeMap::<FlowId, Vec<usize>>::new();
         let mut releasable = ReleasableStages::default();
-        for (position, generator) in state.generators.iter().enumerate() {
-            let Some(dependencies) = generator.stage_dependencies() else {
+        for position in 0..state.generators.len() {
+            let Some(dependencies) = state.stage_dependencies(position) else {
                 continue;
             };
             if let Some(predecessor) = dependencies.local_predecessor {
@@ -110,7 +122,7 @@ impl HostStageIndex {
                     .or_default()
                     .push(position);
             }
-            releasable.refresh(position, generator);
+            releasable.refresh(position, state.stage(position));
         }
         Self {
             generators_by_flow: by_flow(state.generators.iter().map(|generator| generator.flow)),
@@ -178,11 +190,16 @@ impl HostStageIndex {
     pub(crate) fn first_ready(
         &mut self,
         generators: &ProbedTable<'_, FlowGeneratorState>,
+        stages: &ProbedTable<'_, Option<CollectiveStage>>,
     ) -> Option<usize> {
-        self.first_ready_in(generators.items)
+        self.first_ready_in(generators.items, stages.items)
     }
 
-    fn first_ready_in(&mut self, generators: &[FlowGeneratorState]) -> Option<usize> {
+    fn first_ready_in(
+        &mut self,
+        generators: &[FlowGeneratorState],
+        stages: &[Option<CollectiveStage>],
+    ) -> Option<usize> {
         let mut examined = 0_usize;
         let ready = self.releasable.0.iter().copied().find(|position| {
             examined += 1;
@@ -191,15 +208,16 @@ impl HostStageIndex {
         self.probe.note(examined.max(1));
         debug_assert_eq!(
             ready,
-            first_ready_by_scan(generators),
+            first_ready_by_scan(generators, stages),
             "the releasable-stage set diverged from the generator table"
         );
         ready
     }
 
-    /// Refreshes `generator`'s releasable membership after its release flag was set.
-    pub(crate) fn refresh_releasable(&mut self, position: usize, generator: &FlowGeneratorState) {
-        self.releasable.refresh(position, generator);
+    /// Refreshes the releasable membership of the stage at `position` after its release flag was
+    /// set.
+    pub(crate) fn refresh_releasable(&mut self, position: usize, stage: Option<CollectiveStage>) {
+        self.releasable.refresh(position, stage);
     }
 
     /// Entries this host's lookups examined.
@@ -209,7 +227,7 @@ impl HostStageIndex {
     }
 }
 
-/// One host's stage index together with the read counters of the host's two tables.
+/// One host's stage index together with the read counters of the host's three tables.
 ///
 /// Stored per host in `TransitionState::host_indices`. The counters sit beside the index, not
 /// inside it, so the stage view can borrow the index and both counters at once.
@@ -217,29 +235,34 @@ impl HostStageIndex {
 pub(crate) struct HostStageSlot {
     index: HostStageIndex,
     generator_reads: StageScanProbe,
+    stage_reads: StageScanProbe,
     receiver_reads: StageScanProbe,
 }
+
+/// The index and the read counters of a host's generator, stage and TCP-receiver tables.
+pub(crate) type HostStageParts<'a> = (
+    &'a mut HostStageIndex,
+    &'a mut StageScanProbe,
+    &'a mut StageScanProbe,
+    &'a mut StageScanProbe,
+);
 
 impl HostStageSlot {
     pub(crate) fn build(state: &HostState) -> Self {
         Self {
             index: HostStageIndex::build(state),
             generator_reads: StageScanProbe::default(),
+            stage_reads: StageScanProbe::default(),
             receiver_reads: StageScanProbe::default(),
         }
     }
 
-    /// The index, and the generator-table and TCP-receiver-table read counters.
-    pub(crate) fn parts_mut(
-        &mut self,
-    ) -> (
-        &mut HostStageIndex,
-        &mut StageScanProbe,
-        &mut StageScanProbe,
-    ) {
+    /// The index, and the generator-table, stage-table and TCP-receiver-table read counters.
+    pub(crate) fn parts_mut(&mut self) -> HostStageParts<'_> {
         (
             &mut self.index,
             &mut self.generator_reads,
+            &mut self.stage_reads,
             &mut self.receiver_reads,
         )
     }
@@ -250,6 +273,7 @@ impl HostStageSlot {
         self.index
             .visits()
             .saturating_add(self.generator_reads.visits())
+            .saturating_add(self.stage_reads.visits())
             .saturating_add(self.receiver_reads.visits())
     }
 
@@ -336,6 +360,23 @@ impl<T> IndexMut<usize> for ProbedTable<'_, T> {
     #[inline(always)]
     fn index_mut(&mut self, position: usize) -> &mut T {
         &mut self.items[position]
+    }
+}
+
+/// A host's stage table as the stage path sees it. The table is empty on a host without stages, so
+/// its accessors take a generator position and answer `None` for an ungated generator; each is one
+/// O(1) positional read, uncounted like `table[i]`.
+impl ProbedTable<'_, Option<CollectiveStage>> {
+    /// The stage record of the generator at `position`.
+    #[inline(always)]
+    pub(crate) fn stage(&self, position: usize) -> Option<CollectiveStage> {
+        stage_at(self.items, position)
+    }
+
+    /// The stage record of the generator at `position`, to write.
+    #[inline(always)]
+    pub(crate) fn stage_mut(&mut self, position: usize) -> Option<&mut CollectiveStage> {
+        self.items.get_mut(position).and_then(Option::as_mut)
     }
 }
 
@@ -485,7 +526,7 @@ pub(crate) mod legacy_scans {
     /// The generators owning `flow`, in table order: the candidates of `host_pacing_timer`'s
     /// `any(|generator| generator.flow == flow && <compute stage>)`.
     pub(crate) fn generators_of(state: &HostState, flow: FlowId) -> Vec<usize> {
-        positions_where(state, |generator| generator.flow == flow)
+        positions_where(state, |_, generator| generator.flow == flow)
     }
 
     /// `host_tcp_data_arrival`.
@@ -498,41 +539,45 @@ pub(crate) mod legacy_scans {
 
     /// The generators `complete_local_successors` updates for `completed`, in table order.
     pub(crate) fn local_successors(state: &HostState, completed: FlowId) -> Vec<usize> {
-        positions_where(state, |generator| {
-            generator
-                .stage_dependencies()
+        positions_where(state, |position, _| {
+            state
+                .stage_dependencies(position)
                 .is_some_and(|dependencies| dependencies.local_predecessor == Some(completed))
         })
     }
 
     /// The generators `record_inbound_progress` updates for `inbound`, in table order.
     pub(crate) fn inbound_successors(state: &HostState, inbound: FlowId) -> Vec<usize> {
-        positions_where(state, |generator| {
-            generator
-                .stage_dependencies()
+        positions_where(state, |position, _| {
+            state
+                .stage_dependencies(position)
                 .is_some_and(|dependencies| dependencies.inbound_predecessor == Some(inbound))
         })
     }
 
     /// `activate_ready_collectives`' `find(stage_ready_to_activate)`.
     pub(crate) fn first_ready(state: &HostState) -> Option<usize> {
-        state.generators.iter().position(|generator| {
+        positions_where(state, |position, generator| {
             generator.next_emission.status == GeneratorStatus::Blocked
-                && generator.stage.is_some_and(|stage| {
+                && state.stage(position).is_some_and(|stage| {
                     !stage.activated && stage.dependencies.prerequisites_complete()
                 })
         })
+        .first()
+        .copied()
     }
 
+    /// The generator positions, in table order, that satisfy `predicate`. A generator's stage
+    /// record lives in the host's stage table and is read by position.
     fn positions_where(
         state: &HostState,
-        predicate: impl Fn(&FlowGeneratorState) -> bool,
+        predicate: impl Fn(usize, &FlowGeneratorState) -> bool,
     ) -> Vec<usize> {
         state
             .generators
             .iter()
             .enumerate()
-            .filter(|(_, generator)| predicate(generator))
+            .filter(|(position, generator)| predicate(*position, generator))
             .map(|(position, _)| position)
             .collect()
     }
@@ -557,9 +602,9 @@ pub(crate) fn check_host_index(
     }
     let mut index = rebuilt;
     let mut queries = extra_flows.into_iter().collect::<Vec<_>>();
-    for generator in &state.generators {
+    for (position, generator) in state.generators.iter().enumerate() {
         queries.push(generator.flow);
-        if let Some(dependencies) = generator.stage_dependencies() {
+        if let Some(dependencies) = state.stage_dependencies(position) {
             queries.extend(dependencies.local_predecessor);
             queries.extend(dependencies.inbound_predecessor);
         }
@@ -612,7 +657,7 @@ pub(crate) fn check_host_index(
             return mismatch("inbound successors", &indexed, &scanned);
         }
     }
-    let indexed = index.first_ready_in(&state.generators);
+    let indexed = index.first_ready_in(&state.generators, &state.stages);
     let scanned = legacy_scans::first_ready(state);
     if indexed != scanned {
         return Err(format!(

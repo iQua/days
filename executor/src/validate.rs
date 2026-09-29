@@ -240,11 +240,13 @@ impl FlowIndex {
             }
         }
 
+        // `validate_stage_tables` established that every stage table is empty or has a stage, so
+        // a non-empty table is exactly a host with a stage generator, and a stageless image reads
+        // no generator here.
         let stage_lookups = image
             .host_states
             .iter()
-            .flat_map(|state| &state.generators)
-            .any(|generator| generator.stage.is_some())
+            .any(|state| !state.stages.is_empty())
             .then(|| StageLookups::build(image));
 
         Self {
@@ -275,17 +277,17 @@ impl FlowIndex {
         &self,
         image: &'a SimulationImage,
         position: CollectivePosition,
-    ) -> Option<&'a crate::FlowGeneratorState> {
+    ) -> Option<StagedGenerator<'a>> {
         self.stage_lookups
             .as_ref()?
             .collective_stages
             .get(&position)
-            .map(|&(host, index)| &image.host_states[host].generators[index])
+            .map(|&(host, index)| staged_generator(&image.host_states[host], index))
     }
 
     /// Returns the first generator, in `host_states`-then-`generators` order, whose flow is `id`.
     ///
-    /// Exactly equivalent to `image.host_states.iter().flat_map(|state| &state.generators)
+    /// Exactly equivalent to `image.host_states.iter().flat_map(staged_generators)
     /// .find(|generator| generator.flow == id)`: a dense slot records the first generator that
     /// resolves to it, and an identifier outside the dense table falls back to the same `find`
     /// over the unindexed generators, which keep their relative order.
@@ -297,15 +299,15 @@ impl FlowIndex {
         &self,
         image: &'a SimulationImage,
         id: crate::FlowId,
-    ) -> Option<&'a crate::FlowGeneratorState> {
+    ) -> Option<StagedGenerator<'a>> {
         let Some(lookups) = &self.stage_lookups else {
             return image
                 .host_states
                 .iter()
-                .flat_map(|state| &state.generators)
+                .flat_map(staged_generators)
                 .find(|generator| generator.flow == id);
         };
-        let at = |(host, index): (usize, usize)| &image.host_states[host].generators[index];
+        let at = |(host, index): (usize, usize)| staged_generator(&image.host_states[host], index);
         match dense_flow_slot(image, id) {
             Some(slot) => lookups.generator_slots[slot].map(at),
             None => lookups
@@ -385,7 +387,7 @@ impl StageLookups {
         let mut unindexed_generators = Vec::new();
         let mut collective_stages = BTreeMap::new();
         for (host, state) in image.host_states.iter().enumerate() {
-            for (index, generator) in state.generators.iter().enumerate() {
+            for (index, generator) in staged_generators(state).enumerate() {
                 match dense_flow_slot(image, generator.flow) {
                     Some(slot) => {
                         generator_slots[slot].get_or_insert((host, index));
@@ -509,8 +511,10 @@ pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), Validat
     validate_link_ids(image)?;
     validate_flow_ids(image)?;
     validate_packet_ids(image)?;
-    // Dense flow identifiers and strictly ascending payload identifiers are established above,
-    // which is everything the flow index needs; it reads the image and cannot itself reject.
+    validate_stage_tables(image)?;
+    // Dense flow identifiers, strictly ascending payload identifiers and canonical stage tables
+    // are established above, which is everything the flow index needs; it reads the image and
+    // cannot itself reject.
     let flow_index = FlowIndex::build(image);
     validate_state_ownership(image)?;
     validate_links(image)?;
@@ -579,6 +583,36 @@ const fn congestion_control_mss_bytes(control: crate::TcpCongestionControl) -> u
         crate::TcpCongestionControl::Reno(state) => state.mss_bytes,
         crate::TcpCongestionControl::Cubic(state) => state.mss_bytes,
     }
+}
+
+/// Every host's stage table has one of its two canonical shapes: empty, or one entry per generator
+/// with at least one stage.
+///
+/// Under this rule a host's generators, each with its stage record, determine the table, which is
+/// why `HostState`'s `Debug` rendering, and with it every image and result fingerprint, prints the
+/// records inline and not the table.
+fn validate_stage_tables(image: &SimulationImage) -> Result<(), ValidationError> {
+    for (slot, state) in image.host_states.iter().enumerate() {
+        if state.stages_are_canonical() {
+            continue;
+        }
+        return Err(ValidationError::new(
+            if state.stages.len() == state.generators.len() {
+                format!(
+                    "host state slot {slot} has a stage table without a stage; a host without stages \
+                 has an empty table"
+                )
+            } else {
+                format!(
+                    "host state slot {slot} has {} stage table entries for {} generators; the table \
+                 is empty or has one entry per generator",
+                    state.stages.len(),
+                    state.generators.len()
+                )
+            },
+        ));
+    }
+    Ok(())
 }
 
 fn validate_node_ids(image: &SimulationImage) -> Result<(), ValidationError> {
@@ -916,7 +950,7 @@ fn derived_pfc_max_frame_bytes(
             maximum[priority] = maximum[priority].max(packet.size_bytes);
         }
     }
-    for generator in image.host_states.iter().flat_map(|state| &state.generators) {
+    for generator in image.host_states.iter().flat_map(staged_generators) {
         let executable = executable_generator_packets(image, generator)? != 0;
         let flow = flow(image, generator.flow).expect("generator validation established the flow");
         let priority = usize::from(flow.priority);
@@ -1492,7 +1526,7 @@ fn validate_generators(
             }
         }
         let mut previous = None;
-        for (index, generator) in state.generators.iter().enumerate() {
+        for (index, generator) in staged_generators(state).enumerate() {
             if previous.is_some_and(|flow| flow >= generator.flow) {
                 return Err(ValidationError::new(format!(
                     "host node {:?} generator {index} flow {:?} does not advance previous flow {:?}",
@@ -2286,7 +2320,7 @@ fn validate_generators(
         let is_dcqcn = image
             .host_states
             .iter()
-            .flat_map(|state| &state.generators)
+            .flat_map(staged_generators)
             .find(|generator| generator.flow == receiver_flow)
             .is_some_and(|generator| matches!(generator.kind, FlowGeneratorKind::Dcqcn(_)));
         if !is_dcqcn {
@@ -2344,7 +2378,7 @@ struct CollectivePartitionState {
 
 fn validate_collective_partitions(image: &SimulationImage) -> Result<(), ValidationError> {
     let mut collectives = BTreeMap::<u64, CollectivePartitionState>::new();
-    for generator in image.host_states.iter().flat_map(|state| &state.generators) {
+    for generator in image.host_states.iter().flat_map(staged_generators) {
         let Some(crate::CollectiveStage {
             role: crate::StageRole::Collective(stage),
             ..
@@ -2460,7 +2494,7 @@ fn validate_preloaded_arrival_capacity(image: &SimulationImage) -> Result<(), Va
     let generator_flows = image
         .host_states
         .iter()
-        .flat_map(|state| &state.generators)
+        .flat_map(staged_generators)
         .map(|generator| generator.flow)
         .collect::<BTreeSet<_>>();
     let mut counts = BTreeMap::<crate::FlowId, usize>::new();
@@ -2498,7 +2532,7 @@ fn validate_tcp_segment_ledger(
             conflict.replacement_size_bytes
         ))
     })?;
-    for generator in image.host_states.iter().flat_map(|state| &state.generators) {
+    for generator in image.host_states.iter().flat_map(staged_generators) {
         let FlowGeneratorKind::Tcp(tcp) = generator.kind else {
             continue;
         };
@@ -2568,16 +2602,55 @@ fn incomplete_tcp_segment_ledger(
     ))
 }
 
-fn is_compute_generator(generator: &crate::FlowGeneratorState) -> bool {
+/// A generator together with its stage record, read from the host's stage table by position.
+///
+/// The validator asks about a generator's stage wherever it asked about the generator's former
+/// `stage` field; this view carries both, and dereferences to the generator for everything else.
+#[derive(Clone, Copy)]
+struct StagedGenerator<'a> {
+    generator: &'a crate::FlowGeneratorState,
+    stage: Option<crate::CollectiveStage>,
+}
+
+impl StagedGenerator<'_> {
+    /// `generator` in place of this view's generator, with the same stage record.
+    const fn with_generator(self, generator: &crate::FlowGeneratorState) -> StagedGenerator<'_> {
+        StagedGenerator {
+            generator,
+            stage: self.stage,
+        }
+    }
+}
+
+impl std::ops::Deref for StagedGenerator<'_> {
+    type Target = crate::FlowGeneratorState;
+
+    fn deref(&self) -> &crate::FlowGeneratorState {
+        self.generator
+    }
+}
+
+/// The generator at `position` of `state`, with its stage record.
+fn staged_generator(state: &crate::HostState, position: usize) -> StagedGenerator<'_> {
+    StagedGenerator {
+        generator: &state.generators[position],
+        stage: state.stage(position),
+    }
+}
+
+/// `state`'s generators in table order, each with its stage record.
+fn staged_generators(state: &crate::HostState) -> impl Iterator<Item = StagedGenerator<'_>> {
+    (0..state.generators.len()).map(|position| staged_generator(state, position))
+}
+
+fn is_compute_generator(generator: StagedGenerator<'_>) -> bool {
     generator
         .stage
         .is_some_and(|stage| matches!(stage.role, crate::StageRole::Compute(_)))
 }
 
 /// Collective identity of a stage, when the generator carries one.
-fn collective_identity(
-    generator: &crate::FlowGeneratorState,
-) -> Option<crate::CollectiveStageIdentity> {
+fn collective_identity(generator: StagedGenerator<'_>) -> Option<crate::CollectiveStageIdentity> {
     match generator.stage?.role {
         crate::StageRole::Collective(identity) => Some(identity),
         crate::StageRole::Compute(_) => None,
@@ -2596,7 +2669,7 @@ fn validate_collective_stage(
     flow_index: &FlowIndex,
     state: &crate::HostState,
     flow: &crate::FlowDescriptor,
-    generator: &crate::FlowGeneratorState,
+    generator: StagedGenerator<'_>,
     stage: crate::CollectiveStage,
     positions: &mut BTreeMap<(u64, crate::CollectivePhase, u32, u32), crate::FlowId>,
     compute_positions: &mut BTreeMap<(u64, u32), crate::FlowId>,
@@ -2839,7 +2912,7 @@ fn validate_compute_stage(
     flow_index: &FlowIndex,
     state: &crate::HostState,
     flow: &crate::FlowDescriptor,
-    generator: &crate::FlowGeneratorState,
+    generator: StagedGenerator<'_>,
     compute: crate::ComputeStage,
     stage: crate::CollectiveStage,
     positions: &mut BTreeMap<(u64, u32), crate::FlowId>,
@@ -3012,7 +3085,7 @@ fn validate_compute_stage(
 /// its first activation starts from: nothing sent, acknowledged, timed, or reserved.
 fn validate_unreleased_tcp_stage(
     flow: crate::FlowId,
-    generator: &crate::FlowGeneratorState,
+    generator: StagedGenerator<'_>,
     tcp: crate::TcpGenerator,
 ) -> Result<(), ValidationError> {
     if generator.packets_emitted != 0
@@ -3289,7 +3362,7 @@ fn validate_packets_and_derive_delays(
         }
     }
     for state in &image.host_states {
-        for generator in &state.generators {
+        for generator in staged_generators(state) {
             let flow = flow(image, generator.flow).expect("generator validation established flow");
             let generator_can_emit = matches!(
                 generator.next_emission.status,
@@ -3779,7 +3852,7 @@ fn executable_resident_packets(image: &SimulationImage) -> Vec<&crate::PacketDes
     let scheduled_payloads = image
         .host_states
         .iter()
-        .flat_map(|state| &state.generators)
+        .flat_map(staged_generators)
         .filter(|generator| {
             generator.next_emission.status == GeneratorStatus::Scheduled
                 || matches!(
@@ -3912,7 +3985,7 @@ fn packet_can_still_cross_link(
 fn tcp_future_data_max_frame(
     image: &SimulationImage,
     flow_index: &FlowIndex,
-    generator: &crate::FlowGeneratorState,
+    generator: StagedGenerator<'_>,
     tcp: crate::TcpGenerator,
 ) -> u64 {
     if matches!(
@@ -3956,7 +4029,7 @@ fn maximum_drr_frame_bytes(
         .max()
         .unwrap_or(0);
 
-    for generator in image.host_states.iter().flat_map(|state| &state.generators) {
+    for generator in image.host_states.iter().flat_map(staged_generators) {
         let Some(generator_class) = usize::try_from(generator.flow.0 % class_count_u64).ok() else {
             continue;
         };
@@ -4721,7 +4794,7 @@ fn divide_rounding_up(numerator: &BigUint, denominator: &BigUint) -> BigUint {
     (numerator + denominator - 1_u8) / denominator
 }
 
-fn pacing_rate(generator: &crate::FlowGeneratorState) -> crate::RateGenerator {
+fn pacing_rate(generator: StagedGenerator<'_>) -> crate::RateGenerator {
     match generator.kind {
         FlowGeneratorKind::Rate(rate) => rate,
         FlowGeneratorKind::Dcqcn(dcqcn) => dcqcn.rate,
@@ -4730,7 +4803,7 @@ fn pacing_rate(generator: &crate::FlowGeneratorState) -> crate::RateGenerator {
 }
 
 fn with_rate_numerator(
-    generator: &crate::FlowGeneratorState,
+    generator: StagedGenerator<'_>,
     numerator: u64,
 ) -> crate::FlowGeneratorState {
     let mut adjusted = *generator;
@@ -4744,9 +4817,7 @@ fn with_rate_numerator(
     adjusted
 }
 
-fn remaining_rate_pacing_ticks(
-    generator: &crate::FlowGeneratorState,
-) -> Result<BigUint, ValidationError> {
+fn remaining_rate_pacing_ticks(generator: StagedGenerator<'_>) -> Result<BigUint, ValidationError> {
     let rate = pacing_rate(generator);
     let remaining_bytes = BigUint::from(rate.total_bytes - generator.bytes_emitted);
     let packet_size = BigUint::from(rate.packet_size_bytes);
@@ -4786,7 +4857,7 @@ fn remaining_rate_pacing_ticks(
 
 fn executable_rate_pacing_ticks(
     image: &SimulationImage,
-    generator: &crate::FlowGeneratorState,
+    generator: StagedGenerator<'_>,
 ) -> Result<BigUint, ValidationError> {
     if !matches!(
         generator.next_emission.status,
@@ -4804,7 +4875,7 @@ fn executable_rate_pacing_ticks(
 }
 
 fn rate_packets_within_ticks(
-    generator: &crate::FlowGeneratorState,
+    generator: StagedGenerator<'_>,
     ticks: &BigUint,
 ) -> Result<u64, ValidationError> {
     let remaining_packets = remaining_generator_packets(generator)?;
@@ -4842,14 +4913,14 @@ fn rate_packets_within_ticks(
 
 fn executable_rate_packets(
     image: &SimulationImage,
-    generator: &crate::FlowGeneratorState,
+    generator: StagedGenerator<'_>,
 ) -> Result<u64, ValidationError> {
     rate_packets_within_ticks(generator, &executable_rate_pacing_ticks(image, generator)?)
 }
 
 fn rate_payload_allocations(
     image: &SimulationImage,
-    generator: &crate::FlowGeneratorState,
+    generator: StagedGenerator<'_>,
 ) -> Result<u64, ValidationError> {
     let mut successor_ticks = executable_rate_pacing_ticks(image, generator)?;
     if successor_ticks == BigUint::from(0_u8) {
@@ -4861,35 +4932,35 @@ fn rate_payload_allocations(
 
 fn executable_dcqcn_packets(
     image: &SimulationImage,
-    generator: &crate::FlowGeneratorState,
+    generator: StagedGenerator<'_>,
 ) -> Result<u64, ValidationError> {
     let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind else {
         unreachable!("DCQCN packet capacity requires DCQCN state")
     };
     let fastest = with_rate_numerator(generator, dcqcn.controller.config.maximum_rate_bps);
-    executable_rate_packets(image, &fastest)
+    executable_rate_packets(image, generator.with_generator(&fastest))
 }
 
 fn executable_dcqcn_pacing_ticks(
     image: &SimulationImage,
-    generator: &crate::FlowGeneratorState,
+    generator: StagedGenerator<'_>,
 ) -> Result<BigUint, ValidationError> {
     let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind else {
         unreachable!("DCQCN pacing capacity requires DCQCN state")
     };
     let slowest = with_rate_numerator(generator, dcqcn.controller.config.minimum_rate_bps);
-    executable_rate_pacing_ticks(image, &slowest)
+    executable_rate_pacing_ticks(image, generator.with_generator(&slowest))
 }
 
 fn dcqcn_payload_allocations(
     image: &SimulationImage,
-    generator: &crate::FlowGeneratorState,
+    generator: StagedGenerator<'_>,
 ) -> Result<u64, ValidationError> {
     let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind else {
         unreachable!("DCQCN payload capacity requires DCQCN state")
     };
     let fastest = with_rate_numerator(generator, dcqcn.controller.config.maximum_rate_bps);
-    rate_payload_allocations(image, &fastest)
+    rate_payload_allocations(image, generator.with_generator(&fastest))
 }
 
 fn executable_dcqcn_control_ticks(
@@ -4907,7 +4978,7 @@ fn executable_dcqcn_control_ticks(
 
 fn latest_dcqcn_control_time(
     image: &SimulationImage,
-    generator: &crate::FlowGeneratorState,
+    generator: StagedGenerator<'_>,
 ) -> Result<u64, ValidationError> {
     let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind else {
         unreachable!("DCQCN control deadline requires DCQCN state")
@@ -4936,18 +5007,18 @@ fn latest_dcqcn_control_time(
 
 fn latest_dcqcn_pacing_time(
     image: &SimulationImage,
-    generator: &crate::FlowGeneratorState,
+    generator: StagedGenerator<'_>,
 ) -> Result<u64, ValidationError> {
     let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind else {
         unreachable!("DCQCN pacing deadline requires DCQCN state")
     };
     let slowest = with_rate_numerator(generator, dcqcn.controller.config.minimum_rate_bps);
-    latest_rate_pacing_time(image, &slowest)
+    latest_rate_pacing_time(image, generator.with_generator(&slowest))
 }
 
 fn latest_rate_pacing_time(
     image: &SimulationImage,
-    generator: &crate::FlowGeneratorState,
+    generator: StagedGenerator<'_>,
 ) -> Result<u64, ValidationError> {
     let rate = pacing_rate(generator);
     let first_time = generator.next_emission.departure_time_ns;
@@ -5035,7 +5106,7 @@ fn validate_global_time_capacity(
     let scheduled_payloads = image
         .host_states
         .iter()
-        .flat_map(|state| &state.generators)
+        .flat_map(staged_generators)
         .filter(|generator| {
             generator.next_emission.status == GeneratorStatus::Scheduled
                 || generator.next_emission.status == GeneratorStatus::Blocked
@@ -5070,7 +5141,7 @@ fn validate_global_time_capacity(
             })?;
         }
     }
-    for generator in image.host_states.iter().flat_map(|state| &state.generators) {
+    for generator in image.host_states.iter().flat_map(staged_generators) {
         let flow = flow(image, generator.flow).expect("generator validation established the flow");
         let remaining = executable_generator_packets(image, generator)?;
         if remaining == 0 {
@@ -5114,7 +5185,7 @@ fn validate_global_time_capacity(
         }
     }
     let work = future_work(image, flow_index)?;
-    for generator in image.host_states.iter().flat_map(|state| &state.generators) {
+    for generator in image.host_states.iter().flat_map(staged_generators) {
         let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind else {
             continue;
         };
@@ -5166,7 +5237,7 @@ fn validate_global_time_capacity(
     let maximum_generator_time = image
         .host_states
         .iter()
-        .flat_map(|state| &state.generators)
+        .flat_map(staged_generators)
         .filter(|generator| {
             generator.next_emission.status == GeneratorStatus::Scheduled
                 || generator.next_emission.status == GeneratorStatus::Blocked
@@ -5557,7 +5628,7 @@ fn validate_dcqcn_arithmetic_capacity(
         .into_iter()
         .filter_map(|packet| matches!(packet.kind, PacketKind::DcqcnCnp(_)).then_some(packet.flow))
         .collect::<BTreeSet<_>>();
-    for generator in image.host_states.iter().flat_map(|state| &state.generators) {
+    for generator in image.host_states.iter().flat_map(staged_generators) {
         let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind else {
             continue;
         };
@@ -5630,7 +5701,7 @@ fn future_work(
             .checked_add(1)
             .ok_or_else(|| ValidationError::new("packet count exceeds the u64 counter domain"))?;
     }
-    for generator in image.host_states.iter().flat_map(|state| &state.generators) {
+    for generator in image.host_states.iter().flat_map(staged_generators) {
         match generator.kind {
             FlowGeneratorKind::Constant(_) => add_packet_count(
                 &mut data_by_flow[generator.flow.0 as usize],
@@ -5819,7 +5890,7 @@ fn validate_counters(image: &SimulationImage, work: &FutureWork) -> Result<(), V
                     state.received_packets,
                     received,
                 )?;
-                for generator in &state.generators {
+                for generator in staged_generators(state) {
                     let pending = work.feedback_by_flow[generator.flow.0 as usize];
                     if generator.feedback.arrivals.checked_add(pending).is_none() {
                         return Err(ValidationError::new(format!(
@@ -5858,14 +5929,12 @@ fn validate_counters(image: &SimulationImage, work: &FutureWork) -> Result<(), V
 
 /// Future timer events (and token payloads) of a compute stage: one while it waits for release,
 /// none once its timer exists or it has finished. `None` for every other generator.
-fn compute_future_timers(generator: &crate::FlowGeneratorState) -> Option<u64> {
+fn compute_future_timers(generator: StagedGenerator<'_>) -> Option<u64> {
     is_compute_generator(generator)
         .then(|| u64::from(generator.next_emission.status == GeneratorStatus::Blocked))
 }
 
-fn remaining_generator_packets(
-    generator: &crate::FlowGeneratorState,
-) -> Result<u64, ValidationError> {
+fn remaining_generator_packets(generator: StagedGenerator<'_>) -> Result<u64, ValidationError> {
     if is_compute_generator(generator) {
         // A compute stage sends no data packets.
         return Ok(0);
@@ -5991,7 +6060,7 @@ fn remaining_generator_packets(
 
 fn executable_generator_packets(
     image: &SimulationImage,
-    generator: &crate::FlowGeneratorState,
+    generator: StagedGenerator<'_>,
 ) -> Result<u64, ValidationError> {
     if matches!(generator.kind, FlowGeneratorKind::Rate(_))
         && matches!(
@@ -6027,7 +6096,7 @@ fn executable_generator_packets(
 fn tcp_timer_install_upper_bound(
     image: &SimulationImage,
     flow_index: &FlowIndex,
-    generator: &crate::FlowGeneratorState,
+    generator: StagedGenerator<'_>,
 ) -> Result<u64, ValidationError> {
     if matches!(
         generator.next_emission.status,
@@ -6066,7 +6135,7 @@ fn tcp_timer_install_upper_bound(
 fn validate_tcp_timer_capacity(
     image: &SimulationImage,
     flow_index: &FlowIndex,
-    generator: &crate::FlowGeneratorState,
+    generator: StagedGenerator<'_>,
     tcp: crate::TcpGenerator,
 ) -> Result<(), ValidationError> {
     let installations = tcp_timer_install_upper_bound(image, flow_index, generator)?;
@@ -6099,7 +6168,7 @@ fn validate_tcp_timer_capacity(
 fn tcp_attempt_upper_bound(
     image: &SimulationImage,
     flow_index: &FlowIndex,
-    generator: &crate::FlowGeneratorState,
+    generator: StagedGenerator<'_>,
 ) -> Result<u64, ValidationError> {
     if matches!(
         generator.next_emission.status,
@@ -6192,7 +6261,7 @@ fn validate_origin_sequences(
         .filter(|node| node.kind == NodeKind::Host)
     {
         let state = &image.host_states[owner.state_slot as usize];
-        for generator in &state.generators {
+        for generator in staged_generators(state) {
             let emissions = match generator.kind {
                 FlowGeneratorKind::Constant(_) if is_compute_generator(generator) => {
                     compute_future_timers(generator).unwrap_or(0)
@@ -6372,7 +6441,7 @@ fn validate_payload_sequences(
         let state = &image.host_states[owner.state_slot as usize];
         let mut allocations = 0_u64;
         let mut consumed_sequences = 0_u64;
-        for generator in &state.generators {
+        for generator in staged_generators(state) {
             if let Some(future_timers) = compute_future_timers(generator) {
                 consumed_sequences = consumed_sequences
                     .checked_add(u64::from(
@@ -6524,8 +6593,10 @@ fn possible_emission_links(image: &SimulationImage) -> BTreeSet<LinkId> {
         image
             .host_states
             .iter()
-            .flat_map(|state| &state.generators)
-            .filter(|generator| remaining_generator_packets(generator).is_ok_and(|count| count > 0))
+            .flat_map(staged_generators)
+            .filter(|generator| {
+                remaining_generator_packets(*generator).is_ok_and(|count| count > 0)
+            })
             .filter_map(|generator| flow(image, generator.flow))
             .flat_map(|flow| flow.route.iter().copied()),
     );
@@ -6667,7 +6738,8 @@ fn packet(image: &SimulationImage, id: PayloadId) -> Option<&crate::PacketDescri
 #[cfg(feature = "planner-test-hooks")]
 mod legacy_scans {
     use super::{
-        EventKind, FlowIndex, GeneratorStatus, PacketKind, PayloadId, SimulationImage, flow, packet,
+        EventKind, FlowIndex, GeneratorStatus, PacketKind, PayloadId, SimulationImage,
+        StagedGenerator, flow, packet, staged_generators,
     };
 
     pub(super) fn is_preloaded_tcp_ack_arrival(
@@ -6738,7 +6810,7 @@ mod legacy_scans {
     /// `validate.rs:3338` before the fix — the retransmission half of the future frame bound.
     pub(super) fn tcp_future_data_max_frame(
         image: &SimulationImage,
-        generator: &crate::FlowGeneratorState,
+        generator: StagedGenerator<'_>,
         tcp: crate::TcpGenerator,
     ) -> u64 {
         if matches!(
@@ -6771,11 +6843,11 @@ mod legacy_scans {
     pub(super) fn generator_for_flow(
         image: &SimulationImage,
         id: crate::FlowId,
-    ) -> Option<&crate::FlowGeneratorState> {
+    ) -> Option<StagedGenerator<'_>> {
         image
             .host_states
             .iter()
-            .flat_map(|state| &state.generators)
+            .flat_map(staged_generators)
             .find(|generator| generator.flow == id)
     }
 
@@ -6784,14 +6856,14 @@ mod legacy_scans {
     pub(super) fn collective_stage(
         image: &SimulationImage,
         position: super::CollectivePosition,
-    ) -> Option<&crate::FlowGeneratorState> {
+    ) -> Option<StagedGenerator<'_>> {
         let (collective_id, phase, rank, step) = position;
         image
             .host_states
             .iter()
-            .flat_map(|state| &state.generators)
+            .flat_map(staged_generators)
             .find(|candidate| {
-                super::collective_identity(candidate).is_some_and(|stage| {
+                super::collective_identity(*candidate).is_some_and(|stage| {
                     stage.collective_id == collective_id
                         && stage.phase == phase
                         && stage.rank == rank
@@ -6919,7 +6991,7 @@ pub fn assert_validate_generator_index_equivalent_for_testing(
         .iter()
         .map(|descriptor| descriptor.id)
         .collect::<Vec<_>>();
-    for generator in image.host_states.iter().flat_map(|state| &state.generators) {
+    for generator in image.host_states.iter().flat_map(staged_generators) {
         generator_queries.push(generator.flow);
         if let Some(stage) = generator.stage {
             generator_queries.extend(stage.dependencies.local_predecessor);
@@ -6935,7 +7007,7 @@ pub fn assert_validate_generator_index_equivalent_for_testing(
         let indexed = flow_index.generator_for_flow(image, id);
         let scanned = legacy_scans::generator_for_flow(image, id);
         let same = match (indexed, scanned) {
-            (Some(indexed), Some(scanned)) => std::ptr::eq(indexed, scanned),
+            (Some(indexed), Some(scanned)) => std::ptr::eq(indexed.generator, scanned.generator),
             (None, None) => true,
             _ => false,
         };
@@ -6961,7 +7033,7 @@ pub fn assert_validate_generator_index_equivalent_for_testing(
     // than the scan's four-way match answers a perturbed key with a stage, while the scan answers
     // `None` or a different stage.
     let mut positions = Vec::new();
-    for generator in image.host_states.iter().flat_map(|state| &state.generators) {
+    for generator in image.host_states.iter().flat_map(staged_generators) {
         let Some(stage) = collective_identity(generator) else {
             continue;
         };
@@ -6998,7 +7070,7 @@ pub fn assert_validate_generator_index_equivalent_for_testing(
         let indexed = flow_index.collective_stage(image, position);
         let scanned = legacy_scans::collective_stage(image, position);
         let same = match (indexed, scanned) {
-            (Some(indexed), Some(scanned)) => std::ptr::eq(indexed, scanned),
+            (Some(indexed), Some(scanned)) => std::ptr::eq(indexed.generator, scanned.generator),
             (None, None) => true,
             _ => false,
         };
@@ -7127,7 +7199,7 @@ pub fn assert_validate_flow_index_equivalent_for_testing(
         }
     }
 
-    for generator in image.host_states.iter().flat_map(|state| &state.generators) {
+    for generator in image.host_states.iter().flat_map(staged_generators) {
         let acks = flow_index.preloaded_tcp_acks(image, generator.flow);
         let scanned_total = legacy_scans::preloaded_ack_events(image, generator.flow) as u64;
         let scanned_within =
@@ -7184,7 +7256,7 @@ pub fn assert_validate_flow_index_equivalent_for_testing(
         let Some(state) = image.host_states.get(owner.state_slot as usize) else {
             continue;
         };
-        for generator in &state.generators {
+        for generator in staged_generators(state) {
             let FlowGeneratorKind::Tcp(tcp) = generator.kind else {
                 continue;
             };

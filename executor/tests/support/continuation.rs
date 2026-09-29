@@ -68,7 +68,6 @@ pub fn tcp_service_continuation_image() -> SimulationImage {
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![FlowGeneratorState {
-                    stage: None,
                     flow: FLOW,
                     packets_emitted: 0,
                     bytes_emitted: 0,
@@ -90,6 +89,7 @@ pub fn tcp_service_continuation_image() -> SimulationImage {
                         TcpCongestionControl::reno(MSS),
                     )),
                 }],
+                stages: Vec::new(),
                 tcp_receivers: vec![],
                 dcqcn_receivers: vec![],
                 next_origin_seq: 1,
@@ -104,6 +104,7 @@ pub fn tcp_service_continuation_image() -> SimulationImage {
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![],
+                stages: Vec::new(),
                 tcp_receivers: vec![TcpReceiverState::new(FLOW, ACK_BYTES)],
                 dcqcn_receivers: vec![],
                 next_origin_seq: 0,

@@ -228,8 +228,7 @@ fn lowering_peak_bytes(sets: usize) -> u64 {
         image
             .host_states
             .iter()
-            .flat_map(|state| &state.generators)
-            .all(|generator| generator.stage.is_none()),
+            .all(|state| state.stages.is_empty()),
         "the frontier fixture has no stages"
     );
     drop(image);
@@ -271,8 +270,7 @@ fn retained_image_bytes(sets: usize) -> (u64, u64) {
         image
             .host_states
             .iter()
-            .flat_map(|state| &state.generators)
-            .all(|generator| generator.stage.is_none()),
+            .all(|state| state.stages.is_empty()),
         "the derived scenario has no stages"
     );
     drop(image);

@@ -4200,6 +4200,7 @@ fn target_interleaved_outbox_image() -> SimulationImage {
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![],
+                stages: Vec::new(),
                 tcp_receivers: vec![],
                 dcqcn_receivers: vec![],
                 next_origin_seq: 3,
@@ -4214,6 +4215,7 @@ fn target_interleaved_outbox_image() -> SimulationImage {
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![],
+                stages: Vec::new(),
                 tcp_receivers: vec![],
                 dcqcn_receivers: vec![],
                 next_origin_seq: 0,
@@ -4228,6 +4230,7 @@ fn target_interleaved_outbox_image() -> SimulationImage {
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![],
+                stages: Vec::new(),
                 tcp_receivers: vec![],
                 dcqcn_receivers: vec![],
                 next_origin_seq: 0,
@@ -4420,7 +4423,6 @@ fn route_load_estimator_uses_only_declared_routes_and_generator_rates() {
         .into_iter()
         .enumerate()
         .map(|(flow, interval_ns)| FlowGeneratorState {
-            stage: None,
             flow: FlowId(flow as u64),
             packets_emitted: 0,
             bytes_emitted: 0,

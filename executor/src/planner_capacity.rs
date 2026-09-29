@@ -980,7 +980,6 @@ mod tests {
         };
         let mut source = empty_host();
         source.generators.push(FlowGeneratorState {
-            stage: None,
             flow: FlowId(0),
             packets_emitted: 0,
             bytes_emitted: 0,

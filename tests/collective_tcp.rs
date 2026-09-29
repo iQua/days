@@ -11,8 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use days::scenario::compile_config;
 use days_executor::{
     ArrivalDisposition, Backend, CollectiveActivationCause, CollectiveProgressRecord, CpuConfig,
-    FlowGeneratorKind, FlowId, GeneratorStatus, MechanismTransitionRecord, ObservationMode,
-    PacketKind, RunResult, SimulationImage, StageRole, TcpTransitionInput,
+    FlowGeneratorKind, FlowId, GeneratorStatus, HostState, MechanismTransitionRecord,
+    ObservationMode, PacketKind, RunResult, SimulationImage, StageRole, TcpTransitionInput,
     collective_transitions_csv, run_cpu_with_observations, run_scalar_with_observations, validate,
 };
 
@@ -189,15 +189,13 @@ fn tcp_collectives_lower_to_wrapped_tcp_generators() {
         let generators = image
             .host_states
             .iter()
-            .flat_map(|state| &state.generators)
+            .flat_map(HostState::generators_with_stages)
             .collect::<Vec<_>>();
-        for generator in &generators {
+        for (generator, stage) in &generators {
             let FlowGeneratorKind::Tcp(tcp) = generator.kind else {
                 panic!("{algorithm}: TCP stages keep the ordinary TCP generator")
             };
-            let stage = generator
-                .stage
-                .expect("a TCP collective stage carries its record");
+            let stage = stage.expect("a TCP collective stage carries its record");
             let StageRole::Collective(identity) = stage.role else {
                 panic!("a transport stage has a collective role")
             };
@@ -249,17 +247,17 @@ fn tcp_collectives_are_scalar_cpu_byte_identical_and_complete() {
                 .filter(|arrival| arrival.disposition == ArrivalDisposition::Delivered)
                 .count();
             assert!(delivered_data > 0);
-            for generator in result
+            for (generator, stage) in result
                 .host_states
                 .iter()
-                .flat_map(|state| &state.generators)
+                .flat_map(HostState::generators_with_stages)
             {
                 assert_eq!(
                     generator.next_emission.status,
                     GeneratorStatus::Finished,
                     "{label}"
                 );
-                let stage = generator.stage.unwrap();
+                let stage = stage.unwrap();
                 assert!(stage.activated, "{label}");
                 assert!(stage.dependencies.prerequisites_complete(), "{label}");
                 let FlowGeneratorKind::Tcp(tcp) = generator.kind else {
@@ -360,8 +358,8 @@ fn tcp_stage_completion_follows_ack_and_in_order_delivery() {
             let non_roots = image
                 .host_states
                 .iter()
-                .flat_map(|state| &state.generators)
-                .filter(|generator| !generator.stage.unwrap().activated)
+                .flat_map(HostState::generators_with_stages)
+                .filter(|(_, stage)| !stage.unwrap().activated)
                 .count();
             assert_eq!(
                 activations, non_roots,
@@ -466,9 +464,8 @@ fn validator_rejects_an_unreleased_tcp_stage_with_sending_state() {
         .enumerate()
         .find_map(|(slot, state)| {
             state
-                .generators
-                .iter()
-                .position(|generator| !generator.stage.unwrap().activated)
+                .generators_with_stages()
+                .position(|(_, stage)| !stage.unwrap().activated)
                 .map(|index| (slot, index))
         })
         .unwrap();
@@ -485,8 +482,7 @@ fn validator_rejects_an_unreleased_tcp_stage_with_sending_state() {
 
     // A release flag set before both prerequisites complete is itself inconsistent.
     let mut released = image.clone();
-    released.host_states[slot].generators[index]
-        .stage
+    released.host_states[slot].stages[index]
         .as_mut()
         .unwrap()
         .activated = true;
