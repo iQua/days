@@ -391,7 +391,7 @@ pub fn fat_tree_ecmp_explicit_flow_hash(
         },
         duplicate_ordinal,
     };
-    generator_seed(seed ^ 0x4543_4d50_5f48_4153, &key)
+    generator_seed(seed ^ 0x4543_4d50_5f48_4153, &key, &[])
 }
 
 /// Selects the compiler-identical fat-tree ECMP hash for one flow-set member.
@@ -419,7 +419,7 @@ pub fn fat_tree_ecmp_flow_set_member_hash(
         source,
         target,
     };
-    generator_seed(seed ^ 0x4543_4d50_5f48_4153, &key)
+    generator_seed(seed ^ 0x4543_4d50_5f48_4153, &key, &[])
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -485,8 +485,12 @@ enum FlowKey {
         source: u64,
         target: u64,
     },
+    /// `collective` is the ordinal of the stage's normalized [`CollectiveKey`] among the scenario's
+    /// sorted distinct collective keys, which [`CanonicalFlows::collectives`] holds. The mapping is
+    /// order-isomorphic, so these keys order exactly as keys embedding the full collective key
+    /// would, while comparing, cloning and storing in constant space instead of O(ranks).
     CollectiveStage {
-        semantic: CollectiveKey,
+        collective: u64,
         duplicate_ordinal: u64,
         stage: CollectiveStagePosition,
     },
@@ -499,6 +503,8 @@ enum FlowKey {
 #[derive(Clone, Debug)]
 struct CollectiveStageInput {
     collective_id: u64,
+    algorithm: CollectiveAlgorithm,
+    group_size: u32,
     declared_total_bytes: u64,
     position: CollectiveStagePosition,
     chunk_offset_bytes: u64,
@@ -2216,7 +2222,10 @@ fn lower(
         .chain(switch_port_keys.iter().copied())
         .collect::<Vec<_>>();
     let ids = StableIds::new(node_keys, link_keys.iter().copied())?;
-    let flows = canonical_flows(
+    let CanonicalFlows {
+        flows,
+        collectives: collective_table,
+    } = canonical_flows(
         model.explicit_flows,
         model.flow_sets,
         model.collectives,
@@ -2251,7 +2260,11 @@ fn lower(
                 target_switch: NodeIndex::new(host_attachment_switches[&flow.target] as usize),
                 // The hash stands in for a switch's header hash. It is taken from the flow's own
                 // semantic key, so it is a pure function of the scenario text.
-                flow_hash: generator_seed(model.seed ^ 0x4543_4d50_5f48_4153, &flow.key),
+                flow_hash: generator_seed(
+                    model.seed ^ 0x4543_4d50_5f48_4153,
+                    &flow.key,
+                    &collective_table,
+                ),
             }),
         ),
     }
@@ -2405,7 +2418,7 @@ fn lower(
                     packets_emitted: 0,
                     bytes_emitted: 0,
                     next_emission,
-                    rng_state: generator_seed(model.seed, &flow.key),
+                    rng_state: generator_seed(model.seed, &flow.key, &collective_table),
                     feedback: GeneratorFeedbackState {
                         arrivals: 0,
                         outstanding_bytes: 0,
@@ -2528,18 +2541,14 @@ fn lower(
             }
         };
         let collective_stage = flow.collective.as_ref().map(|stage| {
-            let FlowKey::CollectiveStage { semantic, .. } = &flow.key else {
-                unreachable!("collective metadata requires a collective flow key")
-            };
             let stage_flow = |key: &FlowKey| FlowId(flow_ids[key]);
             (
                 CollectiveStageIdentity {
                     collective_id: stage.collective_id,
-                    algorithm: semantic.algorithm,
+                    algorithm: stage.algorithm,
                     topology_level: 0,
                     topology_group: 0,
-                    group_size: u32::try_from(semantic.flow_count)
-                        .expect("collective lowering checked group size"),
+                    group_size: stage.group_size,
                     declared_total_bytes: stage.declared_total_bytes,
                     rank: stage.position.rank,
                     phase: stage.position.phase,
@@ -2574,7 +2583,7 @@ fn lower(
                 packets_emitted: 0,
                 bytes_emitted: 0,
                 next_emission,
-                rng_state: generator_seed(model.seed, &flow.key),
+                rng_state: generator_seed(model.seed, &flow.key, &collective_table),
                 feedback: GeneratorFeedbackState {
                     arrivals: 0,
                     outstanding_bytes: 0,
@@ -2983,6 +2992,22 @@ fn lower(
     })
 }
 
+/// The canonically ordered flow inputs and the collective keys their stage keys index.
+struct CanonicalFlows {
+    flows: Vec<FlowInput>,
+    /// The normalized collective keys, sorted and distinct: `FlowKey::CollectiveStage::collective`
+    /// indexes this table.
+    collectives: Vec<CollectiveKey>,
+}
+
+/// Ordinal of `semantic` in the sorted distinct `table`.
+fn collective_ordinal(table: &[CollectiveKey], semantic: &CollectiveKey) -> u64 {
+    let index = table
+        .binary_search(semantic)
+        .expect("every normalized collective key is in the distinct-key table");
+    u64::try_from(index).expect("the collective table length fits u64")
+}
+
 fn canonical_flows(
     mut explicit: Vec<ExplicitFlowKey>,
     mut flow_sets: Vec<FlowSetKey>,
@@ -2991,7 +3016,7 @@ fn canonical_flows(
     hosts: &BTreeSet<u64>,
     host_attachments: &HostAttachments,
     seed: u64,
-) -> Result<Vec<FlowInput>, CompileError> {
+) -> Result<CanonicalFlows, CompileError> {
     explicit.sort();
     flow_sets.sort();
     collectives.sort();
@@ -3130,10 +3155,19 @@ fn canonical_flows(
     }
     let groups = resolve_stage_groups(&collectives, &computes)?;
 
-    let mut collective_duplicates = BTreeMap::<CollectiveKey, u64>::new();
+    // Normalization filled omitted `sources`/`sinks`, which can reorder keys, so the table is built
+    // from the normalized keys: the flow sort below orders stages by exactly these keys.
+    let collective_table = collectives
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let mut collective_duplicates = vec![0_u64; collective_table.len()];
     let mut next_collective_id = 0_u64;
-    for semantic in collectives.iter().cloned() {
-        let duplicate = collective_duplicates.entry(semantic.clone()).or_default();
+    for semantic in &collectives {
+        let collective = collective_ordinal(&collective_table, semantic);
+        let duplicate = &mut collective_duplicates[collective as usize];
         let duplicate_ordinal = *duplicate;
         *duplicate = duplicate.checked_add(1).ok_or_else(|| {
             CompileError::Invalid("duplicate collective ordinal overflow".to_owned())
@@ -3151,17 +3185,27 @@ fn canonical_flows(
         expand_collective(
             &mut flows,
             semantic,
+            collective,
             duplicate_ordinal,
             collective_id,
             entry.as_ref(),
         )?;
     }
     for (compute_id, compute) in computes.iter().enumerate() {
-        expand_compute(&mut flows, compute, compute_id as u64, &groups)?;
+        expand_compute(
+            &mut flows,
+            compute,
+            compute_id as u64,
+            &groups,
+            &collective_table,
+        )?;
     }
 
     flows.sort_by(|left, right| left.key.cmp(&right.key));
-    Ok(flows)
+    Ok(CanonicalFlows {
+        flows,
+        collectives: collective_table,
+    })
 }
 
 fn collective_chunk_bounds(total: u64, group_size: u64, owner: u64) -> (u64, u64) {
@@ -3198,7 +3242,8 @@ fn collective_stage_owner(
 
 fn expand_collective(
     flows: &mut Vec<FlowInput>,
-    semantic: CollectiveKey,
+    semantic: &CollectiveKey,
+    collective: u64,
     duplicate_ordinal: u64,
     collective_id: u64,
     entry: Option<&ComputeKey>,
@@ -3226,7 +3271,7 @@ fn expand_collective(
         .map_err(|error| {
             CompileError::Invalid(format!("collective stage table is too large: {error}"))
         })?;
-    u32::try_from(n)
+    let group_size = u32::try_from(n)
         .map_err(|_| CompileError::Invalid("collective group size exceeds u32".to_owned()))?;
     let phases: &[CollectivePhase] = match semantic.algorithm {
         CollectiveAlgorithm::RingAllReduce => {
@@ -3298,7 +3343,7 @@ fn expand_collective(
                 let inbound_predecessor_complete =
                     inbound_predecessor.is_none() || chunk_bytes == 0;
                 let stage_key = |stage: CollectiveStagePosition| FlowKey::CollectiveStage {
-                    semantic: semantic.clone(),
+                    collective,
                     duplicate_ordinal,
                     stage,
                 };
@@ -3317,17 +3362,15 @@ fn expand_collective(
                 let mut traffic = semantic.traffic.clone();
                 traffic.termination = Termination::Bytes(chunk_bytes);
                 flows.push(FlowInput {
-                    key: FlowKey::CollectiveStage {
-                        semantic: semantic.clone(),
-                        duplicate_ordinal,
-                        stage: position,
-                    },
+                    key: stage_key(position),
                     source: semantic.sources[rank_u64 as usize],
                     target: semantic.sinks[rank_u64 as usize],
                     priority: semantic.priority,
                     traffic,
                     collective: Some(CollectiveStageInput {
                         collective_id,
+                        algorithm: semantic.algorithm,
+                        group_size,
                         declared_total_bytes: total_bytes,
                         position,
                         chunk_offset_bytes,
@@ -3464,52 +3507,61 @@ fn expand_compute(
     compute: &ComputeKey,
     compute_id: u64,
     groups: &BTreeMap<String, StageGroup<'_>>,
+    collective_table: &[CollectiveKey],
 ) -> Result<(), CompileError> {
     let group_size = u32::try_from(compute.hosts.len())
         .expect("compute validation bounded the group size by u32");
+    let after = compute.after.as_ref().map(|name| groups[name]);
+    let after_collective = match after {
+        Some(StageGroup::Collective(collective)) => {
+            Some(collective_ordinal(collective_table, collective))
+        }
+        Some(StageGroup::Compute(_)) | None => None,
+    };
     for (rank, &host) in (0_u32..).zip(&compute.hosts) {
-        let (local_predecessor, inbound_predecessor, inbound_predecessor_bytes) =
-            match compute.after.as_ref().map(|name| groups[name]) {
-                None => (None, None, 0),
-                Some(StageGroup::Compute(predecessor)) => (
-                    Some(FlowKey::ComputeStage {
-                        semantic: predecessor.clone(),
+        let (local_predecessor, inbound_predecessor, inbound_predecessor_bytes) = match after {
+            None => (None, None, 0),
+            Some(StageGroup::Compute(predecessor)) => (
+                Some(FlowKey::ComputeStage {
+                    semantic: predecessor.clone(),
+                    rank,
+                }),
+                None,
+                0,
+            ),
+            Some(StageGroup::Collective(collective)) => {
+                let n = collective.flow_count;
+                let Termination::Bytes(total_bytes) = collective.traffic.termination else {
+                    unreachable!("collective validation requires byte termination")
+                };
+                let final_step = u32::try_from(n - 1).expect("collective group fits u32");
+                let previous_rank = u32::try_from((u64::from(rank) + n - 1) % n)
+                    .expect("rank is below the u32 group size");
+                // A named collective is unique by name, so its only instance has ordinal 0.
+                let final_stage = |rank: u32| FlowKey::CollectiveStage {
+                    collective: after_collective
+                        .expect("a collective predecessor has a table ordinal"),
+                    duplicate_ordinal: 0,
+                    stage: CollectiveStagePosition {
+                        phase: CollectivePhase::AllGather,
                         rank,
-                    }),
-                    None,
-                    0,
-                ),
-                Some(StageGroup::Collective(collective)) => {
-                    let n = collective.flow_count;
-                    let Termination::Bytes(total_bytes) = collective.traffic.termination else {
-                        unreachable!("collective validation requires byte termination")
-                    };
-                    let final_step = u32::try_from(n - 1).expect("collective group fits u32");
-                    let previous_rank = u32::try_from((u64::from(rank) + n - 1) % n)
-                        .expect("rank is below the u32 group size");
-                    let final_stage = |rank: u32| FlowKey::CollectiveStage {
-                        semantic: collective.clone(),
-                        duplicate_ordinal: 0,
-                        stage: CollectiveStagePosition {
-                            phase: CollectivePhase::AllGather,
-                            rank,
-                            step: final_step,
-                        },
-                    };
-                    let owner = collective_stage_owner(
-                        collective.algorithm,
-                        CollectivePhase::AllGather,
-                        n,
-                        u64::from(previous_rank),
-                        u64::from(final_step),
-                    );
-                    (
-                        Some(final_stage(rank)),
-                        Some(final_stage(previous_rank)),
-                        collective_chunk_bounds(total_bytes, n, owner).1,
-                    )
-                }
-            };
+                        step: final_step,
+                    },
+                };
+                let owner = collective_stage_owner(
+                    collective.algorithm,
+                    CollectivePhase::AllGather,
+                    n,
+                    u64::from(previous_rank),
+                    u64::from(final_step),
+                );
+                (
+                    Some(final_stage(rank)),
+                    Some(final_stage(previous_rank)),
+                    collective_chunk_bounds(total_bytes, n, owner).1,
+                )
+            }
+        };
         flows.push(FlowInput {
             key: FlowKey::ComputeStage {
                 semantic: compute.clone(),
@@ -3632,7 +3684,8 @@ fn allocate_payload_id(
     })
 }
 
-fn generator_seed(image_seed: u64, key: &FlowKey) -> u64 {
+/// `collectives` is the table a `FlowKey::CollectiveStage` indexes; other keys never read it.
+fn generator_seed(image_seed: u64, key: &FlowKey, collectives: &[CollectiveKey]) -> u64 {
     let mut state = mix_seed(image_seed ^ 0x6a09_e667_f3bc_c909);
     match key {
         FlowKey::Explicit {
@@ -3678,10 +3731,12 @@ fn generator_seed(image_seed: u64, key: &FlowKey) -> u64 {
             state = mix_seed(state ^ target);
         }
         FlowKey::CollectiveStage {
-            semantic,
+            collective,
             duplicate_ordinal,
             stage,
         } => {
+            let semantic = &collectives[usize::try_from(*collective)
+                .expect("a collective ordinal indexes the in-memory collective table")];
             state = mix_seed(state ^ 0x434f_4c4c_4543_5449);
             state = mix_seed(state ^ semantic.flow_count);
             state = mix_seed(state ^ duplicate_ordinal);
