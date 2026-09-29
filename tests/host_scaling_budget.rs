@@ -92,8 +92,9 @@ const RATIO_FLOOR: Duration = Duration::from_millis(1);
 
 /// A sample longer than this ends the repetitions at its size; the phase keeps the minimum of the
 /// samples taken, and the record line reports how many there were. No passing sample comes near
-/// it: the longest in the verification runs took about 16 s. On a regressed tree a
-/// large-size sample takes minutes, so the cap bounds how long the failing job runs.
+/// it: the longest in the verification runs, the whole frontier's lowering on four x86 cores,
+/// took 14.8 s, a quarter of the budget. On a regressed tree a large-size sample takes minutes,
+/// so the cap bounds how long the failing job runs.
 const SAMPLE_BUDGET: Duration = Duration::from_secs(60);
 
 /// One scaling case: the two sizes, their repetitions, and the ratio bound.
@@ -572,11 +573,13 @@ fn full_frontier_host_phases() {
 ///
 /// **Detection floor.** A term is caught only once its share `q` of the phase at k=16 reaches
 /// `(22.6 - R) / (64 - 22.6)`, where `R` is the fixed tree's ratio: about 0.25 for validation.
-/// Measured on a 4-core x86 host, that is a per-flow scan adding about 3 us per flow at 1,024
-/// hosts, which at the frontier (262,144 flows over 8,192 hosts) adds about 5 to 7 s per
-/// validation, more than the whole fixed validation. Realistic per-flow scans over hosts cost far
-/// less: two scratch mutants, a per-flow `position` over `nodes` and over `host_states`, added
-/// 0.36 to 1.5 s per validation at the frontier and pass this case (`evidence/P14/ci-scaling.md`).
+/// On four x86 cores that is a per-flow scan over hosts costing about 3 us per flow at 1,024
+/// hosts, which at the frontier (262,144 flows over 8,192 hosts) adds about 6 s to every
+/// validation, more than the whole fixed validation. A scratch mutant repeating a per-flow
+/// `host_states` scan confirms it: at 4.9 s per frontier validation the case passed, at 9.9 s it
+/// failed twice, and the flow-only case passed it. Realistic per-flow scans over hosts cost far
+/// less: a single `position` over `nodes` or over `host_states` added 0.36 to 1.5 s per
+/// validation at the frontier, and both pass this case (`evidence/P14/ci-scaling.md`).
 /// A ratio gate catches gross complexity regressions only. The deterministic budgets
 /// (`scalar_stage_scaling`, `collective_lowering_budget` and `route_scaling_budget`) are the
 /// fine-grained guards.
