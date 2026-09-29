@@ -35,6 +35,7 @@ pub mod model;
 mod planner_capacity;
 pub mod safe_horizon;
 pub mod scalar;
+mod stage_index;
 pub mod tcp;
 mod tcp_ledger;
 mod tcp_ledger_ring;
