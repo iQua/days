@@ -2,8 +2,10 @@
 //!
 //! - Selection: every `configs/p14/` fixture and its checkpoints select the mechanisms build; the
 //!   evaluation cells and plain scheduler images select the plain build.
-//! - Fail closed: forced onto the plain build, every `configs/p14/` fixture stops with
-//!   `MechanismsKernelRequired` and produces no result.
+//! - Fail closed: forced onto the plain build, every image with DCQCN or PFC state (the
+//!   `configs/p14/` fixtures, their DCQCN-only variants, checkpoints, and the finished- and
+//!   active-generator checkpoints of review F2) is refused by the host before launch with
+//!   `MechanismsKernelRequired`, and produces no result.
 //! - Forced onto the mechanisms build, images without DCQCN or PFC state reproduce the plain
 //!   build's bytes and the Scalar oracle's, so a selection error can only cost time.
 
@@ -119,8 +121,9 @@ fn scalar(image: &SimulationImage, horizon: Option<u64>) -> RunResult {
     expected
 }
 
-/// A DCQCN fixture lowered without its (zero-XOFF, inert) PFC link section: the plain build must
-/// then fail closed through the DCQCN checks alone, not the PFC entry check.
+/// A DCQCN fixture lowered without its (zero-XOFF, inert) PFC link section: the host must then
+/// refuse the plain kernel through the plan check's DCQCN conditions (the generator row and the
+/// receiver marker) alone, without the PFC region.
 fn without_pfc(name: &str) -> Option<SimulationImage> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("configs/p14")
@@ -171,7 +174,7 @@ fn fail_closed_fixtures() -> Vec<(String, SimulationImage)> {
 }
 
 #[test]
-fn the_dcqcn_checks_are_exercised_without_pfc_state() {
+fn dcqcn_only_variants_exercise_the_plan_check_without_a_pfc_region() {
     let dcqcn_only = fail_closed_fixtures()
         .into_iter()
         .filter(|(_, image)| !image_has_pfc_state(image))

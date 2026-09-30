@@ -1623,6 +1623,13 @@ impl MetalPlan {
         };
         match crate::device_mechanism::plain_round_kernel_refusal(&plan) {
             None => Ok(()),
+            // Fail closed on a plan the check cannot read, but do not call it mechanism state.
+            Some(crate::device_mechanism::PlainKernelRefusal::MalformedPlan) => {
+                Err(MetalError::Validation(
+                    "plain round kernel plan check: a plan meta or row points outside its plane"
+                        .into(),
+                ))
+            }
             Some(refusal) => Err(MetalError::MechanismsKernelRequired {
                 node: refusal.node(),
             }),
