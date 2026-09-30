@@ -731,6 +731,43 @@ mod cuda {
         }
     }
 
+    /// P14 round 4: the executor loads no module, so its initialization reports no module time;
+    /// each run loads its own and reports what that cost. Printed for the cost record
+    /// (`--nocapture`).
+    #[test]
+    fn cuda_each_run_reports_its_round_module_load_time() {
+        let executor = CudaExecutor::on_device(0).expect("CUDA device 0");
+        assert_eq!(executor.initialization_timings().module_function_load_ns, 0);
+        for repeat in 0..3 {
+            for (name, image, build) in [
+                ("FIFO incast", scheduler_image("FIFO"), RoundKernel::Plain),
+                (
+                    "dcqcn_t26",
+                    fixture("dcqcn_t26.toml"),
+                    RoundKernel::Mechanisms,
+                ),
+            ] {
+                let run = executor
+                    .run_with_observations(
+                        &image,
+                        None,
+                        CudaConfig::default(),
+                        ObservationMode::Full,
+                    )
+                    .unwrap_or_else(|error| panic!("{name}: {error}"));
+                assert_eq!(run.round_kernel, build, "{name}");
+                assert!(run.module_load_ns > 0, "{name}: the run loaded its module");
+                println!(
+                    "record=p14_round_module_load repeat={repeat} round_kernel={build:?} \
+                     module_load_ns={} graph_capture_ns={} retries={}",
+                    run.module_load_ns,
+                    run.graph_capture_ns,
+                    run.capacity_retry_trace.len()
+                );
+            }
+        }
+    }
+
     fn forced(round_kernel: RoundKernel, round_threads_per_block: usize) -> CudaConfig {
         CudaConfig {
             round_threads_per_block,
