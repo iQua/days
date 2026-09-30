@@ -647,9 +647,10 @@ mod cuda {
     }
 
     /// P14 round 4: a run captures its graph with exactly one round module loaded in the context,
-    /// its own. The residue round 3 left appears only when the other build's module is loaded
-    /// before a run allocates its buffers and captures its graph
-    /// (`evidence/P14/diag3-timing.md`), so each run loads its module and no other.
+    /// its own. Round 3's residue was reproduced with the other build's module loaded at
+    /// initialization, and was absent with it never loaded or loaded after graph capture
+    /// (retry-free runs; `evidence/P14/diag3-timing.md`). One module per run is the design that
+    /// this parity evidence covers, so each run loads its module and no other.
     #[test]
     fn cuda_each_run_captures_its_graph_with_one_round_module_loaded() {
         let executor = CudaExecutor::on_device(0).expect("CUDA device 0");

@@ -4999,15 +4999,18 @@ struct DirectCuda {
 /// Why one module per run, and not both loaded once in [`DirectCuda::new`] as round 3 had it:
 /// round 3's modules are code- and layout-identical to their references (`main` for plain, the P14
 /// control for mechanisms), yet runs kept a device-time residue against them. The diagnosis
-/// (`evidence/P14/diag3/instruments.md` and `evidence/P14/diag3-timing.md` in days-gpu) found:
-/// - every data buffer sits at the same device address with one module loaded or two, so neither
-///   module layout nor buffer placement is the cause;
-/// - loading only the run's module reaches parity with the reference;
-/// - loading the other module after the run's buffers are allocated and its graph captured, and
-///   keeping it loaded during every round, also reaches parity.
+/// (`evidence/P14/diag3/instruments.md` and `evidence/P14/diag3-timing.md` in days-gpu) shows:
+/// - data-buffer placement is excluded: every data buffer sits at the same device address with
+///   one module loaded or two;
+/// - intra-module layout is excluded, by the comparator that found the modules layout-identical
+///   to their references;
+/// - module code placement and load order cannot be observed through the driver API and remain
+///   candidates; load order is supported on the mechanisms path;
+/// - the residue was reproduced with the other module loaded at initialization, and was absent
+///   with it never loaded or loaded after graph capture (retry-free runs);
+/// - the mechanism is not identified.
 ///
-/// So the residue appears only when the other round module is loaded before a run allocates its
-/// buffers and captures its graph. The mechanism is not identified.
+/// One module per run is the design that this parity evidence covers.
 struct RoundModule {
     /// The round-kernel build this module carries.
     build: RoundKernel,
