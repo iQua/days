@@ -5766,6 +5766,27 @@ mod tests {
         }
     }
 
+    /// P14 cuda-host: the readback event decode stays force-inlined into `CudaBuffers::finish`.
+    ///
+    /// This pins the three attributes, not the codegen they produce. The codegen is checked on the
+    /// release binary by `evidence/P14/cuda-host/tooling/callsites.py` (days-gpu): `finish` must make
+    /// no out-of-line call to any of the three. Without the attributes it makes 3 / 2 / 2 such calls,
+    /// which cost E6 60% about 25 ms of host run (`evidence/P14/cuda-host.md`).
+    #[test]
+    fn readback_event_decode_is_force_inlined() {
+        let source = include_str!("cuda.rs");
+        for signature in [
+            "fn decode_event(record: &[u64])",
+            "fn decode_packet_kind(value: u64, metadata: &[u64])",
+            "fn decode_packet_fields(words: &[u64])",
+        ] {
+            assert!(
+                source.contains(&format!("#[inline(always)]\n{signature}")),
+                "`{signature}` must be #[inline(always)]"
+            );
+        }
+    }
+
     #[test]
     fn cuda_semantic_fault_decodes_the_word_the_kernels_write() {
         let source = include_str!("cuda_kernels.cu");
