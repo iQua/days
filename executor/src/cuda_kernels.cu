@@ -6,6 +6,14 @@
 // one lane owns each LP and all cross-LP compaction/reductions have fixed deterministic shapes.
 #include <stdint.h>
 
+// P14 round 3: this file is compiled once per round module (`executor/build.rs`). Each module is
+// complete (every shared kernel and the readback gather) and carries exactly one round kernel:
+// `DAYS_ROUND_MODULE` 0 is the plain module (`days_round`), 1 the mechanisms module
+// (`days_round_mechanisms`).
+#if !defined(DAYS_ROUND_MODULE) || (DAYS_ROUND_MODULE != 0 && DAYS_ROUND_MODULE != 1)
+#error "compile cuda_kernels.cu with -DDAYS_ROUND_MODULE=0 (plain) or -DDAYS_ROUND_MODULE=1 (mechanisms)"
+#endif
+
 using uint = uint32_t;
 using ulong = uint64_t;
 
@@ -6300,17 +6308,22 @@ extern "C" __global__ void days_round_prepare(DAYS_BUFFERS) {
 // refuses the plain build on any plan holding DCQCN or PFC state
 // (`device_mechanism::plain_round_kernel_refusal`); the plain build has no device-side stop.
 //
+// Each build lives in its own module (`DAYS_ROUND_MODULE`), at the round slot of an otherwise
+// identical module: a module carrying both round kernels moves every kernel placed after the
+// first one, and that placement alone cost device time (`evidence/P14/modprobe-ab.md`).
+//
 // The body is included, not called: compiled through a forwarding function it loses the hoisting
 // of launch-constant `params` loads, and neither build matches its reference's machine code
 // (`evidence/P14/zero-cost-diagnosis.md` §1.4, §2.2). Included, the plain build is `main`'s
 // `days_round` and the mechanisms build is the P14 control's, instruction for instruction on sm_89.
 
+#if DAYS_ROUND_MODULE == 0
 // The plain build: images without DCQCN or PFC state.
 extern "C" __global__ __launch_bounds__(256) void days_round(DAYS_BUFFERS) {
     constexpr bool MECHANISMS = false;
 #include "cuda_round_body.inc"
 }
-
+#else
 // The mechanisms build: every image, including DCQCN and PFC state. It states one resident block
 // per SM: with `__launch_bounds__(256)` alone, CUDA 13.0's ptxas targets 128 registers on sm_121
 // for this body and spills; with the minimum stated it allocates 232 and does not (sm_86 and sm_89
@@ -6319,6 +6332,7 @@ extern "C" __global__ __launch_bounds__(256, 1) void days_round_mechanisms(DAYS_
     constexpr bool MECHANISMS = true;
 #include "cuda_round_body.inc"
 }
+#endif
 
 // T21 fix 1 — the round-control scans, on the whole grid.
 //

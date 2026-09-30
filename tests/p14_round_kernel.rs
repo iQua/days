@@ -477,10 +477,174 @@ mod metal {
 #[cfg(feature = "cuda-test-hooks")]
 mod cuda {
     use days_executor::{
-        CudaConfig, CudaError, ObservationMode, RoundKernel, run_cuda_with_observations,
+        CudaConfig, CudaError, CudaExecutor, ObservationMode, RoundKernel,
+        run_cuda_with_observations,
     };
 
-    use super::{DISCIPLINES, refused_images, scalar, scheduler_image};
+    use super::{DISCIPLINES, fixture, refused_images, scalar, scheduler_image};
+
+    /// The kernels of one round module, in attempt-DAG order, then the readback gather.
+    fn module_kernels(round: &'static str) -> Vec<&'static str> {
+        vec![
+            "days_horizon_sweep",
+            "days_horizon",
+            "days_round_reset",
+            "days_round_prepare",
+            round,
+            "days_round_control_sweep",
+            "days_round_control",
+            "days_exchange_prefix_sweep",
+            "days_exchange_prefix",
+            "days_exchange_scatter",
+            "days_exchange_merge",
+            "days_round_finalize_sweep",
+            "days_round_finalize",
+            "days_compact_gather",
+        ]
+    }
+
+    /// P14 round 3: each round-kernel build is its own complete module, holding only its own round
+    /// kernel, and every run launches its 14 kernels from that one module. A module holding both
+    /// round kernels moved the code after them and cost device time (`evidence/P14/modprobe-ab.md`).
+    #[test]
+    fn cuda_each_run_launches_one_complete_round_module() {
+        let executor = CudaExecutor::on_device(0).expect("CUDA device 0");
+        let plain = module_kernels("days_round");
+        let mechanisms = module_kernels("days_round_mechanisms");
+        assert_eq!(
+            executor.round_module_kernels_for_testing(RoundKernel::Plain),
+            plain,
+            "the plain module holds exactly main's kernels"
+        );
+        let mut held = executor.round_module_kernels_for_testing(RoundKernel::Mechanisms);
+        // The probe lists the attempt kernels in DAG order with the plain round kernel's slot
+        // first; put the mechanisms round kernel back in its slot for the comparison.
+        if let Some(position) = held
+            .iter()
+            .position(|name| *name == "days_round_mechanisms")
+        {
+            let name = held.remove(position);
+            held.insert(4, name);
+        }
+        assert_eq!(
+            held, mechanisms,
+            "the mechanisms module holds exactly its kernels"
+        );
+
+        // The record identifies each launched handle, not the selection: an attempt array that
+        // borrows slots from the other module, as a mixed-module regression would, is recorded as
+        // exactly that.
+        for build in [RoundKernel::Plain, RoundKernel::Mechanisms] {
+            let other = match build {
+                RoundKernel::Plain => RoundKernel::Mechanisms,
+                RoundKernel::Mechanisms => RoundKernel::Plain,
+            };
+            let own = match build {
+                RoundKernel::Plain => &plain,
+                RoundKernel::Mechanisms => &mechanisms,
+            };
+            let theirs = match build {
+                RoundKernel::Plain => &mechanisms,
+                RoundKernel::Mechanisms => &plain,
+            };
+            for borrowed in [vec![0], vec![4], vec![0, 5, 12]] {
+                let expected = (0..13)
+                    .map(|index| {
+                        if borrowed.contains(&index) {
+                            (other, theirs[index])
+                        } else {
+                            (build, own[index])
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    executor.launch_record_for_testing(build, &borrowed),
+                    expected,
+                    "{build:?} with slots {borrowed:?} borrowed from the {other:?} module"
+                );
+            }
+        }
+
+        // One-record channel and fallback-heap caps force capacity retries (a DCQCN host holds a
+        // pacing timer and a control timer); the record is the final attempt's.
+        let retrying = CudaConfig {
+            max_channel_events_per_stream: Some(1),
+            max_fel_events_per_lp: Some(1),
+            ..CudaConfig::default()
+        };
+        for (name, image, build, forced_build, config, retries) in [
+            (
+                "FIFO incast",
+                scheduler_image("FIFO"),
+                RoundKernel::Plain,
+                None,
+                CudaConfig::default(),
+                false,
+            ),
+            (
+                "dcqcn_t26",
+                fixture("dcqcn_t26.toml"),
+                RoundKernel::Mechanisms,
+                None,
+                CudaConfig::default(),
+                false,
+            ),
+            (
+                "FIFO incast forced onto mechanisms",
+                scheduler_image("FIFO"),
+                RoundKernel::Mechanisms,
+                Some(RoundKernel::Mechanisms),
+                CudaConfig::default(),
+                false,
+            ),
+            (
+                "FIFO incast after capacity retries",
+                scheduler_image("FIFO"),
+                RoundKernel::Plain,
+                None,
+                retrying,
+                true,
+            ),
+            (
+                "dcqcn_t26 after capacity retries",
+                fixture("dcqcn_t26.toml"),
+                RoundKernel::Mechanisms,
+                None,
+                retrying,
+                true,
+            ),
+        ] {
+            let run = run_cuda_with_observations(
+                &image,
+                None,
+                CudaConfig {
+                    round_kernel_override: forced_build,
+                    ..config
+                },
+                ObservationMode::Full,
+            )
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(run.round_kernel, build, "{name}");
+            if retries {
+                assert!(
+                    !run.capacity_retry_trace.is_empty(),
+                    "{name}: the capped run must retry capacity"
+                );
+            }
+            let expected = match build {
+                RoundKernel::Plain => &plain,
+                RoundKernel::Mechanisms => &mechanisms,
+            };
+            assert_eq!(
+                run.launched_kernels,
+                expected
+                    .iter()
+                    .map(|kernel| (build, *kernel))
+                    .collect::<Vec<_>>(),
+                "{name}: every launched kernel comes from the {build:?} module"
+            );
+        }
+    }
 
     fn forced(round_kernel: RoundKernel, round_threads_per_block: usize) -> CudaConfig {
         CudaConfig {

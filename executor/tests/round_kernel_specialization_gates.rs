@@ -272,6 +272,57 @@ fn both_cuda_round_kernels_include_one_body_without_a_forwarding_function() {
     assert_eq!(METAL.matches("[[function_constant(").count(), 1);
 }
 
+/// P14 round 3: each round kernel is emitted by its own compile of the kernel file, so the plain
+/// and mechanisms modules each carry every shared kernel and exactly one round kernel
+/// (`evidence/P14/modprobe-ab.md`: a module holding both moved the code placed after them).
+#[test]
+fn each_round_kernel_is_built_into_its_own_module() {
+    assert!(CUDA.contains(
+        "#if !defined(DAYS_ROUND_MODULE) || (DAYS_ROUND_MODULE != 0 && DAYS_ROUND_MODULE != 1)\n#error"
+    ));
+    let plain = CUDA
+        .find("#if DAYS_ROUND_MODULE == 0\n")
+        .expect("the plain module's branch");
+    let split = CUDA[plain..]
+        .find("#else\n")
+        .expect("the mechanisms branch")
+        + plain;
+    let end = CUDA[split..]
+        .find("#endif\n")
+        .expect("the end of the branches")
+        + split;
+    assert!(CUDA[plain..split].contains("void days_round(DAYS_BUFFERS)"));
+    assert!(!CUDA[plain..split].contains("days_round_mechanisms("));
+    assert!(CUDA[split..end].contains("void days_round_mechanisms(DAYS_BUFFERS)"));
+    assert!(!CUDA[split..end].contains("void days_round("));
+    assert_eq!(CUDA.matches("void days_round(DAYS_BUFFERS)").count(), 1);
+    assert_eq!(
+        CUDA.matches("void days_round_mechanisms(DAYS_BUFFERS)")
+            .count(),
+        1
+    );
+
+    let build = include_str!("../build.rs");
+    for (module, fatbin) in [
+        ("0", "days_cuda_kernels.fatbin"),
+        ("1", "days_cuda_kernels_mechanisms.fatbin"),
+    ] {
+        assert!(build.contains(&format!("(\"{module}\", out_dir.join(\"{fatbin}\"))")));
+    }
+    assert!(build.contains("-DDAYS_ROUND_MODULE={module}"));
+    let cuda_host = include_str!("../src/cuda.rs");
+    for fatbin in [
+        "\"/days_cuda_kernels.fatbin\"",
+        "\"/days_cuda_kernels_mechanisms.fatbin\"",
+    ] {
+        assert_eq!(
+            cuda_host.matches(fatbin).count(),
+            1,
+            "{fatbin} is loaded once"
+        );
+    }
+}
+
 /// The plain build carries no mechanism code: every Lane B entry point is guarded by the constant
 /// (above), and nothing tests its negation. There is no device-side stop and no mechanism error
 /// code; the host check of the uploaded plan is the plain kernel's only fail-closed path.
