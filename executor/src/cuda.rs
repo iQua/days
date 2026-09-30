@@ -435,6 +435,15 @@ fn read_queue(plan: &CompactionPlan, lp: usize, records: &[u64]) -> Vec<PacketDe
         .collect()
 }
 
+/// Decodes one 14-word event record read back from the device.
+///
+/// `decode_event`, [`decode_packet_fields`] and [`decode_packet_kind`] are `#[inline(always)]`
+/// because `CudaBuffers::finish` runs them once per live event and packet: 950,366 channel-stream
+/// events at E6 60% load. Once Lane B's PFC and DCQCN arms grew `decode_packet_kind`, the inliner
+/// left all three out of line in `finish`, whose size overrides an `#[inline]` hint. That cost about
+/// 25 ms of host run at 60% load. Forcing them inline removes the calls and changes no decoded
+/// value (`evidence/P14/cuda-host.md` in days-gpu).
+#[inline(always)]
 fn decode_event(record: &[u64]) -> Result<(Event, PacketDescriptor), CudaError> {
     let kind = decode_event_kind(record[5])?;
     let packet = decode_packet_fields(&record[7..14])?;
@@ -485,6 +494,8 @@ fn decode_event_kind(value: u64) -> Result<EventKind, CudaError> {
     }
 }
 
+/// Forced inline for the readback decode; see [`decode_event`].
+#[inline(always)]
 fn decode_packet_kind(value: u64, metadata: &[u64]) -> Result<PacketKind, CudaError> {
     match value & PACKET_KIND_MASK {
         0 => Ok(PacketKind::Data),
@@ -588,6 +599,8 @@ fn decode_packet_words(words: &[u64]) -> Result<PacketDescriptor, CudaError> {
     decode_packet_fields(words)
 }
 
+/// Forced inline for the readback decode; see [`decode_event`].
+#[inline(always)]
 fn decode_packet_fields(words: &[u64]) -> Result<PacketDescriptor, CudaError> {
     Ok(PacketDescriptor {
         id: PayloadId(words[0]),
