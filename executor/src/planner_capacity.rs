@@ -970,6 +970,7 @@ mod tests {
             in_service: None,
             tx_ready_pending: false,
             generators: vec![],
+            stages: vec![],
             tcp_receivers: vec![],
             dcqcn_receivers: vec![],
             next_origin_seq: 0,
