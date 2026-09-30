@@ -3622,10 +3622,7 @@ fn add_route_observation_capacities(
     }
 }
 
-fn remote_inbound_producers(
-    image: &SimulationImage,
-    pfc_state: PfcState,
-) -> (Vec<u64>, Vec<u64>) {
+fn remote_inbound_producers(image: &SimulationImage, pfc_state: PfcState) -> (Vec<u64>, Vec<u64>) {
     let mut inbound = vec![BTreeSet::new(); image.nodes.len()];
     for flow in &image.flows {
         for (route, terminal) in [
