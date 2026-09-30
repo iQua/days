@@ -858,9 +858,9 @@ pub fn run_scalar_counting_stage_scans_for_testing(
         run_scalar_events(image, None, observation_mode, |_, _| {})?;
     let dispatches = transitions.stage_probe.dispatches();
     let visits = transitions
-        .host_indices
+        .hosts
         .iter()
-        .map(HostStageSlot::visits)
+        .map(|host| host.index.visits())
         .fold(transitions.stage_probe.visits(), u64::saturating_add);
     Ok((transitions.finish(pending_events), dispatches, visits))
 }
@@ -888,13 +888,8 @@ pub fn assert_scalar_stage_index_equivalent_for_testing(
         Ok(initial) => initial,
         Err(error) => return Ok(Err(error)),
     };
-    for (slot, (state, index)) in initial
-        .host_states
-        .iter()
-        .zip(&initial.host_indices)
-        .enumerate()
-    {
-        check_host_index(state, index.index(), image_flows.iter().copied())
+    for (slot, host) in initial.hosts.iter().enumerate() {
+        check_host_index(&host.state, host.index.index(), image_flows.iter().copied())
             .map_err(|mismatch| format!("host slot {slot} of the image: {mismatch}"))?;
     }
     let mut first_mismatch = None;
@@ -914,8 +909,8 @@ pub fn assert_scalar_stage_index_equivalent_for_testing(
             }
             let slot = node.state_slot as usize;
             if let Err(mismatch) = check_host_index(
-                &transitions.host_states[slot],
-                transitions.host_indices[slot].index(),
+                &transitions.hosts[slot].state,
+                transitions.hosts[slot].index.index(),
                 [],
             ) {
                 first_mismatch = Some(format!(
@@ -931,9 +926,28 @@ pub fn assert_scalar_stage_index_equivalent_for_testing(
     Ok(run.map(|(transitions, pending_events)| transitions.finish(pending_events)))
 }
 
+/// One host's semantic state and the executor-local stage index derived from it.
+///
+/// The index sits in the host's own entry, beside the state it describes, so a CPU host LP holds
+/// its host in one allocation, as it did before P14, and the Scalar executor's hosts stay one
+/// contiguous table.
+struct HostEntry {
+    state: HostState,
+    /// Keyed views of `state`'s generator and TCP-receiver tables; derived on construction and
+    /// never serialized.
+    index: HostStageSlot,
+}
+
+impl HostEntry {
+    fn new(state: HostState) -> Self {
+        let index = HostStageSlot::build(&state);
+        Self { state, index }
+    }
+}
+
 pub(crate) struct TransitionState<'image> {
     image: &'image SimulationImage,
-    host_states: Vec<HostState>,
+    hosts: Vec<HostEntry>,
     switch_states: Vec<SwitchState>,
     /// Executor-local redundant state, derived on construction and never serialized.
     switch_queue_bytes: Vec<Vec<u64>>,
@@ -954,9 +968,6 @@ pub(crate) struct TransitionState<'image> {
     /// buffer carries the eager-removal obligation across that boundary and is drained by the
     /// queue owner immediately after every dispatch.
     superseded_timers: Vec<SupersededTimer>,
-    /// Executor-local keyed views of each host's generator and TCP-receiver tables, parallel to
-    /// `host_states`; derived on construction and never serialized.
-    host_indices: Vec<HostStageSlot>,
     /// Test-only dispatch and pending-cause counts; empty in production builds.
     stage_probe: StageScanProbe,
 }
@@ -1169,14 +1180,18 @@ impl<'image> TransitionState<'image> {
                 .ok_or(ExecutionError::CounterOverflow(NodeId(0)))?;
         }
 
-        let host_states = image.host_states.clone();
-        let host_indices = host_states.iter().map(HostStageSlot::build).collect();
+        let hosts = image
+            .host_states
+            .iter()
+            .cloned()
+            .map(HostEntry::new)
+            .collect();
         let switch_states = image.switch_states.clone();
         let switch_queue_bytes = derive_switch_queue_bytes(image, &switch_states, None, &packets)?;
 
         Ok(Self {
             image,
-            host_states,
+            hosts,
             switch_states,
             switch_queue_bytes,
             local_node: None,
@@ -1191,7 +1206,6 @@ impl<'image> TransitionState<'image> {
             mechanism_transitions: Vec::new(),
             tcp_sent_segments,
             superseded_timers: Vec::new(),
-            host_indices,
             stage_probe: StageScanProbe::default(),
         })
     }
@@ -1203,7 +1217,7 @@ impl<'image> TransitionState<'image> {
         tcp_segment_seeds: impl IntoIterator<Item = PacketDescriptor>,
         observation_mode: ObservationMode,
     ) -> Result<Self, ExecutionError> {
-        let (host_states, switch_states) = match node.kind {
+        let (hosts, switch_states) = match node.kind {
             NodeKind::Host => {
                 let state = image
                     .host_states
@@ -1214,7 +1228,7 @@ impl<'image> TransitionState<'image> {
                         kind: node.kind,
                         state_slot: node.state_slot,
                     })?;
-                (vec![state], Vec::new())
+                (vec![HostEntry::new(state)], Vec::new())
             }
             NodeKind::Switch => {
                 let state = image
@@ -1250,7 +1264,7 @@ impl<'image> TransitionState<'image> {
         let tcp_sent_segments = crate::tcp_ledger::seed_packets(image, tcp_segment_seeds)
             .map_err(tcp_segment_conflict_error)?;
         let in_service = match node.kind {
-            NodeKind::Host => host_states[0].in_service.into_iter().collect::<Vec<_>>(),
+            NodeKind::Host => hosts[0].state.in_service.into_iter().collect::<Vec<_>>(),
             NodeKind::Switch => switch_states[0]
                 .queues
                 .iter()
@@ -1269,11 +1283,10 @@ impl<'image> TransitionState<'image> {
 
         let switch_queue_bytes =
             derive_switch_queue_bytes(image, &switch_states, Some(node), &resident)?;
-        let host_indices = host_states.iter().map(HostStageSlot::build).collect();
 
         Ok(Self {
             image,
-            host_states,
+            hosts,
             switch_states,
             switch_queue_bytes,
             local_node: Some(node),
@@ -1288,7 +1301,6 @@ impl<'image> TransitionState<'image> {
             mechanism_transitions: Vec::new(),
             tcp_sent_segments,
             superseded_timers: Vec::new(),
-            host_indices,
             stage_probe: StageScanProbe::default(),
         })
     }
@@ -1367,7 +1379,7 @@ impl<'image> TransitionState<'image> {
         self.mechanism_transitions
             .sort_unstable_by_key(crate::MechanismTransitionRecord::canonical_order_key);
         RunResult {
-            host_states: self.host_states,
+            host_states: self.hosts.into_iter().map(|host| host.state).collect(),
             switch_states: self.switch_states,
             summary: self.summary,
             resident_packets,
@@ -1407,9 +1419,10 @@ impl<'image> TransitionState<'image> {
             .sort_unstable_by_key(crate::MechanismTransitionRecord::canonical_order_key);
         let state = match node.kind {
             NodeKind::Host => LocalNodeState::Host(
-                self.host_states
+                self.hosts
                     .pop()
-                    .expect("local host transition state owns one host"),
+                    .expect("local host transition state owns one host")
+                    .state,
             ),
             NodeKind::Switch => LocalNodeState::Switch(
                 self.switch_states
@@ -4133,8 +4146,9 @@ impl<'image> TransitionState<'image> {
 
     fn host_state_mut(&mut self, node: NodeDescriptor) -> Result<&mut HostState, ExecutionError> {
         let state_slot = self.local_state_slot(node)?;
-        self.host_states
+        self.hosts
             .get_mut(state_slot)
+            .map(|host| &mut host.state)
             .ok_or(ExecutionError::InvalidStateSlot {
                 node: node.id,
                 kind: node.kind,
@@ -4157,12 +4171,9 @@ impl<'image> TransitionState<'image> {
             kind: node.kind,
             state_slot: node.state_slot,
         };
-        let state = self.host_states.get_mut(state_slot).ok_or_else(invalid)?;
-        let (index, generator_reads, stage_reads, receiver_reads) = self
-            .host_indices
-            .get_mut(state_slot)
-            .ok_or_else(invalid)?
-            .parts_mut();
+        let HostEntry { state, index: slot } =
+            self.hosts.get_mut(state_slot).ok_or_else(invalid)?;
+        let (index, generator_reads, stage_reads, receiver_reads) = slot.parts_mut();
         let HostState {
             queue,
             in_service,
@@ -4205,8 +4216,9 @@ impl<'image> TransitionState<'image> {
 
     fn host_state(&self, node: NodeDescriptor) -> Result<&HostState, ExecutionError> {
         let state_slot = self.local_state_slot(node)?;
-        self.host_states
+        self.hosts
             .get(state_slot)
+            .map(|host| &host.state)
             .ok_or(ExecutionError::InvalidStateSlot {
                 node: node.id,
                 kind: node.kind,
@@ -4496,8 +4508,9 @@ impl<'image> TransitionState<'image> {
             .ok_or(ExecutionError::UnknownPacket(payload))?;
         let slot = self.local_state_slot(node)?;
         let position = self
-            .host_states
+            .hosts
             .get(slot)
+            .map(|host| &host.state)
             .ok_or(ExecutionError::InvalidStateSlot {
                 node: node.id,
                 kind: node.kind,
