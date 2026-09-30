@@ -1378,8 +1378,11 @@ impl<'image> TransitionState<'image> {
             .sort_unstable_by_key(|record| record.key);
         self.mechanism_transitions
             .sort_unstable_by_key(crate::MechanismTransitionRecord::canonical_order_key);
+        // An exact table: collecting in place would keep the entries' larger buffer.
+        let mut host_states = Vec::with_capacity(self.hosts.len());
+        host_states.extend(self.hosts.into_iter().map(|host| host.state));
         RunResult {
-            host_states: self.hosts.into_iter().map(|host| host.state).collect(),
+            host_states,
             switch_states: self.switch_states,
             summary: self.summary,
             resident_packets,
