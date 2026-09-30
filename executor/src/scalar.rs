@@ -5483,10 +5483,13 @@ mod tests {
     /// each byte here is a per-LP cost of every CPU run: on E1's 9,472 LPs the LP arrays grow by
     /// 9,472 bytes per byte, and the serial worker walks them. At `main` (948a0e9) it is 512 B.
     /// P14 first kept the host stage indices in a vector of their own beside `host_states` (24 B,
-    /// rounded to 32 B by the 16-byte alignment `RunSummary`'s `u128` counters force), 544 B; the
-    /// CPU `--workers 1` run on E1 measured about 2% slower than `main` on madrid
-    /// (`days-gpu/evidence/P14/e1-residue.md`). Each host's index now lives in the host's own
-    /// entry. Any field added here rounds up to 528 B.
+    /// rounded to 32 B by the 16-byte alignment `RunSummary`'s `u128` counters force), 544 B.
+    /// Removing that growth, with the per-host allocation that came with it, is what the fix
+    /// targets; madrid's re-timing measured the CPU `--workers 1` E1 run recover from +2.3% over
+    /// `main` to +0.22% (median paired; -1.96% against the unfixed tip, 39 of 40 pairs). The
+    /// recovery is measured; that the memory footprint is its mechanism is the fix's premise, not
+    /// something measured directly (`days-gpu/evidence/P14/e1-residue.md`, `e1-retime.md`). Any
+    /// field added here rounds up to 528 B.
     ///
     /// The test hooks' dispatch counter (`stage_probe`, 16 B with the hooks, empty without) is the
     /// one field `main` did not have, so it is allowed for. Layout is the compiler's choice, so the

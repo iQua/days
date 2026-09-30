@@ -7,9 +7,11 @@
 //! heap object per host LP, and its 24-B handle grew every LP of the CPU executor from 592 B to
 //! 624 B (`TransitionState` is 16-byte aligned by `RunSummary`'s `u128` counters). On E1
 //! (8,192 host LPs, one generator each) that is 16,384 extra allocations and 13.8 MB more allocated
-//! per CPU run, against 8,192 and 1.3 MB for Scalar; the CPU `--workers 1` run measured about 2%
-//! slower than `main` on madrid while Scalar stayed at parity
-//! (`days-gpu/evidence/P14/e1-residue.md`).
+//! per CPU run, against 8,192 and 1.3 MB for Scalar. Removing that growth is what the fix targets.
+//! madrid's re-timing measured the CPU `--workers 1` E1 run recover from +2.3% over `main` to
+//! +0.22% (median paired; -1.96% against the unfixed tip, 39 of 40 pairs). The recovery is
+//! measured; that the memory footprint is its mechanism is the fix's premise, not something
+//! measured directly (`days-gpu/evidence/P14/e1-residue.md`, `e1-retime.md`).
 //!
 //! **What is measured.** The allocations this thread makes during `run_cpu` with one worker and
 //! a 1 ns exclusive horizon, so no event runs: LP construction (`build_lps`, on the calling

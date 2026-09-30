@@ -7339,8 +7339,9 @@ mod tests {
     /// size is the number of bytes copied per call, once per generator in each of the validators
     /// that walk the generator tables, on every image, stageless ones included. Holding the stage
     /// record by value made the view the generator reference plus a copied
-    /// `Option<CollectiveStage>`; on E1's stageless image `validate` retired 5.7 M more
-    /// instructions than `main` (948a0e9), 62% of P14's lowering residue
+    /// `Option<CollectiveStage>`, 144 B. The bound was motivated by `validate`'s residue on E1's
+    /// stageless image, 5.6 M instructions more than `main` (948a0e9); borrowing the record
+    /// recovered about 2.3 M of it, and the other 3.3 M is not attributed to the copy
     /// (`days-gpu/evidence/P14/e1-residue.md`). A reference to the record in the host's stage
     /// table keeps the view at two pointers, the reference and the niche-packed optional one.
     #[cfg(target_pointer_width = "64")]
