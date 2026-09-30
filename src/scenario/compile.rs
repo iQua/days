@@ -545,6 +545,29 @@ struct FlowInput {
     compute: Option<Box<ComputeStageInput>>,
 }
 
+/// One host's generator and stage tables as lowering builds them.
+///
+/// The stage table stays unallocated until the host's first stage generator arrives, is then
+/// back-filled with `None` for the generators before it, and grows with every later generator. A
+/// host without a stage therefore leaves lowering with an empty table and no stage allocation, and
+/// both tables move into the host state without a copy: the canonical shapes of
+/// `HostState::stages`.
+#[derive(Default)]
+struct HostTables {
+    generators: Vec<FlowGeneratorState>,
+    stages: Vec<Option<CollectiveStage>>,
+}
+
+impl HostTables {
+    fn push(&mut self, (generator, stage): (FlowGeneratorState, Option<CollectiveStage>)) {
+        if stage.is_some() || !self.stages.is_empty() {
+            self.stages.resize(self.generators.len(), None);
+            self.stages.push(stage);
+        }
+        self.generators.push(generator);
+    }
+}
+
 /// Lowers one Days configuration file into one heterogeneous semantic image.
 ///
 /// This is a separate construction path from Nexosim. It never instantiates legacy actors and
@@ -2341,10 +2364,8 @@ fn lower(
     let node_count = u64::try_from(nodes.len())
         .map_err(|_| CompileError::Invalid("node count exceeds u64".to_owned()))?;
 
-    // Each host's generators with their stage records; host assembly splits them into the generator
-    // table and the stage table.
-    let mut generators_by_source =
-        BTreeMap::<LpKey, Vec<(FlowGeneratorState, Option<CollectiveStage>)>>::new();
+    // Each host's generator table and stage table.
+    let mut generators_by_source = BTreeMap::<LpKey, HostTables>::new();
     let mut payload_sequences = BTreeMap::<LpKey, u64>::new();
     let mut initial_packets = Vec::with_capacity(flows.len());
     let mut initial_event_inputs = Vec::<(LpKey, u64, FlowId, PayloadId, EventKind)>::new();
@@ -2733,17 +2754,8 @@ fn lower(
                 source: PhysicalNodeKey::Host(*host),
                 target: PhysicalNodeKey::Switch(switch),
             };
-            let (generators, stages): (Vec<_>, Vec<_>) = generators_by_source
-                .remove(&node_key)
-                .unwrap_or_default()
-                .into_iter()
-                .unzip();
-            // A host without a stage generator keeps an empty stage table (`HostState::stages`).
-            let stages = if stages.iter().any(Option::is_some) {
-                stages
-            } else {
-                Vec::new()
-            };
+            let HostTables { generators, stages } =
+                generators_by_source.remove(&node_key).unwrap_or_default();
             Ok(HostState {
                 egress_link: ids.link(egress_key),
                 queue: VecDeque::new(),

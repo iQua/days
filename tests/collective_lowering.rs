@@ -696,3 +696,52 @@ fn validator_accepts_only_canonical_stage_tables() {
         "{error}"
     );
 }
+
+/// P14 slim round 2: a host that carries plain flows and stages keeps one stage-table entry per
+/// generator. Plain flows sort before stages, so lowering back-fills `None` for them when the host's
+/// first stage arrives; the image validates and runs identically on Scalar and CPU.
+#[test]
+fn mixed_hosts_keep_a_parallel_stage_table() {
+    let config = collective_config("RingAllReduce")
+        + r#"
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 4
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 10
+arr_dist = { type = "Uniform", low = 0.000000001, high = 0.000000001 }
+pkt_size_dist = { type = "DiscreteUniform", low = 3, high = 3 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+"#;
+    let image =
+        compile_text("mixed-hosts", &config).expect("a collective beside plain flows lowers");
+    validate(&image, Backend::Scalar).expect("mixed hosts validate");
+    let mut mixed_hosts = 0;
+    for state in &image.host_states {
+        let stages = state.stages.iter().flatten().count();
+        let plain = state.generators.len() - stages;
+        if stages == 0 {
+            assert!(
+                state.stages.is_empty(),
+                "a host without stages has no table"
+            );
+            continue;
+        }
+        assert_eq!(state.stages.len(), state.generators.len());
+        if plain > 0 {
+            mixed_hosts += 1;
+            // The plain flows come first in canonical flow order and carry no record.
+            assert!(state.stages[..plain].iter().all(Option::is_none));
+            assert!(state.stages[plain..].iter().all(Option::is_some));
+        }
+    }
+    assert!(
+        mixed_hosts > 0,
+        "the scenario must put plain flows beside stages"
+    );
+    run_everywhere(&image, "mixed hosts");
+}
