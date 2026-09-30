@@ -15,6 +15,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::ops::{Bound, RangeBounds};
+#[cfg(feature = "cuda-test-hooks")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -180,10 +182,6 @@ fn select_cuda_provisioning(
 #[cfg(feature = "cuda-test-hooks")]
 std::thread_local! {
     static PANIC_AFTER_NEXT_EXECUTION: Cell<bool> = const { Cell::new(false) };
-    /// Test-only: the readback gather `DirectCuda::compact` launched on this thread, identified by
-    /// handle. `compact` runs inside the attempt that reads it back, on the same thread; nothing
-    /// is shared across threads.
-    static LAUNCHED_GATHER: Cell<Option<(RoundKernel, &'static str)>> = const { Cell::new(None) };
 }
 
 /// Arms a one-shot panic after this thread's next successful CUDA graph execution.
@@ -1007,19 +1005,30 @@ pub struct CudaRun {
     pub memory_layout: CudaMemoryLayout,
     /// P14: the round kernel build this run launched, selected from the image.
     pub round_kernel: RoundKernel,
+    /// P14 round 4: host time to load this run's round module, resolve its kernels and check
+    /// their thread limits. Paid once per run, before the first attempt's buffers are allocated;
+    /// it is outside `wall_ns` and `device_ns`.
+    pub module_load_ns: u64,
     /// Test-only: `(module, kernel)` for every function this run launched: the captured attempt
     /// kernels, then the readback gather. Each entry names the round module the function was
     /// loaded from.
     #[doc(hidden)]
     #[cfg(feature = "cuda-test-hooks")]
     pub launched_kernels: Vec<(RoundKernel, &'static str)>,
+    /// Test-only: how many round modules were loaded in the device's context when this run's
+    /// final attempt captured its graph.
+    #[doc(hidden)]
+    #[cfg(feature = "cuda-test-hooks")]
+    pub round_modules_at_capture: usize,
 }
 
-/// One-time CUDA context, stream, module, and kernel initialization costs.
+/// One-time CUDA context and stream initialization costs.
+///
+/// The executor loads no module (P14 round 4): each run loads its own round module and reports
+/// that cost as [`CudaRun::module_load_ns`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CudaInitializationTimings {
     pub context_stream_setup_ns: u64,
-    pub module_function_load_ns: u64,
 }
 
 /// Runs the production CUDA executor through the inclusive scenario stop.
@@ -1055,7 +1064,10 @@ pub fn run_cuda_with_observations(
     )
 }
 
-/// Reusable CUDA context, stream, embedded module, kernels, and graph-capture substrate.
+/// Reusable CUDA context, stream, and graph-capture substrate.
+///
+/// The executor holds no kernels. Each run loads the one round module its image selects, holds it
+/// with the device's execution guard until the run ends, and unloads it (P14 round 4).
 ///
 /// Each run allocates fresh explicit device buffers, so a device fault cannot contaminate a later
 /// run. A run executes on [`CudaConfig::device_index`]; contexts are shared per device ordinal
@@ -1124,13 +1136,18 @@ impl CudaExecutor {
         ))
     }
 
-    /// The kernels `build`'s round module holds, probed by name against the loaded module: every
-    /// attempt kernel of either build, and the readback gather. A name the module does not hold
-    /// fails `cuModuleGetFunction`.
+    /// The kernels `build`'s round module holds, probed by name against the module: every attempt
+    /// kernel of either build, and the readback gather. A name the module does not hold fails
+    /// `cuModuleGetFunction`. The module is loaded for the probe, under the execution guard, and
+    /// unloaded after it.
     #[cfg(feature = "cuda-test-hooks")]
     #[doc(hidden)]
     pub fn round_module_kernels_for_testing(&self, build: RoundKernel) -> Vec<&'static str> {
-        let module = &self.direct.module(build)._module;
+        let held = self
+            .direct
+            .hold_round_module(build)
+            .unwrap_or_else(|error| panic!("{build:?} round module: {error}"));
+        let module = &held.module._module;
         KERNEL_NAMES
             .iter()
             .copied()
@@ -1139,9 +1156,13 @@ impl CudaExecutor {
             .collect()
     }
 
-    /// The launch record the production path would produce for `build`'s attempt array with the
-    /// DAG slots in `borrowed` taken from the other build's module: a deliberately mixed run, as a
-    /// regression would launch. The record must name the other module at exactly those slots.
+    /// The launch record for `build`'s attempt array with the DAG slots in `borrowed` taken from
+    /// the other build's module: a deliberately mixed run, as a regression would launch. The
+    /// record must name the other module at exactly those slots.
+    ///
+    /// No run ever has two round modules loaded, so this hook loads the second one itself: `build`'s
+    /// module as a run would hold it, under the execution guard, then the other build's. Both are
+    /// unloaded before the guard is released, so no run on this device sees them.
     #[cfg(feature = "cuda-test-hooks")]
     #[doc(hidden)]
     pub fn launch_record_for_testing(
@@ -1149,11 +1170,18 @@ impl CudaExecutor {
         build: RoundKernel,
         borrowed: &[usize],
     ) -> Vec<(RoundKernel, &'static str)> {
-        let own = self.direct.module(build);
-        let other = self.direct.module(match build {
+        let other_build = match build {
             RoundKernel::Plain => RoundKernel::Mechanisms,
             RoundKernel::Mechanisms => RoundKernel::Plain,
-        });
+        };
+        let held = self
+            .direct
+            .hold_round_module(build)
+            .unwrap_or_else(|error| panic!("{build:?} round module: {error}"));
+        let own = &held.module;
+        // Declared after `held`, so it is dropped (unloaded) first, while the guard is held.
+        let other = RoundModule::load(&self.direct, other_build)
+            .unwrap_or_else(|error| panic!("{other_build:?} round module: {error}"));
         let functions: [&CudaFunction; KERNEL_NAMES.len()] = std::array::from_fn(|index| {
             if borrowed.contains(&index) {
                 &other.functions[index]
@@ -1161,7 +1189,7 @@ impl CudaExecutor {
                 &own.functions[index]
             }
         });
-        self.direct.launch_record(&functions, true)
+        launch_record(&[own, &other], &functions, true)
     }
 
     /// Runs only O1.4's reset/count and stable-write dispatches over a synthetic FEL-root cache.
@@ -1181,10 +1209,13 @@ impl CudaExecutor {
                 "worklist test threads per block must be in 1..={LANES}"
             )));
         }
+        // The plain round module, held with the execution guard for the whole hook, as a run holds
+        // its module.
+        let held = self.direct.hold_round_module(RoundKernel::Plain)?;
         let supported = [2_usize, 3]
             .into_iter()
             .map(|index| {
-                self.direct.module(RoundKernel::Plain).functions[index]
+                held.module.functions[index]
                     .max_threads_per_block()
                     .map(|threads| threads as usize)
                     .map_err(|error| {
@@ -1235,7 +1266,6 @@ impl CudaExecutor {
         host_planes[19] = vec![0; node_count.saturating_mul(ARENA_META_WORDS).max(1)];
         host_planes[25] = stream_state;
 
-        let _execution_guard = self.direct.execution_guard();
         let planes = host_planes
             .into_iter()
             .enumerate()
@@ -1253,7 +1283,7 @@ impl CudaExecutor {
             let mut arguments = self
                 .direct
                 .stream
-                .launch_builder(&self.direct.module(RoundKernel::Plain).functions[index]);
+                .launch_builder(&held.module.functions[index]);
             for plane in &planes {
                 arguments.arg(plane);
             }
@@ -1307,7 +1337,8 @@ impl CudaExecutor {
         )
     }
 
-    /// Executes and reads back under the run device's execution guard.
+    /// Executes and reads back under the run device's execution guard, which the run takes with
+    /// its round module before its first upload and holds until it ends.
     pub fn run_with_observations(
         &self,
         image: &SimulationImage,
@@ -1362,6 +1393,10 @@ impl CudaExecutor {
             image.flows.len(),
         );
         let mut retry_trace = Vec::new();
+        // P14 round 4: this run's round module and the device's execution guard, taken together
+        // once the first plan is accepted and held for every attempt. Dropped when the run ends,
+        // on success, error or panic: the module is unloaded, then the guard released.
+        let mut held_module: Option<HeldRoundModule<'_>> = None;
         loop {
             let attempt = (|| {
                 let plan = CudaPlan::new_with_entity_capacity_floors(
@@ -1377,12 +1412,20 @@ impl CudaExecutor {
                 if round_kernel == RoundKernel::Plain {
                     plan.refuse_plain_round_kernel()?;
                 }
-                let _execution_guard = direct.execution_guard();
+                // The module is loaded before this run allocates a buffer or captures a graph, and
+                // under the guard, so no other run's module is loaded in the context meanwhile.
+                let held = match held_module.as_ref() {
+                    Some(held) => held,
+                    None => held_module.insert(direct.hold_round_module(round_kernel)?),
+                };
                 let buffers = CudaBuffers::new(&direct.stream, plan, direct.provisioning)?;
-                let timing = direct.run(&buffers, attempt_config, round_kernel)?;
+                let timing = direct.run(&buffers, attempt_config, &held.module)?;
                 #[cfg(feature = "cuda-test-hooks")]
                 panic_after_execution_if_requested();
-                buffers.finish(&direct, image, observation_mode, timing)
+                let mut run =
+                    buffers.finish(&direct, &held.module, image, observation_mode, timing)?;
+                run.module_load_ns = held.load_ns;
+                Ok(run)
             })();
             match attempt {
                 Ok(mut run) => {
@@ -4194,6 +4237,7 @@ impl CudaBuffers {
     fn finish(
         &self,
         direct: &DirectCuda,
+        module: &RoundModule,
         image: &SimulationImage,
         observation_mode: ObservationMode,
         timing: CudaTiming,
@@ -4458,8 +4502,8 @@ impl CudaBuffers {
             [Err(error), _, _] | [_, Err(error), _] | [_, _, Err(error)] => return Err(error),
         };
 
-        let gathered = direct.compact(
-            timing.round_kernel,
+        let (gathered, _launched_gather) = direct.compact(
+            module,
             &[
                 (&self.planes[8], &fel_plan),
                 (&self.planes[10], &queue_plan),
@@ -4869,16 +4913,16 @@ impl CudaBuffers {
             wall_ns: timing.wall_ns,
             memory_layout: self.memory_layout,
             round_kernel: timing.round_kernel,
+            // Filled by the run, which holds the module and its load time.
+            module_load_ns: 0,
             #[cfg(feature = "cuda-test-hooks")]
             launched_kernels: {
                 let mut launched = timing.launched_kernels.clone();
-                launched.push(
-                    LAUNCHED_GATHER
-                        .take()
-                        .expect("the readback gather ran in this attempt"),
-                );
+                launched.push(identify(&[module], _launched_gather));
                 launched
             },
+            #[cfg(feature = "cuda-test-hooks")]
+            round_modules_at_capture: timing.round_modules_at_capture,
         })
     }
 }
@@ -4930,54 +4974,126 @@ const PARALLEL_KERNELS: [usize; 5] = [2, 3, 4, 9, 10];
 const FINALIZE_SWEEP_KERNEL_INDEX: usize = 11;
 
 struct DirectCuda {
-    _context: Arc<CudaContext>,
-    /// Serializes execution on this device. It schedules device access rather than protecting
-    /// Rust state, so a panic while it is held must not prevent later runs.
+    /// The device's context. Each run loads its round module into it.
+    context: Arc<CudaContext>,
+    /// Serializes runs on this device. It schedules device access rather than protecting Rust
+    /// state, so a panic while it is held must not prevent later runs. A run holds it from its
+    /// round module's load to that module's unload ([`HeldRoundModule`]).
     execution: Mutex<()>,
     stream: Arc<CudaStream>,
-    /// P14 round 3: one module per round-kernel build, at [`RoundModule::slot`]. A run launches
-    /// every kernel, the readback gather included, from its build's module only.
-    modules: [RoundModule; 2],
+    /// Test-only: the round modules currently loaded in this device's context.
+    #[cfg(feature = "cuda-test-hooks")]
+    live_round_modules: Arc<AtomicUsize>,
     initialization_timings: CudaInitializationTimings,
     provisioning: CudaProvisioning,
 }
 
-/// P14 round 3: one loaded CUDA module and the kernels a run launches from it.
+/// P14 round 4: one loaded CUDA module and the kernels a run launches from it. A run owns it.
 ///
 /// Each round-kernel build has its own complete module: the 12 shared attempt kernels, the readback
-/// gather, and that build's round kernel. So a run executes one module's code, laid out as the
-/// single-round-kernel modules of `main` (plain) and the P14 control (mechanisms) were; a module
-/// carrying both round kernels moved every kernel after them and cost device time
-/// (`evidence/P14/modprobe-ab.md`).
+/// gather, and that build's round kernel. A run loads its build's module before it allocates a
+/// buffer or captures its graph, launches every kernel from it, and drops it when the run ends.
+/// The executor holds no module, and no other round module is loaded in the context while a run
+/// sets up or executes ([`HeldRoundModule`]).
+///
+/// Why one module per run, and not both loaded once in [`DirectCuda::new`] as round 3 had it:
+/// round 3's modules are code- and layout-identical to their references (`main` for plain, the P14
+/// control for mechanisms), yet runs kept a device-time residue against them. The diagnosis
+/// (`evidence/P14/diag3/instruments.md` and `evidence/P14/diag3-timing.md` in days-gpu) shows:
+/// - data-buffer placement is excluded: every data buffer sits at the same device address with
+///   one module loaded or two;
+/// - intra-module layout is excluded, by the comparator that found the modules layout-identical
+///   to their references;
+/// - the residue was reproduced with the other module loaded at initialization, and was absent
+///   with it never loaded or loaded after graph capture (retry-free runs);
+/// - the device addresses of each module's code cannot be observed through the driver API; load
+///   order is known from the source;
+/// - on the mechanisms path, placement / load order is supported: round 3 loaded the mechanisms
+///   module second, where the P14 control loads it first. It remains a candidate alongside graph
+///   instantiation with both modules loaded and other load-time work (the per-module function
+///   and thread-limit queries);
+/// - on the plain path, load order is not a candidate (round 3 loaded the plain module first, as
+///   `main` does) and placement is disfavoured. That leaves graph instantiation with both modules
+///   loaded and other load-time work;
+/// - this list is not exhaustive, and the mechanism is not identified.
+///
+/// One module per run is the design that this parity evidence covers.
 struct RoundModule {
     /// The round-kernel build this module carries.
     build: RoundKernel,
-    /// Holds the module for the context's lifetime (its functions hold it too); the test hook
-    /// probes it by name.
+    /// The loaded module (its functions hold it too); the test hook probes it by name. Dropping
+    /// the `RoundModule` drops every holder and unloads it.
     _module: Arc<CudaModule>,
     /// The attempt DAG in [`KERNEL_NAMES`] order, with this module's round kernel at
     /// [`ROUND_KERNEL_INDEX`].
     functions: Vec<CudaFunction>,
     /// T20l fix 2: the readback gather.
     compact_function: CudaFunction,
+    /// Test-only: counts this module as loaded until it is dropped.
+    #[cfg(feature = "cuda-test-hooks")]
+    _live: LiveRoundModule,
+}
+
+/// Test-only: one loaded round module's entry in its device's live count. The count only observes
+/// loads and unloads for the tests; no production path reads it.
+#[cfg(feature = "cuda-test-hooks")]
+struct LiveRoundModule(Arc<AtomicUsize>);
+
+#[cfg(feature = "cuda-test-hooks")]
+impl LiveRoundModule {
+    fn register(live: &Arc<AtomicUsize>) -> Self {
+        live.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(live))
+    }
+}
+
+#[cfg(feature = "cuda-test-hooks")]
+impl Drop for LiveRoundModule {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// What one run holds on its device from before its first upload until it ends: its round module
+/// and the device's execution guard.
+///
+/// The module is loaded and unloaded under the guard. The guard is what makes "exactly one round
+/// module in the context" hold: a concurrent run on the same device waits for it before loading
+/// its own module, so it cannot load the other build's module during this run's setup, between
+/// its capacity-retry attempts, or during its rounds.
+///
+/// A value the run owns and drops; nothing is shared or lazily initialized. Fields drop in
+/// declaration order: the module is unloaded first, then the guard is released.
+struct HeldRoundModule<'device> {
+    module: RoundModule,
+    /// Host time [`RoundModule::load`] took.
+    load_ns: u64,
+    _execution_guard: MutexGuard<'device, ()>,
 }
 
 impl RoundModule {
-    /// The index of `build`'s module in [`DirectCuda::modules`].
-    const fn slot(build: RoundKernel) -> usize {
+    /// The embedded fatbin of `build`'s module, for sm_121, sm_89 and sm_86.
+    fn fatbin(build: RoundKernel) -> &'static [u8] {
         match build {
-            RoundKernel::Plain => 0,
-            RoundKernel::Mechanisms => 1,
+            RoundKernel::Plain => {
+                include_bytes!(concat!(env!("OUT_DIR"), "/days_cuda_kernels.fatbin"))
+            }
+            RoundKernel::Mechanisms => include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/days_cuda_kernels_mechanisms.fatbin"
+            )),
         }
     }
 
-    fn load(
-        context: &Arc<CudaContext>,
-        fatbin: &[u8],
-        build: RoundKernel,
-    ) -> Result<Self, CudaError> {
-        let module = context
-            .load_module(Ptx::from_binary(fatbin.to_vec()))
+    /// Loads `build`'s module into the device's context, resolves every kernel a run launches, and
+    /// checks the control kernels' thread limits. Fail-closed: any failure is returned before a
+    /// kernel can be launched from the module.
+    ///
+    /// The caller holds the device's execution guard.
+    fn load(direct: &DirectCuda, build: RoundKernel) -> Result<Self, CudaError> {
+        let module = direct
+            .context
+            .load_module(Ptx::from_binary(Self::fatbin(build).to_vec()))
             .map_err(|error| {
                 driver_error(
                     format!("embedded sm_121/sm_89/sm_86 {build:?} round-module fatbin load"),
@@ -4995,29 +5111,76 @@ impl RoundModule {
         let compact_function = module
             .load_function(COMPACT_KERNEL_NAME)
             .map_err(|error| driver_error(format!("kernel `{COMPACT_KERNEL_NAME}` load"), error))?;
-        Ok(Self {
+        let loaded = Self {
             build,
             _module: module,
             functions,
             compact_function,
-        })
+            #[cfg(feature = "cuda-test-hooks")]
+            _live: LiveRoundModule::register(&direct.live_round_modules),
+        };
+        for index in CONTROL_KERNELS {
+            let supported = loaded.functions[index]
+                .max_threads_per_block()
+                .map_err(|error| {
+                    driver_error(
+                        format!("kernel `{}` thread limit query", KERNEL_NAMES[index]),
+                        error,
+                    )
+                })? as usize;
+            if supported < LANES {
+                return Err(CudaError::Unavailable(format!(
+                    "kernel `{}` supports only {supported} threads per block; {LANES} are required \
+                     by its deterministic reduction",
+                    KERNEL_NAMES[index]
+                )));
+            }
+        }
+        Ok(loaded)
+    }
+
+    /// The attempt DAG's functions in [`KERNEL_NAMES`] order, all from this module.
+    fn attempt_functions(&self) -> [&CudaFunction; KERNEL_NAMES.len()] {
+        std::array::from_fn(|index| &self.functions[index])
+    }
+
+    /// Test-only: the kernel `function` is, if this module's vectors hold this very
+    /// `CudaFunction`: the name it was loaded under.
+    #[cfg(feature = "cuda-test-hooks")]
+    fn identify(&self, function: &CudaFunction) -> Option<&'static str> {
+        if let Some(index) = self
+            .functions
+            .iter()
+            .position(|candidate| std::ptr::eq(candidate, function))
+        {
+            return Some(round_kernel_name(index, self.build));
+        }
+        std::ptr::eq(&self.compact_function, function).then_some(COMPACT_KERNEL_NAME)
     }
 }
 
 impl DirectCuda {
-    fn module(&self, build: RoundKernel) -> &RoundModule {
-        let module = &self.modules[RoundModule::slot(build)];
-        debug_assert_eq!(
-            module.build, build,
-            "round modules are stored at their build's slot"
-        );
-        module
-    }
-
     fn execution_guard(&self) -> MutexGuard<'_, ()> {
         self.execution
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Takes the device's execution guard, then loads `build`'s round module under it.
+    ///
+    /// The load must happen under the guard. Loaded before it, a concurrent run on this device
+    /// could have the other build's module in the context while this run allocates its buffers
+    /// and captures its graph, which is the state P14 round 4 removes. On a load or check failure
+    /// the module (if loaded) is unloaded and the guard released before the error returns.
+    fn hold_round_module(&self, build: RoundKernel) -> Result<HeldRoundModule<'_>, CudaError> {
+        let execution_guard = self.execution_guard();
+        let load_started = Instant::now();
+        let module = RoundModule::load(self, build)?;
+        Ok(HeldRoundModule {
+            module,
+            load_ns: duration_ns(load_started.elapsed()),
+            _execution_guard: execution_guard,
+        })
     }
 
     fn new(device_index: usize) -> Result<Self, CudaError> {
@@ -5034,24 +5197,6 @@ impl DirectCuda {
             context.disable_event_tracking();
         }
         let context_stream_setup_ns = duration_ns(setup_started.elapsed());
-
-        let module_started = Instant::now();
-        let modules = [
-            RoundModule::load(
-                &context,
-                include_bytes!(concat!(env!("OUT_DIR"), "/days_cuda_kernels.fatbin")),
-                RoundKernel::Plain,
-            )?,
-            RoundModule::load(
-                &context,
-                include_bytes!(concat!(
-                    env!("OUT_DIR"),
-                    "/days_cuda_kernels_mechanisms.fatbin"
-                )),
-                RoundKernel::Mechanisms,
-            )?,
-        ];
-        let module_function_load_ns = duration_ns(module_started.elapsed());
 
         let (major, minor) = context
             .compute_capability()
@@ -5076,35 +5221,15 @@ impl DirectCuda {
                  reports sm_{major}{minor}"
             )));
         }
-        for (module, index) in modules
-            .iter()
-            .flat_map(|module| CONTROL_KERNELS.map(|index| (module, index)))
-        {
-            let supported = module.functions[index]
-                .max_threads_per_block()
-                .map_err(|error| {
-                    driver_error(
-                        format!("kernel `{}` thread limit query", KERNEL_NAMES[index]),
-                        error,
-                    )
-                })? as usize;
-            if supported < LANES {
-                return Err(CudaError::Unavailable(format!(
-                    "kernel `{}` supports only {supported} threads per block; {LANES} are required \
-                     by its deterministic reduction",
-                    KERNEL_NAMES[index]
-                )));
-            }
-        }
 
         Ok(Self {
-            _context: context,
+            context,
             execution: Mutex::new(()),
             stream,
-            modules,
+            #[cfg(feature = "cuda-test-hooks")]
+            live_round_modules: Arc::new(AtomicUsize::new(0)),
             initialization_timings: CudaInitializationTimings {
                 context_stream_setup_ns,
-                module_function_load_ns,
             },
             provisioning,
         })
@@ -5116,15 +5241,14 @@ impl DirectCuda {
     /// extent comes from [`CompactionPlan`], i.e. from device-written meta words; an arena whose
     /// device-written counts sum to zero is neither launched nor read.
     ///
-    /// Returns one gathered word vector per request, in request order.
-    fn compact(
+    /// Returns one gathered word vector per request, in request order, and the gather handle the
+    /// launches use (the run's launch record identifies it).
+    fn compact<'module>(
         &self,
-        round_kernel: RoundKernel,
+        module: &'module RoundModule,
         requests: &[(&CudaBuffer, &CompactionPlan)],
-    ) -> Result<Vec<Vec<u64>>, CudaError> {
-        let compact_function = &self.module(round_kernel).compact_function;
-        #[cfg(feature = "cuda-test-hooks")]
-        LAUNCHED_GATHER.set(Some(self.identify(compact_function)));
+    ) -> Result<(Vec<Vec<u64>>, &'module CudaFunction), CudaError> {
+        let compact_function = &module.compact_function;
         let mut destinations = Vec::with_capacity(requests.len());
         // The plan and argument buffers must outlive the launches, so they are retained here
         // rather than dropped at the end of each iteration.
@@ -5181,7 +5305,10 @@ impl DirectCuda {
             retained.push((plan_buffer, argument_buffer));
         }
         if destinations.iter().all(Option::is_none) {
-            return Ok(requests.iter().map(|_| Vec::new()).collect());
+            return Ok((
+                requests.iter().map(|_| Vec::new()).collect(),
+                compact_function,
+            ));
         }
 
         let mut gathered = Vec::with_capacity(requests.len());
@@ -5205,22 +5332,18 @@ impl DirectCuda {
         if let Some(error) = readback_error {
             return Err(error);
         }
-        Ok(gathered)
+        Ok((gathered, compact_function))
     }
 
-    /// The attempt DAG's functions in [`KERNEL_NAMES`] order, all from `round_kernel`'s module.
-    fn attempt_functions(&self, round_kernel: RoundKernel) -> [&CudaFunction; KERNEL_NAMES.len()] {
-        let module = self.module(round_kernel);
-        std::array::from_fn(|index| &module.functions[index])
-    }
-
+    /// Captures and replays one attempt, launching every kernel from `module`, the run's own.
     fn run(
         &self,
         buffers: &CudaBuffers,
         config: CudaConfig,
-        round_kernel: RoundKernel,
+        module: &RoundModule,
     ) -> Result<CudaTiming, CudaError> {
-        let functions = self.attempt_functions(round_kernel);
+        let round_kernel = module.build;
+        let functions = module.attempt_functions();
         let parallel_threads = config.round_threads_per_block;
         let supported_parallel_threads = PARALLEL_KERNELS
             .iter()
@@ -5268,6 +5391,8 @@ impl DirectCuda {
             config.attempts_per_graph_wave,
         )?;
         let graph_capture_ns = duration_ns(capture_started.elapsed());
+        #[cfg(feature = "cuda-test-hooks")]
+        let round_modules_at_capture = self.live_round_modules.load(Ordering::SeqCst);
 
         let maximum_replays = buffers
             .dispatch_capacity
@@ -5332,7 +5457,9 @@ impl DirectCuda {
             wall_ns: duration_ns(wall_started.elapsed()),
             round_kernel,
             #[cfg(feature = "cuda-test-hooks")]
-            launched_kernels: self.launch_record(&functions, buffers.finalize_sweep_required),
+            launched_kernels: launch_record(&[module], &functions, buffers.finalize_sweep_required),
+            #[cfg(feature = "cuda-test-hooks")]
+            round_modules_at_capture,
         })
     }
 
@@ -5387,43 +5514,33 @@ impl DirectCuda {
     }
 }
 
-/// Test-only: which module and kernel each launched handle is.
+/// Test-only: `(module, kernel)` for each attempt kernel the graph captured from `functions`, in
+/// DAG order, skipping the finalize sweep when the plan omits it. Each entry identifies the handle
+/// itself ([`identify`]), so a run that mixes modules is recorded as mixed.
 #[cfg(feature = "cuda-test-hooks")]
-impl DirectCuda {
-    /// `(module, kernel)` for each attempt kernel the graph captured from `functions`, in DAG
-    /// order, skipping the finalize sweep when the plan omits it. Each entry identifies the handle
-    /// itself ([`Self::identify`]), so a run that mixes modules is recorded as mixed.
-    fn launch_record(
-        &self,
-        functions: &[&CudaFunction; KERNEL_NAMES.len()],
-        finalize_sweep_required: bool,
-    ) -> Vec<(RoundKernel, &'static str)> {
-        functions
-            .iter()
-            .enumerate()
-            .filter(|&(index, _)| finalize_sweep_required || index != FINALIZE_SWEEP_KERNEL_INDEX)
-            .map(|(_, function)| self.identify(function))
-            .collect()
-    }
+fn launch_record(
+    modules: &[&RoundModule],
+    functions: &[&CudaFunction; KERNEL_NAMES.len()],
+    finalize_sweep_required: bool,
+) -> Vec<(RoundKernel, &'static str)> {
+    functions
+        .iter()
+        .enumerate()
+        .filter(|&(index, _)| finalize_sweep_required || index != FINALIZE_SWEEP_KERNEL_INDEX)
+        .map(|(_, function)| identify(modules, function))
+        .collect()
+}
 
-    /// The module and kernel `function` is, by handle identity: the round module whose vectors
-    /// hold this very `CudaFunction`, and the name it was loaded under. Every launched handle is
-    /// one of those, so no answer is derived from the run's selection.
-    fn identify(&self, function: &CudaFunction) -> (RoundKernel, &'static str) {
-        for module in &self.modules {
-            if let Some(index) = module
-                .functions
-                .iter()
-                .position(|candidate| std::ptr::eq(candidate, function))
-            {
-                return (module.build, round_kernel_name(index, module.build));
-            }
-            if std::ptr::eq(&module.compact_function, function) {
-                return (module.build, COMPACT_KERNEL_NAME);
-            }
-        }
-        panic!("a launched CUDA function handle belongs to no round module")
-    }
+/// Test-only: the module and kernel `function` is, by handle identity: the one of `modules` whose
+/// vectors hold this very `CudaFunction`, and the name it was loaded under. No answer is derived
+/// from the run's selection. A run passes the one module it owns, so a launched handle that is
+/// not that module's is a panic, not a record.
+#[cfg(feature = "cuda-test-hooks")]
+fn identify(modules: &[&RoundModule], function: &CudaFunction) -> (RoundKernel, &'static str) {
+    modules
+        .iter()
+        .find_map(|module| Some((module.build, module.identify(function)?)))
+        .expect("a launched CUDA function handle belongs to the run's round module")
 }
 
 /// The entry point launched at `index` of the attempt DAG for `round_kernel`.
@@ -5490,6 +5607,9 @@ struct CudaTiming {
     /// Test-only: `(module, kernel)` for every function the attempt graph captured.
     #[cfg(feature = "cuda-test-hooks")]
     launched_kernels: Vec<(RoundKernel, &'static str)>,
+    /// Test-only: the round modules loaded in the context when the graph was captured.
+    #[cfg(feature = "cuda-test-hooks")]
+    round_modules_at_capture: usize,
     encoded_attempts: u64,
     graph_replays: u64,
     wave_boundary_syncs: u64,

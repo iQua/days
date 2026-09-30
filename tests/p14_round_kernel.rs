@@ -504,8 +504,8 @@ mod cuda {
     }
 
     /// P14 round 3: each round-kernel build is its own complete module, holding only its own round
-    /// kernel, and every run launches its 14 kernels from that one module. A module holding both
-    /// round kernels moved the code after them and cost device time (`evidence/P14/modprobe-ab.md`).
+    /// kernel, and every run launches its 14 kernels from that one module. Since round 4 a run
+    /// loads only that module, so the mixed-array probe loads the other build's module itself.
     #[test]
     fn cuda_each_run_launches_one_complete_round_module() {
         let executor = CudaExecutor::on_device(0).expect("CUDA device 0");
@@ -643,6 +643,127 @@ mod cuda {
                     .collect::<Vec<_>>(),
                 "{name}: every launched kernel comes from the {build:?} module"
             );
+        }
+    }
+
+    /// P14 round 4: a run captures its graph with exactly one round module loaded in the context,
+    /// its own. Round 3's residue was reproduced with the other build's module loaded at
+    /// initialization, and was absent with it never loaded or loaded after graph capture
+    /// (retry-free runs; `evidence/P14/diag3-timing.md`). One module per run is the design that
+    /// this parity evidence covers, so each run loads its module and no other.
+    #[test]
+    fn cuda_each_run_captures_its_graph_with_one_round_module_loaded() {
+        let executor = CudaExecutor::on_device(0).expect("CUDA device 0");
+        // One-record caps force capacity retries: the module is held across every attempt, and
+        // the count is the final attempt's.
+        let retrying = CudaConfig {
+            max_channel_events_per_stream: Some(1),
+            max_fel_events_per_lp: Some(1),
+            ..CudaConfig::default()
+        };
+        // Both orders of consecutive builds on one executor: a module left loaded by the previous
+        // run would be counted by the next.
+        for (name, image, build, config, retries) in [
+            (
+                "FIFO incast",
+                scheduler_image("FIFO"),
+                RoundKernel::Plain,
+                CudaConfig::default(),
+                false,
+            ),
+            (
+                "dcqcn_t26",
+                fixture("dcqcn_t26.toml"),
+                RoundKernel::Mechanisms,
+                CudaConfig::default(),
+                false,
+            ),
+            (
+                "FIFO incast forced onto mechanisms",
+                scheduler_image("FIFO"),
+                RoundKernel::Mechanisms,
+                forced(RoundKernel::Mechanisms, 256),
+                false,
+            ),
+            (
+                "FIFO incast after capacity retries",
+                scheduler_image("FIFO"),
+                RoundKernel::Plain,
+                retrying,
+                true,
+            ),
+            (
+                "dcqcn_t26 after capacity retries",
+                fixture("dcqcn_t26.toml"),
+                RoundKernel::Mechanisms,
+                retrying,
+                true,
+            ),
+        ] {
+            let run = executor
+                .run_with_observations(&image, None, config, ObservationMode::Full)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(run.round_kernel, build, "{name}");
+            if retries {
+                assert!(
+                    !run.capacity_retry_trace.is_empty(),
+                    "{name}: the capped run must retry capacity"
+                );
+            }
+            assert_eq!(
+                run.round_modules_at_capture, 1,
+                "{name}: only the {build:?} module is loaded while the run captures its graph"
+            );
+            // The warm start plans the converged capacity at once; it owns one module too.
+            let warm = executor
+                .run_with_observations_warm_started(
+                    &image,
+                    None,
+                    config,
+                    ObservationMode::Full,
+                    &run.capacity_warm_start,
+                )
+                .unwrap_or_else(|error| panic!("{name} warm-started: {error}"));
+            assert_eq!(warm.result, run.result, "{name} warm-started");
+            assert_eq!(
+                warm.round_modules_at_capture, 1,
+                "{name} warm-started: only the {build:?} module is loaded at capture"
+            );
+        }
+    }
+
+    /// P14 round 4: the executor loads no module; each run loads its own and reports what that
+    /// cost. Printed for the cost record (`--nocapture`).
+    #[test]
+    fn cuda_each_run_reports_its_round_module_load_time() {
+        let executor = CudaExecutor::on_device(0).expect("CUDA device 0");
+        for repeat in 0..3 {
+            for (name, image, build) in [
+                ("FIFO incast", scheduler_image("FIFO"), RoundKernel::Plain),
+                (
+                    "dcqcn_t26",
+                    fixture("dcqcn_t26.toml"),
+                    RoundKernel::Mechanisms,
+                ),
+            ] {
+                let run = executor
+                    .run_with_observations(
+                        &image,
+                        None,
+                        CudaConfig::default(),
+                        ObservationMode::Full,
+                    )
+                    .unwrap_or_else(|error| panic!("{name}: {error}"));
+                assert_eq!(run.round_kernel, build, "{name}");
+                assert!(run.module_load_ns > 0, "{name}: the run loaded its module");
+                println!(
+                    "record=p14_round_module_load repeat={repeat} round_kernel={build:?} \
+                     module_load_ns={} graph_capture_ns={} retries={}",
+                    run.module_load_ns,
+                    run.graph_capture_ns,
+                    run.capacity_retry_trace.len()
+                );
+            }
         }
     }
 
