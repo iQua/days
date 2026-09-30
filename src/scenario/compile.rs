@@ -545,6 +545,29 @@ struct FlowInput {
     compute: Option<Box<ComputeStageInput>>,
 }
 
+/// One host's generator and stage tables as lowering builds them.
+///
+/// The stage table stays unallocated until the host's first stage generator arrives, is then
+/// back-filled with `None` for the generators before it, and grows with every later generator. A
+/// host without a stage therefore leaves lowering with an empty table and no stage allocation, and
+/// both tables move into the host state without a copy: the canonical shapes of
+/// `HostState::stages`.
+#[derive(Default)]
+struct HostTables {
+    generators: Vec<FlowGeneratorState>,
+    stages: Vec<Option<CollectiveStage>>,
+}
+
+impl HostTables {
+    fn push(&mut self, (generator, stage): (FlowGeneratorState, Option<CollectiveStage>)) {
+        if stage.is_some() || !self.stages.is_empty() {
+            self.stages.resize(self.generators.len(), None);
+            self.stages.push(stage);
+        }
+        self.generators.push(generator);
+    }
+}
+
 /// Lowers one Days configuration file into one heterogeneous semantic image.
 ///
 /// This is a separate construction path from Nexosim. It never instantiates legacy actors and
@@ -2341,7 +2364,8 @@ fn lower(
     let node_count = u64::try_from(nodes.len())
         .map_err(|_| CompileError::Invalid("node count exceeds u64".to_owned()))?;
 
-    let mut generators_by_source = BTreeMap::<LpKey, Vec<FlowGeneratorState>>::new();
+    // Each host's generator table and stage table.
+    let mut generators_by_source = BTreeMap::<LpKey, HostTables>::new();
     let mut payload_sequences = BTreeMap::<LpKey, u64>::new();
     let mut initial_packets = Vec::with_capacity(flows.len());
     let mut initial_event_inputs = Vec::<(LpKey, u64, FlowId, PayloadId, EventKind)>::new();
@@ -2397,30 +2421,8 @@ fn lower(
                 }
             };
             let stage_flow = |key: &FlowKey| FlowId(flow_ids[key]);
-            generators_by_source
-                .entry(source)
-                .or_default()
-                .push(FlowGeneratorState {
-                    stage: Some(CollectiveStage {
-                        role: StageRole::Compute(ComputeStage {
-                            compute_id: compute.compute_id,
-                            group_size: compute.group_size,
-                            rank: compute.rank,
-                            duration_ns: compute.duration_ns,
-                        }),
-                        dependencies: StageDependencies {
-                            local_predecessor: compute.local_predecessor.as_ref().map(stage_flow),
-                            inbound_predecessor: compute
-                                .inbound_predecessor
-                                .as_ref()
-                                .map(stage_flow),
-                            inbound_predecessor_bytes: compute.inbound_predecessor_bytes,
-                            local_predecessor_complete: compute.local_predecessor.is_none(),
-                            inbound_predecessor_complete: compute.inbound_predecessor.is_none(),
-                            inbound_bytes_received: 0,
-                        },
-                        activated: root,
-                    }),
+            generators_by_source.entry(source).or_default().push((
+                FlowGeneratorState {
                     flow: descriptor.id,
                     packets_emitted: 0,
                     bytes_emitted: 0,
@@ -2437,7 +2439,25 @@ fn lower(
                         packet_size_bytes: 0,
                         termination: GeneratorTermination::Bytes(0),
                     }),
-                });
+                },
+                Some(CollectiveStage {
+                    role: StageRole::Compute(ComputeStage {
+                        compute_id: compute.compute_id,
+                        group_size: compute.group_size,
+                        rank: compute.rank,
+                        duration_ns: compute.duration_ns,
+                    }),
+                    dependencies: StageDependencies {
+                        local_predecessor: compute.local_predecessor.as_ref().map(stage_flow),
+                        inbound_predecessor: compute.inbound_predecessor.as_ref().map(stage_flow),
+                        inbound_predecessor_bytes: compute.inbound_predecessor_bytes,
+                        local_predecessor_complete: compute.local_predecessor.is_none(),
+                        inbound_predecessor_complete: compute.inbound_predecessor.is_none(),
+                        inbound_bytes_received: 0,
+                    },
+                    activated: root,
+                }),
+            ));
             continue;
         }
         let emission_count = packet_count(&flow.traffic);
@@ -2575,17 +2595,10 @@ fn lower(
                 },
             )
         });
-        generators_by_source
-            .entry(source)
-            .or_default()
-            .push(FlowGeneratorState {
+        generators_by_source.entry(source).or_default().push((
+            FlowGeneratorState {
                 // Every collective stage is a TCP generator whose dependencies live in this record;
                 // compute stages build theirs in the compute branch above.
-                stage: collective_stage.map(|(identity, dependencies)| CollectiveStage {
-                    role: StageRole::Collective(identity),
-                    dependencies,
-                    activated: collective_ready && emission_count != 0,
-                }),
                 flow: descriptor.id,
                 packets_emitted: 0,
                 bytes_emitted: 0,
@@ -2671,7 +2684,13 @@ fn lower(
                         }
                     }
                 },
-            });
+            },
+            collective_stage.map(|(identity, dependencies)| CollectiveStage {
+                role: StageRole::Collective(identity),
+                dependencies,
+                activated: collective_ready && emission_count != 0,
+            }),
+        ));
     }
     initial_packets.sort_by_key(|packet| packet.id);
 
@@ -2735,12 +2754,15 @@ fn lower(
                 source: PhysicalNodeKey::Host(*host),
                 target: PhysicalNodeKey::Switch(switch),
             };
+            let HostTables { generators, stages } =
+                generators_by_source.remove(&node_key).unwrap_or_default();
             Ok(HostState {
                 egress_link: ids.link(egress_key),
                 queue: VecDeque::new(),
                 in_service: None,
                 tx_ready_pending: false,
-                generators: generators_by_source.remove(&node_key).unwrap_or_default(),
+                generators,
+                stages,
                 tcp_receivers: tcp_receivers_by_target
                     .remove(&node_key)
                     .unwrap_or_default(),

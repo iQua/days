@@ -4,9 +4,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use days::scenario::compile_config;
 use days_executor::{
     Backend, CollectiveAlgorithm, CollectivePhase, CollectiveStage, CollectiveStageIdentity,
-    CpuConfig, FlowGeneratorKind, FlowGeneratorState, GeneratorStatus, MechanismTransitionRecord,
-    ObservationMode, SimulationImage, StageRole, run_cpu_with_observations,
-    run_scalar_with_observations, validate,
+    CpuConfig, FlowGeneratorKind, FlowGeneratorState, GeneratorStatus, HostState,
+    MechanismTransitionRecord, ObservationMode, SimulationImage, StageRole,
+    run_cpu_with_observations, run_scalar_with_observations, validate,
 };
 
 fn collective_config(algorithm: &str) -> String {
@@ -65,19 +65,24 @@ fn compile_collective(algorithm: &str) -> SimulationImage {
     compile_collective_with_total(algorithm, 10)
 }
 
-fn identity(generator: &FlowGeneratorState) -> CollectiveStageIdentity {
-    let Some(CollectiveStage {
-        role: StageRole::Collective(identity),
-        ..
-    }) = generator.stage
-    else {
+fn identity(stage: &CollectiveStage) -> CollectiveStageIdentity {
+    let StageRole::Collective(identity) = stage.role else {
         panic!("every expanded flow is a collective stage")
     };
     identity
 }
 
-fn set_identity(generator: &mut FlowGeneratorState, identity: CollectiveStageIdentity) {
-    generator.stage.as_mut().unwrap().role = StageRole::Collective(identity);
+fn set_identity(stage: &mut CollectiveStage, identity: CollectiveStageIdentity) {
+    stage.role = StageRole::Collective(identity);
+}
+
+/// Every generator of `image` with its stage record; every expanded flow is a stage.
+fn stages(image: &SimulationImage) -> impl Iterator<Item = (&FlowGeneratorState, CollectiveStage)> {
+    image
+        .host_states
+        .iter()
+        .flat_map(HostState::generators_with_stages)
+        .map(|(generator, stage)| (generator, stage.expect("every expanded flow is a stage")))
 }
 
 fn owner(identity: CollectiveStageIdentity) -> u64 {
@@ -89,11 +94,15 @@ fn owner(identity: CollectiveStageIdentity) -> u64 {
         % u64::from(identity.group_size)
 }
 
-fn generators_mut(image: &mut SimulationImage) -> impl Iterator<Item = &mut FlowGeneratorState> {
+/// [`stages`], writable.
+fn stages_mut(
+    image: &mut SimulationImage,
+) -> impl Iterator<Item = (&mut FlowGeneratorState, &mut CollectiveStage)> {
     image
         .host_states
         .iter_mut()
-        .flat_map(|state| &mut state.generators)
+        .flat_map(HostState::generators_with_stages_mut)
+        .map(|(generator, stage)| (generator, stage.expect("every expanded flow is a stage")))
 }
 
 /// Keeps a scheduled root's first TCP segment equal to `min(mss, total_bytes)` after a mutation.
@@ -132,10 +141,10 @@ fn run_everywhere(image: &SimulationImage, label: &str) -> days_executor::RunRes
 
 fn assert_complete(result: &days_executor::RunResult, label: &str) {
     assert!(result.pending_events.is_empty(), "{label}");
-    for generator in result
+    for (generator, stage) in result
         .host_states
         .iter()
-        .flat_map(|state| &state.generators)
+        .flat_map(HostState::generators_with_stages)
     {
         assert_eq!(
             generator.next_emission.status,
@@ -146,7 +155,7 @@ fn assert_complete(result: &days_executor::RunResult, label: &str) {
             panic!("{label}: collective stages are TCP generators")
         };
         assert_eq!(tcp.highest_ack, tcp.total_bytes, "{label}");
-        let stage = generator.stage.unwrap();
+        let stage = stage.unwrap();
         assert!(stage.activated && stage.dependencies.prerequisites_complete());
     }
 }
@@ -159,34 +168,32 @@ fn ring_allreduce_and_allgather_lower_to_parametric_tcp_stages() {
         let image = compile_collective(algorithm);
         assert_eq!(image.flows.len(), expected_flows);
 
-        let generators = image
-            .host_states
-            .iter()
-            .flat_map(|state| &state.generators)
-            .collect::<Vec<_>>();
+        let generators = stages(&image).collect::<Vec<_>>();
         assert_eq!(generators.len(), expected_flows);
         assert_eq!(
             generators
                 .iter()
-                .filter(|generator| generator.next_emission.status == GeneratorStatus::Scheduled)
+                .filter(|(generator, _)| {
+                    generator.next_emission.status == GeneratorStatus::Scheduled
+                })
                 .count(),
             4
         );
         assert_eq!(
             generators
                 .iter()
-                .filter(|generator| generator.next_emission.status == GeneratorStatus::Blocked)
+                .filter(|(generator, _)| generator.next_emission.status == GeneratorStatus::Blocked)
                 .count(),
             expected_flows - 4
         );
 
         let mut phases = std::collections::BTreeSet::new();
         let mut chunk_lengths = std::collections::BTreeSet::new();
-        for generator in generators {
+        for (generator, stage) in generators {
             let FlowGeneratorKind::Tcp(tcp) = generator.kind else {
                 panic!("every expanded flow uses the ordinary TCP generator")
             };
-            let stage = identity(generator);
+            let stage = identity(&stage);
             assert_eq!(stage.topology_level, 0);
             assert_eq!(stage.topology_group, 0);
             assert_eq!(stage.group_size, 4);
@@ -303,12 +310,12 @@ fn collective_validator_rejects_inconsistent_dependency_state() {
     let image = compile_collective("AllGather");
     validate(&image, Backend::Scalar)
         .expect("a pristine dependency-blocked collective must remain legal");
-    let blocked = |generator: &&mut FlowGeneratorState| {
+    let blocked = |(generator, _): &(&mut FlowGeneratorState, &mut CollectiveStage)| {
         generator.next_emission.status == GeneratorStatus::Blocked
     };
 
     let mut reblocked_partial = image.clone();
-    let generator = generators_mut(&mut reblocked_partial)
+    let (generator, _) = stages_mut(&mut reblocked_partial)
         .find(blocked)
         .expect("all-gather has blocked descendants");
     generator.packets_emitted = 1;
@@ -321,12 +328,10 @@ fn collective_validator_rejects_inconsistent_dependency_state() {
     );
 
     let mut inbound_mismatch = image.clone();
-    let generator = generators_mut(&mut inbound_mismatch)
+    let (_, stage) = stages_mut(&mut inbound_mismatch)
         .find(blocked)
         .expect("all-gather has blocked descendants");
-    let mut dependencies = generator.stage_dependencies().unwrap();
-    dependencies.inbound_predecessor_complete = true;
-    generator.set_stage_dependencies(dependencies);
+    stage.dependencies.inbound_predecessor_complete = true;
     assert!(
         validate(&inbound_mismatch, Backend::Scalar)
             .expect_err("completion without inbound bytes must reject")
@@ -335,12 +340,10 @@ fn collective_validator_rejects_inconsistent_dependency_state() {
     );
 
     let mut frontier_mismatch = image.clone();
-    let generator = generators_mut(&mut frontier_mismatch)
+    let (_, stage) = stages_mut(&mut frontier_mismatch)
         .find(blocked)
         .expect("all-gather has blocked descendants");
-    let mut dependencies = generator.stage_dependencies().unwrap();
-    dependencies.inbound_bytes_received = 1;
-    generator.set_stage_dependencies(dependencies);
+    stage.dependencies.inbound_bytes_received = 1;
     assert!(
         validate(&frontier_mismatch, Backend::Scalar)
             .expect_err("inbound bytes must equal the in-order TCP frontier")
@@ -349,12 +352,10 @@ fn collective_validator_rejects_inconsistent_dependency_state() {
     );
 
     let mut local_mismatch = image.clone();
-    let generator = generators_mut(&mut local_mismatch)
+    let (_, stage) = stages_mut(&mut local_mismatch)
         .find(blocked)
         .expect("all-gather has blocked descendants");
-    let mut dependencies = generator.stage_dependencies().unwrap();
-    dependencies.local_predecessor_complete = true;
-    generator.set_stage_dependencies(dependencies);
+    stage.dependencies.local_predecessor_complete = true;
     assert!(
         validate(&local_mismatch, Backend::Scalar)
             .expect_err("local completion before the predecessor is acknowledged must reject")
@@ -363,10 +364,10 @@ fn collective_validator_rejects_inconsistent_dependency_state() {
     );
 
     let mut early_release = image;
-    let generator = generators_mut(&mut early_release)
+    let (_, stage) = stages_mut(&mut early_release)
         .find(blocked)
         .expect("all-gather has blocked descendants");
-    generator.stage.as_mut().unwrap().activated = true;
+    stage.activated = true;
     assert!(
         validate(&early_release, Backend::Scalar)
             .expect_err("a stage cannot be released before its prerequisites")
@@ -382,20 +383,17 @@ fn collective_validator_rejects_duplicate_stage_positions() {
         .expect("the complete unique collective stage table must remain legal");
 
     let mut duplicate = image;
-    let duplicate_stage = duplicate
-        .host_states
-        .iter()
-        .flat_map(|state| &state.generators)
-        .map(identity)
+    let duplicate_stage = stages(&duplicate)
+        .map(|(_, stage)| identity(&stage))
         .find(|stage| stage.rank == 2 && stage.step == 2)
         .expect("all-gather rank 2 has step 2");
-    let generator = generators_mut(&mut duplicate)
-        .find(|generator| {
-            let stage = identity(generator);
+    let (_, stage) = stages_mut(&mut duplicate)
+        .find(|(_, stage)| {
+            let stage = identity(stage);
             stage.rank == 2 && stage.step == 3
         })
         .expect("all-gather rank 2 has a terminal step 3");
-    set_identity(generator, duplicate_stage);
+    set_identity(stage, duplicate_stage);
 
     assert!(
         validate(&duplicate, Backend::Scalar)
@@ -413,14 +411,12 @@ fn collective_validator_rejects_overlapping_equal_remainder_last_partition() {
     let mut overlapping = image;
     let mut changed_stages = 0;
     let mut root_payload = None;
-    for generator in generators_mut(&mut overlapping) {
-        let mut stage = identity(generator);
+    for (generator, record) in stages_mut(&mut overlapping) {
+        let mut stage = identity(record);
         if owner(stage) == 0 {
             stage.chunk_bytes = 3;
-            set_identity(generator, stage);
-            let mut dependencies = generator.stage_dependencies().unwrap();
-            dependencies.inbound_predecessor_bytes = 3;
-            generator.set_stage_dependencies(dependencies);
+            set_identity(record, stage);
+            record.dependencies.inbound_predecessor_bytes = 3;
             let FlowGeneratorKind::Tcp(mut tcp) = generator.kind else {
                 unreachable!()
             };
@@ -450,14 +446,12 @@ fn collective_validator_binds_partition_to_the_declared_total() {
     let image = compile_collective("AllGather");
     let mut changed_total = image;
     let mut root_payloads = Vec::new();
-    for generator in generators_mut(&mut changed_total) {
-        let mut stage = identity(generator);
+    for (generator, record) in stages_mut(&mut changed_total) {
+        let mut stage = identity(record);
         stage.chunk_offset_bytes = owner(stage) * 3;
         stage.chunk_bytes = 3;
-        set_identity(generator, stage);
-        let mut dependencies = generator.stage_dependencies().unwrap();
-        dependencies.inbound_predecessor_bytes = 3;
-        generator.set_stage_dependencies(dependencies);
+        set_identity(record, stage);
+        record.dependencies.inbound_predecessor_bytes = 3;
         let FlowGeneratorKind::Tcp(mut tcp) = generator.kind else {
             unreachable!()
         };
@@ -478,23 +472,20 @@ fn collective_validator_binds_partition_to_the_declared_total() {
 
     let canonical_twelve = compile_collective_with_total("AllGather", 12);
     assert!(
-        canonical_twelve
-            .host_states
-            .iter()
-            .flat_map(|state| &state.generators)
-            .map(identity)
+        stages(&canonical_twelve)
+            .map(|(_, stage)| identity(&stage))
             .all(|stage| stage.declared_total_bytes == 12 && stage.chunk_bytes == 3)
     );
     let result = run_everywhere(&canonical_twelve, "declared twelve");
     assert_complete(&result, "declared twelve");
 
     let mut inconsistent_total = canonical_twelve;
-    let generator = generators_mut(&mut inconsistent_total)
+    let (_, record) = stages_mut(&mut inconsistent_total)
         .next()
         .expect("collective stage");
-    let mut stage = identity(generator);
+    let mut stage = identity(record);
     stage.declared_total_bytes = 11;
-    set_identity(generator, stage);
+    set_identity(record, stage);
     let error = validate(&inconsistent_total, Backend::Scalar)
         .expect_err("declared total must agree across all stages")
         .to_string();
@@ -564,11 +555,8 @@ fn collective_algorithm_specific_boundaries_are_canonical() {
     let image = compile_text("ring-minimum", &minimum_ring).expect("minimum ring must lower");
     let result = run_everywhere(&image, "minimum ring");
     assert_complete(&result, "minimum ring");
-    let data_bytes = image
-        .host_states
-        .iter()
-        .flat_map(|state| &state.generators)
-        .map(|generator| identity(generator).chunk_bytes)
+    let data_bytes = stages(&image)
+        .map(|(_, stage)| identity(&stage).chunk_bytes)
         .sum::<u64>();
     assert_eq!(data_bytes, 4);
 }
@@ -587,12 +575,12 @@ fn collective_roots_beyond_the_stop_leave_every_descendant_unreleased() {
     );
     let result = run_everywhere(&image, "late roots");
     assert_eq!(result.summary.sourced_packets, 0);
-    for generator in result
+    for (generator, stage) in result
         .host_states
         .iter()
-        .flat_map(|state| &state.generators)
+        .flat_map(HostState::generators_with_stages)
     {
-        let stage = generator.stage.unwrap();
+        let stage = stage.expect("every expanded flow is a stage");
         let root = stage.dependencies.local_predecessor.is_none()
             && stage.dependencies.inbound_predecessor.is_none();
         assert_eq!(stage.activated, root);
@@ -611,13 +599,13 @@ fn collective_roots_beyond_the_stop_leave_every_descendant_unreleased() {
 #[test]
 fn collective_maximum_group_width_rejects_without_validator_panic() {
     let mut image = compile_collective("AllGather");
-    let generator = generators_mut(&mut image)
-        .find(|generator| identity(generator).rank > 0)
+    let (_, record) = stages_mut(&mut image)
+        .find(|(_, stage)| identity(stage).rank > 0)
         .expect("all-gather has a nonzero-rank stage");
-    let mut stage = identity(generator);
+    let mut stage = identity(record);
     stage.group_size = u32::MAX;
     stage.rank = u32::MAX - 1;
-    set_identity(generator, stage);
+    set_identity(record, stage);
 
     let result = std::panic::catch_unwind(|| validate(&image, Backend::Scalar));
     assert!(
@@ -666,4 +654,94 @@ fn blocked_collective_stages_reserve_their_payload_identities() {
         validation.contains("payload identity sequence"),
         "{validation}"
     );
+}
+
+/// P14 slim round 2: a host's stage table is empty or parallel to its generators with at least one
+/// stage. Those are the only shapes the `Debug` rendering, which prints each record inline in its
+/// generator, determines, so the validator rejects every other shape.
+#[test]
+fn validator_accepts_only_canonical_stage_tables() {
+    let image = compile_collective("AllGather");
+    validate(&image, Backend::Scalar).expect("the lowered stage tables are canonical");
+    let slot = image
+        .host_states
+        .iter()
+        .position(|state| !state.stages.is_empty())
+        .expect("a host with stages");
+
+    let mut long = image.clone();
+    long.host_states[slot].stages.push(None);
+    let mut short = image.clone();
+    short.host_states[slot].stages.pop();
+    for (label, mutated) in [("one entry too many", long), ("one entry too few", short)] {
+        let error = validate(&mutated, Backend::Scalar)
+            .expect_err(label)
+            .to_string();
+        assert!(
+            error.contains(&format!("host state slot {slot} has"))
+                && error.contains("stage table entries for"),
+            "{label}: {error}"
+        );
+    }
+
+    let mut without_stage = image;
+    without_stage.host_states[slot].stages.fill(None);
+    let error = validate(&without_stage, Backend::Scalar)
+        .expect_err("a table without a stage")
+        .to_string();
+    assert!(
+        error.contains(&format!(
+            "host state slot {slot} has a stage table without a stage"
+        )),
+        "{error}"
+    );
+}
+
+/// P14 slim round 2: a host that carries plain flows and stages keeps one stage-table entry per
+/// generator. Plain flows sort before stages, so lowering back-fills `None` for them when the host's
+/// first stage arrives; the image validates and runs identically on Scalar and CPU.
+#[test]
+fn mixed_hosts_keep_a_parallel_stage_table() {
+    let config = collective_config("RingAllReduce")
+        + r#"
+[[flow_set]]
+flow_type = "TCP"
+flow_count = 4
+
+[flow_set.traffic]
+initial_delay = 0.0
+size = 10
+arr_dist = { type = "Uniform", low = 0.000000001, high = 0.000000001 }
+pkt_size_dist = { type = "DiscreteUniform", low = 3, high = 3 }
+
+[flow_set.traffic.tcp]
+cc_algorithm = "TCPReno"
+"#;
+    let image =
+        compile_text("mixed-hosts", &config).expect("a collective beside plain flows lowers");
+    validate(&image, Backend::Scalar).expect("mixed hosts validate");
+    let mut mixed_hosts = 0;
+    for state in &image.host_states {
+        let stages = state.stages.iter().flatten().count();
+        let plain = state.generators.len() - stages;
+        if stages == 0 {
+            assert!(
+                state.stages.is_empty(),
+                "a host without stages has no table"
+            );
+            continue;
+        }
+        assert_eq!(state.stages.len(), state.generators.len());
+        if plain > 0 {
+            mixed_hosts += 1;
+            // The plain flows come first in canonical flow order and carry no record.
+            assert!(state.stages[..plain].iter().all(Option::is_none));
+            assert!(state.stages[plain..].iter().all(Option::is_some));
+        }
+    }
+    assert!(
+        mixed_hosts > 0,
+        "the scenario must put plain flows beside stages"
+    );
+    run_everywhere(&image, "mixed hosts");
 }

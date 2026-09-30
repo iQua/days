@@ -50,6 +50,7 @@ fn host_state(egress_link: LinkId) -> HostState {
         in_service: None,
         tx_ready_pending: false,
         generators: vec![],
+        stages: vec![],
         tcp_receivers: vec![],
         dcqcn_receivers: vec![],
         next_origin_seq: 0,
@@ -1195,7 +1196,6 @@ fn validator_uses_configured_tcp_ack_size_for_pfc_frame_bounds() {
     });
     image.initial_events.sort_unstable_by_key(|event| event.key);
     image.host_states[1].generators.push(FlowGeneratorState {
-        stage: None,
         flow: tcp_flow,
         packets_emitted: 0,
         bytes_emitted: 0,
@@ -1407,7 +1407,6 @@ fn final_partial_rate_pfc_image(max_frame_bytes: u64) -> SimulationImage {
         .expect("fixture has a PFC monitor")
         .max_frame_bytes[usize::from(PRIORITY)] = max_frame_bytes;
     image.host_states[0].generators.push(FlowGeneratorState {
-        stage: None,
         flow: FLOW,
         packets_emitted: 0,
         bytes_emitted: 0,
@@ -1917,7 +1916,6 @@ fn reverse_route_cycle_image() -> SimulationImage {
     }
     for flow in &image.flows {
         let generator = FlowGeneratorState {
-            stage: None,
             flow: flow.id,
             packets_emitted: 0,
             bytes_emitted: 0,

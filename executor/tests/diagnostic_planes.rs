@@ -18,6 +18,7 @@ fn empty_image() -> SimulationImage {
             in_service: None,
             tx_ready_pending: false,
             generators: Vec::new(),
+            stages: Vec::new(),
             tcp_receivers: Vec::new(),
             dcqcn_receivers: Vec::new(),
             next_payload_seq: 0,

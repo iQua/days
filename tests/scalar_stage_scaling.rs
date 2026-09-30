@@ -42,8 +42,8 @@ mod tcp;
 
 use days_executor::scalar::run_scalar_counting_stage_scans_for_testing;
 use days_executor::{
-    Backend, GeneratorStatus, ObservationMode, SimulationImage, run_scalar_with_observations,
-    validate,
+    Backend, GeneratorStatus, HostState, ObservationMode, SimulationImage,
+    run_scalar_with_observations, validate,
 };
 
 const SMALL_RANKS: u64 = 8;
@@ -97,8 +97,8 @@ fn probe(label: &str, image: &SimulationImage, expected_stages: u64) -> Probe {
     let stages = image
         .host_states
         .iter()
-        .flat_map(|state| &state.generators)
-        .filter(|generator| generator.stage.is_some())
+        .flat_map(|state| &state.stages)
+        .flatten()
         .count() as u64;
     assert_eq!(stages, expected_stages, "{label}: stage count");
     let (result, dispatches, visits) =
@@ -114,9 +114,9 @@ fn probe(label: &str, image: &SimulationImage, expected_stages: u64) -> Probe {
     let unfinished = result
         .host_states
         .iter()
-        .flat_map(|state| &state.generators)
-        .filter(|generator| generator.stage.is_some())
-        .filter(|generator| generator.next_emission.status != GeneratorStatus::Finished)
+        .flat_map(HostState::generators_with_stages)
+        .filter(|(_, stage)| stage.is_some())
+        .filter(|(generator, _)| generator.next_emission.status != GeneratorStatus::Finished)
         .count();
     assert_eq!(unfinished, 0, "{label}: every stage must finish");
     Probe { dispatches, visits }

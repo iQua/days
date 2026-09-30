@@ -32,6 +32,15 @@ pub struct HostState {
     pub tx_ready_pending: bool,
     /// Source-owned flow generators in canonical `FlowId` order.
     pub generators: Vec<FlowGeneratorState>,
+    /// Collective or compute stage records of the generators, by generator position.
+    ///
+    /// Empty on a host without a stage generator, so unused collectives cost a host nothing. On a
+    /// host that carries a stage it holds exactly one entry per generator, `Some` at each stage
+    /// generator; a plain flow sharing that host pays one `Option<CollectiveStage>` entry (136 B),
+    /// the size P14 first gave every generator inline. `validate` accepts only these two shapes
+    /// (`HostState::stages_are_canonical`), so the per-generator view that `Debug` prints
+    /// determines the table.
+    pub stages: Vec<Option<CollectiveStage>>,
     /// Target-owned TCP cumulative-ACK state in canonical `FlowId` order.
     pub tcp_receivers: Vec<TcpReceiverState>,
     /// Target-owned DCQCN CNP interval state in canonical `FlowId` order.
@@ -44,6 +53,114 @@ pub struct HostState {
     pub received_packets: u64,
 }
 
+impl HostState {
+    /// The stage record of the generator at `position`, or `None` for an ungated generator.
+    pub fn stage(&self, position: usize) -> Option<CollectiveStage> {
+        self.stages.get(position).copied().flatten()
+    }
+
+    /// Dependency state of the stage at `position`, or `None` for an ungated generator.
+    pub fn stage_dependencies(&self, position: usize) -> Option<StageDependencies> {
+        self.stage(position).map(|stage| stage.dependencies)
+    }
+
+    /// Writes dependency state back into the stage record at `position`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the generator at `position` is not a stage; callers obtain `dependencies` from
+    /// [`Self::stage_dependencies`].
+    pub fn set_stage_dependencies(&mut self, position: usize, dependencies: StageDependencies) {
+        self.stages
+            .get_mut(position)
+            .and_then(Option::as_mut)
+            .expect("set_stage_dependencies requires a stage record")
+            .dependencies = dependencies;
+    }
+
+    /// Each generator with its stage record, in table order.
+    pub fn generators_with_stages(
+        &self,
+    ) -> impl Iterator<Item = (&FlowGeneratorState, Option<CollectiveStage>)> {
+        self.generators
+            .iter()
+            .enumerate()
+            .map(|(position, generator)| (generator, self.stage(position)))
+    }
+
+    /// Each generator with its stage record, both writable, in table order. On a host whose stage
+    /// table is empty every generator pairs with `None`.
+    pub fn generators_with_stages_mut(
+        &mut self,
+    ) -> impl Iterator<Item = (&mut FlowGeneratorState, Option<&mut CollectiveStage>)> {
+        self.generators.iter_mut().zip(
+            self.stages
+                .iter_mut()
+                .map(Option::as_mut)
+                .chain(std::iter::repeat_with(|| None)),
+        )
+    }
+
+    /// Whether the stage table has one of its two accepted shapes: empty, or one entry per
+    /// generator with at least one stage.
+    pub fn stages_are_canonical(&self) -> bool {
+        self.stages.is_empty()
+            || (self.stages.len() == self.generators.len()
+                && self.stages.iter().any(Option::is_some))
+    }
+}
+
+/// A host's generator table as `Debug` renders it: each generator with its stage record inline.
+///
+/// The rendering is the one every image and result fingerprint used when the record was a
+/// generator field, byte for byte; neither the stage table nor a position appears in it.
+struct GeneratorsWithStages<'a>(&'a HostState);
+
+impl fmt::Debug for GeneratorsWithStages<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = self.0;
+        formatter
+            .debug_list()
+            .entries(
+                state
+                    .generators
+                    .iter()
+                    .enumerate()
+                    .map(|(position, generator)| GeneratorWithStage {
+                        generator,
+                        stage: state.stage(position),
+                    }),
+            )
+            .finish()
+    }
+}
+
+/// One generator and its stage record, rendered as the generator alone was when it held the record.
+struct GeneratorWithStage<'a> {
+    generator: &'a FlowGeneratorState,
+    stage: Option<CollectiveStage>,
+}
+
+impl fmt::Debug for GeneratorWithStage<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let generator = self.generator;
+        let mut debug = formatter.debug_struct("FlowGeneratorState");
+        debug
+            .field("flow", &generator.flow)
+            .field("packets_emitted", &generator.packets_emitted)
+            .field("bytes_emitted", &generator.bytes_emitted)
+            .field("next_emission", &generator.next_emission)
+            .field("rng_state", &generator.rng_state)
+            .field("feedback", &generator.feedback)
+            .field("kind", &generator.kind);
+        // Omitting the absent additive field preserves every frozen pre-P14 image byte.
+        if self.stage.is_some() {
+            debug.field("stage", &self.stage);
+        }
+        debug.finish()
+    }
+}
+
 impl fmt::Debug for HostState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut debug = formatter.debug_struct("HostState");
@@ -52,7 +169,8 @@ impl fmt::Debug for HostState {
             .field("queue", &self.queue)
             .field("in_service", &self.in_service)
             .field("tx_ready_pending", &self.tx_ready_pending)
-            .field("generators", &self.generators)
+            // Each generator with its stage record inline; the stage table is not printed.
+            .field("generators", &GeneratorsWithStages(self))
             .field("tcp_receivers", &self.tcp_receivers);
         // Omitting the empty additive field preserves every frozen pre-T26 image byte.
         if !self.dcqcn_receivers.is_empty() {
@@ -413,49 +531,16 @@ pub struct FlowGeneratorState {
     pub rng_state: u64,
     pub feedback: GeneratorFeedbackState,
     pub kind: FlowGeneratorKind,
-    /// Collective or compute dependency record of a dependency-gated generator.
-    pub stage: Option<CollectiveStage>,
 }
 
-impl FlowGeneratorState {
-    /// Dependency state of a stage, or `None` for an ungated generator.
-    pub const fn stage_dependencies(&self) -> Option<StageDependencies> {
-        match &self.stage {
-            Some(stage) => Some(stage.dependencies),
-            None => None,
-        }
-    }
-
-    /// Writes dependency state back into the stage record.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the generator is not a stage; callers obtain `dependencies` from
-    /// [`Self::stage_dependencies`].
-    pub fn set_stage_dependencies(&mut self, dependencies: StageDependencies) {
-        self.stage
-            .as_mut()
-            .expect("set_stage_dependencies requires a stage record")
-            .dependencies = dependencies;
-    }
-}
-
+/// A generator alone, without its host's stage table, renders with no stage record.
 impl fmt::Debug for FlowGeneratorState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut debug = formatter.debug_struct("FlowGeneratorState");
-        debug
-            .field("flow", &self.flow)
-            .field("packets_emitted", &self.packets_emitted)
-            .field("bytes_emitted", &self.bytes_emitted)
-            .field("next_emission", &self.next_emission)
-            .field("rng_state", &self.rng_state)
-            .field("feedback", &self.feedback)
-            .field("kind", &self.kind);
-        // Omitting the absent additive field preserves every frozen pre-P14 image byte.
-        if self.stage.is_some() {
-            debug.field("stage", &self.stage);
+        GeneratorWithStage {
+            generator: self,
+            stage: None,
         }
-        debug.finish()
+        .fmt(formatter)
     }
 }
 
@@ -770,4 +855,31 @@ pub struct SimulationImage {
     pub channels: Vec<RemoteChannel>,
     pub initial_events: Vec<Event>,
     pub seed: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FlowGeneratorState;
+
+    /// `FlowGeneratorState` is held once per flow in the image and in every Scalar and CPU host
+    /// state, so each byte is a per-flow cost at lowering and at run time: at the 262,144-flow
+    /// frontier every 16 B is 4.2 MB. Before P14 (`main` at 948a0e9) it was 352 B. P14 carried the
+    /// collective or compute stage record inline as `stage: Option<CollectiveStage>` (136 B, padded
+    /// to 144 B by the type's 16-byte alignment), 496 B for every generator though most are not
+    /// stages. The record now lives in the host's parallel `HostState::stages` table, so the
+    /// generator is back to `main`'s layout. `repr(C)` with the 16-byte alignment `u128` credit
+    /// forces gives no spare bytes, so any field added here rounds up to 368 B.
+    ///
+    /// Layout is the compiler's choice, so the bound is an upper bound on 64-bit targets.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn flow_generator_state_keeps_main_size() {
+        const FLOW_GENERATOR_STATE_MAX_BYTES: usize = 352;
+        let size = std::mem::size_of::<FlowGeneratorState>();
+        assert!(
+            size <= FLOW_GENERATOR_STATE_MAX_BYTES,
+            "FlowGeneratorState grew to {size} B, above {FLOW_GENERATOR_STATE_MAX_BYTES} B: keep \
+             per-generator stage data in the host's `stages` table"
+        );
+    }
 }

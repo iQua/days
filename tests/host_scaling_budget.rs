@@ -224,8 +224,8 @@ impl Scenario {
             .image
             .host_states
             .iter()
-            .flat_map(|state| &state.generators)
-            .filter(|generator| generator.stage.is_some())
+            .flat_map(|state| &state.stages)
+            .flatten()
             .count();
         assert_eq!(
             stages,

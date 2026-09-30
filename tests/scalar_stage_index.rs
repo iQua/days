@@ -21,8 +21,8 @@ use std::path::PathBuf;
 use days::scenario::compile_config;
 use days_executor::scalar::assert_scalar_stage_index_equivalent_for_testing;
 use days_executor::{
-    Backend, CpuConfig, FlowGeneratorState, GeneratorStatus, ObservationMode, RunResult,
-    SimulationImage, StageRole, run_cpu_with_observations, run_scalar_with_observations, validate,
+    Backend, CpuConfig, GeneratorStatus, HostState, ObservationMode, RunResult, SimulationImage,
+    StageRole, run_cpu_with_observations, run_scalar_with_observations, validate,
 };
 
 fn ring_allgather_compute_config(ranks: u64) -> String {
@@ -124,8 +124,8 @@ fn stage_count(image: &SimulationImage) -> usize {
     image
         .host_states
         .iter()
-        .flat_map(|state| &state.generators)
-        .filter(|generator| generator.stage.is_some())
+        .flat_map(|state| &state.stages)
+        .flatten()
         .count()
 }
 
@@ -174,9 +174,9 @@ fn stage_index_matches_the_scans_on_collective_and_compute_fixtures() {
         let unfinished = result
             .host_states
             .iter()
-            .flat_map(|state| &state.generators)
-            .filter(|generator| generator.stage.is_some())
-            .filter(|generator| generator.next_emission.status != GeneratorStatus::Finished)
+            .flat_map(HostState::generators_with_stages)
+            .filter(|(_, stage)| stage.is_some())
+            .filter(|(generator, _)| generator.next_emission.status != GeneratorStatus::Finished)
             .count();
         assert_eq!(unfinished, 0, "{label}: every stage must finish");
     }
@@ -192,14 +192,14 @@ fn stage_index_matches_the_scans_on_running_checkpoints() {
             let partly_released = checkpoint
                 .host_states
                 .iter()
-                .flat_map(|state| &state.generators)
-                .filter_map(|generator| generator.stage)
+                .flat_map(|state| &state.stages)
+                .flatten()
                 .any(|stage| stage.activated)
                 && checkpoint
                     .host_states
                     .iter()
-                    .flat_map(|state| &state.generators)
-                    .filter_map(|generator| generator.stage)
+                    .flat_map(|state| &state.stages)
+                    .flatten()
                     .any(|stage| !stage.activated);
             released_mid_run += usize::from(partly_released);
             let label = format!("{label} at {horizon_ns} ns");
@@ -227,21 +227,16 @@ fn stage_host(image: &SimulationImage) -> usize {
     image
         .host_states
         .iter()
-        .position(|state| {
-            state
-                .generators
-                .iter()
-                .filter(|generator| generator.stage.is_some())
-                .count()
-                >= 2
-        })
+        .position(|state| state.stages.iter().flatten().count() >= 2)
         .expect("a host with two stages")
 }
 
-fn mutated(label: &str, mutate: impl FnOnce(&mut Vec<FlowGeneratorState>)) -> SimulationImage {
+/// The ring image with `mutate` applied to its first host with two stages. A mutation that adds or
+/// moves a generator moves its stage-table entry with it, so the table stays parallel.
+fn mutated(label: &str, mutate: impl FnOnce(&mut HostState)) -> SimulationImage {
     let mut image = tcp::compile_text(label, &ring_allgather_compute_config(4));
     let slot = stage_host(&image);
-    mutate(&mut image.host_states[slot].generators);
+    mutate(&mut image.host_states[slot]);
     image
 }
 
@@ -252,45 +247,49 @@ fn stage_index_matches_the_scans_on_tables_the_validator_rejects() {
     let cases: Vec<(&str, SimulationImage)> = vec![
         (
             "duplicate stage generator appended",
-            mutated("dup-appended", |generators| {
-                let copy = *generators
+            mutated("dup-appended", |state| {
+                let position = state
+                    .stages
                     .iter()
-                    .find(|generator| generator.stage.is_some())
+                    .position(Option::is_some)
                     .expect("a stage");
-                generators.push(copy);
+                let (generator, stage) = (state.generators[position], state.stages[position]);
+                state.generators.push(generator);
+                state.stages.push(stage);
             }),
         ),
         (
             "duplicate stage generator adjacent",
-            mutated("dup-adjacent", |generators| {
-                let position = generators
+            mutated("dup-adjacent", |state| {
+                let position = state
+                    .stages
                     .iter()
-                    .rposition(|generator| generator.stage.is_some())
+                    .rposition(Option::is_some)
                     .expect("a stage");
-                let copy = generators[position];
-                generators.insert(position, copy);
+                let (generator, stage) = (state.generators[position], state.stages[position]);
+                state.generators.insert(position, generator);
+                state.stages.insert(position, stage);
             }),
         ),
         (
             "table out of flow order",
-            mutated("reversed", |generators| generators.reverse()),
+            mutated("reversed", |state| {
+                state.generators.reverse();
+                state.stages.reverse();
+            }),
         ),
         (
             "stage releasable at load",
-            mutated("pre-released", |generators| {
-                let generator = generators
+            mutated("pre-released", |state| {
+                let stage = state
+                    .stages
                     .iter_mut()
                     .rev()
-                    .find(|generator| {
-                        generator
-                            .stage
-                            .is_some_and(|stage| matches!(stage.role, StageRole::Collective(_)))
-                    })
+                    .flatten()
+                    .find(|stage| matches!(stage.role, StageRole::Collective(_)))
                     .expect("a collective stage");
-                let mut dependencies = generator.stage_dependencies().expect("a stage");
-                dependencies.local_predecessor_complete = true;
-                dependencies.inbound_predecessor_complete = true;
-                generator.set_stage_dependencies(dependencies);
+                stage.dependencies.local_predecessor_complete = true;
+                stage.dependencies.inbound_predecessor_complete = true;
             }),
         ),
     ];

@@ -18,8 +18,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use days::scenario::compile_config;
 use days_executor::{
     Backend, CollectiveActivationCause, CollectiveProgressRecord, CollectiveStageKind, CpuConfig,
-    FlowGeneratorKind, FlowId, GeneratorStatus, MechanismTransitionRecord, ObservationMode,
-    PacketKind, RunResult, SimulationImage, StageRole, TcpTransitionInput,
+    FlowGeneratorKind, FlowId, GeneratorStatus, HostState, MechanismTransitionRecord,
+    ObservationMode, PacketKind, RunResult, SimulationImage, StageRole, TcpTransitionInput,
     collective_transitions_csv, run_cpu_with_observations, run_scalar_with_observations, validate,
 };
 
@@ -85,8 +85,8 @@ fn compute_stages(image: &SimulationImage) -> BTreeMap<(u64, u32), (FlowId, u64)
     image
         .host_states
         .iter()
-        .flat_map(|state| &state.generators)
-        .filter_map(|generator| match generator.stage?.role {
+        .flat_map(HostState::generators_with_stages)
+        .filter_map(|(generator, stage)| match stage?.role {
             StageRole::Compute(compute) => Some((
                 (compute.duration_ns, compute.rank),
                 (generator.flow, compute.compute_id),
@@ -112,8 +112,12 @@ fn compute_stages_lower_to_timer_only_generators() {
     let image = tcp::compile_text("compute-lowering", &chain_config());
     let stages = compute_stages(&image);
     assert_eq!(stages.len(), 6);
-    for generator in image.host_states.iter().flat_map(|state| &state.generators) {
-        let Some(stage) = generator.stage else {
+    for (generator, stage) in image
+        .host_states
+        .iter()
+        .flat_map(HostState::generators_with_stages)
+    {
+        let Some(stage) = stage else {
             panic!("every stage in the chain carries a record")
         };
         match stage.role {
@@ -371,8 +375,7 @@ fn compute_validator_rejects_inconsistent_stage_state() {
     let (slot, index) = locate(&image, backward);
     reject(
         &|image| {
-            image.host_states[slot].generators[index]
-                .stage
+            image.host_states[slot].stages[index]
                 .as_mut()
                 .unwrap()
                 .activated = true;
@@ -381,10 +384,10 @@ fn compute_validator_rejects_inconsistent_stage_state() {
     );
     reject(
         &|image| {
-            let generator = &mut image.host_states[slot].generators[index];
-            let mut dependencies = generator.stage_dependencies().unwrap();
+            let host = &mut image.host_states[slot];
+            let mut dependencies = host.stage_dependencies(index).unwrap();
             dependencies.local_predecessor = Some(forward);
-            generator.set_stage_dependencies(dependencies);
+            host.set_stage_dependencies(index, dependencies);
         },
         format!(
             "flow {backward:?} compute predecessors are neither a same-rank compute stage nor a collective's final stages"
@@ -392,15 +395,15 @@ fn compute_validator_rejects_inconsistent_stage_state() {
     );
     reject(
         &|image| {
-            let generator = &mut image.host_states[slot].generators[index];
-            let mut dependencies = generator.stage_dependencies().unwrap();
+            let host = &mut image.host_states[slot];
+            let mut dependencies = host.stage_dependencies(index).unwrap();
             dependencies.inbound_bytes_received = 1;
-            generator.set_stage_dependencies(dependencies);
+            host.set_stage_dependencies(index, dependencies);
         },
         format!(
             "flow {backward:?} compute inbound bytes 1 disagree with the in-order TCP frontier Some(0) of flow {:?}",
-            image.host_states[slot].generators[index]
-                .stage_dependencies()
+            image.host_states[slot]
+                .stage_dependencies(index)
                 .unwrap()
                 .inbound_predecessor
                 .unwrap()

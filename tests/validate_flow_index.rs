@@ -437,8 +437,8 @@ fn flow_indexed_generator_lookup_matches_the_scan_on_stage_images() {
     let stages = source
         .host_states
         .iter()
-        .flat_map(|state| &state.generators)
-        .filter(|generator| generator.stage.is_some())
+        .flat_map(|state| &state.stages)
+        .flatten()
         .count();
     assert!(
         stages >= 12,
@@ -467,8 +467,7 @@ fn flow_index_builds_stage_lookups_only_for_images_with_stages() {
             image
                 .host_states
                 .iter()
-                .flat_map(|state| &state.generators)
-                .all(|generator| generator.stage.is_none()),
+                .all(|state| state.stages.is_empty()),
             "{fixture}: the fixture corpus has no stages"
         );
         assert!(
@@ -518,8 +517,8 @@ fn flow_indexed_generator_lookup_matches_the_scan_on_duplicate_and_outside_flows
         .iter()
         .copied()
         .filter(|&(host, index)| {
-            image.host_states[host].generators[index]
-                .stage
+            image.host_states[host]
+                .stage(index)
                 .is_some_and(|stage| matches!(stage.role, StageRole::Collective(_)))
         })
         .collect::<Vec<_>>();
@@ -528,9 +527,9 @@ fn flow_indexed_generator_lookup_matches_the_scan_on_duplicate_and_outside_flows
         "the chain must have collective stages"
     );
     let (first_host, first_index) = collective_locations[0];
-    let earlier_stage = image.host_states[first_host].generators[first_index].stage;
+    let earlier_stage = image.host_states[first_host].stages[first_index];
     let (last_host, last_index) = collective_locations[collective_locations.len() - 1];
-    image.host_states[last_host].generators[last_index].stage = earlier_stage;
+    image.host_states[last_host].stages[last_index] = earlier_stage;
 
     assert_validate_generator_index_equivalent_for_testing(&image)
         .expect("duplicate and outside generator lookups must match the scan");
