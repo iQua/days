@@ -2140,6 +2140,10 @@ impl CudaPlan {
         tcp_capacity_floors: &mut crate::device_capacity::TcpCapacityFloors,
     ) -> Result<Self, CudaError> {
         let node_count = image.nodes.len();
+        // Whether the image carries PFC state, decided by one walk of the switch LPs. Without it the
+        // PFC region, the PFC frame bound and the PFC control lanes are all empty, and the plan skips
+        // the three walks that would find each of them empty (see `PfcState`).
+        let pfc_state = PfcState::of(image);
         let (flow_packet_counts, flow_feedback_counts) = flow_packet_counts(image)?;
         let minimum_lookahead_ns = image
             .channels
@@ -2497,8 +2501,11 @@ impl CudaPlan {
 
         let mut scheduler_state =
             prepare_device_schedulers(image, &queue_meta).map_err(CudaError::Validation)?;
-        let pfc_offset = crate::device_pfc::append_pfc_region(image, &mut scheduler_state)
-            .map_err(CudaError::Validation)?;
+        let pfc_offset = match pfc_state {
+            PfcState::Present => crate::device_pfc::append_pfc_region(image, &mut scheduler_state)
+                .map_err(CudaError::Validation)?,
+            PfcState::Absent => None,
+        };
 
         for event in &image.initial_events {
             let packet = if event.kind == EventKind::RetransmissionTimeout {
@@ -2603,7 +2610,7 @@ impl CudaPlan {
             remote_staging_slots,
             channel_capacity_floors,
         )?;
-        let event_bound = derived_transition_bound(image, &flow_packet_counts)?;
+        let event_bound = derived_transition_bound(image, &flow_packet_counts, pfc_state)?;
         let observation_capacity = if observation_mode == ObservationMode::Full {
             config
                 .max_observations
@@ -2662,7 +2669,7 @@ impl CudaPlan {
             tcp_layout.ledger_meta_offset,
             &mut tcp_state,
         );
-        let (inbound_meta, inbound_producers) = remote_inbound_producers(image);
+        let (inbound_meta, inbound_producers) = remote_inbound_producers(image, pfc_state);
         let round_capacity = config
             .max_rounds
             .unwrap_or_else(|| derived_round_bound(image, exclusive_horizon_ns, event_bound))
@@ -3615,7 +3622,10 @@ fn add_route_observation_capacities(
     }
 }
 
-fn remote_inbound_producers(image: &SimulationImage) -> (Vec<u64>, Vec<u64>) {
+fn remote_inbound_producers(
+    image: &SimulationImage,
+    pfc_state: PfcState,
+) -> (Vec<u64>, Vec<u64>) {
     let mut inbound = vec![BTreeSet::new(); image.nodes.len()];
     for flow in &image.flows {
         for (route, terminal) in [
@@ -3632,8 +3642,10 @@ fn remote_inbound_producers(image: &SimulationImage) -> (Vec<u64>, Vec<u64>) {
             }
         }
     }
-    for (producer, target) in crate::device_pfc::pfc_control_lane_producers(image) {
-        inbound[target].insert(producer);
+    if pfc_state == PfcState::Present {
+        for (producer, target) in crate::device_pfc::pfc_control_lane_producers(image) {
+            inbound[target].insert(producer);
+        }
     }
     let mut meta = vec![0_u64; image.nodes.len() * INBOUND_META_WORDS];
     let mut producers = Vec::new();
@@ -3646,7 +3658,44 @@ fn remote_inbound_producers(image: &SimulationImage) -> (Vec<u64>, Vec<u64>) {
     (meta, producers)
 }
 
-fn derived_transition_bound(image: &SimulationImage, counts: &[usize]) -> Result<usize, CudaError> {
+/// Whether a validated image carries PFC state, decided once per plan.
+///
+/// `Absent` makes the plan skip three walks of the switch LPs, each of which is empty exactly then:
+/// - `append_pfc_region` appends nothing and returns `None` iff `!image_has_pfc`, by its own guard;
+/// - `pfc_frame_transition_bound` returns 0 iff `!image_has_pfc`, by its own guard;
+/// - `pfc_control_lane_producers` reads only switch queues whose `pfc` is `Some`. Validation, which
+///   every CUDA plan follows, makes switch state slots a bijection with switch nodes
+///   (`validate_state_ownership`) and gives a switch LP at most one queue
+///   (`validate_owned_service_state`), so those queues are exactly the first queues of switch nodes,
+///   which `image_has_pfc` reads. It returns no lane iff `!image_has_pfc`.
+///
+/// The plan is therefore the same word for word. Each walk costs about 0.25 ms on E6
+/// (`evidence/P14/cuda-host.md` in days-gpu).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PfcState {
+    Present,
+    Absent,
+}
+
+impl PfcState {
+    fn of(image: &SimulationImage) -> Self {
+        if crate::device_pfc::image_has_pfc(image) {
+            Self::Present
+        } else {
+            Self::Absent
+        }
+    }
+}
+
+fn derived_transition_bound(
+    image: &SimulationImage,
+    counts: &[usize],
+    pfc_state: PfcState,
+) -> Result<usize, CudaError> {
+    let pfc_frames = match pfc_state {
+        PfcState::Present => crate::device_pfc::pfc_frame_transition_bound(image, counts),
+        PfcState::Absent => 0,
+    };
     let network = image
         .flows
         .iter()
@@ -3661,7 +3710,7 @@ fn derived_transition_bound(image: &SimulationImage, counts: &[usize]) -> Result
                 .initial_events
                 .len()
                 .saturating_add(1)
-                .saturating_add(crate::device_pfc::pfc_frame_transition_bound(image, counts)),
+                .saturating_add(pfc_frames),
             usize::saturating_add,
         );
     image
