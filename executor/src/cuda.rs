@@ -1652,6 +1652,22 @@ pub fn mechanism_plane_words_cuda_for_testing(
     })
 }
 
+/// P14 cuda-host: the whole-fabric PFC-state scans one production CUDA plan makes, counted on this
+/// thread (`image_has_pfc` and `pfc_control_lane_producers` each walk every switch LP). On an image
+/// without PFC state one scan decides that every PFC step is empty.
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+pub fn pfc_state_scans_cuda_plan_for_testing(
+    image: &SimulationImage,
+    config: CudaConfig,
+) -> Result<usize, CudaError> {
+    validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
+    validate_config(config)?;
+    crate::device_pfc::take_pfc_state_scans_for_testing();
+    CudaPlan::new(image, None, config, ObservationMode::Summary)?;
+    Ok(crate::device_pfc::take_pfc_state_scans_for_testing())
+}
+
 /// Returns the exact production-plan plane lengths without creating a CUDA device.
 #[cfg(feature = "planner-test-hooks")]
 #[doc(hidden)]
