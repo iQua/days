@@ -2,8 +2,10 @@
 //!
 //! - Selection: every `configs/p14/` fixture and its checkpoints select the mechanisms build; the
 //!   evaluation cells and plain scheduler images select the plain build.
-//! - Fail closed: forced onto the plain build, every `configs/p14/` fixture stops with
-//!   `MechanismsKernelRequired` and produces no result.
+//! - Fail closed: forced onto the plain build, every image with DCQCN or PFC state (the
+//!   `configs/p14/` fixtures, their DCQCN-only variants, checkpoints, and the finished- and
+//!   active-generator checkpoints of review F2) is refused by the host before launch with
+//!   `MechanismsKernelRequired`, and produces no result.
 //! - Forced onto the mechanisms build, images without DCQCN or PFC state reproduce the plain
 //!   build's bytes and the Scalar oracle's, so a selection error can only cost time.
 
@@ -119,8 +121,9 @@ fn scalar(image: &SimulationImage, horizon: Option<u64>) -> RunResult {
     expected
 }
 
-/// A DCQCN fixture lowered without its (zero-XOFF, inert) PFC link section: the plain build must
-/// then fail closed through the DCQCN checks alone, not the PFC entry check.
+/// A DCQCN fixture lowered without its (zero-XOFF, inert) PFC link section: the host must then
+/// refuse the plain kernel through the plan check's DCQCN conditions (the generator row and the
+/// receiver marker) alone, without the PFC region.
 fn without_pfc(name: &str) -> Option<SimulationImage> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("configs/p14")
@@ -171,7 +174,7 @@ fn fail_closed_fixtures() -> Vec<(String, SimulationImage)> {
 }
 
 #[test]
-fn the_dcqcn_checks_are_exercised_without_pfc_state() {
+fn dcqcn_only_variants_exercise_the_plan_check_without_a_pfc_region() {
     let dcqcn_only = fail_closed_fixtures()
         .into_iter()
         .filter(|(_, image)| !image_has_pfc_state(image))
@@ -374,13 +377,44 @@ fn dcqcn_checkpoints(
         .collect()
 }
 
+/// Every image the plain build must refuse before launch: each `configs/p14/` fixture and DCQCN-only
+/// variant with seven checkpoints of each, the finished-generator tails of `dcqcn_t26` and its
+/// bottleneck variant, and the 132 active-generator checkpoints of the lengthened bottleneck
+/// variant, 42 of which the plain build used to run to silently wrong bytes (review F2).
+#[cfg(any(
+    all(feature = "metal-test-hooks", target_vendor = "apple"),
+    feature = "cuda-test-hooks"
+))]
+fn refused_images() -> Vec<(String, SimulationImage)> {
+    let mut images = mechanism_images();
+    for (name, image) in [
+        ("dcqcn_t26", fixture("dcqcn_t26.toml")),
+        ("dcqcn_t26 bottleneck", dcqcn_t26_bottleneck(None)),
+    ] {
+        for (horizon, tail) in dcqcn_checkpoints(&image, CheckpointPhase::GeneratorFinished) {
+            images.push((format!("{name} tail@{horizon}"), tail));
+        }
+    }
+    let lengthened = dcqcn_t26_bottleneck(Some("size = 200_000"));
+    let active = dcqcn_checkpoints(&lengthened, CheckpointPhase::GeneratorActive);
+    assert_eq!(
+        active.len(),
+        132,
+        "the review's active-generator checkpoint set"
+    );
+    for (horizon, checkpoint) in active {
+        images.push((format!("dcqcn_t26 lengthened active@{horizon}"), checkpoint));
+    }
+    images
+}
+
 #[cfg(all(feature = "metal-test-hooks", target_vendor = "apple"))]
 mod metal {
     use days_executor::{
         MetalConfig, MetalError, ObservationMode, RoundKernel, run_metal_with_observations,
     };
 
-    use super::{DISCIPLINES, fail_closed_fixtures, mechanism_images, scalar, scheduler_image};
+    use super::{DISCIPLINES, refused_images, scalar, scheduler_image};
 
     fn forced(round_kernel: RoundKernel, round_threads_per_threadgroup: usize) -> MetalConfig {
         MetalConfig {
@@ -390,24 +424,12 @@ mod metal {
         }
     }
 
+    /// The host refuses the plain kernel on every image with DCQCN or PFC state, before launch:
+    /// the plain kernel carries no device-side stop, so `MechanismsKernelRequired` can only come
+    /// from the host's check of the uploaded plan.
     #[test]
-    fn metal_plain_round_kernel_fails_closed_on_every_p14_fixture_and_checkpoint() {
-        for (name, image) in fail_closed_fixtures() {
-            let error = run_metal_with_observations(
-                &image,
-                None,
-                forced(RoundKernel::Plain, 256),
-                ObservationMode::Full,
-            )
-            .expect_err("the plain build must not run DCQCN or PFC state");
-            assert!(
-                matches!(error, MetalError::MechanismsKernelRequired { .. }),
-                "{name}: {error}"
-            );
-        }
-        // A checkpoint with work left must stop; one with no pending event runs no transition,
-        // so the plain build's result is the unchanged image, which is Scalar's.
-        for (name, image) in mechanism_images() {
+    fn metal_plain_round_kernel_is_refused_before_launch_on_every_mechanism_image() {
+        for (name, image) in refused_images() {
             match run_metal_with_observations(
                 &image,
                 None,
@@ -415,11 +437,7 @@ mod metal {
                 ObservationMode::Full,
             ) {
                 Err(MetalError::MechanismsKernelRequired { .. }) => {}
-                Ok(run) if image.initial_events.is_empty() => {
-                    assert_eq!(run.transitions, 0, "{name}");
-                    assert_eq!(run.result, scalar(&image, None), "{name}");
-                }
-                other => panic!("{name}: expected a fail-closed stop, got {other:?}"),
+                other => panic!("{name}: expected a refusal, got {other:?}"),
             }
         }
     }
@@ -462,7 +480,7 @@ mod cuda {
         CudaConfig, CudaError, ObservationMode, RoundKernel, run_cuda_with_observations,
     };
 
-    use super::{DISCIPLINES, fail_closed_fixtures, mechanism_images, scalar, scheduler_image};
+    use super::{DISCIPLINES, refused_images, scalar, scheduler_image};
 
     fn forced(round_kernel: RoundKernel, round_threads_per_block: usize) -> CudaConfig {
         CudaConfig {
@@ -472,24 +490,12 @@ mod cuda {
         }
     }
 
+    /// The host refuses the plain kernel on every image with DCQCN or PFC state, before launch:
+    /// the plain kernel carries no device-side stop, so `MechanismsKernelRequired` can only come
+    /// from the host's check of the uploaded plan.
     #[test]
-    fn cuda_plain_round_kernel_fails_closed_on_every_p14_fixture_and_checkpoint() {
-        for (name, image) in fail_closed_fixtures() {
-            let error = run_cuda_with_observations(
-                &image,
-                None,
-                forced(RoundKernel::Plain, 256),
-                ObservationMode::Full,
-            )
-            .expect_err("the plain build must not run DCQCN or PFC state");
-            assert!(
-                matches!(error, CudaError::MechanismsKernelRequired { .. }),
-                "{name}: {error}"
-            );
-        }
-        // A checkpoint with work left must stop; one with no pending event runs no transition,
-        // so the plain build's result is the unchanged image, which is Scalar's.
-        for (name, image) in mechanism_images() {
+    fn cuda_plain_round_kernel_is_refused_before_launch_on_every_mechanism_image() {
+        for (name, image) in refused_images() {
             match run_cuda_with_observations(
                 &image,
                 None,
@@ -497,11 +503,7 @@ mod cuda {
                 ObservationMode::Full,
             ) {
                 Err(CudaError::MechanismsKernelRequired { .. }) => {}
-                Ok(run) if image.initial_events.is_empty() => {
-                    assert_eq!(run.transitions, 0, "{name}");
-                    assert_eq!(run.result, scalar(&image, None), "{name}");
-                }
-                other => panic!("{name}: expected a fail-closed stop, got {other:?}"),
+                other => panic!("{name}: expected a refusal, got {other:?}"),
             }
         }
     }

@@ -91,6 +91,286 @@ pub(crate) fn mechanism_flags(image: &SimulationImage) -> u64 {
 
 pub(crate) const GENERATOR_KIND_DCQCN: u64 = 3;
 
+// Word layout shared by both device plans and kernels; `plan_check_word_indices_match_both_kernels`
+// pins each against `cuda_kernels.cu` and `metal_kernels.metal`.
+const PLAN_NONE: u64 = u64::MAX;
+const G_VALID: usize = 0;
+const G_OWNER: usize = 1;
+const G_KIND: usize = 11;
+const PLAN_GENERATOR_WORDS: usize = 43;
+const PLAN_NODE_WORDS: usize = 11;
+const N_SERVICE_VALID: usize = 4;
+const PLAN_FLOW_WORDS: usize = 6;
+const PLAN_QUEUE_META_WORDS: usize = 5;
+const PLAN_ARENA_META_WORDS: usize = 4;
+const PLAN_TCP_RECEIVER_WORDS: usize = 7;
+const PK_KIND: usize = 10;
+const PK_KIND_MASK: u64 = !(1_u64 << 63);
+const PFC_PACKET: u64 = 4;
+const DCQCN_CNP_PACKET: u64 = 5;
+const DCQCN_CONTROL_TIMER_PACKET: u64 = 6;
+
+/// The planes of one uploaded device plan that the plain-kernel check reads, in the word layout
+/// both device backends share (`cuda_kernels.cu` and `metal_kernels.metal`). Each backend fills it
+/// from its own plan, reading its own params indices.
+pub(crate) struct UploadedPlan<'a> {
+    /// `params[P_PFC_OFFSET]`: the PFC region's offset, or `NONE` without one.
+    pub(crate) pfc_offset: u64,
+    /// `params[P_TCP_RECEIVER_OFFSET]`: the per-flow receiver rows in `tcp_state`, or `NONE`.
+    pub(crate) receiver_offset: u64,
+    pub(crate) node_count: usize,
+    pub(crate) flow_count: usize,
+    pub(crate) node_state: &'a [u64],
+    pub(crate) generators: &'a [u64],
+    pub(crate) flows: &'a [u64],
+    pub(crate) fel_meta: &'a [u64],
+    pub(crate) fel_records: &'a [u64],
+    pub(crate) queue_meta: &'a [u64],
+    pub(crate) queue_records: &'a [u64],
+    pub(crate) in_service: &'a [u64],
+    pub(crate) stream_state: &'a [u64],
+    pub(crate) stream_records: &'a [u64],
+    /// Stream layout: channel streams, then one service stream per LP, then one generator stream
+    /// per flow. `stream_count` is zero when streams are disabled.
+    pub(crate) stream_count: usize,
+    pub(crate) service_stream_base: usize,
+    pub(crate) generator_stream_base: usize,
+    pub(crate) tcp_state: &'a [u64],
+}
+
+/// Why the plain round kernel may not run an uploaded plan.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PlainKernelRefusal {
+    /// The plan carries a PFC region.
+    PfcRegion,
+    /// A valid generator row is a DCQCN reaction point.
+    DcqcnGenerator { flow: u64, owner: u64 },
+    /// A flow's receiver row carries a DCQCN notification-point marker.
+    DcqcnReceiver { flow: u64, target: u64 },
+    /// A meta or row index points outside its plane, so the plan cannot be checked.
+    MalformedPlan,
+    /// A live record of a PFC, CNP or control-timer packet.
+    MechanismPacket {
+        arena: PlanArena,
+        lp: Option<u64>,
+        kind: u64,
+    },
+}
+
+/// The plan arenas whose live records the check walks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PlanArena {
+    FallbackHeap,
+    ChannelStream,
+    GeneratorStream,
+    Queue,
+    InService,
+}
+
+impl PlainKernelRefusal {
+    /// The LP the refusal concerns, where there is one.
+    pub(crate) fn node(self) -> Option<crate::NodeId> {
+        match self {
+            Self::PfcRegion | Self::MalformedPlan => None,
+            Self::DcqcnGenerator { owner, .. } => Some(crate::NodeId(owner)),
+            Self::DcqcnReceiver { target, .. } => Some(crate::NodeId(target)),
+            Self::MechanismPacket { lp, .. } => lp.map(crate::NodeId),
+        }
+    }
+}
+
+/// Fails closed for the plain round kernel, on the host, over the plan about to be uploaded.
+///
+/// The plain `days_round` compiles every Lane B transition out and carries no device-side stop, so
+/// the host refuses to launch it on any plan that could need one. It refuses when:
+/// 1. the PFC region is present (`P_PFC_OFFSET != NONE`);
+/// 2. a valid generator row has `G_KIND == GENERATOR_KIND_DCQCN`;
+/// 3. a receiver region exists and a flow's receiver row carries a DCQCN marker (2 or 3; the check
+///    mirrors the kernel's guard, `marker >= 2`);
+/// 4. a live record in the fallback heap, a channel or generator stream, a queue, or `in_service`
+///    has packet kind 4 (PFC), 5 (CNP) or 6 (DCQCN control timer).
+///
+/// **Why these four are sufficient for the whole run.** They are exactly the states under which a
+/// `MECHANISMS`-guarded branch of the kernel is taken: `pfc_row` and `paused_mask` come only from
+/// the PFC region; `dcqcn_pacing_timer` needs `G_KIND == 3`; `dcqcn_data_arrival` needs a receiver
+/// marker of at least 2; `pfc_frame_arrival`, `dcqcn_cnp_arrival` and `dcqcn_control_timer` need
+/// packet kinds 4, 5 and 6. None of these states can arise during a plain run: the only emitters of
+/// kinds 4-6 are `emit_pfc_frame` and the DCQCN transitions, all compiled out; the markers 2 and 3
+/// are written only by `dcqcn_data_arrival` (compiled out) or by the image; and no plain transition
+/// writes `G_KIND` or the PFC offset. So their absence at upload holds for the whole run.
+///
+/// **Why it is independent of [`RoundKernel::for_image`].** Selection evaluates predicates on the
+/// `SimulationImage` before planning. This check reads the encoded words the kernel will execute
+/// on (the `G_KIND` tag, the receiver marker word, the PFC offset, packet-kind words after event
+/// encoding and stream classification) and shares no code with selection. A selection defect, or a
+/// planner or encoder defect (a mis-encoded tag, a region planned without image state, a checkpoint
+/// restoring an in-flight CNP), is caught unless both paths fail the same way.
+///
+/// It walks only live records, by the arena metas, so its cost is linear in resident records plus
+/// one pass over the generator and receiver rows, once per plan. The first refusal in this order
+/// is returned: condition 1, then 2 by flow, then 3 by flow, then 4 by arena and slot.
+pub(crate) fn plain_round_kernel_refusal(plan: &UploadedPlan<'_>) -> Option<PlainKernelRefusal> {
+    // A plan whose metas point outside its planes cannot be checked; refuse it rather than accept.
+    scan_uploaded_plan(plan).unwrap_or(Some(PlainKernelRefusal::MalformedPlan))
+}
+
+/// A meta or row index that points outside its plane.
+struct OutsidePlane;
+
+fn scan_uploaded_plan(plan: &UploadedPlan<'_>) -> Result<Option<PlainKernelRefusal>, OutsidePlane> {
+    use crate::device_event_record::{
+        EVENT_WORDS, StoredEventClass, decode_event_record, stored_event_words,
+    };
+
+    if plan.pfc_offset != PLAN_NONE {
+        return Ok(Some(PlainKernelRefusal::PfcRegion));
+    }
+    for flow in 0..plan.flow_count {
+        let row = words(
+            plan.generators,
+            flow * PLAN_GENERATOR_WORDS,
+            PLAN_GENERATOR_WORDS,
+        )?;
+        if row[G_VALID] != 0 && row[G_KIND] == GENERATOR_KIND_DCQCN {
+            return Ok(Some(PlainKernelRefusal::DcqcnGenerator {
+                flow: flow as u64,
+                owner: row[G_OWNER],
+            }));
+        }
+    }
+    if plan.receiver_offset != PLAN_NONE {
+        for flow in 0..plan.flow_count {
+            let row = add(
+                plan.receiver_offset,
+                (flow * PLAN_TCP_RECEIVER_WORDS) as u64,
+            )?;
+            let marker = words(plan.tcp_state, row as usize, 1)?[0];
+            // The kernel's own guard: `dcqcn_data_arrival` is entered for any marker >= 2.
+            if marker >= DCQCN_RECEIVER_NO_CNP {
+                return Ok(Some(PlainKernelRefusal::DcqcnReceiver {
+                    flow: flow as u64,
+                    target: flow_word(plan, flow, 1)?,
+                }));
+            }
+        }
+    }
+
+    let refuse = |arena, lp, packet_kind: u64| {
+        let kind = packet_kind & PK_KIND_MASK;
+        matches!(
+            kind,
+            PFC_PACKET | DCQCN_CNP_PACKET | DCQCN_CONTROL_TIMER_PACKET
+        )
+        .then_some(PlainKernelRefusal::MechanismPacket { arena, lp, kind })
+    };
+    // The fallback heap: each LP's records occupy `offset..offset + count`.
+    for lp in 0..plan.node_count {
+        let meta = words(
+            plan.fel_meta,
+            lp * PLAN_ARENA_META_WORDS,
+            PLAN_ARENA_META_WORDS,
+        )?;
+        for slot in meta[0]..add(meta[0], meta[3])? {
+            let record = words(plan.fel_records, index(slot, EVENT_WORDS)?, EVENT_WORDS)?;
+            if let Some(refusal) = refuse(PlanArena::FallbackHeap, Some(lp as u64), record[PK_KIND])
+            {
+                return Ok(Some(refusal));
+            }
+        }
+    }
+    // Channel and generator streams: rings of encoded records at word offset `meta[0]`, decoded as
+    // the readback decodes them. Service streams carry no packet kind: TX_COMPLETE hydrates from
+    // `in_service`, checked below.
+    for stream in 0..plan.stream_count {
+        let (class, arena, flow) = if stream < plan.service_stream_base {
+            (StoredEventClass::Channel, PlanArena::ChannelStream, None)
+        } else if stream < plan.generator_stream_base {
+            continue;
+        } else {
+            let flow = stream - plan.generator_stream_base;
+            (
+                StoredEventClass::Generator,
+                PlanArena::GeneratorStream,
+                Some(flow),
+            )
+        };
+        let lp = flow.map(|flow| flow_word(plan, flow, 0)).transpose()?;
+        let meta = words(
+            plan.stream_state,
+            stream * PLAN_ARENA_META_WORDS,
+            PLAN_ARENA_META_WORDS,
+        )?;
+        let (source, capacity, head, count) = (meta[0], meta[1].max(1), meta[2], meta[3]);
+        let record_words = stored_event_words(class);
+        for live in 0..count {
+            let physical = add(head, live)? % capacity;
+            let start = add(source, index(physical, record_words)? as u64)?;
+            let encoded = words(plan.stream_records, start as usize, record_words)?;
+            let record = decode_event_record(
+                encoded,
+                class,
+                lp.unwrap_or(0),
+                flow.map(|flow| flow as u64),
+                None,
+            );
+            if let Some(refusal) = refuse(arena, lp, record[PK_KIND]) {
+                return Ok(Some(refusal));
+            }
+        }
+    }
+    // Queues: each LP's ring of full records.
+    for lp in 0..plan.node_count {
+        let meta = words(
+            plan.queue_meta,
+            lp * PLAN_QUEUE_META_WORDS,
+            PLAN_QUEUE_META_WORDS,
+        )?;
+        let (offset, capacity, head, count) = (meta[0], meta[1].max(1), meta[2], meta[3]);
+        for live in 0..count {
+            let slot = add(offset, add(head, live)? % capacity)?;
+            let record = words(plan.queue_records, index(slot, EVENT_WORDS)?, EVENT_WORDS)?;
+            if let Some(refusal) = refuse(PlanArena::Queue, Some(lp as u64), record[PK_KIND]) {
+                return Ok(Some(refusal));
+            }
+        }
+    }
+    // In-service rows, live while the LP's service is valid.
+    for lp in 0..plan.node_count {
+        if words(plan.node_state, lp * PLAN_NODE_WORDS + N_SERVICE_VALID, 1)?[0] == 0 {
+            continue;
+        }
+        let record = words(plan.in_service, lp * EVENT_WORDS, EVENT_WORDS)?;
+        if let Some(refusal) = refuse(PlanArena::InService, Some(lp as u64), record[PK_KIND]) {
+            return Ok(Some(refusal));
+        }
+    }
+    Ok(None)
+}
+
+/// `plane[start..start + len]`, or [`OutsidePlane`].
+fn words(plane: &[u64], start: usize, len: usize) -> Result<&[u64], OutsidePlane> {
+    start
+        .checked_add(len)
+        .and_then(|end| plane.get(start..end))
+        .ok_or(OutsidePlane)
+}
+
+fn add(left: u64, right: u64) -> Result<u64, OutsidePlane> {
+    left.checked_add(right).ok_or(OutsidePlane)
+}
+
+/// The word offset of record `slot` of `record_words` words.
+fn index(slot: u64, record_words: usize) -> Result<usize, OutsidePlane> {
+    usize::try_from(slot)
+        .ok()
+        .and_then(|slot| slot.checked_mul(record_words))
+        .ok_or(OutsidePlane)
+}
+
+fn flow_word(plan: &UploadedPlan<'_>, flow: usize, word: usize) -> Result<u64, OutsidePlane> {
+    Ok(words(plan.flows, flow * PLAN_FLOW_WORDS + word, 1)?[0])
+}
+
 const G_RATE_FIRST: usize = 12;
 const G_RATE_INTERVAL: usize = 13;
 const G_RATE_PACKET_SIZE: usize = 14;
@@ -547,6 +827,315 @@ mod tests {
                 RoundKernel::Mechanisms,
                 "{name}"
             );
+        }
+    }
+
+    /// A two-LP, two-flow plan with every arena populated: live records of plain kinds, and free or
+    /// dead slots holding PFC, CNP and control-timer kinds, which the check must not see.
+    struct PlanFixture {
+        pfc_offset: u64,
+        receiver_offset: u64,
+        node_state: Vec<u64>,
+        generators: Vec<u64>,
+        flows: Vec<u64>,
+        fel_meta: Vec<u64>,
+        fel_records: Vec<u64>,
+        queue_meta: Vec<u64>,
+        queue_records: Vec<u64>,
+        in_service: Vec<u64>,
+        stream_state: Vec<u64>,
+        stream_records: Vec<u64>,
+        tcp_state: Vec<u64>,
+    }
+
+    const T_NONE: u64 = u64::MAX;
+    const T_EVENT: usize = crate::device_event_record::EVENT_WORDS;
+    const T_ECN: u64 = 1 << 63;
+    // Stream layout: channel stream 0; service streams 1 and 2; generator streams 3 and 4.
+    const T_SERVICE_BASE: usize = 1;
+    const T_GENERATOR_BASE: usize = 3;
+    const T_STREAMS: usize = 5;
+    const T_CHANNEL_WORDS: usize = crate::device_event_record::CHANNEL_EVENT_WORDS;
+    const T_GENERATOR_EVENT_WORDS: usize = crate::device_event_record::GENERATOR_EVENT_WORDS;
+    const T_GENERATOR_STREAM_OFFSET: usize = 2 * T_CHANNEL_WORDS;
+
+    /// A 14-word event record of `event_kind` carrying packet kind `packet_kind`.
+    fn record(event_kind: crate::EventKind, packet_kind: u64) -> [u64; T_EVENT] {
+        let mut record = [0_u64; T_EVENT];
+        record[5] = event_kind as u64;
+        record[10] = packet_kind;
+        record
+    }
+
+    fn stored(
+        event_kind: crate::EventKind,
+        packet_kind: u64,
+        class: crate::device_event_record::StoredEventClass,
+    ) -> Vec<u64> {
+        let encoded =
+            crate::device_event_record::encode_event_record(record(event_kind, packet_kind), class);
+        encoded.words[..encoded.len].to_vec()
+    }
+
+    impl PlanFixture {
+        fn clean() -> Self {
+            use crate::EventKind::{PacketArrival, RemoteArrival, TxReady};
+            use crate::device_event_record::StoredEventClass::{Channel, Generator};
+            let mut generators = vec![0_u64; 2 * 43];
+            // Flow 0: a valid TCP generator at LP 0. Flow 1: an invalid row tagged DCQCN.
+            generators[0] = 1;
+            generators[1] = 0;
+            generators[11] = 1;
+            generators[43 + 11] = GENERATOR_KIND_DCQCN;
+            let mut flows = vec![0_u64; 2 * 6];
+            flows[1] = 1;
+            flows[6] = 1;
+            flows[6 + 1] = 0;
+            // LP 0's heap: one live record, then a dead CNP past its count.
+            let fel_meta = vec![0, 4, 0, 1, 4, 4, 0, 0];
+            let mut fel_records = vec![0_u64; 8 * T_EVENT];
+            fel_records[..T_EVENT].copy_from_slice(&record(TxReady, 0));
+            fel_records[T_EVENT..2 * T_EVENT].copy_from_slice(&record(RemoteArrival, 5));
+            // LP 1's queue: a 3-slot ring with head 2 and count 2, so slots 2 and 0 are live and
+            // slot 1 is free and holds a stale PFC frame.
+            let queue_meta = vec![0, 0, 0, 0, 0, 0, 3, 2, 2, 0];
+            let mut queue_records = vec![0_u64; 3 * T_EVENT];
+            queue_records[T_EVENT + 10] = 4;
+            // LP 0's in-service row holds a control-timer kind, but its service is not valid.
+            let mut in_service = vec![0_u64; 2 * T_EVENT];
+            in_service[10] = 6;
+            // Channel stream 0: 2 slots, head 1, count 1: slot 1 live (data), slot 0 free (CNP).
+            // Generator stream 3 (flow 0): 2 slots, head 0, count 1: slot 0 live, slot 1 free.
+            let mut stream_state = vec![0_u64; T_STREAMS * 4];
+            stream_state[..4].copy_from_slice(&[0, 2, 1, 1]);
+            stream_state[3 * 4..4 * 4].copy_from_slice(&[
+                T_GENERATOR_STREAM_OFFSET as u64,
+                2,
+                0,
+                1,
+            ]);
+            let mut stream_records = Vec::new();
+            stream_records.extend(stored(RemoteArrival, 5, Channel));
+            stream_records.extend(stored(RemoteArrival, 0, Channel));
+            stream_records.extend(stored(PacketArrival, 0, Generator));
+            stream_records.extend(stored(PacketArrival, 6, Generator));
+            assert_eq!(
+                stream_records.len(),
+                T_GENERATOR_STREAM_OFFSET + 2 * T_GENERATOR_EVENT_WORDS
+            );
+            // Receiver rows at offset 0: flow 0 a TCP receiver (marker 1), flow 1 unused.
+            let mut tcp_state = vec![0_u64; 2 * 7];
+            tcp_state[0] = 1;
+            Self {
+                pfc_offset: T_NONE,
+                receiver_offset: 0,
+                node_state: vec![0_u64; 2 * 11],
+                generators,
+                flows,
+                fel_meta,
+                fel_records,
+                queue_meta,
+                queue_records,
+                in_service,
+                stream_state,
+                stream_records,
+                tcp_state,
+            }
+        }
+
+        fn refusal(&self) -> Option<PlainKernelRefusal> {
+            plain_round_kernel_refusal(&UploadedPlan {
+                pfc_offset: self.pfc_offset,
+                receiver_offset: self.receiver_offset,
+                node_count: 2,
+                flow_count: 2,
+                node_state: &self.node_state,
+                generators: &self.generators,
+                flows: &self.flows,
+                fel_meta: &self.fel_meta,
+                fel_records: &self.fel_records,
+                queue_meta: &self.queue_meta,
+                queue_records: &self.queue_records,
+                in_service: &self.in_service,
+                stream_state: &self.stream_state,
+                stream_records: &self.stream_records,
+                stream_count: T_STREAMS,
+                service_stream_base: T_SERVICE_BASE,
+                generator_stream_base: T_GENERATOR_BASE,
+                tcp_state: &self.tcp_state,
+            })
+        }
+    }
+
+    /// Dead heap slots, free ring slots, an invalid in-service row, an invalid DCQCN-tagged
+    /// generator row and a TCP receiver marker are not mechanism state.
+    #[test]
+    fn a_plain_plan_with_stale_mechanism_words_in_free_slots_is_accepted() {
+        assert_eq!(PlanFixture::clean().refusal(), None);
+    }
+
+    #[test]
+    fn a_pfc_region_refuses_the_plain_kernel() {
+        let mut plan = PlanFixture::clean();
+        plan.pfc_offset = 7;
+        assert_eq!(plan.refusal(), Some(PlainKernelRefusal::PfcRegion));
+        assert_eq!(PlainKernelRefusal::PfcRegion.node(), None);
+    }
+
+    #[test]
+    fn a_valid_dcqcn_generator_row_refuses_the_plain_kernel() {
+        let mut plan = PlanFixture::clean();
+        plan.generators[43] = 1;
+        plan.generators[43 + 1] = 1;
+        let refusal = plan.refusal();
+        assert_eq!(
+            refusal,
+            Some(PlainKernelRefusal::DcqcnGenerator { flow: 1, owner: 1 })
+        );
+        assert_eq!(refusal.unwrap().node(), Some(crate::NodeId(1)));
+    }
+
+    #[test]
+    fn a_dcqcn_receiver_marker_refuses_the_plain_kernel_only_with_a_receiver_region() {
+        for marker in [DCQCN_RECEIVER_NO_CNP, DCQCN_RECEIVER_LAST_CNP, 7] {
+            let mut plan = PlanFixture::clean();
+            plan.tcp_state[7] = marker;
+            let refusal = plan.refusal();
+            assert_eq!(
+                refusal,
+                Some(PlainKernelRefusal::DcqcnReceiver { flow: 1, target: 0 }),
+                "marker {marker}"
+            );
+            assert_eq!(refusal.unwrap().node(), Some(crate::NodeId(0)));
+            plan.receiver_offset = T_NONE;
+            assert_eq!(plan.refusal(), None, "no receiver region, marker {marker}");
+        }
+    }
+
+    /// A live record of each mechanism kind, with and without the ECN flag, in each arena.
+    #[test]
+    fn a_live_mechanism_packet_in_any_arena_refuses_the_plain_kernel() {
+        use crate::EventKind::{PacketArrival, RemoteArrival};
+        use crate::device_event_record::StoredEventClass::{Channel, Generator};
+        for kind in [4_u64, 5, 6] {
+            for flag in [0, T_ECN] {
+                let packet_kind = kind | flag;
+                let expect =
+                    |arena, lp| Some(PlainKernelRefusal::MechanismPacket { arena, lp, kind });
+
+                let mut plan = PlanFixture::clean();
+                plan.fel_records[10] = packet_kind;
+                assert_eq!(plan.refusal(), expect(PlanArena::FallbackHeap, Some(0)));
+
+                let mut plan = PlanFixture::clean();
+                plan.queue_records[10] = packet_kind;
+                assert_eq!(plan.refusal(), expect(PlanArena::Queue, Some(1)));
+                let mut plan = PlanFixture::clean();
+                plan.queue_records[2 * T_EVENT + 10] = packet_kind;
+                assert_eq!(plan.refusal(), expect(PlanArena::Queue, Some(1)));
+
+                let mut plan = PlanFixture::clean();
+                plan.node_state[4] = 1;
+                plan.in_service[10] = packet_kind;
+                assert_eq!(plan.refusal(), expect(PlanArena::InService, Some(0)));
+
+                let mut plan = PlanFixture::clean();
+                plan.stream_records[T_CHANNEL_WORDS..2 * T_CHANNEL_WORDS].copy_from_slice(&stored(
+                    RemoteArrival,
+                    packet_kind,
+                    Channel,
+                ));
+                assert_eq!(plan.refusal(), expect(PlanArena::ChannelStream, None));
+
+                let mut plan = PlanFixture::clean();
+                plan.stream_records[T_GENERATOR_STREAM_OFFSET
+                    ..T_GENERATOR_STREAM_OFFSET + T_GENERATOR_EVENT_WORDS]
+                    .copy_from_slice(&stored(PacketArrival, packet_kind, Generator));
+                // Generator stream 3 is flow 0, whose source is LP 0.
+                assert_eq!(plan.refusal(), expect(PlanArena::GeneratorStream, Some(0)));
+            }
+        }
+    }
+
+    /// A meta that points outside its plane refuses, rather than being skipped.
+    #[test]
+    fn a_plan_whose_metas_point_outside_their_planes_is_refused() {
+        // LP 1's heap starts at slot 4 of 8; a count of 9 runs past the plane.
+        let mut plan = PlanFixture::clean();
+        plan.fel_meta[4 + 3] = 9;
+        assert_eq!(plan.refusal(), Some(PlainKernelRefusal::MalformedPlan));
+        let mut plan = PlanFixture::clean();
+        plan.stream_state[0] = 1_000;
+        assert_eq!(plan.refusal(), Some(PlainKernelRefusal::MalformedPlan));
+        let mut plan = PlanFixture::clean();
+        plan.receiver_offset = 1_000;
+        assert_eq!(plan.refusal(), Some(PlainKernelRefusal::MalformedPlan));
+    }
+
+    /// A plan without streams (streams disabled) still has its other arenas checked.
+    #[test]
+    fn a_streamless_plan_is_checked_without_streams() {
+        let mut plan = PlanFixture::clean();
+        plan.fel_records[10] = 5;
+        let refusal = plain_round_kernel_refusal(&UploadedPlan {
+            pfc_offset: plan.pfc_offset,
+            receiver_offset: plan.receiver_offset,
+            node_count: 2,
+            flow_count: 2,
+            node_state: &plan.node_state,
+            generators: &plan.generators,
+            flows: &plan.flows,
+            fel_meta: &plan.fel_meta,
+            fel_records: &plan.fel_records,
+            queue_meta: &plan.queue_meta,
+            queue_records: &plan.queue_records,
+            in_service: &plan.in_service,
+            stream_state: &[0],
+            stream_records: &[0],
+            stream_count: 0,
+            service_stream_base: 0,
+            generator_stream_base: 0,
+            tcp_state: &plan.tcp_state,
+        });
+        assert_eq!(
+            refusal,
+            Some(PlainKernelRefusal::MechanismPacket {
+                arena: PlanArena::FallbackHeap,
+                lp: Some(0),
+                kind: 5,
+            })
+        );
+    }
+
+    /// The word indices the check uses are the kernels' own.
+    #[test]
+    fn plan_check_word_indices_match_both_kernels() {
+        for (backend, source, declare) in [
+            ("CUDA", include_str!("cuda_kernels.cu"), "constexpr"),
+            ("Metal", include_str!("metal_kernels.metal"), "constant"),
+        ] {
+            for (name, value) in [
+                ("uint G_VALID", G_VALID),
+                ("uint G_OWNER", G_OWNER),
+                ("uint G_KIND", G_KIND),
+                ("uint GENERATOR_WORDS", PLAN_GENERATOR_WORDS),
+                ("uint NODE_WORDS", PLAN_NODE_WORDS),
+                ("uint N_SERVICE_VALID", N_SERVICE_VALID),
+                ("uint FLOW_WORDS", PLAN_FLOW_WORDS),
+                ("uint QUEUE_META_WORDS", PLAN_QUEUE_META_WORDS),
+                ("uint META_WORDS", PLAN_ARENA_META_WORDS),
+                ("uint TCP_RECEIVER_WORDS", PLAN_TCP_RECEIVER_WORDS),
+                ("uint PK_KIND", PK_KIND),
+                ("ulong PFC_PACKET", PFC_PACKET as usize),
+                ("ulong DCQCN_CNP_PACKET", DCQCN_CNP_PACKET as usize),
+                (
+                    "ulong DCQCN_CONTROL_TIMER_PACKET",
+                    DCQCN_CONTROL_TIMER_PACKET as usize,
+                ),
+            ] {
+                let line = format!("{declare} {name} = {value};");
+                assert!(source.contains(&line), "{backend}: `{line}`");
+            }
         }
     }
 

@@ -506,9 +506,6 @@ const ERROR_SEMANTIC: u64 = 3;
 /// slot carries a channel stream index, and the TCP ledger sequence overflow, which records no
 /// identity. Neither names an LP.
 const ERROR_CHANNEL_ORDER: u64 = ERROR_SEMANTIC + 42;
-/// P14: the plain `days_round` build met DCQCN or PFC state, which it does not compile in: a
-/// DCQCN or PFC packet event, a DCQCN generator's timer, or (at round entry) a planned PFC region.
-const ERROR_MECHANISMS_REQUIRED: u64 = ERROR_SEMANTIC + 80;
 const CONTROL_DONE: usize = 4;
 const CONTROL_RUN_END_LO: usize = 7;
 const CONTROL_RUN_END_HI: usize = 8;
@@ -587,9 +584,10 @@ pub enum MetalError {
     WfqArithmeticOverflow {
         node: NodeId,
     },
-    /// The plain round kernel met DCQCN or PFC state and stopped rather than continue without the
-    /// mechanism. Only a round-kernel selection error (or a test forcing the plain build) reaches
-    /// it; the run produces no result.
+    /// The host refused to launch the plain round kernel: the plan about to be uploaded holds DCQCN
+    /// or PFC state, which the plain kernel compiles out
+    /// (`device_mechanism::plain_round_kernel_refusal`). Only a round-kernel selection error (or a
+    /// test forcing the plain kernel) reaches it; nothing is launched and no result is produced.
     MechanismsKernelRequired {
         node: Option<NodeId>,
     },
@@ -657,7 +655,10 @@ impl fmt::Display for MetalError {
                 "Metal WFQ arithmetic at LP {node:?} exceeds the exact 320-bit device limit; use Scalar or Cpu for this image"
             ),
             Self::MechanismsKernelRequired { node } => {
-                write!(formatter, "Metal plain round kernel met DCQCN or PFC state")?;
+                write!(
+                    formatter,
+                    "Metal plain round kernel refused: the plan holds DCQCN or PFC state"
+                )?;
                 if let Some(node) = node {
                     write!(formatter, " at LP {node:?}")?;
                 }
@@ -1282,6 +1283,11 @@ impl MetalExecutor {
                     &mut channel_capacity_floors,
                     &mut tcp_capacity_floors,
                 )?;
+                // The plain kernel has no device-side stop: the host refuses it, before upload, on
+                // any plan holding state a mechanism transition would act on.
+                if round_kernel == RoundKernel::Plain {
+                    plan.refuse_plain_round_kernel()?;
+                }
                 let buffers = MetalBuffers::new(&self.direct.device, plan)?;
                 let _execution_guard = metal_device_execution_guard();
                 let timing = self.direct.run(&buffers, attempt_config, round_kernel)?;
@@ -1587,6 +1593,48 @@ fn encoding_limits(rounds_per_command_buffer: usize) -> (usize, usize) {
         .saturating_mul(MAX_COMMAND_BUFFERS)
         .min(MAX_ENCODED_PAIRS_PER_WAVE);
     (pairs_per_command_buffer, pairs_per_wave)
+}
+
+impl MetalPlan {
+    /// Refuses the plain round kernel on this plan, before it is uploaded, if the plan holds any
+    /// state a `MECHANISMS`-guarded kernel branch would act on
+    /// ([`crate::device_mechanism::plain_round_kernel_refusal`]).
+    fn refuse_plain_round_kernel(&self) -> Result<(), MetalError> {
+        let plan = crate::device_mechanism::UploadedPlan {
+            pfc_offset: self.params[PARAM_PFC_OFFSET],
+            receiver_offset: self.params[PARAM_RECEIVER_OFFSET],
+            // `P_NODE_COUNT` and `P_FLOW_COUNT`.
+            node_count: self.params[0] as usize,
+            flow_count: self.params[1] as usize,
+            node_state: &self.node_state,
+            generators: &self.generators,
+            flows: &self.flows,
+            fel_meta: &self.fel_meta,
+            fel_records: &self.fel_records,
+            queue_meta: &self.queue_meta,
+            queue_records: &self.queue_records,
+            in_service: &self.in_service,
+            stream_state: &self.stream_state,
+            stream_records: &self.stream_records,
+            stream_count: self.stream_layout.stream_count,
+            service_stream_base: self.stream_layout.service_stream_base,
+            generator_stream_base: self.stream_layout.generator_stream_base,
+            tcp_state: &self.tcp_state,
+        };
+        match crate::device_mechanism::plain_round_kernel_refusal(&plan) {
+            None => Ok(()),
+            // Fail closed on a plan the check cannot read, but do not call it mechanism state.
+            Some(crate::device_mechanism::PlainKernelRefusal::MalformedPlan) => {
+                Err(MetalError::Validation(
+                    "plain round kernel plan check: a plan meta or row points outside its plane"
+                        .into(),
+                ))
+            }
+            Some(refusal) => Err(MetalError::MechanismsKernelRequired {
+                node: refusal.node(),
+            }),
+        }
+    }
 }
 
 #[derive(Eq, PartialEq)]
@@ -4884,9 +4932,6 @@ fn decode_device_error(control: &[u64]) -> MetalError {
         100 => MetalError::WfqArithmeticOverflow {
             node: identity.map(NodeId).unwrap_or(NodeId(0)),
         },
-        ERROR_MECHANISMS_REQUIRED => MetalError::MechanismsKernelRequired {
-            node: identity.map(NodeId),
-        },
         // The channel-order diagnostic shares the channel capacity identity slot, which carries
         // an immutable stream index rather than an LP after targeted retry plumbing.
         ERROR_CHANNEL_ORDER => MetalError::DeviceExecution {
@@ -5714,26 +5759,22 @@ mod tests {
     use crate::device_mechanism::RoundKernel;
     use std::collections::BTreeSet;
 
-    /// P14: the plain round kernel's fail-closed stop decodes to its own error, naming the LP.
+    /// P14 round 2: the kernels carry no mechanism error code, so a device word never decodes as a
+    /// host refusal; `MechanismsKernelRequired` comes only from the host's plan check.
     #[test]
-    fn mechanisms_required_decodes_with_the_lp_it_names() {
-        let source = include_str!("metal_kernels.metal");
-        assert!(source.contains("constant ulong ERROR_MECHANISMS_REQUIRED = 80;"));
+    fn no_device_word_decodes_as_a_plain_kernel_refusal() {
         let mut control = vec![0_u64; 20];
-        control[0] = super::ERROR_MECHANISMS_REQUIRED;
         control[2] = 7;
-        assert_eq!(super::ERROR_MECHANISMS_REQUIRED, 83);
-        assert_eq!(
-            super::decode_device_error(&control),
-            MetalError::MechanismsKernelRequired {
-                node: Some(crate::NodeId(7)),
-            },
-        );
-        control[2] = u64::MAX;
-        assert_eq!(
-            super::decode_device_error(&control),
-            MetalError::MechanismsKernelRequired { node: None },
-        );
+        for code in 3..=200 {
+            control[0] = code;
+            assert!(
+                !matches!(
+                    decode_device_error(&control),
+                    MetalError::MechanismsKernelRequired { .. }
+                ),
+                "raw code {code}"
+            );
+        }
     }
 
     #[test]

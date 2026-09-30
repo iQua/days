@@ -4,8 +4,9 @@ using namespace metal;
 // P14: whether the DCQCN and PFC transitions are compiled into `days_round`. The host builds two
 // `days_round` pipelines from this one library, specialized with false and true, and dispatches
 // exactly one per run, chosen from the image (`RoundKernel::for_image`): true when the image holds
-// any DCQCN or PFC state. Every Lane B entry point is guarded by it, mirroring the `MECHANISMS`
-// template parameter of `cuda_kernels.cu`.
+// any DCQCN or PFC state. Every Lane B entry point is guarded by it, mirroring `MECHANISMS` in
+// `cuda_kernels.cu`. The false specialization carries no device-side stop: the host refuses it on
+// any plan holding DCQCN or PFC state (`device_mechanism::plain_round_kernel_refusal`).
 constant bool DAYS_MECHANISMS [[function_constant(0)]];
 
 constant uint EVENT_WORDS = 14;
@@ -341,10 +342,6 @@ constant ulong TCP_RTO_GRANULARITY = 1000000ul;
 constant ulong ERROR_CAPACITY = 1;
 constant ulong ERROR_TRANSITION_CAPACITY = 2;
 constant ulong ERROR_SEMANTIC = 3;
-// P14: the plain `days_round` build met DCQCN or PFC state it does not compile in. The host decodes
-// `ERROR_SEMANTIC + 80` as `MechanismsKernelRequired`; only a round-kernel selection error (or a
-// test forcing the plain build) reaches it.
-constant ulong ERROR_MECHANISMS_REQUIRED = 80;
 constant ulong ERROR_WFQ_ARITHMETIC = 100;
 constant ulong ARENA_FEL = 1;
 constant ulong ARENA_QUEUE = 2;
@@ -4841,10 +4838,6 @@ inline bool dispatch_event(
     if (kind == PACING_TIMER && role == HOST) {
         ulong flow = event[PK_FLOW];
         ulong generator = flow * GENERATOR_WORDS;
-        if (!DAYS_MECHANISMS && (event[PK_KIND] & PK_KIND_MASK) == DCQCN_CONTROL_TIMER_PACKET) {
-            set_semantic_error(error, ERROR_MECHANISMS_REQUIRED, node);
-            return false;
-        }
         if (DAYS_MECHANISMS &&
             (event[PK_KIND] & PK_KIND_MASK) == DCQCN_CONTROL_TIMER_PACKET) {
             return dcqcn_control_timer(
@@ -4861,14 +4854,6 @@ inline bool dispatch_event(
         }
         if (flow >= params[P_FLOW_COUNT] || generators[generator + G_VALID] == 0 ||
             generators[generator + G_OWNER] != node || generators[generator + G_KIND] != 2) {
-            // The plain build: a DCQCN generator's timer is where the mechanisms build would
-            // enter `dcqcn_pacing_timer`. Only this non-rate path pays for the test.
-            if (!DAYS_MECHANISMS && flow < params[P_FLOW_COUNT] &&
-                generators[generator + G_VALID] != 0 && generators[generator + G_OWNER] == node &&
-                generators[generator + G_KIND] == GENERATOR_KIND_DCQCN) {
-                set_semantic_error(error, ERROR_MECHANISMS_REQUIRED, node);
-                return false;
-            }
             return true;
         }
         ulong status = generators[generator + G_STATUS];
@@ -5548,10 +5533,6 @@ inline bool dispatch_event(
     }
 
     if (kind == REMOTE_ARRIVAL && role == SWITCH) {
-        if (!DAYS_MECHANISMS && (event[PK_KIND] & PK_KIND_MASK) == PFC_PACKET) {
-            set_semantic_error(error, ERROR_MECHANISMS_REQUIRED, node);
-            return false;
-        }
         if (DAYS_MECHANISMS && (event[PK_KIND] & PK_KIND_MASK) == PFC_PACKET) {
             return pfc_frame_arrival(
                 node, event, error, params, node_state, queue_meta, queue_records,
@@ -6069,10 +6050,6 @@ inline bool dispatch_event(
     if (kind == REMOTE_ARRIVAL && role == HOST) {
         ulong flow_base = event[PK_FLOW] * FLOW_WORDS;
         ulong packet_kind = event[PK_KIND] & PK_KIND_MASK;
-        if (!DAYS_MECHANISMS && packet_kind == DCQCN_CNP_PACKET) {
-            set_semantic_error(error, ERROR_MECHANISMS_REQUIRED, node);
-            return false;
-        }
         if (DAYS_MECHANISMS && packet_kind == DCQCN_CNP_PACKET) {
             return dcqcn_cnp_arrival(
                 node, event, error, params, generators, flows, summary, observation_meta,
@@ -6611,13 +6588,6 @@ kernel void days_round(
     ulong node = worklist[active_index];
     device ulong *state = lp_state + node * LP_STATE_WORDS;
     if (state[L_FINISHED] != 0 || state[L_ERROR] != 0) {
-        return;
-    }
-    // The plain build compiles PFC out, so a planned PFC region stops the run before any transition.
-    // One uniform read per thread per launch; the per-event PFC reads stay compiled out. The region
-    // is the planner's, not the host selection's, so this cross-checks the selection.
-    if (!DAYS_MECHANISMS && params[P_PFC_OFFSET] != NONE) {
-        set_semantic_error(state, ERROR_MECHANISMS_REQUIRED, node);
         return;
     }
 
