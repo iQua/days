@@ -7310,3 +7310,28 @@ pub fn assert_validate_flow_index_equivalent_for_testing(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::StagedGenerator;
+
+    /// Every validator that asks about a generator's stage receives this view by value, so its
+    /// size is the number of bytes copied per call, once per generator in each of the validators
+    /// that walk the generator tables, on every image, stageless ones included. Holding the stage
+    /// record by value made the view the generator reference plus a copied
+    /// `Option<CollectiveStage>`; on E1's stageless image `validate` retired 5.7 M more
+    /// instructions than `main` (948a0e9), 62% of P14's lowering residue
+    /// (`days-gpu/evidence/P14/e1-residue.md`). A reference to the record in the host's stage
+    /// table keeps the view at two pointers, the reference and the niche-packed optional one.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn staged_generator_view_is_two_pointers() {
+        const TWO_POINTERS: usize = 2 * std::mem::size_of::<usize>();
+        let size = std::mem::size_of::<StagedGenerator<'static>>();
+        assert!(
+            size <= TWO_POINTERS,
+            "StagedGenerator is {size} B, above {TWO_POINTERS} B: borrow the stage record from \
+             the host's stage table instead of copying it"
+        );
+    }
+}
