@@ -646,6 +646,91 @@ mod cuda {
         }
     }
 
+    /// P14 round 4: a run captures its graph with exactly one round module loaded in the context,
+    /// its own. The residue round 3 left appears only when the other build's module is loaded
+    /// before a run allocates its buffers and captures its graph
+    /// (`evidence/P14/diag3-timing.md`), so each run loads its module and no other.
+    #[test]
+    fn cuda_each_run_captures_its_graph_with_one_round_module_loaded() {
+        let executor = CudaExecutor::on_device(0).expect("CUDA device 0");
+        // One-record caps force capacity retries: the module is held across every attempt, and
+        // the count is the final attempt's.
+        let retrying = CudaConfig {
+            max_channel_events_per_stream: Some(1),
+            max_fel_events_per_lp: Some(1),
+            ..CudaConfig::default()
+        };
+        // Both orders of consecutive builds on one executor: a module left loaded by the previous
+        // run would be counted by the next.
+        for (name, image, build, config, retries) in [
+            (
+                "FIFO incast",
+                scheduler_image("FIFO"),
+                RoundKernel::Plain,
+                CudaConfig::default(),
+                false,
+            ),
+            (
+                "dcqcn_t26",
+                fixture("dcqcn_t26.toml"),
+                RoundKernel::Mechanisms,
+                CudaConfig::default(),
+                false,
+            ),
+            (
+                "FIFO incast forced onto mechanisms",
+                scheduler_image("FIFO"),
+                RoundKernel::Mechanisms,
+                forced(RoundKernel::Mechanisms, 256),
+                false,
+            ),
+            (
+                "FIFO incast after capacity retries",
+                scheduler_image("FIFO"),
+                RoundKernel::Plain,
+                retrying,
+                true,
+            ),
+            (
+                "dcqcn_t26 after capacity retries",
+                fixture("dcqcn_t26.toml"),
+                RoundKernel::Mechanisms,
+                retrying,
+                true,
+            ),
+        ] {
+            let run = executor
+                .run_with_observations(&image, None, config, ObservationMode::Full)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(run.round_kernel, build, "{name}");
+            if retries {
+                assert!(
+                    !run.capacity_retry_trace.is_empty(),
+                    "{name}: the capped run must retry capacity"
+                );
+            }
+            assert_eq!(
+                run.round_modules_at_capture, 1,
+                "{name}: only the {build:?} module is loaded while the run captures its graph"
+            );
+            // The warm start plans the converged capacity at once; it owns one module too.
+            let warm = executor
+                .run_with_observations_warm_started(
+                    &image,
+                    None,
+                    config,
+                    ObservationMode::Full,
+                    &run.capacity_warm_start,
+                )
+                .unwrap_or_else(|error| panic!("{name} warm-started: {error}"));
+            assert_eq!(warm.result, run.result, "{name} warm-started");
+            assert_eq!(
+                warm.round_modules_at_capture, 1,
+                "{name} warm-started: only the {build:?} module is loaded at capture"
+            );
+        }
+    }
+
     fn forced(round_kernel: RoundKernel, round_threads_per_block: usize) -> CudaConfig {
         CudaConfig {
             round_threads_per_block,

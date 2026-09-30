@@ -15,6 +15,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::ops::{Bound, RangeBounds};
+#[cfg(feature = "cuda-test-hooks")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -1013,6 +1015,11 @@ pub struct CudaRun {
     #[doc(hidden)]
     #[cfg(feature = "cuda-test-hooks")]
     pub launched_kernels: Vec<(RoundKernel, &'static str)>,
+    /// Test-only: how many round modules were loaded in the device's context when this run's
+    /// final attempt captured its graph.
+    #[doc(hidden)]
+    #[cfg(feature = "cuda-test-hooks")]
+    pub round_modules_at_capture: usize,
 }
 
 /// One-time CUDA context, stream, module, and kernel initialization costs.
@@ -4879,6 +4886,8 @@ impl CudaBuffers {
                 );
                 launched
             },
+            #[cfg(feature = "cuda-test-hooks")]
+            round_modules_at_capture: timing.round_modules_at_capture,
         })
     }
 }
@@ -4938,6 +4947,9 @@ struct DirectCuda {
     /// P14 round 3: one module per round-kernel build, at [`RoundModule::slot`]. A run launches
     /// every kernel, the readback gather included, from its build's module only.
     modules: [RoundModule; 2],
+    /// Test-only: the round modules currently loaded in this device's context.
+    #[cfg(feature = "cuda-test-hooks")]
+    live_round_modules: Arc<AtomicUsize>,
     initialization_timings: CudaInitializationTimings,
     provisioning: CudaProvisioning,
 }
@@ -4960,6 +4972,29 @@ struct RoundModule {
     functions: Vec<CudaFunction>,
     /// T20l fix 2: the readback gather.
     compact_function: CudaFunction,
+    /// Test-only: counts this module as loaded until it is dropped.
+    #[cfg(feature = "cuda-test-hooks")]
+    _live: LiveRoundModule,
+}
+
+/// Test-only: one loaded round module's entry in its device's live count. The count only observes
+/// loads and unloads for the tests; no production path reads it.
+#[cfg(feature = "cuda-test-hooks")]
+struct LiveRoundModule(Arc<AtomicUsize>);
+
+#[cfg(feature = "cuda-test-hooks")]
+impl LiveRoundModule {
+    fn register(live: &Arc<AtomicUsize>) -> Self {
+        live.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(live))
+    }
+}
+
+#[cfg(feature = "cuda-test-hooks")]
+impl Drop for LiveRoundModule {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl RoundModule {
@@ -4975,6 +5010,7 @@ impl RoundModule {
         context: &Arc<CudaContext>,
         fatbin: &[u8],
         build: RoundKernel,
+        #[cfg(feature = "cuda-test-hooks")] live: &Arc<AtomicUsize>,
     ) -> Result<Self, CudaError> {
         let module = context
             .load_module(Ptx::from_binary(fatbin.to_vec()))
@@ -5000,6 +5036,8 @@ impl RoundModule {
             _module: module,
             functions,
             compact_function,
+            #[cfg(feature = "cuda-test-hooks")]
+            _live: LiveRoundModule::register(live),
         })
     }
 }
@@ -5035,12 +5073,16 @@ impl DirectCuda {
         }
         let context_stream_setup_ns = duration_ns(setup_started.elapsed());
 
+        #[cfg(feature = "cuda-test-hooks")]
+        let live_round_modules = Arc::new(AtomicUsize::new(0));
         let module_started = Instant::now();
         let modules = [
             RoundModule::load(
                 &context,
                 include_bytes!(concat!(env!("OUT_DIR"), "/days_cuda_kernels.fatbin")),
                 RoundKernel::Plain,
+                #[cfg(feature = "cuda-test-hooks")]
+                &live_round_modules,
             )?,
             RoundModule::load(
                 &context,
@@ -5049,6 +5091,8 @@ impl DirectCuda {
                     "/days_cuda_kernels_mechanisms.fatbin"
                 )),
                 RoundKernel::Mechanisms,
+                #[cfg(feature = "cuda-test-hooks")]
+                &live_round_modules,
             )?,
         ];
         let module_function_load_ns = duration_ns(module_started.elapsed());
@@ -5102,6 +5146,8 @@ impl DirectCuda {
             execution: Mutex::new(()),
             stream,
             modules,
+            #[cfg(feature = "cuda-test-hooks")]
+            live_round_modules,
             initialization_timings: CudaInitializationTimings {
                 context_stream_setup_ns,
                 module_function_load_ns,
@@ -5268,6 +5314,8 @@ impl DirectCuda {
             config.attempts_per_graph_wave,
         )?;
         let graph_capture_ns = duration_ns(capture_started.elapsed());
+        #[cfg(feature = "cuda-test-hooks")]
+        let round_modules_at_capture = self.live_round_modules.load(Ordering::SeqCst);
 
         let maximum_replays = buffers
             .dispatch_capacity
@@ -5333,6 +5381,8 @@ impl DirectCuda {
             round_kernel,
             #[cfg(feature = "cuda-test-hooks")]
             launched_kernels: self.launch_record(&functions, buffers.finalize_sweep_required),
+            #[cfg(feature = "cuda-test-hooks")]
+            round_modules_at_capture,
         })
     }
 
@@ -5490,6 +5540,9 @@ struct CudaTiming {
     /// Test-only: `(module, kernel)` for every function the attempt graph captured.
     #[cfg(feature = "cuda-test-hooks")]
     launched_kernels: Vec<(RoundKernel, &'static str)>,
+    /// Test-only: the round modules loaded in the context when the graph was captured.
+    #[cfg(feature = "cuda-test-hooks")]
+    round_modules_at_capture: usize,
     encoded_attempts: u64,
     graph_replays: u64,
     wave_boundary_syncs: u64,
