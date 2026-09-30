@@ -197,10 +197,10 @@ fn cpu_host_lp_allocates_no_more_than_a_scalar_host() {
 
 /// The Scalar result's host table holds its hosts and no spare capacity.
 ///
-/// The executor keeps each host's stage index beside its state in one entry per host and hands
-/// the states back when the run finishes. Collecting the states out of the entries in place would
-/// keep the entries' larger buffer, 120 B of spare capacity per host (983 kB on E1) retained with
-/// the result for as long as the caller holds it; `main` returned an exact clone.
+/// The Scalar executor clones the image's host-state table exactly and hands it back when the run
+/// finishes. A table built any other way can keep spare capacity: collecting the states out of
+/// per-host entries in place kept the entries' larger buffer (`4c57401`), 120 B per host (983 kB
+/// on E1) retained with the result for as long as the caller holds it.
 #[test]
 fn scalar_result_host_states_carry_no_spare_capacity() {
     let path = e1_k8("capacity", SMALL_HOSTS_PER_EDGE);
