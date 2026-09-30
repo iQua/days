@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 
 use days::scenario::compile_config_with_route_workers;
 use days::topos::route::RouteWorkers;
-use days_executor::{CpuConfig, run_cpu};
+use days_executor::{CpuConfig, run_cpu, run_scalar};
 
 /// Allocations made by the current thread.
 ///
@@ -173,5 +173,26 @@ fn cpu_host_lp_allocates_no_more_than_a_scalar_host() {
         marginal <= MAX_MARGINAL_ALLOCATIONS,
         "{ADDED_HOSTS} more host LPs made {marginal} more allocations, above the cap of \
          {MAX_MARGINAL_ALLOCATIONS}: keep a host's stage index in the host's own entry"
+    );
+}
+
+/// The Scalar result's host table holds its hosts and no spare capacity.
+///
+/// The executor keeps each host's stage index beside its state in one entry per host and hands
+/// the states back when the run finishes. Collecting the states out of the entries in place would
+/// keep the entries' larger buffer, 120 B of spare capacity per host (983 kB on E1) retained with
+/// the result for as long as the caller holds it; `main` returned an exact clone.
+#[test]
+fn scalar_result_host_states_carry_no_spare_capacity() {
+    let path = e1_k8(SMALL_HOSTS_PER_EDGE);
+    let image = compile_config_with_route_workers(&path, RouteWorkers::serial())
+        .expect("the derived E1 scenario lowers");
+    let _ = fs::remove_file(&path);
+    let result = run_scalar(&image, Some(1)).expect("the Scalar run succeeds");
+    assert_eq!(result.host_states.len(), image.host_states.len());
+    assert_eq!(
+        result.host_states.capacity(),
+        result.host_states.len(),
+        "the Scalar result's host states keep spare capacity"
     );
 }
