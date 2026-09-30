@@ -5006,10 +5006,20 @@ impl DirectCuda {
         let context_stream_setup_ns = duration_ns(setup_started.elapsed());
 
         let module_started = Instant::now();
-        let fatbin = include_bytes!(concat!(env!("OUT_DIR"), "/days_cuda_kernels.fatbin"));
         let modules = [
-            RoundModule::load(&context, fatbin, RoundKernel::Plain)?,
-            RoundModule::load(&context, fatbin, RoundKernel::Mechanisms)?,
+            RoundModule::load(
+                &context,
+                include_bytes!(concat!(env!("OUT_DIR"), "/days_cuda_kernels.fatbin")),
+                RoundKernel::Plain,
+            )?,
+            RoundModule::load(
+                &context,
+                include_bytes!(concat!(
+                    env!("OUT_DIR"),
+                    "/days_cuda_kernels_mechanisms.fatbin"
+                )),
+                RoundKernel::Mechanisms,
+            )?,
         ];
         let module_function_load_ns = duration_ns(module_started.elapsed());
 
