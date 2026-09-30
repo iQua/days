@@ -1023,12 +1023,12 @@ pub struct CudaRun {
 }
 
 /// One-time CUDA context and stream initialization costs.
+///
+/// The executor loads no module (P14 round 4): each run loads its own round module and reports
+/// that cost as [`CudaRun::module_load_ns`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CudaInitializationTimings {
     pub context_stream_setup_ns: u64,
-    /// Always 0 since P14 round 4: the executor loads no module. Each run loads its own round
-    /// module and reports the cost as [`CudaRun::module_load_ns`].
-    pub module_function_load_ns: u64,
 }
 
 /// Runs the production CUDA executor through the inclusive scenario stop.
@@ -5220,7 +5220,6 @@ impl DirectCuda {
             live_round_modules: Arc::new(AtomicUsize::new(0)),
             initialization_timings: CudaInitializationTimings {
                 context_stream_setup_ns,
-                module_function_load_ns: 0,
             },
             provisioning,
         })

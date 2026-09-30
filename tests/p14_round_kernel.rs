@@ -731,13 +731,11 @@ mod cuda {
         }
     }
 
-    /// P14 round 4: the executor loads no module, so its initialization reports no module time;
-    /// each run loads its own and reports what that cost. Printed for the cost record
-    /// (`--nocapture`).
+    /// P14 round 4: the executor loads no module; each run loads its own and reports what that
+    /// cost. Printed for the cost record (`--nocapture`).
     #[test]
     fn cuda_each_run_reports_its_round_module_load_time() {
         let executor = CudaExecutor::on_device(0).expect("CUDA device 0");
-        assert_eq!(executor.initialization_timings().module_function_load_ns, 0);
         for repeat in 0..3 {
             for (name, image, build) in [
                 ("FIFO incast", scheduler_image("FIFO"), RoundKernel::Plain),
