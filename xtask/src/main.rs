@@ -28,8 +28,8 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "cuda.rs",
         predicate: r#"feature = "cuda-test-hooks""#,
-        count: 19,
-        purpose: "CUDA-only fault injection, capacity, and worklist-compaction hooks, the P14 round-kernel override that forces either `days_round` build (the config field, its default, and its one read), and the P14 round-3 one-module-per-run probes (the launched-kernel record on the timing and the run, its two fills, and the module-contents probe)",
+        count: 22,
+        purpose: "CUDA-only fault injection, capacity, and worklist-compaction hooks, the P14 round-kernel override that forces either `days_round` build (the config field, its default, and its one read), and the P14 round-3 one-module-per-run probes: the launched-kernel record on the timing and the run and its two fills, the handle-identity helpers that build it, the readback gather's identification in `compact`, the module-contents probe, and the mixed-array record probe",
     },
     AllowedFeatureGate {
         path: "metal.rs",

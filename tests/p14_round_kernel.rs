@@ -565,24 +565,53 @@ mod cuda {
             }
         }
 
-        for (name, image, build, forced_build) in [
+        // One-record channel and fallback-heap caps force capacity retries (a DCQCN host holds a
+        // pacing timer and a control timer); the record is the final attempt's.
+        let retrying = CudaConfig {
+            max_channel_events_per_stream: Some(1),
+            max_fel_events_per_lp: Some(1),
+            ..CudaConfig::default()
+        };
+        for (name, image, build, forced_build, config, retries) in [
             (
                 "FIFO incast",
                 scheduler_image("FIFO"),
                 RoundKernel::Plain,
                 None,
+                CudaConfig::default(),
+                false,
             ),
             (
                 "dcqcn_t26",
                 fixture("dcqcn_t26.toml"),
                 RoundKernel::Mechanisms,
                 None,
+                CudaConfig::default(),
+                false,
             ),
             (
                 "FIFO incast forced onto mechanisms",
                 scheduler_image("FIFO"),
                 RoundKernel::Mechanisms,
                 Some(RoundKernel::Mechanisms),
+                CudaConfig::default(),
+                false,
+            ),
+            (
+                "FIFO incast after capacity retries",
+                scheduler_image("FIFO"),
+                RoundKernel::Plain,
+                None,
+                retrying,
+                true,
+            ),
+            (
+                "dcqcn_t26 after capacity retries",
+                fixture("dcqcn_t26.toml"),
+                RoundKernel::Mechanisms,
+                None,
+                retrying,
+                true,
             ),
         ] {
             let run = run_cuda_with_observations(
@@ -590,12 +619,18 @@ mod cuda {
                 None,
                 CudaConfig {
                     round_kernel_override: forced_build,
-                    ..CudaConfig::default()
+                    ..config
                 },
                 ObservationMode::Full,
             )
             .unwrap_or_else(|error| panic!("{name}: {error}"));
             assert_eq!(run.round_kernel, build, "{name}");
+            if retries {
+                assert!(
+                    !run.capacity_retry_trace.is_empty(),
+                    "{name}: the capped run must retry capacity"
+                );
+            }
             let expected = match build {
                 RoundKernel::Plain => &plain,
                 RoundKernel::Mechanisms => &mechanisms,

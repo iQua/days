@@ -180,6 +180,10 @@ fn select_cuda_provisioning(
 #[cfg(feature = "cuda-test-hooks")]
 std::thread_local! {
     static PANIC_AFTER_NEXT_EXECUTION: Cell<bool> = const { Cell::new(false) };
+    /// Test-only: the readback gather `DirectCuda::compact` launched on this thread, identified by
+    /// handle. `compact` runs inside the attempt that reads it back, on the same thread; nothing
+    /// is shared across threads.
+    static LAUNCHED_GATHER: Cell<Option<(RoundKernel, &'static str)>> = const { Cell::new(None) };
 }
 
 /// Arms a one-shot panic after this thread's next successful CUDA graph execution.
@@ -1157,7 +1161,7 @@ impl CudaExecutor {
                 &own.functions[index]
             }
         });
-        self.direct.launch_record(&functions, build, true)
+        self.direct.launch_record(&functions, true)
     }
 
     /// Runs only O1.4's reset/count and stable-write dispatches over a synthetic FEL-root cache.
@@ -4868,10 +4872,11 @@ impl CudaBuffers {
             #[cfg(feature = "cuda-test-hooks")]
             launched_kernels: {
                 let mut launched = timing.launched_kernels.clone();
-                launched.push((
-                    direct.module(timing.round_kernel).build,
-                    COMPACT_KERNEL_NAME,
-                ));
+                launched.push(
+                    LAUNCHED_GATHER
+                        .take()
+                        .expect("the readback gather ran in this attempt"),
+                );
                 launched
             },
         })
@@ -5118,6 +5123,8 @@ impl DirectCuda {
         requests: &[(&CudaBuffer, &CompactionPlan)],
     ) -> Result<Vec<Vec<u64>>, CudaError> {
         let compact_function = &self.module(round_kernel).compact_function;
+        #[cfg(feature = "cuda-test-hooks")]
+        LAUNCHED_GATHER.set(Some(self.identify(compact_function)));
         let mut destinations = Vec::with_capacity(requests.len());
         // The plan and argument buffers must outlive the launches, so they are retained here
         // rather than dropped at the end of each iteration.
@@ -5325,11 +5332,7 @@ impl DirectCuda {
             wall_ns: duration_ns(wall_started.elapsed()),
             round_kernel,
             #[cfg(feature = "cuda-test-hooks")]
-            launched_kernels: self.launch_record(
-                &functions,
-                round_kernel,
-                buffers.finalize_sweep_required,
-            ),
+            launched_kernels: self.launch_record(&functions, buffers.finalize_sweep_required),
         })
     }
 
@@ -5388,18 +5391,38 @@ impl DirectCuda {
 #[cfg(feature = "cuda-test-hooks")]
 impl DirectCuda {
     /// `(module, kernel)` for each attempt kernel the graph captured from `functions`, in DAG
-    /// order, skipping the finalize sweep when the plan omits it.
+    /// order, skipping the finalize sweep when the plan omits it. Each entry identifies the handle
+    /// itself ([`Self::identify`]), so a run that mixes modules is recorded as mixed.
     fn launch_record(
         &self,
         functions: &[&CudaFunction; KERNEL_NAMES.len()],
-        round_kernel: RoundKernel,
         finalize_sweep_required: bool,
     ) -> Vec<(RoundKernel, &'static str)> {
-        let module = self.module(round_kernel);
-        (0..functions.len())
-            .filter(|&index| finalize_sweep_required || index != FINALIZE_SWEEP_KERNEL_INDEX)
-            .map(|index| (module.build, round_kernel_name(index, module.build)))
+        functions
+            .iter()
+            .enumerate()
+            .filter(|&(index, _)| finalize_sweep_required || index != FINALIZE_SWEEP_KERNEL_INDEX)
+            .map(|(_, function)| self.identify(function))
             .collect()
+    }
+
+    /// The module and kernel `function` is, by handle identity: the round module whose vectors
+    /// hold this very `CudaFunction`, and the name it was loaded under. Every launched handle is
+    /// one of those, so no answer is derived from the run's selection.
+    fn identify(&self, function: &CudaFunction) -> (RoundKernel, &'static str) {
+        for module in &self.modules {
+            if let Some(index) = module
+                .functions
+                .iter()
+                .position(|candidate| std::ptr::eq(candidate, function))
+            {
+                return (module.build, round_kernel_name(index, module.build));
+            }
+            if std::ptr::eq(&module.compact_function, function) {
+                return (module.build, COMPACT_KERNEL_NAME);
+            }
+        }
+        panic!("a launched CUDA function handle belongs to no round module")
     }
 }
 
