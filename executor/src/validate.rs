@@ -1571,7 +1571,7 @@ fn validate_generators(
                     state,
                     flow,
                     generator,
-                    stage,
+                    *stage,
                     &mut collective_positions,
                     &mut compute_positions,
                 )?;
@@ -2602,19 +2602,26 @@ fn incomplete_tcp_segment_ledger(
     ))
 }
 
-/// A generator together with its stage record, read from the host's stage table by position.
+/// A generator together with its stage record, borrowed from the host's stage table by position.
 ///
 /// The validator asks about a generator's stage wherever it asked about the generator's former
 /// `stage` field; this view carries both, and dereferences to the generator for everything else.
+/// Validators take it by value, so it holds the record by reference: two pointers per copy.
 #[derive(Clone, Copy)]
 struct StagedGenerator<'a> {
     generator: &'a crate::FlowGeneratorState,
-    stage: Option<crate::CollectiveStage>,
+    stage: Option<&'a crate::CollectiveStage>,
 }
 
-impl StagedGenerator<'_> {
+impl<'a> StagedGenerator<'a> {
     /// `generator` in place of this view's generator, with the same stage record.
-    const fn with_generator(self, generator: &crate::FlowGeneratorState) -> StagedGenerator<'_> {
+    const fn with_generator<'b>(
+        self,
+        generator: &'b crate::FlowGeneratorState,
+    ) -> StagedGenerator<'b>
+    where
+        'a: 'b,
+    {
         StagedGenerator {
             generator,
             stage: self.stage,
@@ -2634,13 +2641,26 @@ impl std::ops::Deref for StagedGenerator<'_> {
 fn staged_generator(state: &crate::HostState, position: usize) -> StagedGenerator<'_> {
     StagedGenerator {
         generator: &state.generators[position],
-        stage: state.stage(position),
+        stage: state.stages.get(position).and_then(Option::as_ref),
     }
 }
 
 /// `state`'s generators in table order, each with its stage record.
+///
+/// Each generator pairs with the stage table's entry at its position, or with `None` past the
+/// table's end, exactly as [`staged_generator`] reads it, whatever the table's length. On a host
+/// without stages the table is empty, every generator pairs with `None`, and no entry is read.
 fn staged_generators(state: &crate::HostState) -> impl Iterator<Item = StagedGenerator<'_>> {
-    (0..state.generators.len()).map(|position| staged_generator(state, position))
+    let stages = state
+        .stages
+        .iter()
+        .map(Option::as_ref)
+        .chain(std::iter::repeat(None));
+    state
+        .generators
+        .iter()
+        .zip(stages)
+        .map(|(generator, stage)| StagedGenerator { generator, stage })
 }
 
 fn is_compute_generator(generator: StagedGenerator<'_>) -> bool {
