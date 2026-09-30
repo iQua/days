@@ -1147,7 +1147,7 @@ impl CudaExecutor {
             .direct
             .hold_round_module(build)
             .unwrap_or_else(|error| panic!("{build:?} round module: {error}"));
-        let module = &held.module.module;
+        let module = &held.module._module;
         KERNEL_NAMES
             .iter()
             .copied()
@@ -5013,7 +5013,7 @@ struct RoundModule {
     build: RoundKernel,
     /// The loaded module (its functions hold it too); the test hook probes it by name. Dropping
     /// the `RoundModule` drops every holder and unloads it.
-    module: Arc<CudaModule>,
+    _module: Arc<CudaModule>,
     /// The attempt DAG in [`KERNEL_NAMES`] order, with this module's round kernel at
     /// [`ROUND_KERNEL_INDEX`].
     functions: Vec<CudaFunction>,
@@ -5103,7 +5103,7 @@ impl RoundModule {
             .map_err(|error| driver_error(format!("kernel `{COMPACT_KERNEL_NAME}` load"), error))?;
         let loaded = Self {
             build,
-            module,
+            _module: module,
             functions,
             compact_function,
             #[cfg(feature = "cuda-test-hooks")]
