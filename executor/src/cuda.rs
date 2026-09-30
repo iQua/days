@@ -5004,11 +5004,18 @@ struct DirectCuda {
 ///   one module loaded or two;
 /// - intra-module layout is excluded, by the comparator that found the modules layout-identical
 ///   to their references;
-/// - module code placement and load order cannot be observed through the driver API and remain
-///   candidates; load order is supported on the mechanisms path;
 /// - the residue was reproduced with the other module loaded at initialization, and was absent
 ///   with it never loaded or loaded after graph capture (retry-free runs);
-/// - the mechanism is not identified.
+/// - the device addresses of each module's code cannot be observed through the driver API; load
+///   order is known from the source;
+/// - on the mechanisms path, placement / load order is supported: round 3 loaded the mechanisms
+///   module second, where the P14 control loads it first. It remains a candidate alongside graph
+///   instantiation with both modules loaded and other load-time work (the per-module function
+///   and thread-limit queries);
+/// - on the plain path, load order is not a candidate (round 3 loaded the plain module first, as
+///   `main` does) and placement is disfavoured. That leaves graph instantiation with both modules
+///   loaded and other load-time work;
+/// - this list is not exhaustive, and the mechanism is not identified.
 ///
 /// One module per run is the design that this parity evidence covers.
 struct RoundModule {
