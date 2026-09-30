@@ -46,8 +46,14 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "cuda.rs",
         predicate: r#"feature = "planner-test-hooks""#,
-        count: 5,
-        purpose: "CUDA host-plan equality hook and P14 Lane B's mechanism-plane word probe are enabled by the standard test feature",
+        count: 6,
+        purpose: "CUDA host-plan equality hook, P14 Lane B's mechanism-plane word probe and the P14 cuda-host PFC-state scan probe are enabled by the standard test feature",
+    },
+    AllowedFeatureGate {
+        path: "device_pfc.rs",
+        predicate: r#"feature = "planner-test-hooks""#,
+        count: 3,
+        purpose: "the P14 cuda-host PFC-state scan probe: a per-thread scan counter (empty in production builds), its increment in the two whole-fabric PFC scans, and its read-and-reset for the CUDA planner hook",
     },
     AllowedFeatureGate {
         path: "metal.rs",
