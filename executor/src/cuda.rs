@@ -1135,6 +1135,31 @@ impl CudaExecutor {
             .collect()
     }
 
+    /// The launch record the production path would produce for `build`'s attempt array with the
+    /// DAG slots in `borrowed` taken from the other build's module: a deliberately mixed run, as a
+    /// regression would launch. The record must name the other module at exactly those slots.
+    #[cfg(feature = "cuda-test-hooks")]
+    #[doc(hidden)]
+    pub fn launch_record_for_testing(
+        &self,
+        build: RoundKernel,
+        borrowed: &[usize],
+    ) -> Vec<(RoundKernel, &'static str)> {
+        let own = self.direct.module(build);
+        let other = self.direct.module(match build {
+            RoundKernel::Plain => RoundKernel::Mechanisms,
+            RoundKernel::Mechanisms => RoundKernel::Plain,
+        });
+        let functions: [&CudaFunction; KERNEL_NAMES.len()] = std::array::from_fn(|index| {
+            if borrowed.contains(&index) {
+                &other.functions[index]
+            } else {
+                &own.functions[index]
+            }
+        });
+        self.direct.launch_record(&functions, build, true)
+    }
+
     /// Runs only O1.4's reset/count and stable-write dispatches over a synthetic FEL-root cache.
     ///
     /// This is an actual-device output gate for the production kernels. `eligible[node]` becomes
@@ -5300,15 +5325,11 @@ impl DirectCuda {
             wall_ns: duration_ns(wall_started.elapsed()),
             round_kernel,
             #[cfg(feature = "cuda-test-hooks")]
-            launched_kernels: {
-                let module = self.module(round_kernel);
-                (0..KERNEL_NAMES.len())
-                    .filter(|&index| {
-                        buffers.finalize_sweep_required || index != FINALIZE_SWEEP_KERNEL_INDEX
-                    })
-                    .map(|index| (module.build, round_kernel_name(index, module.build)))
-                    .collect()
-            },
+            launched_kernels: self.launch_record(
+                &functions,
+                round_kernel,
+                buffers.finalize_sweep_required,
+            ),
         })
     }
 
@@ -5360,6 +5381,25 @@ impl DirectCuda {
             .upload()
             .map_err(|error| driver_error("CUDA Graph upload", error))?;
         Ok(graph)
+    }
+}
+
+/// Test-only: which module and kernel each launched handle is.
+#[cfg(feature = "cuda-test-hooks")]
+impl DirectCuda {
+    /// `(module, kernel)` for each attempt kernel the graph captured from `functions`, in DAG
+    /// order, skipping the finalize sweep when the plan omits it.
+    fn launch_record(
+        &self,
+        functions: &[&CudaFunction; KERNEL_NAMES.len()],
+        round_kernel: RoundKernel,
+        finalize_sweep_required: bool,
+    ) -> Vec<(RoundKernel, &'static str)> {
+        let module = self.module(round_kernel);
+        (0..functions.len())
+            .filter(|&index| finalize_sweep_required || index != FINALIZE_SWEEP_KERNEL_INDEX)
+            .map(|index| (module.build, round_kernel_name(index, module.build)))
+            .collect()
     }
 }
 

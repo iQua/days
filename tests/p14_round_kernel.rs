@@ -531,6 +531,40 @@ mod cuda {
             "the mechanisms module holds exactly its kernels"
         );
 
+        // The record identifies each launched handle, not the selection: an attempt array that
+        // borrows slots from the other module, as a mixed-module regression would, is recorded as
+        // exactly that.
+        for build in [RoundKernel::Plain, RoundKernel::Mechanisms] {
+            let other = match build {
+                RoundKernel::Plain => RoundKernel::Mechanisms,
+                RoundKernel::Mechanisms => RoundKernel::Plain,
+            };
+            let own = match build {
+                RoundKernel::Plain => &plain,
+                RoundKernel::Mechanisms => &mechanisms,
+            };
+            let theirs = match build {
+                RoundKernel::Plain => &mechanisms,
+                RoundKernel::Mechanisms => &plain,
+            };
+            for borrowed in [vec![0], vec![4], vec![0, 5, 12]] {
+                let expected = (0..13)
+                    .map(|index| {
+                        if borrowed.contains(&index) {
+                            (other, theirs[index])
+                        } else {
+                            (build, own[index])
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    executor.launch_record_for_testing(build, &borrowed),
+                    expected,
+                    "{build:?} with slots {borrowed:?} borrowed from the {other:?} module"
+                );
+            }
+        }
+
         for (name, image, build, forced_build) in [
             (
                 "FIFO incast",
