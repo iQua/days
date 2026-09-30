@@ -5461,27 +5461,30 @@ fn apply_generator_feedback(
 #[cfg(test)]
 mod tests {
     use super::TransitionState;
+    use crate::stage_index::StageScanProbe;
 
     /// The CPU executor builds one `TransitionState` per LP and stores it inline in every LP, so
     /// each byte here is a per-LP cost of every CPU run: on E1's 9,472 LPs the LP arrays grow by
-    /// 9,472 bytes per byte, and the whole LP is walked by the serial worker. At `main`
-    /// (948a0e9) it is 512 B. P14 first kept the host stage indices in a vector of their own beside
-    /// `host_states` (24 B, rounded to 32 B by the 16-byte alignment `RunSummary`'s `u128`
-    /// counters force), 544 B; the CPU `--workers 1` run on E1 measured about 2% slower than
-    /// `main` on madrid (`days-gpu/evidence/P14/e1-residue.md`). Each host's index now lives in
-    /// the host's own entry. Any field added here rounds up to 528 B.
+    /// 9,472 bytes per byte, and the serial worker walks them. At `main` (948a0e9) it is 512 B.
+    /// P14 first kept the host stage indices in a vector of their own beside `host_states` (24 B,
+    /// rounded to 32 B by the 16-byte alignment `RunSummary`'s `u128` counters force), 544 B; the
+    /// CPU `--workers 1` run on E1 measured about 2% slower than `main` on madrid
+    /// (`days-gpu/evidence/P14/e1-residue.md`). Each host's index now lives in the host's own
+    /// entry. Any field added here rounds up to 528 B.
     ///
-    /// Layout is the compiler's choice, so the bound is an upper bound on 64-bit targets. The
-    /// planner test hooks add scan counters, so the bound holds for production layouts only.
-    #[cfg(all(target_pointer_width = "64", not(feature = "planner-test-hooks")))]
+    /// The test hooks' dispatch counter (`stage_probe`, 16 B with the hooks, empty without) is the
+    /// one field `main` did not have, so it is allowed for. Layout is the compiler's choice, so the
+    /// bound is an upper bound on 64-bit targets.
+    #[cfg(target_pointer_width = "64")]
     #[test]
     fn transition_state_keeps_main_size() {
-        const TRANSITION_STATE_MAX_BYTES: usize = 512;
+        const MAIN_TRANSITION_STATE_BYTES: usize = 512;
+        let bound = MAIN_TRANSITION_STATE_BYTES + std::mem::size_of::<StageScanProbe>();
         let size = std::mem::size_of::<TransitionState<'static>>();
         assert!(
-            size <= TRANSITION_STATE_MAX_BYTES,
-            "TransitionState grew to {size} B, above {TRANSITION_STATE_MAX_BYTES} B: keep \
-             per-host executor state in the host's own entry"
+            size <= bound,
+            "TransitionState grew to {size} B, above {bound} B: keep per-host executor state in \
+             the host's own entry"
         );
     }
 }
