@@ -504,8 +504,8 @@ mod cuda {
     }
 
     /// P14 round 3: each round-kernel build is its own complete module, holding only its own round
-    /// kernel, and every run launches its 14 kernels from that one module. A module holding both
-    /// round kernels moved the code after them and cost device time (`evidence/P14/modprobe-ab.md`).
+    /// kernel, and every run launches its 14 kernels from that one module. Since round 4 a run
+    /// loads only that module, so the mixed-array probe loads the other build's module itself.
     #[test]
     fn cuda_each_run_launches_one_complete_round_module() {
         let executor = CudaExecutor::on_device(0).expect("CUDA device 0");
