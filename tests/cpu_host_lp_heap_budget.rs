@@ -115,8 +115,9 @@ const MAX_MARGINAL_ALLOCATIONS: u64 = MAIN_MARGINAL_ALLOCATIONS
     + HEADROOM_ALLOCATIONS;
 
 /// E1 on a k = 8 fat-tree with `hosts_per_edge` hosts under every edge switch, one flow per host,
-/// written to a file private to this process.
-fn e1_k8(hosts_per_edge: u64) -> PathBuf {
+/// written to a file private to this process and to the calling test, named by `test`: the tests
+/// of this binary run in parallel, so a shared file would be rewritten while another test reads it.
+fn e1_k8(test: &str, hosts_per_edge: u64) -> PathBuf {
     let text = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(E1_FIXTURE))
         .expect("read the E1 fixture");
     let substitutions = [
@@ -135,7 +136,7 @@ fn e1_k8(hosts_per_edge: u64) -> PathBuf {
         text.replace(from, to)
     });
     let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "cpu_host_lp_heap_budget_k{K}_h{hosts_per_edge}_{}.toml",
+        "cpu_host_lp_heap_budget_{test}_k{K}_h{hosts_per_edge}_{}.toml",
         std::process::id()
     ));
     fs::write(&path, text).expect("write the derived E1 scenario");
@@ -145,7 +146,7 @@ fn e1_k8(hosts_per_edge: u64) -> PathBuf {
 /// Allocations this thread makes during a one-worker CPU run of the derived scenario that stops
 /// before its first event.
 fn cpu_run_allocations(hosts_per_edge: u64) -> u64 {
-    let path = e1_k8(hosts_per_edge);
+    let path = e1_k8("allocations", hosts_per_edge);
     let image = compile_config_with_route_workers(&path, RouteWorkers::serial())
         .expect("the derived E1 scenario lowers");
     let _ = fs::remove_file(&path);
@@ -184,7 +185,7 @@ fn cpu_host_lp_allocates_no_more_than_a_scalar_host() {
 /// the result for as long as the caller holds it; `main` returned an exact clone.
 #[test]
 fn scalar_result_host_states_carry_no_spare_capacity() {
-    let path = e1_k8(SMALL_HOSTS_PER_EDGE);
+    let path = e1_k8("capacity", SMALL_HOSTS_PER_EDGE);
     let image = compile_config_with_route_workers(&path, RouteWorkers::serial())
         .expect("the derived E1 scenario lowers");
     let _ = fs::remove_file(&path);
