@@ -2382,6 +2382,15 @@ impl TransitionState<'_> {
                 "let states = &self.host_states;",
                 "reaches the raw host states",
             ),
+            ("let hosts = &self.hosts;", "reaches the raw host states"),
+            (
+                "let flows = self.hosts[0].state.generators.len();",
+                "reaches the raw host states",
+            ),
+            (
+                "let host: &mut HostEntry = todo!();",
+                "names the raw `HostEntry`",
+            ),
             (
                 "let state: &HostState = todo!();",
                 "names the raw `HostState`",
