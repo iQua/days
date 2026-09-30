@@ -2397,6 +2397,22 @@ impl TransitionState<'_> {
                 "names the raw `HostEntry`",
             ),
             (
+                "let store: &HostStore = todo!();",
+                "names the raw `HostStore`",
+            ),
+            (
+                "let tables: &HostTables = todo!();",
+                "names the raw `HostTables`",
+            ),
+            (
+                "for state in &tables.states {}",
+                "reaches the raw host states",
+            ),
+            (
+                "let slot = &tables.indices[0];",
+                "reaches the raw host states",
+            ),
+            (
                 "let state: &HostState = todo!();",
                 "names the raw `HostState`",
             ),
