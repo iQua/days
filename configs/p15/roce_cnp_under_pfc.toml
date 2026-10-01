@@ -48,7 +48,7 @@ pacing_interval_ns = 1000
 increase_byte_threshold = 100000
 
 [flow.traffic.roce]
-retransmit_timeout_ns = 200000
+retransmit_timeout_ns = 1000000
 
 [[flow]]
 flow_type = "RoCE"
@@ -75,7 +75,7 @@ pacing_interval_ns = 1000
 increase_byte_threshold = 100000
 
 [flow.traffic.roce]
-retransmit_timeout_ns = 200000
+retransmit_timeout_ns = 1000000
 
 [[flow]]
 flow_type = "RoCE"
@@ -102,7 +102,7 @@ pacing_interval_ns = 1000
 increase_byte_threshold = 100000
 
 [flow.traffic.roce]
-retransmit_timeout_ns = 200000
+retransmit_timeout_ns = 1000000
 
 [[flow]]
 flow_type = "RoCE"
@@ -129,4 +129,4 @@ pacing_interval_ns = 1000
 increase_byte_threshold = 100000
 
 [flow.traffic.roce]
-retransmit_timeout_ns = 200000
+retransmit_timeout_ns = 1000000

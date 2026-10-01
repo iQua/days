@@ -3277,6 +3277,16 @@ fn build_lps<'image>(
         }
     }
     for descriptor in image.initial_packets.iter().copied() {
+        // P15: a RoCE queue pair's two timer tokens are part of the pair's state for the whole
+        // run (a parked pacer restarts on a later NACK), so they stay resident and pinned on the
+        // source LP whether or not a pending event names them, as Scalar keeps them.
+        if descriptor.kind.is_timer_token() {
+            if let Some(lp_slot) = queue_pair_token_owner(image, descriptor) {
+                packets[lp_slot].insert(descriptor.id, descriptor);
+                pinned_packets[lp_slot].insert(descriptor.id);
+                continue;
+            }
+        }
         if matches!(descriptor.kind, crate::PacketKind::TcpData(_)) {
             let flow = image
                 .flows
@@ -3615,6 +3625,27 @@ fn assemble_result(
         }),
         pending_events,
     })
+}
+
+/// The source LP slot of the RoCE queue pair whose pacing or control token `token` is, if any.
+fn queue_pair_token_owner(image: &SimulationImage, token: PacketDescriptor) -> Option<usize> {
+    let flow = image
+        .flows
+        .get(usize::try_from(token.flow.0).ok()?)
+        .filter(|flow| flow.id == token.flow)?;
+    let source = image.nodes.get(usize::try_from(flow.source.0).ok()?)?;
+    let owns = image
+        .host_states
+        .get(source.state_slot as usize)?
+        .generators
+        .iter()
+        .any(|generator| {
+            generator.flow == flow.id
+                && matches!(generator.kind, crate::FlowGeneratorKind::Roce(roce)
+                    if roce.pacing_timer_payload == token.id
+                        || roce.control_timer_payload == token.id)
+        });
+    owns.then(|| node_slot(image, flow.source)).flatten()
 }
 
 fn add_state_payloads(local: &LocalTransitionResult, referenced: &mut BTreeSet<PayloadId>) {

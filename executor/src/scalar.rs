@@ -280,6 +280,12 @@ pub enum ExecutionError {
         payload: PayloadId,
         deadline_ns: u64,
     },
+    /// A RoCE packet disagrees with its queue pair: data beyond the flow's total, or an ACK or
+    /// NACK beyond the bytes the sender has sent.
+    InconsistentRocePacket {
+        flow: FlowId,
+        payload: PayloadId,
+    },
     Time(TimeError),
 }
 
@@ -769,6 +775,10 @@ impl fmt::Display for ExecutionError {
             } => write!(
                 formatter,
                 "node {node:?} has no pending retransmission timeout for attempt {payload:?} at {deadline_ns} ns"
+            ),
+            Self::InconsistentRocePacket { flow, payload } => write!(
+                formatter,
+                "RoCE packet {payload:?} is inconsistent with flow {flow:?}'s queue pair"
             ),
             Self::Time(error) => error.fmt(formatter),
         }
@@ -2627,14 +2637,29 @@ impl<'image> TransitionState<'image> {
             let flow = self.flow(packet.flow)?;
             (flow.id, flow.source, flow.target)
         };
-        if let PacketKind::TcpData(header) = packet.kind {
-            return self.host_tcp_data_arrival(node, event, packet, header, children);
-        }
-        if let PacketKind::TcpAck(header) = packet.kind {
-            return self.host_tcp_ack_arrival(node, event, packet, header, children);
-        }
-        if let PacketKind::DcqcnCnp(header) = packet.kind {
-            return self.host_dcqcn_cnp_arrival(node, event, packet, header);
+        // The closed-loop kinds own their arrival transitions; the arms are disjoint.
+        match packet.kind {
+            PacketKind::TcpData(header) => {
+                return self.host_tcp_data_arrival(node, event, packet, header, children);
+            }
+            PacketKind::TcpAck(header) => {
+                return self.host_tcp_ack_arrival(node, event, packet, header, children);
+            }
+            PacketKind::DcqcnCnp(header) => {
+                return self.host_dcqcn_cnp_arrival(node, event, packet, header);
+            }
+            PacketKind::RoceData(header) => {
+                return self.host_roce_data_arrival(node, event, packet, header, children);
+            }
+            PacketKind::RoceAck(header) => {
+                return self
+                    .host_roce_feedback_arrival(node, event, packet, header, false, children);
+            }
+            PacketKind::RoceNack(header) => {
+                return self
+                    .host_roce_feedback_arrival(node, event, packet, header, true, children);
+            }
+            _ => {}
         }
         if packet.kind == PacketKind::Data
             && self
@@ -2718,11 +2743,11 @@ impl<'image> TransitionState<'image> {
                 .received_packets
                 .checked_add(1)
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
-            let interval_open = receiver.last_cnp_time_ns.is_none_or(|last| {
-                last.checked_add(receiver.cnp_interval_ns)
-                    .is_some_and(|earliest| event.key.time_ns >= earliest)
-            });
-            if packet.ecn_codepoint() != crate::EcnCodepoint::Ce || !interval_open {
+            if !crate::roce::notification_point_sends_cnp(
+                receiver,
+                event.key.time_ns,
+                packet.ecn_codepoint() == crate::EcnCodepoint::Ce,
+            ) {
                 None
             } else {
                 let payload = allocate_payload_id(node.id, node_count, state.next_payload_seq)
@@ -2735,7 +2760,6 @@ impl<'image> TransitionState<'image> {
                     .sourced_packets
                     .checked_add(1)
                     .ok_or(ExecutionError::CounterOverflow(node.id))?;
-                receiver.last_cnp_time_ns = Some(event.key.time_ns);
                 let schedule_ready = state.in_service.is_none() && !state.tx_ready_pending;
                 if schedule_ready {
                     state.tx_ready_pending = true;
@@ -2804,19 +2828,37 @@ impl<'image> TransitionState<'image> {
                 .arrivals
                 .checked_add(1)
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
-            let FlowGeneratorKind::Dcqcn(mut dcqcn) = generator.kind else {
-                return Err(ExecutionError::UnknownGenerator {
-                    node: node.id,
-                    flow: packet.flow,
-                });
+            // A queue pair's reaction point is DCQCN's own; the rate change also moves its pacer's
+            // next-tick prediction.
+            let (before, after, applied) = match generator.kind {
+                FlowGeneratorKind::Dcqcn(mut dcqcn) => {
+                    let before = dcqcn.controller;
+                    let applied = dcqcn
+                        .controller
+                        .on_cnp(event.key.time_ns)
+                        .map_err(|_| ExecutionError::CounterOverflow(node.id))?;
+                    dcqcn.rate.rate_numerator_bits_per_second = dcqcn.controller.current_rate_bps;
+                    generator.kind = FlowGeneratorKind::Dcqcn(dcqcn);
+                    (before, dcqcn.controller, applied)
+                }
+                FlowGeneratorKind::Roce(mut roce) => {
+                    let before = roce.controller;
+                    let applied = roce
+                        .controller
+                        .on_cnp(event.key.time_ns)
+                        .map_err(|_| ExecutionError::CounterOverflow(node.id))?;
+                    settle_roce_sender(generator, &roce, generator.next_emission.status);
+                    generator.kind = FlowGeneratorKind::Roce(roce);
+                    (before, roce.controller, applied)
+                }
+                _ => {
+                    return Err(ExecutionError::UnknownGenerator {
+                        node: node.id,
+                        flow: packet.flow,
+                    });
+                }
             };
-            let before = dcqcn.controller;
-            let applied = dcqcn
-                .controller
-                .on_cnp(event.key.time_ns)
-                .map_err(|_| ExecutionError::CounterOverflow(node.id))?;
-            dcqcn.rate.rate_numerator_bits_per_second = dcqcn.controller.current_rate_bps;
-            let transition = crate::DcqcnTransitionRecord {
+            crate::DcqcnTransitionRecord {
                 key: event.key,
                 node: node.id,
                 flow: packet.flow,
@@ -2824,10 +2866,8 @@ impl<'image> TransitionState<'image> {
                 applied,
                 emitted_bytes: 0,
                 before,
-                after: dcqcn.controller,
-            };
-            generator.kind = FlowGeneratorKind::Dcqcn(dcqcn);
-            transition
+                after,
+            }
         };
         if self.observation_mode == ObservationMode::Full {
             self.mechanism_transitions
@@ -3200,6 +3240,14 @@ impl<'image> TransitionState<'image> {
                 break;
             }
         }
+        if timed_out.is_none()
+            && self
+                .packets
+                .get(&event.payload)
+                .is_some_and(|resident| resident.descriptor.kind == PacketKind::RocePacingTimer)
+        {
+            return self.host_roce_timeout(node, event, children);
+        }
         let Some((flow, sequence, transition)) = timed_out else {
             // Live-state contract (T20g item 2): execution removes a superseded timer event at
             // the transition that supersedes it, so this lazy recognition is unreachable for any
@@ -3227,6 +3275,10 @@ impl<'image> TransitionState<'image> {
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
         let packet = self.packet(event.payload)?;
+        // A queue pair's pacing token names its own transition: no generator scan is needed.
+        if packet.kind == PacketKind::RocePacingTimer {
+            return self.host_roce_pacing_timer(node, event, packet, children);
+        }
         let compute_stage_owns = {
             let (state, index) = self.host_parts_mut(node)?;
             index
@@ -3676,7 +3728,7 @@ impl<'image> TransitionState<'image> {
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
         let stop_time_ns = self.image.stop_time_ns;
-        let (transition, next_time_ns) = {
+        let (transition, next_time_ns, queue_pair) = {
             let state = self.host_state_mut(node)?;
             let generator = state
                 .generators
@@ -3686,22 +3738,38 @@ impl<'image> TransitionState<'image> {
                     node: node.id,
                     flow: packet.flow,
                 })?;
-            let FlowGeneratorKind::Dcqcn(mut dcqcn) = generator.kind else {
-                return Ok(());
+            let (control_payload, controller) = match generator.kind {
+                FlowGeneratorKind::Dcqcn(dcqcn) => (dcqcn.control_timer_payload, dcqcn.controller),
+                FlowGeneratorKind::Roce(roce) => (roce.control_timer_payload, roce.controller),
+                _ => return Ok(()),
             };
-            if dcqcn.control_timer_payload != packet.id
-                || dcqcn.controller.next_control_time_ns != event.key.time_ns
+            let queue_pair = matches!(generator.kind, FlowGeneratorKind::Roce(_));
+            if control_payload != packet.id || controller.next_control_time_ns != event.key.time_ns
             {
                 return Ok(());
             }
-            let before = dcqcn.controller;
-            let applied = dcqcn
-                .controller
+            let mut after = controller;
+            let applied = after
                 .on_control_timer(event.key.time_ns)
                 .map_err(|_| ExecutionError::CounterOverflow(node.id))?;
-            dcqcn.rate.rate_numerator_bits_per_second = dcqcn.controller.current_rate_bps;
-            let next_time_ns = (dcqcn.controller.next_control_time_ns <= stop_time_ns)
-                .then_some(dcqcn.controller.next_control_time_ns);
+            let mut next_time_ns =
+                (after.next_control_time_ns <= stop_time_ns).then_some(after.next_control_time_ns);
+            match &mut generator.kind {
+                FlowGeneratorKind::Dcqcn(dcqcn) => {
+                    dcqcn.controller = after;
+                    dcqcn.rate.rate_numerator_bits_per_second = after.current_rate_bps;
+                }
+                FlowGeneratorKind::Roce(roce) => {
+                    roce.controller = after;
+                    // Ruling D2: a completed queue pair's control tick applies and is not re-armed.
+                    if roce.snd_una >= roce.pacer.total_bytes {
+                        next_time_ns = None;
+                    }
+                    let roce = *roce;
+                    settle_roce_sender(generator, &roce, generator.next_emission.status);
+                }
+                _ => unreachable!("matched above"),
+            }
             let transition = crate::DcqcnTransitionRecord {
                 key: event.key,
                 node: node.id,
@@ -3709,11 +3777,10 @@ impl<'image> TransitionState<'image> {
                 kind: crate::DcqcnTransitionKind::Control,
                 applied,
                 emitted_bytes: 0,
-                before,
-                after: dcqcn.controller,
+                before: controller,
+                after,
             };
-            generator.kind = FlowGeneratorKind::Dcqcn(dcqcn);
-            (transition, next_time_ns)
+            (transition, next_time_ns, queue_pair)
         };
         if self.observation_mode == ObservationMode::Full {
             self.mechanism_transitions
@@ -3731,8 +3798,635 @@ impl<'image> TransitionState<'image> {
                 },
                 children,
             )?;
-        } else {
+        } else if !queue_pair {
+            // A queue pair's tokens stay resident for the life of the pair: they are part of
+            // its state, which a later NACK may need to restart, and of any resumed image.
             self.mark_terminal(packet.id)?;
+        }
+        Ok(())
+    }
+
+    /// A RoCE queue pair's pacing tick (design note §5, step 2): one tick of credit at the
+    /// controller's current rate; the packet at `next_psn`, a first transmission or a Go-back-N
+    /// retransmission, is sent when the credit covers it. The pacer re-arms one interval later
+    /// while packets remain, or parks.
+    fn host_roce_pacing_timer(
+        &mut self,
+        node: NodeDescriptor,
+        event: Event,
+        packet: PacketDescriptor,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
+        let now = event.key.time_ns;
+        let stop_time_ns = self.image.stop_time_ns;
+        let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
+        let unexpected = ExecutionError::UnexpectedGeneratorEmission {
+            node: node.id,
+            flow: packet.flow,
+            payload: event.payload,
+        };
+        let (emission, next_tick_ns, timer_ns, byte_transition, record) = {
+            let (mut state, index) = self.host_parts_mut(node)?;
+            let position = index.first_generator(packet.flow).ok_or(unexpected)?;
+            let generator = &mut state.generators[position];
+            let FlowGeneratorKind::Roce(mut roce) = generator.kind else {
+                return Err(unexpected);
+            };
+            if !roce.pacer_armed
+                || roce.pacing_timer_payload != event.payload
+                || generator.next_emission.departure_time_ns != now
+            {
+                return Err(unexpected);
+            }
+            let before = crate::roce::RoceSenderView::of(generator, &roce);
+            roce.pacer_armed = false;
+            let total = roce.pacer.total_bytes;
+            let mut rate_bps = None;
+            let mut emission = None;
+            let mut byte_transition = None;
+            let mut timer_ns = None;
+            let overflow = ExecutionError::CounterOverflow(node.id);
+            if roce.next_psn < total {
+                rate_bps = Some(roce.controller.current_rate_bps);
+                let scale = pacing_credit_scale(1).ok_or(overflow)?;
+                let tick = pacing_tick_credit(
+                    roce.controller.current_rate_bps,
+                    roce.pacer.pacing_interval_ns,
+                )
+                .ok_or(overflow)?;
+                roce.pacer.credit_quanta =
+                    roce.pacer.credit_quanta.checked_add(tick).ok_or(overflow)?;
+                let psn = roce.next_psn;
+                let size = crate::roce::packet_size(&roce, psn);
+                let cost = paced_packet_cost(size, scale).ok_or(overflow)?;
+                if roce.pacer.credit_quanta >= cost {
+                    roce.pacer.credit_quanta -= cost;
+                    let retransmission = psn < generator.bytes_emitted;
+                    let outstanding_before = roce.snd_una < generator.bytes_emitted;
+                    let payload = allocate_payload_id(node.id, node_count, *state.next_payload_seq)
+                        .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
+                    *state.next_payload_seq = state
+                        .next_payload_seq
+                        .checked_add(1)
+                        .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
+                    *state.sourced_packets =
+                        state.sourced_packets.checked_add(1).ok_or(overflow)?;
+                    let generator = &mut state.generators[position];
+                    roce.next_psn = psn + size;
+                    if !retransmission {
+                        // First transmissions only: the high-water mark, as TCP counts them.
+                        generator.bytes_emitted = roce.next_psn;
+                        generator.packets_emitted =
+                            generator.packets_emitted.checked_add(1).ok_or(overflow)?;
+                    }
+                    // Every transmitted byte, retransmissions included, feeds the byte counter.
+                    let controller_before = roce.controller;
+                    let applied = roce
+                        .controller
+                        .on_bytes_emitted(size)
+                        .map_err(|_| overflow)?;
+                    byte_transition = Some(crate::DcqcnTransitionRecord {
+                        key: event.key,
+                        node: node.id,
+                        flow: packet.flow,
+                        kind: crate::DcqcnTransitionKind::Bytes,
+                        applied,
+                        emitted_bytes: size,
+                        before: controller_before,
+                        after: roce.controller,
+                    });
+                    if roce.rto_ns != 0 && !outstanding_before {
+                        let deadline = now
+                            .checked_add(roce.rto_ns)
+                            .ok_or(ExecutionError::GeneratorTimeOverflow(packet.flow))?;
+                        roce.rto_deadline_ns = deadline;
+                        timer_ns = Some(deadline);
+                    }
+                    emission = Some(crate::RoceEmission {
+                        psn,
+                        bytes: size,
+                        retransmission,
+                        payload,
+                    });
+                }
+            }
+            let generator = &mut state.generators[position];
+            let parked_status = if roce.next_psn < total {
+                let next = now
+                    .checked_add(roce.pacer.pacing_interval_ns)
+                    .ok_or(ExecutionError::GeneratorTimeOverflow(packet.flow))?;
+                generator.next_emission.departure_time_ns = next;
+                if next <= stop_time_ns {
+                    roce.pacer_armed = true;
+                    GeneratorStatus::Blocked
+                } else {
+                    GeneratorStatus::Stopped
+                }
+            } else {
+                GeneratorStatus::Blocked
+            };
+            settle_roce_sender(generator, &roce, parked_status);
+            generator.kind = FlowGeneratorKind::Roce(roce);
+            let next_tick_ns = roce
+                .pacer_armed
+                .then_some(generator.next_emission.departure_time_ns);
+            let record = roce_sender_record(
+                event.key,
+                node.id,
+                packet.flow,
+                crate::RoceSenderKind::Tick,
+                &roce,
+                rate_bps,
+                None,
+                emission,
+                before,
+                crate::roce::RoceSenderView::of(generator, &roce),
+            );
+            (emission, next_tick_ns, timer_ns, byte_transition, record)
+        };
+        if self.observation_mode == ObservationMode::Full {
+            self.mechanism_transitions
+                .extend(byte_transition.map(crate::MechanismTransitionRecord::Dcqcn));
+            self.mechanism_transitions.push(record);
+        }
+        if let Some(time_ns) = next_tick_ns {
+            self.emit_from_host(
+                node,
+                event,
+                ChildEmission {
+                    target: node.id,
+                    kind: EventKind::PacingTimer,
+                    payload: event.payload,
+                    time_ns,
+                },
+                children,
+            )?;
+        }
+        if let Some(time_ns) = timer_ns {
+            self.emit_from_host(
+                node,
+                event,
+                ChildEmission {
+                    target: node.id,
+                    kind: EventKind::RetransmissionTimeout,
+                    payload: event.payload,
+                    time_ns,
+                },
+                children,
+            )?;
+        }
+        if let Some(emission) = emission {
+            let data = PacketDescriptor {
+                id: emission.payload,
+                flow: packet.flow,
+                size_bytes: emission.bytes,
+                ecn_marked: false,
+                kind: PacketKind::RoceData(crate::RoceDataHeader {
+                    psn: emission.psn,
+                    sent_time_ns: now,
+                    retransmission: emission.retransmission,
+                }),
+            };
+            self.insert_packet(data, Some(now))?;
+            self.enqueue_source_packet(node, data.id)?;
+            self.record_sourced(node.id, data)?;
+            self.schedule_host_ready(node, event, data.id, children)?;
+        }
+        Ok(())
+    }
+
+    /// A RoCE ACK or NACK at its queue pair's sender (design note §5, steps 4 and 5).
+    ///
+    /// A fresh ACK advances the cumulative acknowledgment; a NACK also rewinds `next_psn` to it
+    /// (Go-back-N). An ACK at or below the acknowledgment, or a NACK below it, is stale. Every
+    /// advance or rewind restarts the retransmission timeout (removing the superseded event in
+    /// this transition) while data stays outstanding, and a parked pacer with packets to send
+    /// again restarts on its next grid point.
+    #[allow(clippy::too_many_arguments)]
+    fn host_roce_feedback_arrival(
+        &mut self,
+        node: NodeDescriptor,
+        event: Event,
+        packet: PacketDescriptor,
+        header: crate::RoceAckHeader,
+        nack: bool,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
+        let flow = self.flow(packet.flow)?;
+        if flow.source != node.id {
+            return Err(ExecutionError::FlowRouteMiss {
+                flow: flow.id,
+                node: node.id,
+            });
+        }
+        self.record_arrival(node.id, packet, event.key, ArrivalDisposition::Feedback)?;
+        self.mark_terminal(packet.id)?;
+        let now = event.key.time_ns;
+        let stop_time_ns = self.image.stop_time_ns;
+        let (superseded_ns, timer_ns, tick_ns, token, record) = {
+            let (mut state, index) = self.host_parts_mut(node)?;
+            let position =
+                index
+                    .first_generator(packet.flow)
+                    .ok_or(ExecutionError::UnknownGenerator {
+                        node: node.id,
+                        flow: packet.flow,
+                    })?;
+            let generator = &mut state.generators[position];
+            let FlowGeneratorKind::Roce(mut roce) = generator.kind else {
+                return Err(ExecutionError::UnknownGenerator {
+                    node: node.id,
+                    flow: packet.flow,
+                });
+            };
+            generator.feedback.arrivals = generator
+                .feedback
+                .arrivals
+                .checked_add(1)
+                .ok_or(ExecutionError::CounterOverflow(node.id))?;
+            let before = crate::roce::RoceSenderView::of(generator, &roce);
+            let acknowledgment = header.acknowledgment;
+            if acknowledgment > generator.bytes_emitted {
+                return Err(ExecutionError::InconsistentRocePacket {
+                    flow: packet.flow,
+                    payload: packet.id,
+                });
+            }
+            let stale = if nack {
+                acknowledgment < roce.snd_una
+            } else {
+                acknowledgment <= roce.snd_una
+            };
+            let mut superseded_ns = None;
+            let mut timer_ns = None;
+            let mut tick_ns = None;
+            if !stale {
+                let outstanding_before = roce.snd_una < generator.bytes_emitted;
+                roce.snd_una = roce.snd_una.max(acknowledgment);
+                // After a spurious timeout an older copy can advance the acknowledgment past
+                // the rewound next PSN.
+                roce.next_psn = roce.next_psn.max(roce.snd_una);
+                if nack {
+                    roce.next_psn = roce.snd_una;
+                }
+                if roce.rto_ns != 0 {
+                    if outstanding_before {
+                        superseded_ns = Some(roce.rto_deadline_ns);
+                    }
+                    if roce.snd_una < generator.bytes_emitted {
+                        let deadline = now
+                            .checked_add(roce.rto_ns)
+                            .ok_or(ExecutionError::GeneratorTimeOverflow(packet.flow))?;
+                        roce.rto_deadline_ns = deadline;
+                        timer_ns = Some(deadline);
+                    } else {
+                        roce.rto_deadline_ns = 0;
+                    }
+                }
+                tick_ns = restart_roce_pacer(generator, &mut roce, now, stop_time_ns)?;
+            }
+            settle_roce_sender(generator, &roce, generator.next_emission.status);
+            generator.kind = FlowGeneratorKind::Roce(roce);
+            let record = roce_sender_record(
+                event.key,
+                node.id,
+                packet.flow,
+                if nack {
+                    crate::RoceSenderKind::Nack
+                } else {
+                    crate::RoceSenderKind::Ack
+                },
+                &roce,
+                None,
+                Some(acknowledgment),
+                None,
+                before,
+                crate::roce::RoceSenderView::of(generator, &roce),
+            );
+            (
+                superseded_ns,
+                timer_ns,
+                tick_ns,
+                roce.pacing_timer_payload,
+                record,
+            )
+        };
+        if let Some(deadline_ns) = superseded_ns {
+            self.superseded_timers.push(SupersededTimer {
+                target: node.id,
+                payload: token,
+                deadline_ns,
+            });
+        }
+        if self.observation_mode == ObservationMode::Full {
+            self.mechanism_transitions.push(record);
+        }
+        self.emit_roce_timers(node, event, token, tick_ns, timer_ns, children)
+    }
+
+    /// A RoCE queue pair's retransmission timeout (design note §5, step 6): Go-back-N rewinds to
+    /// the cumulative acknowledgment, the fixed timeout re-arms, and a parked pacer restarts.
+    fn host_roce_timeout(
+        &mut self,
+        node: NodeDescriptor,
+        event: Event,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
+        let flow = self.packet(event.payload)?.flow;
+        let now = event.key.time_ns;
+        let stop_time_ns = self.image.stop_time_ns;
+        let (timer_ns, tick_ns, record) = {
+            let (mut state, index) = self.host_parts_mut(node)?;
+            let position = index
+                .first_generator(flow)
+                .ok_or(ExecutionError::UnknownGenerator {
+                    node: node.id,
+                    flow,
+                })?;
+            let generator = &mut state.generators[position];
+            let FlowGeneratorKind::Roce(mut roce) = generator.kind else {
+                return Err(ExecutionError::UnknownGenerator {
+                    node: node.id,
+                    flow,
+                });
+            };
+            let armed = roce.rto_ns != 0
+                && roce.snd_una < generator.bytes_emitted
+                && roce.rto_deadline_ns == now
+                && roce.pacing_timer_payload == event.payload;
+            if !armed {
+                // Live-state contract (T20g item 2): a superseded timeout is removed by the
+                // transition that supersedes it, so only imported residue reaches this.
+                #[cfg(debug_assertions)]
+                debug_assert!(
+                    self.imported_event(event.key),
+                    "superseded RoCE retransmission timeout {:?} survived its disarm transition",
+                    event.key
+                );
+                return Ok(());
+            }
+            let before = crate::roce::RoceSenderView::of(generator, &roce);
+            roce.next_psn = roce.snd_una;
+            let deadline = now
+                .checked_add(roce.rto_ns)
+                .ok_or(ExecutionError::GeneratorTimeOverflow(flow))?;
+            roce.rto_deadline_ns = deadline;
+            let tick_ns = restart_roce_pacer(generator, &mut roce, now, stop_time_ns)?;
+            settle_roce_sender(generator, &roce, generator.next_emission.status);
+            generator.kind = FlowGeneratorKind::Roce(roce);
+            let record = roce_sender_record(
+                event.key,
+                node.id,
+                flow,
+                crate::RoceSenderKind::Timeout,
+                &roce,
+                None,
+                None,
+                None,
+                before,
+                crate::roce::RoceSenderView::of(generator, &roce),
+            );
+            (Some(deadline), tick_ns, record)
+        };
+        if self.observation_mode == ObservationMode::Full {
+            self.mechanism_transitions.push(record);
+        }
+        self.emit_roce_timers(node, event, event.payload, tick_ns, timer_ns, children)
+    }
+
+    /// Emits a queue pair's restarted pacing tick, then its re-armed timeout.
+    fn emit_roce_timers(
+        &mut self,
+        node: NodeDescriptor,
+        parent: Event,
+        token: PayloadId,
+        tick_ns: Option<u64>,
+        timer_ns: Option<u64>,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
+        for (kind, time_ns) in [
+            (EventKind::PacingTimer, tick_ns),
+            (EventKind::RetransmissionTimeout, timer_ns),
+        ] {
+            if let Some(time_ns) = time_ns {
+                self.emit_from_host(
+                    node,
+                    parent,
+                    ChildEmission {
+                        target: node.id,
+                        kind,
+                        payload: token,
+                        time_ns,
+                    },
+                    children,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A RoCE data packet at its queue pair's receiver (design note §5, step 9).
+    ///
+    /// The DCQCN notification point decides a CNP exactly as for a DCQCN flow; then the Go-back-N
+    /// receiver accepts the in-order packet, or drops the packet and answers it. The CNP is
+    /// allocated and enqueued before the ACK or NACK (ordering S1).
+    fn host_roce_data_arrival(
+        &mut self,
+        node: NodeDescriptor,
+        event: Event,
+        packet: PacketDescriptor,
+        header: crate::RoceDataHeader,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
+        let flow = self.flow(packet.flow)?;
+        if flow.target != node.id {
+            return Err(ExecutionError::FlowRouteMiss {
+                flow: flow.id,
+                node: node.id,
+            });
+        }
+        let now = event.key.time_ns;
+        let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
+        let congestion_experienced = packet.ecn_codepoint() == crate::EcnCodepoint::Ce;
+        let (cnp, feedback, schedule_ready, record) = {
+            let state = self.host_state_mut(node)?;
+            let unknown = ExecutionError::UnknownGenerator {
+                node: node.id,
+                flow: packet.flow,
+            };
+            let receivers = state.roce_receivers.as_deref_mut().ok_or(unknown)?;
+            let position = receivers
+                .binary_search_by_key(&packet.flow, |receiver| receiver.np.flow)
+                .map_err(|_| unknown)?;
+            let receiver = &mut receivers[position];
+            if header
+                .psn
+                .checked_add(packet.size_bytes)
+                .is_none_or(|end| end > receiver.total_bytes)
+            {
+                return Err(ExecutionError::InconsistentRocePacket {
+                    flow: packet.flow,
+                    payload: packet.id,
+                });
+            }
+            let before = crate::roce::RoceReceiverView::of(receiver);
+            let cnp_sent = crate::roce::notification_point_sends_cnp(
+                &mut receiver.np,
+                now,
+                congestion_experienced,
+            );
+            let action = crate::roce::receive(receiver, header.psn, packet.size_bytes, now);
+            let receiver = *receiver;
+            state.received_packets = state
+                .received_packets
+                .checked_add(1)
+                .ok_or(ExecutionError::CounterOverflow(node.id))?;
+            let mut allocate = || -> Result<PayloadId, ExecutionError> {
+                let payload = allocate_payload_id(node.id, node_count, state.next_payload_seq)
+                    .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
+                state.next_payload_seq = state
+                    .next_payload_seq
+                    .checked_add(1)
+                    .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
+                state.sourced_packets = state
+                    .sourced_packets
+                    .checked_add(1)
+                    .ok_or(ExecutionError::CounterOverflow(node.id))?;
+                Ok(payload)
+            };
+            let cnp = cnp_sent
+                .then(&mut allocate)
+                .transpose()?
+                .map(|payload| (payload, receiver.np.cnp_size_bytes));
+            let feedback = action
+                .sends_feedback()
+                .then(&mut allocate)
+                .transpose()?
+                .map(|payload| (payload, receiver.ack_size_bytes, action));
+            let schedule_ready = (cnp.is_some() || feedback.is_some())
+                && state.in_service.is_none()
+                && !state.tx_ready_pending;
+            if schedule_ready {
+                state.tx_ready_pending = true;
+            }
+            let record = crate::MechanismTransitionRecord::Roce(
+                crate::RoceTransitionRecord::Receiver(crate::RoceReceiverRecord {
+                    key: event.key,
+                    node: node.id,
+                    flow: packet.flow,
+                    total_bytes: receiver.total_bytes,
+                    ack_every_packets: receiver.ack_every_packets,
+                    nack_interval_ns: receiver.nack_interval_ns,
+                    duplicate_ack: receiver.duplicate_ack,
+                    ack_size_bytes: receiver.ack_size_bytes,
+                    cnp_interval_ns: receiver.np.cnp_interval_ns,
+                    packet_psn: header.psn,
+                    packet_bytes: packet.size_bytes,
+                    packet_sent_time_ns: header.sent_time_ns,
+                    packet_retransmission: header.retransmission,
+                    packet_ce: congestion_experienced,
+                    action,
+                    feedback_acknowledgment: feedback.map(|_| receiver.expected_psn),
+                    feedback_payload: feedback.map(|(payload, ..)| payload),
+                    cnp_payload: cnp.map(|(payload, _)| payload),
+                    before,
+                    after: crate::roce::RoceReceiverView::of(&receiver),
+                }),
+            );
+            (
+                cnp,
+                feedback.map(|feedback| (feedback, receiver.expected_psn)),
+                schedule_ready,
+                record,
+            )
+        };
+        self.record_arrival(node.id, packet, event.key, ArrivalDisposition::Delivered)?;
+        self.mark_terminal(packet.id)?;
+        if self.observation_mode == ObservationMode::Full {
+            self.mechanism_transitions.push(record);
+        }
+        let mut first = None;
+        if let Some((payload, size_bytes)) = cnp {
+            let cnp = PacketDescriptor {
+                id: payload,
+                flow: packet.flow,
+                size_bytes,
+                ecn_marked: false,
+                kind: PacketKind::DcqcnCnp(crate::DcqcnCnpHeader {
+                    trigger_payload: packet.id,
+                }),
+            };
+            self.insert_packet(cnp, Some(now))?;
+            self.enqueue_source_packet(node, payload)?;
+            self.record_sourced(node.id, cnp)?;
+            first.get_or_insert(payload);
+        }
+        if let Some(((payload, size_bytes, action), frontier)) = feedback {
+            let header = crate::RoceAckHeader {
+                acknowledgment: frontier,
+                echoed_sent_time_ns: header.sent_time_ns,
+                acknowledged_bytes: packet.size_bytes,
+            };
+            let reply = PacketDescriptor {
+                id: payload,
+                flow: packet.flow,
+                size_bytes,
+                ecn_marked: false,
+                kind: if action == crate::RoceReceiverAction::Nack {
+                    PacketKind::RoceNack(header)
+                } else {
+                    PacketKind::RoceAck(header)
+                },
+            };
+            self.insert_packet(reply, Some(now))?;
+            self.enqueue_source_packet(node, payload)?;
+            self.record_sourced(node.id, reply)?;
+            first.get_or_insert(payload);
+        }
+        if let (true, Some(payload)) = (schedule_ready, first) {
+            self.emit_from_host(
+                node,
+                event,
+                ChildEmission {
+                    target: node.id,
+                    kind: EventKind::TxReady,
+                    payload,
+                    time_ns: now,
+                },
+                children,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Owns a same-instant `TxReady` for `payload` when the host's egress is idle.
+    fn schedule_host_ready(
+        &mut self,
+        node: NodeDescriptor,
+        parent: Event,
+        payload: PayloadId,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
+        let ready = {
+            let state = self.host_state_mut(node)?;
+            let ready = state.in_service.is_none() && !state.tx_ready_pending;
+            if ready {
+                state.tx_ready_pending = true;
+            }
+            ready
+        };
+        if ready {
+            self.emit_from_host(
+                node,
+                parent,
+                ChildEmission {
+                    target: node.id,
+                    kind: EventKind::TxReady,
+                    payload,
+                    time_ns: parent.key.time_ns,
+                },
+                children,
+            )?;
         }
         Ok(())
     }
@@ -5557,6 +6251,80 @@ fn add_summary(total: &mut u128, value: u64, node: NodeId) -> Result<(), Executi
 /// Constant generators only record the arrival. TCP ACK processing calls this hook before its
 /// structured cumulative-ACK transition, then uses the caller's host-owned emission path to
 /// refill the congestion window without introducing a backend-specific event kind.
+/// Settles a queue pair's status and feedback mirrors after a transition (design note §5): the
+/// mirrors hold the outstanding bytes, as TCP's hold its bytes in flight.
+fn settle_roce_sender(
+    generator: &mut crate::FlowGeneratorState,
+    roce: &crate::RoceGenerator,
+    parked_status: GeneratorStatus,
+) {
+    generator.next_emission.status = crate::roce::settled_status(roce, parked_status);
+    let outstanding = generator.bytes_emitted - roce.snd_una;
+    generator.feedback.outstanding_bytes = outstanding;
+    generator.feedback.unacknowledged_bytes = outstanding;
+}
+
+/// Restarts a parked pacer that has packets to send again, on its next grid point after `now_ns`
+/// (ruling D3). Returns the tick to emit, or `None` when the pacer stays as it is; a restart
+/// beyond the stop time leaves it `Stopped` there.
+fn restart_roce_pacer(
+    generator: &mut crate::FlowGeneratorState,
+    roce: &mut crate::RoceGenerator,
+    now_ns: u64,
+    stop_time_ns: u64,
+) -> Result<Option<u64>, ExecutionError> {
+    if roce.pacer_armed
+        || roce.next_psn >= roce.pacer.total_bytes
+        || roce.snd_una >= roce.pacer.total_bytes
+    {
+        return Ok(None);
+    }
+    let time_ns = crate::roce::restart_time_ns(roce, now_ns)
+        .ok_or(ExecutionError::GeneratorTimeOverflow(generator.flow))?;
+    generator.next_emission.departure_time_ns = time_ns;
+    if time_ns <= stop_time_ns {
+        roce.pacer_armed = true;
+        Ok(Some(time_ns))
+    } else {
+        generator.next_emission.status = GeneratorStatus::Stopped;
+        Ok(None)
+    }
+}
+
+/// A queue-pair sender record of the pinned schema.
+#[allow(clippy::too_many_arguments)]
+fn roce_sender_record(
+    key: EventKey,
+    node: NodeId,
+    flow: FlowId,
+    kind: crate::RoceSenderKind,
+    roce: &crate::RoceGenerator,
+    rate_bps: Option<u64>,
+    input_acknowledgment: Option<u64>,
+    emitted: Option<crate::RoceEmission>,
+    before: crate::RoceSenderView,
+    after: crate::RoceSenderView,
+) -> crate::MechanismTransitionRecord {
+    crate::MechanismTransitionRecord::Roce(crate::RoceTransitionRecord::Sender(
+        crate::RoceSenderRecord {
+            key,
+            node,
+            flow,
+            kind,
+            mtu_bytes: roce.pacer.mtu_bytes,
+            total_bytes: roce.pacer.total_bytes,
+            pacing_interval_ns: roce.pacer.pacing_interval_ns,
+            first_pacing_time_ns: roce.pacer.first_pacing_time_ns,
+            rto_ns: roce.rto_ns,
+            rate_bps,
+            input_acknowledgment,
+            emitted,
+            before,
+            after,
+        },
+    ))
+}
+
 fn apply_generator_feedback(
     generator: &mut crate::FlowGeneratorState,
     node: NodeId,

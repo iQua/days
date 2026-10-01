@@ -12,8 +12,9 @@ use std::path::Path;
 
 use days::scenario::compile_config;
 use days_executor::{
-    CpuConfig, FlowGeneratorKind, GeneratorStatus, ObservationMode, PacketKind, RunResult,
-    SimulationImage, run_cpu_with_observations, run_scalar_with_observations,
+    CpuConfig, FlowGeneratorKind, GeneratorStatus, MechanismTransitionRecord, ObservationMode,
+    PacketKind, RoceSenderKind, RoceTransitionRecord, RunResult, SimulationImage,
+    run_cpu_with_observations, run_scalar_with_observations,
 };
 
 fn lower(name: &str) -> SimulationImage {
@@ -55,7 +56,9 @@ struct Contract {
     acks: usize,
     nacks: usize,
     cnps: usize,
-    pfc_frames: usize,
+    /// PFC pause and resume transitions (the frames are switch-sourced control, not observed).
+    pfc_controls: usize,
+    timeouts: usize,
     dropped: u128,
 }
 
@@ -64,7 +67,11 @@ fn contract(result: &RunResult) -> Contract {
         dropped: result.summary.dropped_packets,
         ..Contract::default()
     };
-    for generator in result.host_states.iter().flat_map(|state| &state.generators) {
+    for generator in result
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+    {
         if let FlowGeneratorKind::Roce(roce) = generator.kind {
             contract.queue_pairs += 1;
             if generator.next_emission.status == GeneratorStatus::Finished {
@@ -90,7 +97,22 @@ fn contract(result: &RunResult) -> Contract {
             PacketKind::RoceAck(_) => contract.acks += 1,
             PacketKind::RoceNack(_) => contract.nacks += 1,
             PacketKind::DcqcnCnp(_) => contract.cnps += 1,
-            PacketKind::Pfc(_) => contract.pfc_frames += 1,
+            _ => {}
+        }
+    }
+    for record in &result
+        .diagnostics
+        .as_ref()
+        .expect("full observation carries diagnostics")
+        .mechanism_transitions
+    {
+        match record {
+            MechanismTransitionRecord::PfcControl(_) => contract.pfc_controls += 1,
+            MechanismTransitionRecord::Roce(RoceTransitionRecord::Sender(sender))
+                if sender.kind == RoceSenderKind::Timeout =>
+            {
+                contract.timeouts += 1;
+            }
             _ => {}
         }
     }
@@ -106,12 +128,20 @@ fn lossless_pfc_completes_without_loss_or_recovery() {
     assert_eq!(contract.complete_receivers, 2, "{contract:?}");
     assert_eq!(contract.fresh_data, 400, "{contract:?}");
     assert_eq!(
-        (contract.dropped, contract.nacks, contract.retransmissions),
-        (0, 0, 0),
+        (
+            contract.dropped,
+            contract.nacks,
+            contract.retransmissions,
+            contract.timeouts
+        ),
+        (0, 0, 0, 0),
         "{contract:?}"
     );
-    assert!(contract.acks >= 400, "{contract:?}");
-    assert!(contract.pfc_frames > 0, "{contract:?}");
+    assert_eq!(
+        contract.acks, 400,
+        "one ACK per in-order packet: {contract:?}"
+    );
+    assert!(contract.pfc_controls > 0, "{contract:?}");
 }
 
 #[test]
@@ -129,8 +159,13 @@ fn lossy_go_back_n_recovers_every_loss_by_nack() {
 fn timeout_arm_completes_through_retransmission_timeouts() {
     let result = run_identical("roce_timeout.toml");
     let contract = contract(&result);
-    assert_eq!(contract.finished_pairs, 2, "{contract:?}");
-    assert!(contract.dropped > 0, "{contract:?}");
+    assert_eq!(
+        (contract.queue_pairs, contract.finished_pairs),
+        (1, 1),
+        "{contract:?}"
+    );
+    assert!(contract.timeouts > 0, "{contract:?}");
+    assert!(contract.nacks > 0, "{contract:?}");
     assert!(contract.retransmissions > 0, "{contract:?}");
 }
 
@@ -139,6 +174,7 @@ fn nack_only_profile_has_no_timeout_and_can_stall() {
     let result = run_identical("roce_nack_only.toml");
     let contract = contract(&result);
     assert!(contract.nacks > 0, "{contract:?}");
+    assert_eq!(contract.timeouts, 0, "{contract:?}");
     assert!(
         result
             .pending_events
@@ -146,10 +182,28 @@ fn nack_only_profile_has_no_timeout_and_can_stall() {
             .all(|event| event.kind != days_executor::EventKind::RetransmissionTimeout),
         "the timeout is off"
     );
-    assert!(
-        contract.finished_pairs < contract.queue_pairs,
-        "a tail loss stalls a queue pair with the timeout off: {contract:?}"
+    // roce_timeout.toml is this scenario with the timeout on, and completes.
+    assert_eq!(
+        (
+            contract.queue_pairs,
+            contract.finished_pairs,
+            contract.complete_receivers
+        ),
+        (1, 0, 0),
+        "with the timeout off an unrepaired loss stalls the queue pair: {contract:?}"
     );
+    let stalled = result
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .find_map(|generator| match generator.kind {
+            FlowGeneratorKind::Roce(roce) => Some((generator.next_emission.status, roce)),
+            _ => None,
+        })
+        .expect("the fixture has a queue pair");
+    assert_eq!(stalled.0, GeneratorStatus::Blocked);
+    assert!(!stalled.1.pacer_armed, "the stalled pair's pacer is parked");
+    assert!(stalled.1.snd_una < stalled.1.pacer.total_bytes);
 }
 
 #[test]
@@ -158,7 +212,7 @@ fn cnps_under_pfc_complete_every_queue_pair() {
     let contract = contract(&result);
     assert_eq!(contract.finished_pairs, 4, "{contract:?}");
     assert!(contract.cnps > 0, "{contract:?}");
-    assert!(contract.pfc_frames > 0, "{contract:?}");
+    assert!(contract.pfc_controls > 0, "{contract:?}");
     assert_eq!(contract.dropped, 0, "{contract:?}");
 }
 

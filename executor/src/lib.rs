@@ -33,6 +33,7 @@ pub mod metal;
 pub mod model;
 #[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 mod planner_capacity;
+mod roce;
 pub mod safe_horizon;
 pub mod scalar;
 mod stage_index;
@@ -99,7 +100,7 @@ pub use mechanism_trace::{
     PfcOccupancyAction, PfcThresholdTransitionRecord, RateReplayConfig, RateReplayState,
     RateTransitionRecord, SchedulerPacket, WrrTransitionRecord, collective_transitions_csv,
     dcqcn_transitions_csv, drr_transitions_csv, pfc_transitions_csv, rate_transitions_csv,
-    wrr_transitions_csv,
+    roce_receiver_transitions_csv, roce_sender_transitions_csv, wrr_transitions_csv,
 };
 #[cfg(all(
     feature = "metal",
@@ -129,6 +130,10 @@ pub use model::{
     DropMarkPolicy, DrrSchedulerState, EcnThresholdPolicy, ExactRational, NodeKind, QueueDepthUnit,
     RedPolicyState, SchedulerKind, TransitionHandler, WfqSchedulerState, WrrSchedulerState,
     resolve_transition,
+};
+pub use roce::{
+    RoceEmission, RocePacerState, RoceReceiverAction, RoceReceiverRecord, RoceReceiverView,
+    RoceSenderKind, RoceSenderRecord, RoceSenderView, RoceTransitionRecord,
 };
 pub use safe_horizon::{
     LpRoundWork, RoundMetrics, ScalarRoundRun, run_scalar_rounds,

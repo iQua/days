@@ -148,7 +148,7 @@ fn every_p15_fixture_lowers_to_queue_pairs_with_receivers_and_two_tokens() {
 fn queue_pair_keys_lower_with_their_defaults_and_the_hpcc_profile() {
     let lossless = lower_fixture("roce_lossless_pfc.toml");
     let (flow, roce) = queue_pairs(&lossless)[0];
-    assert_eq!(roce.rto_ns, 200_000);
+    assert_eq!(roce.rto_ns, 1_000_000);
     assert_eq!(roce.pacer.mtu_bytes, 1_000);
     assert_eq!(roce.pacer.total_bytes, 200_000);
     assert_eq!(roce.pacer.pacing_interval_ns, 1_000);
@@ -212,12 +212,12 @@ fn queue_pair_options_are_refused_where_they_do_not_apply() {
         );
     };
     refused(
-        base.replace("retransmit_timeout_ns = 200000\n", ""),
+        base.replace("retransmit_timeout_ns = 1000000\n", ""),
         "retransmit_timeout_ns",
     );
     refused(
         base.replacen("[flow.traffic.roce]\n", "", 1).replacen(
-            "retransmit_timeout_ns = 200000\n",
+            "retransmit_timeout_ns = 1000000\n",
             "",
             1,
         ),
@@ -225,32 +225,32 @@ fn queue_pair_options_are_refused_where_they_do_not_apply() {
     );
     refused(
         base.replacen(
-            "retransmit_timeout_ns = 200000\n",
-            "retransmit_timeout_ns = 200000\nack_every_packets = 0\n",
+            "retransmit_timeout_ns = 1000000\n",
+            "retransmit_timeout_ns = 1000000\nack_every_packets = 0\n",
             1,
         ),
         "ack_every_packets",
     );
     refused(
         base.replacen(
-            "retransmit_timeout_ns = 200000\n",
-            "retransmit_timeout_ns = 200000\nack_size_bytes = 0\n",
+            "retransmit_timeout_ns = 1000000\n",
+            "retransmit_timeout_ns = 1000000\nack_size_bytes = 0\n",
             1,
         ),
         "ack_size_bytes",
     );
     refused(
         base.replacen(
-            "retransmit_timeout_ns = 200000\n",
-            "retransmit_timeout_ns = 200000\nduplicate_ack = false\n",
+            "retransmit_timeout_ns = 1000000\n",
+            "retransmit_timeout_ns = 1000000\nduplicate_ack = false\n",
             1,
         ),
         "duplicate_ack",
     );
     refused(
         base.replacen(
-            "retransmit_timeout_ns = 200000\n",
-            "retransmit_timeout_ns = 200000\nfeedback_priority = 8\n",
+            "retransmit_timeout_ns = 1000000\n",
+            "retransmit_timeout_ns = 1000000\nfeedback_priority = 8\n",
             1,
         ),
         "feedback_priority",
@@ -286,7 +286,7 @@ fn the_rto_off_profile_lowers_only_explicitly() {
     let directory = TempDir::new().unwrap();
     let base = lossless_text();
     let off = base.replace(
-        "retransmit_timeout_ns = 200000\n",
+        "retransmit_timeout_ns = 1000000\n",
         "retransmit_timeout_ns = 0\nduplicate_ack = false\n",
     );
     let image = compile_config(write(&directory, "off.toml", &off)).expect("RTO off lowers");
@@ -314,8 +314,8 @@ fn queue_pair_identity_does_not_depend_on_file_order() {
         .collect::<Vec<_>>();
     assert_eq!(blocks.len(), 2);
     blocks[1] = blocks[1].replace(
-        "retransmit_timeout_ns = 200000",
-        "retransmit_timeout_ns = 300000",
+        "retransmit_timeout_ns = 1000000",
+        "retransmit_timeout_ns = 3000000",
     );
     let forward = format!("{header}{}{}", blocks[0], blocks[1]);
     let reversed = format!("{header}{}{}", blocks[1], blocks[0]);
