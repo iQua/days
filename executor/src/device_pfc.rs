@@ -35,21 +35,22 @@ use crate::{NodeId, NodeKind, PfcQueueState, SimulationImage, SwitchQueueState};
 
 pub(crate) const NONE: u64 = u64::MAX;
 
-#[cfg(feature = "planner-test-hooks")]
+#[cfg(all(feature = "cuda", feature = "planner-test-hooks"))]
 std::thread_local! {
     /// Test-only: whole-fabric PFC-state scans on this thread ([`image_has_pfc`] and
-    /// [`pfc_control_lane_producers`]). Per thread, so parallel tests never share it.
+    /// [`pfc_control_lane_producers`]). Per thread, so parallel tests never share it. Its only
+    /// reader is the CUDA planner hook, so it exists only in CUDA builds with planner test hooks.
     static PFC_STATE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Test-only: counts one whole-fabric PFC-state scan on this thread.
 fn count_pfc_state_scan() {
-    #[cfg(feature = "planner-test-hooks")]
+    #[cfg(all(feature = "cuda", feature = "planner-test-hooks"))]
     PFC_STATE_SCANS.with(|scans| scans.set(scans.get() + 1));
 }
 
 /// Test-only: returns this thread's PFC-state scan count and resets it to zero.
-#[cfg(feature = "planner-test-hooks")]
+#[cfg(all(feature = "cuda", feature = "planner-test-hooks"))]
 pub(crate) fn take_pfc_state_scans_for_testing() -> usize {
     PFC_STATE_SCANS.with(|scans| scans.replace(0))
 }
