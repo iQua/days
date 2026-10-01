@@ -45,6 +45,13 @@ pub struct HostState {
     pub tcp_receivers: Vec<TcpReceiverState>,
     /// Target-owned DCQCN CNP interval state in canonical `FlowId` order.
     pub dcqcn_receivers: Vec<DcqcnReceiverState>,
+    /// Target-owned RoCE queue-pair receivers in canonical `FlowId` order, or `None` on a host
+    /// that receives no queue pair.
+    ///
+    /// Receivers are fixed at lowering, so a boxed slice holds them: a host without one pays the
+    /// 16-B pointer and no allocation, and a host with any pays one allocation. `validate` refuses
+    /// `Some` of an empty slice, so `None` is the only empty shape.
+    pub roce_receivers: Option<Box<[RoceReceiverState]>>,
     pub next_origin_seq: u64,
     /// Per-node packet identity cursor. Every generated packet consumes one sequence value.
     pub next_payload_seq: u64,
@@ -176,6 +183,10 @@ impl fmt::Debug for HostState {
         if !self.dcqcn_receivers.is_empty() {
             debug.field("dcqcn_receivers", &self.dcqcn_receivers);
         }
+        // Omitting the absent additive field preserves every frozen pre-P15 image byte.
+        if let Some(receivers) = &self.roce_receivers {
+            debug.field("roce_receivers", receivers);
+        }
         debug
             .field("next_origin_seq", &self.next_origin_seq)
             .field("next_payload_seq", &self.next_payload_seq)
@@ -282,6 +293,11 @@ pub struct FlowDescriptor {
     pub target: NodeId,
     /// IEEE 802.1Q priority code point used by link-level eligibility mechanisms.
     pub priority: u8,
+    /// Priority code point of the flow's receiver feedback: DCQCN CNPs and RoCE ACKs and NACKs.
+    ///
+    /// Equal to `priority` unless a DCQCN or RoCE flow names another class; every other packet of
+    /// the flow, TCP ACKs included, uses `priority` (see [`Self::packet_priority`]).
+    pub feedback_priority: u8,
     /// Canonical data-packet route from source to target.
     pub route: Vec<LinkId>,
     /// Canonical feedback-packet route from target back to source.
@@ -298,10 +314,32 @@ impl fmt::Debug for FlowDescriptor {
         if self.priority != 0 {
             debug.field("priority", &self.priority);
         }
+        // Omitting the default preserves every frozen pre-P15 image byte.
+        if self.feedback_priority != self.priority {
+            debug.field("feedback_priority", &self.feedback_priority);
+        }
         debug
             .field("route", &self.route)
             .field("reverse_route", &self.reverse_route)
             .finish()
+    }
+}
+
+impl FlowDescriptor {
+    /// The PFC priority class of a packet of this flow.
+    ///
+    /// Receiver feedback (a DCQCN CNP, a RoCE ACK or NACK) rides `feedback_priority`; every other
+    /// packet rides `priority`. Derived from the flow and the packet kind, so no packet carries a
+    /// priority field. Called on every PFC-monitored switch arrival and service decision, so it
+    /// must inline (`scalar::tests` pins the attribute).
+    #[inline(always)]
+    pub const fn packet_priority(&self, kind: PacketKind) -> u8 {
+        match kind {
+            PacketKind::DcqcnCnp(_) | PacketKind::RoceAck(_) | PacketKind::RoceNack(_) => {
+                self.feedback_priority
+            }
+            _ => self.priority,
+        }
     }
 }
 
@@ -481,6 +519,7 @@ pub enum FlowGeneratorKind {
     Tcp(TcpGenerator),
     Rate(RateGenerator),
     Dcqcn(DcqcnGenerator),
+    Roce(RoceGenerator),
 }
 
 /// Exact rational rate source paced by the M3 fallback-heap timer.
@@ -509,6 +548,54 @@ pub struct DcqcnGenerator {
     /// Stable zero-byte token referenced by the second live `PacingTimer` event.
     pub control_timer_payload: PayloadId,
     pub cnp_size_bytes: u64,
+}
+
+/// Exact credit pacer of a RoCE queue pair, on the arithmetic of the DCQCN pacer.
+///
+/// One tick every `pacing_interval_ns` on the grid anchored at `first_pacing_time_ns` adds
+/// `controller.current_rate_bps * pacing_interval_ns` quanta; a packet of `size` bytes costs
+/// `size * 8 * 10^9` quanta (the DCQCN pacer's `rate_denominator` is always one). The DCQCN
+/// pacer's write-only rate mirror and its constant denominator are not stored.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RocePacer {
+    pub first_pacing_time_ns: u64,
+    pub pacing_interval_ns: u64,
+    /// The packet size of every packet but a short last one.
+    pub mtu_bytes: u64,
+    pub total_bytes: u64,
+    pub credit_quanta: u128,
+}
+
+/// A RoCE queue pair: a reliable DCQCN flow with Go-back-N.
+///
+/// The exact DCQCN reaction point (`controller`, its control tick and the separate CNP packet)
+/// paces a Go-back-N sender. A PSN is the byte offset of a packet's first byte, and packet `psn`
+/// is `min(mtu_bytes, total_bytes - psn)` bytes, so a retransmission is a pure function of its
+/// PSN and no segment ledger exists. The high-water mark is `FlowGeneratorState::bytes_emitted`,
+/// which counts first transmissions only, as TCP's does.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RoceGenerator {
+    pub pacer: RocePacer,
+    pub controller: DcqcnController,
+    /// Stable zero-byte token of the control tick (`PacketKind::DcqcnControlTimer`).
+    pub control_timer_payload: PayloadId,
+    /// Stable zero-byte token of the pacing tick and the retransmission timeout
+    /// (`PacketKind::RocePacingTimer`).
+    pub pacing_timer_payload: PayloadId,
+    /// PSN of the next packet the pacer sends.
+    pub next_psn: u64,
+    /// Cumulative acknowledgment: every byte below it is acknowledged.
+    pub snd_una: u64,
+    /// Deadline of the armed retransmission timeout; meaningful only while `rto_ns != 0` and
+    /// `snd_una < bytes_emitted`, and zero otherwise.
+    pub rto_deadline_ns: u64,
+    /// Fixed retransmission timeout (no backoff); zero turns the timeout off, so only a NACK
+    /// recovers a loss and a lost last packet stalls the queue pair for the rest of the run.
+    pub rto_ns: u64,
+    /// Whether exactly one pacing tick is pending. A parked pacer has none.
+    pub pacer_armed: bool,
 }
 
 /// Fixed-width result of routing an ordinary feedback packet into a source generator.
@@ -643,6 +730,38 @@ pub struct DcqcnReceiverState {
     pub last_cnp_time_ns: Option<u64>,
 }
 
+/// The last NACK a RoCE receiver sent: the expected PSN it carried and when.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RoceNackMark {
+    pub expected_psn: u64,
+    pub time_ns: u64,
+}
+
+/// Target-owned state of one RoCE queue pair: the DCQCN notification point and the Go-back-N
+/// receiver.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RoceReceiverState {
+    /// The DCQCN notification point, exactly as a DCQCN flow's receiver holds it.
+    pub np: DcqcnReceiverState,
+    pub total_bytes: u64,
+    /// The in-order frontier: every byte below it has arrived in order.
+    pub expected_psn: u64,
+    /// In-order packets per cumulative ACK; at least one.
+    pub ack_every_packets: u64,
+    /// In-order packets since the last ACK or NACK.
+    pub packets_since_ack: u64,
+    /// Wire size of an ACK or NACK.
+    pub ack_size_bytes: u64,
+    /// Minimum spacing of two NACKs for the same expected PSN.
+    pub nack_interval_ns: u64,
+    pub last_nack: Option<RoceNackMark>,
+    /// Whether a packet below the frontier elicits a cumulative ACK; `false` only with the
+    /// sender's retransmission timeout off.
+    pub duplicate_ack: bool,
+}
+
 /// Immutable per-packet data referenced by a persistent event payload.
 ///
 /// Lowered images retain only the first scheduled packet for each active flow. Later records are
@@ -715,6 +834,26 @@ pub struct TcpAckHeader {
     pub echoed_sent_time_ns: u64,
 }
 
+/// RoCE queue-pair data metadata independent of the transmission-attempt `PayloadId`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RoceDataHeader {
+    /// Byte offset of the packet's first byte.
+    pub psn: u64,
+    pub sent_time_ns: u64,
+    pub retransmission: bool,
+}
+
+/// RoCE cumulative ACK or NACK metadata: the receiver's in-order frontier, and the send time and
+/// size of the data packet that triggered it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RoceAckHeader {
+    pub acknowledgment: u64,
+    pub echoed_sent_time_ns: u64,
+    pub acknowledged_bytes: u64,
+}
+
 /// Closed packet direction used to route ordinary data and feedback packets.
 #[repr(C, u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -727,18 +866,35 @@ pub enum PacketKind {
     DcqcnCnp(DcqcnCnpHeader) = 5,
     /// A source-local zero-byte token. It is never enqueued or transmitted.
     DcqcnControlTimer = 6,
+    RoceData(RoceDataHeader) = 7,
+    RoceAck(RoceAckHeader) = 8,
+    /// A cumulative NACK: `acknowledgment` is the expected PSN the sender rewinds to.
+    RoceNack(RoceAckHeader) = 9,
+    /// A source-local zero-byte token of a RoCE pacer. It is never enqueued or transmitted.
+    RocePacingTimer = 10,
 }
 
 impl PacketKind {
     pub const fn is_data(self) -> bool {
-        matches!(self, Self::Data | Self::TcpData(_))
+        matches!(self, Self::Data | Self::TcpData(_) | Self::RoceData(_))
     }
 
     pub const fn is_feedback(self) -> bool {
         matches!(
             self,
-            Self::Feedback | Self::TcpAck(_) | Self::Pfc(_) | Self::DcqcnCnp(_)
+            Self::Feedback
+                | Self::TcpAck(_)
+                | Self::Pfc(_)
+                | Self::DcqcnCnp(_)
+                | Self::RoceAck(_)
+                | Self::RoceNack(_)
         )
+    }
+
+    /// A zero-byte source-local timer token (a DCQCN or RoCE control tick, a RoCE pacing tick):
+    /// never enqueued, transmitted or delivered.
+    pub const fn is_timer_token(self) -> bool {
+        matches!(self, Self::DcqcnControlTimer | Self::RocePacingTimer)
     }
 
     pub const fn code(self) -> u8 {
@@ -750,6 +906,10 @@ impl PacketKind {
             Self::Pfc(_) => 4,
             Self::DcqcnCnp(_) => 5,
             Self::DcqcnControlTimer => 6,
+            Self::RoceData(_) => 7,
+            Self::RoceAck(_) => 8,
+            Self::RoceNack(_) => 9,
+            Self::RocePacingTimer => 10,
         }
     }
 }
@@ -859,7 +1019,52 @@ pub struct SimulationImage {
 
 #[cfg(test)]
 mod tests {
-    use super::FlowGeneratorState;
+    use super::{
+        FlowDescriptor, FlowGeneratorState, HostState, PacketKind, RoceGenerator, RoceReceiverState,
+    };
+
+    /// P15: `FlowDescriptor::packet_priority` runs on every PFC-monitored switch arrival and
+    /// service decision (five Scalar sites), so it stays force-inlined, as the CUDA readback
+    /// decoders are after P14 lost 25 ms at E6 60% to an out-of-line decode
+    /// (`days-gpu/evidence/P14/cuda-host.md`).
+    #[test]
+    fn packet_priority_is_force_inlined() {
+        let source = include_str!("image.rs");
+        assert!(
+            source.contains("#[inline(always)]\n    pub const fn packet_priority("),
+            "`FlowDescriptor::packet_priority` must be #[inline(always)]"
+        );
+    }
+
+    /// P15 queue-pair layout budgets. A RoCE queue pair is a variant of `FlowGeneratorKind`, whose
+    /// union is 256 B (`TcpGenerator`, 248 B, rounded to the 16-byte alignment of the `u128`
+    /// pacing credit): the queue pair must fit it, or every flow's generator grows by 16 B. Its
+    /// receiver lives in the host's boxed `roce_receivers` slice, which costs a host without one
+    /// the 16-B pointer (200 B at `main` 4174d8a, 216 B now) and no allocation. The flow's
+    /// feedback priority uses padding after `priority`, and every new packet header fits the
+    /// 24 B the TCP headers already reserve. Layout is the compiler's choice, so these are upper
+    /// bounds on 64-bit targets.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn roce_queue_pairs_grow_no_per_flow_record() {
+        let checks = [
+            ("RoceGenerator", std::mem::size_of::<RoceGenerator>(), 256),
+            ("FlowDescriptor", std::mem::size_of::<FlowDescriptor>(), 80),
+            ("HostState", std::mem::size_of::<HostState>(), 216),
+            (
+                "RoceReceiverState",
+                std::mem::size_of::<RoceReceiverState>(),
+                120,
+            ),
+            ("PacketKind", std::mem::size_of::<PacketKind>(), 32),
+        ];
+        for (name, size, bound) in checks {
+            assert!(
+                size <= bound,
+                "{name} grew to {size} B, above its {bound} B budget"
+            );
+        }
+    }
 
     /// `FlowGeneratorState` is held once per flow in the image and in every Scalar and CPU host
     /// state, so each byte is a per-flow cost at lowering and at run time: at the 262,144-flow

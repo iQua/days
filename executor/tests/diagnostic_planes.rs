@@ -21,6 +21,7 @@ fn empty_image() -> SimulationImage {
             stages: Vec::new(),
             tcp_receivers: Vec::new(),
             dcqcn_receivers: Vec::new(),
+            roce_receivers: None,
             next_payload_seq: 0,
             next_origin_seq: 0,
             sourced_packets: 0,

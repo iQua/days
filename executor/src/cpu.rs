@@ -3276,7 +3276,20 @@ fn build_lps<'image>(
             packets[lp_slot].insert(payload, descriptor);
         }
     }
+    // Built once, and only for an image that holds a timer token.
+    let mut queue_pair_token_owners = None;
     for descriptor in image.initial_packets.iter().copied() {
+        // P15: a RoCE queue pair's two timer tokens are part of the pair's state for the whole
+        // run (a parked pacer restarts on a later NACK), so they stay resident and pinned on the
+        // source LP whether or not a pending event names them, as Scalar keeps them.
+        if descriptor.kind.is_timer_token() {
+            let owners = queue_pair_token_owners.get_or_insert_with(|| queue_pair_tokens(image));
+            if let Some(&lp_slot) = owners.get(&descriptor.id) {
+                packets[lp_slot].insert(descriptor.id, descriptor);
+                pinned_packets[lp_slot].insert(descriptor.id);
+                continue;
+            }
+        }
         if matches!(descriptor.kind, crate::PacketKind::TcpData(_)) {
             let flow = image
                 .flows
@@ -3456,6 +3469,7 @@ fn route_offered_load(image: &SimulationImage) -> Vec<u128> {
             }
             FlowGeneratorKind::Rate(rate) => rate.pacing_interval_ns,
             FlowGeneratorKind::Dcqcn(dcqcn) => dcqcn.rate.pacing_interval_ns,
+            FlowGeneratorKind::Roce(roce) => roce.pacer.pacing_interval_ns,
         };
         let Ok(flow_slot) = usize::try_from(generator.flow.0) else {
             continue;
@@ -3614,6 +3628,29 @@ fn assemble_result(
         }),
         pending_events,
     })
+}
+
+/// Every RoCE queue pair's pacing and control tokens, with the LP slot of the pair's source.
+fn queue_pair_tokens(image: &SimulationImage) -> BTreeMap<PayloadId, usize> {
+    let mut tokens = BTreeMap::new();
+    for owner in &image.nodes {
+        if owner.kind != NodeKind::Host {
+            continue;
+        }
+        let (Some(state), Some(lp_slot)) = (
+            image.host_states.get(owner.state_slot as usize),
+            node_slot(image, owner.id),
+        ) else {
+            continue;
+        };
+        for generator in state.generators.iter() {
+            if let crate::FlowGeneratorKind::Roce(roce) = generator.kind {
+                tokens.insert(roce.pacing_timer_payload, lp_slot);
+                tokens.insert(roce.control_timer_payload, lp_slot);
+            }
+        }
+    }
+    tokens
 }
 
 fn add_state_payloads(local: &LocalTransitionResult, referenced: &mut BTreeSet<PayloadId>) {
@@ -4203,6 +4240,7 @@ fn target_interleaved_outbox_image() -> SimulationImage {
                 stages: Vec::new(),
                 tcp_receivers: vec![],
                 dcqcn_receivers: vec![],
+                roce_receivers: None,
                 next_origin_seq: 3,
                 next_payload_seq: 3,
                 sourced_packets: 0,
@@ -4218,6 +4256,7 @@ fn target_interleaved_outbox_image() -> SimulationImage {
                 stages: Vec::new(),
                 tcp_receivers: vec![],
                 dcqcn_receivers: vec![],
+                roce_receivers: None,
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -4233,6 +4272,7 @@ fn target_interleaved_outbox_image() -> SimulationImage {
                 stages: Vec::new(),
                 tcp_receivers: vec![],
                 dcqcn_receivers: vec![],
+                roce_receivers: None,
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -4282,6 +4322,7 @@ fn target_interleaved_outbox_image() -> SimulationImage {
                 source: NodeId(0),
                 target: NodeId(4),
                 priority: 0,
+                feedback_priority: 0,
                 route: vec![source_link.id, higher_port_link.id],
                 reverse_route: vec![],
             },
@@ -4290,6 +4331,7 @@ fn target_interleaved_outbox_image() -> SimulationImage {
                 source: NodeId(0),
                 target: NodeId(3),
                 priority: 0,
+                feedback_priority: 0,
                 route: vec![source_link.id, lower_port_link.id],
                 reverse_route: vec![],
             },
@@ -4298,6 +4340,7 @@ fn target_interleaved_outbox_image() -> SimulationImage {
                 source: NodeId(0),
                 target: NodeId(4),
                 priority: 0,
+                feedback_priority: 0,
                 route: vec![source_link.id, higher_port_link.id],
                 reverse_route: vec![],
             },

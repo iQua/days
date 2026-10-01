@@ -214,6 +214,13 @@ const STAGE_PATH_FUNCTIONS: &[&str] = &[
     "host_pacing_timer",
     "prepare_tcp_attempts",
     "install_tcp_attempts",
+    // P15: DCQCN and RoCE queue-pair transitions, keyed through the same counted view; a host can
+    // hold many queue pairs (collective stages over RoCE follow in a later lane).
+    "host_dcqcn_cnp_arrival",
+    "host_dcqcn_control_timer",
+    "host_roce_pacing_timer",
+    "host_roce_feedback_arrival",
+    "host_roce_timeout",
 ];
 
 /// The only functions of `executor/src/scalar.rs` that may scan a host's generator or TCP-receiver
@@ -229,15 +236,7 @@ const SCALAR_TABLE_SCANNERS: &[AllowedTableScanner] = &[
         reason: "runs per timeout firing and matches by timer identity, not flow; keying it needs a timer map refreshed at every active_timer store",
     },
     AllowedTableScanner {
-        scope: "host_dcqcn_cnp_arrival",
-        reason: "DCQCN only; DCQCN flows cannot be stages (collectives lower only over TCP)",
-    },
-    AllowedTableScanner {
         scope: "host_dcqcn_pacing_timer",
-        reason: "DCQCN only; DCQCN flows cannot be stages (collectives lower only over TCP)",
-    },
-    AllowedTableScanner {
-        scope: "host_dcqcn_control_timer",
         reason: "DCQCN only; DCQCN flows cannot be stages (collectives lower only over TCP)",
     },
 ];
@@ -253,6 +252,10 @@ const CPU_TABLE_SCANNERS: &[AllowedTableScanner] = &[
     AllowedTableScanner {
         scope: "route_load_estimator_uses_only_declared_routes_and_generator_rates",
         reason: "unit test that installs a fixture generator table",
+    },
+    AllowedTableScanner {
+        scope: "queue_pair_tokens",
+        reason: "once per CPU run when the image holds a timer token, at pool build: maps every RoCE queue pair's two tokens to its source LP, so token import is keyed",
     },
 ];
 

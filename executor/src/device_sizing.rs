@@ -860,19 +860,36 @@ impl CapacityContext {
                             generator_intervals[index].push(dcqcn.rate.pacing_interval_ns);
                         }
                     }
+                    // Device backends refuse RoCE queue pairs at validation; these sizes keep a
+                    // direct sizing request conservative. A retransmission may resend any packet
+                    // from the cumulative acknowledgment on, and feedback is an ACK, NACK or CNP.
+                    FlowGeneratorKind::Roce(roce) => {
+                        minimum_data_sizes[index] =
+                            minimum_data_sizes[index].min(finite_generator_minimum_packet_size(
+                                roce.pacer.total_bytes,
+                                roce.snd_una,
+                                roce.pacer.mtu_bytes,
+                            ));
+                        minimum_feedback_sizes[index] = minimum_feedback_sizes[index].min(1);
+                        if roce.pacer_armed {
+                            generator_intervals[index].push(roce.pacer.pacing_interval_ns);
+                        }
+                    }
                 }
             }
         }
         for packet in &image.initial_packets {
             let minimum = match packet.kind {
-                PacketKind::Data | PacketKind::TcpData(_) => {
+                PacketKind::Data | PacketKind::TcpData(_) | PacketKind::RoceData(_) => {
                     &mut minimum_data_sizes[packet.flow.0 as usize]
                 }
                 PacketKind::Feedback
                 | PacketKind::TcpAck(_)
                 | PacketKind::Pfc(_)
-                | PacketKind::DcqcnCnp(_) => &mut minimum_feedback_sizes[packet.flow.0 as usize],
-                PacketKind::DcqcnControlTimer => continue,
+                | PacketKind::DcqcnCnp(_)
+                | PacketKind::RoceAck(_)
+                | PacketKind::RoceNack(_) => &mut minimum_feedback_sizes[packet.flow.0 as usize],
+                PacketKind::DcqcnControlTimer | PacketKind::RocePacingTimer => continue,
             };
             *minimum = (*minimum).min(packet.size_bytes);
         }
@@ -916,10 +933,7 @@ fn flow_packet_counts(
         }
         // The zero-byte DCQCN control-timer token never enters a queue or crosses a link, and a PFC
         // frame travels on its reverse control lane, never on its flow's route.
-        if matches!(
-            packet.kind,
-            PacketKind::DcqcnControlTimer | PacketKind::Pfc(_)
-        ) {
+        if packet.kind.is_timer_token() || matches!(packet.kind, PacketKind::Pfc(_)) {
             continue;
         }
         let counts = if packet.kind.is_data() {
@@ -1005,6 +1019,13 @@ fn flow_packet_counts(
                         data_counts[index] = data_counts[index].saturating_sub(1);
                     }
                     data_counts[index] = data_counts[index].saturating_add(work.packets);
+                }
+                FlowGeneratorKind::Roce(roce) => {
+                    // At most one data packet per remaining grid tick (validation refuses queue
+                    // pairs on device backends; the bound keeps direct sizing conservative).
+                    let ticks = crate::validate::roce_grid_ticks(image, generator, roce);
+                    data_counts[index] = data_counts[index]
+                        .saturating_add(usize::try_from(ticks).unwrap_or(usize::MAX));
                 }
             }
         }
@@ -1493,12 +1514,16 @@ fn add_flow_route_capacities(
     }
     let flow = &image.flows[flow_index];
     let (route, terminal) = match packet_kind {
-        PacketKind::Data | PacketKind::TcpData(_) => (flow.route.as_slice(), flow.target),
+        PacketKind::Data | PacketKind::TcpData(_) | PacketKind::RoceData(_) => {
+            (flow.route.as_slice(), flow.target)
+        }
         PacketKind::Feedback
         | PacketKind::TcpAck(_)
         | PacketKind::Pfc(_)
-        | PacketKind::DcqcnCnp(_) => (flow.reverse_route.as_slice(), flow.source),
-        PacketKind::DcqcnControlTimer => return,
+        | PacketKind::DcqcnCnp(_)
+        | PacketKind::RoceAck(_)
+        | PacketKind::RoceNack(_) => (flow.reverse_route.as_slice(), flow.source),
+        PacketKind::DcqcnControlTimer | PacketKind::RocePacingTimer => return,
     };
     for index in 0..route.len() {
         let target = route
@@ -1520,14 +1545,16 @@ fn add_flow_route_capacities(
                 capacities.aggregate_queue_packets[target_slot].saturating_add(packet_count);
             capacities.minimum_queue_packet_bytes[target_slot] =
                 capacities.minimum_queue_packet_bytes[target_slot].min(match packet_kind {
-                    PacketKind::Data | PacketKind::TcpData(_) => {
+                    PacketKind::Data | PacketKind::TcpData(_) | PacketKind::RoceData(_) => {
                         context.minimum_data_sizes[flow_index]
                     }
                     PacketKind::Feedback
                     | PacketKind::TcpAck(_)
                     | PacketKind::Pfc(_)
-                    | PacketKind::DcqcnCnp(_) => context.minimum_feedback_sizes[flow_index],
-                    PacketKind::DcqcnControlTimer => unreachable!(),
+                    | PacketKind::DcqcnCnp(_)
+                    | PacketKind::RoceAck(_)
+                    | PacketKind::RoceNack(_) => context.minimum_feedback_sizes[flow_index],
+                    PacketKind::DcqcnControlTimer | PacketKind::RocePacingTimer => unreachable!(),
                 });
             let queue = image.switch_states[image.nodes[target_slot].state_slot as usize]
                 .queues
@@ -1565,12 +1592,16 @@ fn flow_link_serialization_ns(
     link_id: LinkId,
 ) -> u64 {
     let minimum_size = match packet_kind {
-        PacketKind::Data | PacketKind::TcpData(_) => context.minimum_data_sizes[flow_index],
+        PacketKind::Data | PacketKind::TcpData(_) | PacketKind::RoceData(_) => {
+            context.minimum_data_sizes[flow_index]
+        }
         PacketKind::Feedback
         | PacketKind::TcpAck(_)
         | PacketKind::Pfc(_)
-        | PacketKind::DcqcnCnp(_) => context.minimum_feedback_sizes[flow_index],
-        PacketKind::DcqcnControlTimer => return 0,
+        | PacketKind::DcqcnCnp(_)
+        | PacketKind::RoceAck(_)
+        | PacketKind::RoceNack(_) => context.minimum_feedback_sizes[flow_index],
+        PacketKind::DcqcnControlTimer | PacketKind::RocePacingTimer => return 0,
     };
     serialization_time_ns(minimum_size, image.links[link_id.0 as usize].rate_bps)
         .expect("lowered GPU image has positive finite serialization intervals")

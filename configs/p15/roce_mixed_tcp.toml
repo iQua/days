@@ -1,0 +1,95 @@
+# P15 lane R1 fixture (RoCE queue pairs), derived from configs/p14/dcqcn_multi_zero_xoff.toml:
+# the same 4-switch line (hosts 0..3 on switches 0..3, 1 Gbps ports) and DCQCN controller keys
+# scaled to 1 Gbps. Mixed transports: a TCP Reno flow (host 1 -> 0, class 0, lossy) and two
+# QPs (hosts 2, 3 -> 0, class 3, lossless with PFC on class 3) share the bottleneck into host 0.
+# The queue pairs ACK every 4 in-order packets, so the ACK cadence and its restart on a
+# duplicate ACK are exercised. Contract: every flow completes; TCP ACKs ride class 0.
+seed = 42
+edges = [[0, 1], [1, 2], [2, 3]]
+hosts = [0, 1, 2, 3]
+duration = 0.02
+
+[switch]
+port_rate = 1000000000
+capacity = 64
+discipline = "FIFO"
+drop = "ECN_THRESHOLD"
+ecn_threshold = 0.5
+
+[link]
+mode = "Pfc"
+
+[link.pfc]
+buffer_capacity = [0, 0, 0, 100000, 0, 0, 0, 0]
+xoff = [0, 0, 0, 20000, 0, 0, 0, 0]
+xon = [0, 0, 0, 10000, 0, 0, 0, 0]
+
+[[flow]]
+flow_type = "TCP"
+priority = 0
+graph = [[1, 0]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 200000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.tcp]
+cc_algorithm = "Reno"
+
+[[flow]]
+flow_type = "RoCE"
+priority = 3
+graph = [[2, 0]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 200000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.dcqcn]
+rate_gbps = 1.0
+min_rate_gbps = 0.01
+max_rate_gbps = 1.0
+g = 0.00390625
+ai_rate_gbps = 0.005
+hai_rate_gbps = 0.05
+mi_factor = 0.5
+rtt_ns = 50000
+cnp_interval_ns = 10000
+pacing_interval_ns = 1000
+increase_byte_threshold = 100000
+
+[flow.traffic.roce]
+retransmit_timeout_ns = 1000000
+ack_every_packets = 4
+
+[[flow]]
+flow_type = "RoCE"
+priority = 3
+graph = [[3, 0]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 200000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.dcqcn]
+rate_gbps = 1.0
+min_rate_gbps = 0.01
+max_rate_gbps = 1.0
+g = 0.00390625
+ai_rate_gbps = 0.005
+hai_rate_gbps = 0.05
+mi_factor = 0.5
+rtt_ns = 50000
+cnp_interval_ns = 10000
+pacing_interval_ns = 1000
+increase_byte_threshold = 100000
+
+[flow.traffic.roce]
+retransmit_timeout_ns = 1000000
+ack_every_packets = 4
