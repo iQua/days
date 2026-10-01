@@ -2252,7 +2252,6 @@ impl<'image> TransitionState<'image> {
             return self.switch_pfc_remote_arrival(node, event, header, children);
         }
         let egress_link = self.packet_egress_at(packet, node.id)?;
-        let priority = usize::from(self.flow(packet.flow)?.packet_priority(packet.kind));
         let rate_bps = egress_link
             .map(|link| self.link(link).map(|descriptor| descriptor.rate_bps))
             .transpose()?;
@@ -2276,6 +2275,13 @@ impl<'image> TransitionState<'image> {
                 queue_bytes,
                 queue.pfc.is_some(),
             )
+        };
+        // The packet's PFC class (P15: its flow's feedback class for a CNP, ACK or NACK). Only a
+        // PFC queue reads it, so a queue without one skips the flow lookup and the kind match.
+        let priority = if queue_has_pfc {
+            usize::from(self.flow(packet.flow)?.packet_priority(packet.kind))
+        } else {
+            0
         };
         // Only a PFC monitor consults the incoming link, and the route walk that derives it is
         // per-arrival work. A queue without a monitor never reads this value.
