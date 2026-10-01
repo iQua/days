@@ -245,3 +245,58 @@ fn tcp_and_queue_pairs_share_a_bottleneck() {
         .collect::<Vec<_>>();
     assert_eq!(tcp_done, [true]);
 }
+
+/// FNV-1a64 over the pretty `Debug` rendering, the `result_fnv1a64` the `days` CLI prints.
+fn fingerprint(value: &impl std::fmt::Debug) -> (u64, u64) {
+    let text = format!("{value:#?}");
+    let hash = text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    (text.len() as u64, hash)
+}
+
+/// The Scalar summary-mode result of a fixture: the complete state every backend must return.
+fn scalar_anchor(name: &str) -> (u64, u64) {
+    let image = lower(name);
+    let result =
+        days_executor::run_scalar_with_observations(&image, None, ObservationMode::Summary)
+            .unwrap_or_else(|error| panic!("{name}: Scalar run failed: {error}"));
+    fingerprint(&result)
+}
+
+/// Frozen at authoring (`b448d08`, 2026-10-01, sim; the `days` CLI printed the same values): the
+/// anchors the device lane proves Metal and CUDA against.
+const ANCHORS: [(&str, u64, u64); 7] = [
+    ("roce_lossless_pfc.toml", 45_710, 0x7e1f_a3a8_7997_030c),
+    ("roce_gbn_lossy.toml", 46_238, 0x4c94_e615_e09a_e734),
+    ("roce_timeout.toml", 34_578, 0x3488_8b67_3127_c7cc),
+    ("roce_nack_only.toml", 34_559, 0x9715_1362_f757_31bf),
+    ("roce_cnp_under_pfc.toml", 58_280, 0x70b0_1e3d_c0d6_15a8),
+    ("roce_feedback_priority.toml", 58_323, 0x6b64_e238_d4d0_3c96),
+    ("roce_mixed_tcp.toml", 52_399, 0x8218_8619_1f0b_7eab),
+];
+
+#[test]
+fn p15_fixtures_match_their_frozen_anchors() {
+    for (name, bytes, fnv1a64) in ANCHORS {
+        let actual = scalar_anchor(name);
+        assert_eq!(
+            actual,
+            (bytes, fnv1a64),
+            "{name}: frozen anchor moved (got bytes={} fnv1a64={:016x})",
+            actual.0,
+            actual.1
+        );
+    }
+}
+
+/// The HPCC cross-check fixture's anchor; ignored in the default matrix (64 queue pairs at 100
+/// Gbps; run it in release: `cargo test --release -p days --test p15_roce_fixtures -- --ignored`).
+#[test]
+#[ignore = "release-only: 64 queue pairs on a 390-host Dragonfly embedding"]
+fn hpcc_fixture_matches_its_frozen_anchor() {
+    assert_eq!(
+        scalar_anchor("hpcc_incast64_dragonfly.toml"),
+        (813_526, 0x1043_7719_b6f6_f177)
+    );
+}
