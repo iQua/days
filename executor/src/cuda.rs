@@ -1042,8 +1042,8 @@ pub struct CudaRun {
     /// P14: the round kernel build this run launched, selected from the image.
     pub round_kernel: RoundKernel,
     /// P14 round 4: host time to load this run's round module, resolve its kernels and check
-    /// their thread limits. Paid once per run, before the first attempt's buffers are allocated;
-    /// it is outside `wall_ns` and `device_ns`.
+    /// their thread limits. Paid once per run, when the run starts, before its first attempt is
+    /// planned; it is outside `wall_ns` and `device_ns`.
     pub module_load_ns: u64,
     /// Test-only: `(module, kernel)` for every function this run launched: the captured attempt
     /// kernels, then the readback gather. Each entry names the round module the function was
@@ -1374,7 +1374,7 @@ impl CudaExecutor {
     }
 
     /// Executes and reads back under the run device's execution guard, which the run takes with
-    /// its round module before its first upload and holds until it ends.
+    /// its round module when it starts, before its first plan, and holds until it ends.
     pub fn run_with_observations(
         &self,
         image: &SimulationImage,
@@ -1430,9 +1430,17 @@ impl CudaExecutor {
         );
         let mut retry_trace = Vec::new();
         // P14 round 4: this run's round module and the device's execution guard, taken together
-        // once the first plan is accepted and held for every attempt. Dropped when the run ends,
-        // on success, error or panic: the module is unloaded, then the guard released.
-        let mut held_module: Option<HeldRoundModule<'_>> = None;
+        // and held for every attempt. Dropped when the run ends, on success, error or panic: the
+        // module is unloaded, then the guard released.
+        //
+        // P14 cuda-host round 3 (option f): both are taken here, when the run starts, before the
+        // first plan. The run then frees the module load's transient copy of the fatbin before
+        // it plans, as `main` frees its executor-start copy, and the plan and the readback run
+        // with the allocator state `main` gives them (`evidence/P14/cuda-host.md` §§14, 18 in
+        // days-gpu). The first plan now runs under the guard, as every retry already did, and a
+        // plan that fails or is refused below loads and unloads the module before its error
+        // returns; nothing is allocated or launched for it.
+        let held = direct.hold_round_module(round_kernel)?;
         loop {
             let attempt = (|| {
                 let plan = CudaPlan::new_with_entity_capacity_floors(
@@ -1445,16 +1453,14 @@ impl CudaExecutor {
                 )?;
                 record_run_step("planned");
                 // The plain kernel has no device-side stop: the host refuses it, before upload, on
-                // any plan holding state a mechanism transition would act on.
+                // any plan holding state a mechanism transition would act on. The module is
+                // already loaded; on a refusal it is unloaded when the run returns, before any
+                // buffer, capture or launch.
                 if round_kernel == RoundKernel::Plain {
                     plan.refuse_plain_round_kernel()?;
                 }
-                // The module is loaded before this run allocates a buffer or captures a graph, and
-                // under the guard, so no other run's module is loaded in the context meanwhile.
-                let held = match held_module.as_ref() {
-                    Some(held) => held,
-                    None => held_module.insert(direct.hold_round_module(round_kernel)?),
-                };
+                // The module was loaded under the guard before this run planned, so it is loaded
+                // before any buffer or graph, and no other run's module is in the context.
                 let buffers = CudaBuffers::new(&direct.stream, plan, direct.provisioning)?;
                 record_run_step("buffers_allocated");
                 let timing = direct.run(&buffers, attempt_config, &held.module)?;
@@ -5091,8 +5097,9 @@ struct DirectCuda {
 /// P14 round 4: one loaded CUDA module and the kernels a run launches from it. A run owns it.
 ///
 /// Each round-kernel build has its own complete module: the 12 shared attempt kernels, the readback
-/// gather, and that build's round kernel. A run loads its build's module before it allocates a
-/// buffer or captures its graph, launches every kernel from it, and drops it when the run ends.
+/// gather, and that build's round kernel. A run loads its build's module when it starts, before it
+/// plans its first attempt and so before it allocates a buffer or captures its graph, launches
+/// every kernel from it, and drops it when the run ends.
 /// The executor holds no module, and no other round module is loaded in the context while a run
 /// sets up or executes ([`HeldRoundModule`]).
 ///
@@ -5156,8 +5163,8 @@ impl Drop for LiveRoundModule {
     }
 }
 
-/// What one run holds on its device from before its first upload until it ends: its round module
-/// and the device's execution guard.
+/// What one run holds on its device from its start, before its first plan, until it ends: its
+/// round module and the device's execution guard.
 ///
 /// The module is loaded and unloaded under the guard. The guard is what makes "exactly one round
 /// module in the context" hold: a concurrent run on the same device waits for it before loading
