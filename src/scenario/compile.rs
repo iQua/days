@@ -117,6 +117,8 @@ struct SourcePropagationTiers {
 
 #[derive(Debug, Default, Deserialize)]
 struct SourcePfc {
+    /// P15: also monitor host-to-switch links, so switches pause host NICs (default off).
+    host_links: Option<bool>,
     xoff: Option<Vec<u64>>,
     xon: Option<Vec<u64>>,
     buffer_capacity: Option<Vec<u64>>,
@@ -727,6 +729,8 @@ struct PfcLowering {
     xoff: [u64; 8],
     xon: [u64; 8],
     buffer_capacity: [u64; 8],
+    /// Monitor host-to-switch links as well as switch-to-switch links.
+    host_links: bool,
 }
 
 impl SupportedModel {
@@ -929,6 +933,7 @@ impl SupportedModel {
                     xoff,
                     xon,
                     buffer_capacity,
+                    host_links: config.host_links.unwrap_or(false),
                 });
             } else if mode != "None" {
                 return Err(CompileError::Unsupported(format!(
@@ -3039,7 +3044,7 @@ fn lower(
             group.iter().map(|(_, receiver)| *receiver).collect(),
         );
     }
-    let host_states = host_topology_ids
+    let mut host_states = host_topology_ids
         .iter()
         .map(|host| {
             let node_key = LpKey::Host(*host);
@@ -3222,15 +3227,21 @@ fn lower(
                         .or_insert(feedback_size);
                 }
             }
+            // A switch egress LP monitors each controlled link that feeds it: a switch-to-switch
+            // link, and with `host_links` the host-to-switch link that starts a route.
+            let monitored = |controlled: LinkDescriptor, downstream: NodeId| {
+                nodes[downstream.0 as usize].kind == NodeKind::Switch
+                    && match nodes[controlled.source.0 as usize].kind {
+                        NodeKind::Switch => true,
+                        NodeKind::Host => pfc.host_links,
+                    }
+            };
             for pair in descriptor.route.windows(2) {
                 let controlled = links[pair[0].0 as usize];
                 let downstream = links[pair[1].0 as usize].source;
-                if nodes[controlled.source.0 as usize].kind != NodeKind::Switch
-                    || nodes[downstream.0 as usize].kind != NodeKind::Switch
-                {
-                    continue;
+                if monitored(controlled, downstream) {
+                    monitored_paths.insert((controlled.id, downstream));
                 }
-                monitored_paths.insert((controlled.id, downstream));
             }
             if matches!(
                 input.traffic.kind,
@@ -3239,9 +3250,7 @@ fn lower(
                 for pair in descriptor.reverse_route.windows(2) {
                     let controlled = links[pair[0].0 as usize];
                     let downstream = links[pair[1].0 as usize].source;
-                    if nodes[controlled.source.0 as usize].kind == NodeKind::Switch
-                        && nodes[downstream.0 as usize].kind == NodeKind::Switch
-                    {
+                    if monitored(controlled, downstream) {
                         monitored_paths.insert((controlled.id, downstream));
                     }
                 }
@@ -3255,11 +3264,10 @@ fn lower(
                     .unwrap_or(0)
             });
             let controlled = links[controlled_id.0 as usize];
-            let upstream_physical = switch_states
-                [nodes[controlled.source.0 as usize].state_slot as usize]
-                .physical_switch;
+            let upstream = nodes[controlled.source.0 as usize];
             let downstream_physical =
                 switch_states[nodes[downstream.0 as usize].state_slot as usize].physical_switch;
+            // The reverse physical link: downstream switch to the upstream switch, or to the host.
             let reverse = links
                 .iter()
                 .copied()
@@ -3267,11 +3275,17 @@ fn lower(
                     let source = nodes[candidate.source.0 as usize];
                     let target = nodes[candidate.target.0 as usize];
                     source.kind == NodeKind::Switch
-                        && target.kind == NodeKind::Switch
                         && switch_states[source.state_slot as usize].physical_switch
                             == downstream_physical
-                        && switch_states[target.state_slot as usize].physical_switch
-                            == upstream_physical
+                        && match upstream.kind {
+                            NodeKind::Switch => {
+                                target.kind == NodeKind::Switch
+                                    && switch_states[target.state_slot as usize].physical_switch
+                                        == switch_states[upstream.state_slot as usize]
+                                            .physical_switch
+                            }
+                            NodeKind::Host => target.id == upstream.id,
+                        }
                 })
                 .ok_or_else(|| {
                     CompileError::Invalid(format!(
@@ -3293,15 +3307,24 @@ fn lower(
                 })?,
             });
 
-            let upstream_slot = nodes[controlled.source.0 as usize].state_slot as usize;
-            let upstream_queue = switch_states[upstream_slot]
-                .queues
-                .iter_mut()
-                .find(|queue| queue.egress_link == Some(controlled_id))
-                .expect("lowered switch egress owns the controlled link");
-            upstream_queue
-                .pfc
-                .get_or_insert_with(PfcQueueState::default);
+            let upstream_slot = upstream.state_slot as usize;
+            match upstream.kind {
+                NodeKind::Switch => {
+                    let upstream_queue = switch_states[upstream_slot]
+                        .queues
+                        .iter_mut()
+                        .find(|queue| queue.egress_link == Some(controlled_id))
+                        .expect("lowered switch egress owns the controlled link");
+                    upstream_queue
+                        .pfc
+                        .get_or_insert_with(PfcQueueState::default);
+                }
+                NodeKind::Host => {
+                    host_states[upstream_slot]
+                        .pfc
+                        .get_or_insert_with(Box::default);
+                }
+            }
 
             let downstream_slot = nodes[downstream.0 as usize].state_slot as usize;
             let downstream_queue = switch_states[downstream_slot]

@@ -87,12 +87,12 @@ pub use image::{
     CollectiveStage, CollectiveStageIdentity, ComputeStage, ConstantGenerator, DcqcnCnpHeader,
     DcqcnGenerator, DcqcnReceiverState, EcnCodepoint, FlowDescriptor, FlowGeneratorKind,
     FlowGeneratorState, GeneratorFeedbackAction, GeneratorFeedbackState, GeneratorStatus,
-    GeneratorTermination, HostPfcState, HostState, LinkDescriptor, NodeDescriptor, PacketDescriptor, PacketKind,
-    PfcHeader, PfcIngressState, PfcQueueState, RateGenerator, RemoteChannel, RoceAckHeader,
-    RoceDataHeader, RoceGenerator, RoceNackMark, RocePacer, RoceReceiverState, ScheduledEmission,
-    SimulationImage, StageDependencies, StageRole, SwitchQueueState, SwitchState, TcpAckHeader,
-    TcpDataHeader, TcpGenerator, TcpReceiveRange, TcpReceiverState, TcpTimerState,
-    default_propagation_ns,
+    GeneratorTermination, HostPfcState, HostState, LinkDescriptor, NodeDescriptor,
+    PacketDescriptor, PacketKind, PfcHeader, PfcIngressState, PfcQueueState, RateGenerator,
+    RemoteChannel, RoceAckHeader, RoceDataHeader, RoceGenerator, RoceNackMark, RocePacer,
+    RoceReceiverState, ScheduledEmission, SimulationImage, StageDependencies, StageRole,
+    SwitchQueueState, SwitchState, TcpAckHeader, TcpDataHeader, TcpGenerator, TcpReceiveRange,
+    TcpReceiverState, TcpTimerState, default_propagation_ns,
 };
 pub use mechanism_trace::{
     CollectiveActivationCause, CollectiveProgressRecord, CollectiveStageKind, DrrTransitionRecord,
