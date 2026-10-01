@@ -609,5 +609,52 @@ expect_reject "executor: control tick lost mid-trace" \
   "REJECT: sender: line $sender_line: pending DCQCN control tick at $control_time did not fire before this row (node_id=2, flow_id=1)" \
   trace "$xb.sender.csv" "$xb.receiver.csv" "$campaign_tmp/control-cut.dcqcn.csv" "$xstop"
 
+# --- Amendment 1: class_paused (host-link PFC backpressure) ------------------------------------
+# Amended sender layout: column 8 is class_paused; the schema's columns 8-37 become 9-38
+# (14 rate_bps, 15 input_acknowledgment, 16 emitted, 17-20 emitted_*, 21-29 before_*,
+# 30-38 after_*: 34 after_credit_quanta, 36 after_pacer, 37 after_next_tick_ns, 38 after_status).
+# Logs without the column (writers before Amendment 1) read class_paused = 0 throughout.
+paused="$fixture_dir/roce_sender_paused_accept.csv"
+paused_dcqcn="$fixture_dir/roce_sender_paused_accept.dcqcn.csv"
+paused_stop=8000
+check_case "roce_sender_paused_accept.csv" 0 "ACCEPT" \
+  sender "$paused" "$paused_dcqcn" "$paused_stop" || true
+check_case "roce_sender_paused_accept.csv (stop inferred)" 0 "ACCEPT" \
+  sender "$paused" "$paused_dcqcn" || true
+# Rows (NR): 2 t1000 flow 3 sends psn 0; 3 t1000 flow 5 sends psn 0; 4 t2000 flow 3 tick finds
+# the class paused: parks, no credit; 5 t2000 flow 5 likewise; 6 t2500 ACK 1000 restarts flow 3
+# on the grid (3000), as any ACK restart; 7 t3000 flow 3's restarted tick parks again; 8 t5000
+# flow 5 timeout rewinds and restarts at 6000; 9 t6000 flow 5's restarted tick parks again.
+mutate_sender "paused-tick-emits" "$paused" "$paused_dcqcn" "$paused_stop" \
+  'NR == 4 { $16 = 1; $17 = 1000; $18 = 1000; $19 = 0; $20 = 17 } { print }' \
+  'REJECT: sender: line 4: RoCE paused tick credits or emits'
+mutate_sender "paused-tick-adds-credit" "$paused" "$paused_dcqcn" "$paused_stop" \
+  'NR == 4 { $34 = 8000000000000 } { print }' \
+  'REJECT: sender: line 4: RoCE sender after-state mismatch'
+mutate_sender "paused-tick-reads-rate" "$paused" "$paused_dcqcn" "$paused_stop" \
+  'NR == 4 { $14 = 8000000000 } { print }' \
+  'REJECT: sender: line 4: RoCE paused tick credits or emits'
+mutate_sender "paused-tick-flag-cleared" "$paused" "$paused_dcqcn" "$paused_stop" \
+  'NR == 4 { $8 = 0 } { print }' \
+  'REJECT: sender: line 4: RoCE tick rate present iff the tick credits'
+mutate_sender "paused-tick-flag-cleared-with-rate" "$paused" "$paused_dcqcn" "$paused_stop" \
+  'NR == 4 { $8 = 0; $14 = 8000000000 } { print }' \
+  'REJECT: sender: line 4: RoCE emission mismatch'
+mutate_sender "paused-tick-keeps-pacer-armed" "$paused" "$paused_dcqcn" "$paused_stop" \
+  'NR == 4 { $36 = "armed"; $37 = 3000; $38 = "scheduled" } { print }' \
+  'REJECT: sender: line 4: RoCE sender after-state mismatch'
+mutate_sender "class-paused-on-ack" "$paused" "$paused_dcqcn" "$paused_stop" \
+  'NR == 6 { $8 = 1 } { print }' \
+  'REJECT: sender: line 6: RoCE class_paused set on a non-tick row'
+mutate_sender "rewind-while-paused-not-restarting" "$paused" "$paused_dcqcn" "$paused_stop" \
+  'NR == 8 { $36 = "parked"; $37 = ""; $38 = "blocked" } { print }' \
+  'REJECT: sender: line 8: RoCE sender after-state mismatch'
+mutate_sender "class-paused-not-a-bit" "$paused" "$paused_dcqcn" "$paused_stop" \
+  'NR == 4 { $8 = 2 } { print }' \
+  "REJECT: sender: line 4: invalid bit: '2'"
+mutate_sender "paused-tick-lost" "$paused" "$paused_dcqcn" "$paused_stop" \
+  'NR == 4 { for (i = 21; i <= 29; i++) before[i] = $i; next } NR == 6 { for (i = 21; i <= 29; i++) $i = before[i] } { print }' \
+  'REJECT: sender: line 5: pending RoCE pacing tick at 2000 did not fire before this row (node_id=1, flow_id=3)'
+
 echo "P10c RoCE campaign checks: $checked; mutations caught: $mutations_caught/$mutations"
 exit "$failures"
