@@ -337,6 +337,25 @@ its event key, or a DCQCN controller row of a queue pair on its own. -/
 inductive SenderItem
   | sender (row : SenderRow) (bytes : Option DcqcnEventLog.Row)
   | dcqcn (row : DcqcnEventLog.Row)
+  /-- Amendment 3: a PFC control record (PAUSE or RESUME) at a queue pair's host. -/
+  | pfc (row : MechanismEventLog.PfcLog.Row)
+
+def SenderItem.key : SenderItem → DaysExecutor.EventKey
+  | .sender row _ => row.key
+  | .dcqcn row => row.key
+  | .pfc row => row.key
+
+/-- Merges the host PFC records into the key-ordered sender items (linear). On an equal key the
+PFC record comes first: a RESUME's `resume` rows carry the RESUME's own key. -/
+def mergePfc : List MechanismEventLog.PfcLog.Row → List SenderItem → List SenderItem →
+    List SenderItem
+  | [], [], acc => acc.reverse
+  | p :: ps, [], acc => mergePfc ps [] (.pfc p :: acc)
+  | [], i :: is, acc => mergePfc [] is (i :: acc)
+  | p :: ps, i :: is, acc =>
+      if p.key ≤ i.key then mergePfc ps (i :: is) (.pfc p :: acc)
+      else mergePfc (p :: ps) is (i :: acc)
+termination_by ps is => ps.length + is.length
 
 /-- Merges the two key-ordered logs (linear). -/
 def mergeLogs : List SenderRow → List DcqcnEventLog.Row → List SenderItem → List SenderItem
@@ -364,6 +383,8 @@ structure FlowTrack where
   /-- Amendment 2: the pacer was parked by a paused tick and not restarted since, so a RESUME may
   restart it. -/
   pauseParked : Bool
+  /-- Amendment 3: the pair's data class (constant per pair). -/
+  dataClass : Option Nat
 
 /--
 The events a pair has pending, as `(time, rank, name)`: the armed pacing tick, the armed timeout,
@@ -396,10 +417,26 @@ structure StopBounds where
   latestWithin : Option (Nat × Nat) := none
   earliestBeyond : Option (Nat × Nat) := none
 
+/-- Amendment 3: the pause-parked pairs a host RESUME must restart, awaiting their `resume` rows
+at the RESUME's key. -/
+structure ResumeExpectation where
+  key : DaysExecutor.EventKey
+  node : Nat
+  dataClass : Nat
+  pfcLine : Nat
+  remaining : Std.HashSet Nat
+
 structure SenderTrack where
   flows : Std.HashMap (Nat × Nat) FlowTrack := ∅
   lastPayload : Std.HashMap Nat Nat := ∅
   stop : StopBounds := {}
+  /-- Amendment 3: `(node, controlled_link, priority)` whose host controller set is non-empty. -/
+  hostAsserted : Std.HashMap (Nat × Nat × Nat) Bool := ∅
+  /-- Amendment 3: per `(node, priority)`, how many host controlled links assert a pause. -/
+  hostPausedLinks : Std.HashMap (Nat × Nat) Nat := ∅
+  /-- Amendment 3: per `(node, data class)`, the flows whose pacer a paused tick parked. -/
+  pauseParkedIndex : Std.HashMap (Nat × Nat) (Std.HashSet Nat) := ∅
+  expectation : Option ResumeExpectation := none
 
 /-- The row-local shape rules of a sender row: phase, which optional fields are present, and the
 validity of its configuration and states. -/
@@ -482,6 +519,8 @@ def checkSenderItem (stopTimeNs : Option Nat) (track : SenderTrack) (row : Sende
     | some flow => do
         at_ (flow.config = row.config)
           s!"RoCE sender config discontinuity (node_id={row.nodeId}, flow_id={row.flowId})"
+        at_ (flow.dataClass = row.dataClass)
+          s!"RoCE data_class discontinuity (node_id={row.nodeId}, flow_id={row.flowId})"
         at_ (flow.state = row.before)
           s!"RoCE sender state discontinuity (node_id={row.nodeId}, flow_id={row.flowId})"
         pure flow.rateBps
@@ -497,7 +536,7 @@ def checkSenderItem (stopTimeNs : Option Nat) (track : SenderTrack) (row : Sende
   | none =>
       checkPending "sender" row.srcLine source
         { config := row.config, state := row.before, rateBps := rate, controlSpent := false,
-          controlNs := controlNs, pauseParked := false }
+          controlNs := controlNs, pauseParked := false, dataClass := row.dataClass }
         row.key.timeNs
   let pauseParked := prior.map (·.pauseParked) |>.getD false
   if row.kind = .resume then
@@ -552,16 +591,29 @@ def checkSenderItem (stopTimeNs : Option Nat) (track : SenderTrack) (row : Sende
         | none => pure ()
         pure (track.lastPayload.insert row.nodeId payload)
   let controlSpent := prior.map (·.controlSpent) |>.getD false
+  let nowPauseParked := row.classPaused || (pauseParked && row.after.pacer = .parked)
+  let pauseParkedIndex :=
+    match row.dataClass with
+    | none => track.pauseParkedIndex
+    | some dataClass =>
+        if nowPauseParked == pauseParked then track.pauseParkedIndex
+        else
+          let slot := (row.nodeId, dataClass)
+          let flows := track.pauseParkedIndex.getD slot ∅
+          track.pauseParkedIndex.insert slot
+            (if nowPauseParked then flows.insert row.flowId else flows.erase row.flowId)
   pure
-    { flows := track.flows.insert source
+    { track with
+      pauseParkedIndex := pauseParkedIndex
+      flows := track.flows.insert source
         { config := row.config, state := row.after, rateBps := rateAfterBytes,
           controlSpent := controlSpent,
           controlNs := match bytes with
             | some d => some d.after.nextControlTimeNs
             | none => controlNs
           -- Set by a paused tick; cleared by any restart (the pacer leaves `parked`).
-          pauseParked :=
-            row.classPaused || (pauseParked && row.after.pacer = .parked) }
+          pauseParked := nowPauseParked
+          dataClass := row.dataClass }
       lastPayload := lastPayload
       stop := stop }
 
@@ -627,6 +679,90 @@ def checkPendingAtEnd (stopTimeNs : Option Nat) (rows : List SenderRow)
       | none =>
           throw s!"sender: pending {name} at {pendingNs} never fired although the log implies stop_time_ns >= {bound} (node_id={node}, flow_id={flow})"
 
+/-- The smallest flow id of a set, independent of the set's iteration order. -/
+def minFlow (flows : Std.HashSet Nat) : Option Nat :=
+  flows.fold (fun least flow => some (match least with | some l => min l flow | none => flow)) none
+
+/-- Amendment 3 completeness: a RESUME's expected `resume` rows have all appeared once the log has
+moved past its key. -/
+def settleExpectation (track : SenderTrack) (key : Option DaysExecutor.EventKey) :
+    Except String SenderTrack := do
+  match track.expectation with
+  | none => pure track
+  | some expected =>
+      if key = some expected.key then pure track
+      else
+        match minFlow expected.remaining with
+        | some flow =>
+            throw s!"pfc: line {expected.pfcLine}: host RESUME of data_class {expected.dataClass} at node {expected.node} did not restart pause-parked queue pair (flow_id={flow})"
+        | none => pure { track with expectation := none }
+
+/--
+Amendment 3: a host PFC control record at a queue pair's host. The host's class `p` is paused while
+any of its controlled links has a non-empty controller set. A record that ends the pause (a host
+RESUME) expects a `resume` row, at its key, for every pair of class `p` at that node that a paused
+tick parked and that the restart rule would restart (`restart_roce_pacer`: parked, `next_psn <
+total`, `snd_una < total`).
+-/
+def checkPfcItem (track : SenderTrack) (row : MechanismEventLog.PfcLog.Row) :
+    Except String SenderTrack := do
+  let track ← settleExpectation track (some row.key)
+  let slot := (row.nodeId, row.priority)
+  let link := (row.nodeId, row.controlledLink, row.priority)
+  let pausedBefore := track.hostPausedLinks.getD slot 0
+  let assertedBefore := track.hostAsserted.getD link false
+  let assertedAfter := !row.afterControllers.isEmpty
+  let pausedAfter :=
+    if assertedBefore == assertedAfter then pausedBefore
+    else if assertedAfter then pausedBefore + 1
+    else pausedBefore - 1
+  let track :=
+    { track with
+      hostAsserted := track.hostAsserted.insert link assertedAfter
+      hostPausedLinks := track.hostPausedLinks.insert slot pausedAfter }
+  if pausedBefore > 0 && pausedAfter = 0 then
+    let parked := track.pauseParkedIndex.getD slot ∅
+    let restartable := parked.fold (fun acc flow =>
+      match track.flows.get? (row.nodeId, flow) with
+      | some pair =>
+          if pair.state.pacer = .parked && pair.state.nextPsn < pair.config.totalBytes &&
+              pair.state.sndUna < pair.config.totalBytes then acc.insert flow else acc
+      | none => acc) (∅ : Std.HashSet Nat)
+    pure { track with
+      expectation := some
+        { key := row.key, node := row.nodeId, dataClass := row.priority, pfcLine := row.srcLine,
+          remaining := restartable } }
+  else
+    pure track
+
+/-- Amendment 3: the warrants of a sender row against the host PFC state at its key. -/
+def checkWarrant (track : SenderTrack) (row : SenderRow) : Except String SenderTrack := do
+  let at_ := requireAt "sender" row.srcLine
+  match row.dataClass with
+  | none => pure track
+  | some dataClass =>
+      let paused := track.hostPausedLinks.getD (row.nodeId, dataClass) 0 > 0
+      match row.kind with
+      | .tick =>
+          if row.classPaused then
+            at_ paused s!"RoCE paused tick while data_class {dataClass} is not paused at node {row.nodeId}"
+          else
+            at_ (!paused) s!"RoCE unpaused tick while data_class {dataClass} is paused at node {row.nodeId}"
+          pure track
+      | .resume =>
+          match track.expectation with
+          | some expected =>
+              at_ (expected.key = row.key && expected.node = row.nodeId &&
+                  expected.dataClass = dataClass)
+                s!"RoCE resume row without a host RESUME of data_class {dataClass} at node {row.nodeId} at this event key"
+              at_ (expected.remaining.contains row.flowId)
+                s!"RoCE resume row of a queue pair the RESUME did not find pause-parked (flow_id={row.flowId})"
+              pure { track with
+                expectation := some { expected with remaining := expected.remaining.erase row.flowId } }
+          | none =>
+              throw s!"sender: line {row.srcLine}: RoCE resume row without a host RESUME of data_class {dataClass} at node {row.nodeId} at this event key"
+      | _ => pure track
+
 /--
 Canonical order of the sender log: strictly increasing event keys, except that the `resume` rows
 of one RESUME share its key (Amendment 2), which is allowed only for rows of one node with
@@ -655,7 +791,22 @@ def checkSenderRows (stopTimeNs : Option Nat) (rows : List SenderRow)
     Except String Unit := do
   requireAt "sender" 1 (!rows.isEmpty) "empty RoCE sender trace"
   checkSenderKeyOrder rows
-  if let some pfcRows := pfc then inRole "pfc" (MechanismEventLog.PfcLog.checkRows pfcRows)
+  -- Amendment 3 input rules: an amended log is checked against its PFC log, and pause and resume
+  -- rows are only accepted with their warrants.
+  let amended := rows.any (·.dataClass.isSome)
+  if !amended then
+    for row in rows do
+      requireAt "sender" row.srcLine (!row.classPaused && row.kind != .resume)
+        "class_paused and resume rows need the data_class column and the PFC log (Amendment 3)"
+    if pfc.isSome then
+      throw "sender: --pfc needs a sender log with the data_class column (Amendment 3)"
+  else if pfc.isNone then
+    throw "sender: the log carries data_class (Amendment 3); pass its PFC log with --pfc"
+  let pfcRows ← match pfc with
+    | none => pure []
+    | some pfcRows => do
+        inRole "pfc" (MechanismEventLog.PfcLog.checkRows pfcRows)
+        inRole "pfc" (MechanismEventLog.PfcLog.canonicalize pfcRows)
   -- The controller log is checked on its own terms first (an empty one only when no queue pair
   -- ever sent a byte and no controller event happened).
   if !dcqcn.isEmpty then inRole "dcqcn" (DcqcnEventLog.checkRows dcqcn)
@@ -668,11 +819,22 @@ def checkSenderRows (stopTimeNs : Option Nat) (rows : List SenderRow)
       requireAt "sender" row.srcLine (row.key.timeNs ≤ stop) s!"event after stop_time_ns={stop}"
     for d in dcqcn do
       requireAt "dcqcn" d.srcLine (d.key.timeNs ≤ stop) s!"event after stop_time_ns={stop}"
+  let hosts := pairs.fold (fun acc (node, _) => acc.insert node) (∅ : Std.HashSet Nat)
+  let hostControl := pfcRows.filter (fun p => p.kind = .control && hosts.contains p.nodeId)
   let mut track : SenderTrack := {}
-  for item in mergeLogs rows pairRows [] do
+  for item in mergePfc hostControl (mergeLogs rows pairRows []) [] do
     match item with
-    | .sender row bytes => track ← checkSenderItem stopTimeNs track row bytes
-    | .dcqcn d => track ← checkDcqcnItem track d
+    | .sender row bytes =>
+        -- A resume row is checked against the expectation of its own key before anything else
+        -- settles it; any other row first settles the expectation of an earlier RESUME.
+        if row.kind != .resume then track ← settleExpectation track (some row.key)
+        track ← checkSenderItem stopTimeNs track row bytes
+        track ← checkWarrant track row
+    | .dcqcn d =>
+        track ← settleExpectation track (some d.key)
+        track ← checkDcqcnItem track d
+    | .pfc p => track ← checkPfcItem track p
+  track ← settleExpectation track none
   match track.stop.latestWithin, track.stop.earliestBeyond with
   | some (within, withinLine), some (beyond, beyondLine) =>
       if within < beyond then pure ()

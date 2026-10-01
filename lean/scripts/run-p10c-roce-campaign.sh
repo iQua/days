@@ -729,7 +729,7 @@ mutate_amended "resume-typed-phase" "$resume" "$resume_dcqcn" "$resume_pfc" "$re
   'REJECT: sender: line 8: RoCE resume must have phase 0'
 mutate_amended "resume-lost" "$resume" "$resume_dcqcn" "$resume_pfc" "$resume_stop" \
   'NR != 8 { print }' \
-  'REJECT: sender: line 10: RoCE sender state discontinuity (node_id=1, flow_id=3)'
+  'REJECT: pfc: line 3: host RESUME of data_class 3 at node 1 did not restart pause-parked queue pair (flow_id=3)'
 
 # --- Amendment 3: pauses and resumes against the host PFC records ------------------------------
 # PFC CSV columns (pfc_transitions_csv): 1 time_ns, 2-4 key, 5 node_id, 6 queue_id, 7 kind,
