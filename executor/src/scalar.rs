@@ -2858,9 +2858,6 @@ impl<'image> TransitionState<'image> {
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
         let packet = self.packet(event.payload)?;
-        if let PacketKind::Pfc(header) = packet.kind {
-            return self.host_pfc_remote_arrival(node, event, header, children);
-        }
         let (flow_id, flow_source, flow_target) = {
             let flow = self.flow(packet.flow)?;
             (flow.id, flow.source, flow.target)
@@ -2886,6 +2883,13 @@ impl<'image> TransitionState<'image> {
             PacketKind::RoceNack(header) => {
                 return self
                     .host_roce_feedback_arrival(node, event, packet, header, true, children);
+            }
+            // Host-link PFC. Dispatched here, after the flow lookup (a PFC frame carries the
+            // flow of the packet that triggered it), not by an early return before it: the
+            // early return made LLVM stop inlining the TCP and DCQCN CNP arrival handlers into
+            // `dispatch` (`hostpfc-impl/tooling/inline-probe/`).
+            PacketKind::Pfc(header) => {
+                return self.host_pfc_remote_arrival(node, event, header, children);
             }
             _ => {}
         }
