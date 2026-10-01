@@ -1342,10 +1342,12 @@ fn validate_pfc(image: &SimulationImage) -> Result<BTreeSet<usize>, ValidationEr
         }
     }
 
+    // Host-link PFC: one scan of the host table when no host owns pause state.
+    let host_pause_state = image.host_states.iter().any(|state| state.pfc.is_some());
     for owner in image
         .nodes
         .iter()
-        .filter(|node| node.kind == NodeKind::Host)
+        .filter(|node| host_pause_state && node.kind == NodeKind::Host)
     {
         let state = &image.host_states[owner.state_slot as usize];
         let Some(pfc) = state.pfc.as_deref() else {
@@ -4131,15 +4133,17 @@ fn validate_owned_service_state(
         }
         // With host-link PFC, a packet whose class is paused at the host's egress waits for its
         // RESUME, which schedules the service.
-        let has_eligible_packet = state.queue.iter().any(|payload| {
-            state.pfc.as_deref().is_none_or(|pfc| {
+        // Without host-link PFC this is today's emptiness test: no per-packet work.
+        let has_eligible_packet = match state.pfc.as_deref() {
+            None => !state.queue.is_empty(),
+            Some(pfc) => state.queue.iter().any(|payload| {
                 packet(image, *payload)
                     .and_then(|packet| {
                         flow(image, packet.flow).map(|flow| flow.packet_priority(packet.kind))
                     })
                     .is_none_or(|priority| !pfc.is_paused(usize::from(priority)))
-            })
-        });
+            }),
+        };
         if has_eligible_packet && state.in_service.is_none() && !state.tx_ready_pending {
             return Err(ValidationError::new(format!(
                 "host node {:?} has queued packets but neither active service nor TxReady pending",
