@@ -373,8 +373,13 @@ structure FlowTrack where
   config : Roce.SenderConfig
   /-- The state after the pair's last transition, including DCQCN status recomputations. -/
   state : Roce.SenderState
-  /-- The controller's current rate after the pair's last controller transition. -/
-  rateBps : Nat
+  /-- The controller's current rate after the pair's last controller transition; `none` while it
+  is not yet known (ruling C6: the pair's first ticks were class-paused). -/
+  rateBps : Option Nat
+  /-- C6: while the rate is unknown, the armed statuses the pair predicted bound it: the rate lies
+  in `[rateLow, rateHigh)`. -/
+  rateLow : Nat
+  rateHigh : Option Nat
   /-- A control tick ran on the completed pair: D2 forbids another. -/
   controlSpent : Bool
   /-- The controller's pending control time, from the pair's last DCQCN row (`none` before the
@@ -499,6 +504,28 @@ def checkStop (stopTimeNs : Option Nat) (row : SenderRow) (query : Option Nat) (
                 | some (earliest, line) => if tick < earliest then some (tick, row.srcLine) else some (earliest, line)
                 | none => some (tick, row.srcLine) }
 
+/--
+Ruling C6: narrows the bounds on a pair's unknown rate by one predicted armed status (`scheduled`:
+the rate reaches the threshold; `blocked`: it stays below it), and requires a rate to remain.
+-/
+def boundRate (lineNo : Nat) (source : Nat × Nat) (threshold : Nat) (status : Roce.Status)
+    (low : Nat) (high : Option Nat) : Except String (Nat × Option Nat) := do
+  let (low, high) ←
+    match status with
+    | .scheduled => pure (max low threshold, high)
+    | .blocked => pure (low, some (match high with | some h => min h threshold | none => threshold))
+    | _ => throw s!"sender: line {lineNo}: invalid RoCE sender after-state"
+  requireAt "sender" lineNo (high.all (low < ·))
+    s!"RoCE statuses predicted before the rate was known fit no controller rate (node_id={source.1}, flow_id={source.2})"
+  pure (low, high)
+
+/-- Ruling C6: the rate the pair's first crediting tick or first DCQCN row reveals must lie within
+the bounds its earlier statuses set. -/
+def revealRate (role : String) (lineNo : Nat) (source : Nat × Nat) (rate low : Nat)
+    (high : Option Nat) : Except String Unit :=
+  requireAt role lineNo (low ≤ rate && high.all (rate < ·))
+    s!"RoCE status predicted before the rate was known contradicts the controller rate {rate} (node_id={source.1}, flow_id={source.2})"
+
 /-- Checks one sender row against §5 given the tracked rate, and returns the updated track. -/
 def checkSenderItem (stopTimeNs : Option Nat) (track : SenderTrack) (row : SenderRow)
     (bytes : Option DcqcnEventLog.Row) : Except String SenderTrack := do
@@ -506,16 +533,32 @@ def checkSenderItem (stopTimeNs : Option Nat) (track : SenderTrack) (row : Sende
   let source := (row.nodeId, row.flowId)
   let prior := track.flows.get? source
   -- Continuity: the first row starts from the initial state, later rows where the pair stood.
-  let rate ←
+  let (knownRate, rateLow, rateHigh) ←
     match prior with
     | none => do
-        let rate ←
-          match row.rateBps with
-          | some rate => pure rate
-          | none => throw s!"sender: line {row.srcLine}: RoCE queue pair's first row is not a crediting tick (node_id={row.nodeId}, flow_id={row.flowId})"
-        at_ (row.kind = .tick && row.before = Roce.initialSender row.config rate)
-          s!"RoCE sender first state is not initial (node_id={row.nodeId}, flow_id={row.flowId})"
-        pure rate
+        match row.rateBps with
+        | some rate =>
+            at_ (row.kind = .tick && row.before = Roce.initialSender row.config rate)
+              s!"RoCE sender first state is not initial (node_id={row.nodeId}, flow_id={row.flowId})"
+            pure (some rate, 0, none)
+        | none =>
+            -- Ruling C6: a first tick that finds the class paused credits nothing and writes no
+            -- rate. The initial state is checked in every field but its armed status, which
+            -- bounds the rate until the rate is revealed.
+            if row.kind = .tick && row.classPaused then
+              let initial := Roce.initialSender row.config 0
+              at_ ({ initial with status := row.before.status } = row.before)
+                s!"RoCE sender first state is not initial (node_id={row.nodeId}, flow_id={row.flowId})"
+              match Roce.statusThreshold row.config initial with
+              | some threshold => do
+                  let (low, high) ← boundRate row.srcLine source threshold row.before.status 0 none
+                  pure (none, low, high)
+              | none => do
+                  at_ (row.before = initial)
+                    s!"RoCE sender first state is not initial (node_id={row.nodeId}, flow_id={row.flowId})"
+                  pure (none, 0, none)
+            else
+              throw s!"sender: line {row.srcLine}: RoCE queue pair's first row is neither a crediting tick nor a class-paused tick (node_id={row.nodeId}, flow_id={row.flowId})"
     | some flow => do
         at_ (flow.config = row.config)
           s!"RoCE sender config discontinuity (node_id={row.nodeId}, flow_id={row.flowId})"
@@ -523,7 +566,15 @@ def checkSenderItem (stopTimeNs : Option Nat) (track : SenderTrack) (row : Sende
           s!"RoCE data_class discontinuity (node_id={row.nodeId}, flow_id={row.flowId})"
         at_ (flow.state = row.before)
           s!"RoCE sender state discontinuity (node_id={row.nodeId}, flow_id={row.flowId})"
-        pure flow.rateBps
+        pure (flow.rateBps, flow.rateLow, flow.rateHigh)
+  -- C6: the pair's first crediting tick reveals the rate, which must fit the bounds.
+  let knownRate ←
+    match knownRate, row.rateBps with
+    | none, some revealed => do
+        revealRate "sender" row.srcLine source revealed rateLow rateHigh
+        pure (some revealed)
+    | known, _ => pure known
+  let rate := knownRate.getD 0
   checkSenderShape row
   -- The pair's pending events fired before this row (review H1). A byte opportunity at this key
   -- carries the controller's pending control time, also for the pair's first DCQCN row.
@@ -535,8 +586,9 @@ def checkSenderItem (stopTimeNs : Option Nat) (track : SenderTrack) (row : Sende
   | some flow => checkPending "sender" row.srcLine source { flow with controlNs := controlNs } row.key.timeNs
   | none =>
       checkPending "sender" row.srcLine source
-        { config := row.config, state := row.before, rateBps := rate, controlSpent := false,
-          controlNs := controlNs, pauseParked := false, dataClass := row.dataClass }
+        { config := row.config, state := row.before, rateBps := knownRate, rateLow := rateLow,
+          rateHigh := rateHigh, controlSpent := false, controlNs := controlNs,
+          pauseParked := false, dataClass := row.dataClass }
         row.key.timeNs
   let pauseParked := prior.map (·.pauseParked) |>.getD false
   if row.kind = .resume then
@@ -577,7 +629,19 @@ def checkSenderItem (stopTimeNs : Option Nat) (track : SenderTrack) (row : Sende
     "RoCE timer exceeds u64"
   at_ (row.kind != .resume || expected.stopQuery.isSome) "RoCE resume of a pacer that cannot restart"
   at_ (row.emission = expected.emission) "RoCE emission mismatch"
-  at_ (row.after = expected.state) "RoCE sender after-state mismatch"
+  -- C6: while the rate is unknown (so the credit is still zero), a rate-dependent armed status is
+  -- the only field compared up to the rate: it narrows the rate's bounds instead. Parked, stopped
+  -- and finished statuses, and every other field, are compared exactly.
+  let (rateLow, rateHigh) ←
+    match knownRate, Roce.statusThreshold row.config expected.state with
+    | none, some threshold => do
+        at_ (expected.state.creditQuanta = 0) "RoCE credit while the rate is unknown"
+        at_ ({ expected.state with status := row.after.status } = row.after)
+          "RoCE sender after-state mismatch"
+        boundRate row.srcLine source threshold row.after.status rateLow rateHigh
+    | _, _ => do
+        at_ (row.after = expected.state) "RoCE sender after-state mismatch"
+        pure (rateLow, rateHigh)
   let stop ← checkStop stopTimeNs row expected.stopQuery withinStop track.stop
   -- Payloads are allocated in event order on each node.
   let lastPayload ←
@@ -606,8 +670,9 @@ def checkSenderItem (stopTimeNs : Option Nat) (track : SenderTrack) (row : Sende
     { track with
       pauseParkedIndex := pauseParkedIndex
       flows := track.flows.insert source
-        { config := row.config, state := row.after, rateBps := rateAfterBytes,
-          controlSpent := controlSpent,
+        { config := row.config, state := row.after,
+          rateBps := knownRate.map (fun _ => rateAfterBytes), rateLow := rateLow,
+          rateHigh := rateHigh, controlSpent := controlSpent,
           controlNs := match bytes with
             | some d => some d.after.nextControlTimeNs
             | none => controlNs
@@ -626,8 +691,13 @@ def checkDcqcnItem (track : SenderTrack) (d : DcqcnEventLog.Row) : Except String
   | none =>
       throw s!"dcqcn: line {d.srcLine}: DCQCN row of a queue pair before its first RoCE tick (node_id={d.nodeId}, flow_id={d.flowId})"
   | some flow =>
-      at_ (d.before.currentRateBps = flow.rateBps)
-        "DCQCN rate differs from the queue pair's tracked controller rate"
+      match flow.rateBps with
+      | some rate =>
+          at_ (d.before.currentRateBps = rate)
+            "DCQCN rate differs from the queue pair's tracked controller rate"
+      | none =>
+          -- C6: the pair's first DCQCN row reveals the rate, which must fit the bounds.
+          revealRate "dcqcn" d.srcLine source d.before.currentRateBps flow.rateLow flow.rateHigh
       at_ (d.kind != .bytes) "DCQCN byte opportunity without a RoCE tick at its event key"
       checkPending "dcqcn" d.srcLine source
         { flow with controlNs := some d.before.nextControlTimeNs } d.key.timeNs
@@ -640,7 +710,7 @@ def checkDcqcnItem (track : SenderTrack) (d : DcqcnEventLog.Row) : Except String
         flows := track.flows.insert source
           { flow with
             state := state
-            rateBps := d.after.currentRateBps
+            rateBps := some d.after.currentRateBps
             controlSpent := flow.controlSpent || (d.kind = .control && completed)
             controlNs := some d.after.nextControlTimeNs } }
 
