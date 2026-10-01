@@ -365,5 +365,90 @@ mutate_sender "stopped-tick-still-armed" "$stopped" "$stopped_dcqcn" "$stopped_s
   'NR == 4 { $35 = "armed"; $37 = "blocked" } { print }' \
   'REJECT: sender: line 4: RoCE pacer stop decision contradicts stop_time_ns=2500 (tick 3200)'
 
+# --- Trace: the three logs of one run, and the cross-role invariants ---------------------------
+loss_sender="$fixture_dir/roce_trace_loss_accept.sender.csv"
+loss_receiver="$fixture_dir/roce_trace_loss_accept.receiver.csv"
+loss_dcqcn="$fixture_dir/roce_trace_loss_accept.dcqcn.csv"
+loss_stop=50000
+
+check_case "roce_trace_loss_accept" 0 "ACCEPT" \
+  trace "$loss_sender" "$loss_receiver" "$loss_dcqcn" "$loss_stop" || true
+# Executor traces committed as fixtures (tests/fixtures-style triples with a .stop_time_ns file).
+for sender_csv in "$fixture_dir"/roce_trace_*_executor_accept.sender.csv; do
+  [[ -e "$sender_csv" ]] || continue
+  base="${sender_csv%.sender.csv}"
+  check_case "$(basename "$base")" 0 "ACCEPT" \
+    trace "$sender_csv" "$base.receiver.csv" "$base.dcqcn.csv" "$(cat "$base.stop_time_ns")" || true
+done
+if [[ -n "${ROCE_TRACE_DIR:-}" ]]; then
+  for sender_csv in "$ROCE_TRACE_DIR"/*.roce_sender.csv; do
+    [[ -e "$sender_csv" ]] || continue
+    base="${sender_csv%.roce_sender.csv}"
+    stop=""
+    [[ -e "$base.stop_time_ns" ]] && stop="$(cat "$base.stop_time_ns")"
+    check_case "external/$(basename "$base")" 0 "ACCEPT" \
+      trace "$sender_csv" "$base.roce_receiver.csv" "$base.dcqcn.csv" $stop || true
+  done
+fi
+
+# mutate_trace <label> <sender|receiver|dcqcn> <awk program> <expected REJECT line>
+mutate_trace() {
+  local label="$1"
+  local role="$2"
+  local program="$3"
+  local expected_output="$4"
+  local sender="$loss_sender"
+  local receiver="$loss_receiver"
+  local dcqcn="$loss_dcqcn"
+  local mutated="$campaign_tmp/trace-$role.csv"
+  case "$role" in
+    sender) awk -F, -v OFS=, "$program" "$loss_sender" > "$mutated"; sender="$mutated" ;;
+    receiver) awk -F, -v OFS=, "$program" "$loss_receiver" > "$mutated"; receiver="$mutated" ;;
+    dcqcn) awk -F, -v OFS=, "$program" "$loss_dcqcn" > "$mutated"; dcqcn="$mutated" ;;
+  esac
+  mutations=$((mutations + 1))
+  if check_case "trace/$label" 1 "$expected_output" \
+      trace "$sender" "$receiver" "$dcqcn" "$loss_stop"; then
+    mutations_caught=$((mutations_caught + 1))
+  fi
+}
+
+# roce_trace_loss_accept: sender rows (NR) 2 t1000 psn 0; 3 t2000 psn 1000 (lost); 4 t2600 ACK
+# 1000; 5 t3000 psn 2000, parks; 6 t4200 NACK 1000 rewinds, restart at 5000 (rate 6 Gb/s after
+# the CNP at 3900: blocked); 7 t5000 tick without credit; 8 t6000 psn 1000 again; 9 t7000 psn
+# 2000 again, parks; 10 t7100 ACK 2000; 11 t8100 ACK 3000, finished. Receiver rows: 2 t1500
+# psn 0 -> ACK 1000; 3 t3500 psn 2000 (CE) -> CNP + NACK 1000; 4 t6500 psn 1000 -> ACK 2000;
+# 5 t7500 psn 2000 -> ACK 3000. Each mutation keeps every log consistent on its own terms.
+mutate_trace "ack-consumed-before-receiver-sent-it" receiver \
+  'NR == 2 { $1 = 2700 } { print }' \
+  'REJECT: sender: line 4: RoCE ACK carries a value no receiver sent before it (flow_id=3, acknowledgment=1000)'
+mutate_trace "nack-consumed-before-receiver-sent-it" receiver \
+  'NR == 3 { $1 = 4300; $31 = 4300; $32 = 4300 } NR >= 4 { $26 = 4300; $27 = 4300; $31 = 4300; $32 = 4300 } { print }' \
+  'REJECT: sender: line 6: RoCE NACK carries a value no receiver sent before it (flow_id=3, acknowledgment=1000)'
+mutate_trace "cnp-applied-before-receiver-sent-it" receiver \
+  'NR == 3 { $1 = 4000; $31 = 4000; $32 = 4000 } NR >= 4 { $26 = 4000; $27 = 4000; $31 = 4000; $32 = 4000 } { print }' \
+  'REJECT: dcqcn: line 5: DCQCN CNP of a queue pair that no receiver sent before it (flow_id=3)'
+mutate_trace "data-never-sent" receiver \
+  'NR == 4 { $15 = 5000 } { print }' \
+  'REJECT: receiver: line 4: RoCE data arrival matches no sender emission (flow_id=3, sent_time_ns=5000)'
+mutate_trace "data-differs-from-emission" receiver \
+  'NR == 4 { $16 = 0 } { print }' \
+  "REJECT: receiver: line 4: RoCE data arrival differs from the sender's emission (flow_id=3, sent_time_ns=6000)"
+mutate_trace "emission-delivered-twice" receiver \
+  'NR == 5 { $15 = 3000; $16 = 0 } { print }' \
+  'REJECT: receiver: line 5: RoCE emission delivered twice (flow_id=3, sent_time_ns=3000)'
+mutate_trace "receiver-total-differs" receiver \
+  'NR >= 2 { $7 = 4000 } { print }' \
+  "REJECT: receiver: line 2: RoCE receiver total_bytes differs from the sender's (flow_id=3)"
+mutate_trace "silent-duplicates-with-timeout-on" receiver \
+  'NR >= 2 { $10 = 0 } { print }' \
+  "REJECT: receiver: line 2: RoCE receiver drops duplicates silently while the sender's timeout is on (D7) (flow_id=3)"
+mutate_trace "receiver-without-sender" receiver \
+  'NR >= 2 { $6 = 4 } { print }' \
+  'REJECT: receiver: line 2: RoCE receiver of a flow with no sender rows (flow_id=4)'
+mutate_trace "receiver-log-checked" receiver \
+  'NR == 5 { $18 = "none"; $19 = ""; $20 = "" } { print }' \
+  'REJECT: receiver: line 5: RoCE receiver action mismatch'
+
 echo "P10c RoCE campaign checks: $checked; mutations caught: $mutations_caught/$mutations"
 exit "$failures"

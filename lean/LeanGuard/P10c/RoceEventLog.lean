@@ -528,4 +528,49 @@ def checkSenderRows (stopTimeNs : Option Nat) (rows : List SenderRow)
       else throw s!"sender: no single stop time fits the pacer decisions: tick {within} (line {withinLine}) is armed and tick {beyond} (line {beyondLine}) is stopped"
   | _, _ => pure ()
 
+/-! ## Cross-role invariants (both logs and the controller log of one run) -/
+
+/-- Merges two time-ordered logs; on equal times the left (sending) side comes first, so a packet
+sent and consumed at the same instant counts as sent before it is consumed. Linear. -/
+def mergeByTime {α β : Type} (ta : α → Nat) (tb : β → Nat) :
+    List α → List β → List (α ⊕ β) → List (α ⊕ β)
+  | [], [], acc => acc.reverse
+  | a :: as, [], acc => mergeByTime ta tb as [] (.inl a :: acc)
+  | [], b :: bs, acc => mergeByTime ta tb [] bs (.inr b :: acc)
+  | a :: as, b :: bs, acc =>
+      if ta a ≤ tb b then mergeByTime ta tb as (b :: bs) (.inl a :: acc)
+      else mergeByTime ta tb (a :: as) bs (.inr b :: acc)
+termination_by as bs => as.length + bs.length
+
+/-- Consumes one unit of `key` from a multiset of sent packets. -/
+def consume {κ : Type} [BEq κ] [Hashable κ] (sent : Std.HashMap κ Nat) (key : κ) :
+    Option (Std.HashMap κ Nat) :=
+  match sent.get? key with
+  | some (count + 1) => some (sent.insert key count)
+  | _ => none
+
+/--
+The invariants only the joined logs show (every check is a hash-map step per row):
+
+* every data arrival at a receiver is a packet its sender emitted at `packet_sent_time_ns`, with
+  the same PSN, size and retransmission bit, and no emission arrives twice;
+* every ACK and NACK the sender applies was sent earlier by the pair's receiver with that value
+  (so `snd_una` advances only to values a receiver's frontier carried), each at most once;
+* every CNP the controller applies for a pair was sent earlier by its receiver, each at most once;
+* the receiver's total equals the sender's, and a receiver drops duplicates silently only when
+  the sender's timeout is off (D7).
+-/
+def checkCrossRole (sender : List SenderRow) (receiver : List ReceiverRow)
+    (dcqcn : List DcqcnEventLog.Row) : Except String Unit := do
+  -- RED stub: no cross-role check yet.
+  let _ := (sender, receiver, dcqcn, @mergeByTime, @consume)
+  pure ()
+
+/-- The three logs of one run: each on its own terms, then the cross-role invariants. -/
+def checkTrace (stopTimeNs : Option Nat) (sender : List SenderRow) (receiver : List ReceiverRow)
+    (dcqcn : List DcqcnEventLog.Row) : Except String Unit := do
+  inRole "receiver" (checkReceiverRows receiver)
+  checkSenderRows stopTimeNs sender dcqcn
+  checkCrossRole sender receiver dcqcn
+
 end LeanGuard.P10c.RoceEventLog

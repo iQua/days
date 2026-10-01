@@ -5,7 +5,8 @@ open LeanGuard.P10c.RoceEventLog
 
 def usage : String :=
   "usage: p10c_roce_check receiver <roce_receiver.csv>\n" ++
-  "       p10c_roce_check sender <roce_sender.csv> <dcqcn.csv> [<stop_time_ns>]"
+  "       p10c_roce_check sender <roce_sender.csv> <dcqcn.csv> [<stop_time_ns>]\n" ++
+  "       p10c_roce_check trace <roce_sender.csv> <roce_receiver.csv> <dcqcn.csv> [<stop_time_ns>]"
 
 def parseStop : List String → Option (Option Nat)
   | [] => some none
@@ -38,6 +39,20 @@ def main (args : List String) : IO UInt32 := do
             let senderRows ← inRole "sender" (parseSenderCsv sender)
             let dcqcnRows ← inRole "dcqcn" (LeanGuard.P10c.DcqcnEventLog.parseCsv dcqcn)
             checkSenderRows stop senderRows dcqcnRows
+  | "trace" :: senderPath :: receiverPath :: dcqcnPath :: rest =>
+      match parseStop rest with
+      | none =>
+          IO.eprintln usage
+          pure 2
+      | some stop =>
+          let sender ← IO.FS.readFile senderPath
+          let receiver ← IO.FS.readFile receiverPath
+          let dcqcn ← IO.FS.readFile dcqcnPath
+          report do
+            let senderRows ← inRole "sender" (parseSenderCsv sender)
+            let receiverRows ← inRole "receiver" (parseReceiverCsv receiver)
+            let dcqcnRows ← inRole "dcqcn" (LeanGuard.P10c.DcqcnEventLog.parseCsv dcqcn)
+            checkTrace stop senderRows receiverRows dcqcnRows
   | _ =>
       IO.eprintln usage
       pure 2
