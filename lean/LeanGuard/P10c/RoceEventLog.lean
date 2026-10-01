@@ -152,12 +152,56 @@ def checkKeyOrder {α : Type} (key : α → DaysExecutor.EventKey) (line : α �
       require (line second) (key first < key second) "duplicate or backward canonical event key"
       checkKeyOrder key line (second :: rest)
 
-/-- RED stub: the receiver semantics are not checked yet. -/
-def checkReceiverRow (_row : ReceiverRow) : Except String Unit := pure ()
+/-- One receiver row against §5 step 9, given only the row. -/
+def checkReceiverRow (row : ReceiverRow) : Except String Unit := do
+  let line := row.srcLine
+  require line (Roce.validReceiverConfig row.config) "invalid RoCE receiver configuration"
+  require line (Roce.validReceiverState row.config row.before) "invalid RoCE receiver before-state"
+  require line (Roce.validReceiverState row.config row.after) "invalid RoCE receiver after-state"
+  require line (row.key.phase = 0) "RoCE data arrival must have phase 0"
+  require line (row.packet.bytes > 0) "RoCE data packet has no bytes"
+  require line (row.packet.psn + row.packet.bytes ≤ row.config.totalBytes)
+    "RoCE data packet extends beyond the queue pair's total bytes"
+  require line (row.packetSentTimeNs ≤ row.key.timeNs) "RoCE data packet arrives before it was sent"
+  let expected := Roce.onData row.config row.before row.key.timeNs row.packet
+  require line (row.cnpSent = expected.cnpSent) "RoCE notification-point decision mismatch"
+  require line (row.cnpPayload.isSome = row.cnpSent) "RoCE CNP payload present iff a CNP was sent"
+  require line (row.action = expected.action) "RoCE receiver action mismatch"
+  require line (row.feedbackAcknowledgment = expected.feedbackAcknowledgment)
+    "RoCE feedback acknowledgment mismatch"
+  require line (row.feedbackPayload.isSome = row.action.sendsFeedback)
+    "RoCE feedback payload present iff an ACK or NACK was sent"
+  require line (row.after = expected.state) "RoCE receiver after-state mismatch"
 
-/-- RED stub: no continuity yet. -/
+/--
+One pass in event order: per-receiver continuity (each row starts where the receiver's previous row ended, the first one
+from the initial state, under one configuration) and the target's payload order: payload
+sequences are allocated in event order, CNP before ACK or NACK (S1), so every payload a receiver
+host allocates exceeds the previous one. Each row is then checked against the semantics.
+-/
 def checkReceiverSequence (rows : List ReceiverRow) : Except String Unit := do
-  for row in rows do checkReceiverRow row
+  let mut last : Std.HashMap (Nat × Nat) ReceiverRow := ∅
+  let mut lastPayload : Std.HashMap Nat Nat := ∅
+  for row in rows do
+    let source := (row.nodeId, row.flowId)
+    match last.get? source with
+    | none =>
+        require row.srcLine (row.before = Roce.initialReceiver)
+          s!"RoCE receiver first state is not initial (node_id={row.nodeId}, flow_id={row.flowId})"
+    | some prior =>
+        require row.srcLine (prior.config = row.config)
+          s!"RoCE receiver config discontinuity (node_id={row.nodeId}, flow_id={row.flowId})"
+        require row.srcLine (prior.after = row.before)
+          s!"RoCE receiver state discontinuity (node_id={row.nodeId}, flow_id={row.flowId})"
+    checkReceiverRow row
+    last := last.insert source row
+    for payload in [row.cnpPayload, row.feedbackPayload].filterMap id do
+      match lastPayload.get? row.nodeId with
+      | some previous =>
+          require row.srcLine (previous < payload)
+            s!"RoCE receiver payloads out of allocation order (node_id={row.nodeId})"
+      | none => pure ()
+      lastPayload := lastPayload.insert row.nodeId payload
 
 def checkReceiverRows (rows : List ReceiverRow) : Except String Unit := do
   require 1 (!rows.isEmpty) "empty RoCE receiver trace"
