@@ -4055,7 +4055,9 @@ impl<'image> TransitionState<'image> {
         let stop_time_ns = self.image.stop_time_ns;
         let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
         let image = self.image;
-        let data_class = image_flow_priority(image, packet.flow)?;
+        // Records are kept only under full observation, so only then are they built: a summary
+        // run of a queue pair pays for neither the views nor the data-class lookup.
+        let full = self.observation_mode == ObservationMode::Full;
         let unexpected = ExecutionError::UnexpectedGeneratorEmission {
             node: node.id,
             flow: packet.flow,
@@ -4074,37 +4076,43 @@ impl<'image> TransitionState<'image> {
             {
                 return Err(unexpected);
             }
-            let before = crate::roce::RoceSenderView::of(generator, &roce);
+            let before = full.then(|| crate::roce::RoceSenderView::of(generator, &roce));
             roce.pacer_armed = false;
             let total = roce.pacer.total_bytes;
             // Host-link PFC, tested first (LeanGuard's writer contract, `leanguard.md` §12): a
             // tick that finds its data class paused at its host sends nothing, adds no credit and
             // parks, and a pacer with packets left joins the class's parked list for the RESUME.
-            if let Some(pfc) = state
-                .pfc
-                .as_deref_mut()
-                .filter(|pfc| pfc.is_paused(usize::from(data_class)))
-            {
+            // A host without host-link PFC pays one `None` test.
+            let paused_class = match state.pfc.as_deref_mut() {
+                None => None,
+                Some(pfc) => {
+                    let class = image_flow_priority(image, packet.flow)?;
+                    pfc.is_paused(usize::from(class)).then_some((pfc, class))
+                }
+            };
+            if let Some((pfc, class)) = paused_class {
                 if roce.next_psn < total && roce.snd_una < total {
-                    pfc.pause_parked[usize::from(data_class)].insert(position);
+                    pfc.pause_parked[usize::from(class)].insert(position);
                 }
                 let generator = &mut state.generators[position];
                 settle_roce_sender(generator, &roce, GeneratorStatus::Blocked);
                 generator.kind = FlowGeneratorKind::Roce(roce);
-                let record = roce_sender_record(
-                    event.key,
-                    node.id,
-                    packet.flow,
-                    crate::RoceSenderKind::Tick,
-                    true,
-                    data_class,
-                    &roce,
-                    None,
-                    None,
-                    None,
-                    before,
-                    crate::roce::RoceSenderView::of(generator, &roce),
-                );
+                let record = before.map(|before| {
+                    roce_sender_record(
+                        event.key,
+                        node.id,
+                        packet.flow,
+                        crate::RoceSenderKind::Tick,
+                        true,
+                        class,
+                        &roce,
+                        None,
+                        None,
+                        None,
+                        before,
+                        crate::roce::RoceSenderView::of(generator, &roce),
+                    )
+                });
                 break 'tick (None, None, None, None, record);
             }
             let mut rate_bps = None;
@@ -4151,7 +4159,7 @@ impl<'image> TransitionState<'image> {
                         .controller
                         .on_bytes_emitted(size)
                         .map_err(|_| overflow)?;
-                    byte_transition = Some(crate::DcqcnTransitionRecord {
+                    byte_transition = full.then_some(crate::DcqcnTransitionRecord {
                         key: event.key,
                         node: node.id,
                         flow: packet.flow,
@@ -4196,26 +4204,29 @@ impl<'image> TransitionState<'image> {
             let next_tick_ns = roce
                 .pacer_armed
                 .then_some(generator.next_emission.departure_time_ns);
-            let record = roce_sender_record(
-                event.key,
-                node.id,
-                packet.flow,
-                crate::RoceSenderKind::Tick,
-                false,
-                data_class,
-                &roce,
-                rate_bps,
-                None,
-                emission,
-                before,
-                crate::roce::RoceSenderView::of(generator, &roce),
-            );
+            let record = match before {
+                Some(before) => Some(roce_sender_record(
+                    event.key,
+                    node.id,
+                    packet.flow,
+                    crate::RoceSenderKind::Tick,
+                    false,
+                    image_flow_priority(image, packet.flow)?,
+                    &roce,
+                    rate_bps,
+                    None,
+                    emission,
+                    before,
+                    crate::roce::RoceSenderView::of(generator, &roce),
+                )),
+                None => None,
+            };
             (emission, next_tick_ns, timer_ns, byte_transition, record)
         };
-        if self.observation_mode == ObservationMode::Full {
+        if full {
             self.mechanism_transitions
                 .extend(byte_transition.map(crate::MechanismTransitionRecord::Dcqcn));
-            self.mechanism_transitions.push(record);
+            self.mechanism_transitions.extend(record);
         }
         if let Some(time_ns) = next_tick_ns {
             self.emit_from_host(
@@ -4291,6 +4302,7 @@ impl<'image> TransitionState<'image> {
             });
         }
         let data_class = flow.priority;
+        let full = self.observation_mode == ObservationMode::Full;
         self.record_arrival(node.id, packet, event.key, ArrivalDisposition::Feedback)?;
         self.mark_terminal(packet.id)?;
         let now = event.key.time_ns;
@@ -4316,7 +4328,7 @@ impl<'image> TransitionState<'image> {
                 .arrivals
                 .checked_add(1)
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
-            let before = crate::roce::RoceSenderView::of(generator, &roce);
+            let before = full.then(|| crate::roce::RoceSenderView::of(generator, &roce));
             let acknowledgment = header.acknowledgment;
             if acknowledgment > generator.bytes_emitted {
                 return Err(ExecutionError::InconsistentRocePacket {
@@ -4361,24 +4373,26 @@ impl<'image> TransitionState<'image> {
             generator.kind = FlowGeneratorKind::Roce(roce);
             leave_parked_list(state.pfc, data_class, position, generator, &roce);
             let generator = &state.generators[position];
-            let record = roce_sender_record(
-                event.key,
-                node.id,
-                packet.flow,
-                if nack {
-                    crate::RoceSenderKind::Nack
-                } else {
-                    crate::RoceSenderKind::Ack
-                },
-                false,
-                data_class,
-                &roce,
-                None,
-                Some(acknowledgment),
-                None,
-                before,
-                crate::roce::RoceSenderView::of(generator, &roce),
-            );
+            let record = before.map(|before| {
+                roce_sender_record(
+                    event.key,
+                    node.id,
+                    packet.flow,
+                    if nack {
+                        crate::RoceSenderKind::Nack
+                    } else {
+                        crate::RoceSenderKind::Ack
+                    },
+                    false,
+                    data_class,
+                    &roce,
+                    None,
+                    Some(acknowledgment),
+                    None,
+                    before,
+                    crate::roce::RoceSenderView::of(generator, &roce),
+                )
+            });
             (
                 superseded_ns,
                 timer_ns,
@@ -4395,7 +4409,7 @@ impl<'image> TransitionState<'image> {
             });
         }
         if self.observation_mode == ObservationMode::Full {
-            self.mechanism_transitions.push(record);
+            self.mechanism_transitions.extend(record);
         }
         self.emit_roce_timers(node, event, token, tick_ns, timer_ns, children)
     }
@@ -4414,6 +4428,7 @@ impl<'image> TransitionState<'image> {
         let flow = self.packet(event.payload)?.flow;
         let now = event.key.time_ns;
         let stop_time_ns = self.image.stop_time_ns;
+        let full = self.observation_mode == ObservationMode::Full;
         let data_class = image_flow_priority(self.image, flow)?;
         let (timer_ns, tick_ns, record) = {
             let (mut state, index) = self.host_parts_mut(node)?;
@@ -4445,7 +4460,7 @@ impl<'image> TransitionState<'image> {
                 );
                 return Ok(());
             }
-            let before = crate::roce::RoceSenderView::of(generator, &roce);
+            let before = full.then(|| crate::roce::RoceSenderView::of(generator, &roce));
             roce.next_psn = roce.snd_una;
             let deadline = now
                 .checked_add(roce.rto_ns)
@@ -4456,24 +4471,26 @@ impl<'image> TransitionState<'image> {
             generator.kind = FlowGeneratorKind::Roce(roce);
             leave_parked_list(state.pfc, data_class, position, generator, &roce);
             let generator = &state.generators[position];
-            let record = roce_sender_record(
-                event.key,
-                node.id,
-                flow,
-                crate::RoceSenderKind::Timeout,
-                false,
-                data_class,
-                &roce,
-                None,
-                None,
-                None,
-                before,
-                crate::roce::RoceSenderView::of(generator, &roce),
-            );
+            let record = before.map(|before| {
+                roce_sender_record(
+                    event.key,
+                    node.id,
+                    flow,
+                    crate::RoceSenderKind::Timeout,
+                    false,
+                    data_class,
+                    &roce,
+                    None,
+                    None,
+                    None,
+                    before,
+                    crate::roce::RoceSenderView::of(generator, &roce),
+                )
+            });
             (Some(deadline), tick_ns, record)
         };
-        if self.observation_mode == ObservationMode::Full {
-            self.mechanism_transitions.push(record);
+        if full {
+            self.mechanism_transitions.extend(record);
         }
         self.emit_roce_timers(node, event, event.payload, tick_ns, timer_ns, children)
     }
