@@ -172,7 +172,9 @@ A RoCE stage differs from a TCP stage in four points:
 - In the final state, the stalled stage's generator is not `Finished` (its `snd_una` is below its total), and its successors' stage records still read `activated: false`.
 - In the collective trace, no local-completion row names the stalled stage as its cause.
 
-On a lossless fabric (PFC on the data class), nothing is lost and no stage stalls.
+With the timeout off, a stage is safe from a stall only if neither its data nor its feedback can be dropped: no loss on its data class and none on its `feedback_priority` class. PFC on the data class alone is not enough. A switch queue's `capacity` counts packets of every class, so unprotected packets that share the queue, such as traffic on a class without PFC or a burst of 64-byte ACKs, can fill it and tail-drop protected data too. The example above protects only its data class: its ACKs, NACKs and CNPs ride class 0, which has no PFC, so other unprotected traffic on the same switches can make it stall.
+
+To check a run, read `dropped_packets` in the run summary (`days` prints it in its result line). A run that dropped no packet has no stall of this kind. If it dropped packets, the two signals above show whether a stage stalled.
 
 ### Compute stages
 
