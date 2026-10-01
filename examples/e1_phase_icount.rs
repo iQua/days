@@ -36,13 +36,18 @@ fn note_size(size: usize) {
     SIZE_BYTES[bin].fetch_add(size as u64, Relaxed);
 }
 fn size_snapshot() -> Vec<(u64, u64)> {
-    (0..4097).map(|bin| (SIZE_COUNT[bin].load(Relaxed), SIZE_BYTES[bin].load(Relaxed))).collect()
+    (0..4097)
+        .map(|bin| (SIZE_COUNT[bin].load(Relaxed), SIZE_BYTES[bin].load(Relaxed)))
+        .collect()
 }
 fn size_report(rep: usize, phase: &str, before: &[(u64, u64)]) {
     for (bin, now) in size_snapshot().iter().enumerate() {
         let count = now.0 - before[bin].0;
         if count > 0 {
-            println!("record=size rep={rep} phase={phase} size={bin} count={count} bytes={}", now.1 - before[bin].1);
+            println!(
+                "record=size rep={rep} phase={phase} size={bin} count={count} bytes={}",
+                now.1 - before[bin].1
+            );
         }
     }
 }
@@ -112,7 +117,13 @@ fn minor_faults() -> i64 {
 fn counters() -> (u64, u64) {
     let mut buffer = [0_u64; 64];
     // SAFETY: the buffer is larger than `rusage_info_v4`.
-    let rc = unsafe { proc_pid_rusage(std::process::id() as i32, RUSAGE_INFO_V4, buffer.as_mut_ptr()) };
+    let rc = unsafe {
+        proc_pid_rusage(
+            std::process::id() as i32,
+            RUSAGE_INFO_V4,
+            buffer.as_mut_ptr(),
+        )
+    };
     assert_eq!(rc, 0, "proc_pid_rusage failed");
     // 16-byte uuid, then 29 u64 fields before ri_instructions and ri_cycles.
     (buffer[2 + 29], buffer[2 + 30])
@@ -122,30 +133,49 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let path = args.next().expect("fixture path");
     let reps: usize = args.next().map_or(1, |value| value.parse().expect("reps"));
-    let phases = args.next().unwrap_or_else(|| "lower,validate,cpu_w1,scalar".to_owned());
+    let phases = args
+        .next()
+        .unwrap_or_else(|| "lower,validate,cpu_w1,scalar".to_owned());
     for rep in 0..reps {
         let faults = minor_faults();
         let heap = heap_mark();
         let start = counters();
-        let image = compile_config_with_route_workers(&path, RouteWorkers::serial()).expect("lower");
+        let image =
+            compile_config_with_route_workers(&path, RouteWorkers::serial()).expect("lower");
         let lowered = counters();
         heap_report(rep, "lower", heap);
-        println!("record=faults rep={rep} phase=lower minor_faults={}", minor_faults() - faults);
-        println!("record=phase rep={rep} phase=lower instructions={} cycles={}", lowered.0 - start.0, lowered.1 - start.1);
+        println!(
+            "record=faults rep={rep} phase=lower minor_faults={}",
+            minor_faults() - faults
+        );
+        println!(
+            "record=phase rep={rep} phase=lower instructions={} cycles={}",
+            lowered.0 - start.0,
+            lowered.1 - start.1
+        );
         if phases.contains("validate") {
             let before = counters();
             validate(&image, Backend::Scalar).expect("valid");
             let after = counters();
-            println!("record=phase rep={rep} phase=validate instructions={} cycles={}", after.0 - before.0, after.1 - before.1);
+            println!(
+                "record=phase rep={rep} phase=validate instructions={} cycles={}",
+                after.0 - before.0,
+                after.1 - before.1
+            );
         }
         if let Some(loops) = phases.strip_prefix("lower_loop=") {
             let loops: usize = loops.parse().expect("loop count");
             for iteration in 0..loops {
                 let before = counters();
-                let again = compile_config_with_route_workers(&path, RouteWorkers::serial()).expect("lower");
+                let again = compile_config_with_route_workers(&path, RouteWorkers::serial())
+                    .expect("lower");
                 let after = counters();
                 drop(again);
-                println!("record=phase rep={rep} phase=lower_iter{iteration} instructions={} cycles={}", after.0 - before.0, after.1 - before.1);
+                println!(
+                    "record=phase rep={rep} phase=lower_iter{iteration} instructions={} cycles={}",
+                    after.0 - before.0,
+                    after.1 - before.1
+                );
             }
         }
         if let Some(loops) = phases.strip_prefix("validate_loop=") {
@@ -155,7 +185,11 @@ fn main() {
                 validate(&image, Backend::Scalar).expect("valid");
             }
             let after = counters();
-            println!("record=phase rep={rep} phase=validate_loop instructions={} cycles={}", (after.0 - before.0) / loops as u64, (after.1 - before.1) / loops as u64);
+            println!(
+                "record=phase rep={rep} phase=validate_loop instructions={} cycles={}",
+                (after.0 - before.0) / loops as u64,
+                (after.1 - before.1) / loops as u64
+            );
         }
         if phases.contains("cpu_w1") {
             let sizes = size_snapshot();
@@ -163,20 +197,46 @@ fn main() {
             let heap = heap_mark();
             let faults = minor_faults();
             let before = counters();
-            let run = run_cpu(&image, None, CpuConfig { workers: 1, ..CpuConfig::default() }).expect("cpu");
+            let run = run_cpu(
+                &image,
+                None,
+                CpuConfig {
+                    workers: 1,
+                    ..CpuConfig::default()
+                },
+            )
+            .expect("cpu");
             let after = counters();
-            println!("record=phase rep={rep} phase=cpu_w1 instructions={} cycles={} sourced={}", after.0 - before.0, after.1 - before.1, run.result.summary.sourced_packets);
+            println!(
+                "record=phase rep={rep} phase=cpu_w1 instructions={} cycles={} sourced={}",
+                after.0 - before.0,
+                after.1 - before.1,
+                run.result.summary.sourced_packets
+            );
             heap_report(rep, "cpu_w1", heap);
-            println!("record=faults rep={rep} phase=cpu_w1 minor_faults={}", minor_faults() - faults);
+            println!(
+                "record=faults rep={rep} phase=cpu_w1 minor_faults={}",
+                minor_faults() - faults
+            );
             size_report(rep, "cpu_w1", &sizes);
             let large_end = (LARGE_NEXT.load(Relaxed) as usize).min(LARGE.len());
-            for (order, slot) in LARGE[large_start.min(large_end)..large_end].iter().enumerate() {
-                println!("record=large rep={rep} phase=cpu_w1 order={order} size={}", slot.load(Relaxed));
+            for (order, slot) in LARGE[large_start.min(large_end)..large_end]
+                .iter()
+                .enumerate()
+            {
+                println!(
+                    "record=large rep={rep} phase=cpu_w1 order={order} size={}",
+                    slot.load(Relaxed)
+                );
             }
             let dropped = counters();
             drop(run);
             let freed = counters();
-            println!("record=phase rep={rep} phase=cpu_w1_drop instructions={} cycles={}", freed.0 - dropped.0, freed.1 - dropped.1);
+            println!(
+                "record=phase rep={rep} phase=cpu_w1_drop instructions={} cycles={}",
+                freed.0 - dropped.0,
+                freed.1 - dropped.1
+            );
         }
         if phases.contains("scalar") {
             let heap = heap_mark();
@@ -184,7 +244,12 @@ fn main() {
             let result = run_scalar(&image, None).expect("scalar");
             let after = counters();
             heap_report(rep, "scalar", heap);
-            println!("record=phase rep={rep} phase=scalar instructions={} cycles={} sourced={}", after.0 - before.0, after.1 - before.1, result.summary.sourced_packets);
+            println!(
+                "record=phase rep={rep} phase=scalar instructions={} cycles={} sourced={}",
+                after.0 - before.0,
+                after.1 - before.1,
+                result.summary.sourced_packets
+            );
         }
     }
 }

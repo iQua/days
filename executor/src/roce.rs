@@ -146,12 +146,13 @@ pub(crate) fn receive(
             RoceReceiverAction::None
         }
     } else {
+        // A repeat's earliest time beyond `u64::MAX` is never reached, as for the CNP interval.
         let admitted = receiver.last_nack.is_none_or(|mark| {
             mark.expected_psn != receiver.expected_psn
                 || mark
                     .time_ns
                     .checked_add(receiver.nack_interval_ns)
-                    .is_none_or(|earliest| now_ns >= earliest)
+                    .is_some_and(|earliest| now_ns >= earliest)
         });
         if admitted {
             receiver.last_nack = Some(crate::RoceNackMark {
@@ -428,7 +429,10 @@ mod tests {
     fn a_nack_interval_beyond_u64_never_expires() {
         let mut state = receiver(1, true);
         state.nack_interval_ns = u64::MAX - 5;
-        assert_eq!(receive(&mut state, 1_000, 1_000, 10), RoceReceiverAction::Nack);
+        assert_eq!(
+            receive(&mut state, 1_000, 1_000, 10),
+            RoceReceiverAction::Nack
+        );
         assert_eq!(
             receive(&mut state, 2_000, 500, u64::MAX),
             RoceReceiverAction::NackSuppressed

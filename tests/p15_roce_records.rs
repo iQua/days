@@ -239,9 +239,11 @@ fn check_receiver(name: &str, record: &RoceReceiverRecord) {
         RoceReceiverAction::Nack | RoceReceiverAction::NackSuppressed => {
             assert!(record.packet_psn > before.expected_psn, "{context}");
             let admitted = before.last_nack_psn != Some(before.expected_psn)
-                || before
-                    .last_nack_time_ns
-                    .is_none_or(|last| record.key.time_ns >= last + record.nack_interval_ns);
+                || before.last_nack_time_ns.is_none_or(|last| {
+                    // A repeat's earliest time beyond u64::MAX is never reached.
+                    last.checked_add(record.nack_interval_ns)
+                        .is_some_and(|earliest| record.key.time_ns >= earliest)
+                });
             assert_eq!(
                 record.action == RoceReceiverAction::Nack,
                 admitted,
