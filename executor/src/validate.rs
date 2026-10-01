@@ -1455,6 +1455,20 @@ fn expected_pause_parked(
     expected
 }
 
+/// Pending `PacingTimer` events at `owner` that carry `payload`, at any time: a range of the
+/// `(node, payload, time)` map, so the count costs a lookup and the matching entries, and
+/// validation stays linear in the pending events.
+fn pending_ticks_with_payload(
+    pacing_counts: &BTreeMap<(NodeId, PayloadId, u64), usize>,
+    owner: NodeId,
+    payload: PayloadId,
+) -> usize {
+    pacing_counts
+        .range((owner, payload, 0)..=(owner, payload, u64::MAX))
+        .map(|(_, count)| *count)
+        .sum()
+}
+
 /// A Go-back-N packet boundary: a multiple of the MTU, or the total byte count.
 const fn roce_boundary(psn: u64, mtu_bytes: u64, total_bytes: u64) -> bool {
     psn == total_bytes || psn.is_multiple_of(mtu_bytes) && psn < total_bytes
@@ -1465,7 +1479,8 @@ const fn roce_boundary(psn: u64, mtu_bytes: u64, total_bytes: u64) -> bool {
 /// fed back; the pacer parked with its scheduled payload the pacing token; the pacer and the
 /// controller anchored at zero (ruling C5), the controller otherwise as lowering builds it. The
 /// release re-anchors both at its instant, so the control deadline must fit after any release up
-/// to the stop. The caller has already counted zero pending ticks and control ticks.
+/// to the stop. The caller has already required that no pending event carries either token, at any
+/// time: no pacing tick or retransmission timeout with the pacing token, no control tick.
 fn validate_unreleased_roce_stage(
     image: &SimulationImage,
     generator: StagedGenerator<'_>,
@@ -1626,7 +1641,9 @@ fn validate_roce_generator(
             }
         }
     } else {
-        if ticks_at_departure != 0 {
+        // A parked pacer (pause-parked, waiting for feedback, or a gated stage) owns no tick at
+        // any time: a stray one would run against a pacer that scheduled nothing.
+        if pending_ticks_with_payload(pacing_counts, owner, roce.pacing_timer_payload) != 0 {
             return Err(invalid("parked pacer owns a pending tick"));
         }
         if status == GeneratorStatus::Scheduled {
@@ -1687,7 +1704,12 @@ fn validate_roce_generator(
         ))
         .copied()
         .unwrap_or(0);
-    // An unreleased stage arms its control tick at its release.
+    // An unreleased stage arms its control tick at its release, so it owns none at any time.
+    if unreleased
+        && pending_ticks_with_payload(pacing_counts, owner, roce.control_timer_payload) != 0
+    {
+        return Err(invalid("owns a pending control tick before its release"));
+    }
     let expected_control =
         usize::from(!unreleased && controller.next_control_time_ns <= image.stop_time_ns);
     if control_events > expected_control || !complete && control_events != expected_control {
