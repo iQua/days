@@ -562,9 +562,64 @@ The invariants only the joined logs show (every check is a hash-map step per row
 -/
 def checkCrossRole (sender : List SenderRow) (receiver : List ReceiverRow)
     (dcqcn : List DcqcnEventLog.Row) : Except String Unit := do
-  -- RED stub: no cross-role check yet.
-  let _ := (sender, receiver, dcqcn, @mergeByTime, @consume)
-  pure ()
+  -- Configuration agreement per flow.
+  let mut senderConfig : Std.HashMap Nat Roce.SenderConfig := ∅
+  for row in sender do senderConfig := senderConfig.insert row.flowId row.config
+  let mut emissions : Std.HashMap (Nat × Nat) Roce.Emission := ∅
+  for row in sender do
+    if let some emission := row.emission then
+      emissions := emissions.insert (row.flowId, row.key.timeNs) emission
+  let mut delivered : Std.HashSet (Nat × Nat) := ∅
+  for row in receiver do
+    let at_ := requireAt "receiver" row.srcLine
+    match senderConfig.get? row.flowId with
+    | none => throw s!"receiver: line {row.srcLine}: RoCE receiver of a flow with no sender rows (flow_id={row.flowId})"
+    | some config =>
+        at_ (row.config.totalBytes = config.totalBytes)
+          s!"RoCE receiver total_bytes differs from the sender's (flow_id={row.flowId})"
+        at_ (row.config.duplicateAck || config.rtoNs = 0)
+          s!"RoCE receiver drops duplicates silently while the sender's timeout is on (D7) (flow_id={row.flowId})"
+    let sent := (row.flowId, row.packetSentTimeNs)
+    match emissions.get? sent with
+    | none =>
+        throw s!"receiver: line {row.srcLine}: RoCE data arrival matches no sender emission (flow_id={row.flowId}, sent_time_ns={row.packetSentTimeNs})"
+    | some emission =>
+        at_ (emission.psn = row.packet.psn && emission.bytes = row.packet.bytes &&
+            emission.retransmission = row.packetRetransmission)
+          s!"RoCE data arrival differs from the sender's emission (flow_id={row.flowId}, sent_time_ns={row.packetSentTimeNs})"
+        at_ (!delivered.contains sent)
+          s!"RoCE emission delivered twice (flow_id={row.flowId}, sent_time_ns={row.packetSentTimeNs})"
+    delivered := delivered.insert sent
+  -- Feedback: (flow, is NACK, value) sent by receivers before the sender consumes it.
+  let feedback := sender.filter (fun row => row.kind = .ack || row.kind = .nack)
+  let mut acks : Std.HashMap (Nat × Bool × Nat) Nat := ∅
+  for item in mergeByTime (·.key.timeNs) (·.key.timeNs) receiver feedback [] do
+    match item with
+    | .inl row =>
+        if let some value := row.feedbackAcknowledgment then
+          let key := (row.flowId, decide (row.action = .nack), value)
+          acks := acks.insert key (acks.getD key 0 + 1)
+    | .inr row =>
+        let value := row.inputAcknowledgment.getD 0
+        let nack := decide (row.kind = .nack)
+        match consume acks (row.flowId, nack, value) with
+        | some rest => acks := rest
+        | none =>
+            throw s!"sender: line {row.srcLine}: RoCE {if nack then "NACK" else "ACK"} carries a value no receiver sent before it (flow_id={row.flowId}, acknowledgment={value})"
+  -- CNPs of queue pairs: sent by the receiver's notification point before the controller applies them.
+  let mut pairs : Std.HashSet (Nat × Nat) := ∅
+  for row in sender do pairs := pairs.insert (row.nodeId, row.flowId)
+  let applied := dcqcn.filter (fun d => d.kind = .cnp && pairs.contains (d.nodeId, d.flowId))
+  let mut cnps : Std.HashMap Nat Nat := ∅
+  for item in mergeByTime (·.key.timeNs) (·.key.timeNs) receiver applied [] do
+    match item with
+    | .inl row =>
+        if row.cnpSent then cnps := cnps.insert row.flowId (cnps.getD row.flowId 0 + 1)
+    | .inr d =>
+        match consume cnps d.flowId with
+        | some rest => cnps := rest
+        | none =>
+            throw s!"dcqcn: line {d.srcLine}: DCQCN CNP of a queue pair that no receiver sent before it (flow_id={d.flowId})"
 
 /-- The three logs of one run: each on its own terms, then the cross-role invariants. -/
 def checkTrace (stopTimeNs : Option Nat) (sender : List SenderRow) (receiver : List ReceiverRow)
