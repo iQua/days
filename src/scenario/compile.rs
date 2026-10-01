@@ -2325,6 +2325,7 @@ fn lower(
                     source: ids.node(LpKey::Host(flow.source)),
                     target: ids.node(LpKey::Host(flow.target)),
                     priority: flow.priority,
+                    feedback_priority: flow.priority,
                     route: Vec::new(),
                     reverse_route: Vec::new(),
                 };
@@ -2336,6 +2337,7 @@ fn lower(
                 source: ids.node(LpKey::Host(flow.source)),
                 target: ids.node(LpKey::Host(flow.target)),
                 priority: flow.priority,
+                feedback_priority: flow.priority,
                 route: image_route(flow.source, flow.target, switch_path, &ids),
                 reverse_route: image_route(flow.target, flow.source, &reverse_switch_path, &ids),
             }
@@ -2769,6 +2771,7 @@ fn lower(
                 dcqcn_receivers: dcqcn_receivers_by_target
                     .remove(&node_key)
                     .unwrap_or_default(),
+                roce_receivers: None,
                 next_origin_seq: origin_sequences.get(&node_key).copied().unwrap_or(0),
                 next_payload_seq: payload_sequences.get(&node_key).copied().unwrap_or(0),
                 sourced_packets: 0,

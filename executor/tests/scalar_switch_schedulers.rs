@@ -120,6 +120,7 @@ fn image(
                 stages: Vec::new(),
                 tcp_receivers: vec![],
                 dcqcn_receivers: vec![],
+                roce_receivers: None,
                 next_origin_seq: packets.len() as u64,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -135,6 +136,7 @@ fn image(
                 stages: Vec::new(),
                 tcp_receivers: vec![],
                 dcqcn_receivers: vec![],
+                roce_receivers: None,
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -165,6 +167,7 @@ fn image(
                 source: SOURCE,
                 target: SINK,
                 priority: 0,
+                feedback_priority: 0,
                 route: vec![SOURCE_LINK, SWITCH_LINK],
                 reverse_route: vec![],
             })
@@ -509,6 +512,7 @@ fn drr_future_tcp_image() -> SimulationImage {
         source: SOURCE,
         target: SINK,
         priority: 0,
+        feedback_priority: 0,
         route: vec![SOURCE_LINK, SWITCH_LINK],
         reverse_route: vec![],
     });
@@ -517,6 +521,7 @@ fn drr_future_tcp_image() -> SimulationImage {
         source: SOURCE,
         target: SINK,
         priority: 0,
+        feedback_priority: 0,
         route: vec![SOURCE_LINK, SWITCH_LINK],
         reverse_route: vec![SINK_EGRESS],
     });

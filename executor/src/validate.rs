@@ -512,6 +512,7 @@ pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), Validat
     validate_flow_ids(image)?;
     validate_packet_ids(image)?;
     validate_stage_tables(image)?;
+    refuse_roce_queue_pairs(image)?;
     // Dense flow identifiers, strictly ascending payload identifiers and canonical stage tables
     // are established above, which is everything the flow index needs; it reads the image and
     // cannot itself reject.
@@ -558,6 +559,12 @@ fn validate_backend_capabilities(
             "backend {backend} does not support collective generators; use Scalar or Cpu"
         )));
     }
+    // P15: RoCE queue pairs run on Scalar and Cpu; the device ports follow in their own lane.
+    if image_has_roce_state(image) {
+        return Err(ValidationError::new(format!(
+            "backend {backend} does not support RoCE queue pairs; use Scalar or Cpu"
+        )));
+    }
     for queue in image.switch_states.iter().flat_map(|state| &state.queues) {
         match queue.drop_mark {
             crate::DropMarkPolicy::TailDrop | crate::DropMarkPolicy::EcnThreshold(_) => {}
@@ -574,6 +581,36 @@ fn validate_backend_capabilities(
             | SchedulerKind::DeficitRoundRobin(_)
             | SchedulerKind::WeightedRoundRobin(_) => {}
         }
+    }
+    Ok(())
+}
+
+/// Whether the image holds any RoCE queue-pair state: a generator, a receiver, or a resident
+/// RoCE packet or pacing token.
+pub(crate) fn image_has_roce_state(image: &SimulationImage) -> bool {
+    image.host_states.iter().any(|state| {
+        state.roce_receivers.is_some()
+            || state
+                .generators
+                .iter()
+                .any(|generator| matches!(generator.kind, FlowGeneratorKind::Roce(_)))
+    }) || image.initial_packets.iter().any(|packet| {
+        matches!(
+            packet.kind,
+            PacketKind::RoceData(_)
+                | PacketKind::RoceAck(_)
+                | PacketKind::RoceNack(_)
+                | PacketKind::RocePacingTimer
+        )
+    })
+}
+
+/// Refuses RoCE queue-pair state until the executor runs it.
+fn refuse_roce_queue_pairs(image: &SimulationImage) -> Result<(), ValidationError> {
+    if image_has_roce_state(image) {
+        return Err(ValidationError::new(
+            "RoCE queue pairs are not executable yet",
+        ));
     }
     Ok(())
 }
@@ -967,6 +1004,7 @@ fn derived_pfc_max_frame_bytes(
                     .rate
                     .packet_size_bytes
                     .min(dcqcn.rate.total_bytes - generator.bytes_emitted),
+                FlowGeneratorKind::Roce(roce) => roce_future_data_max_bytes(roce),
             };
             maximum[priority] = maximum[priority].max(size);
         }
@@ -980,6 +1018,14 @@ fn derived_pfc_max_frame_bytes(
                 FlowGeneratorKind::Dcqcn(dcqcn) => {
                     if executable || live_dcqcn_cnp_flows.contains(&flow.id) {
                         maximum[priority] = maximum[priority].max(dcqcn.cnp_size_bytes);
+                    }
+                }
+                FlowGeneratorKind::Roce(roce) => {
+                    // Every data arrival at the receiver can answer with an ACK or NACK and a
+                    // CNP, so feedback is live while data can still be sent or is in flight.
+                    if executable || roce.snd_una < generator.bytes_emitted {
+                        maximum[priority] =
+                            maximum[priority].max(roce_feedback_max_bytes(image, flow));
                     }
                 }
                 FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => {}
@@ -3472,6 +3518,39 @@ fn validate_packets_and_derive_delays(
                         flow.target,
                     )
                 }
+                FlowGeneratorKind::Roce(roce) => {
+                    let feedback_can_be_emitted =
+                        generator_can_emit || roce.snd_una < generator.bytes_emitted;
+                    let feedback_sizes = roce_receiver(image, flow).map_or([0, 0], |receiver| {
+                        [receiver.ack_size_bytes, receiver.np.cnp_size_bytes]
+                    });
+                    for (index, link_id) in flow.reverse_route.iter().enumerate() {
+                        let link = link(image, *link_id)
+                            .expect("validated reverse route names an existing link");
+                        let route = (
+                            link.id,
+                            route_target(image, &flow.reverse_route, index, flow.source)
+                                .expect("validated reverse route has a direct target"),
+                        );
+                        for size in feedback_sizes {
+                            let delay = link.delay_ns(size).map_err(|error| {
+                                ValidationError::new(format!(
+                                    "link {:?} delay overflows for flow {:?} RoCE feedback: {error}",
+                                    link.id, flow.id
+                                ))
+                            })?;
+                            insert_derived_delay(&mut possible, route, delay);
+                        }
+                        if feedback_can_be_emitted {
+                            required.insert(route);
+                        }
+                    }
+                    (
+                        roce_future_data_min_bytes(roce),
+                        flow.route.as_slice(),
+                        flow.target,
+                    )
+                }
             };
             for (index, link_id) in route.iter().enumerate() {
                 let link =
@@ -4096,6 +4175,15 @@ fn maximum_drr_frame_bytes(
                 }
                 if reverse_reaches && executable_generator_packets(image, generator)? != 0 {
                     maximum = maximum.max(dcqcn.cnp_size_bytes);
+                }
+            }
+            FlowGeneratorKind::Roce(roce) => {
+                let executable = executable_generator_packets(image, generator)? != 0;
+                if forward_reaches && executable {
+                    maximum = maximum.max(roce_future_data_max_bytes(roce));
+                }
+                if reverse_reaches && (executable || roce.snd_una < generator.bytes_emitted) {
+                    maximum = maximum.max(roce_feedback_max_bytes(image, flow));
                 }
             }
         }
@@ -4989,13 +5077,113 @@ fn executable_dcqcn_control_ticks(
     image: &SimulationImage,
     dcqcn: crate::DcqcnGenerator,
 ) -> BigUint {
-    if dcqcn.controller.next_control_time_ns > image.stop_time_ns {
+    executable_control_ticks(image, dcqcn.controller)
+}
+
+/// Control ticks a DCQCN controller can still run until the stop time, its pending one included.
+fn executable_control_ticks(
+    image: &SimulationImage,
+    controller: crate::DcqcnController,
+) -> BigUint {
+    if controller.next_control_time_ns > image.stop_time_ns {
         return BigUint::from(0_u8);
     }
     BigUint::from(
-        (image.stop_time_ns - dcqcn.controller.next_control_time_ns)
-            / dcqcn.controller.config.control_interval_ns,
+        (image.stop_time_ns - controller.next_control_time_ns)
+            / controller.config.control_interval_ns,
     ) + 1_u8
+}
+
+/// Pacing ticks a RoCE queue pair can still run until the stop time, its pending one included.
+///
+/// Every tick lies on the grid anchored at `first_pacing_time_ns` and emits at most one data
+/// packet, so this also bounds the pair's future data packets and data payload allocations. An
+/// armed pacer ticks from its pending departure. A parked pacer of a pair that has not finished
+/// can restart on any later grid point, so every grid point up to the stop time bounds it. A
+/// finished or stopped pair with a parked pacer ticks no more.
+pub(crate) fn roce_grid_ticks(
+    image: &SimulationImage,
+    generator: &crate::FlowGeneratorState,
+    roce: crate::RoceGenerator,
+) -> u64 {
+    let start = if roce.pacer_armed {
+        generator.next_emission.departure_time_ns
+    } else if generator.next_emission.status == GeneratorStatus::Blocked {
+        roce.pacer.first_pacing_time_ns
+    } else {
+        return 0;
+    };
+    if start > image.stop_time_ns || roce.pacer.pacing_interval_ns == 0 {
+        return 0;
+    }
+    (image.stop_time_ns - start) / roce.pacer.pacing_interval_ns + 1
+}
+
+/// Retransmission-timeout installations a RoCE queue pair can still make until the stop time.
+///
+/// A timeout is installed when a send makes data outstanding (at most one per pacing tick), when
+/// an ACK or NACK advances or rewinds the pair (at most one per data arrival at its receiver, so
+/// at most `data_packets`), and when a timeout fires and re-arms (at most one per `rto_ns` until
+/// the stop time). With the timeout off there are none.
+fn roce_timer_installations(
+    image: &SimulationImage,
+    roce: crate::RoceGenerator,
+    pacing_ticks: u64,
+    data_packets: u64,
+) -> Result<u64, ValidationError> {
+    if roce.rto_ns == 0 {
+        return Ok(0);
+    }
+    let timeouts = image.stop_time_ns / roce.rto_ns + 1;
+    pacing_ticks
+        .checked_add(data_packets)
+        .and_then(|total| total.checked_add(timeouts))
+        .ok_or_else(|| ValidationError::new("RoCE timer installation bound exceeds u64"))
+}
+
+/// The RoCE receiver of `flow`, held by the flow's target host in canonical `FlowId` order.
+fn roce_receiver<'a>(
+    image: &'a SimulationImage,
+    flow: &FlowDescriptor,
+) -> Option<&'a crate::RoceReceiverState> {
+    let target = node(image, flow.target)?;
+    if target.kind != NodeKind::Host {
+        return None;
+    }
+    let receivers = image
+        .host_states
+        .get(target.state_slot as usize)?
+        .roce_receivers
+        .as_deref()?;
+    receivers
+        .binary_search_by_key(&flow.id, |receiver| receiver.np.flow)
+        .ok()
+        .map(|index| &receivers[index])
+}
+
+/// The largest feedback packet of a RoCE flow: an ACK or NACK, or a CNP.
+fn roce_feedback_max_bytes(image: &SimulationImage, flow: &FlowDescriptor) -> u64 {
+    roce_receiver(image, flow).map_or(0, |receiver| {
+        receiver.ack_size_bytes.max(receiver.np.cnp_size_bytes)
+    })
+}
+
+/// The largest data packet a RoCE queue pair can still send: a retransmission may resend any
+/// packet from its cumulative acknowledgment on.
+fn roce_future_data_max_bytes(roce: crate::RoceGenerator) -> u64 {
+    roce.pacer
+        .mtu_bytes
+        .min(roce.pacer.total_bytes.saturating_sub(roce.snd_una))
+}
+
+/// The smallest data packet a RoCE queue pair can still send: a full MTU, or the short last one.
+fn roce_future_data_min_bytes(roce: crate::RoceGenerator) -> u64 {
+    let tail = roce.pacer.total_bytes % roce.pacer.mtu_bytes.max(1);
+    if tail == 0 {
+        roce.pacer.mtu_bytes
+    } else {
+        tail
+    }
 }
 
 fn latest_dcqcn_control_time(
@@ -5181,6 +5369,7 @@ fn validate_global_time_capacity(
                 .rate
                 .packet_size_bytes
                 .min(dcqcn.rate.total_bytes - generator.bytes_emitted),
+            FlowGeneratorKind::Roce(roce) => roce_future_data_max_bytes(roce),
         };
         for link_id in &flow.route {
             let link = link(image, *link_id).expect("flow validation established the route link");
@@ -5208,16 +5397,25 @@ fn validate_global_time_capacity(
     }
     let work = future_work(image, flow_index)?;
     for generator in image.host_states.iter().flat_map(staged_generators) {
-        let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind else {
-            continue;
-        };
         let flow = flow(image, generator.flow).expect("generator validation established the flow");
-        let cnp_count = work.dcqcn_cnp_by_flow[flow.id.0 as usize];
+        // DCQCN reserves its CNPs; a RoCE queue pair reserves its ACKs, NACKs and CNPs at the
+        // largest of their sizes.
+        let (feedback_size_bytes, cnp_count) = match generator.kind {
+            FlowGeneratorKind::Dcqcn(dcqcn) => (
+                dcqcn.cnp_size_bytes,
+                work.dcqcn_cnp_by_flow[flow.id.0 as usize],
+            ),
+            FlowGeneratorKind::Roce(_) => (
+                roce_feedback_max_bytes(image, flow),
+                work.feedback_by_flow[flow.id.0 as usize],
+            ),
+            _ => continue,
+        };
         for link_id in &flow.reverse_route {
             let link = link(image, *link_id).expect("flow validation established the route link");
             let delay = link
-                .delay_ns(dcqcn.cnp_size_bytes)
-                .expect("DCQCN CNP/link delay validation already succeeded");
+                .delay_ns(feedback_size_bytes)
+                .expect("feedback/link delay validation already succeeded");
             let flow_delay = delay.checked_mul(cnp_count).ok_or_else(|| {
                 ValidationError::new(format!(
                     "DCQCN CNP reverse-route time bound overflows for flow {:?} on link {:?}",
@@ -5272,6 +5470,7 @@ fn validate_global_time_capacity(
                     FlowGeneratorKind::Dcqcn(dcqcn)
                         if dcqcn.controller.next_control_time_ns <= image.stop_time_ns
                 )
+                || matches!(generator.kind, FlowGeneratorKind::Roce(_))
         })
         .map(|generator| match generator.kind {
             FlowGeneratorKind::Constant(constant) => {
@@ -5306,6 +5505,9 @@ fn validate_global_time_capacity(
                 };
                 Ok(pacing.max(latest_dcqcn_control_time(image, generator)?))
             }
+            // Pacing and control ticks run at most to the stop time; a retransmission timeout
+            // armed before it ends within `rto_ns`, which generator validation bounds.
+            FlowGeneratorKind::Roce(_) => Ok(image.stop_time_ns),
         })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
@@ -5751,6 +5953,17 @@ fn future_work(
                 dcqcn_cnp_by_flow[index] = cnp_count;
                 add_packet_count(&mut feedback_by_flow[index], cnp_count)?;
             }
+            FlowGeneratorKind::Roce(_) => {
+                // At most one data packet per pacing tick; every data arrival, resident or
+                // future, can answer with one ACK or NACK and one CNP.
+                let count = executable_generator_packets(image, generator)?;
+                let index = generator.flow.0 as usize;
+                add_packet_count(&mut data_by_flow[index], count)?;
+                let arrivals = data_by_flow[index];
+                dcqcn_cnp_by_flow[index] = arrivals;
+                add_packet_count(&mut feedback_by_flow[index], arrivals)?;
+                add_packet_count(&mut feedback_by_flow[index], arrivals)?;
+            }
         }
     }
     // Grouped after the counting loop above so that a resident whose flow is outside the dense
@@ -6010,9 +6223,35 @@ fn remaining_generator_packets(generator: StagedGenerator<'_>) -> Result<u64, Va
         }
         return Ok((rate.total_bytes - generator.bytes_emitted).div_ceil(rate.packet_size_bytes));
     }
+    if let FlowGeneratorKind::Roce(roce) = generator.kind {
+        // First transmissions only: the nominal packets from the high-water mark on.
+        let pacer = roce.pacer;
+        if generator.bytes_emitted > pacer.total_bytes {
+            return Err(ValidationError::new(format!(
+                "flow {:?} RoCE emitted byte state exceeds total bytes {}",
+                generator.flow, pacer.total_bytes
+            )));
+        }
+        let expected_bytes = u128::from(generator.packets_emitted)
+            .checked_mul(u128::from(pacer.mtu_bytes))
+            .map(|bytes| bytes.min(u128::from(pacer.total_bytes)))
+            .ok_or_else(|| {
+                ValidationError::new(format!(
+                    "flow {:?} RoCE byte bookkeeping exceeds u128",
+                    generator.flow
+                ))
+            })?;
+        if u128::from(generator.bytes_emitted) != expected_bytes {
+            return Err(ValidationError::new(format!(
+                "flow {:?} RoCE records {} emitted bytes, expected {expected_bytes}",
+                generator.flow, generator.bytes_emitted
+            )));
+        }
+        return Ok((pacer.total_bytes - generator.bytes_emitted).div_ceil(pacer.mtu_bytes));
+    }
     let FlowGeneratorKind::Constant(constant) = generator.kind else {
         let FlowGeneratorKind::Tcp(tcp) = generator.kind else {
-            unreachable!("rate, DCQCN, and collective generators return above")
+            unreachable!("rate, DCQCN, RoCE and collective generators return above")
         };
         if generator.bytes_emitted > tcp.total_bytes || tcp.next_sequence > tcp.total_bytes {
             return Err(ValidationError::new(format!(
@@ -6099,6 +6338,10 @@ fn executable_generator_packets(
         )
     {
         return executable_dcqcn_packets(image, generator);
+    }
+    if let FlowGeneratorKind::Roce(roce) = generator.kind {
+        remaining_generator_packets(generator)?;
+        return Ok(roce_grid_ticks(image, &generator, roce));
     }
     match generator.next_emission.status {
         GeneratorStatus::Scheduled => remaining_generator_packets(generator),
@@ -6340,6 +6583,32 @@ fn validate_origin_sequences(
                             ))
                         })?
                 }
+                FlowGeneratorKind::Roce(roce) => {
+                    // Every pacing tick, restarts included, every control tick and every timeout
+                    // installation is one emitted event (a conservative count: the pending tick
+                    // and control tick already exist).
+                    let pacing_ticks = roce_grid_ticks(image, &generator, roce);
+                    let data_packets = executable_generator_packets(image, generator)?;
+                    let control_ticks =
+                        u64::try_from(executable_control_ticks(image, roce.controller)).map_err(
+                            |_| {
+                                ValidationError::new(format!(
+                                    "flow {:?} RoCE control-timer count exceeds u64",
+                                    generator.flow
+                                ))
+                            },
+                        )?;
+                    let timers = roce_timer_installations(image, roce, pacing_ticks, data_packets)?;
+                    pacing_ticks
+                        .checked_add(control_ticks)
+                        .and_then(|total| total.checked_add(timers))
+                        .ok_or_else(|| {
+                            ValidationError::new(format!(
+                                "flow {:?} RoCE timer event count exceeds u64",
+                                generator.flow
+                            ))
+                        })?
+                }
             };
             emissions_by_node[owner.id.0 as usize] += u128::from(emissions);
         }
@@ -6488,6 +6757,28 @@ fn validate_payload_sequences(
                 FlowGeneratorKind::Tcp(_) => tcp_attempt_upper_bound(image, flow_index, generator)?,
                 FlowGeneratorKind::Rate(_) => rate_payload_allocations(image, generator)?,
                 FlowGeneratorKind::Dcqcn(_) => dcqcn_payload_allocations(image, generator)?,
+                FlowGeneratorKind::Roce(_) => {
+                    // Its two timer tokens were allocated at lowering; every data packet,
+                    // retransmissions included, takes a fresh payload when it is sent.
+                    consumed_sequences = consumed_sequences
+                        .checked_add(generator.packets_emitted)
+                        .and_then(|total| total.checked_add(2))
+                        .ok_or_else(|| {
+                            ValidationError::new(format!(
+                                "node {:?} consumed payload sequence count exceeds u64",
+                                owner.id
+                            ))
+                        })?;
+                    allocations = allocations
+                        .checked_add(executable_generator_packets(image, generator)?)
+                        .ok_or_else(|| {
+                            ValidationError::new(format!(
+                                "node {:?} generated-packet count exceeds u64",
+                                owner.id
+                            ))
+                        })?;
+                    continue;
+                }
             };
             let already_scheduled = u64::from(
                 generator.next_emission.status == GeneratorStatus::Scheduled
@@ -6547,6 +6838,19 @@ fn validate_payload_sequences(
                 .ok_or_else(|| {
                     ValidationError::new(format!(
                         "node {:?} generated DCQCN CNP count exceeds u64",
+                        owner.id
+                    ))
+                })?;
+        }
+        for receiver in state.roce_receivers.iter().flatten() {
+            // One ACK or NACK and one CNP per data arrival.
+            let arrivals = work.data_by_flow[receiver.np.flow.0 as usize];
+            allocations = arrivals
+                .checked_mul(2)
+                .and_then(|feedback| allocations.checked_add(feedback))
+                .ok_or_else(|| {
+                    ValidationError::new(format!(
+                        "node {:?} generated RoCE feedback count exceeds u64",
                         owner.id
                     ))
                 })?;
@@ -6692,23 +6996,28 @@ fn packet_incoming_link_at(
 
 fn packet_route(flow: &FlowDescriptor, packet_kind: PacketKind) -> &[LinkId] {
     match packet_kind {
-        PacketKind::Data | PacketKind::TcpData(_) => &flow.route,
+        PacketKind::Data | PacketKind::TcpData(_) | PacketKind::RoceData(_) => &flow.route,
         PacketKind::Feedback
         | PacketKind::TcpAck(_)
         | PacketKind::Pfc(_)
-        | PacketKind::DcqcnCnp(_) => &flow.reverse_route,
-        PacketKind::DcqcnControlTimer => &[],
+        | PacketKind::DcqcnCnp(_)
+        | PacketKind::RoceAck(_)
+        | PacketKind::RoceNack(_) => &flow.reverse_route,
+        PacketKind::DcqcnControlTimer | PacketKind::RocePacingTimer => &[],
     }
 }
 
 fn packet_terminal(flow: &FlowDescriptor, packet_kind: PacketKind) -> NodeId {
     match packet_kind {
-        PacketKind::Data | PacketKind::TcpData(_) => flow.target,
+        PacketKind::Data | PacketKind::TcpData(_) | PacketKind::RoceData(_) => flow.target,
         PacketKind::Feedback
         | PacketKind::TcpAck(_)
         | PacketKind::Pfc(_)
         | PacketKind::DcqcnCnp(_)
-        | PacketKind::DcqcnControlTimer => flow.source,
+        | PacketKind::RoceAck(_)
+        | PacketKind::RoceNack(_)
+        | PacketKind::DcqcnControlTimer
+        | PacketKind::RocePacingTimer => flow.source,
     }
 }
 

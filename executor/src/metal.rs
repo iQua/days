@@ -2076,6 +2076,11 @@ impl MetalPlan {
                                     &mut generators[offset..offset + GENERATOR_WORDS],
                                 );
                             }
+                            FlowGeneratorKind::Roce(_) => {
+                                return Err(MetalError::Validation(
+                                    "RoCE queue pairs run on Scalar and Cpu".to_owned(),
+                                ));
+                            }
                         }
                     }
                 }
@@ -2409,7 +2414,7 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
         // frame travels on its reverse control lane, never on its flow's route.
         if matches!(
             packet.kind,
-            PacketKind::DcqcnControlTimer | PacketKind::Pfc(_)
+            PacketKind::DcqcnControlTimer | PacketKind::RocePacingTimer | PacketKind::Pfc(_)
         ) {
             continue;
         }
@@ -2558,6 +2563,13 @@ fn add_flow_route_capacities(
         PacketKind::DcqcnCnp(_) => (flow.reverse_route.as_slice(), flow.source),
         PacketKind::DcqcnControlTimer => {
             unreachable!("the zero-byte DCQCN control-timer token is never routed")
+        }
+        PacketKind::RoceData(_) => (flow.route.as_slice(), flow.target),
+        PacketKind::RoceAck(_) | PacketKind::RoceNack(_) => {
+            (flow.reverse_route.as_slice(), flow.source)
+        }
+        PacketKind::RocePacingTimer => {
+            unreachable!("the zero-byte RoCE pacing token is never routed")
         }
     };
     for index in 0..route.len() {
@@ -3310,6 +3322,12 @@ fn derived_transition_bound(
                     .saturating_add(work.pacing_ticks)
                     .saturating_add(work.control_ticks))
             }
+            FlowGeneratorKind::Roce(roce) => Ok(bound
+                .saturating_add(
+                    usize::try_from(crate::validate::roce_grid_ticks(image, generator, roce))
+                        .unwrap_or(usize::MAX),
+                )
+                .saturating_add(1)),
             FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Tcp(_) => Ok(bound),
         })
 }
@@ -3722,7 +3740,17 @@ fn encode_packet_metadata(kind: PacketKind, words: &mut [u64]) {
             words[2] = u64::from(header.pause);
         }
         PacketKind::DcqcnCnp(header) => words[0] = header.trigger_payload.0,
-        PacketKind::DcqcnControlTimer => {}
+        PacketKind::DcqcnControlTimer | PacketKind::RocePacingTimer => {}
+        PacketKind::RoceData(header) => {
+            words[0] = header.psn;
+            words[1] = header.sent_time_ns;
+            words[2] = u64::from(header.retransmission);
+        }
+        PacketKind::RoceAck(header) | PacketKind::RoceNack(header) => {
+            words[0] = header.acknowledgment;
+            words[1] = header.echoed_sent_time_ns;
+            words[2] = header.acknowledged_bytes;
+        }
     }
 }
 

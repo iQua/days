@@ -5566,6 +5566,7 @@ fn apply_generator_feedback(
         FlowGeneratorKind::Tcp(_) => Ok(GeneratorFeedbackAction::None),
         FlowGeneratorKind::Rate(_) => Ok(GeneratorFeedbackAction::None),
         FlowGeneratorKind::Dcqcn(_) => Ok(GeneratorFeedbackAction::None),
+        FlowGeneratorKind::Roce(_) => Ok(GeneratorFeedbackAction::None),
     }
 }
 

@@ -152,6 +152,8 @@ impl PlannerCapacityContext {
                             dcqcn.rate.packet_size_bytes,
                         )
                     }
+                    // Device backends refuse RoCE queue pairs; one byte is conservative.
+                    FlowGeneratorKind::Roce(_) => 1,
                 };
                 update_minimum_packet_size(&mut minimum_packet_sizes[flow][0], size);
                 if let Some(feedback) = generated_feedback_size(generator.kind) {
@@ -172,7 +174,9 @@ impl PlannerCapacityContext {
                     FlowGeneratorKind::Rate(rate) => {
                         interval_burst(packet_count, rate.pacing_interval_ns, lookahead)
                     }
-                    FlowGeneratorKind::Tcp(_) | FlowGeneratorKind::Dcqcn(_) => packet_count,
+                    FlowGeneratorKind::Tcp(_)
+                    | FlowGeneratorKind::Dcqcn(_)
+                    | FlowGeneratorKind::Roce(_) => packet_count,
                 };
                 generator_round_bursts[flow] = generator_round_bursts[flow].saturating_add(burst);
             }
@@ -437,7 +441,8 @@ impl PlannerCapacityContext {
             FlowGeneratorKind::Tcp(tcp) => Some(tcp),
             FlowGeneratorKind::Constant(_)
             | FlowGeneratorKind::Rate(_)
-            | FlowGeneratorKind::Dcqcn(_) => None,
+            | FlowGeneratorKind::Dcqcn(_)
+            | FlowGeneratorKind::Roce(_) => None,
         }
     }
 
@@ -662,6 +667,8 @@ fn precompute_minimum_packet_sizes(
                     dcqcn.rate.packet_size_bytes,
                 )
             }
+            // Device backends refuse RoCE queue pairs; one byte is conservative.
+            FlowGeneratorKind::Roce(_) => 1,
         };
         update_minimum_packet_size(&mut minimums[flow][0], size);
         if let Some(feedback) = generated_feedback_size(generator.kind) {
@@ -678,6 +685,9 @@ fn generated_feedback_size(kind: FlowGeneratorKind) -> Option<u64> {
     match kind {
         FlowGeneratorKind::Tcp(tcp) => Some(tcp.ack_size_bytes),
         FlowGeneratorKind::Dcqcn(dcqcn) => Some(dcqcn.cnp_size_bytes),
+        // Device backends refuse RoCE queue pairs at validation; one byte keeps a direct
+        // planning request conservative.
+        FlowGeneratorKind::Roce(_) => Some(1),
         FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => None,
     }
 }
@@ -785,6 +795,8 @@ fn legacy_minimum_packet_size(
                                     dcqcn.rate.packet_size_bytes,
                                 )
                             }
+                            // Device backends refuse RoCE queue pairs; one byte is conservative.
+                            FlowGeneratorKind::Roce(_) => 1,
                         })
                 })
                 .into_iter()
@@ -805,7 +817,8 @@ fn legacy_tcp_generator(image: &SimulationImage, flow: usize) -> Option<TcpGener
             FlowGeneratorKind::Tcp(tcp) => Some(tcp),
             FlowGeneratorKind::Constant(_)
             | FlowGeneratorKind::Rate(_)
-            | FlowGeneratorKind::Dcqcn(_) => None,
+            | FlowGeneratorKind::Dcqcn(_)
+            | FlowGeneratorKind::Roce(_) => None,
         })
 }
 
@@ -834,7 +847,9 @@ fn legacy_generator_round_burst(
             FlowGeneratorKind::Rate(rate) => {
                 interval_burst(packet_count, rate.pacing_interval_ns, lookahead)
             }
-            FlowGeneratorKind::Tcp(_) | FlowGeneratorKind::Dcqcn(_) => packet_count,
+            FlowGeneratorKind::Tcp(_)
+            | FlowGeneratorKind::Dcqcn(_)
+            | FlowGeneratorKind::Roce(_) => packet_count,
         })
         .fold(0, usize::saturating_add)
 }
@@ -973,6 +988,7 @@ mod tests {
             stages: vec![],
             tcp_receivers: vec![],
             dcqcn_receivers: vec![],
+            roce_receivers: None,
             next_origin_seq: 0,
             next_payload_seq: 0,
             sourced_packets: 0,
@@ -1023,6 +1039,7 @@ mod tests {
                 source: NodeId(0),
                 target: NodeId(1),
                 priority: 0,
+                feedback_priority: 0,
                 route: vec![link.id],
                 reverse_route: vec![],
             }],

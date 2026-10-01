@@ -3456,6 +3456,7 @@ fn route_offered_load(image: &SimulationImage) -> Vec<u128> {
             }
             FlowGeneratorKind::Rate(rate) => rate.pacing_interval_ns,
             FlowGeneratorKind::Dcqcn(dcqcn) => dcqcn.rate.pacing_interval_ns,
+            FlowGeneratorKind::Roce(roce) => roce.pacer.pacing_interval_ns,
         };
         let Ok(flow_slot) = usize::try_from(generator.flow.0) else {
             continue;
@@ -4203,6 +4204,7 @@ fn target_interleaved_outbox_image() -> SimulationImage {
                 stages: Vec::new(),
                 tcp_receivers: vec![],
                 dcqcn_receivers: vec![],
+                roce_receivers: None,
                 next_origin_seq: 3,
                 next_payload_seq: 3,
                 sourced_packets: 0,
@@ -4218,6 +4220,7 @@ fn target_interleaved_outbox_image() -> SimulationImage {
                 stages: Vec::new(),
                 tcp_receivers: vec![],
                 dcqcn_receivers: vec![],
+                roce_receivers: None,
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -4233,6 +4236,7 @@ fn target_interleaved_outbox_image() -> SimulationImage {
                 stages: Vec::new(),
                 tcp_receivers: vec![],
                 dcqcn_receivers: vec![],
+                roce_receivers: None,
                 next_origin_seq: 0,
                 next_payload_seq: 0,
                 sourced_packets: 0,
@@ -4282,6 +4286,7 @@ fn target_interleaved_outbox_image() -> SimulationImage {
                 source: NodeId(0),
                 target: NodeId(4),
                 priority: 0,
+                feedback_priority: 0,
                 route: vec![source_link.id, higher_port_link.id],
                 reverse_route: vec![],
             },
@@ -4290,6 +4295,7 @@ fn target_interleaved_outbox_image() -> SimulationImage {
                 source: NodeId(0),
                 target: NodeId(3),
                 priority: 0,
+                feedback_priority: 0,
                 route: vec![source_link.id, lower_port_link.id],
                 reverse_route: vec![],
             },
@@ -4298,6 +4304,7 @@ fn target_interleaved_outbox_image() -> SimulationImage {
                 source: NodeId(0),
                 target: NodeId(4),
                 priority: 0,
+                feedback_priority: 0,
                 route: vec![source_link.id, higher_port_link.id],
                 reverse_route: vec![],
             },
