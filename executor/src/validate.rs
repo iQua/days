@@ -1498,15 +1498,14 @@ fn validate_roce_generator(
     if status == GeneratorStatus::Stopped && departure <= image.stop_time_ns {
         return Err(invalid("is Stopped at or before the stop time"));
     }
-    // Credit capacity: every remaining tick at the maximum rate stays within u128.
+    // Credit capacity: every remaining tick at the maximum rate stays within u128 (checked
+    // arithmetic: exact, and no heap allocation per queue pair).
     let ticks = roce_grid_ticks(image, &generator, roce);
-    let maximum_credit = BigUint::from(pacer.credit_quanta)
-        + BigUint::from(controller.config.maximum_rate_bps)
-            * BigUint::from(pacer.pacing_interval_ns)
-            * BigUint::from(ticks);
-    if maximum_credit > BigUint::from(u128::MAX) {
-        return Err(invalid("pacing credit can exceed u128 before stop"));
-    }
+    u128::from(controller.config.maximum_rate_bps)
+        .checked_mul(u128::from(pacer.pacing_interval_ns))
+        .and_then(|tick| tick.checked_mul(u128::from(ticks)))
+        .and_then(|credit| credit.checked_add(pacer.credit_quanta))
+        .ok_or_else(|| invalid("pacing credit can exceed u128 before stop"))?;
     // Retransmission timeout: armed iff data is outstanding and the timeout is on; exactly one
     // pending timeout event carries the pacing token, at the deadline.
     let timer_events =
@@ -6982,15 +6981,15 @@ fn validate_origin_sequences(
                     // and control tick already exist).
                     let pacing_ticks = roce_grid_ticks(image, &generator, roce);
                     let data_packets = executable_generator_packets(image, generator)?;
-                    let control_ticks =
-                        u64::try_from(executable_control_ticks(image, roce.controller)).map_err(
-                            |_| {
-                                ValidationError::new(format!(
-                                    "flow {:?} RoCE control-timer count exceeds u64",
-                                    generator.flow
-                                ))
-                            },
-                        )?;
+                    // The DCQCN count in u64 arithmetic, with no heap allocation per queue pair.
+                    let controller = roce.controller;
+                    let control_ticks = if controller.next_control_time_ns > image.stop_time_ns {
+                        0
+                    } else {
+                        (image.stop_time_ns - controller.next_control_time_ns)
+                            / controller.config.control_interval_ns
+                            + 1
+                    };
                     let timers = roce_timer_installations(image, roce, pacing_ticks, data_packets)?;
                     pacing_ticks
                         .checked_add(control_ticks)

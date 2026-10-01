@@ -2982,17 +2982,18 @@ fn lower(
 
     let mut tcp_receivers_by_target = BTreeMap::<LpKey, Vec<TcpReceiverState>>::new();
     let mut dcqcn_receivers_by_target = BTreeMap::<LpKey, Vec<DcqcnReceiverState>>::new();
-    let mut roce_receivers_by_target = BTreeMap::<LpKey, Vec<RoceReceiverState>>::new();
+    // Every receiver with its target, then one exact-length slice per target host: one
+    // allocation per host that receives queue pairs.
+    let mut roce_receivers = Vec::<(LpKey, RoceReceiverState)>::new();
     for (flow, descriptor) in flows.iter().zip(&flow_descriptors) {
         if let TrafficKind::Roce(ordinal) = flow.traffic.kind {
             let roce = roce_key(&roce_keys, ordinal);
             let Termination::Bytes(total_bytes) = flow.traffic.termination else {
                 unreachable!("RoCE validation requires byte termination")
             };
-            roce_receivers_by_target
-                .entry(LpKey::Host(flow.target))
-                .or_default()
-                .push(RoceReceiverState {
+            roce_receivers.push((
+                LpKey::Host(flow.target),
+                RoceReceiverState {
                     np: DcqcnReceiverState {
                         flow: descriptor.id,
                         cnp_interval_ns: roce.dcqcn.cnp_interval_ns,
@@ -3007,7 +3008,8 @@ fn lower(
                     nack_interval_ns: roce.nack_interval_ns,
                     last_nack: None,
                     duplicate_ack: roce.duplicate_ack,
-                });
+                },
+            ));
         }
         if matches!(flow.traffic.kind, TrafficKind::Tcp(_)) {
             tcp_receivers_by_target
@@ -3028,6 +3030,15 @@ fn lower(
         }
     }
 
+    // Stable: each target keeps its receivers in canonical `FlowId` order.
+    roce_receivers.sort_by_key(|(target, _)| *target);
+    let mut roce_receivers_by_target = BTreeMap::<LpKey, Box<[RoceReceiverState]>>::new();
+    for group in roce_receivers.chunk_by(|left, right| left.0 == right.0) {
+        roce_receivers_by_target.insert(
+            group[0].0,
+            group.iter().map(|(_, receiver)| *receiver).collect(),
+        );
+    }
     let host_states = host_topology_ids
         .iter()
         .map(|host| {
@@ -3053,9 +3064,7 @@ fn lower(
                     .remove(&node_key)
                     .unwrap_or_default(),
                 // One allocation on a host that receives queue pairs, none elsewhere.
-                roce_receivers: roce_receivers_by_target
-                    .remove(&node_key)
-                    .map(Vec::into_boxed_slice),
+                roce_receivers: roce_receivers_by_target.remove(&node_key),
                 next_origin_seq: origin_sequences.get(&node_key).copied().unwrap_or(0),
                 next_payload_seq: payload_sequences.get(&node_key).copied().unwrap_or(0),
                 sourced_packets: 0,
