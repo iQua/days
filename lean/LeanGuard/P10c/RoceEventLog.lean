@@ -1,4 +1,5 @@
 import DaysExecutor.Event
+import LeanGuard.P10c.DcqcnEventLog
 import LeanGuard.P10c.Roce.Semantics
 import LeanGuard.Shared.Check
 import LeanGuard.Shared.Csv
@@ -207,5 +208,314 @@ def checkReceiverRows (rows : List ReceiverRow) : Except String Unit := do
   require 1 (!rows.isEmpty) "empty RoCE receiver trace"
   checkKeyOrder (·.key) (·.srcLine) rows
   checkReceiverSequence rows
+
+/-! ## Sender rows, joined with the DCQCN controller log -/
+
+/-- Raises an error that names the log and the line it refers to. -/
+def requireAt (role : String) (lineNo : Nat) (cond : Bool) (msg : String) : Except String Unit :=
+  if cond then pure () else throw s!"{role}: line {lineNo}: {msg}"
+
+def inRole {α : Type} (role : String) (result : Except String α) : Except String α :=
+  match result with
+  | .ok value => pure value
+  | .error error => throw s!"{role}: {error}"
+
+inductive SenderKind
+  | tick
+  | ack
+  | nack
+  | timeout
+  deriving DecidableEq, Repr
+
+def parseSenderKind : String → Except String SenderKind
+  | "tick" => pure .tick
+  | "ack" => pure .ack
+  | "nack" => pure .nack
+  | "timeout" => pure .timeout
+  | other => throw s!"invalid RoCE sender kind: '{other}'"
+
+def parsePacer : String → Except String Roce.Pacer
+  | "armed" => pure .armed
+  | "parked" => pure .parked
+  | "stopped" => pure .stopped
+  | other => throw s!"invalid RoCE pacer state: '{other}'"
+
+def parseStatus : String → Except String Roce.Status
+  | "scheduled" => pure .scheduled
+  | "blocked" => pure .blocked
+  | "finished" => pure .finished
+  | "stopped" => pure .stopped
+  | other => throw s!"invalid generator status: '{other}'"
+
+structure SenderRow where
+  key : DaysExecutor.EventKey
+  nodeId : Nat
+  flowId : Nat
+  kind : SenderKind
+  config : Roce.SenderConfig
+  rateBps : Option Nat
+  inputAcknowledgment : Option Nat
+  emitted : Bool
+  emission : Option Roce.Emission
+  emittedPayload : Option Nat
+  before : Roce.SenderState
+  after : Roce.SenderState
+  srcLine : Nat
+  deriving DecidableEq, Repr
+
+def parseSenderState (fieldPrefix : String) (idx : Std.HashMap String Nat)
+    (fields : Array String) : Except String Roce.SenderState := do
+  pure
+    { nextPsn := ← parseU64 (← getField idx fields s!"{fieldPrefix}_next_psn")
+      sndUna := ← parseU64 (← getField idx fields s!"{fieldPrefix}_snd_una")
+      bytesEmitted := ← parseU64 (← getField idx fields s!"{fieldPrefix}_bytes_emitted")
+      packetsEmitted := ← parseU64 (← getField idx fields s!"{fieldPrefix}_packets_emitted")
+      creditQuanta := ← parseU128 (← getField idx fields s!"{fieldPrefix}_credit_quanta")
+      rtoDeadlineNs := ← parseOptU64 (← getField idx fields s!"{fieldPrefix}_rto_deadline_ns")
+      pacer := ← parsePacer (← getField idx fields s!"{fieldPrefix}_pacer")
+      nextTickNs := ← parseOptU64 (← getField idx fields s!"{fieldPrefix}_next_tick_ns")
+      status := ← parseStatus (← getField idx fields s!"{fieldPrefix}_status") }
+
+def parseSenderRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array String) :
+    Except String SenderRow := withLine lineNo do
+  let emitted ← parseBit (← getField idx fields "emitted")
+  let psn ← parseOptU64 (← getField idx fields "emitted_psn")
+  let bytes ← parseOptU64 (← getField idx fields "emitted_bytes")
+  let retransmission ← parseOpt parseBit (← getField idx fields "emitted_retransmission")
+  let payload ← parseOptU64 (← getField idx fields "emitted_payload")
+  let emission ←
+    match emitted, psn, bytes, retransmission, payload with
+    | true, some psn, some bytes, some retransmission, some _ =>
+        pure (some { psn := psn, bytes := bytes, retransmission := retransmission })
+    | false, none, none, none, none => pure none
+    | _, _, _, _, _ => throw "emitted_* fields must be present iff emitted = 1"
+  pure
+    { key := ← parseKey idx fields
+      nodeId := ← parseU64 (← getField idx fields "node_id")
+      flowId := ← parseU64 (← getField idx fields "flow_id")
+      kind := ← parseSenderKind (← getField idx fields "kind")
+      config :=
+        { mtuBytes := ← parseU64 (← getField idx fields "mtu_bytes")
+          totalBytes := ← parseU64 (← getField idx fields "total_bytes")
+          pacingIntervalNs := ← parseU64 (← getField idx fields "pacing_interval_ns")
+          firstPacingTimeNs := ← parseU64 (← getField idx fields "first_pacing_time_ns")
+          rtoNs := ← parseU64 (← getField idx fields "rto_ns") }
+      rateBps := ← parseOptU64 (← getField idx fields "rate_bps")
+      inputAcknowledgment := ← parseOptU64 (← getField idx fields "input_acknowledgment")
+      emitted := emitted
+      emission := emission
+      emittedPayload := payload
+      before := ← parseSenderState "before" idx fields
+      after := ← parseSenderState "after" idx fields
+      srcLine := lineNo }
+
+def parseSenderCsv (content : String) : Except String (List SenderRow) :=
+  parseLines content parseSenderRow
+
+/-- One sender log item in event order: a sender row with the DCQCN byte opportunity that shares
+its event key, or a DCQCN controller row of a queue pair on its own. -/
+inductive SenderItem
+  | sender (row : SenderRow) (bytes : Option DcqcnEventLog.Row)
+  | dcqcn (row : DcqcnEventLog.Row)
+
+/-- Merges the two key-ordered logs (linear). -/
+def mergeLogs : List SenderRow → List DcqcnEventLog.Row → List SenderItem → List SenderItem
+  | [], [], acc => acc.reverse
+  | s :: ss, [], acc => mergeLogs ss [] (.sender s none :: acc)
+  | [], d :: ds, acc => mergeLogs [] ds (.dcqcn d :: acc)
+  | s :: ss, d :: ds, acc =>
+      if d.key < s.key then mergeLogs (s :: ss) ds (.dcqcn d :: acc)
+      else if s.key < d.key then mergeLogs ss (d :: ds) (.sender s none :: acc)
+      else mergeLogs ss ds (.sender s (some d) :: acc)
+termination_by ss ds => ss.length + ds.length
+
+/-- What the sender checker tracks per queue pair `(node_id, flow_id)`. -/
+structure FlowTrack where
+  config : Roce.SenderConfig
+  /-- The state after the pair's last transition, including DCQCN status recomputations. -/
+  state : Roce.SenderState
+  /-- The controller's current rate after the pair's last controller transition. -/
+  rateBps : Nat
+  /-- A control tick ran on the completed pair: D2 forbids another. -/
+  controlSpent : Bool
+
+/-- The stop-time decisions the log implies, when the stop time is not given. -/
+structure StopBounds where
+  latestWithin : Option (Nat × Nat) := none
+  earliestBeyond : Option (Nat × Nat) := none
+
+structure SenderTrack where
+  flows : Std.HashMap (Nat × Nat) FlowTrack := ∅
+  lastPayload : Std.HashMap Nat Nat := ∅
+  stop : StopBounds := {}
+
+/-- The row-local shape rules of a sender row: phase, which optional fields are present, and the
+validity of its configuration and states. -/
+def checkSenderShape (row : SenderRow) : Except String Unit := do
+  let at_ := requireAt "sender" row.srcLine
+  at_ (Roce.validSenderConfig row.config) "invalid RoCE sender configuration"
+  at_ (Roce.validSenderState row.config row.before) "invalid RoCE sender before-state"
+  at_ (Roce.validSenderState row.config row.after) "invalid RoCE sender after-state"
+  match row.kind with
+  | .tick =>
+      at_ (row.key.phase = 1) "RoCE pacing tick must have phase 1"
+      at_ row.inputAcknowledgment.isNone "RoCE tick row carries an acknowledgment"
+      at_ (row.rateBps.isSome = (row.before.nextPsn < row.config.totalBytes))
+        "RoCE tick rate present iff the tick credits"
+      at_ (row.before.pacer = .armed && row.before.nextTickNs = some row.key.timeNs)
+        "RoCE tick of a pacer not armed for this time"
+  | .ack | .nack =>
+      at_ (row.key.phase = 0) "RoCE ACK or NACK arrival must have phase 0"
+      at_ row.inputAcknowledgment.isSome "RoCE ACK or NACK row has no acknowledgment"
+      at_ (row.rateBps.isNone && !row.emitted) "RoCE ACK or NACK row credits or emits"
+      at_ (row.inputAcknowledgment.all (· ≤ row.before.bytesEmitted))
+        "RoCE acknowledgment above the sender's high-water mark"
+  | .timeout =>
+      at_ (row.key.phase = 1) "RoCE timeout must have phase 1"
+      at_ (row.rateBps.isNone && row.inputAcknowledgment.isNone && !row.emitted)
+        "RoCE timeout row credits, emits or carries an acknowledgment"
+      at_ (row.before.rtoDeadlineNs = some row.key.timeNs)
+        "RoCE timeout fires without an armed deadline at this time"
+
+/-- Records or checks the one stop-time comparison a transition made. -/
+def checkStop (stopTimeNs : Option Nat) (row : SenderRow) (query : Option Nat) (withinStop : Bool)
+    (bounds : StopBounds) : Except String StopBounds := do
+  match query with
+  | none => pure bounds
+  | some tick =>
+      match stopTimeNs with
+      | some stop =>
+          requireAt "sender" row.srcLine (withinStop = decide (tick ≤ stop))
+            s!"RoCE pacer stop decision contradicts stop_time_ns={stop} (tick {tick})"
+          pure bounds
+      | none =>
+          if withinStop then
+            pure { bounds with
+              latestWithin :=
+                match bounds.latestWithin with
+                | some (latest, line) => if tick > latest then some (tick, row.srcLine) else some (latest, line)
+                | none => some (tick, row.srcLine) }
+          else
+            pure { bounds with
+              earliestBeyond :=
+                match bounds.earliestBeyond with
+                | some (earliest, line) => if tick < earliest then some (tick, row.srcLine) else some (earliest, line)
+                | none => some (tick, row.srcLine) }
+
+/-- Checks one sender row against §5 given the tracked rate, and returns the updated track. -/
+def checkSenderItem (stopTimeNs : Option Nat) (track : SenderTrack) (row : SenderRow)
+    (bytes : Option DcqcnEventLog.Row) : Except String SenderTrack := do
+  let at_ := requireAt "sender" row.srcLine
+  let source := (row.nodeId, row.flowId)
+  let prior := track.flows.get? source
+  -- Continuity: the first row starts from the initial state, later rows where the pair stood.
+  let rate ←
+    match prior with
+    | none => do
+        let rate ←
+          match row.rateBps with
+          | some rate => pure rate
+          | none => throw s!"sender: line {row.srcLine}: RoCE queue pair's first row is not a crediting tick (node_id={row.nodeId}, flow_id={row.flowId})"
+        at_ (row.kind = .tick && row.before = Roce.initialSender row.config rate)
+          s!"RoCE sender first state is not initial (node_id={row.nodeId}, flow_id={row.flowId})"
+        pure rate
+    | some flow => do
+        at_ (flow.config = row.config)
+          s!"RoCE sender config discontinuity (node_id={row.nodeId}, flow_id={row.flowId})"
+        at_ (flow.state = row.before)
+          s!"RoCE sender state discontinuity (node_id={row.nodeId}, flow_id={row.flowId})"
+        pure flow.rateBps
+  checkSenderShape row
+  -- The joined controller log: a tick credits at the controller's current rate, and the DCQCN
+  -- byte opportunity at the same key exists exactly when the tick sends, for the same bytes.
+  at_ (row.rateBps.all (· = rate)) "RoCE tick rate differs from the DCQCN controller's current rate"
+  let rateAfterBytes ←
+    match bytes, row.emission with
+    | none, none => pure rate
+    | some d, some emission => do
+        at_ (d.nodeId = row.nodeId && d.flowId = row.flowId && d.kind = .bytes)
+          "RoCE tick shares its event key with a DCQCN row that is not its byte opportunity"
+        at_ (d.emittedBytes = emission.bytes && d.before.currentRateBps = rate)
+          "RoCE emission differs from its DCQCN byte opportunity"
+        pure d.after.currentRateBps
+    | some _, none => throw s!"sender: line {row.srcLine}: DCQCN byte opportunity without a RoCE emission"
+    | none, some _ => throw s!"sender: line {row.srcLine}: RoCE emission without a DCQCN byte opportunity"
+  let withinStop := row.after.pacer != .stopped
+  let expected :=
+    match row.kind, row.inputAcknowledgment with
+    | .tick, _ => Roce.onTick row.config rate rateAfterBytes row.key.timeNs withinStop row.before
+    | .ack, some value =>
+        Roce.onFeedback row.config rate row.key.timeNs value false withinStop row.before
+    | .nack, some value =>
+        Roce.onFeedback row.config rate row.key.timeNs value true withinStop row.before
+    | .timeout, _ => Roce.onTimeout row.config rate row.key.timeNs withinStop row.before
+    | _, none => { state := row.before, emission := none, stopQuery := none }
+  -- The executor's fixed-width arithmetic: anything beyond it is an execution error, not a row.
+  at_ (row.before.creditQuanta + Roce.tickCredit row.config (row.rateBps.getD 0) ≤ Roce.maxU128)
+    "RoCE pacing credit exceeds u128"
+  at_ (expected.stopQuery.all (· ≤ Roce.maxU64) &&
+      row.key.timeNs + row.config.rtoNs ≤ Roce.maxU64)
+    "RoCE timer exceeds u64"
+  at_ (row.emission = expected.emission) "RoCE emission mismatch"
+  at_ (row.after = expected.state) "RoCE sender after-state mismatch"
+  let stop ← checkStop stopTimeNs row expected.stopQuery withinStop track.stop
+  -- Payloads are allocated in event order on each node.
+  let lastPayload ←
+    match row.emittedPayload with
+    | none => pure track.lastPayload
+    | some payload => do
+        match track.lastPayload.get? row.nodeId with
+        | some previous =>
+            at_ (previous < payload)
+              s!"RoCE sender payloads out of allocation order (node_id={row.nodeId})"
+        | none => pure ()
+        pure (track.lastPayload.insert row.nodeId payload)
+  let controlSpent := prior.map (·.controlSpent) |>.getD false
+  pure
+    { flows := track.flows.insert source
+        { config := row.config, state := row.after, rateBps := rateAfterBytes,
+          controlSpent := controlSpent }
+      lastPayload := lastPayload
+      stop := stop }
+
+/-- A DCQCN controller row of a queue pair between its RoCE rows: the rate it leaves, the status
+recomputation (amended §5 step 2), and D2. -/
+def checkDcqcnItem (track : SenderTrack) (d : DcqcnEventLog.Row) : Except String SenderTrack := do
+  let at_ := requireAt "dcqcn" d.srcLine
+  let source := (d.nodeId, d.flowId)
+  match track.flows.get? source with
+  | none =>
+      throw s!"dcqcn: line {d.srcLine}: DCQCN row of a queue pair before its first RoCE tick (node_id={d.nodeId}, flow_id={d.flowId})"
+  | some flow =>
+      at_ (d.before.currentRateBps = flow.rateBps)
+        "DCQCN rate differs from the queue pair's tracked controller rate"
+      at_ (d.kind != .bytes) "DCQCN byte opportunity without a RoCE tick at its event key"
+      let completed := flow.state.sndUna ≥ flow.config.totalBytes
+      if d.kind = .control then
+        at_ (!flow.controlSpent)
+          s!"DCQCN control tick re-armed after queue-pair completion (D2) (node_id={d.nodeId}, flow_id={d.flowId})"
+      let state := Roce.onRateChange flow.config d.after.currentRateBps flow.state
+      pure { track with
+        flows := track.flows.insert source
+          { flow with
+            state := state
+            rateBps := d.after.currentRateBps
+            controlSpent := flow.controlSpent || (d.kind = .control && completed) } }
+
+/--
+The sender log against §5, joined with the DCQCN controller log of the same run. `stopTimeNs` is
+the image's stop time when known; without it, one stop time must separate every armed tick from
+every stopped one.
+-/
+def checkSenderRows (stopTimeNs : Option Nat) (rows : List SenderRow)
+    (dcqcn : List DcqcnEventLog.Row) : Except String Unit := do
+  requireAt "sender" 1 (!rows.isEmpty) "empty RoCE sender trace"
+  inRole "sender" (checkKeyOrder (·.key) (·.srcLine) rows)
+  -- The controller log is checked on its own terms first (an empty one only when no queue pair
+  -- ever sent a byte and no controller event happened).
+  if !dcqcn.isEmpty then inRole "dcqcn" (DcqcnEventLog.checkRows dcqcn)
+  -- RED stub: the sender rows are not yet checked against the semantics or the DCQCN log.
+  let _ := (stopTimeNs, checkSenderItem, checkDcqcnItem)
+  pure ()
 
 end LeanGuard.P10c.RoceEventLog

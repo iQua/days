@@ -16,6 +16,20 @@
 #   26 before_last_nack_time_ns  27 before_last_cnp_time_ns
 #   28 after_expected_psn  29 after_packets_since_ack  30 after_last_nack_psn
 #   31 after_last_nack_time_ns  32 after_last_cnp_time_ns
+#
+# Sender CSV columns (roce_sender_transitions_csv):
+#   1 time_ns  2 event_phase  3 event_origin_node  4 event_origin_sequence  5 node_id  6 flow_id
+#   7 kind  8 mtu_bytes  9 total_bytes  10 pacing_interval_ns  11 first_pacing_time_ns  12 rto_ns
+#   13 rate_bps  14 input_acknowledgment  15 emitted  16 emitted_psn  17 emitted_bytes
+#   18 emitted_retransmission  19 emitted_payload
+#   20 before_next_psn  21 before_snd_una  22 before_bytes_emitted  23 before_packets_emitted
+#   24 before_credit_quanta  25 before_rto_deadline_ns  26 before_pacer  27 before_next_tick_ns
+#   28 before_status
+#   29 after_next_psn  30 after_snd_una  31 after_bytes_emitted  32 after_packets_emitted
+#   33 after_credit_quanta  34 after_rto_deadline_ns  35 after_pacer  36 after_next_tick_ns
+#   37 after_status
+#
+# DCQCN CSV columns: as in run-p10c-dcqcn-campaign.sh (dcqcn_transitions_csv).
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -181,6 +195,175 @@ mutate_receiver "u64-parser-bound" "$rules" \
 mutate_receiver "half-blank-nack-mark" "$rules" \
   'NR == 4 { $30 = 7 } { print }' \
   'REJECT: line 4: after_last_nack_psn and after_last_nack_time_ns must be both present or both blank'
+
+# --- Sender (joined with the DCQCN controller log) --------------------------------------------
+gbn="$fixture_dir/roce_sender_gbn_accept.csv"
+gbn_dcqcn="$fixture_dir/dcqcn_qp_completion_accept.csv"
+gbn_stop=30000
+stopped="$fixture_dir/roce_sender_stopped_accept.csv"
+stopped_dcqcn="$fixture_dir/roce_sender_stopped_accept.dcqcn.csv"
+stopped_stop=2500
+
+check_case "roce_sender_gbn_accept.csv" 0 "ACCEPT" sender "$gbn" "$gbn_dcqcn" "$gbn_stop" || true
+check_case "roce_sender_gbn_accept.csv (stop inferred)" 0 "ACCEPT" sender "$gbn" "$gbn_dcqcn" || true
+check_case "roce_sender_stopped_accept.csv" 0 "ACCEPT" \
+  sender "$stopped" "$stopped_dcqcn" "$stopped_stop" || true
+check_case "roce_sender_stopped_accept.csv (stop inferred)" 0 "ACCEPT" \
+  sender "$stopped" "$stopped_dcqcn" || true
+for csv in "$fixture_dir"/roce_sender_*_reject.csv; do
+  [[ -e "$csv" ]] || continue
+  expected_case "$(basename "$csv")" "${csv%.csv}.expected" sender "$csv" "${csv%.csv}.dcqcn.csv"
+done
+
+# mutate_sender <label> <sender.csv> <dcqcn.csv> <stop or ""> <awk program on the sender CSV>
+#   <expected REJECT line>
+mutate_sender() {
+  local label="$1"
+  local source="$2"
+  local dcqcn="$3"
+  local stop="$4"
+  local program="$5"
+  local expected_output="$6"
+  local mutated="$campaign_tmp/sender.csv"
+  awk -F, -v OFS=, "$program" "$source" > "$mutated"
+  mutations=$((mutations + 1))
+  if check_case "sender/$label" 1 "$expected_output" sender "$mutated" "$dcqcn" $stop; then
+    mutations_caught=$((mutations_caught + 1))
+  fi
+}
+
+# mutate_dcqcn <label> <sender.csv> <dcqcn.csv> <stop> <awk program on the DCQCN CSV>
+#   <expected REJECT line>
+mutate_dcqcn() {
+  local label="$1"
+  local sender="$2"
+  local source="$3"
+  local stop="$4"
+  local program="$5"
+  local expected_output="$6"
+  local mutated="$campaign_tmp/dcqcn.csv"
+  awk -F, -v OFS=, "$program" "$source" > "$mutated"
+  mutations=$((mutations + 1))
+  if check_case "sender/$label" 1 "$expected_output" sender "$sender" "$mutated" $stop; then
+    mutations_caught=$((mutations_caught + 1))
+  fi
+}
+
+# roce_sender_gbn_accept.csv rows (NR): 2 t1000 fresh send; 3 t2000 fresh send; 4 t2500 ACK 1000;
+# 5 t2800 NACK 1000 (= snd_una: rewinds); 6 t3000 retransmission; 7 t4000 tick after the CNP at
+# 3500 (rate 6 Gb/s; status recomputed to blocked between rows); 8 t5000 last fresh packet,
+# parks; 9 t6000 ACK 2000; 10 t11000 timeout, restart on the grid at 12000; 11 t12000
+# retransmission, parks; 12 t13000 ACK 3000, finished.
+mutate_sender "wrong-rewind-point-nack" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  'NR == 5 { $29 = 2000 } { print }' \
+  'REJECT: sender: line 5: RoCE sender after-state mismatch'
+mutate_sender "wrong-rewind-point-timeout" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  'NR == 10 { $29 = 3000 } { print }' \
+  'REJECT: sender: line 10: RoCE sender after-state mismatch'
+mutate_sender "stale-nack-applied" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  'NR == 5 { $14 = 0 } { print }' \
+  'REJECT: sender: line 5: RoCE sender after-state mismatch'
+mutate_sender "stale-ack-applied" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  'NR == 4 { $14 = 0 } { print }' \
+  'REJECT: sender: line 4: RoCE sender after-state mismatch'
+mutate_sender "ack-rewinds" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  'NR == 4 { $29 = 1000 } { print }' \
+  'REJECT: sender: line 4: RoCE sender after-state mismatch'
+mutate_sender "ack-above-frontier" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  'NR == 4 { $14 = 3000 } { print }' \
+  "REJECT: sender: line 4: RoCE acknowledgment above the sender's high-water mark"
+mutate_sender "credit-not-charged-on-retransmission" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  'NR == 6 { $33 = 8000000000000 } { print }' \
+  'REJECT: sender: line 6: RoCE sender after-state mismatch'
+mutate_sender "retransmission-counted-as-fresh" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  'NR == 6 { $31 = 3000; $32 = 3 } { print }' \
+  'REJECT: sender: line 6: RoCE sender after-state mismatch'
+mutate_sender "retransmission-bit-cleared" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  'NR == 6 { $18 = 0 } { print }' \
+  'REJECT: sender: line 6: RoCE emission mismatch'
+mutate_sender "retransmission-from-wrong-psn" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  'NR == 11 { $16 = 1000 } { print }' \
+  'REJECT: sender: line 11: RoCE emission mismatch'
+mutate_sender "emission-without-credit" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  'NR == 7 { $15 = 1; $16 = 2000; $17 = 1000; $18 = 0; $19 = 19 } { print }' \
+  'REJECT: sender: line 7: RoCE emission without a DCQCN byte opportunity'
+mutate_sender "emission-differs-from-byte-counter" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  'NR == 2 { $17 = 999 } { print }' \
+  'REJECT: sender: line 2: RoCE emission differs from its DCQCN byte opportunity'
+mutate_sender "tick-rate-not-controller-rate" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  'NR == 7 { $13 = 8000000000 } { print }' \
+  "REJECT: sender: line 7: RoCE tick rate differs from the DCQCN controller's current rate"
+mutate_sender "status-not-recomputed-at-cnp" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  'NR == 7 { $28 = "scheduled" } { print }' \
+  'REJECT: sender: line 7: RoCE sender state discontinuity (node_id=1, flow_id=3)'
+mutate_sender "timeout-not-rearmed" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  'NR == 10 { $34 = 11000 } { print }' \
+  'REJECT: sender: line 10: RoCE sender after-state mismatch'
+mutate_sender "timeout-before-deadline" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  'NR == 10 { $1 = 10999 } { print }' \
+  'REJECT: sender: line 10: RoCE timeout fires without an armed deadline at this time'
+mutate_sender "restart-at-rewind-instant" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  'NR == 10 { $36 = 11000 } { print }' \
+  'REJECT: sender: line 10: RoCE sender after-state mismatch'
+mutate_sender "rto-not-restarted-by-ack" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  'NR == 4 { $34 = 6000 } { print }' \
+  'REJECT: sender: line 4: RoCE sender after-state mismatch'
+mutate_sender "rto-not-disarmed-at-completion" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  'NR == 12 { $34 = 18000 } { print }' \
+  'REJECT: sender: line 12: invalid RoCE sender after-state'
+mutate_sender "completion-not-finished" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  'NR == 12 { $37 = "blocked" } { print }' \
+  'REJECT: sender: line 12: invalid RoCE sender after-state'
+mutate_sender "tick-of-unarmed-pacer" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  'NR == 7 { $1 = 4500 } { print }' \
+  'REJECT: sender: line 7: RoCE tick of a pacer not armed for this time'
+mutate_sender "typed-tick-phase" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  'NR == 2 { $2 = 0 } { print }' \
+  'REJECT: sender: line 2: RoCE pacing tick must have phase 1'
+mutate_sender "state-splice" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  'NR == 9 { $24 = 4000000000001 } { print }' \
+  'REJECT: sender: line 9: RoCE sender state discontinuity (node_id=1, flow_id=3)'
+mutate_sender "config-splice" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  'NR == 8 { $12 = 5001 } { print }' \
+  'REJECT: sender: line 8: RoCE sender config discontinuity (node_id=1, flow_id=3)'
+mutate_sender "initial-state-splice" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  'NR == 2 { $28 = "blocked" } { print }' \
+  'REJECT: sender: line 2: RoCE sender first state is not initial (node_id=1, flow_id=3)'
+mutate_sender "duplicate-key" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  'NR == 3 { $1 = 1000; $2 = 1; $3 = 1; $4 = 0 } { print }' \
+  'REJECT: sender: line 3: duplicate or backward canonical event key'
+mutate_sender "payload-allocation-order" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  'NR == 3 { $19 = 5 } { print }' \
+  'REJECT: sender: line 3: RoCE sender payloads out of allocation order (node_id=1)'
+mutate_sender "u128-credit-bound" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  'NR == 2 { $24 = "340282366920938463463374607431768211456" } { print }' \
+  "REJECT: sender: line 2: value exceeds u128: '340282366920938463463374607431768211456'"
+mutate_dcqcn "control-rearmed-after-completion" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  '{ print } END { print "29500,1,1,9,1,3,control,0,0,8000000000,1000000000,8000000000,500000000,1000000000,500000000,500000000,0,9500,1000000000000,625000000,4812500000,7000000000,1,22000,fast_recovery,0,0,29500,625000000,4812500000,7000000000,0,22000,fast_recovery,0,0,39000" }' \
+  'REJECT: dcqcn: line 11: DCQCN control tick re-armed after queue-pair completion (D2) (node_id=1, flow_id=3)'
+mutate_dcqcn "retransmission-not-charged-to-byte-counter" "$gbn" "$gbn_dcqcn" "$gbn_stop" \
+  'NR != 4 { print }' \
+  'REJECT: dcqcn: line 4: DCQCN state discontinuity for source (node_id=1, flow_id=3)'
+
+# roce_sender_stopped_accept.csv rows (NR), timeout off, stop 2500: 2 t1000 flow 3 send; 3 t2000
+# flow 3 last packet, parks; 4 t2200 flow 7 tick whose next tick (3200) is beyond stop; 5 t2600
+# NACK 0 rewinds a parked pacer whose restart (3000) is beyond stop; 6 t2700 ACK 1000, still
+# stopped; 7 t2800 ACK 2000 completes a stopped pacer (parked, finished).
+mutate_sender "restart-armed-beyond-stop" "$stopped" "$stopped_dcqcn" "$stopped_stop" \
+  'NR == 5 { $35 = "armed"; $37 = "scheduled" } { print }' \
+  'REJECT: sender: line 5: RoCE pacer stop decision contradicts stop_time_ns=2500 (tick 3000)'
+mutate_sender "inconsistent-inferred-stop" "$stopped" "$stopped_dcqcn" "" \
+  'NR == 4 { $35 = "armed"; $37 = "blocked" } { print }' \
+  'REJECT: sender: no single stop time fits the pacer decisions: tick 3200 (line 4) is armed and tick 3000 (line 5) is stopped'
+mutate_sender "finished-pacer-left-stopped" "$stopped" "$stopped_dcqcn" "$stopped_stop" \
+  'NR == 7 { $35 = "stopped"; $36 = 3000 } { print }' \
+  'REJECT: sender: line 7: invalid RoCE sender after-state'
+mutate_sender "rto-armed-while-off" "$stopped" "$stopped_dcqcn" "$stopped_stop" \
+  'NR == 2 { $34 = 6000 } { print }' \
+  'REJECT: sender: line 2: invalid RoCE sender after-state'
+mutate_sender "stopped-tick-still-armed" "$stopped" "$stopped_dcqcn" "$stopped_stop" \
+  'NR == 4 { $35 = "armed"; $37 = "blocked" } { print }' \
+  'REJECT: sender: line 4: RoCE pacer stop decision contradicts stop_time_ns=2500 (tick 3200)'
 
 echo "P10c RoCE campaign checks: $checked; mutations caught: $mutations_caught/$mutations"
 exit "$failures"
