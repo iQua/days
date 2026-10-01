@@ -610,50 +610,70 @@ expect_reject "executor: control tick lost mid-trace" \
   trace "$xb.sender.csv" "$xb.receiver.csv" "$campaign_tmp/control-cut.dcqcn.csv" "$xstop"
 
 # --- Amendment 1: class_paused (host-link PFC backpressure) ------------------------------------
-# Amended sender layout: column 8 is class_paused; the schema's columns 8-37 become 9-38
-# (14 rate_bps, 15 input_acknowledgment, 16 emitted, 17-20 emitted_*, 21-29 before_*,
-# 30-38 after_*: 34 after_credit_quanta, 36 after_pacer, 37 after_next_tick_ns, 38 after_status).
-# Logs without the column (writers before Amendment 1) read class_paused = 0 throughout.
+# Amended sender layout (Amendments 1 and 3): column 8 is class_paused, column 9 data_class; the
+# schema's columns 8-37 become 10-39 (15 rate_bps, 16 input_acknowledgment, 17 emitted, 18-21
+# emitted_*, 22-30 before_*, 31-39 after_*: 35 after_credit_quanta, 37 after_pacer,
+# 38 after_next_tick_ns, 39 after_status). These fixtures carry their PFC log (--pfc).
+# Logs without class_paused (writers before Amendment 1) read class_paused = 0 throughout.
+# mutate_amended <label> <sender.csv> <dcqcn.csv> <pfc.csv> <stop> <awk program on the sender CSV>
+#   <expected REJECT line>
+mutate_amended() {
+  local label="$1"
+  local source="$2"
+  local dcqcn="$3"
+  local pfc="$4"
+  local stop="$5"
+  local program="$6"
+  local expected_output="$7"
+  local mutated="$campaign_tmp/amended.csv"
+  awk -F, -v OFS=, "$program" "$source" > "$mutated"
+  mutations=$((mutations + 1))
+  if check_case "sender/$label" 1 "$expected_output" \
+      sender "$mutated" "$dcqcn" --pfc "$pfc" "$stop"; then
+    mutations_caught=$((mutations_caught + 1))
+  fi
+}
 paused="$fixture_dir/roce_sender_paused_accept.csv"
 paused_dcqcn="$fixture_dir/roce_sender_paused_accept.dcqcn.csv"
+paused_pfc="$fixture_dir/roce_sender_paused_accept.pfc.csv"
 paused_stop=8000
 check_case "roce_sender_paused_accept.csv" 0 "ACCEPT" \
-  sender "$paused" "$paused_dcqcn" "$paused_stop" || true
+  sender "$paused" "$paused_dcqcn" --pfc "$paused_pfc" "$paused_stop" || true
 check_case "roce_sender_paused_accept.csv (stop inferred)" 0 "ACCEPT" \
-  sender "$paused" "$paused_dcqcn" || true
+  sender "$paused" "$paused_dcqcn" --pfc "$paused_pfc" || true
 # Rows (NR): 2 t1000 flow 3 sends psn 0; 3 t1000 flow 5 sends psn 0; 4 t2000 flow 3 tick finds
 # the class paused: parks, no credit; 5 t2000 flow 5 likewise; 6 t2500 ACK 1000 restarts flow 3
 # on the grid (3000), as any ACK restart; 7 t3000 flow 3's restarted tick parks again; 8 t5000
 # flow 5 timeout rewinds and restarts at 6000; 9 t6000 flow 5's restarted tick parks again.
-mutate_sender "paused-tick-emits" "$paused" "$paused_dcqcn" "$paused_stop" \
-  'NR == 4 { $16 = 1; $17 = 1000; $18 = 1000; $19 = 0; $20 = 17 } { print }' \
+mutate_amended "paused-tick-emits" "$paused" "$paused_dcqcn" "$paused_pfc" "$paused_stop" \
+  'NR == 4 { $17 = 1; $18 = 1000; $19 = 1000; $20 = 0; $21 = 17 } { print }' \
   'REJECT: sender: line 4: RoCE paused tick credits or emits'
-mutate_sender "paused-tick-adds-credit" "$paused" "$paused_dcqcn" "$paused_stop" \
-  'NR == 4 { $34 = 8000000000000 } { print }' \
+mutate_amended "paused-tick-adds-credit" "$paused" "$paused_dcqcn" "$paused_pfc" "$paused_stop" \
+  'NR == 4 { $35 = 8000000000000 } { print }' \
   'REJECT: sender: line 4: RoCE sender after-state mismatch'
-mutate_sender "paused-tick-reads-rate" "$paused" "$paused_dcqcn" "$paused_stop" \
-  'NR == 4 { $14 = 8000000000 } { print }' \
+mutate_amended "paused-tick-reads-rate" "$paused" "$paused_dcqcn" "$paused_pfc" "$paused_stop" \
+  'NR == 4 { $15 = 8000000000 } { print }' \
   'REJECT: sender: line 4: RoCE paused tick credits or emits'
-mutate_sender "paused-tick-flag-cleared" "$paused" "$paused_dcqcn" "$paused_stop" \
+mutate_amended "paused-tick-flag-cleared" "$paused" "$paused_dcqcn" "$paused_pfc" "$paused_stop" \
   'NR == 4 { $8 = 0 } { print }' \
   'REJECT: sender: line 4: RoCE tick rate present iff the tick credits'
-mutate_sender "paused-tick-flag-cleared-with-rate" "$paused" "$paused_dcqcn" "$paused_stop" \
-  'NR == 4 { $8 = 0; $14 = 8000000000 } { print }' \
+mutate_amended "paused-tick-flag-cleared-with-rate" "$paused" "$paused_dcqcn" "$paused_pfc" "$paused_stop" \
+  'NR == 4 { $8 = 0; $15 = 8000000000 } { print }' \
   'REJECT: sender: line 4: RoCE emission mismatch'
-mutate_sender "paused-tick-keeps-pacer-armed" "$paused" "$paused_dcqcn" "$paused_stop" \
-  'NR == 4 { $36 = "armed"; $37 = 3000; $38 = "scheduled" } { print }' \
+mutate_amended "paused-tick-keeps-pacer-armed" "$paused" "$paused_dcqcn" "$paused_pfc" "$paused_stop" \
+  'NR == 4 { $37 = "armed"; $38 = 3000; $39 = "scheduled" } { print }' \
   'REJECT: sender: line 4: RoCE sender after-state mismatch'
-mutate_sender "class-paused-on-ack" "$paused" "$paused_dcqcn" "$paused_stop" \
+mutate_amended "class-paused-on-ack" "$paused" "$paused_dcqcn" "$paused_pfc" "$paused_stop" \
   'NR == 6 { $8 = 1 } { print }' \
   'REJECT: sender: line 6: RoCE class_paused set on a non-tick row'
-mutate_sender "rewind-while-paused-not-restarting" "$paused" "$paused_dcqcn" "$paused_stop" \
-  'NR == 8 { $36 = "parked"; $37 = ""; $38 = "blocked" } { print }' \
+mutate_amended "rewind-while-paused-not-restarting" "$paused" "$paused_dcqcn" "$paused_pfc" "$paused_stop" \
+  'NR == 8 { $37 = "parked"; $38 = ""; $39 = "blocked" } { print }' \
   'REJECT: sender: line 8: RoCE sender after-state mismatch'
-mutate_sender "class-paused-not-a-bit" "$paused" "$paused_dcqcn" "$paused_stop" \
+mutate_amended "class-paused-not-a-bit" "$paused" "$paused_dcqcn" "$paused_pfc" "$paused_stop" \
   'NR == 4 { $8 = 2 } { print }' \
   "REJECT: sender: line 4: invalid bit: '2'"
-mutate_sender "paused-tick-lost" "$paused" "$paused_dcqcn" "$paused_stop" \
-  'NR == 4 { for (i = 21; i <= 29; i++) before[i] = $i; next } NR == 6 { for (i = 21; i <= 29; i++) $i = before[i] } { print }' \
+mutate_amended "paused-tick-lost" "$paused" "$paused_dcqcn" "$paused_pfc" "$paused_stop" \
+  'NR == 4 { for (i = 22; i <= 30; i++) before[i] = $i; next } NR == 6 { for (i = 22; i <= 30; i++) $i = before[i] } { print }' \
   'REJECT: sender: line 5: pending RoCE pacing tick at 2000 did not fire before this row (node_id=1, flow_id=3)'
 
 # --- Amendment 2: resume rows (a PFC RESUME restarts pause-parked queue pairs) -----------------
@@ -662,53 +682,146 @@ mutate_sender "paused-tick-lost" "$paused" "$paused_dcqcn" "$paused_stop" \
 # flows of one node in flow_id order.
 resume="$fixture_dir/roce_sender_resume_accept.csv"
 resume_dcqcn="$fixture_dir/roce_sender_resume_accept.dcqcn.csv"
+resume_pfc="$fixture_dir/roce_sender_resume_accept.pfc.csv"
 resume_stop=8000
 check_case "roce_sender_resume_accept.csv" 0 "ACCEPT" \
-  sender "$resume" "$resume_dcqcn" "$resume_stop" || true
+  sender "$resume" "$resume_dcqcn" --pfc "$resume_pfc" "$resume_stop" || true
 check_case "roce_sender_resume_accept.csv (stop inferred)" 0 "ACCEPT" \
-  sender "$resume" "$resume_dcqcn" || true
+  sender "$resume" "$resume_dcqcn" --pfc "$resume_pfc" || true
 # Rows (NR): 2-4 t1000/1000/1500 flows 3, 5, 7 send psn 0 (flow 7's grid starts at 1500);
 # 5-7 their next ticks find the class paused and park; 8-10 one RESUME at 4500 restarts flows 3, 5
 # and 7 (three rows, one key): 3 and 5 at 5000, 7 at 5500; 11-12 t5000 flows 3 and 5 send their
 # last packet and park; 13 t5500 flow 7's tick finds the class paused again; 14 a RESUME at 7600
 # restarts flow 7 at 8500, beyond stop 8000: stopped.
 resume_order='REJECT: sender: line 9: RoCE resume rows sharing an event key must be of one node in strictly increasing flow_id order'
-mutate_sender "resume-of-unpaused-pair" "$resume" "$resume_dcqcn" "$resume_stop" \
-  'NR == 14 { print "7600,0,9,1,1,3,resume,0,1000,2000,1000,1000,0,,,0,,,,,2000,0,2000,2,0,,parked,,blocked,2000,0,2000,2,0,,parked,,blocked" } { print }' \
+mutate_amended "resume-of-unpaused-pair" "$resume" "$resume_dcqcn" "$resume_pfc" "$resume_stop" \
+  'NR == 14 { print "7600,0,9,1,1,3,resume,0,3,1000,2000,1000,1000,0,,,0,,,,,2000,0,2000,2,0,,parked,,blocked,2000,0,2000,2,0,,parked,,blocked" } { print }' \
   'REJECT: sender: line 14: RoCE resume of a queue pair not parked by a pause (node_id=1, flow_id=3)'
-mutate_sender "two-resume-rows-for-one-flow" "$resume" "$resume_dcqcn" "$resume_stop" \
+mutate_amended "two-resume-rows-for-one-flow" "$resume" "$resume_dcqcn" "$resume_pfc" "$resume_stop" \
   'NR == 8 { print } { print }' \
   "$resume_order"
-mutate_sender "resume-rows-out-of-flow-order" "$resume" "$resume_dcqcn" "$resume_stop" \
+mutate_amended "resume-rows-out-of-flow-order" "$resume" "$resume_dcqcn" "$resume_pfc" "$resume_stop" \
   'NR == 8 { held = $0; next } NR == 9 { print; print held; next } { print }' \
   "$resume_order"
-mutate_sender "resume-rows-of-two-nodes" "$resume" "$resume_dcqcn" "$resume_stop" \
+mutate_amended "resume-rows-of-two-nodes" "$resume" "$resume_dcqcn" "$resume_pfc" "$resume_stop" \
   'NR == 9 { $5 = 2 } { print }' \
   "$resume_order"
-mutate_sender "resume-at-wrong-grid-point" "$resume" "$resume_dcqcn" "$resume_stop" \
-  'NR == 8 { $37 = 6000 } { print }' \
+mutate_amended "resume-at-wrong-grid-point" "$resume" "$resume_dcqcn" "$resume_pfc" "$resume_stop" \
+  'NR == 8 { $38 = 6000 } { print }' \
   'REJECT: sender: line 8: RoCE sender after-state mismatch'
-mutate_sender "resume-restarts-at-the-resume-instant" "$resume" "$resume_dcqcn" "$resume_stop" \
-  'NR == 10 { $37 = 4500 } { print }' \
+mutate_amended "resume-restarts-at-the-resume-instant" "$resume" "$resume_dcqcn" "$resume_pfc" "$resume_stop" \
+  'NR == 10 { $38 = 4500 } { print }' \
   'REJECT: sender: line 10: RoCE sender after-state mismatch'
-mutate_sender "resume-armed-beyond-stop" "$resume" "$resume_dcqcn" "$resume_stop" \
-  'NR == 14 { $36 = "armed"; $38 = "scheduled" } { print }' \
+mutate_amended "resume-armed-beyond-stop" "$resume" "$resume_dcqcn" "$resume_pfc" "$resume_stop" \
+  'NR == 14 { $37 = "armed"; $39 = "scheduled" } { print }' \
   'REJECT: sender: line 14: RoCE pacer stop decision contradicts stop_time_ns=8000 (tick 8500)'
-mutate_sender "resume-with-rate" "$resume" "$resume_dcqcn" "$resume_stop" \
-  'NR == 8 { $14 = 8000000000 } { print }' \
+mutate_amended "resume-with-rate" "$resume" "$resume_dcqcn" "$resume_pfc" "$resume_stop" \
+  'NR == 8 { $15 = 8000000000 } { print }' \
   'REJECT: sender: line 8: RoCE resume row credits, emits or carries an acknowledgment'
-mutate_sender "resume-with-acknowledgment" "$resume" "$resume_dcqcn" "$resume_stop" \
-  'NR == 8 { $15 = 1000 } { print }' \
+mutate_amended "resume-with-acknowledgment" "$resume" "$resume_dcqcn" "$resume_pfc" "$resume_stop" \
+  'NR == 8 { $16 = 1000 } { print }' \
   'REJECT: sender: line 8: RoCE resume row credits, emits or carries an acknowledgment'
-mutate_sender "resume-with-class-paused" "$resume" "$resume_dcqcn" "$resume_stop" \
+mutate_amended "resume-with-class-paused" "$resume" "$resume_dcqcn" "$resume_pfc" "$resume_stop" \
   'NR == 8 { $8 = 1 } { print }' \
   'REJECT: sender: line 8: RoCE class_paused set on a non-tick row'
-mutate_sender "resume-typed-phase" "$resume" "$resume_dcqcn" "$resume_stop" \
+mutate_amended "resume-typed-phase" "$resume" "$resume_dcqcn" "$resume_pfc" "$resume_stop" \
   'NR >= 8 && NR <= 10 { $2 = 1 } { print }' \
   'REJECT: sender: line 8: RoCE resume must have phase 0'
-mutate_sender "resume-lost" "$resume" "$resume_dcqcn" "$resume_stop" \
+mutate_amended "resume-lost" "$resume" "$resume_dcqcn" "$resume_pfc" "$resume_stop" \
   'NR != 8 { print }' \
   'REJECT: sender: line 10: RoCE sender state discontinuity (node_id=1, flow_id=3)'
+
+# --- Amendment 3: pauses and resumes against the host PFC records ------------------------------
+# PFC CSV columns (pfc_transitions_csv): 1 time_ns, 2-4 key, 5 node_id, 6 queue_id, 7 kind,
+# 8 controlled_link, 9 controller, 10 priority, 20 control_action, 21 before_controllers,
+# 22 after_controllers. A host's class is paused while its controller set is non-empty; a host
+# RESUME is a control row that empties it.
+amended_gbn="$fixture_dir/roce_sender_gbn_amended_accept.csv"
+amended_gbn_pfc="$fixture_dir/roce_sender_gbn_amended_accept.pfc.csv"
+check_case "roce_sender_gbn_amended_accept.csv (no host PFC: header-only PFC log)" 0 "ACCEPT" \
+  sender "$amended_gbn" "$gbn_dcqcn" --pfc "$amended_gbn_pfc" "$gbn_stop" || true
+
+# expect_warrant_reject <label> <expected REJECT line> <checker args...>
+expect_warrant_reject() {
+  local label="$1"
+  local expected_output="$2"
+  shift 2
+  mutations=$((mutations + 1))
+  if check_case "warrant/$label" 1 "$expected_output" "$@"; then
+    mutations_caught=$((mutations_caught + 1))
+  fi
+}
+# mutate_pfc <label> <sender.csv> <dcqcn.csv> <pfc.csv> <stop> <awk program on the PFC CSV>
+#   <expected REJECT line>
+mutate_pfc() {
+  local label="$1"
+  local sender="$2"
+  local dcqcn="$3"
+  local source="$4"
+  local stop="$5"
+  local program="$6"
+  local expected_output="$7"
+  local mutated="$campaign_tmp/pfc.csv"
+  awk -F, -v OFS=, "$program" "$source" > "$mutated"
+  mutations=$((mutations + 1))
+  if check_case "warrant/$label" 1 "$expected_output" \
+      sender "$sender" "$dcqcn" --pfc "$mutated" "$stop"; then
+    mutations_caught=$((mutations_caught + 1))
+  fi
+}
+
+# The review's round-2 probes (evidence/P15/leanguard-review/round2), data_class 3 inserted,
+# against roce_sender_resume_accept.pfc.csv (PAUSE 1800, RESUME 4500, PAUSE 5200, RESUME 7600).
+expect_warrant_reject "review B1: flow 3's resume row and restarted tick missing" \
+  'REJECT: pfc: line 3: host RESUME of data_class 3 at node 1 did not restart pause-parked queue pair (flow_id=3)' \
+  sender "$fixture_dir/roce_review_b1.sender.csv" "$fixture_dir/roce_review_b1.dcqcn.csv" \
+  --pfc "$resume_pfc" "$resume_stop"
+expect_warrant_reject "review B2: B1, masked by a later ACK restart" \
+  'REJECT: pfc: line 3: host RESUME of data_class 3 at node 1 did not restart pause-parked queue pair (flow_id=3)' \
+  sender "$fixture_dir/roce_review_b2.sender.csv" "$fixture_dir/roce_review_b2.dcqcn.csv" \
+  --pfc "$resume_pfc" "$resume_stop"
+expect_warrant_reject "review S1: a resume, and a pause, at instants no PFC record claims" \
+  'REJECT: sender: line 14: RoCE resume row without a host RESUME of data_class 3 at node 1 at this event key' \
+  sender "$fixture_dir/roce_review_s1.sender.csv" "$resume_dcqcn" --pfc "$resume_pfc" "$resume_stop"
+mutate_amended "resume-row-missing-for-one-pair" "$resume" "$resume_dcqcn" "$resume_pfc" "$resume_stop" \
+  'NR != 9 { print }' \
+  'REJECT: pfc: line 3: host RESUME of data_class 3 at node 1 did not restart pause-parked queue pair (flow_id=5)'
+mutate_pfc "pause-without-warrant" "$paused" "$paused_dcqcn" "$paused_pfc" "$paused_stop" \
+  'NR == 2 { $1 = 2500 } { print }' \
+  'REJECT: sender: line 4: RoCE paused tick while data_class 3 is not paused at node 1'
+mutate_pfc "unpaused-tick-while-paused" "$resume" "$resume_dcqcn" "$resume_pfc" "$resume_stop" \
+  'NR == 4 { $1 = 4900 } { print }' \
+  'REJECT: sender: line 11: RoCE unpaused tick while data_class 3 is paused at node 1'
+mutate_pfc "resume-at-another-key" "$resume" "$resume_dcqcn" "$resume_pfc" "$resume_stop" \
+  'NR == 3 { $1 = 4400 } { print }' \
+  'REJECT: sender: line 8: RoCE resume row without a host RESUME of data_class 3 at node 1 at this event key'
+mutate_pfc "resume-at-another-node" "$resume" "$resume_dcqcn" "$resume_pfc" "$resume_stop" \
+  'NR == 3 { $5 = 2 } NR == 4 { $21 = 9 } { print }' \
+  'REJECT: sender: line 8: RoCE resume row without a host RESUME of data_class 3 at node 1 at this event key'
+mutate_pfc "resume-of-another-class" "$resume" "$resume_dcqcn" "$resume_pfc" "$resume_stop" \
+  'NR == 3 { $10 = 4 } NR == 4 { $21 = 9 } { print }' \
+  'REJECT: sender: line 8: RoCE resume row without a host RESUME of data_class 3 at node 1 at this event key'
+mutate_pfc "partial-resume-leaves-class-paused" "$resume" "$resume_dcqcn" "$resume_pfc" "$resume_stop" \
+  'NR == 2 { print; print "1900,0,8,0,1,0,control,10,8,3,,,,,,,,,,pause,9,8;9"; next } NR == 3 { $21 = "8;9"; $22 = "8" } NR == 4 { $21 = "8"; $22 = "8;9" } NR == 5 { $21 = "8;9"; $22 = "8" } { print }' \
+  'REJECT: sender: line 8: RoCE resume row without a host RESUME of data_class 3 at node 1 at this event key'
+mutate_amended "data-class-out-of-range" "$resume" "$resume_dcqcn" "$resume_pfc" "$resume_stop" \
+  'NR == 2 { $9 = 8 } { print }' \
+  "REJECT: sender: line 2: data_class exceeds 7: '8'"
+mutate_amended "data-class-discontinuity" "$resume" "$resume_dcqcn" "$resume_pfc" "$resume_stop" \
+  'NR == 5 { $9 = 4 } { print }' \
+  'REJECT: sender: line 5: RoCE data_class discontinuity (node_id=1, flow_id=3)'
+# Input rules: an Amendment 3 log needs its PFC log; pause and resume rows need Amendment 3.
+expect_warrant_reject "amended-log-without-pfc-log" \
+  'REJECT: sender: the log carries data_class (Amendment 3); pass its PFC log with --pfc' \
+  sender "$resume" "$resume_dcqcn" "$resume_stop"
+awk -F, -v OFS=, '{ out = $1; for (i = 2; i <= NF; i++) if (i != 9) out = out OFS $i; print out }' \
+  "$resume" > "$campaign_tmp/amendment2-layout.csv"
+expect_warrant_reject "pause-rows-without-data-class" \
+  'REJECT: sender: line 5: class_paused and resume rows need the data_class column and the PFC log (Amendment 3)' \
+  sender "$campaign_tmp/amendment2-layout.csv" "$resume_dcqcn" "$resume_stop"
+expect_warrant_reject "pfc-log-without-data-class" \
+  'REJECT: sender: --pfc needs a sender log with the data_class column (Amendment 3)' \
+  sender "$gbn" "$gbn_dcqcn" --pfc "$amended_gbn_pfc" "$gbn_stop"
 
 echo "P10c RoCE campaign checks: $checked; mutations caught: $mutations_caught/$mutations"
 exit "$failures"

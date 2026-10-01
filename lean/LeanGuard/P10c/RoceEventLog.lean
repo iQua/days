@@ -1,5 +1,6 @@
 import DaysExecutor.Event
 import LeanGuard.P10c.DcqcnEventLog
+import LeanGuard.P10c.MechanismEventLog
 import LeanGuard.P10c.Roce.Semantics
 import LeanGuard.Shared.Check
 import LeanGuard.Shared.Csv
@@ -257,6 +258,8 @@ structure SenderRow where
   kind : SenderKind
   /-- Amendment 1: the tick found the pair's data class paused on its host's egress. -/
   classPaused : Bool
+  /-- Amendment 3: the pair's data priority (0..=7); `none` in a log without the column. -/
+  dataClass : Option Nat
   config : Roce.SenderConfig
   rateBps : Option Nat
   inputAcknowledgment : Option Nat
@@ -288,6 +291,11 @@ def parseSenderRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array
   let classPaused ←
     if idx.contains "class_paused" then parseBit (← getField idx fields "class_paused")
     else pure false
+  let dataClass ←
+    if idx.contains "data_class" then do
+      let value ← parseNat (← getField idx fields "data_class")
+      if value ≤ 7 then pure (some value) else throw s!"data_class exceeds 7: '{value}'"
+    else pure none
   let emitted ← parseBit (← getField idx fields "emitted")
   let psn ← parseOptU64 (← getField idx fields "emitted_psn")
   let bytes ← parseOptU64 (← getField idx fields "emitted_bytes")
@@ -305,6 +313,7 @@ def parseSenderRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array
       flowId := ← parseU64 (← getField idx fields "flow_id")
       kind := ← parseSenderKind (← getField idx fields "kind")
       classPaused := classPaused
+      dataClass := dataClass
       config :=
         { mtuBytes := ← parseU64 (← getField idx fields "mtu_bytes")
           totalBytes := ← parseU64 (← getField idx fields "total_bytes")
@@ -642,9 +651,11 @@ the image's stop time when known; without it, one stop time must separate every 
 every stopped one.
 -/
 def checkSenderRows (stopTimeNs : Option Nat) (rows : List SenderRow)
-    (dcqcn : List DcqcnEventLog.Row) : Except String Unit := do
+    (dcqcn : List DcqcnEventLog.Row) (pfc : Option (List MechanismEventLog.PfcLog.Row)) :
+    Except String Unit := do
   requireAt "sender" 1 (!rows.isEmpty) "empty RoCE sender trace"
   checkSenderKeyOrder rows
+  if let some pfcRows := pfc then inRole "pfc" (MechanismEventLog.PfcLog.checkRows pfcRows)
   -- The controller log is checked on its own terms first (an empty one only when no queue pair
   -- ever sent a byte and no controller event happened).
   if !dcqcn.isEmpty then inRole "dcqcn" (DcqcnEventLog.checkRows dcqcn)
@@ -764,9 +775,10 @@ def checkCrossRole (sender : List SenderRow) (receiver : List ReceiverRow)
 
 /-- The three logs of one run: each on its own terms, then the cross-role invariants. -/
 def checkTrace (stopTimeNs : Option Nat) (sender : List SenderRow) (receiver : List ReceiverRow)
-    (dcqcn : List DcqcnEventLog.Row) : Except String Unit := do
+    (dcqcn : List DcqcnEventLog.Row) (pfc : Option (List MechanismEventLog.PfcLog.Row)) :
+    Except String Unit := do
   inRole "receiver" (checkReceiverRows receiver)
-  checkSenderRows stopTimeNs sender dcqcn
+  checkSenderRows stopTimeNs sender dcqcn pfc
   checkCrossRole sender receiver dcqcn
 
 end LeanGuard.P10c.RoceEventLog
