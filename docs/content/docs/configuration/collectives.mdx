@@ -154,8 +154,9 @@ The compiler and the validator name the rejected field or backend:
 
 ```text
 unsupported collective algorithm `...`; T26 supports RingAllReduce and AllGather
-unsupported collective flow type `...`; collectives require flow_type = "TCP" (RoCE queue pairs arrive in P15)
+unsupported collective flow type `...`; collectives require a reliable transport, flow_type = "TCP" or "RoCE" (a RoCE queue pair is DCQCN with Go-back-N)
 TCP collective byte size 2 must be at least flow_count 3
+RoCE collective byte size 2 must be at least flow_count 3
 collective flow_count 3 must match the 4 configured hosts when sources/sinks are omitted
 unsupported collective `...` dependency on collective `...`; a collective may follow only a compute group
 compute `...` hosts must equal the ranks of `...` in order

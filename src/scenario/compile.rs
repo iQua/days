@@ -678,12 +678,14 @@ struct SupportedModel {
     roce_keys: Vec<RoceTrafficKey>,
 }
 
-/// Sorts the RoCE keys recorded in parse order, removes duplicates, and rewrites every flow's
-/// parse-order ordinal to its key's rank, so ordinals order exactly as the keys do.
+/// Sorts the RoCE keys recorded in parse order, removes duplicates, and rewrites the parse-order
+/// ordinal of every flow, flow set and collective to its key's rank, so ordinals order exactly as
+/// the keys do.
 fn canonical_roce_keys(
     recorded: Vec<RoceTrafficKey>,
     explicit_flows: &mut [ExplicitFlowKey],
     flow_sets: &mut [FlowSetKey],
+    collectives: &mut [CollectiveKey],
 ) -> Vec<RoceTrafficKey> {
     if recorded.is_empty() {
         return recorded;
@@ -705,7 +707,12 @@ fn canonical_roce_keys(
     let traffic = explicit_flows
         .iter_mut()
         .map(|flow| &mut flow.traffic)
-        .chain(flow_sets.iter_mut().map(|set| &mut set.traffic));
+        .chain(flow_sets.iter_mut().map(|set| &mut set.traffic))
+        .chain(
+            collectives
+                .iter_mut()
+                .map(|collective| &mut collective.traffic),
+        );
     for traffic in traffic {
         if let TrafficKind::Roce(ordinal) = &mut traffic.kind {
             *ordinal = rank[usize::try_from(*ordinal).expect("parse ordinals index the record")];
@@ -963,16 +970,26 @@ impl SupportedModel {
             .into_iter()
             .map(|flow_set| validate_flow_set(flow_set, scenario_text, &mut roce_keys))
             .collect::<Result<Vec<_>, _>>()?;
-        let roce_keys = canonical_roce_keys(roce_keys, &mut explicit_flows, &mut flow_sets);
         let mut collectives = source
             .collective
             .unwrap_or_default()
             .into_iter()
-            .map(|collective| validate_collective(collective, scenario_text))
+            .map(|collective| validate_collective(collective, scenario_text, &mut roce_keys))
             .collect::<Result<Vec<_>, _>>()?;
         for collective_set in source.collective_set.unwrap_or_default() {
-            collectives.extend(validate_collective_set(collective_set, scenario_text)?);
+            collectives.extend(validate_collective_set(
+                collective_set,
+                scenario_text,
+                &mut roce_keys,
+            )?);
         }
+        // After the collectives, whose keys sort them in `canonical_flows`.
+        let roce_keys = canonical_roce_keys(
+            roce_keys,
+            &mut explicit_flows,
+            &mut flow_sets,
+            &mut collectives,
+        );
         let computes = source
             .compute
             .unwrap_or_default()
@@ -1216,16 +1233,17 @@ fn collective_algorithm(name: &str) -> Result<CollectiveAlgorithm, CompileError>
     }
 }
 
-/// Collectives run over TCP only; fixed-rate streams cannot model a collective's completion, and
-/// RoCE queue pairs arrive in P15.
+/// Collectives run over a reliable transport, TCP or RoCE queue pairs: a stage completes when its
+/// last byte is acknowledged, which fixed-rate and unreliable DCQCN streams cannot report.
 fn validate_collective_transport(flow_type: Option<&str>) -> Result<SourceFlowKind, CompileError> {
     match flow_type {
         Some("TCP") => Ok(SourceFlowKind::Tcp),
+        Some("RoCE") => Ok(SourceFlowKind::Roce),
         Some(unsupported) => Err(CompileError::Unsupported(format!(
-            "unsupported collective flow type `{unsupported}`; collectives require flow_type = \"TCP\" (RoCE queue pairs arrive in P15)"
+            "unsupported collective flow type `{unsupported}`; collectives require a reliable transport, flow_type = \"TCP\" or \"RoCE\" (a RoCE queue pair is DCQCN with Go-back-N)"
         ))),
         None => Err(CompileError::Unsupported(
-            "collective flow_type is missing; collectives require flow_type = \"TCP\" (RoCE queue pairs arrive in P15)"
+            "collective flow_type is missing; collectives require a reliable transport, flow_type = \"TCP\" or \"RoCE\""
                 .to_owned(),
         )),
     }
@@ -1245,6 +1263,7 @@ fn collective_key(
     graph: Option<&[(u64, u64)]>,
     traffic: SourceTraffic,
     scenario_text: &str,
+    roce_keys: &mut Vec<RoceTrafficKey>,
 ) -> Result<CollectiveKey, CompileError> {
     let algorithm = collective_algorithm(collective_type)?;
     let flow_kind = validate_collective_transport(flow_type)?;
@@ -1303,13 +1322,14 @@ fn collective_key(
             }
         }
     }
-    // Collective transports are TCP only, so no RoCE key is ever recorded here.
+    // A RoCE collective records its key with the flows', so its stage queue pairs lower with
+    // their `[collective.traffic.roce]` configuration and hash its content into their seeds.
     let traffic = validate_traffic(
         traffic,
         flow_kind,
         priority.unwrap_or(0),
         scenario_text,
-        &mut Vec::new(),
+        roce_keys,
     )?;
     let Termination::Bytes(total_bytes) = traffic.termination else {
         return Err(CompileError::Unsupported(
@@ -1322,10 +1342,16 @@ fn collective_key(
             "RingAllReduce byte size {total_bytes} must be at least flow_count {flow_count}"
         )));
     }
-    if flow_kind == SourceFlowKind::Tcp && total_bytes < flow_count {
-        // EqualRemainderLast would leave an empty chunk, and a TCP flow must carry bytes.
+    if total_bytes < flow_count {
+        // EqualRemainderLast would leave an empty chunk, and a TCP flow or a RoCE queue pair must
+        // carry bytes.
+        let transport = if flow_kind == SourceFlowKind::Roce {
+            "RoCE"
+        } else {
+            "TCP"
+        };
         return Err(CompileError::Invalid(format!(
-            "TCP collective byte size {total_bytes} must be at least flow_count {flow_count}"
+            "{transport} collective byte size {total_bytes} must be at least flow_count {flow_count}"
         )));
     }
     Ok(CollectiveKey {
@@ -1373,6 +1399,7 @@ fn validate_compute(source: SourceCompute) -> Result<ComputeKey, CompileError> {
 fn validate_collective(
     source: SourceCollective,
     scenario_text: &str,
+    roce_keys: &mut Vec<RoceTrafficKey>,
 ) -> Result<CollectiveKey, CompileError> {
     let (name, after) = (source.name, source.after);
     let mut key = collective_key(
@@ -1388,6 +1415,7 @@ fn validate_collective(
         source.graph.as_deref(),
         source.traffic,
         scenario_text,
+        roce_keys,
     )?;
     key.name = name;
     key.after = after;
@@ -1397,6 +1425,7 @@ fn validate_collective(
 fn validate_collective_set(
     source: SourceCollectiveSet,
     scenario_text: &str,
+    roce_keys: &mut Vec<RoceTrafficKey>,
 ) -> Result<Vec<CollectiveKey>, CompileError> {
     collective_algorithm(&source.collective_type)?;
     validate_collective_transport(source.flow_type.as_deref())?;
@@ -1426,6 +1455,7 @@ fn validate_collective_set(
             None,
             source.traffic.clone(),
             scenario_text,
+            roce_keys,
         )?);
     }
     Ok(result)
@@ -2697,11 +2727,54 @@ fn lower(
         let collective_ready = flow.collective.as_ref().is_none_or(|stage| {
             stage.local_predecessor_complete && stage.inbound_predecessor_complete
         });
+        // A RoCE stage that its prerequisites have not released holds its anchors at zero (ruling
+        // C5); its release re-anchors the pacer and the controller at the release instant.
+        let gated_roce = roce.is_some() && !collective_ready;
+        let anchor_ns = if gated_roce {
+            0
+        } else {
+            flow.traffic.initial_delay_ns
+        };
         let next_emission = if emission_count == 0 {
             ScheduledEmission {
                 status: GeneratorStatus::Finished,
                 departure_time_ns: 0,
                 payload: PayloadId(0),
+            }
+        } else if gated_roce {
+            // Ruling C1: a gated RoCE stage's two timer tokens are allocated here, in the order a
+            // released pair's are (pacing, then control), and stay resident with no event, so the
+            // CPU executor imports and pins them like any queue pair's.
+            let sequence = payload_sequences.entry(source).or_default();
+            let mut tokens = [PayloadId(0); 2];
+            for (token, kind) in tokens
+                .iter_mut()
+                .zip([PacketKind::RocePacingTimer, PacketKind::DcqcnControlTimer])
+            {
+                *token = allocate_payload_id(
+                    ids.node(source),
+                    node_count,
+                    *sequence,
+                    "RoCE stage token payload sequence",
+                )?;
+                *sequence = sequence.checked_add(1).ok_or_else(|| {
+                    CompileError::Invalid(format!(
+                        "RoCE stage token payload sequence overflow at {source:?}"
+                    ))
+                })?;
+                initial_packets.push(PacketDescriptor {
+                    id: *token,
+                    flow: descriptor.id,
+                    size_bytes: 0,
+                    ecn_marked: false,
+                    kind,
+                });
+            }
+            dcqcn_control_payload = Some(tokens[1]);
+            ScheduledEmission {
+                status: GeneratorStatus::Blocked,
+                departure_time_ns: 0,
+                payload: tokens[0],
             }
         } else if !collective_ready {
             ScheduledEmission {
@@ -2851,7 +2924,7 @@ fn lower(
         });
         generators_by_source.entry(source).or_default().push((
             FlowGeneratorState {
-                // Every collective stage is a TCP generator whose dependencies live in this record;
+                // Every collective stage is a TCP or RoCE generator whose dependencies live in this record;
                 // compute stages build theirs in the compute branch above.
                 flow: descriptor.id,
                 packets_emitted: 0,
@@ -2924,16 +2997,13 @@ fn lower(
                             };
                             FlowGeneratorKind::Roce(RoceGenerator {
                                 pacer: RocePacer {
-                                    first_pacing_time_ns: flow.traffic.initial_delay_ns,
+                                    first_pacing_time_ns: anchor_ns,
                                     pacing_interval_ns: roce.dcqcn.pacing_interval_ns,
                                     mtu_bytes: flow.traffic.packet_size_bytes,
                                     total_bytes,
                                     credit_quanta: 0,
                                 },
-                                controller: lowered_dcqcn_controller(
-                                    roce.dcqcn,
-                                    flow.traffic.initial_delay_ns,
-                                ),
+                                controller: lowered_dcqcn_controller(roce.dcqcn, anchor_ns),
                                 control_timer_payload: dcqcn_control_payload
                                     .expect("nonempty RoCE lowering allocates a control token"),
                                 pacing_timer_payload: next_emission.payload,
@@ -2941,7 +3011,7 @@ fn lower(
                                 snd_una: 0,
                                 rto_deadline_ns: 0,
                                 rto_ns: roce.retransmit_timeout_ns,
-                                pacer_armed: true,
+                                pacer_armed: !gated_roce,
                             })
                         }
                     }

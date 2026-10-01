@@ -66,7 +66,7 @@ fn roce_collectives_lower_one_queue_pair_per_stage_with_their_keys() {
         ("roce_allgather_lossless.toml", 12, 0, 0),
         ("roce_ring_lossy.toml", 24, 1_000_000, 0),
         ("roce_compute_dag.toml", 24, 1_000_000, 0),
-        ("roce_tcp_mixed_collectives.toml", 6, 1_000_000, 0),
+        ("roce_tcp_mixed_collectives.toml", 12, 1_000_000, 0),
     ] {
         let image = lower(name);
         let found = roce_stages(&image);
@@ -211,10 +211,11 @@ fn collective_transports_other_than_tcp_and_roce_stay_refused() {
 
 #[test]
 fn roce_collectives_need_a_nonempty_chunk_per_rank() {
-    let text = fixture_text("roce_ring_lossy.toml").replace("size = 400000", "size = 3");
+    // AllGather: RingAllReduce refuses a size below the flow count before the transport check.
+    let text = fixture_text("roce_allgather_lossless.toml").replace("size = 300000", "size = 3");
     assert_eq!(
         lower_text("chunk", &text).expect_err("an empty chunk is refused"),
-        "RoCE collective byte size 3 must be at least flow_count 4"
+        "invalid scenario: RoCE collective byte size 3 must be at least flow_count 4"
     );
 }
 
@@ -306,6 +307,6 @@ fn tcp_stage_seeds_do_not_see_roce_collectives() {
             })
             .collect::<BTreeMap<_, _>>()
     };
-    assert_eq!(tcp_seeds(&alone).len(), 6);
+    assert_eq!(tcp_seeds(&alone).len(), 12);
     assert_eq!(tcp_seeds(&alone), tcp_seeds(&mixed));
 }
