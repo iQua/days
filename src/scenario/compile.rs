@@ -3065,6 +3065,7 @@ fn lower(
                     .unwrap_or_default(),
                 // One allocation on a host that receives queue pairs, none elsewhere.
                 roce_receivers: roce_receivers_by_target.remove(&node_key),
+                pfc: None,
                 next_origin_seq: origin_sequences.get(&node_key).copied().unwrap_or(0),
                 next_payload_seq: payload_sequences.get(&node_key).copied().unwrap_or(0),
                 sourced_packets: 0,

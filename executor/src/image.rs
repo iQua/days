@@ -52,6 +52,9 @@ pub struct HostState {
     /// 16-B pointer and no allocation, and a host with any pays one allocation. `validate` refuses
     /// `Some` of an empty slice, so `None` is the only empty shape.
     pub roce_receivers: Option<Box<[RoceReceiverState]>>,
+    /// Egress pause state of a host whose egress link is PFC-controlled (`[link.pfc] host_links`),
+    /// or `None`: a host without one pays the 8-B pointer and no allocation.
+    pub pfc: Option<Box<HostPfcState>>,
     pub next_origin_seq: u64,
     /// Per-node packet identity cursor. Every generated packet consumes one sequence value.
     pub next_payload_seq: u64,
@@ -187,6 +190,10 @@ impl fmt::Debug for HostState {
         if let Some(receivers) = &self.roce_receivers {
             debug.field("roce_receivers", receivers);
         }
+        // Omitting the absent host-link PFC state preserves every image byte without it.
+        if let Some(pfc) = &self.pfc {
+            debug.field("pfc", pfc);
+        }
         debug
             .field("next_origin_seq", &self.next_origin_seq)
             .field("next_payload_seq", &self.next_payload_seq)
@@ -234,6 +241,29 @@ impl fmt::Debug for SwitchQueueState {
             .field("in_service", &self.in_service)
             .field("tx_ready_pending", &self.tx_ready_pending)
             .finish()
+    }
+}
+
+/// Egress pause state of one host whose egress link is PFC-controlled (P15 host-link PFC).
+///
+/// The switch egress LPs that monitor the host's link assert pause per priority, as they do for a
+/// switch queue (`PfcQueueState::paused_by_controller`). A queue pair whose data class is paused
+/// parks its pacer at its next tick (ruling H1 (b)); `pause_parked` holds those queue pairs so
+/// that the RESUME that ends the pause restarts exactly them, without a scan of the host's
+/// generators.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct HostPfcState {
+    /// Downstream controller LPs currently asserting pause for each priority. A priority remains
+    /// paused until every asserting controller has resumed.
+    pub paused_by_controller: [BTreeSet<NodeId>; 8],
+    /// Generator positions (canonical `FlowId` order) of the queue pairs a paused tick parked, by
+    /// data class.
+    pub pause_parked: [BTreeSet<usize>; 8],
+}
+
+impl HostPfcState {
+    pub fn is_paused(&self, priority: usize) -> bool {
+        !self.paused_by_controller[priority].is_empty()
     }
 }
 

@@ -594,6 +594,7 @@ mod tests {
             tcp_receivers: Vec::new(),
             dcqcn_receivers: Vec::new(),
             roce_receivers: None,
+            pfc: None,
             next_origin_seq: 0,
             next_payload_seq: 0,
             sourced_packets: 0,

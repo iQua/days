@@ -989,6 +989,7 @@ mod tests {
             tcp_receivers: vec![],
             dcqcn_receivers: vec![],
             roce_receivers: None,
+            pfc: None,
             next_origin_seq: 0,
             next_payload_seq: 0,
             sourced_packets: 0,
