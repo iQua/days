@@ -656,5 +656,59 @@ mutate_sender "paused-tick-lost" "$paused" "$paused_dcqcn" "$paused_stop" \
   'NR == 4 { for (i = 21; i <= 29; i++) before[i] = $i; next } NR == 6 { for (i = 21; i <= 29; i++) $i = before[i] } { print }' \
   'REJECT: sender: line 5: pending RoCE pacing tick at 2000 did not fire before this row (node_id=1, flow_id=3)'
 
+# --- Amendment 2: resume rows (a PFC RESUME restarts pause-parked queue pairs) -----------------
+# Amended layout as above. A resume row is a D3 restart of a pair parked by a paused tick, at the
+# RESUME's event key (phase 0: a PFC frame arrival); several may share one key, for distinct
+# flows of one node in flow_id order.
+resume="$fixture_dir/roce_sender_resume_accept.csv"
+resume_dcqcn="$fixture_dir/roce_sender_resume_accept.dcqcn.csv"
+resume_stop=8000
+check_case "roce_sender_resume_accept.csv" 0 "ACCEPT" \
+  sender "$resume" "$resume_dcqcn" "$resume_stop" || true
+check_case "roce_sender_resume_accept.csv (stop inferred)" 0 "ACCEPT" \
+  sender "$resume" "$resume_dcqcn" || true
+# Rows (NR): 2-4 t1000/1000/1500 flows 3, 5, 7 send psn 0 (flow 7's grid starts at 1500);
+# 5-7 their next ticks find the class paused and park; 8-10 one RESUME at 4500 restarts flows 3, 5
+# and 7 (three rows, one key): 3 and 5 at 5000, 7 at 5500; 11-12 t5000 flows 3 and 5 send their
+# last packet and park; 13 t5500 flow 7's tick finds the class paused again; 14 a RESUME at 7600
+# restarts flow 7 at 8500, beyond stop 8000: stopped.
+resume_order='REJECT: sender: line 9: RoCE resume rows sharing an event key must be of one node in strictly increasing flow_id order'
+mutate_sender "resume-of-unpaused-pair" "$resume" "$resume_dcqcn" "$resume_stop" \
+  'NR == 14 { print "7600,0,9,1,1,3,resume,0,1000,2000,1000,1000,0,,,0,,,,,2000,0,2000,2,0,,parked,,blocked,2000,0,2000,2,0,,parked,,blocked" } { print }' \
+  'REJECT: sender: line 14: RoCE resume of a queue pair not parked by a pause (node_id=1, flow_id=3)'
+mutate_sender "two-resume-rows-for-one-flow" "$resume" "$resume_dcqcn" "$resume_stop" \
+  'NR == 8 { print } { print }' \
+  "$resume_order"
+mutate_sender "resume-rows-out-of-flow-order" "$resume" "$resume_dcqcn" "$resume_stop" \
+  'NR == 8 { held = $0; next } NR == 9 { print; print held; next } { print }' \
+  "$resume_order"
+mutate_sender "resume-rows-of-two-nodes" "$resume" "$resume_dcqcn" "$resume_stop" \
+  'NR == 9 { $5 = 2 } { print }' \
+  "$resume_order"
+mutate_sender "resume-at-wrong-grid-point" "$resume" "$resume_dcqcn" "$resume_stop" \
+  'NR == 8 { $37 = 6000 } { print }' \
+  'REJECT: sender: line 8: RoCE sender after-state mismatch'
+mutate_sender "resume-restarts-at-the-resume-instant" "$resume" "$resume_dcqcn" "$resume_stop" \
+  'NR == 10 { $37 = 4500 } { print }' \
+  'REJECT: sender: line 10: RoCE sender after-state mismatch'
+mutate_sender "resume-armed-beyond-stop" "$resume" "$resume_dcqcn" "$resume_stop" \
+  'NR == 14 { $36 = "armed"; $38 = "scheduled" } { print }' \
+  'REJECT: sender: line 14: RoCE pacer stop decision contradicts stop_time_ns=8000 (tick 8500)'
+mutate_sender "resume-with-rate" "$resume" "$resume_dcqcn" "$resume_stop" \
+  'NR == 8 { $14 = 8000000000 } { print }' \
+  'REJECT: sender: line 8: RoCE resume row credits, emits or carries an acknowledgment'
+mutate_sender "resume-with-acknowledgment" "$resume" "$resume_dcqcn" "$resume_stop" \
+  'NR == 8 { $15 = 1000 } { print }' \
+  'REJECT: sender: line 8: RoCE resume row credits, emits or carries an acknowledgment'
+mutate_sender "resume-with-class-paused" "$resume" "$resume_dcqcn" "$resume_stop" \
+  'NR == 8 { $8 = 1 } { print }' \
+  'REJECT: sender: line 8: RoCE class_paused set on a non-tick row'
+mutate_sender "resume-typed-phase" "$resume" "$resume_dcqcn" "$resume_stop" \
+  'NR >= 8 && NR <= 10 { $2 = 1 } { print }' \
+  'REJECT: sender: line 8: RoCE resume must have phase 0'
+mutate_sender "resume-lost" "$resume" "$resume_dcqcn" "$resume_stop" \
+  'NR != 8 { print }' \
+  'REJECT: sender: line 10: RoCE sender state discontinuity (node_id=1, flow_id=3)'
+
 echo "P10c RoCE campaign checks: $checked; mutations caught: $mutations_caught/$mutations"
 exit "$failures"
