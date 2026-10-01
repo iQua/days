@@ -34,6 +34,7 @@
 //! How to run each case (both are fast, un-ignored and need the `test` feature):
 //! * `cargo test -p days --features test --test scalar_stage_scaling ring_all_reduce`
 //! * `cargo test -p days --features test --test scalar_stage_scaling compute_chain`
+//! * `cargo test -p days --features test --test scalar_stage_scaling roce_ring`
 #![cfg(feature = "test")]
 
 #[path = "collective_tcp.rs"]
@@ -54,6 +55,32 @@ const MAX_RATIO: f64 = 2.0;
 /// One ring all-reduce with a 1,000-byte chunk per rank (two 500-byte segments per stage).
 fn ring_config(ranks: u64) -> String {
     tcp::tcp_collective_config("RingAllReduce", ranks, ranks * 1_000, 100)
+}
+
+/// The same ring over RoCE queue pairs (P15 lane R3): two 500-byte packets per stage, paced at the
+/// 8 Gb/s port rate, with a 1 ms retransmission timeout.
+fn roce_ring_config(ranks: u64) -> String {
+    ring_config(ranks)
+        .replace("flow_type = \"TCP\"", "flow_type = \"RoCE\"")
+        .replace(
+            "[collective.traffic.tcp]\ncc_algorithm = \"TCPReno\"\n",
+            r#"[collective.traffic.dcqcn]
+rate_gbps = 8.0
+min_rate_gbps = 0.01
+max_rate_gbps = 8.0
+g = 0.00390625
+ai_rate_gbps = 0.04
+hai_rate_gbps = 0.4
+mi_factor = 0.5
+rtt_ns = 50000
+cnp_interval_ns = 10000
+pacing_interval_ns = 500
+increase_byte_threshold = 100000
+
+[collective.traffic.roce]
+retransmit_timeout_ns = 1000000
+"#,
+        )
 }
 
 /// A forward compute stage, then the ring all-reduce, then a backward compute stage, on every rank.
@@ -161,4 +188,17 @@ fn compute_chain_stage_path_visits_per_event_do_not_grow_with_ranks() {
         probe("chain", &image, 2 * ranks * (ranks - 1) + 2 * ranks)
     };
     check("compute_chain", run(SMALL_RANKS), run(LARGE_RANKS));
+}
+
+/// P15 lane R3: a RoCE stage's data arrivals, releases and completions read the host's tables by
+/// key, as TCP's do.
+#[test]
+fn roce_ring_all_reduce_stage_path_visits_per_event_do_not_grow_with_ranks() {
+    let run = |ranks: u64| {
+        let config = roce_ring_config(ranks);
+        assert!(config.contains("flow_type = \"RoCE\""));
+        let image = tcp::compile_text("scan-roce-ring", &config);
+        probe("roce ring", &image, 2 * ranks * (ranks - 1))
+    };
+    check("roce_ring_all_reduce", run(SMALL_RANKS), run(LARGE_RANKS));
 }
