@@ -8,7 +8,8 @@ goes to Claude lanes launched in herdr panes, by kind:
 | Coding: implementation, tests, refactors, mechanical migrations | Opus 5.5, high | `opus-implementer` |
 | Review loops | Opus 5.5, high | `opus-reviewer` |
 | Writing: docs, READMEs, PR bodies, release notes, paper prose | Fable 5.1 | `fable-writer` |
-| Exploration and fact-gathering | Opus 5.5, low | `opus-explorer` |
+| Measurement: A/B campaigns, probes, profiling, remote suite runs | Sonnet 5.5, high | `opus-measurer` |
+| Exploration and fact-gathering | Sonnet 5.5, medium | `opus-explorer` |
 
 The agent definitions live in `~/.claude/agents/` (user level: `.claude/` is
 gitignored here, so worktrees would not see project-level copies).
@@ -42,8 +43,11 @@ herdr agent start <lane-name> --kind claude --pane <pane_id> --timeout 90000 -- 
 herdr agent prompt <lane-name> "$(cat brief.md)" --wait --until working --timeout 15000
 ```
 
-- Writer lanes use `--model claude-fable-5-1 --agent fable-writer`; explorer
-  lanes use `--model claude-opus-5-5 --effort low --agent opus-explorer`.
+- Writer lanes use `--model claude-fable-5-1 --agent fable-writer`; measurer
+  lanes use `--model claude-sonnet-5-5 --effort high --agent opus-measurer`;
+  explorer lanes use `--model claude-sonnet-5-5 --effort medium --agent
+  opus-explorer`. The `opus-` agent names are historical; the model comes
+  from `--model` and the definition's frontmatter.
 - `agent prompt` takes positional TEXT only (there is no `--file` option);
   pass the brief as `"$(cat brief.md)"`. If the lane stays `idle` with the
   brief typed but not submitted, send `herdr agent send-keys <lane-name> enter`.

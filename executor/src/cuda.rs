@@ -15,12 +15,14 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::ops::{Bound, RangeBounds};
+#[cfg(feature = "cuda-test-hooks")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaGraph, CudaSlice, CudaStream, DevicePtr, DeviceSlice,
-    LaunchArgs, LaunchConfig, PushKernelArg, SyncOnDrop, UnifiedSlice, sys,
+    CudaContext, CudaFunction, CudaGraph, CudaModule, CudaSlice, CudaStream, DevicePtr,
+    DeviceSlice, LaunchArgs, LaunchConfig, PushKernelArg, SyncOnDrop, UnifiedSlice, sys,
 };
 use cudarc::nvrtc::Ptx;
 
@@ -32,6 +34,7 @@ use crate::device_event_record::{
     SERVICE_EVENT_WORDS, StoredEventClass, decode_event_record, stored_event_words,
     stream_event_class,
 };
+use crate::device_mechanism::RoundKernel;
 use crate::device_scheduler::{
     QUEUE_META_WORDS, prepare_device_schedulers, restore_device_scheduler,
 };
@@ -100,6 +103,8 @@ const NONE: u64 = u64::MAX;
 /// Params word holding the absolute word offset of the per-flow receiver state in `tcp_state`.
 const PARAM_RECEIVER_OFFSET: usize = 28;
 const PARAM_LEDGER_META_OFFSET: usize = 29;
+/// Params word holding the PFC region offset in `scheduler_state`, or `NONE` without PFC state.
+const PARAM_PFC_OFFSET: usize = 31;
 const PACKET_ECN_FLAG: u64 = 1_u64 << 63;
 const PACKET_KIND_MASK: u64 = !PACKET_ECN_FLAG;
 
@@ -122,8 +127,39 @@ const CONTROL_CONTINUATION: usize = 17;
 const CONTROL_RELAUNCHES: usize = 18;
 const CONTROL_WORDS: usize = 20;
 
-static CUDA_DEVICE_EXECUTION: Mutex<()> = Mutex::new(());
-static CUDA_DIRECT: OnceLock<Result<Arc<DirectCuda>, String>> = OnceLock::new();
+/// One lazily initialized context, stream and module per CUDA device ordinal.
+///
+/// The map lock only fetches or inserts a device's slot; initialization runs outside it, once per
+/// device, so a slow or failing device never blocks another device's first use. A failed
+/// initialization is cached like a successful one: the ordinal stays unavailable for the process.
+type CudaDeviceSlot = Arc<OnceLock<Result<Arc<DirectCuda>, String>>>;
+static CUDA_DEVICES: Mutex<BTreeMap<usize, CudaDeviceSlot>> = Mutex::new(BTreeMap::new());
+
+/// Returns the shared handle for one device ordinal, initializing it on first use.
+fn direct_cuda(device_index: usize) -> Result<Arc<DirectCuda>, CudaError> {
+    let slot = {
+        let mut devices = CUDA_DEVICES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(devices.entry(device_index).or_default())
+    };
+    slot.get_or_init(|| {
+        DirectCuda::new(device_index)
+            .map(Arc::new)
+            .map_err(|error| error.to_string())
+    })
+    .as_ref()
+    .map(Arc::clone)
+    .map_err(|error| CudaError::Unavailable(error.clone()))
+}
+
+/// Number of CUDA devices the driver reports.
+pub fn cuda_device_count() -> Result<usize, CudaError> {
+    let count =
+        CudaContext::device_count().map_err(|error| driver_error("CUDA device count", error))?;
+    usize::try_from(count)
+        .map_err(|_| CudaError::Unavailable(format!("driver reported {count} CUDA devices")))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CudaProvisioning {
@@ -146,21 +182,34 @@ fn select_cuda_provisioning(
 #[cfg(feature = "cuda-test-hooks")]
 std::thread_local! {
     static PANIC_AFTER_NEXT_EXECUTION: Cell<bool> = const { Cell::new(false) };
+    /// Test-only: the steps of the CUDA runs on this thread, in order
+    /// ([`take_cuda_run_steps_for_testing`]). Per thread, so parallel tests never share it.
+    static RUN_STEPS: std::cell::RefCell<Vec<&'static str>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Acquires the supported process-wide CUDA execution envelope.
-///
-/// The guard schedules device access rather than protecting Rust state, so a panic must not
-/// prevent later callers from executing.
-pub(crate) fn cuda_device_execution_guard() -> MutexGuard<'static, ()> {
-    CUDA_DEVICE_EXECUTION
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+/// Test-only: records one step of a CUDA run on this thread: `module_loaded`, `planned`,
+/// `buffers_allocated`, `graph_captured`, `graph_launched` (once per attempt) or
+/// `module_unloaded`. Empty in production builds.
+fn record_run_step(step: &'static str) {
+    #[cfg(feature = "cuda-test-hooks")]
+    RUN_STEPS.with_borrow_mut(|steps| steps.push(step));
+    let _ = step;
+}
+
+/// Test-only: the steps this thread's CUDA runs took since the last call, in order; clears them.
+/// A run that loads its module, plans, uploads, captures and launches once, then ends, records
+/// `module_loaded`, `planned`, `buffers_allocated`, `graph_captured`, `graph_launched`,
+/// `module_unloaded`.
+#[doc(hidden)]
+#[cfg(feature = "cuda-test-hooks")]
+pub fn take_cuda_run_steps_for_testing() -> Vec<&'static str> {
+    RUN_STEPS.take()
 }
 
 /// Arms a one-shot panic after this thread's next successful CUDA graph execution.
 ///
-/// This test hook fires while the process-wide execution guard is still held.
+/// This test hook fires while the device's execution guard is still held.
 #[doc(hidden)]
 #[cfg(feature = "cuda-test-hooks")]
 pub fn panic_after_next_execution_for_testing() {
@@ -409,6 +458,15 @@ fn read_queue(plan: &CompactionPlan, lp: usize, records: &[u64]) -> Vec<PacketDe
         .collect()
 }
 
+/// Decodes one 14-word event record read back from the device.
+///
+/// `decode_event`, [`decode_packet_fields`] and [`decode_packet_kind`] are `#[inline(always)]`
+/// because `CudaBuffers::finish` runs them once per live event and packet: 950,366 channel-stream
+/// events at E6 60% load. Once Lane B's PFC and DCQCN arms grew `decode_packet_kind`, the inliner
+/// left all three out of line in `finish`, whose size overrides an `#[inline]` hint. That cost about
+/// 25 ms of host run at 60% load. Forcing them inline removes the calls and changes no decoded
+/// value (`evidence/P14/cuda-host.md` in days-gpu).
+#[inline(always)]
 fn decode_event(record: &[u64]) -> Result<(Event, PacketDescriptor), CudaError> {
     let kind = decode_event_kind(record[5])?;
     let packet = decode_packet_fields(&record[7..14])?;
@@ -459,6 +517,8 @@ fn decode_event_kind(value: u64) -> Result<EventKind, CudaError> {
     }
 }
 
+/// Forced inline for the readback decode; see [`decode_event`].
+#[inline(always)]
 fn decode_packet_kind(value: u64, metadata: &[u64]) -> Result<PacketKind, CudaError> {
     match value & PACKET_KIND_MASK {
         0 => Ok(PacketKind::Data),
@@ -473,6 +533,15 @@ fn decode_packet_kind(value: u64, metadata: &[u64]) -> Result<PacketKind, CudaEr
             acknowledged_bytes: metadata[1],
             echoed_sent_time_ns: metadata[2],
         })),
+        4 if metadata[1] < 8 && metadata[2] <= 1 => Ok(PacketKind::Pfc(crate::PfcHeader {
+            controlled_link: crate::LinkId(metadata[0]),
+            priority: metadata[1] as u8,
+            pause: metadata[2] != 0,
+        })),
+        5 if metadata[1..] == [0, 0] => Ok(PacketKind::DcqcnCnp(crate::DcqcnCnpHeader {
+            trigger_payload: PayloadId(metadata[0]),
+        })),
+        6 if metadata == [0, 0, 0] => Ok(PacketKind::DcqcnControlTimer),
         _ => Err(CudaError::DeviceExecution {
             code: 93,
             node: None,
@@ -553,6 +622,8 @@ fn decode_packet_words(words: &[u64]) -> Result<PacketDescriptor, CudaError> {
     decode_packet_fields(words)
 }
 
+/// Forced inline for the readback decode; see [`decode_event`].
+#[inline(always)]
 fn decode_packet_fields(words: &[u64]) -> Result<PacketDescriptor, CudaError> {
     Ok(PacketDescriptor {
         id: PayloadId(words[0]),
@@ -614,6 +685,13 @@ pub enum CudaError {
     },
     WfqArithmeticOverflow {
         node: NodeId,
+    },
+    /// The host refused to launch the plain round kernel: the plan about to be uploaded holds DCQCN
+    /// or PFC state, which the plain kernel compiles out
+    /// (`device_mechanism::plain_round_kernel_refusal`). Only a round-kernel selection error (or a
+    /// test forcing the plain kernel) reaches it; nothing is launched and no result is produced.
+    MechanismsKernelRequired {
+        node: Option<NodeId>,
     },
     DeviceExecution {
         code: u64,
@@ -678,6 +756,19 @@ impl fmt::Display for CudaError {
                 formatter,
                 "CUDA WFQ arithmetic at LP {node:?} exceeds the exact 320-bit device limit; use Scalar or Cpu for this image"
             ),
+            Self::MechanismsKernelRequired { node } => {
+                write!(
+                    formatter,
+                    "CUDA plain round kernel refused: the plan holds DCQCN or PFC state"
+                )?;
+                if let Some(node) = node {
+                    write!(formatter, " at LP {node:?}")?;
+                }
+                write!(
+                    formatter,
+                    "; the image requires the mechanisms round kernel"
+                )
+            }
             Self::DeviceExecution { code, node } => {
                 write!(
                     formatter,
@@ -717,6 +808,9 @@ impl CudaError {
 /// Physical capacity and bounded CUDA Graph wave policy for one run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CudaConfig {
+    /// CUDA device ordinal the run executes on. Runs on different devices hold different
+    /// execution guards; runs on one device are serialized.
+    pub device_index: usize,
     /// Enables the stream-decomposed FEL. `false` retains the exact fallback heap path.
     pub streams_enabled: bool,
     /// Optional caps for large capacities derived from the complete image. Exact legacy
@@ -749,11 +843,17 @@ pub struct CudaConfig {
     #[doc(hidden)]
     #[cfg(feature = "cuda-test-hooks")]
     pub fault_injection: Option<CudaArena>,
+    /// Test-only: launch this round kernel build instead of the one the image selects. Forcing
+    /// [`RoundKernel::Plain`] onto an image with DCQCN or PFC state must fail closed.
+    #[doc(hidden)]
+    #[cfg(feature = "cuda-test-hooks")]
+    pub round_kernel_override: Option<RoundKernel>,
 }
 
 impl Default for CudaConfig {
     fn default() -> Self {
         Self {
+            device_index: 0,
             streams_enabled: true,
             capacity_caps: DeviceCapacityCaps::default(),
             capacity_floors: DeviceCapacityFloors::default(),
@@ -769,6 +869,8 @@ impl Default for CudaConfig {
             max_rounds: None,
             #[cfg(feature = "cuda-test-hooks")]
             fault_injection: None,
+            #[cfg(feature = "cuda-test-hooks")]
+            round_kernel_override: None,
         }
     }
 }
@@ -937,20 +1039,39 @@ pub struct CudaRun {
     /// Wall time from graph capture through final wave completion.
     pub wall_ns: u64,
     pub memory_layout: CudaMemoryLayout,
+    /// P14: the round kernel build this run launched, selected from the image.
+    pub round_kernel: RoundKernel,
+    /// P14 round 4: host time to load this run's round module, resolve its kernels and check
+    /// their thread limits. Paid once per run, when the run starts, before its first attempt is
+    /// planned; it is outside `wall_ns` and `device_ns`.
+    pub module_load_ns: u64,
+    /// Test-only: `(module, kernel)` for every function this run launched: the captured attempt
+    /// kernels, then the readback gather. Each entry names the round module the function was
+    /// loaded from.
+    #[doc(hidden)]
+    #[cfg(feature = "cuda-test-hooks")]
+    pub launched_kernels: Vec<(RoundKernel, &'static str)>,
+    /// Test-only: how many round modules were loaded in the device's context when this run's
+    /// final attempt captured its graph.
+    #[doc(hidden)]
+    #[cfg(feature = "cuda-test-hooks")]
+    pub round_modules_at_capture: usize,
 }
 
-/// One-time CUDA context, stream, module, and kernel initialization costs.
+/// One-time CUDA context and stream initialization costs.
+///
+/// The executor loads no module (P14 round 4): each run loads its own round module and reports
+/// that cost as [`CudaRun::module_load_ns`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CudaInitializationTimings {
     pub context_stream_setup_ns: u64,
-    pub module_function_load_ns: u64,
 }
 
 /// Runs the production CUDA executor through the inclusive scenario stop.
 ///
-/// CUDA execution is serialized process-wide: one executor executes at a time, and concurrent
-/// callers queue until execution and explicit readback complete. Executor construction may proceed
-/// concurrently.
+/// CUDA execution is serialized per device: one run executes on a device at a time, and
+/// concurrent callers of that device queue until execution and explicit readback complete. Runs on
+/// different devices proceed independently. Executor construction may proceed concurrently.
 pub fn run_cuda(
     image: &SimulationImage,
     exclusive_horizon_ns: Option<u64>,
@@ -971,7 +1092,7 @@ pub fn run_cuda_with_observations(
     config: CudaConfig,
     observation_mode: ObservationMode,
 ) -> Result<CudaRun, CudaError> {
-    CudaExecutor::new()?.run_with_observations(
+    CudaExecutor::on_device(config.device_index)?.run_with_observations(
         image,
         exclusive_horizon_ns,
         config,
@@ -979,31 +1100,44 @@ pub fn run_cuda_with_observations(
     )
 }
 
-/// Reusable CUDA context, stream, embedded module, kernels, and graph-capture substrate.
+/// Reusable CUDA context, stream, and graph-capture substrate.
+///
+/// The executor holds no kernels. Each run loads the one round module its image selects, holds it
+/// with the device's execution guard until the run ends, and unloads it (P14 round 4).
 ///
 /// Each run allocates fresh explicit device buffers, so a device fault cannot contaminate a later
-/// run. CUDA execution is serialized process-wide: one executor executes at a time, and concurrent
-/// callers queue until execution and readback complete. Executor construction may proceed
+/// run. A run executes on [`CudaConfig::device_index`]; contexts are shared per device ordinal
+/// across the process, and execution is serialized per device. Executor construction may proceed
 /// concurrently.
 pub struct CudaExecutor {
+    device_index: usize,
     direct: Arc<DirectCuda>,
 }
 
 impl CudaExecutor {
-    /// Constructs an executor without acquiring the process-wide execution guard.
+    /// Constructs an executor on device 0 without acquiring its execution guard.
     pub fn new() -> Result<Self, CudaError> {
-        let direct = CUDA_DIRECT.get_or_init(|| {
-            DirectCuda::new()
-                .map(Arc::new)
-                .map_err(|error| error.to_string())
-        });
+        Self::on_device(0)
+    }
+
+    /// Constructs an executor whose initialization targets `device_index`.
+    ///
+    /// A run still executes on its own [`CudaConfig::device_index`]; a different ordinal resolves
+    /// that device's shared context on first use.
+    pub fn on_device(device_index: usize) -> Result<Self, CudaError> {
         Ok(Self {
-            direct: Arc::clone(
-                direct
-                    .as_ref()
-                    .map_err(|error| CudaError::Unavailable(error.clone()))?,
-            ),
+            device_index,
+            direct: direct_cuda(device_index)?,
         })
+    }
+
+    /// The shared handle for a run's device.
+    fn direct_for(&self, device_index: usize) -> Result<Arc<DirectCuda>, CudaError> {
+        if device_index == self.device_index {
+            Ok(Arc::clone(&self.direct))
+        } else {
+            direct_cuda(device_index)
+        }
     }
 
     pub fn initialization_timings(&self) -> CudaInitializationTimings {
@@ -1038,6 +1172,62 @@ impl CudaExecutor {
         ))
     }
 
+    /// The kernels `build`'s round module holds, probed by name against the module: every attempt
+    /// kernel of either build, and the readback gather. A name the module does not hold fails
+    /// `cuModuleGetFunction`. The module is loaded for the probe, under the execution guard, and
+    /// unloaded after it.
+    #[cfg(feature = "cuda-test-hooks")]
+    #[doc(hidden)]
+    pub fn round_module_kernels_for_testing(&self, build: RoundKernel) -> Vec<&'static str> {
+        let held = self
+            .direct
+            .hold_round_module(build)
+            .unwrap_or_else(|error| panic!("{build:?} round module: {error}"));
+        let module = &held.module._module;
+        KERNEL_NAMES
+            .iter()
+            .copied()
+            .chain([MECHANISMS_ROUND_KERNEL_NAME, COMPACT_KERNEL_NAME])
+            .filter(|name| module.load_function(name).is_ok())
+            .collect()
+    }
+
+    /// The launch record for `build`'s attempt array with the DAG slots in `borrowed` taken from
+    /// the other build's module: a deliberately mixed run, as a regression would launch. The
+    /// record must name the other module at exactly those slots.
+    ///
+    /// No run ever has two round modules loaded, so this hook loads the second one itself: `build`'s
+    /// module as a run would hold it, under the execution guard, then the other build's. Both are
+    /// unloaded before the guard is released, so no run on this device sees them.
+    #[cfg(feature = "cuda-test-hooks")]
+    #[doc(hidden)]
+    pub fn launch_record_for_testing(
+        &self,
+        build: RoundKernel,
+        borrowed: &[usize],
+    ) -> Vec<(RoundKernel, &'static str)> {
+        let other_build = match build {
+            RoundKernel::Plain => RoundKernel::Mechanisms,
+            RoundKernel::Mechanisms => RoundKernel::Plain,
+        };
+        let held = self
+            .direct
+            .hold_round_module(build)
+            .unwrap_or_else(|error| panic!("{build:?} round module: {error}"));
+        let own = &held.module;
+        // Declared after `held`, so it is dropped (unloaded) first, while the guard is held.
+        let other = RoundModule::load(&self.direct, other_build)
+            .unwrap_or_else(|error| panic!("{other_build:?} round module: {error}"));
+        let functions: [&CudaFunction; KERNEL_NAMES.len()] = std::array::from_fn(|index| {
+            if borrowed.contains(&index) {
+                &other.functions[index]
+            } else {
+                &own.functions[index]
+            }
+        });
+        launch_record(&[own, &other], &functions, true)
+    }
+
     /// Runs only O1.4's reset/count and stable-write dispatches over a synthetic FEL-root cache.
     ///
     /// This is an actual-device output gate for the production kernels. `eligible[node]` becomes
@@ -1055,10 +1245,13 @@ impl CudaExecutor {
                 "worklist test threads per block must be in 1..={LANES}"
             )));
         }
+        // The plain round module, held with the execution guard for the whole hook, as a run holds
+        // its module.
+        let held = self.direct.hold_round_module(RoundKernel::Plain)?;
         let supported = [2_usize, 3]
             .into_iter()
             .map(|index| {
-                self.direct.functions[index]
+                held.module.functions[index]
                     .max_threads_per_block()
                     .map(|threads| threads as usize)
                     .map_err(|error| {
@@ -1087,7 +1280,8 @@ impl CudaExecutor {
 
         let mut control = vec![0_u64; CONTROL_WORDS];
         control[5] = 1;
-        let mut params = vec![0_u64; 31];
+        let mut params = vec![0_u64; 32];
+        params[PARAM_PFC_OFFSET] = NONE;
         params[0] = node_count as u64;
         params[4] = node_count.max(1) as u64;
         params[13] = 1;
@@ -1108,7 +1302,6 @@ impl CudaExecutor {
         host_planes[19] = vec![0; node_count.saturating_mul(ARENA_META_WORDS).max(1)];
         host_planes[25] = stream_state;
 
-        let _execution_guard = cuda_device_execution_guard();
         let planes = host_planes
             .into_iter()
             .enumerate()
@@ -1126,7 +1319,7 @@ impl CudaExecutor {
             let mut arguments = self
                 .direct
                 .stream
-                .launch_builder(&self.direct.functions[index]);
+                .launch_builder(&held.module.functions[index]);
             for plane in &planes {
                 arguments.arg(plane);
             }
@@ -1180,7 +1373,8 @@ impl CudaExecutor {
         )
     }
 
-    /// Executes and reads back under the process-wide CUDA execution envelope.
+    /// Executes and reads back under the run device's execution guard, which the run takes with
+    /// its round module when it starts, before its first plan, and holds until it ends.
     pub fn run_with_observations(
         &self,
         image: &SimulationImage,
@@ -1219,6 +1413,8 @@ impl CudaExecutor {
     ) -> Result<CudaRun, CudaError> {
         validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
         validate_config(config)?;
+        let direct = self.direct_for(config.device_index)?;
+        let round_kernel = selected_round_kernel(image, config);
 
         let retry_budget = config.max_capacity_retries;
         let mut attempt_config = config;
@@ -1233,6 +1429,18 @@ impl CudaExecutor {
             image.flows.len(),
         );
         let mut retry_trace = Vec::new();
+        // P14 round 4: this run's round module and the device's execution guard, taken together
+        // and held for every attempt. Dropped when the run ends, on success, error or panic: the
+        // module is unloaded, then the guard released.
+        //
+        // P14 cuda-host round 3 (option f): both are taken here, when the run starts, before the
+        // first plan. The run then frees the module load's transient copy of the fatbin before
+        // it plans, as `main` frees its executor-start copy, and the plan and the readback run
+        // with the allocator state `main` gives them (`evidence/P14/cuda-host.md` §§14, 18 in
+        // days-gpu). The first plan now runs under the guard, as every retry already did, and a
+        // plan that fails or is refused below loads and unloads the module before its error
+        // returns; nothing is allocated or launched for it.
+        let held = direct.hold_round_module(round_kernel)?;
         loop {
             let attempt = (|| {
                 let plan = CudaPlan::new_with_entity_capacity_floors(
@@ -1243,13 +1451,25 @@ impl CudaExecutor {
                     &mut channel_capacity_floors,
                     &mut tcp_capacity_floors,
                 )?;
-                let _execution_guard = cuda_device_execution_guard();
-                let buffers =
-                    CudaBuffers::new(&self.direct.stream, plan, self.direct.provisioning)?;
-                let timing = self.direct.run(&buffers, attempt_config)?;
+                record_run_step("planned");
+                // The plain kernel has no device-side stop: the host refuses it, before upload, on
+                // any plan holding state a mechanism transition would act on. The module is
+                // already loaded; on a refusal it is unloaded when the run returns, before any
+                // buffer, capture or launch.
+                if round_kernel == RoundKernel::Plain {
+                    plan.refuse_plain_round_kernel()?;
+                }
+                // The module was loaded under the guard before this run planned, so it is loaded
+                // before any buffer or graph, and no other run's module is in the context.
+                let buffers = CudaBuffers::new(&direct.stream, plan, direct.provisioning)?;
+                record_run_step("buffers_allocated");
+                let timing = direct.run(&buffers, attempt_config, &held.module)?;
                 #[cfg(feature = "cuda-test-hooks")]
                 panic_after_execution_if_requested();
-                buffers.finish(&self.direct, image, observation_mode, timing)
+                let mut run =
+                    buffers.finish(&direct, &held.module, image, observation_mode, timing)?;
+                run.module_load_ns = held.load_ns;
+                Ok(run)
             })();
             match attempt {
                 Ok(mut run) => {
@@ -1435,6 +1655,50 @@ pub fn assert_cuda_planner_bit_equal_for_testing(
     Ok(())
 }
 
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+/// Measures the words the production plan spends on DCQCN and PFC state (P14 Lane B).
+pub fn mechanism_plane_words_cuda_for_testing(
+    image: &SimulationImage,
+    config: CudaConfig,
+) -> Result<crate::MechanismPlaneWords, CudaError> {
+    validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
+    validate_config(config)?;
+    let plan = CudaPlan::new(image, None, config, ObservationMode::Summary)?;
+    let pfc_offset = plan.params[PARAM_PFC_OFFSET];
+    let receiver_offset = plan.params[PARAM_RECEIVER_OFFSET] as usize;
+    Ok(crate::MechanismPlaneWords {
+        pfc_region_words: if pfc_offset == NONE {
+            0
+        } else {
+            plan.scheduler_state.len() - pfc_offset as usize
+        },
+        dcqcn_receiver_rows: (0..image.flows.len())
+            .filter(|flow| {
+                plan.tcp_state[receiver_offset + flow * TCP_RECEIVER_WORDS]
+                    >= crate::device_mechanism::DCQCN_RECEIVER_NO_CNP
+            })
+            .count(),
+        pfc_params_words: 1,
+    })
+}
+
+/// P14 cuda-host: the whole-fabric PFC-state scans one production CUDA plan makes, counted on this
+/// thread (`image_has_pfc` and `pfc_control_lane_producers` each walk every switch LP). On an image
+/// without PFC state one scan decides that every PFC step is empty.
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+pub fn pfc_state_scans_cuda_plan_for_testing(
+    image: &SimulationImage,
+    config: CudaConfig,
+) -> Result<usize, CudaError> {
+    validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
+    validate_config(config)?;
+    crate::device_pfc::take_pfc_state_scans_for_testing();
+    CudaPlan::new(image, None, config, ObservationMode::Summary)?;
+    Ok(crate::device_pfc::take_pfc_state_scans_for_testing())
+}
+
 /// Returns the exact production-plan plane lengths without creating a CUDA device.
 #[cfg(feature = "planner-test-hooks")]
 #[doc(hidden)]
@@ -1535,6 +1799,16 @@ fn validate_config(config: CudaConfig) -> Result<(), CudaError> {
     Ok(())
 }
 
+/// The round kernel build for this run: from the image, unless a test forces one.
+fn selected_round_kernel(image: &SimulationImage, config: CudaConfig) -> RoundKernel {
+    #[cfg(feature = "cuda-test-hooks")]
+    if let Some(forced) = config.round_kernel_override {
+        return forced;
+    }
+    let _ = config;
+    RoundKernel::for_image(image)
+}
+
 fn injected_capacity(config: CudaConfig, arena: CudaArena, default: usize) -> usize {
     #[cfg(feature = "cuda-test-hooks")]
     if config.fault_injection == Some(arena) {
@@ -1542,6 +1816,48 @@ fn injected_capacity(config: CudaConfig, arena: CudaArena, default: usize) -> us
     }
     let _ = (config, arena);
     default
+}
+
+impl CudaPlan {
+    /// Refuses the plain round kernel on this plan, before it is uploaded, if the plan holds any
+    /// state a `MECHANISMS`-guarded kernel branch would act on
+    /// ([`crate::device_mechanism::plain_round_kernel_refusal`]).
+    fn refuse_plain_round_kernel(&self) -> Result<(), CudaError> {
+        let plan = crate::device_mechanism::UploadedPlan {
+            pfc_offset: self.params[PARAM_PFC_OFFSET],
+            receiver_offset: self.params[PARAM_RECEIVER_OFFSET],
+            // `P_NODE_COUNT` and `P_FLOW_COUNT`.
+            node_count: self.params[0] as usize,
+            flow_count: self.params[1] as usize,
+            node_state: &self.node_state,
+            generators: &self.generators,
+            flows: &self.flows,
+            fel_meta: &self.fel_meta,
+            fel_records: &self.fel_records,
+            queue_meta: &self.queue_meta,
+            queue_records: &self.queue_records,
+            in_service: &self.in_service,
+            stream_state: &self.stream_state,
+            stream_records: &self.stream_records,
+            stream_count: self.stream_layout.stream_count,
+            service_stream_base: self.stream_layout.service_stream_base,
+            generator_stream_base: self.stream_layout.generator_stream_base,
+            tcp_state: &self.tcp_state,
+        };
+        match crate::device_mechanism::plain_round_kernel_refusal(&plan) {
+            None => Ok(()),
+            // Fail closed on a plan the check cannot read, but do not call it mechanism state.
+            Some(crate::device_mechanism::PlainKernelRefusal::MalformedPlan) => {
+                Err(CudaError::Validation(
+                    "plain round kernel plan check: a plan meta or row points outside its plane"
+                        .into(),
+                ))
+            }
+            Some(refusal) => Err(CudaError::MechanismsKernelRequired {
+                node: refusal.node(),
+            }),
+        }
+    }
 }
 
 #[derive(Eq, PartialEq)]
@@ -1662,6 +1978,17 @@ fn prepare_tcp_state(
         .ok_or_else(|| CudaError::Validation("TCP ledger metadata size overflows usize".into()))?;
     let mut state = vec![0_u64; next.max(1)];
 
+    for receiver in image
+        .host_states
+        .iter()
+        .flat_map(|host| &host.dcqcn_receivers)
+    {
+        let row = receiver_offset + receiver.flow.0 as usize * TCP_RECEIVER_WORDS;
+        crate::device_mechanism::encode_dcqcn_receiver(
+            receiver,
+            &mut state[row..row + TCP_RECEIVER_WORDS],
+        );
+    }
     for (owner_slot, host) in image.host_states.iter().enumerate() {
         if host.tcp_receivers.is_empty() {
             continue;
@@ -1844,6 +2171,10 @@ impl CudaPlan {
         tcp_capacity_floors: &mut crate::device_capacity::TcpCapacityFloors,
     ) -> Result<Self, CudaError> {
         let node_count = image.nodes.len();
+        // Whether the image carries PFC state, decided by one walk of the switch LPs. Without it the
+        // PFC region, the PFC frame bound and the PFC control lanes are all empty, and the plan skips
+        // the three walks that would find each of them empty (see `PfcState`).
+        let pfc_state = PfcState::of(image);
         let (flow_packet_counts, flow_feedback_counts) = flow_packet_counts(image)?;
         let minimum_lookahead_ns = image
             .channels
@@ -1890,6 +2221,10 @@ impl CudaPlan {
                 capacity_context.source_queue_packet_bound(image, flow_index, data_count),
             );
             legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(4);
+            if capacity_context.dcqcn_generator(image, flow_index) {
+                // A DCQCN source owns two live timer chains, pacing and control.
+                legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(2);
+            }
             if capacity_context.tcp_generator(image, flow_index).is_some() {
                 // Timeout events are intentionally heap-class. Under the live-state contract
                 // (Mechanism API errata E5) a superseded timeout is removed at the invalidating
@@ -2011,6 +2346,10 @@ impl CudaPlan {
                 capacities[target] = capacities[target].saturating_add(1);
             }
             for (flow, descriptor) in image.flows.iter().enumerate() {
+                if capacity_context.dcqcn_generator(image, flow) {
+                    let source = descriptor.source.0 as usize;
+                    capacities[source] = capacities[source].saturating_add(2);
+                }
                 if capacity_context.tcp_generator(image, flow).is_some() {
                     let feedback = flow_feedback_counts[flow];
                     let attempts = capacity_context.tcp_fallback_timer_bound(
@@ -2146,8 +2485,11 @@ impl CudaPlan {
                                 generators[offset + 18] = rate.credit_quanta as u64;
                                 generators[offset + 19] = (rate.credit_quanta >> 64) as u64;
                             }
-                            FlowGeneratorKind::Collective(_) | FlowGeneratorKind::Dcqcn(_) => {
-                                unreachable!("CUDA capability validation rejects this generator")
+                            FlowGeneratorKind::Dcqcn(dcqcn) => {
+                                crate::device_mechanism::encode_dcqcn_generator(
+                                    &dcqcn,
+                                    &mut generators[offset..offset + GENERATOR_WORDS],
+                                );
                             }
                         }
                     }
@@ -2188,8 +2530,13 @@ impl CudaPlan {
             }
         }
 
-        let scheduler_state =
+        let mut scheduler_state =
             prepare_device_schedulers(image, &queue_meta).map_err(CudaError::Validation)?;
+        let pfc_offset = match pfc_state {
+            PfcState::Present => crate::device_pfc::append_pfc_region(image, &mut scheduler_state)
+                .map_err(CudaError::Validation)?,
+            PfcState::Absent => None,
+        };
 
         for event in &image.initial_events {
             let packet = if event.kind == EventKind::RetransmissionTimeout {
@@ -2294,7 +2641,7 @@ impl CudaPlan {
             remote_staging_slots,
             channel_capacity_floors,
         )?;
-        let event_bound = derived_transition_bound(image, &flow_packet_counts)?;
+        let event_bound = derived_transition_bound(image, &flow_packet_counts, pfc_state)?;
         let observation_capacity = if observation_mode == ObservationMode::Full {
             config
                 .max_observations
@@ -2353,7 +2700,7 @@ impl CudaPlan {
             tcp_layout.ledger_meta_offset,
             &mut tcp_state,
         );
-        let (inbound_meta, inbound_producers) = remote_inbound_producers(image);
+        let (inbound_meta, inbound_producers) = remote_inbound_producers(image, pfc_state);
         let round_capacity = config
             .max_rounds
             .unwrap_or_else(|| derived_round_bound(image, exclusive_horizon_ns, event_bound))
@@ -2402,6 +2749,7 @@ impl CudaPlan {
             tcp_layout.receiver_offset as u64,
             tcp_layout.ledger_meta_offset as u64,
             streams.layout.round_scratch_offset as u64,
+            pfc_offset.map_or(NONE, |offset| offset as u64),
         ];
 
         Ok(Self {
@@ -2459,6 +2807,14 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
         if matches!(packet.kind, PacketKind::TcpData(_)) && !live_payloads.contains(&packet.id) {
             continue;
         }
+        // The zero-byte DCQCN control-timer token never enters a queue or crosses a link, and a PFC
+        // frame travels on its reverse control lane, never on its flow's route.
+        if matches!(
+            packet.kind,
+            PacketKind::DcqcnControlTimer | PacketKind::Pfc(_)
+        ) {
+            continue;
+        }
         let counts = if packet.kind.is_data() {
             &mut data_counts
         } else {
@@ -2478,6 +2834,19 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
             if let FlowGeneratorKind::Rate(rate) = generator.kind {
                 let work = crate::device_sizing::rate_device_work(image, generator, rate)
                     .map_err(|error| CudaError::Validation(error.to_string()))?;
+                let owns_timer_token = pacing_timer_tokens.contains(&(
+                    image.flows[index].source,
+                    generator.next_emission.payload,
+                    generator.next_emission.departure_time_ns,
+                ));
+                if owns_timer_token {
+                    data_counts[index] = data_counts[index].saturating_sub(1);
+                }
+                data_counts[index] = data_counts[index].saturating_add(work.packets);
+                continue;
+            }
+            if let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind {
+                let work = crate::device_sizing::dcqcn_device_work(image, generator, dcqcn);
                 let owns_timer_token = pacing_timer_tokens.contains(&(
                     image.flows[index].source,
                     generator.next_emission.payload,
@@ -2542,7 +2911,11 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
     }
     for state in &image.host_states {
         for generator in &state.generators {
-            if matches!(generator.kind, FlowGeneratorKind::Tcp(_)) {
+            // One ACK (TCP) or at most one CNP (DCQCN) per data packet.
+            if matches!(
+                generator.kind,
+                FlowGeneratorKind::Tcp(_) | FlowGeneratorKind::Dcqcn(_)
+            ) {
                 let flow = generator.flow.0 as usize;
                 feedback_counts[flow] = feedback_counts[flow].saturating_add(data_counts[flow]);
             }
@@ -2582,11 +2955,11 @@ fn add_flow_route_capacities(
             (flow.reverse_route.as_slice(), flow.source)
         }
         PacketKind::Pfc(_) => {
-            unreachable!("CUDA capability validation rejects PFC payloads")
+            unreachable!("PFC frames travel on control lanes, never on a flow route")
         }
         PacketKind::DcqcnCnp(_) => (flow.reverse_route.as_slice(), flow.source),
         PacketKind::DcqcnControlTimer => {
-            unreachable!("CUDA capability validation rejects DCQCN timer payloads")
+            unreachable!("the zero-byte DCQCN control-timer token is never routed")
         }
     };
     for index in 0..route.len() {
@@ -3280,7 +3653,7 @@ fn add_route_observation_capacities(
     }
 }
 
-fn remote_inbound_producers(image: &SimulationImage) -> (Vec<u64>, Vec<u64>) {
+fn remote_inbound_producers(image: &SimulationImage, pfc_state: PfcState) -> (Vec<u64>, Vec<u64>) {
     let mut inbound = vec![BTreeSet::new(); image.nodes.len()];
     for flow in &image.flows {
         for (route, terminal) in [
@@ -3297,6 +3670,11 @@ fn remote_inbound_producers(image: &SimulationImage) -> (Vec<u64>, Vec<u64>) {
             }
         }
     }
+    if pfc_state == PfcState::Present {
+        for (producer, target) in crate::device_pfc::pfc_control_lane_producers(image) {
+            inbound[target].insert(producer);
+        }
+    }
     let mut meta = vec![0_u64; image.nodes.len() * INBOUND_META_WORDS];
     let mut producers = Vec::new();
     for (target, target_producers) in inbound.into_iter().enumerate() {
@@ -3308,7 +3686,44 @@ fn remote_inbound_producers(image: &SimulationImage) -> (Vec<u64>, Vec<u64>) {
     (meta, producers)
 }
 
-fn derived_transition_bound(image: &SimulationImage, counts: &[usize]) -> Result<usize, CudaError> {
+/// Whether a validated image carries PFC state, decided once per plan.
+///
+/// `Absent` makes the plan skip three walks of the switch LPs, each of which is empty exactly then:
+/// - `append_pfc_region` appends nothing and returns `None` iff `!image_has_pfc`, by its own guard;
+/// - `pfc_frame_transition_bound` returns 0 iff `!image_has_pfc`, by its own guard;
+/// - `pfc_control_lane_producers` reads only switch queues whose `pfc` is `Some`. Validation, which
+///   every CUDA plan follows, makes switch state slots a bijection with switch nodes
+///   (`validate_state_ownership`) and gives a switch LP at most one queue
+///   (`validate_owned_service_state`), so those queues are exactly the first queues of switch nodes,
+///   which `image_has_pfc` reads. It returns no lane iff `!image_has_pfc`.
+///
+/// The plan is therefore the same word for word. Each walk costs about 0.25 ms on E6
+/// (`evidence/P14/cuda-host.md` in days-gpu).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PfcState {
+    Present,
+    Absent,
+}
+
+impl PfcState {
+    fn of(image: &SimulationImage) -> Self {
+        if crate::device_pfc::image_has_pfc(image) {
+            Self::Present
+        } else {
+            Self::Absent
+        }
+    }
+}
+
+fn derived_transition_bound(
+    image: &SimulationImage,
+    counts: &[usize],
+    pfc_state: PfcState,
+) -> Result<usize, CudaError> {
+    let pfc_frames = match pfc_state {
+        PfcState::Present => crate::device_pfc::pfc_frame_transition_bound(image, counts),
+        PfcState::Absent => 0,
+    };
     let network = image
         .flows
         .iter()
@@ -3319,20 +3734,30 @@ fn derived_transition_bound(image: &SimulationImage, counts: &[usize]) -> Result
             ))
         })
         .fold(
-            image.initial_events.len().saturating_add(1),
+            image
+                .initial_events
+                .len()
+                .saturating_add(1)
+                .saturating_add(pfc_frames),
             usize::saturating_add,
         );
     image
         .host_states
         .iter()
         .flat_map(|state| &state.generators)
-        .try_fold(network, |bound, generator| {
-            let FlowGeneratorKind::Rate(rate) = generator.kind else {
-                return Ok(bound);
-            };
-            let work = crate::device_sizing::rate_device_work(image, generator, rate)
-                .map_err(|error| CudaError::Validation(error.to_string()))?;
-            Ok(bound.saturating_add(work.pacing_ticks))
+        .try_fold(network, |bound, generator| match generator.kind {
+            FlowGeneratorKind::Rate(rate) => {
+                let work = crate::device_sizing::rate_device_work(image, generator, rate)
+                    .map_err(|error| CudaError::Validation(error.to_string()))?;
+                Ok(bound.saturating_add(work.pacing_ticks))
+            }
+            FlowGeneratorKind::Dcqcn(dcqcn) => {
+                let work = crate::device_sizing::dcqcn_device_work(image, generator, dcqcn);
+                Ok(bound
+                    .saturating_add(work.pacing_ticks)
+                    .saturating_add(work.control_ticks))
+            }
+            FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Tcp(_) => Ok(bound),
         })
 }
 
@@ -3918,6 +4343,7 @@ impl CudaBuffers {
     fn finish(
         &self,
         direct: &DirectCuda,
+        module: &RoundModule,
         image: &SimulationImage,
         observation_mode: ObservationMode,
         timing: CudaTiming,
@@ -4182,18 +4608,21 @@ impl CudaBuffers {
             [Err(error), _, _] | [_, Err(error), _] | [_, _, Err(error)] => return Err(error),
         };
 
-        let gathered = direct.compact(&[
-            (&self.planes[8], &fel_plan),
-            (&self.planes[10], &queue_plan),
-            (&self.planes[26], &channel_stream_plan),
-            (&self.planes[26], &service_stream_plan),
-            (&self.planes[26], &generator_stream_plan),
-            (tcp_plane, &ledger_plan),
-            (tcp_plane, &receiver_range_plan),
-            (&self.planes[15], &observed_plan),
-            (&self.planes[16], &departure_plan),
-            (&self.planes[17], &arrival_plan),
-        ])?;
+        let (gathered, _launched_gather) = direct.compact(
+            module,
+            &[
+                (&self.planes[8], &fel_plan),
+                (&self.planes[10], &queue_plan),
+                (&self.planes[26], &channel_stream_plan),
+                (&self.planes[26], &service_stream_plan),
+                (&self.planes[26], &generator_stream_plan),
+                (tcp_plane, &ledger_plan),
+                (tcp_plane, &receiver_range_plan),
+                (&self.planes[15], &observed_plan),
+                (&self.planes[16], &departure_plan),
+                (&self.planes[17], &arrival_plan),
+            ],
+        )?;
         let [
             fel_records,
             queue_records,
@@ -4300,12 +4729,17 @@ impl CudaBuffers {
                                 rate.credit_quanta = u128::from(generators[offset + 18])
                                     | (u128::from(generators[offset + 19]) << 64);
                             }
-                            FlowGeneratorKind::Collective(_) | FlowGeneratorKind::Dcqcn(_) => {
-                                return Err(CudaError::DeviceExecution {
-                                    code: 96,
-                                    node: Some(node.id),
-                                }
-                                .into());
+                            FlowGeneratorKind::Dcqcn(dcqcn) => {
+                                crate::device_mechanism::decode_dcqcn_generator(
+                                    &generators[offset..offset + GENERATOR_WORDS],
+                                    dcqcn,
+                                )
+                                .map_err(|_| {
+                                    CudaError::DeviceExecution {
+                                        code: 96,
+                                        node: Some(node.id),
+                                    }
+                                })?;
                             }
                         }
                     }
@@ -4327,6 +4761,17 @@ impl CudaBuffers {
                             })
                             .collect();
                     }
+                    for receiver in &mut state.dcqcn_receivers {
+                        let row = receiver.flow.0 as usize * TCP_RECEIVER_WORDS;
+                        crate::device_mechanism::decode_dcqcn_receiver(
+                            &receiver_state[row..row + TCP_RECEIVER_WORDS],
+                            receiver,
+                        )
+                        .map_err(|_| CudaError::DeviceExecution {
+                            code: 96,
+                            node: Some(node.id),
+                        })?;
+                    }
                 }
                 NodeKind::Switch => {
                     let state = &mut switch_states[node.state_slot as usize];
@@ -4336,6 +4781,15 @@ impl CudaBuffers {
                         switch_queue.tx_ready_pending = node_state[base + 3] != 0;
                         restore_device_scheduler(lp, &queue_meta, &scheduler_state, switch_queue)
                             .map_err(CudaError::Validation)?;
+                        if params[PARAM_PFC_OFFSET] != NONE {
+                            crate::device_pfc::restore_pfc_queue(
+                                &scheduler_state,
+                                params[PARAM_PFC_OFFSET] as usize,
+                                lp,
+                                switch_queue,
+                            )
+                            .map_err(CudaError::Validation)?;
+                        }
                     }
                     state.next_origin_seq = node_state[base + 5];
                     state.arrived_packets = node_state[base + 7];
@@ -4564,6 +5018,17 @@ impl CudaBuffers {
             device_ns: timing.device_ns,
             wall_ns: timing.wall_ns,
             memory_layout: self.memory_layout,
+            round_kernel: timing.round_kernel,
+            // Filled by the run, which holds the module and its load time.
+            module_load_ns: 0,
+            #[cfg(feature = "cuda-test-hooks")]
+            launched_kernels: {
+                let mut launched = timing.launched_kernels.clone();
+                launched.push(identify(&[module], _launched_gather));
+                launched
+            },
+            #[cfg(feature = "cuda-test-hooks")]
+            round_modules_at_capture: timing.round_modules_at_capture,
         })
     }
 }
@@ -4596,6 +5061,12 @@ const KERNEL_NAMES: [&str; 13] = [
 /// captured attempt DAG, does not take the uniform 29-plane ABI, and is launched only after an
 /// attempt has been screened as successful.
 const COMPACT_KERNEL_NAME: &str = "days_compact_gather";
+/// The position of the round kernel in [`KERNEL_NAMES`]. `days_round` there is the plain build; a
+/// run whose image holds DCQCN or PFC state launches [`MECHANISMS_ROUND_KERNEL_NAME`] in its place.
+const ROUND_KERNEL_INDEX: usize = 4;
+/// P14: the round kernel with the DCQCN and PFC transitions compiled in. See
+/// [`crate::RoundKernel`].
+const MECHANISMS_ROUND_KERNEL_NAME: &str = "days_round_mechanisms";
 // T20l fix 2: one thread per entity, and an entity's work is bounded by its own live count. 256
 // keeps the launch a whole number of warps without reserving the maximum block footprint; the
 // gather's output does not depend on it.
@@ -4609,39 +5080,138 @@ const PARALLEL_KERNELS: [usize; 5] = [2, 3, 4, 9, 10];
 const FINALIZE_SWEEP_KERNEL_INDEX: usize = 11;
 
 struct DirectCuda {
-    _context: Arc<CudaContext>,
+    /// The device's context. Each run loads its round module into it.
+    context: Arc<CudaContext>,
+    /// Serializes runs on this device. It schedules device access rather than protecting Rust
+    /// state, so a panic while it is held must not prevent later runs. A run holds it from its
+    /// round module's load to that module's unload ([`HeldRoundModule`]).
+    execution: Mutex<()>,
     stream: Arc<CudaStream>,
-    functions: Vec<CudaFunction>,
-    /// T20l fix 2: the readback gather, loaded beside the eight attempt kernels.
-    compact_function: CudaFunction,
+    /// Test-only: the round modules currently loaded in this device's context.
+    #[cfg(feature = "cuda-test-hooks")]
+    live_round_modules: Arc<AtomicUsize>,
     initialization_timings: CudaInitializationTimings,
     provisioning: CudaProvisioning,
 }
 
-impl DirectCuda {
-    fn new() -> Result<Self, CudaError> {
-        let setup_started = Instant::now();
-        let context =
-            CudaContext::new(0).map_err(|error| driver_error("device 0 context", error))?;
-        let stream = context
-            .new_stream()
-            .map_err(|error| driver_error("non-blocking execution stream", error))?;
-        // This backend owns one stream, retains every buffer until that stream is synchronized,
-        // and serializes all executions process-wide. Automatic cross-stream event tracking would
-        // add event nodes to graph capture without providing any safety here.
-        unsafe {
-            context.disable_event_tracking();
-        }
-        let context_stream_setup_ns = duration_ns(setup_started.elapsed());
+/// P14 round 4: one loaded CUDA module and the kernels a run launches from it. A run owns it.
+///
+/// Each round-kernel build has its own complete module: the 12 shared attempt kernels, the readback
+/// gather, and that build's round kernel. A run loads its build's module when it starts, before it
+/// plans its first attempt and so before it allocates a buffer or captures its graph, launches
+/// every kernel from it, and drops it when the run ends.
+/// The executor holds no module, and no other round module is loaded in the context while a run
+/// sets up or executes ([`HeldRoundModule`]).
+///
+/// Why one module per run, and not both loaded once in [`DirectCuda::new`] as round 3 had it:
+/// round 3's modules are code- and layout-identical to their references (`main` for plain, the P14
+/// control for mechanisms), yet runs kept a device-time residue against them. The diagnosis
+/// (`evidence/P14/diag3/instruments.md` and `evidence/P14/diag3-timing.md` in days-gpu) shows:
+/// - data-buffer placement is excluded: every data buffer sits at the same device address with
+///   one module loaded or two;
+/// - intra-module layout is excluded, by the comparator that found the modules layout-identical
+///   to their references;
+/// - the residue was reproduced with the other module loaded at initialization, and was absent
+///   with it never loaded or loaded after graph capture (retry-free runs);
+/// - the device addresses of each module's code cannot be observed through the driver API; load
+///   order is known from the source;
+/// - on the mechanisms path, placement / load order is supported: round 3 loaded the mechanisms
+///   module second, where the P14 control loads it first. It remains a candidate alongside graph
+///   instantiation with both modules loaded and other load-time work (the per-module function
+///   and thread-limit queries);
+/// - on the plain path, load order is not a candidate (round 3 loaded the plain module first, as
+///   `main` does) and placement is disfavoured. That leaves graph instantiation with both modules
+///   loaded and other load-time work;
+/// - this list is not exhaustive, and the mechanism is not identified.
+///
+/// One module per run is the design that this parity evidence covers.
+struct RoundModule {
+    /// The round-kernel build this module carries.
+    build: RoundKernel,
+    /// The loaded module (its functions hold it too); the test hook probes it by name. Dropping
+    /// the `RoundModule` drops every holder and unloads it.
+    _module: Arc<CudaModule>,
+    /// The attempt DAG in [`KERNEL_NAMES`] order, with this module's round kernel at
+    /// [`ROUND_KERNEL_INDEX`].
+    functions: Vec<CudaFunction>,
+    /// T20l fix 2: the readback gather.
+    compact_function: CudaFunction,
+    /// Test-only: counts this module as loaded until it is dropped.
+    #[cfg(feature = "cuda-test-hooks")]
+    _live: LiveRoundModule,
+}
 
-        let module_started = Instant::now();
-        let fatbin = include_bytes!(concat!(env!("OUT_DIR"), "/days_cuda_kernels.fatbin"));
-        let module = context
-            .load_module(Ptx::from_binary(fatbin.to_vec()))
-            .map_err(|error| driver_error("embedded sm_121/sm_89 fatbin load", error))?;
-        let functions = KERNEL_NAMES
-            .iter()
-            .map(|name| {
+/// Test-only: one loaded round module's entry in its device's live count. The count only observes
+/// loads and unloads for the tests; no production path reads it.
+#[cfg(feature = "cuda-test-hooks")]
+struct LiveRoundModule(Arc<AtomicUsize>);
+
+#[cfg(feature = "cuda-test-hooks")]
+impl LiveRoundModule {
+    fn register(live: &Arc<AtomicUsize>) -> Self {
+        live.fetch_add(1, Ordering::SeqCst);
+        record_run_step("module_loaded");
+        Self(Arc::clone(live))
+    }
+}
+
+#[cfg(feature = "cuda-test-hooks")]
+impl Drop for LiveRoundModule {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+        record_run_step("module_unloaded");
+    }
+}
+
+/// What one run holds on its device from its start, before its first plan, until it ends: its
+/// round module and the device's execution guard.
+///
+/// The module is loaded and unloaded under the guard. The guard is what makes "exactly one round
+/// module in the context" hold: a concurrent run on the same device waits for it before loading
+/// its own module, so it cannot load the other build's module during this run's setup, between
+/// its capacity-retry attempts, or during its rounds.
+///
+/// A value the run owns and drops; nothing is shared or lazily initialized. Fields drop in
+/// declaration order: the module is unloaded first, then the guard is released.
+struct HeldRoundModule<'device> {
+    module: RoundModule,
+    /// Host time [`RoundModule::load`] took.
+    load_ns: u64,
+    _execution_guard: MutexGuard<'device, ()>,
+}
+
+impl RoundModule {
+    /// The embedded fatbin of `build`'s module, for sm_121, sm_89 and sm_86.
+    fn fatbin(build: RoundKernel) -> &'static [u8] {
+        match build {
+            RoundKernel::Plain => {
+                include_bytes!(concat!(env!("OUT_DIR"), "/days_cuda_kernels.fatbin"))
+            }
+            RoundKernel::Mechanisms => include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/days_cuda_kernels_mechanisms.fatbin"
+            )),
+        }
+    }
+
+    /// Loads `build`'s module into the device's context, resolves every kernel a run launches, and
+    /// checks the control kernels' thread limits. Fail-closed: any failure is returned before a
+    /// kernel can be launched from the module.
+    ///
+    /// The caller holds the device's execution guard.
+    fn load(direct: &DirectCuda, build: RoundKernel) -> Result<Self, CudaError> {
+        let module = direct
+            .context
+            .load_module(Ptx::from_binary(Self::fatbin(build).to_vec()))
+            .map_err(|error| {
+                driver_error(
+                    format!("embedded sm_121/sm_89/sm_86 {build:?} round-module fatbin load"),
+                    error,
+                )
+            })?;
+        let functions = (0..KERNEL_NAMES.len())
+            .map(|index| {
+                let name = round_kernel_name(index, build);
                 module
                     .load_function(name)
                     .map_err(|error| driver_error(format!("kernel `{name}` load"), error))
@@ -4650,7 +5220,92 @@ impl DirectCuda {
         let compact_function = module
             .load_function(COMPACT_KERNEL_NAME)
             .map_err(|error| driver_error(format!("kernel `{COMPACT_KERNEL_NAME}` load"), error))?;
-        let module_function_load_ns = duration_ns(module_started.elapsed());
+        let loaded = Self {
+            build,
+            _module: module,
+            functions,
+            compact_function,
+            #[cfg(feature = "cuda-test-hooks")]
+            _live: LiveRoundModule::register(&direct.live_round_modules),
+        };
+        for index in CONTROL_KERNELS {
+            let supported = loaded.functions[index]
+                .max_threads_per_block()
+                .map_err(|error| {
+                    driver_error(
+                        format!("kernel `{}` thread limit query", KERNEL_NAMES[index]),
+                        error,
+                    )
+                })? as usize;
+            if supported < LANES {
+                return Err(CudaError::Unavailable(format!(
+                    "kernel `{}` supports only {supported} threads per block; {LANES} are required \
+                     by its deterministic reduction",
+                    KERNEL_NAMES[index]
+                )));
+            }
+        }
+        Ok(loaded)
+    }
+
+    /// The attempt DAG's functions in [`KERNEL_NAMES`] order, all from this module.
+    fn attempt_functions(&self) -> [&CudaFunction; KERNEL_NAMES.len()] {
+        std::array::from_fn(|index| &self.functions[index])
+    }
+
+    /// Test-only: the kernel `function` is, if this module's vectors hold this very
+    /// `CudaFunction`: the name it was loaded under.
+    #[cfg(feature = "cuda-test-hooks")]
+    fn identify(&self, function: &CudaFunction) -> Option<&'static str> {
+        if let Some(index) = self
+            .functions
+            .iter()
+            .position(|candidate| std::ptr::eq(candidate, function))
+        {
+            return Some(round_kernel_name(index, self.build));
+        }
+        std::ptr::eq(&self.compact_function, function).then_some(COMPACT_KERNEL_NAME)
+    }
+}
+
+impl DirectCuda {
+    fn execution_guard(&self) -> MutexGuard<'_, ()> {
+        self.execution
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Takes the device's execution guard, then loads `build`'s round module under it.
+    ///
+    /// The load must happen under the guard. Loaded before it, a concurrent run on this device
+    /// could have the other build's module in the context while this run allocates its buffers
+    /// and captures its graph, which is the state P14 round 4 removes. On a load or check failure
+    /// the module (if loaded) is unloaded and the guard released before the error returns.
+    fn hold_round_module(&self, build: RoundKernel) -> Result<HeldRoundModule<'_>, CudaError> {
+        let execution_guard = self.execution_guard();
+        let load_started = Instant::now();
+        let module = RoundModule::load(self, build)?;
+        Ok(HeldRoundModule {
+            module,
+            load_ns: duration_ns(load_started.elapsed()),
+            _execution_guard: execution_guard,
+        })
+    }
+
+    fn new(device_index: usize) -> Result<Self, CudaError> {
+        let setup_started = Instant::now();
+        let context = CudaContext::new(device_index)
+            .map_err(|error| driver_error(format!("device {device_index} context"), error))?;
+        let stream = context
+            .new_stream()
+            .map_err(|error| driver_error("non-blocking execution stream", error))?;
+        // This backend owns one stream per device, retains every buffer until that stream is
+        // synchronized, and serializes executions per device. Automatic cross-stream event tracking would
+        // add event nodes to graph capture without providing any safety here.
+        unsafe {
+            context.disable_event_tracking();
+        }
+        let context_stream_setup_ns = duration_ns(setup_started.elapsed());
 
         let (major, minor) = context
             .compute_capability()
@@ -4669,35 +5324,21 @@ impl DirectCuda {
             != 0;
         let provisioning =
             select_cuda_provisioning(integrated, managed_memory, concurrent_managed_access);
-        if (major, minor) != (12, 1) && (major, minor) != (8, 9) {
+        if !matches!((major, minor), (12, 1) | (8, 9) | (8, 6)) {
             return Err(CudaError::Unavailable(format!(
-                "embedded kernels target sm_121 and sm_89, but device 0 reports sm_{major}{minor}"
+                "embedded kernels target sm_121, sm_89 and sm_86, but device {device_index} \
+                 reports sm_{major}{minor}"
             )));
-        }
-        for index in CONTROL_KERNELS {
-            let supported = functions[index].max_threads_per_block().map_err(|error| {
-                driver_error(
-                    format!("kernel `{}` thread limit query", KERNEL_NAMES[index]),
-                    error,
-                )
-            })? as usize;
-            if supported < LANES {
-                return Err(CudaError::Unavailable(format!(
-                    "kernel `{}` supports only {supported} threads per block; {LANES} are required \
-                     by its deterministic reduction",
-                    KERNEL_NAMES[index]
-                )));
-            }
         }
 
         Ok(Self {
-            _context: context,
+            context,
+            execution: Mutex::new(()),
             stream,
-            functions,
-            compact_function,
+            #[cfg(feature = "cuda-test-hooks")]
+            live_round_modules: Arc::new(AtomicUsize::new(0)),
             initialization_timings: CudaInitializationTimings {
                 context_stream_setup_ns,
-                module_function_load_ns,
             },
             provisioning,
         })
@@ -4709,11 +5350,14 @@ impl DirectCuda {
     /// extent comes from [`CompactionPlan`], i.e. from device-written meta words; an arena whose
     /// device-written counts sum to zero is neither launched nor read.
     ///
-    /// Returns one gathered word vector per request, in request order.
-    fn compact(
+    /// Returns one gathered word vector per request, in request order, and the gather handle the
+    /// launches use (the run's launch record identifies it).
+    fn compact<'module>(
         &self,
+        module: &'module RoundModule,
         requests: &[(&CudaBuffer, &CompactionPlan)],
-    ) -> Result<Vec<Vec<u64>>, CudaError> {
+    ) -> Result<(Vec<Vec<u64>>, &'module CudaFunction), CudaError> {
+        let compact_function = &module.compact_function;
         let mut destinations = Vec::with_capacity(requests.len());
         // The plan and argument buffers must outlive the launches, so they are retained here
         // rather than dropped at the end of each iteration.
@@ -4758,7 +5402,7 @@ impl DirectCuda {
                 block_dim: (COMPACT_THREADS_PER_BLOCK as u32, 1, 1),
                 shared_mem_bytes: 0,
             };
-            let mut arguments = self.stream.launch_builder(&self.compact_function);
+            let mut arguments = self.stream.launch_builder(compact_function);
             arguments.arg(&destination);
             arguments.arg(*source);
             arguments.arg(&plan_buffer);
@@ -4770,7 +5414,10 @@ impl DirectCuda {
             retained.push((plan_buffer, argument_buffer));
         }
         if destinations.iter().all(Option::is_none) {
-            return Ok(requests.iter().map(|_| Vec::new()).collect());
+            return Ok((
+                requests.iter().map(|_| Vec::new()).collect(),
+                compact_function,
+            ));
         }
 
         let mut gathered = Vec::with_capacity(requests.len());
@@ -4794,20 +5441,31 @@ impl DirectCuda {
         if let Some(error) = readback_error {
             return Err(error);
         }
-        Ok(gathered)
+        Ok((gathered, compact_function))
     }
 
-    fn run(&self, buffers: &CudaBuffers, config: CudaConfig) -> Result<CudaTiming, CudaError> {
+    /// Captures and replays one attempt, launching every kernel from `module`, the run's own.
+    fn run(
+        &self,
+        buffers: &CudaBuffers,
+        config: CudaConfig,
+        module: &RoundModule,
+    ) -> Result<CudaTiming, CudaError> {
+        let round_kernel = module.build;
+        let functions = module.attempt_functions();
         let parallel_threads = config.round_threads_per_block;
         let supported_parallel_threads = PARALLEL_KERNELS
             .iter()
             .map(|index| {
-                self.functions[*index]
+                functions[*index]
                     .max_threads_per_block()
                     .map(|value| value as usize)
                     .map_err(|error| {
                         driver_error(
-                            format!("kernel `{}` thread limit query", KERNEL_NAMES[*index]),
+                            format!(
+                                "kernel `{}` thread limit query",
+                                round_kernel_name(*index, round_kernel)
+                            ),
                             error,
                         )
                     })
@@ -4834,8 +5492,17 @@ impl DirectCuda {
 
         let wall_started = Instant::now();
         let capture_started = Instant::now();
-        let graph = self.capture_graph(buffers, &configs, config.attempts_per_graph_wave)?;
+        let graph = self.capture_graph(
+            buffers,
+            &functions,
+            round_kernel,
+            &configs,
+            config.attempts_per_graph_wave,
+        )?;
         let graph_capture_ns = duration_ns(capture_started.elapsed());
+        record_run_step("graph_captured");
+        #[cfg(feature = "cuda-test-hooks")]
+        let round_modules_at_capture = self.live_round_modules.load(Ordering::SeqCst);
 
         let maximum_replays = buffers
             .dispatch_capacity
@@ -4858,6 +5525,9 @@ impl DirectCuda {
                 .launch()
                 .map_err(|error| driver_error("CUDA Graph replay", error))?;
             host_submit_ns = host_submit_ns.saturating_add(duration_ns(submitted.elapsed()));
+            if graph_replays == 0 {
+                record_run_step("graph_launched");
+            }
             let end = self
                 .stream
                 .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
@@ -4898,12 +5568,19 @@ impl DirectCuda {
             host_submit_ns,
             device_ns,
             wall_ns: duration_ns(wall_started.elapsed()),
+            round_kernel,
+            #[cfg(feature = "cuda-test-hooks")]
+            launched_kernels: launch_record(&[module], &functions, buffers.finalize_sweep_required),
+            #[cfg(feature = "cuda-test-hooks")]
+            round_modules_at_capture,
         })
     }
 
     fn capture_graph(
         &self,
         buffers: &CudaBuffers,
+        functions: &[&CudaFunction; KERNEL_NAMES.len()],
+        round_kernel: RoundKernel,
         configs: &[LaunchConfig; KERNEL_NAMES.len()],
         attempts: usize,
     ) -> Result<CudaGraph, CudaError> {
@@ -4913,18 +5590,19 @@ impl DirectCuda {
 
         let captured = (|| {
             for _ in 0..attempts {
-                for (index, ((function, config), name)) in self
-                    .functions
-                    .iter()
-                    .zip(configs)
-                    .zip(KERNEL_NAMES)
-                    .enumerate()
-                {
+                for (index, (function, config)) in functions.iter().zip(configs).enumerate() {
                     if !buffers.finalize_sweep_required && index == FINALIZE_SWEEP_KERNEL_INDEX {
                         continue;
                     }
-                    launch_uniform(&self.stream, function, buffers, *config)
-                        .map_err(|error| driver_error(format!("capture `{name}` launch"), error))?;
+                    launch_uniform(&self.stream, function, buffers, *config).map_err(|error| {
+                        driver_error(
+                            format!(
+                                "capture `{}` launch",
+                                round_kernel_name(index, round_kernel)
+                            ),
+                            error,
+                        )
+                    })?;
                 }
             }
             Ok(())
@@ -4946,6 +5624,44 @@ impl DirectCuda {
             .upload()
             .map_err(|error| driver_error("CUDA Graph upload", error))?;
         Ok(graph)
+    }
+}
+
+/// Test-only: `(module, kernel)` for each attempt kernel the graph captured from `functions`, in
+/// DAG order, skipping the finalize sweep when the plan omits it. Each entry identifies the handle
+/// itself ([`identify`]), so a run that mixes modules is recorded as mixed.
+#[cfg(feature = "cuda-test-hooks")]
+fn launch_record(
+    modules: &[&RoundModule],
+    functions: &[&CudaFunction; KERNEL_NAMES.len()],
+    finalize_sweep_required: bool,
+) -> Vec<(RoundKernel, &'static str)> {
+    functions
+        .iter()
+        .enumerate()
+        .filter(|&(index, _)| finalize_sweep_required || index != FINALIZE_SWEEP_KERNEL_INDEX)
+        .map(|(_, function)| identify(modules, function))
+        .collect()
+}
+
+/// Test-only: the module and kernel `function` is, by handle identity: the one of `modules` whose
+/// vectors hold this very `CudaFunction`, and the name it was loaded under. No answer is derived
+/// from the run's selection. A run passes the one module it owns, so a launched handle that is
+/// not that module's is a panic, not a record.
+#[cfg(feature = "cuda-test-hooks")]
+fn identify(modules: &[&RoundModule], function: &CudaFunction) -> (RoundKernel, &'static str) {
+    modules
+        .iter()
+        .find_map(|module| Some((module.build, module.identify(function)?)))
+        .expect("a launched CUDA function handle belongs to the run's round module")
+}
+
+/// The entry point launched at `index` of the attempt DAG for `round_kernel`.
+fn round_kernel_name(index: usize, round_kernel: RoundKernel) -> &'static str {
+    if index == ROUND_KERNEL_INDEX && round_kernel == RoundKernel::Mechanisms {
+        MECHANISMS_ROUND_KERNEL_NAME
+    } else {
+        KERNEL_NAMES[index]
     }
 }
 
@@ -4999,6 +5715,14 @@ fn launch_uniform(
 }
 
 struct CudaTiming {
+    /// The round kernel build every attempt of this run launched.
+    round_kernel: RoundKernel,
+    /// Test-only: `(module, kernel)` for every function the attempt graph captured.
+    #[cfg(feature = "cuda-test-hooks")]
+    launched_kernels: Vec<(RoundKernel, &'static str)>,
+    /// Test-only: the round modules loaded in the context when the graph was captured.
+    #[cfg(feature = "cuda-test-hooks")]
+    round_modules_at_capture: usize,
     encoded_attempts: u64,
     graph_replays: u64,
     wave_boundary_syncs: u64,
@@ -5135,6 +5859,45 @@ mod tests {
             },
             "a channel index must not be displayed as an LP for the order diagnostic",
         );
+    }
+
+    /// P14 round 2: the kernels carry no mechanism error code, so a device word never decodes as a
+    /// host refusal; `MechanismsKernelRequired` comes only from the host's plan check.
+    #[test]
+    fn no_device_word_decodes_as_a_plain_kernel_refusal() {
+        let mut control = vec![0_u64; 20];
+        control[2] = 7;
+        for code in 3..=200 {
+            control[0] = code;
+            assert!(
+                !matches!(
+                    decode_device_error(&control),
+                    CudaError::MechanismsKernelRequired { .. }
+                ),
+                "raw code {code}"
+            );
+        }
+    }
+
+    /// P14 cuda-host: the readback event decode stays force-inlined into `CudaBuffers::finish`.
+    ///
+    /// This pins the three attributes, not the codegen they produce. The codegen is checked on the
+    /// release binary by `evidence/P14/cuda-host/tooling/callsites.py` (days-gpu): `finish` must make
+    /// no out-of-line call to any of the three. Without the attributes it makes 3 / 2 / 2 such calls,
+    /// which cost E6 60% about 25 ms of host run (`evidence/P14/cuda-host.md`).
+    #[test]
+    fn readback_event_decode_is_force_inlined() {
+        let source = include_str!("cuda.rs");
+        for signature in [
+            "fn decode_event(record: &[u64])",
+            "fn decode_packet_kind(value: u64, metadata: &[u64])",
+            "fn decode_packet_fields(words: &[u64])",
+        ] {
+            assert!(
+                source.contains(&format!("#[inline(always)]\n{signature}")),
+                "`{signature}` must be #[inline(always)]"
+            );
+        }
     }
 
     #[test]

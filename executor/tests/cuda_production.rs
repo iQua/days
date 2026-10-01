@@ -8,7 +8,8 @@ use days_executor::{
     GeneratorFeedbackState, GeneratorStatus, GeneratorTermination, HostState, LinkDescriptor,
     LinkId, NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketDescriptor, PacketKind,
     PayloadId, RemoteChannel, ScheduledEmission, SchedulerKind, SimulationImage, SwitchQueueState,
-    SwitchState, event_phase, run_cuda_with_observations, run_scalar_with_observations, validate,
+    SwitchState, cuda_device_count, event_phase, run_cuda_with_observations,
+    run_scalar_with_observations, validate,
 };
 
 const SOURCE: NodeId = NodeId(0);
@@ -76,6 +77,7 @@ fn generator_image(termination: GeneratorTermination) -> SimulationImage {
                         termination,
                     }),
                 }],
+                stages: Vec::new(),
                 tcp_receivers: vec![],
                 dcqcn_receivers: vec![],
                 next_origin_seq: 1,
@@ -90,6 +92,7 @@ fn generator_image(termination: GeneratorTermination) -> SimulationImage {
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![],
+                stages: Vec::new(),
                 tcp_receivers: vec![],
                 dcqcn_receivers: vec![],
                 next_origin_seq: 0,
@@ -193,6 +196,7 @@ fn fifo_taildrop_image() -> SimulationImage {
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![],
+                stages: Vec::new(),
                 tcp_receivers: vec![],
                 dcqcn_receivers: vec![],
                 next_origin_seq: 5,
@@ -207,6 +211,7 @@ fn fifo_taildrop_image() -> SimulationImage {
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![],
+                stages: Vec::new(),
                 tcp_receivers: vec![],
                 dcqcn_receivers: vec![],
                 next_origin_seq: 0,
@@ -373,6 +378,7 @@ fn long_continuation_image() -> SimulationImage {
                         termination: GeneratorTermination::Bytes(0),
                     }),
                 }],
+                stages: Vec::new(),
                 tcp_receivers: vec![],
                 dcqcn_receivers: vec![],
                 next_origin_seq: 1,
@@ -387,6 +393,7 @@ fn long_continuation_image() -> SimulationImage {
                 in_service: None,
                 tx_ready_pending: false,
                 generators: vec![],
+                stages: Vec::new(),
                 tcp_receivers: vec![],
                 dcqcn_receivers: vec![],
                 next_origin_seq: 0,
@@ -590,4 +597,97 @@ fn cuda_device_capacity_fault_is_explicit_and_executor_recovers() {
     assert_eq!(recovered.capacity_retry_trace[0].capacity, 0);
     assert_eq!(recovered.capacity_retry_trace[0].demand, 1);
     assert_eq!(recovered.capacity_retry_trace[0].grown_capacity, 2);
+}
+
+fn scalar_oracle_without_diagnostics(image: &SimulationImage) -> days_executor::RunResult {
+    let mut expected = run_scalar_with_observations(image, None, ObservationMode::Full)
+        .expect("scalar oracle must run");
+    expected.diagnostics = None;
+    expected
+}
+
+/// Every device the driver reports runs the image to the Scalar result, through both the
+/// per-device executor constructor and a device-0 executor routed by `CudaConfig::device_index`.
+#[test]
+fn cuda_every_visible_device_matches_the_scalar_result() {
+    let image = generator_image(GeneratorTermination::Bytes(8));
+    let expected = scalar_oracle_without_diagnostics(&image);
+    let count = cuda_device_count().expect("the driver must report its devices");
+    assert!(count >= 1);
+    let routed = CudaExecutor::new().expect("device 0 must initialize");
+    for device_index in 0..count {
+        let config = CudaConfig {
+            device_index,
+            ..CudaConfig::default()
+        };
+        let own = CudaExecutor::on_device(device_index)
+            .unwrap_or_else(|error| panic!("device {device_index} must initialize: {error}"))
+            .run_with_observations(&image, None, config, ObservationMode::Full)
+            .unwrap_or_else(|error| panic!("device {device_index} run: {error}"));
+        assert_eq!(own.result, expected, "device {device_index}");
+        let via_config = routed
+            .run_with_observations(&image, None, config, ObservationMode::Full)
+            .unwrap_or_else(|error| panic!("device {device_index} routed run: {error}"));
+        assert_eq!(
+            via_config.result, expected,
+            "device {device_index} via config"
+        );
+    }
+}
+
+/// Two devices in one process keep independent contexts: interleaved runs on the first and last
+/// visible device both reproduce the Scalar result.
+#[test]
+fn cuda_interleaved_runs_on_two_devices_share_no_state() {
+    let count = cuda_device_count().expect("the driver must report its devices");
+    let last = count - 1;
+    let image = generator_image(GeneratorTermination::DurationNs(12));
+    let expected = scalar_oracle_without_diagnostics(&image);
+    for device_index in [0, last, 0, last] {
+        let run = run_cuda_with_observations(
+            &image,
+            None,
+            CudaConfig {
+                device_index,
+                ..CudaConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .unwrap_or_else(|error| panic!("device {device_index}: {error}"));
+        assert_eq!(run.result, expected, "device {device_index}");
+    }
+}
+
+/// An ordinal the driver does not report is an explicit unavailability naming that ordinal,
+/// never a silent run on another device.
+#[test]
+fn cuda_missing_device_index_is_refused_by_name() {
+    let missing = cuda_device_count().expect("the driver must report its devices");
+    let image = generator_image(GeneratorTermination::Bytes(2));
+    let error = run_cuda_with_observations(
+        &image,
+        None,
+        CudaConfig {
+            device_index: missing,
+            ..CudaConfig::default()
+        },
+        ObservationMode::Summary,
+    )
+    .expect_err("a missing ordinal must not run");
+    assert!(
+        matches!(&error, CudaError::Unavailable(message) if message.contains(&format!("device {missing}"))),
+        "{error:?}"
+    );
+    let error = CudaExecutor::new()
+        .expect("device 0 must initialize")
+        .run(
+            &image,
+            None,
+            CudaConfig {
+                device_index: missing,
+                ..CudaConfig::default()
+            },
+        )
+        .expect_err("a missing ordinal routed through a device-0 executor must not run");
+    assert!(matches!(error, CudaError::Unavailable(_)), "{error:?}");
 }

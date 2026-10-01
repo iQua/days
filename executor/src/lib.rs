@@ -16,6 +16,13 @@ mod device_capacity;
 ))]
 mod device_compaction;
 mod device_event_record;
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal", target_vendor = "apple")
+))]
+mod device_mechanism;
+mod device_pfc;
 mod device_scheduler;
 pub mod device_sizing;
 pub mod event;
@@ -28,6 +35,7 @@ pub mod model;
 mod planner_capacity;
 pub mod safe_horizon;
 pub mod scalar;
+mod stage_index;
 pub mod tcp;
 mod tcp_ledger;
 mod tcp_ledger_ring;
@@ -44,13 +52,16 @@ pub use cpu::{
 #[cfg(all(feature = "cuda", feature = "planner-test-hooks"))]
 #[doc(hidden)]
 pub use cuda::assert_cuda_planner_bit_equal_for_testing;
-#[cfg(all(feature = "cuda", feature = "planner-test-hooks"))]
-#[doc(hidden)]
-pub use cuda::size_cuda_plan_for_testing;
 #[cfg(feature = "cuda")]
 pub use cuda::{
     CudaArena, CudaConfig, CudaError, CudaExecutor, CudaInitializationTimings, CudaMemoryLayout,
-    CudaRun, run_cuda, run_cuda_with_observations,
+    CudaRun, cuda_device_count, run_cuda, run_cuda_with_observations,
+};
+#[cfg(all(feature = "cuda", feature = "planner-test-hooks"))]
+#[doc(hidden)]
+pub use cuda::{
+    mechanism_plane_words_cuda_for_testing, pfc_state_scans_cuda_plan_for_testing,
+    size_cuda_plan_for_testing,
 };
 pub use dcqcn::{
     DCQCN_FRACTION_SCALE, DCQCN_STAGE_STEPS, DcqcnArithmeticError, DcqcnController,
@@ -60,30 +71,34 @@ pub use device_capacity::{
     CapacityRetryRecord, CapacityWarmStart, ChannelStreamCapacityLevel, DeviceCapacityCaps,
     DeviceCapacityFloors,
 };
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
+pub use device_mechanism::RoundKernel;
 pub use device_sizing::{
     DeviceEventArenaSizing, DevicePlaneSizing, DeviceSizingError, DeviceSizingReport,
-    size_default_device_plan,
+    MechanismPlaneWords, size_default_device_plan,
 };
 pub use event::{
     Event, EventFelClass, EventKey, EventKind, FlowId, LinkId, NodeId, PayloadId, event_fel_class,
     event_phase,
 };
 pub use image::{
-    CollectiveAlgorithm, CollectiveChannelPolicy, CollectiveChunkPolicy, CollectiveGenerator,
-    CollectivePhase, ConstantGenerator, DcqcnCnpHeader, DcqcnGenerator, DcqcnReceiverState,
-    EcnCodepoint, FlowDescriptor, FlowGeneratorKind, FlowGeneratorState, GeneratorFeedbackAction,
-    GeneratorFeedbackState, GeneratorStatus, GeneratorTermination, HostState, LinkDescriptor,
-    NodeDescriptor, PacketDescriptor, PacketKind, PfcHeader, PfcIngressState, PfcQueueState,
-    RateGenerator, RemoteChannel, ScheduledEmission, SimulationImage, SwitchQueueState,
-    SwitchState, TcpAckHeader, TcpDataHeader, TcpGenerator, TcpReceiveRange, TcpReceiverState,
-    TcpTimerState, default_propagation_ns,
+    CollectiveAlgorithm, CollectiveChannelPolicy, CollectiveChunkPolicy, CollectivePhase,
+    CollectiveStage, CollectiveStageIdentity, ComputeStage, ConstantGenerator, DcqcnCnpHeader,
+    DcqcnGenerator, DcqcnReceiverState, EcnCodepoint, FlowDescriptor, FlowGeneratorKind,
+    FlowGeneratorState, GeneratorFeedbackAction, GeneratorFeedbackState, GeneratorStatus,
+    GeneratorTermination, HostState, LinkDescriptor, NodeDescriptor, PacketDescriptor, PacketKind,
+    PfcHeader, PfcIngressState, PfcQueueState, RateGenerator, RemoteChannel, ScheduledEmission,
+    SimulationImage, StageDependencies, StageRole, SwitchQueueState, SwitchState, TcpAckHeader,
+    TcpDataHeader, TcpGenerator, TcpReceiveRange, TcpReceiverState, TcpTimerState,
+    default_propagation_ns,
 };
 pub use mechanism_trace::{
-    CollectiveActivationCause, CollectiveProgressRecord, DrrTransitionRecord, MechanismTraceError,
-    MechanismTransitionRecord, PfcControlAction, PfcControlTransitionRecord, PfcOccupancyAction,
-    PfcThresholdTransitionRecord, RateReplayConfig, RateReplayState, RateTransitionRecord,
-    SchedulerPacket, WrrTransitionRecord, collective_transitions_csv, dcqcn_transitions_csv,
-    drr_transitions_csv, pfc_transitions_csv, rate_transitions_csv, wrr_transitions_csv,
+    CollectiveActivationCause, CollectiveProgressRecord, CollectiveStageKind, DrrTransitionRecord,
+    MechanismTraceError, MechanismTransitionRecord, PfcControlAction, PfcControlTransitionRecord,
+    PfcOccupancyAction, PfcThresholdTransitionRecord, RateReplayConfig, RateReplayState,
+    RateTransitionRecord, SchedulerPacket, WrrTransitionRecord, collective_transitions_csv,
+    dcqcn_transitions_csv, drr_transitions_csv, pfc_transitions_csv, rate_transitions_csv,
+    wrr_transitions_csv,
 };
 #[cfg(all(
     feature = "metal",
@@ -92,13 +107,6 @@ pub use mechanism_trace::{
 ))]
 #[doc(hidden)]
 pub use metal::assert_metal_planner_bit_equal_for_testing;
-#[cfg(all(
-    feature = "metal",
-    feature = "planner-test-hooks",
-    target_vendor = "apple"
-))]
-#[doc(hidden)]
-pub use metal::size_metal_plan_for_testing;
 #[cfg(all(feature = "metal-test-hooks", target_vendor = "apple"))]
 #[doc(hidden)]
 pub use metal::{
@@ -109,6 +117,13 @@ pub use metal::{
     MetalArena, MetalConfig, MetalError, MetalExecutor, MetalInitializationTimings,
     MetalMemoryLayout, MetalRun, run_metal, run_metal_with_observations,
 };
+#[cfg(all(
+    feature = "metal",
+    feature = "planner-test-hooks",
+    target_vendor = "apple"
+))]
+#[doc(hidden)]
+pub use metal::{mechanism_plane_words_metal_for_testing, size_metal_plan_for_testing};
 pub use model::{
     DropMarkPolicy, DrrSchedulerState, EcnThresholdPolicy, ExactRational, NodeKind, QueueDepthUnit,
     RedPolicyState, SchedulerKind, TransitionHandler, WfqSchedulerState, WrrSchedulerState,
@@ -126,9 +141,13 @@ pub use scalar::{
 pub use tcp::{CUBIC_WINDOW_SCALE, TcpCongestionControl, TcpPhase};
 pub use tcp_trace::{TcpTraceError, tcp_transitions_csv};
 pub use time::{TimeError, link_arrival_time_ns, serialization_time_ns};
-#[cfg(feature = "planner-test-hooks")]
-#[doc(hidden)]
-pub use validate::assert_validate_flow_index_equivalent_for_testing;
 pub use validate::{
     Backend, RateSourceLookahead, ValidationError, rate_source_lookahead, validate,
+};
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+pub use validate::{
+    assert_validate_flow_index_equivalent_for_testing,
+    assert_validate_generator_index_equivalent_for_testing,
+    validate_flow_index_builds_stage_lookups_for_testing,
 };

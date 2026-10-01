@@ -10,7 +10,7 @@ description: Days AGO and legacy PFC configuration with backend limits.
 mode = "Pfc"
 ```
 
-`None` is the default. Legacy `Pfc` requires `cargo build -p days-legacy --features l2_pfc`. Days AGO Scalar and CPU support lowered PFC without that legacy feature; Metal and CUDA reject PFC before execution with a message directing you to Scalar or CPU.
+`None` is the default. Legacy `Pfc` requires `cargo build -p days-legacy --features l2_pfc`. Days AGO supports lowered PFC on Scalar, CPU, Metal, and CUDA without that legacy feature.
 
 ## Legacy PFC
 

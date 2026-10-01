@@ -659,9 +659,8 @@ pub fn main() {
     let oracle = oracle_run.result;
     let executor = CudaExecutor::new().expect("CUDA benchmark executor must initialize");
     let initialization = executor.initialization_timings();
-    let initialization_ns = u128::from(initialization.context_stream_setup_ns)
-        .checked_add(u128::from(initialization.module_function_load_ns))
-        .expect("CUDA initialization time must fit in u128");
+    // The executor loads no module; each run loads its round module inside its measured wall.
+    let initialization_ns = u128::from(initialization.context_stream_setup_ns);
 
     println!(
         "record=sustained_cuda_protocol workload={} rq={} scalar_samples={SCALAR_SAMPLES} scalar_predecessor=none \
@@ -677,12 +676,11 @@ pub fn main() {
     );
     println!(
         "record=sustained_cuda_initialization config={fixture} workload={} rq={} engine=cuda \
-         context_stream_setup_ns={} module_function_load_ns={} initialization_ns={} \
+         context_stream_setup_ns={} initialization_ns={} \
          graph_capture_treatment=per_run_marginal_backend_wall",
         workload.workload(),
         workload.rq(),
         initialization.context_stream_setup_ns,
-        initialization.module_function_load_ns,
         initialization_ns,
     );
 

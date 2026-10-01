@@ -27,7 +27,7 @@ Supported inputs are FatTree, Torus, Dragonfly, and custom `edges`/`hosts` graph
 
 Exact scheduling supports FIFO, strict priority, WFQ, DRR, and WRR. The exact compiler rejects VirtualClock. Exact routing supports shortest path and `FatTreeEcmp`; the latter requires a canonical FatTree and derives a stable semantic flow hash rather than using construction order.
 
-Flow sets support `Random`, `SwitchOffsetHalf`, and `SameSwitchNext` pairing. Days AGO collectives support RingAllReduce and AllGather only, with deterministic byte-terminated `PacketDistribution` traffic; see [Collectives](/docs/configuration/collectives).
+Flow sets support `Random`, `SwitchOffsetHalf`, and `SameSwitchNext` pairing. Days AGO collectives support RingAllReduce and AllGather only, over byte-terminated TCP, and `[[compute]]` adds delay-only compute stages; see [Collectives](/docs/configuration/collectives).
 
 Callers pass the completed `SimulationImage` to `executor::validate(image, backend)`. Image invariants are backend-independent; capability checks then reject mechanisms not ported to the selected device.
 
@@ -62,4 +62,4 @@ With `link.mode = "Pfc"` and the legacy `l2_pfc` feature:
 PacketSwitch -> Scheduler -> PfcEgressGate -> Link -> PfcIngressPort -> PacketSwitch
 ```
 
-The exact compiler can lower PFC into image state, but only scalar and CPU currently execute it; Metal and CUDA reject the image during backend validation.
+The exact compiler lowers PFC into image state, and Scalar, CPU, Metal, and CUDA execute it.

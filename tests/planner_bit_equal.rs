@@ -112,6 +112,7 @@ fn rate_image() -> SimulationImage {
         in_service: None,
         tx_ready_pending: false,
         generators: vec![],
+        stages: vec![],
         tcp_receivers: vec![],
         dcqcn_receivers: vec![],
         next_origin_seq: 0,
@@ -195,7 +196,7 @@ fn rate_image() -> SimulationImage {
     }
 }
 
-fn compile_dcqcn_rejection_fixture() -> SimulationImage {
+fn compile_dcqcn_inert_pfc_fixture() -> SimulationImage {
     let source = fixture_path("configs/dcqcn_1s.toml");
     let mut config = fs::read_to_string(&source)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", source.display()));
@@ -211,7 +212,7 @@ fn compile_dcqcn_rejection_fixture() -> SimulationImage {
     let file = NamedTempFile::new().expect("temporary DCQCN fixture must open");
     fs::write(file.path(), config).expect("temporary DCQCN fixture must be written");
     compile_config(file.path())
-        .unwrap_or_else(|error| panic!("failed to lower DCQCN rejection fixture: {error}"))
+        .unwrap_or_else(|error| panic!("failed to lower the DCQCN inert-PFC fixture: {error}"))
 }
 
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
@@ -384,10 +385,14 @@ fn assert_0695_initial_plan(
             .expect("round scratch must size")
             + 1)
             * std::mem::size_of::<u64>();
+    // P14 Lane B T4 appended one params word addressing the PFC region (`u64::MAX` for this
+    // image, which carries no PFC state and plans no PFC words). No other plane moved.
+    let p14_pfc_params_bytes = std::mem::size_of::<u64>();
     assert_eq!(
         strict.total_device_bytes,
-        expected_total_device_bytes + t21_round_scratch_bytes,
-        "{backend} initial plan bytes, pre-T21 anchor plus the derived round-scratch region",
+        expected_total_device_bytes + t21_round_scratch_bytes + p14_pfc_params_bytes,
+        "{backend} initial plan bytes, pre-T21 anchor plus the derived round-scratch region \
+         and the P14 PFC-offset params word",
     );
 }
 
@@ -649,32 +654,71 @@ fn unsupported_device_families_are_rejected_before_planning() {
         );
     }
 
-    let dcqcn = compile_dcqcn_rejection_fixture();
+    // P14 Lane B: DCQCN with (inert) PFC state now runs on both device backends, so its planner
+    // must plan it, bit-equal to legacy planning, instead of rejecting it. RED admission remains
+    // device-unsupported and keeps the rejection branch exercised.
+    let dcqcn = compile_dcqcn_inert_pfc_fixture();
+    let mut red = dcqcn.clone();
+    for queue in red
+        .switch_states
+        .iter_mut()
+        .flat_map(|state| &mut state.queues)
+    {
+        queue.drop_mark = days_executor::DropMarkPolicy::Red(days_executor::RedPolicyState {
+            unit: days_executor::QueueDepthUnit::Packets,
+            capacity: 64,
+            min_threshold: 8,
+            max_threshold: 32,
+            max_probability_numerator: 1,
+            max_probability_denominator: 10,
+            average_scaled: 0,
+            counter: 0,
+            mark_ecn: false,
+        });
+    }
     planner_rejections += 1;
 
     #[cfg(all(feature = "metal", target_vendor = "apple"))]
     assert!(
         assert_metal_planner_bit_equal_for_testing(
-            &dcqcn,
+            &red,
             None,
             metal_config(true, true),
             ObservationMode::Summary,
         )
-        .is_err(),
-        "Metal must reject DCQCN before planning"
+        .is_err_and(|error| error.to_string().contains("RED admission")),
+        "Metal must reject RED before planning"
     );
 
     #[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
     assert!(
         assert_cuda_planner_bit_equal_for_testing(
-            &dcqcn,
+            &red,
             None,
             cuda_config(true, true),
             ObservationMode::Summary,
         )
-        .is_err(),
-        "CUDA must reject DCQCN before planning"
+        .is_err_and(|error| error.to_string().contains("RED admission")),
+        "CUDA must reject RED before planning"
     );
+
+    #[cfg(all(feature = "metal", target_vendor = "apple"))]
+    assert_metal_planner_bit_equal_for_testing(
+        &dcqcn,
+        None,
+        metal_config(true, true),
+        ObservationMode::Summary,
+    )
+    .expect("Metal must plan DCQCN with PFC state");
+
+    #[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
+    assert_cuda_planner_bit_equal_for_testing(
+        &dcqcn,
+        None,
+        cuda_config(true, true),
+        ObservationMode::Summary,
+    )
+    .expect("CUDA must plan DCQCN with PFC state");
 
     assert_ne!(
         planner_rejections, 0,
