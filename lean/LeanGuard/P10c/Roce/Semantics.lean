@@ -412,6 +412,18 @@ def onPausedTick (config : SenderConfig) (rateBps : Nat) (state : SenderState) :
     stopQuery := none }
 
 /--
+Schema Amendment 2: a PFC RESUME at `timeNs` restarts a pacer that a paused tick parked, on its
+next grid point strictly after `timeNs` (D3), or leaves it `stopped` beyond the stop time. The
+caller checks that the pair was parked by a pause and that a restart happened (`stopQuery`).
+-/
+def onResume (config : SenderConfig) (rateBps timeNs : Nat) (withinStop : Bool)
+    (state : SenderState) : SenderResult :=
+  let (restarted, query) := restart config timeNs withinStop state
+  { state := settle config rateBps restarted restarted.status
+    emission := none
+    stopQuery := query }
+
+/--
 §5 steps 4 and 5: an ACK or NACK carrying `acknowledgment` at `timeNs`.
 
 * Stale (`a ≤ snd_una` for an ACK, `e < snd_una` for a NACK): nothing changes.

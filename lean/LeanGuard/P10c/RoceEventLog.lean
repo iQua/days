@@ -225,6 +225,8 @@ inductive SenderKind
   | ack
   | nack
   | timeout
+  /-- Amendment 2: a PFC RESUME restarted the pair's pause-parked pacer. -/
+  | resume
   deriving DecidableEq, Repr
 
 def parseSenderKind : String → Except String SenderKind
@@ -232,6 +234,7 @@ def parseSenderKind : String → Except String SenderKind
   | "ack" => pure .ack
   | "nack" => pure .nack
   | "timeout" => pure .timeout
+  | "resume" => pure .resume
   | other => throw s!"invalid RoCE sender kind: '{other}'"
 
 def parsePacer : String → Except String Roce.Pacer
@@ -349,6 +352,9 @@ structure FlowTrack where
   /-- The controller's pending control time, from the pair's last DCQCN row (`none` before the
   pair's first DCQCN row). -/
   controlNs : Option Nat
+  /-- Amendment 2: the pacer was parked by a paused tick and not restarted since, so a RESUME may
+  restart it. -/
+  pauseParked : Bool
 
 /--
 The events a pair has pending, as `(time, rank, name)`: the armed pacing tick, the armed timeout,
@@ -411,6 +417,10 @@ def checkSenderShape (row : SenderRow) : Except String Unit := do
       at_ (row.rateBps.isNone && !row.emitted) "RoCE ACK or NACK row credits or emits"
       at_ (row.inputAcknowledgment.all (· ≤ row.before.bytesEmitted))
         "RoCE acknowledgment above the sender's high-water mark"
+  | .resume =>
+      at_ (row.key.phase = 0) "RoCE resume must have phase 0"
+      at_ (row.rateBps.isNone && row.inputAcknowledgment.isNone && !row.emitted)
+        "RoCE resume row credits, emits or carries an acknowledgment"
   | .timeout =>
       at_ (row.key.phase = 1) "RoCE timeout must have phase 1"
       at_ (row.rateBps.isNone && row.inputAcknowledgment.isNone && !row.emitted)
@@ -478,8 +488,12 @@ def checkSenderItem (stopTimeNs : Option Nat) (track : SenderTrack) (row : Sende
   | none =>
       checkPending "sender" row.srcLine source
         { config := row.config, state := row.before, rateBps := rate, controlSpent := false,
-          controlNs := controlNs }
+          controlNs := controlNs, pauseParked := false }
         row.key.timeNs
+  let pauseParked := prior.map (·.pauseParked) |>.getD false
+  if row.kind = .resume then
+    at_ pauseParked
+      s!"RoCE resume of a queue pair not parked by a pause (node_id={row.nodeId}, flow_id={row.flowId})"
   -- The joined controller log: a tick credits at the controller's current rate, and the DCQCN
   -- byte opportunity at the same key exists exactly when the tick sends, for the same bytes.
   at_ (row.rateBps.all (· = rate)) "RoCE tick rate differs from the DCQCN controller's current rate"
@@ -505,6 +519,7 @@ def checkSenderItem (stopTimeNs : Option Nat) (track : SenderTrack) (row : Sende
     | .nack, some value =>
         Roce.onFeedback row.config rate row.key.timeNs value true withinStop row.before
     | .timeout, _ => Roce.onTimeout row.config rate row.key.timeNs withinStop row.before
+    | .resume, _ => Roce.onResume row.config rate row.key.timeNs withinStop row.before
     | _, none => { state := row.before, emission := none, stopQuery := none }
   -- The executor's fixed-width arithmetic: anything beyond it is an execution error, not a row.
   at_ (row.before.creditQuanta + Roce.tickCredit row.config (row.rateBps.getD 0) ≤ Roce.maxU128)
@@ -512,6 +527,7 @@ def checkSenderItem (stopTimeNs : Option Nat) (track : SenderTrack) (row : Sende
   at_ (expected.stopQuery.all (· ≤ Roce.maxU64) &&
       row.key.timeNs + row.config.rtoNs ≤ Roce.maxU64)
     "RoCE timer exceeds u64"
+  at_ (row.kind != .resume || expected.stopQuery.isSome) "RoCE resume of a pacer that cannot restart"
   at_ (row.emission = expected.emission) "RoCE emission mismatch"
   at_ (row.after = expected.state) "RoCE sender after-state mismatch"
   let stop ← checkStop stopTimeNs row expected.stopQuery withinStop track.stop
@@ -533,7 +549,10 @@ def checkSenderItem (stopTimeNs : Option Nat) (track : SenderTrack) (row : Sende
           controlSpent := controlSpent,
           controlNs := match bytes with
             | some d => some d.after.nextControlTimeNs
-            | none => controlNs }
+            | none => controlNs
+          -- Set by a paused tick; cleared by any restart (the pacer leaves `parked`).
+          pauseParked :=
+            row.classPaused || (pauseParked && row.after.pacer = .parked) }
       lastPayload := lastPayload
       stop := stop }
 
@@ -600,6 +619,24 @@ def checkPendingAtEnd (stopTimeNs : Option Nat) (rows : List SenderRow)
           throw s!"sender: pending {name} at {pendingNs} never fired although the log implies stop_time_ns >= {bound} (node_id={node}, flow_id={flow})"
 
 /--
+Canonical order of the sender log: strictly increasing event keys, except that the `resume` rows
+of one RESUME share its key (Amendment 2), which is allowed only for rows of one node with
+strictly increasing `flow_id`.
+-/
+def checkSenderKeyOrder : List SenderRow → Except String Unit
+  | [] | [_] => pure ()
+  | first :: second :: rest => do
+      if first.key = second.key && (first.kind = .resume || second.kind = .resume) then
+        requireAt "sender" second.srcLine
+          (first.kind = .resume && second.kind = .resume && first.nodeId = second.nodeId &&
+            first.flowId < second.flowId)
+          "RoCE resume rows sharing an event key must be of one node in strictly increasing flow_id order"
+      else
+        requireAt "sender" second.srcLine (first.key < second.key)
+          "duplicate or backward canonical event key"
+      checkSenderKeyOrder (second :: rest)
+
+/--
 The sender log against §5, joined with the DCQCN controller log of the same run. `stopTimeNs` is
 the image's stop time when known; without it, one stop time must separate every armed tick from
 every stopped one.
@@ -607,7 +644,7 @@ every stopped one.
 def checkSenderRows (stopTimeNs : Option Nat) (rows : List SenderRow)
     (dcqcn : List DcqcnEventLog.Row) : Except String Unit := do
   requireAt "sender" 1 (!rows.isEmpty) "empty RoCE sender trace"
-  inRole "sender" (checkKeyOrder (·.key) (·.srcLine) rows)
+  checkSenderKeyOrder rows
   -- The controller log is checked on its own terms first (an empty one only when no queue pair
   -- ever sent a byte and no controller event happened).
   if !dcqcn.isEmpty then inRole "dcqcn" (DcqcnEventLog.checkRows dcqcn)
