@@ -214,10 +214,8 @@ fn host_links_variant(test: &str, line: &str) -> SimulationImage {
     )
     .expect("read the host-PFC fixture");
     assert_eq!(text.matches("\nhost_links = true\n").count(), 1);
-    let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "p15_hostpfc_{test}_{}.toml",
-        std::process::id()
-    ));
+    let path = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("p15_hostpfc_{test}_{}.toml", std::process::id()));
     std::fs::write(&path, text.replace("\nhost_links = true\n", line)).expect("write variant");
     let image = compile_config(&path).expect("the variant lowers");
     let _ = std::fs::remove_file(&path);

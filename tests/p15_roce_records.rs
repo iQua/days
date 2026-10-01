@@ -12,9 +12,9 @@ use std::path::Path;
 use days::scenario::compile_config;
 use days_executor::{
     EventKey, FlowId, GeneratorStatus, MechanismTransitionRecord, NodeId, ObservationMode,
-    PacketKind, PfcControlAction, PfcControlTransitionRecord, RoceEmission,
-    RocePacerState, RoceReceiverAction, RoceReceiverRecord, RoceSenderKind, RoceSenderRecord,
-    RoceTransitionRecord, RunResult, roce_receiver_transitions_csv, roce_sender_transitions_csv,
+    PacketKind, PfcControlAction, PfcControlTransitionRecord, RoceEmission, RocePacerState,
+    RoceReceiverAction, RoceReceiverRecord, RoceSenderKind, RoceSenderRecord, RoceTransitionRecord,
+    RunResult, roce_receiver_transitions_csv, roce_sender_transitions_csv,
     run_scalar_with_observations,
 };
 
@@ -578,7 +578,10 @@ fn pause_and_resume_rows_agree_with_the_host_pfc_log() {
             }
         }
     }
-    assert!(paused_ticks > 0 && resumes > 0, "the host-PFC fixture pauses and resumes");
+    assert!(
+        paused_ticks > 0 && resumes > 0,
+        "the host-PFC fixture pauses and resumes"
+    );
 }
 
 /// Amendment 2: rows share an event key only as `resume` rows of distinct flows at one node, in
@@ -594,7 +597,10 @@ fn only_resume_rows_share_an_event_key() {
         .collect::<Vec<_>>();
     for pair in rows.windows(2) {
         if pair[0][..4] == pair[1][..4] {
-            assert_eq!((pair[0][6].as_str(), pair[1][6].as_str()), ("resume", "resume"));
+            assert_eq!(
+                (pair[0][6].as_str(), pair[1][6].as_str()),
+                ("resume", "resume")
+            );
             assert_eq!(pair[0][4], pair[1][4], "one node");
             let flow = |row: &Vec<String>| row[5].parse::<u64>().expect("flow id");
             assert!(flow(&pair[0]) < flow(&pair[1]), "{pair:?}");
