@@ -2814,15 +2814,17 @@ impl<'image> TransitionState<'image> {
             });
         }
         let transition = {
-            let state = self.host_state_mut(node)?;
-            let generator = state
-                .generators
-                .iter_mut()
-                .find(|generator| generator.flow == packet.flow)
-                .ok_or(ExecutionError::UnknownGenerator {
-                    node: node.id,
-                    flow: packet.flow,
-                })?;
+            // Keyed: a host can hold many queue pairs (the first generator of the flow is the
+            // one the retired linear find returned).
+            let (mut state, index) = self.host_parts_mut(node)?;
+            let position =
+                index
+                    .first_generator(packet.flow)
+                    .ok_or(ExecutionError::UnknownGenerator {
+                        node: node.id,
+                        flow: packet.flow,
+                    })?;
+            let generator = &mut state.generators[position];
             generator.feedback.arrivals = generator
                 .feedback
                 .arrivals
@@ -3729,15 +3731,16 @@ impl<'image> TransitionState<'image> {
     ) -> Result<(), ExecutionError> {
         let stop_time_ns = self.image.stop_time_ns;
         let (transition, next_time_ns, queue_pair) = {
-            let state = self.host_state_mut(node)?;
-            let generator = state
-                .generators
-                .iter_mut()
-                .find(|generator| generator.flow == packet.flow)
-                .ok_or(ExecutionError::UnknownGenerator {
-                    node: node.id,
-                    flow: packet.flow,
-                })?;
+            // Keyed, as the CNP arrival is.
+            let (mut state, index) = self.host_parts_mut(node)?;
+            let position =
+                index
+                    .first_generator(packet.flow)
+                    .ok_or(ExecutionError::UnknownGenerator {
+                        node: node.id,
+                        flow: packet.flow,
+                    })?;
+            let generator = &mut state.generators[position];
             let (control_payload, controller) = match generator.kind {
                 FlowGeneratorKind::Dcqcn(dcqcn) => (dcqcn.control_timer_payload, dcqcn.controller),
                 FlowGeneratorKind::Roce(roce) => (roce.control_timer_payload, roce.controller),
