@@ -514,8 +514,18 @@ def checkSenderRows (stopTimeNs : Option Nat) (rows : List SenderRow)
   -- The controller log is checked on its own terms first (an empty one only when no queue pair
   -- ever sent a byte and no controller event happened).
   if !dcqcn.isEmpty then inRole "dcqcn" (DcqcnEventLog.checkRows dcqcn)
-  -- RED stub: the sender rows are not yet checked against the semantics or the DCQCN log.
-  let _ := (stopTimeNs, checkSenderItem, checkDcqcnItem)
-  pure ()
+  let mut pairs : Std.HashSet (Nat × Nat) := ∅
+  for row in rows do pairs := pairs.insert (row.nodeId, row.flowId)
+  let pairRows := dcqcn.filter (fun d => pairs.contains (d.nodeId, d.flowId))
+  let mut track : SenderTrack := {}
+  for item in mergeLogs rows pairRows [] do
+    match item with
+    | .sender row bytes => track ← checkSenderItem stopTimeNs track row bytes
+    | .dcqcn d => track ← checkDcqcnItem track d
+  match track.stop.latestWithin, track.stop.earliestBeyond with
+  | some (within, withinLine), some (beyond, beyondLine) =>
+      if within < beyond then pure ()
+      else throw s!"sender: no single stop time fits the pacer decisions: tick {within} (line {withinLine}) is armed and tick {beyond} (line {beyondLine}) is stopped"
+  | _, _ => pure ()
 
 end LeanGuard.P10c.RoceEventLog
