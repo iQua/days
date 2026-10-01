@@ -10,9 +10,9 @@ use days_executor::{
     GeneratorFeedbackState, GeneratorStatus, GeneratorTermination, HostState, LinkDescriptor,
     LinkId, NodeDescriptor, NodeId, NodeKind, PacketDescriptor, PacketKind, PayloadId,
     PfcIngressState, PfcQueueState, QueueDepthUnit, RateGenerator, RedPolicyState, RemoteChannel,
-    ScheduledEmission, SchedulerKind, SimulationImage, StageDependencies, StageRole,
-    SwitchQueueState, SwitchState, TcpCongestionControl, TcpDataHeader, TcpGenerator,
-    TcpReceiverState, event_phase, validate,
+    RoceGenerator, RocePacer, RoceReceiverState, ScheduledEmission, SchedulerKind, SimulationImage,
+    StageDependencies, StageRole, SwitchQueueState, SwitchState, TcpCongestionControl,
+    TcpDataHeader, TcpGenerator, TcpReceiverState, event_phase, validate,
 };
 use num_bigint::BigUint;
 use petgraph::graph::NodeIndex;
@@ -203,6 +203,22 @@ struct SourceTraffic {
     pkt_size_dist: SourceDistributionInfo,
     tcp: Option<SourceTcp>,
     dcqcn: Option<SourceDcqcn>,
+    roce: Option<SourceRoce>,
+}
+
+/// `[flow.traffic.roce]`: the Go-back-N reliability of a RoCE queue pair. The pair's controller
+/// and pacer come from `[flow.traffic.dcqcn]`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceRoce {
+    /// Required: a fixed retransmission timeout, or `0` for none (NACK-only recovery: a lost last
+    /// packet then stalls the queue pair for the rest of the run).
+    retransmit_timeout_ns: Option<u64>,
+    ack_every_packets: Option<u64>,
+    nack_interval_ns: Option<u64>,
+    feedback_priority: Option<u8>,
+    duplicate_ack: Option<bool>,
+    ack_size_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -277,6 +293,24 @@ enum TrafficKind {
     Constant,
     Tcp(TcpAlgorithm),
     Dcqcn(DcqcnTrafficKey),
+    /// The ordinal of the flow's [`RoceTrafficKey`] among the scenario's sorted distinct RoCE
+    /// keys ([`SupportedModel::roce_keys`]). The mapping is order-isomorphic, so flows order
+    /// exactly as they would with the key inline, while every `TrafficKind` keeps its size:
+    /// inline, the key would grow `TrafficKey`, and with it every flow's `FlowInput`.
+    Roce(u64),
+}
+
+/// The full semantic key of one RoCE queue pair: its DCQCN controller and pacer, and its
+/// Go-back-N reliability. `dcqcn.cnp_priority` holds the pair's feedback priority (CNP, ACK and
+/// NACK).
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct RoceTrafficKey {
+    dcqcn: DcqcnTrafficKey,
+    retransmit_timeout_ns: u64,
+    ack_every_packets: u64,
+    nack_interval_ns: u64,
+    duplicate_ack: bool,
+    ack_size_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -306,16 +340,24 @@ enum SourceFlowKind {
     PacketDistribution,
     Tcp,
     Dcqcn,
+    Roce,
 }
 
 impl TrafficKey {
-    /// The PFC class of the flow's receiver feedback: a DCQCN flow's CNP class, else `priority`.
-    const fn feedback_priority(&self, priority: u8) -> u8 {
+    /// The PFC class of the flow's receiver feedback: a DCQCN flow's CNP class, a RoCE queue
+    /// pair's CNP, ACK and NACK class, else `priority`.
+    fn feedback_priority(&self, priority: u8, roce_keys: &[RoceTrafficKey]) -> u8 {
         match self.kind {
             TrafficKind::Dcqcn(dcqcn) => dcqcn.cnp_priority,
+            TrafficKind::Roce(ordinal) => roce_key(roce_keys, ordinal).dcqcn.cnp_priority,
             TrafficKind::Constant | TrafficKind::Tcp(_) => priority,
         }
     }
+}
+
+/// The RoCE key a lowered `TrafficKind::Roce` ordinal names.
+fn roce_key(roce_keys: &[RoceTrafficKey], ordinal: u64) -> RoceTrafficKey {
+    roce_keys[usize::try_from(ordinal).expect("RoCE key ordinals index the key table")]
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -401,7 +443,7 @@ pub fn fat_tree_ecmp_explicit_flow_hash(
         },
         duplicate_ordinal,
     };
-    generator_seed(seed ^ 0x4543_4d50_5f48_4153, &key, &[])
+    generator_seed(seed ^ 0x4543_4d50_5f48_4153, &key, &[], &[])
 }
 
 /// Selects the compiler-identical fat-tree ECMP hash for one flow-set member.
@@ -429,7 +471,7 @@ pub fn fat_tree_ecmp_flow_set_member_hash(
         source,
         target,
     };
-    generator_seed(seed ^ 0x4543_4d50_5f48_4153, &key, &[])
+    generator_seed(seed ^ 0x4543_4d50_5f48_4153, &key, &[], &[])
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -630,6 +672,44 @@ struct SupportedModel {
     flow_sets: Vec<FlowSetKey>,
     collectives: Vec<CollectiveKey>,
     computes: Vec<ComputeKey>,
+    /// The scenario's distinct RoCE keys, sorted; `TrafficKind::Roce` holds an index into it.
+    roce_keys: Vec<RoceTrafficKey>,
+}
+
+/// Sorts the RoCE keys recorded in parse order, removes duplicates, and rewrites every flow's
+/// parse-order ordinal to its key's rank, so ordinals order exactly as the keys do.
+fn canonical_roce_keys(
+    recorded: Vec<RoceTrafficKey>,
+    explicit_flows: &mut [ExplicitFlowKey],
+    flow_sets: &mut [FlowSetKey],
+) -> Vec<RoceTrafficKey> {
+    if recorded.is_empty() {
+        return recorded;
+    }
+    let mut sorted = recorded.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let rank = recorded
+        .iter()
+        .map(|key| {
+            u64::try_from(
+                sorted
+                    .binary_search(key)
+                    .expect("every recorded key is in the sorted table"),
+            )
+            .expect("key count fits u64")
+        })
+        .collect::<Vec<_>>();
+    let traffic = explicit_flows
+        .iter_mut()
+        .map(|flow| &mut flow.traffic)
+        .chain(flow_sets.iter_mut().map(|set| &mut set.traffic));
+    for traffic in traffic {
+        if let TrafficKind::Roce(ordinal) = &mut traffic.kind {
+            *ordinal = rank[usize::try_from(*ordinal).expect("parse ordinals index the record")];
+        }
+    }
+    sorted
 }
 
 /// How lowering stamps `LinkDescriptor::propagation_ns`.
@@ -863,18 +943,22 @@ impl SupportedModel {
                     .to_owned(),
             ));
         }
-        let explicit_flows = source
+        // RoCE keys are recorded in parse order and then replaced by their rank among the sorted
+        // distinct keys, so lowered flow identity depends only on the scenario's content.
+        let mut roce_keys = Vec::new();
+        let mut explicit_flows = source
             .flow
             .unwrap_or_default()
             .into_iter()
-            .map(|flow| validate_explicit_flow(flow, scenario_text))
+            .map(|flow| validate_explicit_flow(flow, scenario_text, &mut roce_keys))
             .collect::<Result<Vec<_>, _>>()?;
-        let flow_sets = source
+        let mut flow_sets = source
             .flow_set
             .unwrap_or_default()
             .into_iter()
-            .map(|flow_set| validate_flow_set(flow_set, scenario_text))
+            .map(|flow_set| validate_flow_set(flow_set, scenario_text, &mut roce_keys))
             .collect::<Result<Vec<_>, _>>()?;
+        let roce_keys = canonical_roce_keys(roce_keys, &mut explicit_flows, &mut flow_sets);
         let mut collectives = source
             .collective
             .unwrap_or_default()
@@ -932,6 +1016,7 @@ impl SupportedModel {
             flow_sets,
             collectives,
             computes,
+            roce_keys,
         })
     }
 }
@@ -995,8 +1080,9 @@ fn validate_flow_type(flow_type: &str) -> Result<SourceFlowKind, CompileError> {
         "PacketDistribution" => Ok(SourceFlowKind::PacketDistribution),
         "TCP" => Ok(SourceFlowKind::Tcp),
         "DCQCN" => Ok(SourceFlowKind::Dcqcn),
+        "RoCE" => Ok(SourceFlowKind::Roce),
         _ => Err(CompileError::Unsupported(format!(
-            "unsupported flow type `{flow_type}`; Days executor supports PacketDistribution, exact TCP Reno/CUBIC, and exact DCQCN traffic"
+            "unsupported flow type `{flow_type}`; Days executor supports PacketDistribution, exact TCP Reno/CUBIC, exact DCQCN, and RoCE queue-pair traffic"
         ))),
     }
 }
@@ -1040,6 +1126,7 @@ fn reject_flow_options(
 fn validate_explicit_flow(
     flow: SourceFlow,
     scenario_text: &str,
+    roce_keys: &mut Vec<RoceTrafficKey>,
 ) -> Result<ExplicitFlowKey, CompileError> {
     let flow_kind = validate_flow_type(&flow.flow_type)?;
     reject_flow_options(
@@ -1063,7 +1150,7 @@ fn validate_explicit_flow(
         )));
     }
     let priority = flow.priority.unwrap_or(0);
-    let traffic = validate_traffic(flow.traffic, flow_kind, priority, scenario_text)?;
+    let traffic = validate_traffic(flow.traffic, flow_kind, priority, scenario_text, roce_keys)?;
     Ok(ExplicitFlowKey {
         source,
         target,
@@ -1075,6 +1162,7 @@ fn validate_explicit_flow(
 fn validate_flow_set(
     flow_set: SourceFlowSet,
     scenario_text: &str,
+    roce_keys: &mut Vec<RoceTrafficKey>,
 ) -> Result<FlowSetKey, CompileError> {
     let flow_kind = validate_flow_type(&flow_set.flow_type)?;
     reject_flow_options(
@@ -1086,7 +1174,13 @@ fn validate_flow_set(
         None,
     )?;
     let priority = flow_set.priority.unwrap_or(0);
-    let traffic = validate_traffic(flow_set.traffic, flow_kind, priority, scenario_text)?;
+    let traffic = validate_traffic(
+        flow_set.traffic,
+        flow_kind,
+        priority,
+        scenario_text,
+        roce_keys,
+    )?;
     Ok(FlowSetKey {
         flow_count: flow_set.flow_count,
         priority,
@@ -1204,7 +1298,14 @@ fn collective_key(
             }
         }
     }
-    let traffic = validate_traffic(traffic, flow_kind, priority.unwrap_or(0), scenario_text)?;
+    // Collective transports are TCP only, so no RoCE key is ever recorded here.
+    let traffic = validate_traffic(
+        traffic,
+        flow_kind,
+        priority.unwrap_or(0),
+        scenario_text,
+        &mut Vec::new(),
+    )?;
     let Termination::Bytes(total_bytes) = traffic.termination else {
         return Err(CompileError::Unsupported(
             "unsupported duration-terminated collective traffic; T26 collectives require an exact byte size"
@@ -1325,6 +1426,105 @@ fn validate_collective_set(
     Ok(result)
 }
 
+/// Parses and validates a `[flow.traffic.dcqcn]` table: the controller and pacer of a DCQCN flow
+/// or a RoCE queue pair. `priority` is the flow's class, the default of its feedback (CNP) class.
+fn dcqcn_traffic_key(
+    dcqcn: &SourceDcqcn,
+    priority: u8,
+    scenario_text: &str,
+) -> Result<DcqcnTrafficKey, CompileError> {
+    let key = DcqcnTrafficKey {
+        initial_rate_bps: scaled_decimal(
+            scenario_text,
+            &dcqcn.rate_gbps,
+            1_000_000_000,
+            "DCQCN rate",
+        )?,
+        minimum_rate_bps: scaled_decimal(
+            scenario_text,
+            &dcqcn.min_rate_gbps,
+            1_000_000_000,
+            "DCQCN minimum rate",
+        )?,
+        maximum_rate_bps: scaled_decimal(
+            scenario_text,
+            &dcqcn.max_rate_gbps,
+            1_000_000_000,
+            "DCQCN maximum rate",
+        )?,
+        additive_rate_bps: scaled_decimal(
+            scenario_text,
+            &dcqcn.ai_rate_gbps,
+            1_000_000_000,
+            "DCQCN additive rate",
+        )?,
+        hyper_rate_bps: scaled_decimal(
+            scenario_text,
+            &dcqcn.hai_rate_gbps,
+            1_000_000_000,
+            "DCQCN hyper rate",
+        )?,
+        g_ppb: scaled_decimal(scenario_text, &dcqcn.g, 1_000_000_000, "DCQCN g ppb")?,
+        decrease_ppb: scaled_decimal(
+            scenario_text,
+            &dcqcn.mi_factor,
+            1_000_000_000,
+            "DCQCN decrease ppb",
+        )?,
+        cnp_interval_ns: optional_scaled_decimal(
+            scenario_text,
+            dcqcn.cnp_interval_ns.as_ref(),
+            "50000",
+            1,
+            "DCQCN CNP interval ns",
+        )?,
+        control_interval_ns: optional_scaled_decimal(
+            scenario_text,
+            dcqcn.rtt_ns.as_ref(),
+            "100000",
+            1,
+            "DCQCN control interval ns",
+        )?,
+        pacing_interval_ns: optional_scaled_decimal(
+            scenario_text,
+            dcqcn.pacing_interval_ns.as_ref(),
+            "1000",
+            1,
+            "DCQCN pacing interval ns",
+        )?,
+        // The flow's feedback priority (P15 ruling D6): CNPs ride the data class unless
+        // the flow names another. Before P15 the default was 0 and any other value had to
+        // equal the flow priority, so every config accepted then keeps its key.
+        cnp_priority: dcqcn.cnp_priority.unwrap_or(priority),
+        increase_byte_threshold: dcqcn.increase_byte_threshold.unwrap_or(10_000_000),
+    };
+    if key.pacing_interval_ns == 0 {
+        return Err(CompileError::Invalid(
+            "DCQCN pacing interval must be positive".to_owned(),
+        ));
+    }
+    if key.cnp_priority > 7 {
+        return Err(CompileError::Invalid(
+            "DCQCN CNP priority must be in IEEE 802.1Q range 0..=7".to_owned(),
+        ));
+    }
+    DcqcnControllerConfig {
+        initial_rate_bps: key.initial_rate_bps,
+        minimum_rate_bps: key.minimum_rate_bps,
+        maximum_rate_bps: key.maximum_rate_bps,
+        additive_rate_bps: key.additive_rate_bps,
+        hyper_rate_bps: key.hyper_rate_bps,
+        g_ppb: key.g_ppb,
+        decrease_ppb: key.decrease_ppb,
+        cnp_interval_ns: key.cnp_interval_ns,
+        control_interval_ns: key.control_interval_ns,
+        increase_byte_threshold: key.increase_byte_threshold,
+    }
+    .validate()
+    .map_err(|error| CompileError::Invalid(error.to_string()))?;
+    Ok(key)
+}
+
 /// Validates one flow's traffic options. `priority` is the flow's IEEE 802.1Q class, the default
 /// of its receiver feedback class.
 fn validate_traffic(
@@ -1332,8 +1532,15 @@ fn validate_traffic(
     flow_kind: SourceFlowKind,
     priority: u8,
     scenario_text: &str,
+    roce_keys: &mut Vec<RoceTrafficKey>,
 ) -> Result<TrafficKey, CompileError> {
     let packet_size_bytes = constant_packet_size_bytes(&traffic.pkt_size_dist, scenario_text)?;
+    if traffic.roce.is_some() && !matches!(flow_kind, SourceFlowKind::Roce | SourceFlowKind::Dcqcn)
+    {
+        return Err(CompileError::Unsupported(
+            "unsupported RoCE options on non-RoCE traffic; use `flow_type = \"RoCE\"`".to_owned(),
+        ));
+    }
     let (kind, interval_ns, termination) = match flow_kind {
         SourceFlowKind::PacketDistribution => {
             if traffic.dcqcn.is_some() {
@@ -1435,6 +1642,12 @@ fn validate_traffic(
                     "unsupported TCP options on DCQCN traffic".to_owned(),
                 ));
             }
+            if traffic.roce.is_some() {
+                return Err(CompileError::Unsupported(
+                    "unsupported RoCE options on DCQCN traffic; use `flow_type = \"RoCE\"`"
+                        .to_owned(),
+                ));
+            }
             let dcqcn = traffic.dcqcn.ok_or_else(|| {
                 CompileError::Invalid(
                     "DCQCN traffic must provide `[flow.traffic.dcqcn]` or `[flow_set.traffic.dcqcn]`"
@@ -1452,98 +1665,99 @@ fn validate_traffic(
                     "DCQCN traffic `size` must be positive".to_owned(),
                 ));
             }
-            let key = DcqcnTrafficKey {
-                initial_rate_bps: scaled_decimal(
-                    scenario_text,
-                    &dcqcn.rate_gbps,
-                    1_000_000_000,
-                    "DCQCN rate",
-                )?,
-                minimum_rate_bps: scaled_decimal(
-                    scenario_text,
-                    &dcqcn.min_rate_gbps,
-                    1_000_000_000,
-                    "DCQCN minimum rate",
-                )?,
-                maximum_rate_bps: scaled_decimal(
-                    scenario_text,
-                    &dcqcn.max_rate_gbps,
-                    1_000_000_000,
-                    "DCQCN maximum rate",
-                )?,
-                additive_rate_bps: scaled_decimal(
-                    scenario_text,
-                    &dcqcn.ai_rate_gbps,
-                    1_000_000_000,
-                    "DCQCN additive rate",
-                )?,
-                hyper_rate_bps: scaled_decimal(
-                    scenario_text,
-                    &dcqcn.hai_rate_gbps,
-                    1_000_000_000,
-                    "DCQCN hyper rate",
-                )?,
-                g_ppb: scaled_decimal(scenario_text, &dcqcn.g, 1_000_000_000, "DCQCN g ppb")?,
-                decrease_ppb: scaled_decimal(
-                    scenario_text,
-                    &dcqcn.mi_factor,
-                    1_000_000_000,
-                    "DCQCN decrease ppb",
-                )?,
-                cnp_interval_ns: optional_scaled_decimal(
-                    scenario_text,
-                    dcqcn.cnp_interval_ns.as_ref(),
-                    "50000",
-                    1,
-                    "DCQCN CNP interval ns",
-                )?,
-                control_interval_ns: optional_scaled_decimal(
-                    scenario_text,
-                    dcqcn.rtt_ns.as_ref(),
-                    "100000",
-                    1,
-                    "DCQCN control interval ns",
-                )?,
-                pacing_interval_ns: optional_scaled_decimal(
-                    scenario_text,
-                    dcqcn.pacing_interval_ns.as_ref(),
-                    "1000",
-                    1,
-                    "DCQCN pacing interval ns",
-                )?,
-                // The flow's feedback priority (P15 ruling D6): CNPs ride the data class unless
-                // the flow names another. Before P15 the default was 0 and any other value had to
-                // equal the flow priority, so every config accepted then keeps its key.
-                cnp_priority: dcqcn.cnp_priority.unwrap_or(priority),
-                increase_byte_threshold: dcqcn.increase_byte_threshold.unwrap_or(10_000_000),
-            };
-            if key.pacing_interval_ns == 0 {
-                return Err(CompileError::Invalid(
-                    "DCQCN pacing interval must be positive".to_owned(),
-                ));
-            }
-            if key.cnp_priority > 7 {
-                return Err(CompileError::Invalid(
-                    "DCQCN CNP priority must be in IEEE 802.1Q range 0..=7".to_owned(),
-                ));
-            }
-            DcqcnControllerConfig {
-                initial_rate_bps: key.initial_rate_bps,
-                minimum_rate_bps: key.minimum_rate_bps,
-                maximum_rate_bps: key.maximum_rate_bps,
-                additive_rate_bps: key.additive_rate_bps,
-                hyper_rate_bps: key.hyper_rate_bps,
-                g_ppb: key.g_ppb,
-                decrease_ppb: key.decrease_ppb,
-                cnp_interval_ns: key.cnp_interval_ns,
-                control_interval_ns: key.control_interval_ns,
-                increase_byte_threshold: key.increase_byte_threshold,
-            }
-            .validate()
-            .map_err(|error| CompileError::Invalid(error.to_string()))?;
+            let key = dcqcn_traffic_key(&dcqcn, priority, scenario_text)?;
             (
                 TrafficKind::Dcqcn(key),
                 key.pacing_interval_ns,
+                Termination::Bytes(size),
+            )
+        }
+        SourceFlowKind::Roce => {
+            if traffic.tcp.is_some() {
+                return Err(CompileError::Unsupported(
+                    "unsupported TCP options on RoCE traffic".to_owned(),
+                ));
+            }
+            let dcqcn = traffic.dcqcn.ok_or_else(|| {
+                CompileError::Invalid(
+                    "RoCE traffic must provide `[flow.traffic.dcqcn]` or `[flow_set.traffic.dcqcn]` for its controller"
+                        .to_owned(),
+                )
+            })?;
+            if dcqcn.cnp_priority.is_some() {
+                return Err(CompileError::Unsupported(
+                    "unsupported `cnp_priority` on RoCE traffic; set the CNP, ACK and NACK class with `[flow.traffic.roce] feedback_priority`"
+                        .to_owned(),
+                ));
+            }
+            let roce = traffic.roce.ok_or_else(|| {
+                CompileError::Invalid(
+                    "RoCE traffic must provide `[flow.traffic.roce]` or `[flow_set.traffic.roce]` with `retransmit_timeout_ns`"
+                        .to_owned(),
+                )
+            })?;
+            let size = traffic.size.ok_or_else(|| {
+                CompileError::Unsupported(
+                    "unsupported duration-terminated RoCE traffic; the executor requires an exact byte `size`"
+                        .to_owned(),
+                )
+            })?;
+            if size == 0 {
+                return Err(CompileError::Invalid(
+                    "RoCE traffic `size` must be positive".to_owned(),
+                ));
+            }
+            let feedback_priority = roce.feedback_priority.unwrap_or(priority);
+            if feedback_priority > 7 {
+                return Err(CompileError::Invalid(
+                    "RoCE `feedback_priority` must be in IEEE 802.1Q range 0..=7".to_owned(),
+                ));
+            }
+            let mut controller = dcqcn_traffic_key(&dcqcn, priority, scenario_text)?;
+            controller.cnp_priority = feedback_priority;
+            let retransmit_timeout_ns = roce.retransmit_timeout_ns.ok_or_else(|| {
+                CompileError::Invalid(
+                    "RoCE traffic must set `retransmit_timeout_ns`: a fixed timeout, or 0 for none (with no timeout a lost last packet stalls the queue pair for the rest of the run)"
+                        .to_owned(),
+                )
+            })?;
+            let ack_every_packets = roce.ack_every_packets.unwrap_or(1);
+            if ack_every_packets == 0 {
+                return Err(CompileError::Invalid(
+                    "RoCE `ack_every_packets` must be positive".to_owned(),
+                ));
+            }
+            let ack_size_bytes = roce.ack_size_bytes.unwrap_or(64);
+            if ack_size_bytes == 0 {
+                return Err(CompileError::Invalid(
+                    "RoCE `ack_size_bytes` must be positive".to_owned(),
+                ));
+            }
+            let duplicate_ack = roce.duplicate_ack.unwrap_or(true);
+            if !duplicate_ack && retransmit_timeout_ns != 0 {
+                return Err(CompileError::Unsupported(
+                    "unsupported `duplicate_ack = false` with a retransmission timeout: a lost final ACK would never be repaired; it is allowed only with `retransmit_timeout_ns = 0`"
+                        .to_owned(),
+                ));
+            }
+            let key = RoceTrafficKey {
+                dcqcn: controller,
+                retransmit_timeout_ns,
+                ack_every_packets,
+                nack_interval_ns: roce.nack_interval_ns.unwrap_or(500_000),
+                duplicate_ack,
+                ack_size_bytes,
+            };
+            let ordinal = roce_keys
+                .iter()
+                .position(|existing| *existing == key)
+                .unwrap_or_else(|| {
+                    roce_keys.push(key);
+                    roce_keys.len() - 1
+                });
+            (
+                TrafficKind::Roce(u64::try_from(ordinal).expect("key count fits u64")),
+                controller.pacing_interval_ns,
                 Termination::Bytes(size),
             )
         }
@@ -2158,6 +2372,7 @@ fn lower(
     route_workers: RouteWorkers,
 ) -> Result<SimulationImage, CompileError> {
     let link_delay = link_delay_model(model.propagation, profile)?;
+    let roce_keys = model.roce_keys.clone();
     let switch_topology_ids = graph
         .node_indices()
         .map(|node| u64::try_from(node.index()))
@@ -2294,6 +2509,7 @@ fn lower(
                     model.seed ^ 0x4543_4d50_5f48_4153,
                     &flow.key,
                     &collective_table,
+                    &roce_keys,
                 ),
             }),
         ),
@@ -2337,7 +2553,7 @@ fn lower(
                 source: ids.node(LpKey::Host(flow.source)),
                 target: ids.node(LpKey::Host(flow.target)),
                 priority: flow.priority,
-                feedback_priority: flow.traffic.feedback_priority(flow.priority),
+                feedback_priority: flow.traffic.feedback_priority(flow.priority, &roce_keys),
                 route: image_route(flow.source, flow.target, switch_path, &ids),
                 reverse_route: image_route(flow.target, flow.source, &reverse_switch_path, &ids),
             }
@@ -2429,7 +2645,7 @@ fn lower(
                     packets_emitted: 0,
                     bytes_emitted: 0,
                     next_emission,
-                    rng_state: generator_seed(model.seed, &flow.key, &collective_table),
+                    rng_state: generator_seed(model.seed, &flow.key, &collective_table, &roce_keys),
                     feedback: GeneratorFeedbackState {
                         arrivals: 0,
                         outstanding_bytes: 0,
@@ -2464,6 +2680,15 @@ fn lower(
         }
         let emission_count = packet_count(&flow.traffic);
         let mut dcqcn_control_payload = None;
+        // A RoCE queue pair's full key, and the DCQCN controller key of a DCQCN flow or pair.
+        let roce = match flow.traffic.kind {
+            TrafficKind::Roce(ordinal) => Some(roce_key(&roce_keys, ordinal)),
+            _ => None,
+        };
+        let controller_key = match flow.traffic.kind {
+            TrafficKind::Dcqcn(config) => Some(config),
+            _ => roce.map(|roce| roce.dcqcn),
+        };
         let collective_ready = flow.collective.as_ref().is_none_or(|stage| {
             stage.local_predecessor_complete && stage.inbound_predecessor_complete
         });
@@ -2491,6 +2716,9 @@ fn lower(
                 CompileError::Invalid(format!("initial payload sequence overflow at {source:?}"))
             })?;
             let initial_size_bytes = match (flow.traffic.kind, &flow.traffic.termination) {
+                // A queue pair's first payload is its zero-byte pacing token: its data packets
+                // are created when the pacer sends them.
+                (TrafficKind::Roce(_), _) => 0,
                 (TrafficKind::Tcp(_) | TrafficKind::Dcqcn(_), Termination::Bytes(total_bytes)) => {
                     flow.traffic.packet_size_bytes.min(*total_bytes)
                 }
@@ -2504,6 +2732,7 @@ fn lower(
                     retransmission: false,
                 }),
                 TrafficKind::Dcqcn(_) => PacketKind::Data,
+                TrafficKind::Roce(_) => PacketKind::RocePacingTimer,
             };
             initial_packets.push(PacketDescriptor {
                 id: payload,
@@ -2517,13 +2746,16 @@ fn lower(
                 flow.traffic.initial_delay_ns,
                 descriptor.id,
                 payload,
-                if matches!(flow.traffic.kind, TrafficKind::Dcqcn(_)) {
+                if matches!(
+                    flow.traffic.kind,
+                    TrafficKind::Dcqcn(_) | TrafficKind::Roce(_)
+                ) {
                     EventKind::PacingTimer
                 } else {
                     EventKind::PacketArrival
                 },
             ));
-            if let TrafficKind::Dcqcn(config) = flow.traffic.kind {
+            if let Some(config) = controller_key {
                 let control_time_ns = flow
                     .traffic
                     .initial_delay_ns
@@ -2564,7 +2796,22 @@ fn lower(
                 dcqcn_control_payload = Some(control_payload);
             }
             ScheduledEmission {
-                status: GeneratorStatus::Scheduled,
+                status: match (roce, &flow.traffic.termination) {
+                    // A queue pair's status predicts its first tick: it sends iff one tick of
+                    // credit covers the first packet.
+                    (Some(roce), Termination::Bytes(total_bytes)) => {
+                        let first_packet = flow.traffic.packet_size_bytes.min(*total_bytes);
+                        let tick_credit = u128::from(roce.dcqcn.initial_rate_bps)
+                            * u128::from(roce.dcqcn.pacing_interval_ns);
+                        let cost = u128::from(first_packet) * 8 * 1_000_000_000;
+                        if tick_credit >= cost {
+                            GeneratorStatus::Scheduled
+                        } else {
+                            GeneratorStatus::Blocked
+                        }
+                    }
+                    _ => GeneratorStatus::Scheduled,
+                },
                 departure_time_ns: flow.traffic.initial_delay_ns,
                 payload,
             }
@@ -2605,7 +2852,7 @@ fn lower(
                 packets_emitted: 0,
                 bytes_emitted: 0,
                 next_emission,
-                rng_state: generator_seed(model.seed, &flow.key, &collective_table),
+                rng_state: generator_seed(model.seed, &flow.key, &collective_table, &roce_keys),
                 feedback: GeneratorFeedbackState {
                     arrivals: 0,
                     outstanding_bytes: 0,
@@ -2647,27 +2894,8 @@ fn lower(
                             let Termination::Bytes(total_bytes) = flow.traffic.termination else {
                                 unreachable!("DCQCN validation requires byte termination")
                             };
-                            let first_control_time_ns = flow
-                                .traffic
-                                .initial_delay_ns
-                                .checked_add(config.control_interval_ns)
-                                .expect("DCQCN lowering checked first control deadline");
-                            let controller = DcqcnController::new(
-                                DcqcnControllerConfig {
-                                    initial_rate_bps: config.initial_rate_bps,
-                                    minimum_rate_bps: config.minimum_rate_bps,
-                                    maximum_rate_bps: config.maximum_rate_bps,
-                                    additive_rate_bps: config.additive_rate_bps,
-                                    hyper_rate_bps: config.hyper_rate_bps,
-                                    g_ppb: config.g_ppb,
-                                    decrease_ppb: config.decrease_ppb,
-                                    cnp_interval_ns: config.cnp_interval_ns,
-                                    control_interval_ns: config.control_interval_ns,
-                                    increase_byte_threshold: config.increase_byte_threshold,
-                                },
-                                first_control_time_ns,
-                            )
-                            .expect("validated DCQCN controller configuration");
+                            let controller =
+                                lowered_dcqcn_controller(config, flow.traffic.initial_delay_ns);
                             FlowGeneratorKind::Dcqcn(DcqcnGenerator {
                                 rate: RateGenerator {
                                     first_pacing_time_ns: flow.traffic.initial_delay_ns,
@@ -2682,6 +2910,33 @@ fn lower(
                                 control_timer_payload: dcqcn_control_payload
                                     .expect("nonempty DCQCN lowering allocates a control token"),
                                 cnp_size_bytes: 64,
+                            })
+                        }
+                        TrafficKind::Roce(_) => {
+                            let roce = roce.expect("a RoCE flow carries its key");
+                            let Termination::Bytes(total_bytes) = flow.traffic.termination else {
+                                unreachable!("RoCE validation requires byte termination")
+                            };
+                            FlowGeneratorKind::Roce(RoceGenerator {
+                                pacer: RocePacer {
+                                    first_pacing_time_ns: flow.traffic.initial_delay_ns,
+                                    pacing_interval_ns: roce.dcqcn.pacing_interval_ns,
+                                    mtu_bytes: flow.traffic.packet_size_bytes,
+                                    total_bytes,
+                                    credit_quanta: 0,
+                                },
+                                controller: lowered_dcqcn_controller(
+                                    roce.dcqcn,
+                                    flow.traffic.initial_delay_ns,
+                                ),
+                                control_timer_payload: dcqcn_control_payload
+                                    .expect("nonempty RoCE lowering allocates a control token"),
+                                pacing_timer_payload: next_emission.payload,
+                                next_psn: 0,
+                                snd_una: 0,
+                                rto_deadline_ns: 0,
+                                rto_ns: roce.retransmit_timeout_ns,
+                                pacer_armed: true,
                             })
                         }
                     }
@@ -2727,7 +2982,33 @@ fn lower(
 
     let mut tcp_receivers_by_target = BTreeMap::<LpKey, Vec<TcpReceiverState>>::new();
     let mut dcqcn_receivers_by_target = BTreeMap::<LpKey, Vec<DcqcnReceiverState>>::new();
+    let mut roce_receivers_by_target = BTreeMap::<LpKey, Vec<RoceReceiverState>>::new();
     for (flow, descriptor) in flows.iter().zip(&flow_descriptors) {
+        if let TrafficKind::Roce(ordinal) = flow.traffic.kind {
+            let roce = roce_key(&roce_keys, ordinal);
+            let Termination::Bytes(total_bytes) = flow.traffic.termination else {
+                unreachable!("RoCE validation requires byte termination")
+            };
+            roce_receivers_by_target
+                .entry(LpKey::Host(flow.target))
+                .or_default()
+                .push(RoceReceiverState {
+                    np: DcqcnReceiverState {
+                        flow: descriptor.id,
+                        cnp_interval_ns: roce.dcqcn.cnp_interval_ns,
+                        cnp_size_bytes: 64,
+                        last_cnp_time_ns: None,
+                    },
+                    total_bytes,
+                    expected_psn: 0,
+                    ack_every_packets: roce.ack_every_packets,
+                    packets_since_ack: 0,
+                    ack_size_bytes: roce.ack_size_bytes,
+                    nack_interval_ns: roce.nack_interval_ns,
+                    last_nack: None,
+                    duplicate_ack: roce.duplicate_ack,
+                });
+        }
         if matches!(flow.traffic.kind, TrafficKind::Tcp(_)) {
             tcp_receivers_by_target
                 .entry(LpKey::Host(flow.target))
@@ -2771,7 +3052,10 @@ fn lower(
                 dcqcn_receivers: dcqcn_receivers_by_target
                     .remove(&node_key)
                     .unwrap_or_default(),
-                roce_receivers: None,
+                // One allocation on a host that receives queue pairs, none elsewhere.
+                roce_receivers: roce_receivers_by_target
+                    .remove(&node_key)
+                    .map(Vec::into_boxed_slice),
                 next_origin_seq: origin_sequences.get(&node_key).copied().unwrap_or(0),
                 next_payload_seq: payload_sequences.get(&node_key).copied().unwrap_or(0),
                 sourced_packets: 0,
@@ -2821,15 +3105,22 @@ fn lower(
         if packet_count(&input.traffic) == 0 {
             continue;
         }
-        let data_min_size = if matches!(
-            input.traffic.kind,
-            TrafficKind::Tcp(_) | TrafficKind::Dcqcn(_)
-        ) {
+        let data_min_size = match input.traffic.kind {
             // Both controllers may fill the exact remaining congestion-window bytes, so even a
             // byte-aligned total/MSS pair can legally produce a one-byte intermediate segment.
-            1
-        } else {
-            input.traffic.packet_size_bytes
+            TrafficKind::Tcp(_) | TrafficKind::Dcqcn(_) => 1,
+            // A queue pair's packets are a full MTU or the short last one, retransmissions
+            // included, so its channels keep the exact bound.
+            TrafficKind::Roce(_) => {
+                let Termination::Bytes(total_bytes) = input.traffic.termination else {
+                    unreachable!("RoCE validation requires byte termination")
+                };
+                match total_bytes % input.traffic.packet_size_bytes {
+                    0 => input.traffic.packet_size_bytes,
+                    tail => tail,
+                }
+            }
+            TrafficKind::Constant => input.traffic.packet_size_bytes,
         };
         let mut routed_packets = vec![(flow.route.as_slice(), flow.target, data_min_size, "data")];
         if matches!(input.traffic.kind, TrafficKind::Tcp(_)) {
@@ -2837,6 +3128,15 @@ fn lower(
         }
         if matches!(input.traffic.kind, TrafficKind::Dcqcn(_)) {
             routed_packets.push((flow.reverse_route.as_slice(), flow.source, 64, "CNP"));
+        }
+        if let TrafficKind::Roce(ordinal) = input.traffic.kind {
+            let ack_size_bytes = roce_key(&roce_keys, ordinal).ack_size_bytes;
+            routed_packets.push((
+                flow.reverse_route.as_slice(),
+                flow.source,
+                ack_size_bytes.min(64),
+                "ACK, NACK or CNP",
+            ));
         }
         for (route, terminal, packet_size_bytes, direction) in routed_packets {
             for (index, link_id) in route.iter().enumerate() {
@@ -2894,18 +3194,18 @@ fn lower(
                 }
             }
             let feedback_priority = usize::from(descriptor.feedback_priority);
-            if pfc.xoff[feedback_priority] != 0
-                && matches!(
-                    input.traffic.kind,
-                    TrafficKind::Tcp(_) | TrafficKind::Dcqcn(_)
-                )
+            // A TCP ACK, a DCQCN CNP, or a RoCE ACK, NACK or CNP, at its largest.
+            let feedback_size = match input.traffic.kind {
+                TrafficKind::Tcp(_) => Some(40),
+                TrafficKind::Dcqcn(_) => Some(64),
+                TrafficKind::Roce(ordinal) => {
+                    Some(roce_key(&roce_keys, ordinal).ack_size_bytes.max(64))
+                }
+                TrafficKind::Constant => None,
+            };
+            if let Some(feedback_size) = feedback_size.filter(|_| pfc.xoff[feedback_priority] != 0)
             {
                 for link_id in &descriptor.reverse_route {
-                    let feedback_size = if matches!(input.traffic.kind, TrafficKind::Tcp(_)) {
-                        40
-                    } else {
-                        64
-                    };
                     max_frame_by_link_priority
                         .entry((*link_id, feedback_priority))
                         .and_modify(|maximum| *maximum = (*maximum).max(feedback_size))
@@ -2924,7 +3224,7 @@ fn lower(
             }
             if matches!(
                 input.traffic.kind,
-                TrafficKind::Tcp(_) | TrafficKind::Dcqcn(_)
+                TrafficKind::Tcp(_) | TrafficKind::Dcqcn(_) | TrafficKind::Roce(_)
             ) {
                 for pair in descriptor.reverse_route.windows(2) {
                     let controlled = links[pair[0].0 as usize];
@@ -3691,8 +3991,35 @@ fn validate_input_bounds(flows: &[FlowInput]) -> Result<(), CompileError> {
     Ok(())
 }
 
+/// The exact DCQCN reaction point of a DCQCN flow or RoCE queue pair whose pacing starts at
+/// `initial_delay_ns`; its first control tick is one control interval later.
+fn lowered_dcqcn_controller(config: DcqcnTrafficKey, initial_delay_ns: u64) -> DcqcnController {
+    let first_control_time_ns = initial_delay_ns
+        .checked_add(config.control_interval_ns)
+        .expect("DCQCN lowering checked first control deadline");
+    DcqcnController::new(
+        DcqcnControllerConfig {
+            initial_rate_bps: config.initial_rate_bps,
+            minimum_rate_bps: config.minimum_rate_bps,
+            maximum_rate_bps: config.maximum_rate_bps,
+            additive_rate_bps: config.additive_rate_bps,
+            hyper_rate_bps: config.hyper_rate_bps,
+            g_ppb: config.g_ppb,
+            decrease_ppb: config.decrease_ppb,
+            cnp_interval_ns: config.cnp_interval_ns,
+            control_interval_ns: config.control_interval_ns,
+            increase_byte_threshold: config.increase_byte_threshold,
+        },
+        first_control_time_ns,
+    )
+    .expect("validated DCQCN controller configuration")
+}
+
 fn packet_count(traffic: &TrafficKey) -> u64 {
-    if matches!(traffic.kind, TrafficKind::Tcp(_) | TrafficKind::Dcqcn(_)) {
+    if matches!(
+        traffic.kind,
+        TrafficKind::Tcp(_) | TrafficKind::Dcqcn(_) | TrafficKind::Roce(_)
+    ) {
         let Termination::Bytes(bytes) = traffic.termination else {
             unreachable!("closed-loop validation requires byte termination")
         };
@@ -3722,7 +4049,12 @@ fn allocate_payload_id(
 }
 
 /// `collectives` is the table a `FlowKey::CollectiveStage` indexes; other keys never read it.
-fn generator_seed(image_seed: u64, key: &FlowKey, collectives: &[CollectiveKey]) -> u64 {
+fn generator_seed(
+    image_seed: u64,
+    key: &FlowKey,
+    collectives: &[CollectiveKey],
+    roce_keys: &[RoceTrafficKey],
+) -> u64 {
     let mut state = mix_seed(image_seed ^ 0x6a09_e667_f3bc_c909);
     match key {
         FlowKey::Explicit {
@@ -3735,7 +4067,7 @@ fn generator_seed(image_seed: u64, key: &FlowKey, collectives: &[CollectiveKey])
             if semantic.priority != 0 {
                 state = mix_seed(state ^ u64::from(semantic.priority));
             }
-            state = mix_traffic_seed(state, &semantic.traffic);
+            state = mix_traffic_seed(state, &semantic.traffic, roce_keys);
             state = mix_seed(state ^ duplicate_ordinal);
         }
         FlowKey::SetMember {
@@ -3761,7 +4093,7 @@ fn generator_seed(image_seed: u64, key: &FlowKey, collectives: &[CollectiveKey])
                     state = mix_seed(state ^ 0x5041_4952_5f52_4143);
                 }
             }
-            state = mix_traffic_seed(state, &semantic.traffic);
+            state = mix_traffic_seed(state, &semantic.traffic, roce_keys);
             state = mix_seed(state ^ duplicate_ordinal);
             state = mix_seed(state ^ member_ordinal);
             state = mix_seed(state ^ source);
@@ -3780,7 +4112,7 @@ fn generator_seed(image_seed: u64, key: &FlowKey, collectives: &[CollectiveKey])
             state = mix_seed(state ^ u64::from(stage.phase as u8));
             state = mix_seed(state ^ u64::from(stage.rank));
             state = mix_seed(state ^ u64::from(stage.step));
-            state = mix_traffic_seed(state, &semantic.traffic);
+            state = mix_traffic_seed(state, &semantic.traffic, roce_keys);
         }
         FlowKey::ComputeStage { semantic, rank } => {
             state = mix_seed(state ^ 0x434f_4d50_5554_4500);
@@ -3795,7 +4127,7 @@ fn generator_seed(image_seed: u64, key: &FlowKey, collectives: &[CollectiveKey])
     state
 }
 
-fn mix_traffic_seed(mut state: u64, traffic: &TrafficKey) -> u64 {
+fn mix_traffic_seed(mut state: u64, traffic: &TrafficKey, roce_keys: &[RoceTrafficKey]) -> u64 {
     state = mix_seed(state ^ traffic.initial_delay_ns);
     state = mix_seed(state ^ traffic.interval_ns);
     state = mix_seed(state ^ traffic.packet_size_bytes);
@@ -3828,6 +4160,35 @@ fn mix_traffic_seed(mut state: u64, traffic: &TrafficKey) -> u64 {
                 dcqcn.pacing_interval_ns,
                 u64::from(dcqcn.cnp_priority),
                 dcqcn.increase_byte_threshold,
+            ] {
+                state = mix_seed(state ^ value);
+            }
+            state
+        }
+        // The key's content, not its ordinal, so a queue pair's seed and ECMP route do not
+        // depend on the other RoCE keys of the scenario.
+        TrafficKind::Roce(ordinal) => {
+            let roce = roce_key(roce_keys, ordinal);
+            let dcqcn = roce.dcqcn;
+            state = mix_seed(state ^ 0x524f_4345_5f51_5000);
+            for value in [
+                dcqcn.initial_rate_bps,
+                dcqcn.minimum_rate_bps,
+                dcqcn.maximum_rate_bps,
+                dcqcn.additive_rate_bps,
+                dcqcn.hyper_rate_bps,
+                dcqcn.g_ppb,
+                dcqcn.decrease_ppb,
+                dcqcn.cnp_interval_ns,
+                dcqcn.control_interval_ns,
+                dcqcn.pacing_interval_ns,
+                u64::from(dcqcn.cnp_priority),
+                dcqcn.increase_byte_threshold,
+                roce.retransmit_timeout_ns,
+                roce.ack_every_packets,
+                roce.nack_interval_ns,
+                u64::from(roce.duplicate_ack),
+                roce.ack_size_bytes,
             ] {
                 state = mix_seed(state ^ value);
             }

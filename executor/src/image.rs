@@ -891,6 +891,12 @@ impl PacketKind {
         )
     }
 
+    /// A zero-byte source-local timer token (a DCQCN or RoCE control tick, a RoCE pacing tick):
+    /// never enqueued, transmitted or delivered.
+    pub const fn is_timer_token(self) -> bool {
+        matches!(self, Self::DcqcnControlTimer | Self::RocePacingTimer)
+    }
+
     pub const fn code(self) -> u8 {
         match self {
             Self::Data => 0,

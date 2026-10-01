@@ -90,9 +90,12 @@ fn every_p15_fixture_lowers_to_queue_pairs_with_receivers_and_two_tokens() {
             );
             assert!(roce.pacer_armed, "{name}: the pacer starts armed");
             assert_eq!(roce.pacer.credit_quanta, 0);
-            assert_eq!(
-                generator.next_emission.status,
-                GeneratorStatus::Scheduled,
+            // The status predicts the first tick (validation checks the exact credit rule).
+            assert!(
+                matches!(
+                    generator.next_emission.status,
+                    GeneratorStatus::Scheduled | GeneratorStatus::Blocked
+                ),
                 "{name}"
             );
             assert_eq!(generator.next_emission.payload, roce.pacing_timer_payload);
@@ -123,10 +126,7 @@ fn every_p15_fixture_lowers_to_queue_pairs_with_receivers_and_two_tokens() {
             assert_eq!(pacing_events, 1, "{name}: one pending pacing tick");
             let receiver = receiver(&image, flow);
             assert_eq!(receiver.total_bytes, roce.pacer.total_bytes);
-            assert_eq!(
-                (receiver.expected_psn, receiver.packets_since_ack),
-                (0, 0)
-            );
+            assert_eq!((receiver.expected_psn, receiver.packets_since_ack), (0, 0));
             assert_eq!(receiver.last_nack, None);
             assert_eq!(receiver.np.last_cnp_time_ns, None);
             assert_eq!(
@@ -206,15 +206,21 @@ fn queue_pair_options_are_refused_where_they_do_not_apply() {
     let refused = |text: String, expected: &str| {
         let path = write(&directory, "refused.toml", &text);
         let error = compile_config(&path).unwrap_err().to_string();
-        assert!(error.contains(expected), "expected `{expected}` in: {error}");
+        assert!(
+            error.contains(expected),
+            "expected `{expected}` in: {error}"
+        );
     };
     refused(
         base.replace("retransmit_timeout_ns = 200000\n", ""),
         "retransmit_timeout_ns",
     );
     refused(
-        base.replacen("[flow.traffic.roce]\n", "", 1)
-            .replacen("retransmit_timeout_ns = 200000\n", "", 1),
+        base.replacen("[flow.traffic.roce]\n", "", 1).replacen(
+            "retransmit_timeout_ns = 200000\n",
+            "",
+            1,
+        ),
         "[flow.traffic.roce]",
     );
     refused(

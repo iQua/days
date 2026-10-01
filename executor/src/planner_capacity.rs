@@ -103,7 +103,7 @@ impl PlannerCapacityContext {
             let class = usize::from(!packet.kind.is_data());
             // The DCQCN control-timer token is a zero-byte source-local timer, never a packet on
             // a link, so it bounds no serialization interval.
-            if packet.kind != PacketKind::DcqcnControlTimer {
+            if !packet.kind.is_timer_token() {
                 update_minimum_packet_size(
                     &mut minimum_packet_sizes[flow][class],
                     packet.size_bytes,
@@ -638,7 +638,7 @@ fn precompute_minimum_packet_sizes(
     for packet in &image.initial_packets {
         let flow = packet.flow.0 as usize;
         let class = usize::from(!packet.kind.is_data());
-        if packet.kind != PacketKind::DcqcnControlTimer {
+        if !packet.kind.is_timer_token() {
             update_minimum_packet_size(&mut minimums[flow][class], packet.size_bytes);
         }
     }
@@ -744,7 +744,7 @@ fn legacy_minimum_packet_size(
         .filter(|packet| {
             packet.flow.0 as usize == flow
                 && packet.kind.is_data() == packet_kind.is_data()
-                && packet.kind != PacketKind::DcqcnControlTimer
+                && !packet.kind.is_timer_token()
         })
         .map(|packet| packet.size_bytes)
         .chain(

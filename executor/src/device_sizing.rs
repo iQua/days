@@ -933,10 +933,7 @@ fn flow_packet_counts(
         }
         // The zero-byte DCQCN control-timer token never enters a queue or crosses a link, and a PFC
         // frame travels on its reverse control lane, never on its flow's route.
-        if matches!(
-            packet.kind,
-            PacketKind::DcqcnControlTimer | PacketKind::Pfc(_)
-        ) {
+        if packet.kind.is_timer_token() || matches!(packet.kind, PacketKind::Pfc(_)) {
             continue;
         }
         let counts = if packet.kind.is_data() {
