@@ -128,13 +128,17 @@ Days AGO checkers:
   cadence, duplicates, and the NACK rate limit.
 - `sender` checks each pacing tick, ACK, NACK and timeout. It needs the DCQCN log of the same run,
   because the controller's rate decides the sender's status, and a CNP or control tick recomputes
-  that status without a RoCE row. It also checks that a completed queue pair's control tick is not
-  re-armed.
+  that status without a RoCE row. It also checks that every pending pacing tick, timeout and
+  control tick fires before any later event of the pair, and that a completed queue pair's control
+  tick is not re-armed.
 - `trace` runs both, then the cross-role checks. Every data arrival must be a packet the sender
   emitted. Every ACK, NACK and CNP the sender applies must have been sent earlier by the receiver.
 - `<stop_time_ns>` is the image's `stop_time_ns`. No CSV records it, and it decides whether a
-  pacer's next tick is armed or stopped. With it, each decision is checked exactly. Without it,
-  the checker requires one stop time consistent with every armed and stopped decision in the log.
+  pacer's next tick is armed or stopped. With it, each decision is checked exactly, no row may lie
+  after it, and no pending event at or before it may be left unfired at the end of the log.
+  Without it, the checker requires one stop time consistent with every armed and stopped decision
+  in the log, and checks unfired events against the latest time the log shows to be before the
+  stop.
 
 Committed Days AGO certificate fixtures can be checked directly, for example:
 
