@@ -362,8 +362,10 @@ fn scalar_anchor(name: &str) -> (u64, u64) {
     fingerprint(&result)
 }
 
-/// Frozen at authoring (`b448d08`, 2026-10-01, sim; the `days` CLI printed the same values): the
-/// anchors the device lane proves Metal and CUDA against.
+/// Frozen at authoring (`b448d08`, 2026-10-01, sim), with `roce_mixed_tcp` re-frozen at `e32bf1f`
+/// when it moved to an ACK every 4 packets: the anchors the device lane proves Metal and CUDA
+/// against. `run_identical` shows CPU at 1-4 workers equal to Scalar; the `days` CLI cross-check
+/// (Scalar and CPU at 2 workers) is `days-gpu/evidence/P15/qp-impl/sim/p15_anchors.tsv`.
 const ANCHORS: [(&str, u64, u64); 8] = [
     ("roce_lossless_pfc.toml", 45_710, 0x7e1f_a3a8_7997_030c),
     ("roce_gbn_lossy.toml", 46_238, 0x4c94_e615_e09a_e734),
