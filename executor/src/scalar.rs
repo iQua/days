@@ -3298,15 +3298,12 @@ impl<'image> TransitionState<'image> {
                 next_time_ns: generator.next_emission.departure_time_ns,
             };
 
-            let scale = u128::from(rate.rate_denominator)
-                .checked_mul(1_000_000_000)
+            let scale = pacing_credit_scale(rate.rate_denominator)
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
-            let tick_credit = u128::from(rate.rate_numerator_bits_per_second)
-                .checked_mul(u128::from(rate.pacing_interval_ns))
-                .ok_or(ExecutionError::CounterOverflow(node.id))?;
-            let packet_cost = u128::from(packet.size_bytes)
-                .checked_mul(8)
-                .and_then(|bits| bits.checked_mul(scale))
+            let tick_credit =
+                pacing_tick_credit(rate.rate_numerator_bits_per_second, rate.pacing_interval_ns)
+                    .ok_or(ExecutionError::CounterOverflow(node.id))?;
+            let packet_cost = paced_packet_cost(packet.size_bytes, scale)
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
             rate.credit_quanta = rate
                 .credit_quanta
@@ -3352,9 +3349,7 @@ impl<'image> TransitionState<'image> {
                 } else {
                     (packet.id, packet.size_bytes)
                 };
-                let next_cost = u128::from(size_bytes)
-                    .checked_mul(8)
-                    .and_then(|bits| bits.checked_mul(scale))
+                let next_cost = paced_packet_cost(size_bytes, scale)
                     .ok_or(ExecutionError::CounterOverflow(node.id))?;
                 generator.next_emission = crate::ScheduledEmission {
                     status: if rate
@@ -3501,15 +3496,14 @@ impl<'image> TransitionState<'image> {
                 return Ok(());
             }
 
-            let scale = u128::from(dcqcn.rate.rate_denominator)
-                .checked_mul(1_000_000_000)
+            let scale = pacing_credit_scale(dcqcn.rate.rate_denominator)
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
-            let tick_credit = u128::from(dcqcn.controller.current_rate_bps)
-                .checked_mul(u128::from(dcqcn.rate.pacing_interval_ns))
-                .ok_or(ExecutionError::CounterOverflow(node.id))?;
-            let packet_cost = u128::from(packet.size_bytes)
-                .checked_mul(8)
-                .and_then(|bits| bits.checked_mul(scale))
+            let tick_credit = pacing_tick_credit(
+                dcqcn.controller.current_rate_bps,
+                dcqcn.rate.pacing_interval_ns,
+            )
+            .ok_or(ExecutionError::CounterOverflow(node.id))?;
+            let packet_cost = paced_packet_cost(packet.size_bytes, scale)
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
             dcqcn.rate.credit_quanta = dcqcn
                 .rate
@@ -3572,12 +3566,12 @@ impl<'image> TransitionState<'image> {
                 } else {
                     (packet.id, packet.size_bytes)
                 };
-                let next_tick_credit = u128::from(dcqcn.controller.current_rate_bps)
-                    .checked_mul(u128::from(dcqcn.rate.pacing_interval_ns))
-                    .ok_or(ExecutionError::CounterOverflow(node.id))?;
-                let next_cost = u128::from(size_bytes)
-                    .checked_mul(8)
-                    .and_then(|bits| bits.checked_mul(scale))
+                let next_tick_credit = pacing_tick_credit(
+                    dcqcn.controller.current_rate_bps,
+                    dcqcn.rate.pacing_interval_ns,
+                )
+                .ok_or(ExecutionError::CounterOverflow(node.id))?;
+                let next_cost = paced_packet_cost(size_bytes, scale)
                     .ok_or(ExecutionError::CounterOverflow(node.id))?;
                 generator.next_emission = crate::ScheduledEmission {
                     status: if dcqcn
@@ -5054,6 +5048,30 @@ fn resumable_packets(
         descriptors.entry(packet.id).or_insert(*packet);
     }
     descriptors.into_values().collect()
+}
+
+/// Credit quanta per bit of a paced packet: `rate_denominator * 10^9`.
+///
+/// The rate and DCQCN pacers, and the RoCE queue-pair pacer, share this arithmetic: one tick adds
+/// [`pacing_tick_credit`] quanta, and a packet is emitted when the credit covers
+/// [`paced_packet_cost`]. Every expression is exact in `u128`; `None` is an overflow.
+#[inline(always)]
+fn pacing_credit_scale(rate_denominator: u64) -> Option<u128> {
+    u128::from(rate_denominator).checked_mul(1_000_000_000)
+}
+
+/// Credit quanta one pacing tick adds: `rate_bps * pacing_interval_ns`.
+#[inline(always)]
+fn pacing_tick_credit(rate_bps: u64, pacing_interval_ns: u64) -> Option<u128> {
+    u128::from(rate_bps).checked_mul(u128::from(pacing_interval_ns))
+}
+
+/// Credit quanta a packet of `size_bytes` costs at `scale` quanta per bit.
+#[inline(always)]
+fn paced_packet_cost(size_bytes: u64, scale: u128) -> Option<u128> {
+    u128::from(size_bytes)
+        .checked_mul(8)
+        .and_then(|bits| bits.checked_mul(scale))
 }
 
 fn scheduler_class(flow: FlowId, class_count: usize) -> Option<usize> {
