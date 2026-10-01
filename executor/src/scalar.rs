@@ -3810,6 +3810,9 @@ impl<'image> TransitionState<'image> {
     /// controller's current rate; the packet at `next_psn`, a first transmission or a Go-back-N
     /// retransmission, is sent when the credit covers it. The pacer re-arms one interval later
     /// while packets remain, or parks.
+    // Out of line: queue-pair transitions must not grow the shared `dispatch` that every
+    // event of every image runs through (P15 inlining check, `qp-impl/callsites.txt`).
+    #[inline(never)]
     fn host_roce_pacing_timer(
         &mut self,
         node: NodeDescriptor,
@@ -4003,6 +4006,9 @@ impl<'image> TransitionState<'image> {
     /// this transition) while data stays outstanding, and a parked pacer with packets to send
     /// again restarts on its next grid point.
     #[allow(clippy::too_many_arguments)]
+    // Out of line: queue-pair transitions must not grow the shared `dispatch` that every
+    // event of every image runs through (P15 inlining check, `qp-impl/callsites.txt`).
+    #[inline(never)]
     fn host_roce_feedback_arrival(
         &mut self,
         node: NodeDescriptor,
@@ -4126,6 +4132,9 @@ impl<'image> TransitionState<'image> {
 
     /// A RoCE queue pair's retransmission timeout (design note §5, step 6): Go-back-N rewinds to
     /// the cumulative acknowledgment, the fixed timeout re-arms, and a parked pacer restarts.
+    // Out of line: queue-pair transitions must not grow the shared `dispatch` that every
+    // event of every image runs through (P15 inlining check, `qp-impl/callsites.txt`).
+    #[inline(never)]
     fn host_roce_timeout(
         &mut self,
         node: NodeDescriptor,
@@ -4230,6 +4239,9 @@ impl<'image> TransitionState<'image> {
     /// The DCQCN notification point decides a CNP exactly as for a DCQCN flow; then the Go-back-N
     /// receiver accepts the in-order packet, or drops the packet and answers it. The CNP is
     /// allocated and enqueued before the ACK or NACK (ordering S1).
+    // Out of line: queue-pair transitions must not grow the shared `dispatch` that every
+    // event of every image runs through (P15 inlining check, `qp-impl/callsites.txt`).
+    #[inline(never)]
     fn host_roce_data_arrival(
         &mut self,
         node: NodeDescriptor,
