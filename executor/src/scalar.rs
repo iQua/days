@@ -6896,6 +6896,20 @@ mod tests {
     /// The test hooks' dispatch counter (`stage_probe`, 16 B with the hooks, empty without) is the
     /// one field `main` did not have, so it is allowed for. Layout is the compiler's choice, so the
     /// bound is an upper bound on 64-bit targets.
+    /// P15 lane R3: `record_inbound_progress` runs on every TCP data arrival of every image, where a
+    /// host without stages returns at once. With one caller LLVM inlined it into
+    /// `host_tcp_data_arrival`; the RoCE data arrival is a second caller, and without the attribute
+    /// the function went out of line, so every TCP segment paid a call (sim call-site check at
+    /// `ff95eb1`, `days-gpu/evidence/P15/collectives-impl/sim/gate-ff95eb1/callsites.txt`).
+    #[test]
+    fn record_inbound_progress_is_force_inlined() {
+        let source = include_str!("scalar.rs");
+        assert!(
+            source.contains("#[inline(always)]\nfn record_inbound_progress("),
+            "`record_inbound_progress` must be #[inline(always)]"
+        );
+    }
+
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn transition_state_keeps_main_size() {
