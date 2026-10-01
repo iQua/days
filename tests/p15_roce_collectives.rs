@@ -316,17 +316,14 @@ fn check_stage_rules(name: &str, image: &SimulationImage, result: &RunResult) {
         .iter()
         .filter_map(|record| match record {
             MechanismTransitionRecord::Dcqcn(row) if row.kind == DcqcnTransitionKind::Control => {
-                Some((row.flow, row.key.time_ns))
+                Some((row.flow, row.key))
             }
             _ => None,
         })
-        .fold(
-            BTreeMap::<FlowId, Vec<u64>>::new(),
-            |mut map, (flow, time)| {
-                map.entry(flow).or_default().push(time);
-                map
-            },
-        );
+        .fold(BTreeMap::<FlowId, Vec<_>>::new(), |mut map, (flow, key)| {
+            map.entry(flow).or_default().push(key);
+            map
+        });
     let rows = progress(result);
     assert!(!rows.is_empty(), "{name}: progress rows");
     let mut activations = BTreeMap::new();
@@ -407,7 +404,13 @@ fn check_stage_rules(name: &str, image: &SimulationImage, result: &RunResult) {
         let control = control_ticks.get(flow).and_then(|ticks| ticks.first());
         let expected = first.key.time_ns + 50_000;
         if expected <= image.stop_time_ns {
-            assert_eq!(control, Some(&expected), "{name}: first control tick");
+            let control = control.unwrap_or_else(|| panic!("{name}: a first control tick"));
+            assert_eq!(control.time_ns, expected, "{name}: first control tick");
+            // A release emits the pacing tick, then the control tick, as lowering orders a
+            // plain pair's (design note S-R6).
+            if activations.contains_key(flow) {
+                assert_eq!(control.origin_seq, first.key.origin_seq + 1, "{name}");
+            }
         }
     }
 }
