@@ -182,6 +182,29 @@ fn select_cuda_provisioning(
 #[cfg(feature = "cuda-test-hooks")]
 std::thread_local! {
     static PANIC_AFTER_NEXT_EXECUTION: Cell<bool> = const { Cell::new(false) };
+    /// Test-only: the steps of the CUDA runs on this thread, in order
+    /// ([`take_cuda_run_steps_for_testing`]). Per thread, so parallel tests never share it.
+    static RUN_STEPS: std::cell::RefCell<Vec<&'static str>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test-only: records one step of a CUDA run on this thread: `module_loaded`, `planned`,
+/// `buffers_allocated`, `graph_captured`, `graph_launched` (once per attempt) or
+/// `module_unloaded`. Empty in production builds.
+fn record_run_step(step: &'static str) {
+    #[cfg(feature = "cuda-test-hooks")]
+    RUN_STEPS.with_borrow_mut(|steps| steps.push(step));
+    let _ = step;
+}
+
+/// Test-only: the steps this thread's CUDA runs took since the last call, in order; clears them.
+/// A run that loads its module, plans, uploads, captures and launches once, then ends, records
+/// `module_loaded`, `planned`, `buffers_allocated`, `graph_captured`, `graph_launched`,
+/// `module_unloaded`.
+#[doc(hidden)]
+#[cfg(feature = "cuda-test-hooks")]
+pub fn take_cuda_run_steps_for_testing() -> Vec<&'static str> {
+    RUN_STEPS.take()
 }
 
 /// Arms a one-shot panic after this thread's next successful CUDA graph execution.
@@ -435,6 +458,15 @@ fn read_queue(plan: &CompactionPlan, lp: usize, records: &[u64]) -> Vec<PacketDe
         .collect()
 }
 
+/// Decodes one 14-word event record read back from the device.
+///
+/// `decode_event`, [`decode_packet_fields`] and [`decode_packet_kind`] are `#[inline(always)]`
+/// because `CudaBuffers::finish` runs them once per live event and packet: 950,366 channel-stream
+/// events at E6 60% load. Once Lane B's PFC and DCQCN arms grew `decode_packet_kind`, the inliner
+/// left all three out of line in `finish`, whose size overrides an `#[inline]` hint. That cost about
+/// 25 ms of host run at 60% load. Forcing them inline removes the calls and changes no decoded
+/// value (`evidence/P14/cuda-host.md` in days-gpu).
+#[inline(always)]
 fn decode_event(record: &[u64]) -> Result<(Event, PacketDescriptor), CudaError> {
     let kind = decode_event_kind(record[5])?;
     let packet = decode_packet_fields(&record[7..14])?;
@@ -485,6 +517,8 @@ fn decode_event_kind(value: u64) -> Result<EventKind, CudaError> {
     }
 }
 
+/// Forced inline for the readback decode; see [`decode_event`].
+#[inline(always)]
 fn decode_packet_kind(value: u64, metadata: &[u64]) -> Result<PacketKind, CudaError> {
     match value & PACKET_KIND_MASK {
         0 => Ok(PacketKind::Data),
@@ -588,6 +622,8 @@ fn decode_packet_words(words: &[u64]) -> Result<PacketDescriptor, CudaError> {
     decode_packet_fields(words)
 }
 
+/// Forced inline for the readback decode; see [`decode_event`].
+#[inline(always)]
 fn decode_packet_fields(words: &[u64]) -> Result<PacketDescriptor, CudaError> {
     Ok(PacketDescriptor {
         id: PayloadId(words[0]),
@@ -1006,8 +1042,8 @@ pub struct CudaRun {
     /// P14: the round kernel build this run launched, selected from the image.
     pub round_kernel: RoundKernel,
     /// P14 round 4: host time to load this run's round module, resolve its kernels and check
-    /// their thread limits. Paid once per run, before the first attempt's buffers are allocated;
-    /// it is outside `wall_ns` and `device_ns`.
+    /// their thread limits. Paid once per run, when the run starts, before its first attempt is
+    /// planned; it is outside `wall_ns` and `device_ns`.
     pub module_load_ns: u64,
     /// Test-only: `(module, kernel)` for every function this run launched: the captured attempt
     /// kernels, then the readback gather. Each entry names the round module the function was
@@ -1338,7 +1374,7 @@ impl CudaExecutor {
     }
 
     /// Executes and reads back under the run device's execution guard, which the run takes with
-    /// its round module before its first upload and holds until it ends.
+    /// its round module when it starts, before its first plan, and holds until it ends.
     pub fn run_with_observations(
         &self,
         image: &SimulationImage,
@@ -1394,9 +1430,17 @@ impl CudaExecutor {
         );
         let mut retry_trace = Vec::new();
         // P14 round 4: this run's round module and the device's execution guard, taken together
-        // once the first plan is accepted and held for every attempt. Dropped when the run ends,
-        // on success, error or panic: the module is unloaded, then the guard released.
-        let mut held_module: Option<HeldRoundModule<'_>> = None;
+        // and held for every attempt. Dropped when the run ends, on success, error or panic: the
+        // module is unloaded, then the guard released.
+        //
+        // P14 cuda-host round 3 (option f): both are taken here, when the run starts, before the
+        // first plan. The run then frees the module load's transient copy of the fatbin before
+        // it plans, as `main` frees its executor-start copy, and the plan and the readback run
+        // with the allocator state `main` gives them (`evidence/P14/cuda-host.md` §§14, 18 in
+        // days-gpu). The first plan now runs under the guard, as every retry already did, and a
+        // plan that fails or is refused below loads and unloads the module before its error
+        // returns; nothing is allocated or launched for it.
+        let held = direct.hold_round_module(round_kernel)?;
         loop {
             let attempt = (|| {
                 let plan = CudaPlan::new_with_entity_capacity_floors(
@@ -1407,18 +1451,18 @@ impl CudaExecutor {
                     &mut channel_capacity_floors,
                     &mut tcp_capacity_floors,
                 )?;
+                record_run_step("planned");
                 // The plain kernel has no device-side stop: the host refuses it, before upload, on
-                // any plan holding state a mechanism transition would act on.
+                // any plan holding state a mechanism transition would act on. The module is
+                // already loaded; on a refusal it is unloaded when the run returns, before any
+                // buffer, capture or launch.
                 if round_kernel == RoundKernel::Plain {
                     plan.refuse_plain_round_kernel()?;
                 }
-                // The module is loaded before this run allocates a buffer or captures a graph, and
-                // under the guard, so no other run's module is loaded in the context meanwhile.
-                let held = match held_module.as_ref() {
-                    Some(held) => held,
-                    None => held_module.insert(direct.hold_round_module(round_kernel)?),
-                };
+                // The module was loaded under the guard before this run planned, so it is loaded
+                // before any buffer or graph, and no other run's module is in the context.
                 let buffers = CudaBuffers::new(&direct.stream, plan, direct.provisioning)?;
+                record_run_step("buffers_allocated");
                 let timing = direct.run(&buffers, attempt_config, &held.module)?;
                 #[cfg(feature = "cuda-test-hooks")]
                 panic_after_execution_if_requested();
@@ -1637,6 +1681,22 @@ pub fn mechanism_plane_words_cuda_for_testing(
             .count(),
         pfc_params_words: 1,
     })
+}
+
+/// P14 cuda-host: the whole-fabric PFC-state scans one production CUDA plan makes, counted on this
+/// thread (`image_has_pfc` and `pfc_control_lane_producers` each walk every switch LP). On an image
+/// without PFC state one scan decides that every PFC step is empty.
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+pub fn pfc_state_scans_cuda_plan_for_testing(
+    image: &SimulationImage,
+    config: CudaConfig,
+) -> Result<usize, CudaError> {
+    validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
+    validate_config(config)?;
+    crate::device_pfc::take_pfc_state_scans_for_testing();
+    CudaPlan::new(image, None, config, ObservationMode::Summary)?;
+    Ok(crate::device_pfc::take_pfc_state_scans_for_testing())
 }
 
 /// Returns the exact production-plan plane lengths without creating a CUDA device.
@@ -2111,6 +2171,10 @@ impl CudaPlan {
         tcp_capacity_floors: &mut crate::device_capacity::TcpCapacityFloors,
     ) -> Result<Self, CudaError> {
         let node_count = image.nodes.len();
+        // Whether the image carries PFC state, decided by one walk of the switch LPs. Without it the
+        // PFC region, the PFC frame bound and the PFC control lanes are all empty, and the plan skips
+        // the three walks that would find each of them empty (see `PfcState`).
+        let pfc_state = PfcState::of(image);
         let (flow_packet_counts, flow_feedback_counts) = flow_packet_counts(image)?;
         let minimum_lookahead_ns = image
             .channels
@@ -2468,8 +2532,11 @@ impl CudaPlan {
 
         let mut scheduler_state =
             prepare_device_schedulers(image, &queue_meta).map_err(CudaError::Validation)?;
-        let pfc_offset = crate::device_pfc::append_pfc_region(image, &mut scheduler_state)
-            .map_err(CudaError::Validation)?;
+        let pfc_offset = match pfc_state {
+            PfcState::Present => crate::device_pfc::append_pfc_region(image, &mut scheduler_state)
+                .map_err(CudaError::Validation)?,
+            PfcState::Absent => None,
+        };
 
         for event in &image.initial_events {
             let packet = if event.kind == EventKind::RetransmissionTimeout {
@@ -2574,7 +2641,7 @@ impl CudaPlan {
             remote_staging_slots,
             channel_capacity_floors,
         )?;
-        let event_bound = derived_transition_bound(image, &flow_packet_counts)?;
+        let event_bound = derived_transition_bound(image, &flow_packet_counts, pfc_state)?;
         let observation_capacity = if observation_mode == ObservationMode::Full {
             config
                 .max_observations
@@ -2633,7 +2700,7 @@ impl CudaPlan {
             tcp_layout.ledger_meta_offset,
             &mut tcp_state,
         );
-        let (inbound_meta, inbound_producers) = remote_inbound_producers(image);
+        let (inbound_meta, inbound_producers) = remote_inbound_producers(image, pfc_state);
         let round_capacity = config
             .max_rounds
             .unwrap_or_else(|| derived_round_bound(image, exclusive_horizon_ns, event_bound))
@@ -3586,7 +3653,7 @@ fn add_route_observation_capacities(
     }
 }
 
-fn remote_inbound_producers(image: &SimulationImage) -> (Vec<u64>, Vec<u64>) {
+fn remote_inbound_producers(image: &SimulationImage, pfc_state: PfcState) -> (Vec<u64>, Vec<u64>) {
     let mut inbound = vec![BTreeSet::new(); image.nodes.len()];
     for flow in &image.flows {
         for (route, terminal) in [
@@ -3603,8 +3670,10 @@ fn remote_inbound_producers(image: &SimulationImage) -> (Vec<u64>, Vec<u64>) {
             }
         }
     }
-    for (producer, target) in crate::device_pfc::pfc_control_lane_producers(image) {
-        inbound[target].insert(producer);
+    if pfc_state == PfcState::Present {
+        for (producer, target) in crate::device_pfc::pfc_control_lane_producers(image) {
+            inbound[target].insert(producer);
+        }
     }
     let mut meta = vec![0_u64; image.nodes.len() * INBOUND_META_WORDS];
     let mut producers = Vec::new();
@@ -3617,7 +3686,44 @@ fn remote_inbound_producers(image: &SimulationImage) -> (Vec<u64>, Vec<u64>) {
     (meta, producers)
 }
 
-fn derived_transition_bound(image: &SimulationImage, counts: &[usize]) -> Result<usize, CudaError> {
+/// Whether a validated image carries PFC state, decided once per plan.
+///
+/// `Absent` makes the plan skip three walks of the switch LPs, each of which is empty exactly then:
+/// - `append_pfc_region` appends nothing and returns `None` iff `!image_has_pfc`, by its own guard;
+/// - `pfc_frame_transition_bound` returns 0 iff `!image_has_pfc`, by its own guard;
+/// - `pfc_control_lane_producers` reads only switch queues whose `pfc` is `Some`. Validation, which
+///   every CUDA plan follows, makes switch state slots a bijection with switch nodes
+///   (`validate_state_ownership`) and gives a switch LP at most one queue
+///   (`validate_owned_service_state`), so those queues are exactly the first queues of switch nodes,
+///   which `image_has_pfc` reads. It returns no lane iff `!image_has_pfc`.
+///
+/// The plan is therefore the same word for word. Each walk costs about 0.25 ms on E6
+/// (`evidence/P14/cuda-host.md` in days-gpu).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PfcState {
+    Present,
+    Absent,
+}
+
+impl PfcState {
+    fn of(image: &SimulationImage) -> Self {
+        if crate::device_pfc::image_has_pfc(image) {
+            Self::Present
+        } else {
+            Self::Absent
+        }
+    }
+}
+
+fn derived_transition_bound(
+    image: &SimulationImage,
+    counts: &[usize],
+    pfc_state: PfcState,
+) -> Result<usize, CudaError> {
+    let pfc_frames = match pfc_state {
+        PfcState::Present => crate::device_pfc::pfc_frame_transition_bound(image, counts),
+        PfcState::Absent => 0,
+    };
     let network = image
         .flows
         .iter()
@@ -3632,7 +3738,7 @@ fn derived_transition_bound(image: &SimulationImage, counts: &[usize]) -> Result
                 .initial_events
                 .len()
                 .saturating_add(1)
-                .saturating_add(crate::device_pfc::pfc_frame_transition_bound(image, counts)),
+                .saturating_add(pfc_frames),
             usize::saturating_add,
         );
     image
@@ -4991,8 +5097,9 @@ struct DirectCuda {
 /// P14 round 4: one loaded CUDA module and the kernels a run launches from it. A run owns it.
 ///
 /// Each round-kernel build has its own complete module: the 12 shared attempt kernels, the readback
-/// gather, and that build's round kernel. A run loads its build's module before it allocates a
-/// buffer or captures its graph, launches every kernel from it, and drops it when the run ends.
+/// gather, and that build's round kernel. A run loads its build's module when it starts, before it
+/// plans its first attempt and so before it allocates a buffer or captures its graph, launches
+/// every kernel from it, and drops it when the run ends.
 /// The executor holds no module, and no other round module is loaded in the context while a run
 /// sets up or executes ([`HeldRoundModule`]).
 ///
@@ -5043,6 +5150,7 @@ struct LiveRoundModule(Arc<AtomicUsize>);
 impl LiveRoundModule {
     fn register(live: &Arc<AtomicUsize>) -> Self {
         live.fetch_add(1, Ordering::SeqCst);
+        record_run_step("module_loaded");
         Self(Arc::clone(live))
     }
 }
@@ -5051,11 +5159,12 @@ impl LiveRoundModule {
 impl Drop for LiveRoundModule {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+        record_run_step("module_unloaded");
     }
 }
 
-/// What one run holds on its device from before its first upload until it ends: its round module
-/// and the device's execution guard.
+/// What one run holds on its device from its start, before its first plan, until it ends: its
+/// round module and the device's execution guard.
 ///
 /// The module is loaded and unloaded under the guard. The guard is what makes "exactly one round
 /// module in the context" hold: a concurrent run on the same device waits for it before loading
@@ -5391,6 +5500,7 @@ impl DirectCuda {
             config.attempts_per_graph_wave,
         )?;
         let graph_capture_ns = duration_ns(capture_started.elapsed());
+        record_run_step("graph_captured");
         #[cfg(feature = "cuda-test-hooks")]
         let round_modules_at_capture = self.live_round_modules.load(Ordering::SeqCst);
 
@@ -5415,6 +5525,9 @@ impl DirectCuda {
                 .launch()
                 .map_err(|error| driver_error("CUDA Graph replay", error))?;
             host_submit_ns = host_submit_ns.saturating_add(duration_ns(submitted.elapsed()));
+            if graph_replays == 0 {
+                record_run_step("graph_launched");
+            }
             let end = self
                 .stream
                 .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
@@ -5762,6 +5875,27 @@ mod tests {
                     CudaError::MechanismsKernelRequired { .. }
                 ),
                 "raw code {code}"
+            );
+        }
+    }
+
+    /// P14 cuda-host: the readback event decode stays force-inlined into `CudaBuffers::finish`.
+    ///
+    /// This pins the three attributes, not the codegen they produce. The codegen is checked on the
+    /// release binary by `evidence/P14/cuda-host/tooling/callsites.py` (days-gpu): `finish` must make
+    /// no out-of-line call to any of the three. Without the attributes it makes 3 / 2 / 2 such calls,
+    /// which cost E6 60% about 25 ms of host run (`evidence/P14/cuda-host.md`).
+    #[test]
+    fn readback_event_decode_is_force_inlined() {
+        let source = include_str!("cuda.rs");
+        for signature in [
+            "fn decode_event(record: &[u64])",
+            "fn decode_packet_kind(value: u64, metadata: &[u64])",
+            "fn decode_packet_fields(words: &[u64])",
+        ] {
+            assert!(
+                source.contains(&format!("#[inline(always)]\n{signature}")),
+                "`{signature}` must be #[inline(always)]"
             );
         }
     }

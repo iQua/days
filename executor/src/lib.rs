@@ -59,7 +59,10 @@ pub use cuda::{
 };
 #[cfg(all(feature = "cuda", feature = "planner-test-hooks"))]
 #[doc(hidden)]
-pub use cuda::{mechanism_plane_words_cuda_for_testing, size_cuda_plan_for_testing};
+pub use cuda::{
+    mechanism_plane_words_cuda_for_testing, pfc_state_scans_cuda_plan_for_testing,
+    size_cuda_plan_for_testing,
+};
 pub use dcqcn::{
     DCQCN_FRACTION_SCALE, DCQCN_STAGE_STEPS, DcqcnArithmeticError, DcqcnController,
     DcqcnControllerConfig, DcqcnIncreaseStage, DcqcnTransitionKind, DcqcnTransitionRecord,

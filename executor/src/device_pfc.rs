@@ -34,6 +34,25 @@ use std::collections::BTreeSet;
 use crate::{NodeId, NodeKind, PfcQueueState, SimulationImage, SwitchQueueState};
 
 pub(crate) const NONE: u64 = u64::MAX;
+
+#[cfg(feature = "planner-test-hooks")]
+std::thread_local! {
+    /// Test-only: whole-fabric PFC-state scans on this thread ([`image_has_pfc`] and
+    /// [`pfc_control_lane_producers`]). Per thread, so parallel tests never share it.
+    static PFC_STATE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: counts one whole-fabric PFC-state scan on this thread.
+fn count_pfc_state_scan() {
+    #[cfg(feature = "planner-test-hooks")]
+    PFC_STATE_SCANS.with(|scans| scans.set(scans.get() + 1));
+}
+
+/// Test-only: returns this thread's PFC-state scan count and resets it to zero.
+#[cfg(feature = "planner-test-hooks")]
+pub(crate) fn take_pfc_state_scans_for_testing() -> usize {
+    PFC_STATE_SCANS.with(|scans| scans.replace(0))
+}
 pub(crate) const PFC_ROW_HEADER_WORDS: usize = 5;
 pub(crate) const PFC_INGRESS_WORDS: usize = 43;
 const INGRESS_LINK: usize = 0;
@@ -89,6 +108,7 @@ fn lp_queues(image: &SimulationImage) -> impl Iterator<Item = (usize, &SwitchQue
 
 /// Whether the image carries any PFC state, which is exactly when the region exists.
 pub(crate) fn image_has_pfc(image: &SimulationImage) -> bool {
+    count_pfc_state_scan();
     lp_queues(image).any(|(_, queue)| queue.pfc.is_some())
 }
 
@@ -97,6 +117,7 @@ pub(crate) fn image_has_pfc(image: &SimulationImage) -> bool {
 /// Control frames travel on these lanes, never on a flow route, so the exchange's inbound-producer
 /// sets derived from routes must include them. Empty without PFC state.
 pub(crate) fn pfc_control_lane_producers(image: &SimulationImage) -> Vec<(u64, usize)> {
+    count_pfc_state_scan();
     image
         .switch_states
         .iter()

@@ -98,3 +98,19 @@ fn p14_fixtures_plan_their_mechanism_state() {
         }
     }
 }
+
+/// P14 cuda-host: on an image without PFC state, one production CUDA plan walks the switch LPs for
+/// PFC state once. Each scan walks every switch LP (49,152 nodes and 40,960 switch states on E6),
+/// and the plan used to repeat it for the PFC region, the PFC frame bound and the PFC control
+/// lanes, about 0.25 ms each (`evidence/P14/cuda-host.md` in days-gpu).
+#[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
+#[test]
+fn a_plan_without_pfc_state_scans_the_fabric_for_it_once() {
+    let image = lower("configs/benchmarks/evaluation/e6_cbr_k32_load_01.toml");
+    let scans = days_executor::pfc_state_scans_cuda_plan_for_testing(
+        &image,
+        days_executor::CudaConfig::default(),
+    )
+    .expect("CUDA plan must size");
+    assert_eq!(scans, 1, "PFC-state scans in one plain CUDA plan");
+}
