@@ -364,7 +364,7 @@ fn scalar_anchor(name: &str) -> (u64, u64) {
 
 /// Frozen at authoring (`b448d08`, 2026-10-01, sim; the `days` CLI printed the same values): the
 /// anchors the device lane proves Metal and CUDA against.
-const ANCHORS: [(&str, u64, u64); 7] = [
+const ANCHORS: [(&str, u64, u64); 8] = [
     ("roce_lossless_pfc.toml", 45_710, 0x7e1f_a3a8_7997_030c),
     ("roce_gbn_lossy.toml", 46_238, 0x4c94_e615_e09a_e734),
     ("roce_timeout.toml", 34_578, 0x3488_8b67_3127_c7cc),
@@ -372,6 +372,8 @@ const ANCHORS: [(&str, u64, u64); 7] = [
     ("roce_cnp_under_pfc.toml", 58_280, 0x70b0_1e3d_c0d6_15a8),
     ("roce_feedback_priority.toml", 58_323, 0x6b64_e238_d4d0_3c96),
     ("roce_mixed_tcp.toml", 52_398, 0x7612_b5cd_28d5_5949),
+    // Host-link PFC (p15/hostpfc, c26865f).
+    ("hostpfc_incast_lossless.toml", 67_609, 0x08e4_d33e_ffae_89bb),
 ];
 
 #[test]
@@ -417,6 +419,7 @@ fn hpcc_incast_with_host_pfc_loses_nothing() {
 fn hpcc_fixture_matches_its_frozen_anchor() {
     assert_eq!(
         scalar_anchor("hpcc_incast64_dragonfly.toml"),
-        (813_526, 0x1043_7719_b6f6_f177)
+        // Re-frozen at c26865f: the fixture re-sized for host-link PFC (hostpfc-design.md §10.2).
+        (1_262_683, 0x7ec5_84fc_7397_55b8)
     );
 }
