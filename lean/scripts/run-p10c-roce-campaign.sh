@@ -376,7 +376,10 @@ loss_stop=50000
 
 check_case "roce_trace_loss_accept" 0 "ACCEPT" \
   trace "$loss_sender" "$loss_receiver" "$loss_dcqcn" "$loss_stop" || true
-# Executor traces committed as fixtures (tests/fixtures-style triples with a .stop_time_ns file).
+# Executor traces committed as fixtures (tests/fixtures-style triples with a .stop_time_ns file):
+# Scalar full-observation logs of configs/p15/roce_timeout.toml and roce_nack_only.toml, written
+# by days-gpu evidence/P15/leanguard/tooling/p15_lg_csvs.rs. Generated at p15/qp a4387f4;
+# regenerated at R1's final head 4624d21 (feat/p15 d97cc3e) byte-identically (F6).
 for sender_csv in "$fixture_dir"/roce_trace_*_executor_accept.sender.csv; do
   [[ -e "$sender_csv" ]] || continue
   base="${sender_csv%.sender.csv}"
