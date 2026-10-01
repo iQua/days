@@ -41,7 +41,8 @@ use days::scenario::compile_config_with_route_workers;
 use days::topos::route::RouteWorkers;
 use days_executor::{CpuConfig, run_cpu, run_scalar};
 
-/// Allocations made by the current thread, and the bytes it obtained from the allocator.
+/// Allocations made by the current thread, the bytes it obtained from the allocator, and the
+/// blocks it freed.
 ///
 /// The counters are thread-local, so tests that run beside this one in the same binary, and the
 /// CPU executor's worker thread, cannot perturb them; nothing is shared between threads. Bytes
@@ -52,6 +53,7 @@ struct ThreadCountingAllocator;
 thread_local! {
     static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
     static BYTES_OBTAINED: Cell<u64> = const { Cell::new(0) };
+    static FREES: Cell<u64> = const { Cell::new(0) };
 }
 
 fn record_allocation(bytes: usize) {
@@ -61,6 +63,14 @@ fn record_allocation(bytes: usize) {
 
 fn record_bytes(bytes: usize) {
     let _ = BYTES_OBTAINED.try_with(|total| total.set(total.get().wrapping_add(bytes as u64)));
+}
+
+fn record_free() {
+    let _ = FREES.try_with(|count| count.set(count.get().wrapping_add(1)));
+}
+
+fn frees() -> u64 {
+    FREES.with(Cell::get)
 }
 
 fn allocations() -> u64 {
@@ -94,6 +104,7 @@ unsafe impl GlobalAlloc for ThreadCountingAllocator {
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
         // SAFETY: forwarded with the caller's pointer and layout.
         unsafe { System.dealloc(pointer, layout) };
+        record_free();
     }
 
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
@@ -267,5 +278,68 @@ fn scalar_run_hands_back_its_host_states_without_a_copy() {
         marginal <= MAX_MARGINAL_SCALAR_BYTES,
         "{ADDED_HOSTS} more hosts made the Scalar run obtain {marginal} more bytes, above the cap \
          of {MAX_MARGINAL_SCALAR_BYTES}: hand back the cloned host-state table, not a copy"
+    );
+}
+
+/// The marginal allocations and frees of the Scalar run at `main` (948a0e9) for the two scenarios
+/// above, measured by this test.
+const MAIN_MARGINAL_SCALAR_ALLOCATIONS: u64 = 347;
+const MAIN_MARGINAL_SCALAR_FREES: u64 = 155;
+/// The cap on either marginal: `main`'s plus half a block per added host, below the one block per
+/// host that a heap-held stage index costs to build and again to drop.
+const MAX_MARGINAL_SCALAR_ALLOCATIONS: u64 = MAIN_MARGINAL_SCALAR_ALLOCATIONS + ADDED_HOSTS / 2;
+const MAX_MARGINAL_SCALAR_FREES: u64 = MAIN_MARGINAL_SCALAR_FREES + ADDED_HOSTS / 2;
+
+/// Allocations and frees this thread makes during a Scalar run of the derived scenario that stops
+/// before its first event; the result is dropped outside the window.
+fn scalar_run_blocks(hosts_per_edge: u64) -> (u64, u64) {
+    let path = e1_k8("scalar_blocks", hosts_per_edge);
+    let image = compile_config_with_route_workers(&path, RouteWorkers::serial())
+        .expect("the derived E1 scenario lowers");
+    let _ = fs::remove_file(&path);
+    let (allocations_before, frees_before) = (allocations(), frees());
+    let result = run_scalar(&image, Some(1)).expect("the Scalar run succeeds");
+    let (allocations_after, frees_after) = (allocations(), frees());
+    drop(result);
+    (
+        allocations_after - allocations_before,
+        frees_after - frees_before,
+    )
+}
+
+/// A stageless Scalar host's stage index takes nothing from the heap.
+///
+/// Every host of the Scalar run carries a stage index (`HostStageSlot`, built in
+/// `TransitionState::new` and dropped in `finish`). On a host with one generator and no stages it
+/// answers every query a scan of that one generator could, so it must not cost a heap block per
+/// host: on E1 that was 8,192 allocations and 8,192 frees per run (`days-gpu/evidence/P14/
+/// e1-attrib2.md`, about 4.1 M of the run's 4.9 M added instructions against `main`).
+///
+/// **What is measured.** The allocations and the frees this thread makes during `run_scalar` with
+/// a 1 ns exclusive horizon (construction, the events at t = 0 and `finish`; the result is dropped
+/// after the window), as the marginal between the two E1-shaped scenarios above (64 added hosts).
+/// The events at t = 0 allocate per host at `main` too, so they cancel against `main`'s marginal.
+/// The counts are a pure function of the code, the scenario and the toolchain's container
+/// implementations.
+///
+/// **The cap.** `main`'s marginals plus half a block per added host. An index that keeps its
+/// one-entry flow list on the heap adds one allocation and one free per host, and this test fails.
+#[test]
+fn scalar_stageless_host_index_takes_no_heap_blocks() {
+    let (small_allocations, small_frees) = scalar_run_blocks(SMALL_HOSTS_PER_EDGE);
+    let (large_allocations, large_frees) = scalar_run_blocks(LARGE_HOSTS_PER_EDGE);
+    let allocations = large_allocations - small_allocations;
+    let frees = large_frees - small_frees;
+    println!(
+        "record=scalar_run_blocks small_allocations={small_allocations} \
+         large_allocations={large_allocations} small_frees={small_frees} large_frees={large_frees} \
+         added_hosts={ADDED_HOSTS} marginal_allocations={allocations} marginal_frees={frees} \
+         cap_allocations={MAX_MARGINAL_SCALAR_ALLOCATIONS} cap_frees={MAX_MARGINAL_SCALAR_FREES}"
+    );
+    assert!(
+        allocations <= MAX_MARGINAL_SCALAR_ALLOCATIONS && frees <= MAX_MARGINAL_SCALAR_FREES,
+        "{ADDED_HOSTS} more stageless hosts made the Scalar run allocate {allocations} and free \
+         {frees} more blocks, above the caps of {MAX_MARGINAL_SCALAR_ALLOCATIONS} and \
+         {MAX_MARGINAL_SCALAR_FREES}: hold a one-entry stage-index list inline"
     );
 }
