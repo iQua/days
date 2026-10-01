@@ -137,7 +137,11 @@ fn benchmark_workload(image: &days_executor::SimulationImage) -> BenchmarkWorklo
     let mut has_open_loop = false;
     for generator in image.host_states.iter().flat_map(|state| &state.generators) {
         match generator.kind {
-            days_executor::FlowGeneratorKind::Tcp(_) => has_tcp = true,
+            // A RoCE queue pair is closed-loop like TCP (device backends refuse it in P15).
+            days_executor::FlowGeneratorKind::Tcp(_)
+            | days_executor::FlowGeneratorKind::Roce(_) => {
+                has_tcp = true;
+            }
             days_executor::FlowGeneratorKind::Constant(_)
             | days_executor::FlowGeneratorKind::Rate(_)
             | days_executor::FlowGeneratorKind::Dcqcn(_) => has_open_loop = true,
