@@ -922,12 +922,46 @@ awk -v cut="$r_line" 'NR != cut' "$hp.sender.csv" > "$campaign_tmp/hp.sender.csv
 expect_hp_reject "drop a resume row" \
   "REJECT: pfc: line $p_line: host RESUME of data_class 3 at node $r_node did not restart pause-parked queue pair (flow_id=$r_flow)" \
   "$campaign_tmp/hp.sender.csv" "$hp.receiver.csv" "$hp.dcqcn.csv" "$hp.pfc.csv"
-# 2. class_paused 1 -> 0 on a paused tick: an unpaused tick with work left must credit. (The
-# prefix has no no-op tick, so no flip is consistent with every other rule; the hand fixture's
-# unpaused-tick-while-paused case shows the warrant rule on a consistent row.)
+# 2. class_paused 1 -> 0 inside a pause, as an executor that ignored the pause would write the
+# tick: the first paused tick whose credit would not cover its packet, rewritten as the unpaused
+# tick it would otherwise be (class_paused 0; rate_bps the controller's current rate, from the
+# pair's last DCQCN row before it; credit + rate x interval; nothing sent; re-armed one interval
+# later with the armed status prediction). Every transition rule accepts that row; only the PFC
+# log refutes it (the unpaused-tick warrant). awk computes in doubles, so values beyond 2^53 fail
+# this case instead of rounding.
+read -r w_line w_node w_rate w_credit w_tick w_status <<<"$(awk -F, '
+  function before(t1, p1, n1, s1, t2, p2, n2, s2) {
+    return t1 < t2 || (t1 == t2 && (p1 < p2 || (p1 == p2 && (n1 < n2 || (n1 == n2 && s1 < s2))))) }
+  FNR == NR { if (FNR > 1) { d[++nd] = $0 }; next }
+  FNR > 1 && $7 == "tick" && $8 == 1 {
+    rate = ""
+    for (i = 1; i <= nd; i++) { split(d[i], r, ",")
+      if (r[5] == $5 && r[6] == $6 && before(r[1] + 0, r[2] + 0, r[3] + 0, r[4] + 0, $1 + 0, $2 + 0, $3 + 0, $4 + 0)) rate = r[30] }
+    if (rate == "") next
+    size = $10 + 0; if ($11 - $22 < size) size = $11 - $22
+    cost = size * 8000000000; credit = $26 + rate * $12
+    if (credit >= cost || credit + rate * $12 >= 2^53 || cost >= 2^53) next
+    status = (credit + rate * $12 >= cost) ? "scheduled" : "blocked"
+    printf "%d %s %s %.0f %.0f %s\n", FNR, $5, rate, credit, $1 + $12, status; exit }' \
+  "$hp.dcqcn.csv" "$hp.sender.csv")"
+if [[ -z "$w_line" ]]; then
+  echo "fixture failed: hostpfc/class_paused 1 -> 0 (no paused tick fits the consistent rewrite)" >&2
+  failures=$((failures + 1))
+else
+  awk -F, -v OFS=, -v n="$w_line" -v rate="$w_rate" -v credit="$w_credit" -v tick="$w_tick" \
+      -v status="$w_status" \
+    'NR == n { $8 = 0; $15 = rate; $35 = credit; $37 = "armed"; $38 = tick; $39 = status } { print }' \
+    "$hp.sender.csv" > "$campaign_tmp/hp.sender.csv"
+  expect_hp_reject "class_paused 1 -> 0 inside a pause (the tick an executor ignoring the pause writes)" \
+    "REJECT: sender: line $w_line: RoCE unpaused tick while data_class 3 is paused at node $w_node" \
+    "$campaign_tmp/hp.sender.csv" "$hp.receiver.csv" "$hp.dcqcn.csv" "$hp.pfc.csv"
+fi
+# 2b. The same flip of the class_paused field alone: the row then claims an unpaused tick that
+# carries no rate although it has a packet to send, which the row-shape rule rejects before any
+# warrant is consulted. It shows that rule, not the pause warrant (case 2 shows that).
 f_line="$(awk -F, 'NR > 1 && $7 == "tick" && $8 == 1 { print NR; exit }' "$hp.sender.csv")"
 awk -F, -v OFS=, -v n="$f_line" 'NR == n { $8 = 0 } { print }' "$hp.sender.csv" > "$campaign_tmp/hp.sender.csv"
-expect_hp_reject "class_paused 1 -> 0 inside a pause" \
+expect_hp_reject "class_paused 1 -> 0, the field alone" \
   "REJECT: sender: line $f_line: RoCE tick rate present iff the tick credits" \
   "$campaign_tmp/hp.sender.csv" "$hp.receiver.csv" "$hp.dcqcn.csv" "$hp.pfc.csv"
 # 3. class_paused 0 -> 1 outside any pause: a pair's last row, an unpaused tick that sends
