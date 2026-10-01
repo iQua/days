@@ -734,8 +734,9 @@ mod cuda {
 
     /// P14 cuda-host round 3 (option f): a run takes its round module, under the device's guard,
     /// before it plans its first attempt, and holds it across capacity retries. Its steps are one
-    /// load, then every attempt's plan, upload, capture and first launch, then one unload when the
-    /// run ends.
+    /// load, then each attempt's plan, upload, capture and first launch, then one unload when the
+    /// run ends. An attempt whose plan is refused for capacity retries before it records a step,
+    /// so a run makes at most one recorded attempt per retry plus its final one.
     #[test]
     fn cuda_each_run_loads_its_round_module_before_it_plans() {
         use days_executor::cuda::take_cuda_run_steps_for_testing;
@@ -777,12 +778,26 @@ mod cuda {
             let run = executor
                 .run_with_observations(&image, None, config, ObservationMode::Full)
                 .unwrap_or_else(|error| panic!("{name}: {error}"));
-            let mut expected = vec!["module_loaded"];
-            for _ in 0..=run.capacity_retry_trace.len() {
-                expected.extend(ATTEMPT);
-            }
-            expected.push("module_unloaded");
-            assert_eq!(take_cuda_run_steps_for_testing(), expected, "{name}");
+            let steps = take_cuda_run_steps_for_testing();
+            let (Some((&"module_loaded", rest)), Some(&"module_unloaded")) =
+                (steps.split_first(), steps.last())
+            else {
+                panic!("{name}: one module load first and one unload last: {steps:?}");
+            };
+            let attempts = &rest[..rest.len() - 1];
+            assert!(
+                !attempts.is_empty()
+                    && attempts.len().is_multiple_of(ATTEMPT.len())
+                    && attempts
+                        .chunks(ATTEMPT.len())
+                        .all(|attempt| attempt == ATTEMPT),
+                "{name}: every recorded attempt plans, uploads, captures and launches, with the \
+                 module held throughout: {steps:?}"
+            );
+            assert!(
+                attempts.len() / ATTEMPT.len() <= run.capacity_retry_trace.len() + 1,
+                "{name}: at most one recorded attempt per retry plus the final one: {steps:?}"
+            );
         }
     }
 
