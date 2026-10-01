@@ -1,18 +1,18 @@
 ---
 title: Collectives
-description: Days AGO RingAllReduce and AllGather over TCP with delay-only compute stages, and the legacy collective expansion.
+description: Days AGO RingAllReduce and AllGather over TCP or RoCE queue pairs with delay-only compute stages, and the legacy collective expansion.
 ---
 
 **Scope: Days AGO and Legacy Days.** Both engines model collective traffic, not application payload arithmetic, and they accept different algorithms.
 
 | Engine | Algorithms | Transport | Backends |
 | --- | --- | --- | --- |
-| Days AGO | `RingAllReduce`, `AllGather`, plus `[[compute]]` stages | `TCP` only | Scalar and CPU; Metal and CUDA reject collective and compute stages at validation |
+| Days AGO | `RingAllReduce`, `AllGather`, plus `[[compute]]` stages | `TCP` or `RoCE` | Scalar and CPU; Metal and CUDA reject collective and compute stages at validation |
 | Legacy Days | `Broadcast`, `Gather`, `AllReduce`, `RingAllReduce` | `PacketDistribution`, `TCP`, or feature-gated `DCQCN` | Nexosim |
 
 ## Days AGO collectives
 
-Days AGO lowers each collective into TCP stage flows in the `SimulationImage`. Every step of every rank is an ordinary TCP flow that carries one chunk, together with a record of the stages it waits for. Days AGO implements `RingAllReduce` and `AllGather` only, over `flow_type = "TCP"` only. A `[[compute]]` group adds one delay-only stage per host, which a collective can wait for or be waited on by.
+Days AGO lowers each collective into stage flows in the `SimulationImage`. Every step of every rank is an ordinary TCP flow or RoCE queue pair that carries one chunk, together with a record of the stages it waits for. Days AGO implements `RingAllReduce` and `AllGather` only, over `flow_type = "TCP"` or `flow_type = "RoCE"`. A `[[compute]]` group adds one delay-only stage per host, which a collective can wait for or be waited on by.
 
 This scenario runs a forward compute stage on three hosts, then a TCP ring all-reduce, then a backward compute stage:
 
@@ -74,12 +74,13 @@ Both runs end with `result_bytes=72398 result_fnv1a64=2e71360eb637278c`. With `-
 | `name` | Optional. A stage-group name that `after` fields can reference. Names must be unique across `[[collective]]` and `[[compute]]`. |
 | `after` | Optional. The name of a `[[compute]]` group. Each rank's first stage waits for that group's stage of the same rank. A collective may follow only a compute group, and its ranks (`sources`) must equal the group's `hosts` in order. |
 | `collective_type` | `RingAllReduce` or `AllGather`. |
-| `flow_type` | `TCP`. Any other value, including `PacketDistribution`, is rejected, and so is an omitted `flow_type`. |
+| `flow_type` | `TCP` or `RoCE`. Any other value is rejected, and so is an omitted `flow_type`: a stage completes when its last byte is acknowledged, which `PacketDistribution` and unreliable `DCQCN` flows cannot report. |
 | `flow_count` | The rank count. At least 2 for `RingAllReduce`, at least 1 for `AllGather`. |
 | `sources`, `sinks` | Optional. Supply both or neither; each must have `flow_count` entries. |
 | `priority` | Optional 802.1Q priority in `0..=7`; default `0`. |
-| `traffic` | A byte `size` of at least `flow_count`, and a constant `pkt_size_dist`, which sets the segment size (MSS) of every stage. `arr_dist` must be present but does not affect TCP stages. `initial_delay` sets when the first stages start if the collective has no `after`. Duration-terminated traffic is rejected. |
-| `traffic.tcp` | `cc_algorithm = "TCPReno"` or `"TCPCubic"`, with the same limits as a TCP [flow](/docs/configuration/flows#tcp). |
+| `traffic` | A byte `size` of at least `flow_count`, and a constant `pkt_size_dist`, which sets the segment size (MSS) of every TCP stage or the MTU of every RoCE stage. `arr_dist` must be present but does not affect TCP or RoCE stages. `initial_delay` sets when the first stages start if the collective has no `after`. Duration-terminated traffic is rejected. |
+| `traffic.tcp` | TCP only. `cc_algorithm = "TCPReno"` or `"TCPCubic"`, with the same limits as a TCP [flow](/docs/configuration/flows#tcp). |
+| `traffic.dcqcn`, `traffic.roce` | RoCE only, both required. The same tables as a RoCE queue-pair [flow](/docs/configuration/flows), with the same defaults and limits. `retransmit_timeout_ns = 0` is accepted; see [RoCE stages](#roce-stages). |
 
 Lowering rejects `first_flow_id`, `graph`, `routing`, and `paths`: flow identity comes from the collective stage key, and routes come from the topology. `[[collective_set]]` does not accept `name` or `after`.
 
@@ -107,7 +108,7 @@ The declared byte `size` is split into `flow_count` chunks of `size / flow_count
 - `RingAllReduce` runs a reduce-scatter phase and then an all-gather phase, so it lowers to `2 * n * (n - 1)` stage flows.
 - `AllGather` runs one all-gather phase, `n * (n - 1)` stage flows. A one-rank `AllGather` lowers to no stages.
 
-A stage flow is a TCP flow from `sources[rank]` to `sinks[rank]` that carries its chunk, using the collective's segment size and congestion control. Because a TCP flow must carry at least one byte, `size` must be at least `flow_count` for both algorithms.
+A stage flow is a TCP flow or a RoCE queue pair from `sources[rank]` to `sinks[rank]` that carries its chunk, using the collective's transport settings. Because a stage must carry at least one byte, `size` must be at least `flow_count` for both algorithms.
 
 ### When a stage starts
 
@@ -116,9 +117,62 @@ A stage starts once both of its predecessors are complete:
 - The **local predecessor** is the same rank's previous step. For the first step of the all-gather phase of `RingAllReduce`, it is the rank's last reduce-scatter step. It is complete at the first acknowledgement that covers all of its bytes.
 - The **inbound predecessor** is the previous rank's previous step, which sends to this rank. It is complete when this host's in-order receive frontier for that stage reaches the stage's chunk size. Retransmitted or out-of-order bytes count only once the frontier covers them.
 
-A stage starts at the event that completes its later predecessor, and sends its first congestion window from sequence 0 at that instant.
+A stage starts at the event that completes its later predecessor. A TCP stage sends its first congestion window from sequence 0 at that instant; a RoCE stage starts as described in [RoCE stages](#roce-stages).
 
 Step 1 of the first phase (reduce-scatter for `RingAllReduce`, all-gather for `AllGather`) has no predecessor in the collective. Without `after`, it starts at the traffic's `initial_delay`. With `after`, its local predecessor is the same rank's stage in the named compute group.
+
+### RoCE stages
+
+With `flow_type = "RoCE"`, each stage is a RoCE queue pair: DCQCN rate control with Go-back-N recovery, as described for [RoCE flows](/docs/configuration/flows). The collective's tables replace the flow's:
+
+```toml
+[[collective]]
+collective_type = "RingAllReduce"
+flow_type = "RoCE"
+priority = 3
+flow_count = 4
+sources = [0, 2, 1, 3]
+sinks = [2, 1, 3, 0]
+
+[collective.traffic]
+initial_delay = 0.0
+size = 400000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[collective.traffic.dcqcn]
+rate_gbps = 1.0
+min_rate_gbps = 0.01
+max_rate_gbps = 1.0
+g = 0.00390625
+ai_rate_gbps = 0.005
+hai_rate_gbps = 0.05
+mi_factor = 0.5
+rtt_ns = 50000
+cnp_interval_ns = 10000
+pacing_interval_ns = 1000
+increase_byte_threshold = 100000
+
+[collective.traffic.roce]
+retransmit_timeout_ns = 1000000
+feedback_priority = 0
+```
+
+`configs/p15/roce_compute_dag.toml` puts this collective between two compute groups on a four-switch line with host-link PFC. Scalar and CPU at 2 workers both end it with `result_bytes=218236 result_fnv1a64=b3e9c56fa7276c1c`.
+
+A RoCE stage differs from a TCP stage in four points:
+
+- **Start.** A stage that starts at time `t` behaves exactly like a queue pair whose `initial_delay` is `t`. Its first pacing tick is at `t`, its pacing grid is anchored at `t`, and its first DCQCN control tick is at `t + rtt_ns`. Its retransmission timeout is armed by its first packet. Before it starts, a stage sends nothing and has no pending event.
+- **Inbound progress.** The receiver discards out-of-order packets (Go-back-N), so only the packet whose PSN equals the receiver's expected PSN advances the inbound predecessor.
+- **Completion.** The local predecessor is complete at the first ACK that acknowledges all of its bytes. A NACK never completes a stage.
+- **Pause.** If the stage's data class is paused at its host when it starts (host-link PFC), its first tick sends nothing and parks the queue pair, and the RESUME restarts it on the grid anchored at `t`.
+
+**With the timeout off** (`retransmit_timeout_ns = 0`), a loss is repaired only by a NACK, which a later packet of the same stage triggers. If the last data packet or the last ACK of a stage is lost, the stage stalls: it never completes, so its successors never start, and the run continues to its stop time without an error. Two outputs show the stall:
+
+- In the final state, the stalled stage's generator is not `Finished` (its `snd_una` is below its total), and its successors' stage records still read `activated: false`.
+- In the collective trace, no local-completion row names the stalled stage as its cause.
+
+On a lossless fabric (PFC on the data class), nothing is lost and no stage stalls.
 
 ### Compute stages
 
@@ -132,9 +186,9 @@ In the example, every `forward` stage finishes at 5,000 ns, and each `backward` 
 
 ### Traces
 
-With Full observation, Scalar and CPU record one row per collective progress event; `collective_transitions_csv` in the executor library serializes them. `stage_kind` is `tcp` or `compute`, and `duration_ns` is the compute duration (0 on TCP rows). Compute rows leave `algorithm` and `collective_phase` empty. Five further columns certify completion signals:
+With Full observation, Scalar and CPU record one row per collective progress event; `collective_transitions_csv` in the executor library serializes them. `stage_kind` is `tcp`, `roce` or `compute`, and `duration_ns` is the compute duration (0 on TCP and RoCE rows). `packet_size_bytes` is the MSS on TCP rows and the MTU on RoCE rows; `interval_ns` is 0 on TCP rows and the pacing interval on RoCE rows. Compute rows leave `algorithm` and `collective_phase` empty. Five further columns certify completion signals:
 
-- `segment_sequence`, `segment_bytes`: on inbound rows, the data segment that arrived;
+- `segment_sequence`, `segment_bytes`: on inbound rows, the data segment that arrived (its TCP sequence number or RoCE PSN, and its size). `arrival_bytes` is how far it advanced the receiver's in-order frontier, which is 0 for a duplicate or out-of-order packet;
 - `ack_number`, `cause_origin_ns`, `cause_delay_ns`: on a local completion caused by an acknowledgement, the acknowledgement number, the send time it echoes, and the unloaded round trip;
 - `cause_origin_ns`, `cause_delay_ns`: on a local completion caused by a compute timer, the time the timer was armed and its duration.
 

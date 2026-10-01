@@ -181,13 +181,14 @@ pub struct CollectiveProgressRecord {
     pub stage_kind: CollectiveStageKind,
     /// Compute interval of a delay-only stage; zero for every data stage.
     pub duration_ns: u64,
-    /// Inbound rows: the arriving TCP data segment `[segment_sequence, segment_sequence +
-    /// segment_bytes)`. Every segment of a pending inbound predecessor is logged, including ones
-    /// that do not advance the receiver's in-order frontier. Zero on local rows.
+    /// Inbound rows: the arriving data segment `[segment_sequence, segment_sequence +
+    /// segment_bytes)`, from a TCP sequence number or a RoCE PSN. Every segment of a pending
+    /// inbound predecessor is logged, including ones that do not advance the receiver's in-order
+    /// frontier. Zero on local rows.
     pub segment_sequence: u64,
     pub segment_bytes: u64,
-    /// Local rows caused by a TCP stage: the completing ACK's cumulative acknowledgment. Zero for
-    /// a compute cause and on inbound rows.
+    /// Local rows caused by a TCP or RoCE stage: the completing ACK's cumulative acknowledgment.
+    /// Zero for a compute cause and on inbound rows.
     pub ack_number: u64,
     /// Local rows: when the completing signal originated. TCP: when the segment answered by the
     /// completing ACK was sent (the ACK echoes it). Compute: when the timer was armed. Zero on
@@ -242,6 +243,10 @@ impl MechanismTransitionRecord {
     }
 }
 
+/// The collective progress CSV (P14's schema). RoCE stages write `stage_kind = roce` rows under
+/// the same columns, as pinned by Amendment 4 of `days-gpu/plans/briefs/p15/qp-schema.md`: the MTU
+/// and pacing interval in `packet_size_bytes` and `interval_ns`, the PSN in `segment_sequence`,
+/// and the Go-back-N frontier's advance in `arrival_bytes`.
 pub fn collective_transitions_csv(
     records: &[MechanismTransitionRecord],
 ) -> Result<String, MechanismTraceError> {
