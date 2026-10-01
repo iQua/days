@@ -76,6 +76,95 @@ fn with_roce(
     broken
 }
 
+/// `image` with one more pending `PacingTimer` at `time_ns` on the host in `slot`, carrying
+/// `payload`, keyed by the host's next origin sequence.
+fn with_tick(
+    image: &SimulationImage,
+    slot: usize,
+    payload: days_executor::PayloadId,
+    time_ns: u64,
+) -> SimulationImage {
+    let mut broken = image.clone();
+    let owner = broken
+        .nodes
+        .iter()
+        .find(|node| node.kind == NodeKind::Host && node.state_slot as usize == slot)
+        .expect("the host's node")
+        .id;
+    let origin_seq = broken.host_states[slot].next_origin_seq;
+    broken.initial_events.push(Event {
+        key: EventKey {
+            time_ns,
+            phase: 1,
+            origin_node: owner,
+            origin_seq,
+        },
+        target: owner,
+        kind: EventKind::PacingTimer,
+        payload,
+    });
+    broken.host_states[slot].next_origin_seq += 1;
+    broken.initial_events.sort_by_key(|event| event.key);
+    broken
+}
+
+/// Fix round 1 (review M1): a pacer that owns no tick (a gated stage, or a pair parked by a pause)
+/// owns none at any time, and a gated stage owns no control tick either. The validator counted
+/// ticks only at the departure and the control deadline, so a stray tick at another time passed
+/// validation and failed the Scalar run.
+#[test]
+fn a_gated_stage_owns_no_tick_at_any_time() {
+    let image = lower("roce_compute_dag.toml");
+    let (slot, position, activated) = roce_stage_slots(&image)[0];
+    assert!(!activated);
+    let FlowGeneratorKind::Roce(roce) = image.host_states[slot].generators[position].kind else {
+        unreachable!()
+    };
+    for time_ns in [1_000, 4_000, 777_777] {
+        refused(
+            &with_tick(&image, slot, roce.pacing_timer_payload, time_ns),
+            "parked pacer owns a pending tick",
+        );
+        refused(
+            &with_tick(&image, slot, roce.control_timer_payload, time_ns),
+            "owns a pending control tick before its release",
+        );
+    }
+}
+
+/// Review M1, the parked branch shared with host-link PFC: a pair a pause parked (no tick pending,
+/// packets left) given a stray tick is refused.
+#[test]
+fn a_pause_parked_pair_owns_no_tick_at_any_time() {
+    let image = lower("hostpfc_incast_lossless.toml");
+    let mut parked = 0;
+    for horizon_ns in [350_000, 375_000] {
+        let state = checkpoint(&image, horizon_ns);
+        validate(&state, Backend::Scalar).expect("the mid-pause checkpoint validates");
+        for (slot, host) in state.host_states.iter().enumerate() {
+            for generator in &host.generators {
+                let FlowGeneratorKind::Roce(roce) = generator.kind else {
+                    continue;
+                };
+                if roce.pacer_armed || roce.next_psn >= roce.pacer.total_bytes {
+                    continue;
+                }
+                parked += 1;
+                refused(
+                    &with_tick(
+                        &state,
+                        slot,
+                        roce.pacing_timer_payload,
+                        horizon_ns + 3_000_001,
+                    ),
+                    "parked pacer owns a pending tick",
+                );
+            }
+        }
+    }
+    assert!(parked > 0, "no checkpoint held a pause-parked pair");
+}
+
 /// A gated stage holds the pristine state its release starts from (§6.1).
 #[test]
 fn a_gated_roce_stage_is_pristine_and_idle() {
