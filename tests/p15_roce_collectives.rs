@@ -416,6 +416,53 @@ fn check_stage_rules(name: &str, image: &SimulationImage, result: &RunResult) {
     }
 }
 
+/// Ruling C3: with the timeout off, a stage whose tail is lost stalls with no error, and so do its
+/// successors. The documented signs (`collectives.mdx`, RoCE stages): the stage's generator is not
+/// `Finished` and nothing is pending for it, its successors' records read `activated: false`, and
+/// no local-completion row names it.
+#[test]
+fn with_the_timeout_off_a_lost_tail_stalls_its_stage_and_successors_visibly() {
+    let text = fixture_text("roce_ring_lossy.toml").replace(
+        "retransmit_timeout_ns = 1000000",
+        "retransmit_timeout_ns = 0",
+    );
+    let image = lower_text("lossy-no-timeout", &text);
+    let result = run_identical(&image, "lossy, timeout off");
+    let contract = contract(&image, &result);
+    assert_eq!((contract.timeouts, contract.armed_timeouts), (0, 0));
+    assert!(result.pending_events.is_empty(), "no timer is ever armed");
+    let completed_causes = progress(&result)
+        .into_iter()
+        .filter(|row| row.cause == CollectiveActivationCause::LocalCompletion)
+        .map(|row| row.cause_flow)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut stalled = 0;
+    for state in &result.host_states {
+        for (generator, stage) in state.generators_with_stages() {
+            let (FlowGeneratorKind::Roce(roce), Some(stage)) = (generator.kind, stage) else {
+                continue;
+            };
+            if !stage.activated || generator.next_emission.status == GeneratorStatus::Finished {
+                continue;
+            }
+            stalled += 1;
+            assert!(roce.snd_una < roce.pacer.total_bytes);
+            assert!(!roce.pacer_armed, "a stalled pair is parked");
+            assert!(!completed_causes.contains(&generator.flow));
+            for (successor, successor_stage) in state.generators_with_stages() {
+                let Some(successor_stage) = successor_stage else {
+                    continue;
+                };
+                if successor_stage.dependencies.local_predecessor == Some(generator.flow) {
+                    assert!(!successor_stage.activated, "{:?} waits", successor.flow);
+                }
+            }
+        }
+    }
+    assert!(stalled > 0, "a lost tail must stall a stage: {contract:?}");
+    assert!(contract.finished_stages < 24, "{contract:?}");
+}
+
 /// Design note §5.3 and ruling C6: a stage released while its data class is paused at its host
 /// arms its first tick at the release like any other; that tick parks the pair (no credit, no
 /// packet, `class_paused`), the pair joins the host's parked list, and a RESUME restarts it on
