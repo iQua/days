@@ -1050,8 +1050,8 @@ pub struct SimulationImage {
 #[cfg(test)]
 mod tests {
     use super::{
-        FlowDescriptor, FlowGeneratorState, HostPfcState, HostState, LinkId, PacketKind,
-        RoceGenerator, RoceReceiverState,
+        CollectiveStage, FlowDescriptor, FlowGeneratorState, HostPfcState, HostState, LinkId,
+        PacketKind, RoceGenerator, RoceReceiverState, StageDependencies,
     };
     use std::collections::VecDeque;
 
@@ -1127,6 +1127,46 @@ mod tests {
             !format!("{host:#?}").contains("pfc"),
             "a host without host-link PFC keeps its pre-P15 Debug bytes"
         );
+    }
+
+    /// P15 lane R3 layout budget: collective stages over RoCE queue pairs reuse the stage record
+    /// as it is. A RoCE stage's gated state lives in fields the queue pair already has (its anchors
+    /// at zero, its pacer parked) and its release flag is `CollectiveStage::activated`, so neither
+    /// the stage record (136 B at `ade83b4`, one per generator on a stage host) nor its
+    /// dependencies (56 B) nor the progress record (280 B; RoCE rows add a `stage_kind` value, not
+    /// a field) grows. Layout is the compiler's choice, so these are upper bounds on 64-bit
+    /// targets.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn roce_collective_stages_grow_no_stage_record() {
+        let checks = [
+            (
+                "CollectiveStage",
+                std::mem::size_of::<CollectiveStage>(),
+                136,
+            ),
+            (
+                "Option<CollectiveStage>",
+                std::mem::size_of::<Option<CollectiveStage>>(),
+                136,
+            ),
+            (
+                "StageDependencies",
+                std::mem::size_of::<StageDependencies>(),
+                56,
+            ),
+            (
+                "CollectiveProgressRecord",
+                std::mem::size_of::<crate::CollectiveProgressRecord>(),
+                280,
+            ),
+        ];
+        for (name, size, bound) in checks {
+            assert!(
+                size <= bound,
+                "{name} grew to {size} B, above its {bound} B budget"
+            );
+        }
     }
 
     /// `FlowGeneratorState` is held once per flow in the image and in every Scalar and CPU host
