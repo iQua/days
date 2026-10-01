@@ -116,9 +116,10 @@ Days AGO checkers:
 ./.lake/build/bin/p10c_dcqcn_check <path/to/dcqcn_events.csv>
 ./.lake/build/bin/p10c_collective_check <path/to/collective_events.csv>
 ./.lake/build/bin/p10c_roce_check receiver <path/to/roce_receiver.csv>
-./.lake/build/bin/p10c_roce_check sender <path/to/roce_sender.csv> <path/to/dcqcn.csv> [<stop_time_ns>]
+./.lake/build/bin/p10c_roce_check sender <path/to/roce_sender.csv> <path/to/dcqcn.csv> \
+  [--pfc <path/to/pfc.csv>] [<stop_time_ns>]
 ./.lake/build/bin/p10c_roce_check trace <path/to/roce_sender.csv> <path/to/roce_receiver.csv> \
-  <path/to/dcqcn.csv> [<stop_time_ns>]
+  <path/to/dcqcn.csv> [--pfc <path/to/pfc.csv>] [<stop_time_ns>]
 ```
 
 `p10c_roce_check` certifies RoCE queue pairs from the executor's `roce_receiver_transitions_csv`,
@@ -130,13 +131,30 @@ Days AGO checkers:
   because the controller's rate decides the sender's status, and a CNP or control tick recomputes
   that status without a RoCE row. It also checks that every pending pacing tick, timeout and
   control tick fires before any later event of the pair, and that a completed queue pair's control
-  tick is not re-armed. A tick with `class_paused = 1` (host-link PFC paused the pair's data
-  class on its host) must send nothing, add no credit and park the pacer. A sender log without the
-  `class_paused` column, from a writer that predates it, reads `0` on every row. A `resume` row
-  records a PFC RESUME restarting a pacer that a paused tick parked, on its next grid point
-  strictly after the RESUME (or `stopped` beyond the stop time). The rows of one RESUME share its
-  event key, for distinct flows of one node in increasing `flow_id` order; no other rows may
-  share a key.
+  tick is not re-armed.
+- Host-link PFC (schema Amendments 1-3). A tick with `class_paused = 1` found the pair's data
+  class (`data_class`) paused on its host: it must send nothing, add no credit and park the pacer.
+  A `resume` row records a PFC RESUME restarting a pacer that a paused tick parked, on its next
+  grid point strictly after the RESUME (or `stopped` beyond the stop time). The rows of one
+  RESUME share its event key, for distinct flows of one node in increasing `flow_id` order; no
+  other rows may share a key. A sender log with the `data_class` column needs `--pfc` with the
+  run's `pfc_transitions_csv`, and the pauses and resumes are then checked against the host PAUSE
+  and RESUME records in it:
+  - a paused tick finds its class paused at its host at its event key, and an unpaused tick finds
+    it not paused;
+  - every `resume` row shares the key of the host RESUME that unpaused its class at its node;
+  - every host RESUME that unpauses class `p` at node `n` restarts, in `resume` rows at its key,
+    every pair of class `p` at `n` that a paused tick parked and that can restart (work
+    remaining, not complete). A missing `resume` row is caught at the RESUME, even when a later
+    ACK, NACK or timeout restart would mask it.
+
+  What this certifies, and what it trusts: it certifies the transition mechanics of a pause and a
+  resume and their warrant and completeness against the host PFC records. It trusts the
+  `data_class` value each row carries, the host PFC records themselves (checked by the P10c PFC
+  rules for internal consistency, not against the switch threshold records that emitted the
+  frames), and that a parked pair that cannot restart writes no `resume` row. A sender log
+  without `class_paused`, from a writer that predates it, reads `0` on every row; one with
+  `class_paused` but without `data_class` may not contain pause or resume rows.
 - `trace` runs both, then the cross-role checks. Every data arrival must be a packet the sender
   emitted. Every ACK, NACK and CNP the sender applies must have been sent earlier by the receiver.
 - `<stop_time_ns>` is the image's `stop_time_ns`. No CSV records it, and it decides whether a
