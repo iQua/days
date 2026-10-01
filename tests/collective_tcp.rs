@@ -429,11 +429,12 @@ fn dcqcn_collectives_stay_rejected_at_lowering() {
         ID.fetch_add(1, Ordering::Relaxed)
     ));
     fs::write(&path, config).unwrap();
-    let error = compile_config(&path).expect_err("DCQCN collectives are P15");
+    let error =
+        compile_config(&path).expect_err("DCQCN collectives stay refused: DCQCN is unreliable");
     fs::remove_file(path).unwrap();
     assert_eq!(
         error.to_string(),
-        "unsupported collective flow type `DCQCN`; collectives require flow_type = \"TCP\" (RoCE queue pairs arrive in P15)"
+        "unsupported collective flow type `DCQCN`; collectives require a reliable transport, flow_type = \"TCP\" or \"RoCE\" (a RoCE queue pair is DCQCN with Go-back-N)"
     );
 }
 

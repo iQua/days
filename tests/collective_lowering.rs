@@ -264,19 +264,19 @@ fn collective_transport_rejections_are_precise_and_flow_dependencies_stay_reject
     for (replacement, expected) in [
         (
             "flow_type = \"PacketDistribution\"",
-            "unsupported collective flow type `PacketDistribution`; collectives require flow_type = \"TCP\" (RoCE queue pairs arrive in P15)",
+            "unsupported collective flow type `PacketDistribution`; collectives require a reliable transport, flow_type = \"TCP\" or \"RoCE\" (a RoCE queue pair is DCQCN with Go-back-N)",
         ),
         (
             "flow_type = \"DCQCN\"",
-            "unsupported collective flow type `DCQCN`; collectives require flow_type = \"TCP\" (RoCE queue pairs arrive in P15)",
+            "unsupported collective flow type `DCQCN`; collectives require a reliable transport, flow_type = \"TCP\" or \"RoCE\" (a RoCE queue pair is DCQCN with Go-back-N)",
         ),
         (
             "flow_type = \"Rate\"",
-            "unsupported collective flow type `Rate`; collectives require flow_type = \"TCP\" (RoCE queue pairs arrive in P15)",
+            "unsupported collective flow type `Rate`; collectives require a reliable transport, flow_type = \"TCP\" or \"RoCE\" (a RoCE queue pair is DCQCN with Go-back-N)",
         ),
         (
             "",
-            "collective flow_type is missing; collectives require flow_type = \"TCP\" (RoCE queue pairs arrive in P15)",
+            "collective flow_type is missing; collectives require a reliable transport, flow_type = \"TCP\" or \"RoCE\"",
         ),
     ] {
         let config = collective_config("AllGather")
