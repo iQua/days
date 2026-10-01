@@ -169,6 +169,8 @@ On a NACK or a timeout, the sender rewinds to the first unacknowledged byte and 
 
 **With the timeout off, only a NACK repairs a loss.** A NACK needs a later packet of the same queue pair to arrive out of order. If the last packet is lost, or the last ACK, or a resent packet is lost again when nothing follows it, the queue pair stalls for the rest of the run. It never completes, and the run does not report an error. This is the NACK-only Go-back-N of the HPCC ns-3 model; keep the timeout on unless you need that behavior.
 
+With `[link.pfc] host_links = true`, a switch can pause a queue pair's host. The queue pair then stops sending in its data class until the resume; see [host links](/docs/configuration/l2#host-links).
+
 Exact lowering refuses `[flow.traffic.roce]` on other flow types, `[flow.traffic.tcp]` on a queue pair, `cnp_priority` on a queue pair (use `feedback_priority`), and duration-bounded queue pairs. Queue pairs cannot yet carry collective stages. They run on Scalar and CPU; Metal and CUDA refuse them at validation.
 
 ## Days AGO field limits
