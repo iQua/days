@@ -229,8 +229,9 @@ impl HostStageIndex {
 
 /// One host's stage index together with the read counters of the host's three tables.
 ///
-/// Stored per host in `TransitionState::host_indices`. The counters sit beside the index, not
-/// inside it, so the stage view can borrow the index and both counters at once.
+/// Stored in each host's entry of `TransitionState::hosts`, beside the host's state. The counters
+/// sit beside the index, not inside it, so the stage view can borrow the index and both counters
+/// at once.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct HostStageSlot {
     index: HostStageIndex,

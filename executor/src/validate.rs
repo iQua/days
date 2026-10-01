@@ -1571,7 +1571,7 @@ fn validate_generators(
                     state,
                     flow,
                     generator,
-                    stage,
+                    *stage,
                     &mut collective_positions,
                     &mut compute_positions,
                 )?;
@@ -2602,19 +2602,26 @@ fn incomplete_tcp_segment_ledger(
     ))
 }
 
-/// A generator together with its stage record, read from the host's stage table by position.
+/// A generator together with its stage record, borrowed from the host's stage table by position.
 ///
 /// The validator asks about a generator's stage wherever it asked about the generator's former
 /// `stage` field; this view carries both, and dereferences to the generator for everything else.
+/// Validators take it by value, so it holds the record by reference: two pointers per copy.
 #[derive(Clone, Copy)]
 struct StagedGenerator<'a> {
     generator: &'a crate::FlowGeneratorState,
-    stage: Option<crate::CollectiveStage>,
+    stage: Option<&'a crate::CollectiveStage>,
 }
 
-impl StagedGenerator<'_> {
+impl<'a> StagedGenerator<'a> {
     /// `generator` in place of this view's generator, with the same stage record.
-    const fn with_generator(self, generator: &crate::FlowGeneratorState) -> StagedGenerator<'_> {
+    const fn with_generator<'b>(
+        self,
+        generator: &'b crate::FlowGeneratorState,
+    ) -> StagedGenerator<'b>
+    where
+        'a: 'b,
+    {
         StagedGenerator {
             generator,
             stage: self.stage,
@@ -2634,13 +2641,26 @@ impl std::ops::Deref for StagedGenerator<'_> {
 fn staged_generator(state: &crate::HostState, position: usize) -> StagedGenerator<'_> {
     StagedGenerator {
         generator: &state.generators[position],
-        stage: state.stage(position),
+        stage: state.stages.get(position).and_then(Option::as_ref),
     }
 }
 
 /// `state`'s generators in table order, each with its stage record.
+///
+/// Each generator pairs with the stage table's entry at its position, or with `None` past the
+/// table's end, exactly as [`staged_generator`] reads it, whatever the table's length. On a host
+/// without stages the table is empty, every generator pairs with `None`, and no entry is read.
 fn staged_generators(state: &crate::HostState) -> impl Iterator<Item = StagedGenerator<'_>> {
-    (0..state.generators.len()).map(|position| staged_generator(state, position))
+    let stages = state
+        .stages
+        .iter()
+        .map(Option::as_ref)
+        .chain(std::iter::repeat(None));
+    state
+        .generators
+        .iter()
+        .zip(stages)
+        .map(|(generator, stage)| StagedGenerator { generator, stage })
 }
 
 fn is_compute_generator(generator: StagedGenerator<'_>) -> bool {
@@ -7309,4 +7329,30 @@ pub fn assert_validate_flow_index_equivalent_for_testing(
     legacy_scans::future_work_is_stable(image, &flow_index)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StagedGenerator;
+
+    /// Every validator that asks about a generator's stage receives this view by value, so its
+    /// size is the number of bytes copied per call, once per generator in each of the validators
+    /// that walk the generator tables, on every image, stageless ones included. Holding the stage
+    /// record by value made the view the generator reference plus a copied
+    /// `Option<CollectiveStage>`, 144 B. The bound was motivated by `validate`'s residue on E1's
+    /// stageless image, 5.6 M instructions more than `main` (948a0e9); borrowing the record
+    /// recovered about 2.3 M of it, and the other 3.3 M is not attributed to the copy
+    /// (`days-gpu/evidence/P14/e1-residue.md`). A reference to the record in the host's stage
+    /// table keeps the view at two pointers, the reference and the niche-packed optional one.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn staged_generator_view_is_two_pointers() {
+        const TWO_POINTERS: usize = 2 * std::mem::size_of::<usize>();
+        let size = std::mem::size_of::<StagedGenerator<'static>>();
+        assert!(
+            size <= TWO_POINTERS,
+            "StagedGenerator is {size} B, above {TWO_POINTERS} B: borrow the stage record from \
+             the host's stage table instead of copying it"
+        );
+    }
 }

@@ -963,6 +963,12 @@ const SCAN_METHODS: &[&str] = &["iter", "iter_mut", "into_iter"];
 
 /// Accessors that return a host's raw `HostState`, whose tables no probe counts.
 const RAW_HOST_ACCESSORS: &[&str] = &["host_state", "host_state_mut"];
+/// Fields holding raw host states: the image's `host_states`, the executor's `hosts` store, and
+/// the Scalar store's `states` and `indices` tables.
+const RAW_HOST_FIELDS: &[&str] = &["host_states", "hosts", "states", "indices"];
+/// Types that hold a raw host state: the state itself, the executor's host store, and the store's
+/// per-host entry and whole-image tables.
+const RAW_HOST_TYPES: &[&str] = &["HostState", "HostStore", "HostEntry", "HostTables"];
 
 /// Element types of the raw host tables and of the raw pending-cause list.
 const RAW_TABLE_ELEMENTS: &[&str] = &["FlowGeneratorState", "TcpReceiverState"];
@@ -979,7 +985,9 @@ const RAW_CAUSE_ELEMENT: &str = "PendingCollectiveProgress";
 ///   named in [`STAGE_PATH_TABLES`]. Keyed lookups through the stage index are the only per-event
 ///   way into these tables;
 /// - raw host access that would bypass the view's counters: a call of `host_state` or
-///   `host_state_mut`, the `host_states` field, or the `HostState` type;
+///   `host_state_mut`; the `host_states`, `hosts`, `states` or `indices` field (the image's host
+///   states, the executor's host store, and the Scalar store's tables); or the `HostState`,
+///   `HostStore`, `HostEntry` or `HostTables` type;
 /// - raw table types that would let a table escape the view: a slice of `FlowGeneratorState` or
 ///   `TcpReceiverState`, or a `Vec` of `PendingCollectiveProgress`.
 ///
@@ -1140,7 +1148,7 @@ impl<'ast> Visit<'ast> for StageBodyChecker<'_> {
 
     fn visit_expr_field(&mut self, field: &'ast syn::ExprField) {
         if let syn::Member::Named(ident) = &field.member {
-            if ident == "host_states" {
+            if RAW_HOST_FIELDS.contains(&ident.to_string().as_str()) {
                 self.violation(
                     ident.span(),
                     "reaches the raw host states; use the stage view".to_owned(),
@@ -1174,10 +1182,10 @@ impl<'ast> Visit<'ast> for StageBodyChecker<'_> {
 
     fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
         if let Some(last) = path.path.segments.last() {
-            if last.ident == "HostState" {
+            if let Some(raw) = RAW_HOST_TYPES.iter().find(|raw| last.ident == **raw) {
                 self.violation(
                     last.ident.span(),
-                    "names the raw `HostState`; use the stage view".to_owned(),
+                    format!("names the raw `{raw}`; use the stage view"),
                 );
             }
             if last.ident == "Vec" {
@@ -2380,6 +2388,31 @@ impl TransitionState<'_> {
             ),
             (
                 "let states = &self.host_states;",
+                "reaches the raw host states",
+            ),
+            ("let hosts = &self.hosts;", "reaches the raw host states"),
+            (
+                "let flows = self.hosts[0].state.generators.len();",
+                "reaches the raw host states",
+            ),
+            (
+                "let host: &mut HostEntry = todo!();",
+                "names the raw `HostEntry`",
+            ),
+            (
+                "let store: &HostStore = todo!();",
+                "names the raw `HostStore`",
+            ),
+            (
+                "let tables: &HostTables = todo!();",
+                "names the raw `HostTables`",
+            ),
+            (
+                "for state in &tables.states {}",
+                "reaches the raw host states",
+            ),
+            (
+                "let slot = &tables.indices[0];",
                 "reaches the raw host states",
             ),
             (
