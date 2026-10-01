@@ -130,7 +130,9 @@ Days AGO checkers:
   because the controller's rate decides the sender's status, and a CNP or control tick recomputes
   that status without a RoCE row. It also checks that every pending pacing tick, timeout and
   control tick fires before any later event of the pair, and that a completed queue pair's control
-  tick is not re-armed.
+  tick is not re-armed. A tick with `class_paused = 1` (host-link PFC paused the pair's data
+  class on its host) must send nothing, add no credit and park the pacer. A sender log without the
+  `class_paused` column, from a writer that predates it, reads `0` on every row.
 - `trace` runs both, then the cross-role checks. Every data arrival must be a packet the sender
   emitted. Every ACK, NACK and CNP the sender applies must have been sent earlier by the receiver.
 - `<stop_time_ns>` is the image's `stop_time_ns`. No CSV records it, and it decides whether a
