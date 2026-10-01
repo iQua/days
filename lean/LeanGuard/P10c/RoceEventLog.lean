@@ -338,6 +338,35 @@ structure FlowTrack where
   rateBps : Nat
   /-- A control tick ran on the completed pair: D2 forbids another. -/
   controlSpent : Bool
+  /-- The controller's pending control time, from the pair's last DCQCN row (`none` before the
+  pair's first DCQCN row). -/
+  controlNs : Option Nat
+
+/--
+The events a pair has pending, as `(time, rank, name)`: the armed pacing tick, the armed timeout,
+and the control tick unless D2 has spent it (a control tick ran on the completed pair and was not
+re-armed). Each must fire, as a row, before any later event of the pair: a full run executes
+every event with time `≤ stop_time_ns` in `EventKey` order (`scalar.rs` run loop).
+-/
+def pendingEvents (flow : FlowTrack) : List (Nat × Nat × String) :=
+  let tick :=
+    if flow.state.pacer = .armed then flow.state.nextTickNs.map (fun t => (t, 0, "RoCE pacing tick"))
+    else none
+  let timeout := flow.state.rtoDeadlineNs.map (fun t => (t, 1, "RoCE timeout"))
+  let control :=
+    if flow.controlSpent then none else flow.controlNs.map (fun t => (t, 2, "DCQCN control tick"))
+  [tick, timeout, control].filterMap id
+
+/--
+An event of a pair at `timeNs` may not lie after any of the pair's pending events. Equal times are
+allowed: an arrival (phase 0) precedes a timer at the same instant (S2), and two timers of one host
+at one instant are ordered by an `origin_seq` the logs do not show (S3).
+-/
+def checkPending (role : String) (lineNo : Nat) (source : Nat × Nat) (flow : FlowTrack)
+    (timeNs : Nat) : Except String Unit := do
+  for (pendingNs, _, name) in pendingEvents flow do
+    requireAt role lineNo (timeNs ≤ pendingNs)
+      s!"pending {name} at {pendingNs} did not fire before this row (node_id={source.1}, flow_id={source.2})"
 
 /-- The stop-time decisions the log implies, when the stop time is not given. -/
 structure StopBounds where
@@ -426,6 +455,19 @@ def checkSenderItem (stopTimeNs : Option Nat) (track : SenderTrack) (row : Sende
           s!"RoCE sender state discontinuity (node_id={row.nodeId}, flow_id={row.flowId})"
         pure flow.rateBps
   checkSenderShape row
+  -- The pair's pending events fired before this row (review H1). A byte opportunity at this key
+  -- carries the controller's pending control time, also for the pair's first DCQCN row.
+  let controlNs :=
+    match bytes with
+    | some d => some d.before.nextControlTimeNs
+    | none => prior.bind (·.controlNs)
+  match prior with
+  | some flow => checkPending "sender" row.srcLine source { flow with controlNs := controlNs } row.key.timeNs
+  | none =>
+      checkPending "sender" row.srcLine source
+        { config := row.config, state := row.before, rateBps := rate, controlSpent := false,
+          controlNs := controlNs }
+        row.key.timeNs
   -- The joined controller log: a tick credits at the controller's current rate, and the DCQCN
   -- byte opportunity at the same key exists exactly when the tick sends, for the same bytes.
   at_ (row.rateBps.all (· = rate)) "RoCE tick rate differs from the DCQCN controller's current rate"
@@ -474,7 +516,10 @@ def checkSenderItem (stopTimeNs : Option Nat) (track : SenderTrack) (row : Sende
   pure
     { flows := track.flows.insert source
         { config := row.config, state := row.after, rateBps := rateAfterBytes,
-          controlSpent := controlSpent }
+          controlSpent := controlSpent,
+          controlNs := match bytes with
+            | some d => some d.after.nextControlTimeNs
+            | none => controlNs }
       lastPayload := lastPayload
       stop := stop }
 
@@ -490,6 +535,8 @@ def checkDcqcnItem (track : SenderTrack) (d : DcqcnEventLog.Row) : Except String
       at_ (d.before.currentRateBps = flow.rateBps)
         "DCQCN rate differs from the queue pair's tracked controller rate"
       at_ (d.kind != .bytes) "DCQCN byte opportunity without a RoCE tick at its event key"
+      checkPending "dcqcn" d.srcLine source
+        { flow with controlNs := some d.before.nextControlTimeNs } d.key.timeNs
       let completed := flow.state.sndUna ≥ flow.config.totalBytes
       if d.kind = .control then
         at_ (!flow.controlSpent)
@@ -500,7 +547,43 @@ def checkDcqcnItem (track : SenderTrack) (d : DcqcnEventLog.Row) : Except String
           { flow with
             state := state
             rateBps := d.after.currentRateBps
-            controlSpent := flow.controlSpent || (d.kind = .control && completed) } }
+            controlSpent := flow.controlSpent || (d.kind = .control && completed)
+            controlNs := some d.after.nextControlTimeNs } }
+
+/-- `(time, node, flow, rank)` lexicographic order, to name the earliest unfired event whatever the
+hash map's iteration order. -/
+def earlierPending (a b : Nat × Nat × Nat × Nat × String) : Bool :=
+  a.1 < b.1 || (a.1 = b.1 && (a.2.1 < b.2.1 || (a.2.1 = b.2.1 &&
+    (a.2.2.1 < b.2.2.1 || (a.2.2.1 = b.2.2.1 && a.2.2.2.1 < b.2.2.2.1)))))
+
+/--
+At the end of the log, no pair may hold a pending event at or before the stop time: the run would
+have executed it. Without a given stop time, the bound is the latest time the log shows to be at or
+before the stop (any logged event, any armed tick).
+-/
+def checkPendingAtEnd (stopTimeNs : Option Nat) (rows : List SenderRow)
+    (dcqcn : List DcqcnEventLog.Row) (track : SenderTrack) : Except String Unit := do
+  let latestRow := rows.foldl (fun acc row => max acc row.key.timeNs) 0
+  let latestDcqcn := dcqcn.foldl (fun acc d => max acc d.key.timeNs) 0
+  let latestArmed := (track.stop.latestWithin.map (·.1)).getD 0
+  let bound := stopTimeNs.getD (max latestRow (max latestDcqcn latestArmed))
+  let mut earliest : Option (Nat × Nat × Nat × Nat × String) := none
+  for (source, flow) in track.flows.toList do
+    for (pendingNs, rank, name) in pendingEvents flow do
+      if pendingNs ≤ bound then
+        let candidate := (pendingNs, source.1, source.2, rank, name)
+        earliest :=
+          match earliest with
+          | some current => if earlierPending candidate current then some candidate else some current
+          | none => some candidate
+  match earliest with
+  | none => pure ()
+  | some (pendingNs, node, flow, _, name) =>
+      match stopTimeNs with
+      | some stop =>
+          throw s!"sender: pending {name} at {pendingNs} never fired by stop_time_ns={stop} (node_id={node}, flow_id={flow})"
+      | none =>
+          throw s!"sender: pending {name} at {pendingNs} never fired although the log implies stop_time_ns >= {bound} (node_id={node}, flow_id={flow})"
 
 /--
 The sender log against §5, joined with the DCQCN controller log of the same run. `stopTimeNs` is
@@ -517,6 +600,12 @@ def checkSenderRows (stopTimeNs : Option Nat) (rows : List SenderRow)
   let mut pairs : Std.HashSet (Nat × Nat) := ∅
   for row in rows do pairs := pairs.insert (row.nodeId, row.flowId)
   let pairRows := dcqcn.filter (fun d => pairs.contains (d.nodeId, d.flowId))
+  -- A run executes no event after its stop time.
+  if let some stop := stopTimeNs then
+    for row in rows do
+      requireAt "sender" row.srcLine (row.key.timeNs ≤ stop) s!"event after stop_time_ns={stop}"
+    for d in dcqcn do
+      requireAt "dcqcn" d.srcLine (d.key.timeNs ≤ stop) s!"event after stop_time_ns={stop}"
   let mut track : SenderTrack := {}
   for item in mergeLogs rows pairRows [] do
     match item with
@@ -527,6 +616,7 @@ def checkSenderRows (stopTimeNs : Option Nat) (rows : List SenderRow)
       if within < beyond then pure ()
       else throw s!"sender: no single stop time fits the pacer decisions: tick {within} (line {withinLine}) is armed and tick {beyond} (line {beyondLine}) is stopped"
   | _, _ => pure ()
+  checkPendingAtEnd stopTimeNs rows dcqcn track
 
 /-! ## Cross-role invariants (both logs and the controller log of one run) -/
 

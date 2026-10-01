@@ -202,7 +202,7 @@ gbn_dcqcn="$fixture_dir/dcqcn_qp_completion_accept.csv"
 gbn_stop=30000
 stopped="$fixture_dir/roce_sender_stopped_accept.csv"
 stopped_dcqcn="$fixture_dir/roce_sender_stopped_accept.dcqcn.csv"
-stopped_stop=2500
+stopped_stop=2950
 
 check_case "roce_sender_gbn_accept.csv" 0 "ACCEPT" sender "$gbn" "$gbn_dcqcn" "$gbn_stop" || true
 check_case "roce_sender_gbn_accept.csv (stop inferred)" 0 "ACCEPT" sender "$gbn" "$gbn_dcqcn" || true
@@ -345,13 +345,13 @@ mutate_dcqcn "retransmission-not-charged-to-byte-counter" "$gbn" "$gbn_dcqcn" "$
   'NR != 4 { print }' \
   'REJECT: dcqcn: line 4: DCQCN state discontinuity for source (node_id=1, flow_id=3)'
 
-# roce_sender_stopped_accept.csv rows (NR), timeout off, stop 2500: 2 t1000 flow 3 send; 3 t2000
+# roce_sender_stopped_accept.csv rows (NR), timeout off, stop 2950: 2 t1000 flow 3 send; 3 t2000
 # flow 3 last packet, parks; 4 t2200 flow 7 tick whose next tick (3200) is beyond stop; 5 t2600
 # NACK 0 rewinds a parked pacer whose restart (3000) is beyond stop; 6 t2700 ACK 1000, still
 # stopped; 7 t2800 ACK 2000 completes a stopped pacer (parked, finished).
 mutate_sender "restart-armed-beyond-stop" "$stopped" "$stopped_dcqcn" "$stopped_stop" \
   'NR == 5 { $35 = "armed"; $37 = "scheduled" } { print }' \
-  'REJECT: sender: line 5: RoCE pacer stop decision contradicts stop_time_ns=2500 (tick 3000)'
+  'REJECT: sender: line 5: RoCE pacer stop decision contradicts stop_time_ns=2950 (tick 3000)'
 mutate_sender "inconsistent-inferred-stop" "$stopped" "$stopped_dcqcn" "" \
   'NR == 4 { $35 = "armed"; $37 = "blocked" } { print }' \
   'REJECT: sender: no single stop time fits the pacer decisions: tick 3200 (line 4) is armed and tick 3000 (line 5) is stopped'
@@ -361,9 +361,12 @@ mutate_sender "finished-pacer-left-stopped" "$stopped" "$stopped_dcqcn" "$stoppe
 mutate_sender "rto-armed-while-off" "$stopped" "$stopped_dcqcn" "$stopped_stop" \
   'NR == 2 { $34 = 6000 } { print }' \
   'REJECT: sender: line 2: invalid RoCE sender after-state'
+mutate_sender "event-after-stop" "$stopped" "$stopped_dcqcn" 2750 \
+  '{ print }' \
+  'REJECT: sender: line 7: event after stop_time_ns=2750'
 mutate_sender "stopped-tick-still-armed" "$stopped" "$stopped_dcqcn" "$stopped_stop" \
   'NR == 4 { $35 = "armed"; $37 = "blocked" } { print }' \
-  'REJECT: sender: line 4: RoCE pacer stop decision contradicts stop_time_ns=2500 (tick 3200)'
+  'REJECT: sender: line 4: RoCE pacer stop decision contradicts stop_time_ns=2950 (tick 3200)'
 
 # --- Trace: the three logs of one run, and the cross-role invariants ---------------------------
 loss_sender="$fixture_dir/roce_trace_loss_accept.sender.csv"
