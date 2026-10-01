@@ -422,6 +422,19 @@ mod tests {
         assert_eq!(silent.expected_psn, 2_000);
     }
 
+    /// A repeat NACK's earliest time beyond `u64::MAX` is never reached (design note §5.9, as the
+    /// notification point reads the CNP interval): the repeat stays suppressed for the whole run.
+    #[test]
+    fn a_nack_interval_beyond_u64_never_expires() {
+        let mut state = receiver(1, true);
+        state.nack_interval_ns = u64::MAX - 5;
+        assert_eq!(receive(&mut state, 1_000, 1_000, 10), RoceReceiverAction::Nack);
+        assert_eq!(
+            receive(&mut state, 2_000, 500, u64::MAX),
+            RoceReceiverAction::NackSuppressed
+        );
+    }
+
     #[test]
     fn nacks_are_rate_limited_per_expected_psn() {
         let mut state = receiver(1, true);
