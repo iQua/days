@@ -719,3 +719,32 @@ pub(crate) fn check_host_index(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{HostStageIndex, HostStageSlot, KeyedList, StageScanProbe};
+    use std::mem::size_of;
+
+    /// A host's index holds its two keyed lists inline and its stage-only views (the successor
+    /// maps and the releasable set) behind one pointer, so a host without stages builds and drops
+    /// no B-tree.
+    ///
+    /// The bound is the index's size, which is the bytes every host's slot carries and what a
+    /// stageless host constructs and drops: two keyed lists, one pointer and the test-only probe.
+    /// Holding the three stage views inline costs three B-tree handles (72 B on 64-bit targets)
+    /// for every host, stages or not.
+    #[test]
+    fn host_stage_index_holds_stage_views_behind_one_pointer() {
+        let bound = 2 * size_of::<KeyedList>() + size_of::<usize>() + size_of::<StageScanProbe>();
+        let size = size_of::<HostStageIndex>();
+        println!(
+            "record=host_stage_index_size index={size} slot={} keyed_list={} bound={bound}",
+            size_of::<HostStageSlot>(),
+            size_of::<KeyedList>()
+        );
+        assert!(
+            size <= bound,
+            "HostStageIndex is {size} B, above {bound} B: hold the stage-only views out of line"
+        );
+    }
+}
