@@ -49,6 +49,8 @@ jobs:
             drr_check \
             wfq_check \
             p10c_collective_check \
+            p10c_dcqcn_check \
+            p10c_roce_check \
             aqm_check \
             aqm_dcqcn_check
 
@@ -62,6 +64,12 @@ jobs:
 
       - name: Run P10c collective progress checks
         run: bash lean/scripts/run-p10c-collective-campaign.sh
+
+      - name: Run P10c exact-integer DCQCN checks
+        run: bash lean/scripts/run-p10c-dcqcn-campaign.sh
+
+      - name: Run P10c RoCE queue-pair checks
+        run: bash lean/scripts/run-p10c-roce-campaign.sh
 
       - name: Run AQM fixture checks
         run: bash lean/scripts/run-aqm-fixtures.sh
