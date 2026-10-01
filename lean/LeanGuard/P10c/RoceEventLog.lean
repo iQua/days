@@ -725,12 +725,16 @@ At the end of the log, no pair may hold a pending event at or before the stop ti
 have executed it. Without a given stop time, the bound is the latest time the log shows to be at or
 before the stop (any logged event, any armed tick).
 -/
-def checkPendingAtEnd (stopTimeNs : Option Nat) (rows : List SenderRow)
+def checkPendingAtEnd (stopTimeNs horizonNs : Option Nat) (rows : List SenderRow)
     (dcqcn : List DcqcnEventLog.Row) (track : SenderTrack) : Except String Unit := do
   let latestRow := rows.foldl (fun acc row => max acc row.key.timeNs) 0
   let latestDcqcn := dcqcn.foldl (fun acc d => max acc d.key.timeNs) 0
   let latestArmed := (track.stop.latestWithin.map (·.1)).getD 0
-  let bound := stopTimeNs.getD (max latestRow (max latestDcqcn latestArmed))
+  let runBound := stopTimeNs.getD (max latestRow (max latestDcqcn latestArmed))
+  -- A prefix (`--horizon-ns`) holds exactly the events before the horizon, so only events before
+  -- it must have fired.
+  let horizonBinds := horizonNs.any (fun horizon => horizon - 1 < runBound)
+  let bound := if horizonBinds then (horizonNs.getD 1) - 1 else runBound
   let mut earliest : Option (Nat × Nat × Nat × Nat × String) := none
   for (source, flow) in track.flows.toList do
     for (pendingNs, rank, name) in pendingEvents flow do
@@ -743,6 +747,8 @@ def checkPendingAtEnd (stopTimeNs : Option Nat) (rows : List SenderRow)
   match earliest with
   | none => pure ()
   | some (pendingNs, node, flow, _, name) =>
+      if horizonBinds then
+        throw s!"sender: pending {name} at {pendingNs} never fired before horizon_ns={horizonNs.getD 0} (node_id={node}, flow_id={flow})"
       match stopTimeNs with
       | some stop =>
           throw s!"sender: pending {name} at {pendingNs} never fired by stop_time_ns={stop} (node_id={node}, flow_id={flow})"
@@ -856,7 +862,7 @@ The sender log against §5, joined with the DCQCN controller log of the same run
 the image's stop time when known; without it, one stop time must separate every armed tick from
 every stopped one.
 -/
-def checkSenderRows (stopTimeNs : Option Nat) (rows : List SenderRow)
+def checkSenderRows (stopTimeNs horizonNs : Option Nat) (rows : List SenderRow)
     (dcqcn : List DcqcnEventLog.Row) (pfc : Option (List MechanismEventLog.PfcLog.Row)) :
     Except String Unit := do
   requireAt "sender" 1 (!rows.isEmpty) "empty RoCE sender trace"
@@ -889,6 +895,14 @@ def checkSenderRows (stopTimeNs : Option Nat) (rows : List SenderRow)
       requireAt "sender" row.srcLine (row.key.timeNs ≤ stop) s!"event after stop_time_ns={stop}"
     for d in dcqcn do
       requireAt "dcqcn" d.srcLine (d.key.timeNs ≤ stop) s!"event after stop_time_ns={stop}"
+  -- A prefix holds no event at or after its horizon.
+  if let some horizon := horizonNs then
+    for row in rows do
+      requireAt "sender" row.srcLine (row.key.timeNs < horizon) s!"event at or after horizon_ns={horizon}"
+    for d in dcqcn do
+      requireAt "dcqcn" d.srcLine (d.key.timeNs < horizon) s!"event at or after horizon_ns={horizon}"
+    for p in pfc.getD [] do
+      requireAt "pfc" p.srcLine (p.key.timeNs < horizon) s!"event at or after horizon_ns={horizon}"
   let hosts := pairs.fold (fun acc (node, _) => acc.insert node) (∅ : Std.HashSet Nat)
   let hostControl := pfcRows.filter (fun p => p.kind = .control && hosts.contains p.nodeId)
   let mut track : SenderTrack := {}
@@ -910,7 +924,7 @@ def checkSenderRows (stopTimeNs : Option Nat) (rows : List SenderRow)
       if within < beyond then pure ()
       else throw s!"sender: no single stop time fits the pacer decisions: tick {within} (line {withinLine}) is armed and tick {beyond} (line {beyondLine}) is stopped"
   | _, _ => pure ()
-  checkPendingAtEnd stopTimeNs rows dcqcn track
+  checkPendingAtEnd stopTimeNs horizonNs rows dcqcn track
 
 /-! ## Cross-role invariants (both logs and the controller log of one run) -/
 
@@ -1006,11 +1020,14 @@ def checkCrossRole (sender : List SenderRow) (receiver : List ReceiverRow)
             throw s!"dcqcn: line {d.srcLine}: DCQCN CNP of a queue pair that no receiver sent before it (flow_id={d.flowId})"
 
 /-- The three logs of one run: each on its own terms, then the cross-role invariants. -/
-def checkTrace (stopTimeNs : Option Nat) (sender : List SenderRow) (receiver : List ReceiverRow)
-    (dcqcn : List DcqcnEventLog.Row) (pfc : Option (List MechanismEventLog.PfcLog.Row)) :
-    Except String Unit := do
+def checkTrace (stopTimeNs horizonNs : Option Nat) (sender : List SenderRow)
+    (receiver : List ReceiverRow) (dcqcn : List DcqcnEventLog.Row)
+    (pfc : Option (List MechanismEventLog.PfcLog.Row)) : Except String Unit := do
   inRole "receiver" (checkReceiverRows receiver)
-  checkSenderRows stopTimeNs sender dcqcn pfc
+  if let some horizon := horizonNs then
+    for row in receiver do
+      requireAt "receiver" row.srcLine (row.key.timeNs < horizon) s!"event at or after horizon_ns={horizon}"
+  checkSenderRows stopTimeNs horizonNs sender dcqcn pfc
   checkCrossRole sender receiver dcqcn
 
 end LeanGuard.P10c.RoceEventLog
