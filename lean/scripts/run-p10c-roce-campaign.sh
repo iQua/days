@@ -509,5 +509,102 @@ mutate_executor "nack-only-suppressed-sent" nack_only receiver \
   '$18 == "nack_suppressed"' '$18 = "nack"' \
   'REJECT: receiver: line LINE: RoCE receiver action mismatch'
 
+# --- Pending events must fire (review H1) -----------------------------------------------------
+# A full run executes exactly the events with time <= stop_time_ns (scalar.rs run loop), so a
+# pair's pending pacing tick, timeout, or (unless spent by D2) control tick must appear as a row
+# before any later row of the pair, and, at the end, if it lies at or before the stop time.
+# expect_reject <label> <expected REJECT line> <checker args...>
+expect_reject() {
+  local label="$1"
+  local expected_output="$2"
+  shift 2
+  mutations=$((mutations + 1))
+  if check_case "pending/$label" 1 "$expected_output" "$@"; then
+    mutations_caught=$((mutations_caught + 1))
+  fi
+}
+pf="$fixture_dir/roce_pending"
+# Hand traces from the review (evidence/P15/leanguard-review): each reject differs from its
+# accepted twin only by the missing event.
+expect_reject "lost-timeout (M1)" \
+  'REJECT: sender: line 3: pending RoCE timeout at 2500 did not fire before this row (node_id=1, flow_id=3)' \
+  sender "${pf}_timeout_reject.sender.csv" "${pf}_timeout_reject.dcqcn.csv" 5000
+expect_reject "lost-timeout, trace mode (M1)" \
+  'REJECT: sender: line 3: pending RoCE timeout at 2500 did not fire before this row (node_id=1, flow_id=3)' \
+  trace "${pf}_timeout_reject.sender.csv" "${pf}_timeout_reject.receiver.csv" \
+  "${pf}_timeout_reject.dcqcn.csv" 5000
+expect_reject "lost-tick (M2)" \
+  'REJECT: sender: line 3: pending RoCE pacing tick at 2000 did not fire before this row (node_id=1, flow_id=3)' \
+  sender "${pf}_tick_reject.sender.csv" "${pf}_tick_reject.dcqcn.csv" 5000
+expect_reject "lost-tick-at-tail (M2b)" \
+  'REJECT: sender: pending RoCE pacing tick at 2000 never fired by stop_time_ns=5000 (node_id=1, flow_id=3)' \
+  sender "${pf}_tick_tail_reject.sender.csv" "${pf}_tick_reject.dcqcn.csv" 5000
+expect_reject "lost-tick-at-tail, stop inferred (M2b)" \
+  'REJECT: sender: pending RoCE pacing tick at 2000 never fired although the log implies stop_time_ns >= 2000 (node_id=1, flow_id=3)' \
+  sender "${pf}_tick_tail_reject.sender.csv" "${pf}_tick_reject.dcqcn.csv"
+expect_reject "lost-control-tick-of-incomplete-pair (M3)" \
+  'REJECT: sender: line 3: pending DCQCN control tick at 10500 did not fire before this row (node_id=1, flow_id=3)' \
+  sender "${pf}_control_reject.sender.csv" "${pf}_control_reject.dcqcn.csv" 20000
+check_case "pending/lost-timeout twin (M1)" 0 "ACCEPT" \
+  sender "${pf}_timeout_twin.sender.csv" "${pf}_timeout_twin.dcqcn.csv" 5000 || true
+check_case "pending/lost-timeout twin, trace mode (M1)" 0 "ACCEPT" \
+  trace "${pf}_timeout_twin.sender.csv" "${pf}_timeout_twin.receiver.csv" \
+  "${pf}_timeout_twin.dcqcn.csv" 5000 || true
+check_case "pending/lost-tick twin (M2, M2b)" 0 "ACCEPT" \
+  sender "${pf}_tick_twin.sender.csv" "${pf}_tick_twin.dcqcn.csv" 5000 || true
+check_case "pending/lost-control-tick twin (M3)" 0 "ACCEPT" \
+  sender "${pf}_control_reject.sender.csv" "${pf}_control_twin.dcqcn.csv" 20000 || true
+
+# Executor analogues on roce_trace_timeout_executor_accept (one pair: node 2, flow 1).
+xb="$fixture_dir/roce_trace_timeout_executor_accept"
+xstop="$(cat "$xb.stop_time_ns")"
+# truncate_all <time>: the three logs cut before <time> (a run that lost everything from <time>).
+truncate_all() {
+  local cut="$1"
+  for role in sender receiver dcqcn; do
+    awk -F, -v cut="$cut" 'NR == 1 || $1 < cut' "$xb.$role.csv" > "$campaign_tmp/cut.$role.csv"
+  done
+}
+first_timeout="$(awk -F, 'NR > 1 && $7 == "timeout" { print $1; exit }' "$xb.sender.csv")"
+truncate_all "$first_timeout"
+expect_reject "executor: timeout lost at the tail" \
+  "REJECT: sender: pending RoCE timeout at $first_timeout never fired by stop_time_ns=$xstop (node_id=2, flow_id=1)" \
+  trace "$campaign_tmp/cut.sender.csv" "$campaign_tmp/cut.receiver.csv" "$campaign_tmp/cut.dcqcn.csv" "$xstop"
+restart_tick="$(awk -F, 'NR > 1 && $7 == "timeout" { print $36; exit }' "$xb.sender.csv")"
+truncate_all "$restart_tick"
+expect_reject "executor: restarted tick lost at the tail" \
+  "REJECT: sender: pending RoCE pacing tick at $restart_tick never fired by stop_time_ns=$xstop (node_id=2, flow_id=1)" \
+  trace "$campaign_tmp/cut.sender.csv" "$campaign_tmp/cut.receiver.csv" "$campaign_tmp/cut.dcqcn.csv" "$xstop"
+# Mid-trace tick: cut out a tick that sends nothing, followed by an ACK or NACK with no controller
+# row in between; the ACK or NACK then starts from the tick's before-state (consistent logs).
+read -r tick_line tick_time next_line <<<"$(awk -F, '
+  FNR == NR { if (FNR > 1) dtime[$1] = 1; next }
+  FNR > 1 {
+    if (cand && ($7 == "ack" || $7 == "nack")) {
+      clean = 1
+      for (t in dtime) if (t + 0 >= ctime && t + 0 <= $1 + 0) { clean = 0; break }
+      if (clean) { print cline, ctime, FNR; exit }
+    }
+    cand = ($7 == "tick" && $15 == 0); cline = FNR; ctime = $1
+  }' "$xb.dcqcn.csv" "$xb.sender.csv")"
+awk -F, -v OFS=, -v cut="$tick_line" -v next_row="$next_line" '
+  NR == cut { for (i = 20; i <= 28; i++) before[i] = $i; next }
+  NR == next_row { for (i = 20; i <= 28; i++) $i = before[i] }
+  { print }' "$xb.sender.csv" > "$campaign_tmp/tick-cut.sender.csv"
+expect_reject "executor: tick lost mid-trace" \
+  "REJECT: sender: line $((next_line - 1)): pending RoCE pacing tick at $tick_time did not fire before this row (node_id=2, flow_id=1)" \
+  trace "$campaign_tmp/tick-cut.sender.csv" "$xb.receiver.csv" "$xb.dcqcn.csv" "$xstop"
+# Mid-trace control tick: drop the controller log from a control tick that leaves the rate as it
+# was (so no status changes) and at whose time no tick sends; the next sender row exposes it.
+read -r control_time sender_line <<<"$(awk -F, '
+  FNR == NR { if (FNR > 1) { emit[$1] = $15; row[FNR] = $1 }; last = FNR; next }
+  FNR > 1 && $7 == "control" && $21 == $30 && emit[$1] != 1 {
+    for (i = 2; i <= last; i++) if (row[i] + 0 > $1 + 0) { print $1, i; exit }
+  }' "$xb.sender.csv" "$xb.dcqcn.csv")"
+awk -F, -v cut="$control_time" 'NR == 1 || $1 < cut' "$xb.dcqcn.csv" > "$campaign_tmp/control-cut.dcqcn.csv"
+expect_reject "executor: control tick lost mid-trace" \
+  "REJECT: sender: line $sender_line: pending DCQCN control tick at $control_time did not fire before this row (node_id=2, flow_id=1)" \
+  trace "$xb.sender.csv" "$xb.receiver.csv" "$campaign_tmp/control-cut.dcqcn.csv" "$xstop"
+
 echo "P10c RoCE campaign checks: $checked; mutations caught: $mutations_caught/$mutations"
 exit "$failures"
