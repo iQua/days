@@ -51,9 +51,9 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     },
     AllowedFeatureGate {
         path: "device_pfc.rs",
-        predicate: r#"feature = "planner-test-hooks""#,
+        predicate: r#"all(feature = "cuda", feature = "planner-test-hooks")"#,
         count: 3,
-        purpose: "the P14 cuda-host PFC-state scan probe: a per-thread scan counter (empty in production builds), its increment in the two whole-fabric PFC scans, and its read-and-reset for the CUDA planner hook",
+        purpose: "the P14 cuda-host PFC-state scan probe, compiled exactly where its CUDA planner hook is: a per-thread scan counter (empty in every other build), its increment in the two whole-fabric PFC scans, and its read-and-reset for the hook",
     },
     AllowedFeatureGate {
         path: "metal.rs",
