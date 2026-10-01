@@ -13,7 +13,7 @@ use std::path::Path;
 use days::scenario::compile_config;
 use days_executor::{
     CpuConfig, FlowGeneratorKind, GeneratorStatus, MechanismTransitionRecord, ObservationMode,
-    PacketKind, RoceSenderKind, RoceTransitionRecord, RunResult, SimulationImage,
+    PacketKind, PfcControlAction, RoceSenderKind, RoceTransitionRecord, RunResult, SimulationImage,
     run_cpu_with_observations, run_scalar_with_observations,
 };
 
@@ -58,6 +58,11 @@ struct Contract {
     cnps: usize,
     /// PFC pause and resume transitions (the frames are switch-sourced control, not observed).
     pfc_controls: usize,
+    /// PFC pauses applied at a host's egress (host-link PFC).
+    host_pauses: usize,
+    /// Sender ticks that found their queue pair's data class paused, and RESUME restarts.
+    class_paused_ticks: usize,
+    resumes: usize,
     timeouts: usize,
     dropped: u128,
 }
@@ -107,7 +112,29 @@ fn contract(result: &RunResult) -> Contract {
         .mechanism_transitions
     {
         match record {
-            MechanismTransitionRecord::PfcControl(_) => contract.pfc_controls += 1,
+            MechanismTransitionRecord::PfcControl(control) => {
+                contract.pfc_controls += 1;
+                if result
+                    .host_states
+                    .iter()
+                    .any(|state| state.egress_link == control.controlled_link)
+                    && control.action == PfcControlAction::Pause
+                {
+                    contract.host_pauses += 1;
+                }
+            }
+            MechanismTransitionRecord::Roce(RoceTransitionRecord::Sender(sender))
+                if sender.kind == RoceSenderKind::Resume =>
+            {
+                assert!(!sender.class_paused, "{sender:?}");
+                contract.resumes += 1;
+            }
+            MechanismTransitionRecord::Roce(RoceTransitionRecord::Sender(sender))
+                if sender.class_paused =>
+            {
+                assert_eq!(sender.kind, RoceSenderKind::Tick, "{sender:?}");
+                contract.class_paused_ticks += 1;
+            }
             MechanismTransitionRecord::Roce(RoceTransitionRecord::Sender(sender))
                 if sender.kind == RoceSenderKind::Timeout =>
             {
@@ -142,6 +169,79 @@ fn lossless_pfc_completes_without_loss_or_recovery() {
         "one ACK per in-order packet: {contract:?}"
     );
     assert!(contract.pfc_controls > 0, "{contract:?}");
+}
+
+/// Host-link PFC (§10.1 of `evidence/P15/hostpfc-design.md`): the switches pause the sender NICs,
+/// the paused queue pairs park and resume, and nothing is lost, with no retransmission timeout to
+/// fall back on.
+#[test]
+fn host_pfc_incast_pauses_sender_nics_and_loses_nothing() {
+    let image = lower("hostpfc_incast_lossless.toml");
+    let paused_hosts = image
+        .host_states
+        .iter()
+        .filter(|state| state.pfc.is_some())
+        .count();
+    assert_eq!(
+        paused_hosts, 4,
+        "every host link carries data or feedback, so every host owns egress pause state"
+    );
+    let result = run_identical("hostpfc_incast_lossless.toml");
+    let contract = contract(&result);
+    assert_eq!(contract.queue_pairs, 3, "{contract:?}");
+    assert_eq!(contract.finished_pairs, 3, "{contract:?}");
+    assert_eq!(contract.complete_receivers, 3, "{contract:?}");
+    assert_eq!(contract.fresh_data, 3000, "{contract:?}");
+    assert_eq!(
+        (
+            contract.dropped,
+            contract.nacks,
+            contract.retransmissions,
+            contract.timeouts
+        ),
+        (0, 0, 0, 0),
+        "{contract:?}"
+    );
+    assert!(contract.host_pauses > 0, "{contract:?}");
+    assert!(contract.class_paused_ticks > 0, "{contract:?}");
+    assert!(contract.resumes > 0, "{contract:?}");
+}
+
+/// `configs/p15/hostpfc_incast_lossless.toml` with its `host_links` line replaced.
+fn host_links_variant(test: &str, line: &str) -> SimulationImage {
+    let text = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("configs/p15/hostpfc_incast_lossless.toml"),
+    )
+    .expect("read the host-PFC fixture");
+    assert_eq!(text.matches("\nhost_links = true\n").count(), 1);
+    let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "p15_hostpfc_{test}_{}.toml",
+        std::process::id()
+    ));
+    std::fs::write(&path, text.replace("\nhost_links = true\n", line)).expect("write variant");
+    let image = compile_config(&path).expect("the variant lowers");
+    let _ = std::fs::remove_file(&path);
+    image
+}
+
+/// The mechanism is what keeps the incast lossless: without host-link PFC the senders overrun
+/// their first switch.
+#[test]
+fn without_host_links_the_host_pfc_incast_drops() {
+    let image = host_links_variant("off", "\nhost_links = false\n");
+    assert!(image.host_states.iter().all(|state| state.pfc.is_none()));
+    let result = run_scalar_with_observations(&image, None, ObservationMode::Summary)
+        .expect("the Scalar run succeeds");
+    assert!(result.summary.dropped_packets > 0, "{:?}", result.summary);
+}
+
+/// `host_links` defaults to off, and off lowers exactly as a PFC image without the key does.
+#[test]
+fn host_links_default_off() {
+    assert_eq!(
+        host_links_variant("default", "\n"),
+        host_links_variant("explicit", "\nhost_links = false\n")
+    );
 }
 
 #[test]
@@ -288,6 +388,28 @@ fn p15_fixtures_match_their_frozen_anchors() {
             actual.1
         );
     }
+}
+
+/// The HPCC 64->1 incast with host-link PFC (§10.2 of `evidence/P15/hostpfc-design.md`): router 0
+/// pauses the sender NICs, nothing is lost, and every queue pair completes with HPCC's profile
+/// (no retransmission timeout). Release-only, like the anchor below.
+#[test]
+#[ignore = "release-only: 64 queue pairs on a 390-host Dragonfly embedding"]
+fn hpcc_incast_with_host_pfc_loses_nothing() {
+    let image = lower("hpcc_incast64_dragonfly.toml");
+    let result = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("the Scalar run succeeds");
+    let contract = contract(&result);
+    assert_eq!(contract.queue_pairs, 64, "{contract:?}");
+    assert_eq!(contract.finished_pairs, 64, "{contract:?}");
+    assert_eq!(contract.complete_receivers, 64, "{contract:?}");
+    assert_eq!(
+        (contract.dropped, contract.timeouts),
+        (0, 0),
+        "{contract:?}"
+    );
+    assert!(contract.host_pauses > 0, "{contract:?}");
+    assert!(contract.resumes > 0, "{contract:?}");
 }
 
 /// The HPCC cross-check fixture's anchor; ignored in the default matrix (64 queue pairs at 100
