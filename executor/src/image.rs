@@ -1020,8 +1020,10 @@ pub struct SimulationImage {
 #[cfg(test)]
 mod tests {
     use super::{
-        FlowDescriptor, FlowGeneratorState, HostState, PacketKind, RoceGenerator, RoceReceiverState,
+        FlowDescriptor, FlowGeneratorState, HostPfcState, HostState, LinkId, PacketKind,
+        RoceGenerator, RoceReceiverState,
     };
+    use std::collections::VecDeque;
 
     /// P15: `FlowDescriptor::packet_priority` runs on every PFC-monitored switch arrival and
     /// service decision (five Scalar sites), so it stays force-inlined, as the CUDA readback
@@ -1050,7 +1052,7 @@ mod tests {
         let checks = [
             ("RoceGenerator", std::mem::size_of::<RoceGenerator>(), 256),
             ("FlowDescriptor", std::mem::size_of::<FlowDescriptor>(), 80),
-            ("HostState", std::mem::size_of::<HostState>(), 216),
+            ("HostState", std::mem::size_of::<HostState>(), 224),
             (
                 "RoceReceiverState",
                 std::mem::size_of::<RoceReceiverState>(),
@@ -1064,6 +1066,37 @@ mod tests {
                 "{name} grew to {size} B, above its {bound} B budget"
             );
         }
+    }
+
+    /// P15 host-link PFC layout budget. A host's egress pause state lives behind one optional
+    /// box, `HostState::pfc`, so a host without a PFC-controlled egress link pays the 8-B
+    /// pointer (216 B to 224 B, pinned above) and no allocation, and the switch-side
+    /// `PfcQueueState` keeps its layout and its `Debug` bytes.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn host_pfc_state_is_one_optional_box() {
+        assert_eq!(std::mem::size_of::<Option<Box<HostPfcState>>>(), 8);
+        let host = HostState {
+            egress_link: LinkId(0),
+            queue: VecDeque::new(),
+            in_service: None,
+            tx_ready_pending: false,
+            generators: Vec::new(),
+            stages: Vec::new(),
+            tcp_receivers: Vec::new(),
+            dcqcn_receivers: Vec::new(),
+            roce_receivers: None,
+            pfc: None,
+            next_origin_seq: 0,
+            next_payload_seq: 0,
+            sourced_packets: 0,
+            departed_packets: 0,
+            received_packets: 0,
+        };
+        assert!(
+            !format!("{host:#?}").contains("pfc"),
+            "a host without host-link PFC keeps its pre-P15 Debug bytes"
+        );
     }
 
     /// `FlowGeneratorState` is held once per flow in the image and in every Scalar and CPU host
