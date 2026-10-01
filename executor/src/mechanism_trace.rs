@@ -133,6 +133,8 @@ pub enum CollectiveStageKind {
     Tcp,
     /// A delay-only compute stage.
     Compute,
+    /// A collective stage carried by a RoCE queue pair (P15; `qp-schema.md` Amendment 4).
+    Roce,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -320,6 +322,7 @@ pub fn collective_transitions_csv(
 const fn collective_stage_kind(kind: CollectiveStageKind) -> &'static str {
     match kind {
         CollectiveStageKind::Tcp => "tcp",
+        CollectiveStageKind::Roce => "roce",
         CollectiveStageKind::Compute => "compute",
     }
 }

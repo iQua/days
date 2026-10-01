@@ -393,6 +393,24 @@ fn collective_progress_record(
                 ..record
             })
         }
+        // Amendment 4: a RoCE stage writes its MTU and pacing interval.
+        (FlowGeneratorKind::Roce(roce), crate::StageRole::Collective(identity)) => {
+            Some(crate::CollectiveProgressRecord {
+                collective_id: identity.collective_id,
+                algorithm: Some(identity.algorithm),
+                group_size: identity.group_size,
+                declared_total_bytes: identity.declared_total_bytes,
+                rank: identity.rank,
+                phase: Some(identity.phase),
+                step: identity.step,
+                chunk_offset_bytes: identity.chunk_offset_bytes,
+                chunk_bytes: identity.chunk_bytes,
+                packet_size_bytes: roce.pacer.mtu_bytes,
+                interval_ns: roce.pacer.pacing_interval_ns,
+                stage_kind: crate::CollectiveStageKind::Roce,
+                ..record
+            })
+        }
         (FlowGeneratorKind::Constant(_), crate::StageRole::Compute(compute)) => {
             Some(crate::CollectiveProgressRecord {
                 collective_id: compute.compute_id,
@@ -426,6 +444,8 @@ struct HostView<'a> {
     received_packets: &'a mut u64,
     /// Egress pause state under host-link PFC, or `None`.
     pfc: &'a mut Option<Box<crate::HostPfcState>>,
+    /// Target-owned RoCE queue-pair receivers, read by binary search on the flow (never scanned).
+    roce_receivers: &'a mut Option<Box<[crate::RoceReceiverState]>>,
 }
 
 /// The collective progress one event produced, taken by flow in push order.
@@ -538,9 +558,11 @@ fn complete_local_successors(
 /// How delivery of an inbound predecessor's bytes was observed at this host.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum InboundProgress {
-    /// One data segment `[sequence, sequence + bytes)` arrived and the receiver's in-order TCP
+    /// One data segment `[sequence, sequence + bytes)` arrived and the receiver's in-order
     /// frontier advanced by `advance` bytes (zero for a duplicate or out-of-order segment).
-    /// Retransmitted or out-of-order bytes count only once the frontier covers them.
+    /// `sequence` is the segment's first byte: a TCP sequence number, or a RoCE PSN (a byte
+    /// offset). Retransmitted or out-of-order bytes count only once the frontier covers them: a
+    /// TCP receiver fills holes, a Go-back-N receiver advances only on the packet at its frontier.
     Segment {
         sequence: u64,
         bytes: u64,
@@ -1785,7 +1807,9 @@ impl<'image> TransitionState<'image> {
     /// Releases a dependency-gated stage carried by an ordinary transport generator.
     ///
     /// A TCP stage starts exactly as a TCP flow whose first window opens at the release time: the
-    /// sender fills its initial congestion window from sequence zero and arms its timer.
+    /// sender fills its initial congestion window from sequence zero and arms its timer. A RoCE
+    /// stage starts exactly as a queue pair whose initial delay is the release time
+    /// (`start_roce_stage`).
     fn activate_wrapped_stage(
         &mut self,
         node: NodeDescriptor,
@@ -1825,6 +1849,9 @@ impl<'image> TransitionState<'image> {
                 children,
             );
         }
+        if let FlowGeneratorKind::Roce(_) = kind {
+            return self.start_roce_stage(node, parent, flow, cause, ordinal, children);
+        }
         let FlowGeneratorKind::Tcp(_) = kind else {
             return Err(ExecutionError::UnexpectedGeneratorEmission {
                 node: node.id,
@@ -1835,6 +1862,79 @@ impl<'image> TransitionState<'image> {
         let plan = self.prepare_tcp_attempts(node, flow, parent.key.time_ns, None, true, false)?;
         self.push_stage_progress(node, parent, flow, cause, ordinal, true)?;
         self.install_tcp_attempts(node, parent, plan, children)
+    }
+
+    /// Releases a RoCE collective stage at `t`, the parent event's time (design note §5.2,
+    /// rulings C2 and C5): the pacing grid and the DCQCN control timer, held at zero while the
+    /// stage was gated, are anchored at `t`, the pacer is armed with its first tick at `t`, and the
+    /// control tick follows one control interval later if it falls within the stop. The pair is
+    /// then exactly a queue pair whose initial delay is `t`; its retransmission timeout is armed
+    /// by its first send, and a tick that finds its data class paused parks it (H1).
+    ///
+    /// The ticks are emitted in a plain pair's order (pacing, then control), so a control tick on
+    /// the pacing grid precedes the pacing tick of the same instant, as for a lowered pair.
+    // Out of line: it runs once per stage, and must not grow `activate_wrapped_stage`'s TCP path.
+    #[inline(never)]
+    fn start_roce_stage(
+        &mut self,
+        node: NodeDescriptor,
+        parent: Event,
+        flow: FlowId,
+        cause: PendingCollectiveProgress,
+        ordinal: u64,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
+        let now = parent.key.time_ns;
+        let stop_time_ns = self.image.stop_time_ns;
+        let (pacing_token, control) = {
+            let (mut state, index) = self.host_parts_mut(node)?;
+            let position = index
+                .first_generator(flow)
+                .ok_or(ExecutionError::UnknownGenerator {
+                    node: node.id,
+                    flow,
+                })?;
+            let generator = &mut state.generators[position];
+            let FlowGeneratorKind::Roce(mut roce) = generator.kind else {
+                return Err(ExecutionError::UnexpectedGeneratorEmission {
+                    node: node.id,
+                    flow,
+                    payload: parent.payload,
+                });
+            };
+            let control_ns = now
+                .checked_add(roce.controller.config.control_interval_ns)
+                .ok_or(ExecutionError::GeneratorTimeOverflow(flow))?;
+            roce.pacer.first_pacing_time_ns = now;
+            roce.controller.next_control_time_ns = control_ns;
+            roce.pacer_armed = true;
+            generator.next_emission = crate::ScheduledEmission {
+                status: crate::roce::armed_status(&roce),
+                departure_time_ns: now,
+                payload: roce.pacing_timer_payload,
+            };
+            generator.kind = FlowGeneratorKind::Roce(roce);
+            (
+                roce.pacing_timer_payload,
+                (control_ns <= stop_time_ns).then_some((roce.control_timer_payload, control_ns)),
+            )
+        };
+        self.push_stage_progress(node, parent, flow, cause, ordinal, true)?;
+        let ticks = [Some((pacing_token, now)), control];
+        for (payload, time_ns) in ticks.into_iter().flatten() {
+            self.emit_from_host(
+                node,
+                parent,
+                ChildEmission {
+                    target: node.id,
+                    kind: EventKind::PacingTimer,
+                    payload,
+                    time_ns,
+                },
+                children,
+            )?;
+        }
+        Ok(())
     }
 
     /// Starts a released compute interval: a source-local timer fires `duration_ns` later.
@@ -4307,7 +4407,7 @@ impl<'image> TransitionState<'image> {
         self.mark_terminal(packet.id)?;
         let now = event.key.time_ns;
         let stop_time_ns = self.image.stop_time_ns;
-        let (superseded_ns, timer_ns, tick_ns, token, record) = {
+        let (superseded_ns, timer_ns, tick_ns, token, record, completed_stage) = {
             let (mut state, index) = self.host_parts_mut(node)?;
             let position =
                 index
@@ -4344,6 +4444,7 @@ impl<'image> TransitionState<'image> {
             let mut superseded_ns = None;
             let mut timer_ns = None;
             let mut tick_ns = None;
+            let snd_una_before = roce.snd_una;
             if !stale {
                 let outstanding_before = roce.snd_una < generator.bytes_emitted;
                 roce.snd_una = roce.snd_una.max(acknowledgment);
@@ -4393,12 +4494,22 @@ impl<'image> TransitionState<'image> {
                     crate::roce::RoceSenderView::of(generator, &roce),
                 )
             });
+            // A collective stage completes on the ACK that brings the cumulative acknowledgment
+            // to its total (design note §4); a NACK carries the receiver's frontier, which stays
+            // below the total, and later ACKs at the total are stale, so exactly one ACK does.
+            // The stage record is read only then, once per pair.
+            let total = roce.pacer.total_bytes;
+            let completed_stage = (snd_una_before < total
+                && roce.snd_una >= total
+                && state.stages.stage(position).is_some())
+            .then_some(acknowledgment);
             (
                 superseded_ns,
                 timer_ns,
                 tick_ns,
                 roce.pacing_timer_payload,
                 record,
+                completed_stage,
             )
         };
         if let Some(deadline_ns) = superseded_ns {
@@ -4411,7 +4522,37 @@ impl<'image> TransitionState<'image> {
         if self.observation_mode == ObservationMode::Full {
             self.mechanism_transitions.extend(record);
         }
-        self.emit_roce_timers(node, event, token, tick_ns, timer_ns, children)
+        self.emit_roce_timers(node, event, token, tick_ns, timer_ns, children)?;
+        if let Some(acknowledgment) = completed_stage {
+            // The ACK echoes the send time and size of the data packet it answers, so the stage
+            // certifies the unloaded round trip they needed, as a TCP stage does.
+            let completion = CompletionSignal {
+                ack_number: acknowledgment,
+                origin_ns: header.echoed_sent_time_ns,
+                delay_ns: unloaded_round_trip_ns(
+                    self.image,
+                    packet.flow,
+                    header.acknowledged_bytes,
+                    packet.size_bytes,
+                )?,
+            };
+            let mut stage_causes = PendingCauses::default();
+            {
+                let (mut state, index) = self.host_parts_mut(node)?;
+                complete_local_successors(
+                    &state.generators,
+                    &mut state.stages,
+                    index,
+                    packet.flow,
+                    completion,
+                    &mut stage_causes,
+                );
+            }
+            if !stage_causes.is_empty() {
+                self.activate_ready_collectives(node, event, stage_causes, children)?;
+            }
+        }
+        Ok(())
     }
 
     /// A RoCE queue pair's retransmission timeout (design note §5, step 6): Go-back-N rewinds to
@@ -4552,8 +4693,8 @@ impl<'image> TransitionState<'image> {
         let now = event.key.time_ns;
         let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
         let congestion_experienced = packet.ecn_codepoint() == crate::EcnCodepoint::Ce;
-        let (cnp, feedback, schedule_ready, record) = {
-            let state = self.host_state_mut(node)?;
+        let (cnp, feedback, schedule_ready, record, stage_causes) = {
+            let (mut state, index) = self.host_parts_mut(node)?;
             let unknown = ExecutionError::UnknownGenerator {
                 node: node.id,
                 flow: packet.flow,
@@ -4581,18 +4722,36 @@ impl<'image> TransitionState<'image> {
             );
             let action = crate::roce::receive(receiver, header.psn, packet.size_bytes, now);
             let receiver = *receiver;
-            state.received_packets = state
+            // A collective stage waiting on this queue pair counts the receiver's Go-back-N
+            // frontier (design note §3): the packet size for the PSN at the frontier, else 0.
+            // Every packet of a pending inbound predecessor is certified. A host without stages
+            // returns at the index's one `None` test.
+            let mut stage_causes = PendingCauses::default();
+            record_inbound_progress(
+                &state.generators,
+                &mut state.stages,
+                index,
+                packet.flow,
+                InboundProgress::Segment {
+                    sequence: header.psn,
+                    bytes: packet.size_bytes,
+                    advance: receiver.expected_psn - before.expected_psn,
+                },
+                node.id,
+                &mut stage_causes,
+            )?;
+            *state.received_packets = state
                 .received_packets
                 .checked_add(1)
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
             let mut allocate = || -> Result<PayloadId, ExecutionError> {
-                let payload = allocate_payload_id(node.id, node_count, state.next_payload_seq)
+                let payload = allocate_payload_id(node.id, node_count, *state.next_payload_seq)
                     .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
-                state.next_payload_seq = state
+                *state.next_payload_seq = state
                     .next_payload_seq
                     .checked_add(1)
                     .ok_or(ExecutionError::PayloadSequenceOverflow(node.id))?;
-                state.sourced_packets = state
+                *state.sourced_packets = state
                     .sourced_packets
                     .checked_add(1)
                     .ok_or(ExecutionError::CounterOverflow(node.id))?;
@@ -4609,9 +4768,9 @@ impl<'image> TransitionState<'image> {
                 .map(|payload| (payload, receiver.ack_size_bytes, action));
             let schedule_ready = (cnp.is_some() || feedback.is_some())
                 && state.in_service.is_none()
-                && !state.tx_ready_pending;
+                && !*state.tx_ready_pending;
             if schedule_ready {
-                state.tx_ready_pending = true;
+                *state.tx_ready_pending = true;
             }
             let record = crate::MechanismTransitionRecord::Roce(
                 crate::RoceTransitionRecord::Receiver(crate::RoceReceiverRecord {
@@ -4642,6 +4801,7 @@ impl<'image> TransitionState<'image> {
                 feedback.map(|feedback| (feedback, receiver.expected_psn)),
                 schedule_ready,
                 record,
+                stage_causes,
             )
         };
         self.record_arrival(node.id, packet, event.key, ArrivalDisposition::Delivered)?;
@@ -4699,6 +4859,9 @@ impl<'image> TransitionState<'image> {
                 },
                 children,
             )?;
+        }
+        if !stage_causes.is_empty() {
+            self.activate_ready_collectives(node, event, stage_causes, children)?;
         }
         Ok(())
     }
@@ -5260,6 +5423,7 @@ impl<'image> TransitionState<'image> {
             sourced_packets,
             received_packets,
             pfc,
+            roce_receivers,
             ..
         } = state;
         let view = HostView {
@@ -5273,6 +5437,7 @@ impl<'image> TransitionState<'image> {
             sourced_packets,
             received_packets,
             pfc,
+            roce_receivers,
         };
         Ok((view, index))
     }
@@ -6616,6 +6781,36 @@ fn leave_parked_list(
             pfc.pause_parked[usize::from(data_class)].remove(&position);
         }
     }
+}
+
+/// The unloaded round trip of `flow`'s data packet of `data_bytes` and the ACK of `ack_bytes`
+/// that answers it: every link of the forward and reverse routes serializes and propagates each
+/// once, a lower bound on the time from the data's send to the ACK's arrival. Read from the image
+/// in place (no executor borrow, no route copy).
+fn unloaded_round_trip_ns(
+    image: &SimulationImage,
+    flow: FlowId,
+    data_bytes: u64,
+    ack_bytes: u64,
+) -> Result<u64, ExecutionError> {
+    let descriptor = indexed_lookup(&image.flows, flow.0, |candidate| candidate.id == flow)
+        .ok_or(ExecutionError::UnknownFlow(flow))?;
+    let mut total = 0_u64;
+    for (links, bytes) in [
+        (&descriptor.route, data_bytes),
+        (&descriptor.reverse_route, ack_bytes),
+    ] {
+        for &id in links {
+            let delay = indexed_lookup(&image.links, id.0, |link| link.id == id)
+                .ok_or(ExecutionError::UnknownLink(id))?
+                .delay_ns(bytes)
+                .map_err(|_| ExecutionError::GeneratorTimeOverflow(flow))?;
+            total = total
+                .checked_add(delay)
+                .ok_or(ExecutionError::GeneratorTimeOverflow(flow))?;
+        }
+    }
+    Ok(total)
 }
 
 /// A flow's data priority, read from the image (no executor borrow).
