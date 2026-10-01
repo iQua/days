@@ -21,6 +21,9 @@ use crate::{CollectiveStage, FlowGeneratorState, FlowId, GeneratorStatus, HostSt
 /// stage presence, or rewrites a stage's predecessor flows (the two dependency writers store back
 /// the predecessors they read). `releasable` is the only view of mutable state; it is refreshed at
 /// each of the three writes that can change its predicate.
+///
+/// The stage-only views exist exactly when the host's stage table holds a stage record, which no
+/// transition changes, so a host without stages never builds or drops them.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct HostStageIndex {
     /// Every `(flow, position)` of the generator table, sorted by flow and then position, so a
@@ -28,13 +31,20 @@ pub(crate) struct HostStageIndex {
     generators_by_flow: KeyedList,
     /// The same view of the TCP-receiver table.
     receivers_by_flow: KeyedList,
+    /// The views of the host's stages; `None` on a host whose stage table holds no record.
+    stage_views: Option<Box<StageViews>>,
+    /// Test-only visit count. Probes always compare equal: they are not a view of the tables.
+    probe: StageScanProbe,
+}
+
+/// The stage-only views of a host's index.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct StageViews {
     /// Positions of the stages whose local predecessor is the key, in table order.
     local_successors: BTreeMap<FlowId, Vec<usize>>,
     /// Positions of the stages whose inbound predecessor is the key, in table order.
     inbound_successors: BTreeMap<FlowId, Vec<usize>>,
     releasable: ReleasableStages,
-    /// Test-only visit count. Probes always compare equal: they are not a view of the tables.
-    probe: StageScanProbe,
 }
 
 /// Positions of the stages that are unreleased with both prerequisites complete.
@@ -155,33 +165,34 @@ fn by_flow(flows: impl ExactSizeIterator<Item = FlowId>) -> KeyedList {
 
 impl HostStageIndex {
     pub(crate) fn build(state: &HostState) -> Self {
-        let mut local_successors = BTreeMap::<FlowId, Vec<usize>>::new();
-        let mut inbound_successors = BTreeMap::<FlowId, Vec<usize>>::new();
-        let mut releasable = ReleasableStages::default();
+        // The stage views are created at the first stage record, so a host without stages builds
+        // none.
+        let mut stage_views: Option<Box<StageViews>> = None;
         for position in 0..state.generators.len() {
             let Some(dependencies) = state.stage_dependencies(position) else {
                 continue;
             };
+            let views = stage_views.get_or_insert_with(Box::default);
             if let Some(predecessor) = dependencies.local_predecessor {
-                local_successors
+                views
+                    .local_successors
                     .entry(predecessor)
                     .or_default()
                     .push(position);
             }
             if let Some(predecessor) = dependencies.inbound_predecessor {
-                inbound_successors
+                views
+                    .inbound_successors
                     .entry(predecessor)
                     .or_default()
                     .push(position);
             }
-            releasable.refresh(position, state.stage(position));
+            views.releasable.refresh(position, state.stage(position));
         }
         Self {
             generators_by_flow: by_flow(state.generators.iter().map(|generator| generator.flow)),
             receivers_by_flow: by_flow(state.tcp_receivers.iter().map(|receiver| receiver.flow)),
-            local_successors,
-            inbound_successors,
-            releasable,
+            stage_views,
             probe: StageScanProbe::default(),
         }
     }
@@ -212,30 +223,40 @@ impl HostStageIndex {
     }
 
     /// The stages whose local predecessor is `completed`, in table order, with the releasable set
-    /// the caller refreshes as it writes their dependencies.
+    /// the caller refreshes as it writes their dependencies; `None` on a host without stages,
+    /// which has no successors.
     pub(crate) fn local_successors_of(
         &mut self,
         completed: FlowId,
-    ) -> (&[usize], &mut ReleasableStages) {
-        let successors = self
+    ) -> Option<(&[usize], &mut ReleasableStages)> {
+        let Some(views) = self.stage_views.as_deref_mut() else {
+            self.probe.note(1);
+            return None;
+        };
+        let successors = views
             .local_successors
             .get(&completed)
             .map_or(&[][..], Vec::as_slice);
         self.probe.note(successors.len().max(1));
-        (successors, &mut self.releasable)
+        Some((successors, &mut views.releasable))
     }
 
-    /// The stages whose inbound predecessor is `inbound`, in table order, with the releasable set.
+    /// The stages whose inbound predecessor is `inbound`, in table order, with the releasable set;
+    /// `None` on a host without stages, which has no successors.
     pub(crate) fn inbound_successors_of(
         &mut self,
         inbound: FlowId,
-    ) -> (&[usize], &mut ReleasableStages) {
-        let successors = self
+    ) -> Option<(&[usize], &mut ReleasableStages)> {
+        let Some(views) = self.stage_views.as_deref_mut() else {
+            self.probe.note(1);
+            return None;
+        };
+        let successors = views
             .inbound_successors
             .get(&inbound)
             .map_or(&[][..], Vec::as_slice);
         self.probe.note(successors.len().max(1));
-        (successors, &mut self.releasable)
+        Some((successors, &mut views.releasable))
     }
 
     /// The position `generators.iter().position(stage_ready_to_activate)` returns.
@@ -253,9 +274,11 @@ impl HostStageIndex {
         stages: &[Option<CollectiveStage>],
     ) -> Option<usize> {
         let mut examined = 0_usize;
-        let ready = self.releasable.0.iter().copied().find(|position| {
-            examined += 1;
-            generators[*position].next_emission.status == GeneratorStatus::Blocked
+        let ready = self.stage_views.as_deref().and_then(|views| {
+            views.releasable.0.iter().copied().find(|position| {
+                examined += 1;
+                generators[*position].next_emission.status == GeneratorStatus::Blocked
+            })
         });
         self.probe.note(examined.max(1));
         debug_assert_eq!(
@@ -268,8 +291,16 @@ impl HostStageIndex {
 
     /// Refreshes the releasable membership of the stage at `position` after its release flag was
     /// set.
+    ///
+    /// A host without stage views has no stage record, so nothing it refreshes is releasable.
     pub(crate) fn refresh_releasable(&mut self, position: usize, stage: Option<CollectiveStage>) {
-        self.releasable.refresh(position, stage);
+        match self.stage_views.as_deref_mut() {
+            Some(views) => views.releasable.refresh(position, stage),
+            None => debug_assert!(
+                !releasable(stage),
+                "a releasable stage on a host without stage views"
+            ),
+        }
     }
 
     /// Entries this host's lookups examined.
@@ -699,12 +730,16 @@ pub(crate) fn check_host_index(
         if indexed != scanned {
             return mismatch("first receiver", &indexed, &scanned);
         }
-        let indexed = index.local_successors_of(flow).0.to_vec();
+        let indexed = index
+            .local_successors_of(flow)
+            .map_or_else(Vec::new, |(successors, _)| successors.to_vec());
         let scanned = legacy_scans::local_successors(state, flow);
         if indexed != scanned {
             return mismatch("local successors", &indexed, &scanned);
         }
-        let indexed = index.inbound_successors_of(flow).0.to_vec();
+        let indexed = index
+            .inbound_successors_of(flow)
+            .map_or_else(Vec::new, |(successors, _)| successors.to_vec());
         let scanned = legacy_scans::inbound_successors(state, flow);
         if indexed != scanned {
             return mismatch("inbound successors", &indexed, &scanned);
