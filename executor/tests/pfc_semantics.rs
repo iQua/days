@@ -2086,12 +2086,19 @@ fn a_cnp_rides_its_flows_feedback_priority_past_a_paused_data_class() {
     let shared = cnp_behind_paused_data(PRIORITY);
     let queue = &shared.switch_states[0].queues[0];
     assert!(upstream_pfc(&shared).is_paused(usize::from(PRIORITY)));
-    assert_eq!(queue.queue, VecDeque::from([PayloadId(8)]), "same class: the CNP waits");
+    assert_eq!(
+        queue.queue,
+        VecDeque::from([PayloadId(8)]),
+        "same class: the CNP waits"
+    );
     assert_eq!(queue.in_service, None);
 
     let separate = cnp_behind_paused_data(1);
     let queue = &separate.switch_states[0].queues[0];
-    assert!(queue.queue.is_empty(), "feedback class 1 is not paused: the CNP is served");
+    assert!(
+        queue.queue.is_empty(),
+        "feedback class 1 is not paused: the CNP is served"
+    );
     assert_eq!(queue.in_service, Some(PayloadId(8)));
 }
 

@@ -1017,6 +1017,19 @@ mod tests {
         FlowDescriptor, FlowGeneratorState, HostState, PacketKind, RoceGenerator, RoceReceiverState,
     };
 
+    /// P15: `FlowDescriptor::packet_priority` runs on every PFC-monitored switch arrival and
+    /// service decision (five Scalar sites), so it stays force-inlined, as the CUDA readback
+    /// decoders are after P14 lost 25 ms at E6 60% to an out-of-line decode
+    /// (`days-gpu/evidence/P14/cuda-host.md`).
+    #[test]
+    fn packet_priority_is_force_inlined() {
+        let source = include_str!("image.rs");
+        assert!(
+            source.contains("#[inline(always)]\n    pub const fn packet_priority("),
+            "`FlowDescriptor::packet_priority` must be #[inline(always)]"
+        );
+    }
+
     /// P15 queue-pair layout budgets. A RoCE queue pair is a variant of `FlowGeneratorKind`, whose
     /// union is 256 B (`TcpGenerator`, 248 B, rounded to the 16-byte alignment of the `u128`
     /// pacing credit): the queue pair must fit it, or every flow's generator grows by 16 B. Its

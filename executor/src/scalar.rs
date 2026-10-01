@@ -2242,7 +2242,7 @@ impl<'image> TransitionState<'image> {
             return self.switch_pfc_remote_arrival(node, event, header, children);
         }
         let egress_link = self.packet_egress_at(packet, node.id)?;
-        let priority = usize::from(self.flow(packet.flow)?.priority);
+        let priority = usize::from(self.flow(packet.flow)?.packet_priority(packet.kind));
         let rate_bps = egress_link
             .map(|link| self.link(link).map(|descriptor| descriptor.rate_bps))
             .transpose()?;
@@ -2530,7 +2530,10 @@ impl<'image> TransitionState<'image> {
                 .iter()
                 .map(|payload| {
                     let packet = self.packet(*payload)?;
-                    Ok((*payload, usize::from(self.flow(packet.flow)?.priority)))
+                    Ok((
+                        *payload,
+                        usize::from(self.flow(packet.flow)?.packet_priority(packet.kind)),
+                    ))
                 })
                 .collect::<Result<Vec<_>, ExecutionError>>()?
         };
@@ -3774,7 +3777,8 @@ impl<'image> TransitionState<'image> {
                 let mut incoming_links = Vec::new();
                 for (position, payload) in queue.queue.iter().enumerate() {
                     let packet = self.packet(*payload)?;
-                    let priority = usize::from(self.flow(packet.flow)?.priority);
+                    let priority =
+                        usize::from(self.flow(packet.flow)?.packet_priority(packet.kind));
                     let paused = queue
                         .pfc
                         .as_ref()
@@ -4070,7 +4074,8 @@ impl<'image> TransitionState<'image> {
                 None => queue.queue.front().copied(),
                 Some(pfc) => queue.queue.iter().find_map(|payload| {
                     let packet = self.packet(*payload).ok()?;
-                    let priority = usize::from(self.flow(packet.flow).ok()?.priority);
+                    let priority =
+                        usize::from(self.flow(packet.flow).ok()?.packet_priority(packet.kind));
                     (!pfc.is_paused(priority)).then_some(*payload)
                 }),
             }

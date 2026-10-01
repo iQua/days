@@ -559,6 +559,17 @@ fn validate_backend_capabilities(
             "backend {backend} does not support collective generators; use Scalar or Cpu"
         )));
     }
+    // P15: the device kernels read one PFC class per flow; a separate feedback class (a DCQCN
+    // CNP or RoCE ACK/NACK priority) runs on Scalar and Cpu until the device lane ports it.
+    if image
+        .flows
+        .iter()
+        .any(|flow| flow.feedback_priority != flow.priority)
+    {
+        return Err(ValidationError::new(format!(
+            "backend {backend} does not support a feedback priority apart from the data priority; use Scalar or Cpu"
+        )));
+    }
     // P15: RoCE queue pairs run on Scalar and Cpu; the device ports follow in their own lane.
     if image_has_roce_state(image) {
         return Err(ValidationError::new(format!(
@@ -828,6 +839,33 @@ fn validate_flows(image: &SimulationImage, flow_index: &FlowIndex) -> Result<(),
                 flow.id, flow.priority
             )));
         }
+        if flow.feedback_priority > 7 {
+            return Err(ValidationError::new(format!(
+                "flow {:?} feedback priority {} is outside IEEE 802.1Q range 0..=7",
+                flow.id, flow.feedback_priority
+            )));
+        }
+        // Only a DCQCN or RoCE receiver sends feedback that may ride its own class (a CNP, a RoCE
+        // ACK or NACK); a TCP ACK rides the data class. The source walk runs only for such flows.
+        if flow.feedback_priority != flow.priority
+            && !node(image, flow.source)
+                .filter(|source| source.kind == NodeKind::Host)
+                .and_then(|source| image.host_states.get(source.state_slot as usize))
+                .is_some_and(|state| {
+                    state.generators.iter().any(|generator| {
+                        generator.flow == flow.id
+                            && matches!(
+                                generator.kind,
+                                FlowGeneratorKind::Dcqcn(_) | FlowGeneratorKind::Roce(_)
+                            )
+                    })
+                })
+        {
+            return Err(ValidationError::new(format!(
+                "flow {:?} feedback priority {} differs from its priority {}, which only a DCQCN or RoCE flow may do",
+                flow.id, flow.feedback_priority, flow.priority
+            )));
+        }
         let source = node(image, flow.source).ok_or_else(|| {
             ValidationError::new(format!(
                 "flow {:?} names unknown source node {:?}",
@@ -985,7 +1023,7 @@ fn derived_pfc_max_frame_bytes(
         if packet_route(flow, packet.kind).contains(&controlled_link)
             && packet_can_still_cross_link(image, packet, controlled_link)
         {
-            let priority = usize::from(flow.priority);
+            let priority = usize::from(flow.packet_priority(packet.kind));
             maximum[priority] = maximum[priority].max(packet.size_bytes);
         }
     }
@@ -993,6 +1031,7 @@ fn derived_pfc_max_frame_bytes(
         let executable = executable_generator_packets(image, generator)? != 0;
         let flow = flow(image, generator.flow).expect("generator validation established the flow");
         let priority = usize::from(flow.priority);
+        let feedback_priority = usize::from(flow.feedback_priority);
         if executable && flow.route.contains(&controlled_link) {
             let size = match generator.kind {
                 FlowGeneratorKind::Constant(constant) => constant.packet_size_bytes,
@@ -1012,20 +1051,22 @@ fn derived_pfc_max_frame_bytes(
             match generator.kind {
                 FlowGeneratorKind::Tcp(tcp) => {
                     if executable || tcp.bytes_in_flight != 0 {
-                        maximum[priority] = maximum[priority].max(tcp.ack_size_bytes);
+                        maximum[feedback_priority] =
+                            maximum[feedback_priority].max(tcp.ack_size_bytes);
                     }
                 }
                 FlowGeneratorKind::Dcqcn(dcqcn) => {
                     if executable || live_dcqcn_cnp_flows.contains(&flow.id) {
-                        maximum[priority] = maximum[priority].max(dcqcn.cnp_size_bytes);
+                        maximum[feedback_priority] =
+                            maximum[feedback_priority].max(dcqcn.cnp_size_bytes);
                     }
                 }
                 FlowGeneratorKind::Roce(roce) => {
                     // Every data arrival at the receiver can answer with an ACK or NACK and a
                     // CNP, so feedback is live while data can still be sent or is in flight.
                     if executable || roce.snd_una < generator.bytes_emitted {
-                        maximum[priority] =
-                            maximum[priority].max(roce_feedback_max_bytes(image, flow));
+                        maximum[feedback_priority] =
+                            maximum[feedback_priority].max(roce_feedback_max_bytes(image, flow));
                     }
                 }
                 FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => {}
@@ -1159,7 +1200,7 @@ fn validate_pfc(image: &SimulationImage) -> Result<BTreeSet<usize>, ValidationEr
                         let priority = usize::from(
                             flow(image, packet.flow)
                                 .expect("packet validation established flow")
-                                .priority,
+                                .packet_priority(packet.kind),
                         );
                         if ingress.xoff_threshold_bytes[priority] == 0 {
                             continue;
@@ -1323,10 +1364,15 @@ fn validate_pfc_deadlock_scope(
         indegree.entry(*vertex).or_default();
     }
     for flow in &image.flows {
-        for route in [&flow.route, &flow.reverse_route] {
+        // Data holds the flow's class along its route; receiver feedback holds the feedback class
+        // along the reverse route.
+        for (route, priority) in [
+            (&flow.route, flow.priority),
+            (&flow.reverse_route, flow.feedback_priority),
+        ] {
             for pair in route.windows(2) {
-                let from = (pair[0], flow.priority);
-                let to = (pair[1], flow.priority);
+                let from = (pair[0], priority);
+                let to = (pair[1], priority);
                 if controlled.contains(&from)
                     && controlled.contains(&to)
                     && edges.entry(from).or_default().insert(to)
@@ -3749,7 +3795,7 @@ fn validate_owned_service_state(
                 let priority = usize::from(
                     flow(image, packet.flow)
                         .expect("packet validation established flow")
-                        .priority,
+                        .packet_priority(packet.kind),
                 );
                 !queue
                     .pfc
@@ -5989,17 +6035,22 @@ fn future_work(
         {
             let mut controller_frames = 0_u64;
             for flow in &image.flows {
-                let priority = usize::from(flow.priority);
-                if ingress.xoff_threshold_bytes[priority] == 0 {
+                // Data is monitored in the flow's class, receiver feedback in its feedback class.
+                let data_monitored = ingress.xoff_threshold_bytes[usize::from(flow.priority)] != 0;
+                let feedback_monitored =
+                    ingress.xoff_threshold_bytes[usize::from(flow.feedback_priority)] != 0;
+                if !data_monitored && !feedback_monitored {
                     continue;
                 }
                 let mut monitored_packets = 0_u64;
-                if route_enters_pfc_controller(
-                    image,
-                    &flow.route,
-                    ingress.controlled_link,
-                    owner.id,
-                ) {
+                if data_monitored
+                    && route_enters_pfc_controller(
+                        image,
+                        &flow.route,
+                        ingress.controlled_link,
+                        owner.id,
+                    )
+                {
                     let past_resident = u64::try_from(
                         resident_groups
                             .group(image, &resident_packets, flow.id)
@@ -6015,12 +6066,14 @@ fn future_work(
                         .expect("resident data count is included in the per-flow total");
                     add_packet_count(&mut monitored_packets, reachable)?;
                 }
-                if route_enters_pfc_controller(
-                    image,
-                    &flow.reverse_route,
-                    ingress.controlled_link,
-                    owner.id,
-                ) {
+                if feedback_monitored
+                    && route_enters_pfc_controller(
+                        image,
+                        &flow.reverse_route,
+                        ingress.controlled_link,
+                        owner.id,
+                    )
+                {
                     let past_resident = u64::try_from(
                         resident_groups
                             .group(image, &resident_packets, flow.id)

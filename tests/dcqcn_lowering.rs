@@ -520,7 +520,10 @@ fn dcqcn_cnp_priority_is_the_flows_feedback_priority() {
     let base = fs::read_to_string(&path).unwrap();
 
     let unchanged = compile_config(&path).expect("the accepted config still lowers");
-    assert_eq!(unchanged.flows[0].feedback_priority, unchanged.flows[0].priority);
+    assert_eq!(
+        unchanged.flows[0].feedback_priority,
+        unchanged.flows[0].priority
+    );
     assert!(!format!("{unchanged:?}").contains("feedback_priority"));
 
     let defaulted = base
@@ -547,6 +550,10 @@ fn dcqcn_cnp_priority_is_the_flows_feedback_priority() {
         7
     );
     assert_eq!(image.flows[0].packet_priority(PacketKind::Data), 0);
+    for backend in [Backend::Metal, Backend::Cuda] {
+        let error = validate(&image, backend).unwrap_err().to_string();
+        assert!(error.contains("feedback priority"), "{backend:?}: {error}");
+    }
 }
 
 #[test]

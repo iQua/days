@@ -308,6 +308,16 @@ enum SourceFlowKind {
     Dcqcn,
 }
 
+impl TrafficKey {
+    /// The PFC class of the flow's receiver feedback: a DCQCN flow's CNP class, else `priority`.
+    const fn feedback_priority(&self, priority: u8) -> u8 {
+        match self.kind {
+            TrafficKind::Dcqcn(dcqcn) => dcqcn.cnp_priority,
+            TrafficKind::Constant | TrafficKind::Tcp(_) => priority,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct TrafficKey {
     initial_delay_ns: u64,
@@ -1053,15 +1063,7 @@ fn validate_explicit_flow(
         )));
     }
     let priority = flow.priority.unwrap_or(0);
-    let traffic = validate_traffic(flow.traffic, flow_kind, scenario_text)?;
-    if let TrafficKind::Dcqcn(dcqcn) = traffic.kind {
-        if dcqcn.cnp_priority != priority {
-            return Err(CompileError::Unsupported(format!(
-                "DCQCN CNP priority {} must equal flow priority {priority}; the v1 packet record has one priority per flow",
-                dcqcn.cnp_priority
-            )));
-        }
-    }
+    let traffic = validate_traffic(flow.traffic, flow_kind, priority, scenario_text)?;
     Ok(ExplicitFlowKey {
         source,
         target,
@@ -1084,15 +1086,7 @@ fn validate_flow_set(
         None,
     )?;
     let priority = flow_set.priority.unwrap_or(0);
-    let traffic = validate_traffic(flow_set.traffic, flow_kind, scenario_text)?;
-    if let TrafficKind::Dcqcn(dcqcn) = traffic.kind {
-        if dcqcn.cnp_priority != priority {
-            return Err(CompileError::Unsupported(format!(
-                "DCQCN CNP priority {} must equal flow priority {priority}; the v1 packet record has one priority per flow",
-                dcqcn.cnp_priority
-            )));
-        }
-    }
+    let traffic = validate_traffic(flow_set.traffic, flow_kind, priority, scenario_text)?;
     Ok(FlowSetKey {
         flow_count: flow_set.flow_count,
         priority,
@@ -1210,7 +1204,7 @@ fn collective_key(
             }
         }
     }
-    let traffic = validate_traffic(traffic, flow_kind, scenario_text)?;
+    let traffic = validate_traffic(traffic, flow_kind, priority.unwrap_or(0), scenario_text)?;
     let Termination::Bytes(total_bytes) = traffic.termination else {
         return Err(CompileError::Unsupported(
             "unsupported duration-terminated collective traffic; T26 collectives require an exact byte size"
@@ -1331,9 +1325,12 @@ fn validate_collective_set(
     Ok(result)
 }
 
+/// Validates one flow's traffic options. `priority` is the flow's IEEE 802.1Q class, the default
+/// of its receiver feedback class.
 fn validate_traffic(
     traffic: SourceTraffic,
     flow_kind: SourceFlowKind,
+    priority: u8,
     scenario_text: &str,
 ) -> Result<TrafficKey, CompileError> {
     let packet_size_bytes = constant_packet_size_bytes(&traffic.pkt_size_dist, scenario_text)?;
@@ -1514,7 +1511,10 @@ fn validate_traffic(
                     1,
                     "DCQCN pacing interval ns",
                 )?,
-                cnp_priority: dcqcn.cnp_priority.unwrap_or(0),
+                // The flow's feedback priority (P15 ruling D6): CNPs ride the data class unless
+                // the flow names another. Before P15 the default was 0 and any other value had to
+                // equal the flow priority, so every config accepted then keeps its key.
+                cnp_priority: dcqcn.cnp_priority.unwrap_or(priority),
                 increase_byte_threshold: dcqcn.increase_byte_threshold.unwrap_or(10_000_000),
             };
             if key.pacing_interval_ns == 0 {
@@ -2337,7 +2337,7 @@ fn lower(
                 source: ids.node(LpKey::Host(flow.source)),
                 target: ids.node(LpKey::Host(flow.target)),
                 priority: flow.priority,
-                feedback_priority: flow.priority,
+                feedback_priority: flow.traffic.feedback_priority(flow.priority),
                 route: image_route(flow.source, flow.target, switch_path, &ids),
                 reverse_route: image_route(flow.target, flow.source, &reverse_switch_path, &ids),
             }
@@ -2880,6 +2880,8 @@ fn lower(
         let mut monitored_paths = BTreeSet::<(LinkId, NodeId)>::new();
         let mut max_frame_by_link_priority = BTreeMap::<(LinkId, usize), u64>::new();
         for (descriptor, input) in flow_descriptors.iter().zip(&flows) {
+            // Data rides the flow's class along its route; receiver feedback rides the feedback
+            // class (P15) along the reverse route.
             let priority = usize::from(descriptor.priority);
             if pfc.xoff[priority] != 0 {
                 for link_id in &descriptor.route {
@@ -2890,21 +2892,24 @@ fn lower(
                         })
                         .or_insert(input.traffic.packet_size_bytes);
                 }
-                if matches!(
+            }
+            let feedback_priority = usize::from(descriptor.feedback_priority);
+            if pfc.xoff[feedback_priority] != 0
+                && matches!(
                     input.traffic.kind,
                     TrafficKind::Tcp(_) | TrafficKind::Dcqcn(_)
-                ) {
-                    for link_id in &descriptor.reverse_route {
-                        let feedback_size = if matches!(input.traffic.kind, TrafficKind::Tcp(_)) {
-                            40
-                        } else {
-                            64
-                        };
-                        max_frame_by_link_priority
-                            .entry((*link_id, priority))
-                            .and_modify(|maximum| *maximum = (*maximum).max(feedback_size))
-                            .or_insert(feedback_size);
-                    }
+                )
+            {
+                for link_id in &descriptor.reverse_route {
+                    let feedback_size = if matches!(input.traffic.kind, TrafficKind::Tcp(_)) {
+                        40
+                    } else {
+                        64
+                    };
+                    max_frame_by_link_priority
+                        .entry((*link_id, feedback_priority))
+                        .and_modify(|maximum| *maximum = (*maximum).max(feedback_size))
+                        .or_insert(feedback_size);
                 }
             }
             for pair in descriptor.route.windows(2) {
