@@ -25,9 +25,9 @@ use crate::{CollectiveStage, FlowGeneratorState, FlowId, GeneratorStatus, HostSt
 pub(crate) struct HostStageIndex {
     /// Every `(flow, position)` of the generator table, sorted by flow and then position, so a
     /// flow's entries are contiguous and in table order.
-    generators_by_flow: Vec<(FlowId, usize)>,
+    generators_by_flow: KeyedList,
     /// The same view of the TCP-receiver table.
-    receivers_by_flow: Vec<(FlowId, usize)>,
+    receivers_by_flow: KeyedList,
     /// Positions of the stages whose local predecessor is the key, in table order.
     local_successors: BTreeMap<FlowId, Vec<usize>>,
     /// Positions of the stages whose inbound predecessor is the key, in table order.
@@ -91,14 +91,66 @@ fn entries_of(entries: &[(FlowId, usize)], flow: FlowId) -> &[(FlowId, usize)] {
     &entries[start..start + length]
 }
 
-fn by_flow(flows: impl Iterator<Item = FlowId>) -> Vec<(FlowId, usize)> {
-    let mut entries = flows
-        .enumerate()
-        .map(|(position, flow)| (flow, position))
-        .collect::<Vec<_>>();
+/// A `(flow, position)` list sorted by flow and then position, held inline when it has at most one
+/// entry.
+///
+/// Most hosts own one generator and at most one TCP receiver, and a heap block per one-entry list
+/// cost every host an allocation in `TransitionState::new` and a free in `finish`. Both
+/// representations present the same sorted slice (`Deref`), so every lookup reads the list
+/// exactly as before, and equality and `Debug` are the slice's, so the representation is never
+/// observable.
+#[derive(Clone)]
+enum KeyedList {
+    /// Exactly one entry.
+    One([(FlowId, usize); 1]),
+    /// Zero entries (no allocation) or more than one.
+    Many(Vec<(FlowId, usize)>),
+}
+
+impl Default for KeyedList {
+    fn default() -> Self {
+        Self::Many(Vec::new())
+    }
+}
+
+impl std::ops::Deref for KeyedList {
+    type Target = [(FlowId, usize)];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::One(entry) => entry,
+            Self::Many(entries) => entries,
+        }
+    }
+}
+
+impl PartialEq for KeyedList {
+    fn eq(&self, other: &Self) -> bool {
+        **self == **other
+    }
+}
+
+impl Eq for KeyedList {}
+
+impl std::fmt::Debug for KeyedList {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (**self).fmt(formatter)
+    }
+}
+
+/// The `(flow, position)` list of a table whose flows `flows` yields in table order.
+fn by_flow(flows: impl ExactSizeIterator<Item = FlowId>) -> KeyedList {
+    let mut entries = flows.enumerate().map(|(position, flow)| (flow, position));
+    if entries.len() <= 1 {
+        return entries
+            .next()
+            .map_or_else(KeyedList::default, |entry| KeyedList::One([entry]));
+    }
+    let mut entries = entries.collect::<Vec<_>>();
     // Positions are unique, so the unstable sort is deterministic.
     entries.sort_unstable();
-    entries
+    KeyedList::Many(entries)
 }
 
 impl HostStageIndex {

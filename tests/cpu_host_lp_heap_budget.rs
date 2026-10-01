@@ -28,6 +28,9 @@
 //! per added host of headroom for container drift between toolchains: 978. Before the fix
 //! (10d99fa) every host LP makes one more allocation, its own index vector, and the marginal is
 //! 1,010, so this test fails; with each host's index kept in the host's own entry it is 946.
+//! Since a one-entry flow list is held inline (E1b), a stageless host's index allocates nothing
+//! and the marginal is 882, `main`'s; the cap is unchanged, and
+//! `scalar_stageless_host_index_takes_no_heap_blocks` holds the per-host allocation at zero.
 //!
 //! Run: `cargo test -p days --test cpu_host_lp_heap_budget` (default matrix, any profile).
 #![allow(unsafe_code)]
@@ -133,7 +136,8 @@ const ADDED_HOSTS: u64 = EDGE_SWITCHES * (LARGE_HOSTS_PER_EDGE - SMALL_HOSTS_PER
 
 /// The marginal at `main` (948a0e9) for these two scenarios, measured by this test.
 const MAIN_MARGINAL_ALLOCATIONS: u64 = 882;
-/// The stage index's `generators_by_flow` table, which every Scalar and CPU host carries.
+/// The stage index's `generators_by_flow` table, which every Scalar and CPU host carried on the heap
+/// when the cap was set; a one-entry list is now held inline.
 const STAGE_INDEX_ALLOCATIONS_PER_HOST: u64 = 1;
 /// Headroom for container drift: half an allocation per added host, below the one per host that
 /// a separate per-LP index vector costs.
