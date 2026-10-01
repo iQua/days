@@ -450,5 +450,64 @@ mutate_trace "receiver-log-checked" receiver \
   'NR == 5 { $18 = "none"; $19 = ""; $20 = "" } { print }' \
   'REJECT: receiver: line 5: RoCE receiver action mismatch'
 
+# --- Mutations of committed executor traces (rows located by pattern, not by number) ----------
+# mutate_executor <label> <name> <sender|receiver> <row condition> <awk action> <expected message
+# with LINE standing for the mutated line>
+mutate_executor() {
+  local label="$1"
+  local name="$2"
+  local role="$3"
+  local condition="$4"
+  local action="$5"
+  local expected_template="$6"
+  local base="$fixture_dir/roce_trace_${name}_executor_accept"
+  local source="$base.$role.csv"
+  local line
+  line="$(awk -F, "NR > 1 && ($condition) { print NR; exit }" "$source")"
+  mutations=$((mutations + 1))
+  if [[ -z "$line" ]]; then
+    echo "fixture failed: executor/$label (no row matches: $condition)" >&2
+    failures=$((failures + 1))
+    return
+  fi
+  local mutated="$campaign_tmp/executor-$role.csv"
+  awk -F, -v OFS=, -v target="$line" "NR == target { $action } { print }" "$source" > "$mutated"
+  local sender="$base.sender.csv"
+  local receiver="$base.receiver.csv"
+  case "$role" in
+    sender) sender="$mutated" ;;
+    receiver) receiver="$mutated" ;;
+  esac
+  if check_case "executor/$label" 1 "${expected_template//LINE/$line}" \
+      trace "$sender" "$receiver" "$base.dcqcn.csv" "$(cat "$base.stop_time_ns")"; then
+    mutations_caught=$((mutations_caught + 1))
+  fi
+}
+
+mutate_executor "timeout-wrong-rewind-point" timeout sender \
+  '$7 == "timeout" && $21 != $22' '$29 = $31' \
+  'REJECT: sender: line LINE: RoCE sender after-state mismatch'
+mutate_executor "nack-without-rewind" timeout sender \
+  '$7 == "nack" && $20 != $14' '$29 = $20' \
+  'REJECT: sender: line LINE: RoCE sender after-state mismatch'
+mutate_executor "retransmission-not-charged" timeout sender \
+  '$15 == 1 && $18 == 1' '$33 = $24' \
+  'REJECT: sender: line LINE: RoCE sender after-state mismatch'
+mutate_executor "timeout-not-rearmed" timeout sender \
+  '$7 == "timeout"' '$34 = $25' \
+  'REJECT: sender: line LINE: RoCE sender after-state mismatch'
+mutate_executor "nack-inside-suppression-interval" timeout receiver \
+  '$18 == "nack_suppressed"' '$18 = "nack"' \
+  'REJECT: receiver: line LINE: RoCE receiver action mismatch'
+mutate_executor "missing-ack-at-end" timeout receiver \
+  '$18 == "ack" && $28 == $7' '$18 = "none"; $19 = ""; $20 = ""' \
+  'REJECT: receiver: line LINE: RoCE receiver action mismatch'
+mutate_executor "rto-config-spliced-mid-trace" nack_only sender \
+  '$7 == "nack"' '$12 = 1000000' \
+  'REJECT: sender: line LINE: RoCE sender config discontinuity (node_id=2, flow_id=1)'
+mutate_executor "nack-only-suppressed-sent" nack_only receiver \
+  '$18 == "nack_suppressed"' '$18 = "nack"' \
+  'REJECT: receiver: line LINE: RoCE receiver action mismatch'
+
 echo "P10c RoCE campaign checks: $checked; mutations caught: $mutations_caught/$mutations"
 exit "$failures"
