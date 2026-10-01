@@ -366,7 +366,7 @@ fn scalar_anchor(name: &str) -> (u64, u64) {
 /// when it moved to an ACK every 4 packets: the anchors the device lane proves Metal and CUDA
 /// against. `run_identical` shows CPU at 1-4 workers equal to Scalar; the `days` CLI cross-check
 /// (Scalar and CPU at 2 workers) is `days-gpu/evidence/P15/qp-impl/sim/p15_anchors.tsv`.
-const ANCHORS: [(&str, u64, u64); 8] = [
+const ANCHORS: [(&str, u64, u64); 7] = [
     ("roce_lossless_pfc.toml", 45_710, 0x7e1f_a3a8_7997_030c),
     ("roce_gbn_lossy.toml", 46_238, 0x4c94_e615_e09a_e734),
     ("roce_timeout.toml", 34_578, 0x3488_8b67_3127_c7cc),
@@ -374,17 +374,19 @@ const ANCHORS: [(&str, u64, u64); 8] = [
     ("roce_cnp_under_pfc.toml", 58_280, 0x70b0_1e3d_c0d6_15a8),
     ("roce_feedback_priority.toml", 58_323, 0x6b64_e238_d4d0_3c96),
     ("roce_mixed_tcp.toml", 52_398, 0x7612_b5cd_28d5_5949),
-    // Host-link PFC (p15/hostpfc, c26865f).
-    (
-        "hostpfc_incast_lossless.toml",
-        67_609,
-        0x08e4_d33e_ffae_89bb,
-    ),
 ];
+
+/// Host-link PFC anchors (`p15/hostpfc`, frozen at `c26865f` on the Mac; the sim gate's CLI
+/// confirms them on Linux, Scalar and CPU at 2 workers).
+const HOST_PFC_ANCHORS: [(&str, u64, u64); 1] = [(
+    "hostpfc_incast_lossless.toml",
+    67_609,
+    0x08e4_d33e_ffae_89bb,
+)];
 
 #[test]
 fn p15_fixtures_match_their_frozen_anchors() {
-    for (name, bytes, fnv1a64) in ANCHORS {
+    for (name, bytes, fnv1a64) in ANCHORS.into_iter().chain(HOST_PFC_ANCHORS) {
         let actual = scalar_anchor(name);
         assert_eq!(
             actual,
