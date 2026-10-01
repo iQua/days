@@ -252,6 +252,8 @@ structure SenderRow where
   nodeId : Nat
   flowId : Nat
   kind : SenderKind
+  /-- Amendment 1: the tick found the pair's data class paused on its host's egress. -/
+  classPaused : Bool
   config : Roce.SenderConfig
   rateBps : Option Nat
   inputAcknowledgment : Option Nat
@@ -278,6 +280,11 @@ def parseSenderState (fieldPrefix : String) (idx : Std.HashMap String Nat)
 
 def parseSenderRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array String) :
     Except String SenderRow := withLine lineNo do
+  -- Amendment 1. A log from a writer before the amendment has no such column; such a writer
+  -- cannot pause a class, so every row reads 0.
+  let classPaused ←
+    if idx.contains "class_paused" then parseBit (← getField idx fields "class_paused")
+    else pure false
   let emitted ← parseBit (← getField idx fields "emitted")
   let psn ← parseOptU64 (← getField idx fields "emitted_psn")
   let bytes ← parseOptU64 (← getField idx fields "emitted_bytes")
@@ -294,6 +301,7 @@ def parseSenderRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array
       nodeId := ← parseU64 (← getField idx fields "node_id")
       flowId := ← parseU64 (← getField idx fields "flow_id")
       kind := ← parseSenderKind (← getField idx fields "kind")
+      classPaused := classPaused
       config :=
         { mtuBytes := ← parseU64 (← getField idx fields "mtu_bytes")
           totalBytes := ← parseU64 (← getField idx fields "total_bytes")
@@ -385,12 +393,16 @@ def checkSenderShape (row : SenderRow) : Except String Unit := do
   at_ (Roce.validSenderConfig row.config) "invalid RoCE sender configuration"
   at_ (Roce.validSenderState row.config row.before) "invalid RoCE sender before-state"
   at_ (Roce.validSenderState row.config row.after) "invalid RoCE sender after-state"
+  at_ (!row.classPaused || row.kind = .tick) "RoCE class_paused set on a non-tick row"
   match row.kind with
   | .tick =>
       at_ (row.key.phase = 1) "RoCE pacing tick must have phase 1"
       at_ row.inputAcknowledgment.isNone "RoCE tick row carries an acknowledgment"
-      at_ (row.rateBps.isSome = (row.before.nextPsn < row.config.totalBytes))
-        "RoCE tick rate present iff the tick credits"
+      if row.classPaused then
+        at_ (row.rateBps.isNone && !row.emitted) "RoCE paused tick credits or emits"
+      else
+        at_ (row.rateBps.isSome = (row.before.nextPsn < row.config.totalBytes))
+          "RoCE tick rate present iff the tick credits"
       at_ (row.before.pacer = .armed && row.before.nextTickNs = some row.key.timeNs)
         "RoCE tick of a pacer not armed for this time"
   | .ack | .nack =>
@@ -485,7 +497,9 @@ def checkSenderItem (stopTimeNs : Option Nat) (track : SenderTrack) (row : Sende
   let withinStop := row.after.pacer != .stopped
   let expected :=
     match row.kind, row.inputAcknowledgment with
-    | .tick, _ => Roce.onTick row.config rate rateAfterBytes row.key.timeNs withinStop row.before
+    | .tick, _ =>
+        if row.classPaused then Roce.onPausedTick row.config rate row.before
+        else Roce.onTick row.config rate rateAfterBytes row.key.timeNs withinStop row.before
     | .ack, some value =>
         Roce.onFeedback row.config rate row.key.timeNs value false withinStop row.before
     | .nack, some value =>

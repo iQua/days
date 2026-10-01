@@ -401,6 +401,17 @@ def onTick (config : SenderConfig) (rateBps rateAfterBytes timeNs : Nat) (within
     stopQuery := query }
 
 /--
+Schema Amendment 1 (host-link PFC, ruling H1 (b); `hostpfc-design.md` §3.3): a pacing tick that
+finds its queue pair's data class paused on its host's egress sends nothing, adds no credit, and
+parks the pacer, so no tick is pending until a restart. The status settles as for any parked
+pacer.
+-/
+def onPausedTick (config : SenderConfig) (rateBps : Nat) (state : SenderState) : SenderResult :=
+  { state := settle config rateBps { state with pacer := .parked, nextTickNs := none } .blocked
+    emission := none
+    stopQuery := none }
+
+/--
 §5 steps 4 and 5: an ACK or NACK carrying `acknowledgment` at `timeNs`.
 
 * Stale (`a ≤ snd_una` for an ACK, `e < snd_una` for a NACK): nothing changes.
