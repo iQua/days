@@ -273,7 +273,7 @@ const ANCHORS: [(&str, u64, u64); 7] = [
     ("roce_nack_only.toml", 34_559, 0x9715_1362_f757_31bf),
     ("roce_cnp_under_pfc.toml", 58_280, 0x70b0_1e3d_c0d6_15a8),
     ("roce_feedback_priority.toml", 58_323, 0x6b64_e238_d4d0_3c96),
-    ("roce_mixed_tcp.toml", 52_399, 0x8218_8619_1f0b_7eab),
+    ("roce_mixed_tcp.toml", 52_398, 0x7612_b5cd_28d5_5949),
 ];
 
 #[test]

@@ -2,7 +2,8 @@
 # the same 4-switch line (hosts 0..3 on switches 0..3, 1 Gbps ports) and DCQCN controller keys
 # scaled to 1 Gbps. Mixed transports: a TCP Reno flow (host 1 -> 0, class 0, lossy) and two
 # QPs (hosts 2, 3 -> 0, class 3, lossless with PFC on class 3) share the bottleneck into host 0.
-# Contract: every flow completes; TCP ACKs ride class 0.
+# The queue pairs ACK every 4 in-order packets, so the ACK cadence and its restart on a
+# duplicate ACK are exercised. Contract: every flow completes; TCP ACKs ride class 0.
 seed = 42
 edges = [[0, 1], [1, 2], [2, 3]]
 hosts = [0, 1, 2, 3]
@@ -63,6 +64,7 @@ increase_byte_threshold = 100000
 
 [flow.traffic.roce]
 retransmit_timeout_ns = 1000000
+ack_every_packets = 4
 
 [[flow]]
 flow_type = "RoCE"
@@ -90,3 +92,4 @@ increase_byte_threshold = 100000
 
 [flow.traffic.roce]
 retransmit_timeout_ns = 1000000
+ack_every_packets = 4
