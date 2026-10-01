@@ -495,7 +495,9 @@ fn complete_local_successors(
     completion: CompletionSignal,
     causes: &mut PendingCauses,
 ) {
-    let (successors, releasable) = index.local_successors_of(completed);
+    let Some((successors, releasable)) = index.local_successors_of(completed) else {
+        return;
+    };
     for &position in successors {
         let successor = &generators[position];
         let Some(stage) = stages.stage_mut(position) else {
@@ -548,7 +550,9 @@ fn record_inbound_progress(
     node: NodeId,
     causes: &mut PendingCauses,
 ) -> Result<(), ExecutionError> {
-    let (successors, releasable) = index.inbound_successors_of(inbound);
+    let Some((successors, releasable)) = index.inbound_successors_of(inbound) else {
+        return Ok(());
+    };
     for &position in successors {
         let generator = &generators[position];
         let Some(stage) = stages.stage_mut(position) else {

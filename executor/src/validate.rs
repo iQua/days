@@ -616,10 +616,12 @@ fn validate_stage_tables(image: &SimulationImage) -> Result<(), ValidationError>
 }
 
 fn validate_node_ids(image: &SimulationImage) -> Result<(), ValidationError> {
-    let mut seen = BTreeSet::new();
     let count = image.nodes.len() as u64;
     for (index, node) in image.nodes.iter().enumerate() {
-        if !seen.insert(node.id) {
+        // Every earlier descriptor passed all three checks, so its ID equals its position: the IDs
+        // seen so far are exactly 0..index, and this one repeats one of them iff it is below
+        // `index`.
+        if node.id.0 < index as u64 {
             return Err(ValidationError::new(format!(
                 "duplicate node ID {:?} at descriptor {index}",
                 node.id
