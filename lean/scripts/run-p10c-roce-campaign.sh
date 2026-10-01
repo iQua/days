@@ -826,5 +826,45 @@ expect_warrant_reject "pfc-log-without-data-class" \
   'REJECT: sender: --pfc needs a sender log with the data_class column (Amendment 3)' \
   sender "$gbn" "$gbn_dcqcn" --pfc "$amended_gbn_pfc" "$gbn_stop"
 
+# --- Ruling C6: a pair whose first ticks are class-paused (no rate yet) ------------------------
+# A class-paused tick writes no rate, so a pair paused at its first tick has no known rate until
+# its first crediting tick or its first DCQCN row reveals it. Until then the rate cannot change
+# (only the pair's DCQCN rows change it), the armed statuses it predicts bound it, and the
+# revealed rate must fall within those bounds. Amended layout (see Amendment 1-3 above).
+c6="$fixture_dir/roce_sender_c6_accept.csv"
+c6_dcqcn="$fixture_dir/roce_sender_c6_accept.dcqcn.csv"
+c6_pfc="$fixture_dir/roce_sender_c6_accept.pfc.csv"
+c6_stop=7000
+c6_one="$fixture_dir/roce_sender_c6_one_accept.csv"
+c6_one_dcqcn="$fixture_dir/roce_sender_c6_one_accept.dcqcn.csv"
+c6_one_pfc="$fixture_dir/roce_sender_c6_one_accept.pfc.csv"
+c6_one_stop=3000
+check_case "roce_sender_c6_accept.csv (two paused ticks, control and CNP before the first credit)" \
+  0 "ACCEPT" sender "$c6" "$c6_dcqcn" --pfc "$c6_pfc" "$c6_stop" || true
+check_case "roce_sender_c6_one_accept.csv (one paused tick)" 0 "ACCEPT" \
+  sender "$c6_one" "$c6_one_dcqcn" --pfc "$c6_one_pfc" "$c6_one_stop" || true
+# roce_sender_c6_accept.csv rows (NR): 2 t1000 first tick, paused (status before: scheduled, so
+# rate >= 8 Gb/s); 3 RESUME 1500 restarts at 2000 (scheduled); 4 t2000 paused again; [DCQCN: a
+# control tick at 2500 reveals the rate, 8 Gb/s; a CNP at 2600 cuts it to 6 Gb/s]; 5 RESUME 3000
+# restarts at 4000 (blocked at 6 Gb/s); 6-8 t4000-6000 crediting ticks at 6 Gb/s.
+mutate_amended "c6-statuses-contradict-revealed-rate" "$c6" "$c6_dcqcn" "$c6_pfc" "$c6_stop" \
+  'NR == 2 || NR == 4 { $30 = "blocked" } NR == 3 { $39 = "blocked" } { print }' \
+  'REJECT: dcqcn: line 2: RoCE status predicted before the rate was known contradicts the controller rate 8000000000 (node_id=1, flow_id=3)'
+mutate_amended "c6-statuses-fit-no-rate" "$c6" "$c6_dcqcn" "$c6_pfc" "$c6_stop" \
+  'NR == 2 { $30 = "blocked" } { print }' \
+  'REJECT: sender: line 3: RoCE statuses predicted before the rate was known fit no controller rate (node_id=1, flow_id=3)'
+mutate_amended "c6-tick-rate-ignores-cnp" "$c6" "$c6_dcqcn" "$c6_pfc" "$c6_stop" \
+  'NR == 6 { $15 = 8000000000 } { print }' \
+  "REJECT: sender: line 6: RoCE tick rate differs from the DCQCN controller's current rate"
+mutate_amended "c6-revealed-rate-below-bound" "$c6_one" "$c6_one_dcqcn" "$c6_one_pfc" "$c6_one_stop" \
+  'NR == 4 { $15 = 7000000000 } { print }' \
+  'REJECT: sender: line 4: RoCE status predicted before the rate was known contradicts the controller rate 7000000000 (node_id=1, flow_id=3)'
+mutate_amended "c6-first-row-unpaused-without-rate" "$c6_one" "$c6_one_dcqcn" "$c6_one_pfc" "$c6_one_stop" \
+  'NR == 2 { $8 = 0 } { print }' \
+  'REJECT: sender: line 2: RoCE queue pair'"'"'s first row is neither a crediting tick nor a class-paused tick (node_id=1, flow_id=3)'
+mutate_amended "c6-parked-status-is-exact" "$c6" "$c6_dcqcn" "$c6_pfc" "$c6_stop" \
+  'NR == 2 { $39 = "scheduled" } NR == 3 { $30 = "scheduled" } { print }' \
+  'REJECT: sender: line 2: invalid RoCE sender after-state'
+
 echo "P10c RoCE campaign checks: $checked; mutations caught: $mutations_caught/$mutations"
 exit "$failures"
