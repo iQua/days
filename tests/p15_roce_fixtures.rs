@@ -375,7 +375,11 @@ const ANCHORS: [(&str, u64, u64); 8] = [
     ("roce_feedback_priority.toml", 58_323, 0x6b64_e238_d4d0_3c96),
     ("roce_mixed_tcp.toml", 52_398, 0x7612_b5cd_28d5_5949),
     // Host-link PFC (p15/hostpfc, c26865f).
-    ("hostpfc_incast_lossless.toml", 67_609, 0x08e4_d33e_ffae_89bb),
+    (
+        "hostpfc_incast_lossless.toml",
+        67_609,
+        0x08e4_d33e_ffae_89bb,
+    ),
 ];
 
 #[test]

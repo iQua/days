@@ -2722,11 +2722,9 @@ impl<'image> TransitionState<'image> {
         let now = event.key.time_ns;
         let stop_time_ns = self.image.stop_time_ns;
         let image = self.image;
+        // The validator pins every control lane into a host to the host's egress link.
         let (unpaused, transition) = {
-            let state = self.host_state_mut(node)?;
-            if state.egress_link != header.controlled_link {
-                return Err(ExecutionError::InvalidSchedulerState(node.id));
-            }
+            let (state, _) = self.host_parts_mut(node)?;
             let pfc = state
                 .pfc
                 .as_deref_mut()
@@ -2771,9 +2769,9 @@ impl<'image> TransitionState<'image> {
         }
         let ready_payload = match self.host_pfc_first_eligible(node)? {
             Some(position) => {
-                let state = self.host_state_mut(node)?;
-                if state.in_service.is_none() && !state.tx_ready_pending {
-                    state.tx_ready_pending = true;
+                let (state, _) = self.host_parts_mut(node)?;
+                if state.in_service.is_none() && !*state.tx_ready_pending {
+                    *state.tx_ready_pending = true;
                     Some(state.queue[position])
                 } else {
                     None

@@ -221,6 +221,9 @@ const STAGE_PATH_FUNCTIONS: &[&str] = &[
     "host_roce_pacing_timer",
     "host_roce_feedback_arrival",
     "host_roce_timeout",
+    // P15 host-link PFC: a RESUME restarts its class's pause-parked queue pairs, read by
+    // generator position from the host's parked list through the same counted view.
+    "host_pfc_remote_arrival",
 ];
 
 /// The only functions of `executor/src/scalar.rs` that may scan a host's generator or TCP-receiver

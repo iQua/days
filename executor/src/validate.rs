@@ -1822,7 +1822,9 @@ fn validate_pfc_causal_consistency(image: &SimulationImage) -> Result<(), Valida
                     if ingress.xoff_threshold_bytes[priority] == 0 {
                         continue;
                     }
-                    let upstream_paused = upstream_paused_sets[priority].contains(&controller.id);
+                    let upstream_paused = upstream_paused_sets
+                        .get(priority)
+                        .is_some_and(|controllers| controllers.contains(&controller.id));
                     let asserted = ingress.pause_asserted[priority];
                     let mut actions = image
                         .initial_events

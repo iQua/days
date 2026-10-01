@@ -488,8 +488,7 @@ fn paused_before(
 ) -> bool {
     controls
         .iter()
-        .filter(|control| control.node == node && control.priority == class && control.key < key)
-        .next_back()
+        .rfind(|control| control.node == node && control.priority == class && control.key < key)
         .is_some_and(|control| !control.after_controllers.is_empty())
 }
 
