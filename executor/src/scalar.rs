@@ -571,6 +571,10 @@ enum InboundProgress {
 }
 
 /// Advances every stage waiting on `inbound` as its inbound predecessor, in table order.
+///
+/// Force-inlined: every TCP data arrival calls it, and a host without stages returns at the stage
+/// index's first test, so an out-of-line call would cost every TCP segment of every image a call.
+#[inline(always)]
 fn record_inbound_progress(
     generators: &ProbedTable<'_, crate::FlowGeneratorState>,
     stages: &mut ProbedTable<'_, Option<crate::CollectiveStage>>,
