@@ -741,3 +741,57 @@ fn checkpoints_of_gated_active_and_finished_stages_revalidate_and_resume() {
         "{gated} {active} {finished}"
     );
 }
+
+/// FNV-1a64 over the pretty `Debug` rendering, the `result_fnv1a64` the `days` CLI prints.
+fn fingerprint(value: &impl std::fmt::Debug) -> (u64, u64) {
+    let text = format!("{value:#?}");
+    let hash = text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    (text.len() as u64, hash)
+}
+
+/// Frozen at authoring (`5752c51`, 2026-10-01, Mac): the Scalar summary-mode results, which the
+/// `days` CLI reproduced on Scalar and CPU at 2 workers
+/// (`days-gpu/evidence/P15/collectives-impl/raw/anchors-mac-5752c51.txt`).
+const ANCHORS: [(&str, u64, u64); 6] = [
+    (
+        "roce_ring_allreduce_lossless.toml",
+        199_110,
+        0x8b3d_8615_76b7_d646,
+    ),
+    (
+        "roce_allgather_lossless.toml",
+        126_202,
+        0x84c0_e6d2_a574_9c80,
+    ),
+    ("roce_ring_lossy.toml", 190_244, 0xa065_c89e_82b4_e3b9),
+    ("roce_compute_dag.toml", 218_236, 0xb3e9_c56f_a727_6c1c),
+    (
+        "roce_tcp_mixed_collectives.toml",
+        141_856,
+        0xee09_f67f_aca4_91d5,
+    ),
+    (
+        "roce_ring_release_paused.toml",
+        203_330,
+        0x273c_f356_1189_2368,
+    ),
+];
+
+#[test]
+fn roce_collective_fixtures_match_their_frozen_anchors() {
+    for (name, bytes, fnv1a64) in ANCHORS {
+        let image = lower(name);
+        let result = run_scalar_with_observations(&image, None, ObservationMode::Summary)
+            .unwrap_or_else(|error| panic!("{name}: Scalar run failed: {error}"));
+        let actual = fingerprint(&result);
+        assert_eq!(
+            actual,
+            (bytes, fnv1a64),
+            "{name}: frozen anchor moved (got bytes={} fnv1a64={:016x})",
+            actual.0,
+            actual.1
+        );
+    }
+}
