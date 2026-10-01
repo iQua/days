@@ -18,7 +18,7 @@ use days_executor::{
     run_scalar_with_observations,
 };
 
-const FIXTURES: [&str; 8] = [
+const FIXTURES: [&str; 9] = [
     "roce_lossless_pfc.toml",
     "roce_gbn_lossy.toml",
     "roce_timeout.toml",
@@ -27,6 +27,7 @@ const FIXTURES: [&str; 8] = [
     "roce_feedback_priority.toml",
     "roce_mixed_tcp.toml",
     "hostpfc_incast_lossless.toml",
+    "hostpfc_multi_qp_tcp.toml",
 ];
 
 const SENDER_HEADER: &str = "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,kind,class_paused,data_class,mtu_bytes,total_bytes,pacing_interval_ns,first_pacing_time_ns,rto_ns,rate_bps,input_acknowledgment,emitted,emitted_psn,emitted_bytes,emitted_retransmission,emitted_payload,before_next_psn,before_snd_una,before_bytes_emitted,before_packets_emitted,before_credit_quanta,before_rto_deadline_ns,before_pacer,before_next_tick_ns,before_status,after_next_psn,after_snd_una,after_bytes_emitted,after_packets_emitted,after_credit_quanta,after_rto_deadline_ns,after_pacer,after_next_tick_ns,after_status";
@@ -584,18 +585,21 @@ fn pause_and_resume_rows_agree_with_the_host_pfc_log() {
 }
 
 /// Amendment 2: rows share an event key only as `resume` rows of distinct flows at one node, in
-/// ascending `flow_id`.
+/// ascending `flow_id`. The multi-pair fixture's RESUMEs restart several pairs at one key, so the
+/// shared-key case is exercised, not passed vacuously (host-PFC review M1).
 #[test]
 fn only_resume_rows_share_an_event_key() {
-    let result = run("hostpfc_incast_lossless.toml");
+    let result = run("hostpfc_multi_qp_tcp.toml");
     let csv = roce_sender_transitions_csv(records(&result)).expect("sender CSV");
     let rows = csv
         .lines()
         .skip(1)
         .map(|line| line.split(',').map(str::to_owned).collect::<Vec<_>>())
         .collect::<Vec<_>>();
+    let mut shared = 0;
     for pair in rows.windows(2) {
         if pair[0][..4] == pair[1][..4] {
+            shared += 1;
             assert_eq!(
                 (pair[0][6].as_str(), pair[1][6].as_str()),
                 ("resume", "resume")
@@ -605,4 +609,8 @@ fn only_resume_rows_share_an_event_key() {
             assert!(flow(&pair[0]) < flow(&pair[1]), "{pair:?}");
         }
     }
+    assert!(
+        shared > 0,
+        "no two sender rows share an event key: the shared-key case went unexercised"
+    );
 }

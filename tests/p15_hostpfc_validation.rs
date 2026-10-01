@@ -154,3 +154,70 @@ fn mid_pause_checkpoints_revalidate_and_pin_the_parked_list() {
         "no checkpoint caught a parked queue pair"
     );
 }
+
+/// Fix round 1 of the host-PFC review (M2, R3): the parked list's upkeep after an ACK, NACK or
+/// timeout restart. On the multi-pair, TCP-on-a-paused-class variant
+/// (`configs/p15/hostpfc_multi_qp_tcp.toml`), checkpoints every 250 us over its first 10 ms
+/// revalidate on Scalar and CPU (2 workers). At least one checkpoint lands inside a window between
+/// a restart of a pause-parked pair (an `ack`, `nack` or `timeout` row taking the pacer from
+/// `parked` to `armed`) and its re-park (that flow's next row, a `class_paused` tick): there a
+/// stale parked-list entry would be refused, so the executor's upkeep is pinned, not only the
+/// validator's rule.
+#[test]
+fn checkpoints_inside_a_restart_window_revalidate() {
+    use days_executor::{
+        MechanismTransitionRecord, RocePacerState, RoceSenderKind, RoceTransitionRecord,
+    };
+    let image = compile_config(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("configs/p15/hostpfc_multi_qp_tcp.toml"),
+    )
+    .expect("the multi-pair variant lowers");
+    let full = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("the full run succeeds");
+    let mut by_flow = std::collections::BTreeMap::<_, Vec<_>>::new();
+    for record in &full
+        .diagnostics
+        .as_ref()
+        .expect("full observation")
+        .mechanism_transitions
+    {
+        if let MechanismTransitionRecord::Roce(RoceTransitionRecord::Sender(sender)) = record {
+            by_flow.entry(sender.flow).or_default().push(*sender);
+        }
+    }
+    // (restart time, re-park time) of every restart of a pause-parked pair.
+    let windows = by_flow
+        .values()
+        .flat_map(|rows| rows.windows(2))
+        .filter(|pair| {
+            matches!(
+                pair[0].kind,
+                RoceSenderKind::Ack | RoceSenderKind::Nack | RoceSenderKind::Timeout
+            ) && pair[0].before.pacer == RocePacerState::Parked
+                && pair[0].after.pacer == RocePacerState::Armed
+                && pair[1].kind == RoceSenderKind::Tick
+                && pair[1].class_paused
+        })
+        .map(|pair| (pair[0].key.time_ns, pair[1].key.time_ns))
+        .collect::<Vec<_>>();
+    assert!(!windows.is_empty(), "no restart of a pause-parked pair");
+    let mut inside = 0;
+    for horizon_ns in (1..=40).map(|step| step * 250_000) {
+        let state = checkpoint(&image, horizon_ns);
+        validate(&state, Backend::Scalar)
+            .unwrap_or_else(|error| panic!("checkpoint at {horizon_ns} ns: {error}"));
+        validate(&state, Backend::Cpu { workers: 2 })
+            .unwrap_or_else(|error| panic!("checkpoint at {horizon_ns} ns: {error}"));
+        // The exclusive horizon has processed the restart and not yet the re-park.
+        inside += usize::from(
+            windows
+                .iter()
+                .any(|(restart, repark)| *restart < horizon_ns && horizon_ns <= *repark),
+        );
+    }
+    assert!(
+        inside > 0,
+        "no checkpoint fell between a restart and its re-park ({} windows)",
+        windows.len()
+    );
+}
