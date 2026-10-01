@@ -302,6 +302,7 @@ fn stage_rules_hold_on_every_fixture() {
         "roce_ring_lossy.toml",
         "roce_compute_dag.toml",
         "roce_tcp_mixed_collectives.toml",
+        "roce_ring_release_paused.toml",
     ] {
         let image = lower(name);
         let result = scalar(&image, name);
@@ -413,6 +414,82 @@ fn check_stage_rules(name: &str, image: &SimulationImage, result: &RunResult) {
             }
         }
     }
+}
+
+/// Design note §5.3 and ruling C6: a stage released while its data class is paused at its host
+/// arms its first tick at the release like any other; that tick parks the pair (no credit, no
+/// packet, `class_paused`), the pair joins the host's parked list, and a RESUME restarts it on
+/// the grid anchored at the release.
+#[test]
+fn a_stage_released_on_a_paused_class_parks_at_its_first_tick_and_resumes() {
+    let image = lower("roce_ring_release_paused.toml");
+    let result = run_identical(&image, "release paused");
+    let contract = contract(&image, &result);
+    assert_eq!(contract.finished_stages, 24, "{contract:?}");
+    assert_eq!(contract.dropped, 0, "{contract:?}");
+    check_stage_rules("roce_ring_release_paused.toml", &image, &result);
+    let stages = roce_stages(&image);
+    let releases = progress(&result)
+        .into_iter()
+        .filter(|row| row.activated)
+        .map(|row| (row.flow, row.key.time_ns))
+        .collect::<BTreeMap<_, _>>();
+    let senders = sender_rows(&result);
+    let mut parked_at_release = 0;
+    for (flow, rows) in senders.iter().filter(|(flow, _)| stages.contains_key(flow)) {
+        let first = rows[0];
+        if !first.class_paused {
+            continue;
+        }
+        parked_at_release += 1;
+        assert_eq!(
+            Some(&first.key.time_ns),
+            releases.get(flow),
+            "a released stage"
+        );
+        assert_eq!(first.rate_bps, None, "a paused tick credits nothing");
+        assert!(first.emitted.is_none());
+        assert_eq!(first.after.credit_quanta, 0);
+        let resume = rows
+            .iter()
+            .find(|row| row.kind == RoceSenderKind::Resume)
+            .expect("a RESUME restarts the pair");
+        let interval = resume.pacing_interval_ns;
+        let restart = resume.after.next_tick_ns.expect("armed by the RESUME");
+        assert_eq!(
+            (restart - first.key.time_ns) % interval,
+            0,
+            "on the release's grid"
+        );
+        assert!(restart > resume.key.time_ns);
+
+        // Between the paused tick and the RESUME, the pair is on its host's parked list.
+        let state = checkpoint(&image, first.key.time_ns + 1);
+        validate(&state, Backend::Scalar).expect("the mid-pause checkpoint validates");
+        let (slot, position) = state
+            .host_states
+            .iter()
+            .enumerate()
+            .find_map(|(slot, host)| {
+                host.generators
+                    .iter()
+                    .position(|generator| generator.flow == *flow)
+                    .map(|position| (slot, position))
+            })
+            .expect("the stage's host");
+        let pfc = state.host_states[slot]
+            .pfc
+            .as_deref()
+            .expect("host pause state");
+        assert!(
+            pfc.pause_parked[3].contains(&position),
+            "listed while paused"
+        );
+    }
+    assert!(
+        parked_at_release > 0,
+        "a stage must release on a paused class"
+    );
 }
 
 /// The TCP collective of the mixed image shares no queue with the RoCE one, so its progress is the
