@@ -24,7 +24,7 @@ pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 }
 | --- | --- | --- |
 | `flow_id` | no | Explicit legacy flow ID. Omission allocates the next ID. |
 | `starts_before`, `starts_after` | no | Legacy flow dependency IDs. |
-| `flow_type` | yes | `PacketDistribution`, `TCP`, or `DCQCN`. |
+| `flow_type` | yes | `PacketDistribution`, `TCP`, `DCQCN`, or `RoCE` (exact lowering only). |
 | `priority` | no | 802.1Q priority in `0..=7`; default `0`. |
 | `graph` | yes | Exactly one `[source_host, sink_host]` edge. |
 | `routing` | no | Legacy `ShortestPath`, `ECMP`, or `PathFromConfig`. |
@@ -119,7 +119,57 @@ cnp_priority = 0
 
 Rates must satisfy `min_rate_gbps <= rate_gbps <= max_rate_gbps`. `g` and `mi_factor` must lie in `0..=1`; priorities must lie in `0..=7`. Exact lowering also accepts `increase_byte_threshold`, defaulting to `10000000`, but the strict legacy loader does not accept that key.
 
-DCQCN sources emit ECN-capable data. Use `RED_ECN` or `ECN_THRESHOLD` to create CE feedback. Lowered DCQCN, including its controller and CNP state, runs on Scalar, CPU, Metal, and CUDA.
+In exact lowering, `cnp_priority` is the flow's feedback priority: the PFC class its CNPs ride. It defaults to the flow's `priority`. A different value puts CNPs in their own class, so a pause of the data class does not hold them back.
+
+DCQCN sources emit ECN-capable data. Use `RED_ECN` or `ECN_THRESHOLD` to create CE feedback. Lowered DCQCN, including its controller and CNP state, runs on Scalar, CPU, Metal, and CUDA. A `cnp_priority` that differs from `priority` runs on Scalar and CPU; Metal and CUDA refuse it at validation.
+
+## RoCE queue pairs
+
+A RoCE queue pair is a reliable DCQCN flow. It uses the same exact DCQCN controller, pacing and separate CNP packet as a DCQCN flow, and adds Go-back-N reliability: a PSN on every data packet, cumulative ACKs, NACKs, and a retransmission timeout. A queue pair completes when its last byte is acknowledged. Queue pairs are an exact-lowering feature; the legacy simulator does not run them.
+
+```toml
+[[flow]]
+flow_type = "RoCE"
+priority = 3                      # data class; lossless when link.pfc.xoff[3] is nonzero
+graph = [[0, 1]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 2_000_000                  # required: a queue pair is byte-bounded
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }   # the MTU
+
+[flow.traffic.dcqcn]              # the controller: the DCQCN keys above, without cnp_priority
+rate_gbps = 100.0
+min_rate_gbps = 0.1
+max_rate_gbps = 100.0
+g = 0.00390625
+ai_rate_gbps = 0.02
+hai_rate_gbps = 0.2
+mi_factor = 0.5
+rtt_ns = 50000
+pacing_interval_ns = 80
+
+[flow.traffic.roce]
+retransmit_timeout_ns = 1_000_000
+```
+
+| `[flow.traffic.roce]` key | Required | Meaning |
+| --- | --- | --- |
+| `retransmit_timeout_ns` | yes | Fixed retransmission timeout, with no backoff. `0` turns the timeout off (see below). |
+| `ack_every_packets` | no | In-order packets per cumulative ACK; default `1`. The receiver also ACKs the last byte. |
+| `nack_interval_ns` | no | Minimum spacing of two NACKs for the same expected PSN; default `500000`. |
+| `feedback_priority` | no | PFC class of the queue pair's CNPs, ACKs and NACKs, in `0..=7`; default `priority`. |
+| `duplicate_ack` | no | Whether a packet below the receiver's frontier is answered with an ACK; default `true`. `false` is allowed only with `retransmit_timeout_ns = 0`. |
+| `ack_size_bytes` | no | Wire size of an ACK or NACK; default `64`. |
+
+The PSN is the byte offset of a packet's first byte. Every packet is `pkt_size_dist` bytes except a short last one, so a retransmission resends exactly the bytes of the original. The pacer sends at most one packet per `pacing_interval_ns` tick, so the tick must be short enough for the line rate: at 100 Gbps with 1,000-byte packets, at most 80 ns.
+
+On a NACK or a timeout, the sender rewinds to the first unacknowledged byte and resends everything from there (Go-back-N). Retransmissions are paced and charged to the DCQCN byte counter like first transmissions.
+
+**With the timeout off, only a NACK repairs a loss.** A NACK needs a later packet of the same queue pair to arrive out of order. If the last packet is lost, or the last ACK, or a resent packet is lost again when nothing follows it, the queue pair stalls for the rest of the run. It never completes, and the run does not report an error. This is the NACK-only Go-back-N of the HPCC ns-3 model; keep the timeout on unless you need that behavior.
+
+Exact lowering refuses `[flow.traffic.roce]` on other flow types, `[flow.traffic.tcp]` on a queue pair, `cnp_priority` on a queue pair (use `feedback_priority`), and duration-bounded queue pairs. Queue pairs cannot yet carry collective stages. They run on Scalar and CPU; Metal and CUDA refuse them at validation.
 
 ## Days AGO field limits
 
