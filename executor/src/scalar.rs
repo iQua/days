@@ -424,6 +424,8 @@ struct HostView<'a> {
     next_payload_seq: &'a mut u64,
     sourced_packets: &'a mut u64,
     received_packets: &'a mut u64,
+    /// Egress pause state under host-link PFC, or `None`.
+    pfc: &'a mut Option<Box<crate::HostPfcState>>,
 }
 
 /// The collective progress one event produced, taken by flow in push order.
@@ -2141,11 +2143,19 @@ impl<'image> TransitionState<'image> {
                 return Err(ExecutionError::HostAlreadyTransmitting(node.id));
             }
 
-            let Some(payload) = state.queue.pop_front() else {
-                return Ok(());
-            };
-            state.in_service = Some(payload);
-            (state.egress_link, payload)
+            if state.pfc.is_none() {
+                let Some(payload) = state.queue.pop_front() else {
+                    return Ok(());
+                };
+                state.in_service = Some(payload);
+                (state.egress_link, payload)
+            } else {
+                // Host-link PFC: the first queued packet whose class is not paused.
+                let Some(selected) = self.host_pfc_start_eligible(node)? else {
+                    return Ok(());
+                };
+                selected
+            }
         };
 
         let link = self.link(egress_link)?;
@@ -2211,12 +2221,19 @@ impl<'image> TransitionState<'image> {
                 .checked_add(1)
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
 
-            if !state.queue.is_empty() && !state.tx_ready_pending {
+            if state.pfc.is_some() {
+                None
+            } else if !state.queue.is_empty() && !state.tx_ready_pending {
                 state.tx_ready_pending = true;
-                true
+                Some(true)
             } else {
-                false
+                Some(false)
             }
+        };
+        // Host-link PFC: service resumes only for a packet whose class is not paused.
+        let schedule_ready = match schedule_ready {
+            Some(schedule_ready) => schedule_ready,
+            None => self.host_pfc_claim_ready(node)?,
         };
 
         let packet = self.packet(event.payload)?;
@@ -2238,6 +2255,59 @@ impl<'image> TransitionState<'image> {
         }
 
         Ok(())
+    }
+
+    /// The queue position of the first packet a host may send under host-link PFC: the first
+    /// whose class (`packet_priority`) is not paused, as a switch FIFO serves.
+    fn host_pfc_first_eligible(
+        &self,
+        node: NodeDescriptor,
+    ) -> Result<Option<usize>, ExecutionError> {
+        let state = self.host_state(node)?;
+        let Some(pfc) = state.pfc.as_deref() else {
+            return Ok((!state.queue.is_empty()).then_some(0));
+        };
+        for (position, payload) in state.queue.iter().enumerate() {
+            let packet = self.packet(*payload)?;
+            let priority = usize::from(self.flow(packet.flow)?.packet_priority(packet.kind));
+            if !pfc.is_paused(priority) {
+                return Ok(Some(position));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Starts serving the first eligible packet of a host with host-link PFC; `None` when every
+    /// queued packet's class is paused.
+    #[inline(never)]
+    fn host_pfc_start_eligible(
+        &mut self,
+        node: NodeDescriptor,
+    ) -> Result<Option<(LinkId, PayloadId)>, ExecutionError> {
+        let Some(position) = self.host_pfc_first_eligible(node)? else {
+            return Ok(None);
+        };
+        let state = self.host_state_mut(node)?;
+        let payload = state
+            .queue
+            .remove(position)
+            .ok_or(ExecutionError::InvalidSchedulerState(node.id))?;
+        state.in_service = Some(payload);
+        Ok(Some((state.egress_link, payload)))
+    }
+
+    /// After a host with host-link PFC completes a transmission: claims the next `TxReady` when
+    /// an eligible packet waits and none is pending.
+    #[inline(never)]
+    fn host_pfc_claim_ready(&mut self, node: NodeDescriptor) -> Result<bool, ExecutionError> {
+        let eligible = self.host_pfc_first_eligible(node)?.is_some();
+        let state = self.host_state_mut(node)?;
+        if eligible && !state.tx_ready_pending {
+            state.tx_ready_pending = true;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     fn switch_remote_arrival(
@@ -2632,6 +2702,155 @@ impl<'image> TransitionState<'image> {
         Ok(())
     }
 
+    /// A PFC PAUSE or RESUME at a host's egress (host-link PFC, `hostpfc-design.md` §3.2).
+    ///
+    /// The controller set changes as at a switch queue, and the transition is recorded with the
+    /// host as the node and queue 0. When the last controller of a class resumes, an idle host
+    /// with an eligible packet schedules `TxReady` at this instant, and every queue pair the pause
+    /// parked restarts on its next grid point strictly after it (ruling D3), each with one
+    /// `resume` sender row (schema Amendment 2), in generator (`FlowId`) order.
+    // Out of line: only host-link PFC images reach it.
+    #[inline(never)]
+    fn host_pfc_remote_arrival(
+        &mut self,
+        node: NodeDescriptor,
+        event: Event,
+        header: crate::PfcHeader,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
+        let priority = usize::from(header.priority);
+        let now = event.key.time_ns;
+        let stop_time_ns = self.image.stop_time_ns;
+        let image = self.image;
+        // The validator pins every control lane into a host to the host's egress link.
+        let (unpaused, transition) = {
+            let (state, _) = self.host_parts_mut(node)?;
+            let pfc = state
+                .pfc
+                .as_deref_mut()
+                .ok_or(ExecutionError::InvalidSchedulerState(node.id))?;
+            let before_controllers = pfc.paused_by_controller[priority]
+                .iter()
+                .copied()
+                .collect::<Vec<_>>();
+            let unpaused = if header.pause {
+                pfc.paused_by_controller[priority].insert(event.key.origin_node);
+                false
+            } else {
+                // A duplicate or early resume is an idempotent no-op; another controller may
+                // still own the aggregate pause.
+                pfc.paused_by_controller[priority].remove(&event.key.origin_node)
+                    && !pfc.is_paused(priority)
+            };
+            let transition =
+                crate::MechanismTransitionRecord::PfcControl(crate::PfcControlTransitionRecord {
+                    key: event.key,
+                    node: node.id,
+                    queue_id: 0,
+                    controlled_link: header.controlled_link,
+                    controller: event.key.origin_node,
+                    priority: header.priority,
+                    action: if header.pause {
+                        crate::PfcControlAction::Pause
+                    } else {
+                        crate::PfcControlAction::Resume
+                    },
+                    before_controllers,
+                    after_controllers: pfc.paused_by_controller[priority].iter().copied().collect(),
+                });
+            (unpaused, transition)
+        };
+        if self.observation_mode == ObservationMode::Full {
+            self.mechanism_transitions.push(transition);
+        }
+        self.mark_terminal(event.payload)?;
+        if !unpaused {
+            return Ok(());
+        }
+        let ready_payload = match self.host_pfc_first_eligible(node)? {
+            Some(position) => {
+                let (state, _) = self.host_parts_mut(node)?;
+                if state.in_service.is_none() && !*state.tx_ready_pending {
+                    *state.tx_ready_pending = true;
+                    Some(state.queue[position])
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
+        // Restart the pause-parked queue pairs of this class.
+        let mut restarts = Vec::new();
+        let mut records = Vec::new();
+        {
+            let (mut state, _) = self.host_parts_mut(node)?;
+            let parked = std::mem::take(
+                &mut state
+                    .pfc
+                    .as_deref_mut()
+                    .ok_or(ExecutionError::InvalidSchedulerState(node.id))?
+                    .pause_parked[priority],
+            );
+            for position in parked {
+                // The validator pins every listed position to a queue pair of this host.
+                let generator = &mut state.generators[position];
+                let FlowGeneratorKind::Roce(mut roce) = generator.kind else {
+                    return Err(ExecutionError::InvalidSchedulerState(node.id));
+                };
+                let before = crate::roce::RoceSenderView::of(generator, &roce);
+                let tick_ns = restart_roce_pacer(generator, &mut roce, now, stop_time_ns)?;
+                settle_roce_sender(generator, &roce, generator.next_emission.status);
+                generator.kind = FlowGeneratorKind::Roce(roce);
+                let flow = generator.flow;
+                records.push(roce_sender_record(
+                    event.key,
+                    node.id,
+                    flow,
+                    crate::RoceSenderKind::Resume,
+                    false,
+                    image_flow_priority(image, flow)?,
+                    &roce,
+                    None,
+                    None,
+                    None,
+                    before,
+                    crate::roce::RoceSenderView::of(generator, &roce),
+                ));
+                restarts.extend(tick_ns.map(|time_ns| (roce.pacing_timer_payload, time_ns)));
+            }
+        }
+        if self.observation_mode == ObservationMode::Full {
+            self.mechanism_transitions.extend(records);
+        }
+        if let Some(payload) = ready_payload {
+            self.emit_from_host(
+                node,
+                event,
+                ChildEmission {
+                    target: node.id,
+                    kind: EventKind::TxReady,
+                    payload,
+                    time_ns: now,
+                },
+                children,
+            )?;
+        }
+        for (payload, time_ns) in restarts {
+            self.emit_from_host(
+                node,
+                event,
+                ChildEmission {
+                    target: node.id,
+                    kind: EventKind::PacingTimer,
+                    payload,
+                    time_ns,
+                },
+                children,
+            )?;
+        }
+        Ok(())
+    }
+
     fn host_remote_arrival(
         &mut self,
         node: NodeDescriptor,
@@ -2664,6 +2883,13 @@ impl<'image> TransitionState<'image> {
             PacketKind::RoceNack(header) => {
                 return self
                     .host_roce_feedback_arrival(node, event, packet, header, true, children);
+            }
+            // Host-link PFC. Dispatched here, after the flow lookup (a PFC frame carries the
+            // flow of the packet that triggered it), not by an early return before it: the
+            // early return made LLVM stop inlining the TCP and DCQCN CNP arrival handlers into
+            // `dispatch` (`hostpfc-impl/tooling/inline-probe/`).
+            PacketKind::Pfc(header) => {
+                return self.host_pfc_remote_arrival(node, event, header, children);
             }
             _ => {}
         }
@@ -3832,12 +4058,16 @@ impl<'image> TransitionState<'image> {
         let now = event.key.time_ns;
         let stop_time_ns = self.image.stop_time_ns;
         let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
+        let image = self.image;
+        // Records are kept only under full observation, so only then are they built: a summary
+        // run of a queue pair pays for neither the views nor the data-class lookup.
+        let full = self.observation_mode == ObservationMode::Full;
         let unexpected = ExecutionError::UnexpectedGeneratorEmission {
             node: node.id,
             flow: packet.flow,
             payload: event.payload,
         };
-        let (emission, next_tick_ns, timer_ns, byte_transition, record) = {
+        let (emission, next_tick_ns, timer_ns, byte_transition, record) = 'tick: {
             let (mut state, index) = self.host_parts_mut(node)?;
             let position = index.first_generator(packet.flow).ok_or(unexpected)?;
             let generator = &mut state.generators[position];
@@ -3850,9 +4080,45 @@ impl<'image> TransitionState<'image> {
             {
                 return Err(unexpected);
             }
-            let before = crate::roce::RoceSenderView::of(generator, &roce);
+            let before = full.then(|| crate::roce::RoceSenderView::of(generator, &roce));
             roce.pacer_armed = false;
             let total = roce.pacer.total_bytes;
+            // Host-link PFC, tested first (LeanGuard's writer contract, `leanguard.md` §12): a
+            // tick that finds its data class paused at its host sends nothing, adds no credit and
+            // parks, and a pacer with packets left joins the class's parked list for the RESUME.
+            // A host without host-link PFC pays one `None` test.
+            let paused_class = match state.pfc.as_deref_mut() {
+                None => None,
+                Some(pfc) => {
+                    let class = image_flow_priority(image, packet.flow)?;
+                    pfc.is_paused(usize::from(class)).then_some((pfc, class))
+                }
+            };
+            if let Some((pfc, class)) = paused_class {
+                if roce.next_psn < total && roce.snd_una < total {
+                    pfc.pause_parked[usize::from(class)].insert(position);
+                }
+                let generator = &mut state.generators[position];
+                settle_roce_sender(generator, &roce, GeneratorStatus::Blocked);
+                generator.kind = FlowGeneratorKind::Roce(roce);
+                let record = before.map(|before| {
+                    roce_sender_record(
+                        event.key,
+                        node.id,
+                        packet.flow,
+                        crate::RoceSenderKind::Tick,
+                        true,
+                        class,
+                        &roce,
+                        None,
+                        None,
+                        None,
+                        before,
+                        crate::roce::RoceSenderView::of(generator, &roce),
+                    )
+                });
+                break 'tick (None, None, None, None, record);
+            }
             let mut rate_bps = None;
             let mut emission = None;
             let mut byte_transition = None;
@@ -3897,7 +4163,7 @@ impl<'image> TransitionState<'image> {
                         .controller
                         .on_bytes_emitted(size)
                         .map_err(|_| overflow)?;
-                    byte_transition = Some(crate::DcqcnTransitionRecord {
+                    byte_transition = full.then_some(crate::DcqcnTransitionRecord {
                         key: event.key,
                         node: node.id,
                         flow: packet.flow,
@@ -3942,24 +4208,29 @@ impl<'image> TransitionState<'image> {
             let next_tick_ns = roce
                 .pacer_armed
                 .then_some(generator.next_emission.departure_time_ns);
-            let record = roce_sender_record(
-                event.key,
-                node.id,
-                packet.flow,
-                crate::RoceSenderKind::Tick,
-                &roce,
-                rate_bps,
-                None,
-                emission,
-                before,
-                crate::roce::RoceSenderView::of(generator, &roce),
-            );
+            let record = match before {
+                Some(before) => Some(roce_sender_record(
+                    event.key,
+                    node.id,
+                    packet.flow,
+                    crate::RoceSenderKind::Tick,
+                    false,
+                    image_flow_priority(image, packet.flow)?,
+                    &roce,
+                    rate_bps,
+                    None,
+                    emission,
+                    before,
+                    crate::roce::RoceSenderView::of(generator, &roce),
+                )),
+                None => None,
+            };
             (emission, next_tick_ns, timer_ns, byte_transition, record)
         };
-        if self.observation_mode == ObservationMode::Full {
+        if full {
             self.mechanism_transitions
                 .extend(byte_transition.map(crate::MechanismTransitionRecord::Dcqcn));
-            self.mechanism_transitions.push(record);
+            self.mechanism_transitions.extend(record);
         }
         if let Some(time_ns) = next_tick_ns {
             self.emit_from_host(
@@ -4034,6 +4305,8 @@ impl<'image> TransitionState<'image> {
                 node: node.id,
             });
         }
+        let data_class = flow.priority;
+        let full = self.observation_mode == ObservationMode::Full;
         self.record_arrival(node.id, packet, event.key, ArrivalDisposition::Feedback)?;
         self.mark_terminal(packet.id)?;
         let now = event.key.time_ns;
@@ -4059,7 +4332,7 @@ impl<'image> TransitionState<'image> {
                 .arrivals
                 .checked_add(1)
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
-            let before = crate::roce::RoceSenderView::of(generator, &roce);
+            let before = full.then(|| crate::roce::RoceSenderView::of(generator, &roce));
             let acknowledgment = header.acknowledgment;
             if acknowledgment > generator.bytes_emitted {
                 return Err(ExecutionError::InconsistentRocePacket {
@@ -4102,22 +4375,28 @@ impl<'image> TransitionState<'image> {
             }
             settle_roce_sender(generator, &roce, generator.next_emission.status);
             generator.kind = FlowGeneratorKind::Roce(roce);
-            let record = roce_sender_record(
-                event.key,
-                node.id,
-                packet.flow,
-                if nack {
-                    crate::RoceSenderKind::Nack
-                } else {
-                    crate::RoceSenderKind::Ack
-                },
-                &roce,
-                None,
-                Some(acknowledgment),
-                None,
-                before,
-                crate::roce::RoceSenderView::of(generator, &roce),
-            );
+            leave_parked_list(state.pfc, data_class, position, generator, &roce);
+            let generator = &state.generators[position];
+            let record = before.map(|before| {
+                roce_sender_record(
+                    event.key,
+                    node.id,
+                    packet.flow,
+                    if nack {
+                        crate::RoceSenderKind::Nack
+                    } else {
+                        crate::RoceSenderKind::Ack
+                    },
+                    false,
+                    data_class,
+                    &roce,
+                    None,
+                    Some(acknowledgment),
+                    None,
+                    before,
+                    crate::roce::RoceSenderView::of(generator, &roce),
+                )
+            });
             (
                 superseded_ns,
                 timer_ns,
@@ -4134,7 +4413,7 @@ impl<'image> TransitionState<'image> {
             });
         }
         if self.observation_mode == ObservationMode::Full {
-            self.mechanism_transitions.push(record);
+            self.mechanism_transitions.extend(record);
         }
         self.emit_roce_timers(node, event, token, tick_ns, timer_ns, children)
     }
@@ -4153,6 +4432,8 @@ impl<'image> TransitionState<'image> {
         let flow = self.packet(event.payload)?.flow;
         let now = event.key.time_ns;
         let stop_time_ns = self.image.stop_time_ns;
+        let full = self.observation_mode == ObservationMode::Full;
+        let data_class = image_flow_priority(self.image, flow)?;
         let (timer_ns, tick_ns, record) = {
             let (mut state, index) = self.host_parts_mut(node)?;
             let position = index
@@ -4183,7 +4464,7 @@ impl<'image> TransitionState<'image> {
                 );
                 return Ok(());
             }
-            let before = crate::roce::RoceSenderView::of(generator, &roce);
+            let before = full.then(|| crate::roce::RoceSenderView::of(generator, &roce));
             roce.next_psn = roce.snd_una;
             let deadline = now
                 .checked_add(roce.rto_ns)
@@ -4192,22 +4473,28 @@ impl<'image> TransitionState<'image> {
             let tick_ns = restart_roce_pacer(generator, &mut roce, now, stop_time_ns)?;
             settle_roce_sender(generator, &roce, generator.next_emission.status);
             generator.kind = FlowGeneratorKind::Roce(roce);
-            let record = roce_sender_record(
-                event.key,
-                node.id,
-                flow,
-                crate::RoceSenderKind::Timeout,
-                &roce,
-                None,
-                None,
-                None,
-                before,
-                crate::roce::RoceSenderView::of(generator, &roce),
-            );
+            leave_parked_list(state.pfc, data_class, position, generator, &roce);
+            let generator = &state.generators[position];
+            let record = before.map(|before| {
+                roce_sender_record(
+                    event.key,
+                    node.id,
+                    flow,
+                    crate::RoceSenderKind::Timeout,
+                    false,
+                    data_class,
+                    &roce,
+                    None,
+                    None,
+                    None,
+                    before,
+                    crate::roce::RoceSenderView::of(generator, &roce),
+                )
+            });
             (Some(deadline), tick_ns, record)
         };
-        if self.observation_mode == ObservationMode::Full {
-            self.mechanism_transitions.push(record);
+        if full {
+            self.mechanism_transitions.extend(record);
         }
         self.emit_roce_timers(node, event, event.payload, tick_ns, timer_ns, children)
     }
@@ -4976,6 +5263,7 @@ impl<'image> TransitionState<'image> {
             next_payload_seq,
             sourced_packets,
             received_packets,
+            pfc,
             ..
         } = state;
         let view = HostView {
@@ -4988,6 +5276,7 @@ impl<'image> TransitionState<'image> {
             next_payload_seq,
             sourced_packets,
             received_packets,
+            pfc,
         };
         Ok((view, index))
     }
@@ -6312,6 +6601,34 @@ fn restart_roce_pacer(
     }
 }
 
+/// Keeps a host's parked list exact after an ACK, NACK or timeout (host-link PFC): a queue pair
+/// stays listed only while its pacer is parked, not stopped, with packets left to send. A restart
+/// (the restarted tick finds the class paused and parks it again) or completion takes it out.
+fn leave_parked_list(
+    pfc: &mut Option<Box<crate::HostPfcState>>,
+    data_class: u8,
+    position: usize,
+    generator: &crate::FlowGeneratorState,
+    roce: &crate::RoceGenerator,
+) {
+    if let Some(pfc) = pfc.as_deref_mut() {
+        let restartable = !roce.pacer_armed
+            && generator.next_emission.status != GeneratorStatus::Stopped
+            && roce.next_psn < roce.pacer.total_bytes
+            && roce.snd_una < roce.pacer.total_bytes;
+        if !restartable {
+            pfc.pause_parked[usize::from(data_class)].remove(&position);
+        }
+    }
+}
+
+/// A flow's data priority, read from the image (no executor borrow).
+fn image_flow_priority(image: &SimulationImage, flow: FlowId) -> Result<u8, ExecutionError> {
+    indexed_lookup(&image.flows, flow.0, |descriptor| descriptor.id == flow)
+        .map(|descriptor| descriptor.priority)
+        .ok_or(ExecutionError::UnknownFlow(flow))
+}
+
 /// A queue-pair sender record of the pinned schema.
 #[allow(clippy::too_many_arguments)]
 fn roce_sender_record(
@@ -6319,6 +6636,8 @@ fn roce_sender_record(
     node: NodeId,
     flow: FlowId,
     kind: crate::RoceSenderKind,
+    class_paused: bool,
+    data_class: u8,
     roce: &crate::RoceGenerator,
     rate_bps: Option<u64>,
     input_acknowledgment: Option<u64>,
@@ -6332,6 +6651,8 @@ fn roce_sender_record(
             node,
             flow,
             kind,
+            class_paused,
+            data_class,
             mtu_bytes: roce.pacer.mtu_bytes,
             total_bytes: roce.pacer.total_bytes,
             pacing_interval_ns: roce.pacer.pacing_interval_ns,

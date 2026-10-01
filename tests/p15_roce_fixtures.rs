@@ -13,7 +13,7 @@ use std::path::Path;
 use days::scenario::compile_config;
 use days_executor::{
     CpuConfig, FlowGeneratorKind, GeneratorStatus, MechanismTransitionRecord, ObservationMode,
-    PacketKind, RoceSenderKind, RoceTransitionRecord, RunResult, SimulationImage,
+    PacketKind, PfcControlAction, RoceSenderKind, RoceTransitionRecord, RunResult, SimulationImage,
     run_cpu_with_observations, run_scalar_with_observations,
 };
 
@@ -58,6 +58,11 @@ struct Contract {
     cnps: usize,
     /// PFC pause and resume transitions (the frames are switch-sourced control, not observed).
     pfc_controls: usize,
+    /// PFC pauses applied at a host's egress (host-link PFC).
+    host_pauses: usize,
+    /// Sender ticks that found their queue pair's data class paused, and RESUME restarts.
+    class_paused_ticks: usize,
+    resumes: usize,
     timeouts: usize,
     dropped: u128,
 }
@@ -107,7 +112,29 @@ fn contract(result: &RunResult) -> Contract {
         .mechanism_transitions
     {
         match record {
-            MechanismTransitionRecord::PfcControl(_) => contract.pfc_controls += 1,
+            MechanismTransitionRecord::PfcControl(control) => {
+                contract.pfc_controls += 1;
+                if result
+                    .host_states
+                    .iter()
+                    .any(|state| state.egress_link == control.controlled_link)
+                    && control.action == PfcControlAction::Pause
+                {
+                    contract.host_pauses += 1;
+                }
+            }
+            MechanismTransitionRecord::Roce(RoceTransitionRecord::Sender(sender))
+                if sender.kind == RoceSenderKind::Resume =>
+            {
+                assert!(!sender.class_paused, "{sender:?}");
+                contract.resumes += 1;
+            }
+            MechanismTransitionRecord::Roce(RoceTransitionRecord::Sender(sender))
+                if sender.class_paused =>
+            {
+                assert_eq!(sender.kind, RoceSenderKind::Tick, "{sender:?}");
+                contract.class_paused_ticks += 1;
+            }
             MechanismTransitionRecord::Roce(RoceTransitionRecord::Sender(sender))
                 if sender.kind == RoceSenderKind::Timeout =>
             {
@@ -142,6 +169,226 @@ fn lossless_pfc_completes_without_loss_or_recovery() {
         "one ACK per in-order packet: {contract:?}"
     );
     assert!(contract.pfc_controls > 0, "{contract:?}");
+}
+
+/// Host-link PFC (§10.1 of `evidence/P15/hostpfc-design.md`): the switches pause the sender NICs,
+/// the paused queue pairs park and resume, and nothing is lost, with no retransmission timeout to
+/// fall back on.
+#[test]
+fn host_pfc_incast_pauses_sender_nics_and_loses_nothing() {
+    let image = lower("hostpfc_incast_lossless.toml");
+    let paused_hosts = image
+        .host_states
+        .iter()
+        .filter(|state| state.pfc.is_some())
+        .count();
+    assert_eq!(
+        paused_hosts, 4,
+        "every host link carries data or feedback, so every host owns egress pause state"
+    );
+    let result = run_identical("hostpfc_incast_lossless.toml");
+    let contract = contract(&result);
+    assert_eq!(contract.queue_pairs, 3, "{contract:?}");
+    assert_eq!(contract.finished_pairs, 3, "{contract:?}");
+    assert_eq!(contract.complete_receivers, 3, "{contract:?}");
+    assert_eq!(contract.fresh_data, 3000, "{contract:?}");
+    assert_eq!(
+        (
+            contract.dropped,
+            contract.nacks,
+            contract.retransmissions,
+            contract.timeouts
+        ),
+        (0, 0, 0, 0),
+        "{contract:?}"
+    );
+    assert!(contract.host_pauses > 0, "{contract:?}");
+    assert!(contract.class_paused_ticks > 0, "{contract:?}");
+    assert!(contract.resumes > 0, "{contract:?}");
+    no_host_starts_a_paused_class(&image, &result);
+}
+
+/// Host egress eligibility (ruling H1 (a)), checked semantically: no host starts transmitting a
+/// packet whose class (`packet_priority`) is paused at that host, per the host's `PfcControl`
+/// records. A packet's first departure is its originating host's (data from the flow's source,
+/// feedback from its target; departures are in event-key order), and the service started one
+/// serialization time earlier on the host's egress link, at a `TxReady` (phase 2) that follows
+/// every PFC frame (phase 0) of that instant. Returns the number of packets a pause held and its
+/// RESUME released: host service starts at the instant a RESUME unpaused the packet's class there.
+fn no_host_starts_a_paused_class(image: &SimulationImage, result: &RunResult) -> usize {
+    use std::collections::{BTreeMap, BTreeSet};
+    let records = &result
+        .diagnostics
+        .as_ref()
+        .expect("full observation carries diagnostics")
+        .mechanism_transitions;
+    let host_nodes = image
+        .nodes
+        .iter()
+        .filter(|node| node.kind == days_executor::NodeKind::Host)
+        .filter(|node| image.host_states[node.state_slot as usize].pfc.is_some())
+        .map(|node| node.id)
+        .collect::<BTreeSet<_>>();
+    // (host, class) -> that class's pause transitions at the host, in key order.
+    let mut controls = BTreeMap::<(days_executor::NodeId, u8), Vec<(u64, bool)>>::new();
+    for record in records {
+        if let MechanismTransitionRecord::PfcControl(control) = record {
+            if host_nodes.contains(&control.node) {
+                controls
+                    .entry((control.node, control.priority))
+                    .or_default()
+                    .push((control.key.time_ns, !control.after_controllers.is_empty()));
+            }
+        }
+    }
+    let paused_at = |node, class: u8, time_ns: u64| {
+        controls.get(&(node, class)).is_some_and(|transitions| {
+            transitions
+                .iter()
+                .rev()
+                .find(|(at, _)| *at <= time_ns)
+                .is_some_and(|(_, paused)| *paused)
+        })
+    };
+    let packets = result
+        .observed_packets
+        .iter()
+        .map(|packet| (packet.id, *packet))
+        .collect::<BTreeMap<_, _>>();
+    let mut seen = BTreeSet::new();
+    let mut released = 0;
+    for departure in &result.departures {
+        if !seen.insert(departure.payload) {
+            continue;
+        }
+        let packet = packets[&departure.payload];
+        let flow = &image.flows[packet.flow.0 as usize];
+        let host = if packet.kind.is_feedback() {
+            flow.target
+        } else {
+            flow.source
+        };
+        if !host_nodes.contains(&host) {
+            continue;
+        }
+        let state = &image.host_states[image.nodes[host.0 as usize].state_slot as usize];
+        let link = image.links[state.egress_link.0 as usize];
+        let serialization_ns =
+            link.delay_ns(packet.size_bytes).expect("link delay") - link.propagation_ns;
+        let start_ns = departure.time_ns - serialization_ns;
+        let class = flow.packet_priority(packet.kind);
+        assert!(
+            !paused_at(host, class, start_ns),
+            "host {host:?} started {packet:?} (class {class}) at {start_ns} ns while that class \
+             was paused there"
+        );
+        released += usize::from(
+            start_ns > 0
+                && paused_at(host, class, start_ns - 1)
+                && controls[&(host, class)]
+                    .iter()
+                    .any(|(at, paused)| *at == start_ns && !paused),
+        );
+    }
+    released
+}
+
+/// Fix round 1 of the host-PFC review (M1, M2): several queue pairs on one host, and a TCP flow on
+/// the paused class beside them (`configs/p15/hostpfc_multi_qp_tcp.toml`).
+/// - One RESUME at host 1 restarts several pause-parked pairs: `resume` rows share event keys.
+/// - The TCP flow's packets wait at host 2 while class 3 is paused there, so egress eligibility
+///   decides real service starts: no host starts a paused-class packet, checked semantically.
+/// - Lossless, every queue pair and the TCP flow complete, and Scalar = CPU at 1-4 workers with
+///   full observation (records included).
+#[test]
+fn several_queue_pairs_and_tcp_on_a_paused_class() {
+    let image = lower("hostpfc_multi_qp_tcp.toml");
+    let result = run_identical("hostpfc_multi_qp_tcp.toml");
+    let contract = contract(&result);
+    assert_eq!(
+        (
+            contract.queue_pairs,
+            contract.finished_pairs,
+            contract.complete_receivers
+        ),
+        (5, 5, 5),
+        "{contract:?}"
+    );
+    assert_eq!(contract.dropped, 0, "{contract:?}");
+    assert!(contract.host_pauses > 0, "{contract:?}");
+    let tcp_done = result
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .filter_map(|generator| match generator.kind {
+            FlowGeneratorKind::Tcp(tcp) => Some(tcp.highest_ack == tcp.total_bytes),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        tcp_done,
+        [true],
+        "the TCP flow on the paused class completes"
+    );
+    // Amendment 2: some RESUME restarts two or more pairs, one row each at the RESUME's key.
+    let mut resumes_by_key = std::collections::BTreeMap::<_, usize>::new();
+    for record in &result
+        .diagnostics
+        .as_ref()
+        .expect("full observation")
+        .mechanism_transitions
+    {
+        if let MechanismTransitionRecord::Roce(RoceTransitionRecord::Sender(sender)) = record {
+            if sender.kind == RoceSenderKind::Resume {
+                *resumes_by_key.entry(sender.key).or_default() += 1;
+            }
+        }
+    }
+    assert!(
+        resumes_by_key.values().any(|rows| *rows >= 2),
+        "no RESUME restarted two pairs: {resumes_by_key:?}"
+    );
+    // Egress eligibility is exercised: packets of the paused class wait in a host queue and start
+    // at the RESUME that releases them, and no host starts a paused-class packet.
+    assert!(
+        no_host_starts_a_paused_class(&image, &result) > 0,
+        "no packet was held by a host pause and released by its RESUME"
+    );
+}
+
+/// `configs/p15/hostpfc_incast_lossless.toml` with its `host_links` line replaced.
+fn host_links_variant(test: &str, line: &str) -> SimulationImage {
+    let text = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("configs/p15/hostpfc_incast_lossless.toml"),
+    )
+    .expect("read the host-PFC fixture");
+    assert_eq!(text.matches("\nhost_links = true\n").count(), 1);
+    let path = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("p15_hostpfc_{test}_{}.toml", std::process::id()));
+    std::fs::write(&path, text.replace("\nhost_links = true\n", line)).expect("write variant");
+    let image = compile_config(&path).expect("the variant lowers");
+    let _ = std::fs::remove_file(&path);
+    image
+}
+
+/// The mechanism is what keeps the incast lossless: without host-link PFC the senders overrun
+/// their first switch.
+#[test]
+fn without_host_links_the_host_pfc_incast_drops() {
+    let image = host_links_variant("off", "\nhost_links = false\n");
+    assert!(image.host_states.iter().all(|state| state.pfc.is_none()));
+    let result = run_scalar_with_observations(&image, None, ObservationMode::Summary)
+        .expect("the Scalar run succeeds");
+    assert!(result.summary.dropped_packets > 0, "{:?}", result.summary);
+}
+
+/// `host_links` defaults to off, and off lowers exactly as a PFC image without the key does.
+#[test]
+fn host_links_default_off() {
+    assert_eq!(
+        host_links_variant("default", "\n"),
+        host_links_variant("explicit", "\nhost_links = false\n")
+    );
 }
 
 #[test]
@@ -278,9 +525,22 @@ const ANCHORS: [(&str, u64, u64); 7] = [
     ("roce_mixed_tcp.toml", 52_398, 0x7612_b5cd_28d5_5949),
 ];
 
+/// Host-link PFC anchors (`p15/hostpfc`, frozen at `c26865f` on the Mac; the sim gate's CLI
+/// confirms them on Linux, Scalar and CPU at 2 workers).
+const HOST_PFC_ANCHORS: [(&str, u64, u64); 2] = [
+    (
+        "hostpfc_incast_lossless.toml",
+        67_609,
+        0x08e4_d33e_ffae_89bb,
+    ),
+    // Fix round 1: the Summary anchor of the multi-QP and TCP variant (frozen on the Mac at
+    // c762428's code; the sim gate's CLI confirms it on Linux).
+    ("hostpfc_multi_qp_tcp.toml", 78_419, 0x7a1d_7dd4_4487_b8f4),
+];
+
 #[test]
 fn p15_fixtures_match_their_frozen_anchors() {
-    for (name, bytes, fnv1a64) in ANCHORS {
+    for (name, bytes, fnv1a64) in ANCHORS.into_iter().chain(HOST_PFC_ANCHORS) {
         let actual = scalar_anchor(name);
         assert_eq!(
             actual,
@@ -292,6 +552,28 @@ fn p15_fixtures_match_their_frozen_anchors() {
     }
 }
 
+/// The HPCC 64->1 incast with host-link PFC (§10.2 of `evidence/P15/hostpfc-design.md`): router 0
+/// pauses the sender NICs, nothing is lost, and every queue pair completes with HPCC's profile
+/// (no retransmission timeout). Release-only, like the anchor below.
+#[test]
+#[ignore = "release-only: 64 queue pairs on a 390-host Dragonfly embedding"]
+fn hpcc_incast_with_host_pfc_loses_nothing() {
+    let image = lower("hpcc_incast64_dragonfly.toml");
+    let result = run_scalar_with_observations(&image, None, ObservationMode::Full)
+        .expect("the Scalar run succeeds");
+    let contract = contract(&result);
+    assert_eq!(contract.queue_pairs, 64, "{contract:?}");
+    assert_eq!(contract.finished_pairs, 64, "{contract:?}");
+    assert_eq!(contract.complete_receivers, 64, "{contract:?}");
+    assert_eq!(
+        (contract.dropped, contract.timeouts),
+        (0, 0),
+        "{contract:?}"
+    );
+    assert!(contract.host_pauses > 0, "{contract:?}");
+    assert!(contract.resumes > 0, "{contract:?}");
+}
+
 /// The HPCC cross-check fixture's anchor; ignored in the default matrix (64 queue pairs at 100
 /// Gbps; run it in release: `cargo test --release -p days --test p15_roce_fixtures -- --ignored`).
 #[test]
@@ -299,6 +581,7 @@ fn p15_fixtures_match_their_frozen_anchors() {
 fn hpcc_fixture_matches_its_frozen_anchor() {
     assert_eq!(
         scalar_anchor("hpcc_incast64_dragonfly.toml"),
-        (813_526, 0x1043_7719_b6f6_f177)
+        // Re-frozen at c26865f: the fixture re-sized for host-link PFC (hostpfc-design.md §10.2).
+        (1_262_683, 0x7ec5_84fc_7397_55b8)
     );
 }

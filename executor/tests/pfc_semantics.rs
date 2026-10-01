@@ -54,6 +54,7 @@ fn host_state(egress_link: LinkId) -> HostState {
         tcp_receivers: vec![],
         dcqcn_receivers: vec![],
         roce_receivers: None,
+        pfc: None,
         next_origin_seq: 0,
         next_payload_seq: 0,
         sourced_packets: 0,
@@ -1111,11 +1112,11 @@ fn host_sourced_controlled_link_is_rejected_without_panicking() {
     );
     let error = result
         .expect("panic was checked above")
-        .expect_err("PFC state is representable only on a switch-owned upstream queue")
+        .expect_err("a host-owned controlled link needs the host's egress PFC state (P15)")
         .to_string();
     assert!(
-        error.contains("controlled upstream") && error.contains("Switch"),
-        "expected a controlled-upstream switch diagnostic, got: {error}"
+        error.contains("controlled upstream host") && error.contains("host egress PFC state"),
+        "expected a controlled-upstream host diagnostic, got: {error}"
     );
 }
 

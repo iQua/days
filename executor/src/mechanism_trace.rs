@@ -233,7 +233,8 @@ impl MechanismTransitionRecord {
             Self::Wrr(_) => (4, 0),
             Self::Dcqcn(_) => (5, 0),
             Self::Collective(record) => (6, record.ordinal),
-            Self::Roce(_) => (7, 0),
+            // A host RESUME yields one `resume` row per restarted queue pair at one key.
+            Self::Roce(record) => (7, record.flow().0),
         };
         (self.key(), tag, ordinal)
     }
@@ -418,26 +419,38 @@ pub fn dcqcn_transitions_csv(
 pub fn roce_sender_transitions_csv(
     records: &[MechanismTransitionRecord],
 ) -> Result<String, MechanismTraceError> {
-    let records = canonical(
-        "RoCE sender",
-        records
-            .iter()
-            .filter_map(|record| match record {
-                MechanismTransitionRecord::Roce(crate::RoceTransitionRecord::Sender(record)) => {
-                    Some((record.key, *record))
-                }
-                _ => None,
-            })
-            .collect(),
-    )?;
+    // Canonical order is (event key, flow): one event yields one sender row, except a host
+    // RESUME, which yields one `resume` row per queue pair it restarts (schema Amendment 2).
+    let mut records = records
+        .iter()
+        .filter_map(|record| match record {
+            MechanismTransitionRecord::Roce(crate::RoceTransitionRecord::Sender(record)) => {
+                Some(*record)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    records.sort_unstable_by_key(|record| (record.key, record.flow));
+    if let Some(pair) = records.windows(2).find(|pair| {
+        pair[0].key == pair[1].key
+            && (pair[0].flow == pair[1].flow
+                || pair[0].node != pair[1].node
+                || pair[0].kind != crate::RoceSenderKind::Resume
+                || pair[1].kind != crate::RoceSenderKind::Resume)
+    }) {
+        return Err(MechanismTraceError {
+            mechanism: "RoCE sender",
+            duplicate_key: pair[0].key,
+        });
+    }
     let mut csv = String::from(
-        "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,kind,mtu_bytes,total_bytes,pacing_interval_ns,first_pacing_time_ns,rto_ns,rate_bps,input_acknowledgment,emitted,emitted_psn,emitted_bytes,emitted_retransmission,emitted_payload,before_next_psn,before_snd_una,before_bytes_emitted,before_packets_emitted,before_credit_quanta,before_rto_deadline_ns,before_pacer,before_next_tick_ns,before_status,after_next_psn,after_snd_una,after_bytes_emitted,after_packets_emitted,after_credit_quanta,after_rto_deadline_ns,after_pacer,after_next_tick_ns,after_status\n",
+        "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,kind,class_paused,data_class,mtu_bytes,total_bytes,pacing_interval_ns,first_pacing_time_ns,rto_ns,rate_bps,input_acknowledgment,emitted,emitted_psn,emitted_bytes,emitted_retransmission,emitted_payload,before_next_psn,before_snd_una,before_bytes_emitted,before_packets_emitted,before_credit_quanta,before_rto_deadline_ns,before_pacer,before_next_tick_ns,before_status,after_next_psn,after_snd_una,after_bytes_emitted,after_packets_emitted,after_credit_quanta,after_rto_deadline_ns,after_pacer,after_next_tick_ns,after_status\n",
     );
     for record in records {
         let emitted = record.emitted;
         write!(
             csv,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             record.key.time_ns,
             record.key.phase,
             record.key.origin_node.0,
@@ -445,6 +458,8 @@ pub fn roce_sender_transitions_csv(
             record.node.0,
             record.flow.0,
             record.kind.label(),
+            bit(record.class_paused),
+            record.data_class,
             record.mtu_bytes,
             record.total_bytes,
             record.pacing_interval_ns,

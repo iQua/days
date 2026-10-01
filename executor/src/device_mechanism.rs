@@ -594,6 +594,7 @@ mod tests {
             tcp_receivers: Vec::new(),
             dcqcn_receivers: Vec::new(),
             roce_receivers: None,
+            pfc: None,
             next_origin_seq: 0,
             next_payload_seq: 0,
             sourced_packets: 0,
@@ -754,6 +755,27 @@ mod tests {
             })],
         );
         assert_eq!(mechanism_flags(&frame), MECHANISM_PFC);
+    }
+
+    /// P15 host-link PFC: the device PFC region has rows only for switch egress queues, so the
+    /// kernels would ignore a host's pause. The region planner refuses host egress pause state,
+    /// independently of the validator's refusal, rather than plan a run that ignores it.
+    #[test]
+    fn the_pfc_region_refuses_host_egress_pause_state() {
+        let mut image = switch_image(pfc_queue());
+        let mut words = Vec::new();
+        assert!(crate::device_pfc::append_pfc_region(&image, &mut words).is_ok());
+        image.nodes.push(crate::NodeDescriptor {
+            id: crate::NodeId(1),
+            kind: crate::NodeKind::Host,
+            state_slot: 0,
+        });
+        let mut paused_host = host(Vec::new());
+        paused_host.pfc = Some(Box::default());
+        image.host_states.push(paused_host);
+        let error = crate::device_pfc::append_pfc_region(&image, &mut Vec::new())
+            .expect_err("host egress pause state has no device row");
+        assert!(error.contains("host-link PFC"), "{error}");
     }
 
     /// Every source of DCQCN or PFC state selects the mechanisms kernel; nothing else does.

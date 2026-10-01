@@ -567,6 +567,13 @@ fn validate_backend_capabilities(
             "backend {backend} does not support collective generators; use Scalar or Cpu"
         )));
     }
+    // P15: host-link PFC (switches pausing host NICs) runs on Scalar and Cpu; the device kernels
+    // read pause state only at switch egress until the device lane ports it.
+    if image.host_states.iter().any(|state| state.pfc.is_some()) {
+        return Err(ValidationError::new(format!(
+            "backend {backend} does not support host-link PFC (`[link.pfc] host_links`); use Scalar or Cpu"
+        )));
+    }
     // P15: the device kernels read one PFC class per flow; a separate feedback class (a DCQCN
     // CNP or RoCE ACK/NACK priority) runs on Scalar and Cpu until the device lane ports it.
     if image
@@ -1105,27 +1112,36 @@ fn validate_pfc(image: &SimulationImage) -> Result<BTreeSet<usize>, ValidationEr
                 }
                 let controlled_owner = node(image, controlled.source)
                     .expect("link validation established the controlled-link source");
-                if controlled_owner.kind != NodeKind::Switch {
-                    return Err(ValidationError::new(format!(
-                        "PFC controlled upstream link {:?} must be owned by a Switch queue, got {:?} node {:?}",
-                        controlled.id, controlled_owner.kind, controlled_owner.id
-                    )));
-                }
                 if !controller_monitors.insert((controlled.id, owner.id)) {
                     return Err(ValidationError::new(format!(
                         "duplicate PFC controller {:?} for controlled link {:?}; one controller LP may own only one ingress monitor per controlled link",
                         owner.id, controlled.id
                     )));
                 }
-                let controlled_queue = image.switch_states[controlled_owner.state_slot as usize]
-                    .queues
-                    .iter()
-                    .find(|queue| queue.egress_link == Some(controlled.id));
-                if controlled_queue.is_none_or(|queue| queue.pfc.is_none()) {
-                    return Err(ValidationError::new(format!(
-                        "PFC controlled upstream queue at switch {:?} for link {:?} must own controller-scoped PFC state",
-                        controlled.source, controlled.id
-                    )));
+                match controlled_owner.kind {
+                    NodeKind::Switch => {
+                        let controlled_queue = image.switch_states
+                            [controlled_owner.state_slot as usize]
+                            .queues
+                            .iter()
+                            .find(|queue| queue.egress_link == Some(controlled.id));
+                        if controlled_queue.is_none_or(|queue| queue.pfc.is_none()) {
+                            return Err(ValidationError::new(format!(
+                                "PFC controlled upstream queue at switch {:?} for link {:?} must own controller-scoped PFC state",
+                                controlled.source, controlled.id
+                            )));
+                        }
+                    }
+                    // Host-link PFC: the switch pauses the host's NIC.
+                    NodeKind::Host => {
+                        let host = &image.host_states[controlled_owner.state_slot as usize];
+                        if host.egress_link != controlled.id || host.pfc.is_none() {
+                            return Err(ValidationError::new(format!(
+                                "PFC controlled upstream host {:?} for link {:?} must own host egress PFC state for that egress link",
+                                controlled.source, controlled.id
+                            )));
+                        }
+                    }
                 }
                 let channel_index = ingress.control_channel_index as usize;
                 let channel = image.channels.get(channel_index).ok_or_else(|| {
@@ -1326,6 +1342,49 @@ fn validate_pfc(image: &SimulationImage) -> Result<BTreeSet<usize>, ValidationEr
         }
     }
 
+    // Host-link PFC: one scan of the host table when no host owns pause state.
+    let host_pause_state = image.host_states.iter().any(|state| state.pfc.is_some());
+    for owner in image
+        .nodes
+        .iter()
+        .filter(|node| host_pause_state && node.kind == NodeKind::Host)
+    {
+        let state = &image.host_states[owner.state_slot as usize];
+        let Some(pfc) = state.pfc.as_deref() else {
+            continue;
+        };
+        if !controller_monitors
+            .iter()
+            .any(|(link, _)| *link == state.egress_link)
+        {
+            return Err(ValidationError::new(format!(
+                "host node {:?} owns egress PFC state, but its egress link is not PFC-controlled ({:?})",
+                owner.id, state.egress_link
+            )));
+        }
+        let expected = controllers_by_link_priority.get(&state.egress_link);
+        for priority in 0..8 {
+            if let Some(controller) = pfc.paused_by_controller[priority]
+                .iter()
+                .find(|controller| {
+                    !expected.is_some_and(|sets| sets[priority].contains(controller))
+                })
+            {
+                return Err(ValidationError::new(format!(
+                    "host node {:?} PFC priority {priority} has pause state for undeclared controller {:?}",
+                    owner.id, controller
+                )));
+            }
+        }
+        let parked = expected_pause_parked(image, state, pfc);
+        if pfc.pause_parked != parked {
+            return Err(ValidationError::new(format!(
+                "host node {:?} PFC parked list {:?} differs from its paused, parked, restartable queue pairs {:?}",
+                owner.id, pfc.pause_parked, parked
+            )));
+        }
+    }
+
     validate_pfc_deadlock_scope(image, &controlled_priorities)?;
 
     let pfc_events = image
@@ -1349,6 +1408,47 @@ fn validate_pfc(image: &SimulationImage) -> Result<BTreeSet<usize>, ValidationEr
         }
     }
     Ok(control_lanes)
+}
+
+/// Whether `priority` is paused at host `owner`'s egress (host-link PFC).
+fn host_class_paused(image: &SimulationImage, owner: NodeId, priority: u8) -> bool {
+    node(image, owner)
+        .filter(|descriptor| descriptor.kind == NodeKind::Host)
+        .and_then(|descriptor| {
+            image.host_states[descriptor.state_slot as usize]
+                .pfc
+                .as_deref()
+        })
+        .is_some_and(|pfc| pfc.is_paused(usize::from(priority)))
+}
+
+/// The queue pairs a host's parked list must hold, by class: each queue pair whose data class is
+/// paused there and whose pacer a paused tick parked with packets left to send (parked, not
+/// stopped, `next_psn < total` and `snd_una < total`; LeanGuard's restartable parked pairs).
+fn expected_pause_parked(
+    image: &SimulationImage,
+    state: &crate::HostState,
+    pfc: &crate::HostPfcState,
+) -> [BTreeSet<usize>; 8] {
+    let mut expected: [BTreeSet<usize>; 8] = Default::default();
+    for (position, generator) in state.generators.iter().enumerate() {
+        let FlowGeneratorKind::Roce(roce) = generator.kind else {
+            continue;
+        };
+        let Some(flow) = flow(image, generator.flow) else {
+            continue;
+        };
+        let class = usize::from(flow.priority);
+        if pfc.is_paused(class)
+            && !roce.pacer_armed
+            && generator.next_emission.status != GeneratorStatus::Stopped
+            && roce.next_psn < roce.pacer.total_bytes
+            && roce.snd_una < roce.pacer.total_bytes
+        {
+            expected[class].insert(position);
+        }
+    }
+    expected
 }
 
 /// A Go-back-N packet boundary: a multiple of the MTU, or the total byte count.
@@ -1491,7 +1591,12 @@ fn validate_roce_generator(
         if status == GeneratorStatus::Scheduled {
             return Err(invalid("parked pacer is Scheduled"));
         }
-        if status == GeneratorStatus::Blocked && roce.next_psn < pacer.total_bytes {
+        // A pacer parks with packets left to send only while its data class is paused at its
+        // host (host-link PFC); `validate_pfc` pins it in the host's parked list.
+        if status == GeneratorStatus::Blocked
+            && roce.next_psn < pacer.total_bytes
+            && !host_class_paused(image, owner, flow.priority)
+        {
             return Err(invalid("parked pacer has packets left to send"));
         }
     }
@@ -1695,24 +1800,33 @@ fn validate_pfc_causal_consistency(image: &SimulationImage) -> Result<(), Valida
                     .expect("PFC structural validation established the controlled link");
                 let upstream = node(image, controlled.source)
                     .expect("link validation established the controlled-link source");
-                let (upstream_queue_index, upstream_pfc) = image.switch_states
-                    [upstream.state_slot as usize]
-                    .queues
-                    .iter()
-                    .enumerate()
-                    .find_map(|(queue_index, queue)| {
-                        (queue.egress_link == Some(controlled.id))
-                            .then_some((queue_index, queue.pfc.as_ref()))
-                    })
-                    .and_then(|(queue_index, pfc)| pfc.map(|pfc| (queue_index, pfc)))
-                    .expect("PFC structural validation established upstream controller state");
+                let (upstream_queue_index, upstream_paused_sets) = match upstream.kind {
+                    NodeKind::Switch => image.switch_states[upstream.state_slot as usize]
+                        .queues
+                        .iter()
+                        .enumerate()
+                        .find_map(|(queue_index, queue)| {
+                            (queue.egress_link == Some(controlled.id))
+                                .then_some((queue_index, queue.pfc.as_ref()))
+                        })
+                        .and_then(|(queue_index, pfc)| {
+                            pfc.map(|pfc| (queue_index, &pfc.paused_by_controller))
+                        }),
+                    // A host's egress is its queue 0.
+                    NodeKind::Host => image.host_states[upstream.state_slot as usize]
+                        .pfc
+                        .as_deref()
+                        .map(|pfc| (0, &pfc.paused_by_controller)),
+                }
+                .expect("PFC structural validation established upstream controller state");
 
                 for priority in 0..8 {
                     if ingress.xoff_threshold_bytes[priority] == 0 {
                         continue;
                     }
-                    let upstream_paused =
-                        upstream_pfc.paused_by_controller[priority].contains(&controller.id);
+                    let upstream_paused = upstream_paused_sets
+                        .get(priority)
+                        .is_some_and(|controllers| controllers.contains(&controller.id));
                     let asserted = ingress.pause_asserted[priority];
                     let mut actions = image
                         .initial_events
@@ -4017,7 +4131,20 @@ fn validate_owned_service_state(
                 owner.id
             )));
         }
-        if !state.queue.is_empty() && state.in_service.is_none() && !state.tx_ready_pending {
+        // With host-link PFC, a packet whose class is paused at the host's egress waits for its
+        // RESUME, which schedules the service.
+        // Without host-link PFC this is today's emptiness test: no per-packet work.
+        let has_eligible_packet = match state.pfc.as_deref() {
+            None => !state.queue.is_empty(),
+            Some(pfc) => state.queue.iter().any(|payload| {
+                packet(image, *payload)
+                    .and_then(|packet| {
+                        flow(image, packet.flow).map(|flow| flow.packet_priority(packet.kind))
+                    })
+                    .is_none_or(|priority| !pfc.is_paused(usize::from(priority)))
+            }),
+        };
+        if has_eligible_packet && state.in_service.is_none() && !state.tx_ready_pending {
             return Err(ValidationError::new(format!(
                 "host node {:?} has queued packets but neither active service nor TxReady pending",
                 owner.id

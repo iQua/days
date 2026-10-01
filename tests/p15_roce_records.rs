@@ -11,13 +11,14 @@ use std::path::Path;
 
 use days::scenario::compile_config;
 use days_executor::{
-    FlowId, GeneratorStatus, MechanismTransitionRecord, ObservationMode, PacketKind, RoceEmission,
-    RocePacerState, RoceReceiverAction, RoceReceiverRecord, RoceSenderKind, RoceSenderRecord,
-    RoceTransitionRecord, RunResult, roce_receiver_transitions_csv, roce_sender_transitions_csv,
+    EventKey, FlowId, GeneratorStatus, MechanismTransitionRecord, NodeId, ObservationMode,
+    PacketKind, PfcControlAction, PfcControlTransitionRecord, RoceEmission, RocePacerState,
+    RoceReceiverAction, RoceReceiverRecord, RoceSenderKind, RoceSenderRecord, RoceTransitionRecord,
+    RunResult, roce_receiver_transitions_csv, roce_sender_transitions_csv,
     run_scalar_with_observations,
 };
 
-const FIXTURES: [&str; 7] = [
+const FIXTURES: [&str; 9] = [
     "roce_lossless_pfc.toml",
     "roce_gbn_lossy.toml",
     "roce_timeout.toml",
@@ -25,9 +26,11 @@ const FIXTURES: [&str; 7] = [
     "roce_cnp_under_pfc.toml",
     "roce_feedback_priority.toml",
     "roce_mixed_tcp.toml",
+    "hostpfc_incast_lossless.toml",
+    "hostpfc_multi_qp_tcp.toml",
 ];
 
-const SENDER_HEADER: &str = "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,kind,mtu_bytes,total_bytes,pacing_interval_ns,first_pacing_time_ns,rto_ns,rate_bps,input_acknowledgment,emitted,emitted_psn,emitted_bytes,emitted_retransmission,emitted_payload,before_next_psn,before_snd_una,before_bytes_emitted,before_packets_emitted,before_credit_quanta,before_rto_deadline_ns,before_pacer,before_next_tick_ns,before_status,after_next_psn,after_snd_una,after_bytes_emitted,after_packets_emitted,after_credit_quanta,after_rto_deadline_ns,after_pacer,after_next_tick_ns,after_status";
+const SENDER_HEADER: &str = "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,kind,class_paused,data_class,mtu_bytes,total_bytes,pacing_interval_ns,first_pacing_time_ns,rto_ns,rate_bps,input_acknowledgment,emitted,emitted_psn,emitted_bytes,emitted_retransmission,emitted_payload,before_next_psn,before_snd_una,before_bytes_emitted,before_packets_emitted,before_credit_quanta,before_rto_deadline_ns,before_pacer,before_next_tick_ns,before_status,after_next_psn,after_snd_una,after_bytes_emitted,after_packets_emitted,after_credit_quanta,after_rto_deadline_ns,after_pacer,after_next_tick_ns,after_status";
 const RECEIVER_HEADER: &str = "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,total_bytes,ack_every_packets,nack_interval_ns,duplicate_ack,ack_size_bytes,cnp_interval_ns,packet_psn,packet_bytes,packet_sent_time_ns,packet_retransmission,packet_ce,action,feedback_acknowledgment,feedback_payload,cnp_sent,cnp_payload,before_expected_psn,before_packets_since_ack,before_last_nack_psn,before_last_nack_time_ns,before_last_cnp_time_ns,after_expected_psn,after_packets_since_ack,after_last_nack_psn,after_last_nack_time_ns,after_last_cnp_time_ns";
 
 fn run(name: &str) -> RunResult {
@@ -73,6 +76,11 @@ fn check_sender(name: &str, record: &RoceSenderRecord) {
     let (before, after) = (record.before, record.after);
     let now = record.key.time_ns;
     let context = format!("{name}: {record:?}");
+    assert!(record.data_class < 8, "{context}");
+    assert!(
+        !record.class_paused || record.kind == RoceSenderKind::Tick,
+        "only a tick finds its class paused (Amendment 1): {context}"
+    );
     // Common invariants of every view.
     for view in [before, after] {
         assert!(
@@ -97,6 +105,74 @@ fn check_sender(name: &str, record: &RoceSenderRecord) {
         }
     };
     match record.kind {
+        RoceSenderKind::Tick if record.class_paused => {
+            // Amendment 1: the tick sends nothing, adds no credit, and parks.
+            assert_eq!(before.pacer, RocePacerState::Armed, "{context}");
+            assert_eq!(before.next_tick_ns, Some(now), "{context}");
+            assert_eq!(
+                (record.emitted, record.rate_bps, record.input_acknowledgment),
+                (None, None, None),
+                "{context}"
+            );
+            assert_eq!(after.pacer, RocePacerState::Parked, "{context}");
+            assert_eq!(
+                (
+                    after.next_psn,
+                    after.snd_una,
+                    after.bytes_emitted,
+                    after.packets_emitted,
+                    after.credit_quanta,
+                    after.rto_deadline_ns
+                ),
+                (
+                    before.next_psn,
+                    before.snd_una,
+                    before.bytes_emitted,
+                    before.packets_emitted,
+                    before.credit_quanta,
+                    before.rto_deadline_ns
+                ),
+                "{context}"
+            );
+        }
+        RoceSenderKind::Resume => {
+            // Amendment 2: a pause-parked pacer with data to send restarts on its next grid
+            // point strictly after the RESUME, or stops beyond the stop time.
+            assert_eq!(
+                (record.emitted, record.rate_bps, record.input_acknowledgment),
+                (None, None, None),
+                "{context}"
+            );
+            assert_eq!(before.pacer, RocePacerState::Parked, "{context}");
+            assert!(
+                before.next_psn < record.total_bytes && before.snd_una < record.total_bytes,
+                "{context}"
+            );
+            assert!(
+                matches!(after.pacer, RocePacerState::Armed | RocePacerState::Stopped),
+                "{context}"
+            );
+            assert_eq!(after.next_tick_ns, Some(rewound_restart(now)), "{context}");
+            assert_eq!(
+                (
+                    after.next_psn,
+                    after.snd_una,
+                    after.bytes_emitted,
+                    after.packets_emitted,
+                    after.credit_quanta,
+                    after.rto_deadline_ns
+                ),
+                (
+                    before.next_psn,
+                    before.snd_una,
+                    before.bytes_emitted,
+                    before.packets_emitted,
+                    before.credit_quanta,
+                    before.rto_deadline_ns
+                ),
+                "{context}"
+            );
+        }
         RoceSenderKind::Tick => {
             assert_eq!(before.pacer, RocePacerState::Armed, "{context}");
             assert_eq!(before.next_tick_ns, Some(now), "{context}");
@@ -400,4 +476,141 @@ fn the_csv_writers_emit_the_pinned_schema_one_row_per_record() {
             .count();
         assert_eq!(emitted, data, "{name}");
     }
+}
+
+/// Whether `class` is paused at `node` just before `key`, per the PFC control log: the last
+/// control of (node, class) before `key` leaves a nonempty controller set. Controls arrive in
+/// phase 0, before any tick (phase 1) at the same instant.
+fn paused_before(
+    controls: &[PfcControlTransitionRecord],
+    node: NodeId,
+    class: u8,
+    key: EventKey,
+) -> bool {
+    controls
+        .iter()
+        .rfind(|control| control.node == node && control.priority == class && control.key < key)
+        .is_some_and(|control| !control.after_controllers.is_empty())
+}
+
+/// Schema Amendment 3 and the `class_paused` writer contract (`evidence/P15/leanguard.md` §12):
+/// every tick records whether its queue pair's data class is paused at its host, a no-op tick
+/// included; every `resume` row shares the key of a host RESUME of its class at its node; and every
+/// such RESUME restarts every restartable pause-parked queue pair of that class there.
+#[test]
+fn pause_and_resume_rows_agree_with_the_host_pfc_log() {
+    let mut paused_ticks = 0;
+    let mut resumes = 0;
+    for name in FIXTURES {
+        let result = run(name);
+        let records = records(&result);
+        let mut controls = records
+            .iter()
+            .filter_map(|record| match record {
+                MechanismTransitionRecord::PfcControl(control) => Some(control.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        controls.sort_by_key(|control| control.key);
+        let senders = records
+            .iter()
+            .filter_map(|record| match record {
+                MechanismTransitionRecord::Roce(RoceTransitionRecord::Sender(sender)) => {
+                    Some(*sender)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for sender in &senders {
+            let context = format!("{name}: {sender:?}");
+            match sender.kind {
+                RoceSenderKind::Tick => {
+                    assert_eq!(
+                        sender.class_paused,
+                        paused_before(&controls, sender.node, sender.data_class, sender.key),
+                        "{context}"
+                    );
+                    paused_ticks += usize::from(sender.class_paused);
+                }
+                RoceSenderKind::Resume => {
+                    assert!(
+                        controls.iter().any(|control| control.key == sender.key
+                            && control.node == sender.node
+                            && control.priority == sender.data_class
+                            && control.action == PfcControlAction::Resume
+                            && control.after_controllers.is_empty()),
+                        "a resume row needs a host RESUME of its class: {context}"
+                    );
+                    resumes += 1;
+                }
+                _ => {}
+            }
+        }
+        // Completeness: at each RESUME that unpauses (node, class), every queue pair of that
+        // class at that node whose latest earlier row leaves it parked and restartable has a
+        // resume row at the RESUME's key.
+        for control in controls.iter().filter(|control| {
+            control.action == PfcControlAction::Resume
+                && control.after_controllers.is_empty()
+                && !control.before_controllers.is_empty()
+        }) {
+            let mut latest = BTreeMap::<FlowId, RoceSenderRecord>::new();
+            for sender in senders.iter().filter(|sender| {
+                sender.node == control.node
+                    && sender.data_class == control.priority
+                    && sender.key < control.key
+            }) {
+                latest.insert(sender.flow, *sender);
+            }
+            for (flow, last) in latest {
+                let restartable = last.after.pacer == RocePacerState::Parked
+                    && last.after.next_psn < last.total_bytes
+                    && last.after.snd_una < last.total_bytes;
+                let resumed = senders.iter().any(|sender| {
+                    sender.flow == flow
+                        && sender.key == control.key
+                        && sender.kind == RoceSenderKind::Resume
+                });
+                assert_eq!(
+                    resumed, restartable,
+                    "{name}: flow {flow:?} at {control:?} after {last:?}"
+                );
+            }
+        }
+    }
+    assert!(
+        paused_ticks > 0 && resumes > 0,
+        "the host-PFC fixture pauses and resumes"
+    );
+}
+
+/// Amendment 2: rows share an event key only as `resume` rows of distinct flows at one node, in
+/// ascending `flow_id`. The multi-pair fixture's RESUMEs restart several pairs at one key, so the
+/// shared-key case is exercised, not passed vacuously (host-PFC review M1).
+#[test]
+fn only_resume_rows_share_an_event_key() {
+    let result = run("hostpfc_multi_qp_tcp.toml");
+    let csv = roce_sender_transitions_csv(records(&result)).expect("sender CSV");
+    let rows = csv
+        .lines()
+        .skip(1)
+        .map(|line| line.split(',').map(str::to_owned).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let mut shared = 0;
+    for pair in rows.windows(2) {
+        if pair[0][..4] == pair[1][..4] {
+            shared += 1;
+            assert_eq!(
+                (pair[0][6].as_str(), pair[1][6].as_str()),
+                ("resume", "resume")
+            );
+            assert_eq!(pair[0][4], pair[1][4], "one node");
+            let flow = |row: &Vec<String>| row[5].parse::<u64>().expect("flow id");
+            assert!(flow(&pair[0]) < flow(&pair[1]), "{pair:?}");
+        }
+    }
+    assert!(
+        shared > 0,
+        "no two sender rows share an event key: the shared-key case went unexercised"
+    );
 }

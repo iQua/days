@@ -189,6 +189,22 @@ pub(crate) fn append_pfc_region(
     if !image_has_pfc(image) {
         return Ok(None);
     }
+    // P15 host-link PFC: the region holds switch egress rows only, and the kernels pause only
+    // switch egress. Fail closed on host pause state even if validation was bypassed. A host-PFC
+    // image always has switch PFC state (its monitors), so this runs for it; it runs once per plan
+    // and only for PFC images.
+    if let Some(host) = image.nodes.iter().find(|node| {
+        node.kind == NodeKind::Host
+            && image
+                .host_states
+                .get(node.state_slot as usize)
+                .is_some_and(|state| state.pfc.is_some())
+    }) {
+        return Err(format!(
+            "host {:?} owns host-link PFC state, which the device PFC region cannot represent; use Scalar or Cpu",
+            host.id
+        ));
+    }
     let node_count = image.nodes.len();
     let flow_count = image.flows.len();
     let queues = lp_queues(image)

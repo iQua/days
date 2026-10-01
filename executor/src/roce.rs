@@ -260,6 +260,8 @@ pub enum RoceSenderKind {
     Ack = 1,
     Nack = 2,
     Timeout = 3,
+    /// A host RESUME restarted the queue pair's pause-parked pacer (schema Amendment 2).
+    Resume = 4,
 }
 
 impl RoceSenderKind {
@@ -269,6 +271,7 @@ impl RoceSenderKind {
             Self::Ack => "ack",
             Self::Nack => "nack",
             Self::Timeout => "timeout",
+            Self::Resume => "resume",
         }
     }
 }
@@ -289,6 +292,10 @@ pub struct RoceSenderRecord {
     pub node: NodeId,
     pub flow: FlowId,
     pub kind: RoceSenderKind,
+    /// A tick that found the queue pair's data class paused at its host (Amendment 1).
+    pub class_paused: bool,
+    /// The queue pair's data priority (Amendment 3).
+    pub data_class: u8,
     pub mtu_bytes: u64,
     pub total_bytes: u64,
     pub pacing_interval_ns: u64,
@@ -365,6 +372,13 @@ impl RoceTransitionRecord {
         match self {
             Self::Sender(record) => record.key,
             Self::Receiver(record) => record.key,
+        }
+    }
+
+    pub const fn flow(&self) -> FlowId {
+        match self {
+            Self::Sender(record) => record.flow,
+            Self::Receiver(record) => record.flow,
         }
     }
 }

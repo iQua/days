@@ -35,6 +35,7 @@ fn one_image_contains_host_and_switch_state_arenas() {
             tcp_receivers: vec![],
             dcqcn_receivers: vec![],
             roce_receivers: None,
+            pfc: None,
             next_payload_seq: 0,
             next_origin_seq: 0,
             sourced_packets: 0,
