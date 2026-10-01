@@ -182,6 +182,29 @@ fn select_cuda_provisioning(
 #[cfg(feature = "cuda-test-hooks")]
 std::thread_local! {
     static PANIC_AFTER_NEXT_EXECUTION: Cell<bool> = const { Cell::new(false) };
+    /// Test-only: the steps of the CUDA runs on this thread, in order
+    /// ([`take_cuda_run_steps_for_testing`]). Per thread, so parallel tests never share it.
+    static RUN_STEPS: std::cell::RefCell<Vec<&'static str>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test-only: records one step of a CUDA run on this thread: `module_loaded`, `planned`,
+/// `buffers_allocated`, `graph_captured`, `graph_launched` (once per attempt) or
+/// `module_unloaded`. Empty in production builds.
+fn record_run_step(step: &'static str) {
+    #[cfg(feature = "cuda-test-hooks")]
+    RUN_STEPS.with_borrow_mut(|steps| steps.push(step));
+    let _ = step;
+}
+
+/// Test-only: the steps this thread's CUDA runs took since the last call, in order; clears them.
+/// A run that loads its module, plans, uploads, captures and launches once, then ends, records
+/// `module_loaded`, `planned`, `buffers_allocated`, `graph_captured`, `graph_launched`,
+/// `module_unloaded`.
+#[doc(hidden)]
+#[cfg(feature = "cuda-test-hooks")]
+pub fn take_cuda_run_steps_for_testing() -> Vec<&'static str> {
+    RUN_STEPS.take()
 }
 
 /// Arms a one-shot panic after this thread's next successful CUDA graph execution.
@@ -1420,6 +1443,7 @@ impl CudaExecutor {
                     &mut channel_capacity_floors,
                     &mut tcp_capacity_floors,
                 )?;
+                record_run_step("planned");
                 // The plain kernel has no device-side stop: the host refuses it, before upload, on
                 // any plan holding state a mechanism transition would act on.
                 if round_kernel == RoundKernel::Plain {
@@ -1432,6 +1456,7 @@ impl CudaExecutor {
                     None => held_module.insert(direct.hold_round_module(round_kernel)?),
                 };
                 let buffers = CudaBuffers::new(&direct.stream, plan, direct.provisioning)?;
+                record_run_step("buffers_allocated");
                 let timing = direct.run(&buffers, attempt_config, &held.module)?;
                 #[cfg(feature = "cuda-test-hooks")]
                 panic_after_execution_if_requested();
@@ -5118,6 +5143,7 @@ struct LiveRoundModule(Arc<AtomicUsize>);
 impl LiveRoundModule {
     fn register(live: &Arc<AtomicUsize>) -> Self {
         live.fetch_add(1, Ordering::SeqCst);
+        record_run_step("module_loaded");
         Self(Arc::clone(live))
     }
 }
@@ -5126,6 +5152,7 @@ impl LiveRoundModule {
 impl Drop for LiveRoundModule {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+        record_run_step("module_unloaded");
     }
 }
 
@@ -5466,6 +5493,7 @@ impl DirectCuda {
             config.attempts_per_graph_wave,
         )?;
         let graph_capture_ns = duration_ns(capture_started.elapsed());
+        record_run_step("graph_captured");
         #[cfg(feature = "cuda-test-hooks")]
         let round_modules_at_capture = self.live_round_modules.load(Ordering::SeqCst);
 
@@ -5490,6 +5518,9 @@ impl DirectCuda {
                 .launch()
                 .map_err(|error| driver_error("CUDA Graph replay", error))?;
             host_submit_ns = host_submit_ns.saturating_add(duration_ns(submitted.elapsed()));
+            if graph_replays == 0 {
+                record_run_step("graph_launched");
+            }
             let end = self
                 .stream
                 .record_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))

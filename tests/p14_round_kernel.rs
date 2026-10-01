@@ -732,6 +732,60 @@ mod cuda {
         }
     }
 
+    /// P14 cuda-host round 3 (option f): a run takes its round module, under the device's guard,
+    /// before it plans its first attempt, and holds it across capacity retries. Its steps are one
+    /// load, then every attempt's plan, upload, capture and first launch, then one unload when the
+    /// run ends.
+    #[test]
+    fn cuda_each_run_loads_its_round_module_before_it_plans() {
+        use days_executor::cuda::take_cuda_run_steps_for_testing;
+        const ATTEMPT: [&str; 4] = [
+            "planned",
+            "buffers_allocated",
+            "graph_captured",
+            "graph_launched",
+        ];
+        let executor = CudaExecutor::on_device(0).expect("CUDA device 0");
+        let retrying = CudaConfig {
+            max_channel_events_per_stream: Some(1),
+            max_fel_events_per_lp: Some(1),
+            ..CudaConfig::default()
+        };
+        for (name, image, config) in [
+            (
+                "FIFO incast",
+                scheduler_image("FIFO"),
+                CudaConfig::default(),
+            ),
+            (
+                "dcqcn_t26",
+                fixture("dcqcn_t26.toml"),
+                CudaConfig::default(),
+            ),
+            (
+                "FIFO incast after capacity retries",
+                scheduler_image("FIFO"),
+                retrying,
+            ),
+            (
+                "dcqcn_t26 after capacity retries",
+                fixture("dcqcn_t26.toml"),
+                retrying,
+            ),
+        ] {
+            take_cuda_run_steps_for_testing();
+            let run = executor
+                .run_with_observations(&image, None, config, ObservationMode::Full)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let mut expected = vec!["module_loaded"];
+            for _ in 0..=run.capacity_retry_trace.len() {
+                expected.extend(ATTEMPT);
+            }
+            expected.push("module_unloaded");
+            assert_eq!(take_cuda_run_steps_for_testing(), expected, "{name}");
+        }
+    }
+
     /// P14 round 4: the executor loads no module; each run loads its own and reports what that
     /// cost. Printed for the cost record (`--nocapture`).
     #[test]
@@ -778,9 +832,15 @@ mod cuda {
     /// The host refuses the plain kernel on every image with DCQCN or PFC state, before launch:
     /// the plain kernel carries no device-side stop, so `MechanismsKernelRequired` can only come
     /// from the host's check of the uploaded plan.
+    ///
+    /// P14 cuda-host round 3 (option f): the run takes its module before it plans, so a refused run
+    /// loads the module, plans, is refused, and unloads the module before it returns. It allocates
+    /// no buffer, captures no graph and launches nothing.
     #[test]
     fn cuda_plain_round_kernel_is_refused_before_launch_on_every_mechanism_image() {
+        use days_executor::cuda::take_cuda_run_steps_for_testing;
         for (name, image) in refused_images() {
+            take_cuda_run_steps_for_testing();
             match run_cuda_with_observations(
                 &image,
                 None,
@@ -790,6 +850,11 @@ mod cuda {
                 Err(CudaError::MechanismsKernelRequired { .. }) => {}
                 other => panic!("{name}: expected a refusal, got {other:?}"),
             }
+            assert_eq!(
+                take_cuda_run_steps_for_testing(),
+                ["module_loaded", "planned", "module_unloaded"],
+                "{name}: a refused run unloads its module and launches nothing"
+            );
         }
     }
 
