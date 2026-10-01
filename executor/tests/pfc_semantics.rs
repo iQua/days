@@ -543,6 +543,7 @@ fn packet_already_past_controller(enabled: bool) -> SimulationImage {
     let mut image = path_image();
     if !enabled {
         image.flows[0].priority = 2;
+        image.flows[0].feedback_priority = 2;
     }
     image.initial_events.push(Event {
         key: EventKey {
@@ -1247,6 +1248,7 @@ fn validator_uses_configured_tcp_ack_size_for_pfc_frame_bounds() {
 fn validator_reserves_only_control_frames_that_can_be_emitted() {
     let mut disabled = path_image();
     disabled.flows[0].priority = 2;
+    disabled.flows[0].feedback_priority = 2;
     disabled.switch_states[1].next_origin_seq = u64::MAX - 3;
     validate(&disabled, Backend::Scalar)
         .expect("a disabled priority emits no PFC frames and must reserve zero frame identities");
@@ -1264,6 +1266,7 @@ fn disabled_priority_waiting_bytes_remain_zero_in_a_checkpoint() {
     let mut image = path_image();
     image.stop_time_ns = 1;
     image.flows[0].priority = 2;
+    image.flows[0].feedback_priority = 2;
     image.initial_packets = vec![data_packet(DATA_0, 100), data_packet(DATA_1, 100)];
     image.switch_states[1].queues[0].in_service = Some(DATA_0);
     image.initial_events.extend([
@@ -1312,6 +1315,7 @@ fn disabled_pfc_priority_uses_the_ordinary_queue_capacity_path() {
     let mut image = path_image();
     image.stop_time_ns = 1;
     image.flows[0].priority = 2;
+    image.flows[0].feedback_priority = 2;
     image.initial_packets[0] = data_packet(DATA_0, 1_000);
     image.initial_events.push(Event {
         key: EventKey {
@@ -2021,4 +2025,88 @@ fn reverse_route_cycle_image() -> SimulationImage {
 fn validator_rejects_a_pfc_cycle_carried_only_by_tcp_ack_routes() {
     validate(&reverse_route_cycle_image(), Backend::Scalar)
         .expect_err("AB -> BC -> CA -> AB on executable ACK routes must be rejected");
+}
+
+/// P15: a flow's receiver feedback (a DCQCN CNP, a RoCE ACK or NACK) rides its feedback priority,
+/// so a CNP queued behind a paused data class is served when its feedback class is not paused,
+/// and waits with the data when the two classes agree.
+fn cnp_behind_paused_data(feedback_priority: u8) -> RunResult {
+    const FLOW_B: FlowId = FlowId(1);
+    const CNP: PayloadId = PayloadId(8);
+    let mut image = pause_behind_service_image();
+    // Flow B runs from the sink back to the source; its receiver feedback crosses the upstream
+    // queue on the controlled link, the path flow A's data takes.
+    image.flows.push(FlowDescriptor {
+        id: FLOW_B,
+        source: SINK,
+        target: SOURCE,
+        priority: PRIORITY,
+        feedback_priority,
+        route: vec![SINK_EGRESS],
+        reverse_route: vec![SOURCE_LINK, CONTROLLED_LINK, EGRESS_LINK],
+    });
+    image.initial_packets.push(PacketDescriptor {
+        id: CNP,
+        flow: FLOW_B,
+        size_bytes: 64,
+        ecn_marked: false,
+        kind: PacketKind::DcqcnCnp(days_executor::DcqcnCnpHeader {
+            trigger_payload: PayloadId(12),
+        }),
+    });
+    image.switch_states[0].queues[0].queue = VecDeque::from([CNP]);
+    run_scalar_cpu_with_external_controls(&image)
+}
+
+/// The upstream queue serves `DATA_0` until 10 ns while a pause of `PRIORITY` arrives at 5 ns.
+fn pause_behind_service_image() -> SimulationImage {
+    let mut image = path_image();
+    image.stop_time_ns = 10;
+    image.initial_packets = vec![data_packet(DATA_0, 100)];
+    image.switch_states[0].queues[0].in_service = Some(DATA_0);
+    image.switch_states[0].next_origin_seq = 1;
+    add_control(&mut image, 5, 0, true);
+    image.initial_events.push(Event {
+        key: EventKey {
+            time_ns: 10,
+            phase: event_phase(EventKind::TxComplete),
+            origin_node: UPSTREAM,
+            origin_seq: 0,
+        },
+        target: UPSTREAM,
+        kind: EventKind::TxComplete,
+        payload: DATA_0,
+    });
+    image.initial_events.sort_unstable_by_key(|event| event.key);
+    image
+}
+
+#[test]
+fn a_cnp_rides_its_flows_feedback_priority_past_a_paused_data_class() {
+    let shared = cnp_behind_paused_data(PRIORITY);
+    let queue = &shared.switch_states[0].queues[0];
+    assert!(upstream_pfc(&shared).is_paused(usize::from(PRIORITY)));
+    assert_eq!(queue.queue, VecDeque::from([PayloadId(8)]), "same class: the CNP waits");
+    assert_eq!(queue.in_service, None);
+
+    let separate = cnp_behind_paused_data(1);
+    let queue = &separate.switch_states[0].queues[0];
+    assert!(queue.queue.is_empty(), "feedback class 1 is not paused: the CNP is served");
+    assert_eq!(queue.in_service, Some(PayloadId(8)));
+}
+
+/// P15: a feedback priority is an IEEE 802.1Q class, and only a DCQCN or RoCE flow, whose receiver
+/// sends CNPs or ACKs and NACKs, may name one apart from its data priority.
+#[test]
+fn validator_confines_a_separate_feedback_priority_to_dcqcn_and_roce_flows() {
+    let mut image = packet_already_past_controller(true);
+    validate(&image, Backend::Scalar).expect("the base image validates");
+
+    image.flows[0].feedback_priority = 8;
+    let error = validate(&image, Backend::Scalar).unwrap_err().to_string();
+    assert!(error.contains("feedback priority 8"), "{error}");
+
+    image.flows[0].feedback_priority = 1;
+    let error = validate(&image, Backend::Scalar).unwrap_err().to_string();
+    assert!(error.contains("DCQCN or RoCE"), "{error}");
 }
