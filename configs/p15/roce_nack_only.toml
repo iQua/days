@@ -1,0 +1,81 @@
+# P15 lane R1 fixture (RoCE queue pairs), derived from configs/p14/dcqcn_multi_zero_xoff.toml:
+# the same 4-switch line (hosts 0..3 on switches 0..3, 1 Gbps ports) and DCQCN controller keys
+# scaled to 1 Gbps. NACK-only arm (the HPCC profile, ruling D5/D7): the lossy arm with the
+# retransmission timeout off and duplicates dropped silently. A loss with no later out-of-order
+# arrival (the tail) is never repaired, so a QP can stall for the rest of the run. Contract: no
+# timeout; NACK-repaired losses recover; at least one QP stalls where roce_timeout.toml completes.
+seed = 42
+edges = [[0, 1], [1, 2], [2, 3]]
+hosts = [0, 1, 2, 3]
+duration = 0.02
+
+[switch]
+port_rate = 1000000000
+capacity = 8
+discipline = "FIFO"
+drop = "ECN_THRESHOLD"
+ecn_threshold = 1.0
+
+[link]
+mode = "Pfc"
+
+[link.pfc]
+buffer_capacity = [0, 0, 0, 0, 0, 0, 0, 0]
+xoff = [0, 0, 0, 0, 0, 0, 0, 0]
+xon = [0, 0, 0, 0, 0, 0, 0, 0]
+
+[[flow]]
+flow_type = "RoCE"
+priority = 0
+graph = [[2, 0]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 200000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.dcqcn]
+rate_gbps = 1.0
+min_rate_gbps = 0.01
+max_rate_gbps = 1.0
+g = 0.00390625
+ai_rate_gbps = 0.005
+hai_rate_gbps = 0.05
+mi_factor = 0.5
+rtt_ns = 50000
+cnp_interval_ns = 10000
+pacing_interval_ns = 1000
+increase_byte_threshold = 100000
+
+[flow.traffic.roce]
+retransmit_timeout_ns = 0
+duplicate_ack = false
+
+[[flow]]
+flow_type = "RoCE"
+priority = 0
+graph = [[3, 0]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 200000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.dcqcn]
+rate_gbps = 1.0
+min_rate_gbps = 0.01
+max_rate_gbps = 1.0
+g = 0.00390625
+ai_rate_gbps = 0.005
+hai_rate_gbps = 0.05
+mi_factor = 0.5
+rtt_ns = 50000
+cnp_interval_ns = 10000
+pacing_interval_ns = 1000
+increase_byte_threshold = 100000
+
+[flow.traffic.roce]
+retransmit_timeout_ns = 0
+duplicate_ack = false

@@ -1,0 +1,136 @@
+# P15 lane R1 fixture (RoCE queue pairs), derived from configs/p14/dcqcn_multi_zero_xoff.toml:
+# the same 4-switch line (hosts 0..3 on switches 0..3, 1 Gbps ports) and DCQCN controller keys
+# scaled to 1 Gbps. Feedback priority: roce_cnp_under_pfc.toml with every QP's CNP, ACK and NACK
+# on class 1, which has no PFC, so feedback is never paused with the data class. Contract: the
+# run differs from roce_cnp_under_pfc.toml; every QP completes.
+seed = 42
+edges = [[0, 1], [1, 2], [2, 3]]
+hosts = [0, 1, 2, 3]
+duration = 0.02
+
+[switch]
+port_rate = 1000000000
+capacity = 1000
+discipline = "FIFO"
+drop = "ECN_THRESHOLD"
+ecn_threshold = 0.05
+
+[link]
+mode = "Pfc"
+
+[link.pfc]
+buffer_capacity = [100000, 0, 0, 0, 0, 0, 0, 0]
+xoff = [20000, 0, 0, 0, 0, 0, 0, 0]
+xon = [10000, 0, 0, 0, 0, 0, 0, 0]
+
+[[flow]]
+flow_type = "RoCE"
+priority = 0
+graph = [[2, 0]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 200000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.dcqcn]
+rate_gbps = 1.0
+min_rate_gbps = 0.01
+max_rate_gbps = 1.0
+g = 0.00390625
+ai_rate_gbps = 0.005
+hai_rate_gbps = 0.05
+mi_factor = 0.5
+rtt_ns = 50000
+cnp_interval_ns = 10000
+pacing_interval_ns = 1000
+increase_byte_threshold = 100000
+
+[flow.traffic.roce]
+retransmit_timeout_ns = 200000
+feedback_priority = 1
+
+[[flow]]
+flow_type = "RoCE"
+priority = 0
+graph = [[3, 0]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 200000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.dcqcn]
+rate_gbps = 1.0
+min_rate_gbps = 0.01
+max_rate_gbps = 1.0
+g = 0.00390625
+ai_rate_gbps = 0.005
+hai_rate_gbps = 0.05
+mi_factor = 0.5
+rtt_ns = 50000
+cnp_interval_ns = 10000
+pacing_interval_ns = 1000
+increase_byte_threshold = 100000
+
+[flow.traffic.roce]
+retransmit_timeout_ns = 200000
+feedback_priority = 1
+
+[[flow]]
+flow_type = "RoCE"
+priority = 0
+graph = [[0, 3]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 200000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.dcqcn]
+rate_gbps = 1.0
+min_rate_gbps = 0.01
+max_rate_gbps = 1.0
+g = 0.00390625
+ai_rate_gbps = 0.005
+hai_rate_gbps = 0.05
+mi_factor = 0.5
+rtt_ns = 50000
+cnp_interval_ns = 10000
+pacing_interval_ns = 1000
+increase_byte_threshold = 100000
+
+[flow.traffic.roce]
+retransmit_timeout_ns = 200000
+feedback_priority = 1
+
+[[flow]]
+flow_type = "RoCE"
+priority = 0
+graph = [[1, 3]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 200000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.dcqcn]
+rate_gbps = 1.0
+min_rate_gbps = 0.01
+max_rate_gbps = 1.0
+g = 0.00390625
+ai_rate_gbps = 0.005
+hai_rate_gbps = 0.05
+mi_factor = 0.5
+rtt_ns = 50000
+cnp_interval_ns = 10000
+pacing_interval_ns = 1000
+increase_byte_threshold = 100000
+
+[flow.traffic.roce]
+retransmit_timeout_ns = 200000
+feedback_priority = 1
