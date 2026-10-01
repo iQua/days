@@ -132,7 +132,11 @@ Days AGO checkers:
   control tick fires before any later event of the pair, and that a completed queue pair's control
   tick is not re-armed. A tick with `class_paused = 1` (host-link PFC paused the pair's data
   class on its host) must send nothing, add no credit and park the pacer. A sender log without the
-  `class_paused` column, from a writer that predates it, reads `0` on every row.
+  `class_paused` column, from a writer that predates it, reads `0` on every row. A `resume` row
+  records a PFC RESUME restarting a pacer that a paused tick parked, on its next grid point
+  strictly after the RESUME (or `stopped` beyond the stop time). The rows of one RESUME share its
+  event key, for distinct flows of one node in increasing `flow_id` order; no other rows may
+  share a key.
 - `trace` runs both, then the cross-role checks. Every data arrival must be a packet the sender
   emitted. Every ACK, NACK and CNP the sender applies must have been sent earlier by the receiver.
 - `<stop_time_ns>` is the image's `stop_time_ns`. No CSV records it, and it decides whether a
