@@ -1,0 +1,8 @@
+time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,kind,class_paused,data_class,mtu_bytes,total_bytes,pacing_interval_ns,first_pacing_time_ns,rto_ns,rate_bps,input_acknowledgment,emitted,emitted_psn,emitted_bytes,emitted_retransmission,emitted_payload,before_next_psn,before_snd_una,before_bytes_emitted,before_packets_emitted,before_credit_quanta,before_rto_deadline_ns,before_pacer,before_next_tick_ns,before_status,after_next_psn,after_snd_una,after_bytes_emitted,after_packets_emitted,after_credit_quanta,after_rto_deadline_ns,after_pacer,after_next_tick_ns,after_status
+1000,1,1,0,1,3,tick,1,3,1000,2000,1000,1000,0,,,0,,,,,0,0,0,0,0,,armed,1000,scheduled,0,0,0,0,0,,parked,,blocked
+1500,0,9,1,1,3,resume,0,3,1000,2000,1000,1000,0,,,0,,,,,0,0,0,0,0,,parked,,blocked,0,0,0,0,0,,armed,2000,scheduled
+2000,1,1,1,1,3,tick,1,3,1000,2000,1000,1000,0,,,0,,,,,0,0,0,0,0,,armed,2000,scheduled,0,0,0,0,0,,parked,,blocked
+3000,0,9,3,1,3,resume,0,3,1000,2000,1000,1000,0,,,0,,,,,0,0,0,0,0,,parked,,blocked,0,0,0,0,0,,armed,4000,blocked
+4000,1,1,3,1,3,tick,0,3,1000,2000,1000,1000,0,6000000000,,0,,,,,0,0,0,0,0,,armed,4000,blocked,0,0,0,0,6000000000000,,armed,5000,scheduled
+5000,1,1,4,1,3,tick,0,3,1000,2000,1000,1000,0,6000000000,,1,0,1000,0,9,0,0,0,0,6000000000000,,armed,5000,scheduled,1000,0,1000,1,4000000000000,,armed,6000,scheduled
+6000,1,1,5,1,3,tick,0,3,1000,2000,1000,1000,0,6000000000,,1,1000,1000,0,13,1000,0,1000,1,4000000000000,,armed,6000,scheduled,2000,0,2000,2,2000000000000,,parked,,blocked

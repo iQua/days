@@ -298,6 +298,22 @@ def settle (config : SenderConfig) (rateBps : Nat) (state : SenderState)
     pacer := pacer
     nextTickNs := if pacer = .parked then none else state.nextTickNs }
 
+/--
+Ruling C6: the rate at which an armed status turns from `blocked` to `scheduled`, when the status
+depends on the rate at all (`armedStatus` of an armed, unfinished pacer with a packet to send):
+`scheduled` iff `rate ≥` this threshold, since `credit + rate × interval ≥ cost` is monotone in
+the rate. The caller uses it only while the pair's credit is still zero, where the `u128` bound
+of `armedStatus` cannot bind (`rate × interval < 2^128`).
+-/
+def statusThreshold (config : SenderConfig) (state : SenderState) : Option Nat :=
+  if state.pacer = .armed && state.sndUna < config.totalBytes &&
+      state.nextPsn < config.totalBytes then
+    let cost := packetCost (packetSize config state.nextPsn)
+    some (if cost ≤ state.creditQuanta then 0
+      else (cost - state.creditQuanta + config.pacingIntervalNs - 1) / config.pacingIntervalNs)
+  else
+    none
+
 /-- §5 step 1: the state before the first pacing tick, at `first_pacing_time_ns`. -/
 def initialSender (config : SenderConfig) (rateBps : Nat) : SenderState :=
   let state : SenderState :=

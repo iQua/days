@@ -5,26 +5,37 @@ open LeanGuard.P10c.RoceEventLog
 
 def usage : String :=
   "usage: p10c_roce_check receiver <roce_receiver.csv>\n" ++
-  "       p10c_roce_check sender <roce_sender.csv> <dcqcn.csv> [--pfc <pfc.csv>] [<stop_time_ns>]\n" ++
-  "       p10c_roce_check trace <roce_sender.csv> <roce_receiver.csv> <dcqcn.csv> [--pfc <pfc.csv>] [<stop_time_ns>]\n" ++
+  "       p10c_roce_check sender <roce_sender.csv> <dcqcn.csv> [--pfc <pfc.csv>] [--horizon-ns <ns>] [<stop_time_ns>]\n" ++
+  "       p10c_roce_check trace <roce_sender.csv> <roce_receiver.csv> <dcqcn.csv> [--pfc <pfc.csv>] [--horizon-ns <ns>] [<stop_time_ns>]\n" ++
   "  <dcqcn.csv> is the dcqcn_transitions_csv of the same run (the sender's rate and status).\n" ++
   "  <pfc.csv> is the pfc_transitions_csv of the same run; it is required when the sender log\n" ++
   "  has the data_class column (schema Amendment 3), and the pauses and resumes are checked\n" ++
   "  against its host PAUSE and RESUME records.\n" ++
+  "  --horizon-ns <ns> checks a prefix of a run: the logs hold exactly its events with\n" ++
+  "  time_ns < <ns>; pending events at or after it need not have fired.\n" ++
   "  <stop_time_ns> is the image's stop_time_ns, which no CSV records; when omitted, one stop\n" ++
   "  time must fit every armed and stopped pacer decision in the log."
 
-/-- The optional arguments after the logs: `--pfc <path>` and a stop time, in either order. -/
-def parseOptions : List String → Option (Option String × Option Nat)
-  | [] => some (none, none)
+/-- The optional arguments after the logs, in any order: `--pfc <path>`, `--horizon-ns <ns>` and
+a stop time, each at most once. -/
+structure Options where
+  pfc : Option String := none
+  horizon : Option Nat := none
+  stop : Option Nat := none
+
+def parseOptions : List String → Option Options
+  | [] => some {}
   | "--pfc" :: path :: rest => do
-      let (pfc, stop) ← parseOptions rest
-      if pfc.isSome then none else some (some path, stop)
-  | [value] => value.toNat?.map (fun stop => (none, some stop))
+      let options ← parseOptions rest
+      if options.pfc.isSome then none else some { options with pfc := some path }
+  | "--horizon-ns" :: value :: rest => do
+      let horizon ← value.toNat?
+      let options ← parseOptions rest
+      if options.horizon.isSome then none else some { options with horizon := some horizon }
   | value :: rest => do
       let stop ← value.toNat?
-      let (pfc, later) ← parseOptions rest
-      if later.isSome then none else some (pfc, some stop)
+      let options ← parseOptions rest
+      if options.stop.isSome then none else some { options with stop := some stop }
 
 def readPfc (path : Option String) :
     IO (Except String (Option (List LeanGuard.P10c.MechanismEventLog.PfcLog.Row))) := do
@@ -53,29 +64,29 @@ def main (args : List String) : IO UInt32 := do
       | none =>
           IO.eprintln usage
           pure 2
-      | some (pfcPath, stop) =>
+      | some options =>
           let sender ← IO.FS.readFile senderPath
           let dcqcn ← IO.FS.readFile dcqcnPath
-          let pfc ← readPfc pfcPath
+          let pfc ← readPfc options.pfc
           report do
             let senderRows ← inRole "sender" (parseSenderCsv sender)
             let dcqcnRows ← inRole "dcqcn" (LeanGuard.P10c.DcqcnEventLog.parseCsv dcqcn)
-            checkSenderRows stop senderRows dcqcnRows (← pfc)
+            checkSenderRows options.stop options.horizon senderRows dcqcnRows (← pfc)
   | "trace" :: senderPath :: receiverPath :: dcqcnPath :: rest =>
       match parseOptions rest with
       | none =>
           IO.eprintln usage
           pure 2
-      | some (pfcPath, stop) =>
+      | some options =>
           let sender ← IO.FS.readFile senderPath
           let receiver ← IO.FS.readFile receiverPath
           let dcqcn ← IO.FS.readFile dcqcnPath
-          let pfc ← readPfc pfcPath
+          let pfc ← readPfc options.pfc
           report do
             let senderRows ← inRole "sender" (parseSenderCsv sender)
             let receiverRows ← inRole "receiver" (parseReceiverCsv receiver)
             let dcqcnRows ← inRole "dcqcn" (LeanGuard.P10c.DcqcnEventLog.parseCsv dcqcn)
-            checkTrace stop senderRows receiverRows dcqcnRows (← pfc)
+            checkTrace options.stop options.horizon senderRows receiverRows dcqcnRows (← pfc)
   | _ =>
       IO.eprintln usage
       pure 2

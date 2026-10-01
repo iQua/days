@@ -5,6 +5,8 @@
 # Optional: ROCE_TRACE_DIR=<dir> also checks every executor trace triple
 # <name>.roce_sender.csv / <name>.roce_receiver.csv / <name>.dcqcn.csv found there
 # (with <name>.stop_time_ns holding the image's stop time, when present). Those must ACCEPT.
+# Optional: ADE_TRACE_DIR=<dir> does the same for logs with the Amendment 1-3 columns, adding
+# <name>.pfc.csv (--pfc); sender logs above ADE_TRACE_MAX_BYTES (default 64 MiB) are skipped.
 #
 # Receiver CSV columns (roce_receiver_transitions_csv):
 #   1 time_ns  2 event_phase  3 event_origin_node  4 event_origin_sequence  5 node_id  6 flow_id
@@ -380,11 +382,19 @@ check_case "roce_trace_loss_accept" 0 "ACCEPT" \
 # Scalar full-observation logs of configs/p15/roce_timeout.toml and roce_nack_only.toml, written
 # by days-gpu evidence/P15/leanguard/tooling/p15_lg_csvs.rs. Generated at p15/qp a4387f4;
 # regenerated at R1's final head 4624d21 (feat/p15 d97cc3e) byte-identically (F6).
+# roce_trace_hostpfc_prefix_executor_accept: the logs of configs/p15/hostpfc_incast_lossless.toml
+# at p15/hostpfc ade83b4 (p15_lg_csvs_pfc.rs), cut to the rows with time_ns < 1,871,513 (the 10th
+# host RESUME, at 1,871,512, and every row up to its instant): 10 complete host PAUSE/RESUME
+# cycles. A prefix is checked with --horizon-ns: the log holds exactly the events before it.
 for sender_csv in "$fixture_dir"/roce_trace_*_executor_accept.sender.csv; do
   [[ -e "$sender_csv" ]] || continue
   base="${sender_csv%.sender.csv}"
+  options=()
+  [[ -e "$base.pfc.csv" ]] && options+=(--pfc "$base.pfc.csv")
+  [[ -e "$base.horizon_ns" ]] && options+=(--horizon-ns "$(cat "$base.horizon_ns")")
   check_case "$(basename "$base")" 0 "ACCEPT" \
-    trace "$sender_csv" "$base.receiver.csv" "$base.dcqcn.csv" "$(cat "$base.stop_time_ns")" || true
+    trace "$sender_csv" "$base.receiver.csv" "$base.dcqcn.csv" ${options[@]+"${options[@]}"} \
+    "$(cat "$base.stop_time_ns")" || true
 done
 if [[ -n "${ROCE_TRACE_DIR:-}" ]]; then
   for sender_csv in "$ROCE_TRACE_DIR"/*.roce_sender.csv; do
@@ -825,6 +835,196 @@ expect_warrant_reject "pause-rows-without-data-class" \
 expect_warrant_reject "pfc-log-without-data-class" \
   'REJECT: sender: --pfc needs a sender log with the data_class column (Amendment 3)' \
   sender "$gbn" "$gbn_dcqcn" --pfc "$amended_gbn_pfc" "$gbn_stop"
+
+# --- Ruling C6: a pair whose first ticks are class-paused (no rate yet) ------------------------
+# A class-paused tick writes no rate, so a pair paused at its first tick has no known rate until
+# its first crediting tick or its first DCQCN row reveals it. Until then the rate cannot change
+# (only the pair's DCQCN rows change it), the armed statuses it predicts bound it, and the
+# revealed rate must fall within those bounds. Amended layout (see Amendment 1-3 above).
+c6="$fixture_dir/roce_sender_c6_accept.csv"
+c6_dcqcn="$fixture_dir/roce_sender_c6_accept.dcqcn.csv"
+c6_pfc="$fixture_dir/roce_sender_c6_accept.pfc.csv"
+c6_stop=7000
+c6_one="$fixture_dir/roce_sender_c6_one_accept.csv"
+c6_one_dcqcn="$fixture_dir/roce_sender_c6_one_accept.dcqcn.csv"
+c6_one_pfc="$fixture_dir/roce_sender_c6_one_accept.pfc.csv"
+c6_one_stop=3000
+check_case "roce_sender_c6_accept.csv (two paused ticks, control and CNP before the first credit)" \
+  0 "ACCEPT" sender "$c6" "$c6_dcqcn" --pfc "$c6_pfc" "$c6_stop" || true
+check_case "roce_sender_c6_one_accept.csv (one paused tick)" 0 "ACCEPT" \
+  sender "$c6_one" "$c6_one_dcqcn" --pfc "$c6_one_pfc" "$c6_one_stop" || true
+# roce_sender_c6_accept.csv rows (NR): 2 t1000 first tick, paused (status before: scheduled, so
+# rate >= 8 Gb/s); 3 RESUME 1500 restarts at 2000 (scheduled); 4 t2000 paused again; [DCQCN: a
+# control tick at 2500 reveals the rate, 8 Gb/s; a CNP at 2600 cuts it to 6 Gb/s]; 5 RESUME 3000
+# restarts at 4000 (blocked at 6 Gb/s); 6-8 t4000-6000 crediting ticks at 6 Gb/s.
+mutate_amended "c6-statuses-contradict-revealed-rate" "$c6" "$c6_dcqcn" "$c6_pfc" "$c6_stop" \
+  'NR == 2 || NR == 4 { $30 = "blocked" } NR == 3 { $39 = "blocked" } { print }' \
+  'REJECT: dcqcn: line 2: RoCE status predicted before the rate was known contradicts the controller rate 8000000000 (node_id=1, flow_id=3)'
+mutate_amended "c6-statuses-fit-no-rate" "$c6" "$c6_dcqcn" "$c6_pfc" "$c6_stop" \
+  'NR == 2 { $30 = "blocked" } { print }' \
+  'REJECT: sender: line 3: RoCE statuses predicted before the rate was known fit no controller rate (node_id=1, flow_id=3)'
+mutate_amended "c6-tick-rate-ignores-cnp" "$c6" "$c6_dcqcn" "$c6_pfc" "$c6_stop" \
+  'NR == 6 { $15 = 8000000000 } { print }' \
+  "REJECT: sender: line 6: RoCE tick rate differs from the DCQCN controller's current rate"
+mutate_amended "c6-revealed-rate-below-bound" "$c6_one" "$c6_one_dcqcn" "$c6_one_pfc" "$c6_one_stop" \
+  'NR == 4 { $15 = 7000000000 } { print }' \
+  'REJECT: sender: line 4: RoCE status predicted before the rate was known contradicts the controller rate 7000000000 (node_id=1, flow_id=3)'
+mutate_amended "c6-first-row-unpaused-without-rate" "$c6_one" "$c6_one_dcqcn" "$c6_one_pfc" "$c6_one_stop" \
+  'NR == 2 { $8 = 0 } { print }' \
+  'REJECT: sender: line 2: RoCE queue pair'"'"'s first row is neither a crediting tick nor a class-paused tick (node_id=1, flow_id=3)'
+mutate_amended "c6-parked-status-is-exact" "$c6" "$c6_dcqcn" "$c6_pfc" "$c6_stop" \
+  'NR == 2 { $39 = "scheduled" } NR == 3 { $30 = "scheduled" } { print }' \
+  'REJECT: sender: line 2: invalid RoCE sender after-state'
+
+# --- Host-link PFC executor traces (Task 2 part 2) ----------------------------------------------
+hp="$fixture_dir/roce_trace_hostpfc_prefix_executor_accept"
+hp_stop="$(cat "$hp.stop_time_ns")"
+hp_horizon="$(cat "$hp.horizon_ns")"
+# trace_case <label> <expected> <sender> <receiver> <dcqcn> <pfc>: the prefix in trace mode.
+expect_hp_reject() {
+  local label="$1"
+  local expected_output="$2"
+  mutations=$((mutations + 1))
+  if check_case "hostpfc/$label" 1 "$expected_output" \
+      trace "$3" "$4" "$5" --pfc "$6" --horizon-ns "$hp_horizon" "$hp_stop"; then
+    mutations_caught=$((mutations_caught + 1))
+  fi
+}
+# The prefix is not a whole run: without the horizon, its armed ticks beyond the cut are pending
+# events that never fired.
+check_case "hostpfc/prefix without --horizon-ns" 1 \
+  "REJECT: sender: pending RoCE pacing tick at 1872000 never fired by stop_time_ns=$hp_stop (node_id=1, flow_id=0)" \
+  trace "$hp.sender.csv" "$hp.receiver.csv" "$hp.dcqcn.csv" --pfc "$hp.pfc.csv" "$hp_stop" || true
+# Horizon mutations.
+awk -F, -v OFS=, -v h="$hp_horizon" '{ print } END { $1 = h; print }' "$hp.sender.csv" > "$campaign_tmp/hp.sender.csv"
+expect_hp_reject "row at the horizon" \
+  "REJECT: sender: line $(($(wc -l < "$hp.sender.csv") + 1)): event at or after horizon_ns=$hp_horizon" \
+  "$campaign_tmp/hp.sender.csv" "$hp.receiver.csv" "$hp.dcqcn.csv" "$hp.pfc.csv"
+# A pair's last row, an unpaused tick that sends nothing, removed: its tick before the horizon
+# never fired.
+read -r last_line last_time last_node last_flow <<<"$(awk -F, '
+  NR > 1 { last[$5 "," $6] = NR; row[NR] = $0 }
+  END { best = 0; for (k in last) { split(row[last[k]], f, ",");
+          if (f[7] == "tick" && f[8] == 0 && f[17] == 0 && (best == 0 || last[k] < best)) best = last[k] }
+        split(row[best], f, ","); print best, f[1], f[5], f[6] }' "$hp.sender.csv")"
+awk -v cut="$last_line" 'NR != cut' "$hp.sender.csv" > "$campaign_tmp/hp.sender.csv"
+expect_hp_reject "a pair's last tick before the horizon lost" \
+  "REJECT: sender: pending RoCE pacing tick at $last_time never fired before horizon_ns=$hp_horizon (node_id=$last_node, flow_id=$last_flow)" \
+  "$campaign_tmp/hp.sender.csv" "$hp.receiver.csv" "$hp.dcqcn.csv" "$hp.pfc.csv"
+
+# Red capability on the executor prefix (the brief's seven mutations). The first resume row, at
+# a key no other resume row shares, and the host RESUME record that warrants it:
+read -r r_line r_time r_node r_flow r_restart <<<"$(awk -F, 'NR > 1 && $7 == "resume" { print NR, $1, $5, $6, $38; exit }' "$hp.sender.csv")"
+r_key="$(awk -F, -v n="$r_line" 'NR == n { print $1 "," $2 "," $3 "," $4 }' "$hp.sender.csv")"
+read -r p_line p_ctl p_link <<<"$(awk -F, -v k="$r_key" -v node="$r_node" 'NR > 1 && $7 == "control" && $5 == node && ($1 "," $2 "," $3 "," $4) == k { print NR, $9, $8; exit }' "$hp.pfc.csv")"
+# 1. Drop one resume row: the RESUME did not restart a pause-parked pair (completeness).
+awk -v cut="$r_line" 'NR != cut' "$hp.sender.csv" > "$campaign_tmp/hp.sender.csv"
+expect_hp_reject "drop a resume row" \
+  "REJECT: pfc: line $p_line: host RESUME of data_class 3 at node $r_node did not restart pause-parked queue pair (flow_id=$r_flow)" \
+  "$campaign_tmp/hp.sender.csv" "$hp.receiver.csv" "$hp.dcqcn.csv" "$hp.pfc.csv"
+# 2. class_paused 1 -> 0 inside a pause, as an executor that ignored the pause would write the
+# tick: the first paused tick whose credit would not cover its packet, rewritten as the unpaused
+# tick it would otherwise be (class_paused 0; rate_bps the controller's current rate, from the
+# pair's last DCQCN row before it; credit + rate x interval; nothing sent; re-armed one interval
+# later with the armed status prediction). Every transition rule accepts that row; only the PFC
+# log refutes it (the unpaused-tick warrant). awk computes in doubles, so values beyond 2^53 fail
+# this case instead of rounding.
+read -r w_line w_node w_rate w_credit w_tick w_status <<<"$(awk -F, '
+  function before(t1, p1, n1, s1, t2, p2, n2, s2) {
+    return t1 < t2 || (t1 == t2 && (p1 < p2 || (p1 == p2 && (n1 < n2 || (n1 == n2 && s1 < s2))))) }
+  FNR == NR { if (FNR > 1) { d[++nd] = $0 }; next }
+  FNR > 1 && $7 == "tick" && $8 == 1 {
+    rate = ""
+    for (i = 1; i <= nd; i++) { split(d[i], r, ",")
+      if (r[5] == $5 && r[6] == $6 && before(r[1] + 0, r[2] + 0, r[3] + 0, r[4] + 0, $1 + 0, $2 + 0, $3 + 0, $4 + 0)) rate = r[30] }
+    if (rate == "") next
+    size = $10 + 0; if ($11 - $22 < size) size = $11 - $22
+    cost = size * 8000000000; credit = $26 + rate * $12
+    if (credit >= cost || credit + rate * $12 >= 2^53 || cost >= 2^53) next
+    status = (credit + rate * $12 >= cost) ? "scheduled" : "blocked"
+    printf "%d %s %s %.0f %.0f %s\n", FNR, $5, rate, credit, $1 + $12, status; exit }' \
+  "$hp.dcqcn.csv" "$hp.sender.csv")"
+if [[ -z "$w_line" ]]; then
+  echo "fixture failed: hostpfc/class_paused 1 -> 0 (no paused tick fits the consistent rewrite)" >&2
+  failures=$((failures + 1))
+else
+  awk -F, -v OFS=, -v n="$w_line" -v rate="$w_rate" -v credit="$w_credit" -v tick="$w_tick" \
+      -v status="$w_status" \
+    'NR == n { $8 = 0; $15 = rate; $35 = credit; $37 = "armed"; $38 = tick; $39 = status } { print }' \
+    "$hp.sender.csv" > "$campaign_tmp/hp.sender.csv"
+  expect_hp_reject "class_paused 1 -> 0 inside a pause (the tick an executor ignoring the pause writes)" \
+    "REJECT: sender: line $w_line: RoCE unpaused tick while data_class 3 is paused at node $w_node" \
+    "$campaign_tmp/hp.sender.csv" "$hp.receiver.csv" "$hp.dcqcn.csv" "$hp.pfc.csv"
+fi
+# 2b. The same flip of the class_paused field alone: the row then claims an unpaused tick that
+# carries no rate although it has a packet to send, which the row-shape rule rejects before any
+# warrant is consulted. It shows that rule, not the pause warrant (case 2 shows that).
+f_line="$(awk -F, 'NR > 1 && $7 == "tick" && $8 == 1 { print NR; exit }' "$hp.sender.csv")"
+awk -F, -v OFS=, -v n="$f_line" 'NR == n { $8 = 0 } { print }' "$hp.sender.csv" > "$campaign_tmp/hp.sender.csv"
+expect_hp_reject "class_paused 1 -> 0, the field alone" \
+  "REJECT: sender: line $f_line: RoCE tick rate present iff the tick credits" \
+  "$campaign_tmp/hp.sender.csv" "$hp.receiver.csv" "$hp.dcqcn.csv" "$hp.pfc.csv"
+# 3. class_paused 0 -> 1 outside any pause: a pair's last row, an unpaused tick that sends
+# nothing, rewritten as a well-formed paused tick (no rate, parked); only the PFC log refutes it.
+read -r u_line u_node <<<"$(awk -F, '
+  NR > 1 { last[$5 "," $6] = NR; row[NR] = $0 }
+  END { best = 0; for (k in last) { split(row[last[k]], f, ",");
+          if (f[7] == "tick" && f[8] == 0 && f[17] == 0 && (best == 0 || last[k] < best)) best = last[k] }
+        split(row[best], f, ","); print best, f[5] }' "$hp.sender.csv")"
+awk -F, -v OFS=, -v n="$u_line" 'NR == n { $8 = 1; $15 = "";
+    for (i = 22; i <= 30; i++) $(i + 9) = $i; $37 = "parked"; $38 = ""; $39 = "blocked" } { print }' \
+  "$hp.sender.csv" > "$campaign_tmp/hp.sender.csv"
+expect_hp_reject "class_paused 0 -> 1 outside any pause" \
+  "REJECT: sender: line $u_line: RoCE paused tick while data_class 3 is not paused at node $u_node" \
+  "$campaign_tmp/hp.sender.csv" "$hp.receiver.csv" "$hp.dcqcn.csv" "$hp.pfc.csv"
+# 4. Change one data_class (on a row that is not the pair's first).
+awk -F, -v OFS=, -v n="$r_line" 'NR == n { $9 = 4 } { print }' "$hp.sender.csv" > "$campaign_tmp/hp.sender.csv"
+expect_hp_reject "change one data_class" \
+  "REJECT: sender: line $r_line: RoCE data_class discontinuity (node_id=$r_node, flow_id=$r_flow)" \
+  "$campaign_tmp/hp.sender.csv" "$hp.receiver.csv" "$hp.dcqcn.csv" "$hp.pfc.csv"
+# 5. Move a resume row's key off its RESUME record, by 1 ns (the restart grid point is unchanged:
+# it lies beyond the new instant, and the next row is later still).
+awk -F, -v OFS=, -v n="$r_line" 'NR == n { $1 = $1 + 1 } { print }' "$hp.sender.csv" > "$campaign_tmp/hp.sender.csv"
+expect_hp_reject "move a resume row off its RESUME key" \
+  "REJECT: sender: line $r_line: RoCE resume row without a host RESUME of data_class 3 at node $r_node at this event key" \
+  "$campaign_tmp/hp.sender.csv" "$hp.receiver.csv" "$hp.dcqcn.csv" "$hp.pfc.csv"
+# 6. Duplicate a resume row.
+awk -v n="$r_line" 'NR == n { print } { print }' "$hp.sender.csv" > "$campaign_tmp/hp.sender.csv"
+expect_hp_reject "duplicate a resume row" \
+  "REJECT: sender: line $((r_line + 1)): RoCE resume rows sharing an event key must be of one node in strictly increasing flow_id order" \
+  "$campaign_tmp/hp.sender.csv" "$hp.receiver.csv" "$hp.dcqcn.csv" "$hp.pfc.csv"
+# 7. Delete the host RESUME record, keeping its resume rows. The next control record of that
+# queue (a PAUSE by the same controller) becomes an idempotent PAUSE, so the PFC log stays
+# consistent and the resume rows have no warrant.
+n_line="$(awk -F, -v after="$p_line" -v node="$r_node" 'NR > after && $7 == "control" && $5 == node { print NR; exit }' "$hp.pfc.csv")"
+awk -F, -v OFS=, -v cut="$p_line" -v n="$n_line" -v c="$p_ctl" \
+  'NR == cut { next } NR == n { $21 = c; $22 = c } { print }' "$hp.pfc.csv" > "$campaign_tmp/hp.pfc.csv"
+expect_hp_reject "delete the host RESUME record" \
+  "REJECT: sender: line $r_line: RoCE resume row without a host RESUME of data_class 3 at node $r_node at this event key" \
+  "$hp.sender.csv" "$hp.receiver.csv" "$hp.dcqcn.csv" "$campaign_tmp/hp.pfc.csv"
+# 7b. The same deletion without the repair: the P10c PFC rules see the controller set jump.
+awk -v cut="$p_line" 'NR != cut' "$hp.pfc.csv" > "$campaign_tmp/hp.pfc.csv"
+expect_hp_reject "delete the host RESUME record (unrepaired)" \
+  "REJECT: pfc: line $((n_line - 1)): PFC controller-set discontinuity for queue (node_id=$r_node, queue_id=0, controlled_link=$p_link, priority=3)" \
+  "$hp.sender.csv" "$hp.receiver.csv" "$hp.dcqcn.csv" "$campaign_tmp/hp.pfc.csv"
+
+# Host-PFC executor traces kept outside the repository (ADE_TRACE_DIR=<dir>): every
+# <name>.roce_sender.csv there with <name>.roce_receiver.csv, <name>.dcqcn.csv, <name>.pfc.csv and
+# <name>.stop_time_ns runs in trace mode with the PFC join. Sender logs above
+# ADE_TRACE_MAX_BYTES (default 64 MiB) are skipped and named, so a multi-GB log is run on purpose.
+if [[ -n "${ADE_TRACE_DIR:-}" ]]; then
+  for sender_csv in "$ADE_TRACE_DIR"/*.roce_sender.csv; do
+    [[ -e "$sender_csv" ]] || continue
+    base="${sender_csv%.roce_sender.csv}"
+    if (( $(wc -c < "$sender_csv") > ${ADE_TRACE_MAX_BYTES:-67108864} )); then
+      echo "skipped (size): external/$(basename "$base")"
+      continue
+    fi
+    check_case "external/$(basename "$base") (with PFC)" 0 "ACCEPT" \
+      trace "$sender_csv" "$base.roce_receiver.csv" "$base.dcqcn.csv" --pfc "$base.pfc.csv" \
+      "$(cat "$base.stop_time_ns")" || true
+  done
+fi
 
 echo "P10c RoCE campaign checks: $checked; mutations caught: $mutations_caught/$mutations"
 exit "$failures"
