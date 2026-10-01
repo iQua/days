@@ -6,7 +6,10 @@ open LeanGuard.P10c.RoceEventLog
 def usage : String :=
   "usage: p10c_roce_check receiver <roce_receiver.csv>\n" ++
   "       p10c_roce_check sender <roce_sender.csv> <dcqcn.csv> [<stop_time_ns>]\n" ++
-  "       p10c_roce_check trace <roce_sender.csv> <roce_receiver.csv> <dcqcn.csv> [<stop_time_ns>]"
+  "       p10c_roce_check trace <roce_sender.csv> <roce_receiver.csv> <dcqcn.csv> [<stop_time_ns>]\n" ++
+  "  <dcqcn.csv> is the dcqcn_transitions_csv of the same run (the sender's rate and status).\n" ++
+  "  <stop_time_ns> is the image's stop_time_ns, which no CSV records; when omitted, one stop\n" ++
+  "  time must fit every armed and stopped pacer decision in the log."
 
 def parseStop : List String → Option (Option Nat)
   | [] => some none

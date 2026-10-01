@@ -18,7 +18,8 @@ cd lean
 lake build DaysExecutor \
   dcqcn_check pfc_check cubic_check tcp_check drr_check wfq_check sp_check \
   aqm_check aqm_dcqcn_check \
-  p10c_mechanisms_check p10c_aqm_check p10c_dcqcn_check p10c_collective_check
+  p10c_mechanisms_check p10c_aqm_check p10c_dcqcn_check p10c_collective_check \
+  p10c_roce_check
 cd ..
 ```
 
@@ -114,7 +115,26 @@ Days AGO checkers:
 ./.lake/build/bin/p10c_aqm_check <path/to/aqm_events.csv>
 ./.lake/build/bin/p10c_dcqcn_check <path/to/dcqcn_events.csv>
 ./.lake/build/bin/p10c_collective_check <path/to/collective_events.csv>
+./.lake/build/bin/p10c_roce_check receiver <path/to/roce_receiver.csv>
+./.lake/build/bin/p10c_roce_check sender <path/to/roce_sender.csv> <path/to/dcqcn.csv> [<stop_time_ns>]
+./.lake/build/bin/p10c_roce_check trace <path/to/roce_sender.csv> <path/to/roce_receiver.csv> \
+  <path/to/dcqcn.csv> [<stop_time_ns>]
 ```
+
+`p10c_roce_check` certifies RoCE queue pairs from the executor's `roce_receiver_transitions_csv`,
+`roce_sender_transitions_csv` and `dcqcn_transitions_csv` of one full-observation run:
+
+- `receiver` checks each data arrival: the notification point, the in-order frontier, the ACK
+  cadence, duplicates, and the NACK rate limit.
+- `sender` checks each pacing tick, ACK, NACK and timeout. It needs the DCQCN log of the same run,
+  because the controller's rate decides the sender's status, and a CNP or control tick recomputes
+  that status without a RoCE row. It also checks that a completed queue pair's control tick is not
+  re-armed.
+- `trace` runs both, then the cross-role checks. Every data arrival must be a packet the sender
+  emitted. Every ACK, NACK and CNP the sender applies must have been sent earlier by the receiver.
+- `<stop_time_ns>` is the image's `stop_time_ns`. No CSV records it, and it decides whether a
+  pacer's next tick is armed or stopped. With it, each decision is checked exactly. Without it,
+  the checker requires one stop time consistent with every armed and stopped decision in the log.
 
 Committed Days AGO certificate fixtures can be checked directly, for example:
 
@@ -123,6 +143,10 @@ Committed Days AGO certificate fixtures can be checked directly, for example:
 ./.lake/build/bin/p10c_dcqcn_check fixtures/p10c/dcqcn_executor_trace_accept.csv
 ./.lake/build/bin/p10c_mechanisms_check drr fixtures/p10c/drr_executor_accept.csv
 ./.lake/build/bin/p10c_collective_check fixtures/p10c/collective_allgather_executor_accept.csv
+./.lake/build/bin/p10c_roce_check trace fixtures/p10c/roce_trace_timeout_executor_accept.sender.csv \
+  fixtures/p10c/roce_trace_timeout_executor_accept.receiver.csv \
+  fixtures/p10c/roce_trace_timeout_executor_accept.dcqcn.csv \
+  "$(cat fixtures/p10c/roce_trace_timeout_executor_accept.stop_time_ns)"
 ./.lake/build/bin/sp_check fixtures/sp/sp_priority_and_fifo_accept.csv
 ```
 
@@ -137,8 +161,10 @@ coverpoints. The `p10c_*` executables do not expose the coverage flag.
 - `2`: invalid command-line usage
 
 Legacy checkers report failures in their canonical replay order, which may differ from physical CSV
-order. Days AGO diagnostics use the complete `EventKey`; `p10c_dcqcn_check` additionally
-requires the input rows to arrive in strictly increasing key order.
+order. Days AGO diagnostics use the complete `EventKey`; `p10c_dcqcn_check` and `p10c_roce_check`
+additionally require the input rows to arrive in strictly increasing key order. A
+`p10c_roce_check` diagnostic names the log it refers to (`sender:`, `receiver:` or `dcqcn:`) in
+`sender` and `trace` modes.
 
 Common rejection causes include malformed or out-of-domain integers, duplicate keys, parameter or
 state discontinuity, an illegal queue/protocol action, unmatched paired events, and a post-state
