@@ -43,6 +43,14 @@ for csv in "$fixture_dir"/collective_*_executor_accept.csv; do
   check_case "$(basename "$csv")" "$csv" "$expected_exit" "$expected_output"
 done
 
+# Hand fixtures for the RoCE rules (schema Amendment 4): one accept trace and its reject twins.
+for csv in "$fixture_dir"/collective_*_hand_accept.csv "$fixture_dir"/collective_*_hand_*_reject.csv; do
+  expected="${csv%.csv}.expected"
+  expected_exit="$(sed -n '1s/^exit=//p' "$expected")"
+  expected_output="$(sed '1d' "$expected")"
+  check_case "$(basename "$csv")" "$csv" "$expected_exit" "$expected_output"
+done
+
 campaign_tmp="$(mktemp -d)"
 campaign_case="$campaign_tmp/mutated.csv"
 trap 'rm -f "$campaign_case"; rmdir "$campaign_tmp"' EXIT
