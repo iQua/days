@@ -386,12 +386,19 @@ check_case "roce_trace_loss_accept" 0 "ACCEPT" \
 # at p15/hostpfc ade83b4 (p15_lg_csvs_pfc.rs), cut to the rows with time_ns < 1,871,513 (the 10th
 # host RESUME, at 1,871,512, and every row up to its instant): 10 complete host PAUSE/RESUME
 # cycles. A prefix is checked with --horizon-ns: the log holds exactly the events before it.
+# Collective stages over RoCE (schema Amendment 4; P15 LeanGuard part 3), with the run's
+# collective progress log (.collective.csv, checked with --collective): at 9bc3c63, R3's
+# configs/p15/roce_compute_dag.toml and roce_tcp_mixed_collectives.toml at size = 8000 and 6000
+# (days-gpu evidence/P15/leanguard/tooling/p15_lg3_csvs.rs). roce_trace_roce_dag_prefix keeps
+# the rows with time_ns < 150,000: 11 stage releases, 4 of them compute-gated roots under host-link
+# PFC, and 2 logged stages not yet released; roce_trace_roce_tcp_mixed is the whole run.
 for sender_csv in "$fixture_dir"/roce_trace_*_executor_accept.sender.csv; do
   [[ -e "$sender_csv" ]] || continue
   base="${sender_csv%.sender.csv}"
   options=()
   [[ -e "$base.pfc.csv" ]] && options+=(--pfc "$base.pfc.csv")
   [[ -e "$base.horizon_ns" ]] && options+=(--horizon-ns "$(cat "$base.horizon_ns")")
+  [[ -e "$base.collective.csv" ]] && options+=(--collective "$base.collective.csv")
   check_case "$(basename "$base")" 0 "ACCEPT" \
     trace "$sender_csv" "$base.receiver.csv" "$base.dcqcn.csv" ${options[@]+"${options[@]}"} \
     "$(cat "$base.stop_time_ns")" || true
