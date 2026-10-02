@@ -1688,19 +1688,36 @@ pub fn mechanism_plane_words_cuda_for_testing(
     let plan = CudaPlan::new(image, None, config, ObservationMode::Summary)?;
     let pfc_offset = plan.params[PARAM_PFC_OFFSET];
     let receiver_offset = plan.params[PARAM_RECEIVER_OFFSET] as usize;
+    let receiver_markers = |marker: fn(u64) -> bool| {
+        (0..image.flows.len())
+            .filter(|flow| marker(plan.tcp_state[receiver_offset + flow * TCP_RECEIVER_WORDS]))
+            .count()
+    };
     Ok(crate::MechanismPlaneWords {
         pfc_region_words: if pfc_offset == NONE {
             0
         } else {
             plan.scheduler_state.len() - pfc_offset as usize
         },
-        dcqcn_receiver_rows: (0..image.flows.len())
-            .filter(|flow| {
-                plan.tcp_state[receiver_offset + flow * TCP_RECEIVER_WORDS]
-                    >= crate::device_mechanism::DCQCN_RECEIVER_NO_CNP
-            })
-            .count(),
+        dcqcn_receiver_rows: receiver_markers(|marker| {
+            marker == crate::device_mechanism::DCQCN_RECEIVER_NO_CNP
+                || marker == crate::device_mechanism::DCQCN_RECEIVER_LAST_CNP
+        }),
         pfc_params_words: 1,
+        roce_region_words: if plan.params[PARAM_ROCE_OFFSET] == NONE {
+            0
+        } else {
+            plan.tcp_state.len() - plan.params[PARAM_ROCE_OFFSET] as usize
+        },
+        roce_receiver_rows: receiver_markers(|marker| {
+            marker == crate::device_mechanism::ROCE_RECEIVER_MARKER
+        }),
+        pfc_class_words: if pfc_offset == NONE {
+            Vec::new()
+        } else {
+            let start = pfc_offset as usize + image.nodes.len();
+            plan.scheduler_state[start..start + image.flows.len()].to_vec()
+        },
     })
 }
 

@@ -194,10 +194,11 @@ impl DeviceEventArenaSizing {
 ///
 /// Open-loop images retain the established 28 planes. TCP images add one packed auxiliary plane
 /// for receiver ranges, segment ledgers, and full-observation transition state.
-/// Words a production device plan spends on the P14 DCQCN and PFC mechanism state.
+/// Words a production device plan spends on the P14 DCQCN and PFC and the P15 queue-pair and
+/// host-link PFC mechanism state.
 ///
-/// Both are sized from image data: an image without DCQCN or PFC state spends nothing on them.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// Every field is sized from image data: an image without the state spends nothing on it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MechanismPlaneWords {
     /// Words of the PFC region appended to the scheduler plane; zero without PFC state.
     pub pfc_region_words: usize,
@@ -206,6 +207,14 @@ pub struct MechanismPlaneWords {
     pub dcqcn_receiver_rows: usize,
     /// Params words holding the PFC region offset: one, holding `u64::MAX` without PFC state.
     pub pfc_params_words: usize,
+    /// Words of the RoCE receiver region appended to `tcp_state`; zero without queue pairs.
+    pub roce_region_words: usize,
+    /// Per-flow receiver rows that carry the RoCE queue-pair marker (they already exist for every
+    /// flow; the receiver state lives in the region).
+    pub roce_receiver_rows: usize,
+    /// The PFC region's per-flow class words (`priority | ((feedback_priority ^ priority) << 8)`),
+    /// in flow order; empty without PFC state.
+    pub pfc_class_words: Vec<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

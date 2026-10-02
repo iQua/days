@@ -72,6 +72,9 @@ fn evaluation_fixtures_plan_no_dcqcn_or_pfc_words() {
                     pfc_region_words: 0,
                     dcqcn_receiver_rows: 0,
                     pfc_params_words: 1,
+                    roce_region_words: 0,
+                    roce_receiver_rows: 0,
+                    pfc_class_words: Vec::new(),
                 },
                 "{backend} {name}"
             );
@@ -96,6 +99,40 @@ fn p14_fixtures_plan_their_mechanism_state() {
             );
             assert_eq!(words.dcqcn_receiver_rows, dcqcn, "{backend} {name}");
         }
+    }
+}
+
+/// P15 lane R4: queue-pair images plan the RoCE region (13 words per receiver) and mark their
+/// receiver rows; host-link PFC adds host rows; and the per-flow class word pins the feedback
+/// class (ruling D2): `hostpfc_multi_qp_tcp`'s queue pairs carry data on class 3 and feedback on
+/// class 0, so their word is `3 | (3 << 8)`, while its TCP flow (both classes 3) keeps `3`.
+#[test]
+fn p15_fixtures_plan_their_queue_pair_and_host_pfc_state() {
+    for (name, pairs) in [
+        ("roce_gbn_lossy.toml", 2),
+        ("roce_lossless_pfc.toml", 2),
+        ("hostpfc_multi_qp_tcp.toml", 5),
+    ] {
+        let image = lower(&format!("configs/p15/{name}"));
+        for (backend, words) in measure(&image) {
+            assert_eq!(words.roce_receiver_rows, pairs, "{backend} {name}");
+            assert_eq!(words.roce_region_words, 13 * pairs, "{backend} {name}");
+            assert_eq!(words.dcqcn_receiver_rows, 0, "{backend} {name}");
+        }
+    }
+    let image = lower("configs/p15/hostpfc_multi_qp_tcp.toml");
+    let expected = image
+        .flows
+        .iter()
+        .map(|flow| match (flow.priority, flow.feedback_priority) {
+            (3, 0) => 3 | (3 << 8),
+            (3, 3) => 3,
+            other => panic!("unexpected classes {other:?}"),
+        })
+        .collect::<Vec<u64>>();
+    assert!(expected.contains(&(3 | (3 << 8))) && expected.contains(&3));
+    for (backend, words) in measure(&image) {
+        assert_eq!(words.pfc_class_words, expected, "{backend}");
     }
 }
 
