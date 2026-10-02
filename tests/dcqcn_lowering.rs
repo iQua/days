@@ -550,9 +550,11 @@ fn dcqcn_cnp_priority_is_the_flows_feedback_priority() {
         7
     );
     assert_eq!(image.flows[0].packet_priority(PacketKind::Data), 0);
+    // P15 lane R4: both device backends run a feedback class apart from the data class (ruling
+    // D2, the PFC region's per-flow class word).
     for backend in [Backend::Metal, Backend::Cuda] {
-        let error = validate(&image, backend).unwrap_err().to_string();
-        assert!(error.contains("feedback priority"), "{backend:?}: {error}");
+        validate(&image, backend)
+            .unwrap_or_else(|error| panic!("{backend:?} accepts a feedback class: {error}"));
     }
 }
 
