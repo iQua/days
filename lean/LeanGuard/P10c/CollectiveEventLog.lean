@@ -356,9 +356,14 @@ def checkTransportRow (row : Row) (algorithm : Collective.Algorithm) (phase : Co
 def checkComputeRow (row : Row) : Except String Unit := do
   require row.srcLine
     (row.algorithm.isNone && row.collectivePhase.isNone && row.step = 0 &&
-      row.declaredTotalBytes = 0 && row.chunkOffsetBytes = 0 && row.chunkBytes = 0 &&
-      row.packetSizeBytes = 0 && row.intervalNs = 0)
+      row.declaredTotalBytes = 0 && row.chunkOffsetBytes = 0 && row.chunkBytes = 0)
     "compute stage row carries collective fields"
+  -- Amendment 5: a compute stage whose inbound predecessor is a RoCE stage carries that queue
+  -- pair's MTU and pacing interval; every other compute stage writes zero in both.
+  require row.srcLine (decide (row.packetSizeBytes = 0) = decide (row.intervalNs = 0))
+    "compute stage inbound transport columns must be both zero or both positive (Amendment 5)"
+  require row.srcLine (row.packetSizeBytes = 0 || row.inboundPredecessorFlowId.isSome)
+    "compute stage without an inbound predecessor carries inbound transport columns"
   require row.srcLine (row.durationNs > 0)
     "compute stage duration must be positive"
   require row.srcLine (row.rank < row.groupSize)
@@ -524,6 +529,14 @@ def checkComputePredecessors (rows : List Row) (row : Row) : Except String Unit 
         (isFinal inbound previousRank && inbound.chunkBytes = row.inboundPredecessorBytes)
         "compute inbound predecessor is not the previous rank's final collective stage"
   | none, _ => pure ()
+  -- Amendment 5: a logged inbound predecessor's transport columns are the stage's own when it is
+  -- a RoCE stage, and zero otherwise.
+  if let some inbound := inbound? then
+    require row.srcLine
+      (if inbound.stageKind = .roce then
+        row.packetSizeBytes = inbound.packetSizeBytes && row.intervalNs = inbound.intervalNs
+      else row.packetSizeBytes = 0 && row.intervalNs = 0)
+      "compute stage inbound transport columns disagree with its inbound predecessor"
   match row.cause with
   | .localCompletion =>
       requireEarlierRelease row (local?.filter (·.activated))
@@ -565,26 +578,18 @@ def frontierOf (segments : List (Nat × Nat)) : Nat :=
 def segmentOf (row : Row) : Nat × Nat :=
   (row.segmentSequence, row.segmentSequence + row.segmentBytes)
 
-/-- Each flow's first row, built in one pass. A flow's stage kind and transport columns are the
-same on all its rows (`checkContinuity`). -/
-def flowIndex (rows : List Row) : Std.HashMap Nat Row :=
-  rows.foldl
-    (fun index row => if index.contains row.flowId then index else index.insert row.flowId row) ∅
-
 /-- The MTU of the RoCE queue pair whose packets a row's inbound segments are, or `none` for TCP
 segments. A RoCE stage's inbound predecessor is a stage of its own collective (one transport per
-collective), whose MTU `sameGroupConfig` makes the row's own. A compute stage takes its logged
-predecessor's transport; a compute stage whose predecessor is not logged (the final stage of an
-ungated two-rank AllGather is a root) is replayed as TCP, as before RoCE stages existed. -/
-def roceInboundMtu (flows : Std.HashMap Nat Row) (row : Row) : Option Nat :=
+collective), whose MTU `sameGroupConfig` makes the row's own. A compute stage names its inbound
+predecessor's transport itself (schema Amendment 5): the MTU in `packet_size_bytes` when that
+predecessor is a RoCE stage, zero for TCP. This holds whether the predecessor is logged or not (the
+final stage of an ungated two-rank AllGather is an unlogged root); when it is logged,
+`checkComputePredecessors` requires the two to agree, before the replay runs. -/
+def roceInboundMtu (row : Row) : Option Nat :=
   match row.stageKind with
   | .roce => some row.packetSizeBytes
   | .tcp => none
-  | .compute =>
-      match row.inboundPredecessorFlowId.bind flows.get? with
-      | some predecessor =>
-          if predecessor.stageKind = .roce then some predecessor.packetSizeBytes else none
-      | none => none
+  | .compute => if row.packetSizeBytes > 0 then some row.packetSizeBytes else none
 
 /-- Schema Amendment 4: an inbound row of a RoCE predecessor certifies one data packet, which is
 the predecessor's packet at its PSN, and the advance of the receiver's Go-back-N frontier
@@ -607,10 +612,9 @@ def checkGoBackN (mtu : Nat) (row : Row) : Except String Unit := do
 byte counts of each inbound row must equal the frontier replayed from that stage's segments: the
 Go-back-N frontier for RoCE packets, TCP's in-order frontier (which merges out-of-order segments)
 otherwise. -/
-def checkInboundReplay (flows : Std.HashMap Nat Row) (rows : List Row) (row : Row) :
-    Except String Unit := do
+def checkInboundReplay (rows : List Row) (row : Row) : Except String Unit := do
   if row.cause = .inboundArrival then
-    if let some mtu := roceInboundMtu flows row then
+    if let some mtu := roceInboundMtu row then
       return (← checkGoBackN mtu row)
     let prior :=
       (rows.filter fun candidate =>
@@ -816,8 +820,7 @@ def checkRows (rows : List Row) : Except String Unit := do
   for row in canonical do checkRow row
   checkCoverage canonical
   for row in canonical do checkPredecessors canonical row
-  let flows := flowIndex canonical
-  for row in canonical do checkInboundReplay flows canonical row
+  for row in canonical do checkInboundReplay canonical row
   for row in canonical do checkLocalSignal canonical row
 
 end LeanGuard.P10c.CollectiveEventLog
