@@ -354,6 +354,29 @@ mutate_case "compute-after-roce-packet-not-at-psn" "$roce_dag" \
 mutate_case "compute-after-roce-out-of-order-advance" "$roce_dag" \
   'NR == 63 { $column["segment_sequence"] = 1000 }' \
   "REJECT: line 63: inbound progress does not match the receiver's Go-back-N frontier"
+# Schema Amendment 5 (fix round 1, review M1): a compute stage names its RoCE inbound predecessor's
+# MTU and pacing interval. roce_agc is configs/p15/roce_allgather_compute_lossy.toml with the ring
+# at 40,000 B and the AllGather at 20,000 B: the AllGather's stages are unlogged roots. Flow 27
+# receives flow 24's PSNs 5000-9000 out of order (rows 37-53), then the Go-back-N resend from 0;
+# TCP's merge would jump from 4000 to 10000 at row 72 (PSN 4000) and log no later arrival.
+roce_agc="$fixture_dir/collective_roce_allgather_compute_lossy_executor_accept.csv"
+mutate_case "compute-after-unlogged-roce-hole-fill" "$roce_agc" \
+  'NR == 72 { $column["arrival_bytes"] = 6000; $column["after_inbound_bytes"] = 10000; $column["after_inbound_complete"] = 1 } NR >= 73 && NR <= 77 { next }' \
+  "REJECT: line 72: inbound progress does not match the receiver's Go-back-N frontier"
+# Without the columns the stage is replayed as TCP, which refuses the real Go-back-N receiver.
+mutate_case "compute-after-unlogged-roce-zero-columns" "$roce_agc" \
+  '$column["stage_kind"] == "compute" { $column["packet_size_bytes"] = 0; $column["interval_ns"] = 0 }' \
+  'REJECT: line 72: inbound progress does not match the receiver frontier replayed from the certified segments'
+mutate_case "compute-mtu-disagrees-with-logged-predecessor" "$roce_dag" \
+  '$column["stage_kind"] == "compute" { $column["packet_size_bytes"] = 1500 }' \
+  'REJECT: line 63: compute stage inbound transport columns disagree with its inbound predecessor'
+mutate_case "compute-mtu-without-interval" "$roce_dag" \
+  '$column["stage_kind"] == "compute" { $column["interval_ns"] = 0 }' \
+  'REJECT: line 63: compute stage inbound transport columns must be both zero or both positive (Amendment 5)'
+# P14's chain: the optimizer group follows the backward compute group and has no inbound stage.
+mutate_case "compute-transport-without-inbound-predecessor" "$chain" \
+  '$column["stage_kind"] == "compute" && $column["inbound_predecessor_flow_id"] == "" { $column["packet_size_bytes"] = 1000; $column["interval_ns"] = 1000 }' \
+  'REJECT: line 41: compute stage without an inbound predecessor carries inbound transport columns'
 mutate_case "roce-stage-coverage" "$roce_lossy" \
   '$column["flow_id"] == 7 { next }' \
   'REJECT: line 2: incomplete collective progress coverage for collective_id=0: expected 20, found 19'
