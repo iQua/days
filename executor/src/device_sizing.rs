@@ -1838,13 +1838,16 @@ fn derived_channel_stream_capacities(
     // A flow's channel for a (link, target) is the first: lowering appends the PFC control lanes
     // after every flow channel, and a control lane can share its flow channel's link and target
     // (a host-link lane always does). With the last entry winning, a flow channel's packets were
-    // counted on the control lane and the flow channel started at the bare slack (P15).
-    let mut channels = BTreeMap::new();
-    for (index, channel) in image.channels.iter().enumerate() {
-        channels
-            .entry((channel.link, channel.target))
-            .or_insert(index);
-    }
+    // counted on the control lane and the flow channel started at the bare slack (P15). The
+    // channels are collected in reverse, so the collect's last-wins dedup keeps the first; the
+    // bulk build allocates as before (per-entry inserts cost 390 more allocations on k16).
+    let channels = image
+        .channels
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(index, channel)| ((channel.link, channel.target), index))
+        .collect::<BTreeMap<_, _>>();
     let mut packet_counts = vec![0_usize; image.channels.len()];
     let mut minimum_serialization = vec![None::<u64>; image.channels.len()];
     for (flow_index, flow) in image.flows.iter().enumerate() {
