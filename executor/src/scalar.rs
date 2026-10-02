@@ -327,11 +327,14 @@ struct CollectiveProgressContext {
     activated: bool,
 }
 
+/// `inbound_transport` is a compute stage's RoCE inbound predecessor's MTU and pacing interval
+/// (schema Amendment 5), or `(0, 0)`; transport stages write their own.
 fn collective_progress_record(
     context: CollectiveProgressContext,
     cause: PendingCollectiveProgress,
     generator: &crate::FlowGeneratorState,
     stage: Option<crate::CollectiveStage>,
+    inbound_transport: (u64, u64),
 ) -> Option<crate::CollectiveProgressRecord> {
     let stage = stage?;
     let dependencies = stage.dependencies;
@@ -418,6 +421,8 @@ fn collective_progress_record(
                 rank: compute.rank,
                 stage_kind: crate::CollectiveStageKind::Compute,
                 duration_ns: compute.duration_ns,
+                packet_size_bytes: inbound_transport.0,
+                interval_ns: inbound_transport.1,
                 ..record
             })
         }
@@ -2102,6 +2107,25 @@ impl<'image> TransitionState<'image> {
                 node: node.id,
                 flow,
             })?;
+        let stage = state.stages.stage(position);
+        // Schema Amendment 5: a compute stage after a RoCE collective names that queue pair's MTU
+        // and pacing interval. Its local predecessor is the same rank's final stage of the same
+        // collective, on this host (the validator requires both predecessors to agree), so the
+        // values are read through the stage index, keyed and in constant time.
+        let inbound_transport = stage
+            .filter(|stage| {
+                matches!(stage.role, crate::StageRole::Compute(_))
+                    && stage.dependencies.inbound_predecessor.is_some()
+            })
+            .and_then(|stage| stage.dependencies.local_predecessor)
+            .and_then(|local| index.first_generator(local))
+            .and_then(|local| match state.generators[local].kind {
+                FlowGeneratorKind::Roce(roce) => {
+                    Some((roce.pacer.mtu_bytes, roce.pacer.pacing_interval_ns))
+                }
+                _ => None,
+            })
+            .unwrap_or((0, 0));
         let record = collective_progress_record(
             CollectiveProgressContext {
                 key: parent.key,
@@ -2112,7 +2136,8 @@ impl<'image> TransitionState<'image> {
             },
             cause,
             &state.generators[position],
-            state.stages.stage(position),
+            stage,
+            inbound_transport,
         )
         .ok_or(ExecutionError::UnexpectedGeneratorEmission {
             node: node.id,

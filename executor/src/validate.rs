@@ -3542,6 +3542,17 @@ fn host_inbound_frontier(
 }
 
 /// The transport of a stage generator, as validation errors name it.
+/// A RoCE queue pair's MTU and pacing interval, which a compute stage after it writes on its
+/// progress rows (schema Amendment 5); `None` for any other generator.
+const fn roce_transport(kind: &FlowGeneratorKind) -> Option<(u64, u64)> {
+    match kind {
+        FlowGeneratorKind::Roce(roce) => {
+            Some((roce.pacer.mtu_bytes, roce.pacer.pacing_interval_ns))
+        }
+        _ => None,
+    }
+}
+
 const fn transport_label(generator: &crate::FlowGeneratorState) -> &'static str {
     match generator.kind {
         FlowGeneratorKind::Roce(_) => "RoCE",
@@ -3664,6 +3675,16 @@ fn validate_compute_stage(
             if inbound.1.chunk_bytes != dependencies.inbound_predecessor_bytes {
                 return Err(ValidationError::new(format!(
                     "flow {:?} compute inbound predecessor does not deliver the declared chunk",
+                    flow.id
+                )));
+            }
+            // Schema Amendment 5: the stage's progress rows name its inbound transport from its
+            // local predecessor, the same rank's final stage of the same collective.
+            if local.map(|candidate| roce_transport(&candidate.kind))
+                != Some(roce_transport(&inbound.0.kind))
+            {
+                return Err(ValidationError::new(format!(
+                    "flow {:?} compute local and inbound predecessors disagree on the RoCE MTU or pacing interval",
                     flow.id
                 )));
             }
