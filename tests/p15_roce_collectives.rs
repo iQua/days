@@ -842,3 +842,79 @@ fn roce_collective_fixtures_match_their_frozen_anchors() {
         );
     }
 }
+
+/// The lowered RoCE queue pair of `flow`: (MTU, pacing interval), or `None` for any other flow.
+fn roce_transport(image: &SimulationImage, flow: FlowId) -> Option<(u64, u64)> {
+    image
+        .host_states
+        .iter()
+        .flat_map(|state| state.generators.iter())
+        .find(|generator| generator.flow == flow)
+        .and_then(|generator| match generator.kind {
+            FlowGeneratorKind::Roce(roce) => {
+                Some((roce.pacer.mtu_bytes, roce.pacer.pacing_interval_ns))
+            }
+            _ => None,
+        })
+}
+
+/// Schema Amendment 5 (LeanGuard part 3, review M1): a compute stage whose inbound predecessor is
+/// a RoCE stage writes that queue pair's MTU and pacing interval on every progress row, so the
+/// certificate can be replayed with the Go-back-N frontier even when the predecessor is an
+/// unlogged root (`roce_allgather_compute_lossy`, an ungated two-rank AllGather); every other
+/// compute row writes zero. Every compute inbound row of a RoCE predecessor is a packet of that
+/// pair at its PSN and advances the frontier exactly when the PSN is the frontier.
+#[test]
+fn compute_rows_name_their_roce_inbound_transport() {
+    for name in ["roce_compute_dag.toml", "roce_allgather_compute_lossy.toml"] {
+        let image = lower(name);
+        let result = run_identical(&image, name);
+        let rows: Vec<_> = progress(&result)
+            .into_iter()
+            .filter(|row| row.stage_kind == days_executor::CollectiveStageKind::Compute)
+            .collect();
+        let (mut transported, mut out_of_order) = (0, 0);
+        for row in &rows {
+            let expected = row
+                .inbound_predecessor
+                .and_then(|flow| roce_transport(&image, flow))
+                .unwrap_or((0, 0));
+            assert_eq!(
+                (row.packet_size_bytes, row.interval_ns),
+                expected,
+                "{name}: compute row of flow {:?} at {:?}",
+                row.flow,
+                row.key
+            );
+            if expected.0 == 0 {
+                continue;
+            }
+            transported += 1;
+            if row.cause == CollectiveActivationCause::InboundArrival {
+                let (mtu, total) = (expected.0, row.inbound_predecessor_bytes);
+                let psn = row.segment_sequence;
+                assert!(
+                    psn % mtu == 0 && psn < total && row.segment_bytes == mtu.min(total - psn),
+                    "{name}: compute inbound row is not its pair's packet at PSN {psn}"
+                );
+                let advance = if psn == row.before_inbound_bytes {
+                    row.segment_bytes
+                } else {
+                    out_of_order += 1;
+                    0
+                };
+                assert_eq!(row.arrival_bytes, advance, "{name}: Go-back-N advance");
+            }
+        }
+        assert!(
+            transported > 0,
+            "{name}: no compute row follows a RoCE stage"
+        );
+        if name == "roce_allgather_compute_lossy.toml" {
+            assert!(
+                out_of_order > 0,
+                "{name}: the lossy contract needs compute inbound rows off the frontier"
+            );
+        }
+    }
+}
