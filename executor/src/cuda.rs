@@ -3857,7 +3857,7 @@ fn derived_transition_bound(
                     .saturating_add(work.control_ticks))
             }
             FlowGeneratorKind::Roce(roce) => Ok(bound
-                .saturating_add(crate::device_sizing::roce_transition_bound(
+                .saturating_add(crate::device_mechanism::roce_transition_bound(
                     image, generator, roce,
                 ))
                 .saturating_add(1)),

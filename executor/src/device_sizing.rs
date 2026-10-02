@@ -375,52 +375,6 @@ pub(crate) fn roce_data_packet_estimate(
     usize::try_from(fresh.saturating_add(resend).saturating_add(1).min(ticks)).unwrap_or(usize::MAX)
 }
 
-/// An upper bound on the device transitions one RoCE queue pair can still cause, beyond what its
-/// estimated packets contribute (P15). Its timers: pacing ticks (at most one per remaining grid
-/// point, restarts included: a restart lands on a grid point and at most one tick is pending),
-/// control ticks (as for DCQCN, through the stop time) and timeout firings (each re-arms `rto_ns`
-/// later, so at most one per `rto_ns` until the stop time; none with the timeout off). Its
-/// packets: at most one data packet per grid tick, each answered by at most an ACK or NACK and a
-/// CNP, each taking at most `1 + 3 * hops` transitions. The bound feeds only the round and dispatch
-/// counts (scalars), so its size costs no memory; it keeps the round bound sound when loss makes
-/// the packet estimate low.
-#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
-pub(crate) fn roce_transition_bound(
-    image: &SimulationImage,
-    generator: &crate::FlowGeneratorState,
-    roce: crate::RoceGenerator,
-) -> usize {
-    let stop = image.stop_time_ns;
-    let pacing = crate::validate::roce_grid_ticks(image, generator, roce);
-    let control = &roce.controller;
-    let control_ticks = if control.next_control_time_ns <= stop {
-        1 + (stop - control.next_control_time_ns) / control.config.control_interval_ns.max(1)
-    } else {
-        0
-    };
-    let timeouts = if roce.rto_ns == 0 {
-        0
-    } else {
-        1 + stop / roce.rto_ns
-    };
-    let hops = image
-        .flows
-        .get(generator.flow.0 as usize)
-        .map_or(0, |flow| {
-            flow.route.len().max(flow.reverse_route.len()) as u64
-        });
-    let packet_transitions = pacing
-        .saturating_mul(3)
-        .saturating_mul(1_u64.saturating_add(hops.saturating_mul(3)));
-    usize::try_from(
-        pacing
-            .saturating_add(control_ticks)
-            .saturating_add(timeouts)
-            .saturating_add(packet_transitions),
-    )
-    .unwrap_or(usize::MAX)
-}
-
 pub(crate) fn rate_device_work(
     image: &SimulationImage,
     generator: &crate::FlowGeneratorState,
