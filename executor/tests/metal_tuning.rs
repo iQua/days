@@ -41,3 +41,20 @@ fn cuda_retains_the_independently_tuned_o13_fast_path() {
         );
     }
 }
+
+#[test]
+fn metal_forces_the_timer_heap_removal_inline_as_cuda_does() {
+    // P15 R4: the queue-pair ACK/NACK driver is the third call site of `heap_remove_timer`. Left to
+    // Apple's inliner heuristics, that third site moved the mechanisms pipeline's run time on
+    // DCQCN images that never execute it (host instructions on `dcqcn_1s_zero_xoff`, interleaved:
+    // 811M with plain `inline`, 780M forced, 777M before queue pairs). CUDA already declares it
+    // `__forceinline__`; Metal must match.
+    assert!(
+        CUDA.contains("__device__ __forceinline__ bool heap_remove_timer("),
+        "CUDA's timer-heap removal must stay force-inlined",
+    );
+    assert!(
+        METAL.contains("[[gnu::always_inline]] inline bool heap_remove_timer("),
+        "Metal's timer-heap removal must be force-inlined like CUDA's",
+    );
+}
