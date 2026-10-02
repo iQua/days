@@ -1015,6 +1015,63 @@ expect_hp_reject "delete the host RESUME record (unrepaired)" \
   "REJECT: pfc: line $((n_line - 1)): PFC controller-set discontinuity for queue (node_id=$r_node, queue_id=0, controlled_link=$p_link, priority=3)" \
   "$hp.sender.csv" "$hp.receiver.csv" "$hp.dcqcn.csv" "$campaign_tmp/hp.pfc.csv"
 
+# --- Collective stages over RoCE (P15 LeanGuard part 3): the --collective joins -----------------
+# The DAG prefix: rows 2-5 release the four compute-gated roots at 5,000 ns; row 11 releases flow 7
+# at node 1 by the ACK of flow 6 (sender line 67) that completes it; flow 6's previous ACK is at
+# sender line 66 (53024 ns, origin 6, sequence 8); flow 7's first DCQCN row holds its first control
+# tick at 104,048 = 54,048 + 50,000.
+rd="$fixture_dir/roce_trace_roce_dag_prefix_executor_accept"
+rd_stop="$(cat "$rd.stop_time_ns")"
+rd_horizon="$(cat "$rd.horizon_ns")"
+# mutate_stages <label> <collective|dcqcn> <awk program over named columns> <expected REJECT line>
+mutate_stages() {
+  local label="$1"
+  local role="$2"
+  local program="$3"
+  local expected_output="$4"
+  local collective="$rd.collective.csv"
+  local dcqcn="$rd.dcqcn.csv"
+  local mutated="$campaign_tmp/stages-$role.csv"
+  awk -F, -v OFS=, \
+    'NR == 1 { for (i = 1; i <= NF; i++) column[$i] = i; print; next } '"$program"' { print }' \
+    "$rd.$role.csv" > "$mutated"
+  case "$role" in
+    collective) collective="$mutated" ;;
+    dcqcn) dcqcn="$mutated" ;;
+  esac
+  mutations=$((mutations + 1))
+  if check_case "stages/$label" 1 "$expected_output" \
+      trace "$rd.sender.csv" "$rd.receiver.csv" "$dcqcn" --pfc "$rd.pfc.csv" \
+      --horizon-ns "$rd_horizon" --collective "$collective" "$rd_stop"; then
+    mutations_caught=$((mutations_caught + 1))
+  fi
+}
+mutate_stages "release-before-first-tick" collective \
+  'NR == 2 { $column["time_ns"] = 4999; $column["after_next_time_ns"] = 4999 }' \
+  "REJECT: collective: line 2: RoCE stage queue pair's first pacing tick is not at its release instant, on a grid anchored there (node_id=0, flow_id=0)"
+# Flow 7's whole control chain one nanosecond late: self-consistent, so only the release anchors it.
+shift_control='$column["flow_id"] == 7 { $column["before_next_control_time_ns"] += 1; $column["after_next_control_time_ns"] += 1; if ($column["kind"] == "control") $column["time_ns"] += 1 }'
+awk -F, -v OFS=, \
+  'NR == 1 { for (i = 1; i <= NF; i++) column[$i] = i; print; next } '"$shift_control"' { print }' \
+  "$rd.dcqcn.csv" > "$campaign_tmp/stages-shifted.dcqcn.csv"
+check_case "stages/control-chain-shifted (queue-pair logs alone)" 0 "ACCEPT" \
+  trace "$rd.sender.csv" "$rd.receiver.csv" "$campaign_tmp/stages-shifted.dcqcn.csv" \
+  --pfc "$rd.pfc.csv" --horizon-ns "$rd_horizon" "$rd_stop" || true
+mutate_stages "control-chain-shifted" dcqcn "$shift_control" \
+  "REJECT: collective: line 11: RoCE stage queue pair's first control tick is not one control interval after its release (node_id=1, flow_id=7)"
+mutate_stages "unreleased-stage-with-queue-pair-rows" collective \
+  'NR == 11 { next }' \
+  "REJECT: collective: line 6: unreleased RoCE stage has queue-pair rows (node_id=1, flow_id=7)"
+mutate_stages "completion-by-an-earlier-ack" collective \
+  'NR == 11 { $column["time_ns"] = 53024; $column["event_origin_sequence"] = 8; $column["after_next_time_ns"] = 53024 }' \
+  "REJECT: collective: line 11: RoCE local completion is not the ACK that completes its predecessor queue pair (node_id=1, flow_id=6, sender line 66)"
+mutate_stages "completion-without-a-sender-row" collective \
+  'NR == 11 { $column["event_origin_sequence"] = 99 }' \
+  "REJECT: collective: line 11: RoCE local completion without a sender row of its predecessor queue pair at its event key (node_id=1, flow_id=6)"
+mutate_stages "collective-row-at-horizon" collective \
+  'NR == 29 { print; $column["time_ns"] = 150000 }' \
+  "REJECT: collective: line 30: event at or after horizon_ns=150000"
+
 # Host-PFC executor traces kept outside the repository (ADE_TRACE_DIR=<dir>): every
 # <name>.roce_sender.csv there with <name>.roce_receiver.csv, <name>.dcqcn.csv, <name>.pfc.csv and
 # <name>.stop_time_ns runs in trace mode with the PFC join. Sender logs above

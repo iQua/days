@@ -74,6 +74,16 @@ def checkStages (horizonNs : Option Nat) (collective : List CollectiveEventLog.R
   for row in collective do
     let at_ := requireAt "collective" row.srcLine
     let pair := (row.nodeId, row.flowId)
+    if ackCompletion row && senderFlows.contains row.causeFlowId then
+      match atKey.get? (keyedPair row.key row.nodeId row.causeFlowId) with
+      | none =>
+          throw s!"collective: line {row.srcLine}: RoCE local completion without a sender row of its predecessor queue pair at its event key (node_id={row.nodeId}, flow_id={row.causeFlowId})"
+      | some ack =>
+          at_
+            (ack.kind = .ack && ack.before.sndUna < ack.config.totalBytes &&
+              ack.after.sndUna = ack.config.totalBytes &&
+              ack.inputAcknowledgment = some row.ackNumber)
+            s!"RoCE local completion is not the ACK that completes its predecessor queue pair (node_id={row.nodeId}, flow_id={row.causeFlowId}, sender line {ack.srcLine})"
     if row.stageKind = .roce then
       if row.activated then
         match firstSender.get? pair with
@@ -92,15 +102,5 @@ def checkStages (horizonNs : Option Nat) (collective : List CollectiveEventLog.R
       else if !released.contains pair then
         at_ (!firstSender.contains pair)
           s!"unreleased RoCE stage has queue-pair rows (node_id={row.nodeId}, flow_id={row.flowId})"
-    if ackCompletion row && senderFlows.contains row.causeFlowId then
-      match atKey.get? (keyedPair row.key row.nodeId row.causeFlowId) with
-      | none =>
-          throw s!"collective: line {row.srcLine}: RoCE local completion without a sender row of its predecessor queue pair at its event key (node_id={row.nodeId}, flow_id={row.causeFlowId})"
-      | some ack =>
-          at_
-            (ack.kind = .ack && ack.before.sndUna < ack.config.totalBytes &&
-              ack.after.sndUna = ack.config.totalBytes &&
-              ack.inputAcknowledgment = some row.ackNumber)
-            s!"RoCE local completion is not the ACK that completes its predecessor queue pair (node_id={row.nodeId}, flow_id={row.causeFlowId}, sender line {ack.srcLine})"
 
 end LeanGuard.P10c.RoceStages
