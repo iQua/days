@@ -1,4 +1,5 @@
 import Std
+import LeanGuard.P10c.Roce.Semantics
 
 namespace LeanGuard.P10c.Collective
 
@@ -106,6 +107,29 @@ that the collective certificate does not carry. -/
 def roceRelease (timeNs : Nat) (status : Status) (nextTimeNs packets bytes : Nat) : Bool :=
   packets = 0 && bytes = 0 && nextTimeNs = timeNs &&
     (status = .scheduled || status = .blocked)
+
+/-- The Go-back-N receiver's in-order frontier after a data packet `[psn, psn + bytes)`: it
+advances by the packet exactly when the PSN is the frontier. A duplicate or an out-of-order
+packet leaves it where it is, and nothing is buffered, so no later packet fills a hole. -/
+def goBackNFrontier (frontier psn bytes : Nat) : Nat :=
+  if psn = frontier then frontier + bytes else frontier
+
+/-- `goBackNFrontier` is the frontier of the queue-pair receiver that the RoCE checker replays
+(`Roce.onData`, `roce.rs` `receive`), whatever its configuration, state and the packet's CE mark. -/
+theorem goBackNFrontier_onData (config : Roce.ReceiverConfig) (state : Roce.ReceiverState)
+    (timeNs : Nat) (packet : Roce.DataArrival) :
+    (Roce.onData config state timeNs packet).state.expectedPsn =
+      goBackNFrontier state.expectedPsn packet.psn packet.bytes := by
+  unfold Roce.onData goBackNFrontier
+  by_cases hcnp : (packet.ce && Roce.cnpAdmitted config state timeNs) = true <;>
+    simp only [hcnp] <;> split <;> split <;> (try split) <;> (try split) <;> simp_all
+  -- Sending feedback resets only the ACK cadence, never the frontier.
+  all_goals split <;> rfl
+
+/-- A data packet of a RoCE queue pair whose chunk is `total` bytes: its PSN is a packet boundary
+(a multiple of the MTU) and its size is `min(mtu, total - psn)` (`Roce.packetSize`, §1). -/
+def roceSegment (mtu total psn bytes : Nat) : Bool :=
+  mtu > 0 && psn % mtu = 0 && psn < total && bytes = min mtu (total - psn)
 
 /-- Status and deadline written when a compute interval is released at `timeNs`. -/
 def computeTimerAfter (timeNs durationNs stopTimeNs : Nat) : Status × Nat :=

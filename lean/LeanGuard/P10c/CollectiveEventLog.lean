@@ -233,8 +233,8 @@ def inboundDone (row : Row) (bytes : Nat) : Bool :=
 Local completion flips the local flag (TCP or RoCE: last byte acknowledged; compute: timer
 fired). An inbound row certifies one arriving segment of the inbound predecessor and the
 resulting advance of the receiver's in-order frontier, which may be zero (duplicate or
-out-of-order segment) or cover several segments at once (a filled hole).
-`checkInboundReplay` replays the frontier from the certified segments; `checkLocalSignal`
+out-of-order segment) or, for TCP only, cover several segments at once (a filled hole).
+`checkInboundReplay` replays the frontier by the predecessor's transport; `checkLocalSignal`
 binds local completions to their cause. -/
 def checkProgress (row : Row) : Except String Unit := do
   require row.srcLine (row.beforeInboundComplete = inboundDone row row.beforeInboundBytes)
@@ -565,10 +565,53 @@ def frontierOf (segments : List (Nat × Nat)) : Nat :=
 def segmentOf (row : Row) : Nat × Nat :=
   (row.segmentSequence, row.segmentSequence + row.segmentBytes)
 
+/-- Each flow's first row, built in one pass. A flow's stage kind and transport columns are the
+same on all its rows (`checkContinuity`). -/
+def flowIndex (rows : List Row) : Std.HashMap Nat Row :=
+  rows.foldl
+    (fun index row => if index.contains row.flowId then index else index.insert row.flowId row) ∅
+
+/-- The MTU of the RoCE queue pair whose packets a row's inbound segments are, or `none` for TCP
+segments. A RoCE stage's inbound predecessor is a stage of its own collective (one transport per
+collective), whose MTU `sameGroupConfig` makes the row's own. A compute stage takes its logged
+predecessor's transport; a compute stage whose predecessor is not logged (the final stage of an
+ungated two-rank AllGather is a root) is replayed as TCP, as before RoCE stages existed. -/
+def roceInboundMtu (flows : Std.HashMap Nat Row) (row : Row) : Option Nat :=
+  match row.stageKind with
+  | .roce => some row.packetSizeBytes
+  | .tcp => none
+  | .compute =>
+      match row.inboundPredecessorFlowId.bind flows.get? with
+      | some predecessor =>
+          if predecessor.stageKind = .roce then some predecessor.packetSizeBytes else none
+      | none => none
+
+/-- Schema Amendment 4: an inbound row of a RoCE predecessor certifies one data packet, which is
+the predecessor's packet at its PSN, and the advance of the receiver's Go-back-N frontier
+(`Collective.goBackNFrontier`, the `Roce.onData` frontier): the packet's size when its PSN is the
+frontier, else zero, with no hole filling. Unlike TCP's, this frontier depends only on the
+frontier before the packet and the packet itself, and `checkContinuity` and `checkInitialState`
+chain each row's before count to the stage's previous row from zero, so checking each row against
+its own before count replays the frontier in constant time per row. -/
+def checkGoBackN (mtu : Nat) (row : Row) : Except String Unit := do
+  require row.srcLine
+    (Collective.roceSegment mtu row.inboundPredecessorBytes row.segmentSequence row.segmentBytes)
+    "inbound RoCE packet is not the predecessor queue pair's packet at its PSN"
+  let after :=
+    Collective.goBackNFrontier row.beforeInboundBytes row.segmentSequence row.segmentBytes
+  require row.srcLine
+    (row.afterInboundBytes = after && row.arrivalBytes = after - row.beforeInboundBytes)
+    "inbound progress does not match the receiver's Go-back-N frontier"
+
 /-- Every segment of a pending inbound predecessor is certified in order, so the before and after
-byte counts of each inbound row must equal the frontier replayed from that stage's segments. -/
-def checkInboundReplay (rows : List Row) (row : Row) : Except String Unit := do
+byte counts of each inbound row must equal the frontier replayed from that stage's segments: the
+Go-back-N frontier for RoCE packets, TCP's in-order frontier (which merges out-of-order segments)
+otherwise. -/
+def checkInboundReplay (flows : Std.HashMap Nat Row) (rows : List Row) (row : Row) :
+    Except String Unit := do
   if row.cause = .inboundArrival then
+    if let some mtu := roceInboundMtu flows row then
+      return (← checkGoBackN mtu row)
     let prior :=
       (rows.filter fun candidate =>
         candidate.flowId = row.flowId && candidate.cause = .inboundArrival &&
@@ -773,7 +816,8 @@ def checkRows (rows : List Row) : Except String Unit := do
   for row in canonical do checkRow row
   checkCoverage canonical
   for row in canonical do checkPredecessors canonical row
-  for row in canonical do checkInboundReplay canonical row
+  let flows := flowIndex canonical
+  for row in canonical do checkInboundReplay flows canonical row
   for row in canonical do checkLocalSignal canonical row
 
 end LeanGuard.P10c.CollectiveEventLog
