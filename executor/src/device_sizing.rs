@@ -344,6 +344,39 @@ pub(crate) fn dcqcn_device_work(
     }
 }
 
+/// Upper bounds on the device transitions one RoCE queue pair's timers can still take (P15):
+/// pacing ticks (at most one per remaining grid point, restarts included: a restart lands on a grid
+/// point and at most one tick is pending), control ticks (as for DCQCN, through the stop time), and
+/// retransmission-timeout firings (each re-arms `rto_ns` later, so at most one per `rto_ns` until
+/// the stop time; none with the timeout off). Outward-safe: an over-estimate costs only memory.
+/// Its consumers are the device planners' transition bounds.
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
+pub(crate) fn roce_timer_transitions(
+    image: &SimulationImage,
+    generator: &crate::FlowGeneratorState,
+    roce: crate::RoceGenerator,
+) -> usize {
+    let stop = image.stop_time_ns;
+    let pacing = crate::validate::roce_grid_ticks(image, generator, roce);
+    let control = &roce.controller;
+    let control_ticks = if control.next_control_time_ns <= stop {
+        1 + (stop - control.next_control_time_ns) / control.config.control_interval_ns.max(1)
+    } else {
+        0
+    };
+    let timeouts = if roce.rto_ns == 0 {
+        0
+    } else {
+        1 + stop / roce.rto_ns
+    };
+    usize::try_from(
+        pacing
+            .saturating_add(control_ticks)
+            .saturating_add(timeouts),
+    )
+    .unwrap_or(usize::MAX)
+}
+
 pub(crate) fn rate_device_work(
     image: &SimulationImage,
     generator: &crate::FlowGeneratorState,
@@ -1032,13 +1065,18 @@ fn flow_packet_counts(
     }
     for state in &image.host_states {
         for generator in &state.generators {
-            // One ACK (TCP) or at most one CNP (DCQCN) per data packet.
-            if matches!(
-                generator.kind,
-                FlowGeneratorKind::Tcp(_) | FlowGeneratorKind::Dcqcn(_)
-            ) {
+            // One ACK (TCP) or at most one CNP (DCQCN) per data packet; a queue pair's receiver
+            // answers a data arrival with at most one ACK or NACK and one CNP (validator
+            // invariant 20 of `evidence/P15/qp-design.md` §7).
+            let per_packet = match generator.kind {
+                FlowGeneratorKind::Tcp(_) | FlowGeneratorKind::Dcqcn(_) => 1,
+                FlowGeneratorKind::Roce(_) => 2,
+                FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => 0,
+            };
+            if per_packet != 0 {
                 let flow = generator.flow.0 as usize;
-                feedback_counts[flow] = feedback_counts[flow].saturating_add(data_counts[flow]);
+                feedback_counts[flow] = feedback_counts[flow]
+                    .saturating_add(data_counts[flow].saturating_mul(per_packet));
             }
         }
     }

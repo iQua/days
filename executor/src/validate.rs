@@ -1425,7 +1425,7 @@ fn host_class_paused(image: &SimulationImage, owner: NodeId, priority: u8) -> bo
 /// The queue pairs a host's parked list must hold, by class: each queue pair whose data class is
 /// paused there and whose pacer a paused tick parked with packets left to send (parked, not
 /// stopped, `next_psn < total` and `snd_una < total`; LeanGuard's restartable parked pairs).
-fn expected_pause_parked(
+pub(crate) fn expected_pause_parked(
     image: &SimulationImage,
     state: &crate::HostState,
     pfc: &crate::HostPfcState,
