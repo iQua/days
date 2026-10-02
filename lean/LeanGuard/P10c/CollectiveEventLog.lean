@@ -33,6 +33,7 @@ def parseStatus : String → Except String Collective.Status
 def parseStageKind : String → Except String Collective.StageKind
   | "tcp" => pure .tcp
   | "compute" => pure .compute
+  | "roce" => pure .roce
   | other => throw s!"invalid stage kind: '{other}'"
 
 def parseBit (value : String) : Except String Bool :=
@@ -68,7 +69,7 @@ structure Row where
   cause : Collective.Cause
   causeFlowId : Nat
   arrivalBytes : Nat
-  /-- Collective identity for a TCP stage; compute-group identity for a compute stage. -/
+  /-- Collective identity for a transport stage; compute-group identity for a compute stage. -/
   collectiveId : Nat
   algorithm : Option Collective.Algorithm
   groupSize : Nat
@@ -97,14 +98,17 @@ structure Row where
   afterNextTimeNs : Nat
   stageKind : Collective.StageKind
   durationNs : Nat
-  /-- Inbound rows: the arriving TCP segment `[segmentSequence, segmentSequence + segmentBytes)`. -/
+  /-- Inbound rows: the arriving TCP segment or RoCE packet
+  `[segmentSequence, segmentSequence + segmentBytes)` (a RoCE PSN is a byte offset). -/
   segmentSequence : Nat
   segmentBytes : Nat
-  /-- Local rows caused by TCP: the completing ACK's cumulative acknowledgment. -/
+  /-- Local rows caused by a transport stage: the completing ACK's cumulative acknowledgment. -/
   ackNumber : Nat
-  /-- Local rows: TCP, when the answered segment was sent; compute, when the timer was armed. -/
+  /-- Local rows: TCP or RoCE, when the answered segment was sent; compute, when the timer was
+  armed. -/
   causeOriginNs : Nat
-  /-- Local rows: TCP, the unloaded round trip of that segment and its ACK; compute, the duration. -/
+  /-- Local rows: TCP or RoCE, the unloaded round trip of that segment and its ACK; compute, the
+  duration. -/
   causeDelayNs : Nat
   srcLine : Nat
   deriving DecidableEq, Repr
@@ -214,7 +218,7 @@ def checkOrdinals : List Row → Except String Unit
             go row tail
       go first rest
 
-/-- Whether a TCP row is a root stage, which is logged only when a compute stage gates it. -/
+/-- Whether a transport row is a root stage, which is logged only when a compute stage gates it. -/
 def isRoot (row : Row) : Bool :=
   match row.algorithm, row.collectivePhase with
   | some algorithm, some phase => Collective.rootPosition algorithm phase row.step
@@ -224,13 +228,14 @@ def isRoot (row : Row) : Bool :=
 def inboundDone (row : Row) (bytes : Nat) : Bool :=
   row.inboundPredecessorFlowId.isNone || bytes = row.inboundPredecessorBytes
 
-/-- Prerequisite transitions shared by TCP and compute stages.
+/-- Prerequisite transitions shared by transport and compute stages.
 
-Local completion flips the local flag (TCP: last byte acknowledged; compute: timer fired). An
-inbound row certifies one arriving TCP segment of the inbound predecessor and the resulting
-advance of the receiver's in-order frontier, which may be zero (duplicate or out-of-order
-segment) or cover several segments at once (a filled hole). `checkInboundReplay` replays the
-frontier from the certified segments; `checkLocalSignal` binds local completions to their cause. -/
+Local completion flips the local flag (TCP or RoCE: last byte acknowledged; compute: timer
+fired). An inbound row certifies one arriving segment of the inbound predecessor and the
+resulting advance of the receiver's in-order frontier, which may be zero (duplicate or
+out-of-order segment) or cover several segments at once (a filled hole).
+`checkInboundReplay` replays the frontier from the certified segments; `checkLocalSignal`
+binds local completions to their cause. -/
 def checkProgress (row : Row) : Except String Unit := do
   require row.srcLine (row.beforeInboundComplete = inboundDone row row.beforeInboundBytes)
     "before inbound completion flag disagrees with the delivered total"
@@ -286,18 +291,28 @@ def checkNotReleased (row : Row) : Except String Unit := do
   require row.srcLine (row.afterStatus = .blocked && row.afterNextTimeNs = 0)
     "nonactivated collective status or deadline mismatch"
 
-def checkTcpRow (row : Row) (algorithm : Collective.Algorithm) (phase : Collective.Phase) :
+/-- A collective stage carried by TCP or by a RoCE queue pair. The two transports share the
+partition, the predecessors, the event phases and the progress rules; they differ in the
+transport columns and in what a release writes (Amendment 4). -/
+def checkTransportRow (row : Row) (algorithm : Collective.Algorithm) (phase : Collective.Phase) :
     Except String Unit := do
+  let tcp := row.stageKind = .tcp
   require row.srcLine
     (Collective.legalPosition algorithm phase row.groupSize row.rank row.step)
     "collective algorithm, phase, rank, or step is illegal"
   require row.srcLine (row.declaredTotalBytes > 0)
     "declared collective total must be positive"
   require row.srcLine (row.groupSize ≤ row.declaredTotalBytes)
-    "TCP collective declared total must cover every rank"
-  require row.srcLine
-    (row.packetSizeBytes > 0 && row.intervalNs = 0 && row.durationNs = 0)
-    "TCP collective stage requires a positive MSS and no pacing interval or duration"
+    (if tcp then "TCP collective declared total must cover every rank"
+      else "RoCE collective declared total must cover every rank")
+  if tcp then
+    require row.srcLine
+      (row.packetSizeBytes > 0 && row.intervalNs = 0 && row.durationNs = 0)
+      "TCP collective stage requires a positive MSS and no pacing interval or duration"
+  else
+    require row.srcLine
+      (row.packetSizeBytes > 0 && row.intervalNs > 0 && row.durationNs = 0)
+      "RoCE collective stage requires a positive MTU and pacing interval and no duration"
   let owner := Collective.stageOwner algorithm phase row.groupSize row.rank row.step
   let expectedBounds := Collective.chunkBounds row.declaredTotalBytes row.groupSize owner
   require row.srcLine
@@ -321,12 +336,20 @@ def checkTcpRow (row : Row) (algorithm : Collective.Algorithm) (phase : Collecti
     "collective progress event phase disagrees with its cause"
   checkProgress row
   if row.activated then
-    require row.srcLine
-      (Collective.tcpFirstWindow
-        row.packetSizeBytes row.chunkBytes row.afterPacketsEmitted row.afterBytesEmitted)
-      "first TCP window counters mismatch"
-    require row.srcLine (row.afterStatus = .blocked && row.afterNextTimeNs = 0)
-      "post-activation status or deadline mismatch"
+    if tcp then
+      require row.srcLine
+        (Collective.tcpFirstWindow
+          row.packetSizeBytes row.chunkBytes row.afterPacketsEmitted row.afterBytesEmitted)
+        "first TCP window counters mismatch"
+      require row.srcLine (row.afterStatus = .blocked && row.afterNextTimeNs = 0)
+        "post-activation status or deadline mismatch"
+    else
+      require row.srcLine (row.afterPacketsEmitted = 0 && row.afterBytesEmitted = 0)
+        "RoCE stage release has emitted counters: its first pacing tick is at the release instant"
+      require row.srcLine
+        (Collective.roceRelease row.key.timeNs row.afterStatus row.afterNextTimeNs
+          row.afterPacketsEmitted row.afterBytesEmitted)
+        "RoCE stage release status or first pacing tick mismatch"
   else
     checkNotReleased row
 
@@ -368,8 +391,10 @@ def checkRow (row : Row) : Except String Unit := do
   require row.srcLine (row.key.timeNs ≤ row.stopTimeNs)
     "collective progress occurs after the simulation stop time"
   match row.stageKind, row.algorithm, row.collectivePhase with
-  | .tcp, some algorithm, some phase => checkTcpRow row algorithm phase
+  | .tcp, some algorithm, some phase | .roce, some algorithm, some phase =>
+      checkTransportRow row algorithm phase
   | .tcp, _, _ => require row.srcLine false "TCP stage row requires an algorithm and a phase"
+  | .roce, _, _ => require row.srcLine false "RoCE stage row requires an algorithm and a phase"
   | .compute, _, _ => checkComputeRow row
 
 /-- Two rows belong to the same collective or the same compute group. -/
@@ -439,7 +464,7 @@ def requireEarlierRelease (row : Row) (predecessor : Option Row) (message : Stri
   | none => pure ()
   | some predecessor => require row.srcLine (compositeLT predecessor row) message
 
-def checkTcpPredecessors (rows : List Row) (row : Row) (phase : Collective.Phase) :
+def checkTransportPredecessors (rows : List Row) (row : Row) (phase : Collective.Phase) :
     Except String Unit := do
   if isRoot row then
     -- A root's gate is a compute stage, never a stage of its own collective.
@@ -473,7 +498,7 @@ of a collective together with the previous rank's final stage. Logged predecesso
 def checkComputePredecessors (rows : List Row) (row : Row) : Except String Unit := do
   let previousRank := if row.rank = 0 then row.groupSize - 1 else row.rank - 1
   let isFinal (candidate : Row) (rank : Nat) : Bool :=
-    candidate.stageKind = .tcp && candidate.collectivePhase = some .allGather &&
+    candidate.stageKind.isTransport && candidate.collectivePhase = some .allGather &&
       candidate.step + 1 = candidate.groupSize && candidate.rank = rank &&
       candidate.groupSize = row.groupSize
   let local? := rows.find? fun candidate => some candidate.flowId = row.localPredecessorFlowId
@@ -524,8 +549,8 @@ def checkComputeTimerCause (rows : List Row) (row : Row) : Except String Unit :=
 def checkPredecessors (rows : List Row) (row : Row) : Except String Unit := do
   checkComputeTimerCause rows row
   match row.stageKind, row.collectivePhase with
-  | .tcp, some phase => checkTcpPredecessors rows row phase
-  | .tcp, none => pure ()
+  | .tcp, some phase | .roce, some phase => checkTransportPredecessors rows row phase
+  | .tcp, none | .roce, none => pure ()
   | .compute, _ => checkComputePredecessors rows row
 
 /-- The receiver's in-order frontier after the half-open segments `[start, stop)` arrive, as
@@ -556,20 +581,23 @@ def checkInboundReplay (rows : List Row) (row : Row) : Except String Unit := do
       "inbound progress does not match the receiver frontier replayed from the certified segments"
 
 /-- Whether a local completion is caused by a compute timer: a gated root's gate, or a compute
-stage that follows a compute group. Every other local cause is a TCP stage's completing ACK. -/
+stage that follows a compute group. Every other local cause is a transport stage's completing
+ACK (TCP, or a RoCE ACK: a NACK never completes, since it acknowledges the receiver's frontier
+below the chunk). -/
 def causeIsTimer (row : Row) : Bool :=
   match row.stageKind with
-  | .tcp => isRoot row
+  | .tcp | .roce => isRoot row
   | .compute => row.inboundPredecessorFlowId.isNone
 
-/-- The byte total of a TCP local predecessor: from the ring recurrence for a TCP stage, or from
-the rows of the stage that receives it (its inbound byte count) for a compute stage. -/
+/-- The byte total of a transport local predecessor: from the ring recurrence for a transport
+stage, or from the rows of the stage that receives it (its inbound byte count) for a compute
+stage. -/
 def localPredecessorTotal (rows : List Row) (row : Row) : Option Nat :=
   let received :=
     (rows.find? fun candidate =>
       candidate.inboundPredecessorFlowId = some row.causeFlowId).map (·.inboundPredecessorBytes)
   match row.stageKind, row.algorithm, row.collectivePhase with
-  | .tcp, some algorithm, some phase =>
+  | .tcp, some algorithm, some phase | .roce, some algorithm, some phase =>
       let position := localPredecessorPosition row phase
       let owner :=
         Collective.stageOwner algorithm position.phase row.groupSize position.rank position.step
@@ -579,8 +607,9 @@ def localPredecessorTotal (rows : List Row) (row : Row) : Option Nat :=
 /-- Binds a local completion to the event that caused it.
 
 A compute timer completes its successor exactly at arm time + duration; a logged compute
-predecessor was armed at its release, an unlogged one (a root) at time zero. A TCP predecessor
-completes at the first ACK whose acknowledgment reaches its byte total: the row names that
+predecessor was armed at its release, an unlogged one (a root) at time zero. A transport
+predecessor (TCP, or a RoCE queue pair) completes at the first ACK whose acknowledgment reaches its
+byte total: the row names that
 acknowledgment, which must equal the predecessor's total; the answered segment was sent after the
 predecessor's release; and the ACK arrives after the receiver's frontier completed and no sooner
 than the segment's send time plus the unloaded round trip of the segment and the ACK. -/
@@ -712,7 +741,7 @@ def coverageIndex (rows : List Row) : CoverageIndex := Id.run do
         finals := index.finals.insert (stageId row) row }
   pure index
 
-/-- A complete trace releases every logged stage exactly once and leaves it complete. A TCP
+/-- A complete trace releases every logged stage exactly once and leaves it complete. A transport
 collective logs its non-root stages, plus its roots when compute stages gate them; a compute
 group logs one stage per rank. The group tallies are computed once, so the check is linear; each
 row is checked in canonical order, as by a per-row scan of its group. -/
@@ -722,7 +751,7 @@ def checkCoverage (rows : List Row) : Except String Unit := do
     let tally := index.groups.getD (groupId row) {}
     let expected :=
       match row.stageKind, row.algorithm with
-      | .tcp, some algorithm =>
+      | .tcp, some algorithm | .roce, some algorithm =>
           Collective.expectedActivationCount algorithm row.groupSize tally.hasRoot
       | _, _ => row.groupSize
     require row.srcLine (tally.stages = expected)

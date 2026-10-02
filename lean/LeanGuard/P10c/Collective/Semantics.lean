@@ -37,7 +37,14 @@ inductive StageKind
   | tcp
   /-- A delay-only compute interval. -/
   | compute
+  /-- A collective stage carried by a RoCE queue pair (schema Amendment 4). -/
+  | roce
   deriving DecidableEq, Repr, Hashable
+
+/-- A stage that moves bytes over a reliable transport, TCP or a RoCE queue pair. -/
+def StageKind.isTransport : StageKind → Bool
+  | .tcp | .roce => true
+  | .compute => false
 
 /-- The owner offset in the lowering recurrence. -/
 def ownerOffset : Algorithm → Phase → Nat
@@ -76,8 +83,9 @@ def nonRootStagesPerRank (algorithm : Algorithm) (groupSize : Nat) : Nat :=
   | .allGather => groupSize - 2
   | .ringAllReduce => 2 * groupSize - 3
 
-/-- Stages a complete TCP trace releases. TCP collectives carry at least one byte per rank, so
-every chunk is nonempty; a compute-gated collective also releases its `n` roots. -/
+/-- Stages a complete trace of a transport collective releases. TCP and RoCE collectives carry at
+least one byte per rank, so every chunk is nonempty; a compute-gated collective also releases its
+`n` roots. -/
 def expectedActivationCount (algorithm : Algorithm) (groupSize : Nat) (gated : Bool) : Nat :=
   groupSize * nonRootStagesPerRank algorithm groupSize + (if gated then groupSize else 0)
 
@@ -90,6 +98,14 @@ the largest initial window rather than fixed. -/
 def tcpFirstWindow (mss chunkBytes packets bytes : Nat) : Bool :=
   packets ≥ 1 && packets ≤ maxInitialWindowSegments && (packets - 1) * mss < chunkBytes &&
     bytes = min chunkBytes (packets * mss)
+
+/-- Schema Amendment 4: a released RoCE stage arms its first pacing tick at the release instant,
+on a grid anchored there (ruling C2), so the release itself sends nothing. Its status is the
+pacer's armed-status prediction, `Scheduled` or `Blocked`, which depends on the controller's rate
+that the collective certificate does not carry. -/
+def roceRelease (timeNs : Nat) (status : Status) (nextTimeNs packets bytes : Nat) : Bool :=
+  packets = 0 && bytes = 0 && nextTimeNs = timeNs &&
+    (status = .scheduled || status = .blocked)
 
 /-- Status and deadline written when a compute interval is released at `timeNs`. -/
 def computeTimerAfter (timeNs durationNs stopTimeNs : Nat) : Status × Nat :=
