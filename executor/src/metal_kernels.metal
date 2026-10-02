@@ -1019,7 +1019,10 @@ inline void active_remove(
 // The per-flow slot word makes this O(log n): validate the identity at the recorded slot, fill the
 // hole with the last record, and repair in whichever direction the fill violates. Semantic code 61
 // reports a slot that does not carry the flow's armed timer, which the live-state contract forbids.
-inline bool heap_remove_timer(
+//
+// Forced inline, as CUDA's `__forceinline__` is. With plain `inline`, the queue-pair ACK/NACK
+// driver's call site (the third) slowed the mechanisms pipeline on DCQCN images that never reach it.
+[[gnu::always_inline]] inline bool heap_remove_timer(
     ulong node,
     ulong flow,
     ulong attempt,
