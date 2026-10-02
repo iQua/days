@@ -15,7 +15,10 @@ released and finishes where its successor sees it finish:
 * **Release.** A released RoCE stage's queue pair runs its first pacing tick at the release
   instant, on a grid anchored there (the sender log's first row of the pair: a tick, possibly
   class-paused (C6), with `time_ns` and `first_pacing_time_ns` equal to the release row's
-  `time_ns`), and its controller's first control tick is one control interval later (the pair's
+  `time_ns`). The release row's status is the pacer's armed status that tick starts from (its
+  `before_status`, which `RoceEventLog` binds to the controller's rate; the collective log alone
+  can only bound it to `Scheduled` or `Blocked`). The controller's first control tick is one
+  control interval later (the pair's
   first DCQCN row, of any kind, holds `before_next_control_time_ns = time_ns +
   control_interval_ns`; a pair with no DCQCN row before the horizon is not checked).
 * **No early start.** A logged RoCE stage that is never released has no queue-pair rows.
@@ -39,6 +42,13 @@ abbrev KeyedPair := Nat × Nat × Nat × Nat × Nat × Nat
 
 def keyedPair (key : DaysExecutor.EventKey) (node flow : Nat) : KeyedPair :=
   (key.timeNs, key.phase, key.originNode, key.originSeq, node, flow)
+
+/-- The generator status a collective row records, as the RoCE sender log writes it. -/
+def senderStatus : Collective.Status → Roce.Status
+  | .blocked => .blocked
+  | .scheduled => .scheduled
+  | .finished => .finished
+  | .stopped => .stopped
 
 /-- A local completion caused by a transport stage's completing ACK (not a compute timer). -/
 def ackCompletion (row : CollectiveEventLog.Row) : Bool :=
@@ -94,6 +104,8 @@ def checkStages (horizonNs : Option Nat) (collective : List CollectiveEventLog.R
               (first.kind = .tick && first.key.timeNs = row.key.timeNs &&
                 first.config.firstPacingTimeNs = row.key.timeNs)
               s!"RoCE stage queue pair's first pacing tick is not at its release instant, on a grid anchored there (node_id={row.nodeId}, flow_id={row.flowId})"
+            at_ (first.before.status = senderStatus row.afterStatus)
+              s!"RoCE stage release status is not its queue pair's armed status at its first tick (node_id={row.nodeId}, flow_id={row.flowId})"
         if let some first := firstDcqcn.get? pair then
           at_
             (first.before.nextControlTimeNs =
