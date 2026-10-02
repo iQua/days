@@ -17,7 +17,7 @@ inductive Algorithm
 inductive Phase
   | reduceScatter
   | allGather
-  deriving DecidableEq, Repr
+  deriving DecidableEq, Repr, Hashable
 
 inductive Cause
   | localCompletion
@@ -37,7 +37,7 @@ inductive StageKind
   | tcp
   /-- A delay-only compute interval. -/
   | compute
-  deriving DecidableEq, Repr
+  deriving DecidableEq, Repr, Hashable
 
 /-- The owner offset in the lowering recurrence. -/
 def ownerOffset : Algorithm → Phase → Nat

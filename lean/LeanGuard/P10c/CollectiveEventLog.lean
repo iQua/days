@@ -390,14 +390,6 @@ def sameStage (first second : Row) : Bool :=
     first.collectivePhase = second.collectivePhase &&
     first.rank = second.rank && first.step = second.step
 
-def distinctStageCount : List Row → Nat
-  | [] => 0
-  | row :: rest =>
-      if rest.any (sameStage row ·) then
-        distinctStageCount rest
-      else
-        distinctStageCount rest + 1
-
 structure Position where
   phase : Collective.Phase
   rank : Nat
@@ -683,28 +675,66 @@ def checkContinuity (rows : List Row) : Except String Unit := do
         go (row :: previous) rest
   go [] rows
 
+/-- A row's group (`sameGroup`) as a hash key. -/
+abbrev GroupId := Collective.StageKind × Nat
+
+/-- A row's stage (`sameStage`) as a hash key: its group and its position. -/
+abbrev StageId := Collective.StageKind × Nat × Option Collective.Phase × Nat × Nat
+
+def groupId (row : Row) : GroupId := (row.stageKind, row.collectiveId)
+
+def stageId (row : Row) : StageId :=
+  (row.stageKind, row.collectiveId, row.collectivePhase, row.rank, row.step)
+
+/-- What coverage needs of one group: its distinct stages, its activated rows, and whether a root
+is logged. -/
+structure GroupTally where
+  stages : Nat := 0
+  activated : Nat := 0
+  hasRoot : Bool := false
+
+/-- The per-group tallies and each stage's last row, built in one pass (linear in the trace). -/
+structure CoverageIndex where
+  groups : Std.HashMap GroupId GroupTally := ∅
+  finals : Std.HashMap StageId Row := ∅
+
+def coverageIndex (rows : List Row) : CoverageIndex := Id.run do
+  let mut index : CoverageIndex := {}
+  for row in rows do
+    let tally := index.groups.getD (groupId row) {}
+    let newStage := !index.finals.contains (stageId row)
+    index :=
+      { groups := index.groups.insert (groupId row)
+          { stages := tally.stages + (if newStage then 1 else 0)
+            activated := tally.activated + (if row.activated then 1 else 0)
+            hasRoot := tally.hasRoot || isRoot row }
+        -- Rows are canonical, so the last insertion is the stage's final row.
+        finals := index.finals.insert (stageId row) row }
+  pure index
+
 /-- A complete trace releases every logged stage exactly once and leaves it complete. A TCP
 collective logs its non-root stages, plus its roots when compute stages gate them; a compute
-group logs one stage per rank. -/
+group logs one stage per rank. The group tallies are computed once, so the check is linear; each
+row is checked in canonical order, as by a per-row scan of its group. -/
 def checkCoverage (rows : List Row) : Except String Unit := do
+  let index := coverageIndex rows
   for row in rows do
-    let group := rows.filter (sameGroup row ·)
+    let tally := index.groups.getD (groupId row) {}
     let expected :=
       match row.stageKind, row.algorithm with
       | .tcp, some algorithm =>
-          Collective.expectedActivationCount algorithm row.groupSize (group.any isRoot)
+          Collective.expectedActivationCount algorithm row.groupSize tally.hasRoot
       | _, _ => row.groupSize
-    require row.srcLine (distinctStageCount group = expected)
-      s!"incomplete collective progress coverage for collective_id={row.collectiveId}: expected {expected}, found {distinctStageCount group}"
-    let final? := rows.reverse.find? (sameStage · row)
-    let final ← requireSome row.srcLine "final collective stage progress" final?
+    require row.srcLine (tally.stages = expected)
+      s!"incomplete collective progress coverage for collective_id={row.collectiveId}: expected {expected}, found {tally.stages}"
+    let final ← requireSome row.srcLine "final collective stage progress"
+      (index.finals.get? (stageId row))
     require row.srcLine
       (final.afterLocalComplete && final.afterInboundComplete &&
         inboundDone final final.afterInboundBytes)
       "collective stage final prerequisite state is incomplete"
-    let activated := group.filter (·.activated)
-    require row.srcLine (activated.length = expected)
-      s!"incomplete collective activation coverage for collective_id={row.collectiveId}: expected {expected}, found {activated.length}"
+    require row.srcLine (tally.activated = expected)
+      s!"incomplete collective activation coverage for collective_id={row.collectiveId}: expected {expected}, found {tally.activated}"
 
 def checkRows (rows : List Row) : Except String Unit := do
   require 1 (!rows.isEmpty) "empty collective activation trace"
