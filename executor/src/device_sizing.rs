@@ -353,14 +353,39 @@ pub(crate) fn dcqcn_device_work(
     }
 }
 
-/// Upper bounds on the device transitions one RoCE queue pair's timers can still take (P15):
-/// pacing ticks (at most one per remaining grid point, restarts included: a restart lands on a grid
-/// point and at most one tick is pending), control ticks (as for DCQCN, through the stop time), and
-/// retransmission-timeout firings (each re-arms `rto_ns` later, so at most one per `rto_ns` until
-/// the stop time; none with the timeout off). Outward-safe: an over-estimate costs only memory.
-/// Its consumers are the device planners' transition bounds.
+/// The data packets a RoCE queue pair is expected to source from here on, for sizing the event
+/// and queue arenas (P15): its remaining fresh packets plus one Go-back-N resend of what is
+/// outstanding, and never more than one per remaining grid tick. It is an estimate, not a bound:
+/// heavier loss resends more, and an arena that overflows takes the ordinary capacity retry, which
+/// grows it and replays the run from the start (byte-exact). The grid-tick bound itself, at a
+/// microsecond pacing interval, sized the HPCC incast's arenas at 17.7 GiB.
+pub(crate) fn roce_data_packet_estimate(
+    image: &SimulationImage,
+    generator: &crate::FlowGeneratorState,
+    roce: crate::RoceGenerator,
+) -> usize {
+    let mtu = roce.pacer.mtu_bytes.max(1);
+    let fresh = (roce
+        .pacer
+        .total_bytes
+        .saturating_sub(generator.bytes_emitted))
+    .div_ceil(mtu);
+    let resend = (generator.bytes_emitted.saturating_sub(roce.snd_una)).div_ceil(mtu);
+    let ticks = crate::validate::roce_grid_ticks(image, generator, roce);
+    usize::try_from(fresh.saturating_add(resend).saturating_add(1).min(ticks)).unwrap_or(usize::MAX)
+}
+
+/// An upper bound on the device transitions one RoCE queue pair can still cause, beyond what its
+/// estimated packets contribute (P15). Its timers: pacing ticks (at most one per remaining grid
+/// point, restarts included: a restart lands on a grid point and at most one tick is pending),
+/// control ticks (as for DCQCN, through the stop time) and timeout firings (each re-arms `rto_ns`
+/// later, so at most one per `rto_ns` until the stop time; none with the timeout off). Its
+/// packets: at most one data packet per grid tick, each answered by at most an ACK or NACK and a
+/// CNP, each taking at most `1 + 3 * hops` transitions. The bound feeds only the round and dispatch
+/// counts (scalars), so its size costs no memory; it keeps the round bound sound when loss makes
+/// the packet estimate low.
 #[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
-pub(crate) fn roce_timer_transitions(
+pub(crate) fn roce_transition_bound(
     image: &SimulationImage,
     generator: &crate::FlowGeneratorState,
     roce: crate::RoceGenerator,
@@ -378,10 +403,20 @@ pub(crate) fn roce_timer_transitions(
     } else {
         1 + stop / roce.rto_ns
     };
+    let hops = image
+        .flows
+        .get(generator.flow.0 as usize)
+        .map_or(0, |flow| {
+            flow.route.len().max(flow.reverse_route.len()) as u64
+        });
+    let packet_transitions = pacing
+        .saturating_mul(3)
+        .saturating_mul(1_u64.saturating_add(hops.saturating_mul(3)));
     usize::try_from(
         pacing
             .saturating_add(control_ticks)
-            .saturating_add(timeouts),
+            .saturating_add(timeouts)
+            .saturating_add(packet_transitions),
     )
     .unwrap_or(usize::MAX)
 }
@@ -676,13 +711,20 @@ pub fn size_default_device_plan(
     //     always precedes re-arm inside a single transition.
     //   * imported events stay a hard floor: an image may supply legacy residue that no armed
     //     timer owns, and that residue is resident until its deadline.
+    //   * a queue-pair source owns three: pacing, control and its one live timeout (P15), as both
+    //     device planners reserve.
     let dcqcn_timer_slots = image
         .host_states
         .iter()
         .flat_map(|state| &state.generators)
-        .filter(|generator| matches!(generator.kind, FlowGeneratorKind::Dcqcn(_)))
-        .count()
-        .saturating_mul(2);
+        .map(|generator| match generator.kind {
+            FlowGeneratorKind::Dcqcn(_) => 2,
+            FlowGeneratorKind::Roce(_) => 3,
+            FlowGeneratorKind::Constant(_)
+            | FlowGeneratorKind::Tcp(_)
+            | FlowGeneratorKind::Rate(_) => 0,
+        })
+        .fold(0_usize, usize::saturating_add);
     let fallback_fel_event_slots = node_count
         .checked_add(image.initial_events.len())
         .and_then(|slots| slots.checked_add(runtime_tcp_timer_slots))
@@ -1063,11 +1105,8 @@ fn flow_packet_counts(
                     data_counts[index] = data_counts[index].saturating_add(work.packets);
                 }
                 FlowGeneratorKind::Roce(roce) => {
-                    // At most one data packet per remaining grid tick (validation refuses queue
-                    // pairs on device backends; the bound keeps direct sizing conservative).
-                    let ticks = crate::validate::roce_grid_ticks(image, generator, roce);
                     data_counts[index] = data_counts[index]
-                        .saturating_add(usize::try_from(ticks).unwrap_or(usize::MAX));
+                        .saturating_add(roce_data_packet_estimate(image, generator, roce));
                 }
             }
         }
@@ -1796,12 +1835,16 @@ fn derived_channel_stream_capacities(
     image: &SimulationImage,
     context: &CapacityContext,
 ) -> Result<Vec<usize>, DeviceSizingError> {
-    let channels = image
-        .channels
-        .iter()
-        .enumerate()
-        .map(|(index, channel)| ((channel.link, channel.target), index))
-        .collect::<BTreeMap<_, _>>();
+    // A flow's channel for a (link, target) is the first: lowering appends the PFC control lanes
+    // after every flow channel, and a control lane can share its flow channel's link and target
+    // (a host-link lane always does). With the last entry winning, a flow channel's packets were
+    // counted on the control lane and the flow channel started at the bare slack (P15).
+    let mut channels = BTreeMap::new();
+    for (index, channel) in image.channels.iter().enumerate() {
+        channels
+            .entry((channel.link, channel.target))
+            .or_insert(index);
+    }
     let mut packet_counts = vec![0_usize; image.channels.len()];
     let mut minimum_serialization = vec![None::<u64>; image.channels.len()];
     for (flow_index, flow) in image.flows.iter().enumerate() {

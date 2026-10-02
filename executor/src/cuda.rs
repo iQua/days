@@ -2931,11 +2931,12 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
                 continue;
             }
             if let FlowGeneratorKind::Roce(roce) = generator.kind {
-                // P15: at most one data packet (fresh or a Go-back-N resend) per remaining grid
-                // tick; the pacing token is a zero-byte packet the initial count skips.
-                let ticks = crate::validate::roce_grid_ticks(image, generator, roce);
-                data_counts[index] =
-                    data_counts[index].saturating_add(usize::try_from(ticks).unwrap_or(usize::MAX));
+                // P15: an estimate (remaining fresh packets and one resend of the outstanding
+                // window); an overflow takes the capacity retry. The pacing token is a zero-byte
+                // packet the initial count skips.
+                data_counts[index] = data_counts[index].saturating_add(
+                    crate::device_sizing::roce_data_packet_estimate(image, generator, roce),
+                );
                 continue;
             }
             let FlowGeneratorKind::Constant(constant) = generator.kind else {
@@ -3584,12 +3585,16 @@ fn derived_channel_stream_capacities(
     // horizon. Constant propagation can retain at most ceil(propagation/serialization) older
     // events, and two additional records provide outward-rounded slack. The channel's finite
     // whole-run packet count remains an absolute cap on semantic events, before slack.
-    let channels = image
-        .channels
-        .iter()
-        .enumerate()
-        .map(|(index, channel)| ((channel.link, channel.target), index))
-        .collect::<BTreeMap<_, _>>();
+    // A flow's channel for a (link, target) is the first: lowering appends the PFC control lanes
+    // after every flow channel, and a control lane can share its flow channel's link and target
+    // (a host-link lane always does). With the last entry winning, a flow channel's packets were
+    // counted on the control lane and the flow channel started at the bare slack (P15).
+    let mut channels = BTreeMap::new();
+    for (index, channel) in image.channels.iter().enumerate() {
+        channels
+            .entry((channel.link, channel.target))
+            .or_insert(index);
+    }
     let mut packet_counts = vec![0_usize; image.channels.len()];
     let mut minimum_serialization = vec![None::<u64>; image.channels.len()];
     for (flow_index, flow) in image.flows.iter().enumerate() {
@@ -3849,7 +3854,7 @@ fn derived_transition_bound(
                     .saturating_add(work.control_ticks))
             }
             FlowGeneratorKind::Roce(roce) => Ok(bound
-                .saturating_add(crate::device_sizing::roce_timer_transitions(
+                .saturating_add(crate::device_sizing::roce_transition_bound(
                     image, generator, roce,
                 ))
                 .saturating_add(1)),
