@@ -1059,6 +1059,11 @@ check_case "stages/control-chain-shifted (queue-pair logs alone)" 0 "ACCEPT" \
   --pfc "$rd.pfc.csv" --horizon-ns "$rd_horizon" "$rd_stop" || true
 mutate_stages "control-chain-shifted" dcqcn "$shift_control" \
   "REJECT: collective: line 11: RoCE stage queue pair's first control tick is not one control interval after its release (node_id=1, flow_id=7)"
+# Row 11's release predicts Blocked (one tick of credit does not cover the first packet at the
+# controller's rate); the collective log alone allows Scheduled or Blocked.
+mutate_stages "release-status-not-the-pair-prediction" collective \
+  'NR == 11 { $column["after_status"] = "scheduled" }' \
+  "REJECT: collective: line 11: RoCE stage release status is not its queue pair's armed status at its first tick (node_id=1, flow_id=7)"
 mutate_stages "unreleased-stage-with-queue-pair-rows" collective \
   'NR == 11 { next }' \
   "REJECT: collective: line 6: unreleased RoCE stage has queue-pair rows (node_id=1, flow_id=7)"
