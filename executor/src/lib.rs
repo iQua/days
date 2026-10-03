@@ -28,6 +28,8 @@ pub mod device_sizing;
 pub mod event;
 pub mod image;
 mod mechanism_trace;
+// P16 D1 staging: the Mellanox-form controller, swapped in for `dcqcn` once its users move.
+pub mod mellanox;
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 pub mod metal;
 pub mod model;
