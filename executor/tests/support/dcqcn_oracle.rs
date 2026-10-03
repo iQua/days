@@ -7,7 +7,7 @@
 //! precedes every timer at `t`.
 #![allow(dead_code)]
 
-use days_executor::mellanox::{DcqcnController, DcqcnControllerConfig};
+use days_executor::{DcqcnController, DcqcnControllerConfig};
 
 const ONE: u128 = 1 << 63;
 

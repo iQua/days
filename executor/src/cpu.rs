@@ -3630,7 +3630,7 @@ fn assemble_result(
     })
 }
 
-/// Every RoCE queue pair's pacing and control tokens, with the LP slot of the pair's source.
+/// Every RoCE queue pair's pacing token, with the LP slot of the pair's source.
 fn queue_pair_tokens(image: &SimulationImage) -> BTreeMap<PayloadId, usize> {
     let mut tokens = BTreeMap::new();
     for owner in &image.nodes {
@@ -3646,7 +3646,6 @@ fn queue_pair_tokens(image: &SimulationImage) -> BTreeMap<PayloadId, usize> {
         for generator in state.generators.iter() {
             if let crate::FlowGeneratorKind::Roce(roce) = generator.kind {
                 tokens.insert(roce.pacing_timer_payload, lp_slot);
-                tokens.insert(roce.control_timer_payload, lp_slot);
             }
         }
     }

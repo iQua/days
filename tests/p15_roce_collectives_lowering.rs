@@ -120,34 +120,23 @@ fn gated_roce_stages_hold_their_tokens_zero_anchors_and_no_event() {
             let FlowGeneratorKind::Roce(roce) = generator.kind else {
                 unreachable!()
             };
-            for (token, kind) in [
-                (roce.pacing_timer_payload, PacketKind::RocePacingTimer),
-                (roce.control_timer_payload, PacketKind::DcqcnControlTimer),
-            ] {
-                let packet = packets
-                    .get(&token)
-                    .unwrap_or_else(|| panic!("{name}: a stage token is resident"));
-                assert_eq!(
-                    (packet.kind, packet.flow, packet.size_bytes),
-                    (kind, generator.flow, 0)
-                );
-            }
+            // The Mellanox-form controller owns no token (P16): one pacing token per stage.
+            let packet = packets
+                .get(&roce.pacing_timer_payload)
+                .unwrap_or_else(|| panic!("{name}: a stage token is resident"));
+            assert_eq!(
+                (packet.kind, packet.flow, packet.size_bytes),
+                (PacketKind::RocePacingTimer, generator.flow, 0)
+            );
             let events = image
                 .initial_events
                 .iter()
-                .filter(|event| {
-                    event.payload == roce.pacing_timer_payload
-                        || event.payload == roce.control_timer_payload
-                })
+                .filter(|event| event.payload == roce.pacing_timer_payload)
                 .collect::<Vec<_>>();
             if activated {
                 roots += 1;
                 assert!(roce.pacer_armed, "{name}: a root's pacer is armed");
-                assert_eq!(
-                    events.len(),
-                    2,
-                    "{name}: a root has its tick and its control tick"
-                );
+                assert_eq!(events.len(), 1, "{name}: a root has its pacing tick");
                 assert!(
                     events
                         .iter()
@@ -165,9 +154,9 @@ fn gated_roce_stages_hold_their_tokens_zero_anchors_and_no_event() {
                 assert_eq!(generator.next_emission.payload, roce.pacing_timer_payload);
                 assert_eq!(roce.pacer.first_pacing_time_ns, 0, "{name}: anchor at zero");
                 assert_eq!(
-                    roce.controller.next_control_time_ns,
-                    roce.controller.config.control_interval_ns,
-                    "{name}: the control anchor at zero"
+                    roce.controller,
+                    days_executor::DcqcnController::pristine(roce.controller.config),
+                    "{name}: a gated stage's controller is pristine"
                 );
                 assert_eq!(
                     (roce.next_psn, roce.snd_una, roce.rto_deadline_ns),
@@ -254,11 +243,8 @@ max_rate_gbps = 1.0
 g = 0.00390625
 ai_rate_gbps = 0.005
 hai_rate_gbps = 0.05
-mi_factor = 0.5
-rtt_ns = 50000
-cnp_interval_ns = 10000
+rp_timer_ns = 50000
 pacing_interval_ns = 1000
-increase_byte_threshold = 100000
 
 [flow.traffic.roce]
 retransmit_timeout_ns = 500000

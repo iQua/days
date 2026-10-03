@@ -15,10 +15,7 @@
 //! is otherwise unused and DCQCN adds no words to any plane. Words 4..6 remain zero because the
 //! readback reads them as the TCP receive-range metadata.
 
-use crate::{
-    DcqcnGenerator, DcqcnIncreaseStage, DcqcnReceiverState, FlowGeneratorKind, PacketKind,
-    SimulationImage,
-};
+use crate::{DcqcnGenerator, DcqcnReceiverState, FlowGeneratorKind, PacketKind, SimulationImage};
 
 /// Mechanism bit: some host holds a DCQCN notification point, so a receiver row can carry a
 /// DCQCN marker. Without it every receiver-row marker is a TCP `1` or an unused `0` for the whole
@@ -88,7 +85,7 @@ pub(crate) fn mechanism_flags(image: &SimulationImage) -> u64 {
     }
     for packet in &image.initial_packets {
         match packet.kind {
-            PacketKind::DcqcnCnp(_) | PacketKind::DcqcnControlTimer => flags |= MECHANISM_DCQCN,
+            PacketKind::DcqcnCnp(_) => flags |= MECHANISM_DCQCN,
             PacketKind::Pfc(_) => flags |= MECHANISM_PFC,
             PacketKind::RoceData(_)
             | PacketKind::RoceAck(_)
@@ -437,26 +434,32 @@ const G_RATE_NUMERATOR: usize = 16;
 const G_RATE_DENOMINATOR: usize = 17;
 const G_RATE_CREDIT_LOW: usize = 18;
 const G_RATE_CREDIT_HIGH: usize = 19;
+// The Mellanox-form DCQCN controller (P16), words 20..=35 of a DCQCN or RoCE generator row:
+// configuration in 20..=28 (the fast-recovery count in the low 32 bits of 28, the target clamp in
+// bit 32), mutable state in 29..=35 (the stage in the low 32 bits of 35, then one bit each for
+// `armed`, `alpha_pending`, `decrease_pending` and `increase_armed` from bit 32). Words 36..=39
+// are zero. `config.initial_rate_bps` is image data no device transition reads.
 pub(crate) const G_DCQCN_MIN_RATE: usize = 20;
 const G_DCQCN_MAX_RATE: usize = 21;
 const G_DCQCN_ADDITIVE_RATE: usize = 22;
 const G_DCQCN_HYPER_RATE: usize = 23;
 const G_DCQCN_G: usize = 24;
-const G_DCQCN_DECREASE: usize = 25;
-const G_DCQCN_CNP_INTERVAL: usize = 26;
-const G_DCQCN_CONTROL_INTERVAL: usize = 27;
-const G_DCQCN_BYTE_THRESHOLD: usize = 28;
+const G_DCQCN_ALPHA_INTERVAL: usize = 25;
+const G_DCQCN_DECREASE_INTERVAL: usize = 26;
+const G_DCQCN_INCREASE_INTERVAL: usize = 27;
+const G_DCQCN_STEPS_CLAMP: usize = 28;
 const G_DCQCN_ALPHA: usize = 29;
 const G_DCQCN_CURRENT_RATE: usize = 30;
 const G_DCQCN_TARGET_RATE: usize = 31;
-const G_DCQCN_CNP_SEEN: usize = 32;
-const G_DCQCN_LAST_CNP_VALID: usize = 33;
-const G_DCQCN_LAST_CNP: usize = 34;
-const G_DCQCN_STAGE: usize = 35;
-const G_DCQCN_STAGE_STEPS: usize = 36;
-const G_DCQCN_BYTES_SINCE_INCREASE: usize = 37;
-const G_DCQCN_NEXT_CONTROL: usize = 38;
-pub(crate) const G_DCQCN_CONTROL_PAYLOAD: usize = 39;
+const G_DCQCN_NEXT_ALPHA: usize = 32;
+const G_DCQCN_NEXT_DECREASE: usize = 33;
+const G_DCQCN_NEXT_INCREASE: usize = 34;
+const G_DCQCN_STATE: usize = 35;
+const DCQCN_CLAMP_BIT: u64 = 1 << 32;
+const DCQCN_ARMED_BIT: u64 = 1 << 32;
+const DCQCN_ALPHA_PENDING_BIT: u64 = 1 << 33;
+const DCQCN_DECREASE_PENDING_BIT: u64 = 1 << 34;
+const DCQCN_INCREASE_ARMED_BIT: u64 = 1 << 35;
 
 /// Receiver-row marker: no CNP sent yet.
 pub(crate) const DCQCN_RECEIVER_NO_CNP: u64 = 2;
@@ -467,46 +470,52 @@ const DR_CNP_INTERVAL: usize = 2;
 const DR_CNP_SIZE: usize = 3;
 
 /// Writes the DCQCN controller words (20..=39) of a DCQCN or RoCE generator row.
-fn encode_dcqcn_controller(
-    controller: &crate::DcqcnController,
-    control_timer_payload: crate::PayloadId,
-    row: &mut [u64],
-) {
+fn encode_dcqcn_controller(controller: &crate::DcqcnController, row: &mut [u64]) {
     let config = controller.config;
     row[G_DCQCN_MIN_RATE] = config.minimum_rate_bps;
     row[G_DCQCN_MAX_RATE] = config.maximum_rate_bps;
     row[G_DCQCN_ADDITIVE_RATE] = config.additive_rate_bps;
     row[G_DCQCN_HYPER_RATE] = config.hyper_rate_bps;
-    row[G_DCQCN_G] = config.g_ppb;
-    row[G_DCQCN_DECREASE] = config.decrease_ppb;
-    row[G_DCQCN_CNP_INTERVAL] = config.cnp_interval_ns;
-    row[G_DCQCN_CONTROL_INTERVAL] = config.control_interval_ns;
-    row[G_DCQCN_BYTE_THRESHOLD] = config.increase_byte_threshold;
-    row[G_DCQCN_ALPHA] = controller.alpha_ppb;
+    row[G_DCQCN_G] = config.g_q63;
+    row[G_DCQCN_ALPHA_INTERVAL] = config.alpha_interval_ns;
+    row[G_DCQCN_DECREASE_INTERVAL] = config.decrease_interval_ns;
+    row[G_DCQCN_INCREASE_INTERVAL] = config.increase_interval_ns;
+    row[G_DCQCN_STEPS_CLAMP] = u64::from(config.fast_recovery_steps)
+        | if config.clamp_target_rate {
+            DCQCN_CLAMP_BIT
+        } else {
+            0
+        };
+    row[G_DCQCN_ALPHA] = controller.alpha_q63;
     row[G_DCQCN_CURRENT_RATE] = controller.current_rate_bps;
     row[G_DCQCN_TARGET_RATE] = controller.target_rate_bps;
-    row[G_DCQCN_CNP_SEEN] = u64::from(controller.cnp_seen);
-    row[G_DCQCN_LAST_CNP_VALID] = u64::from(controller.last_cnp_time_ns.is_some());
-    row[G_DCQCN_LAST_CNP] = controller.last_cnp_time_ns.unwrap_or(0);
-    row[G_DCQCN_STAGE] = controller.stage as u64;
-    row[G_DCQCN_STAGE_STEPS] = u64::from(controller.stage_steps);
-    row[G_DCQCN_BYTES_SINCE_INCREASE] = controller.bytes_since_increase;
-    row[G_DCQCN_NEXT_CONTROL] = controller.next_control_time_ns;
-    row[G_DCQCN_CONTROL_PAYLOAD] = control_timer_payload.0;
+    row[G_DCQCN_NEXT_ALPHA] = controller.next_alpha_ns;
+    row[G_DCQCN_NEXT_DECREASE] = controller.next_decrease_ns;
+    row[G_DCQCN_NEXT_INCREASE] = controller.next_increase_ns;
+    let bit = |flag: bool, bit: u64| if flag { bit } else { 0 };
+    row[G_DCQCN_STATE] = u64::from(controller.stage)
+        | bit(controller.armed, DCQCN_ARMED_BIT)
+        | bit(controller.alpha_pending, DCQCN_ALPHA_PENDING_BIT)
+        | bit(controller.decrease_pending, DCQCN_DECREASE_PENDING_BIT)
+        | bit(controller.increase_armed, DCQCN_INCREASE_ARMED_BIT);
+    row[36..40].fill(0);
 }
 
-/// The controller words no device transition writes: configuration and the control token.
-const CONTROLLER_IMMUTABLE: [usize; 10] = [
+/// The controller words no device transition writes: configuration and the unused tail.
+const CONTROLLER_IMMUTABLE: [usize; 13] = [
     G_DCQCN_MIN_RATE,
     G_DCQCN_MAX_RATE,
     G_DCQCN_ADDITIVE_RATE,
     G_DCQCN_HYPER_RATE,
     G_DCQCN_G,
-    G_DCQCN_DECREASE,
-    G_DCQCN_CNP_INTERVAL,
-    G_DCQCN_CONTROL_INTERVAL,
-    G_DCQCN_BYTE_THRESHOLD,
-    G_DCQCN_CONTROL_PAYLOAD,
+    G_DCQCN_ALPHA_INTERVAL,
+    G_DCQCN_DECREASE_INTERVAL,
+    G_DCQCN_INCREASE_INTERVAL,
+    G_DCQCN_STEPS_CLAMP,
+    36,
+    37,
+    38,
+    39,
 ];
 
 /// Restores the mutable controller words of a DCQCN or RoCE row; the caller checks the
@@ -515,25 +524,22 @@ fn decode_dcqcn_controller(
     row: &[u64],
     controller: &mut crate::DcqcnController,
 ) -> Result<(), &'static str> {
-    let stage = match row[G_DCQCN_STAGE] {
-        0 => DcqcnIncreaseStage::FastRecovery,
-        1 => DcqcnIncreaseStage::Additive,
-        2 => DcqcnIncreaseStage::Hyper,
-        _ => return Err("DCQCN generator row carries an unknown increase stage"),
-    };
-    let stage_steps = u8::try_from(row[G_DCQCN_STAGE_STEPS])
-        .map_err(|_| "DCQCN generator row stage counter exceeds u8")?;
-    controller.alpha_ppb = row[G_DCQCN_ALPHA];
+    let state = row[G_DCQCN_STATE];
+    if state >> 36 != 0 {
+        return Err("DCQCN generator row carries unknown controller state bits");
+    }
+    controller.alpha_q63 = row[G_DCQCN_ALPHA];
     controller.current_rate_bps = row[G_DCQCN_CURRENT_RATE];
     controller.target_rate_bps = row[G_DCQCN_TARGET_RATE];
-    controller.cnp_seen = flag_word(row[G_DCQCN_CNP_SEEN])?;
-    controller.last_cnp_time_ns =
-        flag_word(row[G_DCQCN_LAST_CNP_VALID])?.then_some(row[G_DCQCN_LAST_CNP]);
-    controller.stage = stage;
-    controller.stage_steps = stage_steps;
-    controller.bytes_since_increase = row[G_DCQCN_BYTES_SINCE_INCREASE];
-    controller.next_control_time_ns = row[G_DCQCN_NEXT_CONTROL];
-    Ok(())
+    controller.next_alpha_ns = row[G_DCQCN_NEXT_ALPHA];
+    controller.next_decrease_ns = row[G_DCQCN_NEXT_DECREASE];
+    controller.next_increase_ns = row[G_DCQCN_NEXT_INCREASE];
+    controller.stage = state as u32;
+    controller.armed = state & DCQCN_ARMED_BIT != 0;
+    controller.alpha_pending = state & DCQCN_ALPHA_PENDING_BIT != 0;
+    controller.decrease_pending = state & DCQCN_DECREASE_PENDING_BIT != 0;
+    controller.increase_armed = state & DCQCN_INCREASE_ARMED_BIT != 0;
+    controller.validate_state()
 }
 
 fn flag_word(word: u64) -> Result<bool, &'static str> {
@@ -556,13 +562,13 @@ pub(crate) fn encode_dcqcn_generator(dcqcn: &DcqcnGenerator, row: &mut [u64]) {
     row[G_RATE_DENOMINATOR] = rate.rate_denominator;
     row[G_RATE_CREDIT_LOW] = rate.credit_quanta as u64;
     row[G_RATE_CREDIT_HIGH] = (rate.credit_quanta >> 64) as u64;
-    encode_dcqcn_controller(&dcqcn.controller, dcqcn.control_timer_payload, row);
+    encode_dcqcn_controller(&dcqcn.controller, row);
 }
 
 /// Restores the mutable DCQCN words of one generator row onto the image's generator.
 ///
-/// Configuration, the control-timer token and the CNP size are image data no device transition
-/// writes; they are checked rather than trusted, so a corrupted row surfaces as an error.
+/// Configuration and the CNP size are image data no device transition writes; they are checked
+/// rather than trusted, so a corrupted row surfaces as an error.
 pub(crate) fn decode_dcqcn_generator(
     row: &[u64],
     dcqcn: &mut DcqcnGenerator,
@@ -615,7 +621,7 @@ pub(crate) fn encode_roce_generator(roce: &crate::RoceGenerator, row: &mut [u64]
     row[G_ROCE_SND_UNA] = roce.snd_una;
     row[G_RATE_CREDIT_LOW] = pacer.credit_quanta as u64;
     row[G_RATE_CREDIT_HIGH] = (pacer.credit_quanta >> 64) as u64;
-    encode_dcqcn_controller(&roce.controller, roce.control_timer_payload, row);
+    encode_dcqcn_controller(&roce.controller, row);
     row[G_ROCE_PACER_ARMED] = u64::from(roce.pacer_armed);
     row[G_ROCE_RTO_DEADLINE] = roce.rto_deadline_ns;
     row[G_ROCE_RTO] = roce.rto_ns;
@@ -823,7 +829,7 @@ pub(crate) fn queue_pair_tokens(
             FlowGeneratorKind::Roce(roce) => Some(roce),
             _ => None,
         })
-        .flat_map(|roce| [roce.pacing_timer_payload, roce.control_timer_payload])
+        .map(|roce| roce.pacing_timer_payload)
         .filter_map(|payload| initial_by_payload.get(&payload).copied())
         .collect()
 }
@@ -841,8 +847,8 @@ pub(crate) fn recompute_pause_parked(image: &SimulationImage, state: &mut crate:
 
 /// An upper bound on the device transitions one RoCE queue pair can still cause, beyond what its
 /// estimated packets contribute (P15). Its timers: pacing ticks (at most one per remaining grid
-/// point, restarts included: a restart lands on a grid point and at most one tick is pending),
-/// control ticks (as for DCQCN, through the stop time) and timeout firings (each re-arms `rto_ns`
+/// point, restarts included: a restart lands on a grid point and at most one tick is pending)
+/// and timeout firings (the Mellanox-form controller has no timer event, P16) (each re-arms `rto_ns`
 /// later, so at most one per `rto_ns` until the stop time; none with the timeout off). Its
 /// packets: at most one data packet per grid tick, each answered by at most an ACK or NACK and a
 /// CNP, each taking at most `1 + 3 * hops` transitions. The bound feeds only the round and dispatch
@@ -855,12 +861,6 @@ pub(crate) fn roce_transition_bound(
 ) -> usize {
     let stop = image.stop_time_ns;
     let pacing = crate::validate::roce_grid_ticks(image, generator, roce);
-    let control = &roce.controller;
-    let control_ticks = if control.next_control_time_ns <= stop {
-        1 + (stop - control.next_control_time_ns) / control.config.control_interval_ns.max(1)
-    } else {
-        0
-    };
     let timeouts = stop.checked_div(roce.rto_ns).map_or(0, |fires| fires + 1);
     let hops = image
         .flows
@@ -873,7 +873,6 @@ pub(crate) fn roce_transition_bound(
         .saturating_mul(1_u64.saturating_add(hops.saturating_mul(3)));
     usize::try_from(
         pacing
-            .saturating_add(control_ticks)
             .saturating_add(timeouts)
             .saturating_add(packet_transitions),
     )
@@ -919,30 +918,31 @@ mod tests {
     use crate::{DcqcnController, DcqcnControllerConfig, FlowId, PayloadId, RateGenerator};
 
     fn generator() -> DcqcnGenerator {
-        let mut controller = DcqcnController::new(
-            DcqcnControllerConfig {
-                initial_rate_bps: 10,
-                minimum_rate_bps: 1,
-                maximum_rate_bps: 20,
-                additive_rate_bps: 2,
-                hyper_rate_bps: 3,
-                g_ppb: 4,
-                decrease_ppb: 5,
-                cnp_interval_ns: 6,
-                control_interval_ns: 7,
-                increase_byte_threshold: 8,
-            },
-            9,
-        )
+        let mut controller = DcqcnController::new(DcqcnControllerConfig {
+            initial_rate_bps: 10,
+            minimum_rate_bps: 3,
+            maximum_rate_bps: 20,
+            additive_rate_bps: 2,
+            hyper_rate_bps: 3,
+            g_q63: 4,
+            alpha_interval_ns: 5,
+            decrease_interval_ns: 6,
+            increase_interval_ns: 7,
+            fast_recovery_steps: 8,
+            clamp_target_rate: true,
+        })
         .expect("valid controller");
-        controller.alpha_ppb = 11;
+        controller.alpha_q63 = 11;
         controller.current_rate_bps = 12;
         controller.target_rate_bps = 13;
-        controller.cnp_seen = true;
-        controller.last_cnp_time_ns = Some(u64::MAX);
-        controller.stage = DcqcnIncreaseStage::Additive;
-        controller.stage_steps = 4;
-        controller.bytes_since_increase = 14;
+        controller.next_alpha_ns = u64::MAX;
+        controller.next_decrease_ns = 24;
+        controller.next_increase_ns = 25;
+        controller.stage = 9;
+        controller.armed = true;
+        controller.alpha_pending = false;
+        controller.decrease_pending = true;
+        controller.increase_armed = true;
         DcqcnGenerator {
             rate: RateGenerator {
                 first_pacing_time_ns: 15,
@@ -954,7 +954,6 @@ mod tests {
                 credit_quanta: (u128::from(u64::MAX) << 64) | 20,
             },
             controller,
-            control_timer_payload: PayloadId(21),
             cnp_size_bytes: 22,
         }
     }
@@ -1061,18 +1060,13 @@ mod tests {
             )),
             MECHANISM_DCQCN
         );
-        for resident in [
-            PacketKind::DcqcnCnp(crate::DcqcnCnpHeader {
-                trigger_payload: PayloadId(0),
-            }),
-            PacketKind::DcqcnControlTimer,
-        ] {
-            assert_eq!(
-                mechanism_flags(&image(vec![host(Vec::new())], vec![resident])),
-                MECHANISM_DCQCN,
-                "{resident:?}"
-            );
-        }
+        let resident = PacketKind::DcqcnCnp(crate::DcqcnCnpHeader {
+            trigger_payload: PayloadId(0),
+        });
+        assert_eq!(
+            mechanism_flags(&image(vec![host(Vec::new())], vec![resident])),
+            MECHANISM_DCQCN
+        );
     }
 
     fn pfc_queue() -> crate::SwitchQueueState {
@@ -1250,10 +1244,6 @@ mod tests {
                         trigger_payload: PayloadId(0),
                     })],
                 ),
-            ),
-            (
-                "resident control timer",
-                image(vec![host(Vec::new())], vec![PacketKind::DcqcnControlTimer]),
             ),
             ("PFC queue state", switch_image(pfc_queue())),
             (
@@ -1629,17 +1619,26 @@ mod tests {
         let mut row = [0_u64; 43];
         encode_dcqcn_generator(&original, &mut row);
         let mut decoded = original;
-        decoded.controller.alpha_ppb = 0;
-        decoded.controller.last_cnp_time_ns = None;
-        decoded.controller.stage = DcqcnIncreaseStage::Hyper;
+        decoded.controller = DcqcnController::pristine(original.controller.config);
         decoded.rate.credit_quanta = 0;
         decode_dcqcn_generator(&row, &mut decoded).expect("row must decode");
         assert_eq!(decoded, original);
+        assert_eq!(
+            &row[36..40],
+            &[0, 0, 0, 0],
+            "the controller's unused tail is zero"
+        );
 
         row[G_DCQCN_G] += 1;
         assert!(decode_dcqcn_generator(&row, &mut decoded).is_err());
         row[G_DCQCN_G] -= 1;
-        row[G_DCQCN_STAGE] = 3;
+        // An unknown state bit, and a stage above fast_recovery_times + 1, are corrupt rows.
+        row[G_DCQCN_STATE] |= 1 << 36;
+        assert!(decode_dcqcn_generator(&row, &mut decoded).is_err());
+        row[G_DCQCN_STATE] &= !(1 << 36);
+        row[G_DCQCN_STATE] = (row[G_DCQCN_STATE] & !u64::from(u32::MAX)) | 10;
+        assert!(decode_dcqcn_generator(&row, &mut decoded).is_err());
+        row[39] = 1;
         assert!(decode_dcqcn_generator(&row, &mut decoded).is_err());
     }
 
@@ -1675,7 +1674,6 @@ mod tests {
                 credit_quanta: (u128::from(u64::MAX) << 64) | 20,
             },
             controller: dcqcn.controller,
-            control_timer_payload: PayloadId(21),
             pacing_timer_payload: PayloadId(23),
             next_psn: 34,
             snd_una: 17,
@@ -1698,8 +1696,7 @@ mod tests {
         decoded.pacer.credit_quanta = 0;
         decoded.pacer_armed = false;
         decoded.rto_deadline_ns = 0;
-        decoded.controller.alpha_ppb = 0;
-        decoded.controller.stage = DcqcnIncreaseStage::Hyper;
+        decoded.controller = crate::DcqcnController::pristine(original.controller.config);
         decode_roce_generator(&row, &mut decoded).expect("row must decode");
         assert_eq!(decoded, original);
 
@@ -1902,18 +1899,13 @@ mod tests {
             route: Vec::new(),
             reverse_route: Vec::new(),
         });
-        for (id, kind) in [
-            (21, PacketKind::DcqcnControlTimer),
-            (23, PacketKind::RocePacingTimer),
-        ] {
-            image.initial_packets.push(crate::PacketDescriptor {
-                id: PayloadId(id),
-                flow: FlowId(0),
-                size_bytes: 0,
-                ecn_marked: false,
-                kind,
-            });
-        }
+        image.initial_packets.push(crate::PacketDescriptor {
+            id: PayloadId(23),
+            flow: FlowId(0),
+            size_bytes: 0,
+            ecn_marked: false,
+            kind: PacketKind::RocePacingTimer,
+        });
 
         let mut words = vec![0_u64; PLAN_TCP_RECEIVER_WORDS];
         let region = append_roce_region(&image, 0, &mut words).expect("a receiver plans a region");
@@ -1941,7 +1933,7 @@ mod tests {
         let tokens = queue_pair_tokens(&image, &by_payload);
         assert_eq!(
             tokens.iter().map(|packet| packet.id.0).collect::<Vec<_>>(),
-            vec![23, 21]
+            vec![23]
         );
 
         let mut state = image.host_states[0].clone();
@@ -1956,7 +1948,7 @@ mod tests {
     }
 
     /// The transition bound counts every grid tick's pacing transition and up to three packets per
-    /// tick at `1 + 3 * hops` transitions each, plus control ticks and timeout firings.
+    /// tick at `1 + 3 * hops` transitions each, plus timeout firings (no control tick, P16).
     #[test]
     fn roce_transition_bound_covers_ticks_packets_and_timers() {
         let mut image = image(Vec::new(), Vec::new());
@@ -1971,10 +1963,9 @@ mod tests {
             reverse_route: vec![crate::LinkId(2), crate::LinkId(3)],
         });
         let mut roce = roce_generator();
-        roce.controller.next_control_time_ns = 200;
         let mut generator = generator_state(FlowGeneratorKind::Roce(roce));
         generator.next_emission.departure_time_ns = 0;
-        // 11 grid ticks (0, 16, ..., 160), no control tick before the stop, 4 timeout firings
+        // 11 grid ticks (0, 16, ..., 160), 4 timeout firings
         // (`rto_ns` 50 up to 160), and 3 packets per tick at 1 + 3 * 2 transitions each.
         assert_eq!(
             roce_transition_bound(&image, &generator, roce),

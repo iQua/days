@@ -125,10 +125,6 @@ fn a_gated_stage_owns_no_tick_at_any_time() {
             &with_tick(&image, slot, roce.pacing_timer_payload, time_ns),
             "parked pacer owns a pending tick",
         );
-        refused(
-            &with_tick(&image, slot, roce.control_timer_payload, time_ns),
-            "owns a pending control tick before its release",
-        );
     }
 }
 
@@ -181,11 +177,11 @@ fn a_gated_roce_stage_is_pristine_and_idle() {
         "dependency-blocked after its sending state changed",
     );
     let control = with_roce(&image, slot, position, |_, roce| {
-        roce.controller.next_control_time_ns += 1_000;
+        roce.controller.current_rate_bps -= 1;
     });
     refused(
         &control,
-        "dependency-blocked after its sending state changed",
+        "has a DCQCN controller that moved before its first feedback",
     );
     let credited = with_roce(&image, slot, position, |_, roce| {
         roce.pacer.credit_quanta = 1;

@@ -28,8 +28,6 @@ pub mod device_sizing;
 pub mod event;
 pub mod image;
 mod mechanism_trace;
-// P16 D1 staging: the Mellanox-form controller, swapped in for `dcqcn` once its users move.
-pub mod mellanox;
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 pub mod metal;
 pub mod model;
@@ -67,8 +65,8 @@ pub use cuda::{
     size_cuda_plan_for_testing,
 };
 pub use dcqcn::{
-    DCQCN_FRACTION_SCALE, DCQCN_STAGE_STEPS, DcqcnArithmeticError, DcqcnController,
-    DcqcnControllerConfig, DcqcnIncreaseStage, DcqcnTransitionKind, DcqcnTransitionRecord,
+    DCQCN_ALPHA_ONE, DcqcnAdvance, DcqcnArithmeticError, DcqcnController, DcqcnControllerConfig,
+    DcqcnTransitionKind, DcqcnTransitionRecord,
 };
 pub use device_capacity::{
     CapacityRetryRecord, CapacityWarmStart, ChannelStreamCapacityLevel, DeviceCapacityCaps,

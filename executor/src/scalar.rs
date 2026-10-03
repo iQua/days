@@ -1874,14 +1874,11 @@ impl<'image> TransitionState<'image> {
     }
 
     /// Releases a RoCE collective stage at `t`, the parent event's time (design note §5.2,
-    /// rulings C2 and C5): the pacing grid and the DCQCN control timer, held at zero while the
-    /// stage was gated, are anchored at `t`, the pacer is armed with its first tick at `t`, and the
-    /// control tick follows one control interval later if it falls within the stop. The pair is
-    /// then exactly a queue pair whose initial delay is `t`; its retransmission timeout is armed
-    /// by its first send, and a tick that finds its data class paused parks it (H1).
-    ///
-    /// The ticks are emitted in a plain pair's order (pacing, then control), so a control tick on
-    /// the pacing grid precedes the pacing tick of the same instant, as for a lowered pair.
+    /// rulings C2 and C5): the pacing grid, held at zero while the stage was gated, is anchored at
+    /// `t`, and the pacer is armed with its first tick at `t`. The pair is then exactly a queue pair
+    /// whose initial delay is `t`; its retransmission timeout is armed by its first send, and a tick
+    /// that finds its data class paused parks it (H1). Its DCQCN controller stays pristine: the
+    /// Mellanox form starts its timers at the first feedback (P16), so nothing is anchored.
     // Out of line: it runs once per stage, and must not grow `activate_wrapped_stage`'s TCP path.
     #[inline(never)]
     fn start_roce_stage(
@@ -1894,8 +1891,7 @@ impl<'image> TransitionState<'image> {
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
         let now = parent.key.time_ns;
-        let stop_time_ns = self.image.stop_time_ns;
-        let (pacing_token, control) = {
+        let pacing_token = {
             let (mut state, index) = self.host_parts_mut(node)?;
             let position = index
                 .first_generator(flow)
@@ -1911,11 +1907,7 @@ impl<'image> TransitionState<'image> {
                     payload: parent.payload,
                 });
             };
-            let control_ns = now
-                .checked_add(roce.controller.config.control_interval_ns)
-                .ok_or(ExecutionError::GeneratorTimeOverflow(flow))?;
             roce.pacer.first_pacing_time_ns = now;
-            roce.controller.next_control_time_ns = control_ns;
             roce.pacer_armed = true;
             generator.next_emission = crate::ScheduledEmission {
                 status: crate::roce::armed_status(&roce),
@@ -1923,26 +1915,20 @@ impl<'image> TransitionState<'image> {
                 payload: roce.pacing_timer_payload,
             };
             generator.kind = FlowGeneratorKind::Roce(roce);
-            (
-                roce.pacing_timer_payload,
-                (control_ns <= stop_time_ns).then_some((roce.control_timer_payload, control_ns)),
-            )
+            roce.pacing_timer_payload
         };
         self.push_stage_progress(node, parent, flow, cause, ordinal, true)?;
-        let ticks = [Some((pacing_token, now)), control];
-        for (payload, time_ns) in ticks.into_iter().flatten() {
-            self.emit_from_host(
-                node,
-                parent,
-                ChildEmission {
-                    target: node.id,
-                    kind: EventKind::PacingTimer,
-                    payload,
-                    time_ns,
-                },
-                children,
-            )?;
-        }
+        self.emit_from_host(
+            node,
+            parent,
+            ChildEmission {
+                target: node.id,
+                kind: EventKind::PacingTimer,
+                payload: pacing_token,
+                time_ns: now,
+            },
+            children,
+        )?;
         Ok(())
     }
 
@@ -2927,10 +2913,27 @@ impl<'image> TransitionState<'image> {
                     return Err(ExecutionError::InvalidSchedulerState(node.id));
                 };
                 let before = crate::roce::RoceSenderView::of(generator, &roce);
+                let flow = generator.flow;
+                // A phase-0 transition: the controller instants before `now` apply first.
+                let complete = roce.snd_una >= roce.pacer.total_bytes;
+                let materialized = dcqcn_materialize(&mut roce.controller, complete, now)
+                    .filter(|(_, advance)| advance.applied_rate_change());
+                if let Some((controller_before, advance)) = materialized {
+                    records.push(crate::MechanismTransitionRecord::Dcqcn(dcqcn_record(
+                        event.key,
+                        node.id,
+                        flow,
+                        crate::DcqcnTransitionKind::Advance,
+                        now,
+                        advance,
+                        false,
+                        controller_before,
+                        roce.controller,
+                    )));
+                }
                 let tick_ns = restart_roce_pacer(generator, &mut roce, now, stop_time_ns)?;
                 settle_roce_sender(generator, &roce, generator.next_emission.status);
                 generator.kind = FlowGeneratorKind::Roce(roce);
-                let flow = generator.flow;
                 records.push(roce_sender_record(
                     event.key,
                     node.id,
@@ -3191,28 +3194,36 @@ impl<'image> TransitionState<'image> {
                 .arrivals
                 .checked_add(1)
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
-            // A queue pair's reaction point is DCQCN's own; the rate change also moves its pacer's
-            // next-tick prediction.
-            let (before, after, applied) = match generator.kind {
+            // A feedback (P16 ruling D4): the controller instants before `now` apply, then the
+            // feedback. A complete flow's controller is frozen and ignores it (ruling D11). A
+            // queue pair's rate change also moves its pacer's next-tick prediction.
+            let now = event.key.time_ns;
+            let applied = match generator.kind {
                 FlowGeneratorKind::Dcqcn(mut dcqcn) => {
-                    let before = dcqcn.controller;
-                    let applied = dcqcn
-                        .controller
-                        .on_cnp(event.key.time_ns)
-                        .map_err(|_| ExecutionError::CounterOverflow(node.id))?;
-                    dcqcn.rate.rate_numerator_bits_per_second = dcqcn.controller.current_rate_bps;
-                    generator.kind = FlowGeneratorKind::Dcqcn(dcqcn);
-                    (before, dcqcn.controller, applied)
+                    if !matches!(
+                        generator.next_emission.status,
+                        GeneratorStatus::Scheduled | GeneratorStatus::Blocked
+                    ) {
+                        None
+                    } else {
+                        let before = dcqcn.controller;
+                        let advance = dcqcn.controller.on_feedback(now);
+                        dcqcn.rate.rate_numerator_bits_per_second =
+                            dcqcn.controller.current_rate_bps;
+                        generator.kind = FlowGeneratorKind::Dcqcn(dcqcn);
+                        Some((before, advance, dcqcn.controller))
+                    }
                 }
                 FlowGeneratorKind::Roce(mut roce) => {
-                    let before = roce.controller;
-                    let applied = roce
-                        .controller
-                        .on_cnp(event.key.time_ns)
-                        .map_err(|_| ExecutionError::CounterOverflow(node.id))?;
-                    settle_roce_sender(generator, &roce, generator.next_emission.status);
-                    generator.kind = FlowGeneratorKind::Roce(roce);
-                    (before, roce.controller, applied)
+                    if roce.snd_una >= roce.pacer.total_bytes {
+                        None
+                    } else {
+                        let before = roce.controller;
+                        let advance = roce.controller.on_feedback(now);
+                        settle_roce_sender(generator, &roce, generator.next_emission.status);
+                        generator.kind = FlowGeneratorKind::Roce(roce);
+                        Some((before, advance, roce.controller))
+                    }
                 }
                 _ => {
                     return Err(ExecutionError::UnknownGenerator {
@@ -3221,20 +3232,23 @@ impl<'image> TransitionState<'image> {
                     });
                 }
             };
-            crate::DcqcnTransitionRecord {
-                key: event.key,
-                node: node.id,
-                flow: packet.flow,
-                kind: crate::DcqcnTransitionKind::Cnp,
-                applied,
-                emitted_bytes: 0,
-                before,
-                after,
-            }
+            applied.map(|(before, advance, after)| {
+                dcqcn_record(
+                    event.key,
+                    node.id,
+                    packet.flow,
+                    crate::DcqcnTransitionKind::Feedback,
+                    now,
+                    advance,
+                    false,
+                    before,
+                    after,
+                )
+            })
         };
         if self.observation_mode == ObservationMode::Full {
             self.mechanism_transitions
-                .push(crate::MechanismTransitionRecord::Dcqcn(transition));
+                .extend(transition.map(crate::MechanismTransitionRecord::Dcqcn));
         }
         self.record_arrival(node.id, packet, event.key, ArrivalDisposition::Feedback)?;
         self.mark_terminal(packet.id)
@@ -3657,9 +3671,6 @@ impl<'image> TransitionState<'image> {
         if compute_stage_owns {
             return self.host_compute_timer(node, event, packet.flow, children);
         }
-        if packet.kind == PacketKind::DcqcnControlTimer {
-            return self.host_dcqcn_control_timer(node, event, packet, children);
-        }
         let dcqcn_owns = {
             let (state, index) = self.host_parts_mut(node)?;
             index
@@ -3890,7 +3901,8 @@ impl<'image> TransitionState<'image> {
         let mut next_packet = None;
         let mut next_timer = None;
         let mut terminal_unused_token = false;
-        let mut byte_transition = None;
+        let mut tick_transition = None;
+        let full = self.observation_mode == ObservationMode::Full;
 
         {
             let state = self.host_state_mut(node)?;
@@ -3914,6 +3926,12 @@ impl<'image> TransitionState<'image> {
                 return Ok(());
             }
 
+            // A phase-1 transition: the controller instants at or before `now` apply before the
+            // tick reads the rate (P16 ruling D2).
+            let bound = event.key.time_ns.saturating_add(1);
+            let controller_before = dcqcn.controller;
+            let mut advance = dcqcn_materialize(&mut dcqcn.controller, false, bound)
+                .map_or(crate::DcqcnAdvance::default(), |(_, advance)| advance);
             let scale = pacing_credit_scale(dcqcn.rate.rate_denominator)
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
             let tick_credit = pacing_tick_credit(
@@ -3942,21 +3960,6 @@ impl<'image> TransitionState<'image> {
                     .sourced_packets
                     .checked_add(1)
                     .ok_or(ExecutionError::CounterOverflow(node.id))?;
-                let before = dcqcn.controller;
-                let applied = dcqcn
-                    .controller
-                    .on_bytes_emitted(packet.size_bytes)
-                    .map_err(|_| ExecutionError::CounterOverflow(node.id))?;
-                byte_transition = Some(crate::DcqcnTransitionRecord {
-                    key: event.key,
-                    node: node.id,
-                    flow: packet.flow,
-                    kind: crate::DcqcnTransitionKind::Bytes,
-                    applied,
-                    emitted_bytes: packet.size_bytes,
-                    before,
-                    after: dcqcn.controller,
-                });
                 emitted = true;
             }
             dcqcn.rate.rate_numerator_bits_per_second = dcqcn.controller.current_rate_bps;
@@ -4021,17 +4024,41 @@ impl<'image> TransitionState<'image> {
                 } else {
                     GeneratorStatus::Stopped
                 };
+                // The flow is complete: its controller freezes at this tick (ruling D11).
+                let settled = dcqcn.controller.settle(bound);
+                advance.alpha_ticks += settled.alpha_ticks;
+                advance.increase_fires += settled.increase_fires;
+                advance.decrease_cuts += settled.decrease_cuts;
                 if let Some(candidate_time) = candidate_time {
                     generator.next_emission.departure_time_ns = candidate_time;
                 }
                 terminal_unused_token = !emitted;
+            }
+            dcqcn.rate.rate_numerator_bits_per_second = dcqcn.controller.current_rate_bps;
+            // Every tick of an unreliable flow is a row (ruling D17); the rate it read is the
+            // row's `after.current_rate_bps`, unchanged by a freeze.
+            if full {
+                tick_transition = Some(dcqcn_record(
+                    event.key,
+                    node.id,
+                    packet.flow,
+                    crate::DcqcnTransitionKind::Tick,
+                    bound,
+                    advance,
+                    !matches!(
+                        generator.next_emission.status,
+                        GeneratorStatus::Scheduled | GeneratorStatus::Blocked
+                    ),
+                    controller_before,
+                    dcqcn.controller,
+                ));
             }
             generator.kind = FlowGeneratorKind::Dcqcn(dcqcn);
         }
 
         if self.observation_mode == ObservationMode::Full {
             self.mechanism_transitions
-                .extend(byte_transition.map(crate::MechanismTransitionRecord::Dcqcn));
+                .extend(tick_transition.map(crate::MechanismTransitionRecord::Dcqcn));
         }
         if emitted {
             self.set_source_time(packet.id, event.key.time_ns)?;
@@ -4083,93 +4110,6 @@ impl<'image> TransitionState<'image> {
         Ok(())
     }
 
-    fn host_dcqcn_control_timer(
-        &mut self,
-        node: NodeDescriptor,
-        event: Event,
-        packet: PacketDescriptor,
-        children: &mut Vec<Event>,
-    ) -> Result<(), ExecutionError> {
-        let stop_time_ns = self.image.stop_time_ns;
-        let (transition, next_time_ns, queue_pair) = {
-            // Keyed, as the CNP arrival is.
-            let (mut state, index) = self.host_parts_mut(node)?;
-            let position =
-                index
-                    .first_generator(packet.flow)
-                    .ok_or(ExecutionError::UnknownGenerator {
-                        node: node.id,
-                        flow: packet.flow,
-                    })?;
-            let generator = &mut state.generators[position];
-            let (control_payload, controller) = match generator.kind {
-                FlowGeneratorKind::Dcqcn(dcqcn) => (dcqcn.control_timer_payload, dcqcn.controller),
-                FlowGeneratorKind::Roce(roce) => (roce.control_timer_payload, roce.controller),
-                _ => return Ok(()),
-            };
-            let queue_pair = matches!(generator.kind, FlowGeneratorKind::Roce(_));
-            if control_payload != packet.id || controller.next_control_time_ns != event.key.time_ns
-            {
-                return Ok(());
-            }
-            let mut after = controller;
-            let applied = after
-                .on_control_timer(event.key.time_ns)
-                .map_err(|_| ExecutionError::CounterOverflow(node.id))?;
-            let mut next_time_ns =
-                (after.next_control_time_ns <= stop_time_ns).then_some(after.next_control_time_ns);
-            match &mut generator.kind {
-                FlowGeneratorKind::Dcqcn(dcqcn) => {
-                    dcqcn.controller = after;
-                    dcqcn.rate.rate_numerator_bits_per_second = after.current_rate_bps;
-                }
-                FlowGeneratorKind::Roce(roce) => {
-                    roce.controller = after;
-                    // Ruling D2: a completed queue pair's control tick applies and is not re-armed.
-                    if roce.snd_una >= roce.pacer.total_bytes {
-                        next_time_ns = None;
-                    }
-                    let roce = *roce;
-                    settle_roce_sender(generator, &roce, generator.next_emission.status);
-                }
-                _ => unreachable!("matched above"),
-            }
-            let transition = crate::DcqcnTransitionRecord {
-                key: event.key,
-                node: node.id,
-                flow: packet.flow,
-                kind: crate::DcqcnTransitionKind::Control,
-                applied,
-                emitted_bytes: 0,
-                before: controller,
-                after,
-            };
-            (transition, next_time_ns, queue_pair)
-        };
-        if self.observation_mode == ObservationMode::Full {
-            self.mechanism_transitions
-                .push(crate::MechanismTransitionRecord::Dcqcn(transition));
-        }
-        if let Some(time_ns) = next_time_ns {
-            self.emit_from_host(
-                node,
-                event,
-                ChildEmission {
-                    target: node.id,
-                    kind: EventKind::PacingTimer,
-                    payload: packet.id,
-                    time_ns,
-                },
-                children,
-            )?;
-        } else if !queue_pair {
-            // A queue pair's tokens stay resident for the life of the pair: they are part of
-            // its state, which a later NACK may need to restart, and of any resumed image.
-            self.mark_terminal(packet.id)?;
-        }
-        Ok(())
-    }
-
     /// A RoCE queue pair's pacing tick (design note §5, step 2): one tick of credit at the
     /// controller's current rate; the packet at `next_psn`, a first transmission or a Go-back-N
     /// retransmission, is sent when the credit covers it. The pacer re-arms one interval later
@@ -4196,7 +4136,7 @@ impl<'image> TransitionState<'image> {
             flow: packet.flow,
             payload: event.payload,
         };
-        let (emission, next_tick_ns, timer_ns, byte_transition, record) = 'tick: {
+        let (emission, next_tick_ns, timer_ns, dcqcn_transition, record) = 'tick: {
             let (mut state, index) = self.host_parts_mut(node)?;
             let position = index.first_generator(packet.flow).ok_or(unexpected)?;
             let generator = &mut state.generators[position];
@@ -4211,6 +4151,25 @@ impl<'image> TransitionState<'image> {
             }
             let before = full.then(|| crate::roce::RoceSenderView::of(generator, &roce));
             roce.pacer_armed = false;
+            // A phase-1 transition: the controller instants at or before `now` apply before the
+            // tick reads the rate or settles its prediction (P16 ruling D2).
+            let bound = now.saturating_add(1);
+            let complete = roce.snd_una >= roce.pacer.total_bytes;
+            let dcqcn_transition = dcqcn_materialize(&mut roce.controller, complete, bound)
+                .filter(|(_, advance)| full && advance.applied_rate_change())
+                .map(|(controller_before, advance)| {
+                    dcqcn_record(
+                        event.key,
+                        node.id,
+                        packet.flow,
+                        crate::DcqcnTransitionKind::Advance,
+                        bound,
+                        advance,
+                        false,
+                        controller_before,
+                        roce.controller,
+                    )
+                });
             let total = roce.pacer.total_bytes;
             // Host-link PFC, tested first (LeanGuard's writer contract, `leanguard.md` §12): a
             // tick that finds its data class paused at its host sends nothing, adds no credit and
@@ -4246,11 +4205,10 @@ impl<'image> TransitionState<'image> {
                         crate::roce::RoceSenderView::of(generator, &roce),
                     )
                 });
-                break 'tick (None, None, None, None, record);
+                break 'tick (None, None, None, dcqcn_transition, record);
             }
             let mut rate_bps = None;
             let mut emission = None;
-            let mut byte_transition = None;
             let mut timer_ns = None;
             let overflow = ExecutionError::CounterOverflow(node.id);
             if roce.next_psn < total {
@@ -4286,22 +4244,6 @@ impl<'image> TransitionState<'image> {
                         generator.packets_emitted =
                             generator.packets_emitted.checked_add(1).ok_or(overflow)?;
                     }
-                    // Every transmitted byte, retransmissions included, feeds the byte counter.
-                    let controller_before = roce.controller;
-                    let applied = roce
-                        .controller
-                        .on_bytes_emitted(size)
-                        .map_err(|_| overflow)?;
-                    byte_transition = full.then_some(crate::DcqcnTransitionRecord {
-                        key: event.key,
-                        node: node.id,
-                        flow: packet.flow,
-                        kind: crate::DcqcnTransitionKind::Bytes,
-                        applied,
-                        emitted_bytes: size,
-                        before: controller_before,
-                        after: roce.controller,
-                    });
                     if roce.rto_ns != 0 && !outstanding_before {
                         let deadline = now
                             .checked_add(roce.rto_ns)
@@ -4354,11 +4296,11 @@ impl<'image> TransitionState<'image> {
                 )),
                 None => None,
             };
-            (emission, next_tick_ns, timer_ns, byte_transition, record)
+            (emission, next_tick_ns, timer_ns, dcqcn_transition, record)
         };
         if full {
             self.mechanism_transitions
-                .extend(byte_transition.map(crate::MechanismTransitionRecord::Dcqcn));
+                .extend(dcqcn_transition.map(crate::MechanismTransitionRecord::Dcqcn));
             self.mechanism_transitions.extend(record);
         }
         if let Some(time_ns) = next_tick_ns {
@@ -4440,7 +4382,7 @@ impl<'image> TransitionState<'image> {
         self.mark_terminal(packet.id)?;
         let now = event.key.time_ns;
         let stop_time_ns = self.image.stop_time_ns;
-        let (superseded_ns, timer_ns, tick_ns, token, record, completed_stage) = {
+        let (superseded_ns, timer_ns, tick_ns, token, record, dcqcn_transition, completed_stage) = {
             let (mut state, index) = self.host_parts_mut(node)?;
             let position =
                 index
@@ -4462,6 +4404,12 @@ impl<'image> TransitionState<'image> {
                 .checked_add(1)
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
             let before = full.then(|| crate::roce::RoceSenderView::of(generator, &roce));
+            // A phase-0 transition: the controller instants before `now` apply first (P16 ruling
+            // D2); the ACK that completes the pair then freezes the controller (ruling D11).
+            let total = roce.pacer.total_bytes;
+            let controller_before = roce.controller;
+            let mut advance = dcqcn_materialize(&mut roce.controller, roce.snd_una >= total, now)
+                .map_or(crate::DcqcnAdvance::default(), |(_, advance)| advance);
             let acknowledgment = header.acknowledgment;
             if acknowledgment > generator.bytes_emitted {
                 return Err(ExecutionError::InconsistentRocePacket {
@@ -4503,6 +4451,26 @@ impl<'image> TransitionState<'image> {
                 }
                 tick_ns = restart_roce_pacer(generator, &mut roce, now, stop_time_ns)?;
             }
+            let froze = snd_una_before < total && roce.snd_una >= total;
+            if froze {
+                let settled = roce.controller.settle(now);
+                advance.alpha_ticks += settled.alpha_ticks;
+                advance.increase_fires += settled.increase_fires;
+                advance.decrease_cuts += settled.decrease_cuts;
+            }
+            let dcqcn_transition = (full && (froze || advance.applied_rate_change())).then(|| {
+                dcqcn_record(
+                    event.key,
+                    node.id,
+                    packet.flow,
+                    crate::DcqcnTransitionKind::Advance,
+                    now,
+                    advance,
+                    froze,
+                    controller_before,
+                    roce.controller,
+                )
+            });
             settle_roce_sender(generator, &roce, generator.next_emission.status);
             generator.kind = FlowGeneratorKind::Roce(roce);
             leave_parked_list(state.pfc, data_class, position, generator, &roce);
@@ -4531,7 +4499,6 @@ impl<'image> TransitionState<'image> {
             // to its total (design note §4); a NACK carries the receiver's frontier, which stays
             // below the total, and later ACKs at the total are stale, so exactly one ACK does.
             // The stage record is read only then, once per pair.
-            let total = roce.pacer.total_bytes;
             let completed_stage = (snd_una_before < total
                 && roce.snd_una >= total
                 && state.stages.stage(position).is_some())
@@ -4542,6 +4509,7 @@ impl<'image> TransitionState<'image> {
                 tick_ns,
                 roce.pacing_timer_payload,
                 record,
+                dcqcn_transition,
                 completed_stage,
             )
         };
@@ -4553,6 +4521,8 @@ impl<'image> TransitionState<'image> {
             });
         }
         if self.observation_mode == ObservationMode::Full {
+            self.mechanism_transitions
+                .extend(dcqcn_transition.map(crate::MechanismTransitionRecord::Dcqcn));
             self.mechanism_transitions.extend(record);
         }
         self.emit_roce_timers(node, event, token, tick_ns, timer_ns, children)?;
@@ -4604,7 +4574,7 @@ impl<'image> TransitionState<'image> {
         let stop_time_ns = self.image.stop_time_ns;
         let full = self.observation_mode == ObservationMode::Full;
         let data_class = image_flow_priority(self.image, flow)?;
-        let (timer_ns, tick_ns, record) = {
+        let (timer_ns, tick_ns, record, dcqcn_transition) = {
             let (mut state, index) = self.host_parts_mut(node)?;
             let position = index
                 .first_generator(flow)
@@ -4635,6 +4605,25 @@ impl<'image> TransitionState<'image> {
                 return Ok(());
             }
             let before = full.then(|| crate::roce::RoceSenderView::of(generator, &roce));
+            // A phase-1 transition: the controller instants at or before `now` apply before the
+            // restart settles the pacer's prediction (P16 ruling D2). An armed timeout implies an
+            // incomplete pair.
+            let bound = now.saturating_add(1);
+            let dcqcn_transition = dcqcn_materialize(&mut roce.controller, false, bound)
+                .filter(|(_, advance)| full && advance.applied_rate_change())
+                .map(|(controller_before, advance)| {
+                    dcqcn_record(
+                        event.key,
+                        node.id,
+                        flow,
+                        crate::DcqcnTransitionKind::Advance,
+                        bound,
+                        advance,
+                        false,
+                        controller_before,
+                        roce.controller,
+                    )
+                });
             roce.next_psn = roce.snd_una;
             let deadline = now
                 .checked_add(roce.rto_ns)
@@ -4661,9 +4650,11 @@ impl<'image> TransitionState<'image> {
                     crate::roce::RoceSenderView::of(generator, &roce),
                 )
             });
-            (Some(deadline), tick_ns, record)
+            (Some(deadline), tick_ns, record, dcqcn_transition)
         };
         if full {
+            self.mechanism_transitions
+                .extend(dcqcn_transition.map(crate::MechanismTransitionRecord::Dcqcn));
             self.mechanism_transitions.extend(record);
         }
         self.emit_roce_timers(node, event, event.payload, tick_ns, timer_ns, children)
@@ -6748,6 +6739,49 @@ fn add_summary(total: &mut u128, value: u64, node: NodeId) -> Result<(), Executi
         .checked_add(u128::from(value))
         .ok_or(ExecutionError::CounterOverflow(node))?;
     Ok(())
+}
+
+/// P16 ruling D2: a transition of a DCQCN flow or queue pair at exclusive bound `bound` first
+/// applies its controller's due rate-increase and rate-decrease instants. Returns the controller
+/// before and what was applied, or `None` when nothing was due (the common case: one comparison)
+/// or the flow is complete and its controller frozen (ruling D11).
+#[inline(always)]
+fn dcqcn_materialize(
+    controller: &mut crate::DcqcnController,
+    frozen: bool,
+    bound: u64,
+) -> Option<(crate::DcqcnController, crate::DcqcnAdvance)> {
+    if frozen || controller.due_ns() >= bound {
+        return None;
+    }
+    let before = *controller;
+    Some((before, controller.materialize(bound)))
+}
+
+/// A DCQCN controller transition record (schema `days-gpu/plans/briefs/p16/dcqcn-schema.md`).
+#[allow(clippy::too_many_arguments)]
+const fn dcqcn_record(
+    key: EventKey,
+    node: NodeId,
+    flow: FlowId,
+    kind: crate::DcqcnTransitionKind,
+    bound_ns: u64,
+    advance: crate::DcqcnAdvance,
+    frozen: bool,
+    before: crate::DcqcnController,
+    after: crate::DcqcnController,
+) -> crate::DcqcnTransitionRecord {
+    crate::DcqcnTransitionRecord {
+        key,
+        node,
+        flow,
+        kind,
+        bound_ns,
+        advance,
+        frozen,
+        before,
+        after,
+    }
 }
 
 /// Routes an arriving feedback packet through the source-generator contract hook.

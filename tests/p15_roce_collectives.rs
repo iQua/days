@@ -14,10 +14,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use days::scenario::compile_config;
 use days_executor::{
     Backend, CollectiveActivationCause, CollectivePhase, CollectiveProgressRecord, CpuConfig,
-    DcqcnTransitionKind, FlowGeneratorKind, FlowId, GeneratorStatus, MechanismTransitionRecord,
-    ObservationMode, PacketKind, PfcControlAction, RoceSenderKind, RoceSenderRecord,
-    RoceTransitionRecord, RunResult, SimulationImage, StageRole, run_cpu_with_observations,
-    run_scalar_with_observations, validate,
+    FlowGeneratorKind, FlowId, GeneratorStatus, MechanismTransitionRecord, ObservationMode,
+    PacketKind, PfcControlAction, RoceSenderKind, RoceSenderRecord, RoceTransitionRecord,
+    RunResult, SimulationImage, StageRole, run_cpu_with_observations, run_scalar_with_observations,
+    validate,
 };
 
 fn fixture_path(name: &str) -> std::path::PathBuf {
@@ -313,16 +313,16 @@ fn stage_rules_hold_on_every_fixture() {
 fn check_stage_rules(name: &str, image: &SimulationImage, result: &RunResult) {
     let stages = roce_stages(image);
     let senders = sender_rows(result);
-    let control_ticks = records(result)
+    // The Mellanox-form controller starts at the pair's first feedback (P16): a stage's first
+    // DCQCN row, if any, comes no earlier than its first tick and starts from the pristine state.
+    let first_dcqcn_rows = records(result)
         .iter()
         .filter_map(|record| match record {
-            MechanismTransitionRecord::Dcqcn(row) if row.kind == DcqcnTransitionKind::Control => {
-                Some((row.flow, row.key))
-            }
+            MechanismTransitionRecord::Dcqcn(row) => Some(*row),
             _ => None,
         })
-        .fold(BTreeMap::<FlowId, Vec<_>>::new(), |mut map, (flow, key)| {
-            map.entry(flow).or_default().push(key);
+        .fold(BTreeMap::<FlowId, _>::new(), |mut map, row| {
+            map.entry(row.flow).or_insert(row);
             map
         });
     let rows = progress(result);
@@ -402,16 +402,16 @@ fn check_stage_rules(name: &str, image: &SimulationImage, result: &RunResult) {
         if let Some(&released) = activations.get(flow) {
             assert_eq!(first.key.time_ns, released, "{name}");
         }
-        let control = control_ticks.get(flow).and_then(|ticks| ticks.first());
-        let expected = first.key.time_ns + 50_000;
-        if expected <= image.stop_time_ns {
-            let control = control.unwrap_or_else(|| panic!("{name}: a first control tick"));
-            assert_eq!(control.time_ns, expected, "{name}: first control tick");
-            // A release emits the pacing tick, then the control tick, as lowering orders a
-            // plain pair's (design note S-R6).
-            if activations.contains_key(flow) {
-                assert_eq!(control.origin_seq, first.key.origin_seq + 1, "{name}");
-            }
+        if let Some(row) = first_dcqcn_rows.get(flow) {
+            assert!(
+                row.key > first.key,
+                "{name}: a DCQCN row before the first tick"
+            );
+            assert_eq!(
+                row.before,
+                days_executor::DcqcnController::pristine(row.before.config),
+                "{name}: the controller starts pristine"
+            );
         }
     }
 }
@@ -618,11 +618,8 @@ max_rate_gbps = 1.0
 g = 0.00390625
 ai_rate_gbps = 0.005
 hai_rate_gbps = 0.05
-mi_factor = 0.5
-rtt_ns = 50000
-cnp_interval_ns = 10000
+rp_timer_ns = 50000
 pacing_interval_ns = 1000
-increase_byte_threshold = 100000
 
 [{table}.traffic.roce]
 retransmit_timeout_ns = 1000000

@@ -543,7 +543,6 @@ pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), Validat
     let future_work = validate_global_time_capacity(image, &flow_index, backend)?;
     validate_service_event_consistency(image)?;
     validate_counters(image, &future_work)?;
-    validate_dcqcn_arithmetic_capacity(image, &future_work)?;
     validate_origin_sequences(image, &flow_index, &future_work)?;
     validate_payload_sequences(image, &flow_index, &future_work)?;
     validate_preloaded_arrival_capacity(image)?;
@@ -569,6 +568,26 @@ fn validate_backend_capabilities(
     }
     // P15 lane R4: both device backends run RoCE queue pairs, host-link PFC and a feedback class
     // apart from the data class (`evidence/P15/device-design.md`), so none needs a refusal here.
+    //
+    // P16 D1 staging: the device kernels still run the paper-form controller, so a backend whose
+    // Mellanox-form port has not landed refuses every DCQCN controller (DCQCN flows and queue
+    // pairs) rather than run it wrong. Each port commit removes its backend from this list.
+    if matches!(backend, Backend::Metal | Backend::Cuda)
+        && image
+            .host_states
+            .iter()
+            .flat_map(|state| &state.generators)
+            .any(|generator| {
+                matches!(
+                    generator.kind,
+                    crate::FlowGeneratorKind::Dcqcn(_) | crate::FlowGeneratorKind::Roce(_)
+                )
+            })
+    {
+        return Err(ValidationError::new(format!(
+            "backend {backend} does not yet run the Mellanox-form DCQCN controller (P16 D1 port pending); use Scalar or Cpu"
+        )));
+    }
     for queue in image.switch_states.iter().flat_map(|state| &state.queues) {
         match queue.drop_mark {
             crate::DropMarkPolicy::TailDrop | crate::DropMarkPolicy::EcnThreshold(_) => {}
@@ -1434,21 +1453,15 @@ const fn roce_boundary(psn: u64, mtu_bytes: u64, total_bytes: u64) -> bool {
 
 /// A RoCE collective stage that its prerequisites have not released holds the state its release
 /// starts from (`collectives-design.md` §6.1): nothing sent, acknowledged, credited, timed or
-/// fed back; the pacer parked with its scheduled payload the pacing token; the pacer and the
-/// controller anchored at zero (ruling C5), the controller otherwise as lowering builds it. The
-/// release re-anchors both at its instant, so the control deadline must fit after any release up
-/// to the stop. The caller has already required that no pending event carries either token, at any
-/// time: no pacing tick or retransmission timeout with the pacing token, no control tick.
+/// fed back; the pacer parked with its scheduled payload the pacing token, anchored at zero
+/// (ruling C5); the controller pristine (the Mellanox form starts its timers at the first
+/// feedback, P16). The caller has already required that no pending event carries the pacing
+/// token, at any time.
 fn validate_unreleased_roce_stage(
-    image: &SimulationImage,
     generator: StagedGenerator<'_>,
     roce: crate::RoceGenerator,
 ) -> Result<(), &'static str> {
-    // Lowering builds the controller with its first control deadline one interval after the
-    // anchor (`lowered_dcqcn_controller`), here zero.
-    let config = roce.controller.config;
-    let pristine_controller = crate::DcqcnController::new(config, config.control_interval_ns)
-        .map_err(|_| "has a controller whose first control deadline exceeds u64")?;
+    let pristine_controller = crate::DcqcnController::pristine(roce.controller.config);
     if generator.packets_emitted != 0
         || generator.bytes_emitted != 0
         || generator.feedback.arrivals != 0
@@ -1464,8 +1477,20 @@ fn validate_unreleased_roce_stage(
     {
         return Err("collective stage is dependency-blocked after its sending state changed");
     }
-    if roce.controller.config.control_interval_ns > u64::MAX - image.stop_time_ns {
-        return Err("collective stage's first control deadline after a release exceeds u64");
+    Ok(())
+}
+
+/// Range checks of a Mellanox-form controller held in an image (P16): `DcqcnController::
+/// validate_state`, and both rates within `[dcqcn_rate_floor_bps(minimum), maximum]`, the range
+/// the controller's transitions keep.
+fn validate_dcqcn_controller_state(controller: crate::DcqcnController) -> Result<(), &'static str> {
+    controller.validate_state()?;
+    let floor = crate::dcqcn::dcqcn_rate_floor_bps(controller.config.minimum_rate_bps);
+    let maximum = controller.config.maximum_rate_bps;
+    if !(floor..=maximum).contains(&controller.current_rate_bps)
+        || !(floor..=maximum).contains(&controller.target_rate_bps)
+    {
+        return Err("has a DCQCN rate outside the controller's reachable range");
     }
     Ok(())
 }
@@ -1491,17 +1516,7 @@ fn validate_roce_generator(
         .config
         .validate()
         .map_err(|error| invalid(&format!("has an invalid DCQCN configuration: {error}")))?;
-    if controller.alpha_ppb > crate::DCQCN_FRACTION_SCALE
-        || controller.current_rate_bps < controller.config.minimum_rate_bps
-        || controller.current_rate_bps > controller.config.maximum_rate_bps
-        || controller.target_rate_bps < controller.config.minimum_rate_bps
-        || controller.target_rate_bps > controller.config.maximum_rate_bps
-        || controller.stage_steps >= crate::DCQCN_STAGE_STEPS
-        || controller.stage == crate::DcqcnIncreaseStage::Hyper && controller.stage_steps != 0
-        || controller.cnp_seen && controller.last_cnp_time_ns.is_none()
-    {
-        return Err(invalid("has an out-of-range fixed-point controller state"));
-    }
+    validate_dcqcn_controller_state(controller).map_err(invalid)?;
     let pacer = roce.pacer;
     if pacer.pacing_interval_ns == 0 || pacer.mtu_bytes == 0 || pacer.total_bytes == 0 {
         return Err(invalid("needs a positive pacing interval, MTU and total"));
@@ -1538,28 +1553,19 @@ fn validate_roce_generator(
             roce.snd_una, pacer.total_bytes
         )));
     }
-    // Tokens: a zero-byte control token and pacing token of this flow; the pacing token is the
-    // generator's scheduled payload.
-    for (token, kind) in [
-        (roce.control_timer_payload, PacketKind::DcqcnControlTimer),
-        (roce.pacing_timer_payload, PacketKind::RocePacingTimer),
-    ] {
-        let resident =
-            packet(image, token).ok_or_else(|| invalid("names a missing timer token"))?;
-        if resident.flow != flow.id
-            || resident.kind != kind
-            || resident.size_bytes != 0
-            || resident.ecn_marked
-        {
-            return Err(invalid("timer token is inconsistent"));
-        }
-    }
-    if roce.control_timer_payload == roce.pacing_timer_payload
-        || generator.next_emission.payload != roce.pacing_timer_payload
+    // Token: a zero-byte pacing token of this flow, the generator's scheduled payload. The
+    // controller owns no token and no event (P16 ruling D2).
+    let resident = packet(image, roce.pacing_timer_payload)
+        .ok_or_else(|| invalid("names a missing timer token"))?;
+    if resident.flow != flow.id
+        || resident.kind != PacketKind::RocePacingTimer
+        || resident.size_bytes != 0
+        || resident.ecn_marked
     {
-        return Err(invalid(
-            "timer tokens are not distinct or not its scheduled payload",
-        ));
+        return Err(invalid("timer token is inconsistent"));
+    }
+    if generator.next_emission.payload != roce.pacing_timer_payload {
+        return Err(invalid("pacing token is not its scheduled payload"));
     }
     // Pacer: armed iff exactly one pending tick carries the pacing token at the scheduled
     // departure, on the grid; its status predicts that tick.
@@ -1653,30 +1659,8 @@ fn validate_roce_generator(
             "retransmission timeout exceeds the deadline headroom",
         ));
     }
-    // Control tick, exactly as DCQCN's; a completed pair keeps at most its last pending tick.
-    let control_events = pacing_counts
-        .get(&(
-            owner,
-            roce.control_timer_payload,
-            controller.next_control_time_ns,
-        ))
-        .copied()
-        .unwrap_or(0);
-    // An unreleased stage arms its control tick at its release, so it owns none at any time.
-    if unreleased
-        && pending_ticks_with_payload(pacing_counts, owner, roce.control_timer_payload) != 0
-    {
-        return Err(invalid("owns a pending control tick before its release"));
-    }
-    let expected_control =
-        usize::from(!unreleased && controller.next_control_time_ns <= image.stop_time_ns);
-    if control_events > expected_control || !complete && control_events != expected_control {
-        return Err(invalid(&format!(
-            "has {control_events} matching control events; expected {expected_control}"
-        )));
-    }
     if unreleased {
-        validate_unreleased_roce_stage(image, generator, roce).map_err(invalid)?;
+        validate_unreleased_roce_stage(generator, roce).map_err(invalid)?;
     }
     if flow.reverse_route.is_empty() {
         return Err(invalid("requires a reverse feedback route"));
@@ -1684,7 +1668,6 @@ fn validate_roce_generator(
     let receiver =
         roce_receiver(image, flow).ok_or_else(|| invalid("has no receiver at its target"))?;
     if receiver.total_bytes != pacer.total_bytes
-        || receiver.np.cnp_interval_ns != controller.config.cnp_interval_ns
         || receiver.np.cnp_size_bytes == 0
         || receiver.ack_size_bytes == 0
         || receiver.ack_every_packets == 0
@@ -2487,21 +2470,9 @@ fn validate_generators(
                         flow.id
                     )));
                 }
-                if dcqcn.controller.alpha_ppb > crate::DCQCN_FRACTION_SCALE
-                    || dcqcn.controller.current_rate_bps < dcqcn.controller.config.minimum_rate_bps
-                    || dcqcn.controller.current_rate_bps > dcqcn.controller.config.maximum_rate_bps
-                    || dcqcn.controller.target_rate_bps < dcqcn.controller.config.minimum_rate_bps
-                    || dcqcn.controller.target_rate_bps > dcqcn.controller.config.maximum_rate_bps
-                    || dcqcn.controller.stage_steps >= crate::DCQCN_STAGE_STEPS
-                    || dcqcn.controller.stage == crate::DcqcnIncreaseStage::Hyper
-                        && dcqcn.controller.stage_steps != 0
-                    || dcqcn.controller.cnp_seen && dcqcn.controller.last_cnp_time_ns.is_none()
-                {
-                    return Err(ValidationError::new(format!(
-                        "flow {:?} DCQCN fixed-point controller state is out of range",
-                        flow.id
-                    )));
-                }
+                validate_dcqcn_controller_state(dcqcn.controller).map_err(|what| {
+                    ValidationError::new(format!("flow {:?} DCQCN {what}", flow.id))
+                })?;
                 if generator.bytes_emitted > rate.total_bytes {
                     return Err(ValidationError::new(format!(
                         "flow {:?} DCQCN emitted bytes {} exceed total bytes {}",
@@ -2631,34 +2602,6 @@ fn validate_generators(
                         flow.id
                     )));
                 }
-                let control = packet(image, dcqcn.control_timer_payload).ok_or_else(|| {
-                    ValidationError::new(format!(
-                        "flow {:?} DCQCN control timer references unknown token {:?}",
-                        flow.id, dcqcn.control_timer_payload
-                    ))
-                })?;
-                if control.flow != flow.id
-                    || control.kind != PacketKind::DcqcnControlTimer
-                    || control.size_bytes != 0
-                    || control.ecn_marked
-                {
-                    return Err(ValidationError::new(format!(
-                        "flow {:?} DCQCN control token is inconsistent",
-                        flow.id
-                    )));
-                }
-                let control_matches = pacing_counts
-                    .get(&(owner.id, control.id, dcqcn.controller.next_control_time_ns))
-                    .copied()
-                    .unwrap_or(0);
-                let expected_control =
-                    usize::from(dcqcn.controller.next_control_time_ns <= image.stop_time_ns);
-                if control_matches != expected_control {
-                    return Err(ValidationError::new(format!(
-                        "flow {:?} DCQCN has {control_matches} matching control events; expected {expected_control}",
-                        flow.id
-                    )));
-                }
                 if flow.reverse_route.is_empty() {
                     return Err(ValidationError::new(format!(
                         "flow {:?} DCQCN requires a reverse CNP route",
@@ -2676,11 +2619,9 @@ fn validate_generators(
                             flow.id, flow.target
                         ))
                     })?;
-                if receiver.cnp_interval_ns != dcqcn.controller.config.cnp_interval_ns
-                    || receiver.cnp_size_bytes != dcqcn.cnp_size_bytes
-                {
+                if receiver.cnp_size_bytes != dcqcn.cnp_size_bytes {
                     return Err(ValidationError::new(format!(
-                        "flow {:?} DCQCN receiver and controller CNP parameters disagree",
+                        "flow {:?} DCQCN receiver and sender CNP sizes disagree",
                         flow.id
                     )));
                 }
@@ -3923,12 +3864,6 @@ fn validate_packets_and_derive_delays(
                 .any(|generator| {
                     generator.flow == flow.id
                         && match (packet.kind, generator.kind) {
-                            (PacketKind::DcqcnControlTimer, FlowGeneratorKind::Dcqcn(dcqcn)) => {
-                                dcqcn.control_timer_payload == packet.id
-                            }
-                            (PacketKind::DcqcnControlTimer, FlowGeneratorKind::Roce(roce)) => {
-                                roce.control_timer_payload == packet.id
-                            }
                             (PacketKind::RocePacingTimer, FlowGeneratorKind::Roce(roce)) => {
                                 roce.pacing_timer_payload == packet.id
                             }
@@ -3937,7 +3872,7 @@ fn validate_packets_and_derive_delays(
                 });
             if packet.size_bytes != 0 || !owns_token {
                 return Err(ValidationError::new(format!(
-                    "DCQCN control token {:?} must be zero-byte NotECT state owned by its DCQCN generator",
+                    "timer token {:?} must be zero-byte NotECT state owned by its queue pair",
                     packet.id
                 )));
             }
@@ -5678,27 +5613,6 @@ fn dcqcn_payload_allocations(
     rate_payload_allocations(image, generator.with_generator(&fastest))
 }
 
-fn executable_dcqcn_control_ticks(
-    image: &SimulationImage,
-    dcqcn: crate::DcqcnGenerator,
-) -> BigUint {
-    executable_control_ticks(image, dcqcn.controller)
-}
-
-/// Control ticks a DCQCN controller can still run until the stop time, its pending one included.
-fn executable_control_ticks(
-    image: &SimulationImage,
-    controller: crate::DcqcnController,
-) -> BigUint {
-    if controller.next_control_time_ns > image.stop_time_ns {
-        return BigUint::from(0_u8);
-    }
-    BigUint::from(
-        (image.stop_time_ns - controller.next_control_time_ns)
-            / controller.config.control_interval_ns,
-    ) + 1_u8
-}
-
 /// Pacing ticks a RoCE queue pair can still run until the stop time, its pending one included.
 ///
 /// Every tick lies on the grid anchored at `first_pacing_time_ns` and emits at most one data
@@ -5789,35 +5703,6 @@ fn roce_future_data_min_bytes(roce: crate::RoceGenerator) -> u64 {
     } else {
         tail
     }
-}
-
-fn latest_dcqcn_control_time(
-    image: &SimulationImage,
-    generator: StagedGenerator<'_>,
-) -> Result<u64, ValidationError> {
-    let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind else {
-        unreachable!("DCQCN control deadline requires DCQCN state")
-    };
-    let ticks = executable_dcqcn_control_ticks(image, dcqcn);
-    if ticks == BigUint::from(0_u8) {
-        return Ok(0);
-    }
-    let computed_successor = BigUint::from(dcqcn.controller.next_control_time_ns)
-        + BigUint::from(dcqcn.controller.config.control_interval_ns) * &ticks;
-    if computed_successor > BigUint::from(u64::MAX) {
-        return Err(ValidationError::new(format!(
-            "flow {:?} DCQCN control timer successor exceeds u64",
-            generator.flow
-        )));
-    }
-    let latest_event =
-        computed_successor - BigUint::from(dcqcn.controller.config.control_interval_ns);
-    u64::try_from(latest_event).map_err(|_| {
-        ValidationError::new(format!(
-            "flow {:?} latest DCQCN control time exceeds u64",
-            generator.flow
-        ))
-    })
 }
 
 fn latest_dcqcn_pacing_time(
@@ -6070,11 +5955,6 @@ fn validate_global_time_capacity(
                         generator.kind,
                         FlowGeneratorKind::Rate(_) | FlowGeneratorKind::Dcqcn(_)
                     )
-                || matches!(
-                    generator.kind,
-                    FlowGeneratorKind::Dcqcn(dcqcn)
-                        if dcqcn.controller.next_control_time_ns <= image.stop_time_ns
-                )
                 || matches!(generator.kind, FlowGeneratorKind::Roce(_))
         })
         .map(|generator| match generator.kind {
@@ -6108,9 +5988,9 @@ fn validate_global_time_capacity(
                 } else {
                     0
                 };
-                Ok(pacing.max(latest_dcqcn_control_time(image, generator)?))
+                Ok(pacing)
             }
-            // Pacing and control ticks run at most to the stop time; a retransmission timeout
+            // Pacing ticks run at most to the stop time; a retransmission timeout
             // armed before it ends within `rto_ns`, which generator validation bounds.
             FlowGeneratorKind::Roce(_) => Ok(image.stop_time_ns),
         })
@@ -6447,56 +6327,6 @@ struct FutureWork {
     dcqcn_cnp_by_flow: Vec<u64>,
     pfc_by_node: Vec<u64>,
     pfc_by_channel: Vec<u64>,
-}
-
-fn validate_dcqcn_arithmetic_capacity(
-    image: &SimulationImage,
-    work: &FutureWork,
-) -> Result<(), ValidationError> {
-    let resident_cnp_flows = executable_resident_packets(image)
-        .into_iter()
-        .filter_map(|packet| matches!(packet.kind, PacketKind::DcqcnCnp(_)).then_some(packet.flow))
-        .collect::<BTreeSet<_>>();
-    for generator in image.host_states.iter().flat_map(staged_generators) {
-        let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind else {
-            continue;
-        };
-        let index = generator.flow.0 as usize;
-        let cnp_can_arrive =
-            work.dcqcn_cnp_by_flow[index] != 0 || resident_cnp_flows.contains(&generator.flow);
-        if cnp_can_arrive
-            && dcqcn.controller.last_cnp_time_ns.is_some_and(|last| {
-                last.checked_add(dcqcn.controller.config.cnp_interval_ns)
-                    .is_none()
-            })
-        {
-            return Err(ValidationError::new(format!(
-                "flow {:?} DCQCN CNP interval deadline can exceed u64 while feedback remains executable",
-                generator.flow
-            )));
-        }
-
-        let executable_packets = executable_dcqcn_packets(image, generator)?;
-        let remaining_bytes = dcqcn.rate.total_bytes - generator.bytes_emitted;
-        let executable_bytes = u128::from(executable_packets)
-            .checked_mul(u128::from(dcqcn.rate.packet_size_bytes))
-            .map(|bytes| bytes.min(u128::from(remaining_bytes)))
-            .ok_or_else(|| {
-                ValidationError::new(format!(
-                    "flow {:?} DCQCN executable byte bound exceeds u128",
-                    generator.flow
-                ))
-            })?;
-        if u128::from(dcqcn.controller.bytes_since_increase) + executable_bytes
-            > u128::from(u64::MAX)
-        {
-            return Err(ValidationError::new(format!(
-                "flow {:?} DCQCN byte counter can exceed u64 across {executable_packets} executable packets",
-                generator.flow
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn route_enters_pfc_controller(
@@ -7163,7 +6993,7 @@ fn validate_origin_sequences(
                         })?
                     }
                 }
-                FlowGeneratorKind::Dcqcn(dcqcn) => {
+                FlowGeneratorKind::Dcqcn(_) => {
                     let pacing_ticks = executable_dcqcn_pacing_ticks(image, generator)?;
                     let pacing_successors = if pacing_ticks == BigUint::from(0_u8) {
                         0
@@ -7175,51 +7005,20 @@ fn validate_origin_sequences(
                             ))
                         })?
                     };
-                    let control_ticks = executable_dcqcn_control_ticks(image, dcqcn);
-                    let control_successors = if control_ticks == BigUint::from(0_u8) {
-                        0
-                    } else {
-                        u64::try_from(control_ticks - 1_u8).map_err(|_| {
-                            ValidationError::new(format!(
-                                "flow {:?} DCQCN successor control-timer count exceeds u64",
-                                generator.flow
-                            ))
-                        })?
-                    };
                     pacing_successors
-                        .checked_add(control_successors)
-                        .ok_or_else(|| {
-                            ValidationError::new(format!(
-                                "flow {:?} DCQCN successor timer count exceeds u64",
-                                generator.flow
-                            ))
-                        })?
                 }
                 FlowGeneratorKind::Roce(roce) => {
-                    // Every pacing tick, restarts included, every control tick and every timeout
-                    // installation is one emitted event (a conservative count: the pending tick
-                    // and control tick already exist).
+                    // Every pacing tick, restarts included, and every timeout installation is one
+                    // emitted event (a conservative count: the pending tick already exists).
                     let pacing_ticks = roce_grid_ticks(image, &generator, roce);
                     let data_packets = executable_generator_packets(image, generator)?;
-                    // The DCQCN count in u64 arithmetic, with no heap allocation per queue pair.
-                    let controller = roce.controller;
-                    let control_ticks = if controller.next_control_time_ns > image.stop_time_ns {
-                        0
-                    } else {
-                        (image.stop_time_ns - controller.next_control_time_ns)
-                            / controller.config.control_interval_ns
-                            + 1
-                    };
                     let timers = roce_timer_installations(image, roce, pacing_ticks, data_packets)?;
-                    pacing_ticks
-                        .checked_add(control_ticks)
-                        .and_then(|total| total.checked_add(timers))
-                        .ok_or_else(|| {
-                            ValidationError::new(format!(
-                                "flow {:?} RoCE timer event count exceeds u64",
-                                generator.flow
-                            ))
-                        })?
+                    pacing_ticks.checked_add(timers).ok_or_else(|| {
+                        ValidationError::new(format!(
+                            "flow {:?} RoCE timer event count exceeds u64",
+                            generator.flow
+                        ))
+                    })?
                 }
             };
             emissions_by_node[owner.id.0 as usize] += u128::from(emissions);
@@ -7370,11 +7169,11 @@ fn validate_payload_sequences(
                 FlowGeneratorKind::Rate(_) => rate_payload_allocations(image, generator)?,
                 FlowGeneratorKind::Dcqcn(_) => dcqcn_payload_allocations(image, generator)?,
                 FlowGeneratorKind::Roce(_) => {
-                    // Its two timer tokens were allocated at lowering; every data packet,
+                    // Its pacing token was allocated at lowering; every data packet,
                     // retransmissions included, takes a fresh payload when it is sent.
                     consumed_sequences = consumed_sequences
                         .checked_add(generator.packets_emitted)
-                        .and_then(|total| total.checked_add(2))
+                        .and_then(|total| total.checked_add(1))
                         .ok_or_else(|| {
                             ValidationError::new(format!(
                                 "node {:?} consumed payload sequence count exceeds u64",
@@ -7402,12 +7201,6 @@ fn validate_payload_sequences(
             consumed_sequences = consumed_sequences
                 .checked_add(generator.packets_emitted)
                 .and_then(|total| total.checked_add(already_scheduled))
-                .and_then(|total| {
-                    total.checked_add(u64::from(matches!(
-                        generator.kind,
-                        FlowGeneratorKind::Dcqcn(_)
-                    )))
-                })
                 .ok_or_else(|| {
                     ValidationError::new(format!(
                         "node {:?} consumed payload sequence count exceeds u64",
@@ -7615,7 +7408,7 @@ fn packet_route(flow: &FlowDescriptor, packet_kind: PacketKind) -> &[LinkId] {
         | PacketKind::DcqcnCnp(_)
         | PacketKind::RoceAck(_)
         | PacketKind::RoceNack(_) => &flow.reverse_route,
-        PacketKind::DcqcnControlTimer | PacketKind::RocePacingTimer => &[],
+        PacketKind::RocePacingTimer => &[],
     }
 }
 
@@ -7628,7 +7421,6 @@ fn packet_terminal(flow: &FlowDescriptor, packet_kind: PacketKind) -> NodeId {
         | PacketKind::DcqcnCnp(_)
         | PacketKind::RoceAck(_)
         | PacketKind::RoceNack(_)
-        | PacketKind::DcqcnControlTimer
         | PacketKind::RocePacingTimer => flow.source,
     }
 }

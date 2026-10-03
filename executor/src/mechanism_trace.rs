@@ -357,28 +357,38 @@ fn optional_flow(flow: Option<FlowId>) -> String {
     flow.map_or_else(String::new, |flow| flow.0.to_string())
 }
 
+/// The Mellanox-form DCQCN controller transitions, one row per (event, flow) in `EventKey` order
+/// (pinned schema `days-gpu/plans/briefs/p16/dcqcn-schema.md`). One event yields at most one row
+/// per flow; a host RESUME can yield one `advance` row per queue pair it restarts.
 pub fn dcqcn_transitions_csv(
     records: &[MechanismTransitionRecord],
 ) -> Result<String, MechanismTraceError> {
-    let records = canonical(
-        "DCQCN",
-        records
-            .iter()
-            .filter_map(|record| match record {
-                MechanismTransitionRecord::Dcqcn(record) => Some((record.key, *record)),
-                _ => None,
-            })
-            .collect(),
-    )?;
+    let mut records = records
+        .iter()
+        .filter_map(|record| match record {
+            MechanismTransitionRecord::Dcqcn(record) => Some(*record),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    records.sort_unstable_by_key(|record| (record.key, record.flow));
+    if let Some(pair) = records
+        .windows(2)
+        .find(|pair| pair[0].key == pair[1].key && pair[0].flow == pair[1].flow)
+    {
+        return Err(MechanismTraceError {
+            mechanism: "DCQCN",
+            duplicate_key: pair[0].key,
+        });
+    }
     let mut csv = String::from(
-        "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,kind,applied,emitted_bytes,initial_rate_bps,minimum_rate_bps,maximum_rate_bps,additive_rate_bps,hyper_rate_bps,g_ppb,decrease_ppb,cnp_interval_ns,control_interval_ns,increase_byte_threshold,before_alpha_ppb,before_current_rate_bps,before_target_rate_bps,before_cnp_seen,before_last_cnp_time_ns,before_stage,before_stage_steps,before_bytes_since_increase,before_next_control_time_ns,after_alpha_ppb,after_current_rate_bps,after_target_rate_bps,after_cnp_seen,after_last_cnp_time_ns,after_stage,after_stage_steps,after_bytes_since_increase,after_next_control_time_ns\n",
+        "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,kind,bound_ns,frozen,alpha_ticks,increase_fires,decrease_cuts,initial_rate_bps,minimum_rate_bps,maximum_rate_bps,additive_rate_bps,hyper_rate_bps,g_q63,alpha_interval_ns,decrease_interval_ns,increase_interval_ns,fast_recovery_steps,clamp_target_rate,before_alpha_q63,before_current_rate_bps,before_target_rate_bps,before_next_alpha_ns,before_next_decrease_ns,before_next_increase_ns,before_stage,before_armed,before_alpha_pending,before_decrease_pending,before_increase_armed,after_alpha_q63,after_current_rate_bps,after_target_rate_bps,after_next_alpha_ns,after_next_decrease_ns,after_next_increase_ns,after_stage,after_armed,after_alpha_pending,after_decrease_pending,after_increase_armed\n",
     );
     for record in records {
         let config = record.before.config;
         debug_assert_eq!(config, record.after.config);
-        writeln!(
+        write!(
             csv,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             record.key.time_ns,
             record.key.phase,
             record.key.origin_node.0,
@@ -386,38 +396,43 @@ pub fn dcqcn_transitions_csv(
             record.node.0,
             record.flow.0,
             record.kind.label(),
-            bit(record.applied),
-            record.emitted_bytes,
+            record.bound_ns,
+            bit(record.frozen),
+            record.advance.alpha_ticks,
+            record.advance.increase_fires,
+            record.advance.decrease_cuts,
             config.initial_rate_bps,
             config.minimum_rate_bps,
             config.maximum_rate_bps,
             config.additive_rate_bps,
             config.hyper_rate_bps,
-            config.g_ppb,
-            config.decrease_ppb,
-            config.cnp_interval_ns,
-            config.control_interval_ns,
-            config.increase_byte_threshold,
-            record.before.alpha_ppb,
-            record.before.current_rate_bps,
-            record.before.target_rate_bps,
-            bit(record.before.cnp_seen),
-            optional_u64(record.before.last_cnp_time_ns),
-            record.before.stage.label(),
-            record.before.stage_steps,
-            record.before.bytes_since_increase,
-            record.before.next_control_time_ns,
-            record.after.alpha_ppb,
-            record.after.current_rate_bps,
-            record.after.target_rate_bps,
-            bit(record.after.cnp_seen),
-            optional_u64(record.after.last_cnp_time_ns),
-            record.after.stage.label(),
-            record.after.stage_steps,
-            record.after.bytes_since_increase,
-            record.after.next_control_time_ns,
+            config.g_q63,
+            config.alpha_interval_ns,
+            config.decrease_interval_ns,
+            config.increase_interval_ns,
+            config.fast_recovery_steps,
+            bit(config.clamp_target_rate),
         )
         .expect("writing to String cannot fail");
+        for state in [record.before, record.after] {
+            write!(
+                csv,
+                ",{},{},{},{},{},{},{},{},{},{},{}",
+                state.alpha_q63,
+                state.current_rate_bps,
+                state.target_rate_bps,
+                state.next_alpha_ns,
+                state.next_decrease_ns,
+                state.next_increase_ns,
+                state.stage,
+                bit(state.armed),
+                bit(state.alpha_pending),
+                bit(state.decrease_pending),
+                bit(state.increase_armed),
+            )
+            .expect("writing to String cannot fail");
+        }
+        csv.push('\n');
     }
     Ok(csv)
 }

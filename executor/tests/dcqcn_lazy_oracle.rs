@@ -7,7 +7,7 @@
 #[path = "support/dcqcn_oracle.rs"]
 mod oracle;
 
-use days_executor::mellanox::{DCQCN_ALPHA_ONE, DcqcnController, DcqcnControllerConfig};
+use days_executor::{DCQCN_ALPHA_ONE, DcqcnController, DcqcnControllerConfig};
 use oracle::{EagerDcqcn, rate_state_matches};
 
 struct Rng(u64);

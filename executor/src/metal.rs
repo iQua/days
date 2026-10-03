@@ -1858,13 +1858,14 @@ impl MetalPlan {
             );
             legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(4);
             if capacity_context.dcqcn_generator(image, flow_index) {
-                // A DCQCN source owns two live timer chains, pacing and control.
-                legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(2);
+                // A DCQCN source owns one live timer chain, pacing (the Mellanox-form controller
+                // has no timer event, P16).
+                legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(1);
             }
             if capacity_context.roce_generator(image, flow_index) {
-                // A queue-pair source owns three live timers: pacing, control and the
-                // retransmission timeout (one live record under the live-state contract).
-                legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(3);
+                // A queue-pair source owns two live timers: pacing and the retransmission
+                // timeout (one live record under the live-state contract).
+                legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(2);
             }
             if capacity_context.tcp_generator(image, flow_index).is_some() {
                 // TCP timers remain fallback-heap events. Under the live-state contract
@@ -2461,11 +2462,11 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
         if matches!(packet.kind, PacketKind::TcpData(_)) && !live_payloads.contains(&packet.id) {
             continue;
         }
-        // The zero-byte DCQCN control-timer token never enters a queue or crosses a link, and a PFC
+        // A zero-byte pacing token never enters a queue or crosses a link, and a PFC
         // frame travels on its reverse control lane, never on its flow's route.
         if matches!(
             packet.kind,
-            PacketKind::DcqcnControlTimer | PacketKind::RocePacingTimer | PacketKind::Pfc(_)
+            PacketKind::RocePacingTimer | PacketKind::Pfc(_)
         ) {
             continue;
         }
@@ -2625,9 +2626,6 @@ fn add_flow_route_capacities(
             unreachable!("PFC frames travel on control lanes, never on a flow route")
         }
         PacketKind::DcqcnCnp(_) => (flow.reverse_route.as_slice(), flow.source),
-        PacketKind::DcqcnControlTimer => {
-            unreachable!("the zero-byte DCQCN control-timer token is never routed")
-        }
         PacketKind::RoceData(_) => (flow.route.as_slice(), flow.target),
         PacketKind::RoceAck(_) | PacketKind::RoceNack(_) => {
             (flow.reverse_route.as_slice(), flow.source)
@@ -3389,9 +3387,7 @@ fn derived_transition_bound(
             }
             FlowGeneratorKind::Dcqcn(dcqcn) => {
                 let work = crate::device_sizing::dcqcn_device_work(image, generator, dcqcn);
-                Ok(bound
-                    .saturating_add(work.pacing_ticks)
-                    .saturating_add(work.control_ticks))
+                Ok(bound.saturating_add(work.pacing_ticks))
             }
             FlowGeneratorKind::Roce(roce) => Ok(bound
                 .saturating_add(crate::device_mechanism::roce_transition_bound(
@@ -3813,7 +3809,7 @@ fn encode_packet_metadata(kind: PacketKind, words: &mut [u64]) {
             words[2] = u64::from(header.pause);
         }
         PacketKind::DcqcnCnp(header) => words[0] = header.trigger_payload.0,
-        PacketKind::DcqcnControlTimer | PacketKind::RocePacingTimer => {}
+        PacketKind::RocePacingTimer => {}
         PacketKind::RoceData(header) => {
             words[0] = header.psn;
             words[1] = header.sent_time_ns;
@@ -5237,7 +5233,6 @@ fn decode_packet_kind(value: u64, metadata: &[u64]) -> Result<PacketKind, MetalE
         5 if metadata[1..] == [0, 0] => Ok(PacketKind::DcqcnCnp(crate::DcqcnCnpHeader {
             trigger_payload: PayloadId(metadata[0]),
         })),
-        6 if metadata == [0, 0, 0] => Ok(PacketKind::DcqcnControlTimer),
         7 if metadata[2] <= 1 => Ok(PacketKind::RoceData(crate::RoceDataHeader {
             psn: metadata[0],
             sent_time_ns: metadata[1],

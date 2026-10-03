@@ -138,7 +138,8 @@ fn dcqcn_fixtures_exercise_the_controller_and_carry_no_pfc_state() {
     assert_eq!(cnps, 195, "the multi-hop fixture must stay CNP-heavy");
 }
 
-/// A resumed checkpoint whose DCQCN source is Blocked with both timer chains live.
+/// A resumed checkpoint whose DCQCN source is Blocked with its controller armed (its timers are
+/// lazy, P16: the pacing chain is the only live timer).
 fn blocked_dcqcn_checkpoint() -> SimulationImage {
     let image = lower("dcqcn_t26.toml");
     for horizon in (1_000..image.stop_time_ns).step_by(1_000) {
@@ -148,19 +149,15 @@ fn blocked_dcqcn_checkpoint() -> SimulationImage {
         let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind else {
             panic!("the T26 source must stay DCQCN");
         };
-        let control_live = prefix
-            .pending_events
-            .iter()
-            .any(|event| event.payload == dcqcn.control_timer_payload);
-        if generator.next_emission.status == GeneratorStatus::Blocked && control_live {
+        if generator.next_emission.status == GeneratorStatus::Blocked && dcqcn.controller.armed {
             return checkpoint_image(&image, &prefix);
         }
     }
-    panic!("the T26 scenario must reach a Blocked source with a live control timer");
+    panic!("the T26 scenario must reach a Blocked source with an armed controller");
 }
 
 #[test]
-fn the_blocked_checkpoint_validates_and_owns_two_live_timer_chains() {
+fn the_blocked_checkpoint_validates_and_owns_one_live_timer_chain() {
     let image = blocked_dcqcn_checkpoint();
     days_executor::validate(&image, days_executor::Backend::Scalar)
         .expect("the checkpoint must validate");
@@ -169,7 +166,7 @@ fn the_blocked_checkpoint_validates_and_owns_two_live_timer_chains() {
         .iter()
         .filter(|event| event.kind == days_executor::EventKind::PacingTimer)
         .count();
-    assert_eq!(timers, 2, "pacing and control chains must both be live");
+    assert_eq!(timers, 1, "the pacing chain is the only live timer");
 }
 
 /// The DCQCN planner terms (packet and CNP counts, control ticks, the second timer chain, the CNP

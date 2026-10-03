@@ -569,14 +569,14 @@ pub struct RateGenerator {
     pub credit_quanta: u128,
 }
 
-/// Exact DCQCN reaction-point state over the T25 rate generator.
+/// Exact Mellanox-form DCQCN reaction point over the T25 rate generator: an unreliable DCQCN
+/// flow, whose receiver answers CE-marked data with CNP packets. The controller has no timer
+/// event (P16 ruling D2); its one live event is the pacing tick.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DcqcnGenerator {
     pub rate: RateGenerator,
     pub controller: DcqcnController,
-    /// Stable zero-byte token referenced by the second live `PacingTimer` event.
-    pub control_timer_payload: PayloadId,
     pub cnp_size_bytes: u64,
 }
 
@@ -599,7 +599,7 @@ pub struct RocePacer {
 
 /// A RoCE queue pair: a reliable DCQCN flow with Go-back-N.
 ///
-/// The exact DCQCN reaction point (`controller`, its control tick and the separate CNP packet)
+/// The exact Mellanox-form DCQCN reaction point (`controller`, with lazy timers and no timer event)
 /// paces a Go-back-N sender. A PSN is the byte offset of a packet's first byte, and packet `psn`
 /// is `min(mtu_bytes, total_bytes - psn)` bytes, so a retransmission is a pure function of its
 /// PSN and no segment ledger exists. The high-water mark is `FlowGeneratorState::bytes_emitted`,
@@ -609,8 +609,6 @@ pub struct RocePacer {
 pub struct RoceGenerator {
     pub pacer: RocePacer,
     pub controller: DcqcnController,
-    /// Stable zero-byte token of the control tick (`PacketKind::DcqcnControlTimer`).
-    pub control_timer_payload: PayloadId,
     /// Stable zero-byte token of the pacing tick and the retransmission timeout
     /// (`PacketKind::RocePacingTimer`).
     pub pacing_timer_payload: PayloadId,
@@ -894,8 +892,8 @@ pub enum PacketKind {
     TcpAck(TcpAckHeader) = 3,
     Pfc(PfcHeader) = 4,
     DcqcnCnp(DcqcnCnpHeader) = 5,
-    /// A source-local zero-byte token. It is never enqueued or transmitted.
-    DcqcnControlTimer = 6,
+    // Code 6 was the paper-form DCQCN control tick, removed in P16 (the Mellanox-form controller
+    // has no timer events); the remaining codes keep their values.
     RoceData(RoceDataHeader) = 7,
     RoceAck(RoceAckHeader) = 8,
     /// A cumulative NACK: `acknowledgment` is the expected PSN the sender rewinds to.
@@ -921,10 +919,10 @@ impl PacketKind {
         )
     }
 
-    /// A zero-byte source-local timer token (a DCQCN or RoCE control tick, a RoCE pacing tick):
-    /// never enqueued, transmitted or delivered.
+    /// A zero-byte source-local timer token (a RoCE pacing tick): never enqueued, transmitted or
+    /// delivered.
     pub const fn is_timer_token(self) -> bool {
-        matches!(self, Self::DcqcnControlTimer | Self::RocePacingTimer)
+        matches!(self, Self::RocePacingTimer)
     }
 
     pub const fn code(self) -> u8 {
@@ -935,7 +933,6 @@ impl PacketKind {
             Self::TcpAck(_) => 3,
             Self::Pfc(_) => 4,
             Self::DcqcnCnp(_) => 5,
-            Self::DcqcnControlTimer => 6,
             Self::RoceData(_) => 7,
             Self::RoceAck(_) => 8,
             Self::RoceNack(_) => 9,

@@ -2,7 +2,7 @@ use std::fs;
 
 use days::scenario::compile_config;
 use days_executor::{
-    Backend, DcqcnIncreaseStage, EventKind, FlowGeneratorKind, GeneratorStatus,
+    Backend, DcqcnController, EventKind, FlowGeneratorKind, GeneratorStatus,
     MechanismTransitionRecord, ObservationMode, PacketKind, dcqcn_transitions_csv,
     run_cpu_with_observations, run_scalar_with_observations, validate,
 };
@@ -46,12 +46,10 @@ max_rate_gbps = 20.0
 g = 0.5
 ai_rate_gbps = 0.5
 hai_rate_gbps = 1.0
-mi_factor = 0.5
-rtt_ns = 100000
+rp_timer_ns = 100000
 cnp_interval_ns = 10000
 pacing_interval_ns = 1000
 cnp_priority = 0
-increase_byte_threshold = 1000
 "#,
     )
     .unwrap();
@@ -168,18 +166,6 @@ fn finish_dcqcn_with_ce_in_flight(image: &mut days_executor::SimulationImage) {
     image.initial_events.sort_by_key(|event| event.key);
 }
 
-fn move_control_beyond_stop(image: &mut days_executor::SimulationImage) {
-    let FlowGeneratorKind::Dcqcn(mut dcqcn) = image.host_states[0].generators[0].kind else {
-        unreachable!()
-    };
-    dcqcn.controller.next_control_time_ns = image.stop_time_ns + 1;
-    let control_payload = dcqcn.control_timer_payload;
-    image.host_states[0].generators[0].kind = FlowGeneratorKind::Dcqcn(dcqcn);
-    image
-        .initial_events
-        .retain(|event| event.payload != control_payload);
-}
-
 fn blocked_dcqcn_service_boundary() -> days_executor::SimulationImage {
     const DUPLICATED_TOKEN_DELAY_NS: u64 = 922_337_203_685_452_262;
     const NON_PRIMARY_PER_PACKET_DELAY_NS: u64 = 318;
@@ -229,7 +215,7 @@ fn blocked_dcqcn_service_boundary() -> days_executor::SimulationImage {
 }
 
 #[test]
-fn dcqcn_lowers_to_rate_controller_receiver_and_two_timer_tokens() {
+fn dcqcn_lowers_to_rate_controller_receiver_and_one_pacing_event() {
     let directory = TempDir::new().unwrap();
     let image = compile_config(write_dcqcn_config(&directory)).unwrap();
     let generator = &image.host_states[0].generators[0];
@@ -237,17 +223,31 @@ fn dcqcn_lowers_to_rate_controller_receiver_and_two_timer_tokens() {
         panic!("expected exact DCQCN generator")
     };
     assert_eq!(dcqcn.rate.rate_numerator_bits_per_second, 10_000_000_000);
-    assert_eq!(dcqcn.controller.config.g_ppb, 500_000_000);
-    assert_eq!(dcqcn.controller.config.decrease_ppb, 500_000_000);
-    assert_eq!(dcqcn.controller.stage, DcqcnIncreaseStage::Hyper);
+    let config = dcqcn.controller.config;
+    // g = 0.5 in Q63; the Mellanox-form timers at their SimAI defaults but the RP timer.
+    assert_eq!(config.g_q63, 1 << 62);
+    assert_eq!(
+        (
+            config.alpha_interval_ns,
+            config.decrease_interval_ns,
+            config.increase_interval_ns,
+            config.fast_recovery_steps,
+            config.clamp_target_rate
+        ),
+        (1_000, 4_000, 100_000, 1, false)
+    );
+    assert_eq!(dcqcn.controller, DcqcnController::pristine(config));
     assert_eq!(image.host_states[1].dcqcn_receivers.len(), 1);
     assert_eq!(
+        image.host_states[1].dcqcn_receivers[0].cnp_interval_ns,
+        10_000
+    );
+    // The controller owns no token and no event (P16 ruling D2): one pacing tick per flow.
+    assert!(
         image
             .initial_packets
             .iter()
-            .filter(|packet| matches!(packet.kind, PacketKind::DcqcnControlTimer))
-            .count(),
-        1
+            .all(|packet| !packet.kind.is_timer_token())
     );
     assert_eq!(
         image
@@ -255,7 +255,7 @@ fn dcqcn_lowers_to_rate_controller_receiver_and_two_timer_tokens() {
             .iter()
             .filter(|event| event.kind == days_executor::EventKind::PacingTimer)
             .count(),
-        2
+        1
     );
 }
 
@@ -309,25 +309,21 @@ fn dcqcn_decimal_rates_lower_losslessly_through_u64_max() {
 fn blocked_dcqcn_pacing_token_is_counted_once_at_service_boundaries() {
     let below_max = blocked_dcqcn_service_boundary();
     validate(&below_max, Backend::Scalar)
-        .expect("the review fixture's logical service bound is exactly 15 ns below u64::MAX");
+        .expect("the review fixture's logical service bound fits below u64::MAX");
 
+    // With no controller timer (P16 ruling D2), the latest departure is the last pacing tick
+    // (159,999 ns) rather than the last control tick, so the exact boundary moved: the reverse
+    // link may take exactly 17,000 ns more per CNP before the service bound passes u64::MAX
+    // (bisected when this test was re-pinned).
     let mut exact = below_max;
-    exact.stop_time_ns = 500_015;
-    let FlowGeneratorKind::Dcqcn(mut dcqcn) = exact.host_states[0].generators[0].kind else {
-        unreachable!()
-    };
-    dcqcn.controller.config.control_interval_ns = 100_003;
-    dcqcn.controller.next_control_time_ns = 100_003;
-    let control_payload = dcqcn.control_timer_payload;
-    exact.host_states[0].generators[0].kind = FlowGeneratorKind::Dcqcn(dcqcn);
+    let reverse = exact.flows[0].reverse_route[0];
+    exact.links[reverse.0 as usize].propagation_ns += 17_000;
     exact
-        .initial_events
+        .channels
         .iter_mut()
-        .find(|event| event.payload == control_payload)
-        .expect("control event exists")
-        .key
-        .time_ns = 100_003;
-    exact.initial_events.sort_by_key(|event| event.key);
+        .find(|channel| channel.link == reverse)
+        .expect("reverse channel exists")
+        .min_delay_ns += 17_000;
     validate(&exact, Backend::Scalar).expect("the exact u64 service-time boundary must validate");
 
     let mut one_past = exact;
@@ -436,19 +432,23 @@ fn ecn_marking_generates_cnp_and_exact_scalar_cpu_controller_trajectory() {
         fs::write(&fixture_path, &csv).unwrap();
     }
     assert_eq!(csv, fs::read_to_string(fixture_path).unwrap());
-    assert!(dcqcn_records.iter().any(|record| {
-        record.kind == days_executor::DcqcnTransitionKind::Cnp && record.applied
-    }));
+    // Feedback rows from the CNPs, a tick row per pacing tick (ruling D17), and at least one cut.
     assert!(
         dcqcn_records
             .iter()
-            .any(|record| { record.kind == days_executor::DcqcnTransitionKind::Control })
+            .any(|record| record.kind == days_executor::DcqcnTransitionKind::Feedback)
     );
     assert!(
         dcqcn_records
             .iter()
-            .any(|record| { record.kind == days_executor::DcqcnTransitionKind::Bytes })
+            .any(|record| record.kind == days_executor::DcqcnTransitionKind::Tick)
     );
+    assert!(
+        dcqcn_records
+            .iter()
+            .any(|record| record.advance.decrease_cuts != 0)
+    );
+    assert!(dcqcn_records.iter().any(|record| record.frozen));
 
     for workers in [1, 2, 4] {
         let cpu = run_cpu_with_observations(
@@ -466,7 +466,7 @@ fn ecn_marking_generates_cnp_and_exact_scalar_cpu_controller_trajectory() {
 }
 
 #[test]
-fn terminal_dcqcn_checkpoint_with_dormant_control_timer_revalidates() {
+fn terminal_dcqcn_checkpoint_revalidates() {
     let directory = TempDir::new().unwrap();
     let image = compile_config(write_dcqcn_config(&directory)).unwrap();
     let result =
@@ -493,13 +493,52 @@ fn nonrepresentable_dcqcn_parameters_and_cnp_priority_are_rejected() {
     let path = write_dcqcn_config(&directory);
     let base = fs::read_to_string(&path).unwrap();
 
-    fs::write(&path, base.replace("g = 0.5", "g = 0.0000000005")).unwrap();
-    assert!(
-        compile_config(&path)
-            .unwrap_err()
-            .to_string()
-            .contains("ppb")
-    );
+    // g lowers exactly to Q63 where it is dyadic (1/1024 failed to lower in ppb in P15), is
+    // rounded half to even otherwise, and is refused outside 0..=1 or beyond 38 decimal places.
+    fs::write(&path, base.replace("g = 0.5", "g = 0.0009765625")).unwrap();
+    let image = compile_config(&path).unwrap();
+    let FlowGeneratorKind::Dcqcn(dcqcn) = image.host_states[0].generators[0].kind else {
+        unreachable!()
+    };
+    assert_eq!(dcqcn.controller.config.g_q63, 1 << 53);
+    fs::write(&path, base.replace("g = 0.5", "g = 0.001")).unwrap();
+    let image = compile_config(&path).unwrap();
+    let FlowGeneratorKind::Dcqcn(dcqcn) = image.host_states[0].generators[0].kind else {
+        unreachable!()
+    };
+    // round_half_even(2^63 / 1000) = 9,223,372,036,854,775.808 -> ...776.
+    assert_eq!(dcqcn.controller.config.g_q63, 9_223_372_036_854_776);
+    for (g, expected) in [
+        ("1.5", "0..=1"),
+        ("-0.25", "0..=1"),
+        (
+            "0.000000000000000000000000000000000000001",
+            "38 decimal places",
+        ),
+    ] {
+        fs::write(&path, base.replace("g = 0.5", &format!("g = {g}"))).unwrap();
+        let error = compile_config(&path).unwrap_err().to_string();
+        assert!(error.contains(expected), "g = {g}: {error}");
+    }
+    for (key, value) in [
+        ("mi_factor", "0.5"),
+        ("rtt_ns", "100000"),
+        ("increase_byte_threshold", "1000"),
+    ] {
+        fs::write(
+            &path,
+            base.replace(
+                "cnp_priority = 0",
+                &format!("cnp_priority = 0\n{key} = {value}"),
+            ),
+        )
+        .unwrap();
+        let error = compile_config(&path).unwrap_err().to_string();
+        assert!(
+            error.contains(key) && error.contains("removed in P16"),
+            "{key}: {error}"
+        );
+    }
 
     fs::write(&path, base.replace("cnp_priority = 0", "cnp_priority = 8")).unwrap();
     assert!(
@@ -577,7 +616,7 @@ fn dcqcn_validator_covers_state_ranges_and_exact_credit_representability() {
     );
 
     let mut receiver_mismatch = image.clone();
-    receiver_mismatch.host_states[1].dcqcn_receivers[0].cnp_interval_ns += 1;
+    receiver_mismatch.host_states[1].dcqcn_receivers[0].cnp_size_bytes += 1;
     assert!(
         validate(&receiver_mismatch, Backend::Scalar)
             .unwrap_err()
@@ -585,36 +624,45 @@ fn dcqcn_validator_covers_state_ranges_and_exact_credit_representability() {
             .contains("receiver")
     );
 
-    let mut invalid_hyper_stage = image.clone();
-    let FlowGeneratorKind::Dcqcn(mut dcqcn) = invalid_hyper_stage.host_states[0].generators[0].kind
-    else {
-        unreachable!()
-    };
-    dcqcn.controller.stage = DcqcnIncreaseStage::Hyper;
-    dcqcn.controller.stage_steps = 1;
-    invalid_hyper_stage.host_states[0].generators[0].kind = FlowGeneratorKind::Dcqcn(dcqcn);
-    assert!(
-        validate(&invalid_hyper_stage, Backend::Scalar)
-            .unwrap_err()
-            .to_string()
-            .contains("fixed-point controller state is out of range")
-    );
-
-    let mut seen_without_timestamp = image.clone();
-    let FlowGeneratorKind::Dcqcn(mut dcqcn) =
-        seen_without_timestamp.host_states[0].generators[0].kind
-    else {
-        unreachable!()
-    };
-    dcqcn.controller.cnp_seen = true;
-    dcqcn.controller.last_cnp_time_ns = None;
-    seen_without_timestamp.host_states[0].generators[0].kind = FlowGeneratorKind::Dcqcn(dcqcn);
-    assert!(
-        validate(&seen_without_timestamp, Backend::Scalar)
-            .unwrap_err()
-            .to_string()
-            .contains("fixed-point controller state is out of range")
-    );
+    // Mellanox-form state ranges: the stage saturates at fast_recovery_times + 1, alpha is at
+    // most one, a controller is pristine until its first feedback, and both rates stay within
+    // [2 * floor((minimum - 1) / 2), maximum].
+    for (edit, expected) in [
+        (
+            (|controller: &mut DcqcnController| {
+                controller.armed = true;
+                controller.stage = controller.config.fast_recovery_steps + 2;
+            }) as fn(&mut DcqcnController),
+            "stage above",
+        ),
+        (
+            |controller| {
+                controller.armed = true;
+                controller.alpha_q63 = days_executor::DCQCN_ALPHA_ONE + 1;
+            },
+            "alpha above one",
+        ),
+        (
+            |controller| controller.next_alpha_ns = 1,
+            "moved before its first feedback",
+        ),
+        (
+            |controller| {
+                controller.armed = true;
+                controller.target_rate_bps = controller.config.maximum_rate_bps + 1;
+            },
+            "reachable range",
+        ),
+    ] {
+        let mut corrupt = image.clone();
+        let FlowGeneratorKind::Dcqcn(mut dcqcn) = corrupt.host_states[0].generators[0].kind else {
+            unreachable!()
+        };
+        edit(&mut dcqcn.controller);
+        corrupt.host_states[0].generators[0].kind = FlowGeneratorKind::Dcqcn(dcqcn);
+        let error = validate(&corrupt, Backend::Scalar).unwrap_err().to_string();
+        assert!(error.contains(expected), "{expected}: {error}");
+    }
 
     let mut exact = image.clone();
     let FlowGeneratorKind::Dcqcn(mut dcqcn) = exact.host_states[0].generators[0].kind else {
@@ -644,62 +692,6 @@ fn dcqcn_validator_covers_state_ranges_and_exact_credit_representability() {
             .unwrap_err()
             .to_string()
             .contains("credit can exceed u128")
-    );
-}
-
-#[test]
-fn dcqcn_controller_counter_and_cnp_deadline_capacity_are_exact() {
-    let image = dcqcn_image();
-
-    let mut exact_cnp = image.clone();
-    let FlowGeneratorKind::Dcqcn(mut dcqcn) = exact_cnp.host_states[0].generators[0].kind else {
-        unreachable!()
-    };
-    dcqcn.controller.last_cnp_time_ns = Some(
-        u64::MAX
-            .checked_sub(dcqcn.controller.config.cnp_interval_ns)
-            .unwrap(),
-    );
-    exact_cnp.host_states[0].generators[0].kind = FlowGeneratorKind::Dcqcn(dcqcn);
-    validate(&exact_cnp, Backend::Scalar).expect("the exact CNP deadline boundary must fit");
-
-    let mut cnp_one_past = exact_cnp;
-    let FlowGeneratorKind::Dcqcn(mut dcqcn) = cnp_one_past.host_states[0].generators[0].kind else {
-        unreachable!()
-    };
-    dcqcn.controller.last_cnp_time_ns = dcqcn.controller.last_cnp_time_ns.map(|last| last + 1);
-    cnp_one_past.host_states[0].generators[0].kind = FlowGeneratorKind::Dcqcn(dcqcn);
-    assert!(
-        validate(&cnp_one_past, Backend::Scalar)
-            .unwrap_err()
-            .to_string()
-            .contains("CNP interval deadline can exceed u64")
-    );
-
-    let mut exact_bytes = image;
-    let generator = exact_bytes.host_states[0].generators[0];
-    let FlowGeneratorKind::Dcqcn(mut dcqcn) = generator.kind else {
-        unreachable!()
-    };
-    let executable_bytes = dcqcn.rate.total_bytes - generator.bytes_emitted;
-    dcqcn.controller.cnp_seen = true;
-    dcqcn.controller.last_cnp_time_ns = Some(0);
-    dcqcn.controller.bytes_since_increase = u64::MAX - executable_bytes;
-    exact_bytes.host_states[0].generators[0].kind = FlowGeneratorKind::Dcqcn(dcqcn);
-    validate(&exact_bytes, Backend::Scalar).expect("the exact byte-counter boundary must fit");
-
-    let mut bytes_one_past = exact_bytes;
-    let FlowGeneratorKind::Dcqcn(mut dcqcn) = bytes_one_past.host_states[0].generators[0].kind
-    else {
-        unreachable!()
-    };
-    dcqcn.controller.bytes_since_increase += 1;
-    bytes_one_past.host_states[0].generators[0].kind = FlowGeneratorKind::Dcqcn(dcqcn);
-    assert!(
-        validate(&bytes_one_past, Backend::Scalar)
-            .unwrap_err()
-            .to_string()
-            .contains("byte counter can exceed u64")
     );
 }
 
@@ -863,10 +855,9 @@ fn pfc_frame_bound_includes_only_executable_reverse_dcqcn_cnp_work() {
 }
 
 #[test]
-fn dcqcn_origin_capacity_counts_data_pacing_and_control_successors_exactly() {
+fn dcqcn_origin_capacity_counts_data_and_pacing_successors_exactly() {
     let mut pacing = dcqcn_image();
     fix_dcqcn_rate(&mut pacing);
-    move_control_beyond_stop(&mut pacing);
     // Twenty data transmissions create 60 source-link events, and the pacing process creates
     // exactly 19 successor timers after its resident first timer.
     let exact_pacing_origin_bound = 79;
@@ -881,19 +872,12 @@ fn dcqcn_origin_capacity_counts_data_pacing_and_control_successors_exactly() {
             .contains("origin sequence space overflows")
     );
 
-    let mut control = dcqcn_image();
-    finish_dcqcn_data(&mut control);
-    // Control deadlines are 100k, 200k, ..., 500k: five executions and four successors.
-    control.host_states[0].next_origin_seq = u64::MAX - 4;
-    validate(&control, Backend::Scalar).expect("the exact control origin boundary must fit");
-    let mut one_past = control;
-    one_past.host_states[0].next_origin_seq += 1;
-    assert!(
-        validate(&one_past, Backend::Scalar)
-            .unwrap_err()
-            .to_string()
-            .contains("origin sequence space overflows")
-    );
+    // A finished source owns no successor at all: its controller has no timer event (P16), so
+    // its origin sequence may sit at u64::MAX.
+    let mut finished = dcqcn_image();
+    finish_dcqcn_data(&mut finished);
+    finished.host_states[0].next_origin_seq = u64::MAX;
+    validate(&finished, Backend::Scalar).expect("a finished DCQCN source owns no successor");
 }
 
 #[test]
@@ -944,12 +928,17 @@ fn dcqcn_cnp_counter_origin_and_payload_capacity_are_exact() {
 fn terminal_and_beyond_stop_dcqcn_own_zero_future_capacity() {
     let mut terminal = dcqcn_image();
     finish_dcqcn_data(&mut terminal);
-    move_control_beyond_stop(&mut terminal);
     let FlowGeneratorKind::Dcqcn(mut dcqcn) = terminal.host_states[0].generators[0].kind else {
         unreachable!()
     };
-    dcqcn.controller.bytes_since_increase = u64::MAX;
-    dcqcn.controller.last_cnp_time_ns = Some(u64::MAX);
+    // An armed controller at its extremes: instants at u64::MAX never fire and own no capacity.
+    dcqcn.controller.armed = true;
+    dcqcn.controller.decrease_pending = true;
+    dcqcn.controller.increase_armed = true;
+    dcqcn.controller.next_alpha_ns = u64::MAX;
+    dcqcn.controller.next_decrease_ns = u64::MAX;
+    dcqcn.controller.next_increase_ns = u64::MAX;
+    dcqcn.controller.alpha_q63 = 0;
     terminal.host_states[0].generators[0].kind = FlowGeneratorKind::Dcqcn(dcqcn);
     terminal.host_states[0].sourced_packets = u64::MAX;
     terminal.host_states[1].sourced_packets = u64::MAX;
@@ -958,10 +947,9 @@ fn terminal_and_beyond_stop_dcqcn_own_zero_future_capacity() {
     terminal.host_states[0].next_payload_seq = u64::MAX;
     terminal.host_states[1].next_payload_seq = u64::MAX;
     validate(&terminal, Backend::Scalar)
-        .expect("terminal data and beyond-stop control state own zero future capacity");
+        .expect("terminal data and an armed controller own zero future capacity");
 
     let mut beyond = dcqcn_image();
-    move_control_beyond_stop(&mut beyond);
     let generator = &mut beyond.host_states[0].generators[0];
     generator.next_emission.departure_time_ns = beyond.stop_time_ns + 1_000;
     let pacing_payload = generator.next_emission.payload;
@@ -975,8 +963,14 @@ fn terminal_and_beyond_stop_dcqcn_own_zero_future_capacity() {
     let FlowGeneratorKind::Dcqcn(mut dcqcn) = beyond.host_states[0].generators[0].kind else {
         unreachable!()
     };
-    dcqcn.controller.bytes_since_increase = u64::MAX;
-    dcqcn.controller.last_cnp_time_ns = Some(u64::MAX);
+    // An armed controller at its extremes: instants at u64::MAX never fire and own no capacity.
+    dcqcn.controller.armed = true;
+    dcqcn.controller.decrease_pending = true;
+    dcqcn.controller.increase_armed = true;
+    dcqcn.controller.next_alpha_ns = u64::MAX;
+    dcqcn.controller.next_decrease_ns = u64::MAX;
+    dcqcn.controller.next_increase_ns = u64::MAX;
+    dcqcn.controller.alpha_q63 = 0;
     beyond.host_states[0].generators[0].kind = FlowGeneratorKind::Dcqcn(dcqcn);
     beyond.host_states[0].sourced_packets = u64::MAX;
     beyond.host_states[1].sourced_packets = u64::MAX;
@@ -985,57 +979,13 @@ fn terminal_and_beyond_stop_dcqcn_own_zero_future_capacity() {
     beyond.host_states[0].next_payload_seq = u64::MAX;
     beyond.host_states[1].next_payload_seq = u64::MAX;
     validate(&beyond, Backend::Scalar)
-        .expect("active pacing and control deadlines beyond stop own zero future capacity");
-}
-
-#[test]
-fn dcqcn_control_timer_deadline_closes_at_u64_max() {
-    let mut exact = dcqcn_image();
-    finish_dcqcn_data(&mut exact);
-    let FlowGeneratorKind::Dcqcn(mut dcqcn) = exact.host_states[0].generators[0].kind else {
-        unreachable!()
-    };
-    dcqcn.controller.config.control_interval_ns = 1;
-    dcqcn.controller.next_control_time_ns = u64::MAX - 1;
-    let control_payload = dcqcn.control_timer_payload;
-    exact.host_states[0].generators[0].kind = FlowGeneratorKind::Dcqcn(dcqcn);
-    exact.stop_time_ns = u64::MAX - 1;
-    let control_event = exact
-        .initial_events
-        .iter_mut()
-        .find(|event| event.payload == control_payload)
-        .unwrap();
-    control_event.key.time_ns = u64::MAX - 1;
-    validate(&exact, Backend::Scalar).expect("the exact maximum successor deadline must fit");
-
-    let mut one_past = exact;
-    one_past.stop_time_ns = u64::MAX;
-    let FlowGeneratorKind::Dcqcn(mut dcqcn) = one_past.host_states[0].generators[0].kind else {
-        unreachable!()
-    };
-    dcqcn.controller.next_control_time_ns = u64::MAX;
-    let control_payload = dcqcn.control_timer_payload;
-    one_past.host_states[0].generators[0].kind = FlowGeneratorKind::Dcqcn(dcqcn);
-    one_past
-        .initial_events
-        .iter_mut()
-        .find(|event| event.payload == control_payload)
-        .unwrap()
-        .key
-        .time_ns = u64::MAX;
-    assert!(
-        validate(&one_past, Backend::Scalar)
-            .unwrap_err()
-            .to_string()
-            .contains("control timer successor exceeds u64")
-    );
+        .expect("an active pacing deadline beyond stop owns zero future capacity");
 }
 
 #[test]
 fn dcqcn_reverse_cnp_service_time_closes_at_u64_max() {
     let mut exact = dcqcn_image();
     fix_dcqcn_rate(&mut exact);
-    move_control_beyond_stop(&mut exact);
     let generator = exact.host_states[0].generators[0];
     let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind else {
         unreachable!()

@@ -253,20 +253,30 @@ impl<'de> Deserialize<'de> for SourceDistributionInfo {
     }
 }
 
+/// `[flow.traffic.dcqcn]`: the Mellanox-form DCQCN reaction point (P16) and its pacer. Every key
+/// but `max_rate_gbps` defaults to SimAI's and HPCC's shipped block (ruling D8). The paper-form
+/// keys `mi_factor`, `rtt_ns` and `increase_byte_threshold` are rejected by name (ruling D9), and
+/// any other unknown key by `deny_unknown_fields`.
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceDcqcn {
-    rate_gbps: ExactDecimal,
-    min_rate_gbps: ExactDecimal,
     max_rate_gbps: ExactDecimal,
-    g: ExactDecimal,
-    ai_rate_gbps: ExactDecimal,
-    hai_rate_gbps: ExactDecimal,
-    mi_factor: ExactDecimal,
-    rtt_ns: Option<ExactDecimal>,
+    rate_gbps: Option<ExactDecimal>,
+    min_rate_gbps: Option<ExactDecimal>,
+    g: Option<ExactDecimal>,
+    ai_rate_gbps: Option<ExactDecimal>,
+    hai_rate_gbps: Option<ExactDecimal>,
+    alpha_resume_interval_ns: Option<ExactDecimal>,
+    rate_decrease_interval_ns: Option<ExactDecimal>,
+    rp_timer_ns: Option<ExactDecimal>,
+    fast_recovery_times: Option<u32>,
+    clamp_target_rate: Option<bool>,
     cnp_interval_ns: Option<ExactDecimal>,
     pacing_interval_ns: Option<ExactDecimal>,
     cnp_priority: Option<u8>,
-    increase_byte_threshold: Option<u64>,
+    mi_factor: Option<serde::de::IgnoredAny>,
+    rtt_ns: Option<serde::de::IgnoredAny>,
+    increase_byte_threshold: Option<serde::de::IgnoredAny>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -322,13 +332,16 @@ struct DcqcnTrafficKey {
     maximum_rate_bps: u64,
     additive_rate_bps: u64,
     hyper_rate_bps: u64,
-    g_ppb: u64,
-    decrease_ppb: u64,
+    g_q63: u64,
+    alpha_interval_ns: u64,
+    decrease_interval_ns: u64,
+    increase_interval_ns: u64,
+    fast_recovery_steps: u32,
+    clamp_target_rate: bool,
+    /// The notification point's CNP spacing of an unreliable DCQCN flow; zero for a queue pair.
     cnp_interval_ns: u64,
-    control_interval_ns: u64,
     pacing_interval_ns: u64,
     cnp_priority: u8,
-    increase_byte_threshold: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1468,70 +1481,82 @@ fn dcqcn_traffic_key(
     priority: u8,
     scenario_text: &str,
 ) -> Result<DcqcnTrafficKey, CompileError> {
+    for (present, key, reason) in [
+        (
+            dcqcn.mi_factor.is_some(),
+            "mi_factor",
+            "the Mellanox-form cut is alpha / 2",
+        ),
+        (
+            dcqcn.rtt_ns.is_some(),
+            "rtt_ns",
+            "the rate-increase timer is `rp_timer_ns`",
+        ),
+        (
+            dcqcn.increase_byte_threshold.is_some(),
+            "increase_byte_threshold",
+            "the Mellanox form has no byte counter",
+        ),
+    ] {
+        if present {
+            return Err(CompileError::Unsupported(format!(
+                "unsupported paper-form DCQCN key `{key}` (removed in P16: {reason}); see docs/content/docs/configuration/flows.mdx"
+            )));
+        }
+    }
+    let gbps = |value: Option<&ExactDecimal>, default: &str, label: &str| {
+        optional_scaled_decimal(scenario_text, value, default, 1_000_000_000, label)
+    };
+    let nanoseconds = |value: Option<&ExactDecimal>, default: &str, label: &str| {
+        optional_scaled_decimal(scenario_text, value, default, 1, label)
+    };
+    let maximum_rate_bps = scaled_decimal(
+        scenario_text,
+        &dcqcn.max_rate_gbps,
+        1_000_000_000,
+        "DCQCN maximum rate",
+    )?;
+    let g_literal = match dcqcn.g.as_ref() {
+        Some(value) => exact_decimal_literal(scenario_text, value, "DCQCN g")?,
+        None => "0.00390625",
+    };
     let key = DcqcnTrafficKey {
-        initial_rate_bps: scaled_decimal(
-            scenario_text,
-            &dcqcn.rate_gbps,
-            1_000_000_000,
-            "DCQCN rate",
+        initial_rate_bps: match dcqcn.rate_gbps.as_ref() {
+            Some(value) => scaled_decimal(scenario_text, value, 1_000_000_000, "DCQCN rate")?,
+            None => maximum_rate_bps,
+        },
+        minimum_rate_bps: gbps(dcqcn.min_rate_gbps.as_ref(), "0.1", "DCQCN minimum rate")?,
+        maximum_rate_bps,
+        additive_rate_bps: gbps(dcqcn.ai_rate_gbps.as_ref(), "0.05", "DCQCN additive rate")?,
+        hyper_rate_bps: gbps(dcqcn.hai_rate_gbps.as_ref(), "0.1", "DCQCN hyper rate")?,
+        g_q63: q63_decimal_literal(g_literal, "DCQCN g")?,
+        alpha_interval_ns: nanoseconds(
+            dcqcn.alpha_resume_interval_ns.as_ref(),
+            "1000",
+            "DCQCN alpha resume interval ns",
         )?,
-        minimum_rate_bps: scaled_decimal(
-            scenario_text,
-            &dcqcn.min_rate_gbps,
-            1_000_000_000,
-            "DCQCN minimum rate",
+        decrease_interval_ns: nanoseconds(
+            dcqcn.rate_decrease_interval_ns.as_ref(),
+            "4000",
+            "DCQCN rate decrease interval ns",
         )?,
-        maximum_rate_bps: scaled_decimal(
-            scenario_text,
-            &dcqcn.max_rate_gbps,
-            1_000_000_000,
-            "DCQCN maximum rate",
+        increase_interval_ns: nanoseconds(
+            dcqcn.rp_timer_ns.as_ref(),
+            "900000",
+            "DCQCN rp timer ns",
         )?,
-        additive_rate_bps: scaled_decimal(
-            scenario_text,
-            &dcqcn.ai_rate_gbps,
-            1_000_000_000,
-            "DCQCN additive rate",
-        )?,
-        hyper_rate_bps: scaled_decimal(
-            scenario_text,
-            &dcqcn.hai_rate_gbps,
-            1_000_000_000,
-            "DCQCN hyper rate",
-        )?,
-        g_ppb: scaled_decimal(scenario_text, &dcqcn.g, 1_000_000_000, "DCQCN g ppb")?,
-        decrease_ppb: scaled_decimal(
-            scenario_text,
-            &dcqcn.mi_factor,
-            1_000_000_000,
-            "DCQCN decrease ppb",
-        )?,
-        cnp_interval_ns: optional_scaled_decimal(
-            scenario_text,
-            dcqcn.cnp_interval_ns.as_ref(),
-            "50000",
-            1,
-            "DCQCN CNP interval ns",
-        )?,
-        control_interval_ns: optional_scaled_decimal(
-            scenario_text,
-            dcqcn.rtt_ns.as_ref(),
-            "100000",
-            1,
-            "DCQCN control interval ns",
-        )?,
-        pacing_interval_ns: optional_scaled_decimal(
-            scenario_text,
+        fast_recovery_steps: dcqcn.fast_recovery_times.unwrap_or(1),
+        clamp_target_rate: dcqcn.clamp_target_rate.unwrap_or(false),
+        cnp_interval_ns: nanoseconds(dcqcn.cnp_interval_ns.as_ref(), "0", "DCQCN CNP interval ns")?,
+        pacing_interval_ns: nanoseconds(
             dcqcn.pacing_interval_ns.as_ref(),
             "1000",
-            1,
             "DCQCN pacing interval ns",
         )?,
         // The flow's feedback priority (P15 ruling D6): CNPs ride the data class unless
         // the flow names another. Before P15 the default was 0 and any other value had to
         // equal the flow priority, so every config accepted then keeps its key.
         cnp_priority: dcqcn.cnp_priority.unwrap_or(priority),
-        increase_byte_threshold: dcqcn.increase_byte_threshold.unwrap_or(10_000_000),
     };
     if key.pacing_interval_ns == 0 {
         return Err(CompileError::Invalid(
@@ -1543,21 +1568,105 @@ fn dcqcn_traffic_key(
             "DCQCN CNP priority must be in IEEE 802.1Q range 0..=7".to_owned(),
         ));
     }
+    dcqcn_controller_config(key)
+        .validate()
+        .map_err(|error| CompileError::Invalid(error.to_string()))?;
+    Ok(key)
+}
+
+impl DcqcnTrafficKey {
+    /// The key's content, in declaration order, for the flow seed.
+    const fn seed_words(self) -> [u64; 14] {
+        [
+            self.initial_rate_bps,
+            self.minimum_rate_bps,
+            self.maximum_rate_bps,
+            self.additive_rate_bps,
+            self.hyper_rate_bps,
+            self.g_q63,
+            self.alpha_interval_ns,
+            self.decrease_interval_ns,
+            self.increase_interval_ns,
+            self.fast_recovery_steps as u64,
+            self.clamp_target_rate as u64,
+            self.cnp_interval_ns,
+            self.pacing_interval_ns,
+            self.cnp_priority as u64,
+        ]
+    }
+}
+
+/// The controller configuration a lowered DCQCN key names.
+const fn dcqcn_controller_config(key: DcqcnTrafficKey) -> DcqcnControllerConfig {
     DcqcnControllerConfig {
         initial_rate_bps: key.initial_rate_bps,
         minimum_rate_bps: key.minimum_rate_bps,
         maximum_rate_bps: key.maximum_rate_bps,
         additive_rate_bps: key.additive_rate_bps,
         hyper_rate_bps: key.hyper_rate_bps,
-        g_ppb: key.g_ppb,
-        decrease_ppb: key.decrease_ppb,
-        cnp_interval_ns: key.cnp_interval_ns,
-        control_interval_ns: key.control_interval_ns,
-        increase_byte_threshold: key.increase_byte_threshold,
+        g_q63: key.g_q63,
+        alpha_interval_ns: key.alpha_interval_ns,
+        decrease_interval_ns: key.decrease_interval_ns,
+        increase_interval_ns: key.increase_interval_ns,
+        fast_recovery_steps: key.fast_recovery_steps,
+        clamp_target_rate: key.clamp_target_rate,
     }
-    .validate()
-    .map_err(|error| CompileError::Invalid(error.to_string()))?;
-    Ok(key)
+}
+
+/// An exact decimal `0 <= g <= 1` in Q63 (`1` is `2^63`), rounded half to even: exact for every
+/// dyadic gain down to 2^-63 (1/16, 1/256, 1/1024, ...), and within 2^-64 otherwise (P16 design
+/// note §1.6). At most 19 significant digits and 38 fractional places are accepted; integer
+/// arithmetic only.
+fn q63_decimal_literal(literal: &str, label: &str) -> Result<u64, CompileError> {
+    let literal = literal.trim();
+    let parsed = parsed_decimal(literal, label)?;
+    let out_of_range = || CompileError::Invalid(format!("{label} must be in 0..=1, got {literal}"));
+    if parsed.negative && parsed.digits != "0" {
+        return Err(out_of_range());
+    }
+    if parsed.digits == "0" {
+        return Ok(0);
+    }
+    if parsed.digits.len() > 19 || parsed.power < -38 {
+        return Err(CompileError::Unsupported(format!(
+            "unsupported {label} `{literal}`; at most 19 significant digits and 38 decimal places"
+        )));
+    }
+    let digits = parsed.digits.parse::<u128>().map_err(|_| out_of_range())?;
+    let (numerator, denominator) = if parsed.power >= 0 {
+        let scale = 10_u128
+            .checked_pow(u32::try_from(parsed.power).map_err(|_| out_of_range())?)
+            .ok_or_else(out_of_range)?;
+        (digits.checked_mul(scale).ok_or_else(out_of_range)?, 1_u128)
+    } else {
+        (digits, 10_u128.pow(parsed.power.unsigned_abs() as u32))
+    };
+    if numerator > denominator {
+        return Err(out_of_range());
+    }
+    // numerator <= denominator <= 10^38 < 2^127: binary long division stays within u128.
+    long_q63(numerator, denominator).ok_or_else(out_of_range)
+}
+
+/// `round_half_even(numerator * 2^63 / denominator)` for `numerator <= denominator`, by binary long
+/// division (exact for any `denominator < 2^127`).
+fn long_q63(numerator: u128, denominator: u128) -> Option<u64> {
+    let mut quotient: u128 = numerator / denominator;
+    let mut rest = numerator % denominator;
+    for _ in 0..63 {
+        rest <<= 1;
+        quotient <<= 1;
+        if rest >= denominator {
+            rest -= denominator;
+            quotient |= 1;
+        }
+    }
+    // Round half to even on the remainder.
+    let twice = rest << 1;
+    if twice > denominator || twice == denominator && quotient & 1 == 1 {
+        quotient += 1;
+    }
+    u64::try_from(quotient).ok().filter(|&q| q <= 1 << 63)
 }
 
 /// Validates one flow's traffic options. `priority` is the flow's IEEE 802.1Q class, the default
@@ -1721,7 +1830,13 @@ fn validate_traffic(
             })?;
             if dcqcn.cnp_priority.is_some() {
                 return Err(CompileError::Unsupported(
-                    "unsupported `cnp_priority` on RoCE traffic; set the CNP, ACK and NACK class with `[flow.traffic.roce] feedback_priority`"
+                    "unsupported `cnp_priority` on RoCE traffic; set the ACK and NACK class with `[flow.traffic.roce] feedback_priority`"
+                        .to_owned(),
+                ));
+            }
+            if dcqcn.cnp_interval_ns.is_some() {
+                return Err(CompileError::Unsupported(
+                    "unsupported `cnp_interval_ns` on RoCE traffic: a queue pair's receiver echoes ECN on its ACKs and NACKs and sends no CNP (P16)"
                         .to_owned(),
                 ));
             }
@@ -2714,15 +2829,10 @@ fn lower(
             continue;
         }
         let emission_count = packet_count(&flow.traffic);
-        let mut dcqcn_control_payload = None;
-        // A RoCE queue pair's full key, and the DCQCN controller key of a DCQCN flow or pair.
+        // A RoCE queue pair's full key.
         let roce = match flow.traffic.kind {
             TrafficKind::Roce(ordinal) => Some(roce_key(&roce_keys, ordinal)),
             _ => None,
-        };
-        let controller_key = match flow.traffic.kind {
-            TrafficKind::Dcqcn(config) => Some(config),
-            _ => roce.map(|roce| roce.dcqcn),
         };
         let collective_ready = flow.collective.as_ref().is_none_or(|stage| {
             stage.local_predecessor_complete && stage.inbound_predecessor_complete
@@ -2742,39 +2852,32 @@ fn lower(
                 payload: PayloadId(0),
             }
         } else if gated_roce {
-            // Ruling C1: a gated RoCE stage's two timer tokens are allocated here, in the order a
-            // released pair's are (pacing, then control), and stay resident with no event, so the
-            // CPU executor imports and pins them like any queue pair's.
+            // Ruling C1: a gated RoCE stage's pacing token is allocated here, as a released
+            // pair's is, and stays resident with no event, so the CPU executor imports and pins
+            // it like any queue pair's. (The Mellanox-form controller owns no token, P16.)
             let sequence = payload_sequences.entry(source).or_default();
-            let mut tokens = [PayloadId(0); 2];
-            for (token, kind) in tokens
-                .iter_mut()
-                .zip([PacketKind::RocePacingTimer, PacketKind::DcqcnControlTimer])
-            {
-                *token = allocate_payload_id(
-                    ids.node(source),
-                    node_count,
-                    *sequence,
-                    "RoCE stage token payload sequence",
-                )?;
-                *sequence = sequence.checked_add(1).ok_or_else(|| {
-                    CompileError::Invalid(format!(
-                        "RoCE stage token payload sequence overflow at {source:?}"
-                    ))
-                })?;
-                initial_packets.push(PacketDescriptor {
-                    id: *token,
-                    flow: descriptor.id,
-                    size_bytes: 0,
-                    ecn_marked: false,
-                    kind,
-                });
-            }
-            dcqcn_control_payload = Some(tokens[1]);
+            let token = allocate_payload_id(
+                ids.node(source),
+                node_count,
+                *sequence,
+                "RoCE stage token payload sequence",
+            )?;
+            *sequence = sequence.checked_add(1).ok_or_else(|| {
+                CompileError::Invalid(format!(
+                    "RoCE stage token payload sequence overflow at {source:?}"
+                ))
+            })?;
+            initial_packets.push(PacketDescriptor {
+                id: token,
+                flow: descriptor.id,
+                size_bytes: 0,
+                ecn_marked: false,
+                kind: PacketKind::RocePacingTimer,
+            });
             ScheduledEmission {
                 status: GeneratorStatus::Blocked,
                 departure_time_ns: 0,
-                payload: tokens[0],
+                payload: token,
             }
         } else if !collective_ready {
             ScheduledEmission {
@@ -2833,46 +2936,6 @@ fn lower(
                     EventKind::PacketArrival
                 },
             ));
-            if let Some(config) = controller_key {
-                let control_time_ns = flow
-                    .traffic
-                    .initial_delay_ns
-                    .checked_add(config.control_interval_ns)
-                    .ok_or_else(|| {
-                        CompileError::Invalid(format!(
-                            "flow {:?} first DCQCN control deadline exceeds u64",
-                            descriptor.id
-                        ))
-                    })?;
-                let control_payload = allocate_payload_id(
-                    ids.node(source),
-                    node_count,
-                    *sequence,
-                    "DCQCN control payload sequence",
-                )?;
-                *sequence = sequence.checked_add(1).ok_or_else(|| {
-                    CompileError::Invalid(format!(
-                        "DCQCN control payload sequence overflow at {source:?}"
-                    ))
-                })?;
-                initial_packets.push(PacketDescriptor {
-                    id: control_payload,
-                    flow: descriptor.id,
-                    size_bytes: 0,
-                    ecn_marked: false,
-                    kind: PacketKind::DcqcnControlTimer,
-                });
-                if control_time_ns <= model.stop_time_ns {
-                    initial_event_inputs.push((
-                        source,
-                        control_time_ns,
-                        descriptor.id,
-                        control_payload,
-                        EventKind::PacingTimer,
-                    ));
-                }
-                dcqcn_control_payload = Some(control_payload);
-            }
             ScheduledEmission {
                 status: match (roce, &flow.traffic.termination) {
                     // A queue pair's status predicts its first tick: it sends iff one tick of
@@ -2972,8 +3035,7 @@ fn lower(
                             let Termination::Bytes(total_bytes) = flow.traffic.termination else {
                                 unreachable!("DCQCN validation requires byte termination")
                             };
-                            let controller =
-                                lowered_dcqcn_controller(config, flow.traffic.initial_delay_ns);
+                            let controller = lowered_dcqcn_controller(config);
                             FlowGeneratorKind::Dcqcn(DcqcnGenerator {
                                 rate: RateGenerator {
                                     first_pacing_time_ns: flow.traffic.initial_delay_ns,
@@ -2985,8 +3047,6 @@ fn lower(
                                     credit_quanta: 0,
                                 },
                                 controller,
-                                control_timer_payload: dcqcn_control_payload
-                                    .expect("nonempty DCQCN lowering allocates a control token"),
                                 cnp_size_bytes: 64,
                             })
                         }
@@ -3003,9 +3063,7 @@ fn lower(
                                     total_bytes,
                                     credit_quanta: 0,
                                 },
-                                controller: lowered_dcqcn_controller(roce.dcqcn, anchor_ns),
-                                control_timer_payload: dcqcn_control_payload
-                                    .expect("nonempty RoCE lowering allocates a control token"),
+                                controller: lowered_dcqcn_controller(roce.dcqcn),
                                 pacing_timer_payload: next_emission.payload,
                                 next_psn: 0,
                                 snd_una: 0,
@@ -4094,28 +4152,11 @@ fn validate_input_bounds(flows: &[FlowInput]) -> Result<(), CompileError> {
     Ok(())
 }
 
-/// The exact DCQCN reaction point of a DCQCN flow or RoCE queue pair whose pacing starts at
-/// `initial_delay_ns`; its first control tick is one control interval later.
-fn lowered_dcqcn_controller(config: DcqcnTrafficKey, initial_delay_ns: u64) -> DcqcnController {
-    let first_control_time_ns = initial_delay_ns
-        .checked_add(config.control_interval_ns)
-        .expect("DCQCN lowering checked first control deadline");
-    DcqcnController::new(
-        DcqcnControllerConfig {
-            initial_rate_bps: config.initial_rate_bps,
-            minimum_rate_bps: config.minimum_rate_bps,
-            maximum_rate_bps: config.maximum_rate_bps,
-            additive_rate_bps: config.additive_rate_bps,
-            hyper_rate_bps: config.hyper_rate_bps,
-            g_ppb: config.g_ppb,
-            decrease_ppb: config.decrease_ppb,
-            cnp_interval_ns: config.cnp_interval_ns,
-            control_interval_ns: config.control_interval_ns,
-            increase_byte_threshold: config.increase_byte_threshold,
-        },
-        first_control_time_ns,
-    )
-    .expect("validated DCQCN controller configuration")
+/// The exact Mellanox-form DCQCN reaction point of a DCQCN flow or RoCE queue pair: pristine, with
+/// no timer started (its timers start at its first feedback, P16).
+fn lowered_dcqcn_controller(config: DcqcnTrafficKey) -> DcqcnController {
+    DcqcnController::new(dcqcn_controller_config(config))
+        .expect("validated DCQCN controller configuration")
 }
 
 fn packet_count(traffic: &TrafficKey) -> u64 {
@@ -4250,20 +4291,7 @@ fn mix_traffic_seed(mut state: u64, traffic: &TrafficKey, roce_keys: &[RoceTraff
         TrafficKind::Tcp(TcpAlgorithm::Cubic) => mix_seed(state ^ 0x5450_435f_4355_4249),
         TrafficKind::Dcqcn(dcqcn) => {
             state = mix_seed(state ^ 0x4443_5143_4e00_0000);
-            for value in [
-                dcqcn.initial_rate_bps,
-                dcqcn.minimum_rate_bps,
-                dcqcn.maximum_rate_bps,
-                dcqcn.additive_rate_bps,
-                dcqcn.hyper_rate_bps,
-                dcqcn.g_ppb,
-                dcqcn.decrease_ppb,
-                dcqcn.cnp_interval_ns,
-                dcqcn.control_interval_ns,
-                dcqcn.pacing_interval_ns,
-                u64::from(dcqcn.cnp_priority),
-                dcqcn.increase_byte_threshold,
-            ] {
+            for value in dcqcn.seed_words() {
                 state = mix_seed(state ^ value);
             }
             state
@@ -4274,25 +4302,13 @@ fn mix_traffic_seed(mut state: u64, traffic: &TrafficKey, roce_keys: &[RoceTraff
             let roce = roce_key(roce_keys, ordinal);
             let dcqcn = roce.dcqcn;
             state = mix_seed(state ^ 0x524f_4345_5f51_5000);
-            for value in [
-                dcqcn.initial_rate_bps,
-                dcqcn.minimum_rate_bps,
-                dcqcn.maximum_rate_bps,
-                dcqcn.additive_rate_bps,
-                dcqcn.hyper_rate_bps,
-                dcqcn.g_ppb,
-                dcqcn.decrease_ppb,
-                dcqcn.cnp_interval_ns,
-                dcqcn.control_interval_ns,
-                dcqcn.pacing_interval_ns,
-                u64::from(dcqcn.cnp_priority),
-                dcqcn.increase_byte_threshold,
+            for value in dcqcn.seed_words().into_iter().chain([
                 roce.retransmit_timeout_ns,
                 roce.ack_every_packets,
                 roce.nack_interval_ns,
                 u64::from(roce.duplicate_ack),
                 roce.ack_size_bytes,
-            ] {
+            ]) {
                 state = mix_seed(state ^ value);
             }
             state
