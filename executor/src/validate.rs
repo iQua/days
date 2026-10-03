@@ -569,10 +569,9 @@ fn validate_backend_capabilities(
     // P15 lane R4: both device backends run RoCE queue pairs, host-link PFC and a feedback class
     // apart from the data class (`evidence/P15/device-design.md`), so none needs a refusal here.
     //
-    // P16 D1 staging: the device kernels still run the paper-form controller, so a backend whose
-    // Mellanox-form port has not landed refuses every DCQCN controller (DCQCN flows and queue
-    // pairs) rather than run it wrong. Each port commit removes its backend from this list.
-    if matches!(backend, Backend::Metal | Backend::Cuda)
+    // P16 D1 staging: the CUDA kernel still runs the paper-form controller, so it refuses every
+    // DCQCN controller (DCQCN flows and queue pairs) rather than run it wrong, until its port.
+    if matches!(backend, Backend::Cuda)
         && image
             .host_states
             .iter()

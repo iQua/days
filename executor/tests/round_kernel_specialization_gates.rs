@@ -31,18 +31,24 @@ fn cuda_source() -> String {
     format!("{CUDA}\n{}", cuda_round_body())
 }
 
-/// The functions P14 Lane B and P15 lane R4 (queue pairs, host-link PFC) added to both kernels.
-const LANE_B_FUNCTIONS: [&str; 39] = [
-    "dcqcn_apply_increase",
-    "dcqcn_average_with_target",
-    "dcqcn_checked_weighted_div",
+/// The functions P14 Lane B, P15 lane R4 (queue pairs, host-link PFC) and P16 D1 (the Mellanox-form
+/// DCQCN controller) added to both kernels.
+const LANE_B_FUNCTIONS: [&str; 42] = [
+    "dcqcn_alpha_through",
     "dcqcn_cnp_arrival",
-    "dcqcn_control_timer",
     "dcqcn_data_arrival",
-    "dcqcn_on_bytes_emitted",
-    "dcqcn_on_cnp",
-    "dcqcn_on_control_timer",
+    "dcqcn_decrease_check",
+    "dcqcn_decrease_due",
+    "dcqcn_due",
+    "dcqcn_first_decrease_at_or_after",
+    "dcqcn_increase_due",
+    "dcqcn_increase_fire",
+    "dcqcn_materialize",
+    "dcqcn_materialize_if_due",
+    "dcqcn_mul_shr63",
+    "dcqcn_on_feedback",
     "dcqcn_pacing_timer",
+    "dcqcn_settle",
     "emit_pfc_frame",
     "flow_route_mechanisms",
     "packet_egress_mechanisms",
@@ -57,8 +63,6 @@ const LANE_B_FUNCTIONS: [&str; 39] = [
     "pfc_paused_mask",
     "pfc_priority_paused",
     "pfc_queue_row",
-    "roce_cnp_arrival",
-    "roce_control_tick",
     "roce_data_arrival",
     "roce_emit_timers",
     "roce_feedback_arrival",

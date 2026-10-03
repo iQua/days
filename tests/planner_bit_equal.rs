@@ -203,22 +203,15 @@ fn rate_image() -> SimulationImage {
     }
 }
 
+/// The DCQCN fixture with inert PFC state. P16 D1 (ruling D10, condition 4): the legacy-format
+/// `configs/dcqcn_1s.toml` no longer lowers, so this reads `configs/p14/dcqcn_1s_zero_xoff.toml`,
+/// which at `main` 9ff20ea lowered to the byte-identical image of the old splice (zero XOFF/XON
+/// into the legacy file) with an equal Metal sizing report
+/// (`days-gpu/evidence/P16/dcqcn-impl/planner-pin-move.txt`). The test pins no hash: it requires
+/// host and device planning to agree on this image.
 fn compile_dcqcn_inert_pfc_fixture() -> SimulationImage {
-    let source = fixture_path("configs/dcqcn_1s.toml");
-    let mut config = fs::read_to_string(&source)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", source.display()));
-    let buffer_capacity = "buffer_capacity = [0, 0, 0, 0, 0, 0, 0, 0]";
-    assert!(config.contains(buffer_capacity));
-    config = config.replacen(
-        buffer_capacity,
-        &format!(
-            "{buffer_capacity}\nxoff = [0, 0, 0, 0, 0, 0, 0, 0]\nxon = [0, 0, 0, 0, 0, 0, 0, 0]"
-        ),
-        1,
-    );
-    let file = NamedTempFile::new().expect("temporary DCQCN fixture must open");
-    fs::write(file.path(), config).expect("temporary DCQCN fixture must be written");
-    compile_config(file.path())
+    let path = fixture_path("configs/p14/dcqcn_1s_zero_xoff.toml");
+    compile_config(&path)
         .unwrap_or_else(|error| panic!("failed to lower the DCQCN inert-PFC fixture: {error}"))
 }
 

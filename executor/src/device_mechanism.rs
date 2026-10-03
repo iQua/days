@@ -124,7 +124,6 @@ const PK_KIND: usize = 10;
 const PK_KIND_MASK: u64 = !(1_u64 << 63);
 const PFC_PACKET: u64 = 4;
 const DCQCN_CNP_PACKET: u64 = 5;
-const DCQCN_CONTROL_TIMER_PACKET: u64 = 6;
 const ROCE_DATA_PACKET: u64 = 7;
 const ROCE_ACK_PACKET: u64 = 8;
 const ROCE_NACK_PACKET: u64 = 9;
@@ -310,7 +309,6 @@ fn scan_uploaded_plan(plan: &UploadedPlan<'_>) -> Result<Option<PlainKernelRefus
             kind,
             PFC_PACKET
                 | DCQCN_CNP_PACKET
-                | DCQCN_CONTROL_TIMER_PACKET
                 | ROCE_DATA_PACKET
                 | ROCE_ACK_PACKET
                 | ROCE_NACK_PACKET
@@ -1466,7 +1464,9 @@ mod tests {
     fn a_live_mechanism_packet_in_any_arena_refuses_the_plain_kernel() {
         use crate::EventKind::{PacketArrival, RemoteArrival};
         use crate::device_event_record::StoredEventClass::{Channel, Generator};
-        for kind in [4_u64, 5, 6] {
+        // Code 6 (the paper-form control tick) is gone in P16; the queue-pair kinds 7..=10 are
+        // mechanism packets too.
+        for kind in [4_u64, 5, 7, 8, 9, 10] {
             for flag in [0, T_ECN] {
                 let packet_kind = kind | flag;
                 let expect =
@@ -1578,10 +1578,23 @@ mod tests {
                 ("uint PK_KIND", PK_KIND),
                 ("ulong PFC_PACKET", PFC_PACKET as usize),
                 ("ulong DCQCN_CNP_PACKET", DCQCN_CNP_PACKET as usize),
-                (
-                    "ulong DCQCN_CONTROL_TIMER_PACKET",
-                    DCQCN_CONTROL_TIMER_PACKET as usize,
-                ),
+                // P16 D1: the Mellanox-form controller words and state bits of the generator row.
+                ("uint G_DCQCN_MIN_RATE", G_DCQCN_MIN_RATE),
+                ("uint G_DCQCN_MAX_RATE", G_DCQCN_MAX_RATE),
+                ("uint G_DCQCN_ADDITIVE_RATE", G_DCQCN_ADDITIVE_RATE),
+                ("uint G_DCQCN_HYPER_RATE", G_DCQCN_HYPER_RATE),
+                ("uint G_DCQCN_G", G_DCQCN_G),
+                ("uint G_DCQCN_ALPHA_INTERVAL", G_DCQCN_ALPHA_INTERVAL),
+                ("uint G_DCQCN_DECREASE_INTERVAL", G_DCQCN_DECREASE_INTERVAL),
+                ("uint G_DCQCN_INCREASE_INTERVAL", G_DCQCN_INCREASE_INTERVAL),
+                ("uint G_DCQCN_STEPS_CLAMP", G_DCQCN_STEPS_CLAMP),
+                ("uint G_DCQCN_ALPHA", G_DCQCN_ALPHA),
+                ("uint G_DCQCN_CURRENT_RATE", G_DCQCN_CURRENT_RATE),
+                ("uint G_DCQCN_TARGET_RATE", G_DCQCN_TARGET_RATE),
+                ("uint G_DCQCN_NEXT_ALPHA", G_DCQCN_NEXT_ALPHA),
+                ("uint G_DCQCN_NEXT_DECREASE", G_DCQCN_NEXT_DECREASE),
+                ("uint G_DCQCN_NEXT_INCREASE", G_DCQCN_NEXT_INCREASE),
+                ("uint G_DCQCN_STATE", G_DCQCN_STATE),
                 ("ulong ROCE_DATA_PACKET", ROCE_DATA_PACKET as usize),
                 ("ulong ROCE_ACK_PACKET", ROCE_ACK_PACKET as usize),
                 ("ulong ROCE_NACK_PACKET", ROCE_NACK_PACKET as usize),
