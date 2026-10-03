@@ -4458,19 +4458,33 @@ impl<'image> TransitionState<'image> {
                 advance.increase_fires += settled.increase_fires;
                 advance.decrease_cuts += settled.decrease_cuts;
             }
-            let dcqcn_transition = (full && (froze || advance.applied_rate_change())).then(|| {
-                dcqcn_record(
-                    event.key,
-                    node.id,
-                    packet.flow,
-                    crate::DcqcnTransitionKind::Advance,
-                    now,
-                    advance,
-                    froze,
-                    controller_before,
-                    roce.controller,
-                )
-            });
+            // The ECN echo is the pair's congestion feedback (ruling D4), ignored once the pair is
+            // complete (ruling D11), as HPCC's `QpComplete` precedes `cnp_received_mlx`.
+            let feedback = header.ce_echo && roce.snd_una < total;
+            if feedback {
+                let fed = roce.controller.on_feedback(now);
+                advance.alpha_ticks += fed.alpha_ticks;
+                advance.increase_fires += fed.increase_fires;
+                advance.decrease_cuts += fed.decrease_cuts;
+            }
+            let dcqcn_transition = (full && (feedback || froze || advance.applied_rate_change()))
+                .then(|| {
+                    dcqcn_record(
+                        event.key,
+                        node.id,
+                        packet.flow,
+                        if feedback {
+                            crate::DcqcnTransitionKind::Feedback
+                        } else {
+                            crate::DcqcnTransitionKind::Advance
+                        },
+                        now,
+                        advance,
+                        froze,
+                        controller_before,
+                        roce.controller,
+                    )
+                });
             settle_roce_sender(generator, &roce, generator.next_emission.status);
             generator.kind = FlowGeneratorKind::Roce(roce);
             leave_parked_list(state.pfc, data_class, position, generator, &roce);
@@ -4489,7 +4503,7 @@ impl<'image> TransitionState<'image> {
                     data_class,
                     &roce,
                     None,
-                    Some(acknowledgment),
+                    Some(header),
                     None,
                     before,
                     crate::roce::RoceSenderView::of(generator, &roce),
@@ -4535,7 +4549,7 @@ impl<'image> TransitionState<'image> {
                 delay_ns: unloaded_round_trip_ns(
                     self.image,
                     packet.flow,
-                    header.acknowledged_bytes,
+                    u64::from(header.acknowledged_bytes),
                     packet.size_bytes,
                 )?,
             };
@@ -4693,9 +4707,8 @@ impl<'image> TransitionState<'image> {
 
     /// A RoCE data packet at its queue pair's receiver (design note §5, step 9).
     ///
-    /// The DCQCN notification point decides a CNP exactly as for a DCQCN flow; then the Go-back-N
-    /// receiver accepts the in-order packet, or drops the packet and answers it. The CNP is
-    /// allocated and enqueued before the ACK or NACK (ordering S1).
+    /// The Go-back-N receiver accepts the in-order packet, or drops the packet and answers it. An
+    /// ACK or NACK echoes the packet's CE mark; the receiver sends no CNP (P16 rulings D4, D5).
     // Out of line: queue-pair transitions must not grow the shared `dispatch` that every
     // event of every image runs through (P15 inlining check, `qp-impl/callsites.txt`).
     #[inline(never)]
@@ -4717,7 +4730,7 @@ impl<'image> TransitionState<'image> {
         let now = event.key.time_ns;
         let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
         let congestion_experienced = packet.ecn_codepoint() == crate::EcnCodepoint::Ce;
-        let (cnp, feedback, schedule_ready, record, stage_causes) = {
+        let (feedback, schedule_ready, record, stage_causes) = {
             let (mut state, index) = self.host_parts_mut(node)?;
             let unknown = ExecutionError::UnknownGenerator {
                 node: node.id,
@@ -4725,7 +4738,7 @@ impl<'image> TransitionState<'image> {
             };
             let receivers = state.roce_receivers.as_deref_mut().ok_or(unknown)?;
             let position = receivers
-                .binary_search_by_key(&packet.flow, |receiver| receiver.np.flow)
+                .binary_search_by_key(&packet.flow, |receiver| receiver.flow)
                 .map_err(|_| unknown)?;
             let receiver = &mut receivers[position];
             if header
@@ -4739,11 +4752,6 @@ impl<'image> TransitionState<'image> {
                 });
             }
             let before = crate::roce::RoceReceiverView::of(receiver);
-            let cnp_sent = crate::roce::notification_point_sends_cnp(
-                &mut receiver.np,
-                now,
-                congestion_experienced,
-            );
             let action = crate::roce::receive(receiver, header.psn, packet.size_bytes, now);
             let receiver = *receiver;
             // A collective stage waiting on this queue pair counts the receiver's Go-back-N
@@ -4781,18 +4789,13 @@ impl<'image> TransitionState<'image> {
                     .ok_or(ExecutionError::CounterOverflow(node.id))?;
                 Ok(payload)
             };
-            let cnp = cnp_sent
-                .then(&mut allocate)
-                .transpose()?
-                .map(|payload| (payload, receiver.np.cnp_size_bytes));
             let feedback = action
                 .sends_feedback()
                 .then(&mut allocate)
                 .transpose()?
                 .map(|payload| (payload, receiver.ack_size_bytes, action));
-            let schedule_ready = (cnp.is_some() || feedback.is_some())
-                && state.in_service.is_none()
-                && !*state.tx_ready_pending;
+            let schedule_ready =
+                feedback.is_some() && state.in_service.is_none() && !*state.tx_ready_pending;
             if schedule_ready {
                 *state.tx_ready_pending = true;
             }
@@ -4806,7 +4809,6 @@ impl<'image> TransitionState<'image> {
                     nack_interval_ns: receiver.nack_interval_ns,
                     duplicate_ack: receiver.duplicate_ack,
                     ack_size_bytes: receiver.ack_size_bytes,
-                    cnp_interval_ns: receiver.np.cnp_interval_ns,
                     packet_psn: header.psn,
                     packet_bytes: packet.size_bytes,
                     packet_sent_time_ns: header.sent_time_ns,
@@ -4815,13 +4817,12 @@ impl<'image> TransitionState<'image> {
                     action,
                     feedback_acknowledgment: feedback.map(|_| receiver.expected_psn),
                     feedback_payload: feedback.map(|(payload, ..)| payload),
-                    cnp_payload: cnp.map(|(payload, _)| payload),
+                    feedback_ce_echo: feedback.map(|_| congestion_experienced),
                     before,
                     after: crate::roce::RoceReceiverView::of(&receiver),
                 }),
             );
             (
-                cnp,
                 feedback.map(|feedback| (feedback, receiver.expected_psn)),
                 schedule_ready,
                 record,
@@ -4834,26 +4835,18 @@ impl<'image> TransitionState<'image> {
             self.mechanism_transitions.push(record);
         }
         let mut first = None;
-        if let Some((payload, size_bytes)) = cnp {
-            let cnp = PacketDescriptor {
-                id: payload,
-                flow: packet.flow,
-                size_bytes,
-                ecn_marked: false,
-                kind: PacketKind::DcqcnCnp(crate::DcqcnCnpHeader {
-                    trigger_payload: packet.id,
-                }),
-            };
-            self.insert_packet(cnp, Some(now))?;
-            self.enqueue_source_packet(node, payload)?;
-            self.record_sourced(node.id, cnp)?;
-            first.get_or_insert(payload);
-        }
         if let Some(((payload, size_bytes, action), frontier)) = feedback {
+            // The ECN echo of the packet that triggered the ACK or NACK (rulings D4 and D5).
             let header = crate::RoceAckHeader {
                 acknowledgment: frontier,
                 echoed_sent_time_ns: header.sent_time_ns,
-                acknowledged_bytes: packet.size_bytes,
+                acknowledged_bytes: u32::try_from(packet.size_bytes).map_err(|_| {
+                    ExecutionError::InconsistentRocePacket {
+                        flow: packet.flow,
+                        payload: packet.id,
+                    }
+                })?,
+                ce_echo: congestion_experienced,
             };
             let reply = PacketDescriptor {
                 id: payload,
@@ -6898,7 +6891,7 @@ fn roce_sender_record(
     data_class: u8,
     roce: &crate::RoceGenerator,
     rate_bps: Option<u64>,
-    input_acknowledgment: Option<u64>,
+    input: Option<crate::RoceAckHeader>,
     emitted: Option<crate::RoceEmission>,
     before: crate::RoceSenderView,
     after: crate::RoceSenderView,
@@ -6917,7 +6910,8 @@ fn roce_sender_record(
             first_pacing_time_ns: roce.pacer.first_pacing_time_ns,
             rto_ns: roce.rto_ns,
             rate_bps,
-            input_acknowledgment,
+            input_acknowledgment: input.map(|header| header.acknowledgment),
+            input_ce_echo: input.map(|header| header.ce_echo),
             emitted,
             before,
             after,

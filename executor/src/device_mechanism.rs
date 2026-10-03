@@ -664,29 +664,48 @@ pub(crate) fn decode_roce_generator(
     Ok(())
 }
 
+/// Word 2 of a RoCE ACK or NACK's packet metadata (P16 ruling D6): the acknowledged packet's size
+/// in the low 32 bits and the ECN echo in bit 32.
+#[inline(always)]
+pub(crate) const fn roce_ack_size_echo_word(header: crate::RoceAckHeader) -> u64 {
+    header.acknowledged_bytes as u64 | (header.ce_echo as u64) << 32
+}
+
+/// The RoCE ACK or NACK header of packet-metadata words, or `None` when word 2 carries bits a
+/// header cannot (a corrupt record).
+#[inline(always)]
+pub(crate) const fn roce_ack_header_of_words(metadata: &[u64]) -> Option<crate::RoceAckHeader> {
+    if metadata[2] >> 33 != 0 {
+        return None;
+    }
+    Some(crate::RoceAckHeader {
+        acknowledgment: metadata[0],
+        echoed_sent_time_ns: metadata[1],
+        acknowledged_bytes: metadata[2] as u32,
+        ce_echo: metadata[2] >> 32 != 0,
+    })
+}
+
 /// Receiver-row marker of a RoCE queue pair (P15). The row's word 1 holds the absolute
 /// `tcp_state` offset of the flow's record in the RoCE region; words 2..6 stay zero, so the
 /// readback's range compaction, which reads words 4..6 of every row, needs no branch (ruling D4).
 /// The device never writes the row: every mutable receiver word lives in the record.
 pub(crate) const ROCE_RECEIVER_MARKER: u64 = 4;
-/// Words of one RoCE receiver record in the RoCE region (a tail of `tcp_state`).
-pub(crate) const ROCE_RECEIVER_WORDS: usize = 13;
+/// Words of one RoCE receiver record in the RoCE region (a tail of `tcp_state`). P16: the queue
+/// pair's receiver holds no notification point (its ACKs echo ECN), so the P15 CNP words are gone.
+pub(crate) const ROCE_RECEIVER_WORDS: usize = 10;
 const RR_TOTAL: usize = 0;
 const RR_ACK_EVERY: usize = 1;
 const RR_ACK_SIZE: usize = 2;
 const RR_NACK_INTERVAL: usize = 3;
 const RR_DUPLICATE_ACK: usize = 4;
-const RR_CNP_INTERVAL: usize = 5;
-const RR_CNP_SIZE: usize = 6;
-const RR_LAST_CNP: usize = 7;
-const RR_EXPECTED: usize = 8;
-const RR_SINCE_ACK: usize = 9;
-const RR_NACK_PSN: usize = 10;
-const RR_NACK_TIME: usize = 11;
-/// Bit 0: `last_cnp_time_ns` is `Some`; bit 1: `last_nack` is `Some`.
-const RR_FLAGS: usize = 12;
-const RR_FLAG_LAST_CNP: u64 = 1;
-const RR_FLAG_LAST_NACK: u64 = 2;
+const RR_EXPECTED: usize = 5;
+const RR_SINCE_ACK: usize = 6;
+const RR_NACK_PSN: usize = 7;
+const RR_NACK_TIME: usize = 8;
+/// Bit 0: `last_nack` is `Some`.
+const RR_FLAGS: usize = 9;
+const RR_FLAG_LAST_NACK: u64 = 1;
 
 /// The receiver row of a RoCE queue pair whose record starts at `record_offset`.
 pub(crate) fn roce_receiver_row(record_offset: usize, row: &mut [u64]) {
@@ -702,22 +721,15 @@ pub(crate) fn encode_roce_receiver(receiver: &crate::RoceReceiverState, record: 
     record[RR_ACK_SIZE] = receiver.ack_size_bytes;
     record[RR_NACK_INTERVAL] = receiver.nack_interval_ns;
     record[RR_DUPLICATE_ACK] = u64::from(receiver.duplicate_ack);
-    record[RR_CNP_INTERVAL] = receiver.np.cnp_interval_ns;
-    record[RR_CNP_SIZE] = receiver.np.cnp_size_bytes;
-    record[RR_LAST_CNP] = receiver.np.last_cnp_time_ns.unwrap_or(0);
     record[RR_EXPECTED] = receiver.expected_psn;
     record[RR_SINCE_ACK] = receiver.packets_since_ack;
     record[RR_NACK_PSN] = receiver.last_nack.map_or(0, |mark| mark.expected_psn);
     record[RR_NACK_TIME] = receiver.last_nack.map_or(0, |mark| mark.time_ns);
-    record[RR_FLAGS] = (if receiver.np.last_cnp_time_ns.is_some() {
-        RR_FLAG_LAST_CNP
-    } else {
-        0
-    }) | (if receiver.last_nack.is_some() {
+    record[RR_FLAGS] = if receiver.last_nack.is_some() {
         RR_FLAG_LAST_NACK
     } else {
         0
-    });
+    };
 }
 
 /// Restores one RoCE receiver's mutable state from its record, checking the configuration.
@@ -730,16 +742,13 @@ pub(crate) fn decode_roce_receiver(
         || record[RR_ACK_SIZE] != receiver.ack_size_bytes
         || record[RR_NACK_INTERVAL] != receiver.nack_interval_ns
         || record[RR_DUPLICATE_ACK] != u64::from(receiver.duplicate_ack)
-        || record[RR_CNP_INTERVAL] != receiver.np.cnp_interval_ns
-        || record[RR_CNP_SIZE] != receiver.np.cnp_size_bytes
     {
         return Err("RoCE receiver record changed immutable configuration");
     }
     let flags = record[RR_FLAGS];
-    if flags & !(RR_FLAG_LAST_CNP | RR_FLAG_LAST_NACK) != 0 {
+    if flags & !RR_FLAG_LAST_NACK != 0 {
         return Err("RoCE receiver record carries unknown flags");
     }
-    receiver.np.last_cnp_time_ns = (flags & RR_FLAG_LAST_CNP != 0).then_some(record[RR_LAST_CNP]);
     receiver.expected_psn = record[RR_EXPECTED];
     receiver.packets_since_ack = record[RR_SINCE_ACK];
     receiver.last_nack = (flags & RR_FLAG_LAST_NACK != 0).then_some(crate::RoceNackMark {
@@ -785,7 +794,7 @@ pub(crate) fn append_roce_region(
             receiver,
             &mut tcp_state[record..record + ROCE_RECEIVER_WORDS],
         );
-        let row = receiver_offset + receiver.np.flow.0 as usize * PLAN_TCP_RECEIVER_WORDS;
+        let row = receiver_offset + receiver.flow.0 as usize * PLAN_TCP_RECEIVER_WORDS;
         roce_receiver_row(record, &mut tcp_state[row..row + PLAN_TCP_RECEIVER_WORDS]);
         record += ROCE_RECEIVER_WORDS;
     }
@@ -850,8 +859,8 @@ pub(crate) fn recompute_pause_parked(image: &SimulationImage, state: &mut crate:
 /// point, restarts included: a restart lands on a grid point and at most one tick is pending)
 /// and timeout firings (the Mellanox-form controller has no timer event, P16) (each re-arms `rto_ns`
 /// later, so at most one per `rto_ns` until the stop time; none with the timeout off). Its
-/// packets: at most one data packet per grid tick, each answered by at most an ACK or NACK and a
-/// CNP, each taking at most `1 + 3 * hops` transitions. The bound feeds only the round and dispatch
+/// packets: at most one data packet per grid tick, each answered by at most an ACK or NACK (P16:
+/// no CNP), each taking at most `1 + 3 * hops` transitions. The bound feeds only the round and dispatch
 /// counts (scalars), so its size costs no memory; it keeps the round bound sound when loss makes
 /// the packet estimate low.
 pub(crate) fn roce_transition_bound(
@@ -869,7 +878,7 @@ pub(crate) fn roce_transition_bound(
             flow.route.len().max(flow.reverse_route.len()) as u64
         });
     let packet_transitions = pacing
-        .saturating_mul(3)
+        .saturating_mul(2)
         .saturating_mul(1_u64.saturating_add(hops.saturating_mul(3)));
     usize::try_from(
         pacing
@@ -1592,15 +1601,11 @@ mod tests {
                 ("uint RR_ACK_SIZE", RR_ACK_SIZE),
                 ("uint RR_NACK_INTERVAL", RR_NACK_INTERVAL),
                 ("uint RR_DUPLICATE_ACK", RR_DUPLICATE_ACK),
-                ("uint RR_CNP_INTERVAL", RR_CNP_INTERVAL),
-                ("uint RR_CNP_SIZE", RR_CNP_SIZE),
-                ("uint RR_LAST_CNP", RR_LAST_CNP),
                 ("uint RR_EXPECTED", RR_EXPECTED),
                 ("uint RR_SINCE_ACK", RR_SINCE_ACK),
                 ("uint RR_NACK_PSN", RR_NACK_PSN),
                 ("uint RR_NACK_TIME", RR_NACK_TIME),
                 ("uint RR_FLAGS", RR_FLAGS),
-                ("ulong RR_FLAG_LAST_CNP", RR_FLAG_LAST_CNP as usize),
                 ("ulong RR_FLAG_LAST_NACK", RR_FLAG_LAST_NACK as usize),
             ] {
                 let line = format!("{declare} {name} = {value};");
@@ -1720,19 +1725,9 @@ mod tests {
 
     #[test]
     fn roce_receiver_records_round_trip_and_rows_keep_range_metadata_zero() {
-        for (last_cnp, last_nack) in [
-            (None, None),
-            (Some(7), None),
-            (None, Some((34, 9))),
-            (Some(u64::MAX), Some((u64::MAX, u64::MAX))),
-        ] {
+        for last_nack in [None, Some((34, 9)), Some((u64::MAX, u64::MAX))] {
             let original = crate::RoceReceiverState {
-                np: DcqcnReceiverState {
-                    flow: FlowId(2),
-                    cnp_interval_ns: 5,
-                    cnp_size_bytes: 64,
-                    last_cnp_time_ns: last_cnp,
-                },
+                flow: FlowId(2),
                 total_bytes: 180,
                 expected_psn: 34,
                 ack_every_packets: 4,
@@ -1748,7 +1743,6 @@ mod tests {
             let mut record = [7_u64; ROCE_RECEIVER_WORDS];
             encode_roce_receiver(&original, &mut record);
             let mut decoded = original;
-            decoded.np.last_cnp_time_ns = Some(1);
             decoded.last_nack = None;
             decoded.expected_psn = 0;
             decoded.packets_since_ack = 0;
@@ -1758,12 +1752,34 @@ mod tests {
             changed[RR_ACK_SIZE] += 1;
             assert!(decode_roce_receiver(&changed, &mut decoded).is_err());
             changed = record;
-            changed[RR_FLAGS] = 4;
+            changed[RR_FLAGS] = 2;
             assert!(decode_roce_receiver(&changed, &mut decoded).is_err());
         }
         let mut row = [9_u64; PLAN_TCP_RECEIVER_WORDS];
         roce_receiver_row(123, &mut row);
         assert_eq!(row, [ROCE_RECEIVER_MARKER, 123, 0, 0, 0, 0, 0]);
+    }
+
+    /// P16 ruling D6: an ACK's word 2 carries the packet size and the ECN echo, and any other bit
+    /// is a corrupt record.
+    #[test]
+    fn roce_ack_word_two_round_trips_the_size_and_the_echo() {
+        for (bytes, echo) in [
+            (0, false),
+            (1_048, true),
+            (u32::MAX, true),
+            (u32::MAX, false),
+        ] {
+            let header = crate::RoceAckHeader {
+                acknowledgment: 5,
+                echoed_sent_time_ns: 6,
+                acknowledged_bytes: bytes,
+                ce_echo: echo,
+            };
+            let words = [5, 6, roce_ack_size_echo_word(header)];
+            assert_eq!(roce_ack_header_of_words(&words), Some(header));
+        }
+        assert_eq!(roce_ack_header_of_words(&[0, 0, 1 << 33]), None);
     }
 
     /// Every source of queue-pair state sets the RoCE bit; host pause state sets the PFC bit.
@@ -1788,6 +1804,7 @@ mod tests {
             acknowledgment: 0,
             echoed_sent_time_ns: 0,
             acknowledged_bytes: 0,
+            ce_echo: false,
         };
         for resident in [
             PacketKind::RoceData(crate::RoceDataHeader {
@@ -1872,12 +1889,7 @@ mod tests {
         pfc.paused_by_controller[3].insert(crate::NodeId(9));
         sender.pfc = Some(Box::new(pfc));
         let receiver = crate::RoceReceiverState {
-            np: DcqcnReceiverState {
-                flow: FlowId(0),
-                cnp_interval_ns: 5,
-                cnp_size_bytes: 64,
-                last_cnp_time_ns: None,
-            },
+            flow: FlowId(0),
             total_bytes: 180,
             expected_psn: 17,
             ack_every_packets: 1,
@@ -1947,7 +1959,7 @@ mod tests {
         );
     }
 
-    /// The transition bound counts every grid tick's pacing transition and up to three packets per
+    /// The transition bound counts every grid tick's pacing transition and up to two packets per
     /// tick at `1 + 3 * hops` transitions each, plus timeout firings (no control tick, P16).
     #[test]
     fn roce_transition_bound_covers_ticks_packets_and_timers() {
@@ -1966,15 +1978,15 @@ mod tests {
         let mut generator = generator_state(FlowGeneratorKind::Roce(roce));
         generator.next_emission.departure_time_ns = 0;
         // 11 grid ticks (0, 16, ..., 160), 4 timeout firings
-        // (`rto_ns` 50 up to 160), and 3 packets per tick at 1 + 3 * 2 transitions each.
+        // (`rto_ns` 50 up to 160), and 2 packets per tick (data and its ACK or NACK) at 1 + 3 * 2 transitions each.
         assert_eq!(
             roce_transition_bound(&image, &generator, roce),
-            11 + 4 + 11 * 3 * 7
+            11 + 4 + 11 * 2 * 7
         );
         roce.rto_ns = 0;
         assert_eq!(
             roce_transition_bound(&image, &generator, roce),
-            11 + 11 * 3 * 7
+            11 + 11 * 2 * 7
         );
     }
 }

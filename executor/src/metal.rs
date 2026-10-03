@@ -2576,10 +2576,11 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
     for state in &image.host_states {
         for generator in &state.generators {
             // One ACK (TCP) or at most one CNP (DCQCN) per data packet; a queue pair's receiver
-            // answers a data arrival with at most one ACK or NACK and one CNP.
+            // answers a data arrival with at most one ACK or NACK (P16: no CNP).
             let per_packet = match generator.kind {
-                FlowGeneratorKind::Tcp(_) | FlowGeneratorKind::Dcqcn(_) => 1,
-                FlowGeneratorKind::Roce(_) => 2,
+                FlowGeneratorKind::Tcp(_)
+                | FlowGeneratorKind::Dcqcn(_)
+                | FlowGeneratorKind::Roce(_) => 1,
                 FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => 0,
             };
             if per_packet != 0 {
@@ -3818,7 +3819,7 @@ fn encode_packet_metadata(kind: PacketKind, words: &mut [u64]) {
         PacketKind::RoceAck(header) | PacketKind::RoceNack(header) => {
             words[0] = header.acknowledgment;
             words[1] = header.echoed_sent_time_ns;
-            words[2] = header.acknowledged_bytes;
+            words[2] = crate::device_mechanism::roce_ack_size_echo_word(header);
         }
     }
 }
@@ -5200,16 +5201,6 @@ fn decode_event_kind(value: u64) -> Result<EventKind, MetalError> {
     }
 }
 
-/// The RoCE ACK/NACK header in `encode_packet_metadata`'s word order.
-#[inline(always)]
-fn roce_ack_header(metadata: &[u64]) -> crate::RoceAckHeader {
-    crate::RoceAckHeader {
-        acknowledgment: metadata[0],
-        echoed_sent_time_ns: metadata[1],
-        acknowledged_bytes: metadata[2],
-    }
-}
-
 #[inline(always)]
 fn decode_packet_kind(value: u64, metadata: &[u64]) -> Result<PacketKind, MetalError> {
     match value & PACKET_KIND_MASK {
@@ -5238,8 +5229,18 @@ fn decode_packet_kind(value: u64, metadata: &[u64]) -> Result<PacketKind, MetalE
             sent_time_ns: metadata[1],
             retransmission: metadata[2] != 0,
         })),
-        8 => Ok(PacketKind::RoceAck(roce_ack_header(metadata))),
-        9 => Ok(PacketKind::RoceNack(roce_ack_header(metadata))),
+        8 => crate::device_mechanism::roce_ack_header_of_words(metadata)
+            .map(PacketKind::RoceAck)
+            .ok_or(MetalError::DeviceExecution {
+                code: 93,
+                node: None,
+            }),
+        9 => crate::device_mechanism::roce_ack_header_of_words(metadata)
+            .map(PacketKind::RoceNack)
+            .ok_or(MetalError::DeviceExecution {
+                code: 93,
+                node: None,
+            }),
         10 if metadata == [0, 0, 0] => Ok(PacketKind::RocePacingTimer),
         _ => Err(MetalError::DeviceExecution {
             code: 93,

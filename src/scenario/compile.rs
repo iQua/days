@@ -1857,6 +1857,12 @@ fn validate_traffic(
                     "RoCE traffic `size` must be positive".to_owned(),
                 ));
             }
+            // An ACK echoes the size of the packet it answers in 32 bits (P16 ruling D6).
+            if packet_size_bytes > u64::from(u32::MAX) {
+                return Err(CompileError::Unsupported(
+                    "unsupported RoCE packet size above 4294967295 bytes".to_owned(),
+                ));
+            }
             let feedback_priority = roce.feedback_priority.unwrap_or(priority);
             if feedback_priority > 7 {
                 return Err(CompileError::Invalid(
@@ -3127,12 +3133,7 @@ fn lower(
             roce_receivers.push((
                 LpKey::Host(flow.target),
                 RoceReceiverState {
-                    np: DcqcnReceiverState {
-                        flow: descriptor.id,
-                        cnp_interval_ns: roce.dcqcn.cnp_interval_ns,
-                        cnp_size_bytes: 64,
-                        last_cnp_time_ns: None,
-                    },
+                    flow: descriptor.id,
                     total_bytes,
                     expected_psn: 0,
                     ack_every_packets: roce.ack_every_packets,

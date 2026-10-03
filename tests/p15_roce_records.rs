@@ -30,8 +30,8 @@ const FIXTURES: [&str; 9] = [
     "hostpfc_multi_qp_tcp.toml",
 ];
 
-const SENDER_HEADER: &str = "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,kind,class_paused,data_class,mtu_bytes,total_bytes,pacing_interval_ns,first_pacing_time_ns,rto_ns,rate_bps,input_acknowledgment,emitted,emitted_psn,emitted_bytes,emitted_retransmission,emitted_payload,before_next_psn,before_snd_una,before_bytes_emitted,before_packets_emitted,before_credit_quanta,before_rto_deadline_ns,before_pacer,before_next_tick_ns,before_status,after_next_psn,after_snd_una,after_bytes_emitted,after_packets_emitted,after_credit_quanta,after_rto_deadline_ns,after_pacer,after_next_tick_ns,after_status";
-const RECEIVER_HEADER: &str = "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,total_bytes,ack_every_packets,nack_interval_ns,duplicate_ack,ack_size_bytes,cnp_interval_ns,packet_psn,packet_bytes,packet_sent_time_ns,packet_retransmission,packet_ce,action,feedback_acknowledgment,feedback_payload,cnp_sent,cnp_payload,before_expected_psn,before_packets_since_ack,before_last_nack_psn,before_last_nack_time_ns,before_last_cnp_time_ns,after_expected_psn,after_packets_since_ack,after_last_nack_psn,after_last_nack_time_ns,after_last_cnp_time_ns";
+const SENDER_HEADER: &str = "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,kind,class_paused,data_class,mtu_bytes,total_bytes,pacing_interval_ns,first_pacing_time_ns,rto_ns,rate_bps,input_acknowledgment,input_ce_echo,emitted,emitted_psn,emitted_bytes,emitted_retransmission,emitted_payload,before_next_psn,before_snd_una,before_bytes_emitted,before_packets_emitted,before_credit_quanta,before_rto_deadline_ns,before_pacer,before_next_tick_ns,before_status,after_next_psn,after_snd_una,after_bytes_emitted,after_packets_emitted,after_credit_quanta,after_rto_deadline_ns,after_pacer,after_next_tick_ns,after_status";
+const RECEIVER_HEADER: &str = "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,total_bytes,ack_every_packets,nack_interval_ns,duplicate_ack,ack_size_bytes,packet_psn,packet_bytes,packet_sent_time_ns,packet_retransmission,packet_ce,action,feedback_acknowledgment,feedback_payload,feedback_ce_echo,before_expected_psn,before_packets_since_ack,before_last_nack_psn,before_last_nack_time_ns,after_expected_psn,after_packets_since_ack,after_last_nack_psn,after_last_nack_time_ns";
 
 fn run(name: &str) -> RunResult {
     let image =
@@ -338,21 +338,13 @@ fn check_receiver(name: &str, record: &RoceReceiverRecord) {
         assert_eq!(after.packets_since_ack, 0, "{context}");
         assert_eq!(record.feedback_acknowledgment, Some(after.expected_psn));
     }
-    // The CNP is decided first and allocated first (ordering S1).
-    if let (Some(cnp), Some(feedback)) = (record.cnp_payload, record.feedback_payload) {
-        assert!(cnp < feedback, "{context}");
-    }
-    // The notification point: a CNP moves the last-CNP time to now; otherwise it is unchanged.
-    if record.cnp_payload.is_some() {
-        assert!(record.packet_ce, "{context}");
-        assert_eq!(
-            after.last_cnp_time_ns,
-            Some(record.key.time_ns),
-            "{context}"
-        );
-    } else {
-        assert_eq!(after.last_cnp_time_ns, before.last_cnp_time_ns, "{context}");
-    }
+    // P16 rulings D4 and D5: an ACK or NACK echoes the CE mark of the packet that triggered it;
+    // the receiver sends no CNP.
+    assert_eq!(
+        record.feedback_ce_echo,
+        sends.then_some(record.packet_ce),
+        "{context}"
+    );
 }
 
 #[test]
@@ -406,28 +398,28 @@ fn queue_pair_records_replay_the_go_back_n_semantics() {
 /// Ordering S1: when one arrival yields a CNP and an ACK or NACK, the receiver host serves the CNP
 /// first, because both enter its FIFO at the same instant and the CNP holds the smaller payload.
 #[test]
-fn a_cnp_leaves_the_receiver_before_the_ack_of_the_same_arrival() {
+fn an_ack_or_nack_carries_the_echo_its_receiver_recorded() {
     let result = run("roce_cnp_under_pfc.toml");
-    let first_departure = result.departures.iter().enumerate().fold(
-        BTreeMap::new(),
-        |mut first, (index, departure)| {
-            first.entry(departure.payload).or_insert(index);
-            first
-        },
-    );
-    let mut pairs = 0;
+    let packets = result
+        .observed_packets
+        .iter()
+        .map(|packet| (packet.id, packet.kind))
+        .collect::<BTreeMap<_, _>>();
+    let mut echoes = 0;
     for record in records(&result) {
         if let MechanismTransitionRecord::Roce(RoceTransitionRecord::Receiver(record)) = record {
-            if let (Some(cnp), Some(feedback)) = (record.cnp_payload, record.feedback_payload) {
-                assert!(
-                    first_departure[&cnp] < first_departure[&feedback],
-                    "{record:?}"
-                );
-                pairs += 1;
-            }
+            let Some(payload) = record.feedback_payload else {
+                continue;
+            };
+            let (PacketKind::RoceAck(header) | PacketKind::RoceNack(header)) = packets[&payload]
+            else {
+                panic!("{record:?}: the feedback is an ACK or NACK");
+            };
+            assert_eq!(Some(header.ce_echo), record.feedback_ce_echo, "{record:?}");
+            echoes += usize::from(header.ce_echo);
         }
     }
-    assert!(pairs > 0, "the fixture exercises same-arrival CNP and ACK");
+    assert!(echoes > 0, "the fixture exercises echoing ACKs");
 }
 
 #[test]

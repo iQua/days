@@ -1521,6 +1521,10 @@ fn validate_roce_generator(
     if pacer.pacing_interval_ns == 0 || pacer.mtu_bytes == 0 || pacer.total_bytes == 0 {
         return Err(invalid("needs a positive pacing interval, MTU and total"));
     }
+    // An ACK echoes its packet's size in 32 bits (P16 ruling D6).
+    if pacer.mtu_bytes > u64::from(u32::MAX) {
+        return Err(invalid("needs an MTU of at most 4294967295 bytes"));
+    }
     // Go-back-N ordering: acknowledged <= next to send <= high-water mark <= total, each a
     // packet boundary, so every packet is a pure function of its PSN.
     remaining_generator_packets(generator)?;
@@ -1668,7 +1672,6 @@ fn validate_roce_generator(
     let receiver =
         roce_receiver(image, flow).ok_or_else(|| invalid("has no receiver at its target"))?;
     if receiver.total_bytes != pacer.total_bytes
-        || receiver.np.cnp_size_bytes == 0
         || receiver.ack_size_bytes == 0
         || receiver.ack_every_packets == 0
         || receiver.packets_since_ack >= receiver.ack_every_packets
@@ -2022,7 +2025,7 @@ fn validate_generators(
             }
             let mut previous_roce_receiver = None;
             for receiver in receivers.iter() {
-                let receiver_flow = receiver.np.flow;
+                let receiver_flow = receiver.flow;
                 if previous_roce_receiver.is_some_and(|flow| flow >= receiver_flow) {
                     return Err(ValidationError::new(format!(
                         "host node {:?} has duplicate or non-increasing RoCE receiver flow {receiver_flow:?}",
@@ -3432,7 +3435,7 @@ fn host_inbound_frontier(
         FlowGeneratorKind::Roce(_) => state
             .roce_receivers
             .as_deref()?
-            .binary_search_by_key(&predecessor.flow, |receiver| receiver.np.flow)
+            .binary_search_by_key(&predecessor.flow, |receiver| receiver.flow)
             .ok()
             .map(|index| state.roce_receivers.as_deref().expect("searched")[index].expected_psn),
         _ => host_tcp_receiver(state, predecessor.flow)
@@ -3886,14 +3889,12 @@ fn validate_packets_and_derive_delays(
                 .iter()
                 .any(|generator| {
                     generator.flow == flow.id
-                        && matches!(
-                            generator.kind,
-                            FlowGeneratorKind::Dcqcn(_) | FlowGeneratorKind::Roce(_)
-                        )
+                        && matches!(generator.kind, FlowGeneratorKind::Dcqcn(_))
                 });
+            // A queue pair echoes ECN on its ACKs and never sends a CNP (P16 ruling D4).
             if packet.size_bytes != 64 || !is_dcqcn {
                 return Err(ValidationError::new(format!(
-                    "DCQCN CNP packet {:?} must be an exact 64-byte NotECT frame bound to a DCQCN generator",
+                    "DCQCN CNP packet {:?} must be an exact 64-byte NotECT frame bound to an unreliable DCQCN generator",
                     packet.id
                 )));
             }
@@ -4048,9 +4049,9 @@ fn validate_packets_and_derive_delays(
                 FlowGeneratorKind::Roce(roce) => {
                     let feedback_can_be_emitted =
                         generator_can_emit || roce.snd_una < generator.bytes_emitted;
-                    let feedback_sizes = roce_receiver(image, flow).map_or([0, 0], |receiver| {
-                        [receiver.ack_size_bytes, receiver.np.cnp_size_bytes]
-                    });
+                    // A queue pair's feedback is its ACKs and NACKs (P16: no CNP).
+                    let feedback_sizes = roce_receiver(image, flow)
+                        .map_or([0], |receiver| [receiver.ack_size_bytes]);
                     for (index, link_id) in flow.reverse_route.iter().enumerate() {
                         let link = link(image, *link_id)
                             .expect("validated reverse route names an existing link");
@@ -5675,16 +5676,14 @@ fn roce_receiver<'a>(
         .roce_receivers
         .as_deref()?;
     receivers
-        .binary_search_by_key(&flow.id, |receiver| receiver.np.flow)
+        .binary_search_by_key(&flow.id, |receiver| receiver.flow)
         .ok()
         .map(|index| &receivers[index])
 }
 
-/// The largest feedback packet of a RoCE flow: an ACK or NACK, or a CNP.
+/// The largest feedback packet of a RoCE flow: an ACK or NACK (P16: no CNP).
 fn roce_feedback_max_bytes(image: &SimulationImage, flow: &FlowDescriptor) -> u64 {
-    roce_receiver(image, flow).map_or(0, |receiver| {
-        receiver.ack_size_bytes.max(receiver.np.cnp_size_bytes)
-    })
+    roce_receiver(image, flow).map_or(0, |receiver| receiver.ack_size_bytes)
 }
 
 /// The largest data packet a RoCE queue pair can still send: a retransmission may resend any
@@ -7248,17 +7247,14 @@ fn validate_payload_sequences(
                 })?;
         }
         for receiver in state.roce_receivers.iter().flatten() {
-            // One ACK or NACK and one CNP per data arrival.
-            let arrivals = work.data_by_flow[receiver.np.flow.0 as usize];
-            allocations = arrivals
-                .checked_mul(2)
-                .and_then(|feedback| allocations.checked_add(feedback))
-                .ok_or_else(|| {
-                    ValidationError::new(format!(
-                        "node {:?} generated RoCE feedback count exceeds u64",
-                        owner.id
-                    ))
-                })?;
+            // At most one ACK or NACK per data arrival (P16: no CNP).
+            let arrivals = work.data_by_flow[receiver.flow.0 as usize];
+            allocations = allocations.checked_add(arrivals).ok_or_else(|| {
+                ValidationError::new(format!(
+                    "node {:?} generated RoCE feedback count exceeds u64",
+                    owner.id
+                ))
+            })?;
         }
         if state.next_payload_seq < consumed_sequences {
             return Err(ValidationError::new(format!(

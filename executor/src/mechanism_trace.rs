@@ -467,13 +467,13 @@ pub fn roce_sender_transitions_csv(
         });
     }
     let mut csv = String::from(
-        "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,kind,class_paused,data_class,mtu_bytes,total_bytes,pacing_interval_ns,first_pacing_time_ns,rto_ns,rate_bps,input_acknowledgment,emitted,emitted_psn,emitted_bytes,emitted_retransmission,emitted_payload,before_next_psn,before_snd_una,before_bytes_emitted,before_packets_emitted,before_credit_quanta,before_rto_deadline_ns,before_pacer,before_next_tick_ns,before_status,after_next_psn,after_snd_una,after_bytes_emitted,after_packets_emitted,after_credit_quanta,after_rto_deadline_ns,after_pacer,after_next_tick_ns,after_status\n",
+        "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,kind,class_paused,data_class,mtu_bytes,total_bytes,pacing_interval_ns,first_pacing_time_ns,rto_ns,rate_bps,input_acknowledgment,input_ce_echo,emitted,emitted_psn,emitted_bytes,emitted_retransmission,emitted_payload,before_next_psn,before_snd_una,before_bytes_emitted,before_packets_emitted,before_credit_quanta,before_rto_deadline_ns,before_pacer,before_next_tick_ns,before_status,after_next_psn,after_snd_una,after_bytes_emitted,after_packets_emitted,after_credit_quanta,after_rto_deadline_ns,after_pacer,after_next_tick_ns,after_status\n",
     );
     for record in records {
         let emitted = record.emitted;
         write!(
             csv,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             record.key.time_ns,
             record.key.phase,
             record.key.origin_node.0,
@@ -490,6 +490,7 @@ pub fn roce_sender_transitions_csv(
             record.rto_ns,
             optional_u64(record.rate_bps),
             optional_u64(record.input_acknowledgment),
+            optional_bit(record.input_ce_echo),
             bit(emitted.is_some()),
             optional_u64(emitted.map(|emission| emission.psn)),
             optional_u64(emitted.map(|emission| emission.bytes)),
@@ -538,12 +539,12 @@ pub fn roce_receiver_transitions_csv(
             .collect(),
     )?;
     let mut csv = String::from(
-        "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,total_bytes,ack_every_packets,nack_interval_ns,duplicate_ack,ack_size_bytes,cnp_interval_ns,packet_psn,packet_bytes,packet_sent_time_ns,packet_retransmission,packet_ce,action,feedback_acknowledgment,feedback_payload,cnp_sent,cnp_payload,before_expected_psn,before_packets_since_ack,before_last_nack_psn,before_last_nack_time_ns,before_last_cnp_time_ns,after_expected_psn,after_packets_since_ack,after_last_nack_psn,after_last_nack_time_ns,after_last_cnp_time_ns\n",
+        "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,total_bytes,ack_every_packets,nack_interval_ns,duplicate_ack,ack_size_bytes,packet_psn,packet_bytes,packet_sent_time_ns,packet_retransmission,packet_ce,action,feedback_acknowledgment,feedback_payload,feedback_ce_echo,before_expected_psn,before_packets_since_ack,before_last_nack_psn,before_last_nack_time_ns,after_expected_psn,after_packets_since_ack,after_last_nack_psn,after_last_nack_time_ns\n",
     );
     for record in records {
         write!(
             csv,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             record.key.time_ns,
             record.key.phase,
             record.key.origin_node.0,
@@ -555,7 +556,6 @@ pub fn roce_receiver_transitions_csv(
             record.nack_interval_ns,
             bit(record.duplicate_ack),
             record.ack_size_bytes,
-            record.cnp_interval_ns,
             record.packet_psn,
             record.packet_bytes,
             record.packet_sent_time_ns,
@@ -564,19 +564,17 @@ pub fn roce_receiver_transitions_csv(
             record.action.label(),
             optional_u64(record.feedback_acknowledgment),
             optional_u64(record.feedback_payload.map(|payload| payload.0)),
-            bit(record.cnp_payload.is_some()),
-            optional_u64(record.cnp_payload.map(|payload| payload.0)),
+            optional_bit(record.feedback_ce_echo),
         )
         .expect("writing to String cannot fail");
         for view in [record.before, record.after] {
             write!(
                 csv,
-                ",{},{},{},{},{}",
+                ",{},{},{},{}",
                 view.expected_psn,
                 view.packets_since_ack,
                 optional_u64(view.last_nack_psn),
                 optional_u64(view.last_nack_time_ns),
-                optional_u64(view.last_cnp_time_ns),
             )
             .expect("writing to String cannot fail");
         }
@@ -587,6 +585,14 @@ pub fn roce_receiver_transitions_csv(
 
 fn optional_u64(value: Option<u64>) -> String {
     value.map_or_else(String::new, |value| value.to_string())
+}
+
+fn optional_bit(value: Option<bool>) -> &'static str {
+    match value {
+        None => "",
+        Some(false) => "0",
+        Some(true) => "1",
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

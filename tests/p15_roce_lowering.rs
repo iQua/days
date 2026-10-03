@@ -57,7 +57,7 @@ fn receiver(image: &SimulationImage, flow: days_executor::FlowId) -> RoceReceive
         .expect("a QP's target host holds RoCE receivers");
     *receivers
         .iter()
-        .find(|receiver| receiver.np.flow == flow)
+        .find(|receiver| receiver.flow == flow)
         .expect("the QP has a receiver on its target host")
 }
 
@@ -128,7 +128,6 @@ fn every_p15_fixture_lowers_to_queue_pairs_with_receivers_and_two_tokens() {
             assert_eq!(receiver.total_bytes, roce.pacer.total_bytes);
             assert_eq!((receiver.expected_psn, receiver.packets_since_ack), (0, 0));
             assert_eq!(receiver.last_nack, None);
-            assert_eq!(receiver.np.last_cnp_time_ns, None);
             assert_eq!(
                 descriptor.feedback_priority,
                 if name == "roce_feedback_priority.toml" {
@@ -161,11 +160,6 @@ fn queue_pair_keys_lower_with_their_defaults_and_the_hpcc_profile() {
     assert_eq!(defaults.nack_interval_ns, 500_000);
     assert_eq!(defaults.ack_size_bytes, 64);
     assert!(defaults.duplicate_ack);
-    assert_eq!(defaults.np.cnp_size_bytes, 64);
-    assert_eq!(
-        defaults.np.cnp_interval_ns, 0,
-        "queue pairs carry no CNP interval"
-    );
 
     let hpcc = lower_fixture("hpcc_incast64_dragonfly.toml");
     let pairs = queue_pairs(&hpcc);

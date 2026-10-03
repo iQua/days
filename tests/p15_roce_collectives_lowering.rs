@@ -88,7 +88,7 @@ fn roce_collectives_lower_one_queue_pair_per_stage_with_their_keys() {
             let receiver = image.host_states[target.state_slot as usize]
                 .roce_receivers
                 .as_deref()
-                .and_then(|receivers| receivers.iter().find(|r| r.np.flow == flow.id))
+                .and_then(|receivers| receivers.iter().find(|r| r.flow == flow.id))
                 .unwrap_or_else(|| panic!("{name}: a stage queue pair has its receiver"));
             assert_eq!(receiver.total_bytes, roce.pacer.total_bytes);
             assert_eq!(receiver.ack_every_packets, 1);

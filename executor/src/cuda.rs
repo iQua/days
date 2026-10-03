@@ -549,23 +549,23 @@ fn decode_packet_kind(value: u64, metadata: &[u64]) -> Result<PacketKind, CudaEr
             sent_time_ns: metadata[1],
             retransmission: metadata[2] != 0,
         })),
-        8 => Ok(PacketKind::RoceAck(roce_ack_header(metadata))),
-        9 => Ok(PacketKind::RoceNack(roce_ack_header(metadata))),
+        8 => crate::device_mechanism::roce_ack_header_of_words(metadata)
+            .map(PacketKind::RoceAck)
+            .ok_or(CudaError::DeviceExecution {
+                code: 93,
+                node: None,
+            }),
+        9 => crate::device_mechanism::roce_ack_header_of_words(metadata)
+            .map(PacketKind::RoceNack)
+            .ok_or(CudaError::DeviceExecution {
+                code: 93,
+                node: None,
+            }),
         10 if metadata == [0, 0, 0] => Ok(PacketKind::RocePacingTimer),
         _ => Err(CudaError::DeviceExecution {
             code: 93,
             node: None,
         }),
-    }
-}
-
-/// The RoCE ACK/NACK header in `packet_metadata`'s word order.
-#[inline(always)]
-fn roce_ack_header(metadata: &[u64]) -> crate::RoceAckHeader {
-    crate::RoceAckHeader {
-        acknowledgment: metadata[0],
-        echoed_sent_time_ns: metadata[1],
-        acknowledged_bytes: metadata[2],
     }
 }
 
@@ -2993,10 +2993,11 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
     for state in &image.host_states {
         for generator in &state.generators {
             // One ACK (TCP) or at most one CNP (DCQCN) per data packet; a queue pair's receiver
-            // answers a data arrival with at most one ACK or NACK and one CNP.
+            // answers a data arrival with at most one ACK or NACK (P16: no CNP).
             let per_packet = match generator.kind {
-                FlowGeneratorKind::Tcp(_) | FlowGeneratorKind::Dcqcn(_) => 1,
-                FlowGeneratorKind::Roce(_) => 2,
+                FlowGeneratorKind::Tcp(_)
+                | FlowGeneratorKind::Dcqcn(_)
+                | FlowGeneratorKind::Roce(_) => 1,
                 FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => 0,
             };
             if per_packet != 0 {
@@ -4089,7 +4090,7 @@ fn packet_metadata(kind: PacketKind) -> [u64; 3] {
         PacketKind::RoceAck(header) | PacketKind::RoceNack(header) => [
             header.acknowledgment,
             header.echoed_sent_time_ns,
-            header.acknowledged_bytes,
+            crate::device_mechanism::roce_ack_size_echo_word(header),
         ],
         PacketKind::RocePacingTimer => [0; 3],
     }

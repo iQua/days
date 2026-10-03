@@ -890,7 +890,7 @@ impl CapacityContext {
                     }
                     // Device backends refuse RoCE queue pairs at validation; these sizes keep a
                     // direct sizing request conservative. A retransmission may resend any packet
-                    // from the cumulative acknowledgment on, and feedback is an ACK, NACK or CNP.
+                    // from the cumulative acknowledgment on, and feedback is an ACK or NACK.
                     FlowGeneratorKind::Roce(roce) => {
                         minimum_data_sizes[index] =
                             minimum_data_sizes[index].min(finite_generator_minimum_packet_size(
@@ -1058,11 +1058,12 @@ fn flow_packet_counts(
     for state in &image.host_states {
         for generator in &state.generators {
             // One ACK (TCP) or at most one CNP (DCQCN) per data packet; a queue pair's receiver
-            // answers a data arrival with at most one ACK or NACK and one CNP (validator
-            // invariant 20 of `evidence/P15/qp-design.md` §7).
+            // answers a data arrival with at most one ACK or NACK (P16: its ACKs echo ECN and it
+            // sends no CNP).
             let per_packet = match generator.kind {
-                FlowGeneratorKind::Tcp(_) | FlowGeneratorKind::Dcqcn(_) => 1,
-                FlowGeneratorKind::Roce(_) => 2,
+                FlowGeneratorKind::Tcp(_)
+                | FlowGeneratorKind::Dcqcn(_)
+                | FlowGeneratorKind::Roce(_) => 1,
                 FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => 0,
             };
             if per_packet != 0 {

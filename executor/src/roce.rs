@@ -1,7 +1,7 @@
 //! RoCE queue pairs: exact Go-back-N rules and their LeanGuard transition records.
 //!
-//! A queue pair is a reliable DCQCN flow (`FlowGeneratorKind::Roce`). The DCQCN controller, its
-//! control tick and the separate CNP packet are DCQCN's own and keep emitting
+//! A queue pair is a reliable DCQCN flow (`FlowGeneratorKind::Roce`). Its Mellanox-form controller
+//! takes its congestion feedback from the ECN echo of its ACKs and NACKs (P16 ruling D4) and emits
 //! [`crate::DcqcnTransitionRecord`]s. This module holds the reliability layer: the pure rules the
 //! Scalar and CPU transitions apply (pacer status, the restart grid point, the receiver's
 //! decision), and the records of the pinned schema `days-gpu/plans/briefs/p15/qp-schema.md`.
@@ -170,8 +170,8 @@ pub(crate) fn receive(
     action
 }
 
-/// The DCQCN notification point of a data arrival: a CE-marked packet admitted by the CNP interval
-/// sends a CNP. Shared by DCQCN receivers and queue-pair receivers.
+/// The DCQCN notification point of an unreliable DCQCN flow's data arrival: a CE-marked packet
+/// admitted by the CNP interval sends a CNP. (A queue pair echoes ECN on its ACKs instead.)
 pub(crate) fn notification_point_sends_cnp(
     np: &mut crate::DcqcnReceiverState,
     now_ns: u64,
@@ -305,6 +305,8 @@ pub struct RoceSenderRecord {
     pub rate_bps: Option<u64>,
     /// The ACK or NACK value of an `ack` or `nack` transition.
     pub input_acknowledgment: Option<u64>,
+    /// The ECN echo of an `ack` or `nack` transition's packet (P16 schema Amendment 6).
+    pub input_ce_echo: Option<bool>,
     pub emitted: Option<RoceEmission>,
     pub before: RoceSenderView,
     pub after: RoceSenderView,
@@ -317,7 +319,6 @@ pub struct RoceReceiverView {
     pub packets_since_ack: u64,
     pub last_nack_psn: Option<u64>,
     pub last_nack_time_ns: Option<u64>,
-    pub last_cnp_time_ns: Option<u64>,
 }
 
 impl RoceReceiverView {
@@ -327,7 +328,6 @@ impl RoceReceiverView {
             packets_since_ack: receiver.packets_since_ack,
             last_nack_psn: receiver.last_nack.map(|mark| mark.expected_psn),
             last_nack_time_ns: receiver.last_nack.map(|mark| mark.time_ns),
-            last_cnp_time_ns: receiver.np.last_cnp_time_ns,
         }
     }
 }
@@ -343,7 +343,6 @@ pub struct RoceReceiverRecord {
     pub nack_interval_ns: u64,
     pub duplicate_ack: bool,
     pub ack_size_bytes: u64,
-    pub cnp_interval_ns: u64,
     pub packet_psn: u64,
     pub packet_bytes: u64,
     pub packet_sent_time_ns: u64,
@@ -353,7 +352,8 @@ pub struct RoceReceiverRecord {
     /// The frontier an ACK or NACK carried.
     pub feedback_acknowledgment: Option<u64>,
     pub feedback_payload: Option<PayloadId>,
-    pub cnp_payload: Option<PayloadId>,
+    /// The ECN echo an ACK or NACK carried: the CE mark of the packet that triggered it (ruling D5).
+    pub feedback_ce_echo: Option<bool>,
     pub before: RoceReceiverView,
     pub after: RoceReceiverView,
 }
@@ -386,16 +386,11 @@ impl RoceTransitionRecord {
 #[cfg(test)]
 mod tests {
     use super::{RoceReceiverAction, receive};
-    use crate::{DcqcnReceiverState, FlowId, RoceNackMark, RoceReceiverState};
+    use crate::{FlowId, RoceNackMark, RoceReceiverState};
 
     fn receiver(ack_every_packets: u64, duplicate_ack: bool) -> RoceReceiverState {
         RoceReceiverState {
-            np: DcqcnReceiverState {
-                flow: FlowId(0),
-                cnp_interval_ns: 0,
-                cnp_size_bytes: 64,
-                last_cnp_time_ns: None,
-            },
+            flow: FlowId(0),
             total_bytes: 2_500,
             expected_psn: 0,
             ack_every_packets,

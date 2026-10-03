@@ -766,13 +766,13 @@ pub struct RoceNackMark {
     pub time_ns: u64,
 }
 
-/// Target-owned state of one RoCE queue pair: the DCQCN notification point and the Go-back-N
-/// receiver.
+/// Target-owned state of one RoCE queue pair: the Go-back-N receiver. Its ACKs and NACKs echo the
+/// ECN mark of the data packet that triggered them, so it holds no notification point (P16 ruling
+/// D4).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RoceReceiverState {
-    /// The DCQCN notification point, exactly as a DCQCN flow's receiver holds it.
-    pub np: DcqcnReceiverState,
+    pub flow: FlowId,
     pub total_bytes: u64,
     /// The in-order frontier: every byte below it has arrived in order.
     pub expected_psn: u64,
@@ -872,14 +872,18 @@ pub struct RoceDataHeader {
     pub retransmission: bool,
 }
 
-/// RoCE cumulative ACK or NACK metadata: the receiver's in-order frontier, and the send time and
-/// size of the data packet that triggered it.
+/// RoCE cumulative ACK or NACK metadata: the receiver's in-order frontier, the send time and size
+/// of the data packet that triggered it, and that packet's ECN echo (P16 ruling D4: the queue
+/// pair's congestion feedback, as HPCC's and SimAI's ACK `FLAG_CNP`). The size is a packet size,
+/// at most the queue pair's MTU, which lowering bounds by `u32::MAX`, so the header keeps the 24 B
+/// every packet descriptor reserves.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RoceAckHeader {
     pub acknowledgment: u64,
     pub echoed_sent_time_ns: u64,
-    pub acknowledged_bytes: u64,
+    pub acknowledged_bytes: u32,
+    pub ce_echo: bool,
 }
 
 /// Closed packet direction used to route ordinary data and feedback packets.
@@ -1077,13 +1081,56 @@ mod tests {
     #[test]
     fn roce_queue_pairs_grow_no_per_flow_record() {
         let checks = [
-            ("RoceGenerator", std::mem::size_of::<RoceGenerator>(), 256),
+            ("RoceGenerator", std::mem::size_of::<RoceGenerator>(), 240),
             ("FlowDescriptor", std::mem::size_of::<FlowDescriptor>(), 80),
             ("HostState", std::mem::size_of::<HostState>(), 224),
             (
                 "RoceReceiverState",
                 std::mem::size_of::<RoceReceiverState>(),
-                120,
+                88,
+            ),
+            ("PacketKind", std::mem::size_of::<PacketKind>(), 32),
+        ];
+        for (name, size, bound) in checks {
+            assert!(
+                size <= bound,
+                "{name} grew to {size} B, above its {bound} B budget"
+            );
+        }
+    }
+
+    /// P16 D1 layout budgets (`days-gpu/evidence/P16/dcqcn-design.md` §5.4). The Mellanox-form
+    /// controller is 136 B (152 B for the paper form at `main` 9ff20ea): 80 B of configuration and
+    /// 56 B of state, four `bool`s packed after the `u32` stage (a stored freeze flag would pad it to
+    /// 144 B, so the freeze is derived from the generator). With no control token, an unreliable
+    /// DCQCN generator is 208 B (240 B at `main`) and a queue pair 240 B (256 B, the union's full
+    /// budget, at `main`), which leaves the window its 16 B. A queue pair's receiver loses its
+    /// 40 B notification point (88 B; 120 B at `main`), and the ACK header keeps the 24 B every
+    /// packet descriptor reserves although it now carries the ECN echo.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn mellanox_dcqcn_state_fits_its_budgets() {
+        let checks = [
+            (
+                "DcqcnController",
+                std::mem::size_of::<super::DcqcnController>(),
+                136,
+            ),
+            (
+                "DcqcnGenerator",
+                std::mem::size_of::<super::DcqcnGenerator>(),
+                208,
+            ),
+            ("RoceGenerator", std::mem::size_of::<RoceGenerator>(), 240),
+            (
+                "RoceReceiverState",
+                std::mem::size_of::<RoceReceiverState>(),
+                88,
+            ),
+            (
+                "RoceAckHeader",
+                std::mem::size_of::<super::RoceAckHeader>(),
+                24,
             ),
             ("PacketKind", std::mem::size_of::<PacketKind>(), 32),
         ];
