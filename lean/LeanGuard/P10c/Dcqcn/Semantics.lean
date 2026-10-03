@@ -163,21 +163,44 @@ def decreaseDue (state : State) : Nat :=
   if state.decreasePending then state.nextDecreaseNs else maxU64
 
 /-- Every rate-increase and rate-decrease instant before `bound`, increase first at equal time,
-with the alpha ticks each cut reads. Each step moves the earliest pending instant strictly later. -/
-partial def materialize (config : Config) (state : State) (bound : Nat) (counts : Counts := {}) :
+with the alpha ticks each cut reads. An instant at `maxU64` never fires (the executor's bounds never
+exceed `u64::MAX`), and a zero increase interval, which `validConfig` rejects, applies nothing.
+
+It terminates: a decrease check clears `decreasePending`, which nothing here sets again, so it
+fires at most once; an increase fire moves its instant strictly later while it stays below
+`bound`. -/
+def materialize (config : Config) (state : State) (bound : Nat) (counts : Counts := {}) :
     State × Counts :=
-  let increase := increaseDue state
-  let decrease := decreaseDue state
-  if bound ≤ min increase decrease then (state, counts)
-  else if increase ≤ decrease then
-    materialize config (increaseFire config state increase) bound
+  if _hstop : bound ≤ min (increaseDue state) (decreaseDue state) ∨
+      maxU64 ≤ min (increaseDue state) (decreaseDue state) ∨ config.increaseIntervalNs = 0 then
+    (state, counts)
+  else if _hinc : increaseDue state ≤ decreaseDue state then
+    materialize config (increaseFire config state (increaseDue state)) bound
       { counts with increaseFires := counts.increaseFires + 1 }
   else
-    let (ticked, ticks) := alphaThrough config state decrease
-    materialize config (decreaseCheck config ticked decrease) bound
+    let ticked := alphaThrough config state (decreaseDue state)
+    materialize config (decreaseCheck config ticked.1 (decreaseDue state)) bound
       { counts with
-        alphaTicks := counts.alphaTicks + ticks
+        alphaTicks := counts.alphaTicks + ticked.2
         decreaseCuts := counts.decreaseCuts + 1 }
+termination_by (if state.decreasePending then bound + 1 else 0) + (bound - increaseDue state)
+decreasing_by
+  · -- An increase fire: the increase timer is armed below `maxU64` and moves strictly later.
+    have harmed : state.increaseArmed = true := by
+      cases h : state.increaseArmed
+      · simp [increaseDue, h] at _hstop _hinc; omega
+      · rfl
+    simp only [increaseDue, harmed, if_true] at _hstop _hinc ⊢
+    simp only [increaseFire, harmed, if_true, later]
+    split <;> omega
+  · -- A decrease check: it was pending, and it clears the flag.
+    have hpending : state.decreasePending = true := by
+      cases h : state.decreasePending
+      · simp [decreaseDue, h] at _hstop _hinc
+        omega
+      · rfl
+    simp only [hpending, if_true, decreaseCheck, Bool.false_eq_true, if_false]
+    omega
 
 /-- The first instant of the decrease grid at or after `time`. -/
 def firstDecreaseAtOrAfter (config : Config) (state : State) (time : Nat) : Nat :=
