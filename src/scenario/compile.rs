@@ -2942,14 +2942,18 @@ fn lower(
                     EventKind::PacketArrival
                 },
             ));
+            // A DCQCN flow's or queue pair's status predicts its first tick: it sends iff one
+            // tick of credit covers the first packet (the validator's next-tick rule).
+            let paced_key = match flow.traffic.kind {
+                TrafficKind::Dcqcn(config) => Some(config),
+                _ => roce.map(|roce| roce.dcqcn),
+            };
             ScheduledEmission {
-                status: match (roce, &flow.traffic.termination) {
-                    // A queue pair's status predicts its first tick: it sends iff one tick of
-                    // credit covers the first packet.
-                    (Some(roce), Termination::Bytes(total_bytes)) => {
+                status: match (paced_key, &flow.traffic.termination) {
+                    (Some(key), Termination::Bytes(total_bytes)) => {
                         let first_packet = flow.traffic.packet_size_bytes.min(*total_bytes);
-                        let tick_credit = u128::from(roce.dcqcn.initial_rate_bps)
-                            * u128::from(roce.dcqcn.pacing_interval_ns);
+                        let tick_credit =
+                            u128::from(key.initial_rate_bps) * u128::from(key.pacing_interval_ns);
                         let cost = u128::from(first_packet) * 8 * 1_000_000_000;
                         if tick_credit >= cost {
                             GeneratorStatus::Scheduled

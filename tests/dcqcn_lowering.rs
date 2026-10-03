@@ -1054,3 +1054,26 @@ fn dcqcn_reverse_cnp_service_time_closes_at_u64_max() {
         "{error}"
     );
 }
+
+/// A DCQCN flow whose first pacing tick cannot cover a packet lowers `Blocked`, as the validator's
+/// next-tick rule requires (it failed to lower at `main` 9ff20ea: lowering predicted `Scheduled`
+/// for every unreliable DCQCN flow). `configs/p16/dcqcn_mlx_blocked.toml` paces 5 Gb/s in 1 us
+/// ticks against 1,000-byte packets: 5,000 bits of credit against 8,000.
+#[test]
+fn a_dcqcn_flow_below_one_packet_per_tick_lowers_blocked() {
+    let image = compile_config(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("configs/p16/dcqcn_mlx_blocked.toml"),
+    )
+    .expect("the fixture lowers and validates");
+    let statuses = image
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .filter(|generator| matches!(generator.kind, FlowGeneratorKind::Dcqcn(_)))
+        .map(|generator| generator.next_emission.status)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        statuses,
+        [GeneratorStatus::Blocked, GeneratorStatus::Blocked]
+    );
+}
