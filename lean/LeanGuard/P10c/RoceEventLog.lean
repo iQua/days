@@ -255,6 +255,8 @@ structure SenderRow where
   kind : SenderKind
   /-- Amendment 1: the tick found the pair's data class paused on its host's egress. -/
   classPaused : Bool
+  /-- Amendment 6 (P16 ruling D7): the tick found the pair's window closed. -/
+  windowBlocked : Bool
   /-- Amendment 3: the pair's data priority (0..=7); `none` in a log without the column. -/
   dataClass : Option Nat
   config : Roce.SenderConfig
@@ -290,6 +292,19 @@ def parseSenderRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array
   let classPaused ←
     if idx.contains "class_paused" then parseBit (← getField idx fields "class_paused")
     else pure false
+  -- Amendment 6's window columns: a log without them has no window (every row reads 0).
+  let windowBlocked ←
+    if idx.contains "window_blocked" then parseBit (← getField idx fields "window_blocked")
+    else pure false
+  let windowBytes ←
+    if idx.contains "window_bytes" then parseU64 (← getField idx fields "window_bytes")
+    else pure 0
+  let variableWindow ←
+    if idx.contains "variable_window" then parseBit (← getField idx fields "variable_window")
+    else pure false
+  let maximumRateBps ←
+    if idx.contains "maximum_rate_bps" then parseU64 (← getField idx fields "maximum_rate_bps")
+    else pure 0
   let dataClass ←
     if idx.contains "data_class" then do
       let value ← parseNat (← getField idx fields "data_class")
@@ -312,13 +327,17 @@ def parseSenderRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array
       flowId := ← parseU64 (← getField idx fields "flow_id")
       kind := ← parseSenderKind (← getField idx fields "kind")
       classPaused := classPaused
+      windowBlocked := windowBlocked
       dataClass := dataClass
       config :=
         { mtuBytes := ← parseU64 (← getField idx fields "mtu_bytes")
           totalBytes := ← parseU64 (← getField idx fields "total_bytes")
           pacingIntervalNs := ← parseU64 (← getField idx fields "pacing_interval_ns")
           firstPacingTimeNs := ← parseU64 (← getField idx fields "first_pacing_time_ns")
-          rtoNs := ← parseU64 (← getField idx fields "rto_ns") }
+          rtoNs := ← parseU64 (← getField idx fields "rto_ns")
+          windowBytes := windowBytes
+          variableWindow := variableWindow
+          maximumRateBps := maximumRateBps }
       rateBps := ← parseOptU64 (← getField idx fields "rate_bps")
       inputAcknowledgment := ← parseOptU64 (← getField idx fields "input_acknowledgment")
       inputCeEcho := ← parseOpt parseBit (← getField idx fields "input_ce_echo")
@@ -456,6 +475,8 @@ def checkSenderShape (row : SenderRow) : Except String Unit := do
   at_ (Roce.validSenderState row.config row.before) "invalid RoCE sender before-state"
   at_ (Roce.validSenderState row.config row.after) "invalid RoCE sender after-state"
   at_ (!row.classPaused || row.kind = .tick) "RoCE class_paused set on a non-tick row"
+  at_ (!row.windowBlocked || (row.kind = .tick && !row.classPaused))
+    "RoCE window_blocked set on a non-tick row or with class_paused"
   at_ (row.inputCeEcho.isSome = (row.kind = .ack || row.kind = .nack))
     "RoCE input_ce_echo present iff the row is an ACK or NACK"
   match row.kind with
@@ -464,6 +485,8 @@ def checkSenderShape (row : SenderRow) : Except String Unit := do
       at_ row.inputAcknowledgment.isNone "RoCE tick row carries an acknowledgment"
       if row.classPaused then
         at_ (row.rateBps.isNone && !row.emitted) "RoCE paused tick credits or emits"
+      else if row.windowBlocked then
+        at_ (row.rateBps.isNone && !row.emitted) "RoCE window-blocked tick credits or emits"
       else
         at_ (row.rateBps.isSome = (row.before.nextPsn < row.config.totalBytes))
           "RoCE tick rate present iff the tick credits"
@@ -578,6 +601,9 @@ def checkControllerJoin (row : SenderRow) (controllerRow : Option DcqcnEventLog.
         s!"DCQCN row kind is not its RoCE transition's: feedback for an echoing ACK or NACK, advance otherwise (node_id={d.nodeId}, flow_id={d.flowId})"
       atD (d.frozen = froze)
         s!"DCQCN freeze is not the RoCE transition that completes the queue pair (node_id={d.nodeId}, flow_id={d.flowId})"
+      atD (row.config.maximumRateBps = 0 ||
+          d.config.maximumRateBps = row.config.maximumRateBps)
+        s!"DCQCN maximum rate differs from the queue pair's maximum_rate_bps (node_id={d.nodeId}, flow_id={d.flowId})"
       if let some c := controller then
         atD (d.before = c)
           s!"DCQCN row does not continue the queue pair's controller (node_id={d.nodeId}, flow_id={d.flowId})"
@@ -659,11 +685,22 @@ def checkSenderItem (stopTimeNs : Option Nat) (track : SenderTrack) (row : Sende
   let rate := knownRate.getD 0
   -- A tick credits at the controller's rate as of the tick: `materialize(controller, time + 1)`.
   at_ (row.rateBps.all (· = rate)) "RoCE tick rate differs from the DCQCN controller's current rate"
+  -- Ruling D7: after the PFC test, a tick with a packet to send parks exactly when the window,
+  -- at the rate as of the tick, is closed.
+  if row.kind = .tick && !row.classPaused && row.before.nextPsn < row.config.totalBytes then
+    let closed := knownRate.isSome && Roce.windowBound row.config rate row.before
+    if row.windowBlocked then
+      at_ closed "RoCE window-blocked tick finds the window open"
+    else
+      at_ (!closed) "RoCE tick credits inside a closed window"
+  else
+    at_ (!row.windowBlocked) "RoCE window-blocked tick with nothing to send"
   let withinStop := row.after.pacer != .stopped
   let expected :=
     match row.kind, row.inputAcknowledgment with
     | .tick, _ =>
         if row.classPaused then Roce.onPausedTick row.config rate row.before
+        else if row.windowBlocked then Roce.onWindowBlockedTick row.config rate row.before
         else Roce.onTick row.config rate rate row.key.timeNs withinStop row.before
     | .ack, some value =>
         Roce.onFeedback row.config rate row.key.timeNs value false withinStop row.before

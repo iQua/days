@@ -165,6 +165,13 @@ structure SenderConfig where
   firstPacingTimeNs : Nat
   /-- The fixed retransmission timeout; `0` means the timeout is off (§5 step 11). -/
   rtoNs : Nat
+  /-- P16 ruling D7 (Amendment 6): the window in bytes; `0` means no window. -/
+  windowBytes : Nat := 0
+  /-- The window scales with the controller's rate (SimAI `m_var_win`). -/
+  variableWindow : Bool := false
+  /-- The controller's maximum rate, which scales a variable window; `0` when the log does not
+  carry it (a log without the window columns, which has no window). -/
+  maximumRateBps : Nat := 0
   deriving DecidableEq, Repr
 
 /--
@@ -225,7 +232,10 @@ def validSenderConfig (config : SenderConfig) : Bool :=
     config.pacingIntervalNs > 0 &&
     config.pacingIntervalNs ≤ maxU64 &&
     config.firstPacingTimeNs ≤ maxU64 &&
-    config.rtoNs ≤ maxU64
+    config.rtoNs ≤ maxU64 &&
+    config.windowBytes ≤ maxU64 &&
+    config.maximumRateBps ≤ maxU64 &&
+    (!config.variableWindow || (config.windowBytes > 0 && config.maximumRateBps > 0))
 
 /-- §7 invariants 2, 3, 4 and 5, as far as one sender's record shows them. -/
 def validSenderState (config : SenderConfig) (state : SenderState) : Bool :=
@@ -246,13 +256,27 @@ def validSenderState (config : SenderConfig) (state : SenderState) : Bool :=
     (state.pacer != .parked || state.status = .blocked || state.status = .finished)
 
 /--
-The status an armed pacer's pending tick predicts (`roce::armed_status`): `scheduled` when one
-more tick of credit at the controller's current rate covers the next packet, else `blocked`. The
-executor adds in `u128`; a sum beyond it predicts `blocked`. A pending tick with nothing left to
-send is `blocked`.
+P16 ruling D7 (SimAI `GetWin`): the window at controller rate `rateBps`: `windowBytes`, or with a
+variable window `max(1, floor(windowBytes × rate / maximum))`; `none` without a window.
+-/
+def window (config : SenderConfig) (rateBps : Nat) : Option Nat :=
+  if config.windowBytes = 0 then none
+  else if config.variableWindow then
+    some (max 1 (config.windowBytes * rateBps / config.maximumRateBps))
+  else some config.windowBytes
+
+/-- The window binds (SimAI `IsWinBound`): `next_psn - snd_una ≥ w`. -/
+def windowBound (config : SenderConfig) (rateBps : Nat) (state : SenderState) : Bool :=
+  (window config rateBps).any (fun w => state.nextPsn - state.sndUna ≥ w)
+
+/--
+The status an armed pacer's pending tick predicts (`roce::armed_status`): `scheduled` when the
+window, if any, is open and one more tick of credit at the controller's current rate covers the
+next packet, else `blocked`. The executor adds in `u128`; a sum beyond it predicts `blocked`. A
+pending tick with nothing left to send is `blocked`.
 -/
 def armedStatus (config : SenderConfig) (rateBps : Nat) (state : SenderState) : Status :=
-  if state.nextPsn ≥ config.totalBytes then
+  if state.nextPsn ≥ config.totalBytes || windowBound config rateBps state then
     .blocked
   else
     let credit := state.creditQuanta + tickCredit config rateBps
@@ -289,13 +313,27 @@ depends on the rate at all (`armedStatus` of an armed, unfinished pacer with a p
 `scheduled` iff `rate ≥` this threshold, since `credit + rate × interval ≥ cost` is monotone in
 the rate. The caller uses it only while the pair's credit is still zero, where the `u128` bound
 of `armedStatus` cannot bind (`rate × interval < 2^128`).
+
+A window (ruling D7) adds a second monotone condition. A variable window is open iff
+`floor(W × rate / maximum) ≥ outstanding + 1`, iff `rate ≥ ceil((outstanding + 1) × maximum / W)`
+(always, with nothing outstanding), so the threshold is the larger of the two; a fixed window
+that binds predicts `blocked` at every rate (`none`: compared exactly). With nothing outstanding,
+as before any pair's first credit, no window binds.
 -/
 def statusThreshold (config : SenderConfig) (state : SenderState) : Option Nat :=
   if state.pacer = .armed && state.sndUna < config.totalBytes &&
       state.nextPsn < config.totalBytes then
     let cost := packetCost (packetSize config state.nextPsn)
-    some (if cost ≤ state.creditQuanta then 0
-      else (cost - state.creditQuanta + config.pacingIntervalNs - 1) / config.pacingIntervalNs)
+    let credit :=
+      if cost ≤ state.creditQuanta then 0
+      else (cost - state.creditQuanta + config.pacingIntervalNs - 1) / config.pacingIntervalNs
+    let outstanding := state.nextPsn - state.sndUna
+    if config.windowBytes = 0 || outstanding = 0 then some credit
+    else if config.variableWindow then
+      some (max credit
+        (((outstanding + 1) * config.maximumRateBps + config.windowBytes - 1) / config.windowBytes))
+    else if outstanding ≥ config.windowBytes then none
+    else some credit
   else
     none
 
@@ -408,6 +446,18 @@ parks the pacer, so no tick is pending until a restart. The status settles as fo
 pacer.
 -/
 def onPausedTick (config : SenderConfig) (rateBps : Nat) (state : SenderState) : SenderResult :=
+  { state := settle config rateBps { state with pacer := .parked, nextTickNs := none } .blocked
+    emission := none
+    stopQuery := none }
+
+/--
+P16 ruling D7 (Amendment 6): a pacing tick that finds the window closed at the rate as of the tick
+sends nothing, adds no credit and parks, as a paused tick does; only an ACK or NACK that moves
+`snd_una`, or a timeout, restarts it (`onFeedback`, `onTimeout`), never a host RESUME. The caller
+checks the window.
+-/
+def onWindowBlockedTick (config : SenderConfig) (rateBps : Nat) (state : SenderState) :
+    SenderResult :=
   { state := settle config rateBps { state with pacer := .parked, nextTickNs := none } .blocked
     emission := none
     stopQuery := none }

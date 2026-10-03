@@ -1053,6 +1053,94 @@ expect_hp_reject "delete the host RESUME record (unrepaired)" \
   "REJECT: pfc: line $((n_line - 1)): PFC controller-set discontinuity for queue (node_id=$r_node, queue_id=0, controlled_link=$p_link, priority=3)" \
   "$hp.sender.csv" "$hp.receiver.csv" "$hp.dcqcn.csv" "$campaign_tmp/hp.pfc.csv"
 
+# --- Amendment 6: the queue-pair window (P16 ruling D7) ----------------------------------------
+# roce_trace_window_prefix_executor_accept: the logs of configs/p16/dcqcn_mlx_window.toml before
+# 400,000 ns (Scalar, full observation; days-gpu evidence/P16/dcqcn-impl/tooling/p16_lg_csvs.rs):
+# four queue pairs with fixed (200,000 and 4,000 B) and variable (20,000 and 8,000 B) windows,
+# window-blocked ticks, rate cuts that shrink the variable windows, and the 4,000 B pair (paced one
+# packet per tick) window-parked through a host PAUSE and RESUME. These mutations locate their
+# rows by named columns, so the sender layout (with the window columns) is not numbered here.
+wn="$fixture_dir/roce_trace_window_prefix_executor_accept"
+# The awk preludes that name the columns (`c["name"]`): one keeps the header (a mutation), one
+# drops it (a lookup).
+named='NR == 1 { for (i = 1; i <= NF; i++) c[$i] = i; print; next }'
+columns='NR == 1 { for (i = 1; i <= NF; i++) c[$i] = i; next }'
+# The controller rate a sender row's pair holds as of it: the last DCQCN row of the pair at or
+# before its key, or else the rate of the pair's crediting ticks (the initial rate). Reads the
+# DCQCN log, then the sender log; `rate_lookup <condition>` prints `line rate` for the first row
+# meeting the awk condition (which may read `rate`).
+rate_head='
+  function le(a, b) { split(a, x, " "); split(b, y, " ");
+    for (i = 1; i <= 4; i++) { if (x[i] + 0 < y[i] + 0) return 1; if (x[i] + 0 > y[i] + 0) return 0 }
+    return 1 }
+  FNR == NR { if (FNR == 1) { for (i = 1; i <= NF; i++) d[$i] = i; next }
+    n++; df[n] = $d["flow_id"]; dk[n] = $1 " " $2 " " $3 " " $4; dr[n] = $d["after_current_rate_bps"]; next }
+  FNR == 1 { for (i = 1; i <= NF; i++) c[$i] = i; next }
+  { f = $c["flow_id"]; key = $1 " " $2 " " $3 " " $4; rate = (f in initial) ? initial[f] : ""
+    for (j = 1; j <= n; j++) if (df[j] == f && le(dk[j], key)) rate = dr[j]
+    if (rate != "" && ('
+rate_tail=')) { print FNR, rate; exit }
+    if ($c["rate_bps"] != "" && !(f in initial)) initial[f] = $c["rate_bps"] }'
+rate_lookup() {
+  awk -F, "$rate_head$1$rate_tail" "$wn.dcqcn.csv" "$wn.sender.csv"
+}
+# window_reject <label> <awk program over the sender log> <expected REJECT line>
+window_reject() {
+  awk -F, -v OFS=, "$named $2"' { print }' "$wn.sender.csv" > "$campaign_tmp/window.sender.csv"
+  mutations=$((mutations + 1))
+  if check_case "window/$1" 1 "$3" \
+      trace "$campaign_tmp/window.sender.csv" "$wn.receiver.csv" "$wn.dcqcn.csv" --pfc "$wn.pfc.csv" \
+      --horizon-ns "$(cat "$wn.horizon_ns")" "$(cat "$wn.stop_time_ns")"; then
+    mutations_caught=$((mutations_caught + 1))
+  fi
+}
+# A. A tick that credits but sends nothing, recorded as window-blocked: its window was open (not
+# a pair's first row, which the first-row rule decides).
+a_line="$(awk -F, "$columns"' seen[$c["flow_id"]]++ && $c["kind"] == "tick" && $c["window_bytes"] > 0 && $c["window_blocked"] == 0 && $c["class_paused"] == 0 && $c["rate_bps"] != "" && $c["emitted"] == 0 { print NR; exit }' "$wn.sender.csv")"
+window_reject "open-window-recorded-as-blocked" \
+  "NR == $a_line"' { $c["window_blocked"] = 1; $c["rate_bps"] = "" }' \
+  "REJECT: sender: line $a_line: RoCE window-blocked tick finds the window open"
+# B. A window-blocked tick of a fixed window recorded as an ordinary tick at the controller's rate:
+# it would credit inside the closed window.
+read -r b_line b_rate <<<"$(rate_lookup '$c["window_blocked"] == 1 && $c["variable_window"] == 0')"
+window_reject "closed-window-recorded-as-crediting" \
+  "NR == $b_line"' { $c["window_blocked"] = 0; $c["rate_bps"] = '"$b_rate"' }' \
+  "REJECT: sender: line $b_line: RoCE tick credits inside a closed window"
+# The same for a variable window, whose size the checker scales by the rate as of the tick.
+read -r v_line v_rate <<<"$(rate_lookup '$c["window_blocked"] == 1 && $c["variable_window"] == 1')"
+window_reject "closed-variable-window-recorded-as-crediting" \
+  "NR == $v_line"' { $c["window_blocked"] = 0; $c["rate_bps"] = '"$v_rate"' }' \
+  "REJECT: sender: line $v_line: RoCE tick credits inside a closed window"
+# C. A variable window read as a fixed one: at that tick the fixed window is open.
+read -r f_line f_flow <<<"$(awk -F, "$columns"' $c["window_blocked"] == 1 && $c["variable_window"] == 1 && $c["before_next_psn"] - $c["before_snd_una"] < $c["window_bytes"] { print NR, $c["flow_id"]; exit }' "$wn.sender.csv")"
+window_reject "variable-window-read-as-fixed" \
+  '$c["flow_id"] == '"$f_flow"' { $c["variable_window"] = 0 }' \
+  "REJECT: sender: line $f_line: RoCE window-blocked tick finds the window open"
+# D. The prediction: an armed pacer whose next tick has the credit for its packet but finds the
+# window closed predicts Blocked (the 4,000 B pair, one packet of credit per tick).
+read -r p_line p_rate <<<"$(rate_lookup '$c["after_pacer"] == "armed" && $c["variable_window"] == 0 && $c["window_bytes"] > 0 && $c["after_next_psn"] - $c["after_snd_una"] >= $c["window_bytes"] && $c["after_credit_quanta"] + rate * $c["pacing_interval_ns"] >= $c["mtu_bytes"] * 8000000000')"
+window_reject "prediction-ignores-the-window" \
+  "NR == $p_line"' { $c["after_status"] = "scheduled" }' \
+  "REJECT: sender: line $p_line: RoCE sender after-state mismatch"
+# E. Shape: window_blocked only on ticks, never with class_paused.
+w_ack="$(awk -F, "$columns"' $c["kind"] == "ack" { print NR; exit }' "$wn.sender.csv")"
+window_reject "window-blocked-ack" \
+  "NR == $w_ack"' { $c["window_blocked"] = 1 }' \
+  "REJECT: sender: line $w_ack: RoCE window_blocked set on a non-tick row or with class_paused"
+w_tick="$(awk -F, "$columns"' $c["window_blocked"] == 1 { print NR; exit }' "$wn.sender.csv")"
+window_reject "window-blocked-and-class-paused" \
+  "NR == $w_tick"' { $c["class_paused"] = 1 }' \
+  "REJECT: sender: line $w_tick: RoCE window_blocked set on a non-tick row or with class_paused"
+window_reject "window-blocked-tick-credits" \
+  "NR == $w_tick"' { $c["rate_bps"] = 1000000000 }' \
+  "REJECT: sender: line $w_tick: RoCE window-blocked tick credits or emits"
+# F. The maximum rate that scales a window is the controller's.
+read -r m_flow m_node <<<"$(awk -F, "$columns"' $c["variable_window"] == 0 && $c["window_bytes"] == 4000 { print $c["flow_id"], $c["node_id"]; exit }' "$wn.sender.csv")"
+m_line="$(awk -F, -v flow="$m_flow" 'NR == 1 { for (i = 1; i <= NF; i++) d[$i] = i; next } $d["flow_id"] == flow { print NR; exit }' "$wn.dcqcn.csv")"
+window_reject "maximum-rate-not-the-controllers" \
+  '$c["flow_id"] == '"$m_flow"' { $c["maximum_rate_bps"] += 1 }' \
+  "REJECT: dcqcn: line $m_line: DCQCN maximum rate differs from the queue pair's maximum_rate_bps (node_id=$m_node, flow_id=$m_flow)"
+
 # --- Collective stages over RoCE (P15 LeanGuard part 3): the --collective joins -----------------
 # The DAG prefix: rows 2-5 release the four compute-gated roots at 5,000 ns; row 11 releases flow 7
 # at node 1 by the ACK of flow 6 (sender line 67) that completes it; flow 6's previous ACK is at
