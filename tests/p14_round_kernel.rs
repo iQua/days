@@ -379,8 +379,12 @@ fn dcqcn_checkpoints(
 
 /// Every image the plain build must refuse before launch: each `configs/p14/` fixture and DCQCN-only
 /// variant with seven checkpoints of each, the finished-generator tails of `dcqcn_t26` and its
-/// bottleneck variant, and the 132 active-generator checkpoints of the lengthened bottleneck
-/// variant, 42 of which the plain build used to run to silently wrong bytes (review F2).
+/// bottleneck variant, and the 104 active-generator checkpoints of the lengthened bottleneck
+/// variant (132 under P14's paper-form controller). With the host refusal bypassed (a scratch
+/// patch), the plain build runs all 104 to silently wrong bytes on Metal, and the mechanisms build
+/// reproduces all 104 (`days-gpu/evidence/P16/dcqcn-impl/raw/f4-plain-forced-head.log`); P14's
+/// review F2 counted 42 of 132 when the plain build still had per-event stops, which the host
+/// refusal replaced. The refusal is the only guard.
 #[cfg(any(
     all(feature = "metal-test-hooks", target_vendor = "apple"),
     feature = "cuda-test-hooks"
@@ -399,8 +403,8 @@ fn refused_images() -> Vec<(String, SimulationImage)> {
     let active = dcqcn_checkpoints(&lengthened, CheckpointPhase::GeneratorActive);
     assert_eq!(
         active.len(),
-        132,
-        "the review's active-generator checkpoint set"
+        104,
+        "the active-generator checkpoint set (P16 Mellanox form)"
     );
     for (horizon, checkpoint) in active {
         images.push((format!("dcqcn_t26 lengthened active@{horizon}"), checkpoint));
