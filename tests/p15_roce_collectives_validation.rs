@@ -109,8 +109,8 @@ fn with_tick(
 }
 
 /// Fix round 1 (review M1): a pacer that owns no tick (a gated stage, or a pair parked by a pause)
-/// owns none at any time, and a gated stage owns no control tick either. The validator counted
-/// ticks only at the departure and the control deadline, so a stray tick at another time passed
+/// owns none at any time (in P15 a gated stage also owned no control tick; P16 removed the control
+/// tick). The validator counted ticks only at the departure and the control deadline, so a stray tick at another time passed
 /// validation and failed the Scalar run.
 #[test]
 fn a_gated_stage_owns_no_tick_at_any_time() {
@@ -124,10 +124,6 @@ fn a_gated_stage_owns_no_tick_at_any_time() {
         refused(
             &with_tick(&image, slot, roce.pacing_timer_payload, time_ns),
             "parked pacer owns a pending tick",
-        );
-        refused(
-            &with_tick(&image, slot, roce.control_timer_payload, time_ns),
-            "owns a pending control tick before its release",
         );
     }
 }
@@ -181,11 +177,11 @@ fn a_gated_roce_stage_is_pristine_and_idle() {
         "dependency-blocked after its sending state changed",
     );
     let control = with_roce(&image, slot, position, |_, roce| {
-        roce.controller.next_control_time_ns += 1_000;
+        roce.controller.current_rate_bps -= 1;
     });
     refused(
         &control,
-        "dependency-blocked after its sending state changed",
+        "has a DCQCN controller that moved before its first feedback",
     );
     let credited = with_roce(&image, slot, position, |_, roce| {
         roce.pacer.credit_quanta = 1;

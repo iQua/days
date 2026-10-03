@@ -295,15 +295,15 @@ pub(crate) struct DcqcnDeviceWork {
     pub pacing_ticks: usize,
     /// Data packets the flow can still source.
     pub packets: usize,
-    /// Control-timer transitions, which continue through the stop time after the flow finishes.
-    pub control_ticks: usize,
 }
 
 /// Bounds a DCQCN source's remaining work without simulating its controller.
 ///
-/// The controller clamps the pacing rate to `[minimum, maximum]`, so every pacing tick adds at least
-/// `minimum_rate * interval` credit quanta and one packet needs at most
-/// `ceil(packet_bits * denominator * 1e9 / (minimum_rate * interval))` ticks. Pacing therefore ends
+/// The Mellanox-form controller has no timer event (P16 ruling D2), so its only device work is
+/// the pacing tick. Its rate never falls below `dcqcn_rate_floor_bps(minimum)` (the cut floors at
+/// the minimum, and the average truncates each half), so every pacing tick adds at least
+/// `floor * interval` credit quanta and one packet needs at most
+/// `ceil(packet_bits * denominator * 1e9 / (floor * interval))` ticks. Pacing therefore ends
 /// within that many ticks per remaining packet, and never after the stop time. Every packet costs
 /// at least one tick, so `packets <= pacing_ticks`. The bounds are outward-safe: they size arenas
 /// and the round bound, and an over-estimate costs only memory.
@@ -314,14 +314,6 @@ pub(crate) fn dcqcn_device_work(
 ) -> DcqcnDeviceWork {
     let stop = image.stop_time_ns;
     let control = &dcqcn.controller;
-    let control_ticks = if control.next_control_time_ns <= stop {
-        usize::try_from(
-            1 + (stop - control.next_control_time_ns) / control.config.control_interval_ns.max(1),
-        )
-        .unwrap_or(usize::MAX)
-    } else {
-        0
-    };
     let rate = dcqcn.rate;
     if !matches!(
         generator.next_emission.status,
@@ -329,10 +321,7 @@ pub(crate) fn dcqcn_device_work(
     ) || generator.bytes_emitted >= rate.total_bytes
         || generator.next_emission.departure_time_ns > stop
     {
-        return DcqcnDeviceWork {
-            control_ticks,
-            ..DcqcnDeviceWork::default()
-        };
+        return DcqcnDeviceWork::default();
     }
     let stop_ticks = 1 + u128::from(stop - generator.next_emission.departure_time_ns)
         / u128::from(rate.pacing_interval_ns.max(1));
@@ -342,14 +331,15 @@ pub(crate) fn dcqcn_device_work(
         .saturating_mul(8)
         .saturating_mul(u128::from(rate.rate_denominator))
         .saturating_mul(1_000_000_000);
-    let tick = u128::from(control.config.minimum_rate_bps.max(1))
-        .saturating_mul(u128::from(rate.pacing_interval_ns.max(1)));
+    let tick = u128::from(crate::dcqcn::dcqcn_rate_floor_bps(
+        control.config.minimum_rate_bps,
+    ))
+    .saturating_mul(u128::from(rate.pacing_interval_ns.max(1)));
     let ticks_per_packet = cost.div_ceil(tick).max(1);
     let pacing_ticks = stop_ticks.min(packets.saturating_mul(ticks_per_packet).saturating_add(1));
     DcqcnDeviceWork {
         pacing_ticks: usize::try_from(pacing_ticks).unwrap_or(usize::MAX),
         packets: usize::try_from(packets.min(pacing_ticks)).unwrap_or(usize::MAX),
-        control_ticks,
     }
 }
 
@@ -658,22 +648,22 @@ pub fn size_default_device_plan(
     //
     // Outward safety of each term, at live-timer scale:
     //   * the `1` covers one pacing chain, which pops its predecessor before pushing its
-    //     successor. A DCQCN source owns two chains, pacing and control, so each DCQCN
-    //     generator adds 2, exactly as both device planners do.
+    //     successor. A DCQCN source owns one chain, pacing (the Mellanox-form controller has no
+    //     timer event, P16), so each DCQCN generator adds 1, exactly as both device planners do.
     //   * each source-owned TCP flow contributes at most one record, because the T20g live-state
     //     contract removes a superseded timeout at the transition that supersedes it and disarm
     //     always precedes re-arm inside a single transition.
     //   * imported events stay a hard floor: an image may supply legacy residue that no armed
     //     timer owns, and that residue is resident until its deadline.
-    //   * a queue-pair source owns three: pacing, control and its one live timeout (P15), as both
-    //     device planners reserve.
+    //   * a queue-pair source owns two: pacing and its one live timeout, as both device planners
+    //     reserve.
     let dcqcn_timer_slots = image
         .host_states
         .iter()
         .flat_map(|state| &state.generators)
         .map(|generator| match generator.kind {
-            FlowGeneratorKind::Dcqcn(_) => 2,
-            FlowGeneratorKind::Roce(_) => 3,
+            FlowGeneratorKind::Dcqcn(_) => 1,
+            FlowGeneratorKind::Roce(_) => 2,
             FlowGeneratorKind::Constant(_)
             | FlowGeneratorKind::Tcp(_)
             | FlowGeneratorKind::Rate(_) => 0,
@@ -900,7 +890,7 @@ impl CapacityContext {
                     }
                     // Device backends refuse RoCE queue pairs at validation; these sizes keep a
                     // direct sizing request conservative. A retransmission may resend any packet
-                    // from the cumulative acknowledgment on, and feedback is an ACK, NACK or CNP.
+                    // from the cumulative acknowledgment on, and feedback is an ACK or NACK.
                     FlowGeneratorKind::Roce(roce) => {
                         minimum_data_sizes[index] =
                             minimum_data_sizes[index].min(finite_generator_minimum_packet_size(
@@ -927,7 +917,7 @@ impl CapacityContext {
                 | PacketKind::DcqcnCnp(_)
                 | PacketKind::RoceAck(_)
                 | PacketKind::RoceNack(_) => &mut minimum_feedback_sizes[packet.flow.0 as usize],
-                PacketKind::DcqcnControlTimer | PacketKind::RocePacingTimer => continue,
+                PacketKind::RocePacingTimer => continue,
             };
             *minimum = (*minimum).min(packet.size_bytes);
         }
@@ -1068,11 +1058,12 @@ fn flow_packet_counts(
     for state in &image.host_states {
         for generator in &state.generators {
             // One ACK (TCP) or at most one CNP (DCQCN) per data packet; a queue pair's receiver
-            // answers a data arrival with at most one ACK or NACK and one CNP (validator
-            // invariant 20 of `evidence/P15/qp-design.md` §7).
+            // answers a data arrival with at most one ACK or NACK (P16: its ACKs echo ECN and it
+            // sends no CNP).
             let per_packet = match generator.kind {
-                FlowGeneratorKind::Tcp(_) | FlowGeneratorKind::Dcqcn(_) => 1,
-                FlowGeneratorKind::Roce(_) => 2,
+                FlowGeneratorKind::Tcp(_)
+                | FlowGeneratorKind::Dcqcn(_)
+                | FlowGeneratorKind::Roce(_) => 1,
                 FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => 0,
             };
             if per_packet != 0 {
@@ -1563,7 +1554,7 @@ fn add_flow_route_capacities(
         | PacketKind::DcqcnCnp(_)
         | PacketKind::RoceAck(_)
         | PacketKind::RoceNack(_) => (flow.reverse_route.as_slice(), flow.source),
-        PacketKind::DcqcnControlTimer | PacketKind::RocePacingTimer => return,
+        PacketKind::RocePacingTimer => return,
     };
     for index in 0..route.len() {
         let target = route
@@ -1594,7 +1585,7 @@ fn add_flow_route_capacities(
                     | PacketKind::DcqcnCnp(_)
                     | PacketKind::RoceAck(_)
                     | PacketKind::RoceNack(_) => context.minimum_feedback_sizes[flow_index],
-                    PacketKind::DcqcnControlTimer | PacketKind::RocePacingTimer => unreachable!(),
+                    PacketKind::RocePacingTimer => unreachable!(),
                 });
             let queue = image.switch_states[image.nodes[target_slot].state_slot as usize]
                 .queues
@@ -1641,7 +1632,7 @@ fn flow_link_serialization_ns(
         | PacketKind::DcqcnCnp(_)
         | PacketKind::RoceAck(_)
         | PacketKind::RoceNack(_) => context.minimum_feedback_sizes[flow_index],
-        PacketKind::DcqcnControlTimer | PacketKind::RocePacingTimer => return 0,
+        PacketKind::RocePacingTimer => return 0,
     };
     serialization_time_ns(minimum_size, image.links[link_id.0 as usize].rate_bps)
         .expect("lowered GPU image has positive finite serialization intervals")

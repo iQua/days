@@ -120,11 +120,17 @@ theorem goBackNFrontier_onData (config : Roce.ReceiverConfig) (state : Roce.Rece
     (timeNs : Nat) (packet : Roce.DataArrival) :
     (Roce.onData config state timeNs packet).state.expectedPsn =
       goBackNFrontier state.expectedPsn packet.psn packet.bytes := by
-  unfold Roce.onData goBackNFrontier
-  by_cases hcnp : (packet.ce && Roce.cnpAdmitted config state timeNs) = true <;>
-    simp only [hcnp] <;> split <;> split <;> (try split) <;> (try split) <;> simp_all
   -- Sending feedback resets only the ACK cadence, never the frontier.
-  all_goals split <;> rfl
+  unfold Roce.onData goBackNFrontier
+  by_cases hin : packet.psn = state.expectedPsn
+  · by_cases hack : state.packetsSinceAck + 1 ≥ config.ackEveryPackets ∨
+        state.expectedPsn + packet.bytes = config.totalBytes <;>
+      simp [hin, hack, Roce.Action.sendsFeedback]
+  · by_cases hdup : packet.psn < state.expectedPsn
+    · by_cases hdupAck : config.duplicateAck = true <;>
+        simp [hin, hdup, hdupAck, Roce.Action.sendsFeedback]
+    · by_cases hnack : Roce.nackAdmitted config state timeNs = true <;>
+        simp [hin, hdup, hnack, Roce.Action.sendsFeedback]
 
 /-- A data packet of a RoCE queue pair whose chunk is `total` bytes: its PSN is a packet boundary
 (a multiple of the MTU) and its size is `min(mtu, total - psn)` (`Roce.packetSize`, §1). -/

@@ -3,8 +3,9 @@
 //!
 //! The images are the `configs/p14/` DCQCN fixtures and checkpoints taken from them at many
 //! horizons, so the devices resume from mid-run controller states: in-flight CNPs, Blocked pacing
-//! tokens, pending control timers, every increase stage. Fixtures lowered with inert PFC state (all
-//! XOFF thresholds zero) have that state stripped here; PFC itself is exercised by the PFC tests.
+//! tokens, armed controllers with pending rate instants, every increase stage. Fixtures lowered
+//! with inert PFC state (all XOFF thresholds zero) have that state stripped here; PFC itself is
+//! exercised by the PFC tests.
 
 #![cfg(any(
     feature = "cuda",
@@ -20,6 +21,7 @@ use days_executor::{
     run_scalar_with_observations,
 };
 
+/// A fixture of `configs/p14`; a P16 fixture is named relative to it (`../p16/...`).
 fn lower(name: &str) -> SimulationImage {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("configs/p14")
@@ -86,16 +88,22 @@ fn scalar(image: &SimulationImage, horizon: Option<u64>) -> RunResult {
     expected
 }
 
-/// The DCQCN images without PFC state: the T26 scenario, the CNP-heavy multi-hop fixture and the
-/// control-timer-heavy 1 s fixture, plus checkpoints of the first two at every `step` ns.
+/// The DCQCN images without PFC state: the T26 scenario, the CNP-heavy multi-hop fixture, the 1 s
+/// fixture and the two unreliable P16 same-instant images (fix round 1, review F1: CNPs on alpha
+/// ticks, an RP fire and a pending decrease check), plus checkpoints of the first two at every
+/// `step` ns and of the P16 images at 1.7 ms, with their controllers armed mid-run.
 fn dcqcn_images() -> Vec<(String, SimulationImage)> {
     let t26 = lower("dcqcn_t26.toml");
     let multi = strip_inert_pfc(lower("dcqcn_multi_zero_xoff.toml"));
     let one_second = strip_inert_pfc(lower("dcqcn_1s_zero_xoff.toml"));
+    let coincident = strip_inert_pfc(lower("../p16/dcqcn_mlx_coincident.toml"));
+    let pending = strip_inert_pfc(lower("../p16/dcqcn_mlx_coincident_pending.toml"));
     let mut images = vec![
         ("dcqcn_t26".to_owned(), t26.clone()),
         ("dcqcn_multi".to_owned(), multi.clone()),
         ("dcqcn_1s".to_owned(), one_second),
+        ("dcqcn_mlx_coincident".to_owned(), coincident.clone()),
+        ("dcqcn_mlx_coincident_pending".to_owned(), pending.clone()),
     ];
     for (name, image, step) in [
         ("dcqcn_t26", &t26, 25_000),
@@ -111,6 +119,18 @@ fn dcqcn_images() -> Vec<(String, SimulationImage)> {
             ));
             horizon += step;
         }
+    }
+    for (name, image) in [
+        ("dcqcn_mlx_coincident", &coincident),
+        ("dcqcn_mlx_coincident_pending", &pending),
+    ] {
+        let horizon = 1_700_000;
+        let prefix = run_scalar_with_observations(image, Some(horizon), ObservationMode::Full)
+            .expect("checkpoint prefix must run");
+        images.push((
+            format!("{name}@{horizon}"),
+            checkpoint_image(image, &prefix),
+        ));
     }
     images
 }
@@ -138,29 +158,55 @@ fn dcqcn_fixtures_exercise_the_controller_and_carry_no_pfc_state() {
     assert_eq!(cnps, 195, "the multi-hop fixture must stay CNP-heavy");
 }
 
-/// A resumed checkpoint whose DCQCN source is Blocked with both timer chains live.
+/// A resumed checkpoint whose DCQCN source is Blocked with its controller armed (its timers are
+/// lazy, P16: the pacing chain is the only live timer). `configs/p16/dcqcn_mlx_blocked.toml` paces
+/// below one packet per tick and is still sending when its first cuts land; 1.7 ms is the first
+/// 50 us horizon with such a source (scanned when the test was written; asserted here).
 fn blocked_dcqcn_checkpoint() -> SimulationImage {
-    let image = lower("dcqcn_t26.toml");
-    for horizon in (1_000..image.stop_time_ns).step_by(1_000) {
-        let prefix = run_scalar_with_observations(&image, Some(horizon), ObservationMode::Full)
-            .expect("checkpoint prefix must run");
-        let generator = prefix.host_states[0].generators[0];
-        let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind else {
-            panic!("the T26 source must stay DCQCN");
-        };
-        let control_live = prefix
-            .pending_events
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("configs/p16/dcqcn_mlx_blocked.toml");
+    let image = compile_config(&path).expect("the blocked-source fixture lowers");
+    let prefix = run_scalar_with_observations(&image, Some(1_700_000), ObservationMode::Full)
+        .expect("checkpoint prefix must run");
+    assert!(
+        prefix
+            .host_states
             .iter()
-            .any(|event| event.payload == dcqcn.control_timer_payload);
-        if generator.next_emission.status == GeneratorStatus::Blocked && control_live {
-            return checkpoint_image(&image, &prefix);
-        }
-    }
-    panic!("the T26 scenario must reach a Blocked source with a live control timer");
+            .flat_map(|state| &state.generators)
+            .any(|generator| {
+                matches!(generator.kind, FlowGeneratorKind::Dcqcn(dcqcn) if dcqcn.controller.armed)
+                    && generator.next_emission.status == GeneratorStatus::Blocked
+            }),
+        "the checkpoint has a Blocked source with an armed controller"
+    );
+    checkpoint_image(&image, &prefix)
+}
+
+/// A resumed checkpoint of a lossy queue-pair fixture whose source LP holds two fallback-heap
+/// records (the pacing tick and an armed retransmission timeout) while its Mellanox-form controller
+/// is armed: a one-record heap must fault, retry, and reproduce the Scalar result, controller
+/// state included. 9.92 ms is the latest 10 us horizon of `roce_gbn_lossy` with such a pair
+/// (scanned when the test was written; asserted here), so the retried run replays little.
+fn armed_queue_pair_checkpoint() -> SimulationImage {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("configs/p15/roce_gbn_lossy.toml");
+    let image = compile_config(&path).expect("the lossy queue-pair fixture lowers");
+    let prefix = run_scalar_with_observations(&image, Some(9_920_000), ObservationMode::Full)
+        .expect("checkpoint prefix must run");
+    assert!(
+        prefix
+            .host_states
+            .iter()
+            .flat_map(|state| &state.generators)
+            .any(|generator| {
+                matches!(generator.kind, FlowGeneratorKind::Roce(roce)
+                    if roce.controller.armed && roce.pacer_armed && roce.rto_deadline_ns != 0)
+            }),
+        "the checkpoint has an armed controller beside an armed timeout"
+    );
+    checkpoint_image(&image, &prefix)
 }
 
 #[test]
-fn the_blocked_checkpoint_validates_and_owns_two_live_timer_chains() {
+fn the_blocked_checkpoint_validates_and_owns_one_live_timer_chain() {
     let image = blocked_dcqcn_checkpoint();
     days_executor::validate(&image, days_executor::Backend::Scalar)
         .expect("the checkpoint must validate");
@@ -169,11 +215,25 @@ fn the_blocked_checkpoint_validates_and_owns_two_live_timer_chains() {
         .iter()
         .filter(|event| event.kind == days_executor::EventKind::PacingTimer)
         .count();
-    assert_eq!(timers, 2, "pacing and control chains must both be live");
+    let active_sources = image
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .filter(|generator| {
+            matches!(generator.kind, FlowGeneratorKind::Dcqcn(_))
+                && matches!(
+                    generator.next_emission.status,
+                    GeneratorStatus::Scheduled | GeneratorStatus::Blocked
+                )
+        })
+        .count();
+    assert_eq!(
+        timers, active_sources,
+        "each active source's pacing chain is its only live timer"
+    );
 }
 
-/// The DCQCN planner terms (packet and CNP counts, control ticks, the second timer chain, the CNP
-/// feedback minimum) agree between the precomputed and legacy capacity modes.
+/// The DCQCN planner terms (packet and CNP counts, the timer chain, the CNP feedback minimum) agree between the precomputed and legacy capacity modes.
 #[cfg(all(feature = "test", any(feature = "cuda", feature = "cuda-planner-test")))]
 #[test]
 fn cuda_dcqcn_planner_is_bit_equal_to_legacy_planning() {
@@ -204,7 +264,7 @@ fn cuda_dcqcn_planner_is_bit_equal_to_legacy_planning() {
 mod cuda {
     use days_executor::{CudaArena, CudaConfig, ObservationMode, run_cuda_with_observations};
 
-    use super::{blocked_dcqcn_checkpoint, dcqcn_images, scalar};
+    use super::{armed_queue_pair_checkpoint, dcqcn_images, scalar};
 
     #[test]
     fn cuda_dcqcn_fixtures_and_checkpoints_match_scalar() {
@@ -244,13 +304,14 @@ mod cuda {
         }
     }
 
-    /// The T24 gate failure: a resumed checkpoint whose source is Blocked with a live timer hit a
-    /// capacity fault the planner never sized for. Here the fallback heap is capped at one record
-    /// while two DCQCN timer chains are live, so the first attempt must fault on the heap, retry,
-    /// and still reproduce the Scalar result exactly.
+    /// The T24 gate failure: a resumed checkpoint with live timers hit a capacity fault the
+    /// planner never sized for. Here the fallback heap is capped at one record while a queue pair
+    /// holds two (P16: the controller has no timer chain of its own), so the first attempt must
+    /// fault on the heap, retry, and still reproduce the Scalar result exactly, armed controller
+    /// included.
     #[test]
-    fn cuda_dcqcn_control_timer_survives_a_fallback_heap_capacity_retry() {
-        let image = blocked_dcqcn_checkpoint();
+    fn cuda_armed_controller_survives_a_fallback_heap_capacity_retry() {
+        let image = armed_queue_pair_checkpoint();
         let expected = scalar(&image, None);
         let run = run_cuda_with_observations(
             &image,
@@ -304,7 +365,7 @@ fn metal_dcqcn_planner_is_bit_equal_to_legacy_planning() {
 mod metal {
     use days_executor::{MetalArena, MetalConfig, ObservationMode, run_metal_with_observations};
 
-    use super::{blocked_dcqcn_checkpoint, dcqcn_images, scalar};
+    use super::{armed_queue_pair_checkpoint, dcqcn_images, scalar};
 
     #[test]
     fn metal_dcqcn_fixtures_and_checkpoints_match_scalar() {
@@ -346,8 +407,8 @@ mod metal {
 
     /// The Metal twin of the CUDA fallback-heap retry test.
     #[test]
-    fn metal_dcqcn_control_timer_survives_a_fallback_heap_capacity_retry() {
-        let image = blocked_dcqcn_checkpoint();
+    fn metal_armed_controller_survives_a_fallback_heap_capacity_retry() {
+        let image = armed_queue_pair_checkpoint();
         let expected = scalar(&image, None);
         let run = run_metal_with_observations(
             &image,

@@ -5,11 +5,13 @@ namespace LeanGuard.P10c.Roce
 /-!
 Exact semantics of a RoCE queue pair's reliability layer (P15).
 
-A queue pair is a reliable DCQCN flow: the DCQCN controller, its control tick and its CNP stay
-DCQCN's own (`LeanGuard.P10c.Dcqcn`); this module specifies the Go-back-N layer on top of it.
-The rules mirror `days-gpu/evidence/P15/qp-design.md` §5 (steps 1-11, same-instant rules S1-S6)
-and its Phase 2 amendments; the record views mirror the schema pinned in
-`days-gpu/plans/briefs/p15/qp-schema.md`.
+A queue pair is a reliable DCQCN flow: its Mellanox-form controller stays DCQCN's own
+(`LeanGuard.P10c.Dcqcn`); this module specifies the Go-back-N layer on top of it. The rules mirror
+`days-gpu/evidence/P15/qp-design.md` §5 (steps 1-11, same-instant rules S1-S6) and its Phase 2
+amendments, with P16's ECN echo (`days-gpu/evidence/P16/dcqcn-design.md` §3, rulings D4-D6): the
+receiver sends no CNP, and each ACK or NACK echoes the CE mark of the data packet that triggered
+it. The record views mirror the schema pinned in `days-gpu/plans/briefs/p15/qp-schema.md` with
+its Amendment 6.
 
 A PSN is the byte offset of a packet's first byte. Packet `psn` is `min(mtu, total - psn)` bytes,
 and every PSN the sender can name is a packet boundary (§1).
@@ -30,7 +32,6 @@ structure ReceiverConfig where
   nackIntervalNs : Nat
   duplicateAck : Bool
   ackSizeBytes : Nat
-  cnpIntervalNs : Nat
   deriving DecidableEq, Repr
 
 /-- The rate-limit mark of the last NACK sent: its frontier and its time. -/
@@ -43,7 +44,6 @@ structure ReceiverState where
   expectedPsn : Nat
   packetsSinceAck : Nat
   lastNack : Option NackMark
-  lastCnpNs : Option Nat
   deriving DecidableEq, Repr
 
 /-- What the receiver answers one data arrival with (`RoceReceiverAction`). -/
@@ -69,9 +69,10 @@ structure DataArrival where
 structure ReceiverResult where
   state : ReceiverState
   action : Action
-  cnpSent : Bool
   /-- The frontier an ACK or NACK carries, when one is sent. -/
   feedbackAcknowledgment : Option Nat
+  /-- The CE mark an ACK or NACK echoes, when one is sent: the arriving packet's (ruling D5). -/
+  feedbackCeEcho : Option Bool
   deriving DecidableEq, Repr
 
 def validReceiverConfig (config : ReceiverConfig) : Bool :=
@@ -81,30 +82,16 @@ def validReceiverConfig (config : ReceiverConfig) : Bool :=
     config.ackEveryPackets ≤ maxU64 &&
     config.nackIntervalNs ≤ maxU64 &&
     config.ackSizeBytes ≥ 1 &&
-    config.ackSizeBytes ≤ maxU64 &&
-    config.cnpIntervalNs ≤ maxU64
+    config.ackSizeBytes ≤ maxU64
 
 /-- §7 invariant 11, restricted to what one receiver sees. -/
 def validReceiverState (config : ReceiverConfig) (state : ReceiverState) : Bool :=
   state.expectedPsn ≤ config.totalBytes &&
     state.packetsSinceAck < config.ackEveryPackets &&
-    state.lastNack.all (fun mark => mark.expectedPsn ≤ state.expectedPsn && mark.timeNs ≤ maxU64) &&
-    state.lastCnpNs.all (· ≤ maxU64)
+    state.lastNack.all (fun mark => mark.expectedPsn ≤ state.expectedPsn && mark.timeNs ≤ maxU64)
 
 def initialReceiver : ReceiverState :=
-  { expectedPsn := 0, packetsSinceAck := 0, lastNack := none, lastCnpNs := none }
-
-/--
-The DCQCN notification point (shared with DCQCN receivers, `scalar.rs` `host_dcqcn_data_arrival`):
-a CE-marked packet sends a CNP when no CNP was sent yet, or when the CNP interval has elapsed.
-The executor computes the deadline with `checked_add`; a deadline beyond `u64` keeps the interval
-closed.
--/
-def cnpAdmitted (config : ReceiverConfig) (state : ReceiverState) (timeNs : Nat) : Bool :=
-  match state.lastCnpNs with
-  | none => true
-  | some last =>
-      last + config.cnpIntervalNs ≤ maxU64 && last + config.cnpIntervalNs ≤ timeNs
+  { expectedPsn := 0, packetsSinceAck := 0, lastNack := none }
 
 /--
 The NACK rate limit (§5 step 9): a NACK goes out unless the last NACK carried the same frontier
@@ -117,8 +104,7 @@ def nackAdmitted (config : ReceiverConfig) (state : ReceiverState) (timeNs : Nat
       mark.expectedPsn != state.expectedPsn || mark.timeNs + config.nackIntervalNs ≤ timeNs
 
 /--
-One data arrival (§5 step 9): the notification point decides the CNP first (S1), then the
-reliability layer.
+One data arrival (§5 step 9, as amended by P16 ruling D4: no notification point).
 
 * In order: the frontier advances; an ACK goes out every `ack_every_packets` packets and at the
   last byte.
@@ -126,35 +112,34 @@ reliability layer.
   else a silent drop.
 * Above it (out of order, dropped by Go-back-N): a NACK of the frontier unless rate-limited.
 
-Every ACK or NACK restarts the ACK cadence; a suppressed NACK and a silent drop change nothing.
+Every ACK or NACK restarts the ACK cadence and echoes the packet's CE mark (D5); a suppressed NACK
+and a silent drop change nothing and echo nothing.
 -/
 def onData (config : ReceiverConfig) (state : ReceiverState) (timeNs : Nat)
     (packet : DataArrival) : ReceiverResult :=
-  let cnpSent := packet.ce && cnpAdmitted config state timeNs
-  let afterCnp := if cnpSent then { state with lastCnpNs := some timeNs } else state
   let (reliable, action) :=
-    if packet.psn = afterCnp.expectedPsn then
-      let expected := afterCnp.expectedPsn + packet.bytes
-      let count := afterCnp.packetsSinceAck + 1
-      let next := { afterCnp with expectedPsn := expected, packetsSinceAck := count }
+    if packet.psn = state.expectedPsn then
+      let expected := state.expectedPsn + packet.bytes
+      let count := state.packetsSinceAck + 1
+      let next := { state with expectedPsn := expected, packetsSinceAck := count }
       if count ≥ config.ackEveryPackets || expected = config.totalBytes then
         (next, Action.ack)
       else
         (next, Action.none)
-    else if packet.psn < afterCnp.expectedPsn then
-      if config.duplicateAck then (afterCnp, Action.duplicateAck) else (afterCnp, Action.none)
-    else if nackAdmitted config afterCnp timeNs then
-      ({ afterCnp with
-          lastNack := some { expectedPsn := afterCnp.expectedPsn, timeNs := timeNs } },
+    else if packet.psn < state.expectedPsn then
+      if config.duplicateAck then (state, Action.duplicateAck) else (state, Action.none)
+    else if nackAdmitted config state timeNs then
+      ({ state with
+          lastNack := some { expectedPsn := state.expectedPsn, timeNs := timeNs } },
         Action.nack)
     else
-      (afterCnp, Action.nackSuppressed)
+      (state, Action.nackSuppressed)
   let final :=
     if action.sendsFeedback then { reliable with packetsSinceAck := 0 } else reliable
   { state := final
     action := action
-    cnpSent := cnpSent
-    feedbackAcknowledgment := if action.sendsFeedback then some final.expectedPsn else none }
+    feedbackAcknowledgment := if action.sendsFeedback then some final.expectedPsn else none
+    feedbackCeEcho := if action.sendsFeedback then some packet.ce else none }
 
 /-! ## Sender (§2.2, §5 steps 1-8) -/
 
@@ -180,6 +165,15 @@ structure SenderConfig where
   firstPacingTimeNs : Nat
   /-- The fixed retransmission timeout; `0` means the timeout is off (§5 step 11). -/
   rtoNs : Nat
+  /-- P16 ruling D7 (Amendment 6): the window in bytes; `0` means no window. -/
+  windowBytes : Nat
+  /-- The window scales with the controller's rate (SimAI `m_var_win`). -/
+  variableWindow : Bool
+  /-- The controller's maximum rate, which scales a variable window. -/
+  maximumRateBps : Nat
+  /-- The controller's configured initial rate, the pair's rate while its controller is pristine
+  (fix round 1, review F3). -/
+  initialRateBps : Nat
   deriving DecidableEq, Repr
 
 /--
@@ -240,7 +234,10 @@ def validSenderConfig (config : SenderConfig) : Bool :=
     config.pacingIntervalNs > 0 &&
     config.pacingIntervalNs ≤ maxU64 &&
     config.firstPacingTimeNs ≤ maxU64 &&
-    config.rtoNs ≤ maxU64
+    config.rtoNs ≤ maxU64 &&
+    config.windowBytes ≤ maxU64 &&
+    config.maximumRateBps ≤ maxU64 &&
+    (!config.variableWindow || (config.windowBytes > 0 && config.maximumRateBps > 0))
 
 /-- §7 invariants 2, 3, 4 and 5, as far as one sender's record shows them. -/
 def validSenderState (config : SenderConfig) (state : SenderState) : Bool :=
@@ -261,13 +258,27 @@ def validSenderState (config : SenderConfig) (state : SenderState) : Bool :=
     (state.pacer != .parked || state.status = .blocked || state.status = .finished)
 
 /--
-The status an armed pacer's pending tick predicts (`roce::armed_status`): `scheduled` when one
-more tick of credit at the controller's current rate covers the next packet, else `blocked`. The
-executor adds in `u128`; a sum beyond it predicts `blocked`. A pending tick with nothing left to
-send is `blocked`.
+P16 ruling D7 (SimAI `GetWin`): the window at controller rate `rateBps`: `windowBytes`, or with a
+variable window `max(1, floor(windowBytes × rate / maximum))`; `none` without a window.
+-/
+def window (config : SenderConfig) (rateBps : Nat) : Option Nat :=
+  if config.windowBytes = 0 then none
+  else if config.variableWindow then
+    some (max 1 (config.windowBytes * rateBps / config.maximumRateBps))
+  else some config.windowBytes
+
+/-- The window binds (SimAI `IsWinBound`): `next_psn - snd_una ≥ w`. -/
+def windowBound (config : SenderConfig) (rateBps : Nat) (state : SenderState) : Bool :=
+  (window config rateBps).any (fun w => state.nextPsn - state.sndUna ≥ w)
+
+/--
+The status an armed pacer's pending tick predicts (`roce::armed_status`): `scheduled` when the
+window, if any, is open and one more tick of credit at the controller's current rate covers the
+next packet, else `blocked`. The executor adds in `u128`; a sum beyond it predicts `blocked`. A
+pending tick with nothing left to send is `blocked`.
 -/
 def armedStatus (config : SenderConfig) (rateBps : Nat) (state : SenderState) : Status :=
-  if state.nextPsn ≥ config.totalBytes then
+  if state.nextPsn ≥ config.totalBytes || windowBound config rateBps state then
     .blocked
   else
     let credit := state.creditQuanta + tickCredit config rateBps
@@ -277,8 +288,8 @@ def armedStatus (config : SenderConfig) (rateBps : Nat) (state : SenderState) : 
       .blocked
 
 /--
-§5 step 2 (amended): the status is recomputed at every queue-pair transition, the CNP and the
-control tick included (`roce::settled_status`): `finished` once every byte is acknowledged, the
+§5 step 2 (amended): the status is recomputed at every queue-pair transition, at the controller's
+rate as of that transition (P16 ruling D2; `roce::settled_status`): `finished` once every byte is acknowledged, the
 armed tick's prediction, or the parked status as it stands.
 -/
 def settle (config : SenderConfig) (rateBps : Nat) (state : SenderState)
@@ -304,13 +315,27 @@ depends on the rate at all (`armedStatus` of an armed, unfinished pacer with a p
 `scheduled` iff `rate ≥` this threshold, since `credit + rate × interval ≥ cost` is monotone in
 the rate. The caller uses it only while the pair's credit is still zero, where the `u128` bound
 of `armedStatus` cannot bind (`rate × interval < 2^128`).
+
+A window (ruling D7) adds a second monotone condition. A variable window is open iff
+`floor(W × rate / maximum) ≥ outstanding + 1`, iff `rate ≥ ceil((outstanding + 1) × maximum / W)`
+(always, with nothing outstanding), so the threshold is the larger of the two; a fixed window
+that binds predicts `blocked` at every rate (`none`: compared exactly). With nothing outstanding,
+as before any pair's first credit, no window binds.
 -/
 def statusThreshold (config : SenderConfig) (state : SenderState) : Option Nat :=
   if state.pacer = .armed && state.sndUna < config.totalBytes &&
       state.nextPsn < config.totalBytes then
     let cost := packetCost (packetSize config state.nextPsn)
-    some (if cost ≤ state.creditQuanta then 0
-      else (cost - state.creditQuanta + config.pacingIntervalNs - 1) / config.pacingIntervalNs)
+    let credit :=
+      if cost ≤ state.creditQuanta then 0
+      else (cost - state.creditQuanta + config.pacingIntervalNs - 1) / config.pacingIntervalNs
+    let outstanding := state.nextPsn - state.sndUna
+    if config.windowBytes = 0 || outstanding = 0 then some credit
+    else if config.variableWindow then
+      some (max credit
+        (((outstanding + 1) * config.maximumRateBps + config.windowBytes - 1) / config.windowBytes))
+    else if outstanding ≥ config.windowBytes then none
+    else some credit
   else
     none
 
@@ -428,6 +453,18 @@ def onPausedTick (config : SenderConfig) (rateBps : Nat) (state : SenderState) :
     stopQuery := none }
 
 /--
+P16 ruling D7 (Amendment 6): a pacing tick that finds the window closed at the rate as of the tick
+sends nothing, adds no credit and parks, as a paused tick does; only an ACK or NACK that moves
+`snd_una`, or a timeout, restarts it (`onFeedback`, `onTimeout`), never a host RESUME. The caller
+checks the window.
+-/
+def onWindowBlockedTick (config : SenderConfig) (rateBps : Nat) (state : SenderState) :
+    SenderResult :=
+  { state := settle config rateBps { state with pacer := .parked, nextTickNs := none } .blocked
+    emission := none
+    stopQuery := none }
+
+/--
 Schema Amendment 2: a PFC RESUME at `timeNs` restarts a pacer that a paused tick parked, on its
 next grid point strictly after `timeNs` (D3), or leaves it `stopped` beyond the stop time. The
 caller checks that the pair was parked by a pause and that a restart happened (`stopQuery`).
@@ -474,9 +511,5 @@ def onTimeout (config : SenderConfig) (rateBps timeNs : Nat) (withinStop : Bool)
   { state := settle config rateBps restarted restarted.status
     emission := none
     stopQuery := query }
-
-/-- §5 steps 7 and 8: a CNP or a control tick changes the rate; the status is recomputed. -/
-def onRateChange (config : SenderConfig) (rateBps : Nat) (state : SenderState) : SenderState :=
-  settle config rateBps state state.status
 
 end LeanGuard.P10c.Roce

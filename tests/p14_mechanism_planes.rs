@@ -102,7 +102,8 @@ fn p14_fixtures_plan_their_mechanism_state() {
     }
 }
 
-/// P15 lane R4: queue-pair images plan the RoCE region (13 words per receiver) and mark their
+/// P15 lane R4: queue-pair images plan the RoCE region (10 words per receiver since P16, whose
+/// receiver holds no notification point; 13 in P15) and mark their
 /// receiver rows; host-link PFC adds host rows; and the per-flow class word pins the feedback
 /// class (ruling D2): `hostpfc_multi_qp_tcp`'s queue pairs carry data on class 3 and feedback on
 /// class 0, so their word is `3 | (3 << 8)`, while its TCP flow (both classes 3) keeps `3`.
@@ -116,7 +117,7 @@ fn p15_fixtures_plan_their_queue_pair_and_host_pfc_state() {
         let image = lower(&format!("configs/p15/{name}"));
         for (backend, words) in measure(&image) {
             assert_eq!(words.roce_receiver_rows, pairs, "{backend} {name}");
-            assert_eq!(words.roce_region_words, 13 * pairs, "{backend} {name}");
+            assert_eq!(words.roce_region_words, 10 * pairs, "{backend} {name}");
             assert_eq!(words.dcqcn_receiver_rows, 0, "{backend} {name}");
         }
     }

@@ -2325,7 +2325,7 @@ fn dcqcn_cnp_and_non_data_ecn_state_cannot_hide_in_a_tcp_checkpoint() {
         PacketKind::DcqcnCnp(DcqcnCnpHeader {
             trigger_payload: FIRST,
         }),
-        PacketKind::DcqcnControlTimer,
+        PacketKind::RocePacingTimer,
     ] {
         let packet = PacketDescriptor {
             id: PayloadId(99),
@@ -2354,7 +2354,7 @@ fn dcqcn_cnp_and_non_data_ecn_state_cannot_hide_in_a_tcp_checkpoint() {
     }
 
     let mut retyped_control = image.clone();
-    retyped_control.initial_packets[ack_index].kind = PacketKind::DcqcnControlTimer;
+    retyped_control.initial_packets[ack_index].kind = PacketKind::RocePacingTimer;
     retyped_control.initial_packets[ack_index].size_bytes = 0;
     for backend in [
         Backend::Scalar,
@@ -2363,9 +2363,9 @@ fn dcqcn_cnp_and_non_data_ecn_state_cannot_hide_in_a_tcp_checkpoint() {
         Backend::Cuda,
     ] {
         let error = validate(&retyped_control, backend)
-            .expect_err("a DCQCN control token requires its DCQCN generator")
+            .expect_err("a timer token requires the queue pair that owns it")
             .to_string();
-        assert!(error.contains("DCQCN"), "{backend}: {error}");
+        assert!(error.contains("queue pair"), "{backend}: {error}");
     }
 
     let mut orphan_receiver = image.clone();

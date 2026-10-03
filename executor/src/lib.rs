@@ -65,8 +65,8 @@ pub use cuda::{
     size_cuda_plan_for_testing,
 };
 pub use dcqcn::{
-    DCQCN_FRACTION_SCALE, DCQCN_STAGE_STEPS, DcqcnArithmeticError, DcqcnController,
-    DcqcnControllerConfig, DcqcnIncreaseStage, DcqcnTransitionKind, DcqcnTransitionRecord,
+    DCQCN_ALPHA_ONE, DcqcnAdvance, DcqcnArithmeticError, DcqcnController, DcqcnControllerConfig,
+    DcqcnTransitionKind, DcqcnTransitionRecord,
 };
 pub use device_capacity::{
     CapacityRetryRecord, CapacityWarmStart, ChannelStreamCapacityLevel, DeviceCapacityCaps,
@@ -99,8 +99,9 @@ pub use mechanism_trace::{
     MechanismTraceError, MechanismTransitionRecord, PfcControlAction, PfcControlTransitionRecord,
     PfcOccupancyAction, PfcThresholdTransitionRecord, RateReplayConfig, RateReplayState,
     RateTransitionRecord, SchedulerPacket, WrrTransitionRecord, collective_transitions_csv,
-    dcqcn_transitions_csv, drr_transitions_csv, pfc_transitions_csv, rate_transitions_csv,
-    roce_receiver_transitions_csv, roce_sender_transitions_csv, wrr_transitions_csv,
+    dcqcn_cnp_arrivals_csv, dcqcn_transitions_csv, drr_transitions_csv, pfc_transitions_csv,
+    rate_transitions_csv, roce_receiver_transitions_csv, roce_sender_transitions_csv,
+    wrr_transitions_csv,
 };
 #[cfg(all(
     feature = "metal",

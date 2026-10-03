@@ -1,0 +1,79 @@
+# P16 D1 condition 1 (plans/briefs/p16/dcqcn-go.md): the lazy controller against the eager oracle
+# on an image whose controller grids collide. Derived from configs/p14/dcqcn_multi_zero_xoff.toml with
+# alpha_resume_interval_ns = 1000, rate_decrease_interval_ns = 999 and rp_timer_ns = 1998: the first
+# decrease check (t0 + 1000) meets the first alpha tick, every rate-increase fire meets a decrease
+# check (RP = 2D), and feedback, which arrives on the 1 us pacing lattice, meets alpha ticks. The
+# flows carry 2,000,000 B (multi: 200,000 B) so their CNPs arrive before they finish: an unreliable
+# flow's controller freezes when it has sent its last byte (ruling D11).
+
+# DCQCN multi-flow example for trace-checker experiments.
+
+seed = 42
+edges = [[0, 1], [1, 2], [2, 3]]
+hosts = [0, 1, 2, 3]
+duration = 0.2
+log_path = "logs/dcqcn_multi"
+
+[switch]
+port_rate = 1000000000
+capacity = 512
+discipline = "FIFO"
+drop = "ECN_THRESHOLD"
+ecn_threshold = 0.2
+
+[link]
+mode = "Pfc"
+
+[link.pfc]
+# 0 disables drops at the PFC ingress buffer (lossless L2).
+buffer_capacity = [0, 0, 0, 0, 0, 0, 0, 0]
+xoff = [0, 0, 0, 0, 0, 0, 0, 0]
+xon = [0, 0, 0, 0, 0, 0, 0, 0]
+
+[[flow]]
+flow_type = "DCQCN"
+graph = [[0, 3]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 2000000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.dcqcn]
+rate_gbps = 10.0
+min_rate_gbps = 1.0
+max_rate_gbps = 10.0
+g = 0.5
+ai_rate_gbps = 0.5
+hai_rate_gbps = 1.0
+alpha_resume_interval_ns = 1000
+rate_decrease_interval_ns = 999
+rp_timer_ns = 1998
+cnp_interval_ns = 10000
+pacing_interval_ns = 1000
+cnp_priority = 0
+
+[[flow]]
+flow_type = "DCQCN"
+graph = [[1, 2]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 2000000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.dcqcn]
+rate_gbps = 10.0
+min_rate_gbps = 1.0
+max_rate_gbps = 10.0
+g = 0.5
+ai_rate_gbps = 0.5
+hai_rate_gbps = 1.0
+alpha_resume_interval_ns = 1000
+rate_decrease_interval_ns = 999
+rp_timer_ns = 1998
+cnp_interval_ns = 10000
+pacing_interval_ns = 1000
+cnp_priority = 0

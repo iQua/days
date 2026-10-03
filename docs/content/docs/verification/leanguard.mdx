@@ -117,11 +117,17 @@ Days AGO checkers:
 ./.lake/build/bin/p10c_collective_check <path/to/collective_events.csv>
 ./.lake/build/bin/p10c_roce_check receiver <path/to/roce_receiver.csv>
 ./.lake/build/bin/p10c_roce_check sender <path/to/roce_sender.csv> <path/to/dcqcn.csv> \
-  [--pfc <path/to/pfc.csv>] [--horizon-ns <ns>] [<stop_time_ns>]
+  --pfc <path/to/pfc.csv> [--horizon-ns <ns>] [<stop_time_ns>]
 ./.lake/build/bin/p10c_roce_check trace <path/to/roce_sender.csv> <path/to/roce_receiver.csv> \
-  <path/to/dcqcn.csv> [--pfc <path/to/pfc.csv>] [--horizon-ns <ns>] \
+  <path/to/dcqcn.csv> --pfc <path/to/pfc.csv> [--horizon-ns <ns>] \
   [--collective <path/to/collective.csv>] [<stop_time_ns>]
 ```
+
+`p10c_roce_check` reads one sender format: the full P16 sender schema, every column the
+executor's `roce_sender_transitions_csv` writes (`class_paused`, `data_class`, the window columns,
+`maximum_rate_bps` and `initial_rate_bps` included). It rejects a log that lacks any of them and
+names the missing columns. No older sender layout is read; the committed fixtures are all in this
+format.
 
 `p10c_roce_check` certifies RoCE queue pairs from the executor's `roce_receiver_transitions_csv`,
 `roce_sender_transitions_csv` and `dcqcn_transitions_csv` of one full-observation run:
@@ -138,9 +144,9 @@ Days AGO checkers:
   A `resume` row records a PFC RESUME restarting a pacer that a paused tick parked, on its next
   grid point strictly after the RESUME (or `stopped` beyond the stop time). The rows of one
   RESUME share its event key, for distinct flows of one node in increasing `flow_id` order; no
-  other rows may share a key. A sender log with the `data_class` column needs `--pfc` with the
-  run's `pfc_transitions_csv`, and the pauses and resumes are then checked against the host PAUSE
-  and RESUME records in it:
+  other rows may share a key. Every sender log carries `data_class`, so `--pfc` with the run's
+  `pfc_transitions_csv` is required (header-only for a run without PFC), and the pauses and
+  resumes are checked against the host PAUSE and RESUME records in it:
   - a paused tick finds its class paused at its host at its event key, and an unpaused tick finds
     it not paused;
   - every `resume` row shares the key of the host RESUME that unpaused its class at its node;
@@ -153,9 +159,7 @@ Days AGO checkers:
   resume and their warrant and completeness against the host PFC records. It trusts the
   `data_class` value each row carries, the host PFC records themselves (checked by the P10c PFC
   rules for internal consistency, not against the switch threshold records that emitted the
-  frames), and that a parked pair that cannot restart writes no `resume` row. A sender log
-  without `class_paused`, from a writer that predates it, reads `0` on every row; one with
-  `class_paused` but without `data_class` may not contain pause or resume rows.
+  frames), and that a parked pair that cannot restart writes no `resume` row.
 - A queue pair whose first ticks find its class paused writes no rate until its first crediting
   tick. Until that tick, or the pair's first DCQCN row, reveals the rate, the checker compares
   every field exactly except a status that depends on the rate; each such status bounds the rate,
@@ -195,6 +199,7 @@ Committed Days AGO certificate fixtures can be checked directly, for example:
 ./.lake/build/bin/p10c_roce_check trace fixtures/p10c/roce_trace_timeout_executor_accept.sender.csv \
   fixtures/p10c/roce_trace_timeout_executor_accept.receiver.csv \
   fixtures/p10c/roce_trace_timeout_executor_accept.dcqcn.csv \
+  --pfc fixtures/p10c/roce_trace_timeout_executor_accept.pfc.csv \
   "$(cat fixtures/p10c/roce_trace_timeout_executor_accept.stop_time_ns)"
 ./.lake/build/bin/sp_check fixtures/sp/sp_priority_and_fifo_accept.csv
 ```

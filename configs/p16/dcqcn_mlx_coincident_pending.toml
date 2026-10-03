@@ -1,0 +1,76 @@
+# P16 D1 fix round 1 (review F1): same-instant coverage of a pending decrease check, for unreliable
+# flows. configs/p16/dcqcn_mlx_coincident.toml with rate_decrease_interval_ns = 15999 and
+# rp_timer_ns = 16000: each flow's CNPs arrive exactly 16,000 ns apart, so its first decrease check
+# (first feedback + D + 1 = +16,000 ns) falls exactly on its second CNP while the first one's
+# decrease is pending, and the RP timer armed by that cut fires exactly on a later CNP. Coverage
+# (tests/p16_dcqcn_oracle_fixtures.rs): 2 feedbacks on a pending check, 2 on an RP fire, 40 on an
+# alpha tick.
+seed = 42
+edges = [[0, 1], [1, 2], [2, 3]]
+hosts = [0, 1, 2, 3]
+duration = 0.2
+log_path = "logs/dcqcn_multi"
+
+[switch]
+port_rate = 1000000000
+capacity = 512
+discipline = "FIFO"
+drop = "ECN_THRESHOLD"
+ecn_threshold = 0.2
+
+[link]
+mode = "Pfc"
+
+[link.pfc]
+# 0 disables drops at the PFC ingress buffer (lossless L2).
+buffer_capacity = [0, 0, 0, 0, 0, 0, 0, 0]
+xoff = [0, 0, 0, 0, 0, 0, 0, 0]
+xon = [0, 0, 0, 0, 0, 0, 0, 0]
+
+[[flow]]
+flow_type = "DCQCN"
+graph = [[0, 3]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 2000000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.dcqcn]
+rate_gbps = 10.0
+min_rate_gbps = 1.0
+max_rate_gbps = 10.0
+g = 0.5
+ai_rate_gbps = 0.5
+hai_rate_gbps = 1.0
+alpha_resume_interval_ns = 1000
+rate_decrease_interval_ns = 15999
+rp_timer_ns = 16000
+cnp_interval_ns = 10000
+pacing_interval_ns = 1000
+cnp_priority = 0
+
+[[flow]]
+flow_type = "DCQCN"
+graph = [[1, 2]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 2000000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.dcqcn]
+rate_gbps = 10.0
+min_rate_gbps = 1.0
+max_rate_gbps = 10.0
+g = 0.5
+ai_rate_gbps = 0.5
+hai_rate_gbps = 1.0
+alpha_resume_interval_ns = 1000
+rate_decrease_interval_ns = 15999
+rp_timer_ns = 16000
+cnp_interval_ns = 10000
+pacing_interval_ns = 1000
+cnp_priority = 0

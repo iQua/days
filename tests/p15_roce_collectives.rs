@@ -14,10 +14,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use days::scenario::compile_config;
 use days_executor::{
     Backend, CollectiveActivationCause, CollectivePhase, CollectiveProgressRecord, CpuConfig,
-    DcqcnTransitionKind, FlowGeneratorKind, FlowId, GeneratorStatus, MechanismTransitionRecord,
-    ObservationMode, PacketKind, PfcControlAction, RoceSenderKind, RoceSenderRecord,
-    RoceTransitionRecord, RunResult, SimulationImage, StageRole, run_cpu_with_observations,
-    run_scalar_with_observations, validate,
+    FlowGeneratorKind, FlowId, GeneratorStatus, MechanismTransitionRecord, ObservationMode,
+    PacketKind, PfcControlAction, RoceSenderKind, RoceSenderRecord, RoceTransitionRecord,
+    RunResult, SimulationImage, StageRole, run_cpu_with_observations, run_scalar_with_observations,
+    validate,
 };
 
 fn fixture_path(name: &str) -> std::path::PathBuf {
@@ -313,16 +313,16 @@ fn stage_rules_hold_on_every_fixture() {
 fn check_stage_rules(name: &str, image: &SimulationImage, result: &RunResult) {
     let stages = roce_stages(image);
     let senders = sender_rows(result);
-    let control_ticks = records(result)
+    // The Mellanox-form controller starts at the pair's first feedback (P16): a stage's first
+    // DCQCN row, if any, comes no earlier than its first tick and starts from the pristine state.
+    let first_dcqcn_rows = records(result)
         .iter()
         .filter_map(|record| match record {
-            MechanismTransitionRecord::Dcqcn(row) if row.kind == DcqcnTransitionKind::Control => {
-                Some((row.flow, row.key))
-            }
+            MechanismTransitionRecord::Dcqcn(row) => Some(*row),
             _ => None,
         })
-        .fold(BTreeMap::<FlowId, Vec<_>>::new(), |mut map, (flow, key)| {
-            map.entry(flow).or_default().push(key);
+        .fold(BTreeMap::<FlowId, _>::new(), |mut map, row| {
+            map.entry(row.flow).or_insert(row);
             map
         });
     let rows = progress(result);
@@ -402,16 +402,16 @@ fn check_stage_rules(name: &str, image: &SimulationImage, result: &RunResult) {
         if let Some(&released) = activations.get(flow) {
             assert_eq!(first.key.time_ns, released, "{name}");
         }
-        let control = control_ticks.get(flow).and_then(|ticks| ticks.first());
-        let expected = first.key.time_ns + 50_000;
-        if expected <= image.stop_time_ns {
-            let control = control.unwrap_or_else(|| panic!("{name}: a first control tick"));
-            assert_eq!(control.time_ns, expected, "{name}: first control tick");
-            // A release emits the pacing tick, then the control tick, as lowering orders a
-            // plain pair's (design note S-R6).
-            if activations.contains_key(flow) {
-                assert_eq!(control.origin_seq, first.key.origin_seq + 1, "{name}");
-            }
+        if let Some(row) = first_dcqcn_rows.get(flow) {
+            assert!(
+                row.key > first.key,
+                "{name}: a DCQCN row before the first tick"
+            );
+            assert_eq!(
+                row.before,
+                days_executor::DcqcnController::pristine(row.before.config),
+                "{name}: the controller starts pristine"
+            );
         }
     }
 }
@@ -618,11 +618,8 @@ max_rate_gbps = 1.0
 g = 0.00390625
 ai_rate_gbps = 0.005
 hai_rate_gbps = 0.05
-mi_factor = 0.5
-rtt_ns = 50000
-cnp_interval_ns = 10000
+rp_timer_ns = 50000
 pacing_interval_ns = 1000
-increase_byte_threshold = 100000
 
 [{table}.traffic.roce]
 retransmit_timeout_ns = 1000000
@@ -800,29 +797,31 @@ fn fingerprint(value: &impl std::fmt::Debug) -> (u64, u64) {
 
 /// Frozen at authoring (`5752c51`, 2026-10-01, Mac): the Scalar summary-mode results, which the
 /// `days` CLI reproduced on Scalar and CPU at 2 workers
-/// (`days-gpu/evidence/P15/collectives-impl/raw/anchors-mac-5752c51.txt`).
+/// (`days-gpu/evidence/P15/collectives-impl/raw/anchors-mac-5752c51.txt`); re-frozen at P16 D1
+/// (2026-10-03, Mac) for the Mellanox-form controller and the ECN echo
+/// (`days-gpu/evidence/P16/dcqcn-impl/anchors.md`).
 const ANCHORS: [(&str, u64, u64); 6] = [
     (
         "roce_ring_allreduce_lossless.toml",
-        199_110,
-        0x8b3d_8615_76b7_d646,
+        193_075,
+        0x02fc_5b57_38bf_9639,
     ),
     (
         "roce_allgather_lossless.toml",
-        126_202,
-        0x84c0_e6d2_a574_9c80,
+        123_170,
+        0xc32f_fe08_1e7b_440d,
     ),
-    ("roce_ring_lossy.toml", 190_244, 0xa065_c89e_82b4_e3b9),
-    ("roce_compute_dag.toml", 218_236, 0xb3e9_c56f_a727_6c1c),
+    ("roce_ring_lossy.toml", 182_347, 0xb718_c505_7453_0f5a),
+    ("roce_compute_dag.toml", 212_197, 0xe94b_963f_a5fd_954a),
     (
         "roce_tcp_mixed_collectives.toml",
-        141_856,
-        0xee09_f67f_aca4_91d5,
+        138_792,
+        0x88ff_2fe4_10cc_0df8,
     ),
     (
         "roce_ring_release_paused.toml",
-        203_330,
-        0x273c_f356_1189_2368,
+        197_029,
+        0xf5e6_4cf6_d7ca_985e,
     ),
 ];
 
