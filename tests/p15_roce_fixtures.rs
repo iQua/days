@@ -494,6 +494,17 @@ fn tcp_and_queue_pairs_share_a_bottleneck() {
 }
 
 /// FNV-1a64 over the pretty `Debug` rendering, the `result_fnv1a64` the `days` CLI prints.
+/// P15 lane R4 fix round 1 (device review M1): the bidirectional DRR and WRR host-link PFC
+/// fixtures, whose feedback (class 0) waits in switch queues behind a paused data class (3), run
+/// identically on Scalar and CPU at 1-4 workers. `tests/p15_device_qp.rs` holds Metal and CUDA to
+/// the same Scalar result.
+#[test]
+fn bidirectional_drr_and_wrr_host_pfc_fixtures_match_cpu_at_one_to_four_workers() {
+    for name in ["hostpfc_bidir_drr.toml", "hostpfc_bidir_wrr.toml"] {
+        run_identical(name);
+    }
+}
+
 fn fingerprint(value: &impl std::fmt::Debug) -> (u64, u64) {
     let text = format!("{value:#?}");
     let hash = text.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {

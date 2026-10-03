@@ -17,8 +17,8 @@ use std::path::PathBuf;
 
 use days::scenario::compile_config;
 use days_executor::{
-    EventKind, FlowGeneratorKind, ObservationMode, RunResult, SimulationImage,
-    run_scalar_with_observations,
+    EventKind, FlowGeneratorKind, MechanismTransitionRecord, NodeKind, ObservationMode,
+    PfcControlAction, RunResult, SchedulerKind, SimulationImage, run_scalar_with_observations,
 };
 
 /// Every fixture except the release-only HPCC incast, which has its own tests below.
@@ -32,6 +32,8 @@ const FIXTURES: &[&str] = &[
     "roce_mixed_tcp.toml",
     "hostpfc_incast_lossless.toml",
     "hostpfc_multi_qp_tcp.toml",
+    "hostpfc_bidir_drr.toml",
+    "hostpfc_bidir_wrr.toml",
 ];
 
 fn lower(name: &str) -> SimulationImage {
@@ -153,6 +155,70 @@ fn qp_images_exercise_token_pinning_timeouts_and_parked_pairs() {
         mid_pause,
         "some checkpoint must hold a paused class with pause-parked pairs"
     );
+}
+
+/// The bidirectional fixtures (review M1) hold ruling D2's feedback class behind a paused data
+/// class in DRR and WRR switch queues: queue pairs run both ways through the same switch egresses,
+/// every pair's feedback class (0) differs from its data class (3), and Scalar pauses the data
+/// class at switches. That is the case `scheduler_first_packet_for_class` decides on the devices.
+#[test]
+fn bidirectional_fixtures_put_feedback_behind_a_paused_data_class_under_drr_and_wrr() {
+    for (name, deficit) in [
+        ("hostpfc_bidir_drr.toml", true),
+        ("hostpfc_bidir_wrr.toml", false),
+    ] {
+        let image = lower(name);
+        let switch_queues = image
+            .switch_states
+            .iter()
+            .flat_map(|state| &state.queues)
+            .collect::<Vec<_>>();
+        assert!(
+            !switch_queues.is_empty()
+                && switch_queues.iter().all(|queue| match &queue.scheduler {
+                    SchedulerKind::DeficitRoundRobin(_) => deficit,
+                    SchedulerKind::WeightedRoundRobin(_) => !deficit,
+                    _ => false,
+                }),
+            "{name}: every switch queue runs the fixture's discipline"
+        );
+        let queue_pair_flows = queue_pairs(&image.host_states)
+            .map(|(flow, _)| &image.flows[usize::try_from(flow).expect("flow id fits usize")])
+            .collect::<Vec<_>>();
+        assert!(
+            queue_pair_flows
+                .iter()
+                .all(|flow| flow.priority == 3 && flow.feedback_priority == 0),
+            "{name}: every queue pair sends data on class 3 and feedback on class 0"
+        );
+        assert!(
+            queue_pair_flows.iter().any(|forward| queue_pair_flows
+                .iter()
+                .any(|reverse| reverse.source == forward.target)),
+            "{name}: some queue pair sources at another pair's target"
+        );
+        let full = run_scalar_with_observations(&image, None, ObservationMode::Full)
+            .expect("scalar oracle must run");
+        let switch_pauses = full
+            .diagnostics
+            .as_ref()
+            .expect("full observation keeps diagnostics")
+            .mechanism_transitions
+            .iter()
+            .filter(|record| {
+                matches!(record, MechanismTransitionRecord::PfcControl(control)
+                    if control.action == PfcControlAction::Pause
+                        && control.priority == 3
+                        && image.nodes[usize::try_from(control.node.0).expect("node id fits usize")]
+                            .kind
+                            == NodeKind::Switch)
+            })
+            .count();
+        assert!(
+            switch_pauses > 0,
+            "{name}: Scalar pauses class 3 at a switch"
+        );
+    }
 }
 
 #[cfg(feature = "cuda")]
