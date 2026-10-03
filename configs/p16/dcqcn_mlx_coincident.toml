@@ -2,7 +2,9 @@
 # on an image whose controller grids collide. Derived from configs/p14/dcqcn_multi_zero_xoff.toml with
 # alpha_resume_interval_ns = 1000, rate_decrease_interval_ns = 999 and rp_timer_ns = 1998: the first
 # decrease check (t0 + 1000) meets the first alpha tick, every rate-increase fire meets a decrease
-# check (RP = 2D), and feedback, which arrives on the 1 us pacing lattice, meets alpha ticks.
+# check (RP = 2D), and feedback, which arrives on the 1 us pacing lattice, meets alpha ticks. The
+# flows carry 2,000,000 B (multi: 200,000 B) so their CNPs arrive before they finish: an unreliable
+# flow's controller freezes when it has sent its last byte (ruling D11).
 
 # DCQCN multi-flow example for trace-checker experiments.
 
@@ -34,7 +36,7 @@ graph = [[0, 3]]
 
 [flow.traffic]
 initial_delay = 0.0
-size = 200000
+size = 2000000
 arr_dist = { type = "Uniform", low = 1, high = 1 }
 pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
 
@@ -58,7 +60,7 @@ graph = [[1, 2]]
 
 [flow.traffic]
 initial_delay = 0.0
-size = 200000
+size = 2000000
 arr_dist = { type = "Uniform", low = 1, high = 1 }
 pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
 

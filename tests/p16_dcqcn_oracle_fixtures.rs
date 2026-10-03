@@ -143,15 +143,28 @@ fn the_lazy_controller_equals_the_eager_oracle_on_every_fixture() {
     );
 }
 
-/// The synthetic image puts feedback, alpha ticks, rate-increase fires and decrease checks in the
-/// same microsecond; the run must also hit at least one feedback exactly on a pending instant.
+/// The synthetic images put feedback, alpha ticks, rate-increase fires and decrease checks in the
+/// same microsecond. Each must reach its controllers with feedback that cuts before its flows
+/// finish (an unreliable flow's controller freezes when it has sent its last byte, ruling D11),
+/// and the runs must hit at least one feedback exactly on a pending instant.
 #[test]
 fn the_coincident_fixtures_exercise_same_instant_order() {
-    let mut coverage = Coverage::default();
-    replay("p16/dcqcn_mlx_coincident.toml", &mut coverage);
-    replay("p16/dcqcn_mlx_coincident_qp.toml", &mut coverage);
-    println!("record=oracle_coincident {coverage:?}");
-    assert!(coverage.coincident_feedbacks > 0, "{coverage:?}");
+    let mut total = Coverage::default();
+    for name in [
+        "p16/dcqcn_mlx_coincident.toml",
+        "p16/dcqcn_mlx_coincident_qp.toml",
+    ] {
+        let mut coverage = Coverage::default();
+        replay(name, &mut coverage);
+        println!("record=oracle_coincident image={name} {coverage:?}");
+        assert!(
+            coverage.feedbacks > 0 && coverage.cuts > 0,
+            "{name}: no live feedback {coverage:?}"
+        );
+        total.feedbacks += coverage.feedbacks;
+        total.coincident_feedbacks += coverage.coincident_feedbacks;
+    }
+    assert!(total.coincident_feedbacks > 0, "{total:?}");
 }
 
 #[test]
