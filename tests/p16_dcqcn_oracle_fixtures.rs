@@ -22,7 +22,7 @@ use oracle::{EagerDcqcn, rate_state_matches};
 
 /// Every DCQCN and queue-pair fixture of `configs/p14`, `configs/p15` and `configs/p16`, except
 /// the 64-pair HPCC incast, which the release-only test below covers.
-const FIXTURES: [&str; 29] = [
+const FIXTURES: [&str; 31] = [
     "p14/dcqcn_10s_zero_xoff.toml",
     "p14/dcqcn_1s_zero_xoff.toml",
     "p14/dcqcn_2s_zero_xoff.toml",
@@ -51,6 +51,8 @@ const FIXTURES: [&str; 29] = [
     "p15/roce_timeout.toml",
     "p16/dcqcn_mlx_coincident.toml",
     "p16/dcqcn_mlx_coincident_qp.toml",
+    "p16/dcqcn_mlx_coincident_grid_qp.toml",
+    "p16/dcqcn_mlx_coincident_pending.toml",
     "p16/dcqcn_mlx_window.toml",
 ];
 
@@ -63,6 +65,29 @@ struct Coverage {
     increases: u64,
     /// Feedbacks at exactly an instant the eager oracle had pending.
     coincident_feedbacks: usize,
+    /// Fix round 1 (review F1): the same-instant classes. A feedback at `t` (phase 0) precedes
+    /// every timer at `t` (ruling D3), so each class pins one ordering: an alpha tick, a
+    /// rate-increase (RP) fire, a pending decrease check, and an idle decrease-grid instant (the
+    /// grid fires with nothing pending, so a feedback there opens a cut at `t`, not `t + D`).
+    on_alpha_tick: usize,
+    on_rp_fire: usize,
+    on_pending_decrease: usize,
+    on_idle_decrease_grid: usize,
+}
+
+impl Coverage {
+    fn add(&mut self, other: &Coverage) {
+        self.rows += other.rows;
+        self.feedbacks += other.feedbacks;
+        self.freezes += other.freezes;
+        self.cuts += other.cuts;
+        self.increases += other.increases;
+        self.coincident_feedbacks += other.coincident_feedbacks;
+        self.on_alpha_tick += other.on_alpha_tick;
+        self.on_rp_fire += other.on_rp_fire;
+        self.on_pending_decrease += other.on_pending_decrease;
+        self.on_idle_decrease_grid += other.on_idle_decrease_grid;
+    }
 }
 
 fn rows(name: &str) -> Vec<DcqcnTransitionRecord> {
@@ -104,9 +129,16 @@ fn replay(name: &str, coverage: &mut Coverage) {
             eager.advance_to(row.bound_ns);
             let eager_after = match row.kind {
                 DcqcnTransitionKind::Feedback => {
-                    let instants = [eager.next_alpha, eager.next_increase, eager.next_decrease];
-                    coverage.coincident_feedbacks +=
-                        usize::from(instants.contains(&Some(row.key.time_ns)));
+                    let now = Some(row.key.time_ns);
+                    let on_alpha = eager.next_alpha == now;
+                    let on_rp = eager.increase_armed && eager.next_increase == now;
+                    let on_check = eager.next_decrease == now;
+                    coverage.coincident_feedbacks += usize::from(on_alpha || on_rp || on_check);
+                    coverage.on_alpha_tick += usize::from(on_alpha);
+                    coverage.on_rp_fire += usize::from(on_rp);
+                    coverage.on_pending_decrease += usize::from(on_check && eager.decrease_pending);
+                    coverage.on_idle_decrease_grid +=
+                        usize::from(on_check && !eager.decrease_pending);
                     eager.feedback(row.key.time_ns);
                     coverage.feedbacks += 1;
                     eager.as_controller()
@@ -143,16 +175,19 @@ fn the_lazy_controller_equals_the_eager_oracle_on_every_fixture() {
     );
 }
 
-/// The synthetic images put feedback, alpha ticks, rate-increase fires and decrease checks in the
-/// same microsecond. Each must reach its controllers with feedback that cuts before its flows
-/// finish (an unreliable flow's controller freezes when it has sent its last byte, ruling D11),
-/// and the runs must hit at least one feedback exactly on a pending instant.
+/// The synthetic images put feedback in the same nanosecond as alpha ticks, rate-increase fires and
+/// decrease checks, pending and idle. Each must reach its controllers with feedback that cuts before
+/// its flows finish (an unreliable flow's controller freezes when it has sent its last byte, ruling
+/// D11), and together they must land feedback exactly on every class of instant (review F1): a
+/// feedback at `t` precedes every timer at `t` (ruling D3), so each class pins one ordering.
 #[test]
 fn the_coincident_fixtures_exercise_same_instant_order() {
     let mut total = Coverage::default();
     for name in [
         "p16/dcqcn_mlx_coincident.toml",
         "p16/dcqcn_mlx_coincident_qp.toml",
+        "p16/dcqcn_mlx_coincident_grid_qp.toml",
+        "p16/dcqcn_mlx_coincident_pending.toml",
     ] {
         let mut coverage = Coverage::default();
         replay(name, &mut coverage);
@@ -161,10 +196,17 @@ fn the_coincident_fixtures_exercise_same_instant_order() {
             coverage.feedbacks > 0 && coverage.cuts > 0,
             "{name}: no live feedback {coverage:?}"
         );
-        total.feedbacks += coverage.feedbacks;
-        total.coincident_feedbacks += coverage.coincident_feedbacks;
+        total.add(&coverage);
     }
-    assert!(total.coincident_feedbacks > 0, "{total:?}");
+    println!("record=oracle_coincident_total {total:?}");
+    for (class, count) in [
+        ("an alpha tick", total.on_alpha_tick),
+        ("a rate-increase fire", total.on_rp_fire),
+        ("a pending decrease check", total.on_pending_decrease),
+        ("an idle decrease-grid instant", total.on_idle_decrease_grid),
+    ] {
+        assert!(count > 0, "no feedback lands exactly on {class}: {total:?}");
+    }
 }
 
 #[test]
