@@ -1,0 +1,2 @@
+exit=1
+REJECT: line 13: completing acknowledgment does not reach exactly the local predecessor's byte total

@@ -1,0 +1,2 @@
+exit=1
+REJECT: line 2: RoCE collective stage requires a positive MTU and pacing interval and no duration

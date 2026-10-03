@@ -60,10 +60,12 @@ thread_local! {
     static LIVE_BYTES: Cell<isize> = const { Cell::new(0) };
     static PEAK_BYTES: Cell<isize> = const { Cell::new(0) };
     static ALLOCATED_BYTES: Cell<usize> = const { Cell::new(0) };
+    static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
 }
 
 fn record_allocation(bytes: usize) {
     let _ = ALLOCATED_BYTES.try_with(|total| total.set(total.get().wrapping_add(bytes)));
+    let _ = ALLOCATIONS.try_with(|count| count.set(count.get().wrapping_add(1)));
 }
 
 fn record(delta: isize) {
@@ -176,12 +178,50 @@ cc_algorithm = "TCPReno"
     path
 }
 
+/// The same ring over RoCE queue pairs (P15 lane R3): each stage lowers one queue pair, its two
+/// timer tokens and its receiver.
+fn roce_ring_all_reduce_scenario(test: &str, ranks: u64) -> PathBuf {
+    let tcp = ring_all_reduce_scenario(test, ranks);
+    let config = fs::read_to_string(&tcp)
+        .expect("read the ring scenario")
+        .replace("flow_type = \"TCP\"", "flow_type = \"RoCE\"")
+        .replace(
+            "[collective.traffic.tcp]\ncc_algorithm = \"TCPReno\"\n",
+            r#"[collective.traffic.dcqcn]
+rate_gbps = 8.0
+min_rate_gbps = 0.01
+max_rate_gbps = 8.0
+g = 0.00390625
+ai_rate_gbps = 0.04
+hai_rate_gbps = 0.4
+mi_factor = 0.5
+rtt_ns = 50000
+cnp_interval_ns = 10000
+pacing_interval_ns = 500
+increase_byte_threshold = 100000
+
+[collective.traffic.roce]
+retransmit_timeout_ns = 1000000
+"#,
+        );
+    assert!(
+        config.contains("flow_type = \"RoCE\"") && config.contains("[collective.traffic.roce]")
+    );
+    let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "collective_lowering_budget_{test}_roce_ring_{ranks}_ranks.toml"
+    ));
+    fs::write(&path, config).expect("write the RoCE ring scenario");
+    path
+}
+
 fn stages(ranks: u64) -> u64 {
     2 * ranks * (ranks - 1)
 }
 
 /// Heap use of one serial lowering.
 struct HeapUse {
+    /// Allocations and reallocations made.
+    allocations: u64,
     /// Peak live bytes above the bytes live when the lowering starts.
     peak_bytes: u64,
     /// Bytes requested by every allocation and reallocation, freed or not.
@@ -189,14 +229,19 @@ struct HeapUse {
 }
 
 fn lowering_heap_use(ranks: u64) -> HeapUse {
-    let path = ring_all_reduce_scenario("heap", ranks);
+    lowering_heap_use_of(ranks, ring_all_reduce_scenario("heap", ranks))
+}
+
+fn lowering_heap_use_of(ranks: u64, path: PathBuf) -> HeapUse {
     let baseline = LIVE_BYTES.with(Cell::get);
     PEAK_BYTES.with(|peak| peak.set(baseline));
     let allocated_before = ALLOCATED_BYTES.with(Cell::get);
+    let allocations_before = ALLOCATIONS.with(Cell::get);
     let image = compile_config_with_route_workers(&path, RouteWorkers::serial())
         .unwrap_or_else(|error| panic!("lower {ranks} ranks: {error}"));
     let peak = PEAK_BYTES.with(Cell::get);
     let allocated = ALLOCATED_BYTES.with(Cell::get) - allocated_before;
+    let allocations = ALLOCATIONS.with(Cell::get) - allocations_before;
     let generators = image
         .host_states
         .iter()
@@ -206,6 +251,7 @@ fn lowering_heap_use(ranks: u64) -> HeapUse {
     assert_eq!(generators, stages(ranks), "{ranks} ranks: stage count");
     drop(image);
     HeapUse {
+        allocations,
         peak_bytes: u64::try_from(peak - baseline).expect("the peak is at least the baseline"),
         allocated_bytes: allocated as u64,
     }
@@ -255,6 +301,58 @@ fn collective_lowering_heap_scales_linearly_in_stages() {
         ),
         check(
             "lowering_allocated",
+            "bytes",
+            small.allocated_bytes as f64,
+            large.allocated_bytes as f64,
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// P15 lane R3: RoCE stages lower linearly in their count too; the tokens join the image's one
+/// packet table and each receiving host gets one receiver slice.
+#[test]
+fn roce_collective_lowering_heap_scales_linearly_in_stages() {
+    let heap =
+        |ranks: u64| lowering_heap_use_of(ranks, roce_ring_all_reduce_scenario("roce-heap", ranks));
+    let (small, large) = (heap(SMALL_RANKS), heap(LARGE_RANKS));
+    // No allocation per stage beyond TCP's. A RoCE stage's two timer tokens are resident packets,
+    // which validation keeps in its ordered maps (node growth, about one allocation per several
+    // entries), so the RoCE ring's extra allocations over the TCP ring stay below one per stage
+    // and do not grow per stage with the ranks; a heap block per stage would cost at least one.
+    let (tcp_small, tcp_large) = (
+        lowering_heap_use(SMALL_RANKS),
+        lowering_heap_use(LARGE_RANKS),
+    );
+    let per_stage = |roce: &HeapUse, tcp: &HeapUse, ranks: u64| {
+        (roce.allocations as f64 - tcp.allocations as f64) / stages(ranks) as f64
+    };
+    let (small_per_stage, large_per_stage) = (
+        per_stage(&small, &tcp_small, SMALL_RANKS),
+        per_stage(&large, &tcp_large, LARGE_RANKS),
+    );
+    println!(
+        "record=collective_lowering_budget phase=roce_extra_allocations_per_stage \
+         small_ranks={SMALL_RANKS} large_ranks={LARGE_RANKS} small={small_per_stage:.3} \
+         large={large_per_stage:.3}"
+    );
+    assert!(
+        large_per_stage < 1.0 && large_per_stage <= small_per_stage * 1.5,
+        "RoCE stages allocate per stage: {small_per_stage:.3} -> {large_per_stage:.3} extra \
+         allocations per stage over TCP from {SMALL_RANKS} to {LARGE_RANKS} ranks"
+    );
+    let failures = [
+        check(
+            "roce_lowering_peak_heap",
+            "bytes",
+            small.peak_bytes as f64,
+            large.peak_bytes as f64,
+        ),
+        check(
+            "roce_lowering_allocated",
             "bytes",
             small.allocated_bytes as f64,
             large.allocated_bytes as f64,

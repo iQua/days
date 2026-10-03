@@ -1,0 +1,2 @@
+exit=1
+REJECT: line 3: inbound RoCE packet is not the predecessor queue pair's packet at its PSN

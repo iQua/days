@@ -1393,6 +1393,10 @@ pub(crate) fn expected_pause_parked(
         let FlowGeneratorKind::Roce(roce) = generator.kind else {
             continue;
         };
+        // A collective stage not yet released has never ticked, so no pause parked it.
+        if state.stage(position).is_some_and(|stage| !stage.activated) {
+            continue;
+        }
         let Some(flow) = flow(image, generator.flow) else {
             continue;
         };
@@ -1409,9 +1413,61 @@ pub(crate) fn expected_pause_parked(
     expected
 }
 
+/// Pending `PacingTimer` events at `owner` that carry `payload`, at any time: a range of the
+/// `(node, payload, time)` map, so the count costs a lookup and the matching entries, and
+/// validation stays linear in the pending events.
+fn pending_ticks_with_payload(
+    pacing_counts: &BTreeMap<(NodeId, PayloadId, u64), usize>,
+    owner: NodeId,
+    payload: PayloadId,
+) -> usize {
+    pacing_counts
+        .range((owner, payload, 0)..=(owner, payload, u64::MAX))
+        .map(|(_, count)| *count)
+        .sum()
+}
+
 /// A Go-back-N packet boundary: a multiple of the MTU, or the total byte count.
 const fn roce_boundary(psn: u64, mtu_bytes: u64, total_bytes: u64) -> bool {
     psn == total_bytes || psn.is_multiple_of(mtu_bytes) && psn < total_bytes
+}
+
+/// A RoCE collective stage that its prerequisites have not released holds the state its release
+/// starts from (`collectives-design.md` §6.1): nothing sent, acknowledged, credited, timed or
+/// fed back; the pacer parked with its scheduled payload the pacing token; the pacer and the
+/// controller anchored at zero (ruling C5), the controller otherwise as lowering builds it. The
+/// release re-anchors both at its instant, so the control deadline must fit after any release up
+/// to the stop. The caller has already required that no pending event carries either token, at any
+/// time: no pacing tick or retransmission timeout with the pacing token, no control tick.
+fn validate_unreleased_roce_stage(
+    image: &SimulationImage,
+    generator: StagedGenerator<'_>,
+    roce: crate::RoceGenerator,
+) -> Result<(), &'static str> {
+    // Lowering builds the controller with its first control deadline one interval after the
+    // anchor (`lowered_dcqcn_controller`), here zero.
+    let config = roce.controller.config;
+    let pristine_controller = crate::DcqcnController::new(config, config.control_interval_ns)
+        .map_err(|_| "has a controller whose first control deadline exceeds u64")?;
+    if generator.packets_emitted != 0
+        || generator.bytes_emitted != 0
+        || generator.feedback.arrivals != 0
+        || roce.next_psn != 0
+        || roce.snd_una != 0
+        || roce.rto_deadline_ns != 0
+        || roce.pacer.credit_quanta != 0
+        || roce.pacer_armed
+        || generator.next_emission.status != GeneratorStatus::Blocked
+        || generator.next_emission.departure_time_ns != 0
+        || roce.pacer.first_pacing_time_ns != 0
+        || roce.controller != pristine_controller
+    {
+        return Err("collective stage is dependency-blocked after its sending state changed");
+    }
+    if roce.controller.config.control_interval_ns > u64::MAX - image.stop_time_ns {
+        return Err("collective stage's first control deadline after a release exceeds u64");
+    }
+    Ok(())
 }
 
 /// The invariants of one RoCE queue pair's sender (design note `qp-design.md` §7).
@@ -1427,9 +1483,9 @@ fn validate_roce_generator(
 ) -> Result<(), ValidationError> {
     let invalid =
         |what: &str| ValidationError::new(format!("flow {:?} RoCE queue pair {what}", flow.id));
-    if collective_identity(generator).is_some() || is_compute_generator(generator) {
-        return Err(invalid("cannot carry a collective or compute stage yet"));
-    }
+    // A collective stage its prerequisites have not released (design note §6.1): pristine, parked
+    // with no pending event, its anchors at zero (ruling C5). Its release arms the pacer.
+    let unreleased = generator.stage.is_some_and(|stage| !stage.activated);
     let controller = roce.controller;
     controller
         .config
@@ -1543,16 +1599,20 @@ fn validate_roce_generator(
             }
         }
     } else {
-        if ticks_at_departure != 0 {
+        // A parked pacer (pause-parked, waiting for feedback, or a gated stage) owns no tick at
+        // any time: a stray one would run against a pacer that scheduled nothing.
+        if pending_ticks_with_payload(pacing_counts, owner, roce.pacing_timer_payload) != 0 {
             return Err(invalid("parked pacer owns a pending tick"));
         }
         if status == GeneratorStatus::Scheduled {
             return Err(invalid("parked pacer is Scheduled"));
         }
         // A pacer parks with packets left to send only while its data class is paused at its
-        // host (host-link PFC); `validate_pfc` pins it in the host's parked list.
+        // host (host-link PFC); `validate_pfc` pins it in the host's parked list. An unreleased
+        // stage is parked before its first tick.
         if status == GeneratorStatus::Blocked
             && roce.next_psn < pacer.total_bytes
+            && !unreleased
             && !host_class_paused(image, owner, flow.priority)
         {
             return Err(invalid("parked pacer has packets left to send"));
@@ -1602,11 +1662,21 @@ fn validate_roce_generator(
         ))
         .copied()
         .unwrap_or(0);
-    let expected_control = usize::from(controller.next_control_time_ns <= image.stop_time_ns);
+    // An unreleased stage arms its control tick at its release, so it owns none at any time.
+    if unreleased
+        && pending_ticks_with_payload(pacing_counts, owner, roce.control_timer_payload) != 0
+    {
+        return Err(invalid("owns a pending control tick before its release"));
+    }
+    let expected_control =
+        usize::from(!unreleased && controller.next_control_time_ns <= image.stop_time_ns);
     if control_events > expected_control || !complete && control_events != expected_control {
         return Err(invalid(&format!(
             "has {control_events} matching control events; expected {expected_control}"
         )));
+    }
+    if unreleased {
+        validate_unreleased_roce_stage(image, generator, roce).map_err(&invalid)?;
     }
     if flow.reverse_route.is_empty() {
         return Err(invalid("requires a reverse feedback route"));
@@ -3202,11 +3272,15 @@ fn validate_collective_stage(
             );
         }
     };
-    let FlowGeneratorKind::Tcp(tcp) = generator.kind else {
-        return Err(ValidationError::new(format!(
-            "flow {:?} collective stage record requires a TCP generator",
-            flow.id
-        )));
+    let transport_bytes = match generator.kind {
+        FlowGeneratorKind::Tcp(tcp) => tcp.total_bytes,
+        FlowGeneratorKind::Roce(roce) => roce.pacer.total_bytes,
+        _ => {
+            return Err(ValidationError::new(format!(
+                "flow {:?} collective stage record requires a TCP or RoCE generator",
+                flow.id
+            )));
+        }
     };
     let position = (
         collective.collective_id,
@@ -3256,10 +3330,10 @@ fn validate_collective_stage(
                 flow.id
             ))
         })?;
-    if tcp.total_bytes != collective.chunk_bytes {
+    if transport_bytes != collective.chunk_bytes {
         return Err(ValidationError::new(format!(
-            "flow {:?} TCP collective stage carries {} bytes for a {}-byte chunk",
-            flow.id, tcp.total_bytes, collective.chunk_bytes
+            "flow {:?} collective stage carries {} bytes for a {}-byte chunk",
+            flow.id, transport_bytes, collective.chunk_bytes
         )));
     }
     if dependencies.inbound_bytes_received > dependencies.inbound_predecessor_bytes {
@@ -3369,12 +3443,24 @@ fn validate_collective_stage(
                 flow.id
             )));
         }
-        let frontier = host_tcp_receiver(state, inbound.0.flow)
-            .map(|receiver| receiver.next_expected_sequence);
+        // One collective, one transport: its stages share one traffic key.
+        if std::mem::discriminant(&inbound.0.kind) != std::mem::discriminant(&generator.kind)
+            || std::mem::discriminant(&local.kind) != std::mem::discriminant(&generator.kind)
+        {
+            return Err(ValidationError::new(format!(
+                "flow {:?} collective predecessors use another transport",
+                flow.id
+            )));
+        }
+        let frontier = host_inbound_frontier(state, &inbound.0);
         if frontier != Some(dependencies.inbound_bytes_received) {
             return Err(ValidationError::new(format!(
-                "flow {:?} collective inbound bytes {} disagree with the in-order TCP frontier {:?} of flow {:?}",
-                flow.id, dependencies.inbound_bytes_received, frontier, inbound.0.flow
+                "flow {:?} collective inbound bytes {} disagree with the in-order {} frontier {:?} of flow {:?}",
+                flow.id,
+                dependencies.inbound_bytes_received,
+                transport_label(&inbound.0),
+                frontier,
+                inbound.0.flow
             )));
         }
     }
@@ -3393,6 +3479,43 @@ fn validate_collective_stage(
 /// the linear `find(|flow| flow.id == id)` found.
 fn flow_source(image: &SimulationImage, id: crate::FlowId) -> Option<NodeId> {
     flow(image, id).map(|flow| flow.source)
+}
+
+/// The in-order frontier this host's receiver holds for the inbound predecessor `predecessor`:
+/// TCP's next expected sequence, or a RoCE queue pair's Go-back-N expected PSN.
+fn host_inbound_frontier(
+    state: &crate::HostState,
+    predecessor: &crate::FlowGeneratorState,
+) -> Option<u64> {
+    match predecessor.kind {
+        FlowGeneratorKind::Roce(_) => state
+            .roce_receivers
+            .as_deref()?
+            .binary_search_by_key(&predecessor.flow, |receiver| receiver.np.flow)
+            .ok()
+            .map(|index| state.roce_receivers.as_deref().expect("searched")[index].expected_psn),
+        _ => host_tcp_receiver(state, predecessor.flow)
+            .map(|receiver| receiver.next_expected_sequence),
+    }
+}
+
+/// The transport of a stage generator, as validation errors name it.
+/// A RoCE queue pair's MTU and pacing interval, which a compute stage after it writes on its
+/// progress rows (schema Amendment 5); `None` for any other generator.
+const fn roce_transport(kind: &FlowGeneratorKind) -> Option<(u64, u64)> {
+    match kind {
+        FlowGeneratorKind::Roce(roce) => {
+            Some((roce.pacer.mtu_bytes, roce.pacer.pacing_interval_ns))
+        }
+        _ => None,
+    }
+}
+
+const fn transport_label(generator: &crate::FlowGeneratorState) -> &'static str {
+    match generator.kind {
+        FlowGeneratorKind::Roce(_) => "RoCE",
+        _ => "TCP",
+    }
 }
 
 /// The host's TCP receiver for `id`.
@@ -3513,12 +3636,24 @@ fn validate_compute_stage(
                     flow.id
                 )));
             }
-            let frontier = host_tcp_receiver(state, inbound_id)
-                .map(|receiver| receiver.next_expected_sequence);
+            // Schema Amendment 5: the stage's progress rows name its inbound transport from its
+            // local predecessor, the same rank's final stage of the same collective.
+            if local.map(|candidate| roce_transport(&candidate.kind))
+                != Some(roce_transport(&inbound.0.kind))
+            {
+                return Err(ValidationError::new(format!(
+                    "flow {:?} compute local and inbound predecessors disagree on the RoCE MTU or pacing interval",
+                    flow.id
+                )));
+            }
+            let frontier = host_inbound_frontier(state, &inbound.0);
             if frontier != Some(dependencies.inbound_bytes_received) {
                 return Err(ValidationError::new(format!(
-                    "flow {:?} compute inbound bytes {} disagree with the in-order TCP frontier {:?} of flow {inbound_id:?}",
-                    flow.id, dependencies.inbound_bytes_received, frontier
+                    "flow {:?} compute inbound bytes {} disagree with the in-order {} frontier {:?} of flow {inbound_id:?}",
+                    flow.id,
+                    dependencies.inbound_bytes_received,
+                    transport_label(&inbound.0),
+                    frontier
                 )));
             }
         }

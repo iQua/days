@@ -43,6 +43,14 @@ for csv in "$fixture_dir"/collective_*_executor_accept.csv; do
   check_case "$(basename "$csv")" "$csv" "$expected_exit" "$expected_output"
 done
 
+# Hand fixtures for the RoCE rules (schema Amendment 4): one accept trace and its reject twins.
+for csv in "$fixture_dir"/collective_*_hand_accept.csv "$fixture_dir"/collective_*_hand_*_reject.csv; do
+  expected="${csv%.csv}.expected"
+  expected_exit="$(sed -n '1s/^exit=//p' "$expected")"
+  expected_output="$(sed '1d' "$expected")"
+  check_case "$(basename "$csv")" "$csv" "$expected_exit" "$expected_output"
+done
+
 campaign_tmp="$(mktemp -d)"
 campaign_case="$campaign_tmp/mutated.csv"
 trap 'rm -f "$campaign_case"; rmdir "$campaign_tmp"' EXIT
@@ -290,6 +298,88 @@ mutate_case "compute-completion-before-timer" "$chain" \
 mutate_case "compute-group-coverage" "$chain" \
   '$column["flow_id"] == 20 { next }' \
   'REJECT: line 41: incomplete collective progress coverage for collective_id=2: expected 3, found 2'
+
+# RoCE stages (schema Amendment 4). The lossy ring certificate is R3's roce_ring_lossy at
+# size = 40000 (9bc3c63): Go-back-N drops, NACKs and retransmissions inside stages.
+roce_lossy="$fixture_dir/collective_roce_ring_lossy_executor_accept.csv"
+roce_dag="$fixture_dir/collective_roce_compute_dag_executor_accept.csv"
+
+# Flow 1 loses PSNs 5000-7000; PSNs 8000 and 9000 arrive out of order (rows 32, 35, advance 0)
+# and are discarded; the retransmissions from 5000 complete the chunk at row 46. A receiver that
+# buffered them, as TCP's does, would fill the hole at row 42 (PSN 7000: 7000 -> 10000) and log no
+# later arrival. TCP's merging replay accepts this; the Go-back-N frontier does not jump.
+mutate_case "roce-frontier-jump-out-of-order" "$roce_lossy" \
+  'NR == 42 { $column["arrival_bytes"] = 3000; $column["after_inbound_bytes"] = 10000; $column["after_inbound_complete"] = 1 } NR == 44 || NR == 46 { next }' \
+  "REJECT: line 42: inbound progress does not match the receiver's Go-back-N frontier"
+# Row 76 is a duplicate (PSN 5000 below the frontier 6000). Counting it moves the frontier to 7000,
+# so the next packet (PSN 6000, row 77) becomes a duplicate and the chain rejoins the trace.
+mutate_case "roce-inbound-counts-duplicate" "$roce_lossy" \
+  'NR == 76 { $column["arrival_bytes"] = 1000; $column["after_inbound_bytes"] = 7000 } NR == 77 { $column["before_inbound_bytes"] = 7000; $column["arrival_bytes"] = 0 }' \
+  "REJECT: line 76: inbound progress does not match the receiver's Go-back-N frontier"
+mutate_case "roce-packet-not-at-psn" "$roce_lossy" \
+  'NR == 77 { $column["segment_bytes"] = 999 }' \
+  "REJECT: line 77: inbound RoCE packet is not the predecessor queue pair's packet at its PSN"
+# Row 34 releases flow 7: its first pacing tick is at the release instant, so nothing is sent yet.
+mutate_case "roce-release-emitted-packet" "$roce_lossy" \
+  'NR == 34 { $column["after_packets_emitted"] = 1; $column["after_bytes_emitted"] = 1000 }' \
+  'REJECT: line 34: RoCE stage release has emitted counters: its first pacing tick is at the release instant'
+mutate_case "roce-release-tcp-deadline" "$roce_lossy" \
+  'NR == 34 { $column["after_next_time_ns"] = 0 }' \
+  'REJECT: line 34: RoCE stage release status or first pacing tick mismatch'
+mutate_case "roce-release-finished" "$roce_lossy" \
+  'NR == 34 { $column["after_status"] = "finished" }' \
+  'REJECT: line 34: RoCE stage release status or first pacing tick mismatch'
+mutate_case "roce-zero-pacing-interval" "$roce_lossy" \
+  'NR > 1 { $column["interval_ns"] = 0 }' \
+  'REJECT: line 2: RoCE collective stage requires a positive MTU and pacing interval and no duration'
+mutate_case "roce-missing-algorithm" "$roce_lossy" \
+  'NR > 1 { $column["algorithm"] = "" }' \
+  'REJECT: line 2: RoCE stage row requires an algorithm and a phase'
+# Row 74's ACK returns exactly at origin + unloaded round trip (512288 ns); one nanosecond earlier
+# is impossible.
+mutate_case "roce-completion-before-round-trip" "$roce_lossy" \
+  'NR == 74 { $column["time_ns"] = 512287 }' \
+  'REJECT: line 74: local completion precedes the earliest return of the completing acknowledgment'
+# The run's receiver log NACKs flow 9 once, acknowledging its frontier 5000 for the packet sent at
+# 71000 ns. A NACK acknowledges the frontier below an out-of-order PSN, so it never reaches the
+# chunk: row 50 (completed by flow 9) cannot be caused by it.
+mutate_case "roce-completion-by-nack" "$roce_lossy" \
+  'NR == 50 { $column["ack_number"] = 5000; $column["cause_origin_ns"] = 71000 }' \
+  'REJECT: line 50: completing acknowledgment does not reach exactly the local predecessor'"'"'s byte total'
+# A compute stage after the RoCE collective receives RoCE packets: its rows replay the Go-back-N
+# frontier of its logged predecessor (row 63: flow 27 receives flow 20's PSN 0).
+mutate_case "compute-after-roce-packet-not-at-psn" "$roce_dag" \
+  'NR == 63 { $column["segment_bytes"] = 999 }' \
+  "REJECT: line 63: inbound RoCE packet is not the predecessor queue pair's packet at its PSN"
+mutate_case "compute-after-roce-out-of-order-advance" "$roce_dag" \
+  'NR == 63 { $column["segment_sequence"] = 1000 }' \
+  "REJECT: line 63: inbound progress does not match the receiver's Go-back-N frontier"
+# Schema Amendment 5 (fix round 1, review M1): a compute stage names its RoCE inbound predecessor's
+# MTU and pacing interval. roce_agc is configs/p15/roce_allgather_compute_lossy.toml with the ring
+# at 40,000 B and the AllGather at 20,000 B: the AllGather's stages are unlogged roots. Flow 27
+# receives flow 24's PSNs 5000-9000 out of order (rows 37-53), then the Go-back-N resend from 0;
+# TCP's merge would jump from 4000 to 10000 at row 72 (PSN 4000) and log no later arrival.
+roce_agc="$fixture_dir/collective_roce_allgather_compute_lossy_executor_accept.csv"
+mutate_case "compute-after-unlogged-roce-hole-fill" "$roce_agc" \
+  'NR == 72 { $column["arrival_bytes"] = 6000; $column["after_inbound_bytes"] = 10000; $column["after_inbound_complete"] = 1 } NR >= 73 && NR <= 77 { next }' \
+  "REJECT: line 72: inbound progress does not match the receiver's Go-back-N frontier"
+# Without the columns the stage is replayed as TCP, which refuses the real Go-back-N receiver.
+mutate_case "compute-after-unlogged-roce-zero-columns" "$roce_agc" \
+  '$column["stage_kind"] == "compute" { $column["packet_size_bytes"] = 0; $column["interval_ns"] = 0 }' \
+  'REJECT: line 72: inbound progress does not match the receiver frontier replayed from the certified segments'
+mutate_case "compute-mtu-disagrees-with-logged-predecessor" "$roce_dag" \
+  '$column["stage_kind"] == "compute" { $column["packet_size_bytes"] = 1500 }' \
+  'REJECT: line 63: compute stage inbound transport columns disagree with its inbound predecessor'
+mutate_case "compute-mtu-without-interval" "$roce_dag" \
+  '$column["stage_kind"] == "compute" { $column["interval_ns"] = 0 }' \
+  'REJECT: line 63: compute stage inbound transport columns must be both zero or both positive (Amendment 5)'
+# P14's chain: the optimizer group follows the backward compute group and has no inbound stage.
+mutate_case "compute-transport-without-inbound-predecessor" "$chain" \
+  '$column["stage_kind"] == "compute" && $column["inbound_predecessor_flow_id"] == "" { $column["packet_size_bytes"] = 1000; $column["interval_ns"] = 1000 }' \
+  'REJECT: line 41: compute stage without an inbound predecessor carries inbound transport columns'
+mutate_case "roce-stage-coverage" "$roce_lossy" \
+  '$column["flow_id"] == 7 { next }' \
+  'REJECT: line 2: incomplete collective progress coverage for collective_id=0: expected 20, found 19'
 
 echo "P10c exact-integer collective campaign checks: $checked"
 exit "$failures"

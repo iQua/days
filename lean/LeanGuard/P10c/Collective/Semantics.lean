@@ -1,4 +1,5 @@
 import Std
+import LeanGuard.P10c.Roce.Semantics
 
 namespace LeanGuard.P10c.Collective
 
@@ -17,7 +18,7 @@ inductive Algorithm
 inductive Phase
   | reduceScatter
   | allGather
-  deriving DecidableEq, Repr
+  deriving DecidableEq, Repr, Hashable
 
 inductive Cause
   | localCompletion
@@ -37,7 +38,14 @@ inductive StageKind
   | tcp
   /-- A delay-only compute interval. -/
   | compute
-  deriving DecidableEq, Repr
+  /-- A collective stage carried by a RoCE queue pair (schema Amendment 4). -/
+  | roce
+  deriving DecidableEq, Repr, Hashable
+
+/-- A stage that moves bytes over a reliable transport, TCP or a RoCE queue pair. -/
+def StageKind.isTransport : StageKind → Bool
+  | .tcp | .roce => true
+  | .compute => false
 
 /-- The owner offset in the lowering recurrence. -/
 def ownerOffset : Algorithm → Phase → Nat
@@ -76,8 +84,9 @@ def nonRootStagesPerRank (algorithm : Algorithm) (groupSize : Nat) : Nat :=
   | .allGather => groupSize - 2
   | .ringAllReduce => 2 * groupSize - 3
 
-/-- Stages a complete TCP trace releases. TCP collectives carry at least one byte per rank, so
-every chunk is nonempty; a compute-gated collective also releases its `n` roots. -/
+/-- Stages a complete trace of a transport collective releases. TCP and RoCE collectives carry at
+least one byte per rank, so every chunk is nonempty; a compute-gated collective also releases its
+`n` roots. -/
 def expectedActivationCount (algorithm : Algorithm) (groupSize : Nat) (gated : Bool) : Nat :=
   groupSize * nonRootStagesPerRank algorithm groupSize + (if gated then groupSize else 0)
 
@@ -90,6 +99,37 @@ the largest initial window rather than fixed. -/
 def tcpFirstWindow (mss chunkBytes packets bytes : Nat) : Bool :=
   packets ≥ 1 && packets ≤ maxInitialWindowSegments && (packets - 1) * mss < chunkBytes &&
     bytes = min chunkBytes (packets * mss)
+
+/-- Schema Amendment 4: a released RoCE stage arms its first pacing tick at the release instant,
+on a grid anchored there (ruling C2), so the release itself sends nothing. Its status is the
+pacer's armed-status prediction, `Scheduled` or `Blocked`, which depends on the controller's rate
+that the collective certificate does not carry. -/
+def roceRelease (timeNs : Nat) (status : Status) (nextTimeNs packets bytes : Nat) : Bool :=
+  packets = 0 && bytes = 0 && nextTimeNs = timeNs &&
+    (status = .scheduled || status = .blocked)
+
+/-- The Go-back-N receiver's in-order frontier after a data packet `[psn, psn + bytes)`: it
+advances by the packet exactly when the PSN is the frontier. A duplicate or an out-of-order
+packet leaves it where it is, and nothing is buffered, so no later packet fills a hole. -/
+def goBackNFrontier (frontier psn bytes : Nat) : Nat :=
+  if psn = frontier then frontier + bytes else frontier
+
+/-- `goBackNFrontier` is the frontier of the queue-pair receiver that the RoCE checker replays
+(`Roce.onData`, `roce.rs` `receive`), whatever its configuration, state and the packet's CE mark. -/
+theorem goBackNFrontier_onData (config : Roce.ReceiverConfig) (state : Roce.ReceiverState)
+    (timeNs : Nat) (packet : Roce.DataArrival) :
+    (Roce.onData config state timeNs packet).state.expectedPsn =
+      goBackNFrontier state.expectedPsn packet.psn packet.bytes := by
+  unfold Roce.onData goBackNFrontier
+  by_cases hcnp : (packet.ce && Roce.cnpAdmitted config state timeNs) = true <;>
+    simp only [hcnp] <;> split <;> split <;> (try split) <;> (try split) <;> simp_all
+  -- Sending feedback resets only the ACK cadence, never the frontier.
+  all_goals split <;> rfl
+
+/-- A data packet of a RoCE queue pair whose chunk is `total` bytes: its PSN is a packet boundary
+(a multiple of the MTU) and its size is `min(mtu, total - psn)` (`Roce.packetSize`, §1). -/
+def roceSegment (mtu total psn bytes : Nat) : Bool :=
+  mtu > 0 && psn % mtu = 0 && psn < total && bytes = min mtu (total - psn)
 
 /-- Status and deadline written when a compute interval is released at `timeNs`. -/
 def computeTimerAfter (timeNs durationNs stopTimeNs : Nat) : Status × Nat :=

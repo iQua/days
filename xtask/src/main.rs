@@ -215,12 +215,16 @@ const STAGE_PATH_FUNCTIONS: &[&str] = &[
     "prepare_tcp_attempts",
     "install_tcp_attempts",
     // P15: DCQCN and RoCE queue-pair transitions, keyed through the same counted view; a host can
-    // hold many queue pairs (collective stages over RoCE follow in a later lane).
+    // hold many queue pairs.
     "host_dcqcn_cnp_arrival",
     "host_dcqcn_control_timer",
     "host_roce_pacing_timer",
     "host_roce_feedback_arrival",
     "host_roce_timeout",
+    // P15 lane R3: collective stages over RoCE queue pairs. A data arrival advances the stages
+    // waiting on its pair's Go-back-N frontier; a release re-anchors and arms the pair.
+    "host_roce_data_arrival",
+    "start_roce_stage",
     // P15 host-link PFC: a RESUME restarts its class's pause-parked queue pairs, read by
     // generator position from the host's parked list through the same counted view.
     "host_pfc_remote_arrival",
