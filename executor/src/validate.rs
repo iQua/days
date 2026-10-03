@@ -1676,7 +1676,7 @@ fn validate_roce_generator(
         )));
     }
     if unreleased {
-        validate_unreleased_roce_stage(image, generator, roce).map_err(&invalid)?;
+        validate_unreleased_roce_stage(image, generator, roce).map_err(invalid)?;
     }
     if flow.reverse_route.is_empty() {
         return Err(invalid("requires a reverse feedback route"));
