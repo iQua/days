@@ -1,0 +1,2 @@
+exit=1
+REJECT: line 20: inbound progress does not match the receiver's Go-back-N frontier

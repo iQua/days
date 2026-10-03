@@ -1,0 +1,2 @@
+exit=1
+REJECT: line 13: RoCE stage release has emitted counters: its first pacing tick is at the release instant

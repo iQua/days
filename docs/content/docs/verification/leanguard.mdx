@@ -119,7 +119,8 @@ Days AGO checkers:
 ./.lake/build/bin/p10c_roce_check sender <path/to/roce_sender.csv> <path/to/dcqcn.csv> \
   [--pfc <path/to/pfc.csv>] [--horizon-ns <ns>] [<stop_time_ns>]
 ./.lake/build/bin/p10c_roce_check trace <path/to/roce_sender.csv> <path/to/roce_receiver.csv> \
-  <path/to/dcqcn.csv> [--pfc <path/to/pfc.csv>] [--horizon-ns <ns>] [<stop_time_ns>]
+  <path/to/dcqcn.csv> [--pfc <path/to/pfc.csv>] [--horizon-ns <ns>] \
+  [--collective <path/to/collective.csv>] [<stop_time_ns>]
 ```
 
 `p10c_roce_check` certifies RoCE queue pairs from the executor's `roce_receiver_transitions_csv`,
@@ -162,6 +163,19 @@ Days AGO checkers:
 - `--horizon-ns <ns>` checks a prefix of a run: the logs must hold exactly the run's events with
   `time_ns < ns`. Pending events at or after the horizon need not have fired; stop decisions are
   still checked against the run's stop time.
+- `--collective <path>` (trace mode) joins the run's `collective_transitions_csv` to the queue-pair
+  logs. A released RoCE collective stage's pair runs its first pacing tick at the release instant,
+  from the armed status the release row records, and its first control tick one control interval
+  later; a logged stage that is never released has no queue-pair rows; and a local completion
+  caused by a RoCE pair shares its event key with that pair's ACK that brings its acknowledgment to
+  the pair's total.
+
+`p10c_collective_check` replays each stage's inbound rows by the transport that sent them: TCP's
+in-order frontier, which absorbs buffered out-of-order segments, or a RoCE queue pair's Go-back-N
+frontier, which advances only on the packet at the frontier and requires each packet to be the
+pair's packet at its PSN. A RoCE stage's rows carry its MTU; a compute stage after a RoCE
+collective carries the predecessor's MTU and pacing interval, which must equal a logged
+predecessor's.
 - `trace` runs both, then the cross-role checks. Every data arrival must be a packet the sender
   emitted. Every ACK, NACK and CNP the sender applies must have been sent earlier by the receiver.
 - `<stop_time_ns>` is the image's `stop_time_ns`. No CSV records it, and it decides whether a

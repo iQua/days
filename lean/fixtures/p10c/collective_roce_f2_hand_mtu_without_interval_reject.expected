@@ -1,0 +1,2 @@
+exit=1
+REJECT: line 2: compute stage inbound transport columns must be both zero or both positive (Amendment 5)
