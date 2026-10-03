@@ -569,24 +569,6 @@ fn validate_backend_capabilities(
     // P15 lane R4: both device backends run RoCE queue pairs, host-link PFC and a feedback class
     // apart from the data class (`evidence/P15/device-design.md`), so none needs a refusal here.
     //
-    // P16 D1 staging: the CUDA kernel still runs the paper-form controller, so it refuses every
-    // DCQCN controller (DCQCN flows and queue pairs) rather than run it wrong, until its port.
-    if matches!(backend, Backend::Cuda)
-        && image
-            .host_states
-            .iter()
-            .flat_map(|state| &state.generators)
-            .any(|generator| {
-                matches!(
-                    generator.kind,
-                    crate::FlowGeneratorKind::Dcqcn(_) | crate::FlowGeneratorKind::Roce(_)
-                )
-            })
-    {
-        return Err(ValidationError::new(format!(
-            "backend {backend} does not yet run the Mellanox-form DCQCN controller (P16 D1 port pending); use Scalar or Cpu"
-        )));
-    }
     for queue in image.switch_states.iter().flat_map(|state| &state.queues) {
         match queue.drop_mark {
             crate::DropMarkPolicy::TailDrop | crate::DropMarkPolicy::EcnThreshold(_) => {}
