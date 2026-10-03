@@ -58,9 +58,17 @@ check_case() {
   local expected_output="$3"
   shift 3
   checked=$((checked + 1))
+  # Fix round 3 (orchestrator ruling): the checker requires the full P16 sender schema unless told
+  # otherwise. Most committed sender fixtures predate P16's window and initial-rate columns, so
+  # sender and trace cases pass --legacy-sender-format unless the caller sets
+  # sender_format=current for a current-format log.
+  local format=()
+  if [[ "${sender_format:-legacy}" != current && ( "$1" == sender || "$1" == trace ) ]]; then
+    format=(--legacy-sender-format)
+  fi
 
   set +e
-  actual_output="$("$checker" "$@" 2>&1)"
+  actual_output="$("$checker" "$@" ${format[@]+"${format[@]}"} 2>&1)"
   actual_exit=$?
   set -e
 
@@ -768,34 +776,65 @@ if check_case "sender/initial-rate-not-the-credited-rate" 1 \
   mutations_caught=$((mutations_caught + 1))
 fi
 
-# Fix round 2 (re-review residual F3): a current-format sender log (one carrying the P16 columns,
-# `maximum_rate_bps`) must carry `initial_rate_bps`; its absence is rejected by name, so deleting
-# the column cannot re-admit a re-rated pair. Logs from before P16's columns stay readable.
-omission='REJECT: sender: line 2: current-format sender log (it carries maximum_rate_bps) has no initial_rate_bps column'
+# Fix round 3 (orchestrator ruling on residual F3): the sender log's format is explicit. By default
+# the checker requires every column of the P16 sender schema and names the missing ones; a log from
+# before P16's window and initial-rate columns is read only under --legacy-sender-format, which
+# check_case passes unless sender_format=current. Deleting or renaming columns therefore cannot
+# turn a current log into an untied legacy one.
+lacks() {
+  echo "REJECT: sender: line 1: sender log lacks P16 sender schema column(s): $1 (a log from before P16's window and initial-rate columns needs --legacy-sender-format)"
+}
 # drop_column <name>: an awk program printing every row without the named column.
 drop_column() {
   printf '%s' 'NR == 1 { for (i = 1; i <= NF; i++) if ($i == "'"$1"'") drop = i }
     { out = ""; sep = ""; for (i = 1; i <= NF; i++) if (i != drop) { out = out sep $i; sep = OFS }; print out }'
 }
-wn_omit="$fixture_dir/roce_trace_window_prefix_executor_accept"
-awk -F, -v OFS=, "$(drop_column initial_rate_bps)" "$wn_omit.sender.csv" > "$campaign_tmp/omitted.csv"
-mutations=$((mutations + 1))
-if check_case "sender/window-prefix-initial-rate-column-deleted" 1 "$omission" \
-    trace "$campaign_tmp/omitted.csv" "$wn_omit.receiver.csv" "$wn_omit.dcqcn.csv" \
-    --pfc "$wn_omit.pfc.csv" --horizon-ns "$(cat "$wn_omit.horizon_ns")" \
-    "$(cat "$wn_omit.stop_time_ns")"; then
-  mutations_caught=$((mutations_caught + 1))
-fi
-# The reviewer's probe: the paused fixture in the current layout (maximum_rate_bps added), flow 3
-# re-rated to 9 Gb/s with its credit chain recomputed, and initial_rate_bps deleted.
+# rename_column <old> <new>: an awk program renaming one header field.
+rename_column() {
+  printf '%s' 'NR == 1 { for (i = 1; i <= NF; i++) if ($i == "'"$1"'") $i = "'"$2"'" } { print }'
+}
+wn_fmt="$fixture_dir/roce_trace_window_prefix_executor_accept"
+# current_trace <label> <expected exit> <expected output> <sender log>: the window prefix's trace,
+# with no format flag.
+current_trace() {
+  mutations=$((mutations + $2))
+  if sender_format=current check_case "format/$1" "$2" "$3" \
+      trace "$4" "$wn_fmt.receiver.csv" "$wn_fmt.dcqcn.csv" --pfc "$wn_fmt.pfc.csv" \
+      --horizon-ns "$(cat "$wn_fmt.horizon_ns")" "$(cat "$wn_fmt.stop_time_ns")"; then
+    mutations_caught=$((mutations_caught + $2))
+  fi
+}
+current_trace "window-prefix-in-the-current-format" 0 "ACCEPT" "$wn_fmt.sender.csv"
+awk -F, -v OFS=, "$(drop_column initial_rate_bps)" "$wn_fmt.sender.csv" > "$campaign_tmp/format.csv"
+current_trace "initial-rate-column-deleted" 1 "$(lacks initial_rate_bps)" "$campaign_tmp/format.csv"
+awk -F, -v OFS=, "$(drop_column initial_rate_bps)" "$wn_fmt.sender.csv" \
+  | awk -F, -v OFS=, "$(drop_column maximum_rate_bps)" > "$campaign_tmp/format.csv"
+current_trace "both-rate-columns-deleted" 1 "$(lacks "maximum_rate_bps, initial_rate_bps")" "$campaign_tmp/format.csv"
+awk -F, -v OFS=, "$(rename_column maximum_rate_bps maximum_rate)" "$wn_fmt.sender.csv" > "$campaign_tmp/format.csv"
+current_trace "marker-renamed" 1 "$(lacks maximum_rate_bps)" "$campaign_tmp/format.csv"
+awk -F, -v OFS=, "$(rename_column maximum_rate_bps maximum_rate)" "$wn_fmt.sender.csv" \
+  | awk -F, -v OFS=, "$(drop_column initial_rate_bps)" > "$campaign_tmp/format.csv"
+current_trace "marker-renamed-and-initial-rate-deleted" 1 "$(lacks "maximum_rate_bps, initial_rate_bps")" "$campaign_tmp/format.csv"
+# The reviewer's probe: the paused fixture with maximum_rate_bps added, flow 3 re-rated to 9 Gb/s
+# with its credit chain recomputed, and initial_rate_bps deleted. Without the flag it names every
+# P16 column it lacks.
 awk -F, -v OFS=, 'NR == 1 { print $0 ",maximum_rate_bps"; next } { print $0 ",8000000000" }' "$paused" \
   | awk -F, -v OFS=, "$(rerate 9000000000)" \
-  | awk -F, -v OFS=, "$(drop_column initial_rate_bps)" > "$campaign_tmp/omitted.csv"
+  | awk -F, -v OFS=, "$(drop_column initial_rate_bps)" > "$campaign_tmp/format.csv"
 mutations=$((mutations + 1))
-if check_case "sender/re-rated-pair-with-initial-rate-column-deleted" 1 "$omission" \
-    sender "$campaign_tmp/omitted.csv" "$paused_dcqcn" --pfc "$paused_pfc" "$paused_stop"; then
+if sender_format=current check_case "format/re-rated-pair-with-initial-rate-deleted" 1 \
+    "$(lacks "window_blocked, window_bytes, variable_window, initial_rate_bps")" \
+    sender "$campaign_tmp/format.csv" "$paused_dcqcn" --pfc "$paused_pfc" "$paused_stop"; then
   mutations_caught=$((mutations_caught + 1))
 fi
+# A legacy fixture ACCEPTs only with the flag.
+mutations=$((mutations + 1))
+if sender_format=current check_case "format/legacy-fixture-without-the-flag" 1 \
+    "$(lacks "class_paused, window_blocked, data_class, window_bytes, variable_window, maximum_rate_bps, initial_rate_bps")" \
+    sender "$gbn" "$gbn_dcqcn" "$gbn_stop"; then
+  mutations_caught=$((mutations_caught + 1))
+fi
+check_case "format/legacy-fixture-with-the-flag" 0 "ACCEPT" sender "$gbn" "$gbn_dcqcn" "$gbn_stop" || true
 
 # --- Amendment 2: resume rows (a PFC RESUME restarts pause-parked queue pairs) -----------------
 # Amended layout as above. A resume row is a D3 restart of a pair parked by a paused tick, at the
@@ -1151,7 +1190,7 @@ rate_lookup() {
 window_reject() {
   awk -F, -v OFS=, "$named $2"' { print }' "$wn.sender.csv" > "$campaign_tmp/window.sender.csv"
   mutations=$((mutations + 1))
-  if check_case "window/$1" 1 "$3" \
+  if sender_format=current check_case "window/$1" 1 "$3" \
       trace "$campaign_tmp/window.sender.csv" "$wn.receiver.csv" "$wn.dcqcn.csv" --pfc "$wn.pfc.csv" \
       --horizon-ns "$(cat "$wn.horizon_ns")" "$(cat "$wn.stop_time_ns")"; then
     mutations_caught=$((mutations_caught + 1))

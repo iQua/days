@@ -117,11 +117,18 @@ Days AGO checkers:
 ./.lake/build/bin/p10c_collective_check <path/to/collective_events.csv>
 ./.lake/build/bin/p10c_roce_check receiver <path/to/roce_receiver.csv>
 ./.lake/build/bin/p10c_roce_check sender <path/to/roce_sender.csv> <path/to/dcqcn.csv> \
-  [--pfc <path/to/pfc.csv>] [--horizon-ns <ns>] [<stop_time_ns>]
+  [--pfc <path/to/pfc.csv>] [--horizon-ns <ns>] [--legacy-sender-format] [<stop_time_ns>]
 ./.lake/build/bin/p10c_roce_check trace <path/to/roce_sender.csv> <path/to/roce_receiver.csv> \
   <path/to/dcqcn.csv> [--pfc <path/to/pfc.csv>] [--horizon-ns <ns>] \
-  [--collective <path/to/collective.csv>] [<stop_time_ns>]
+  [--collective <path/to/collective.csv>] [--legacy-sender-format] [<stop_time_ns>]
 ```
+
+By default `p10c_roce_check` requires the full P16 sender schema, every column the executor's
+`roce_sender_transitions_csv` writes (`initial_rate_bps`, `maximum_rate_bps` and the window
+columns included), and rejects a log that lacks any of them, naming the missing columns. A log
+written before P16's window and initial-rate columns is read only with `--legacy-sender-format`:
+those columns are then optional (no window, class 0), and a queue pair with no DCQCN row has no
+initial-rate tie. The LeanGuard campaign passes the flag for its older committed fixtures.
 
 `p10c_roce_check` certifies RoCE queue pairs from the executor's `roce_receiver_transitions_csv`,
 `roce_sender_transitions_csv` and `dcqcn_transitions_csv` of one full-observation run:
@@ -195,6 +202,7 @@ Committed Days AGO certificate fixtures can be checked directly, for example:
 ./.lake/build/bin/p10c_roce_check trace fixtures/p10c/roce_trace_timeout_executor_accept.sender.csv \
   fixtures/p10c/roce_trace_timeout_executor_accept.receiver.csv \
   fixtures/p10c/roce_trace_timeout_executor_accept.dcqcn.csv \
+  --pfc fixtures/p10c/roce_trace_timeout_executor_accept.pfc.csv --legacy-sender-format \
   "$(cat fixtures/p10c/roce_trace_timeout_executor_accept.stop_time_ns)"
 ./.lake/build/bin/sp_check fixtures/sp/sp_priority_and_fifo_accept.csv
 ```

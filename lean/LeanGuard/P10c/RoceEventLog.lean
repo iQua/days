@@ -358,7 +358,69 @@ def parseSenderRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array
       after := ← parseSenderState "after" idx fields
       srcLine := lineNo }
 
-def parseSenderCsv (content : String) : Except String (List SenderRow) :=
+/-- The P16 sender schema (`roce_sender_transitions_csv`; `qp-schema-amendment-6.md` and
+`dcqcn-schema.md` Amendment 1): every column the executor writes. -/
+def senderSchema : List String := [
+    "time_ns",
+    "event_phase",
+    "event_origin_node",
+    "event_origin_sequence",
+    "node_id",
+    "flow_id",
+    "kind",
+    "class_paused",
+    "window_blocked",
+    "data_class",
+    "mtu_bytes",
+    "total_bytes",
+    "pacing_interval_ns",
+    "first_pacing_time_ns",
+    "rto_ns",
+    "window_bytes",
+    "variable_window",
+    "maximum_rate_bps",
+    "initial_rate_bps",
+    "rate_bps",
+    "input_acknowledgment",
+    "input_ce_echo",
+    "emitted",
+    "emitted_psn",
+    "emitted_bytes",
+    "emitted_retransmission",
+    "emitted_payload",
+    "before_next_psn",
+    "before_snd_una",
+    "before_bytes_emitted",
+    "before_packets_emitted",
+    "before_credit_quanta",
+    "before_rto_deadline_ns",
+    "before_pacer",
+    "before_next_tick_ns",
+    "before_status",
+    "after_next_psn",
+    "after_snd_una",
+    "after_bytes_emitted",
+    "after_packets_emitted",
+    "after_credit_quanta",
+    "after_rto_deadline_ns",
+    "after_pacer",
+    "after_next_tick_ns",
+    "after_status"]
+
+/-- Fix round 3 (orchestrator ruling on residual F3): the format is explicit. By default a sender
+log must carry every column of `senderSchema`, and the missing ones are named, so deleting or
+renaming columns cannot make a current log read as an older one. A log from before P16's window and
+initial-rate columns is read only with `legacy` (`--legacy-sender-format`), where those columns are
+optional and read as absent (no window, class 0, no initial-rate tie). -/
+def parseSenderCsv (content : String) (legacy : Bool := false) : Except String (List SenderRow) := do
+  if !legacy then
+    match content.splitOn "\n" |>.map stripCR |>.map String.trim |>.filter (· != "") with
+    | [] => throw "empty CSV"
+    | header :: _ =>
+        let idx := mkIndex (splitCsvLine header)
+        let missing := senderSchema.filter (fun column => !idx.contains column)
+        if !missing.isEmpty then
+          throw s!"line 1: sender log lacks P16 sender schema column(s): {", ".intercalate missing} (a log from before P16's window and initial-rate columns needs --legacy-sender-format)"
   parseLines content parseSenderRow
 
 /-- One sender log item in `(event key, flow)` order: a sender row with its pair's DCQCN row at the
