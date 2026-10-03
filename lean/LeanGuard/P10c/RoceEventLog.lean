@@ -305,9 +305,14 @@ def parseSenderRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array
   let maximumRateBps ←
     if idx.contains "maximum_rate_bps" then parseU64 (← getField idx fields "maximum_rate_bps")
     else pure 0
+  -- Fix round 2 (re-review residual F3): a current-format log (one carrying P16's columns, marked
+  -- by `maximum_rate_bps`) must carry `initial_rate_bps`, so deleting the column cannot re-admit a
+  -- re-rated pair. A log from before those columns has neither and reads no initial rate.
   let initialRateBps ←
     if idx.contains "initial_rate_bps" then
       some <$> parseU64 (← getField idx fields "initial_rate_bps")
+    else if idx.contains "maximum_rate_bps" then
+      throw "current-format sender log (it carries maximum_rate_bps) has no initial_rate_bps column"
     else pure none
   let dataClass ←
     if idx.contains "data_class" then do

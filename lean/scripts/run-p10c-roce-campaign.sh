@@ -768,6 +768,35 @@ if check_case "sender/initial-rate-not-the-credited-rate" 1 \
   mutations_caught=$((mutations_caught + 1))
 fi
 
+# Fix round 2 (re-review residual F3): a current-format sender log (one carrying the P16 columns,
+# `maximum_rate_bps`) must carry `initial_rate_bps`; its absence is rejected by name, so deleting
+# the column cannot re-admit a re-rated pair. Logs from before P16's columns stay readable.
+omission='REJECT: sender: line 2: current-format sender log (it carries maximum_rate_bps) has no initial_rate_bps column'
+# drop_column <name>: an awk program printing every row without the named column.
+drop_column() {
+  printf '%s' 'NR == 1 { for (i = 1; i <= NF; i++) if ($i == "'"$1"'") drop = i }
+    { out = ""; sep = ""; for (i = 1; i <= NF; i++) if (i != drop) { out = out sep $i; sep = OFS }; print out }'
+}
+wn_omit="$fixture_dir/roce_trace_window_prefix_executor_accept"
+awk -F, -v OFS=, "$(drop_column initial_rate_bps)" "$wn_omit.sender.csv" > "$campaign_tmp/omitted.csv"
+mutations=$((mutations + 1))
+if check_case "sender/window-prefix-initial-rate-column-deleted" 1 "$omission" \
+    trace "$campaign_tmp/omitted.csv" "$wn_omit.receiver.csv" "$wn_omit.dcqcn.csv" \
+    --pfc "$wn_omit.pfc.csv" --horizon-ns "$(cat "$wn_omit.horizon_ns")" \
+    "$(cat "$wn_omit.stop_time_ns")"; then
+  mutations_caught=$((mutations_caught + 1))
+fi
+# The reviewer's probe: the paused fixture in the current layout (maximum_rate_bps added), flow 3
+# re-rated to 9 Gb/s with its credit chain recomputed, and initial_rate_bps deleted.
+awk -F, -v OFS=, 'NR == 1 { print $0 ",maximum_rate_bps"; next } { print $0 ",8000000000" }' "$paused" \
+  | awk -F, -v OFS=, "$(rerate 9000000000)" \
+  | awk -F, -v OFS=, "$(drop_column initial_rate_bps)" > "$campaign_tmp/omitted.csv"
+mutations=$((mutations + 1))
+if check_case "sender/re-rated-pair-with-initial-rate-column-deleted" 1 "$omission" \
+    sender "$campaign_tmp/omitted.csv" "$paused_dcqcn" --pfc "$paused_pfc" "$paused_stop"; then
+  mutations_caught=$((mutations_caught + 1))
+fi
+
 # --- Amendment 2: resume rows (a PFC RESUME restarts pause-parked queue pairs) -----------------
 # Amended layout as above. A resume row is a D3 restart of a pair parked by a paused tick, at the
 # RESUME's event key (phase 0: a PFC frame arrival); several may share one key, for distinct
