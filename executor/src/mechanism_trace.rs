@@ -438,7 +438,8 @@ pub fn dcqcn_transitions_csv(
 }
 
 /// The sender transitions of RoCE queue pairs, one row per event in `EventKey` order (pinned
-/// schema `days-gpu/plans/briefs/p15/qp-schema.md`).
+/// schema `days-gpu/plans/briefs/p15/qp-schema.md`, with Amendment 6: the ECN echo and the
+/// window).
 pub fn roce_sender_transitions_csv(
     records: &[MechanismTransitionRecord],
 ) -> Result<String, MechanismTraceError> {
@@ -467,13 +468,13 @@ pub fn roce_sender_transitions_csv(
         });
     }
     let mut csv = String::from(
-        "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,kind,class_paused,data_class,mtu_bytes,total_bytes,pacing_interval_ns,first_pacing_time_ns,rto_ns,rate_bps,input_acknowledgment,input_ce_echo,emitted,emitted_psn,emitted_bytes,emitted_retransmission,emitted_payload,before_next_psn,before_snd_una,before_bytes_emitted,before_packets_emitted,before_credit_quanta,before_rto_deadline_ns,before_pacer,before_next_tick_ns,before_status,after_next_psn,after_snd_una,after_bytes_emitted,after_packets_emitted,after_credit_quanta,after_rto_deadline_ns,after_pacer,after_next_tick_ns,after_status\n",
+        "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,kind,class_paused,window_blocked,data_class,mtu_bytes,total_bytes,pacing_interval_ns,first_pacing_time_ns,rto_ns,window_bytes,variable_window,maximum_rate_bps,rate_bps,input_acknowledgment,input_ce_echo,emitted,emitted_psn,emitted_bytes,emitted_retransmission,emitted_payload,before_next_psn,before_snd_una,before_bytes_emitted,before_packets_emitted,before_credit_quanta,before_rto_deadline_ns,before_pacer,before_next_tick_ns,before_status,after_next_psn,after_snd_una,after_bytes_emitted,after_packets_emitted,after_credit_quanta,after_rto_deadline_ns,after_pacer,after_next_tick_ns,after_status\n",
     );
     for record in records {
         let emitted = record.emitted;
         write!(
             csv,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             record.key.time_ns,
             record.key.phase,
             record.key.origin_node.0,
@@ -482,12 +483,16 @@ pub fn roce_sender_transitions_csv(
             record.flow.0,
             record.kind.label(),
             bit(record.class_paused),
+            bit(record.window_blocked),
             record.data_class,
             record.mtu_bytes,
             record.total_bytes,
             record.pacing_interval_ns,
             record.first_pacing_time_ns,
             record.rto_ns,
+            record.window_bytes,
+            bit(record.variable_window),
+            record.maximum_rate_bps,
             optional_u64(record.rate_bps),
             optional_u64(record.input_acknowledgment),
             optional_bit(record.input_ce_echo),
@@ -521,8 +526,8 @@ pub fn roce_sender_transitions_csv(
 }
 
 /// The receiver transitions of RoCE queue pairs: one row per data arrival in `EventKey` order
-/// (pinned schema `days-gpu/plans/briefs/p15/qp-schema.md`). It also certifies the DCQCN
-/// notification point of each pair (`cnp_sent`, `last_cnp_time_ns`).
+/// (pinned schema `days-gpu/plans/briefs/p15/qp-schema.md`, with Amendment 6: a queue pair's
+/// receiver has no notification point, and each ACK or NACK echoes its packet's CE mark).
 pub fn roce_receiver_transitions_csv(
     records: &[MechanismTransitionRecord],
 ) -> Result<String, MechanismTraceError> {

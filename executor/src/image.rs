@@ -622,8 +622,16 @@ pub struct RoceGenerator {
     /// Fixed retransmission timeout (no backoff); zero turns the timeout off, so only a NACK
     /// recovers a loss and a lost last packet stalls the queue pair for the rest of the run.
     pub rto_ns: u64,
+    /// P16 ruling D7: the window in bytes (SimAI `m_win`); zero turns it off.
+    pub window_bytes: u64,
     /// Whether exactly one pacing tick is pending. A parked pacer has none.
     pub pacer_armed: bool,
+    /// P16 ruling D7: the window scales with the controller's rate (SimAI `m_var_win`).
+    pub variable_window: bool,
+    /// The pacer is parked because a tick found the window closed, and no restart has run since.
+    /// Only an ACK or NACK that moves `snd_una`, or a timeout, restarts such a pacer; a host
+    /// RESUME does not (it restarts pause-parked pacers), so the bit keeps the two apart.
+    pub window_parked: bool,
 }
 
 /// Fixed-width result of routing an ordinary feedback packet into a source generator.

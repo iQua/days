@@ -30,7 +30,7 @@ const FIXTURES: [&str; 9] = [
     "hostpfc_multi_qp_tcp.toml",
 ];
 
-const SENDER_HEADER: &str = "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,kind,class_paused,data_class,mtu_bytes,total_bytes,pacing_interval_ns,first_pacing_time_ns,rto_ns,rate_bps,input_acknowledgment,input_ce_echo,emitted,emitted_psn,emitted_bytes,emitted_retransmission,emitted_payload,before_next_psn,before_snd_una,before_bytes_emitted,before_packets_emitted,before_credit_quanta,before_rto_deadline_ns,before_pacer,before_next_tick_ns,before_status,after_next_psn,after_snd_una,after_bytes_emitted,after_packets_emitted,after_credit_quanta,after_rto_deadline_ns,after_pacer,after_next_tick_ns,after_status";
+const SENDER_HEADER: &str = "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,kind,class_paused,window_blocked,data_class,mtu_bytes,total_bytes,pacing_interval_ns,first_pacing_time_ns,rto_ns,window_bytes,variable_window,maximum_rate_bps,rate_bps,input_acknowledgment,input_ce_echo,emitted,emitted_psn,emitted_bytes,emitted_retransmission,emitted_payload,before_next_psn,before_snd_una,before_bytes_emitted,before_packets_emitted,before_credit_quanta,before_rto_deadline_ns,before_pacer,before_next_tick_ns,before_status,after_next_psn,after_snd_una,after_bytes_emitted,after_packets_emitted,after_credit_quanta,after_rto_deadline_ns,after_pacer,after_next_tick_ns,after_status";
 const RECEIVER_HEADER: &str = "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,total_bytes,ack_every_packets,nack_interval_ns,duplicate_ack,ack_size_bytes,packet_psn,packet_bytes,packet_sent_time_ns,packet_retransmission,packet_ce,action,feedback_acknowledgment,feedback_payload,feedback_ce_echo,before_expected_psn,before_packets_since_ack,before_last_nack_psn,before_last_nack_time_ns,after_expected_psn,after_packets_since_ack,after_last_nack_psn,after_last_nack_time_ns";
 
 fn run(name: &str) -> RunResult {
@@ -57,8 +57,9 @@ fn cost(bytes: u64) -> u128 {
     u128::from(bytes) * 8 * 1_000_000_000
 }
 
-/// The reliability state one record's `after` hands to the next record of the same flow. The
-/// status is excluded: a CNP or control tick (DCQCN records) can move an armed pacer's prediction.
+/// The reliability state one record's `after` hands to the next record of the same flow, status
+/// included: nothing recomputes a pair's prediction between its transitions (P16 ruling D2; in P15
+/// a CNP or control tick could).
 fn continuation(view: &days_executor::RoceSenderView) -> impl PartialEq + std::fmt::Debug {
     (
         view.next_psn,
@@ -69,6 +70,7 @@ fn continuation(view: &days_executor::RoceSenderView) -> impl PartialEq + std::f
         view.rto_deadline_ns,
         view.pacer,
         view.next_tick_ns,
+        view.status,
     )
 }
 

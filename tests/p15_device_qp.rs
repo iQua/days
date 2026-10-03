@@ -34,8 +34,10 @@ const FIXTURES: &[&str] = &[
     "hostpfc_multi_qp_tcp.toml",
     "hostpfc_bidir_drr.toml",
     "hostpfc_bidir_wrr.toml",
+    "../p16/dcqcn_mlx_window.toml",
 ];
 
+/// A fixture of `configs/p15`; a P16 fixture is named relative to it (`../p16/...`).
 fn lower(name: &str) -> SimulationImage {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("configs/p15")
@@ -65,7 +67,7 @@ fn scalar(image: &SimulationImage, horizon: Option<u64>) -> RunResult {
 /// Checkpoints of `name` at every `step` ns up to `until` ns.
 fn checkpoints(name: &str, step: u64, until: u64) -> Vec<(String, SimulationImage)> {
     let image = lower(name);
-    let stem = name.trim_end_matches(".toml");
+    let stem = name.trim_start_matches("../p16/").trim_end_matches(".toml");
     let mut images = Vec::new();
     let mut horizon = step;
     while horizon <= until.min(image.stop_time_ns - 1) {
@@ -85,7 +87,10 @@ fn checkpoints(name: &str, step: u64, until: u64) -> Vec<(String, SimulationImag
 fn qp_images() -> Vec<(String, SimulationImage)> {
     let mut images = FIXTURES
         .iter()
-        .map(|name| (name.trim_end_matches(".toml").to_owned(), lower(name)))
+        .map(|name| {
+            let stem = name.trim_start_matches("../p16/").trim_end_matches(".toml");
+            (stem.to_owned(), lower(name))
+        })
         .collect::<Vec<_>>();
     images.extend(checkpoints("roce_timeout.toml", 2_500_000, 20_000_000));
     images.extend(checkpoints(
@@ -93,6 +98,17 @@ fn qp_images() -> Vec<(String, SimulationImage)> {
         1_000_000,
         10_000_000,
     ));
+    // P16 ruling D7: inside the window fixture's first window park under a host pause (its PAUSE
+    // at 320,512 ns and RESUME at 352,512 ns fall inside the park of 312,000..369,536 ns): the pair
+    // is window-parked and off the parked list while its class is paused, and stays parked after
+    // the RESUME.
+    for horizon in [320_513, 352_513] {
+        images.extend(checkpoints(
+            "../p16/dcqcn_mlx_window.toml",
+            horizon,
+            horizon,
+        ));
+    }
     images
 }
 
@@ -154,6 +170,22 @@ fn qp_images_exercise_token_pinning_timeouts_and_parked_pairs() {
     assert!(
         mid_pause,
         "some checkpoint must hold a paused class with pause-parked pairs"
+    );
+    let window_parked_paused = images.iter().any(|(_, image)| {
+        image.host_states.iter().any(|host| {
+            host.pfc.as_deref().is_some_and(|pfc| {
+                host.generators.iter().enumerate().any(|(position, generator)| {
+                    matches!(generator.kind, FlowGeneratorKind::Roce(roce) if roce.window_parked)
+                        && (0..8).any(|class| {
+                            pfc.is_paused(class) && !pfc.pause_parked[class].contains(&position)
+                        })
+                })
+            })
+        })
+    });
+    assert!(
+        window_parked_paused,
+        "some checkpoint must hold a window-parked pair while its host pauses a class (P16 D7)"
     );
 }
 

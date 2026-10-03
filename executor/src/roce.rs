@@ -34,7 +34,7 @@ const fn packet_cost(size_bytes: u64) -> u128 {
 /// controller's current rate covers the next packet, else `Blocked`. A pending tick with nothing
 /// left to send (an ACK moved `next_psn` to the end while it waited) will send nothing.
 pub(crate) fn armed_status(roce: &RoceGenerator) -> GeneratorStatus {
-    if roce.next_psn >= roce.pacer.total_bytes {
+    if roce.next_psn >= roce.pacer.total_bytes || window_bound(roce) {
         return GeneratorStatus::Blocked;
     }
     let tick =
@@ -49,6 +49,35 @@ pub(crate) fn armed_status(roce: &RoceGenerator) -> GeneratorStatus {
     } else {
         GeneratorStatus::Blocked
     }
+}
+
+/// Why a pacing tick parked without crediting, when it did: its data class was paused at its host
+/// (host-link PFC, Amendment 1, tested first) or its window was closed (ruling D7).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TickPark {
+    ClassPaused,
+    WindowBlocked,
+}
+
+/// P16 ruling D7: the queue pair's window at the controller's current rate, or `None` when the
+/// window is off: `window_bytes`, or with a variable window `max(1, floor(window_bytes * R_C /
+/// R_max))` (SimAI `GetWin`), computed exactly in `u128` (SimAI's `u64` product can wrap; this
+/// one cannot). It never exceeds `window_bytes`, since the controller keeps `R_C <= R_max`.
+pub(crate) fn window_bytes(roce: &RoceGenerator) -> Option<u64> {
+    if roce.window_bytes == 0 {
+        return None;
+    }
+    if !roce.variable_window {
+        return Some(roce.window_bytes);
+    }
+    let scaled = u128::from(roce.window_bytes) * u128::from(roce.controller.current_rate_bps)
+        / u128::from(roce.controller.config.maximum_rate_bps.max(1));
+    Some(u64::try_from(scaled).unwrap_or(u64::MAX).max(1))
+}
+
+/// P16 ruling D7: the window binds: `next_psn - snd_una >= w` (SimAI `IsWinBound`).
+pub(crate) fn window_bound(roce: &RoceGenerator) -> bool {
+    window_bytes(roce).is_some_and(|window| roce.next_psn.saturating_sub(roce.snd_una) >= window)
 }
 
 /// The status a queue pair holds after a transition that leaves its pacer as it is: `Finished`
@@ -294,6 +323,8 @@ pub struct RoceSenderRecord {
     pub kind: RoceSenderKind,
     /// A tick that found the queue pair's data class paused at its host (Amendment 1).
     pub class_paused: bool,
+    /// A tick that found the queue pair's window closed (P16 Amendment 6, ruling D7).
+    pub window_blocked: bool,
     /// The queue pair's data priority (Amendment 3).
     pub data_class: u8,
     pub mtu_bytes: u64,
@@ -301,6 +332,11 @@ pub struct RoceSenderRecord {
     pub pacing_interval_ns: u64,
     pub first_pacing_time_ns: u64,
     pub rto_ns: u64,
+    /// The window configuration (Amendment 6): `window_bytes` (0: none), `variable_window`, and
+    /// the controller's maximum rate, which scales a variable window.
+    pub window_bytes: u64,
+    pub variable_window: bool,
+    pub maximum_rate_bps: u64,
     /// The controller rate a tick credited, for a tick that credited one.
     pub rate_bps: Option<u64>,
     /// The ACK or NACK value of an `ack` or `nack` transition.
@@ -385,8 +421,81 @@ impl RoceTransitionRecord {
 
 #[cfg(test)]
 mod tests {
-    use super::{RoceReceiverAction, receive};
-    use crate::{FlowId, RoceNackMark, RoceReceiverState};
+    use super::{RoceReceiverAction, armed_status, receive, window_bound, window_bytes};
+    use crate::{FlowId, GeneratorStatus, RoceNackMark, RoceReceiverState};
+
+    /// A queue pair with a window, at controller rate `current` of `maximum`.
+    fn windowed(
+        window: u64,
+        variable_window: bool,
+        current: u64,
+        maximum: u64,
+    ) -> crate::RoceGenerator {
+        let config = crate::DcqcnControllerConfig {
+            initial_rate_bps: maximum,
+            minimum_rate_bps: 3,
+            maximum_rate_bps: maximum,
+            additive_rate_bps: 1,
+            hyper_rate_bps: 1,
+            g_q63: 1,
+            alpha_interval_ns: 1,
+            decrease_interval_ns: 1,
+            increase_interval_ns: 1,
+            fast_recovery_steps: 1,
+            clamp_target_rate: false,
+        };
+        let mut controller = crate::DcqcnController::pristine(config);
+        controller.current_rate_bps = current;
+        crate::RoceGenerator {
+            pacer: crate::RocePacer {
+                first_pacing_time_ns: 0,
+                pacing_interval_ns: 1,
+                mtu_bytes: 1_000,
+                total_bytes: 10_000,
+                credit_quanta: 0,
+            },
+            controller,
+            pacing_timer_payload: crate::PayloadId(0),
+            next_psn: 0,
+            snd_una: 0,
+            rto_deadline_ns: 0,
+            rto_ns: 0,
+            pacer_armed: true,
+            window_bytes: window,
+            variable_window,
+            window_parked: false,
+        }
+    }
+
+    #[test]
+    fn the_window_is_fixed_or_scaled_by_the_rate_floored_and_at_least_one() {
+        assert_eq!(window_bytes(&windowed(0, false, 5, 10)), None);
+        assert_eq!(window_bytes(&windowed(8_000, false, 5, 10)), Some(8_000));
+        assert_eq!(window_bytes(&windowed(8_000, true, 5, 10)), Some(4_000));
+        assert_eq!(window_bytes(&windowed(8_001, true, 1, 3)), Some(2_667));
+        assert_eq!(window_bytes(&windowed(7, true, 1, 100)), Some(1));
+        // 10^8 B at 4 x 10^11 b/s is a 4 x 10^19 product, past u64 (SimAI's u64 product wraps).
+        let maximum = 400_000_000_000;
+        assert_eq!(
+            window_bytes(&windowed(100_000_000, true, maximum - 1, maximum)),
+            Some(99_999_999)
+        );
+    }
+
+    #[test]
+    fn a_closed_window_predicts_blocked_whatever_the_credit() {
+        let mut roce = windowed(2_000, false, 10, 10);
+        roce.next_psn = 2_000;
+        roce.pacer.credit_quanta = u128::MAX / 2;
+        assert!(window_bound(&roce));
+        assert_eq!(armed_status(&roce), GeneratorStatus::Blocked);
+        roce.snd_una = 1_000;
+        assert!(!window_bound(&roce));
+        assert_eq!(armed_status(&roce), GeneratorStatus::Scheduled);
+        roce.window_bytes = 0;
+        roce.snd_una = 0;
+        assert!(!window_bound(&roce), "no window never binds");
+    }
 
     fn receiver(ack_every_packets: u64, duplicate_ack: bool) -> RoceReceiverState {
         RoceReceiverState {

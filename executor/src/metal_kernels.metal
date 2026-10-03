@@ -328,12 +328,16 @@ constant uint DR_CNP_SIZE = 3;
 // P15 lane R4: RoCE queue pairs (`evidence/P15/device-design.md` §1). A queue-pair generator row
 // (kind 4) shares DCQCN's pacer words 12..15 and 18..19 and its controller words 20..39, so the
 // controller helpers run on it unchanged; word 6 (`G_PAYLOAD`) is the stable pacing token.
-//   16 next PSN  17 cumulative acknowledgment  40 pacer armed  41 timeout deadline  42 timeout
+//   16 next PSN  17 cumulative acknowledgment  36 window bytes  37 variable window
+//   38 window-parked  40 pacer armed  41 timeout deadline  42 timeout
 // The flow's receiver row holds marker 4 and, at +1, the absolute `tcp_state` offset of its
 // record in the RoCE region; words 2..6 stay zero (the readback compaction reads 4..6).
 constant ulong GENERATOR_KIND_ROCE = 4;
 constant uint G_ROCE_NEXT_PSN = 16;
 constant uint G_ROCE_SND_UNA = 17;
+constant uint G_ROCE_WINDOW = 36;
+constant uint G_ROCE_VARIABLE_WINDOW = 37;
+constant uint G_ROCE_WINDOW_PARKED = 38;
 constant uint G_ROCE_PACER_ARMED = 40;
 constant uint G_ROCE_RTO_DEADLINE = 41;
 constant uint G_ROCE_RTO = 42;
@@ -4846,6 +4850,18 @@ inline ulong roce_packet_size(const device ulong *row, ulong psn) {
     return row[G_RATE_PACKET_SIZE] < remaining ? row[G_RATE_PACKET_SIZE] : remaining;
 }
 
+// `roce::window_bound` (P16 ruling D7): `next_psn - snd_una >= w`, with `w` the window or, when it
+// varies, `max(1, floor(window * R_C / R_max))` exactly. Callers test `window != 0` first, so a
+// queue pair without a window pays one zero test.
+inline bool roce_window_bound(const device ulong *row) {
+    ulong window = row[G_ROCE_WINDOW];
+    if (row[G_ROCE_VARIABLE_WINDOW] != 0) {
+        window = mul_div_u64(window, row[G_DCQCN_CURRENT_RATE], max(row[G_DCQCN_MAX_RATE], 1ul));
+        window = max(window, 1ul);
+    }
+    return row[G_ROCE_NEXT_PSN] - row[G_ROCE_SND_UNA] >= window;
+}
+
 // `settle_roce_sender`: the status (`roce::settled_status`) and the outstanding-byte mirrors.
 inline void roce_settle(device ulong *row, ulong parked_status) {
     ulong total = row[G_RATE_TOTAL];
@@ -4853,9 +4869,11 @@ inline void roce_settle(device ulong *row, ulong parked_status) {
     if (row[G_ROCE_SND_UNA] >= total) {
         status = 2;
     } else if (row[G_ROCE_PACER_ARMED] != 0) {
-        // `roce::armed_status`: Scheduled when one more tick of credit covers the next packet.
+        // `roce::armed_status`: Scheduled when one more tick of credit covers the next packet and
+        // the window, if any, is open.
         status = 1;
-        if (row[G_ROCE_NEXT_PSN] < total) {
+        if (row[G_ROCE_NEXT_PSN] < total &&
+            (row[G_ROCE_WINDOW] == 0 || !roce_window_bound(row))) {
             ulong tick_low;
             ulong tick_high;
             u128_from_mul_u64(
@@ -4884,6 +4902,8 @@ inline void roce_settle(device ulong *row, ulong parked_status) {
 // the pacer stays as it is; a restart beyond the stop time leaves it Stopped. False on overflow.
 inline bool roce_restart(device ulong *row, ulong now, ulong stop, thread ulong &tick) {
     tick = NONE;
+    // Every restart attempt ends a window park (ruling D7).
+    row[G_ROCE_WINDOW_PARKED] = 0;
     ulong total = row[G_RATE_TOTAL];
     if (row[G_ROCE_PACER_ARMED] != 0 || row[G_ROCE_NEXT_PSN] >= total ||
         row[G_ROCE_SND_UNA] >= total) {
@@ -4988,6 +5008,13 @@ inline bool roce_pacing_tick(
         pfc_priority_paused(
             pfc_row, pfc_flow_data_class(flow, params, scheduler_state), scheduler_state)) {
         // The pause-parked list is not stored: the RESUME scan and the readback derive it.
+        roce_settle(row, 1);
+        return true;
+    }
+    // P16 ruling D7: a closed window, at the rate as of the tick, parks the pacer without credit
+    // until feedback moves `snd_una`.
+    if (row[G_ROCE_WINDOW] != 0 && row[G_ROCE_NEXT_PSN] < total && roce_window_bound(row)) {
+        row[G_ROCE_WINDOW_PARKED] = 1;
         roce_settle(row, 1);
         return true;
     }
@@ -5389,7 +5416,9 @@ inline bool roce_data_arrival(
 // Specification: `validate::expected_pause_parked`, the validator's characterization of Scalar's
 // `HostPfcState::pause_parked`. The device stores no parked set (ruling D3); the scan applies that
 // function's conjuncts with `data class == priority` in place of `is_paused(class)`, because Scalar
-// takes the set after the last controller's resume has unpaused the class. After R3 merges, the
+// takes the set after the last controller's resume has unpaused the class. A window-parked pair
+// waits for feedback, not for the RESUME (P16 ruling D7), so the scan skips it as that function
+// does. After R3 merges, the
 // specification skips queue pairs of unreleased collective stages: devices refuse stages in P15,
 // and P16 must add the same skip here.
 inline bool roce_resume_parked(
@@ -5417,8 +5446,9 @@ inline bool roce_resume_parked(
         device ulong *generator = generators + flow * GENERATOR_WORDS;
         ulong total = generator[G_RATE_TOTAL];
         if (pfc_flow_data_class(flow, params, scheduler_state) != priority ||
-            generator[G_ROCE_PACER_ARMED] != 0 || generator[G_STATUS] == 3 ||
-            generator[G_ROCE_NEXT_PSN] >= total || generator[G_ROCE_SND_UNA] >= total) {
+            generator[G_ROCE_PACER_ARMED] != 0 || generator[G_ROCE_WINDOW_PARKED] != 0 ||
+            generator[G_STATUS] == 3 || generator[G_ROCE_NEXT_PSN] >= total ||
+            generator[G_ROCE_SND_UNA] >= total) {
             continue;
         }
         // A phase-0 transition: the controller's due instants before the RESUME apply first.

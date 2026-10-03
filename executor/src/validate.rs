@@ -1382,7 +1382,8 @@ fn host_class_paused(image: &SimulationImage, owner: NodeId, priority: u8) -> bo
 
 /// The queue pairs a host's parked list must hold, by class: each queue pair whose data class is
 /// paused there and whose pacer a paused tick parked with packets left to send (parked, not
-/// stopped, `next_psn < total` and `snd_una < total`; LeanGuard's restartable parked pairs).
+/// window-parked, not stopped, `next_psn < total` and `snd_una < total`; LeanGuard's restartable
+/// parked pairs). A window-parked pair (P16 ruling D7) waits for feedback, not for the RESUME.
 pub(crate) fn expected_pause_parked(
     image: &SimulationImage,
     state: &crate::HostState,
@@ -1403,6 +1404,7 @@ pub(crate) fn expected_pause_parked(
         let class = usize::from(flow.priority);
         if pfc.is_paused(class)
             && !roce.pacer_armed
+            && !roce.window_parked
             && generator.next_emission.status != GeneratorStatus::Stopped
             && roce.next_psn < roce.pacer.total_bytes
             && roce.snd_una < roce.pacer.total_bytes
@@ -1451,6 +1453,7 @@ fn validate_unreleased_roce_stage(
         || roce.rto_deadline_ns != 0
         || roce.pacer.credit_quanta != 0
         || roce.pacer_armed
+        || roce.window_parked
         || generator.next_emission.status != GeneratorStatus::Blocked
         || generator.next_emission.departure_time_ns != 0
         || roce.pacer.first_pacing_time_ns != 0
@@ -1538,6 +1541,23 @@ fn validate_roce_generator(
             roce.snd_una, pacer.total_bytes
         )));
     }
+    // Window (P16 ruling D7): a variable window scales a window; a window park is a Blocked,
+    // parked pacer with packets left and bytes in flight (a tick found `next_psn - snd_una >= w
+    // >= 1`, and only stale feedback has run since: any other restart attempt clears it).
+    if roce.variable_window && roce.window_bytes == 0 {
+        return Err(invalid("has a variable window without a window"));
+    }
+    if roce.window_parked
+        && (roce.window_bytes == 0
+            || roce.pacer_armed
+            || status != GeneratorStatus::Blocked
+            || roce.next_psn >= pacer.total_bytes
+            || roce.next_psn <= roce.snd_una)
+    {
+        return Err(invalid(
+            "is window-parked without a window, a parked Blocked pacer, or bytes in flight",
+        ));
+    }
     // Token: a zero-byte pacing token of this flow, the generator's scheduled payload. The
     // controller owns no token and no event (P16 ruling D2).
     let resident = packet(image, roce.pacing_timer_payload)
@@ -1580,7 +1600,7 @@ fn validate_roce_generator(
                 )
                 .ok_or_else(|| invalid("pacing credit exceeds u128"))?;
             let cost = u128::from(size) * 8 * 1_000_000_000;
-            let expected = if credit >= cost {
+            let expected = if credit >= cost && !crate::roce::window_bound(&roce) {
                 GeneratorStatus::Scheduled
             } else {
                 GeneratorStatus::Blocked
@@ -1599,11 +1619,12 @@ fn validate_roce_generator(
             return Err(invalid("parked pacer is Scheduled"));
         }
         // A pacer parks with packets left to send only while its data class is paused at its
-        // host (host-link PFC); `validate_pfc` pins it in the host's parked list. An unreleased
-        // stage is parked before its first tick.
+        // host (host-link PFC; `validate_pfc` pins it in the host's parked list) or its window is
+        // closed (P16 ruling D7). An unreleased stage is parked before its first tick.
         if status == GeneratorStatus::Blocked
             && roce.next_psn < pacer.total_bytes
             && !unreleased
+            && !roce.window_parked
             && !host_class_paused(image, owner, flow.priority)
         {
             return Err(invalid("parked pacer has packets left to send"));

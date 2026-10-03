@@ -2939,7 +2939,7 @@ impl<'image> TransitionState<'image> {
                     node.id,
                     flow,
                     crate::RoceSenderKind::Resume,
-                    false,
+                    None,
                     image_flow_priority(image, flow)?,
                     &roce,
                     None,
@@ -4195,7 +4195,34 @@ impl<'image> TransitionState<'image> {
                         node.id,
                         packet.flow,
                         crate::RoceSenderKind::Tick,
-                        true,
+                        Some(crate::roce::TickPark::ClassPaused),
+                        class,
+                        &roce,
+                        None,
+                        None,
+                        None,
+                        before,
+                        crate::roce::RoceSenderView::of(generator, &roce),
+                    )
+                });
+                break 'tick (None, None, None, dcqcn_transition, record);
+            }
+            // P16 ruling D7: a tick that finds the window closed, at the rate as of the tick,
+            // sends nothing, adds no credit and parks until feedback moves `snd_una`. Without a
+            // window this is one zero test.
+            if roce.window_bytes != 0 && roce.next_psn < total && crate::roce::window_bound(&roce) {
+                roce.window_parked = true;
+                let class = image_flow_priority(image, packet.flow)?;
+                let generator = &mut state.generators[position];
+                settle_roce_sender(generator, &roce, GeneratorStatus::Blocked);
+                generator.kind = FlowGeneratorKind::Roce(roce);
+                let record = before.map(|before| {
+                    roce_sender_record(
+                        event.key,
+                        node.id,
+                        packet.flow,
+                        crate::RoceSenderKind::Tick,
+                        Some(crate::roce::TickPark::WindowBlocked),
                         class,
                         &roce,
                         None,
@@ -4285,7 +4312,7 @@ impl<'image> TransitionState<'image> {
                     node.id,
                     packet.flow,
                     crate::RoceSenderKind::Tick,
-                    false,
+                    None,
                     image_flow_priority(image, packet.flow)?,
                     &roce,
                     rate_bps,
@@ -4499,7 +4526,7 @@ impl<'image> TransitionState<'image> {
                     } else {
                         crate::RoceSenderKind::Ack
                     },
-                    false,
+                    None,
                     data_class,
                     &roce,
                     None,
@@ -4654,7 +4681,7 @@ impl<'image> TransitionState<'image> {
                     node.id,
                     flow,
                     crate::RoceSenderKind::Timeout,
-                    false,
+                    None,
                     data_class,
                     &roce,
                     None,
@@ -6804,6 +6831,9 @@ fn restart_roce_pacer(
     now_ns: u64,
     stop_time_ns: u64,
 ) -> Result<Option<u64>, ExecutionError> {
+    // Every restart attempt ends a window park (ruling D7): it runs only for an ACK or NACK that
+    // moves `snd_una` and for a timeout, whatever it then finds.
+    roce.window_parked = false;
     if roce.pacer_armed
         || roce.next_psn >= roce.pacer.total_bytes
         || roce.snd_una >= roce.pacer.total_bytes
@@ -6887,7 +6917,7 @@ fn roce_sender_record(
     node: NodeId,
     flow: FlowId,
     kind: crate::RoceSenderKind,
-    class_paused: bool,
+    park: Option<crate::roce::TickPark>,
     data_class: u8,
     roce: &crate::RoceGenerator,
     rate_bps: Option<u64>,
@@ -6902,13 +6932,17 @@ fn roce_sender_record(
             node,
             flow,
             kind,
-            class_paused,
+            class_paused: park == Some(crate::roce::TickPark::ClassPaused),
+            window_blocked: park == Some(crate::roce::TickPark::WindowBlocked),
             data_class,
             mtu_bytes: roce.pacer.mtu_bytes,
             total_bytes: roce.pacer.total_bytes,
             pacing_interval_ns: roce.pacer.pacing_interval_ns,
             first_pacing_time_ns: roce.pacer.first_pacing_time_ns,
             rto_ns: roce.rto_ns,
+            window_bytes: roce.window_bytes,
+            variable_window: roce.variable_window,
+            maximum_rate_bps: roce.controller.config.maximum_rate_bps,
             rate_bps,
             input_acknowledgment: input.map(|header| header.acknowledgment),
             input_ce_echo: input.map(|header| header.ce_echo),

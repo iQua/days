@@ -221,6 +221,10 @@ struct SourceRoce {
     feedback_priority: Option<u8>,
     duplicate_ack: Option<bool>,
     ack_size_bytes: Option<u64>,
+    /// P16 ruling D7: the window in bytes (SimAI `m_win`); 0 (the default) is no window.
+    window_bytes: Option<u64>,
+    /// P16 ruling D7: scale the window with the controller's rate (SimAI `m_var_win`).
+    variable_window: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -323,6 +327,8 @@ struct RoceTrafficKey {
     nack_interval_ns: u64,
     duplicate_ack: bool,
     ack_size_bytes: u64,
+    window_bytes: u64,
+    variable_window: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1896,6 +1902,14 @@ fn validate_traffic(
                         .to_owned(),
                 ));
             }
+            let window_bytes = roce.window_bytes.unwrap_or(0);
+            let variable_window = roce.variable_window.unwrap_or(false);
+            if variable_window && window_bytes == 0 {
+                return Err(CompileError::Invalid(
+                    "RoCE `variable_window = true` needs a window: set `window_bytes` above 0"
+                        .to_owned(),
+                ));
+            }
             let key = RoceTrafficKey {
                 dcqcn: controller,
                 retransmit_timeout_ns,
@@ -1903,6 +1917,8 @@ fn validate_traffic(
                 nack_interval_ns: roce.nack_interval_ns.unwrap_or(500_000),
                 duplicate_ack,
                 ack_size_bytes,
+                window_bytes,
+                variable_window,
             };
             let ordinal = roce_keys
                 .iter()
@@ -3080,6 +3096,9 @@ fn lower(
                                 rto_deadline_ns: 0,
                                 rto_ns: roce.retransmit_timeout_ns,
                                 pacer_armed: !gated_roce,
+                                window_bytes: roce.window_bytes,
+                                variable_window: roce.variable_window,
+                                window_parked: false,
                             })
                         }
                     }
@@ -4315,6 +4334,13 @@ fn mix_traffic_seed(mut state: u64, traffic: &TrafficKey, roce_keys: &[RoceTraff
                 roce.ack_size_bytes,
             ]) {
                 state = mix_seed(state ^ value);
+            }
+            // A window joins the key's content only when it is on, so queue pairs without one
+            // keep the seeds and routes they had before windows existed (P16 ruling D7).
+            if roce.window_bytes != 0 {
+                for value in [roce.window_bytes, u64::from(roce.variable_window)] {
+                    state = mix_seed(state ^ value);
+                }
             }
             state
         }

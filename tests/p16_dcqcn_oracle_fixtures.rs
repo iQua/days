@@ -22,7 +22,7 @@ use oracle::{EagerDcqcn, rate_state_matches};
 
 /// Every DCQCN and queue-pair fixture of `configs/p14`, `configs/p15` and `configs/p16`, except
 /// the 64-pair HPCC incast, which the release-only test below covers.
-const FIXTURES: [&str; 28] = [
+const FIXTURES: [&str; 29] = [
     "p14/dcqcn_10s_zero_xoff.toml",
     "p14/dcqcn_1s_zero_xoff.toml",
     "p14/dcqcn_2s_zero_xoff.toml",
@@ -51,6 +51,7 @@ const FIXTURES: [&str; 28] = [
     "p15/roce_timeout.toml",
     "p16/dcqcn_mlx_coincident.toml",
     "p16/dcqcn_mlx_coincident_qp.toml",
+    "p16/dcqcn_mlx_window.toml",
 ];
 
 #[derive(Debug, Default)]

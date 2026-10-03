@@ -5,9 +5,10 @@
 //! The word layout is mirrored by `cuda_kernels.cu` and `metal_kernels.metal`.
 //!
 //! **Generator row (kind [`GENERATOR_KIND_DCQCN`]).** Words 12..19 keep the T25 rate layout. The
-//! controller follows at [`G_DCQCN_MIN_RATE`]..=[`G_DCQCN_CONTROL_PAYLOAD`]. Immutable image data
-//! that no transition reads (the initial rate and the CNP size) stays host-side: readback starts
-//! from the image, so those fields are carried through unchanged.
+//! Mellanox-form controller follows at [`G_DCQCN_MIN_RATE`]..=[`G_DCQCN_STATE`]; words 36..39 are
+//! zero in a DCQCN row (a queue pair's row holds its window there). Immutable image data that no
+//! transition reads (the initial rate and the CNP size) stays host-side: readback starts from the
+//! image, so those fields are carried through unchanged.
 //!
 //! **Receiver row.** A DCQCN flow's notification-point state occupies that flow's receiver row in
 //! the transport plane, the row a TCP flow uses for its cumulative-ACK receiver. Validation makes
@@ -220,14 +221,15 @@ impl PlainKernelRefusal {
 /// 3. a receiver region exists and a flow's receiver row carries a DCQCN marker (2 or 3; the check
 ///    mirrors the kernel's guard, `marker >= 2`);
 /// 4. a live record in the fallback heap, a channel or generator stream, a queue, or `in_service`
-///    has packet kind 4 (PFC), 5 (CNP) or 6 (DCQCN control timer).
+///    has packet kind 4 (PFC) or 5 (CNP). (Kind 6, the paper-form DCQCN control timer, is gone
+///    since P16: the Mellanox-form controller has no events.)
 ///
 /// **Why these four are sufficient for the whole run.** They are exactly the states under which a
 /// `MECHANISMS`-guarded branch of the kernel is taken: `pfc_row` and `paused_mask` come only from
 /// the PFC region; `dcqcn_pacing_timer` needs `G_KIND == 3`; `dcqcn_data_arrival` needs a receiver
-/// marker of at least 2; `pfc_frame_arrival`, `dcqcn_cnp_arrival` and `dcqcn_control_timer` need
-/// packet kinds 4, 5 and 6. None of these states can arise during a plain run: the only emitters of
-/// kinds 4-6 are `emit_pfc_frame` and the DCQCN transitions, all compiled out; the markers 2 and 3
+/// marker of at least 2; `pfc_frame_arrival` and `dcqcn_cnp_arrival` need packet kinds 4 and 5.
+/// None of these states can arise during a plain run: the only emitters of kinds 4 and 5 are
+/// `emit_pfc_frame` and the DCQCN transitions, all compiled out; the markers 2 and 3
 /// are written only by `dcqcn_data_arrival` (compiled out) or by the image; and no plain transition
 /// writes `G_KIND` or the PFC offset. So their absence at upload holds for the whole run.
 ///
@@ -499,8 +501,8 @@ fn encode_dcqcn_controller(controller: &crate::DcqcnController, row: &mut [u64])
     row[36..40].fill(0);
 }
 
-/// The controller words no device transition writes: configuration and the unused tail.
-const CONTROLLER_IMMUTABLE: [usize; 13] = [
+/// The controller words no device transition writes: its configuration.
+const CONTROLLER_IMMUTABLE: [usize; 9] = [
     G_DCQCN_MIN_RATE,
     G_DCQCN_MAX_RATE,
     G_DCQCN_ADDITIVE_RATE,
@@ -510,11 +512,11 @@ const CONTROLLER_IMMUTABLE: [usize; 13] = [
     G_DCQCN_DECREASE_INTERVAL,
     G_DCQCN_INCREASE_INTERVAL,
     G_DCQCN_STEPS_CLAMP,
-    36,
-    37,
-    38,
-    39,
 ];
+
+/// The words after the controller that a DCQCN row leaves zero (a queue pair's row holds its
+/// window in 36..38 and leaves 39 zero).
+const DCQCN_ZERO_TAIL: [usize; 4] = [36, 37, 38, 39];
 
 /// Restores the mutable controller words of a DCQCN or RoCE row; the caller checks the
 /// immutable ones.
@@ -584,6 +586,7 @@ pub(crate) fn decode_dcqcn_generator(
         || immutable
             .iter()
             .chain(&CONTROLLER_IMMUTABLE)
+            .chain(&DCQCN_ZERO_TAIL)
             .any(|&word| row[word] != expected[word])
     {
         return Err("DCQCN generator row changed immutable configuration");
@@ -598,11 +601,15 @@ pub(crate) fn decode_dcqcn_generator(
 }
 
 // RoCE queue-pair generator row (P15, `evidence/P15/device-design.md` §1.1). Words 12..15 are the
-// pacer's grid anchor, interval, MTU and total; 18..19 its credit; 20..39 the DCQCN controller,
-// shared with DCQCN rows so the kernel's controller helpers run unchanged. Word 6 (`G_PAYLOAD`)
+// pacer's grid anchor, interval, MTU and total; 18..19 its credit; 20..35 the DCQCN controller,
+// shared with DCQCN rows so the kernel's controller helpers run unchanged; 36..38 the window (P16
+// ruling D7: its size and variable flag, immutable, and the window-park bit). Word 6 (`G_PAYLOAD`)
 // is always the pacing token: validation pins `next_emission.payload` to it.
 pub(crate) const G_ROCE_NEXT_PSN: usize = 16;
 pub(crate) const G_ROCE_SND_UNA: usize = 17;
+pub(crate) const G_ROCE_WINDOW: usize = 36;
+pub(crate) const G_ROCE_VARIABLE_WINDOW: usize = 37;
+pub(crate) const G_ROCE_WINDOW_PARKED: usize = 38;
 pub(crate) const G_ROCE_PACER_ARMED: usize = 40;
 pub(crate) const G_ROCE_RTO_DEADLINE: usize = 41;
 pub(crate) const G_ROCE_RTO: usize = 42;
@@ -620,6 +627,9 @@ pub(crate) fn encode_roce_generator(roce: &crate::RoceGenerator, row: &mut [u64]
     row[G_RATE_CREDIT_LOW] = pacer.credit_quanta as u64;
     row[G_RATE_CREDIT_HIGH] = (pacer.credit_quanta >> 64) as u64;
     encode_dcqcn_controller(&roce.controller, row);
+    row[G_ROCE_WINDOW] = roce.window_bytes;
+    row[G_ROCE_VARIABLE_WINDOW] = u64::from(roce.variable_window);
+    row[G_ROCE_WINDOW_PARKED] = u64::from(roce.window_parked);
     row[G_ROCE_PACER_ARMED] = u64::from(roce.pacer_armed);
     row[G_ROCE_RTO_DEADLINE] = roce.rto_deadline_ns;
     row[G_ROCE_RTO] = roce.rto_ns;
@@ -640,6 +650,9 @@ pub(crate) fn decode_roce_generator(
         G_RATE_PACKET_SIZE,
         G_RATE_TOTAL,
         G_ROCE_RTO,
+        G_ROCE_WINDOW,
+        G_ROCE_VARIABLE_WINDOW,
+        39,
     ];
     if row[11] != GENERATOR_KIND_ROCE
         || row[6] != roce.pacing_timer_payload.0
@@ -658,6 +671,7 @@ pub(crate) fn decode_roce_generator(
     roce.pacer.credit_quanta =
         u128::from(row[G_RATE_CREDIT_LOW]) | (u128::from(row[G_RATE_CREDIT_HIGH]) << 64);
     roce.pacer_armed = flag_word(row[G_ROCE_PACER_ARMED])?;
+    roce.window_parked = flag_word(row[G_ROCE_WINDOW_PARKED])?;
     roce.rto_deadline_ns = row[G_ROCE_RTO_DEADLINE];
     Ok(())
 }
@@ -1606,6 +1620,9 @@ mod tests {
                 ("ulong ROCE_RECEIVER_MARKER", ROCE_RECEIVER_MARKER as usize),
                 ("uint G_ROCE_NEXT_PSN", G_ROCE_NEXT_PSN),
                 ("uint G_ROCE_SND_UNA", G_ROCE_SND_UNA),
+                ("uint G_ROCE_WINDOW", G_ROCE_WINDOW),
+                ("uint G_ROCE_VARIABLE_WINDOW", G_ROCE_VARIABLE_WINDOW),
+                ("uint G_ROCE_WINDOW_PARKED", G_ROCE_WINDOW_PARKED),
                 ("uint G_ROCE_PACER_ARMED", G_ROCE_PACER_ARMED),
                 ("uint G_ROCE_RTO_DEADLINE", G_ROCE_RTO_DEADLINE),
                 ("uint G_ROCE_RTO", G_ROCE_RTO),
@@ -1698,12 +1715,19 @@ mod tests {
             rto_deadline_ns: 99,
             rto_ns: 50,
             pacer_armed: true,
+            window_bytes: 8_000,
+            variable_window: true,
+            window_parked: false,
         }
     }
 
     #[test]
     fn roce_generator_rows_round_trip_every_mutable_word() {
-        let original = roce_generator();
+        let original = crate::RoceGenerator {
+            pacer_armed: false,
+            window_parked: true,
+            ..roce_generator()
+        };
         let mut row = [0_u64; 43];
         row[6] = original.pacing_timer_payload.0;
         encode_roce_generator(&original, &mut row);
@@ -1712,7 +1736,8 @@ mod tests {
         decoded.next_psn = 0;
         decoded.snd_una = 0;
         decoded.pacer.credit_quanta = 0;
-        decoded.pacer_armed = false;
+        decoded.pacer_armed = true;
+        decoded.window_parked = false;
         decoded.rto_deadline_ns = 0;
         decoded.controller = crate::DcqcnController::pristine(original.controller.config);
         decode_roce_generator(&row, &mut decoded).expect("row must decode");
@@ -1721,6 +1746,8 @@ mod tests {
         for (word, value) in [
             (G_RATE_TOTAL, 181),
             (G_ROCE_RTO, 51),
+            (G_ROCE_WINDOW, 8_001),
+            (G_ROCE_VARIABLE_WINDOW, 0),
             (G_DCQCN_G, 5),
             (6, 24),
         ] {
@@ -1731,9 +1758,14 @@ mod tests {
                 "immutable word {word}"
             );
         }
-        let mut changed = row;
-        changed[G_ROCE_PACER_ARMED] = 2;
-        assert!(decode_roce_generator(&changed, &mut decoded).is_err());
+        for word in [G_ROCE_PACER_ARMED, G_ROCE_WINDOW_PARKED] {
+            let mut changed = row;
+            changed[word] = 2;
+            assert!(
+                decode_roce_generator(&changed, &mut decoded).is_err(),
+                "flag word {word}"
+            );
+        }
     }
 
     #[test]
