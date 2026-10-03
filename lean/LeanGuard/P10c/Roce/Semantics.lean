@@ -172,6 +172,9 @@ structure SenderConfig where
   /-- The controller's maximum rate, which scales a variable window; `0` when the log does not
   carry it (a log without the window columns, which has no window). -/
   maximumRateBps : Nat := 0
+  /-- The controller's configured initial rate, the pair's rate while its controller is pristine
+  (fix round 1, review F3); `none` in a log without the column. -/
+  initialRateBps : Option Nat := none
   deriving DecidableEq, Repr
 
 /--

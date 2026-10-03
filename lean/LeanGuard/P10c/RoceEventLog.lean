@@ -305,6 +305,10 @@ def parseSenderRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array
   let maximumRateBps ←
     if idx.contains "maximum_rate_bps" then parseU64 (← getField idx fields "maximum_rate_bps")
     else pure 0
+  let initialRateBps ←
+    if idx.contains "initial_rate_bps" then
+      some <$> parseU64 (← getField idx fields "initial_rate_bps")
+    else pure none
   let dataClass ←
     if idx.contains "data_class" then do
       let value ← parseNat (← getField idx fields "data_class")
@@ -337,7 +341,8 @@ def parseSenderRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array
           rtoNs := ← parseU64 (← getField idx fields "rto_ns")
           windowBytes := windowBytes
           variableWindow := variableWindow
-          maximumRateBps := maximumRateBps }
+          maximumRateBps := maximumRateBps
+          initialRateBps := initialRateBps }
       rateBps := ← parseOptU64 (← getField idx fields "rate_bps")
       inputAcknowledgment := ← parseOptU64 (← getField idx fields "input_acknowledgment")
       inputCeEcho := ← parseOpt parseBit (← getField idx fields "input_ce_echo")
@@ -604,6 +609,8 @@ def checkControllerJoin (row : SenderRow) (controllerRow : Option DcqcnEventLog.
       atD (row.config.maximumRateBps = 0 ||
           d.config.maximumRateBps = row.config.maximumRateBps)
         s!"DCQCN maximum rate differs from the queue pair's maximum_rate_bps (node_id={d.nodeId}, flow_id={d.flowId})"
+      atD (row.config.initialRateBps.all (· = d.config.initialRateBps))
+        s!"DCQCN initial rate differs from the queue pair's initial_rate_bps (node_id={d.nodeId}, flow_id={d.flowId})"
       if let some c := controller then
         atD (d.before = c)
           s!"DCQCN row does not continue the queue pair's controller (node_id={d.nodeId}, flow_id={d.flowId})"
@@ -683,6 +690,12 @@ def checkSenderItem (stopTimeNs : Option Nat) (track : SenderTrack) (row : Sende
         pure (some revealed)
     | known, _ => pure known
   let rate := knownRate.getD 0
+  -- Fix round 1 (review F3): while the pair's controller is pristine (no DCQCN row yet), its rate
+  -- is the configured initial rate, which the log carries; a pair that never sees an echo has no
+  -- DCQCN row, so this is what ties its credited rate to its configuration.
+  if controller.isNone then
+    at_ (row.config.initialRateBps.all (fun initial => knownRate.all (· = initial)))
+      s!"RoCE rate of a pair whose controller is pristine is not its initial_rate_bps (node_id={row.nodeId}, flow_id={row.flowId})"
   -- A tick credits at the controller's rate as of the tick: `materialize(controller, time + 1)`.
   at_ (row.rateBps.all (· = rate)) "RoCE tick rate differs from the DCQCN controller's current rate"
   -- Ruling D7: after the PFC test, a tick with a packet to send parks exactly when the window,

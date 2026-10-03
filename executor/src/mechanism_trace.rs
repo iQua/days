@@ -357,6 +357,37 @@ fn optional_flow(flow: Option<FlowId>) -> String {
     flow.map_or_else(String::new, |flow| flow.0.to_string())
 }
 
+/// The CNP arrivals at DCQCN reaction points, one row per arrival in `(time, flow, payload)`
+/// order (P16 D1 fix round 1: the LeanGuard CNP join for unreliable flows, `p10c_dcqcn_check
+/// trace`). Built from a full-observation result's arrival and packet planes: every arrival with
+/// disposition `Feedback` of a `DcqcnCnp` packet, which the source host consumes whether or not
+/// its controller is frozen. Columns: `time_ns,flow_id,payload`.
+pub fn dcqcn_cnp_arrivals_csv(
+    arrivals: &[crate::PacketArrivalObservation],
+    packets: &[crate::PacketDescriptor],
+) -> String {
+    let cnp_flows = packets
+        .iter()
+        .filter(|packet| matches!(packet.kind, crate::PacketKind::DcqcnCnp(_)))
+        .map(|packet| (packet.id, packet.flow))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut rows = arrivals
+        .iter()
+        .filter(|arrival| arrival.disposition == crate::ArrivalDisposition::Feedback)
+        .filter_map(|arrival| {
+            cnp_flows
+                .get(&arrival.payload)
+                .map(|flow| (arrival.time_ns, flow.0, arrival.payload.0))
+        })
+        .collect::<Vec<_>>();
+    rows.sort_unstable();
+    let mut csv = String::from("time_ns,flow_id,payload\n");
+    for (time_ns, flow, payload) in rows {
+        writeln!(csv, "{time_ns},{flow},{payload}").expect("writing to String cannot fail");
+    }
+    csv
+}
+
 /// The Mellanox-form DCQCN controller transitions, one row per (event, flow) in `EventKey` order
 /// (pinned schema `days-gpu/plans/briefs/p16/dcqcn-schema.md`). One event yields at most one row
 /// per flow; a host RESUME can yield one `advance` row per queue pair it restarts.
@@ -468,13 +499,13 @@ pub fn roce_sender_transitions_csv(
         });
     }
     let mut csv = String::from(
-        "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,kind,class_paused,window_blocked,data_class,mtu_bytes,total_bytes,pacing_interval_ns,first_pacing_time_ns,rto_ns,window_bytes,variable_window,maximum_rate_bps,rate_bps,input_acknowledgment,input_ce_echo,emitted,emitted_psn,emitted_bytes,emitted_retransmission,emitted_payload,before_next_psn,before_snd_una,before_bytes_emitted,before_packets_emitted,before_credit_quanta,before_rto_deadline_ns,before_pacer,before_next_tick_ns,before_status,after_next_psn,after_snd_una,after_bytes_emitted,after_packets_emitted,after_credit_quanta,after_rto_deadline_ns,after_pacer,after_next_tick_ns,after_status\n",
+        "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,kind,class_paused,window_blocked,data_class,mtu_bytes,total_bytes,pacing_interval_ns,first_pacing_time_ns,rto_ns,window_bytes,variable_window,maximum_rate_bps,initial_rate_bps,rate_bps,input_acknowledgment,input_ce_echo,emitted,emitted_psn,emitted_bytes,emitted_retransmission,emitted_payload,before_next_psn,before_snd_una,before_bytes_emitted,before_packets_emitted,before_credit_quanta,before_rto_deadline_ns,before_pacer,before_next_tick_ns,before_status,after_next_psn,after_snd_una,after_bytes_emitted,after_packets_emitted,after_credit_quanta,after_rto_deadline_ns,after_pacer,after_next_tick_ns,after_status\n",
     );
     for record in records {
         let emitted = record.emitted;
         write!(
             csv,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             record.key.time_ns,
             record.key.phase,
             record.key.origin_node.0,
@@ -493,6 +524,7 @@ pub fn roce_sender_transitions_csv(
             record.window_bytes,
             bit(record.variable_window),
             record.maximum_rate_bps,
+            record.initial_rate_bps,
             optional_u64(record.rate_bps),
             optional_u64(record.input_acknowledgment),
             optional_bit(record.input_ce_echo),

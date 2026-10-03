@@ -6943,6 +6943,7 @@ fn roce_sender_record(
             window_bytes: roce.window_bytes,
             variable_window: roce.variable_window,
             maximum_rate_bps: roce.controller.config.maximum_rate_bps,
+            initial_rate_bps: roce.controller.config.initial_rate_bps,
             rate_bps,
             input_acknowledgment: input.map(|header| header.acknowledgment),
             input_ce_echo: input.map(|header| header.ce_echo),

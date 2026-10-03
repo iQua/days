@@ -192,4 +192,88 @@ def checkRows (rows : List Row) : Except String Unit := do
     checkRow row
     sources := sources.insert source { config := row.config, after := row.after, frozen := row.frozen }
 
+/-! ## The CNP join for unreliable flows (P16 D1 fix round 1)
+
+`dcqcn_cnp_arrivals_csv` lists every CNP the executor delivered to a reaction point
+(`time_ns,flow_id,payload`). An unreliable flow (one with `tick` rows, ruling D17) applies a CNP
+that arrives at or before its freeze, the `frozen` row of its finishing or stopping tick: a CNP is a
+phase-0 arrival, so at the freezing tick's own instant it still applies. Each such CNP is exactly
+one `feedback` row of its flow at its time, and every `feedback` row of an unreliable flow is one
+such CNP. A CNP after the freeze is ignored (ruling D11); the row checks above already reject any
+row after a freeze. Queue pairs get no CNP (ruling D4): their feedback is the ECN echo, joined by
+the RoCE checker. -/
+
+structure CnpArrival where
+  timeNs : Nat
+  flowId : Nat
+  payload : Nat
+  srcLine : Nat
+  deriving Repr
+
+def parseCnpCsv (content : String) : Except String (List CnpArrival) := do
+  let lines :=
+    content.splitOn "\n" |>.map stripCR |>.map String.trim |>.filter (· != "")
+  match lines with
+  | [] => throw "empty CNP arrivals CSV"
+  | header :: data =>
+      let idx := mkIndex (splitCsvLine header)
+      let rec go (lineNo : Nat) (remaining : List String) (rows : List CnpArrival) := do
+        match remaining with
+        | [] => pure rows.reverse
+        | line :: rest =>
+            let fields := (splitCsvLine line).toArray
+            let row : Except String CnpArrival := do
+              pure
+                { timeNs := ← parseU64 (← getField idx fields "time_ns")
+                  flowId := ← parseU64 (← getField idx fields "flow_id")
+                  payload := ← parseU64 (← getField idx fields "payload")
+                  srcLine := lineNo }
+            match row with
+            | .ok row => go (lineNo + 1) rest (row :: rows)
+            | .error error => throw s!"line {lineNo}: {error}"
+      go 2 data []
+
+/-- `(time, flow, payload)` order, strictly increasing (a payload arrives once). -/
+def checkCnpOrder : List CnpArrival → Except String Unit
+  | [] | [_] => pure ()
+  | first :: second :: rest => do
+      let lt := first.timeNs < second.timeNs ||
+        (first.timeNs = second.timeNs && (first.flowId < second.flowId ||
+          (first.flowId = second.flowId && first.payload < second.payload)))
+      require second.srcLine lt "duplicate or backward (time, flow, payload)"
+      checkCnpOrder (second :: rest)
+
+def inRole {α : Type} (role : String) (result : Except String α) : Except String α :=
+  match result with
+  | .ok value => pure value
+  | .error error => throw s!"{role}: {error}"
+
+def checkCnpJoin (rows : List Row) (cnps : List CnpArrival) : Except String Unit := do
+  inRole "cnp" (checkCnpOrder cnps)
+  let mut unreliable : Std.HashSet Nat := ∅
+  let mut freeze : Std.HashMap Nat Nat := ∅
+  for row in rows do
+    if row.kind = .tick then unreliable := unreliable.insert row.flowId
+    if row.frozen then freeze := freeze.insert row.flowId row.key.timeNs
+  -- The unreliable flows' feedback rows, as a multiset over (time, flow).
+  let mut feedback : Std.HashMap (Nat × Nat) Nat := ∅
+  for row in rows do
+    if row.kind = .feedback && unreliable.contains row.flowId then
+      let key := (row.key.timeNs, row.flowId)
+      feedback := feedback.insert key (feedback.getD key 0 + 1)
+  for cnp in cnps do
+    if !unreliable.contains cnp.flowId then
+      throw s!"cnp: line {cnp.srcLine}: CNP arrival for flow {cnp.flowId}, which has no DCQCN tick rows (not an unreliable DCQCN flow)"
+    let live := (freeze.get? cnp.flowId).all (cnp.timeNs ≤ ·)
+    if live then
+      let key := (cnp.timeNs, cnp.flowId)
+      match feedback.getD key 0 with
+      | 0 =>
+          throw s!"cnp: line {cnp.srcLine}: CNP arrival at {cnp.timeNs} before the freeze of flow {cnp.flowId} has no DCQCN feedback row"
+      | count + 1 => feedback := feedback.insert key count
+  for row in rows do
+    if row.kind = .feedback && unreliable.contains row.flowId &&
+        feedback.getD (row.key.timeNs, row.flowId) 0 > 0 then
+      throw s!"dcqcn: line {row.srcLine}: DCQCN feedback row of unreliable flow {row.flowId} with no CNP arrival at its time"
+
 end LeanGuard.P10c.DcqcnEventLog

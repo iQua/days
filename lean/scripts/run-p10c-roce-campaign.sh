@@ -734,6 +734,40 @@ mutate_amended "paused-tick-lost" "$paused" "$paused_dcqcn" "$paused_pfc" "$paus
   'NR == 4 { for (i = 23; i <= 31; i++) before[i] = $i; next } NR == 6 { for (i = 23; i <= 31; i++) $i = before[i] } { print }' \
   'REJECT: sender: line 5: pending RoCE pacing tick at 2000 did not fire before this row (node_id=1, flow_id=3)'
 
+# --- Fix round 1 (review F3): a pristine pair's rate is its initial_rate_bps -------------------
+# roce_sender_paused_accept.csv carries `initial_rate_bps` (appended last, so the numbered columns
+# above are unchanged). Its pairs see no echo and have no DCQCN row, so only that column ties
+# their credited rate to their configuration. The reviewer's probe
+# (days-gpu evidence/P16/dcqcn-review/lean/rate-probe/rerate.py): re-rate flow 3 on every row and
+# recompute its credit chain, so the sender log stays consistent on its own terms.
+# rerate <rate>: the awk program over named columns.
+rerate() {
+  printf '%s' 'NR == 1 { for (i = 1; i <= NF; i++) c[$i] = i; print; next }
+    $c["flow_id"] == 3 { if (seen) $c["before_credit_quanta"] = credit
+      after = $c["before_credit_quanta"]
+      if ($c["rate_bps"] != "") { $c["rate_bps"] = '"$1"'; after += '"$1"' * $c["pacing_interval_ns"]
+        if ($c["emitted"] == 1) after -= $c["emitted_bytes"] * 8000000000 }
+      $c["after_credit_quanta"] = sprintf("%.0f", after); credit = $c["after_credit_quanta"]; seen = 1 }
+    { print }'
+}
+for rate in 8000000001 9000000000; do
+  awk -F, -v OFS=, "$(rerate $rate)" "$paused" > "$campaign_tmp/rerated.csv"
+  mutations=$((mutations + 1))
+  if check_case "sender/pristine-pair-re-rated-to-$rate" 1 \
+      'REJECT: sender: line 2: RoCE rate of a pair whose controller is pristine is not its initial_rate_bps (node_id=1, flow_id=3)' \
+      sender "$campaign_tmp/rerated.csv" "$paused_dcqcn" --pfc "$paused_pfc" "$paused_stop"; then
+    mutations_caught=$((mutations_caught + 1))
+  fi
+done
+awk -F, -v OFS=, 'NR == 1 { for (i = 1; i <= NF; i++) c[$i] = i; print; next }
+  $c["flow_id"] == 5 { $c["initial_rate_bps"] = 7000000000 } { print }' "$paused" > "$campaign_tmp/rerated.csv"
+mutations=$((mutations + 1))
+if check_case "sender/initial-rate-not-the-credited-rate" 1 \
+    'REJECT: sender: line 3: RoCE rate of a pair whose controller is pristine is not its initial_rate_bps (node_id=1, flow_id=5)' \
+    sender "$campaign_tmp/rerated.csv" "$paused_dcqcn" --pfc "$paused_pfc" "$paused_stop"; then
+  mutations_caught=$((mutations_caught + 1))
+fi
+
 # --- Amendment 2: resume rows (a PFC RESUME restarts pause-parked queue pairs) -----------------
 # Amended layout as above. A resume row is a D3 restart of a pair parked by a paused tick, at the
 # RESUME's event key (phase 0: a PFC frame arrival); several may share one key, for distinct

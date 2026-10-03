@@ -337,6 +337,9 @@ pub struct RoceSenderRecord {
     pub window_bytes: u64,
     pub variable_window: bool,
     pub maximum_rate_bps: u64,
+    /// The controller's configured initial rate: a pair's rate until its controller's first
+    /// feedback (fix round 1, review F3), so a pair with no DCQCN row is tied to its config.
+    pub initial_rate_bps: u64,
     /// The controller rate a tick credited, for a tick that credited one.
     pub rate_bps: Option<u64>,
     /// The ACK or NACK value of an `ack` or `nack` transition.
