@@ -914,6 +914,26 @@ pub fn run_scalar_counting_stage_scans_for_testing(
     Ok((transitions.finish(pending_events), dispatches, visits))
 }
 
+/// Test hook: a Scalar run with the number of service decisions made at PFC switch queues and the
+/// number of queued entries those decisions read (`PfcServiceProbe`).
+///
+/// The run itself is `run_scalar_with_observations`; the probe only counts.
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+pub fn run_scalar_counting_pfc_service_for_testing(
+    image: &SimulationImage,
+    observation_mode: ObservationMode,
+) -> Result<(RunResult, u64, u64), ExecutionError> {
+    let (transitions, pending_events) =
+        run_scalar_events(image, None, observation_mode, |_, _| {})?;
+    let probe = transitions.pfc_service_probe;
+    Ok((
+        transitions.finish(pending_events),
+        probe.decisions,
+        probe.entries,
+    ))
+}
+
 /// Proves that the keyed stage path answers every query as the retired scans did, on `image`
 /// and after every event of a Scalar run over it.
 ///
@@ -1092,6 +1112,8 @@ pub(crate) struct TransitionState<'image> {
     superseded_timers: Vec<SupersededTimer>,
     /// Test-only dispatch and pending-cause counts; empty in production builds.
     stage_probe: StageScanProbe,
+    /// Test-only PFC service-decision counts; empty in production builds.
+    pfc_service_probe: PfcServiceProbe,
 }
 
 /// Identity of a retransmission-timeout event that stopped being a flow's armed timer.
@@ -1214,6 +1236,46 @@ enum SwitchServicePlan {
     },
 }
 
+/// Test-only count of the service decisions made at PFC switch queues and of the queued entries
+/// they read.
+///
+/// An entry is *read* when the decision looks up its packet record (and from it the flow's PFC
+/// class or the packet's incoming link): that per-entry work is what a whole-queue plan repeats on
+/// every decision. Without the test hooks the probe is empty and `note` compiles to nothing, so the
+/// count can neither cost a production run anything nor influence it.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PfcServiceProbe {
+    #[cfg(feature = "planner-test-hooks")]
+    decisions: u64,
+    #[cfg(feature = "planner-test-hooks")]
+    entries: u64,
+}
+
+impl PfcServiceProbe {
+    /// Records one `TxReady` decision at a PFC queue that read `entries` queued entries.
+    #[inline]
+    fn note_decision(&mut self, entries: usize) {
+        #[cfg(feature = "planner-test-hooks")]
+        {
+            self.decisions = self.decisions.saturating_add(1);
+        }
+        self.note_reads(entries);
+    }
+
+    /// Records `entries` queued entries read outside a `TxReady` decision: the first-eligible
+    /// search after a transmission completes and on a PFC control frame.
+    #[inline]
+    fn note_reads(&mut self, entries: usize) {
+        let _ = entries;
+        #[cfg(feature = "planner-test-hooks")]
+        {
+            self.entries = self
+                .entries
+                .saturating_add(u64::try_from(entries).unwrap_or(u64::MAX));
+        }
+    }
+}
+
 /// Projects an eligible-packet list onto the record shape the round-robin certificates carry.
 fn scheduler_packets(packets: &[PacketDescriptor]) -> Vec<crate::SchedulerPacket> {
     packets
@@ -1324,6 +1386,7 @@ impl<'image> TransitionState<'image> {
             tcp_sent_segments,
             superseded_timers: Vec::new(),
             stage_probe: StageScanProbe::default(),
+            pfc_service_probe: PfcServiceProbe::default(),
         })
     }
 
@@ -1422,6 +1485,7 @@ impl<'image> TransitionState<'image> {
             tcp_sent_segments,
             superseded_timers: Vec::new(),
             stage_probe: StageScanProbe::default(),
+            pfc_service_probe: PfcServiceProbe::default(),
         })
     }
 
@@ -2738,6 +2802,7 @@ impl<'image> TransitionState<'image> {
                 })
                 .collect::<Result<Vec<_>, ExecutionError>>()?
         };
+        self.pfc_service_probe.note_reads(queued.len());
         let (schedule_payload, transition) = {
             let state = self.switch_state_mut(node)?;
             let (queue_id, queue) = state
@@ -4957,6 +5022,7 @@ impl<'image> TransitionState<'image> {
             });
         };
 
+        let mut probed_entries = None;
         let plan = {
             let state = self.switch_state(node)?;
             let queue = state
@@ -4976,6 +5042,9 @@ impl<'image> TransitionState<'image> {
                         .transpose()?,
                 )
             } else {
+                if queue.pfc.is_some() {
+                    probed_entries = Some(queue.queue.len());
+                }
                 let mut positions = Vec::new();
                 let mut packets = Vec::new();
                 let mut priorities = Vec::new();
@@ -5003,6 +5072,9 @@ impl<'image> TransitionState<'image> {
                 }
             }
         };
+        if let Some(entries) = probed_entries {
+            self.pfc_service_probe.note_decision(entries);
+        }
         let state_slot = self.local_state_slot(node)?;
         let (payload, selected_packet, queue_slot, pfc_plan, pfc_transition, scheduler_transition) = 'service: {
             let state = self.switch_state_mut(node)?;
@@ -5263,6 +5335,7 @@ impl<'image> TransitionState<'image> {
         };
         let rate_bps = self.link(egress_link)?.rate_bps;
 
+        let mut probed_reads = 0_usize;
         let eligible_next_payload = {
             let state = self.switch_state(node)?;
             let queue = state
@@ -5278,6 +5351,7 @@ impl<'image> TransitionState<'image> {
             match &queue.pfc {
                 None => queue.queue.front().copied(),
                 Some(pfc) => queue.queue.iter().find_map(|payload| {
+                    probed_reads += 1;
                     let packet = self.packet(*payload).ok()?;
                     let priority =
                         usize::from(self.flow(packet.flow).ok()?.packet_priority(packet.kind));
@@ -5285,6 +5359,7 @@ impl<'image> TransitionState<'image> {
                 }),
             }
         };
+        self.pfc_service_probe.note_reads(probed_reads);
         let next_payload = {
             let state = self.switch_state_mut(node)?;
             let queue = state
@@ -7010,7 +7085,9 @@ mod tests {
     #[test]
     fn transition_state_keeps_main_size() {
         const MAIN_TRANSITION_STATE_BYTES: usize = 512;
-        let bound = MAIN_TRANSITION_STATE_BYTES + std::mem::size_of::<StageScanProbe>();
+        let bound = MAIN_TRANSITION_STATE_BYTES
+            + std::mem::size_of::<StageScanProbe>()
+            + std::mem::size_of::<super::PfcServiceProbe>();
         let size = std::mem::size_of::<TransitionState<'static>>();
         assert!(
             size <= bound,
