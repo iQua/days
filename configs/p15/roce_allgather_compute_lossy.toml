@@ -1,0 +1,97 @@
+# P15 LeanGuard part 3, fix round 1 (schema Amendment 5): a compute group after an ungated two-rank
+# RoCE AllGather, whose stages are roots and so never appear in the collective progress log.
+# From the review's probe days-gpu/evidence/P15/leanguard-part3-review/probes/f2_reach_lossy.toml.
+#
+# The 4-switch line of configs/p15/roce_ring_lossy.toml (hosts 0..3 on switches 0..3, 1 Gbps ports,
+# 8-packet drop-tail queues, PFC inert): the AllGather `ag2` between hosts 0 and 3 (40,000 B)
+# contends with R3's lossy RoCE ring, so its packets are lost, arrive out of order and are resent
+# by Go-back-N inside the compute stages' inbound predecessors. Contract: the compute rows carry the
+# AllGather's MTU and pacing interval (Amendment 5), and every compute inbound row replays the
+# Go-back-N frontier; Scalar = CPU at 1 to 4 workers.
+seed = 42
+edges = [[0, 1], [1, 2], [2, 3]]
+hosts = [0, 1, 2, 3]
+duration = 0.05
+
+[switch]
+port_rate = 1000000000
+capacity = 8
+discipline = "FIFO"
+drop = "ECN_THRESHOLD"
+ecn_threshold = 1.0
+
+[link]
+mode = "Pfc"
+
+[link.pfc]
+buffer_capacity = [0, 0, 0, 0, 0, 0, 0, 0]
+xoff = [0, 0, 0, 0, 0, 0, 0, 0]
+xon = [0, 0, 0, 0, 0, 0, 0, 0]
+
+[[collective]]
+name = "ag2"
+collective_type = "AllGather"
+flow_type = "RoCE"
+priority = 0
+flow_count = 2
+sources = [0, 3]
+sinks = [3, 0]
+
+[collective.traffic]
+initial_delay = 0.0
+size = 40000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[collective.traffic.dcqcn]
+rate_gbps = 1.0
+min_rate_gbps = 0.01
+max_rate_gbps = 1.0
+g = 0.00390625
+ai_rate_gbps = 0.005
+hai_rate_gbps = 0.05
+mi_factor = 0.5
+rtt_ns = 50000
+cnp_interval_ns = 10000
+pacing_interval_ns = 1000
+increase_byte_threshold = 100000
+
+[collective.traffic.roce]
+retransmit_timeout_ns = 1000000
+
+[[collective]]
+name = "ring"
+collective_type = "RingAllReduce"
+flow_type = "RoCE"
+priority = 0
+flow_count = 4
+sources = [0, 2, 1, 3]
+sinks = [2, 1, 3, 0]
+
+[collective.traffic]
+initial_delay = 0.0
+size = 400000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[collective.traffic.dcqcn]
+rate_gbps = 1.0
+min_rate_gbps = 0.01
+max_rate_gbps = 1.0
+g = 0.00390625
+ai_rate_gbps = 0.005
+hai_rate_gbps = 0.05
+mi_factor = 0.5
+rtt_ns = 50000
+cnp_interval_ns = 10000
+pacing_interval_ns = 1000
+increase_byte_threshold = 100000
+
+[collective.traffic.roce]
+retransmit_timeout_ns = 1000000
+
+[[compute]]
+name = "backward"
+hosts = [0, 3]
+duration_ns = 7000
+after = "ag2"

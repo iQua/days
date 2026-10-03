@@ -105,6 +105,9 @@ const PARAM_RECEIVER_OFFSET: usize = 28;
 const PARAM_LEDGER_META_OFFSET: usize = 29;
 /// Params word holding the PFC region offset in `scheduler_state`, or `NONE` without PFC state.
 const PARAM_PFC_OFFSET: usize = 31;
+/// Params word holding the RoCE receiver region offset in `tcp_state`, or `NONE` without queue-pair
+/// receivers (P15).
+const PARAM_ROCE_OFFSET: usize = 32;
 const PACKET_ECN_FLAG: u64 = 1_u64 << 63;
 const PACKET_KIND_MASK: u64 = !PACKET_ECN_FLAG;
 
@@ -542,10 +545,28 @@ fn decode_packet_kind(value: u64, metadata: &[u64]) -> Result<PacketKind, CudaEr
             trigger_payload: PayloadId(metadata[0]),
         })),
         6 if metadata == [0, 0, 0] => Ok(PacketKind::DcqcnControlTimer),
+        7 if metadata[2] <= 1 => Ok(PacketKind::RoceData(crate::RoceDataHeader {
+            psn: metadata[0],
+            sent_time_ns: metadata[1],
+            retransmission: metadata[2] != 0,
+        })),
+        8 => Ok(PacketKind::RoceAck(roce_ack_header(metadata))),
+        9 => Ok(PacketKind::RoceNack(roce_ack_header(metadata))),
+        10 if metadata == [0, 0, 0] => Ok(PacketKind::RocePacingTimer),
         _ => Err(CudaError::DeviceExecution {
             code: 93,
             node: None,
         }),
+    }
+}
+
+/// The RoCE ACK/NACK header in `packet_metadata`'s word order.
+#[inline(always)]
+fn roce_ack_header(metadata: &[u64]) -> crate::RoceAckHeader {
+    crate::RoceAckHeader {
+        acknowledgment: metadata[0],
+        echoed_sent_time_ns: metadata[1],
+        acknowledged_bytes: metadata[2],
     }
 }
 
@@ -1667,19 +1688,36 @@ pub fn mechanism_plane_words_cuda_for_testing(
     let plan = CudaPlan::new(image, None, config, ObservationMode::Summary)?;
     let pfc_offset = plan.params[PARAM_PFC_OFFSET];
     let receiver_offset = plan.params[PARAM_RECEIVER_OFFSET] as usize;
+    let receiver_markers = |marker: fn(u64) -> bool| {
+        (0..image.flows.len())
+            .filter(|flow| marker(plan.tcp_state[receiver_offset + flow * TCP_RECEIVER_WORDS]))
+            .count()
+    };
     Ok(crate::MechanismPlaneWords {
         pfc_region_words: if pfc_offset == NONE {
             0
         } else {
             plan.scheduler_state.len() - pfc_offset as usize
         },
-        dcqcn_receiver_rows: (0..image.flows.len())
-            .filter(|flow| {
-                plan.tcp_state[receiver_offset + flow * TCP_RECEIVER_WORDS]
-                    >= crate::device_mechanism::DCQCN_RECEIVER_NO_CNP
-            })
-            .count(),
+        dcqcn_receiver_rows: receiver_markers(|marker| {
+            marker == crate::device_mechanism::DCQCN_RECEIVER_NO_CNP
+                || marker == crate::device_mechanism::DCQCN_RECEIVER_LAST_CNP
+        }),
         pfc_params_words: 1,
+        roce_region_words: if plan.params[PARAM_ROCE_OFFSET] == NONE {
+            0
+        } else {
+            plan.tcp_state.len() - plan.params[PARAM_ROCE_OFFSET] as usize
+        },
+        roce_receiver_rows: receiver_markers(|marker| {
+            marker == crate::device_mechanism::ROCE_RECEIVER_MARKER
+        }),
+        pfc_class_words: if pfc_offset == NONE {
+            Vec::new()
+        } else {
+            let start = pfc_offset as usize + image.nodes.len();
+            plan.scheduler_state[start..start + image.flows.len()].to_vec()
+        },
     })
 }
 
@@ -1825,6 +1863,7 @@ impl CudaPlan {
     fn refuse_plain_round_kernel(&self) -> Result<(), CudaError> {
         let plan = crate::device_mechanism::UploadedPlan {
             pfc_offset: self.params[PARAM_PFC_OFFSET],
+            roce_offset: self.params[PARAM_ROCE_OFFSET],
             receiver_offset: self.params[PARAM_RECEIVER_OFFSET],
             // `P_NODE_COUNT` and `P_FLOW_COUNT`.
             node_count: self.params[0] as usize,
@@ -1928,6 +1967,8 @@ struct PreparedStreams {
 struct TcpLayout {
     receiver_offset: usize,
     ledger_meta_offset: usize,
+    /// The RoCE receiver region, a tail of `tcp_state`; `None` without queue-pair receivers.
+    roce_offset: Option<usize>,
 }
 
 fn encode_control(control: TcpCongestionControl, words: &mut [u64]) {
@@ -2092,11 +2133,14 @@ fn prepare_tcp_state(
         }
     }
 
+    let roce_offset =
+        crate::device_mechanism::append_roce_region(image, receiver_offset, &mut state);
     Ok((
         state,
         TcpLayout {
             receiver_offset,
             ledger_meta_offset,
+            roce_offset,
         },
     ))
 }
@@ -2200,7 +2244,13 @@ impl CudaPlan {
             .copied()
             .map(|packet| (packet.id, packet))
             .collect::<BTreeMap<_, _>>();
-        let orphan_packets = crate::tcp_ledger::initial_non_tcp_orphan_packets(image);
+        let mut orphan_packets = crate::tcp_ledger::initial_non_tcp_orphan_packets(image);
+        // Design note F3: a queue pair's tokens stay resident for its life even with no live
+        // event, so readback pins them with the orphans.
+        orphan_packets.extend(crate::device_mechanism::queue_pair_tokens(
+            image,
+            &initial_by_payload,
+        ));
 
         let mut queue_caps = vec![1_usize; node_count];
         let mut aggregate_queue_packets = vec![0_usize; node_count];
@@ -2224,6 +2274,11 @@ impl CudaPlan {
             if capacity_context.dcqcn_generator(image, flow_index) {
                 // A DCQCN source owns two live timer chains, pacing and control.
                 legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(2);
+            }
+            if capacity_context.roce_generator(image, flow_index) {
+                // A queue-pair source owns three live timers: pacing, control and the
+                // retransmission timeout (one live record under the live-state contract).
+                legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(3);
             }
             if capacity_context.tcp_generator(image, flow_index).is_some() {
                 // Timeout events are intentionally heap-class. Under the live-state contract
@@ -2349,6 +2404,10 @@ impl CudaPlan {
                 if capacity_context.dcqcn_generator(image, flow) {
                     let source = descriptor.source.0 as usize;
                     capacities[source] = capacities[source].saturating_add(2);
+                }
+                if capacity_context.roce_generator(image, flow) {
+                    let source = descriptor.source.0 as usize;
+                    capacities[source] = capacities[source].saturating_add(3);
                 }
                 if capacity_context.tcp_generator(image, flow).is_some() {
                     let feedback = flow_feedback_counts[flow];
@@ -2491,6 +2550,12 @@ impl CudaPlan {
                                     &mut generators[offset..offset + GENERATOR_WORDS],
                                 );
                             }
+                            FlowGeneratorKind::Roce(roce) => {
+                                crate::device_mechanism::encode_roce_generator(
+                                    &roce,
+                                    &mut generators[offset..offset + GENERATOR_WORDS],
+                                );
+                            }
                         }
                     }
                 }
@@ -2540,7 +2605,13 @@ impl CudaPlan {
 
         for event in &image.initial_events {
             let packet = if event.kind == EventKind::RetransmissionTimeout {
-                timer_packet_for(image, *event)?
+                // P15: a queue pair's timeout carries its resident pacing token (Scalar's
+                // `host_retransmission_timeout` falls through to the queue pair exactly when the
+                // payload is a `RocePacingTimer`); every other timeout is a TCP timer's.
+                match initial_by_payload.get(&event.payload) {
+                    Some(token) if token.kind == PacketKind::RocePacingTimer => *token,
+                    _ => timer_packet_for(image, *event)?,
+                }
             } else {
                 packet_for(&initial_by_payload, event.payload)?
             };
@@ -2750,6 +2821,7 @@ impl CudaPlan {
             tcp_layout.ledger_meta_offset as u64,
             streams.layout.round_scratch_offset as u64,
             pfc_offset.map_or(NONE, |offset| offset as u64),
+            tcp_layout.roce_offset.map_or(NONE, |offset| offset as u64),
         ];
 
         Ok(Self {
@@ -2811,7 +2883,7 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
         // frame travels on its reverse control lane, never on its flow's route.
         if matches!(
             packet.kind,
-            PacketKind::DcqcnControlTimer | PacketKind::Pfc(_)
+            PacketKind::DcqcnControlTimer | PacketKind::RocePacingTimer | PacketKind::Pfc(_)
         ) {
             continue;
         }
@@ -2856,6 +2928,15 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
                     data_counts[index] = data_counts[index].saturating_sub(1);
                 }
                 data_counts[index] = data_counts[index].saturating_add(work.packets);
+                continue;
+            }
+            if let FlowGeneratorKind::Roce(roce) = generator.kind {
+                // P15: an estimate (remaining fresh packets and one resend of the outstanding
+                // window); an overflow takes the capacity retry. The pacing token is a zero-byte
+                // packet the initial count skips.
+                data_counts[index] = data_counts[index].saturating_add(
+                    crate::device_sizing::roce_data_packet_estimate(image, generator, roce),
+                );
                 continue;
             }
             let FlowGeneratorKind::Constant(constant) = generator.kind else {
@@ -2911,13 +2992,17 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
     }
     for state in &image.host_states {
         for generator in &state.generators {
-            // One ACK (TCP) or at most one CNP (DCQCN) per data packet.
-            if matches!(
-                generator.kind,
-                FlowGeneratorKind::Tcp(_) | FlowGeneratorKind::Dcqcn(_)
-            ) {
+            // One ACK (TCP) or at most one CNP (DCQCN) per data packet; a queue pair's receiver
+            // answers a data arrival with at most one ACK or NACK and one CNP.
+            let per_packet = match generator.kind {
+                FlowGeneratorKind::Tcp(_) | FlowGeneratorKind::Dcqcn(_) => 1,
+                FlowGeneratorKind::Roce(_) => 2,
+                FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => 0,
+            };
+            if per_packet != 0 {
                 let flow = generator.flow.0 as usize;
-                feedback_counts[flow] = feedback_counts[flow].saturating_add(data_counts[flow]);
+                feedback_counts[flow] = feedback_counts[flow]
+                    .saturating_add(data_counts[flow].saturating_mul(per_packet));
             }
         }
     }
@@ -2960,6 +3045,13 @@ fn add_flow_route_capacities(
         PacketKind::DcqcnCnp(_) => (flow.reverse_route.as_slice(), flow.source),
         PacketKind::DcqcnControlTimer => {
             unreachable!("the zero-byte DCQCN control-timer token is never routed")
+        }
+        PacketKind::RoceData(_) => (flow.route.as_slice(), flow.target),
+        PacketKind::RoceAck(_) | PacketKind::RoceNack(_) => {
+            (flow.reverse_route.as_slice(), flow.source)
+        }
+        PacketKind::RocePacingTimer => {
+            unreachable!("the zero-byte RoCE pacing token is never routed")
         }
     };
     for index in 0..route.len() {
@@ -3493,10 +3585,17 @@ fn derived_channel_stream_capacities(
     // horizon. Constant propagation can retain at most ceil(propagation/serialization) older
     // events, and two additional records provide outward-rounded slack. The channel's finite
     // whole-run packet count remains an absolute cap on semantic events, before slack.
+    // A flow's channel for a (link, target) is the first: lowering appends the PFC control lanes
+    // after every flow channel, and a control lane can share its flow channel's link and target
+    // (a host-link lane always does). With the last entry winning, a flow channel's packets were
+    // counted on the control lane and the flow channel started at the bare slack (P15). The
+    // channels are collected in reverse, so the collect's last-wins dedup keeps the first; the
+    // bulk build allocates as before (per-entry inserts cost 390 more allocations on k16).
     let channels = image
         .channels
         .iter()
         .enumerate()
+        .rev()
         .map(|(index, channel)| ((channel.link, channel.target), index))
         .collect::<BTreeMap<_, _>>();
     let mut packet_counts = vec![0_usize; image.channels.len()];
@@ -3757,6 +3856,11 @@ fn derived_transition_bound(
                     .saturating_add(work.pacing_ticks)
                     .saturating_add(work.control_ticks))
             }
+            FlowGeneratorKind::Roce(roce) => Ok(bound
+                .saturating_add(crate::device_mechanism::roce_transition_bound(
+                    image, generator, roce,
+                ))
+                .saturating_add(1)),
             FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Tcp(_) => Ok(bound),
         })
 }
@@ -3983,6 +4087,17 @@ fn packet_metadata(kind: PacketKind) -> [u64; 3] {
         ],
         PacketKind::DcqcnCnp(header) => [header.trigger_payload.0, 0, 0],
         PacketKind::DcqcnControlTimer => [0; 3],
+        PacketKind::RoceData(header) => [
+            header.psn,
+            header.sent_time_ns,
+            u64::from(header.retransmission),
+        ],
+        PacketKind::RoceAck(header) | PacketKind::RoceNack(header) => [
+            header.acknowledgment,
+            header.echoed_sent_time_ns,
+            header.acknowledged_bytes,
+        ],
+        PacketKind::RocePacingTimer => [0; 3],
     }
 }
 
@@ -4484,6 +4599,22 @@ impl CudaBuffers {
                 ),
             ],
         )?;
+        // P15: the RoCE receiver region, read only when the plan holds one (a non-QP image issues
+        // the same readback requests as before).
+        let roce_region = if params[PARAM_ROCE_OFFSET] != NONE {
+            let [region] = bounded_plane_words(
+                stream,
+                [(
+                    tcp_plane,
+                    params[PARAM_ROCE_OFFSET] as usize,
+                    crate::device_mechanism::roce_region_words(image),
+                    "RoCE receiver region",
+                )],
+            )?;
+            Some(region)
+        } else {
+            None
+        };
 
         let fel_plan = arena_compaction_plan(
             "FEL record",
@@ -4741,6 +4872,18 @@ impl CudaBuffers {
                                     }
                                 })?;
                             }
+                            FlowGeneratorKind::Roce(roce) => {
+                                crate::device_mechanism::decode_roce_generator(
+                                    &generators[offset..offset + GENERATOR_WORDS],
+                                    roce,
+                                )
+                                .map_err(|_| {
+                                    CudaError::DeviceExecution {
+                                        code: 96,
+                                        node: Some(node.id),
+                                    }
+                                })?;
+                            }
                         }
                     }
                     for receiver in &mut state.tcp_receivers {
@@ -4772,6 +4915,16 @@ impl CudaBuffers {
                             node: Some(node.id),
                         })?;
                     }
+                    if params[PARAM_PFC_OFFSET] != NONE {
+                        crate::device_pfc::restore_host_pfc(
+                            &scheduler_state,
+                            params[PARAM_PFC_OFFSET] as usize,
+                            lp,
+                            state,
+                        )
+                        .map_err(CudaError::Validation)?;
+                        crate::device_mechanism::recompute_pause_parked(image, state);
+                    }
                 }
                 NodeKind::Switch => {
                     let state = &mut switch_states[node.state_slot as usize];
@@ -4797,6 +4950,14 @@ impl CudaBuffers {
                     state.departed_packets = node_state[base + 9];
                 }
             }
+        }
+        if let Some(region) = &roce_region {
+            crate::device_mechanism::decode_roce_receivers(region, &mut host_states).map_err(
+                |_| CudaError::DeviceExecution {
+                    code: 96,
+                    node: None,
+                },
+            )?;
         }
 
         let mut pending_events = Vec::new();

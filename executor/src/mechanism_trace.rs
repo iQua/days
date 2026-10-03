@@ -133,6 +133,8 @@ pub enum CollectiveStageKind {
     Tcp,
     /// A delay-only compute stage.
     Compute,
+    /// A collective stage carried by a RoCE queue pair (P15; `qp-schema.md` Amendment 4).
+    Roce,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -179,13 +181,14 @@ pub struct CollectiveProgressRecord {
     pub stage_kind: CollectiveStageKind,
     /// Compute interval of a delay-only stage; zero for every data stage.
     pub duration_ns: u64,
-    /// Inbound rows: the arriving TCP data segment `[segment_sequence, segment_sequence +
-    /// segment_bytes)`. Every segment of a pending inbound predecessor is logged, including ones
-    /// that do not advance the receiver's in-order frontier. Zero on local rows.
+    /// Inbound rows: the arriving data segment `[segment_sequence, segment_sequence +
+    /// segment_bytes)`, from a TCP sequence number or a RoCE PSN. Every segment of a pending
+    /// inbound predecessor is logged, including ones that do not advance the receiver's in-order
+    /// frontier. Zero on local rows.
     pub segment_sequence: u64,
     pub segment_bytes: u64,
-    /// Local rows caused by a TCP stage: the completing ACK's cumulative acknowledgment. Zero for
-    /// a compute cause and on inbound rows.
+    /// Local rows caused by a TCP or RoCE stage: the completing ACK's cumulative acknowledgment.
+    /// Zero for a compute cause and on inbound rows.
     pub ack_number: u64,
     /// Local rows: when the completing signal originated. TCP: when the segment answered by the
     /// completing ACK was sent (the ACK echoes it). Compute: when the timer was armed. Zero on
@@ -206,6 +209,8 @@ pub enum MechanismTransitionRecord {
     Wrr(WrrTransitionRecord),
     Dcqcn(DcqcnTransitionRecord),
     Collective(CollectiveProgressRecord),
+    /// A RoCE queue pair's reliability transition (P15; schema `qp-schema.md`).
+    Roce(crate::RoceTransitionRecord),
 }
 
 impl MechanismTransitionRecord {
@@ -218,6 +223,7 @@ impl MechanismTransitionRecord {
             Self::Wrr(record) => record.key,
             Self::Dcqcn(record) => record.key,
             Self::Collective(record) => record.key,
+            Self::Roce(record) => record.key(),
         }
     }
 
@@ -230,11 +236,17 @@ impl MechanismTransitionRecord {
             Self::Wrr(_) => (4, 0),
             Self::Dcqcn(_) => (5, 0),
             Self::Collective(record) => (6, record.ordinal),
+            // A host RESUME yields one `resume` row per restarted queue pair at one key.
+            Self::Roce(record) => (7, record.flow().0),
         };
         (self.key(), tag, ordinal)
     }
 }
 
+/// The collective progress CSV (P14's schema). RoCE stages write `stage_kind = roce` rows under
+/// the same columns, as pinned by Amendment 4 of `days-gpu/plans/briefs/p15/qp-schema.md`: the MTU
+/// and pacing interval in `packet_size_bytes` and `interval_ns`, the PSN in `segment_sequence`,
+/// and the Go-back-N frontier's advance in `arrival_bytes`.
 pub fn collective_transitions_csv(
     records: &[MechanismTransitionRecord],
 ) -> Result<String, MechanismTraceError> {
@@ -315,6 +327,7 @@ pub fn collective_transitions_csv(
 const fn collective_stage_kind(kind: CollectiveStageKind) -> &'static str {
     match kind {
         CollectiveStageKind::Tcp => "tcp",
+        CollectiveStageKind::Roce => "roce",
         CollectiveStageKind::Compute => "compute",
     }
 }
@@ -405,6 +418,154 @@ pub fn dcqcn_transitions_csv(
             record.after.next_control_time_ns,
         )
         .expect("writing to String cannot fail");
+    }
+    Ok(csv)
+}
+
+/// The sender transitions of RoCE queue pairs, one row per event in `EventKey` order (pinned
+/// schema `days-gpu/plans/briefs/p15/qp-schema.md`).
+pub fn roce_sender_transitions_csv(
+    records: &[MechanismTransitionRecord],
+) -> Result<String, MechanismTraceError> {
+    // Canonical order is (event key, flow): one event yields one sender row, except a host
+    // RESUME, which yields one `resume` row per queue pair it restarts (schema Amendment 2).
+    let mut records = records
+        .iter()
+        .filter_map(|record| match record {
+            MechanismTransitionRecord::Roce(crate::RoceTransitionRecord::Sender(record)) => {
+                Some(*record)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    records.sort_unstable_by_key(|record| (record.key, record.flow));
+    if let Some(pair) = records.windows(2).find(|pair| {
+        pair[0].key == pair[1].key
+            && (pair[0].flow == pair[1].flow
+                || pair[0].node != pair[1].node
+                || pair[0].kind != crate::RoceSenderKind::Resume
+                || pair[1].kind != crate::RoceSenderKind::Resume)
+    }) {
+        return Err(MechanismTraceError {
+            mechanism: "RoCE sender",
+            duplicate_key: pair[0].key,
+        });
+    }
+    let mut csv = String::from(
+        "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,kind,class_paused,data_class,mtu_bytes,total_bytes,pacing_interval_ns,first_pacing_time_ns,rto_ns,rate_bps,input_acknowledgment,emitted,emitted_psn,emitted_bytes,emitted_retransmission,emitted_payload,before_next_psn,before_snd_una,before_bytes_emitted,before_packets_emitted,before_credit_quanta,before_rto_deadline_ns,before_pacer,before_next_tick_ns,before_status,after_next_psn,after_snd_una,after_bytes_emitted,after_packets_emitted,after_credit_quanta,after_rto_deadline_ns,after_pacer,after_next_tick_ns,after_status\n",
+    );
+    for record in records {
+        let emitted = record.emitted;
+        write!(
+            csv,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            record.key.time_ns,
+            record.key.phase,
+            record.key.origin_node.0,
+            record.key.origin_seq,
+            record.node.0,
+            record.flow.0,
+            record.kind.label(),
+            bit(record.class_paused),
+            record.data_class,
+            record.mtu_bytes,
+            record.total_bytes,
+            record.pacing_interval_ns,
+            record.first_pacing_time_ns,
+            record.rto_ns,
+            optional_u64(record.rate_bps),
+            optional_u64(record.input_acknowledgment),
+            bit(emitted.is_some()),
+            optional_u64(emitted.map(|emission| emission.psn)),
+            optional_u64(emitted.map(|emission| emission.bytes)),
+            emitted.map_or_else(String::new, |emission| bit(emission.retransmission)
+                .to_string()),
+            optional_u64(emitted.map(|emission| emission.payload.0)),
+        )
+        .expect("writing to String cannot fail");
+        for view in [record.before, record.after] {
+            write!(
+                csv,
+                ",{},{},{},{},{},{},{},{},{}",
+                view.next_psn,
+                view.snd_una,
+                view.bytes_emitted,
+                view.packets_emitted,
+                view.credit_quanta,
+                optional_u64(view.rto_deadline_ns),
+                view.pacer.label(),
+                optional_u64(view.next_tick_ns),
+                status(view.status),
+            )
+            .expect("writing to String cannot fail");
+        }
+        csv.push('\n');
+    }
+    Ok(csv)
+}
+
+/// The receiver transitions of RoCE queue pairs: one row per data arrival in `EventKey` order
+/// (pinned schema `days-gpu/plans/briefs/p15/qp-schema.md`). It also certifies the DCQCN
+/// notification point of each pair (`cnp_sent`, `last_cnp_time_ns`).
+pub fn roce_receiver_transitions_csv(
+    records: &[MechanismTransitionRecord],
+) -> Result<String, MechanismTraceError> {
+    let records = canonical(
+        "RoCE receiver",
+        records
+            .iter()
+            .filter_map(|record| match record {
+                MechanismTransitionRecord::Roce(crate::RoceTransitionRecord::Receiver(record)) => {
+                    Some((record.key, *record))
+                }
+                _ => None,
+            })
+            .collect(),
+    )?;
+    let mut csv = String::from(
+        "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,total_bytes,ack_every_packets,nack_interval_ns,duplicate_ack,ack_size_bytes,cnp_interval_ns,packet_psn,packet_bytes,packet_sent_time_ns,packet_retransmission,packet_ce,action,feedback_acknowledgment,feedback_payload,cnp_sent,cnp_payload,before_expected_psn,before_packets_since_ack,before_last_nack_psn,before_last_nack_time_ns,before_last_cnp_time_ns,after_expected_psn,after_packets_since_ack,after_last_nack_psn,after_last_nack_time_ns,after_last_cnp_time_ns\n",
+    );
+    for record in records {
+        write!(
+            csv,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            record.key.time_ns,
+            record.key.phase,
+            record.key.origin_node.0,
+            record.key.origin_seq,
+            record.node.0,
+            record.flow.0,
+            record.total_bytes,
+            record.ack_every_packets,
+            record.nack_interval_ns,
+            bit(record.duplicate_ack),
+            record.ack_size_bytes,
+            record.cnp_interval_ns,
+            record.packet_psn,
+            record.packet_bytes,
+            record.packet_sent_time_ns,
+            bit(record.packet_retransmission),
+            bit(record.packet_ce),
+            record.action.label(),
+            optional_u64(record.feedback_acknowledgment),
+            optional_u64(record.feedback_payload.map(|payload| payload.0)),
+            bit(record.cnp_payload.is_some()),
+            optional_u64(record.cnp_payload.map(|payload| payload.0)),
+        )
+        .expect("writing to String cannot fail");
+        for view in [record.before, record.after] {
+            write!(
+                csv,
+                ",{},{},{},{},{}",
+                view.expected_psn,
+                view.packets_since_ack,
+                optional_u64(view.last_nack_psn),
+                optional_u64(view.last_nack_time_ns),
+                optional_u64(view.last_cnp_time_ns),
+            )
+            .expect("writing to String cannot fail");
+        }
+        csv.push('\n');
     }
     Ok(csv)
 }

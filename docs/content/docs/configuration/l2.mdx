@@ -49,6 +49,26 @@ PFC refresh/drain timers are outside the T25 executor mechanism; use edge-trigge
 
 For an enabled priority, validation requires `xon < xoff <= buffer_capacity`. Set `xoff = 0` to disable that priority. A zero `pause_quanta` entry also disables its priority during lowering. Exact execution models pause/resume state, not a timed pause duration.
 
+Each switch egress port monitors every switch-to-switch link that feeds it, separately per link and priority: the thresholds apply to the bytes that arrived over that link and wait in that port's queue. A paused upstream port serves the first queued packet whose priority is not paused; the packet in service is never preempted.
+
+### Host links
+
+By default only switch-to-switch links are PFC-controlled, so a switch never pauses a host and a host sends at its own rate. Set `host_links = true` to also monitor each host-to-switch link with the same thresholds, so that switches pause host NICs:
+
+```toml
+[link.pfc]
+host_links = true                 # default false
+xoff = [0, 0, 0, 60256, 0, 0, 0, 0]
+xon = [0, 0, 0, 57184, 0, 0, 0, 0]
+buffer_capacity = [0, 0, 0, 97756, 0, 0, 0, 0]
+```
+
+A paused host keeps queuing what its flows send and transmits the first queued packet whose priority is not paused, as a switch port does. Pause and resume at a host appear in the PFC records with the host as the node and queue `0`.
+
+RoCE queue pairs also stop sending while their data class is paused at their host. The pacer's next tick sends nothing, adds no pacing credit, and parks the pacer. The resume restarts it at its next pacing tick after the resume. An ACK, NACK or timeout during the pause restarts the pacer as usual, and its next tick parks it again. Other flow types keep generating packets into the host queue while paused.
+
+Because the thresholds are per link, a port fed by many links can hold up to the sum of their `buffer_capacity` values before every link is paused. Size `xoff` and `buffer_capacity` so that this sum fits the switch queue (`switch.capacity` packets), or the queue drops before PFC holds it. `host_links` changes the lowered image only when it is `true`, and it runs on Scalar and CPU: Metal and CUDA refuse it at validation.
+
 ## Propagation interaction
 
 `link.propagation_ns` works with `mode = "None"`. Legacy rejects propagation on PFC links. Exact lowering treats PFC and propagation as separate mechanisms and can place the configured link delay in the lowered image. See [Topology and routing](/docs/configuration/topology) for uniform and tiered propagation.

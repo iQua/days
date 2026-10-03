@@ -31,8 +31,8 @@ fn cuda_source() -> String {
     format!("{CUDA}\n{}", cuda_round_body())
 }
 
-/// The functions P14 Lane B added to both kernels.
-const LANE_B_FUNCTIONS: [&str; 21] = [
+/// The functions P14 Lane B and P15 lane R4 (queue pairs, host-link PFC) added to both kernels.
+const LANE_B_FUNCTIONS: [&str; 39] = [
     "dcqcn_apply_increase",
     "dcqcn_average_with_target",
     "dcqcn_checked_weighted_div",
@@ -44,15 +44,33 @@ const LANE_B_FUNCTIONS: [&str; 21] = [
     "dcqcn_on_control_timer",
     "dcqcn_pacing_timer",
     "emit_pfc_frame",
+    "flow_route_mechanisms",
+    "packet_egress_mechanisms",
     "packet_incoming_link",
+    "packet_remote_target_mechanisms",
     "pfc_copy_queue_record",
     "pfc_enabled_ingress",
     "pfc_first_eligible",
-    "pfc_flow_priority",
+    "pfc_flow_data_class",
     "pfc_frame_arrival",
+    "pfc_packet_priority",
     "pfc_paused_mask",
     "pfc_priority_paused",
     "pfc_queue_row",
+    "roce_cnp_arrival",
+    "roce_control_tick",
+    "roce_data_arrival",
+    "roce_emit_timers",
+    "roce_feedback_arrival",
+    "roce_pacing_tick",
+    "roce_packet_size",
+    "roce_receive",
+    "roce_receiver_packet",
+    "roce_restart",
+    "roce_resume_parked",
+    "roce_settle",
+    "roce_timeout",
+    "roce_token_packet",
     "wfq_remove_at",
 ];
 

@@ -40,6 +40,10 @@ const FIXTURES: &[&str] = &[
     "configs/benchmarks/lookahead/rq9_closed_k16.toml",
     // Multi-cohort width-via-load planning.
     "configs/benchmarks/width_via_load/fattree_k32_target_w01000.toml",
+    // P15 lane R4: RoCE queue pairs (the RoCE region), and host-link PFC with a feedback class
+    // apart from the data class (host rows, the class word).
+    "configs/p15/roce_gbn_lossy.toml",
+    "configs/p15/hostpfc_multi_qp_tcp.toml",
 ];
 
 const TEST_CAPS: DeviceCapacityCaps = DeviceCapacityCaps {
@@ -115,6 +119,8 @@ fn rate_image() -> SimulationImage {
         stages: vec![],
         tcp_receivers: vec![],
         dcqcn_receivers: vec![],
+        roce_receivers: None,
+        pfc: None,
         next_origin_seq: 0,
         next_payload_seq: 0,
         sourced_packets: 0,
@@ -163,6 +169,7 @@ fn rate_image() -> SimulationImage {
             source,
             target: sink,
             priority: 0,
+            feedback_priority: 0,
             route: vec![forward_id],
             reverse_route: vec![reverse_id],
         }],
@@ -388,11 +395,17 @@ fn assert_0695_initial_plan(
     // P14 Lane B T4 appended one params word addressing the PFC region (`u64::MAX` for this
     // image, which carries no PFC state and plans no PFC words). No other plane moved.
     let p14_pfc_params_bytes = std::mem::size_of::<u64>();
+    // P15 lane R4 appended one params word addressing the RoCE receiver region (`u64::MAX` for this
+    // image, which carries no queue pairs and plans no RoCE words). No other plane moved.
+    let p15_roce_params_bytes = std::mem::size_of::<u64>();
     assert_eq!(
         strict.total_device_bytes,
-        expected_total_device_bytes + t21_round_scratch_bytes + p14_pfc_params_bytes,
-        "{backend} initial plan bytes, pre-T21 anchor plus the derived round-scratch region \
-         and the P14 PFC-offset params word",
+        expected_total_device_bytes
+            + t21_round_scratch_bytes
+            + p14_pfc_params_bytes
+            + p15_roce_params_bytes,
+        "{backend} initial plan bytes, pre-T21 anchor plus the derived round-scratch region, \
+         the P14 PFC-offset params word and the P15 RoCE-offset params word",
     );
 }
 

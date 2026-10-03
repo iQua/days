@@ -377,6 +377,15 @@ impl FlowIndex {
             .copied()
             .unwrap_or(0)
     }
+
+    /// Returns how many initial retransmission-timeout events carry `payload` at `owner`, at any
+    /// deadline: one ordered range of the same buckets.
+    fn retransmission_timeout_events_with_payload(&self, owner: NodeId, payload: PayloadId) -> u64 {
+        self.retransmission_timeouts
+            .range((owner, payload, 0)..=(owner, payload, u64::MAX))
+            .map(|(_, count)| *count)
+            .sum()
+    }
 }
 
 impl StageLookups {
@@ -558,6 +567,8 @@ fn validate_backend_capabilities(
             "backend {backend} does not support collective generators; use Scalar or Cpu"
         )));
     }
+    // P15 lane R4: both device backends run RoCE queue pairs, host-link PFC and a feedback class
+    // apart from the data class (`evidence/P15/device-design.md`), so none needs a refusal here.
     for queue in image.switch_states.iter().flat_map(|state| &state.queues) {
         match queue.drop_mark {
             crate::DropMarkPolicy::TailDrop | crate::DropMarkPolicy::EcnThreshold(_) => {}
@@ -791,6 +802,33 @@ fn validate_flows(image: &SimulationImage, flow_index: &FlowIndex) -> Result<(),
                 flow.id, flow.priority
             )));
         }
+        if flow.feedback_priority > 7 {
+            return Err(ValidationError::new(format!(
+                "flow {:?} feedback priority {} is outside IEEE 802.1Q range 0..=7",
+                flow.id, flow.feedback_priority
+            )));
+        }
+        // Only a DCQCN or RoCE receiver sends feedback that may ride its own class (a CNP, a RoCE
+        // ACK or NACK); a TCP ACK rides the data class. The source walk runs only for such flows.
+        if flow.feedback_priority != flow.priority
+            && !node(image, flow.source)
+                .filter(|source| source.kind == NodeKind::Host)
+                .and_then(|source| image.host_states.get(source.state_slot as usize))
+                .is_some_and(|state| {
+                    state.generators.iter().any(|generator| {
+                        generator.flow == flow.id
+                            && matches!(
+                                generator.kind,
+                                FlowGeneratorKind::Dcqcn(_) | FlowGeneratorKind::Roce(_)
+                            )
+                    })
+                })
+        {
+            return Err(ValidationError::new(format!(
+                "flow {:?} feedback priority {} differs from its priority {}, which only a DCQCN or RoCE flow may do",
+                flow.id, flow.feedback_priority, flow.priority
+            )));
+        }
         let source = node(image, flow.source).ok_or_else(|| {
             ValidationError::new(format!(
                 "flow {:?} names unknown source node {:?}",
@@ -948,7 +986,7 @@ fn derived_pfc_max_frame_bytes(
         if packet_route(flow, packet.kind).contains(&controlled_link)
             && packet_can_still_cross_link(image, packet, controlled_link)
         {
-            let priority = usize::from(flow.priority);
+            let priority = usize::from(flow.packet_priority(packet.kind));
             maximum[priority] = maximum[priority].max(packet.size_bytes);
         }
     }
@@ -956,6 +994,7 @@ fn derived_pfc_max_frame_bytes(
         let executable = executable_generator_packets(image, generator)? != 0;
         let flow = flow(image, generator.flow).expect("generator validation established the flow");
         let priority = usize::from(flow.priority);
+        let feedback_priority = usize::from(flow.feedback_priority);
         if executable && flow.route.contains(&controlled_link) {
             let size = match generator.kind {
                 FlowGeneratorKind::Constant(constant) => constant.packet_size_bytes,
@@ -967,6 +1006,7 @@ fn derived_pfc_max_frame_bytes(
                     .rate
                     .packet_size_bytes
                     .min(dcqcn.rate.total_bytes - generator.bytes_emitted),
+                FlowGeneratorKind::Roce(roce) => roce_future_data_max_bytes(roce),
             };
             maximum[priority] = maximum[priority].max(size);
         }
@@ -974,12 +1014,22 @@ fn derived_pfc_max_frame_bytes(
             match generator.kind {
                 FlowGeneratorKind::Tcp(tcp) => {
                     if executable || tcp.bytes_in_flight != 0 {
-                        maximum[priority] = maximum[priority].max(tcp.ack_size_bytes);
+                        maximum[feedback_priority] =
+                            maximum[feedback_priority].max(tcp.ack_size_bytes);
                     }
                 }
                 FlowGeneratorKind::Dcqcn(dcqcn) => {
                     if executable || live_dcqcn_cnp_flows.contains(&flow.id) {
-                        maximum[priority] = maximum[priority].max(dcqcn.cnp_size_bytes);
+                        maximum[feedback_priority] =
+                            maximum[feedback_priority].max(dcqcn.cnp_size_bytes);
+                    }
+                }
+                FlowGeneratorKind::Roce(roce) => {
+                    // Every data arrival at the receiver can answer with an ACK or NACK and a
+                    // CNP, so feedback is live while data can still be sent or is in flight.
+                    if executable || roce.snd_una < generator.bytes_emitted {
+                        maximum[feedback_priority] =
+                            maximum[feedback_priority].max(roce_feedback_max_bytes(image, flow));
                     }
                 }
                 FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => {}
@@ -1020,27 +1070,36 @@ fn validate_pfc(image: &SimulationImage) -> Result<BTreeSet<usize>, ValidationEr
                 }
                 let controlled_owner = node(image, controlled.source)
                     .expect("link validation established the controlled-link source");
-                if controlled_owner.kind != NodeKind::Switch {
-                    return Err(ValidationError::new(format!(
-                        "PFC controlled upstream link {:?} must be owned by a Switch queue, got {:?} node {:?}",
-                        controlled.id, controlled_owner.kind, controlled_owner.id
-                    )));
-                }
                 if !controller_monitors.insert((controlled.id, owner.id)) {
                     return Err(ValidationError::new(format!(
                         "duplicate PFC controller {:?} for controlled link {:?}; one controller LP may own only one ingress monitor per controlled link",
                         owner.id, controlled.id
                     )));
                 }
-                let controlled_queue = image.switch_states[controlled_owner.state_slot as usize]
-                    .queues
-                    .iter()
-                    .find(|queue| queue.egress_link == Some(controlled.id));
-                if controlled_queue.is_none_or(|queue| queue.pfc.is_none()) {
-                    return Err(ValidationError::new(format!(
-                        "PFC controlled upstream queue at switch {:?} for link {:?} must own controller-scoped PFC state",
-                        controlled.source, controlled.id
-                    )));
+                match controlled_owner.kind {
+                    NodeKind::Switch => {
+                        let controlled_queue = image.switch_states
+                            [controlled_owner.state_slot as usize]
+                            .queues
+                            .iter()
+                            .find(|queue| queue.egress_link == Some(controlled.id));
+                        if controlled_queue.is_none_or(|queue| queue.pfc.is_none()) {
+                            return Err(ValidationError::new(format!(
+                                "PFC controlled upstream queue at switch {:?} for link {:?} must own controller-scoped PFC state",
+                                controlled.source, controlled.id
+                            )));
+                        }
+                    }
+                    // Host-link PFC: the switch pauses the host's NIC.
+                    NodeKind::Host => {
+                        let host = &image.host_states[controlled_owner.state_slot as usize];
+                        if host.egress_link != controlled.id || host.pfc.is_none() {
+                            return Err(ValidationError::new(format!(
+                                "PFC controlled upstream host {:?} for link {:?} must own host egress PFC state for that egress link",
+                                controlled.source, controlled.id
+                            )));
+                        }
+                    }
                 }
                 let channel_index = ingress.control_channel_index as usize;
                 let channel = image.channels.get(channel_index).ok_or_else(|| {
@@ -1113,7 +1172,7 @@ fn validate_pfc(image: &SimulationImage) -> Result<BTreeSet<usize>, ValidationEr
                         let priority = usize::from(
                             flow(image, packet.flow)
                                 .expect("packet validation established flow")
-                                .priority,
+                                .packet_priority(packet.kind),
                         );
                         if ingress.xoff_threshold_bytes[priority] == 0 {
                             continue;
@@ -1241,6 +1300,49 @@ fn validate_pfc(image: &SimulationImage) -> Result<BTreeSet<usize>, ValidationEr
         }
     }
 
+    // Host-link PFC: one scan of the host table when no host owns pause state.
+    let host_pause_state = image.host_states.iter().any(|state| state.pfc.is_some());
+    for owner in image
+        .nodes
+        .iter()
+        .filter(|node| host_pause_state && node.kind == NodeKind::Host)
+    {
+        let state = &image.host_states[owner.state_slot as usize];
+        let Some(pfc) = state.pfc.as_deref() else {
+            continue;
+        };
+        if !controller_monitors
+            .iter()
+            .any(|(link, _)| *link == state.egress_link)
+        {
+            return Err(ValidationError::new(format!(
+                "host node {:?} owns egress PFC state, but its egress link is not PFC-controlled ({:?})",
+                owner.id, state.egress_link
+            )));
+        }
+        let expected = controllers_by_link_priority.get(&state.egress_link);
+        for priority in 0..8 {
+            if let Some(controller) = pfc.paused_by_controller[priority]
+                .iter()
+                .find(|controller| {
+                    !expected.is_some_and(|sets| sets[priority].contains(controller))
+                })
+            {
+                return Err(ValidationError::new(format!(
+                    "host node {:?} PFC priority {priority} has pause state for undeclared controller {:?}",
+                    owner.id, controller
+                )));
+            }
+        }
+        let parked = expected_pause_parked(image, state, pfc);
+        if pfc.pause_parked != parked {
+            return Err(ValidationError::new(format!(
+                "host node {:?} PFC parked list {:?} differs from its paused, parked, restartable queue pairs {:?}",
+                owner.id, pfc.pause_parked, parked
+            )));
+        }
+    }
+
     validate_pfc_deadlock_scope(image, &controlled_priorities)?;
 
     let pfc_events = image
@@ -1266,6 +1368,392 @@ fn validate_pfc(image: &SimulationImage) -> Result<BTreeSet<usize>, ValidationEr
     Ok(control_lanes)
 }
 
+/// Whether `priority` is paused at host `owner`'s egress (host-link PFC).
+fn host_class_paused(image: &SimulationImage, owner: NodeId, priority: u8) -> bool {
+    node(image, owner)
+        .filter(|descriptor| descriptor.kind == NodeKind::Host)
+        .and_then(|descriptor| {
+            image.host_states[descriptor.state_slot as usize]
+                .pfc
+                .as_deref()
+        })
+        .is_some_and(|pfc| pfc.is_paused(usize::from(priority)))
+}
+
+/// The queue pairs a host's parked list must hold, by class: each queue pair whose data class is
+/// paused there and whose pacer a paused tick parked with packets left to send (parked, not
+/// stopped, `next_psn < total` and `snd_una < total`; LeanGuard's restartable parked pairs).
+pub(crate) fn expected_pause_parked(
+    image: &SimulationImage,
+    state: &crate::HostState,
+    pfc: &crate::HostPfcState,
+) -> [BTreeSet<usize>; 8] {
+    let mut expected: [BTreeSet<usize>; 8] = Default::default();
+    for (position, generator) in state.generators.iter().enumerate() {
+        let FlowGeneratorKind::Roce(roce) = generator.kind else {
+            continue;
+        };
+        // A collective stage not yet released has never ticked, so no pause parked it.
+        if state.stage(position).is_some_and(|stage| !stage.activated) {
+            continue;
+        }
+        let Some(flow) = flow(image, generator.flow) else {
+            continue;
+        };
+        let class = usize::from(flow.priority);
+        if pfc.is_paused(class)
+            && !roce.pacer_armed
+            && generator.next_emission.status != GeneratorStatus::Stopped
+            && roce.next_psn < roce.pacer.total_bytes
+            && roce.snd_una < roce.pacer.total_bytes
+        {
+            expected[class].insert(position);
+        }
+    }
+    expected
+}
+
+/// Pending `PacingTimer` events at `owner` that carry `payload`, at any time: a range of the
+/// `(node, payload, time)` map, so the count costs a lookup and the matching entries, and
+/// validation stays linear in the pending events.
+fn pending_ticks_with_payload(
+    pacing_counts: &BTreeMap<(NodeId, PayloadId, u64), usize>,
+    owner: NodeId,
+    payload: PayloadId,
+) -> usize {
+    pacing_counts
+        .range((owner, payload, 0)..=(owner, payload, u64::MAX))
+        .map(|(_, count)| *count)
+        .sum()
+}
+
+/// A Go-back-N packet boundary: a multiple of the MTU, or the total byte count.
+const fn roce_boundary(psn: u64, mtu_bytes: u64, total_bytes: u64) -> bool {
+    psn == total_bytes || psn.is_multiple_of(mtu_bytes) && psn < total_bytes
+}
+
+/// A RoCE collective stage that its prerequisites have not released holds the state its release
+/// starts from (`collectives-design.md` §6.1): nothing sent, acknowledged, credited, timed or
+/// fed back; the pacer parked with its scheduled payload the pacing token; the pacer and the
+/// controller anchored at zero (ruling C5), the controller otherwise as lowering builds it. The
+/// release re-anchors both at its instant, so the control deadline must fit after any release up
+/// to the stop. The caller has already required that no pending event carries either token, at any
+/// time: no pacing tick or retransmission timeout with the pacing token, no control tick.
+fn validate_unreleased_roce_stage(
+    image: &SimulationImage,
+    generator: StagedGenerator<'_>,
+    roce: crate::RoceGenerator,
+) -> Result<(), &'static str> {
+    // Lowering builds the controller with its first control deadline one interval after the
+    // anchor (`lowered_dcqcn_controller`), here zero.
+    let config = roce.controller.config;
+    let pristine_controller = crate::DcqcnController::new(config, config.control_interval_ns)
+        .map_err(|_| "has a controller whose first control deadline exceeds u64")?;
+    if generator.packets_emitted != 0
+        || generator.bytes_emitted != 0
+        || generator.feedback.arrivals != 0
+        || roce.next_psn != 0
+        || roce.snd_una != 0
+        || roce.rto_deadline_ns != 0
+        || roce.pacer.credit_quanta != 0
+        || roce.pacer_armed
+        || generator.next_emission.status != GeneratorStatus::Blocked
+        || generator.next_emission.departure_time_ns != 0
+        || roce.pacer.first_pacing_time_ns != 0
+        || roce.controller != pristine_controller
+    {
+        return Err("collective stage is dependency-blocked after its sending state changed");
+    }
+    if roce.controller.config.control_interval_ns > u64::MAX - image.stop_time_ns {
+        return Err("collective stage's first control deadline after a release exceeds u64");
+    }
+    Ok(())
+}
+
+/// The invariants of one RoCE queue pair's sender (design note `qp-design.md` §7).
+#[allow(clippy::too_many_arguments)]
+fn validate_roce_generator(
+    image: &SimulationImage,
+    flow_index: &FlowIndex,
+    owner: NodeId,
+    generator: StagedGenerator<'_>,
+    flow: &FlowDescriptor,
+    roce: crate::RoceGenerator,
+    pacing_counts: &BTreeMap<(NodeId, PayloadId, u64), usize>,
+) -> Result<(), ValidationError> {
+    let invalid =
+        |what: &str| ValidationError::new(format!("flow {:?} RoCE queue pair {what}", flow.id));
+    // A collective stage its prerequisites have not released (design note §6.1): pristine, parked
+    // with no pending event, its anchors at zero (ruling C5). Its release arms the pacer.
+    let unreleased = generator.stage.is_some_and(|stage| !stage.activated);
+    let controller = roce.controller;
+    controller
+        .config
+        .validate()
+        .map_err(|error| invalid(&format!("has an invalid DCQCN configuration: {error}")))?;
+    if controller.alpha_ppb > crate::DCQCN_FRACTION_SCALE
+        || controller.current_rate_bps < controller.config.minimum_rate_bps
+        || controller.current_rate_bps > controller.config.maximum_rate_bps
+        || controller.target_rate_bps < controller.config.minimum_rate_bps
+        || controller.target_rate_bps > controller.config.maximum_rate_bps
+        || controller.stage_steps >= crate::DCQCN_STAGE_STEPS
+        || controller.stage == crate::DcqcnIncreaseStage::Hyper && controller.stage_steps != 0
+        || controller.cnp_seen && controller.last_cnp_time_ns.is_none()
+    {
+        return Err(invalid("has an out-of-range fixed-point controller state"));
+    }
+    let pacer = roce.pacer;
+    if pacer.pacing_interval_ns == 0 || pacer.mtu_bytes == 0 || pacer.total_bytes == 0 {
+        return Err(invalid("needs a positive pacing interval, MTU and total"));
+    }
+    // Go-back-N ordering: acknowledged <= next to send <= high-water mark <= total, each a
+    // packet boundary, so every packet is a pure function of its PSN.
+    remaining_generator_packets(generator)?;
+    let high_water = generator.bytes_emitted;
+    let ordered = roce.snd_una <= roce.next_psn
+        && roce.next_psn <= high_water
+        && high_water <= pacer.total_bytes;
+    let on_boundaries = [roce.snd_una, roce.next_psn, high_water]
+        .into_iter()
+        .all(|psn| roce_boundary(psn, pacer.mtu_bytes, pacer.total_bytes));
+    if !ordered || !on_boundaries {
+        return Err(invalid(&format!(
+            "sequence state is inconsistent: snd_una {}, next_psn {}, bytes_emitted {high_water}, total {}",
+            roce.snd_una, roce.next_psn, pacer.total_bytes
+        )));
+    }
+    let outstanding = high_water - roce.snd_una;
+    if generator.feedback.outstanding_bytes != outstanding
+        || generator.feedback.unacknowledged_bytes != outstanding
+    {
+        return Err(invalid(
+            "feedback mirrors disagree with its outstanding bytes",
+        ));
+    }
+    let complete = roce.snd_una == pacer.total_bytes;
+    let status = generator.next_emission.status;
+    if (status == GeneratorStatus::Finished) != complete {
+        return Err(invalid(&format!(
+            "status {status:?} disagrees with completion (snd_una {} of {})",
+            roce.snd_una, pacer.total_bytes
+        )));
+    }
+    // Tokens: a zero-byte control token and pacing token of this flow; the pacing token is the
+    // generator's scheduled payload.
+    for (token, kind) in [
+        (roce.control_timer_payload, PacketKind::DcqcnControlTimer),
+        (roce.pacing_timer_payload, PacketKind::RocePacingTimer),
+    ] {
+        let resident =
+            packet(image, token).ok_or_else(|| invalid("names a missing timer token"))?;
+        if resident.flow != flow.id
+            || resident.kind != kind
+            || resident.size_bytes != 0
+            || resident.ecn_marked
+        {
+            return Err(invalid("timer token is inconsistent"));
+        }
+    }
+    if roce.control_timer_payload == roce.pacing_timer_payload
+        || generator.next_emission.payload != roce.pacing_timer_payload
+    {
+        return Err(invalid(
+            "timer tokens are not distinct or not its scheduled payload",
+        ));
+    }
+    // Pacer: armed iff exactly one pending tick carries the pacing token at the scheduled
+    // departure, on the grid; its status predicts that tick.
+    let departure = generator.next_emission.departure_time_ns;
+    let ticks_at_departure = pacing_counts
+        .get(&(owner, roce.pacing_timer_payload, departure))
+        .copied()
+        .unwrap_or(0);
+    let on_grid = departure >= pacer.first_pacing_time_ns
+        && (departure - pacer.first_pacing_time_ns).is_multiple_of(pacer.pacing_interval_ns);
+    if roce.pacer_armed {
+        if ticks_at_departure != 1 || !on_grid {
+            return Err(invalid("armed pacer has no pending on-grid tick"));
+        }
+        if !matches!(
+            status,
+            GeneratorStatus::Scheduled | GeneratorStatus::Blocked | GeneratorStatus::Finished
+        ) {
+            return Err(invalid("armed pacer has a stopped status"));
+        }
+        if roce.next_psn < pacer.total_bytes && !complete {
+            let size = pacer.mtu_bytes.min(pacer.total_bytes - roce.next_psn);
+            let credit = pacer
+                .credit_quanta
+                .checked_add(
+                    u128::from(controller.current_rate_bps) * u128::from(pacer.pacing_interval_ns),
+                )
+                .ok_or_else(|| invalid("pacing credit exceeds u128"))?;
+            let cost = u128::from(size) * 8 * 1_000_000_000;
+            let expected = if credit >= cost {
+                GeneratorStatus::Scheduled
+            } else {
+                GeneratorStatus::Blocked
+            };
+            if status != expected {
+                return Err(invalid("pacer status disagrees with its next-tick credit"));
+            }
+        }
+    } else {
+        // A parked pacer (pause-parked, waiting for feedback, or a gated stage) owns no tick at
+        // any time: a stray one would run against a pacer that scheduled nothing.
+        if pending_ticks_with_payload(pacing_counts, owner, roce.pacing_timer_payload) != 0 {
+            return Err(invalid("parked pacer owns a pending tick"));
+        }
+        if status == GeneratorStatus::Scheduled {
+            return Err(invalid("parked pacer is Scheduled"));
+        }
+        // A pacer parks with packets left to send only while its data class is paused at its
+        // host (host-link PFC); `validate_pfc` pins it in the host's parked list. An unreleased
+        // stage is parked before its first tick.
+        if status == GeneratorStatus::Blocked
+            && roce.next_psn < pacer.total_bytes
+            && !unreleased
+            && !host_class_paused(image, owner, flow.priority)
+        {
+            return Err(invalid("parked pacer has packets left to send"));
+        }
+    }
+    if status == GeneratorStatus::Stopped && departure <= image.stop_time_ns {
+        return Err(invalid("is Stopped at or before the stop time"));
+    }
+    // Credit capacity: every remaining tick at the maximum rate stays within u128 (checked
+    // arithmetic: exact, and no heap allocation per queue pair).
+    let ticks = roce_grid_ticks(image, &generator, roce);
+    u128::from(controller.config.maximum_rate_bps)
+        .checked_mul(u128::from(pacer.pacing_interval_ns))
+        .and_then(|tick| tick.checked_mul(u128::from(ticks)))
+        .and_then(|credit| credit.checked_add(pacer.credit_quanta))
+        .ok_or_else(|| invalid("pacing credit can exceed u128 before stop"))?;
+    // Retransmission timeout: armed iff data is outstanding and the timeout is on; exactly one
+    // pending timeout event carries the pacing token, at the deadline.
+    let timer_events =
+        flow_index.retransmission_timeout_events_with_payload(owner, roce.pacing_timer_payload);
+    if roce.rto_ns == 0 || outstanding == 0 {
+        if timer_events != 0 || roce.rto_deadline_ns != 0 {
+            return Err(invalid("owns a retransmission timer while none is armed"));
+        }
+    } else if timer_events != 1
+        || flow_index.retransmission_timeout_events(
+            owner,
+            roce.pacing_timer_payload,
+            roce.rto_deadline_ns,
+        ) != 1
+    {
+        return Err(invalid(
+            "armed retransmission timer has no single pending event",
+        ));
+    }
+    if roce.rto_ns > u64::MAX - image.stop_time_ns {
+        return Err(invalid(
+            "retransmission timeout exceeds the deadline headroom",
+        ));
+    }
+    // Control tick, exactly as DCQCN's; a completed pair keeps at most its last pending tick.
+    let control_events = pacing_counts
+        .get(&(
+            owner,
+            roce.control_timer_payload,
+            controller.next_control_time_ns,
+        ))
+        .copied()
+        .unwrap_or(0);
+    // An unreleased stage arms its control tick at its release, so it owns none at any time.
+    if unreleased
+        && pending_ticks_with_payload(pacing_counts, owner, roce.control_timer_payload) != 0
+    {
+        return Err(invalid("owns a pending control tick before its release"));
+    }
+    let expected_control =
+        usize::from(!unreleased && controller.next_control_time_ns <= image.stop_time_ns);
+    if control_events > expected_control || !complete && control_events != expected_control {
+        return Err(invalid(&format!(
+            "has {control_events} matching control events; expected {expected_control}"
+        )));
+    }
+    if unreleased {
+        validate_unreleased_roce_stage(image, generator, roce).map_err(invalid)?;
+    }
+    if flow.reverse_route.is_empty() {
+        return Err(invalid("requires a reverse feedback route"));
+    }
+    let receiver =
+        roce_receiver(image, flow).ok_or_else(|| invalid("has no receiver at its target"))?;
+    if receiver.total_bytes != pacer.total_bytes
+        || receiver.np.cnp_interval_ns != controller.config.cnp_interval_ns
+        || receiver.np.cnp_size_bytes == 0
+        || receiver.ack_size_bytes == 0
+        || receiver.ack_every_packets == 0
+        || receiver.packets_since_ack >= receiver.ack_every_packets
+        || !receiver.duplicate_ack && roce.rto_ns != 0
+        || !roce_boundary(receiver.expected_psn, pacer.mtu_bytes, pacer.total_bytes)
+        || receiver.expected_psn < roce.snd_una
+        || receiver.expected_psn > high_water
+        || receiver
+            .last_nack
+            .is_some_and(|mark| mark.expected_psn > receiver.expected_psn)
+    {
+        return Err(invalid("receiver state disagrees with its sender"));
+    }
+    Ok(())
+}
+
+/// Every resident RoCE packet belongs to a queue pair and matches its PSN arithmetic.
+fn validate_roce_packets(image: &SimulationImage) -> Result<(), ValidationError> {
+    for packet in &image.initial_packets {
+        let (psn, ack) = match packet.kind {
+            PacketKind::RoceData(header) => (Some(header.psn), None),
+            PacketKind::RoceAck(header) | PacketKind::RoceNack(header) => {
+                (None, Some(header.acknowledgment))
+            }
+            PacketKind::RocePacingTimer => (None, None),
+            _ => continue,
+        };
+        let invalid = || {
+            ValidationError::new(format!(
+                "RoCE packet {:?} of flow {:?} is inconsistent with its queue pair",
+                packet.id, packet.flow
+            ))
+        };
+        let flow = flow(image, packet.flow).ok_or_else(invalid)?;
+        let source = node(image, flow.source).ok_or_else(invalid)?;
+        let (generator, roce) = image
+            .host_states
+            .get(source.state_slot as usize)
+            .and_then(|state| {
+                state
+                    .generators
+                    .iter()
+                    .find(|generator| generator.flow == flow.id)
+            })
+            .and_then(|generator| match generator.kind {
+                FlowGeneratorKind::Roce(roce) => Some((generator, roce)),
+                _ => None,
+            })
+            .ok_or_else(invalid)?;
+        let pacer = roce.pacer;
+        if let Some(psn) = psn {
+            if !roce_boundary(psn, pacer.mtu_bytes, pacer.total_bytes)
+                || psn >= generator.bytes_emitted
+                || packet.size_bytes != pacer.mtu_bytes.min(pacer.total_bytes - psn)
+            {
+                return Err(invalid());
+            }
+        }
+        if let Some(ack) = ack {
+            let frontier = roce_receiver(image, flow).ok_or_else(invalid)?.expected_psn;
+            if !roce_boundary(ack, pacer.mtu_bytes, pacer.total_bytes) || ack > frontier {
+                return Err(invalid());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_pfc_deadlock_scope(
     image: &SimulationImage,
     controlled: &BTreeSet<(LinkId, u8)>,
@@ -1277,10 +1765,15 @@ fn validate_pfc_deadlock_scope(
         indegree.entry(*vertex).or_default();
     }
     for flow in &image.flows {
-        for route in [&flow.route, &flow.reverse_route] {
+        // Data holds the flow's class along its route; receiver feedback holds the feedback class
+        // along the reverse route.
+        for (route, priority) in [
+            (&flow.route, flow.priority),
+            (&flow.reverse_route, flow.feedback_priority),
+        ] {
             for pair in route.windows(2) {
-                let from = (pair[0], flow.priority);
-                let to = (pair[1], flow.priority);
+                let from = (pair[0], priority);
+                let to = (pair[1], priority);
                 if controlled.contains(&from)
                     && controlled.contains(&to)
                     && edges.entry(from).or_default().insert(to)
@@ -1335,24 +1828,33 @@ fn validate_pfc_causal_consistency(image: &SimulationImage) -> Result<(), Valida
                     .expect("PFC structural validation established the controlled link");
                 let upstream = node(image, controlled.source)
                     .expect("link validation established the controlled-link source");
-                let (upstream_queue_index, upstream_pfc) = image.switch_states
-                    [upstream.state_slot as usize]
-                    .queues
-                    .iter()
-                    .enumerate()
-                    .find_map(|(queue_index, queue)| {
-                        (queue.egress_link == Some(controlled.id))
-                            .then_some((queue_index, queue.pfc.as_ref()))
-                    })
-                    .and_then(|(queue_index, pfc)| pfc.map(|pfc| (queue_index, pfc)))
-                    .expect("PFC structural validation established upstream controller state");
+                let (upstream_queue_index, upstream_paused_sets) = match upstream.kind {
+                    NodeKind::Switch => image.switch_states[upstream.state_slot as usize]
+                        .queues
+                        .iter()
+                        .enumerate()
+                        .find_map(|(queue_index, queue)| {
+                            (queue.egress_link == Some(controlled.id))
+                                .then_some((queue_index, queue.pfc.as_ref()))
+                        })
+                        .and_then(|(queue_index, pfc)| {
+                            pfc.map(|pfc| (queue_index, &pfc.paused_by_controller))
+                        }),
+                    // A host's egress is its queue 0.
+                    NodeKind::Host => image.host_states[upstream.state_slot as usize]
+                        .pfc
+                        .as_deref()
+                        .map(|pfc| (0, &pfc.paused_by_controller)),
+                }
+                .expect("PFC structural validation established upstream controller state");
 
                 for priority in 0..8 {
                     if ingress.xoff_threshold_bytes[priority] == 0 {
                         continue;
                     }
-                    let upstream_paused =
-                        upstream_pfc.paused_by_controller[priority].contains(&controller.id);
+                    let upstream_paused = upstream_paused_sets
+                        .get(priority)
+                        .is_some_and(|controllers| controllers.contains(&controller.id));
                     let asserted = ingress.pause_asserted[priority];
                     let mut actions = image
                         .initial_events
@@ -1456,6 +1958,7 @@ fn validate_generators(
         BTreeMap::<crate::FlowId, (NodeId, GeneratorStatus, PayloadId, u64, bool)>::new();
     let mut receiver_owners = BTreeMap::<crate::FlowId, NodeId>::new();
     let mut dcqcn_receiver_owners = BTreeMap::<crate::FlowId, NodeId>::new();
+    let mut roce_receiver_owners = BTreeMap::<crate::FlowId, NodeId>::new();
     let mut collective_positions =
         BTreeMap::<(u64, crate::CollectivePhase, u32, u32), crate::FlowId>::new();
     let mut claimed_tcp_timers = BTreeMap::<(NodeId, PayloadId, u64), crate::FlowId>::new();
@@ -1525,6 +2028,36 @@ fn validate_generators(
                     "host node {:?} owns inconsistent DCQCN receiver state for flow {:?}",
                     owner.id, receiver.flow
                 )));
+            }
+        }
+        if let Some(receivers) = &state.roce_receivers {
+            if receivers.is_empty() {
+                return Err(ValidationError::new(format!(
+                    "host node {:?} holds an empty RoCE receiver table; a host without RoCE receivers holds none",
+                    owner.id
+                )));
+            }
+            let mut previous_roce_receiver = None;
+            for receiver in receivers.iter() {
+                let receiver_flow = receiver.np.flow;
+                if previous_roce_receiver.is_some_and(|flow| flow >= receiver_flow) {
+                    return Err(ValidationError::new(format!(
+                        "host node {:?} has duplicate or non-increasing RoCE receiver flow {receiver_flow:?}",
+                        owner.id
+                    )));
+                }
+                previous_roce_receiver = Some(receiver_flow);
+                let target = flow(image, receiver_flow).map(|flow| flow.target);
+                if target != Some(owner.id)
+                    || roce_receiver_owners
+                        .insert(receiver_flow, owner.id)
+                        .is_some()
+                {
+                    return Err(ValidationError::new(format!(
+                        "host node {:?} owns inconsistent RoCE receiver state for flow {receiver_flow:?}",
+                        owner.id
+                    )));
+                }
             }
         }
         let mut previous = None;
@@ -2154,6 +2687,19 @@ fn validate_generators(
                 continue;
             }
 
+            if let FlowGeneratorKind::Roce(roce) = generator.kind {
+                validate_roce_generator(
+                    image,
+                    flow_index,
+                    owner.id,
+                    generator,
+                    flow,
+                    roce,
+                    &pacing_counts,
+                )?;
+                continue;
+            }
+
             let FlowGeneratorKind::Constant(constant) = generator.kind else {
                 unreachable!("non-constant generators continue above")
             };
@@ -2331,6 +2877,20 @@ fn validate_generators(
             )));
         }
     }
+    for (receiver_flow, receiver_owner) in roce_receiver_owners {
+        let is_roce = image
+            .host_states
+            .iter()
+            .flat_map(staged_generators)
+            .find(|generator| generator.flow == receiver_flow)
+            .is_some_and(|generator| matches!(generator.kind, FlowGeneratorKind::Roce(_)));
+        if !is_roce {
+            return Err(ValidationError::new(format!(
+                "host node {receiver_owner:?} owns RoCE receiver state for flow {receiver_flow:?}, but the flow generator is not a RoCE queue pair"
+            )));
+        }
+    }
+    validate_roce_packets(image)?;
     for packet in image
         .initial_packets
         .iter()
@@ -2712,11 +3272,15 @@ fn validate_collective_stage(
             );
         }
     };
-    let FlowGeneratorKind::Tcp(tcp) = generator.kind else {
-        return Err(ValidationError::new(format!(
-            "flow {:?} collective stage record requires a TCP generator",
-            flow.id
-        )));
+    let transport_bytes = match generator.kind {
+        FlowGeneratorKind::Tcp(tcp) => tcp.total_bytes,
+        FlowGeneratorKind::Roce(roce) => roce.pacer.total_bytes,
+        _ => {
+            return Err(ValidationError::new(format!(
+                "flow {:?} collective stage record requires a TCP or RoCE generator",
+                flow.id
+            )));
+        }
     };
     let position = (
         collective.collective_id,
@@ -2766,10 +3330,10 @@ fn validate_collective_stage(
                 flow.id
             ))
         })?;
-    if tcp.total_bytes != collective.chunk_bytes {
+    if transport_bytes != collective.chunk_bytes {
         return Err(ValidationError::new(format!(
-            "flow {:?} TCP collective stage carries {} bytes for a {}-byte chunk",
-            flow.id, tcp.total_bytes, collective.chunk_bytes
+            "flow {:?} collective stage carries {} bytes for a {}-byte chunk",
+            flow.id, transport_bytes, collective.chunk_bytes
         )));
     }
     if dependencies.inbound_bytes_received > dependencies.inbound_predecessor_bytes {
@@ -2879,12 +3443,24 @@ fn validate_collective_stage(
                 flow.id
             )));
         }
-        let frontier = host_tcp_receiver(state, inbound.0.flow)
-            .map(|receiver| receiver.next_expected_sequence);
+        // One collective, one transport: its stages share one traffic key.
+        if std::mem::discriminant(&inbound.0.kind) != std::mem::discriminant(&generator.kind)
+            || std::mem::discriminant(&local.kind) != std::mem::discriminant(&generator.kind)
+        {
+            return Err(ValidationError::new(format!(
+                "flow {:?} collective predecessors use another transport",
+                flow.id
+            )));
+        }
+        let frontier = host_inbound_frontier(state, &inbound.0);
         if frontier != Some(dependencies.inbound_bytes_received) {
             return Err(ValidationError::new(format!(
-                "flow {:?} collective inbound bytes {} disagree with the in-order TCP frontier {:?} of flow {:?}",
-                flow.id, dependencies.inbound_bytes_received, frontier, inbound.0.flow
+                "flow {:?} collective inbound bytes {} disagree with the in-order {} frontier {:?} of flow {:?}",
+                flow.id,
+                dependencies.inbound_bytes_received,
+                transport_label(&inbound.0),
+                frontier,
+                inbound.0.flow
             )));
         }
     }
@@ -2903,6 +3479,43 @@ fn validate_collective_stage(
 /// the linear `find(|flow| flow.id == id)` found.
 fn flow_source(image: &SimulationImage, id: crate::FlowId) -> Option<NodeId> {
     flow(image, id).map(|flow| flow.source)
+}
+
+/// The in-order frontier this host's receiver holds for the inbound predecessor `predecessor`:
+/// TCP's next expected sequence, or a RoCE queue pair's Go-back-N expected PSN.
+fn host_inbound_frontier(
+    state: &crate::HostState,
+    predecessor: &crate::FlowGeneratorState,
+) -> Option<u64> {
+    match predecessor.kind {
+        FlowGeneratorKind::Roce(_) => state
+            .roce_receivers
+            .as_deref()?
+            .binary_search_by_key(&predecessor.flow, |receiver| receiver.np.flow)
+            .ok()
+            .map(|index| state.roce_receivers.as_deref().expect("searched")[index].expected_psn),
+        _ => host_tcp_receiver(state, predecessor.flow)
+            .map(|receiver| receiver.next_expected_sequence),
+    }
+}
+
+/// The transport of a stage generator, as validation errors name it.
+/// A RoCE queue pair's MTU and pacing interval, which a compute stage after it writes on its
+/// progress rows (schema Amendment 5); `None` for any other generator.
+const fn roce_transport(kind: &FlowGeneratorKind) -> Option<(u64, u64)> {
+    match kind {
+        FlowGeneratorKind::Roce(roce) => {
+            Some((roce.pacer.mtu_bytes, roce.pacer.pacing_interval_ns))
+        }
+        _ => None,
+    }
+}
+
+const fn transport_label(generator: &crate::FlowGeneratorState) -> &'static str {
+    match generator.kind {
+        FlowGeneratorKind::Roce(_) => "RoCE",
+        _ => "TCP",
+    }
 }
 
 /// The host's TCP receiver for `id`.
@@ -3023,12 +3636,24 @@ fn validate_compute_stage(
                     flow.id
                 )));
             }
-            let frontier = host_tcp_receiver(state, inbound_id)
-                .map(|receiver| receiver.next_expected_sequence);
+            // Schema Amendment 5: the stage's progress rows name its inbound transport from its
+            // local predecessor, the same rank's final stage of the same collective.
+            if local.map(|candidate| roce_transport(&candidate.kind))
+                != Some(roce_transport(&inbound.0.kind))
+            {
+                return Err(ValidationError::new(format!(
+                    "flow {:?} compute local and inbound predecessors disagree on the RoCE MTU or pacing interval",
+                    flow.id
+                )));
+            }
+            let frontier = host_inbound_frontier(state, &inbound.0);
             if frontier != Some(dependencies.inbound_bytes_received) {
                 return Err(ValidationError::new(format!(
-                    "flow {:?} compute inbound bytes {} disagree with the in-order TCP frontier {:?} of flow {inbound_id:?}",
-                    flow.id, dependencies.inbound_bytes_received, frontier
+                    "flow {:?} compute inbound bytes {} disagree with the in-order {} frontier {:?} of flow {inbound_id:?}",
+                    flow.id,
+                    dependencies.inbound_bytes_received,
+                    transport_label(&inbound.0),
+                    frontier
                 )));
             }
         }
@@ -3271,7 +3896,7 @@ fn validate_packets_and_derive_delays(
             }
             continue;
         }
-        if packet.size_bytes == 0 && packet.kind != PacketKind::DcqcnControlTimer {
+        if packet.size_bytes == 0 && !packet.kind.is_timer_token() {
             return Err(ValidationError::new(format!(
                 "packet {:?} has zero size, which cannot certify positive serialization",
                 packet.id
@@ -3289,7 +3914,7 @@ fn validate_packets_and_derive_delays(
                 packet.id, packet.kind
             )));
         }
-        if packet.kind == PacketKind::DcqcnControlTimer {
+        if packet.kind.is_timer_token() {
             let source =
                 node(image, flow.source).expect("flow validation established the source node");
             let owns_token = image.host_states[source.state_slot as usize]
@@ -3297,8 +3922,18 @@ fn validate_packets_and_derive_delays(
                 .iter()
                 .any(|generator| {
                     generator.flow == flow.id
-                        && matches!(generator.kind, FlowGeneratorKind::Dcqcn(dcqcn)
-                            if dcqcn.control_timer_payload == packet.id)
+                        && match (packet.kind, generator.kind) {
+                            (PacketKind::DcqcnControlTimer, FlowGeneratorKind::Dcqcn(dcqcn)) => {
+                                dcqcn.control_timer_payload == packet.id
+                            }
+                            (PacketKind::DcqcnControlTimer, FlowGeneratorKind::Roce(roce)) => {
+                                roce.control_timer_payload == packet.id
+                            }
+                            (PacketKind::RocePacingTimer, FlowGeneratorKind::Roce(roce)) => {
+                                roce.pacing_timer_payload == packet.id
+                            }
+                            _ => false,
+                        }
                 });
             if packet.size_bytes != 0 || !owns_token {
                 return Err(ValidationError::new(format!(
@@ -3316,7 +3951,10 @@ fn validate_packets_and_derive_delays(
                 .iter()
                 .any(|generator| {
                     generator.flow == flow.id
-                        && matches!(generator.kind, FlowGeneratorKind::Dcqcn(_))
+                        && matches!(
+                            generator.kind,
+                            FlowGeneratorKind::Dcqcn(_) | FlowGeneratorKind::Roce(_)
+                        )
                 });
             if packet.size_bytes != 64 || !is_dcqcn {
                 return Err(ValidationError::new(format!(
@@ -3472,6 +4110,39 @@ fn validate_packets_and_derive_delays(
                         flow.target,
                     )
                 }
+                FlowGeneratorKind::Roce(roce) => {
+                    let feedback_can_be_emitted =
+                        generator_can_emit || roce.snd_una < generator.bytes_emitted;
+                    let feedback_sizes = roce_receiver(image, flow).map_or([0, 0], |receiver| {
+                        [receiver.ack_size_bytes, receiver.np.cnp_size_bytes]
+                    });
+                    for (index, link_id) in flow.reverse_route.iter().enumerate() {
+                        let link = link(image, *link_id)
+                            .expect("validated reverse route names an existing link");
+                        let route = (
+                            link.id,
+                            route_target(image, &flow.reverse_route, index, flow.source)
+                                .expect("validated reverse route has a direct target"),
+                        );
+                        for size in feedback_sizes {
+                            let delay = link.delay_ns(size).map_err(|error| {
+                                ValidationError::new(format!(
+                                    "link {:?} delay overflows for flow {:?} RoCE feedback: {error}",
+                                    link.id, flow.id
+                                ))
+                            })?;
+                            insert_derived_delay(&mut possible, route, delay);
+                        }
+                        if feedback_can_be_emitted {
+                            required.insert(route);
+                        }
+                    }
+                    (
+                        roce_future_data_min_bytes(roce),
+                        flow.route.as_slice(),
+                        flow.target,
+                    )
+                }
             };
             for (index, link_id) in route.iter().enumerate() {
                 let link =
@@ -3553,7 +4224,20 @@ fn validate_owned_service_state(
                 owner.id
             )));
         }
-        if !state.queue.is_empty() && state.in_service.is_none() && !state.tx_ready_pending {
+        // With host-link PFC, a packet whose class is paused at the host's egress waits for its
+        // RESUME, which schedules the service.
+        // Without host-link PFC this is today's emptiness test: no per-packet work.
+        let has_eligible_packet = match state.pfc.as_deref() {
+            None => !state.queue.is_empty(),
+            Some(pfc) => state.queue.iter().any(|payload| {
+                packet(image, *payload)
+                    .and_then(|packet| {
+                        flow(image, packet.flow).map(|flow| flow.packet_priority(packet.kind))
+                    })
+                    .is_none_or(|priority| !pfc.is_paused(usize::from(priority)))
+            }),
+        };
+        if has_eligible_packet && state.in_service.is_none() && !state.tx_ready_pending {
             return Err(ValidationError::new(format!(
                 "host node {:?} has queued packets but neither active service nor TxReady pending",
                 owner.id
@@ -3670,7 +4354,7 @@ fn validate_owned_service_state(
                 let priority = usize::from(
                     flow(image, packet.flow)
                         .expect("packet validation established flow")
-                        .priority,
+                        .packet_priority(packet.kind),
                 );
                 !queue
                     .pfc
@@ -3893,7 +4577,7 @@ fn executable_resident_packets(image: &SimulationImage) -> Vec<&crate::PacketDes
             !matches!(packet.kind, PacketKind::TcpData(_)) || live_payloads.contains(&packet.id)
         })
         .filter(|packet| !matches!(packet.kind, PacketKind::Pfc(_)))
-        .filter(|packet| packet.kind != PacketKind::DcqcnControlTimer)
+        .filter(|packet| !packet.kind.is_timer_token())
         .collect()
 }
 
@@ -4096,6 +4780,15 @@ fn maximum_drr_frame_bytes(
                 }
                 if reverse_reaches && executable_generator_packets(image, generator)? != 0 {
                     maximum = maximum.max(dcqcn.cnp_size_bytes);
+                }
+            }
+            FlowGeneratorKind::Roce(roce) => {
+                let executable = executable_generator_packets(image, generator)? != 0;
+                if forward_reaches && executable {
+                    maximum = maximum.max(roce_future_data_max_bytes(roce));
+                }
+                if reverse_reaches && (executable || roce.snd_una < generator.bytes_emitted) {
+                    maximum = maximum.max(roce_feedback_max_bytes(image, flow));
                 }
             }
         }
@@ -4751,7 +5444,7 @@ fn validate_events(
                         event.payload, flow.source
                     )));
                 }
-                if !packet.kind.is_data() && packet.kind != PacketKind::DcqcnControlTimer {
+                if !packet.kind.is_data() && !packet.kind.is_timer_token() {
                     return Err(ValidationError::new(format!(
                         "PacingTimer event {index} references non-data payload {:?}",
                         event.payload
@@ -4989,13 +5682,113 @@ fn executable_dcqcn_control_ticks(
     image: &SimulationImage,
     dcqcn: crate::DcqcnGenerator,
 ) -> BigUint {
-    if dcqcn.controller.next_control_time_ns > image.stop_time_ns {
+    executable_control_ticks(image, dcqcn.controller)
+}
+
+/// Control ticks a DCQCN controller can still run until the stop time, its pending one included.
+fn executable_control_ticks(
+    image: &SimulationImage,
+    controller: crate::DcqcnController,
+) -> BigUint {
+    if controller.next_control_time_ns > image.stop_time_ns {
         return BigUint::from(0_u8);
     }
     BigUint::from(
-        (image.stop_time_ns - dcqcn.controller.next_control_time_ns)
-            / dcqcn.controller.config.control_interval_ns,
+        (image.stop_time_ns - controller.next_control_time_ns)
+            / controller.config.control_interval_ns,
     ) + 1_u8
+}
+
+/// Pacing ticks a RoCE queue pair can still run until the stop time, its pending one included.
+///
+/// Every tick lies on the grid anchored at `first_pacing_time_ns` and emits at most one data
+/// packet, so this also bounds the pair's future data packets and data payload allocations. An
+/// armed pacer ticks from its pending departure. A parked pacer of a pair that has not finished
+/// can restart on any later grid point, so every grid point up to the stop time bounds it. A
+/// finished or stopped pair with a parked pacer ticks no more.
+pub(crate) fn roce_grid_ticks(
+    image: &SimulationImage,
+    generator: &crate::FlowGeneratorState,
+    roce: crate::RoceGenerator,
+) -> u64 {
+    let start = if roce.pacer_armed {
+        generator.next_emission.departure_time_ns
+    } else if generator.next_emission.status == GeneratorStatus::Blocked {
+        roce.pacer.first_pacing_time_ns
+    } else {
+        return 0;
+    };
+    if start > image.stop_time_ns || roce.pacer.pacing_interval_ns == 0 {
+        return 0;
+    }
+    (image.stop_time_ns - start) / roce.pacer.pacing_interval_ns + 1
+}
+
+/// Retransmission-timeout installations a RoCE queue pair can still make until the stop time.
+///
+/// A timeout is installed when a send makes data outstanding (at most one per pacing tick), when
+/// an ACK or NACK advances or rewinds the pair (at most one per data arrival at its receiver, so
+/// at most `data_packets`), and when a timeout fires and re-arms (at most one per `rto_ns` until
+/// the stop time). With the timeout off there are none.
+fn roce_timer_installations(
+    image: &SimulationImage,
+    roce: crate::RoceGenerator,
+    pacing_ticks: u64,
+    data_packets: u64,
+) -> Result<u64, ValidationError> {
+    if roce.rto_ns == 0 {
+        return Ok(0);
+    }
+    let timeouts = image.stop_time_ns / roce.rto_ns + 1;
+    pacing_ticks
+        .checked_add(data_packets)
+        .and_then(|total| total.checked_add(timeouts))
+        .ok_or_else(|| ValidationError::new("RoCE timer installation bound exceeds u64"))
+}
+
+/// The RoCE receiver of `flow`, held by the flow's target host in canonical `FlowId` order.
+fn roce_receiver<'a>(
+    image: &'a SimulationImage,
+    flow: &FlowDescriptor,
+) -> Option<&'a crate::RoceReceiverState> {
+    let target = node(image, flow.target)?;
+    if target.kind != NodeKind::Host {
+        return None;
+    }
+    let receivers = image
+        .host_states
+        .get(target.state_slot as usize)?
+        .roce_receivers
+        .as_deref()?;
+    receivers
+        .binary_search_by_key(&flow.id, |receiver| receiver.np.flow)
+        .ok()
+        .map(|index| &receivers[index])
+}
+
+/// The largest feedback packet of a RoCE flow: an ACK or NACK, or a CNP.
+fn roce_feedback_max_bytes(image: &SimulationImage, flow: &FlowDescriptor) -> u64 {
+    roce_receiver(image, flow).map_or(0, |receiver| {
+        receiver.ack_size_bytes.max(receiver.np.cnp_size_bytes)
+    })
+}
+
+/// The largest data packet a RoCE queue pair can still send: a retransmission may resend any
+/// packet from its cumulative acknowledgment on.
+fn roce_future_data_max_bytes(roce: crate::RoceGenerator) -> u64 {
+    roce.pacer
+        .mtu_bytes
+        .min(roce.pacer.total_bytes.saturating_sub(roce.snd_una))
+}
+
+/// The smallest data packet a RoCE queue pair can still send: a full MTU, or the short last one.
+fn roce_future_data_min_bytes(roce: crate::RoceGenerator) -> u64 {
+    let tail = roce.pacer.total_bytes % roce.pacer.mtu_bytes.max(1);
+    if tail == 0 {
+        roce.pacer.mtu_bytes
+    } else {
+        tail
+    }
 }
 
 fn latest_dcqcn_control_time(
@@ -5181,6 +5974,7 @@ fn validate_global_time_capacity(
                 .rate
                 .packet_size_bytes
                 .min(dcqcn.rate.total_bytes - generator.bytes_emitted),
+            FlowGeneratorKind::Roce(roce) => roce_future_data_max_bytes(roce),
         };
         for link_id in &flow.route {
             let link = link(image, *link_id).expect("flow validation established the route link");
@@ -5208,16 +6002,25 @@ fn validate_global_time_capacity(
     }
     let work = future_work(image, flow_index)?;
     for generator in image.host_states.iter().flat_map(staged_generators) {
-        let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind else {
-            continue;
-        };
         let flow = flow(image, generator.flow).expect("generator validation established the flow");
-        let cnp_count = work.dcqcn_cnp_by_flow[flow.id.0 as usize];
+        // DCQCN reserves its CNPs; a RoCE queue pair reserves its ACKs, NACKs and CNPs at the
+        // largest of their sizes.
+        let (feedback_size_bytes, cnp_count) = match generator.kind {
+            FlowGeneratorKind::Dcqcn(dcqcn) => (
+                dcqcn.cnp_size_bytes,
+                work.dcqcn_cnp_by_flow[flow.id.0 as usize],
+            ),
+            FlowGeneratorKind::Roce(_) => (
+                roce_feedback_max_bytes(image, flow),
+                work.feedback_by_flow[flow.id.0 as usize],
+            ),
+            _ => continue,
+        };
         for link_id in &flow.reverse_route {
             let link = link(image, *link_id).expect("flow validation established the route link");
             let delay = link
-                .delay_ns(dcqcn.cnp_size_bytes)
-                .expect("DCQCN CNP/link delay validation already succeeded");
+                .delay_ns(feedback_size_bytes)
+                .expect("feedback/link delay validation already succeeded");
             let flow_delay = delay.checked_mul(cnp_count).ok_or_else(|| {
                 ValidationError::new(format!(
                     "DCQCN CNP reverse-route time bound overflows for flow {:?} on link {:?}",
@@ -5272,6 +6075,7 @@ fn validate_global_time_capacity(
                     FlowGeneratorKind::Dcqcn(dcqcn)
                         if dcqcn.controller.next_control_time_ns <= image.stop_time_ns
                 )
+                || matches!(generator.kind, FlowGeneratorKind::Roce(_))
         })
         .map(|generator| match generator.kind {
             FlowGeneratorKind::Constant(constant) => {
@@ -5306,6 +6110,9 @@ fn validate_global_time_capacity(
                 };
                 Ok(pacing.max(latest_dcqcn_control_time(image, generator)?))
             }
+            // Pacing and control ticks run at most to the stop time; a retransmission timeout
+            // armed before it ends within `rto_ns`, which generator validation bounds.
+            FlowGeneratorKind::Roce(_) => Ok(image.stop_time_ns),
         })
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
@@ -5751,6 +6558,17 @@ fn future_work(
                 dcqcn_cnp_by_flow[index] = cnp_count;
                 add_packet_count(&mut feedback_by_flow[index], cnp_count)?;
             }
+            FlowGeneratorKind::Roce(_) => {
+                // At most one data packet per pacing tick; every data arrival, resident or
+                // future, can answer with one ACK or NACK and one CNP.
+                let count = executable_generator_packets(image, generator)?;
+                let index = generator.flow.0 as usize;
+                add_packet_count(&mut data_by_flow[index], count)?;
+                let arrivals = data_by_flow[index];
+                dcqcn_cnp_by_flow[index] = arrivals;
+                add_packet_count(&mut feedback_by_flow[index], arrivals)?;
+                add_packet_count(&mut feedback_by_flow[index], arrivals)?;
+            }
         }
     }
     // Grouped after the counting loop above so that a resident whose flow is outside the dense
@@ -5776,17 +6594,22 @@ fn future_work(
         {
             let mut controller_frames = 0_u64;
             for flow in &image.flows {
-                let priority = usize::from(flow.priority);
-                if ingress.xoff_threshold_bytes[priority] == 0 {
+                // Data is monitored in the flow's class, receiver feedback in its feedback class.
+                let data_monitored = ingress.xoff_threshold_bytes[usize::from(flow.priority)] != 0;
+                let feedback_monitored =
+                    ingress.xoff_threshold_bytes[usize::from(flow.feedback_priority)] != 0;
+                if !data_monitored && !feedback_monitored {
                     continue;
                 }
                 let mut monitored_packets = 0_u64;
-                if route_enters_pfc_controller(
-                    image,
-                    &flow.route,
-                    ingress.controlled_link,
-                    owner.id,
-                ) {
+                if data_monitored
+                    && route_enters_pfc_controller(
+                        image,
+                        &flow.route,
+                        ingress.controlled_link,
+                        owner.id,
+                    )
+                {
                     let past_resident = u64::try_from(
                         resident_groups
                             .group(image, &resident_packets, flow.id)
@@ -5802,12 +6625,14 @@ fn future_work(
                         .expect("resident data count is included in the per-flow total");
                     add_packet_count(&mut monitored_packets, reachable)?;
                 }
-                if route_enters_pfc_controller(
-                    image,
-                    &flow.reverse_route,
-                    ingress.controlled_link,
-                    owner.id,
-                ) {
+                if feedback_monitored
+                    && route_enters_pfc_controller(
+                        image,
+                        &flow.reverse_route,
+                        ingress.controlled_link,
+                        owner.id,
+                    )
+                {
                     let past_resident = u64::try_from(
                         resident_groups
                             .group(image, &resident_packets, flow.id)
@@ -6010,9 +6835,35 @@ fn remaining_generator_packets(generator: StagedGenerator<'_>) -> Result<u64, Va
         }
         return Ok((rate.total_bytes - generator.bytes_emitted).div_ceil(rate.packet_size_bytes));
     }
+    if let FlowGeneratorKind::Roce(roce) = generator.kind {
+        // First transmissions only: the nominal packets from the high-water mark on.
+        let pacer = roce.pacer;
+        if generator.bytes_emitted > pacer.total_bytes {
+            return Err(ValidationError::new(format!(
+                "flow {:?} RoCE emitted byte state exceeds total bytes {}",
+                generator.flow, pacer.total_bytes
+            )));
+        }
+        let expected_bytes = u128::from(generator.packets_emitted)
+            .checked_mul(u128::from(pacer.mtu_bytes))
+            .map(|bytes| bytes.min(u128::from(pacer.total_bytes)))
+            .ok_or_else(|| {
+                ValidationError::new(format!(
+                    "flow {:?} RoCE byte bookkeeping exceeds u128",
+                    generator.flow
+                ))
+            })?;
+        if u128::from(generator.bytes_emitted) != expected_bytes {
+            return Err(ValidationError::new(format!(
+                "flow {:?} RoCE records {} emitted bytes, expected {expected_bytes}",
+                generator.flow, generator.bytes_emitted
+            )));
+        }
+        return Ok((pacer.total_bytes - generator.bytes_emitted).div_ceil(pacer.mtu_bytes));
+    }
     let FlowGeneratorKind::Constant(constant) = generator.kind else {
         let FlowGeneratorKind::Tcp(tcp) = generator.kind else {
-            unreachable!("rate, DCQCN, and collective generators return above")
+            unreachable!("rate, DCQCN, RoCE and collective generators return above")
         };
         if generator.bytes_emitted > tcp.total_bytes || tcp.next_sequence > tcp.total_bytes {
             return Err(ValidationError::new(format!(
@@ -6099,6 +6950,10 @@ fn executable_generator_packets(
         )
     {
         return executable_dcqcn_packets(image, generator);
+    }
+    if let FlowGeneratorKind::Roce(roce) = generator.kind {
+        remaining_generator_packets(generator)?;
+        return Ok(roce_grid_ticks(image, &generator, roce));
     }
     match generator.next_emission.status {
         GeneratorStatus::Scheduled => remaining_generator_packets(generator),
@@ -6340,6 +7195,32 @@ fn validate_origin_sequences(
                             ))
                         })?
                 }
+                FlowGeneratorKind::Roce(roce) => {
+                    // Every pacing tick, restarts included, every control tick and every timeout
+                    // installation is one emitted event (a conservative count: the pending tick
+                    // and control tick already exist).
+                    let pacing_ticks = roce_grid_ticks(image, &generator, roce);
+                    let data_packets = executable_generator_packets(image, generator)?;
+                    // The DCQCN count in u64 arithmetic, with no heap allocation per queue pair.
+                    let controller = roce.controller;
+                    let control_ticks = if controller.next_control_time_ns > image.stop_time_ns {
+                        0
+                    } else {
+                        (image.stop_time_ns - controller.next_control_time_ns)
+                            / controller.config.control_interval_ns
+                            + 1
+                    };
+                    let timers = roce_timer_installations(image, roce, pacing_ticks, data_packets)?;
+                    pacing_ticks
+                        .checked_add(control_ticks)
+                        .and_then(|total| total.checked_add(timers))
+                        .ok_or_else(|| {
+                            ValidationError::new(format!(
+                                "flow {:?} RoCE timer event count exceeds u64",
+                                generator.flow
+                            ))
+                        })?
+                }
             };
             emissions_by_node[owner.id.0 as usize] += u128::from(emissions);
         }
@@ -6488,6 +7369,28 @@ fn validate_payload_sequences(
                 FlowGeneratorKind::Tcp(_) => tcp_attempt_upper_bound(image, flow_index, generator)?,
                 FlowGeneratorKind::Rate(_) => rate_payload_allocations(image, generator)?,
                 FlowGeneratorKind::Dcqcn(_) => dcqcn_payload_allocations(image, generator)?,
+                FlowGeneratorKind::Roce(_) => {
+                    // Its two timer tokens were allocated at lowering; every data packet,
+                    // retransmissions included, takes a fresh payload when it is sent.
+                    consumed_sequences = consumed_sequences
+                        .checked_add(generator.packets_emitted)
+                        .and_then(|total| total.checked_add(2))
+                        .ok_or_else(|| {
+                            ValidationError::new(format!(
+                                "node {:?} consumed payload sequence count exceeds u64",
+                                owner.id
+                            ))
+                        })?;
+                    allocations = allocations
+                        .checked_add(executable_generator_packets(image, generator)?)
+                        .ok_or_else(|| {
+                            ValidationError::new(format!(
+                                "node {:?} generated-packet count exceeds u64",
+                                owner.id
+                            ))
+                        })?;
+                    continue;
+                }
             };
             let already_scheduled = u64::from(
                 generator.next_emission.status == GeneratorStatus::Scheduled
@@ -6547,6 +7450,19 @@ fn validate_payload_sequences(
                 .ok_or_else(|| {
                     ValidationError::new(format!(
                         "node {:?} generated DCQCN CNP count exceeds u64",
+                        owner.id
+                    ))
+                })?;
+        }
+        for receiver in state.roce_receivers.iter().flatten() {
+            // One ACK or NACK and one CNP per data arrival.
+            let arrivals = work.data_by_flow[receiver.np.flow.0 as usize];
+            allocations = arrivals
+                .checked_mul(2)
+                .and_then(|feedback| allocations.checked_add(feedback))
+                .ok_or_else(|| {
+                    ValidationError::new(format!(
+                        "node {:?} generated RoCE feedback count exceeds u64",
                         owner.id
                     ))
                 })?;
@@ -6692,23 +7608,28 @@ fn packet_incoming_link_at(
 
 fn packet_route(flow: &FlowDescriptor, packet_kind: PacketKind) -> &[LinkId] {
     match packet_kind {
-        PacketKind::Data | PacketKind::TcpData(_) => &flow.route,
+        PacketKind::Data | PacketKind::TcpData(_) | PacketKind::RoceData(_) => &flow.route,
         PacketKind::Feedback
         | PacketKind::TcpAck(_)
         | PacketKind::Pfc(_)
-        | PacketKind::DcqcnCnp(_) => &flow.reverse_route,
-        PacketKind::DcqcnControlTimer => &[],
+        | PacketKind::DcqcnCnp(_)
+        | PacketKind::RoceAck(_)
+        | PacketKind::RoceNack(_) => &flow.reverse_route,
+        PacketKind::DcqcnControlTimer | PacketKind::RocePacingTimer => &[],
     }
 }
 
 fn packet_terminal(flow: &FlowDescriptor, packet_kind: PacketKind) -> NodeId {
     match packet_kind {
-        PacketKind::Data | PacketKind::TcpData(_) => flow.target,
+        PacketKind::Data | PacketKind::TcpData(_) | PacketKind::RoceData(_) => flow.target,
         PacketKind::Feedback
         | PacketKind::TcpAck(_)
         | PacketKind::Pfc(_)
         | PacketKind::DcqcnCnp(_)
-        | PacketKind::DcqcnControlTimer => flow.source,
+        | PacketKind::RoceAck(_)
+        | PacketKind::RoceNack(_)
+        | PacketKind::DcqcnControlTimer
+        | PacketKind::RocePacingTimer => flow.source,
     }
 }
 

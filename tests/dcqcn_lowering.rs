@@ -501,13 +501,61 @@ fn nonrepresentable_dcqcn_parameters_and_cnp_priority_are_rejected() {
             .contains("ppb")
     );
 
-    fs::write(&path, base.replace("cnp_priority = 0", "cnp_priority = 7")).unwrap();
+    fs::write(&path, base.replace("cnp_priority = 0", "cnp_priority = 8")).unwrap();
     assert!(
         compile_config(&path)
             .unwrap_err()
             .to_string()
             .contains("CNP priority")
     );
+}
+
+/// P15 (orchestrator ruling D6): `cnp_priority` is the flow's feedback priority. It defaults to
+/// the flow's priority (before P15 it defaulted to 0 and had to equal the flow priority), any
+/// 0..=7 value is accepted, and every config accepted before lowers to the same image.
+#[test]
+fn dcqcn_cnp_priority_is_the_flows_feedback_priority() {
+    let directory = TempDir::new().unwrap();
+    let path = write_dcqcn_config(&directory);
+    let base = fs::read_to_string(&path).unwrap();
+
+    let unchanged = compile_config(&path).expect("the accepted config still lowers");
+    assert_eq!(
+        unchanged.flows[0].feedback_priority,
+        unchanged.flows[0].priority
+    );
+    assert!(!format!("{unchanged:?}").contains("feedback_priority"));
+
+    let defaulted = base
+        .replace("priority = 0\ngraph", "priority = 3\ngraph")
+        .replace("cnp_priority = 0\n", "");
+    fs::write(&path, defaulted).unwrap();
+    let image = compile_config(&path).expect("an omitted CNP priority defaults to the flow's");
+    assert_eq!(
+        (image.flows[0].priority, image.flows[0].feedback_priority),
+        (3, 3)
+    );
+
+    fs::write(&path, base.replace("cnp_priority = 0", "cnp_priority = 7")).unwrap();
+    let image = compile_config(&path).expect("a separate CNP class lowers");
+    assert_eq!(
+        (image.flows[0].priority, image.flows[0].feedback_priority),
+        (0, 7)
+    );
+    assert!(format!("{image:?}").contains("feedback_priority: 7"));
+    assert_eq!(
+        image.flows[0].packet_priority(PacketKind::DcqcnCnp(days_executor::DcqcnCnpHeader {
+            trigger_payload: days_executor::PayloadId(0),
+        })),
+        7
+    );
+    assert_eq!(image.flows[0].packet_priority(PacketKind::Data), 0);
+    // P15 lane R4: both device backends run a feedback class apart from the data class (ruling
+    // D2, the PFC region's per-flow class word).
+    for backend in [Backend::Metal, Backend::Cuda] {
+        validate(&image, backend)
+            .unwrap_or_else(|error| panic!("{backend:?} accepts a feedback class: {error}"));
+    }
 }
 
 #[test]

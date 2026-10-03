@@ -18,7 +18,8 @@ cd lean
 lake build DaysExecutor \
   dcqcn_check pfc_check cubic_check tcp_check drr_check wfq_check sp_check \
   aqm_check aqm_dcqcn_check \
-  p10c_mechanisms_check p10c_aqm_check p10c_dcqcn_check p10c_collective_check
+  p10c_mechanisms_check p10c_aqm_check p10c_dcqcn_check p10c_collective_check \
+  p10c_roce_check
 cd ..
 ```
 
@@ -114,7 +115,75 @@ Days AGO checkers:
 ./.lake/build/bin/p10c_aqm_check <path/to/aqm_events.csv>
 ./.lake/build/bin/p10c_dcqcn_check <path/to/dcqcn_events.csv>
 ./.lake/build/bin/p10c_collective_check <path/to/collective_events.csv>
+./.lake/build/bin/p10c_roce_check receiver <path/to/roce_receiver.csv>
+./.lake/build/bin/p10c_roce_check sender <path/to/roce_sender.csv> <path/to/dcqcn.csv> \
+  [--pfc <path/to/pfc.csv>] [--horizon-ns <ns>] [<stop_time_ns>]
+./.lake/build/bin/p10c_roce_check trace <path/to/roce_sender.csv> <path/to/roce_receiver.csv> \
+  <path/to/dcqcn.csv> [--pfc <path/to/pfc.csv>] [--horizon-ns <ns>] \
+  [--collective <path/to/collective.csv>] [<stop_time_ns>]
 ```
+
+`p10c_roce_check` certifies RoCE queue pairs from the executor's `roce_receiver_transitions_csv`,
+`roce_sender_transitions_csv` and `dcqcn_transitions_csv` of one full-observation run:
+
+- `receiver` checks each data arrival: the notification point, the in-order frontier, the ACK
+  cadence, duplicates, and the NACK rate limit.
+- `sender` checks each pacing tick, ACK, NACK and timeout. It needs the DCQCN log of the same run,
+  because the controller's rate decides the sender's status, and a CNP or control tick recomputes
+  that status without a RoCE row. It also checks that every pending pacing tick, timeout and
+  control tick fires before any later event of the pair, and that a completed queue pair's control
+  tick is not re-armed.
+- Host-link PFC (schema Amendments 1-3). A tick with `class_paused = 1` found the pair's data
+  class (`data_class`) paused on its host: it must send nothing, add no credit and park the pacer.
+  A `resume` row records a PFC RESUME restarting a pacer that a paused tick parked, on its next
+  grid point strictly after the RESUME (or `stopped` beyond the stop time). The rows of one
+  RESUME share its event key, for distinct flows of one node in increasing `flow_id` order; no
+  other rows may share a key. A sender log with the `data_class` column needs `--pfc` with the
+  run's `pfc_transitions_csv`, and the pauses and resumes are then checked against the host PAUSE
+  and RESUME records in it:
+  - a paused tick finds its class paused at its host at its event key, and an unpaused tick finds
+    it not paused;
+  - every `resume` row shares the key of the host RESUME that unpaused its class at its node;
+  - every host RESUME that unpauses class `p` at node `n` restarts, in `resume` rows at its key,
+    every pair of class `p` at `n` that a paused tick parked and that can restart (work
+    remaining, not complete). A missing `resume` row is caught at the RESUME, even when a later
+    ACK, NACK or timeout restart would mask it.
+
+  What this certifies, and what it trusts: it certifies the transition mechanics of a pause and a
+  resume and their warrant and completeness against the host PFC records. It trusts the
+  `data_class` value each row carries, the host PFC records themselves (checked by the P10c PFC
+  rules for internal consistency, not against the switch threshold records that emitted the
+  frames), and that a parked pair that cannot restart writes no `resume` row. A sender log
+  without `class_paused`, from a writer that predates it, reads `0` on every row; one with
+  `class_paused` but without `data_class` may not contain pause or resume rows.
+- A queue pair whose first ticks find its class paused writes no rate until its first crediting
+  tick. Until that tick, or the pair's first DCQCN row, reveals the rate, the checker compares
+  every field exactly except a status that depends on the rate; each such status bounds the rate,
+  and the revealed rate must lie within the bounds.
+- `--horizon-ns <ns>` checks a prefix of a run: the logs must hold exactly the run's events with
+  `time_ns < ns`. Pending events at or after the horizon need not have fired; stop decisions are
+  still checked against the run's stop time.
+- `--collective <path>` (trace mode) joins the run's `collective_transitions_csv` to the queue-pair
+  logs. A released RoCE collective stage's pair runs its first pacing tick at the release instant,
+  from the armed status the release row records, and its first control tick one control interval
+  later; a logged stage that is never released has no queue-pair rows; and a local completion
+  caused by a RoCE pair shares its event key with that pair's ACK that brings its acknowledgment to
+  the pair's total.
+
+`p10c_collective_check` replays each stage's inbound rows by the transport that sent them: TCP's
+in-order frontier, which absorbs buffered out-of-order segments, or a RoCE queue pair's Go-back-N
+frontier, which advances only on the packet at the frontier and requires each packet to be the
+pair's packet at its PSN. A RoCE stage's rows carry its MTU; a compute stage after a RoCE
+collective carries the predecessor's MTU and pacing interval, which must equal a logged
+predecessor's.
+- `trace` runs both, then the cross-role checks. Every data arrival must be a packet the sender
+  emitted. Every ACK, NACK and CNP the sender applies must have been sent earlier by the receiver.
+- `<stop_time_ns>` is the image's `stop_time_ns`. No CSV records it, and it decides whether a
+  pacer's next tick is armed or stopped. With it, each decision is checked exactly, no row may lie
+  after it, and no pending event at or before it may be left unfired at the end of the log.
+  Without it, the checker requires one stop time consistent with every armed and stopped decision
+  in the log, and checks unfired events against the latest time the log shows to be before the
+  stop.
 
 Committed Days AGO certificate fixtures can be checked directly, for example:
 
@@ -123,6 +192,10 @@ Committed Days AGO certificate fixtures can be checked directly, for example:
 ./.lake/build/bin/p10c_dcqcn_check fixtures/p10c/dcqcn_executor_trace_accept.csv
 ./.lake/build/bin/p10c_mechanisms_check drr fixtures/p10c/drr_executor_accept.csv
 ./.lake/build/bin/p10c_collective_check fixtures/p10c/collective_allgather_executor_accept.csv
+./.lake/build/bin/p10c_roce_check trace fixtures/p10c/roce_trace_timeout_executor_accept.sender.csv \
+  fixtures/p10c/roce_trace_timeout_executor_accept.receiver.csv \
+  fixtures/p10c/roce_trace_timeout_executor_accept.dcqcn.csv \
+  "$(cat fixtures/p10c/roce_trace_timeout_executor_accept.stop_time_ns)"
 ./.lake/build/bin/sp_check fixtures/sp/sp_priority_and_fifo_accept.csv
 ```
 
@@ -137,8 +210,10 @@ coverpoints. The `p10c_*` executables do not expose the coverage flag.
 - `2`: invalid command-line usage
 
 Legacy checkers report failures in their canonical replay order, which may differ from physical CSV
-order. Days AGO diagnostics use the complete `EventKey`; `p10c_dcqcn_check` additionally
-requires the input rows to arrive in strictly increasing key order.
+order. Days AGO diagnostics use the complete `EventKey`; `p10c_dcqcn_check` and `p10c_roce_check`
+additionally require the input rows to arrive in strictly increasing key order. A
+`p10c_roce_check` diagnostic names the log it refers to (`sender:`, `receiver:` or `dcqcn:`) in
+`sender` and `trace` modes.
 
 Common rejection causes include malformed or out-of-domain integers, duplicate keys, parameter or
 state discontinuity, an illegal queue/protocol action, unmatched paired events, and a post-state

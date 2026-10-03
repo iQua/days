@@ -112,6 +112,9 @@ constant uint ROUND_SCRATCH_CACHE_WORDS = 2;
 // P14 Lane B T4: absolute offset of the PFC region in `scheduler_state`, or NONE when the image
 // carries no PFC state. Layout in `executor/src/device_pfc.rs`.
 constant uint P_PFC_OFFSET = 32;
+// P15 lane R4: absolute offset of the RoCE receiver region in `tcp_state`, or NONE without queue-pair
+// receivers. Layout in `executor/src/device_mechanism.rs`.
+constant uint P_ROCE_OFFSET = 33;
 constant uint PFC_ROW_HEADER_WORDS = 5;
 constant uint PFC_INGRESS_WORDS = 43;
 constant uint PI_LINK = 0;
@@ -126,11 +129,11 @@ constant ulong PFC_FRAME_BYTES = 64;
 
 // Test-hook-only vector offsets appended to the physical metadata buffers after planning. Each
 // entity owns its own slot, so ordinary max writes preserve the actor model and need no atomics.
-// They follow every production params word, P14 Lane B's PFC offset (32) included.
+// They follow every production params word, P15's RoCE offset (33) included.
 #ifdef DAYS_DOMINANT_ARENA_HIGH_WATER
-constant uint P_STREAM_HIGH_WATER_OFFSET = 33;
-constant uint P_REMOTE_HIGH_WATER_OFFSET = 34;
-constant uint P_QUEUE_HIGH_WATER_OFFSET = 35;
+constant uint P_STREAM_HIGH_WATER_OFFSET = 34;
+constant uint P_REMOTE_HIGH_WATER_OFFSET = 35;
+constant uint P_QUEUE_HIGH_WATER_OFFSET = 36;
 #define RECORD_STREAM_HIGH_WATER(params, state, entity, occupancy) \
     (state)[(params)[P_STREAM_HIGH_WATER_OFFSET] + (entity)] = max( \
         (state)[(params)[P_STREAM_HIGH_WATER_OFFSET] + (entity)], \
@@ -224,6 +227,10 @@ constant ulong TCP_ACK_PACKET = 3;
 constant ulong PFC_PACKET = 4;
 constant ulong DCQCN_CNP_PACKET = 5;
 constant ulong DCQCN_CONTROL_TIMER_PACKET = 6;
+constant ulong ROCE_DATA_PACKET = 7;
+constant ulong ROCE_ACK_PACKET = 8;
+constant ulong ROCE_NACK_PACKET = 9;
+constant ulong ROCE_PACING_TIMER_PACKET = 10;
 constant ulong SCHED_FIFO = 0;
 constant ulong SCHED_SP = 1;
 constant ulong SCHED_WFQ = 2;
@@ -316,6 +323,39 @@ constant ulong DCQCN_RECEIVER_LAST_CNP = 3;
 constant uint DR_LAST_CNP = 1;
 constant uint DR_CNP_INTERVAL = 2;
 constant uint DR_CNP_SIZE = 3;
+// P15 lane R4: RoCE queue pairs (`evidence/P15/device-design.md` §1). A queue-pair generator row
+// (kind 4) shares DCQCN's pacer words 12..15 and 18..19 and its controller words 20..39, so the
+// controller helpers run on it unchanged; word 6 (`G_PAYLOAD`) is the stable pacing token.
+//   16 next PSN  17 cumulative acknowledgment  40 pacer armed  41 timeout deadline  42 timeout
+// The flow's receiver row holds marker 4 and, at +1, the absolute `tcp_state` offset of its
+// record in the RoCE region; words 2..6 stay zero (the readback compaction reads 4..6).
+constant ulong GENERATOR_KIND_ROCE = 4;
+constant uint G_ROCE_NEXT_PSN = 16;
+constant uint G_ROCE_SND_UNA = 17;
+constant uint G_ROCE_PACER_ARMED = 40;
+constant uint G_ROCE_RTO_DEADLINE = 41;
+constant uint G_ROCE_RTO = 42;
+constant ulong ROCE_RECEIVER_MARKER = 4;
+constant uint RR_TOTAL = 0;
+constant uint RR_ACK_EVERY = 1;
+constant uint RR_ACK_SIZE = 2;
+constant uint RR_NACK_INTERVAL = 3;
+constant uint RR_DUPLICATE_ACK = 4;
+constant uint RR_CNP_INTERVAL = 5;
+constant uint RR_CNP_SIZE = 6;
+constant uint RR_LAST_CNP = 7;
+constant uint RR_EXPECTED = 8;
+constant uint RR_SINCE_ACK = 9;
+constant uint RR_NACK_PSN = 10;
+constant uint RR_NACK_TIME = 11;
+constant uint RR_FLAGS = 12;
+constant ulong RR_FLAG_LAST_CNP = 1;
+constant ulong RR_FLAG_LAST_NACK = 2;
+constant ulong ROCE_ACTION_ACK = 0;
+constant ulong ROCE_ACTION_DUPLICATE_ACK = 1;
+constant ulong ROCE_ACTION_NACK = 2;
+constant ulong ROCE_ACTION_NACK_SUPPRESSED = 3;
+constant ulong ROCE_ACTION_NONE = 4;
 
 constant uint CTL_KIND = 0;
 constant uint CTL_MSS = 1;
@@ -979,7 +1019,10 @@ inline void active_remove(
 // The per-flow slot word makes this O(log n): validate the identity at the recorded slot, fill the
 // hole with the last record, and repair in whichever direction the fill violates. Semantic code 61
 // reports a slot that does not carry the flow's armed timer, which the live-state contract forbids.
-inline bool heap_remove_timer(
+//
+// Forced inline, as CUDA's `__forceinline__` is. With plain `inline`, the queue-pair ACK/NACK
+// driver's call site (the third) slowed the mechanisms pipeline on DCQCN images that never reach it.
+[[gnu::always_inline]] inline bool heap_remove_timer(
     ulong node,
     ulong flow,
     ulong attempt,
@@ -2806,6 +2849,47 @@ inline bool scheduler_active_weight_sum(
 
 // P14 Lane B T4: a nonzero `paused_mask` hides the packets of paused PFC priorities, so DRR and WRR
 // select over exactly the scalar eligible-packet list. Zero leaves every packet eligible.
+// Scalar `FlowDescriptor::packet_priority` (P15): the flow's class word holds the data class in bits
+// 0..8 and the feedback class's difference in bits 8..16; a CNP, RoCE ACK or RoCE NACK takes the
+// feedback class. The word equals the data class when the two agree. One overload per address
+// space of the packet record.
+inline ulong pfc_class_of(ulong word, ulong kind_word) {
+    ulong kind = kind_word & PK_KIND_MASK;
+    if (kind == DCQCN_CNP_PACKET || kind == ROCE_ACK_PACKET || kind == ROCE_NACK_PACKET) {
+        word ^= word >> 8;
+    }
+    return word & 0xfful;
+}
+
+inline ulong pfc_packet_priority(
+    const device ulong *packet,
+    const device ulong *params,
+    const device ulong *scheduler_state
+) {
+    return pfc_class_of(
+        scheduler_state[params[P_PFC_OFFSET] + params[P_NODE_COUNT] + packet[PK_FLOW]],
+        packet[PK_KIND]);
+}
+
+inline ulong pfc_packet_priority(
+    const thread ulong *packet,
+    const device ulong *params,
+    const device ulong *scheduler_state
+) {
+    return pfc_class_of(
+        scheduler_state[params[P_PFC_OFFSET] + params[P_NODE_COUNT] + packet[PK_FLOW]],
+        packet[PK_KIND]);
+}
+
+// A flow's data class (the class a queue pair's pacer pauses on).
+inline ulong pfc_flow_data_class(
+    ulong flow,
+    const device ulong *params,
+    const device ulong *scheduler_state
+) {
+    return scheduler_state[params[P_PFC_OFFSET] + params[P_NODE_COUNT] + flow] & 0xfful;
+}
+
 inline bool scheduler_first_packet_for_class(
     ulong node,
     ulong class_count,
@@ -2827,9 +2911,8 @@ inline bool scheduler_first_packet_for_class(
         ulong physical = (head + logical) % max(capacity, 1ul);
         ulong record_base = (offset + physical) * EVENT_WORDS;
         if (DAYS_MECHANISMS && paused_mask != 0 &&
-            ((paused_mask >> scheduler_state[
-                params[P_PFC_OFFSET] + params[P_NODE_COUNT] + queue_records[record_base + PK_FLOW]
-            ]) & 1ul) != 0) {
+            ((paused_mask >> pfc_packet_priority(
+                queue_records + record_base, params, scheduler_state)) & 1ul) != 0) {
             continue;
         }
         if (queue_records[record_base + PK_FLOW] % class_count == class_index) {
@@ -3528,6 +3611,81 @@ inline bool packet_remote_target(
     ulong length;
     ulong terminal;
     flow_route(packet, flows, offset, length, terminal);
+    for (ulong index = 0; index < length; ++index) {
+        if (routes[offset + index] == egress) {
+            if (index + 1 < length) {
+                ulong next = routes[offset + index + 1];
+                target = links[next * LINK_WORDS];
+            } else {
+                target = terminal;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+// P15: the mechanisms build's copies, where RoCE data (kind 7) also rides the forward route. The
+// plain build keeps the originals above unchanged, as the CUDA kernel does.
+inline bool flow_route_mechanisms(
+    const thread ulong *packet,
+    const device ulong *flows,
+    thread ulong &offset,
+    thread ulong &length,
+    thread ulong &terminal
+) {
+    ulong flow_base = packet[PK_FLOW] * FLOW_WORDS;
+    ulong kind = packet[PK_KIND] & PK_KIND_MASK;
+    if (kind == DATA_PACKET || kind == TCP_DATA_PACKET || kind == ROCE_DATA_PACKET) {
+        offset = flows[flow_base + 2];
+        length = flows[flow_base + 3];
+        terminal = flows[flow_base + 1];
+    } else {
+        offset = flows[flow_base + 4];
+        length = flows[flow_base + 5];
+        terminal = flows[flow_base];
+    }
+    return true;
+}
+
+inline bool packet_egress_mechanisms(
+    ulong node,
+    const thread ulong *packet,
+    const device ulong *flows,
+    const device ulong *routes,
+    const device ulong *links,
+    thread ulong &egress
+) {
+    ulong offset;
+    ulong length;
+    ulong terminal;
+    flow_route_mechanisms(packet, flows, offset, length, terminal);
+    for (ulong index = 0; index < length; ++index) {
+        ulong link = routes[offset + index];
+        if (links[link * LINK_WORDS] == node) {
+            egress = link;
+            return true;
+        }
+    }
+    if (terminal == node) {
+        egress = NONE;
+        return true;
+    }
+    return false;
+}
+
+inline bool packet_remote_target_mechanisms(
+    const thread ulong *packet,
+    ulong egress,
+    const device ulong *flows,
+    const device ulong *routes,
+    const device ulong *links,
+    thread ulong &target
+) {
+    ulong offset;
+    ulong length;
+    ulong terminal;
+    flow_route_mechanisms(packet, flows, offset, length, terminal);
     for (ulong index = 0; index < length; ++index) {
         if (routes[offset + index] == egress) {
             if (index + 1 < length) {
@@ -4536,13 +4694,6 @@ inline ulong pfc_queue_row(
     return region == NONE ? NONE : scheduler_state[region + node];
 }
 
-inline ulong pfc_flow_priority(
-    ulong flow,
-    const device ulong *params,
-    const device ulong *scheduler_state
-) {
-    return scheduler_state[params[P_PFC_OFFSET] + params[P_NODE_COUNT] + flow];
-}
 
 // Scalar `PfcQueueState::is_paused`: some controller still asserts pause for the priority.
 inline bool pfc_priority_paused(
@@ -4587,7 +4738,7 @@ inline ulong pfc_first_eligible(
     for (ulong logical = 0; logical < count; ++logical) {
         ulong record_base = (offset + (head + logical) % max(capacity, 1ul)) * EVENT_WORDS;
         ulong priority =
-            pfc_flow_priority(queue_records[record_base + PK_FLOW], params, scheduler_state);
+            pfc_packet_priority(queue_records + record_base, params, scheduler_state);
         if (((paused_mask >> priority) & 1ul) == 0) {
             return logical;
         }
@@ -4618,7 +4769,7 @@ inline ulong packet_incoming_link(
     ulong offset;
     ulong length;
     ulong terminal;
-    flow_route(packet, flows, offset, length, terminal);
+    flow_route_mechanisms(packet, flows, offset, length, terminal);
     for (ulong index = 0; index < length; ++index) {
         ulong target = index + 1 < length
             ? links[routes[offset + index + 1] * LINK_WORDS] : terminal;
@@ -4691,14 +4842,714 @@ inline bool emit_pfc_frame(
         stream_records, tcp_state);
 }
 
-// `switch_pfc_remote_arrival`: assign one controller's pause bit; on the last resume, schedule
-// service for the first packet whose priority is no longer paused.
-inline bool pfc_frame_arrival(
+// ---------------------------------------------------------------------------------------------
+// RoCE queue pairs (P15 lane R4). Transliterated from the scalar drivers `host_roce_pacing_timer`,
+// `host_roce_feedback_arrival`, `host_roce_timeout`, `host_roce_data_arrival`, the queue-pair arms
+// of `host_dcqcn_cnp_arrival` and `host_dcqcn_control_timer`, and the pure rules of
+// `executor/src/roce.rs` (`settled_status`, `restart_time_ns`, `receive`). Every queue-pair word is
+// owned by one LP: the generator row by its source, the receiver record by its target.
+//
+// Metal keeps P14's plain-`inline` style throughout (it has no inline control); the structure
+// mirrors the CUDA kernel's RoCE block function for function.
+// ---------------------------------------------------------------------------------------------
+
+// The zero-byte pacing token, the payload of every pacing tick and timeout of the queue pair.
+inline void roce_token_packet(const device ulong *row, ulong flow, thread ulong *packet) {
+    packet_clear(packet);
+    packet[PK_ID] = row[G_PAYLOAD];
+    packet[PK_FLOW] = flow;
+    packet[PK_KIND] = ROCE_PACING_TIMER_PACKET;
+}
+
+// `roce::packet_size`: `min(mtu, total - psn)`.
+inline ulong roce_packet_size(const device ulong *row, ulong psn) {
+    ulong remaining = row[G_RATE_TOTAL] - psn;
+    return row[G_RATE_PACKET_SIZE] < remaining ? row[G_RATE_PACKET_SIZE] : remaining;
+}
+
+// `settle_roce_sender`: the status (`roce::settled_status`) and the outstanding-byte mirrors.
+inline void roce_settle(device ulong *row, ulong parked_status) {
+    ulong total = row[G_RATE_TOTAL];
+    ulong status = parked_status;
+    if (row[G_ROCE_SND_UNA] >= total) {
+        status = 2;
+    } else if (row[G_ROCE_PACER_ARMED] != 0) {
+        // `roce::armed_status`: Scheduled when one more tick of credit covers the next packet.
+        status = 1;
+        if (row[G_ROCE_NEXT_PSN] < total) {
+            ulong tick_low;
+            ulong tick_high;
+            u128_from_mul_u64(
+                row[G_DCQCN_CURRENT_RATE], row[G_RATE_INTERVAL], tick_low, tick_high);
+            ulong credit_low;
+            ulong credit_high;
+            ulong size = roce_packet_size(row, row[G_ROCE_NEXT_PSN]);
+            ulong cost_low;
+            ulong cost_high;
+            u128_mul(size << 3, size >> 61, DCQCN_SCALE, 0, cost_low, cost_high);
+            if (u128_add(row[G_RATE_CREDIT_LOW], row[G_RATE_CREDIT_HIGH], tick_low, tick_high,
+                    credit_low, credit_high) &&
+                u128_at_least(credit_low, credit_high, cost_low, cost_high)) {
+                status = 0;
+            }
+        }
+    }
+    row[G_STATUS] = status;
+    ulong outstanding = row[G_BYTES] - row[G_ROCE_SND_UNA];
+    row[G_OUTSTANDING] = outstanding;
+    row[G_UNACKNOWLEDGED] = outstanding;
+}
+
+// `restart_roce_pacer`: a parked pacer with packets to send restarts on the first point of its
+// pacing grid strictly after `now` (ruling D3). `tick` is the restarted tick's time, or NONE when
+// the pacer stays as it is; a restart beyond the stop time leaves it Stopped. False on overflow.
+inline bool roce_restart(device ulong *row, ulong now, ulong stop, thread ulong &tick) {
+    tick = NONE;
+    ulong total = row[G_RATE_TOTAL];
+    if (row[G_ROCE_PACER_ARMED] != 0 || row[G_ROCE_NEXT_PSN] >= total ||
+        row[G_ROCE_SND_UNA] >= total) {
+        return true;
+    }
+    ulong first = row[G_RATE_FIRST];
+    ulong interval = row[G_RATE_INTERVAL];
+    ulong time = first;
+    if (now >= first) {
+        // The 128-bit product, not a `> NONE / interval` test: LLVM folds that test into a 64-bit
+        // multiply-with-overflow, which Apple's GPU backend cannot legalize.
+        ulong ticks = (now - first) / interval;
+        ulong product_low;
+        ulong product_high;
+        u128_from_mul_u64(ticks + 1, interval, product_low, product_high);
+        if (ticks == NONE || product_high != 0 || !checked_add(product_low, first, time)) {
+            return false;
+        }
+    }
+    row[G_DEPARTURE] = time;
+    if (time <= stop) {
+        row[G_ROCE_PACER_ARMED] = 1;
+        tick = time;
+    } else {
+        row[G_STATUS] = 3;
+    }
+    return true;
+}
+
+// Emits the queue pair's restarted pacing tick, then its re-armed timeout (`emit_roce_timers`).
+inline bool roce_emit_timers(
+    ulong node,
+    const thread ulong *event,
+    const device ulong *row,
+    ulong flow,
+    ulong tick,
+    ulong timeout,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *node_state,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *remote_meta,
+    device ulong *remote_staging,
+    device ulong *stream_state,
+    device ulong *stream_records,
+    device ulong *tcp_state
+) {
+    ulong token[EVENT_WORDS];
+    roce_token_packet(row, flow, token);
+    if (tick != NONE && !emit_child(
+            node, event, node, PACING_TIMER, tick, token, error, params, node_state, fel_meta,
+            fel_records, remote_meta, remote_staging, stream_state, stream_records, tcp_state)) {
+        return false;
+    }
+    return timeout == NONE || emit_child(
+        node, event, node, RETRANSMISSION_TIMEOUT, timeout, token, error, params, node_state,
+        fel_meta, fel_records, remote_meta, remote_staging, stream_state, stream_records, tcp_state);
+}
+
+// `host_roce_pacing_timer`: one tick of credit at the controller's current rate, the packet at the
+// next PSN when the credit covers it, and the next tick on the grid. A tick that finds its data
+// class paused at its host (host-link PFC, tested first) sends nothing, adds no credit and parks.
+inline bool roce_pacing_tick(
     ulong node,
     const thread ulong *event,
     device ulong *error,
     const device ulong *params,
     device ulong *node_state,
+    device ulong *generators,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *queue_meta,
+    device ulong *queue_records,
+    device ulong *remote_meta,
+    device ulong *remote_staging,
+    device ulong *stream_state,
+    device ulong *stream_records,
+    device ulong *summary,
+    device ulong *observation_meta,
+    device ulong *observed,
+    const device ulong *scheduler_state,
+    device ulong *tcp_state
+) {
+    ulong node_base = node * NODE_WORDS;
+    ulong flow = event[PK_FLOW];
+    device ulong *row = generators + flow * GENERATOR_WORDS;
+    if (flow >= params[P_FLOW_COUNT] || row[G_VALID] == 0 || row[G_OWNER] != node ||
+        row[G_KIND] != GENERATOR_KIND_ROCE || row[G_ROCE_PACER_ARMED] == 0 ||
+        row[G_PAYLOAD] != event[E_PAYLOAD] || row[G_DEPARTURE] != event[E_TIME]) {
+        set_semantic_error(error, 80, node);
+        return false;
+    }
+    ulong now = event[E_TIME];
+    ulong total = row[G_RATE_TOTAL];
+    row[G_ROCE_PACER_ARMED] = 0;
+    ulong pfc_row = pfc_queue_row(node, params, scheduler_state);
+    if (pfc_row != NONE &&
+        pfc_priority_paused(
+            pfc_row, pfc_flow_data_class(flow, params, scheduler_state), scheduler_state)) {
+        // The pause-parked list is not stored: the RESUME scan and the readback derive it.
+        roce_settle(row, 1);
+        return true;
+    }
+    bool emitted = false;
+    ulong psn = row[G_ROCE_NEXT_PSN];
+    ulong size = 0;
+    ulong payload = 0;
+    bool retransmission = false;
+    ulong timeout = NONE;
+    if (psn < total) {
+        ulong tick_low;
+        ulong tick_high;
+        u128_from_mul_u64(row[G_DCQCN_CURRENT_RATE], row[G_RATE_INTERVAL], tick_low, tick_high);
+        ulong credit_low;
+        ulong credit_high;
+        if (!u128_add(row[G_RATE_CREDIT_LOW], row[G_RATE_CREDIT_HIGH], tick_low, tick_high,
+                credit_low, credit_high)) {
+            set_semantic_error(error, 81, node);
+            return false;
+        }
+        size = roce_packet_size(row, psn);
+        ulong cost_low;
+        ulong cost_high;
+        u128_mul(size << 3, size >> 61, DCQCN_SCALE, 0, cost_low, cost_high);
+        if (u128_at_least(credit_low, credit_high, cost_low, cost_high)) {
+            u128_sub(credit_low, credit_high, cost_low, cost_high, credit_low, credit_high);
+            retransmission = psn < row[G_BYTES];
+            bool outstanding_before = row[G_ROCE_SND_UNA] < row[G_BYTES];
+            if (!allocate_tcp_payload(node, node_state, params, payload) ||
+                node_state[node_base + N_COUNTER_0] == NONE) {
+                set_semantic_error(error, 81, node);
+                return false;
+            }
+            node_state[node_base + N_COUNTER_0] += 1;
+            row[G_ROCE_NEXT_PSN] = psn + size;
+            if (!retransmission) {
+                if (row[G_PACKETS] == NONE) {
+                    set_semantic_error(error, 81, node);
+                    return false;
+                }
+                row[G_BYTES] = psn + size;
+                row[G_PACKETS] += 1;
+            }
+            if (!dcqcn_on_bytes_emitted(row, size)) {
+                set_semantic_error(error, 82, node);
+                return false;
+            }
+            if (row[G_ROCE_RTO] != 0 && !outstanding_before) {
+                if (!checked_add(now, row[G_ROCE_RTO], timeout)) {
+                    set_semantic_error(error, 81, node);
+                    return false;
+                }
+                row[G_ROCE_RTO_DEADLINE] = timeout;
+            }
+            emitted = true;
+        }
+        row[G_RATE_CREDIT_LOW] = credit_low;
+        row[G_RATE_CREDIT_HIGH] = credit_high;
+    }
+    ulong parked = 1;
+    ulong tick = NONE;
+    if (row[G_ROCE_NEXT_PSN] < total) {
+        ulong next;
+        if (!checked_add(now, row[G_RATE_INTERVAL], next)) {
+            set_semantic_error(error, 81, node);
+            return false;
+        }
+        row[G_DEPARTURE] = next;
+        if (next <= params[P_STOP_TIME]) {
+            row[G_ROCE_PACER_ARMED] = 1;
+            tick = next;
+        } else {
+            parked = 3;
+        }
+    }
+    roce_settle(row, parked);
+    if (!roce_emit_timers(
+            node, event, row, flow, tick, timeout, error, params, node_state, fel_meta,
+            fel_records, remote_meta, remote_staging, stream_state, stream_records, tcp_state)) {
+        return false;
+    }
+    if (!emitted) {
+        return true;
+    }
+    ulong data[EVENT_WORDS];
+    packet_clear(data);
+    data[E_TIME] = now;
+    data[E_PHASE] = 1;
+    data[PK_ID] = payload;
+    data[PK_FLOW] = flow;
+    data[PK_SIZE] = size;
+    data[PK_KIND] = ROCE_DATA_PACKET;
+    data[PK_META_0] = psn;
+    data[PK_META_1] = now;
+    data[PK_META_2] = retransmission ? 1 : 0;
+    if (!source_queue_insert(node, data, error, params, queue_meta, queue_records) ||
+        !record_sourced(node, data, error, params, summary, observation_meta, observed)) {
+        return false;
+    }
+    if (node_state[node_base + N_SERVICE_VALID] == 0 &&
+        node_state[node_base + N_READY_PENDING] == 0) {
+        node_state[node_base + N_READY_PENDING] = 1;
+        return emit_child(
+            node, event, node, TX_READY, now, data, error, params, node_state, fel_meta,
+            fel_records, remote_meta, remote_staging, stream_state, stream_records, tcp_state);
+    }
+    return true;
+}
+
+// The queue-pair arm of `host_dcqcn_control_timer`: DCQCN's control tick, not re-armed once the
+// pair has completed (ruling D2), with the pacer's status recomputed.
+inline bool roce_control_tick(
+    ulong node,
+    const thread ulong *event,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *node_state,
+    device ulong *generators,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *remote_meta,
+    device ulong *remote_staging,
+    device ulong *stream_state,
+    device ulong *stream_records,
+    device ulong *tcp_state
+) {
+    ulong flow = event[PK_FLOW];
+    device ulong *row = generators + flow * GENERATOR_WORDS;
+    if (row[G_DCQCN_CONTROL_PAYLOAD] != event[PK_ID] ||
+        row[G_DCQCN_NEXT_CONTROL] != event[E_TIME]) {
+        return true;
+    }
+    if (!dcqcn_on_control_timer(row, event[E_TIME])) {
+        set_semantic_error(error, 65, node);
+        return false;
+    }
+    roce_settle(row, row[G_STATUS]);
+    if (row[G_DCQCN_NEXT_CONTROL] > params[P_STOP_TIME] ||
+        row[G_ROCE_SND_UNA] >= row[G_RATE_TOTAL]) {
+        return true;
+    }
+    return emit_child(
+        node, event, node, PACING_TIMER, row[G_DCQCN_NEXT_CONTROL], event, error, params,
+        node_state, fel_meta, fel_records, remote_meta, remote_staging, stream_state,
+        stream_records, tcp_state);
+}
+
+// The queue-pair arm of `host_dcqcn_cnp_arrival`: DCQCN's interval-gated decrease, with the
+// pacer's status recomputed and no rate mirror (word 16 is the next PSN here).
+inline bool roce_cnp_arrival(
+    ulong node,
+    const thread ulong *event,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *generators,
+    device ulong *summary,
+    device ulong *observation_meta,
+    device ulong *observed,
+    device ulong *arrivals
+) {
+    device ulong *row = generators + event[PK_FLOW] * GENERATOR_WORDS;
+    row[G_FEEDBACK] += 1;
+    bool applied;
+    if (!dcqcn_on_cnp(row, event[E_TIME], applied)) {
+        set_semantic_error(error, 67, node);
+        return false;
+    }
+    roce_settle(row, row[G_STATUS]);
+    return record_arrival(
+        node, event, 3, error, params, summary, observation_meta, observed, arrivals);
+}
+
+// `host_roce_feedback_arrival`: a fresh ACK advances the cumulative acknowledgment; a NACK also
+// rewinds the next PSN to it (Go-back-N). Every advance or rewind restarts the timeout, removing
+// the superseded record in this transition (the live-state contract), and restarts a parked pacer.
+inline bool roce_feedback_arrival(
+    ulong node,
+    const thread ulong *event,
+    bool nack,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *node_state,
+    device ulong *generators,
+    const device ulong *flows,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *remote_meta,
+    device ulong *remote_staging,
+    device ulong *stream_state,
+    device ulong *stream_records,
+    device ulong *summary,
+    device ulong *observation_meta,
+    device ulong *observed,
+    device ulong *arrivals,
+    device ulong *tcp_state
+) {
+    ulong flow = event[PK_FLOW];
+    device ulong *row = generators + flow * GENERATOR_WORDS;
+    if (flow >= params[P_FLOW_COUNT] || flows[flow * FLOW_WORDS] != node ||
+        row[G_VALID] == 0 || row[G_OWNER] != node || row[G_KIND] != GENERATOR_KIND_ROCE ||
+        row[G_FEEDBACK] == NONE) {
+        set_semantic_error(error, 83, node);
+        return false;
+    }
+    if (!record_arrival(
+            node, event, 3, error, params, summary, observation_meta, observed, arrivals)) {
+        return false;
+    }
+    row[G_FEEDBACK] += 1;
+    ulong now = event[E_TIME];
+    ulong acknowledgment = event[PK_META_0];
+    if (acknowledgment > row[G_BYTES]) {
+        set_semantic_error(error, 84, node);
+        return false;
+    }
+    ulong snd_una = row[G_ROCE_SND_UNA];
+    bool stale = nack ? acknowledgment < snd_una : acknowledgment <= snd_una;
+    ulong tick = NONE;
+    ulong timeout = NONE;
+    if (!stale) {
+        bool outstanding_before = snd_una < row[G_BYTES];
+        snd_una = max(snd_una, acknowledgment);
+        row[G_ROCE_SND_UNA] = snd_una;
+        row[G_ROCE_NEXT_PSN] = nack ? snd_una : max(row[G_ROCE_NEXT_PSN], snd_una);
+        if (row[G_ROCE_RTO] != 0) {
+            if (outstanding_before && !heap_remove_timer(
+                    node, flow, row[G_PAYLOAD], row[G_ROCE_RTO_DEADLINE], error, params,
+                    fel_meta, fel_records, stream_state, tcp_state)) {
+                return false;
+            }
+            if (snd_una < row[G_BYTES]) {
+                if (!checked_add(now, row[G_ROCE_RTO], timeout)) {
+                    set_semantic_error(error, 84, node);
+                    return false;
+                }
+                row[G_ROCE_RTO_DEADLINE] = timeout;
+            } else {
+                row[G_ROCE_RTO_DEADLINE] = 0;
+            }
+        }
+        if (!roce_restart(row, now, params[P_STOP_TIME], tick)) {
+            set_semantic_error(error, 84, node);
+            return false;
+        }
+    }
+    roce_settle(row, row[G_STATUS]);
+    return roce_emit_timers(
+        node, event, row, flow, tick, timeout, error, params, node_state, fel_meta, fel_records,
+        remote_meta, remote_staging, stream_state, stream_records, tcp_state);
+}
+
+// `host_roce_timeout`: Go-back-N rewinds to the cumulative acknowledgment, the fixed timeout
+// re-arms, and a parked pacer restarts. The popped record's slot was cleared by the pop; a record
+// owned by the flow must be the armed timeout, exactly as for TCP (the live-state contract).
+inline bool roce_timeout(
+    ulong node,
+    const thread ulong *event,
+    ulong popped_timer_owner,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *node_state,
+    device ulong *generators,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *remote_meta,
+    device ulong *remote_staging,
+    device ulong *stream_state,
+    device ulong *stream_records,
+    device ulong *tcp_state
+) {
+    ulong flow = event[PK_FLOW];
+    device ulong *row = generators + flow * GENERATOR_WORDS;
+    ulong now = event[E_TIME];
+    bool armed = row[G_OWNER] == node && row[G_ROCE_RTO] != 0 &&
+        row[G_ROCE_SND_UNA] < row[G_BYTES] && row[G_ROCE_RTO_DEADLINE] == now &&
+        row[G_PAYLOAD] == event[E_PAYLOAD];
+    bool owned = popped_timer_owner != NONE && popped_timer_owner == flow;
+    if (armed != owned) {
+        set_semantic_error(error, 61, node);
+        return false;
+    }
+    if (!armed) {
+        return true;
+    }
+    row[G_ROCE_NEXT_PSN] = row[G_ROCE_SND_UNA];
+    ulong timeout;
+    ulong tick;
+    if (!checked_add(now, row[G_ROCE_RTO], timeout) ||
+        !roce_restart(row, now, params[P_STOP_TIME], tick)) {
+        set_semantic_error(error, 85, node);
+        return false;
+    }
+    row[G_ROCE_RTO_DEADLINE] = timeout;
+    roce_settle(row, row[G_STATUS]);
+    return roce_emit_timers(
+        node, event, row, flow, tick, timeout, error, params, node_state, fel_meta, fel_records,
+        remote_meta, remote_staging, stream_state, stream_records, tcp_state);
+}
+
+// The receiver's whole state step for one data arrival, on its record: the DCQCN notification
+// point (`roce::notification_point_sends_cnp`) and then the Go-back-N rule (`roce::receive`).
+// Returns the action, with bit 8 set when a CNP is sent. Out of line: it is pure record
+// arithmetic with a small ABI.
+constant ulong ROCE_RECEIVE_CNP = 1ul << 8;
+inline ulong roce_receive(
+    device ulong *record,
+    ulong psn,
+    ulong size,
+    ulong now,
+    bool congestion_experienced
+) {
+    ulong earliest;
+    bool interval_open = (record[RR_FLAGS] & RR_FLAG_LAST_CNP) == 0 ||
+        (checked_add(record[RR_LAST_CNP], record[RR_CNP_INTERVAL], earliest) &&
+            now >= earliest);
+    ulong cnp = 0;
+    if (congestion_experienced && interval_open) {
+        record[RR_LAST_CNP] = now;
+        record[RR_FLAGS] |= RR_FLAG_LAST_CNP;
+        cnp = ROCE_RECEIVE_CNP;
+    }
+    ulong expected = record[RR_EXPECTED];
+    ulong action;
+    if (psn == expected) {
+        expected += size;
+        record[RR_EXPECTED] = expected;
+        record[RR_SINCE_ACK] += 1;
+        action = record[RR_SINCE_ACK] >= record[RR_ACK_EVERY] || expected == record[RR_TOTAL]
+            ? ROCE_ACTION_ACK : ROCE_ACTION_NONE;
+    } else if (psn < expected) {
+        action = record[RR_DUPLICATE_ACK] != 0 ? ROCE_ACTION_DUPLICATE_ACK : ROCE_ACTION_NONE;
+    } else {
+        bool admitted = (record[RR_FLAGS] & RR_FLAG_LAST_NACK) == 0 ||
+            record[RR_NACK_PSN] != expected ||
+            (checked_add(record[RR_NACK_TIME], record[RR_NACK_INTERVAL], earliest) &&
+                now >= earliest);
+        if (admitted) {
+            record[RR_NACK_PSN] = expected;
+            record[RR_NACK_TIME] = now;
+            record[RR_FLAGS] |= RR_FLAG_LAST_NACK;
+            action = ROCE_ACTION_NACK;
+        } else {
+            action = ROCE_ACTION_NACK_SUPPRESSED;
+        }
+    }
+    if (action <= ROCE_ACTION_NACK) {
+        record[RR_SINCE_ACK] = 0;
+    }
+    return action | cnp;
+}
+
+// One packet a queue-pair receiver sources: the CNP (feedback kind 5, carrying the triggering
+// data packet) or the ACK/NACK (carrying the frontier, the echoed send time and the data size).
+inline void roce_receiver_packet(
+    thread ulong *packet,
+    ulong now,
+    ulong payload,
+    ulong flow,
+    ulong size,
+    ulong kind,
+    ulong meta_0,
+    ulong meta_1,
+    ulong meta_2
+) {
+    packet_clear(packet);
+    packet[E_TIME] = now;
+    packet[E_PHASE] = 1;
+    packet[PK_ID] = payload;
+    packet[PK_FLOW] = flow;
+    packet[PK_SIZE] = size;
+    packet[PK_KIND] = kind;
+    packet[PK_META_0] = meta_0;
+    packet[PK_META_1] = meta_1;
+    packet[PK_META_2] = meta_2;
+}
+
+// `host_roce_data_arrival`: the DCQCN notification point decides a CNP exactly as for a DCQCN
+// flow; then the Go-back-N receiver accepts the in-order packet, or drops the packet and answers
+// it. The CNP is allocated and enqueued before the ACK or NACK (ordering S1); one TX_READY claims
+// an idle egress for the first of them. The packets are built one after another in one record,
+// so only one is live at a time (register plan).
+inline bool roce_data_arrival(
+    ulong node,
+    const thread ulong *event,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *node_state,
+    const device ulong *flows,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *queue_meta,
+    device ulong *queue_records,
+    device ulong *remote_meta,
+    device ulong *remote_staging,
+    device ulong *stream_state,
+    device ulong *stream_records,
+    device ulong *summary,
+    device ulong *observation_meta,
+    device ulong *observed,
+    device ulong *arrivals,
+    device ulong *tcp_state
+) {
+    ulong node_base = node * NODE_WORDS;
+    ulong flow = event[PK_FLOW];
+    const device ulong *receiver_row =
+        tcp_state + params[P_TCP_RECEIVER_OFFSET] + flow * TCP_RECEIVER_WORDS;
+    if (flow >= params[P_FLOW_COUNT] || flows[flow * FLOW_WORDS + 1] != node ||
+        receiver_row[0] != ROCE_RECEIVER_MARKER ||
+        node_state[node_base + N_COUNTER_2] == NONE) {
+        set_semantic_error(error, 86, node);
+        return false;
+    }
+    device ulong *record = tcp_state + receiver_row[1];
+    ulong now = event[E_TIME];
+    ulong end;
+    if (!checked_add(event[PK_META_0], event[PK_SIZE], end) || end > record[RR_TOTAL]) {
+        set_semantic_error(error, 86, node);
+        return false;
+    }
+    ulong step = roce_receive(
+        record, event[PK_META_0], event[PK_SIZE], now, (event[PK_KIND] & PK_ECN_FLAG) != 0);
+    bool cnp_sent = (step & ROCE_RECEIVE_CNP) != 0;
+    ulong action = step & 0xfful;
+    bool feedback = action <= ROCE_ACTION_NACK;
+    node_state[node_base + N_COUNTER_2] += 1;
+    ulong cnp_payload = 0;
+    ulong feedback_payload = 0;
+    ulong sourced = (cnp_sent ? 1 : 0) + (feedback ? 1 : 0);
+    if ((cnp_sent && !allocate_tcp_payload(node, node_state, params, cnp_payload)) ||
+        (feedback && !allocate_tcp_payload(node, node_state, params, feedback_payload)) ||
+        node_state[node_base + N_COUNTER_0] > NONE - sourced) {
+        set_semantic_error(error, 87, node);
+        return false;
+    }
+    node_state[node_base + N_COUNTER_0] += sourced;
+    bool schedule_ready = sourced != 0 &&
+        node_state[node_base + N_SERVICE_VALID] == 0 &&
+        node_state[node_base + N_READY_PENDING] == 0;
+    if (schedule_ready) {
+        node_state[node_base + N_READY_PENDING] = 1;
+    }
+    if (!record_arrival(
+            node, event, 2, error, params, summary, observation_meta, observed, arrivals)) {
+        return false;
+    }
+    // The TX_READY (the handler's only emission, so its key is the same wherever it is emitted)
+    // carries the first sourced packet and is emitted right after that packet is enqueued.
+    ulong packet[EVENT_WORDS];
+    for (ulong index = 0; index < 2; ++index) {
+        bool cnp = index == 0;
+        if (cnp ? !cnp_sent : !feedback) {
+            continue;
+        }
+        if (cnp) {
+            roce_receiver_packet(
+                packet, now, cnp_payload, flow, record[RR_CNP_SIZE], DCQCN_CNP_PACKET,
+                event[PK_ID], 0, 0);
+        } else {
+            roce_receiver_packet(
+                packet, now, feedback_payload, flow, record[RR_ACK_SIZE],
+                action == ROCE_ACTION_NACK ? ROCE_NACK_PACKET : ROCE_ACK_PACKET,
+                record[RR_EXPECTED], event[PK_META_1], event[PK_SIZE]);
+        }
+        if (!source_queue_insert(node, packet, error, params, queue_meta, queue_records) ||
+            !record_sourced(node, packet, error, params, summary, observation_meta, observed)) {
+            return false;
+        }
+        if (schedule_ready) {
+            schedule_ready = false;
+            if (!emit_child(
+                    node, event, node, TX_READY, now, packet, error, params, node_state,
+                    fel_meta, fel_records, remote_meta, remote_staging, stream_state,
+                    stream_records, tcp_state)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// Host-link PFC (P15): the queue pairs a RESUME of class `priority` restarts at a host, each on its
+// next grid point strictly after the RESUME, in generator-position (`FlowId`) order.
+//
+// Specification: `validate::expected_pause_parked`, the validator's characterization of Scalar's
+// `HostPfcState::pause_parked`. The device stores no parked set (ruling D3); the scan applies that
+// function's conjuncts with `data class == priority` in place of `is_paused(class)`, because Scalar
+// takes the set after the last controller's resume has unpaused the class. After R3 merges, the
+// specification skips queue pairs of unreleased collective stages: devices refuse stages in P15,
+// and P16 must add the same skip here.
+inline bool roce_resume_parked(
+    ulong node,
+    const thread ulong *event,
+    ulong row,
+    ulong priority,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *node_state,
+    device ulong *generators,
+    const device ulong *scheduler_state,
+    device ulong *fel_meta,
+    device ulong *fel_records,
+    device ulong *remote_meta,
+    device ulong *remote_staging,
+    device ulong *stream_state,
+    device ulong *stream_records,
+    device ulong *tcp_state
+) {
+    ulong list = scheduler_state[row + 4];
+    ulong pairs = scheduler_state[list];
+    for (ulong index = 0; index < pairs; ++index) {
+        ulong flow = scheduler_state[list + 1 + index];
+        device ulong *generator = generators + flow * GENERATOR_WORDS;
+        ulong total = generator[G_RATE_TOTAL];
+        if (pfc_flow_data_class(flow, params, scheduler_state) != priority ||
+            generator[G_ROCE_PACER_ARMED] != 0 || generator[G_STATUS] == 3 ||
+            generator[G_ROCE_NEXT_PSN] >= total || generator[G_ROCE_SND_UNA] >= total) {
+            continue;
+        }
+        ulong tick;
+        if (!roce_restart(generator, event[E_TIME], params[P_STOP_TIME], tick)) {
+            set_semantic_error(error, 88, node);
+            return false;
+        }
+        roce_settle(generator, generator[G_STATUS]);
+        if (!roce_emit_timers(
+                node, event, generator, flow, tick, NONE, error, params, node_state, fel_meta,
+                fel_records, remote_meta, remote_staging, stream_state, stream_records,
+                tcp_state)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// `switch_pfc_remote_arrival`: assign one controller's pause bit; on the last resume, schedule
+// service for the first packet whose priority is no longer paused.
+inline bool pfc_frame_arrival(
+    ulong node,
+    const thread ulong *event,
+    ulong role,
+    device ulong *error,
+    const device ulong *params,
+    device ulong *node_state,
+    device ulong *generators,
     const device ulong *queue_meta,
     const device ulong *queue_records,
     device ulong *scheduler_state,
@@ -4746,16 +5597,27 @@ inline bool pfc_frame_arrival(
     ulong position = pfc_first_eligible(
         node, pfc_paused_mask(row, scheduler_state), queue_meta, queue_records, params,
         scheduler_state);
-    if (position == NONE || node_state[node_base + N_SERVICE_VALID] != 0 ||
-        node_state[node_base + N_READY_PENDING] != 0) {
-        return true;
+    if (position != NONE && node_state[node_base + N_SERVICE_VALID] == 0 &&
+        node_state[node_base + N_READY_PENDING] == 0) {
+        node_state[node_base + N_READY_PENDING] = 1;
+        ulong next[EVENT_WORDS];
+        pfc_copy_queue_record(node, position, queue_meta, queue_records, next);
+        if (!emit_child(
+                node, event, node, TX_READY, event[E_TIME], next, error, params, node_state,
+                fel_meta, fel_records, remote_meta, remote_staging, stream_state, stream_records,
+                tcp_state)) {
+            return false;
+        }
     }
-    node_state[node_base + N_READY_PENDING] = 1;
-    ulong next[EVENT_WORDS];
-    pfc_copy_queue_record(node, position, queue_meta, queue_records, next);
-    return emit_child(
-        node, event, node, TX_READY, event[E_TIME], next, error, params, node_state, fel_meta,
-        fel_records, remote_meta, remote_staging, stream_state, stream_records, tcp_state);
+    // P15 host-link PFC (`host_pfc_remote_arrival`): after the TX_READY, the RESUME restarts the
+    // host's pause-parked queue pairs of this class, each emitting its tick in `FlowId` order.
+    if (DAYS_MECHANISMS && role == HOST) {
+        return roce_resume_parked(
+            node, event, row, priority, error, params, node_state, generators, scheduler_state,
+            fel_meta, fel_records, remote_meta, remote_staging, stream_state, stream_records,
+            tcp_state);
+    }
+    return true;
 }
 
 // Removes the WFQ packet at `logical` together with its finish tag, which moves to the in-service
@@ -4838,6 +5700,23 @@ inline bool dispatch_event(
     if (kind == PACING_TIMER && role == HOST) {
         ulong flow = event[PK_FLOW];
         ulong generator = flow * GENERATOR_WORDS;
+        // P15: a queue pair's pacing token is tested first (one tag compare ahead of today's paths,
+        // as Scalar's `host_pacing_timer` does).
+        if (DAYS_MECHANISMS && (event[PK_KIND] & PK_KIND_MASK) == ROCE_PACING_TIMER_PACKET) {
+            return roce_pacing_tick(
+                node, event, error, params, node_state, generators, fel_meta, fel_records,
+                queue_meta, queue_records, remote_meta, remote_staging, stream_state,
+                stream_records, summary, observation_meta, observed, scheduler_state, tcp_state);
+        }
+        if (DAYS_MECHANISMS &&
+            (event[PK_KIND] & PK_KIND_MASK) == DCQCN_CONTROL_TIMER_PACKET &&
+            flow < params[P_FLOW_COUNT] && generators[generator + G_VALID] != 0 &&
+            generators[generator + G_OWNER] == node &&
+            generators[generator + G_KIND] == GENERATOR_KIND_ROCE) {
+            return roce_control_tick(
+                node, event, error, params, node_state, generators, fel_meta, fel_records,
+                remote_meta, remote_staging, stream_state, stream_records, tcp_state);
+        }
         if (DAYS_MECHANISMS &&
             (event[PK_KIND] & PK_KIND_MASK) == DCQCN_CONTROL_TIMER_PACKET) {
             return dcqcn_control_timer(
@@ -5261,8 +6140,9 @@ inline bool dispatch_event(
         bool selected_position_valid = true;
         // PFC: while a priority is paused, selection runs over the eligible packets only, as the
         // scalar eligible-packet plan does. With nothing eligible the decision point is a no-op.
-        ulong pfc_row = DAYS_MECHANISMS && role == SWITCH
-            ? pfc_queue_row(node, params, scheduler_state) : NONE;
+        // P15 host-link PFC: a host with egress pause state serves the first packet whose class is
+        // not paused, as a switch FIFO does (`host_pfc_start_eligible`).
+        ulong pfc_row = DAYS_MECHANISMS ? pfc_queue_row(node, params, scheduler_state) : NONE;
         ulong paused_mask = DAYS_MECHANISMS && pfc_row != NONE
             ? pfc_paused_mask(pfc_row, scheduler_state) : 0;
         if (DAYS_MECHANISMS && paused_mask != 0) {
@@ -5347,8 +6227,8 @@ inline bool dispatch_event(
         // releases the pause with a resume frame, emitted before the transmission's children.
         ulong resume_ingress = NONE;
         ulong resume_priority = 0;
-        if (DAYS_MECHANISMS && pfc_row != NONE) {
-            resume_priority = pfc_flow_priority(selected[PK_FLOW], params, scheduler_state);
+        if (DAYS_MECHANISMS && role == SWITCH && pfc_row != NONE) {
+            resume_priority = pfc_packet_priority(selected, params, scheduler_state);
             ulong incoming = packet_incoming_link(node, selected, flows, routes, links);
             ulong ingress = incoming == NONE
                 ? NONE : pfc_enabled_ingress(pfc_row, incoming, resume_priority, scheduler_state);
@@ -5394,7 +6274,9 @@ inline bool dispatch_event(
             return false;
         }
         ulong target;
-        if (!packet_remote_target(selected, egress, flows, routes, links, target)) {
+        if (!(DAYS_MECHANISMS
+                ? packet_remote_target_mechanisms(selected, egress, flows, routes, links, target)
+                : packet_remote_target(selected, egress, flows, routes, links, target))) {
             set_semantic_error(error, 14, node);
             return false;
         }
@@ -5493,8 +6375,7 @@ inline bool dispatch_event(
             node_state[node_base + N_READY_PENDING] == 0
         ) {
             ulong next[EVENT_WORDS];
-            ulong pfc_row = DAYS_MECHANISMS && role == SWITCH
-                ? pfc_queue_row(node, params, scheduler_state) : NONE;
+            ulong pfc_row = DAYS_MECHANISMS ? pfc_queue_row(node, params, scheduler_state) : NONE;
             if (DAYS_MECHANISMS && pfc_row != NONE) {
                 // PFC: the next decision point serves the first packet whose priority is unpaused;
                 // with none eligible, service waits for a resume.
@@ -5535,9 +6416,9 @@ inline bool dispatch_event(
     if (kind == REMOTE_ARRIVAL && role == SWITCH) {
         if (DAYS_MECHANISMS && (event[PK_KIND] & PK_KIND_MASK) == PFC_PACKET) {
             return pfc_frame_arrival(
-                node, event, error, params, node_state, queue_meta, queue_records,
-                scheduler_state, fel_meta, fel_records, remote_meta, remote_staging,
-                stream_state, stream_records, tcp_state);
+                node, event, role, error, params, node_state, generators, queue_meta,
+                queue_records, scheduler_state, fel_meta, fel_records, remote_meta,
+                remote_staging, stream_state, stream_records, tcp_state);
         }
         if (node_state[node_base + N_COUNTER_0] == NONE) {
             set_semantic_error(error, 18, node);
@@ -5545,7 +6426,9 @@ inline bool dispatch_event(
         }
         node_state[node_base + N_COUNTER_0] += 1;
         ulong egress;
-        if (!packet_egress(node, event, flows, routes, links, egress)) {
+        if (!(DAYS_MECHANISMS
+                ? packet_egress_mechanisms(node, event, flows, routes, links, egress)
+                : packet_egress(node, event, flows, routes, links, egress))) {
             set_semantic_error(error, 19, node);
             return false;
         }
@@ -5562,7 +6445,7 @@ inline bool dispatch_event(
         ulong pfc_priority = 0;
         ulong pfc_ingress = NONE;
         if (DAYS_MECHANISMS && pfc_row != NONE) {
-            pfc_priority = pfc_flow_priority(event[PK_FLOW], params, scheduler_state);
+            pfc_priority = pfc_packet_priority(event, params, scheduler_state);
             ulong incoming = packet_incoming_link(node, event, flows, routes, links);
             pfc_ingress = incoming == NONE
                 ? NONE : pfc_enabled_ingress(pfc_row, incoming, pfc_priority, scheduler_state);
@@ -5605,7 +6488,8 @@ inline bool dispatch_event(
         }
         ulong packet_kind = event[PK_KIND] & PK_KIND_MASK;
         if (admission == 1 &&
-            (packet_kind == DATA_PACKET || packet_kind == TCP_DATA_PACKET)) {
+            (packet_kind == DATA_PACKET || packet_kind == TCP_DATA_PACKET ||
+             (DAYS_MECHANISMS && packet_kind == ROCE_DATA_PACKET))) {
             event[PK_KIND] |= PK_ECN_FLAG;
         }
         ulong scheduler_kind = scheduler_state[scheduler_base + S_KIND];
@@ -5983,6 +6867,17 @@ inline bool dispatch_event(
         );
     }
 
+    // P15: a queue pair's timeout precedes the TCP handler, whose armed/owned check would fault on
+    // a timeout record a queue pair owns.
+    if (DAYS_MECHANISMS && kind == RETRANSMISSION_TIMEOUT && role == HOST &&
+        event[PK_FLOW] < params[P_FLOW_COUNT] &&
+        generators[event[PK_FLOW] * GENERATOR_WORDS + G_VALID] != 0 &&
+        generators[event[PK_FLOW] * GENERATOR_WORDS + G_KIND] == GENERATOR_KIND_ROCE) {
+        return roce_timeout(
+            node, event, popped_timer_owner, error, params, node_state, generators, fel_meta,
+            fel_records, remote_meta, remote_staging, stream_state, stream_records, tcp_state);
+    }
+
     if (kind == RETRANSMISSION_TIMEOUT && role == HOST) {
         ulong flow = event[PK_FLOW];
         ulong generator = flow * GENERATOR_WORDS;
@@ -6050,6 +6945,38 @@ inline bool dispatch_event(
     if (kind == REMOTE_ARRIVAL && role == HOST) {
         ulong flow_base = event[PK_FLOW] * FLOW_WORDS;
         ulong packet_kind = event[PK_KIND] & PK_KIND_MASK;
+        // P15: queue-pair data at its receiver, ACK and NACK at its sender, and host-link PFC
+        // frames (switches pausing this host's egress).
+        if (DAYS_MECHANISMS && packet_kind == ROCE_DATA_PACKET) {
+            return roce_data_arrival(
+                node, event, error, params, node_state, flows, fel_meta, fel_records,
+                queue_meta, queue_records, remote_meta, remote_staging, stream_state,
+                stream_records, summary, observation_meta, observed, arrivals, tcp_state);
+        }
+        if (DAYS_MECHANISMS &&
+            (packet_kind == ROCE_ACK_PACKET || packet_kind == ROCE_NACK_PACKET)) {
+            return roce_feedback_arrival(
+                node, event, packet_kind == ROCE_NACK_PACKET, error, params, node_state,
+                generators, flows, fel_meta, fel_records, remote_meta, remote_staging,
+                stream_state, stream_records, summary, observation_meta, observed, arrivals,
+                tcp_state);
+        }
+        if (DAYS_MECHANISMS && packet_kind == PFC_PACKET) {
+            return pfc_frame_arrival(
+                node, event, role, error, params, node_state, generators, queue_meta,
+                queue_records, scheduler_state, fel_meta, fel_records, remote_meta,
+                remote_staging, stream_state, stream_records, tcp_state);
+        }
+        if (DAYS_MECHANISMS && packet_kind == DCQCN_CNP_PACKET &&
+            event[PK_FLOW] < params[P_FLOW_COUNT] && flows[flow_base] == node &&
+            generators[event[PK_FLOW] * GENERATOR_WORDS + G_VALID] != 0 &&
+            generators[event[PK_FLOW] * GENERATOR_WORDS + G_OWNER] == node &&
+            generators[event[PK_FLOW] * GENERATOR_WORDS + G_KIND] == GENERATOR_KIND_ROCE &&
+            generators[event[PK_FLOW] * GENERATOR_WORDS + G_FEEDBACK] != NONE) {
+            return roce_cnp_arrival(
+                node, event, error, params, generators, summary, observation_meta, observed,
+                arrivals);
+        }
         if (DAYS_MECHANISMS && packet_kind == DCQCN_CNP_PACKET) {
             return dcqcn_cnp_arrival(
                 node, event, error, params, generators, flows, summary, observation_meta,

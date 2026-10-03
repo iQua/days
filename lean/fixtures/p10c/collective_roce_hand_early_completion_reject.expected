@@ -1,0 +1,2 @@
+exit=1
+REJECT: line 10: local completion precedes the earliest return of the completing acknowledgment

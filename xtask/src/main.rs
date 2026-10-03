@@ -148,8 +148,8 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "planner_capacity.rs",
         predicate: r#"any(test, feature = "planner-test-hooks")"#,
-        count: 20,
-        purpose: "legacy quadratic helpers exist only for unit and standard full-plan equality tests. T21 added two: the retained `planning_horizon_ns` field and its literal, which is an INPUT the legacy ledger-bound arm recomputes from and the precomputed table has already baked in, so a production build must not carry it. P14 Lane B added the legacy arm of `dcqcn_generator`",
+        count: 21,
+        purpose: "legacy quadratic helpers exist only for unit and standard full-plan equality tests. T21 added two: the retained `planning_horizon_ns` field and its literal, which is an INPUT the legacy ledger-bound arm recomputes from and the precomputed table has already baked in, so a production build must not carry it. P14 Lane B added the legacy arm of `dcqcn_generator`, and P15 lane R4 the legacy arm of `roce_generator`",
     },
     AllowedFeatureGate {
         path: "planner_capacity.rs",
@@ -214,6 +214,20 @@ const STAGE_PATH_FUNCTIONS: &[&str] = &[
     "host_pacing_timer",
     "prepare_tcp_attempts",
     "install_tcp_attempts",
+    // P15: DCQCN and RoCE queue-pair transitions, keyed through the same counted view; a host can
+    // hold many queue pairs.
+    "host_dcqcn_cnp_arrival",
+    "host_dcqcn_control_timer",
+    "host_roce_pacing_timer",
+    "host_roce_feedback_arrival",
+    "host_roce_timeout",
+    // P15 lane R3: collective stages over RoCE queue pairs. A data arrival advances the stages
+    // waiting on its pair's Go-back-N frontier; a release re-anchors and arms the pair.
+    "host_roce_data_arrival",
+    "start_roce_stage",
+    // P15 host-link PFC: a RESUME restarts its class's pause-parked queue pairs, read by
+    // generator position from the host's parked list through the same counted view.
+    "host_pfc_remote_arrival",
 ];
 
 /// The only functions of `executor/src/scalar.rs` that may scan a host's generator or TCP-receiver
@@ -229,15 +243,7 @@ const SCALAR_TABLE_SCANNERS: &[AllowedTableScanner] = &[
         reason: "runs per timeout firing and matches by timer identity, not flow; keying it needs a timer map refreshed at every active_timer store",
     },
     AllowedTableScanner {
-        scope: "host_dcqcn_cnp_arrival",
-        reason: "DCQCN only; DCQCN flows cannot be stages (collectives lower only over TCP)",
-    },
-    AllowedTableScanner {
         scope: "host_dcqcn_pacing_timer",
-        reason: "DCQCN only; DCQCN flows cannot be stages (collectives lower only over TCP)",
-    },
-    AllowedTableScanner {
-        scope: "host_dcqcn_control_timer",
         reason: "DCQCN only; DCQCN flows cannot be stages (collectives lower only over TCP)",
     },
 ];
@@ -253,6 +259,10 @@ const CPU_TABLE_SCANNERS: &[AllowedTableScanner] = &[
     AllowedTableScanner {
         scope: "route_load_estimator_uses_only_declared_routes_and_generator_rates",
         reason: "unit test that installs a fixture generator table",
+    },
+    AllowedTableScanner {
+        scope: "queue_pair_tokens",
+        reason: "once per CPU run when the image holds a timer token, at pool build: maps every RoCE queue pair's two tokens to its source LP, so token import is keyed",
     },
 ];
 

@@ -194,10 +194,11 @@ impl DeviceEventArenaSizing {
 ///
 /// Open-loop images retain the established 28 planes. TCP images add one packed auxiliary plane
 /// for receiver ranges, segment ledgers, and full-observation transition state.
-/// Words a production device plan spends on the P14 DCQCN and PFC mechanism state.
+/// Words a production device plan spends on the P14 DCQCN and PFC and the P15 queue-pair and
+/// host-link PFC mechanism state.
 ///
-/// Both are sized from image data: an image without DCQCN or PFC state spends nothing on them.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// Every field is sized from image data: an image without the state spends nothing on it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MechanismPlaneWords {
     /// Words of the PFC region appended to the scheduler plane; zero without PFC state.
     pub pfc_region_words: usize,
@@ -206,6 +207,14 @@ pub struct MechanismPlaneWords {
     pub dcqcn_receiver_rows: usize,
     /// Params words holding the PFC region offset: one, holding `u64::MAX` without PFC state.
     pub pfc_params_words: usize,
+    /// Words of the RoCE receiver region appended to `tcp_state`; zero without queue pairs.
+    pub roce_region_words: usize,
+    /// Per-flow receiver rows that carry the RoCE queue-pair marker (they already exist for every
+    /// flow; the receiver state lives in the region).
+    pub roce_receiver_rows: usize,
+    /// The PFC region's per-flow class words (`priority | ((feedback_priority ^ priority) << 8)`),
+    /// in flow order; empty without PFC state.
+    pub pfc_class_words: Vec<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -342,6 +351,28 @@ pub(crate) fn dcqcn_device_work(
         packets: usize::try_from(packets.min(pacing_ticks)).unwrap_or(usize::MAX),
         control_ticks,
     }
+}
+
+/// The data packets a RoCE queue pair is expected to source from here on, for sizing the event
+/// and queue arenas (P15): its remaining fresh packets plus one Go-back-N resend of what is
+/// outstanding, and never more than one per remaining grid tick. It is an estimate, not a bound:
+/// heavier loss resends more, and an arena that overflows takes the ordinary capacity retry, which
+/// grows it and replays the run from the start (byte-exact). The grid-tick bound itself, at a
+/// microsecond pacing interval, sized the HPCC incast's arenas at 17.7 GiB.
+pub(crate) fn roce_data_packet_estimate(
+    image: &SimulationImage,
+    generator: &crate::FlowGeneratorState,
+    roce: crate::RoceGenerator,
+) -> usize {
+    let mtu = roce.pacer.mtu_bytes.max(1);
+    let fresh = (roce
+        .pacer
+        .total_bytes
+        .saturating_sub(generator.bytes_emitted))
+    .div_ceil(mtu);
+    let resend = (generator.bytes_emitted.saturating_sub(roce.snd_una)).div_ceil(mtu);
+    let ticks = crate::validate::roce_grid_ticks(image, generator, roce);
+    usize::try_from(fresh.saturating_add(resend).saturating_add(1).min(ticks)).unwrap_or(usize::MAX)
 }
 
 pub(crate) fn rate_device_work(
@@ -634,13 +665,20 @@ pub fn size_default_device_plan(
     //     always precedes re-arm inside a single transition.
     //   * imported events stay a hard floor: an image may supply legacy residue that no armed
     //     timer owns, and that residue is resident until its deadline.
+    //   * a queue-pair source owns three: pacing, control and its one live timeout (P15), as both
+    //     device planners reserve.
     let dcqcn_timer_slots = image
         .host_states
         .iter()
         .flat_map(|state| &state.generators)
-        .filter(|generator| matches!(generator.kind, FlowGeneratorKind::Dcqcn(_)))
-        .count()
-        .saturating_mul(2);
+        .map(|generator| match generator.kind {
+            FlowGeneratorKind::Dcqcn(_) => 2,
+            FlowGeneratorKind::Roce(_) => 3,
+            FlowGeneratorKind::Constant(_)
+            | FlowGeneratorKind::Tcp(_)
+            | FlowGeneratorKind::Rate(_) => 0,
+        })
+        .fold(0_usize, usize::saturating_add);
     let fallback_fel_event_slots = node_count
         .checked_add(image.initial_events.len())
         .and_then(|slots| slots.checked_add(runtime_tcp_timer_slots))
@@ -860,19 +898,36 @@ impl CapacityContext {
                             generator_intervals[index].push(dcqcn.rate.pacing_interval_ns);
                         }
                     }
+                    // Device backends refuse RoCE queue pairs at validation; these sizes keep a
+                    // direct sizing request conservative. A retransmission may resend any packet
+                    // from the cumulative acknowledgment on, and feedback is an ACK, NACK or CNP.
+                    FlowGeneratorKind::Roce(roce) => {
+                        minimum_data_sizes[index] =
+                            minimum_data_sizes[index].min(finite_generator_minimum_packet_size(
+                                roce.pacer.total_bytes,
+                                roce.snd_una,
+                                roce.pacer.mtu_bytes,
+                            ));
+                        minimum_feedback_sizes[index] = minimum_feedback_sizes[index].min(1);
+                        if roce.pacer_armed {
+                            generator_intervals[index].push(roce.pacer.pacing_interval_ns);
+                        }
+                    }
                 }
             }
         }
         for packet in &image.initial_packets {
             let minimum = match packet.kind {
-                PacketKind::Data | PacketKind::TcpData(_) => {
+                PacketKind::Data | PacketKind::TcpData(_) | PacketKind::RoceData(_) => {
                     &mut minimum_data_sizes[packet.flow.0 as usize]
                 }
                 PacketKind::Feedback
                 | PacketKind::TcpAck(_)
                 | PacketKind::Pfc(_)
-                | PacketKind::DcqcnCnp(_) => &mut minimum_feedback_sizes[packet.flow.0 as usize],
-                PacketKind::DcqcnControlTimer => continue,
+                | PacketKind::DcqcnCnp(_)
+                | PacketKind::RoceAck(_)
+                | PacketKind::RoceNack(_) => &mut minimum_feedback_sizes[packet.flow.0 as usize],
+                PacketKind::DcqcnControlTimer | PacketKind::RocePacingTimer => continue,
             };
             *minimum = (*minimum).min(packet.size_bytes);
         }
@@ -916,10 +971,7 @@ fn flow_packet_counts(
         }
         // The zero-byte DCQCN control-timer token never enters a queue or crosses a link, and a PFC
         // frame travels on its reverse control lane, never on its flow's route.
-        if matches!(
-            packet.kind,
-            PacketKind::DcqcnControlTimer | PacketKind::Pfc(_)
-        ) {
+        if packet.kind.is_timer_token() || matches!(packet.kind, PacketKind::Pfc(_)) {
             continue;
         }
         let counts = if packet.kind.is_data() {
@@ -1006,18 +1058,27 @@ fn flow_packet_counts(
                     }
                     data_counts[index] = data_counts[index].saturating_add(work.packets);
                 }
+                FlowGeneratorKind::Roce(roce) => {
+                    data_counts[index] = data_counts[index]
+                        .saturating_add(roce_data_packet_estimate(image, generator, roce));
+                }
             }
         }
     }
     for state in &image.host_states {
         for generator in &state.generators {
-            // One ACK (TCP) or at most one CNP (DCQCN) per data packet.
-            if matches!(
-                generator.kind,
-                FlowGeneratorKind::Tcp(_) | FlowGeneratorKind::Dcqcn(_)
-            ) {
+            // One ACK (TCP) or at most one CNP (DCQCN) per data packet; a queue pair's receiver
+            // answers a data arrival with at most one ACK or NACK and one CNP (validator
+            // invariant 20 of `evidence/P15/qp-design.md` §7).
+            let per_packet = match generator.kind {
+                FlowGeneratorKind::Tcp(_) | FlowGeneratorKind::Dcqcn(_) => 1,
+                FlowGeneratorKind::Roce(_) => 2,
+                FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => 0,
+            };
+            if per_packet != 0 {
                 let flow = generator.flow.0 as usize;
-                feedback_counts[flow] = feedback_counts[flow].saturating_add(data_counts[flow]);
+                feedback_counts[flow] = feedback_counts[flow]
+                    .saturating_add(data_counts[flow].saturating_mul(per_packet));
             }
         }
     }
@@ -1493,12 +1554,16 @@ fn add_flow_route_capacities(
     }
     let flow = &image.flows[flow_index];
     let (route, terminal) = match packet_kind {
-        PacketKind::Data | PacketKind::TcpData(_) => (flow.route.as_slice(), flow.target),
+        PacketKind::Data | PacketKind::TcpData(_) | PacketKind::RoceData(_) => {
+            (flow.route.as_slice(), flow.target)
+        }
         PacketKind::Feedback
         | PacketKind::TcpAck(_)
         | PacketKind::Pfc(_)
-        | PacketKind::DcqcnCnp(_) => (flow.reverse_route.as_slice(), flow.source),
-        PacketKind::DcqcnControlTimer => return,
+        | PacketKind::DcqcnCnp(_)
+        | PacketKind::RoceAck(_)
+        | PacketKind::RoceNack(_) => (flow.reverse_route.as_slice(), flow.source),
+        PacketKind::DcqcnControlTimer | PacketKind::RocePacingTimer => return,
     };
     for index in 0..route.len() {
         let target = route
@@ -1520,14 +1585,16 @@ fn add_flow_route_capacities(
                 capacities.aggregate_queue_packets[target_slot].saturating_add(packet_count);
             capacities.minimum_queue_packet_bytes[target_slot] =
                 capacities.minimum_queue_packet_bytes[target_slot].min(match packet_kind {
-                    PacketKind::Data | PacketKind::TcpData(_) => {
+                    PacketKind::Data | PacketKind::TcpData(_) | PacketKind::RoceData(_) => {
                         context.minimum_data_sizes[flow_index]
                     }
                     PacketKind::Feedback
                     | PacketKind::TcpAck(_)
                     | PacketKind::Pfc(_)
-                    | PacketKind::DcqcnCnp(_) => context.minimum_feedback_sizes[flow_index],
-                    PacketKind::DcqcnControlTimer => unreachable!(),
+                    | PacketKind::DcqcnCnp(_)
+                    | PacketKind::RoceAck(_)
+                    | PacketKind::RoceNack(_) => context.minimum_feedback_sizes[flow_index],
+                    PacketKind::DcqcnControlTimer | PacketKind::RocePacingTimer => unreachable!(),
                 });
             let queue = image.switch_states[image.nodes[target_slot].state_slot as usize]
                 .queues
@@ -1565,12 +1632,16 @@ fn flow_link_serialization_ns(
     link_id: LinkId,
 ) -> u64 {
     let minimum_size = match packet_kind {
-        PacketKind::Data | PacketKind::TcpData(_) => context.minimum_data_sizes[flow_index],
+        PacketKind::Data | PacketKind::TcpData(_) | PacketKind::RoceData(_) => {
+            context.minimum_data_sizes[flow_index]
+        }
         PacketKind::Feedback
         | PacketKind::TcpAck(_)
         | PacketKind::Pfc(_)
-        | PacketKind::DcqcnCnp(_) => context.minimum_feedback_sizes[flow_index],
-        PacketKind::DcqcnControlTimer => return 0,
+        | PacketKind::DcqcnCnp(_)
+        | PacketKind::RoceAck(_)
+        | PacketKind::RoceNack(_) => context.minimum_feedback_sizes[flow_index],
+        PacketKind::DcqcnControlTimer | PacketKind::RocePacingTimer => return 0,
     };
     serialization_time_ns(minimum_size, image.links[link_id.0 as usize].rate_bps)
         .expect("lowered GPU image has positive finite serialization intervals")
@@ -1718,10 +1789,17 @@ fn derived_channel_stream_capacities(
     image: &SimulationImage,
     context: &CapacityContext,
 ) -> Result<Vec<usize>, DeviceSizingError> {
+    // A flow's channel for a (link, target) is the first: lowering appends the PFC control lanes
+    // after every flow channel, and a control lane can share its flow channel's link and target
+    // (a host-link lane always does). With the last entry winning, a flow channel's packets were
+    // counted on the control lane and the flow channel started at the bare slack (P15). The
+    // channels are collected in reverse, so the collect's last-wins dedup keeps the first; the
+    // bulk build allocates as before (per-entry inserts cost 390 more allocations on k16).
     let channels = image
         .channels
         .iter()
         .enumerate()
+        .rev()
         .map(|(index, channel)| ((channel.link, channel.target), index))
         .collect::<BTreeMap<_, _>>();
     let mut packet_counts = vec![0_usize; image.channels.len()];

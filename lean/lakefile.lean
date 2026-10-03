@@ -47,3 +47,6 @@ lean_exe aqm_check where
 
 lean_exe aqm_dcqcn_check where
   root := `LeanGuard.AqmDcqcnMain
+
+lean_exe p10c_roce_check where
+  root := `LeanGuard.P10cRoceMain
