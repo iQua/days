@@ -5700,25 +5700,25 @@ inline bool dispatch_event(
     if (kind == PACING_TIMER && role == HOST) {
         ulong flow = event[PK_FLOW];
         ulong generator = flow * GENERATOR_WORDS;
-        // P15: the queue-pair arms sit behind the DCQCN ones, so a DCQCN image's PACING_TIMER pays
-        // only the tests it paid before queue pairs. Scalar's `host_pacing_timer` tests the queue-pair
-        // token first; the device tests it last. The results cannot differ:
-        // - the queue-pair control tick is folded inside the one DCQCN control-tag test, the same
-        //   predicate split in two, so the control drivers see exactly the events they saw;
-        // - the queue-pair pacing tag (10) and the DCQCN control tag (6) are disjoint, and DCQCN pacing
-        //   takes only a flow whose generator is DCQCN. A queue-pair pacing token always names a RoCE
-        //   generator: `validate` admits a resident one only if its flow's RoCE generator owns it,
-        //   `roce_token_packet` builds one only for its own RoCE row, and no kernel writes `G_KIND`.
-        //   So every queue-pair token still reaches `roce_pacing_tick`, which fails closed (code 80)
-        //   on anything but its armed pair, as before.
-        if (DAYS_MECHANISMS && (event[PK_KIND] & PK_KIND_MASK) == DCQCN_CONTROL_TIMER_PACKET) {
-            if (flow < params[P_FLOW_COUNT] && generators[generator + G_VALID] != 0 &&
-                generators[generator + G_OWNER] == node &&
-                generators[generator + G_KIND] == GENERATOR_KIND_ROCE) {
-                return roce_control_tick(
-                    node, event, error, params, node_state, generators, fel_meta, fel_records,
-                    remote_meta, remote_staging, stream_state, stream_records, tcp_state);
-            }
+        // P15: a queue pair's pacing token is tested first (one tag compare ahead of today's paths,
+        // as Scalar's `host_pacing_timer` does).
+        if (DAYS_MECHANISMS && (event[PK_KIND] & PK_KIND_MASK) == ROCE_PACING_TIMER_PACKET) {
+            return roce_pacing_tick(
+                node, event, error, params, node_state, generators, fel_meta, fel_records,
+                queue_meta, queue_records, remote_meta, remote_staging, stream_state,
+                stream_records, summary, observation_meta, observed, scheduler_state, tcp_state);
+        }
+        if (DAYS_MECHANISMS &&
+            (event[PK_KIND] & PK_KIND_MASK) == DCQCN_CONTROL_TIMER_PACKET &&
+            flow < params[P_FLOW_COUNT] && generators[generator + G_VALID] != 0 &&
+            generators[generator + G_OWNER] == node &&
+            generators[generator + G_KIND] == GENERATOR_KIND_ROCE) {
+            return roce_control_tick(
+                node, event, error, params, node_state, generators, fel_meta, fel_records,
+                remote_meta, remote_staging, stream_state, stream_records, tcp_state);
+        }
+        if (DAYS_MECHANISMS &&
+            (event[PK_KIND] & PK_KIND_MASK) == DCQCN_CONTROL_TIMER_PACKET) {
             return dcqcn_control_timer(
                 node, event, error, params, node_state, generators, fel_meta, fel_records,
                 remote_meta, remote_staging, stream_state, stream_records, tcp_state);
@@ -5730,12 +5730,6 @@ inline bool dispatch_event(
                 node, event, error, params, node_state, generators, fel_meta, fel_records,
                 queue_meta, queue_records, remote_meta, remote_staging, stream_state,
                 stream_records, summary, observation_meta, observed, tcp_state);
-        }
-        if (DAYS_MECHANISMS && (event[PK_KIND] & PK_KIND_MASK) == ROCE_PACING_TIMER_PACKET) {
-            return roce_pacing_tick(
-                node, event, error, params, node_state, generators, fel_meta, fel_records,
-                queue_meta, queue_records, remote_meta, remote_staging, stream_state,
-                stream_records, summary, observation_meta, observed, scheduler_state, tcp_state);
         }
         if (flow >= params[P_FLOW_COUNT] || generators[generator + G_VALID] == 0 ||
             generators[generator + G_OWNER] != node || generators[generator + G_KIND] != 2) {
