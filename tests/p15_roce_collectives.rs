@@ -797,29 +797,31 @@ fn fingerprint(value: &impl std::fmt::Debug) -> (u64, u64) {
 
 /// Frozen at authoring (`5752c51`, 2026-10-01, Mac): the Scalar summary-mode results, which the
 /// `days` CLI reproduced on Scalar and CPU at 2 workers
-/// (`days-gpu/evidence/P15/collectives-impl/raw/anchors-mac-5752c51.txt`).
+/// (`days-gpu/evidence/P15/collectives-impl/raw/anchors-mac-5752c51.txt`); re-frozen at P16 D1
+/// (2026-10-03, Mac) for the Mellanox-form controller and the ECN echo
+/// (`days-gpu/evidence/P16/dcqcn-impl/anchors.md`).
 const ANCHORS: [(&str, u64, u64); 6] = [
     (
         "roce_ring_allreduce_lossless.toml",
-        199_110,
-        0x8b3d_8615_76b7_d646,
+        193_075,
+        0x02fc_5b57_38bf_9639,
     ),
     (
         "roce_allgather_lossless.toml",
-        126_202,
-        0x84c0_e6d2_a574_9c80,
+        123_170,
+        0xc32f_fe08_1e7b_440d,
     ),
-    ("roce_ring_lossy.toml", 190_244, 0xa065_c89e_82b4_e3b9),
-    ("roce_compute_dag.toml", 218_236, 0xb3e9_c56f_a727_6c1c),
+    ("roce_ring_lossy.toml", 182_347, 0xb718_c505_7453_0f5a),
+    ("roce_compute_dag.toml", 212_197, 0xe94b_963f_a5fd_954a),
     (
         "roce_tcp_mixed_collectives.toml",
-        141_856,
-        0xee09_f67f_aca4_91d5,
+        138_792,
+        0x88ff_2fe4_10cc_0df8,
     ),
     (
         "roce_ring_release_paused.toml",
-        203_330,
-        0x273c_f356_1189_2368,
+        197_029,
+        0xf5e6_4cf6_d7ca_985e,
     ),
 ];
 

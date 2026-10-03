@@ -161,47 +161,52 @@ const fn fixture(
     }
 }
 
-/// Frozen at authoring (tree `e625b9e`, 2026-09-27).
+/// Frozen at authoring (tree `e625b9e`, 2026-09-27); re-frozen at P16 D1 (2026-10-03, Mac) for the
+/// Mellanox-form controller (rulings D2, D11, D17): no control ticks, one `tick` row per pacing
+/// tick, frozen controllers ignore later CNPs. The five single-flow zero-XOFF fixtures see no CE,
+/// so their controllers stay pristine and their final states, and anchors, now coincide (their
+/// durations differed only in control ticks). `leanguard_pfc_executable` (no DCQCN) is unmoved.
+/// Old and new values: `days-gpu/evidence/P16/dcqcn-impl/anchors.md`.
 const FIXTURES: [Fixture; 9] = [
     fixture(
         "dcqcn_t26.toml",
-        (0, 0, 3, 0, 28),
-        (8_368, 0x91fc9013a0ea656e),
+        (0, 0, 2, 0, 22),
+        (8_337, 0x88f8f102984b0f8e),
     ),
     fixture(
         "dcqcn_t26_pfc.toml",
-        (4, 2, 3, 40, 28),
-        (16_517, 0xd3b43c756519eab9),
+        (4, 2, 2, 40, 22),
+        (16_486, 0xeddf443ad909fd4f),
     ),
     fixture(
         "dcqcn_simple_zero_xoff.toml",
-        (4, 0, 0, 0, 2_200),
-        (16_409, 0xb6596e44f813c462),
+        (4, 0, 0, 0, 200),
+        (16_450, 0x5b33b4b35e8f42e5),
     ),
     fixture(
         "dcqcn_1s_zero_xoff.toml",
-        (4, 0, 0, 0, 10_200),
-        (16_411, 0x3af8cda420ad9cf6),
+        (4, 0, 0, 0, 200),
+        (16_450, 0x5b33b4b35e8f42e5),
     ),
     fixture(
         "dcqcn_2s_zero_xoff.toml",
-        (4, 0, 0, 0, 20_200),
-        (16_411, 0x112ca3066f3d3064),
+        (4, 0, 0, 0, 200),
+        (16_450, 0x5b33b4b35e8f42e5),
     ),
     fixture(
         "dcqcn_10s_zero_xoff.toml",
-        (4, 0, 0, 0, 100_200),
-        (16_413, 0x3bb2f491803b6242),
+        (4, 0, 0, 0, 200),
+        (16_450, 0x5b33b4b35e8f42e5),
     ),
     fixture(
         "dcqcn_multi_zero_xoff.toml",
-        (10, 0, 195, 0, 4_595),
-        (47_407, 0x264fae42036b8aea),
+        (10, 0, 195, 0, 400),
+        (47_336, 0xbccc6a4c5c6883c1),
     ),
     fixture(
         "leanguard_dcqcn_zero_xoff.toml",
-        (4, 0, 0, 0, 2_200),
-        (16_409, 0xb6596e44f813c462),
+        (4, 0, 0, 0, 200),
+        (16_450, 0x5b33b4b35e8f42e5),
     ),
     fixture(
         "leanguard_pfc_executable.toml",

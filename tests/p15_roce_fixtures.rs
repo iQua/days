@@ -533,30 +533,32 @@ fn scalar_anchor(name: &str) -> (u64, u64) {
 }
 
 /// Frozen at authoring (`b448d08`, 2026-10-01, sim), with `roce_mixed_tcp` re-frozen at `e32bf1f`
-/// when it moved to an ACK every 4 packets: the anchors the device lane proves Metal and CUDA
+/// when it moved to an ACK every 4 packets; every anchor re-frozen at P16 D1 (2026-10-03, Mac) for
+/// the Mellanox-form controller, the ECN echo (no CNP) and the queue-pair window fields
+/// (`days-gpu/evidence/P16/dcqcn-impl/anchors.md`): the anchors the device lane proves Metal and CUDA
 /// against. `run_identical` shows CPU at 1-4 workers equal to Scalar; the `days` CLI cross-check
 /// (Scalar and CPU at 2 workers) is `days-gpu/evidence/P15/qp-impl/sim/p15_anchors.tsv`.
 const ANCHORS: [(&str, u64, u64); 7] = [
-    ("roce_lossless_pfc.toml", 45_710, 0x7e1f_a3a8_7997_030c),
-    ("roce_gbn_lossy.toml", 46_238, 0x4c94_e615_e09a_e734),
-    ("roce_timeout.toml", 34_578, 0x3488_8b67_3127_c7cc),
-    ("roce_nack_only.toml", 34_559, 0x9715_1362_f757_31bf),
-    ("roce_cnp_under_pfc.toml", 58_280, 0x70b0_1e3d_c0d6_15a8),
-    ("roce_feedback_priority.toml", 58_323, 0x6b64_e238_d4d0_3c96),
-    ("roce_mixed_tcp.toml", 52_398, 0x7612_b5cd_28d5_5949),
+    ("roce_lossless_pfc.toml", 45_211, 0x86d4_4c03_e8a2_fe87),
+    ("roce_gbn_lossy.toml", 45_468, 0xb0bb_425a_1abc_c97f),
+    ("roce_timeout.toml", 34_182, 0x8e8e_74eb_ee72_2ced),
+    ("roce_nack_only.toml", 34_161, 0xfa68_ecea_f3fb_dba3),
+    ("roce_cnp_under_pfc.toml", 56_702, 0x55d3_b5d2_ce26_fd5b),
+    ("roce_feedback_priority.toml", 56_749, 0xf5d8_63d1_7bfd_52b6),
+    ("roce_mixed_tcp.toml", 51_617, 0x1259_f21e_71bb_205e),
 ];
 
 /// Host-link PFC anchors (`p15/hostpfc`, frozen at `c26865f` on the Mac; the sim gate's CLI
-/// confirms them on Linux, Scalar and CPU at 2 workers).
+/// confirms them on Linux, Scalar and CPU at 2 workers); re-frozen at P16 D1 with the others.
 const HOST_PFC_ANCHORS: [(&str, u64, u64); 2] = [
     (
         "hostpfc_incast_lossless.toml",
-        67_609,
-        0x08e4_d33e_ffae_89bb,
+        66_858,
+        0x7533_75b4_1b13_00cf,
     ),
     // Fix round 1: the Summary anchor of the multi-QP and TCP variant (frozen on the Mac at
     // c762428's code; the sim gate's CLI confirms it on Linux).
-    ("hostpfc_multi_qp_tcp.toml", 78_419, 0x7a1d_7dd4_4487_b8f4),
+    ("hostpfc_multi_qp_tcp.toml", 77_170, 0x13f3_943d_8d1c_1069),
 ];
 
 #[test]
@@ -602,7 +604,8 @@ fn hpcc_incast_with_host_pfc_loses_nothing() {
 fn hpcc_fixture_matches_its_frozen_anchor() {
     assert_eq!(
         scalar_anchor("hpcc_incast64_dragonfly.toml"),
-        // Re-frozen at c26865f: the fixture re-sized for host-link PFC (hostpfc-design.md §10.2).
-        (1_262_683, 0x7ec5_84fc_7397_55b8)
+        // Re-frozen at c26865f: the fixture re-sized for host-link PFC (hostpfc-design.md §10.2);
+        // re-frozen at P16 D1 for the Mellanox-form controller and the ECN echo.
+        (1_237_835, 0x6dcb_f0e0_afac_8968)
     );
 }
