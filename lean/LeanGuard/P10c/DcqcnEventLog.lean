@@ -5,26 +5,28 @@ import LeanGuard.Shared.Csv
 
 namespace LeanGuard.P10c.DcqcnEventLog
 
+/-! Replay checker of `dcqcn_transitions_csv` (pinned schema
+`days-gpu/plans/briefs/p16/dcqcn-schema.md`). Every row is recomputed from its `before` state:
+a `feedback` row is `onFeedback(before, time)`, any other row `settle(before, bound)` when it froze
+its flow and `materialize(before, bound)` otherwise; the bound is the event time for an arrival
+(phase 0) and the next nanosecond for a timer (phase 1). Rows are in (event key, flow) order, each
+source's first row starts from the pristine controller, each later row continues the previous one,
+and a frozen source has no later row. -/
+
 open LeanGuard.Shared
 open LeanGuard.P10c
 
 inductive Kind
-  | cnp
-  | control
-  | bytes
+  | feedback
+  | tick
+  | advance
   deriving DecidableEq, Repr
 
 def parseKind : String → Except String Kind
-  | "cnp" => pure .cnp
-  | "control" => pure .control
-  | "bytes" => pure .bytes
+  | "feedback" => pure .feedback
+  | "tick" => pure .tick
+  | "advance" => pure .advance
   | other => throw s!"invalid DCQCN row kind: '{other}'"
-
-def parseStage : String → Except String Dcqcn.Stage
-  | "fast_recovery" => pure .fastRecovery
-  | "additive" => pure .additive
-  | "hyper" => pure .hyper
-  | other => throw s!"invalid DCQCN stage: '{other}'"
 
 def parseBit (value : String) : Except String Bool :=
   match value with
@@ -39,66 +41,69 @@ def parseU64 (value : String) : Except String Nat := do
   else
     throw s!"value exceeds u64: '{value}'"
 
-def parseOptU64 (value : String) : Except String (Option Nat) :=
-  parseOpt parseU64 value
-
 structure Row where
   key : DaysExecutor.EventKey
   nodeId : Nat
   flowId : Nat
   kind : Kind
-  applied : Bool
-  emittedBytes : Nat
+  boundNs : Nat
+  frozen : Bool
+  counts : Dcqcn.Counts
   config : Dcqcn.Config
   before : Dcqcn.State
   after : Dcqcn.State
   srcLine : Nat
-  deriving DecidableEq, Repr
+  deriving Repr
 
 def parseState
     (fieldPrefix : String)
     (idx : Std.HashMap String Nat)
     (fields : Array String) : Except String Dcqcn.State := do
+  let field := fun name => getField idx fields s!"{fieldPrefix}_{name}"
   pure
-    { alphaPpb := ← parseU64 (← getField idx fields s!"{fieldPrefix}_alpha_ppb")
-      currentRateBps := ← parseU64 (← getField idx fields s!"{fieldPrefix}_current_rate_bps")
-      targetRateBps := ← parseU64 (← getField idx fields s!"{fieldPrefix}_target_rate_bps")
-      stage := ← parseStage (← getField idx fields s!"{fieldPrefix}_stage")
-      stageSteps := ← parseU64 (← getField idx fields s!"{fieldPrefix}_stage_steps")
-      bytesSinceIncrease :=
-        ← parseU64 (← getField idx fields s!"{fieldPrefix}_bytes_since_increase")
-      cnpSeen := ← parseBit (← getField idx fields s!"{fieldPrefix}_cnp_seen")
-      lastCnpNs :=
-        ← parseOptU64 (← getField idx fields s!"{fieldPrefix}_last_cnp_time_ns")
-      nextControlTimeNs :=
-        ← parseU64 (← getField idx fields s!"{fieldPrefix}_next_control_time_ns") }
+    { alphaQ63 := ← parseU64 (← field "alpha_q63")
+      currentRateBps := ← parseU64 (← field "current_rate_bps")
+      targetRateBps := ← parseU64 (← field "target_rate_bps")
+      nextAlphaNs := ← parseU64 (← field "next_alpha_ns")
+      nextDecreaseNs := ← parseU64 (← field "next_decrease_ns")
+      nextIncreaseNs := ← parseU64 (← field "next_increase_ns")
+      stage := ← parseU64 (← field "stage")
+      armed := ← parseBit (← field "armed")
+      alphaPending := ← parseBit (← field "alpha_pending")
+      decreasePending := ← parseBit (← field "decrease_pending")
+      increaseArmed := ← parseBit (← field "increase_armed") }
 
 def parseRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array String) :
     Except String Row := do
+  let field := getField idx fields
   let result : Except String Row := do
     pure
       { key :=
-          { timeNs := ← parseU64 (← getField idx fields "time_ns")
-            phase := ← parseU64 (← getField idx fields "event_phase")
-            originNode := ← parseU64 (← getField idx fields "event_origin_node")
-            originSeq := ← parseU64 (← getField idx fields "event_origin_sequence") }
-        nodeId := ← parseU64 (← getField idx fields "node_id")
-        flowId := ← parseU64 (← getField idx fields "flow_id")
-        kind := ← parseKind (← getField idx fields "kind")
-        applied := ← parseBit (← getField idx fields "applied")
-        emittedBytes := ← parseU64 (← getField idx fields "emitted_bytes")
+          { timeNs := ← parseU64 (← field "time_ns")
+            phase := ← parseU64 (← field "event_phase")
+            originNode := ← parseU64 (← field "event_origin_node")
+            originSeq := ← parseU64 (← field "event_origin_sequence") }
+        nodeId := ← parseU64 (← field "node_id")
+        flowId := ← parseU64 (← field "flow_id")
+        kind := ← parseKind (← field "kind")
+        boundNs := ← parseU64 (← field "bound_ns")
+        frozen := ← parseBit (← field "frozen")
+        counts :=
+          { alphaTicks := ← parseU64 (← field "alpha_ticks")
+            increaseFires := ← parseU64 (← field "increase_fires")
+            decreaseCuts := ← parseU64 (← field "decrease_cuts") }
         config :=
-          { initialRateBps := ← parseU64 (← getField idx fields "initial_rate_bps")
-            minimumRateBps := ← parseU64 (← getField idx fields "minimum_rate_bps")
-            maximumRateBps := ← parseU64 (← getField idx fields "maximum_rate_bps")
-            additiveRateBps := ← parseU64 (← getField idx fields "additive_rate_bps")
-            hyperRateBps := ← parseU64 (← getField idx fields "hyper_rate_bps")
-            gPpb := ← parseU64 (← getField idx fields "g_ppb")
-            decreasePpb := ← parseU64 (← getField idx fields "decrease_ppb")
-            cnpIntervalNs := ← parseU64 (← getField idx fields "cnp_interval_ns")
-            controlIntervalNs := ← parseU64 (← getField idx fields "control_interval_ns")
-            increaseByteThreshold :=
-              ← parseU64 (← getField idx fields "increase_byte_threshold") }
+          { initialRateBps := ← parseU64 (← field "initial_rate_bps")
+            minimumRateBps := ← parseU64 (← field "minimum_rate_bps")
+            maximumRateBps := ← parseU64 (← field "maximum_rate_bps")
+            additiveRateBps := ← parseU64 (← field "additive_rate_bps")
+            hyperRateBps := ← parseU64 (← field "hyper_rate_bps")
+            gQ63 := ← parseU64 (← field "g_q63")
+            alphaIntervalNs := ← parseU64 (← field "alpha_interval_ns")
+            decreaseIntervalNs := ← parseU64 (← field "decrease_interval_ns")
+            increaseIntervalNs := ← parseU64 (← field "increase_interval_ns")
+            fastRecoverySteps := ← parseU64 (← field "fast_recovery_steps")
+            clampTargetRate := ← parseBit (← field "clamp_target_rate") }
         before := ← parseState "before" idx fields
         after := ← parseState "after" idx fields
         srcLine := lineNo }
@@ -121,76 +126,70 @@ def parseCsv (content : String) : Except String (List Row) := do
             go (lineNo + 1) rest (row :: rows)
       go 2 data []
 
-def sameSource (first second : Row) : Bool :=
-  first.nodeId = second.nodeId && first.flowId = second.flowId
-
-def continuous (first second : Row) : Bool :=
-  first.after = second.before
-
-def checkKeyOrder : List Row → Except String Unit
+/-- Rows are ordered by (event key, flow); one event yields at most one row per flow. -/
+def checkOrder : List Row → Except String Unit
   | [] | [_] => pure ()
   | first :: second :: rest => do
-      require second.srcLine (first.key < second.key)
-        "duplicate or backward canonical event key"
-      checkKeyOrder (second :: rest)
+      require second.srcLine
+        (first.key < second.key || (first.key = second.key && first.flowId < second.flowId))
+        "duplicate or backward (event key, flow)"
+      checkOrder (second :: rest)
+
+/-- The transition a row must show, recomputed from its `before` state. -/
+def expected (row : Row) : Dcqcn.State × Dcqcn.Counts :=
+  match row.kind with
+  | .feedback => Dcqcn.onFeedback row.config row.before row.key.timeNs
+  | .tick | .advance =>
+      if row.frozen then Dcqcn.settle row.config row.before row.boundNs
+      else Dcqcn.materialize row.config row.before row.boundNs
 
 def checkRow (row : Row) : Except String Unit := do
   require row.srcLine (Dcqcn.validConfig row.config) "invalid DCQCN configuration"
-  require row.srcLine (Dcqcn.validState row.config row.before)
-    "invalid DCQCN before-state"
-  require row.srcLine (Dcqcn.validState row.config row.after)
-    "invalid DCQCN after-state"
-  let expected ←
-    match row.kind with
-    | .cnp => do
-        require row.srcLine (row.key.phase = 0) "DCQCN CNP arrival must have phase 0"
-        require row.srcLine (row.emittedBytes = 0) "CNP row has emitted bytes"
-        match row.before.lastCnpNs with
-        | some last =>
-            require row.srcLine
-              (last + row.config.cnpIntervalNs ≤ Dcqcn.maxU64)
-              "CNP interval deadline exceeds u64"
-        | none => pure ()
-        pure (Dcqcn.onCnp row.config row.before row.key.timeNs)
-    | .control => do
-        require row.srcLine (row.key.phase = 1) "DCQCN control tick must have phase 1"
-        require row.srcLine (row.emittedBytes = 0) "control row has emitted bytes"
-        require row.srcLine (row.before.nextControlTimeNs = row.key.timeNs)
-          "control event time does not match before-state deadline"
-        require row.srcLine
-          (row.key.timeNs + row.config.controlIntervalNs ≤ Dcqcn.maxU64)
-          "next control deadline exceeds u64"
-        pure (Dcqcn.onControl row.config row.before row.key.timeNs)
-    | .bytes => do
-        require row.srcLine (row.key.phase = 1) "DCQCN byte opportunity must have phase 1"
-        require row.srcLine (row.emittedBytes > 0) "byte row must emit positive bytes"
-        require row.srcLine
-          (row.before.bytesSinceIncrease + row.emittedBytes ≤ Dcqcn.maxU64)
-          "DCQCN byte counter exceeds u64"
-        pure (Dcqcn.onBytes row.config row.before row.emittedBytes)
-  require row.srcLine (row.applied = expected.acted) "DCQCN transition result mismatch"
-  require row.srcLine (row.after = expected.state) "DCQCN after-state mismatch"
+  require row.srcLine (Dcqcn.validState row.config row.before) "invalid DCQCN before-state"
+  require row.srcLine (Dcqcn.validState row.config row.after) "invalid DCQCN after-state"
+  require row.srcLine (row.key.phase ≤ 1) "DCQCN row from a phase-2 event"
+  require row.srcLine (row.boundNs = row.key.timeNs + row.key.phase)
+    "DCQCN bound is not the event time (arrival) or the next nanosecond (timer)"
+  match row.kind with
+  | .feedback =>
+      require row.srcLine (row.key.phase = 0) "DCQCN feedback must be an arrival (phase 0)"
+      require row.srcLine (!row.frozen) "DCQCN feedback on a frozen controller"
+  | .tick =>
+      require row.srcLine (row.key.phase = 1) "DCQCN pacing tick must have phase 1"
+  | .advance => pure ()
+  let (state, counts) := expected row
+  require row.srcLine (row.after = state) "DCQCN after-state mismatch"
+  require row.srcLine (row.counts = counts) "DCQCN transition counts mismatch"
+  if row.kind = .advance then
+    require row.srcLine (row.frozen || 0 < counts.increaseFires + counts.decreaseCuts)
+      "DCQCN advance row applied no rate instant and froze nothing"
 
-def checkContinuity (rows : List Row) : Except String Unit := do
-  let rec go (previous : List Row) : List Row → Except String Unit
-    | [] => pure ()
-    | row :: rest => do
-        match previous.find? (sameSource · row) with
-        | none =>
-            require row.srcLine (Dcqcn.initialCompatible row.config row.before)
-              s!"DCQCN first state is not initial for source (node_id={row.nodeId}, flow_id={row.flowId})"
-        | some prior =>
-            require row.srcLine (prior.config = row.config)
-              s!"DCQCN config discontinuity for source (node_id={row.nodeId}, flow_id={row.flowId})"
-            require row.srcLine (continuous prior row)
-              s!"DCQCN state discontinuity for source (node_id={row.nodeId}, flow_id={row.flowId})"
-        go (row :: previous.filter (fun prior => !sameSource prior row)) rest
-  go [] rows
+structure SourceState where
+  config : Dcqcn.Config
+  after : Dcqcn.State
+  frozen : Bool
 
+/-- One pass in row order, keyed by (node, flow): a row first continues its source (the pristine
+controller for the first row, the previous `after` otherwise, never after a freeze), then obeys
+its own transition rule, so the first rejected line is the earliest violation. -/
 def checkRows (rows : List Row) : Except String Unit := do
   require 1 (!rows.isEmpty) "empty DCQCN trace"
-  checkKeyOrder rows
-  checkContinuity rows
-  for row in rows do checkRow row
+  checkOrder rows
+  let mut sources : Std.HashMap (Nat × Nat) SourceState := {}
+  for row in rows do
+    let source := (row.nodeId, row.flowId)
+    match sources.get? source with
+    | none =>
+        require row.srcLine (row.before = Dcqcn.pristine row.config)
+          s!"DCQCN first state is not pristine for source (node_id={row.nodeId}, flow_id={row.flowId})"
+    | some prior =>
+        require row.srcLine (!prior.frozen)
+          s!"DCQCN row after the freeze of source (node_id={row.nodeId}, flow_id={row.flowId})"
+        require row.srcLine (prior.config = row.config)
+          s!"DCQCN config discontinuity for source (node_id={row.nodeId}, flow_id={row.flowId})"
+        require row.srcLine (prior.after = row.before)
+          s!"DCQCN state discontinuity for source (node_id={row.nodeId}, flow_id={row.flowId})"
+    checkRow row
+    sources := sources.insert source { config := row.config, after := row.after, frozen := row.frozen }
 
 end LeanGuard.P10c.DcqcnEventLog

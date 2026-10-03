@@ -2,24 +2,25 @@ import Std
 
 namespace LeanGuard.P10c.Dcqcn
 
-/-- Executor DCQCN uses one part-per-billion scale and integer bit/s rates.
+/-! The Mellanox-form DCQCN reaction point of the executor (P16), the controller of HPCC's ns-3
+(`CC_MODE 1`) and SimAI: `days-gpu/evidence/P16/simai-dcqcn-spec.md` §7, pinned record schema
+`days-gpu/plans/briefs/p16/dcqcn-schema.md`.
 
-This is intentionally separate from `LeanGuard.Dcqcn.Semantics`, which specifies the
-legacy simulator's floating-point controller. The executor extends that lineage with
-an explicit target rate, staged recovery, and byte-triggered increase opportunities.
-Every division below is the sole floor operation for its complete rational expression.
--/
-def fractionScale : Nat := 1_000_000_000
+The eager machine has three periodic timers: the alpha update every `alphaIntervalNs` from the
+first feedback, the rate-decrease check on the grid `t0 + D + 1 + m D`, and the rate-increase timer
+every `increaseIntervalNs` from the last cut. At equal time a feedback arrival precedes the timers,
+and the timers fire in the order alpha, increase, decrease. The executor applies them lazily; the
+transitions below are the eager machine's instants applied in that order before an exclusive bound,
+which is what each transition record must show.
+
+The arithmetic is exact `Nat` arithmetic in the direct rational forms (alpha in Q63, `2^63` is one):
+it shares no algebraic identity with the executor's u64 code. This is intentionally separate from
+`LeanGuard.Dcqcn.Semantics`, which specifies the legacy simulator's floating-point controller. -/
 
 def maxU64 : Nat := 2 ^ 64 - 1
 
-def stageLength : Nat := 5
-
-inductive Stage
-  | fastRecovery
-  | additive
-  | hyper
-  deriving DecidableEq, Repr
+/-- `alpha = 1` in Q63. -/
+def alphaOne : Nat := 2 ^ 63
 
 structure Config where
   initialRateBps : Nat
@@ -27,149 +28,199 @@ structure Config where
   maximumRateBps : Nat
   additiveRateBps : Nat
   hyperRateBps : Nat
-  gPpb : Nat
-  decreasePpb : Nat
-  cnpIntervalNs : Nat
-  controlIntervalNs : Nat
-  increaseByteThreshold : Nat
+  gQ63 : Nat
+  alphaIntervalNs : Nat
+  decreaseIntervalNs : Nat
+  increaseIntervalNs : Nat
+  fastRecoverySteps : Nat
+  clampTargetRate : Bool
   deriving DecidableEq, Repr
 
 structure State where
-  alphaPpb : Nat
+  alphaQ63 : Nat
   currentRateBps : Nat
   targetRateBps : Nat
-  stage : Stage
-  stageSteps : Nat
-  bytesSinceIncrease : Nat
-  cnpSeen : Bool
-  lastCnpNs : Option Nat
-  nextControlTimeNs : Nat
+  nextAlphaNs : Nat
+  nextDecreaseNs : Nat
+  nextIncreaseNs : Nat
+  stage : Nat
+  armed : Bool
+  alphaPending : Bool
+  decreasePending : Bool
+  increaseArmed : Bool
   deriving DecidableEq, Repr
 
-structure Result where
-  state : State
-  acted : Bool
+/-- What one transition applied (the record's diagnostic counts). -/
+structure Counts where
+  alphaTicks : Nat := 0
+  increaseFires : Nat := 0
+  decreaseCuts : Nat := 0
   deriving DecidableEq, Repr
+
+def Counts.add (left right : Counts) : Counts :=
+  { alphaTicks := left.alphaTicks + right.alphaTicks
+    increaseFires := left.increaseFires + right.increaseFires
+    decreaseCuts := left.decreaseCuts + right.decreaseCuts }
+
+/-- `t + interval`, where an instant at or beyond `u64::MAX` never fires. -/
+def later (time interval : Nat) : Nat := min maxU64 (time + interval)
+
+/-- The lowest rate a controller reaches: `2 * floor((minimum - 1) / 2)`. -/
+def rateFloor (config : Config) : Nat := 2 * ((config.minimumRateBps - 1) / 2)
 
 def validConfig (config : Config) : Bool :=
-  config.minimumRateBps > 0 &&
+  3 ≤ config.minimumRateBps &&
     config.minimumRateBps ≤ config.initialRateBps &&
     config.initialRateBps ≤ config.maximumRateBps &&
     config.maximumRateBps ≤ maxU64 &&
     config.additiveRateBps ≤ maxU64 &&
     config.hyperRateBps ≤ maxU64 &&
-    config.gPpb ≤ fractionScale &&
-    config.decreasePpb ≤ fractionScale &&
-    config.cnpIntervalNs ≤ maxU64 &&
-    config.controlIntervalNs > 0 &&
-    config.controlIntervalNs ≤ maxU64 &&
-    config.increaseByteThreshold > 0 &&
-    config.increaseByteThreshold ≤ maxU64
+    config.gQ63 ≤ alphaOne &&
+    0 < config.alphaIntervalNs && config.alphaIntervalNs ≤ maxU64 &&
+    0 < config.decreaseIntervalNs && config.decreaseIntervalNs ≤ maxU64 &&
+    0 < config.increaseIntervalNs && config.increaseIntervalNs ≤ maxU64 &&
+    config.fastRecoverySteps < 2 ^ 32 - 1
 
-def validStage (state : State) : Bool :=
-  match state.stage with
-  | .fastRecovery | .additive => state.stageSteps < stageLength
-  | .hyper => state.stageSteps = 0
+def pristine (config : Config) : State :=
+  { alphaQ63 := alphaOne
+    currentRateBps := config.initialRateBps
+    targetRateBps := config.initialRateBps
+    nextAlphaNs := 0
+    nextDecreaseNs := 0
+    nextIncreaseNs := 0
+    stage := 0
+    armed := false
+    alphaPending := false
+    decreasePending := false
+    increaseArmed := false }
 
 def validState (config : Config) (state : State) : Bool :=
-  state.alphaPpb ≤ fractionScale &&
-    config.minimumRateBps ≤ state.currentRateBps &&
+  state.alphaQ63 ≤ alphaOne &&
+    state.stage ≤ config.fastRecoverySteps + 1 &&
+    rateFloor config ≤ state.currentRateBps &&
     state.currentRateBps ≤ config.maximumRateBps &&
-    config.minimumRateBps ≤ state.targetRateBps &&
+    rateFloor config ≤ state.targetRateBps &&
     state.targetRateBps ≤ config.maximumRateBps &&
-    validStage state &&
-    state.bytesSinceIncrease ≤ maxU64 &&
-    state.nextControlTimeNs ≤ maxU64 &&
-    (!state.cnpSeen || state.lastCnpNs.isSome) &&
-    state.lastCnpNs.all (· ≤ maxU64)
+    state.nextAlphaNs ≤ maxU64 &&
+    state.nextDecreaseNs ≤ maxU64 &&
+    state.nextIncreaseNs ≤ maxU64 &&
+    (state.armed || state == pristine config)
 
-def initialCompatible (config : Config) (state : State) : Bool :=
-  state.alphaPpb = 0 &&
-    state.currentRateBps = config.initialRateBps &&
-    state.targetRateBps = config.initialRateBps &&
-    state.stage = .hyper &&
-    state.stageSteps = 0 &&
-    state.bytesSinceIncrease = 0 &&
-    !state.cnpSeen &&
-    state.lastCnpNs.isNone &&
-    state.nextControlTimeNs + config.controlIntervalNs ≤ maxU64
+/-- One alpha update: `floor(((S - g) alpha + [pending] g S) / S)`. -/
+def alphaStep (config : Config) (alpha : Nat) (pending : Bool) : Nat :=
+  ((alphaOne - config.gQ63) * alpha + (if pending then config.gQ63 * alphaOne else 0)) / alphaOne
 
-def alphaOnCnp (config : Config) (alphaPpb : Nat) : Nat :=
-  ((fractionScale - config.gPpb) * alphaPpb + config.gPpb * fractionScale) /
-    fractionScale
+/-- `ticks` pure decays; decay is monotone and floors to zero, after which it is the identity. -/
+def decay (config : Config) : Nat → Nat → Nat
+  | 0, alpha => alpha
+  | ticks + 1, alpha => if alpha = 0 then 0 else decay config ticks (alphaStep config alpha false)
 
-def alphaOnQuietTick (config : Config) (alphaPpb : Nat) : Nat :=
-  ((fractionScale - config.gPpb) * alphaPpb) / fractionScale
-
-def decreasedRate (config : Config) (rateBps alphaPpb : Nat) : Nat :=
-  let square := fractionScale * fractionScale
-  let factor := square - config.decreasePpb * alphaPpb
-  max config.minimumRateBps ((rateBps * factor) / square)
-
-def averageRate (current target : Nat) : Nat :=
-  (current + target) / 2
-
-def clampIncrease (maximum current increment : Nat) : Nat :=
-  min maximum (current + increment)
-
-def increase (config : Config) (state : State) : State :=
-  match state.stage with
-  | .fastRecovery =>
-      let steps := state.stageSteps + 1
-      { state with
-        currentRateBps := averageRate state.currentRateBps state.targetRateBps
-        stage := if steps = stageLength then .additive else .fastRecovery
-        stageSteps := if steps = stageLength then 0 else steps }
-  | .additive =>
-      let target := clampIncrease config.maximumRateBps state.targetRateBps config.additiveRateBps
-      let steps := state.stageSteps + 1
-      { state with
-        currentRateBps := averageRate state.currentRateBps target
-        targetRateBps := target
-        stage := if steps = stageLength then .hyper else .additive
-        stageSteps := if steps = stageLength then 0 else steps }
-  | .hyper =>
-      let target := clampIncrease config.maximumRateBps state.targetRateBps config.hyperRateBps
-      { state with
-        currentRateBps := averageRate state.currentRateBps target
-        targetRateBps := target
-        stageSteps := 0 }
-
-def acceptsCnp (config : Config) (state : State) (timeNs : Nat) : Bool :=
-  match state.lastCnpNs with
-  | none => true
-  | some last => last + config.cnpIntervalNs ≤ timeNs
-
-def onCnp (config : Config) (state : State) (timeNs : Nat) : Result :=
-  if acceptsCnp config state timeNs then
-    let alpha := alphaOnCnp config state.alphaPpb
-    { state :=
-        { state with
-          alphaPpb := alpha
-          currentRateBps := decreasedRate config state.currentRateBps alpha
-          targetRateBps := state.currentRateBps
-          stage := .fastRecovery
-          stageSteps := 0
-          bytesSinceIncrease := 0
-          cnpSeen := true
-          lastCnpNs := some timeNs }
-      acted := true }
+/-- Every alpha tick with time at most `time`. -/
+def alphaThrough (config : Config) (state : State) (time : Nat) : State × Nat :=
+  if time < state.nextAlphaNs || state.nextAlphaNs = maxU64 then (state, 0)
   else
-    { state, acted := false }
+    let ticks := (time - state.nextAlphaNs) / config.alphaIntervalNs + 1
+    let first := alphaStep config state.alphaQ63 state.alphaPending
+    ({ state with
+        alphaQ63 := decay config (ticks - 1) first
+        alphaPending := false
+        nextAlphaNs := min maxU64 (state.nextAlphaNs + ticks * config.alphaIntervalNs) },
+      ticks)
 
-def onControl (config : Config) (state : State) (timeNs : Nat) : Result :=
-  let scheduled := { state with nextControlTimeNs := timeNs + config.controlIntervalNs }
-  if state.cnpSeen then
-    { state := { scheduled with cnpSeen := false }, acted := false }
-  else
-    let quiet := { scheduled with alphaPpb := alphaOnQuietTick config state.alphaPpb }
-    { state := increase config quiet, acted := true }
+/-- The rate-decrease check at `time`, with a decrease pending: `floor(R (2^64 - alpha) / 2^64)`. -/
+def decreaseCheck (config : Config) (state : State) (time : Nat) : State :=
+  let target :=
+    if config.clampTargetRate || state.stage ≠ 0 then state.currentRateBps else state.targetRateBps
+  let cut := state.currentRateBps * (2 ^ 64 - state.alphaQ63) / 2 ^ 64
+  { state with
+    nextDecreaseNs := later time config.decreaseIntervalNs
+    targetRateBps := target
+    currentRateBps := max config.minimumRateBps cut
+    stage := 0
+    decreasePending := false
+    increaseArmed := true
+    nextIncreaseNs := later time config.increaseIntervalNs }
 
-def onBytes (config : Config) (state : State) (emittedBytes : Nat) : Result :=
-  let bytes := state.bytesSinceIncrease + emittedBytes
-  if !state.cnpSeen && config.increaseByteThreshold ≤ bytes then
-    { state := increase config { state with bytesSinceIncrease := 0 }, acted := true }
+/-- The rate-increase timer at `time`: fast recovery, one additive step at `F`, hyper beyond. -/
+def increaseFire (config : Config) (state : State) (time : Nat) : State :=
+  let steps := config.fastRecoverySteps
+  let target :=
+    if state.stage = steps then
+      min config.maximumRateBps (state.targetRateBps + config.additiveRateBps)
+    else if steps < state.stage then
+      min config.maximumRateBps (state.targetRateBps + config.hyperRateBps)
+    else state.targetRateBps
+  { state with
+    nextIncreaseNs := later time config.increaseIntervalNs
+    targetRateBps := target
+    currentRateBps := state.currentRateBps / 2 + target / 2
+    stage := if state.stage ≤ steps then state.stage + 1 else state.stage }
+
+def increaseDue (state : State) : Nat :=
+  if state.increaseArmed then state.nextIncreaseNs else maxU64
+
+def decreaseDue (state : State) : Nat :=
+  if state.decreasePending then state.nextDecreaseNs else maxU64
+
+/-- Every rate-increase and rate-decrease instant before `bound`, increase first at equal time,
+with the alpha ticks each cut reads. Each step moves the earliest pending instant strictly later. -/
+partial def materialize (config : Config) (state : State) (bound : Nat) (counts : Counts := {}) :
+    State × Counts :=
+  let increase := increaseDue state
+  let decrease := decreaseDue state
+  if bound ≤ min increase decrease then (state, counts)
+  else if increase ≤ decrease then
+    materialize config (increaseFire config state increase) bound
+      { counts with increaseFires := counts.increaseFires + 1 }
   else
-    { state := { state with bytesSinceIncrease := bytes }, acted := false }
+    let (ticked, ticks) := alphaThrough config state decrease
+    materialize config (decreaseCheck config ticked decrease) bound
+      { counts with
+        alphaTicks := counts.alphaTicks + ticks
+        decreaseCuts := counts.decreaseCuts + 1 }
+
+/-- The first instant of the decrease grid at or after `time`. -/
+def firstDecreaseAtOrAfter (config : Config) (state : State) (time : Nat) : Nat :=
+  let anchor := state.nextDecreaseNs
+  if time ≤ anchor || anchor = maxU64 then anchor
+  else
+    let interval := config.decreaseIntervalNs
+    let steps := (time - anchor + interval - 1) / interval
+    min maxU64 (anchor + steps * interval)
+
+/-- A feedback (an echoing ACK or NACK, or a CNP) at `time`, a phase-0 transition. -/
+def onFeedback (config : Config) (state : State) (time : Nat) : State × Counts :=
+  if !state.armed then
+    ({ state with
+        armed := true
+        alphaQ63 := alphaOne
+        alphaPending := false
+        decreasePending := true
+        nextAlphaNs := later time config.alphaIntervalNs
+        nextDecreaseNs := later (later time config.decreaseIntervalNs) 1 },
+      {})
+  else
+    let (materialized, counts) := materialize config state time
+    let (ticked, ticks) :=
+      if time = 0 then (materialized, 0) else alphaThrough config materialized (time - 1)
+    let pending := { ticked with alphaPending := true }
+    let opened :=
+      if pending.decreasePending then pending
+      else
+        { pending with
+          decreasePending := true
+          nextDecreaseNs := firstDecreaseAtOrAfter config pending time }
+    (opened, { counts with alphaTicks := counts.alphaTicks + ticks })
+
+/-- The freeze at the transition that completes the flow: every instant before `bound`, alpha
+included, and the decrease grid at its first instant at or after the bound. -/
+def settle (config : Config) (state : State) (bound : Nat) : State × Counts :=
+  if !state.armed then (state, {})
+  else
+    let (materialized, counts) := materialize config state bound
+    let (ticked, ticks) :=
+      if bound = 0 then (materialized, 0) else alphaThrough config materialized (bound - 1)
+    ({ ticked with nextDecreaseNs := firstDecreaseAtOrAfter config ticked bound },
+      { counts with alphaTicks := counts.alphaTicks + ticks })
 
 end LeanGuard.P10c.Dcqcn
