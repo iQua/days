@@ -257,8 +257,8 @@ structure SenderRow where
   classPaused : Bool
   /-- Amendment 6 (P16 ruling D7): the tick found the pair's window closed. -/
   windowBlocked : Bool
-  /-- Amendment 3: the pair's data priority (0..=7); `none` in a log without the column. -/
-  dataClass : Option Nat
+  /-- Amendment 3: the pair's data priority (0..=7). -/
+  dataClass : Nat
   config : Roce.SenderConfig
   rateBps : Option Nat
   inputAcknowledgment : Option Nat
@@ -287,38 +287,17 @@ def parseSenderState (fieldPrefix : String) (idx : Std.HashMap String Nat)
 
 def parseSenderRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array String) :
     Except String SenderRow := withLine lineNo do
-  -- Amendment 1. A log from a writer before the amendment has no such column; such a writer
-  -- cannot pause a class, so every row reads 0.
-  let classPaused ←
-    if idx.contains "class_paused" then parseBit (← getField idx fields "class_paused")
-    else pure false
-  -- Amendment 6's window columns: a log without them has no window (every row reads 0).
-  let windowBlocked ←
-    if idx.contains "window_blocked" then parseBit (← getField idx fields "window_blocked")
-    else pure false
-  let windowBytes ←
-    if idx.contains "window_bytes" then parseU64 (← getField idx fields "window_bytes")
-    else pure 0
-  let variableWindow ←
-    if idx.contains "variable_window" then parseBit (← getField idx fields "variable_window")
-    else pure false
-  let maximumRateBps ←
-    if idx.contains "maximum_rate_bps" then parseU64 (← getField idx fields "maximum_rate_bps")
-    else pure 0
-  -- Fix round 2 (re-review residual F3): a current-format log (one carrying P16's columns, marked
-  -- by `maximum_rate_bps`) must carry `initial_rate_bps`, so deleting the column cannot re-admit a
-  -- re-rated pair. A log from before those columns has neither and reads no initial rate.
-  let initialRateBps ←
-    if idx.contains "initial_rate_bps" then
-      some <$> parseU64 (← getField idx fields "initial_rate_bps")
-    else if idx.contains "maximum_rate_bps" then
-      throw "current-format sender log (it carries maximum_rate_bps) has no initial_rate_bps column"
-    else pure none
-  let dataClass ←
-    if idx.contains "data_class" then do
-      let value ← parseNat (← getField idx fields "data_class")
-      if value ≤ 7 then pure (some value) else throw s!"data_class exceeds 7: '{value}'"
-    else pure none
+  -- Every column of the P16 sender schema is required (`parseSenderCsv` names the missing ones):
+  -- Amendments 1 and 3 (`class_paused`, `data_class`), 6 (the window and the rate configuration).
+  let classPaused ← parseBit (← getField idx fields "class_paused")
+  let windowBlocked ← parseBit (← getField idx fields "window_blocked")
+  let windowBytes ← parseU64 (← getField idx fields "window_bytes")
+  let variableWindow ← parseBit (← getField idx fields "variable_window")
+  let maximumRateBps ← parseU64 (← getField idx fields "maximum_rate_bps")
+  let initialRateBps ← parseU64 (← getField idx fields "initial_rate_bps")
+  let dataClass ← do
+    let value ← parseNat (← getField idx fields "data_class")
+    if value ≤ 7 then pure value else throw s!"data_class exceeds 7: '{value}'"
   let emitted ← parseBit (← getField idx fields "emitted")
   let psn ← parseOptU64 (← getField idx fields "emitted_psn")
   let bytes ← parseOptU64 (← getField idx fields "emitted_bytes")
@@ -407,20 +386,16 @@ def senderSchema : List String := [
     "after_next_tick_ns",
     "after_status"]
 
-/-- Fix round 3 (orchestrator ruling on residual F3): the format is explicit. By default a sender
-log must carry every column of `senderSchema`, and the missing ones are named, so deleting or
-renaming columns cannot make a current log read as an older one. A log from before P16's window and
-initial-rate columns is read only with `legacy` (`--legacy-sender-format`), where those columns are
-optional and read as absent (no window, class 0, no initial-rate tie). -/
-def parseSenderCsv (content : String) (legacy : Bool := false) : Except String (List SenderRow) := do
-  if !legacy then
-    match content.splitOn "\n" |>.map stripCR |>.map String.trim |>.filter (· != "") with
-    | [] => throw "empty CSV"
-    | header :: _ =>
-        let idx := mkIndex (splitCsvLine header)
-        let missing := senderSchema.filter (fun column => !idx.contains column)
-        if !missing.isEmpty then
-          throw s!"line 1: sender log lacks P16 sender schema column(s): {", ".intercalate missing} (a log from before P16's window and initial-rate columns needs --legacy-sender-format)"
+/-- The sender log must carry every column of `senderSchema`; the missing ones are named. P16 fix
+round 4 (the user's ruling) removed the pre-P16 sender layouts: no other format is read. -/
+def parseSenderCsv (content : String) : Except String (List SenderRow) := do
+  match content.splitOn "\n" |>.map stripCR |>.map String.trim |>.filter (· != "") with
+  | [] => throw "empty CSV"
+  | header :: _ =>
+      let idx := mkIndex (splitCsvLine header)
+      let missing := senderSchema.filter (fun column => !idx.contains column)
+      if !missing.isEmpty then
+        throw s!"line 1: sender log lacks P16 sender schema column(s): {", ".intercalate missing}"
   parseLines content parseSenderRow
 
 /-- One sender log item in `(event key, flow)` order: a sender row with its pair's DCQCN row at the
@@ -487,7 +462,7 @@ structure FlowTrack where
   restart it. -/
   pauseParked : Bool
   /-- Amendment 3: the pair's data class (constant per pair). -/
-  dataClass : Option Nat
+  dataClass : Nat
 
 /--
 The events a pair has pending, as `(time, rank, name)`: the armed pacing tick and the armed
@@ -673,10 +648,9 @@ def checkControllerJoin (row : SenderRow) (controllerRow : Option DcqcnEventLog.
         s!"DCQCN row kind is not its RoCE transition's: feedback for an echoing ACK or NACK, advance otherwise (node_id={d.nodeId}, flow_id={d.flowId})"
       atD (d.frozen = froze)
         s!"DCQCN freeze is not the RoCE transition that completes the queue pair (node_id={d.nodeId}, flow_id={d.flowId})"
-      atD (row.config.maximumRateBps = 0 ||
-          d.config.maximumRateBps = row.config.maximumRateBps)
+      atD (d.config.maximumRateBps = row.config.maximumRateBps)
         s!"DCQCN maximum rate differs from the queue pair's maximum_rate_bps (node_id={d.nodeId}, flow_id={d.flowId})"
-      atD (row.config.initialRateBps.all (· = d.config.initialRateBps))
+      atD (d.config.initialRateBps = row.config.initialRateBps)
         s!"DCQCN initial rate differs from the queue pair's initial_rate_bps (node_id={d.nodeId}, flow_id={d.flowId})"
       if let some c := controller then
         atD (d.before = c)
@@ -761,7 +735,7 @@ def checkSenderItem (stopTimeNs : Option Nat) (track : SenderTrack) (row : Sende
   -- is the configured initial rate, which the log carries; a pair that never sees an echo has no
   -- DCQCN row, so this is what ties its credited rate to its configuration.
   if controller.isNone then
-    at_ (row.config.initialRateBps.all (fun initial => knownRate.all (· = initial)))
+    at_ (knownRate.all (· = row.config.initialRateBps))
       s!"RoCE rate of a pair whose controller is pristine is not its initial_rate_bps (node_id={row.nodeId}, flow_id={row.flowId})"
   -- A tick credits at the controller's rate as of the tick: `materialize(controller, time + 1)`.
   at_ (row.rateBps.all (· = rate)) "RoCE tick rate differs from the DCQCN controller's current rate"
@@ -824,15 +798,12 @@ def checkSenderItem (stopTimeNs : Option Nat) (track : SenderTrack) (row : Sende
         pure (track.lastPayload.insert row.nodeId payload)
   let nowPauseParked := row.classPaused || (pauseParked && row.after.pacer = .parked)
   let pauseParkedIndex :=
-    match row.dataClass with
-    | none => track.pauseParkedIndex
-    | some dataClass =>
-        if nowPauseParked == pauseParked then track.pauseParkedIndex
-        else
-          let slot := (row.nodeId, dataClass)
-          let flows := track.pauseParkedIndex.getD slot ∅
-          track.pauseParkedIndex.insert slot
-            (if nowPauseParked then flows.insert row.flowId else flows.erase row.flowId)
+    if nowPauseParked == pauseParked then track.pauseParkedIndex
+    else
+      let slot := (row.nodeId, row.dataClass)
+      let flows := track.pauseParkedIndex.getD slot ∅
+      track.pauseParkedIndex.insert slot
+        (if nowPauseParked then flows.insert row.flowId else flows.erase row.flowId)
   pure
     { track with
       pauseParkedIndex := pauseParkedIndex
@@ -945,30 +916,28 @@ def checkPfcItem (track : SenderTrack) (row : MechanismEventLog.PfcLog.Row) :
 /-- Amendment 3: the warrants of a sender row against the host PFC state at its key. -/
 def checkWarrant (track : SenderTrack) (row : SenderRow) : Except String SenderTrack := do
   let at_ := requireAt "sender" row.srcLine
-  match row.dataClass with
-  | none => pure track
-  | some dataClass =>
-      let paused := track.hostPausedLinks.getD (row.nodeId, dataClass) 0 > 0
-      match row.kind with
-      | .tick =>
-          if row.classPaused then
-            at_ paused s!"RoCE paused tick while data_class {dataClass} is not paused at node {row.nodeId}"
-          else
-            at_ (!paused) s!"RoCE unpaused tick while data_class {dataClass} is paused at node {row.nodeId}"
-          pure track
-      | .resume =>
-          match track.expectation with
-          | some expected =>
-              at_ (expected.key = row.key && expected.node = row.nodeId &&
-                  expected.dataClass = dataClass)
-                s!"RoCE resume row without a host RESUME of data_class {dataClass} at node {row.nodeId} at this event key"
-              at_ (expected.remaining.contains row.flowId)
-                s!"RoCE resume row of a queue pair the RESUME did not find pause-parked (flow_id={row.flowId})"
-              pure { track with
-                expectation := some { expected with remaining := expected.remaining.erase row.flowId } }
-          | none =>
-              throw s!"sender: line {row.srcLine}: RoCE resume row without a host RESUME of data_class {dataClass} at node {row.nodeId} at this event key"
-      | _ => pure track
+  let dataClass := row.dataClass
+  let paused := track.hostPausedLinks.getD (row.nodeId, dataClass) 0 > 0
+  match row.kind with
+  | .tick =>
+      if row.classPaused then
+        at_ paused s!"RoCE paused tick while data_class {dataClass} is not paused at node {row.nodeId}"
+      else
+        at_ (!paused) s!"RoCE unpaused tick while data_class {dataClass} is paused at node {row.nodeId}"
+      pure track
+  | .resume =>
+      match track.expectation with
+      | some expected =>
+          at_ (expected.key = row.key && expected.node = row.nodeId &&
+              expected.dataClass = dataClass)
+            s!"RoCE resume row without a host RESUME of data_class {dataClass} at node {row.nodeId} at this event key"
+          at_ (expected.remaining.contains row.flowId)
+            s!"RoCE resume row of a queue pair the RESUME did not find pause-parked (flow_id={row.flowId})"
+          pure { track with
+            expectation := some { expected with remaining := expected.remaining.erase row.flowId } }
+      | none =>
+          throw s!"sender: line {row.srcLine}: RoCE resume row without a host RESUME of data_class {dataClass} at node {row.nodeId} at this event key"
+  | _ => pure track
 
 /--
 Canonical order of the sender log: strictly increasing event keys, except that the `resume` rows
@@ -998,16 +967,9 @@ def checkSenderRows (stopTimeNs horizonNs : Option Nat) (rows : List SenderRow)
     Except String Unit := do
   requireAt "sender" 1 (!rows.isEmpty) "empty RoCE sender trace"
   checkSenderKeyOrder rows
-  -- Amendment 3 input rules: an amended log is checked against its PFC log, and pause and resume
-  -- rows are only accepted with their warrants.
-  let amended := rows.any (·.dataClass.isSome)
-  if !amended then
-    for row in rows do
-      requireAt "sender" row.srcLine (!row.classPaused && row.kind != .resume)
-        "class_paused and resume rows need the data_class column and the PFC log (Amendment 3)"
-    if pfc.isSome then
-      throw "sender: --pfc needs a sender log with the data_class column (Amendment 3)"
-  else if pfc.isNone then
+  -- Amendment 3: the sender log carries data_class, so its pauses and resumes are checked against
+  -- the run's PFC log, which is required (header-only for a run without PFC).
+  if pfc.isNone then
     throw "sender: the log carries data_class (Amendment 3); pass its PFC log with --pfc"
   let pfcRows ← match pfc with
     | none => pure []

@@ -6,21 +6,19 @@ open LeanGuard.P10c.RoceEventLog
 
 def usage : String :=
   "usage: p10c_roce_check receiver <roce_receiver.csv>\n" ++
-  "       p10c_roce_check sender <roce_sender.csv> <dcqcn.csv> [--pfc <pfc.csv>] [--horizon-ns <ns>] [--legacy-sender-format] [<stop_time_ns>]\n" ++
-  "       p10c_roce_check trace <roce_sender.csv> <roce_receiver.csv> <dcqcn.csv> [--pfc <pfc.csv>] [--horizon-ns <ns>] [--collective <collective.csv>] [--legacy-sender-format] [<stop_time_ns>]\n" ++
+  "       p10c_roce_check sender <roce_sender.csv> <dcqcn.csv> --pfc <pfc.csv> [--horizon-ns <ns>] [<stop_time_ns>]\n" ++
+  "       p10c_roce_check trace <roce_sender.csv> <roce_receiver.csv> <dcqcn.csv> --pfc <pfc.csv> [--horizon-ns <ns>] [--collective <collective.csv>] [<stop_time_ns>]\n" ++
   "  <dcqcn.csv> is the dcqcn_transitions_csv of the same run: each queue pair's controller\n" ++
   "  transitions, at the sender rows that make them (the sender's rate and status).\n" ++
-  "  <pfc.csv> is the pfc_transitions_csv of the same run; it is required when the sender log\n" ++
-  "  has the data_class column (schema Amendment 3), and the pauses and resumes are checked\n" ++
+  "  <pfc.csv> is the pfc_transitions_csv of the same run (header-only without PFC); it is required\n" ++
+  "  (the sender log's data_class, schema Amendment 3), and the pauses and resumes are checked\n" ++
   "  against its host PAUSE and RESUME records.\n" ++
   "  --horizon-ns <ns> checks a prefix of a run: the logs hold exactly its events with\n" ++
   "  time_ns < <ns>; pending events at or after it need not have fired.\n" ++
   "  --collective <collective.csv> (trace mode) is the collective_transitions_csv of the same run:\n" ++
   "  each RoCE stage's queue pair starts at its release and completes its successor's prerequisite.\n" ++
   "  The sender log must carry the full P16 sender schema (every column the executor writes); a\n" ++
-  "  missing column is named and rejected. --legacy-sender-format reads a log from before P16's\n" ++
-  "  window and initial-rate columns: those columns are then optional (no window, class 0, and a\n" ++
-  "  pair without DCQCN rows has no initial-rate tie).\n" ++
+  "  missing column is named and rejected. No other sender format is read.\n" ++
   "  <stop_time_ns> is the image's stop_time_ns, which no CSV records; when omitted, one stop\n" ++
   "  time must fit every armed and stopped pacer decision in the log."
 
@@ -31,7 +29,6 @@ structure Options where
   horizon : Option Nat := none
   collective : Option String := none
   stop : Option Nat := none
-  legacySender : Bool := false
 
 def parseOptions : List String → Option Options
   | [] => some {}
@@ -41,9 +38,6 @@ def parseOptions : List String → Option Options
   | "--collective" :: path :: rest => do
       let options ← parseOptions rest
       if options.collective.isSome then none else some { options with collective := some path }
-  | "--legacy-sender-format" :: rest => do
-      let options ← parseOptions rest
-      if options.legacySender then none else some { options with legacySender := true }
   | "--horizon-ns" :: value :: rest => do
       let horizon ← value.toNat?
       let options ← parseOptions rest
@@ -89,7 +83,7 @@ def main (args : List String) : IO UInt32 := do
           let dcqcn ← IO.FS.readFile dcqcnPath
           let pfc ← readPfc options.pfc
           report do
-            let senderRows ← inRole "sender" (parseSenderCsv sender options.legacySender)
+            let senderRows ← inRole "sender" (parseSenderCsv sender)
             let dcqcnRows ← inRole "dcqcn" (LeanGuard.P10c.DcqcnEventLog.parseCsv dcqcn)
             checkSenderRows options.stop options.horizon senderRows dcqcnRows (← pfc)
   | "trace" :: senderPath :: receiverPath :: dcqcnPath :: rest =>
@@ -107,7 +101,7 @@ def main (args : List String) : IO UInt32 := do
             | none => pure none
             | some path => some <$> IO.FS.readFile path
           report do
-            let senderRows ← inRole "sender" (parseSenderCsv sender options.legacySender)
+            let senderRows ← inRole "sender" (parseSenderCsv sender)
             let receiverRows ← inRole "receiver" (parseReceiverCsv receiver)
             let dcqcnRows ← inRole "dcqcn" (LeanGuard.P10c.DcqcnEventLog.parseCsv dcqcn)
             checkTrace options.stop options.horizon senderRows receiverRows dcqcnRows (← pfc)

@@ -166,15 +166,14 @@ structure SenderConfig where
   /-- The fixed retransmission timeout; `0` means the timeout is off (§5 step 11). -/
   rtoNs : Nat
   /-- P16 ruling D7 (Amendment 6): the window in bytes; `0` means no window. -/
-  windowBytes : Nat := 0
+  windowBytes : Nat
   /-- The window scales with the controller's rate (SimAI `m_var_win`). -/
-  variableWindow : Bool := false
-  /-- The controller's maximum rate, which scales a variable window; `0` when the log does not
-  carry it (a log without the window columns, which has no window). -/
-  maximumRateBps : Nat := 0
+  variableWindow : Bool
+  /-- The controller's maximum rate, which scales a variable window. -/
+  maximumRateBps : Nat
   /-- The controller's configured initial rate, the pair's rate while its controller is pristine
-  (fix round 1, review F3); `none` in a log without the column. -/
-  initialRateBps : Option Nat := none
+  (fix round 1, review F3). -/
+  initialRateBps : Nat
   deriving DecidableEq, Repr
 
 /--
