@@ -485,7 +485,7 @@ mod cuda {
         run_cuda_with_observations,
     };
 
-    use super::{DISCIPLINES, fixture, refused_images, scalar, scheduler_image};
+    use super::{DISCIPLINES, fixture, lower, refused_images, scalar, scheduler_image};
 
     /// The kernels of one round module, in attempt-DAG order, then the readback gather.
     fn module_kernels(round: &'static str) -> Vec<&'static str> {
@@ -569,8 +569,11 @@ mod cuda {
             }
         }
 
-        // One-record channel and fallback-heap caps force capacity retries (a DCQCN host holds a
-        // pacing timer and in-flight CNPs); the record is the final attempt's.
+        // One-record channel and fallback-heap caps force capacity retries; the record is the
+        // final attempt's. The mechanisms case is a queue pair, whose host holds its pacing tick
+        // and its retransmission timeout at once: since P16 a DCQCN host holds only its pacing
+        // timer (the Mellanox-form controller has no events), so `dcqcn_t26` no longer overflows
+        // a one-record cap.
         let retrying = CudaConfig {
             max_channel_events_per_stream: Some(1),
             max_fel_events_per_lp: Some(1),
@@ -610,8 +613,8 @@ mod cuda {
                 true,
             ),
             (
-                "dcqcn_t26 after capacity retries",
-                fixture("dcqcn_t26.toml"),
+                "roce_timeout after capacity retries",
+                lower("configs/p15/roce_timeout.toml"),
                 RoundKernel::Mechanisms,
                 None,
                 retrying,
@@ -697,8 +700,8 @@ mod cuda {
                 true,
             ),
             (
-                "dcqcn_t26 after capacity retries",
-                fixture("dcqcn_t26.toml"),
+                "roce_timeout after capacity retries",
+                lower("configs/p15/roce_timeout.toml"),
                 RoundKernel::Mechanisms,
                 retrying,
                 true,
@@ -773,8 +776,8 @@ mod cuda {
                 retrying,
             ),
             (
-                "dcqcn_t26 after capacity retries",
-                fixture("dcqcn_t26.toml"),
+                "roce_timeout after capacity retries",
+                lower("configs/p15/roce_timeout.toml"),
                 retrying,
             ),
         ] {
