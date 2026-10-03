@@ -55,6 +55,8 @@ struct Contract {
     retransmissions: usize,
     acks: usize,
     nacks: usize,
+    /// ACKs and NACKs echoing CE (P16 ruling D4: a queue pair's receiver sends no CNP).
+    echoes: usize,
     cnps: usize,
     /// PFC pause and resume transitions (the frames are switch-sourced control, not observed).
     pfc_controls: usize,
@@ -99,8 +101,14 @@ fn contract(result: &RunResult) -> Contract {
         match packet.kind {
             PacketKind::RoceData(header) if header.retransmission => contract.retransmissions += 1,
             PacketKind::RoceData(_) => contract.fresh_data += 1,
-            PacketKind::RoceAck(_) => contract.acks += 1,
-            PacketKind::RoceNack(_) => contract.nacks += 1,
+            PacketKind::RoceAck(header) => {
+                contract.acks += 1;
+                contract.echoes += usize::from(header.ce_echo);
+            }
+            PacketKind::RoceNack(header) => {
+                contract.nacks += 1;
+                contract.echoes += usize::from(header.ce_echo);
+            }
             PacketKind::DcqcnCnp(_) => contract.cnps += 1,
             _ => {}
         }
@@ -453,12 +461,14 @@ fn nack_only_profile_has_no_timeout_and_can_stall() {
     assert!(stalled.1.snd_una < stalled.1.pacer.total_bytes);
 }
 
+/// The P15 fixture's CNPs are ECN echoes on ACKs since P16 (rulings D4-D6): the congestion signal
+/// still flows under PFC, with no CNP at all.
 #[test]
-fn cnps_under_pfc_complete_every_queue_pair() {
+fn echoes_under_pfc_complete_every_queue_pair() {
     let result = run_identical("roce_cnp_under_pfc.toml");
     let contract = contract(&result);
     assert_eq!(contract.finished_pairs, 4, "{contract:?}");
-    assert!(contract.cnps > 0, "{contract:?}");
+    assert!(contract.echoes > 0 && contract.cnps == 0, "{contract:?}");
     assert!(contract.pfc_controls > 0, "{contract:?}");
     assert_eq!(contract.dropped, 0, "{contract:?}");
 }
@@ -469,7 +479,7 @@ fn a_separate_feedback_class_changes_the_run() {
     let separate = run_identical("roce_feedback_priority.toml");
     let contract = contract(&separate);
     assert_eq!(contract.finished_pairs, 4, "{contract:?}");
-    assert!(contract.cnps > 0, "{contract:?}");
+    assert!(contract.echoes > 0 && contract.cnps == 0, "{contract:?}");
     assert_ne!(
         shared.departures, separate.departures,
         "feedback on an unpaused class must change the schedule"
