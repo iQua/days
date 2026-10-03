@@ -193,7 +193,7 @@ fn image_has_pfc_state(image: &SimulationImage) -> bool {
 }
 
 /// Every `configs/p14/` fixture, and checkpoints of each taken across its run, down to the tail
-/// where every DCQCN generator has finished and only in-flight data and control timers remain.
+/// where every DCQCN generator has finished and only in-flight data and feedback remain.
 fn mechanism_images() -> Vec<(String, SimulationImage)> {
     let mut images = Vec::new();
     for (name, image) in fail_closed_fixtures() {
@@ -241,11 +241,11 @@ fn evaluation_cells_and_plain_scheduler_images_select_the_plain_round_kernel() {
 }
 
 /// The receiver-only gap (see `evidence/P14/spec.md`): on the plain build, only a DCQCN timer event
-/// (a pacing tick or a control timer) or a CNP arrival fails closed. Any run window that holds none
-/// of them, but in which CE-marked data reaches a notification point, runs to completion on the
-/// plain build and silently omits the CNPs. Such windows exist whenever the run's horizon falls
-/// inside one pacing interval of an active generator, or after the generator finishes and before
-/// the next control timer. Both were measured to diverge from Scalar on the bottleneck variants
+/// (a pacing tick; in P14 also a control timer, which P16 removed) or a CNP arrival fails closed.
+/// Any run window that holds none of them, but in which CE-marked data reaches a notification
+/// point, runs to completion on the plain build and silently omits the CNPs. Such windows exist
+/// whenever the run's horizon falls inside one pacing interval of an active generator, or after the
+/// generator finishes. Both were measured (P14) to diverge from Scalar on the bottleneck variants
 /// below. The only guard is static, image-level selection: every checkpoint of a DCQCN image keeps
 /// its notification points, so it selects the mechanisms build. These tests pin that for
 /// checkpoints taken while the generator is active and after it has finished.
@@ -319,7 +319,7 @@ fn dcqcn_t26_bottleneck(flow_size: Option<&str>) -> SimulationImage {
 enum CheckpointPhase {
     /// A DCQCN generator is still `Scheduled`: windows between its pacing ticks.
     GeneratorActive,
-    /// No generator has a pacing timer left: windows before the next control timer.
+    /// No generator has a pacing timer left: windows after its last tick.
     GeneratorFinished,
 }
 
@@ -566,7 +566,7 @@ mod cuda {
         }
 
         // One-record channel and fallback-heap caps force capacity retries (a DCQCN host holds a
-        // pacing timer and a control timer); the record is the final attempt's.
+        // pacing timer and in-flight CNPs); the record is the final attempt's.
         let retrying = CudaConfig {
             max_channel_events_per_stream: Some(1),
             max_fel_events_per_lp: Some(1),

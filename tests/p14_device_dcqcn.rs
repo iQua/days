@@ -3,8 +3,9 @@
 //!
 //! The images are the `configs/p14/` DCQCN fixtures and checkpoints taken from them at many
 //! horizons, so the devices resume from mid-run controller states: in-flight CNPs, Blocked pacing
-//! tokens, pending control timers, every increase stage. Fixtures lowered with inert PFC state (all
-//! XOFF thresholds zero) have that state stripped here; PFC itself is exercised by the PFC tests.
+//! tokens, armed controllers with pending rate instants, every increase stage. Fixtures lowered
+//! with inert PFC state (all XOFF thresholds zero) have that state stripped here; PFC itself is
+//! exercised by the PFC tests.
 
 #![cfg(any(
     feature = "cuda",
@@ -213,8 +214,7 @@ fn the_blocked_checkpoint_validates_and_owns_one_live_timer_chain() {
     );
 }
 
-/// The DCQCN planner terms (packet and CNP counts, control ticks, the second timer chain, the CNP
-/// feedback minimum) agree between the precomputed and legacy capacity modes.
+/// The DCQCN planner terms (packet and CNP counts, the timer chain, the CNP feedback minimum) agree between the precomputed and legacy capacity modes.
 #[cfg(all(feature = "test", any(feature = "cuda", feature = "cuda-planner-test")))]
 #[test]
 fn cuda_dcqcn_planner_is_bit_equal_to_legacy_planning() {

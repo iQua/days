@@ -109,8 +109,8 @@ fn with_tick(
 }
 
 /// Fix round 1 (review M1): a pacer that owns no tick (a gated stage, or a pair parked by a pause)
-/// owns none at any time, and a gated stage owns no control tick either. The validator counted
-/// ticks only at the departure and the control deadline, so a stray tick at another time passed
+/// owns none at any time (in P15 a gated stage also owned no control tick; P16 removed the control
+/// tick). The validator counted ticks only at the departure and the control deadline, so a stray tick at another time passed
 /// validation and failed the Scalar run.
 #[test]
 fn a_gated_stage_owns_no_tick_at_any_time() {

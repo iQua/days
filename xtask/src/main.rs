@@ -215,9 +215,8 @@ const STAGE_PATH_FUNCTIONS: &[&str] = &[
     "prepare_tcp_attempts",
     "install_tcp_attempts",
     // P15: DCQCN and RoCE queue-pair transitions, keyed through the same counted view; a host can
-    // hold many queue pairs.
+    // hold many queue pairs. (P16 removed the DCQCN control timer: the controller has no events.)
     "host_dcqcn_cnp_arrival",
-    "host_dcqcn_control_timer",
     "host_roce_pacing_timer",
     "host_roce_feedback_arrival",
     "host_roce_timeout",
