@@ -427,6 +427,25 @@ impl PlannerCapacityContext {
         })
     }
 
+    /// Whether the flow's source generator is a RoCE queue pair (P15).
+    pub(crate) fn roce_generator(&self, image: &SimulationImage, flow: usize) -> bool {
+        #[cfg(any(test, feature = "planner-test-hooks"))]
+        if self.mode == PlannerCapacityMode::Legacy {
+            return image
+                .host_states
+                .iter()
+                .flat_map(|state| &state.generators)
+                .find(|generator| generator.flow.0 as usize == flow)
+                .is_some_and(|generator| matches!(generator.kind, FlowGeneratorKind::Roce(_)));
+        }
+        self.flow_to_generator[flow].is_some_and(|location| {
+            matches!(
+                image.host_states[location.host].generators[location.generator].kind,
+                FlowGeneratorKind::Roce(_)
+            )
+        })
+    }
+
     pub(crate) fn tcp_generator(
         &self,
         image: &SimulationImage,

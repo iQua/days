@@ -7,7 +7,10 @@
 //! Region layout, as absolute word offsets from the region start `R`:
 //!
 //! - `R + node`: the node's PFC queue row offset (absolute in the plane), or [`NONE`].
-//! - `R + node_count + flow`: the flow's 802.1Q priority.
+//! - `R + node_count + flow`: the flow's PFC class word, `priority | ((feedback_priority ^
+//!   priority) << 8)`. Bits 0..8 are the data class; a CNP, RoCE ACK or RoCE NACK takes
+//!   `(word ^ (word >> 8)) & 0xff`, its feedback class (P15). The word equals `priority` whenever
+//!   the two classes agree, so images without a separate feedback class keep every word.
 //! - One row per switch queue carrying `PfcQueueState`:
 //!   - `+0` controller count `C`
 //!   - `+1` ingress-monitor count `I`
@@ -18,6 +21,13 @@
 //!   - the pause bitsets: priority-major, `8 * W` words. Bit `b` of priority `p` is set while
 //!     controller `b` asserts pause. A priority is paused while any bit of its words is set.
 //!   - `I` ingress records of [`PFC_INGRESS_WORDS`] words, in image order
+//!
+//! - One row per host with egress pause state (`HostPfcState`, P15 host-link PFC), in the same
+//!   layout with no ingress records (`+1` is zero; hosts hold no monitors), and `+4` the absolute
+//!   offset of the host's queue-pair list `[Q, flow_0 .. flow_{Q-1}]`, in generator-position
+//!   (`FlowId`) order. A RESUME restarts pause-parked pairs by scanning this list; the parked set
+//!   itself is not stored (ruling D3): readback recomputes it with the validator's
+//!   `expected_pause_parked`.
 //!
 //! Scalar keeps `paused_by_controller: [BTreeSet<NodeId>; 8]`. A queue's possible controllers are
 //! static image data: the downstream LPs with an ingress monitor on the queue's egress link, which
@@ -31,7 +41,10 @@
 
 use std::collections::BTreeSet;
 
-use crate::{NodeId, NodeKind, PfcQueueState, SimulationImage, SwitchQueueState};
+use crate::{
+    FlowGeneratorKind, HostState, LinkId, NodeId, NodeKind, PfcQueueState, SimulationImage,
+    SwitchQueueState,
+};
 
 pub(crate) const NONE: u64 = u64::MAX;
 
@@ -65,11 +78,15 @@ const INGRESS_XON: usize = 19;
 const INGRESS_OCCUPANCY: usize = 27;
 const INGRESS_ASSERTED: usize = 35;
 
-/// The controllers that may hold pause on the queue whose egress is `egress`: every switch LP whose
-/// PFC ingress monitors control that link, ascending by node id.
-fn queue_controllers(image: &SimulationImage, queue: &SwitchQueueState) -> Vec<NodeId> {
+/// The controllers that may hold pause on an egress link: every switch LP whose PFC ingress
+/// monitors control that link, ascending by node id, plus any residual holder in `paused`.
+fn link_controllers(
+    image: &SimulationImage,
+    egress: Option<LinkId>,
+    paused: &[BTreeSet<NodeId>; 8],
+) -> Vec<NodeId> {
     let mut controllers = BTreeSet::new();
-    if let Some(egress) = queue.egress_link {
+    if let Some(egress) = egress {
         for node in image
             .nodes
             .iter()
@@ -90,27 +107,82 @@ fn queue_controllers(image: &SimulationImage, queue: &SwitchQueueState) -> Vec<N
     }
     // Validation admits pause state only for declared controllers; keeping any residue here makes
     // the encoding total rather than silently dropping a holder.
-    if let Some(pfc) = &queue.pfc {
-        controllers.extend(pfc.paused_by_controller.iter().flatten().copied());
-    }
+    controllers.extend(paused.iter().flatten().copied());
     controllers.into_iter().collect()
 }
 
-/// The first queue of every switch LP, which is the only queue a lowered LP owns and the only one
-/// the device kernels model.
-fn lp_queues(image: &SimulationImage) -> impl Iterator<Item = (usize, &SwitchQueueState)> {
+/// One row of the PFC region: a switch LP's first queue, or a host with egress pause state.
+#[derive(Clone, Copy)]
+enum PfcRow<'a> {
+    Switch(&'a SwitchQueueState),
+    Host(&'a HostState),
+}
+
+impl PfcRow<'_> {
+    fn paused(&self) -> &[BTreeSet<NodeId>; 8] {
+        match self {
+            Self::Switch(queue) => &queue.pfc.as_ref().expect("a PFC row").paused_by_controller,
+            Self::Host(state) => {
+                &state
+                    .pfc
+                    .as_deref()
+                    .expect("a PFC row")
+                    .paused_by_controller
+            }
+        }
+    }
+
+    fn controllers(&self, image: &SimulationImage) -> Vec<NodeId> {
+        let egress = match self {
+            Self::Switch(queue) => queue.egress_link,
+            Self::Host(state) => Some(state.egress_link),
+        };
+        link_controllers(image, egress, self.paused())
+    }
+
+    fn ingress_count(&self) -> usize {
+        match self {
+            Self::Switch(queue) => queue.pfc.as_ref().map_or(0, |pfc| pfc.ingresses.len()),
+            Self::Host(_) => 0,
+        }
+    }
+}
+
+/// The flows of a host's queue-pair generators, in generator-position (`FlowId`) order.
+fn host_queue_pairs(state: &HostState) -> impl Iterator<Item = u64> + '_ {
+    state
+        .generators
+        .iter()
+        .filter(|generator| matches!(generator.kind, FlowGeneratorKind::Roce(_)))
+        .map(|generator| generator.flow.0)
+}
+
+/// Every PFC row in node order: each switch LP's first queue with PFC state (the only queue a
+/// lowered LP owns and the only one the device kernels model) and each host with egress pause
+/// state. One pass over the nodes.
+fn pfc_rows(image: &SimulationImage) -> impl Iterator<Item = (usize, PfcRow<'_>)> {
     image.nodes.iter().filter_map(|node| {
-        (node.kind == NodeKind::Switch)
-            .then(|| image.switch_states[node.state_slot as usize].queues.first())
-            .flatten()
-            .map(|queue| (node.id.0 as usize, queue))
+        let lp = node.id.0 as usize;
+        match node.kind {
+            NodeKind::Switch => image.switch_states[node.state_slot as usize]
+                .queues
+                .first()
+                .filter(|queue| queue.pfc.is_some())
+                .map(|queue| (lp, PfcRow::Switch(queue))),
+            NodeKind::Host => image
+                .host_states
+                .get(node.state_slot as usize)
+                .filter(|state| state.pfc.is_some())
+                .map(|state| (lp, PfcRow::Host(state))),
+        }
     })
 }
 
-/// Whether the image carries any PFC state, which is exactly when the region exists.
+/// Whether the image carries any PFC state (switch queues or host egress), which is exactly when
+/// the region exists. One pass over the nodes, decided per node.
 pub(crate) fn image_has_pfc(image: &SimulationImage) -> bool {
     count_pfc_state_scan();
-    lp_queues(image).any(|(_, queue)| queue.pfc.is_some())
+    pfc_rows(image).next().is_some()
 }
 
 /// `(producer, target)` LP pairs of every PFC reverse control lane.
@@ -152,30 +224,38 @@ pub(crate) fn pfc_frame_transition_bound(image: &SimulationImage, counts: &[usiz
         })
 }
 
+/// The PFC class word of a flow: the data class, with the feedback class's difference in bits
+/// 8..16 (zero whenever the classes agree).
+pub(crate) fn flow_class_word(flow: &crate::FlowDescriptor) -> u64 {
+    u64::from(flow.priority) | (u64::from(flow.feedback_priority ^ flow.priority) << 8)
+}
+
 /// Words the PFC region occupies: zero exactly when the image carries no PFC state.
 pub(crate) fn pfc_region_words(image: &SimulationImage) -> usize {
     if !image_has_pfc(image) {
         return 0;
     }
-    let queues = lp_queues(image)
-        .filter(|(_, queue)| queue.pfc.is_some())
-        .map(|(_, queue)| (queue, queue_controllers(image, queue).len()))
+    let rows = pfc_rows(image)
+        .map(|(_, row)| (row, row.controllers(image).len()))
         .collect::<Vec<_>>();
-    let bitset_words = queues
+    let bitset_words = rows
         .iter()
         .map(|(_, controllers)| controllers.div_ceil(64))
         .max()
         .unwrap_or(0)
         .max(1);
-    queues.iter().fold(
+    rows.iter().fold(
         image.nodes.len().saturating_add(image.flows.len()),
-        |total, (queue, controllers)| {
-            let ingresses = queue.pfc.as_ref().map_or(0, |pfc| pfc.ingresses.len());
+        |total, (row, controllers)| {
+            let tail = match row {
+                PfcRow::Switch(_) => row.ingress_count().saturating_mul(PFC_INGRESS_WORDS),
+                PfcRow::Host(state) => 1 + host_queue_pairs(state).count(),
+            };
             total
                 .saturating_add(PFC_ROW_HEADER_WORDS)
                 .saturating_add(*controllers)
                 .saturating_add(8 * bitset_words)
-                .saturating_add(ingresses.saturating_mul(PFC_INGRESS_WORDS))
+                .saturating_add(tail)
         },
     )
 }
@@ -189,29 +269,12 @@ pub(crate) fn append_pfc_region(
     if !image_has_pfc(image) {
         return Ok(None);
     }
-    // P15 host-link PFC: the region holds switch egress rows only, and the kernels pause only
-    // switch egress. Fail closed on host pause state even if validation was bypassed. A host-PFC
-    // image always has switch PFC state (its monitors), so this runs for it; it runs once per plan
-    // and only for PFC images.
-    if let Some(host) = image.nodes.iter().find(|node| {
-        node.kind == NodeKind::Host
-            && image
-                .host_states
-                .get(node.state_slot as usize)
-                .is_some_and(|state| state.pfc.is_some())
-    }) {
-        return Err(format!(
-            "host {:?} owns host-link PFC state, which the device PFC region cannot represent; use Scalar or Cpu",
-            host.id
-        ));
-    }
     let node_count = image.nodes.len();
     let flow_count = image.flows.len();
-    let queues = lp_queues(image)
-        .filter(|(_, queue)| queue.pfc.is_some())
-        .map(|(lp, queue)| (lp, queue, queue_controllers(image, queue)))
+    let rows = pfc_rows(image)
+        .map(|(lp, row)| (lp, row, row.controllers(image)))
         .collect::<Vec<_>>();
-    let bitset_words = queues
+    let bitset_words = rows
         .iter()
         .map(|(_, _, controllers)| controllers.len().div_ceil(64))
         .max()
@@ -222,60 +285,128 @@ pub(crate) fn append_pfc_region(
     words.resize(region + node_count + flow_count, 0);
     words[region..region + node_count].fill(NONE);
     for (index, flow) in image.flows.iter().enumerate() {
-        words[region + node_count + index] = u64::from(flow.priority);
+        words[region + node_count + index] = flow_class_word(flow);
     }
-    for (lp, queue, controllers) in queues {
-        let pfc = queue.pfc.as_ref().expect("filtered to PFC queues");
-        let row = words.len();
-        let bitsets = row + PFC_ROW_HEADER_WORDS + controllers.len();
-        let ingresses = bitsets + 8 * bitset_words;
-        let end = ingresses
-            .checked_add(
-                pfc.ingresses
-                    .len()
-                    .checked_mul(PFC_INGRESS_WORDS)
-                    .ok_or("PFC ingress region overflows usize")?,
-            )
+    for (lp, row, controllers) in rows {
+        let start = words.len();
+        let bitsets = start + PFC_ROW_HEADER_WORDS + controllers.len();
+        let tail = bitsets + 8 * bitset_words;
+        let tail_words = match row {
+            PfcRow::Switch(_) => row
+                .ingress_count()
+                .checked_mul(PFC_INGRESS_WORDS)
+                .ok_or("PFC ingress region overflows usize")?,
+            PfcRow::Host(state) => 1 + host_queue_pairs(state).count(),
+        };
+        let end = tail
+            .checked_add(tail_words)
             .ok_or("PFC region overflows usize")?;
         words.resize(end, 0);
-        words[region + lp] = row as u64;
-        words[row] = controllers.len() as u64;
-        words[row + 1] = pfc.ingresses.len() as u64;
-        words[row + 2] = bitset_words as u64;
-        words[row + 3] = bitsets as u64;
-        words[row + 4] = ingresses as u64;
+        words[region + lp] = start as u64;
+        words[start] = controllers.len() as u64;
+        words[start + 1] = row.ingress_count() as u64;
+        words[start + 2] = bitset_words as u64;
+        words[start + 3] = bitsets as u64;
+        words[start + 4] = tail as u64;
         for (index, controller) in controllers.iter().enumerate() {
-            words[row + PFC_ROW_HEADER_WORDS + index] = controller.0;
+            words[start + PFC_ROW_HEADER_WORDS + index] = controller.0;
         }
-        for (priority, holders) in pfc.paused_by_controller.iter().enumerate() {
+        for (priority, holders) in row.paused().iter().enumerate() {
             for holder in holders {
                 let bit = controllers
                     .binary_search(holder)
-                    .expect("queue_controllers includes every pause holder");
+                    .expect("the controllers include every pause holder");
                 words[bitsets + priority * bitset_words + bit / 64] |= 1_u64 << (bit % 64);
             }
         }
-        for (index, ingress) in pfc.ingresses.iter().enumerate() {
-            let base = ingresses + index * PFC_INGRESS_WORDS;
-            let channel = image
-                .channels
-                .get(ingress.control_channel_index as usize)
-                .ok_or("PFC ingress references an unknown control channel")?;
-            words[base + INGRESS_LINK] = ingress.controlled_link.0;
-            words[base + INGRESS_TARGET] = channel.target.0;
-            words[base + INGRESS_DELAY] = channel.min_delay_ns;
-            for priority in 0..8 {
-                words[base + INGRESS_CAPACITY + priority] = ingress.buffer_capacity_bytes[priority];
-                words[base + INGRESS_XOFF + priority] = ingress.xoff_threshold_bytes[priority];
-                words[base + INGRESS_XON + priority] = ingress.xon_threshold_bytes[priority];
-                words[base + INGRESS_OCCUPANCY + priority] = ingress.occupancy_bytes[priority];
-                words[base + INGRESS_ASSERTED + priority] =
-                    u64::from(ingress.pause_asserted[priority]);
+        match row {
+            PfcRow::Switch(queue) => {
+                let pfc = queue.pfc.as_ref().expect("a PFC row");
+                for (index, ingress) in pfc.ingresses.iter().enumerate() {
+                    let base = tail + index * PFC_INGRESS_WORDS;
+                    let channel = image
+                        .channels
+                        .get(ingress.control_channel_index as usize)
+                        .ok_or("PFC ingress references an unknown control channel")?;
+                    words[base + INGRESS_LINK] = ingress.controlled_link.0;
+                    words[base + INGRESS_TARGET] = channel.target.0;
+                    words[base + INGRESS_DELAY] = channel.min_delay_ns;
+                    for priority in 0..8 {
+                        words[base + INGRESS_CAPACITY + priority] =
+                            ingress.buffer_capacity_bytes[priority];
+                        words[base + INGRESS_XOFF + priority] =
+                            ingress.xoff_threshold_bytes[priority];
+                        words[base + INGRESS_XON + priority] =
+                            ingress.xon_threshold_bytes[priority];
+                        words[base + INGRESS_OCCUPANCY + priority] =
+                            ingress.occupancy_bytes[priority];
+                        words[base + INGRESS_ASSERTED + priority] =
+                            u64::from(ingress.pause_asserted[priority]);
+                    }
+                }
+            }
+            PfcRow::Host(state) => {
+                let mut count = 0;
+                for flow in host_queue_pairs(state) {
+                    count += 1;
+                    words[tail + count] = flow;
+                }
+                words[tail] = count as u64;
             }
         }
     }
     debug_assert_eq!(words.len() - region, pfc_region_words(image));
     Ok(Some(region))
+}
+
+/// Restores a host's egress pause sets from its PFC row (P15 host-link PFC).
+///
+/// The pause bitsets are device-written; the header and the queue-pair list are image data, checked
+/// rather than trusted. `pause_parked` is left as it is: it is a function of the restored pause
+/// sets and the queue pairs' states, which the caller recomputes once the generators are decoded
+/// (ruling D3).
+pub(crate) fn restore_host_pfc(
+    words: &[u64],
+    region: usize,
+    lp: usize,
+    state: &mut HostState,
+) -> Result<(), String> {
+    let row_word = words[region + lp];
+    let Some(pfc) = state.pfc.as_deref_mut() else {
+        return if row_word == NONE {
+            Ok(())
+        } else {
+            Err(format!(
+                "PFC row published for host LP {lp} without pause state"
+            ))
+        };
+    };
+    let row = usize::try_from(row_word).map_err(|_| "PFC row offset overflows usize")?;
+    let controllers = usize::try_from(words[row]).map_err(|_| "PFC controller count")?;
+    let bitset_words = usize::try_from(words[row + 2]).map_err(|_| "PFC bitset width")?;
+    let bitsets = usize::try_from(words[row + 3]).map_err(|_| "PFC bitset offset")?;
+    let list = usize::try_from(words[row + 4]).map_err(|_| "PFC queue-pair list offset")?;
+    let pairs = state
+        .generators
+        .iter()
+        .filter(|generator| matches!(generator.kind, FlowGeneratorKind::Roce(_)))
+        .map(|generator| generator.flow.0)
+        .collect::<Vec<_>>();
+    if words[row + 1] != 0
+        || words[list] != pairs.len() as u64
+        || words[list + 1..list + 1 + pairs.len()] != pairs[..]
+    {
+        return Err(format!("PFC row for host LP {lp} changed immutable state"));
+    }
+    pfc.paused_by_controller = std::array::from_fn(|priority| {
+        (0..controllers)
+            .filter(|bit| {
+                words[bitsets + priority * bitset_words + bit / 64] & (1_u64 << (bit % 64)) != 0
+            })
+            .map(|bit| NodeId(words[row + PFC_ROW_HEADER_WORDS + bit]))
+            .collect()
+    });
+    Ok(())
 }
 
 /// Restores one LP queue's PFC state from the region.

@@ -66,18 +66,16 @@ fn host_pfc_mut(image: &mut SimulationImage, host: usize) -> &mut HostPfcState {
         .expect("the host owns egress pause state")
 }
 
+/// P15 lane R4: every backend accepts host-link PFC (the devices hold host rows in the PFC region).
 #[test]
-fn the_lowered_image_validates_and_devices_refuse_host_pfc() {
+fn the_lowered_image_validates_on_every_backend() {
     let image = lower(None);
     assert!(image.host_states.iter().all(|state| state.pfc.is_some()));
     validate(&image, Backend::Scalar).expect("Scalar accepts host-link PFC");
     validate(&image, Backend::Cpu { workers: 4 }).expect("CPU accepts host-link PFC");
     for backend in [Backend::Metal, Backend::Cuda] {
-        let error = validate(&image, backend).expect_err("devices refuse host-link PFC");
-        assert!(
-            error.to_string().contains("host-link PFC"),
-            "{backend:?}: {error}"
-        );
+        validate(&image, backend)
+            .unwrap_or_else(|error| panic!("{backend:?} accepts host-link PFC: {error}"));
     }
 }
 

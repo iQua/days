@@ -567,30 +567,8 @@ fn validate_backend_capabilities(
             "backend {backend} does not support collective generators; use Scalar or Cpu"
         )));
     }
-    // P15: host-link PFC (switches pausing host NICs) runs on Scalar and Cpu; the device kernels
-    // read pause state only at switch egress until the device lane ports it.
-    if image.host_states.iter().any(|state| state.pfc.is_some()) {
-        return Err(ValidationError::new(format!(
-            "backend {backend} does not support host-link PFC (`[link.pfc] host_links`); use Scalar or Cpu"
-        )));
-    }
-    // P15: the device kernels read one PFC class per flow; a separate feedback class (a DCQCN
-    // CNP or RoCE ACK/NACK priority) runs on Scalar and Cpu until the device lane ports it.
-    if image
-        .flows
-        .iter()
-        .any(|flow| flow.feedback_priority != flow.priority)
-    {
-        return Err(ValidationError::new(format!(
-            "backend {backend} does not support a feedback priority apart from the data priority; use Scalar or Cpu"
-        )));
-    }
-    // P15: RoCE queue pairs run on Scalar and Cpu; the device ports follow in their own lane.
-    if image_has_roce_state(image) {
-        return Err(ValidationError::new(format!(
-            "backend {backend} does not support RoCE queue pairs; use Scalar or Cpu"
-        )));
-    }
+    // P15 lane R4: both device backends run RoCE queue pairs, host-link PFC and a feedback class
+    // apart from the data class (`evidence/P15/device-design.md`), so none needs a refusal here.
     for queue in image.switch_states.iter().flat_map(|state| &state.queues) {
         match queue.drop_mark {
             crate::DropMarkPolicy::TailDrop | crate::DropMarkPolicy::EcnThreshold(_) => {}
@@ -609,26 +587,6 @@ fn validate_backend_capabilities(
         }
     }
     Ok(())
-}
-
-/// Whether the image holds any RoCE queue-pair state: a generator, a receiver, or a resident
-/// RoCE packet or pacing token.
-pub(crate) fn image_has_roce_state(image: &SimulationImage) -> bool {
-    image.host_states.iter().any(|state| {
-        state.roce_receivers.is_some()
-            || state
-                .generators
-                .iter()
-                .any(|generator| matches!(generator.kind, FlowGeneratorKind::Roce(_)))
-    }) || image.initial_packets.iter().any(|packet| {
-        matches!(
-            packet.kind,
-            PacketKind::RoceData(_)
-                | PacketKind::RoceAck(_)
-                | PacketKind::RoceNack(_)
-                | PacketKind::RocePacingTimer
-        )
-    })
 }
 
 const fn congestion_control_mss_bytes(control: crate::TcpCongestionControl) -> u64 {
@@ -1425,7 +1383,7 @@ fn host_class_paused(image: &SimulationImage, owner: NodeId, priority: u8) -> bo
 /// The queue pairs a host's parked list must hold, by class: each queue pair whose data class is
 /// paused there and whose pacer a paused tick parked with packets left to send (parked, not
 /// stopped, `next_psn < total` and `snd_una < total`; LeanGuard's restartable parked pairs).
-fn expected_pause_parked(
+pub(crate) fn expected_pause_parked(
     image: &SimulationImage,
     state: &crate::HostState,
     pfc: &crate::HostPfcState,

@@ -493,6 +493,9 @@ const PARAM_RECEIVER_OFFSET: usize = 28;
 const PARAM_LEDGER_META_OFFSET: usize = 29;
 /// Params word holding the PFC region offset in `scheduler_state`, or `NONE` without PFC state.
 const PARAM_PFC_OFFSET: usize = 32;
+/// Params word holding the RoCE receiver region offset in `tcp_state`, or `NONE` without queue-pair
+/// receivers (P15). The test-hook high-water words follow it.
+const PARAM_ROCE_OFFSET: usize = 33;
 const PARAM_ROUND_THREADS: usize = 30;
 
 const CONTROL_ERROR: usize = 0;
@@ -1491,19 +1494,36 @@ pub fn mechanism_plane_words_metal_for_testing(
     let plan = MetalPlan::new(image, None, config, ObservationMode::Summary)?;
     let pfc_offset = plan.params[PARAM_PFC_OFFSET];
     let receiver_offset = plan.params[PARAM_RECEIVER_OFFSET] as usize;
+    let receiver_markers = |marker: fn(u64) -> bool| {
+        (0..image.flows.len())
+            .filter(|flow| marker(plan.tcp_state[receiver_offset + flow * TCP_RECEIVER_WORDS]))
+            .count()
+    };
     Ok(crate::MechanismPlaneWords {
         pfc_region_words: if pfc_offset == NONE {
             0
         } else {
             plan.scheduler_state.len() - pfc_offset as usize
         },
-        dcqcn_receiver_rows: (0..image.flows.len())
-            .filter(|flow| {
-                plan.tcp_state[receiver_offset + flow * TCP_RECEIVER_WORDS]
-                    >= crate::device_mechanism::DCQCN_RECEIVER_NO_CNP
-            })
-            .count(),
+        dcqcn_receiver_rows: receiver_markers(|marker| {
+            marker == crate::device_mechanism::DCQCN_RECEIVER_NO_CNP
+                || marker == crate::device_mechanism::DCQCN_RECEIVER_LAST_CNP
+        }),
         pfc_params_words: 1,
+        roce_region_words: if plan.params[PARAM_ROCE_OFFSET] == NONE {
+            0
+        } else {
+            plan.tcp_state.len() - plan.params[PARAM_ROCE_OFFSET] as usize
+        },
+        roce_receiver_rows: receiver_markers(|marker| {
+            marker == crate::device_mechanism::ROCE_RECEIVER_MARKER
+        }),
+        pfc_class_words: if pfc_offset == NONE {
+            Vec::new()
+        } else {
+            let start = pfc_offset as usize + image.nodes.len();
+            plan.scheduler_state[start..start + image.flows.len()].to_vec()
+        },
     })
 }
 
@@ -1602,6 +1622,7 @@ impl MetalPlan {
     fn refuse_plain_round_kernel(&self) -> Result<(), MetalError> {
         let plan = crate::device_mechanism::UploadedPlan {
             pfc_offset: self.params[PARAM_PFC_OFFSET],
+            roce_offset: self.params[PARAM_ROCE_OFFSET],
             receiver_offset: self.params[PARAM_RECEIVER_OFFSET],
             // `P_NODE_COUNT` and `P_FLOW_COUNT`.
             node_count: self.params[0] as usize,
@@ -1705,6 +1726,8 @@ struct PreparedStreams {
 struct TcpStateLayout {
     receiver_offset: usize,
     ledger_meta_offset: usize,
+    /// The RoCE receiver region, a tail of `tcp_state`; `None` without queue-pair receivers.
+    roce_offset: Option<usize>,
 }
 
 struct PreparedTcpState {
@@ -1807,7 +1830,13 @@ impl MetalPlan {
             .copied()
             .map(|packet| (packet.id, packet))
             .collect::<BTreeMap<_, _>>();
-        let orphan_packets = crate::tcp_ledger::initial_non_tcp_orphan_packets(image);
+        let mut orphan_packets = crate::tcp_ledger::initial_non_tcp_orphan_packets(image);
+        // Design note F3: a queue pair's tokens stay resident for its life even with no live
+        // event, so readback pins them with the orphans.
+        orphan_packets.extend(crate::device_mechanism::queue_pair_tokens(
+            image,
+            &initial_by_payload,
+        ));
 
         let mut queue_caps = vec![1_usize; node_count];
         let mut aggregate_queue_packets = vec![0_usize; node_count];
@@ -1831,6 +1860,11 @@ impl MetalPlan {
             if capacity_context.dcqcn_generator(image, flow_index) {
                 // A DCQCN source owns two live timer chains, pacing and control.
                 legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(2);
+            }
+            if capacity_context.roce_generator(image, flow_index) {
+                // A queue-pair source owns three live timers: pacing, control and the
+                // retransmission timeout (one live record under the live-state contract).
+                legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(3);
             }
             if capacity_context.tcp_generator(image, flow_index).is_some() {
                 // TCP timers remain fallback-heap events. Under the live-state contract
@@ -1957,6 +1991,10 @@ impl MetalPlan {
                     let source = descriptor.source.0 as usize;
                     capacities[source] = capacities[source].saturating_add(2);
                 }
+                if capacity_context.roce_generator(image, flow) {
+                    let source = descriptor.source.0 as usize;
+                    capacities[source] = capacities[source].saturating_add(3);
+                }
                 if capacity_context.tcp_generator(image, flow).is_some() {
                     let attempts = capacity_context.tcp_fallback_timer_bound(
                         image,
@@ -2076,10 +2114,11 @@ impl MetalPlan {
                                     &mut generators[offset..offset + GENERATOR_WORDS],
                                 );
                             }
-                            FlowGeneratorKind::Roce(_) => {
-                                return Err(MetalError::Validation(
-                                    "RoCE queue pairs run on Scalar and Cpu".to_owned(),
-                                ));
+                            FlowGeneratorKind::Roce(roce) => {
+                                crate::device_mechanism::encode_roce_generator(
+                                    &roce,
+                                    &mut generators[offset..offset + GENERATOR_WORDS],
+                                );
                             }
                         }
                     }
@@ -2126,13 +2165,21 @@ impl MetalPlan {
             .map_err(MetalError::Validation)?;
 
         for event in &image.initial_events {
+            // P15: a queue pair's timeout carries its resident pacing token (Scalar's
+            // `host_retransmission_timeout` falls through to the queue pair exactly when the
+            // payload is a `RocePacingTimer`); every other timeout is a TCP timer's.
+            let queue_pair_token = (event.kind == EventKind::RetransmissionTimeout)
+                .then(|| initial_by_payload.get(&event.payload))
+                .flatten()
+                .filter(|token| token.kind == PacketKind::RocePacingTimer)
+                .copied();
             let packet = if event.kind == EventKind::RetransmissionTimeout {
-                None
+                queue_pair_token
             } else {
                 Some(packet_for(&initial_by_payload, event.payload)?)
             };
             let mut record = event_record(*event, packet);
-            if event.kind == EventKind::RetransmissionTimeout {
+            if event.kind == EventKind::RetransmissionTimeout && queue_pair_token.is_none() {
                 let node = &image.nodes[event.target.0 as usize];
                 let timer_flow = image.host_states[node.state_slot as usize]
                     .generators
@@ -2342,6 +2389,10 @@ impl MetalPlan {
             config.round_threads_per_threadgroup as u64,
             streams.layout.round_scratch_offset as u64,
             pfc_offset.map_or(NONE, |offset| offset as u64),
+            tcp_state
+                .layout
+                .roce_offset
+                .map_or(NONE, |offset| offset as u64),
         ];
 
         if node_count.div_ceil(config.round_threads_per_threadgroup) > u32::MAX as usize {
@@ -2461,6 +2512,15 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
                 data_counts[index] = data_counts[index].saturating_add(work.packets);
                 continue;
             }
+            if let FlowGeneratorKind::Roce(roce) = generator.kind {
+                // P15: an estimate (remaining fresh packets and one resend of the outstanding
+                // window); an overflow takes the capacity retry. The pacing token is a zero-byte
+                // packet the initial count skips.
+                data_counts[index] = data_counts[index].saturating_add(
+                    crate::device_sizing::roce_data_packet_estimate(image, generator, roce),
+                );
+                continue;
+            }
             let FlowGeneratorKind::Constant(constant) = generator.kind else {
                 let FlowGeneratorKind::Tcp(tcp) = generator.kind else {
                     unreachable!()
@@ -2514,13 +2574,17 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
     }
     for state in &image.host_states {
         for generator in &state.generators {
-            // One ACK (TCP) or at most one CNP (DCQCN) per data packet.
-            if matches!(
-                generator.kind,
-                FlowGeneratorKind::Tcp(_) | FlowGeneratorKind::Dcqcn(_)
-            ) {
+            // One ACK (TCP) or at most one CNP (DCQCN) per data packet; a queue pair's receiver
+            // answers a data arrival with at most one ACK or NACK and one CNP.
+            let per_packet = match generator.kind {
+                FlowGeneratorKind::Tcp(_) | FlowGeneratorKind::Dcqcn(_) => 1,
+                FlowGeneratorKind::Roce(_) => 2,
+                FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => 0,
+            };
+            if per_packet != 0 {
                 let flow = generator.flow.0 as usize;
-                feedback_counts[flow] = feedback_counts[flow].saturating_add(data_counts[flow]);
+                feedback_counts[flow] = feedback_counts[flow]
+                    .saturating_add(data_counts[flow].saturating_mul(per_packet));
             }
         }
     }
@@ -3095,10 +3159,17 @@ fn derived_channel_stream_capacities(
     // horizon. Constant propagation can retain at most ceil(propagation/serialization) older
     // events, and two additional records provide outward-rounded slack. The channel's finite
     // whole-run packet count remains an absolute cap on semantic events, before slack.
+    // A flow's channel for a (link, target) is the first: lowering appends the PFC control lanes
+    // after every flow channel, and a control lane can share its flow channel's link and target
+    // (a host-link lane always does). With the last entry winning, a flow channel's packets were
+    // counted on the control lane and the flow channel started at the bare slack (P15). The
+    // channels are collected in reverse, so the collect's last-wins dedup keeps the first; the
+    // bulk build allocates as before (per-entry inserts cost 390 more allocations on k16).
     let channels = image
         .channels
         .iter()
         .enumerate()
+        .rev()
         .map(|(index, channel)| ((channel.link, channel.target), index))
         .collect::<BTreeMap<_, _>>();
     let mut packet_counts = vec![0_usize; image.channels.len()];
@@ -3323,10 +3394,9 @@ fn derived_transition_bound(
                     .saturating_add(work.control_ticks))
             }
             FlowGeneratorKind::Roce(roce) => Ok(bound
-                .saturating_add(
-                    usize::try_from(crate::validate::roce_grid_ticks(image, generator, roce))
-                        .unwrap_or(usize::MAX),
-                )
+                .saturating_add(crate::device_mechanism::roce_transition_bound(
+                    image, generator, roce,
+                ))
                 .saturating_add(1)),
             FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Tcp(_) => Ok(bound),
         })
@@ -3663,11 +3733,14 @@ fn prepare_tcp_state(
             }
         }
     }
+    let roce_offset =
+        crate::device_mechanism::append_roce_region(image, receiver_offset, &mut words);
     Ok(PreparedTcpState {
         words,
         layout: TcpStateLayout {
             receiver_offset,
             ledger_meta_offset,
+            roce_offset,
         },
     })
 }
@@ -4296,6 +4369,20 @@ impl MetalBuffers {
         let ledger_meta = self
             .tcp_state
             .read_range(ledger_meta_range.start, ledger_meta_range.len());
+        // P15: the RoCE receiver region, read only when the plan holds one (a non-QP image issues
+        // the same reads as before).
+        let roce_region = if params[PARAM_ROCE_OFFSET] != NONE {
+            let range = metadata_region(
+                self.tcp_state.words,
+                params[PARAM_ROCE_OFFSET] as usize,
+                crate::device_mechanism::roce_region_words(image),
+                "RoCE receiver region",
+            )
+            .map_err(compaction_error)?;
+            Some(self.tcp_state.read_range(range.start, range.len()))
+        } else {
+            None
+        };
 
         let fel_plan = arena_compaction_plan(
             "FEL record",
@@ -4545,6 +4632,25 @@ impl MetalBuffers {
                                     }
                                 })?;
                             }
+                            crate::device_mechanism::GENERATOR_KIND_ROCE => {
+                                let FlowGeneratorKind::Roce(roce) = &mut generator.kind else {
+                                    return Err(MetalError::DeviceExecution {
+                                        code: 96,
+                                        node: Some(node.id),
+                                    }
+                                    .into());
+                                };
+                                crate::device_mechanism::decode_roce_generator(
+                                    &generators[offset..offset + GENERATOR_WORDS],
+                                    roce,
+                                )
+                                .map_err(|_| {
+                                    MetalError::DeviceExecution {
+                                        code: 96,
+                                        node: Some(node.id),
+                                    }
+                                })?;
+                            }
                             _ => {
                                 return Err(MetalError::DeviceExecution {
                                     code: 96,
@@ -4590,6 +4696,16 @@ impl MetalBuffers {
                             node: Some(node.id),
                         })?;
                     }
+                    if params[PARAM_PFC_OFFSET] != NONE {
+                        crate::device_pfc::restore_host_pfc(
+                            &scheduler_state,
+                            params[PARAM_PFC_OFFSET] as usize,
+                            lp,
+                            state,
+                        )
+                        .map_err(MetalError::Validation)?;
+                        crate::device_mechanism::recompute_pause_parked(image, state);
+                    }
                 }
                 NodeKind::Switch => {
                     let state = &mut switch_states[node.state_slot as usize];
@@ -4615,6 +4731,14 @@ impl MetalBuffers {
                     state.departed_packets = node_state[base + 9];
                 }
             }
+        }
+        if let Some(region) = &roce_region {
+            crate::device_mechanism::decode_roce_receivers(region, &mut host_states).map_err(
+                |_| MetalError::DeviceExecution {
+                    code: 96,
+                    node: None,
+                },
+            )?;
         }
 
         let mut pending_events = Vec::new();
@@ -5080,6 +5204,17 @@ fn decode_event_kind(value: u64) -> Result<EventKind, MetalError> {
     }
 }
 
+/// The RoCE ACK/NACK header in `encode_packet_metadata`'s word order.
+#[inline(always)]
+fn roce_ack_header(metadata: &[u64]) -> crate::RoceAckHeader {
+    crate::RoceAckHeader {
+        acknowledgment: metadata[0],
+        echoed_sent_time_ns: metadata[1],
+        acknowledged_bytes: metadata[2],
+    }
+}
+
+#[inline(always)]
 fn decode_packet_kind(value: u64, metadata: &[u64]) -> Result<PacketKind, MetalError> {
     match value & PACKET_KIND_MASK {
         0 => Ok(PacketKind::Data),
@@ -5103,6 +5238,14 @@ fn decode_packet_kind(value: u64, metadata: &[u64]) -> Result<PacketKind, MetalE
             trigger_payload: PayloadId(metadata[0]),
         })),
         6 if metadata == [0, 0, 0] => Ok(PacketKind::DcqcnControlTimer),
+        7 if metadata[2] <= 1 => Ok(PacketKind::RoceData(crate::RoceDataHeader {
+            psn: metadata[0],
+            sent_time_ns: metadata[1],
+            retransmission: metadata[2] != 0,
+        })),
+        8 => Ok(PacketKind::RoceAck(roce_ack_header(metadata))),
+        9 => Ok(PacketKind::RoceNack(roce_ack_header(metadata))),
+        10 if metadata == [0, 0, 0] => Ok(PacketKind::RocePacingTimer),
         _ => Err(MetalError::DeviceExecution {
             code: 93,
             node: None,
@@ -6125,6 +6268,18 @@ mod tests {
                 "{error}",
             );
         }
+    }
+
+    /// P15: the readback's packet-kind decoder is forced inline, as CUDA's is
+    /// (`readback_event_decode_is_force_inlined` in `cuda.rs`): it gained the RoCE arms, and an
+    /// out-of-line decoder costs every decoded record a call (P14's `decode_packet_kind` lesson).
+    #[test]
+    fn readback_packet_kind_decode_is_force_inlined() {
+        assert!(
+            include_str!("metal.rs")
+                .contains("#[inline(always)]\nfn decode_packet_kind(value: u64, metadata: &[u64])"),
+            "`decode_packet_kind` must be #[inline(always)]"
+        );
     }
 
     #[test]
