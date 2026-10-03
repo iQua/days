@@ -35,6 +35,10 @@ const FIXTURES: &[&str] = &[
     "hostpfc_bidir_drr.toml",
     "hostpfc_bidir_wrr.toml",
     "../p16/dcqcn_mlx_window.toml",
+    // P16 fix round 1 (review F1): the same-instant images, so the devices run every class of
+    // coincidence (alpha tick, RP fire, idle decrease-grid instant).
+    "../p16/dcqcn_mlx_coincident_qp.toml",
+    "../p16/dcqcn_mlx_coincident_grid_qp.toml",
 ];
 
 /// A fixture of `configs/p15`; a P16 fixture is named relative to it (`../p16/...`).

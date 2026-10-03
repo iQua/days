@@ -21,6 +21,7 @@ use days_executor::{
     run_scalar_with_observations,
 };
 
+/// A fixture of `configs/p14`; a P16 fixture is named relative to it (`../p16/...`).
 fn lower(name: &str) -> SimulationImage {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("configs/p14")
@@ -87,16 +88,22 @@ fn scalar(image: &SimulationImage, horizon: Option<u64>) -> RunResult {
     expected
 }
 
-/// The DCQCN images without PFC state: the T26 scenario, the CNP-heavy multi-hop fixture and the
-/// 1 s fixture, plus checkpoints of the first two at every `step` ns.
+/// The DCQCN images without PFC state: the T26 scenario, the CNP-heavy multi-hop fixture, the 1 s
+/// fixture and the two unreliable P16 same-instant images (fix round 1, review F1: CNPs on alpha
+/// ticks, an RP fire and a pending decrease check), plus checkpoints of the first two at every
+/// `step` ns and of the P16 images at 1.7 ms, with their controllers armed mid-run.
 fn dcqcn_images() -> Vec<(String, SimulationImage)> {
     let t26 = lower("dcqcn_t26.toml");
     let multi = strip_inert_pfc(lower("dcqcn_multi_zero_xoff.toml"));
     let one_second = strip_inert_pfc(lower("dcqcn_1s_zero_xoff.toml"));
+    let coincident = strip_inert_pfc(lower("../p16/dcqcn_mlx_coincident.toml"));
+    let pending = strip_inert_pfc(lower("../p16/dcqcn_mlx_coincident_pending.toml"));
     let mut images = vec![
         ("dcqcn_t26".to_owned(), t26.clone()),
         ("dcqcn_multi".to_owned(), multi.clone()),
         ("dcqcn_1s".to_owned(), one_second),
+        ("dcqcn_mlx_coincident".to_owned(), coincident.clone()),
+        ("dcqcn_mlx_coincident_pending".to_owned(), pending.clone()),
     ];
     for (name, image, step) in [
         ("dcqcn_t26", &t26, 25_000),
@@ -112,6 +119,18 @@ fn dcqcn_images() -> Vec<(String, SimulationImage)> {
             ));
             horizon += step;
         }
+    }
+    for (name, image) in [
+        ("dcqcn_mlx_coincident", &coincident),
+        ("dcqcn_mlx_coincident_pending", &pending),
+    ] {
+        let horizon = 1_700_000;
+        let prefix = run_scalar_with_observations(image, Some(horizon), ObservationMode::Full)
+            .expect("checkpoint prefix must run");
+        images.push((
+            format!("{name}@{horizon}"),
+            checkpoint_image(image, &prefix),
+        ));
     }
     images
 }
