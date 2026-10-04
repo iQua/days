@@ -575,6 +575,7 @@ def frontierOf (segments : List (Nat × Nat)) : Nat :=
   sorted.foldl (fun frontier segment =>
     if segment.1 ≤ frontier then max frontier segment.2 else frontier) 0
 
+
 def segmentOf (row : Row) : Nat × Nat :=
   (row.segmentSequence, row.segmentSequence + row.segmentBytes)
 
@@ -626,6 +627,7 @@ def checkInboundReplay (rows : List Row) (row : Row) : Except String Unit := do
       (row.beforeInboundBytes = before && row.afterInboundBytes = after &&
         row.arrivalBytes = after - before)
       "inbound progress does not match the receiver frontier replayed from the certified segments"
+
 
 /-- Whether a local completion is caused by a compute timer: a gated root's gate, or a compute
 stage that follows a compute group. Every other local cause is a transport stage's completing
@@ -700,6 +702,7 @@ def checkLocalSignal (rows : List Row) (row : Row) : Except String Unit := do
         (row.causeDelayNs > 0 && row.key.timeNs ≥ row.causeOriginNs + row.causeDelayNs)
         "local completion precedes the earliest return of the completing acknowledgment"
 
+
 def sameStageConfig (first second : Row) : Bool :=
   first.nodeId = second.nodeId && first.flowId = second.flowId &&
     first.chunkOffsetBytes = second.chunkOffsetBytes &&
@@ -718,39 +721,6 @@ def checkInitialState (row : Row) : Except String Unit := do
       row.beforeInboundBytes = 0)
     "first inbound prerequisite state is not initial"
 
-def checkContinuity (rows : List Row) : Except String Unit := do
-  let rec go (previous : List Row) : List Row → Except String Unit
-    | [] => pure ()
-    | row :: rest => do
-        match previous.find? (sameGroup · row) with
-        | none => pure ()
-        | some prior =>
-            require row.srcLine (sameGroupConfig prior row)
-              s!"collective configuration discontinuity for collective_id={row.collectiveId}"
-        for prior in previous do
-          if sameGroup prior row then
-            require row.srcLine
-              ((prior.rank = row.rank) = (prior.nodeId = row.nodeId))
-              "collective rank-to-node mapping is inconsistent"
-          if prior.flowId = row.flowId then
-            require row.srcLine (sameStage prior row)
-              "collective flow identity changed stage position"
-        match previous.find? (sameStage · row) with
-        | none => checkInitialState row
-        | some prior =>
-            require row.srcLine (sameStageConfig prior row)
-              "collective stage configuration changed during progress"
-            require row.srcLine
-              (row.beforeLocalComplete = prior.afterLocalComplete &&
-                row.beforeInboundComplete = prior.afterInboundComplete &&
-                row.beforeInboundBytes = prior.afterInboundBytes)
-              "collective stage before-state does not continue the prior after-state"
-        require row.srcLine
-          (!previous.any (fun prior => sameStage prior row && prior.activated && row.activated))
-          "collective stage activated more than once"
-        go (row :: previous) rest
-  go [] rows
-
 /-- A row's group (`sameGroup`) as a hash key. -/
 abbrev GroupId := Collective.StageKind × Nat
 
@@ -761,6 +731,97 @@ def groupId (row : Row) : GroupId := (row.stageKind, row.collectiveId)
 
 def stageId (row : Row) : StageId :=
   (row.stageKind, row.collectiveId, row.collectivePhase, row.rank, row.step)
+
+/-- What `checkContinuity` keeps of the rows before the current one (canonical positions count from
+zero). -/
+structure ContinuityState where
+  /-- The most recent row of each group. -/
+  lastOfGroup : Std.HashMap GroupId Row := ∅
+  /-- For each (group, rank): the node of its rows and the position of the most recent one. -/
+  rankNode : Std.HashMap (GroupId × Nat) (Nat × Nat) := ∅
+  /-- For each (group, node): the rank of its rows and the position of the most recent one. -/
+  nodeRank : Std.HashMap (GroupId × Nat) (Nat × Nat) := ∅
+  /-- For each flow: the stage of its rows and the position of the most recent one. -/
+  flowStage : Std.HashMap Nat (StageId × Nat) := ∅
+  /-- The most recent row of each stage. -/
+  lastOfStage : Std.HashMap StageId Row := ∅
+  /-- The stages with an activated row. -/
+  activated : Std.HashSet StageId := ∅
+
+/-- The position of the most recent earlier row that breaks the group's rank-to-node mapping
+against `row`, if any. -/
+def ContinuityState.rankNodeBreak (state : ContinuityState) (row : Row) : Option Nat :=
+  let byRank := match state.rankNode.get? (groupId row, row.rank) with
+    | some (node, position) => if node = row.nodeId then none else some position
+    | none => none
+  let byNode := match state.nodeRank.get? (groupId row, row.nodeId) with
+    | some (rank, position) => if rank = row.rank then none else some position
+    | none => none
+  match byRank, byNode with
+  | some first, some second => some (max first second)
+  | some first, none | none, some first => some first
+  | none, none => none
+
+/-- The position of the most recent earlier row of `row`'s flow at another stage, if any. -/
+def ContinuityState.flowBreak (state : ContinuityState) (row : Row) : Option Nat :=
+  match state.flowStage.get? row.flowId with
+  | some (stage, position) => if stage = stageId row then none else some position
+  | none => none
+
+/-- Each row continues its group and its stage, in one pass in canonical order.
+
+The list scan this replaces compared each row with every earlier row, most recent first, and for
+each earlier row required first the group's rank-to-node mapping and then the flow's stage. Its
+first error is therefore that of the most recent earlier row breaking either rule, with the mapping
+message when one row breaks both. The keyed form finds the same row: when the pass reaches a row,
+every pair of earlier rows obeys both rules (else the pass would have stopped at the later of the
+two), so all earlier rows of one (group, rank) share a node, all earlier rows of one (group, node)
+share a rank, and all earlier rows of one flow share a stage. The earlier rows that break the
+mapping against `row` are then exactly the rows of `(group, row.rank)` when their node differs and
+the rows of `(group, row.nodeId)` when their rank differs, and those that break the flow rule are
+all rows of the flow when their stage differs; the most recent of each set is the stored position.
+The other requirements read only the most recent row of the group or stage, or whether the stage
+has activated, which the state keeps exactly. -/
+def checkContinuity (rows : List Row) : Except String Unit := do
+  let mut state : ContinuityState := {}
+  let mut position := 0
+  for row in rows do
+    let group := groupId row
+    let stage := stageId row
+    match state.lastOfGroup.get? group with
+    | none => pure ()
+    | some prior =>
+        require row.srcLine (sameGroupConfig prior row)
+          s!"collective configuration discontinuity for collective_id={row.collectiveId}"
+    match state.rankNodeBreak row, state.flowBreak row with
+    | some mapping, some flow =>
+        if mapping ≥ flow then
+          require row.srcLine false "collective rank-to-node mapping is inconsistent"
+        else
+          require row.srcLine false "collective flow identity changed stage position"
+    | some _, none => require row.srcLine false "collective rank-to-node mapping is inconsistent"
+    | none, some _ => require row.srcLine false "collective flow identity changed stage position"
+    | none, none => pure ()
+    match state.lastOfStage.get? stage with
+    | none => checkInitialState row
+    | some prior =>
+        require row.srcLine (sameStageConfig prior row)
+          "collective stage configuration changed during progress"
+        require row.srcLine
+          (row.beforeLocalComplete = prior.afterLocalComplete &&
+            row.beforeInboundComplete = prior.afterInboundComplete &&
+            row.beforeInboundBytes = prior.afterInboundBytes)
+          "collective stage before-state does not continue the prior after-state"
+    require row.srcLine (!(state.activated.contains stage && row.activated))
+      "collective stage activated more than once"
+    state :=
+      { lastOfGroup := state.lastOfGroup.insert group row
+        rankNode := state.rankNode.insert (group, row.rank) (row.nodeId, position)
+        nodeRank := state.nodeRank.insert (group, row.nodeId) (row.rank, position)
+        flowStage := state.flowStage.insert row.flowId (stage, position)
+        lastOfStage := state.lastOfStage.insert stage row
+        activated := if row.activated then state.activated.insert stage else state.activated }
+    position := position + 1
 
 /-- What coverage needs of one group: its distinct stages, its activated rows, and whether a root
 is logged. -/
