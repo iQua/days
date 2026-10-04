@@ -11,6 +11,12 @@ namespace LeanGuard.P10c.CollectiveEventLog
 open LeanGuard.Shared
 open LeanGuard.P10c
 
+def position? (row : Row) : Option Position :=
+  row.collectivePhase.map fun phase => { phase := phase, rank := row.rank, step := row.step }
+
+def atPosition (collective : Row) (wanted : Position) (candidate : Row) : Bool :=
+  sameGroup collective candidate && position? candidate = some wanted
+
 def findStageReference (rows : List Row) (collective : Row) (wanted : Position) : Option Row :=
   rows.find? (atPosition collective wanted)
 

@@ -426,9 +426,6 @@ structure Position where
   step : Nat
   deriving DecidableEq, Repr
 
-def position? (row : Row) : Option Position :=
-  row.collectivePhase.map fun phase => { phase := phase, rank := row.rank, step := row.step }
-
 def predecessorPhaseStep (row : Row) (phase : Collective.Phase) : Collective.Phase × Nat :=
   if row.step > 1 then
     (phase, row.step - 1)
@@ -444,24 +441,91 @@ def inboundPredecessorPosition (row : Row) (phase : Collective.Phase) : Position
   let previousRank := if row.rank = 0 then row.groupSize - 1 else row.rank - 1
   { phase := predecessor.1, rank := previousRank, step := predecessor.2 }
 
-def atPosition (collective : Row) (wanted : Position) (candidate : Row) : Bool :=
-  sameGroup collective candidate && position? candidate = some wanted
+/-- A row's group (`sameGroup`) as a hash key. -/
+abbrev GroupId := Collective.StageKind × Nat
 
-def findStage (rows : List Row) (collective : Row) (wanted : Position) : Option Row :=
-  rows.find? (atPosition collective wanted)
+/-- A row's stage (`sameStage`) as a hash key: its group and its position. -/
+abbrev StageId := Collective.StageKind × Nat × Option Collective.Phase × Nat × Nat
 
-def findActivatedStage (rows : List Row) (collective : Row) (wanted : Position) : Option Row :=
-  rows.find? fun candidate => atPosition collective wanted candidate && candidate.activated
+def groupId (row : Row) : GroupId := (row.stageKind, row.collectiveId)
+
+def stageId (row : Row) : StageId :=
+  (row.stageKind, row.collectiveId, row.collectivePhase, row.rank, row.step)
+
+/-- The stage of `collective`'s group at `wanted`, as a hash key. -/
+def positionId (collective : Row) (wanted : Position) : StageId :=
+  (collective.stageKind, collective.collectiveId, some wanted.phase, wanted.rank, wanted.step)
+
+/-- Insert unless present, so a map built in canonical order holds each key's first row. -/
+def insertFirst {α β : Type} [BEq α] [Hashable α] (map : Std.HashMap α β) (key : α) (value : β) :
+    Std.HashMap α β :=
+  if map.contains key then map else map.insert key value
+
+/-! ## Keyed lookups
+
+Each lookup of the predecessor and signal checks returns the first row of the canonical trace that
+satisfies one predicate, as `List.find?` over the whole trace did (the list-scan forms are kept,
+test-only, in `LeanGuard/P10c/Test/CollectiveReference.lean`). `lookupIndex` builds one map per
+predicate in a single pass, inserting a key only at its first matching row, so every lookup returns
+exactly the row the scan returned, and the checks that use them are unchanged. -/
+
+structure LookupIndex where
+  /-- The first row of each flow (`find? (some ·.flowId = id)`). -/
+  byFlow : Std.HashMap Nat Row := ∅
+  /-- The first activated row of each flow. -/
+  activatedByFlow : Std.HashMap Nat Row := ∅
+  /-- The first activated compute row of each flow. -/
+  activatedComputeByFlow : Std.HashMap Nat Row := ∅
+  /-- The first row at each stage (`atPosition`, for positioned rows). -/
+  byStage : Std.HashMap StageId Row := ∅
+  /-- The first activated row at each stage. -/
+  activatedByStage : Std.HashMap StageId Row := ∅
+  /-- For each stage, the local predecessor flow of the first non-root row of its group whose
+  local predecessor position it is (the successor edge that resolves an unlogged root). -/
+  successorLocal : Std.HashMap StageId (Option Nat) := ∅
+  /-- The (group, flow) pairs of the trace. -/
+  groupFlows : Std.HashSet (GroupId × Nat) := ∅
+  /-- For each flow, the inbound byte count of the first row whose inbound predecessor it is. -/
+  receivedBytes : Std.HashMap Nat Nat := ∅
+  /-- For each flow, the first inbound row that completes its delivery at its receiver. -/
+  delivered : Std.HashMap Nat Row := ∅
+
+def lookupIndex (rows : List Row) : LookupIndex := Id.run do
+  let mut index : LookupIndex := {}
+  for row in rows do
+    index := { index with
+      byFlow := insertFirst index.byFlow row.flowId row
+      byStage := insertFirst index.byStage (stageId row) row
+      groupFlows := index.groupFlows.insert (groupId row, row.flowId) }
+    if row.activated then
+      index := { index with
+        activatedByFlow := insertFirst index.activatedByFlow row.flowId row
+        activatedByStage := insertFirst index.activatedByStage (stageId row) row }
+      if row.stageKind = .compute then
+        index := { index with
+          activatedComputeByFlow := insertFirst index.activatedComputeByFlow row.flowId row }
+    if let some phase := row.collectivePhase then
+      if !isRoot row then
+        index := { index with
+          successorLocal := insertFirst index.successorLocal
+            (positionId row (localPredecessorPosition row phase)) row.localPredecessorFlowId }
+    if let some predecessor := row.inboundPredecessorFlowId then
+      index := { index with
+        receivedBytes := insertFirst index.receivedBytes predecessor row.inboundPredecessorBytes }
+    if row.cause = .inboundArrival && row.afterInboundComplete && !row.beforeInboundComplete then
+      index := { index with delivered := insertFirst index.delivered row.causeFlowId row }
+  pure index
+
+/-- The first row of a flow named by an optional identity. -/
+def LookupIndex.flow? (index : LookupIndex) (flowId : Option Nat) : Option Row :=
+  flowId.bind index.byFlow.get?
 
 /-- Resolve a stage's flow, including an unlogged root via its local successor edge. -/
-def resolveStageFlow (rows : List Row) (collective : Row) (wanted : Position) : Option Nat :=
-  match findStage rows collective wanted with
+def resolveStageFlow (index : LookupIndex) (collective : Row) (wanted : Position) : Option Nat :=
+  let key := positionId collective wanted
+  match index.byStage.get? key with
   | some stage => some stage.flowId
-  | none =>
-      (rows.find? fun successor =>
-        sameGroup collective successor && !isRoot successor &&
-          (successor.collectivePhase.map (localPredecessorPosition successor ·)) = some wanted
-        ).bind (·.localPredecessorFlowId)
+  | none => (index.successorLocal.get? key).bind id
 
 def requireEarlierRelease (row : Row) (predecessor : Option Row) (message : String) :
     Except String Unit :=
@@ -469,45 +533,44 @@ def requireEarlierRelease (row : Row) (predecessor : Option Row) (message : Stri
   | none => pure ()
   | some predecessor => require row.srcLine (compositeLT predecessor row) message
 
-def checkTransportPredecessors (rows : List Row) (row : Row) (phase : Collective.Phase) :
+def checkTransportPredecessors (index : LookupIndex) (row : Row) (phase : Collective.Phase) :
     Except String Unit := do
   if isRoot row then
     -- A root's gate is a compute stage, never a stage of its own collective.
     require row.srcLine
-      (!rows.any fun candidate =>
-        sameGroup row candidate && some candidate.flowId = row.localPredecessorFlowId)
+      (!row.localPredecessorFlowId.any fun gate => index.groupFlows.contains (groupId row, gate))
       "a root stage's gate must be a compute stage outside its collective"
     return
   let localPosition := localPredecessorPosition row phase
   let inboundPosition := inboundPredecessorPosition row phase
-  match resolveStageFlow rows row localPosition with
+  match resolveStageFlow index row localPosition with
   | none => pure ()
   | some expected =>
       require row.srcLine (row.localPredecessorFlowId = some expected)
         "local predecessor identity does not match the stage recurrence"
-  match resolveStageFlow rows row inboundPosition with
+  match resolveStageFlow index row inboundPosition with
   | none => pure ()
   | some expected =>
       require row.srcLine (row.inboundPredecessorFlowId = some expected)
         "inbound predecessor identity does not match the stage recurrence"
   match row.cause with
   | .localCompletion =>
-      requireEarlierRelease row (findActivatedStage rows row localPosition)
+      requireEarlierRelease row (index.activatedByStage.get? (positionId row localPosition))
         "local predecessor stage did not activate earlier"
   | .inboundArrival =>
-      requireEarlierRelease row (findActivatedStage rows row inboundPosition)
+      requireEarlierRelease row (index.activatedByStage.get? (positionId row inboundPosition))
         "inbound predecessor stage did not activate earlier"
 
 /-- A compute stage follows the same-rank stage of a compute group, or the same-rank final stage
 of a collective together with the previous rank's final stage. Logged predecessors are checked. -/
-def checkComputePredecessors (rows : List Row) (row : Row) : Except String Unit := do
+def checkComputePredecessors (index : LookupIndex) (row : Row) : Except String Unit := do
   let previousRank := if row.rank = 0 then row.groupSize - 1 else row.rank - 1
   let isFinal (candidate : Row) (rank : Nat) : Bool :=
     candidate.stageKind.isTransport && candidate.collectivePhase = some .allGather &&
       candidate.step + 1 = candidate.groupSize && candidate.rank = rank &&
       candidate.groupSize = row.groupSize
-  let local? := rows.find? fun candidate => some candidate.flowId = row.localPredecessorFlowId
-  let inbound? := rows.find? fun candidate => some candidate.flowId = row.inboundPredecessorFlowId
+  let local? := index.flow? row.localPredecessorFlowId
+  let inbound? := index.flow? row.inboundPredecessorFlowId
   match local?, row.inboundPredecessorFlowId with
   | some predecessor, none =>
       require row.srcLine
@@ -548,23 +611,24 @@ def checkComputePredecessors (rows : List Row) (row : Row) : Except String Unit 
 /-- A compute stage completes only when its timer fires. When the completed compute stage is
 logged, its release row records the timer deadline (`after_next_time_ns` = release + duration), so
 the successor's local completion must happen exactly then, as a phase-1 timer event. -/
-def checkComputeTimerCause (rows : List Row) (row : Row) : Except String Unit := do
+def checkComputeTimerCause (index : LookupIndex) (row : Row) : Except String Unit := do
   if row.cause = .localCompletion then
-    let released? := rows.find? fun candidate =>
-      candidate.flowId = row.causeFlowId && candidate.stageKind = .compute && candidate.activated
-    match released? with
+    match index.activatedComputeByFlow.get? row.causeFlowId with
     | none => pure ()
     | some predecessor =>
         require row.srcLine
           (row.key.timeNs = predecessor.afterNextTimeNs && row.key.phase = 1)
           "compute local completion does not occur at its predecessor's timer deadline"
 
-def checkPredecessors (rows : List Row) (row : Row) : Except String Unit := do
-  checkComputeTimerCause rows row
+def checkPredecessors (index : LookupIndex) (row : Row) : Except String Unit := do
+  checkComputeTimerCause index row
   match row.stageKind, row.collectivePhase with
-  | .tcp, some phase | .roce, some phase => checkTransportPredecessors rows row phase
+  | .tcp, some phase | .roce, some phase => checkTransportPredecessors index row phase
   | .tcp, none | .roce, none => pure ()
-  | .compute, _ => checkComputePredecessors rows row
+  | .compute, _ => checkComputePredecessors index row
+
+def segmentOf (row : Row) : Nat × Nat :=
+  (row.segmentSequence, row.segmentSequence + row.segmentBytes)
 
 /-- The receiver's in-order frontier after the half-open segments `[start, stop)` arrive, as
 `tcp_receive_range` computes it: sorted by start, extended from zero through every segment that
@@ -575,9 +639,6 @@ def frontierOf (segments : List (Nat × Nat)) : Nat :=
   sorted.foldl (fun frontier segment =>
     if segment.1 ≤ frontier then max frontier segment.2 else frontier) 0
 
-
-def segmentOf (row : Row) : Nat × Nat :=
-  (row.segmentSequence, row.segmentSequence + row.segmentBytes)
 
 /-- The MTU of the RoCE queue pair whose packets a row's inbound segments are, or `none` for TCP
 segments. A RoCE stage's inbound predecessor is a stage of its own collective (one transport per
@@ -641,17 +702,14 @@ def causeIsTimer (row : Row) : Bool :=
 /-- The byte total of a transport local predecessor: from the ring recurrence for a transport
 stage, or from the rows of the stage that receives it (its inbound byte count) for a compute
 stage. -/
-def localPredecessorTotal (rows : List Row) (row : Row) : Option Nat :=
-  let received :=
-    (rows.find? fun candidate =>
-      candidate.inboundPredecessorFlowId = some row.causeFlowId).map (·.inboundPredecessorBytes)
+def localPredecessorTotal (index : LookupIndex) (row : Row) : Option Nat :=
   match row.stageKind, row.algorithm, row.collectivePhase with
   | .tcp, some algorithm, some phase | .roce, some algorithm, some phase =>
       let position := localPredecessorPosition row phase
       let owner :=
         Collective.stageOwner algorithm position.phase row.groupSize position.rank position.step
       some (Collective.chunkBounds row.declaredTotalBytes row.groupSize owner).2
-  | _, _, _ => received
+  | _, _, _ => index.receivedBytes.get? row.causeFlowId
 
 /-- Binds a local completion to the event that caused it.
 
@@ -662,10 +720,9 @@ byte total: the row names that
 acknowledgment, which must equal the predecessor's total; the answered segment was sent after the
 predecessor's release; and the ACK arrives after the receiver's frontier completed and no sooner
 than the segment's send time plus the unloaded round trip of the segment and the ACK. -/
-def checkLocalSignal (rows : List Row) (row : Row) : Except String Unit := do
+def checkLocalSignal (index : LookupIndex) (row : Row) : Except String Unit := do
   if row.cause = .localCompletion then
-    let released? := rows.find? fun candidate =>
-      candidate.flowId = row.causeFlowId && candidate.activated
+    let released? := index.activatedByFlow.get? row.causeFlowId
     if causeIsTimer row then
       require row.srcLine
         (row.ackNumber = 0 && row.causeDelayNs > 0 &&
@@ -682,7 +739,7 @@ def checkLocalSignal (rows : List Row) (row : Row) : Except String Unit := do
             "an unlogged root compute stage is armed at time zero"
     else
       let total ← requireSome row.srcLine "local predecessor byte total"
-        (localPredecessorTotal rows row)
+        (localPredecessorTotal index row)
       require row.srcLine (row.ackNumber = total)
         "completing acknowledgment does not reach exactly the local predecessor's byte total"
       match released? with
@@ -690,10 +747,7 @@ def checkLocalSignal (rows : List Row) (row : Row) : Except String Unit := do
           require row.srcLine (row.causeOriginNs ≥ predecessor.key.timeNs)
             "acknowledged segment was sent before its stage was released"
       | none => pure ()
-      let delivered? := rows.find? fun candidate =>
-        candidate.cause = .inboundArrival && candidate.causeFlowId = row.causeFlowId &&
-          candidate.afterInboundComplete && !candidate.beforeInboundComplete
-      match delivered? with
+      match index.delivered.get? row.causeFlowId with
       | some delivered =>
           require row.srcLine (compositeLT delivered row && delivered.key.timeNs < row.key.timeNs)
             "local completion precedes its predecessor's delivery at the receiver"
@@ -701,7 +755,6 @@ def checkLocalSignal (rows : List Row) (row : Row) : Except String Unit := do
       require row.srcLine
         (row.causeDelayNs > 0 && row.key.timeNs ≥ row.causeOriginNs + row.causeDelayNs)
         "local completion precedes the earliest return of the completing acknowledgment"
-
 
 def sameStageConfig (first second : Row) : Bool :=
   first.nodeId = second.nodeId && first.flowId = second.flowId &&
@@ -720,17 +773,6 @@ def checkInitialState (row : Row) : Except String Unit := do
     (row.beforeInboundComplete = row.inboundPredecessorFlowId.isNone &&
       row.beforeInboundBytes = 0)
     "first inbound prerequisite state is not initial"
-
-/-- A row's group (`sameGroup`) as a hash key. -/
-abbrev GroupId := Collective.StageKind × Nat
-
-/-- A row's stage (`sameStage`) as a hash key: its group and its position. -/
-abbrev StageId := Collective.StageKind × Nat × Option Collective.Phase × Nat × Nat
-
-def groupId (row : Row) : GroupId := (row.stageKind, row.collectiveId)
-
-def stageId (row : Row) : StageId :=
-  (row.stageKind, row.collectiveId, row.collectivePhase, row.rank, row.step)
 
 /-- What `checkContinuity` keeps of the rows before the current one (canonical positions count from
 zero). -/
@@ -880,8 +922,9 @@ def checkRows (rows : List Row) : Except String Unit := do
   checkContinuity canonical
   for row in canonical do checkRow row
   checkCoverage canonical
-  for row in canonical do checkPredecessors canonical row
+  let index := lookupIndex canonical
+  for row in canonical do checkPredecessors index row
   for row in canonical do checkInboundReplay canonical row
-  for row in canonical do checkLocalSignal canonical row
+  for row in canonical do checkLocalSignal index row
 
 end LeanGuard.P10c.CollectiveEventLog
