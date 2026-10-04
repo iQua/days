@@ -630,15 +630,42 @@ def checkPredecessors (index : LookupIndex) (row : Row) : Except String Unit := 
 def segmentOf (row : Row) : Nat × Nat :=
   (row.segmentSequence, row.segmentSequence + row.segmentBytes)
 
-/-- The receiver's in-order frontier after the half-open segments `[start, stop)` arrive, as
-`tcp_receive_range` computes it: sorted by start, extended from zero through every segment that
-begins at or before the frontier. -/
-def frontierOf (segments : List (Nat × Nat)) : Nat :=
-  let sorted :=
-    (segments.toArray.qsort fun a b => a.1 < b.1 || (a.1 = b.1 && a.2 < b.2)).toList
-  sorted.foldl (fun frontier segment =>
-    if segment.1 ≤ frontier then max frontier segment.2 else frontier) 0
+/-- The receiver's in-order frontier of one stage, replayed incrementally: `frontier` is the
+frontier of the segments seen so far, as `tcp_receive_range` computes it (sorted by start, extended
+from zero through every segment that begins at or before the frontier), and `pending` maps the
+start of every seen segment beyond the frontier to the largest stop among the segments with that
+start. The frontier is the least fixpoint of `F = max (0, max {stop | start ≤ F})`, which does not
+depend on the order the segments arrive in. Every seen segment that starts at or before the frontier
+also ends there, so a new segment beyond the frontier leaves it unchanged, and one at or before it
+raises it to its stop and then absorbs the pending segments in start order while they reach it.
+Each segment enters and leaves `pending` once: O(log n) per row. -/
+structure Frontier where
+  frontier : Nat := 0
+  pending : Std.TreeMap Nat Nat := ∅
 
+/-- Absorb the pending segments that start at or before `frontier`, in start order. -/
+def Frontier.absorb (frontier : Nat) (pending : Std.TreeMap Nat Nat) : Frontier := Id.run do
+  let mut frontier := frontier
+  let mut pending := pending
+  -- Each iteration erases one entry, so `pending.size + 1` iterations always suffice.
+  for _ in [0:pending.size + 1] do
+    match pending.minEntry? with
+    | some (start, stop) =>
+        if start ≤ frontier then
+          frontier := max frontier stop
+          pending := pending.erase start
+        else
+          break
+    | none => break
+  pure { frontier, pending }
+
+/-- The replay after one more segment `[start, stop)`. -/
+def Frontier.add (state : Frontier) (segment : Nat × Nat) : Frontier :=
+  let (start, stop) := segment
+  if start ≤ state.frontier then
+    Frontier.absorb (max state.frontier stop) state.pending
+  else
+    { state with pending := state.pending.insert start (max stop (state.pending.getD start 0)) }
 
 /-- The MTU of the RoCE queue pair whose packets a row's inbound segments are, or `none` for TCP
 segments. A RoCE stage's inbound predecessor is a stage of its own collective (one transport per
@@ -673,22 +700,25 @@ def checkGoBackN (mtu : Nat) (row : Row) : Except String Unit := do
 /-- Every segment of a pending inbound predecessor is certified in order, so the before and after
 byte counts of each inbound row must equal the frontier replayed from that stage's segments: the
 Go-back-N frontier for RoCE packets, TCP's in-order frontier (which merges out-of-order segments)
-otherwise. -/
-def checkInboundReplay (rows : List Row) (row : Row) : Except String Unit := do
-  if row.cause = .inboundArrival then
-    if let some mtu := roceInboundMtu row then
-      return (← checkGoBackN mtu row)
-    let prior :=
-      (rows.filter fun candidate =>
-        candidate.flowId = row.flowId && candidate.cause = .inboundArrival &&
-          compositeLT candidate row).map segmentOf
-    let before := frontierOf prior
-    let after := frontierOf (prior ++ [segmentOf row])
-    require row.srcLine
-      (row.beforeInboundBytes = before && row.afterInboundBytes = after &&
-        row.arrivalBytes = after - before)
-      "inbound progress does not match the receiver frontier replayed from the certified segments"
-
+otherwise. One pass in canonical order keeps each flow's `Frontier` over all its earlier inbound
+rows (whatever their transport, as the list scan's filter did), checks the row against it, and then
+adds the row's segment. -/
+def checkInboundReplay (rows : List Row) : Except String Unit := do
+  let mut replays : Std.HashMap Nat Frontier := ∅
+  for row in rows do
+    if row.cause = .inboundArrival then
+      let state := replays.getD row.flowId {}
+      let next := state.add (segmentOf row)
+      match roceInboundMtu row with
+      | some mtu => checkGoBackN mtu row
+      | none =>
+          let before := state.frontier
+          let after := next.frontier
+          require row.srcLine
+            (row.beforeInboundBytes = before && row.afterInboundBytes = after &&
+              row.arrivalBytes = after - before)
+            "inbound progress does not match the receiver frontier replayed from the certified segments"
+      replays := replays.insert row.flowId next
 
 /-- Whether a local completion is caused by a compute timer: a gated root's gate, or a compute
 stage that follows a compute group. Every other local cause is a transport stage's completing
@@ -924,7 +954,7 @@ def checkRows (rows : List Row) : Except String Unit := do
   checkCoverage canonical
   let index := lookupIndex canonical
   for row in canonical do checkPredecessors index row
-  for row in canonical do checkInboundReplay canonical row
+  checkInboundReplay canonical
   for row in canonical do checkLocalSignal index row
 
 end LeanGuard.P10c.CollectiveEventLog

@@ -23,9 +23,18 @@ lake build p10c_collective_diff
 diff_checker="$lean_dir/.lake/build/bin/p10c_collective_diff"
 fixture_dir="$lean_dir/fixtures/p10c"
 max_ratio_percent=200
-max_per_row=2000
+max_per_row=200
 
 status=0
+# Heartbeats count allocations, so they miss a scan that allocates nothing (a find? over earlier
+# rows). The shipped checker must also hold no whole-trace list scan: rows, previous rows and the
+# canonical trace are walked only by `for` passes that build or read keyed state.
+echo "== no whole-trace list scan in the shipped checker"
+scan_pattern='\b(rows|previous|canonical)[[:space:]]*\.[[:space:]]*(find\?|filter|filterMap|any|all|count|contains|lookup|find)\b|for[[:space:]]+prior[[:space:]]+in'
+if grep -nE "$scan_pattern" "$lean_dir/LeanGuard/P10c/CollectiveEventLog.lean"; then
+  echo "SCAN AUDIT FAILED: a whole-trace list scan in LeanGuard/P10c/CollectiveEventLog.lean" >&2
+  status=1
+fi
 echo "== RoCE lossy ring"
 "$diff_checker" budget "$max_ratio_percent" "$max_per_row" \
   "$fixture_dir/collective_roce_ring_lossy_executor_accept.csv" \
