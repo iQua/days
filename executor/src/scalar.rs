@@ -914,8 +914,8 @@ pub fn run_scalar_counting_stage_scans_for_testing(
     Ok((transitions.finish(pending_events), dispatches, visits))
 }
 
-/// Test hook: a Scalar run with the number of service decisions made at PFC switch queues and the
-/// number of queued entries those decisions read (`PfcServiceProbe`).
+/// Test hook: a Scalar run with the service decisions made at PFC switch queues and the queued
+/// entries the PFC service paths read (`PfcServiceProbe`).
 ///
 /// The run itself is `run_scalar_with_observations`; the probe only counts.
 #[cfg(feature = "planner-test-hooks")]
@@ -923,15 +923,11 @@ pub fn run_scalar_counting_stage_scans_for_testing(
 pub fn run_scalar_counting_pfc_service_for_testing(
     image: &SimulationImage,
     observation_mode: ObservationMode,
-) -> Result<(RunResult, u64, u64), ExecutionError> {
+) -> Result<(RunResult, PfcServiceCounts), ExecutionError> {
     let (transitions, pending_events) =
         run_scalar_events(image, None, observation_mode, |_, _| {})?;
-    let probe = transitions.pfc_service_probe;
-    Ok((
-        transitions.finish(pending_events),
-        probe.decisions,
-        probe.entries,
-    ))
+    let counts = transitions.pfc_service_probe.counts;
+    Ok((transitions.finish(pending_events), counts))
 }
 
 /// Proves that the keyed stage path answers every query as the retired scans did, on `image`
@@ -1246,18 +1242,35 @@ enum SwitchServicePlan {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct PfcServiceProbe {
     #[cfg(feature = "planner-test-hooks")]
-    decisions: u64,
-    #[cfg(feature = "planner-test-hooks")]
-    entries: u64,
+    counts: PfcServiceCounts,
+}
+
+/// What `PfcServiceProbe` counts (test hooks only).
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PfcServiceCounts {
+    /// `TxReady` decisions at PFC switch queues.
+    pub decisions: u64,
+    /// Queued entries the PFC service paths read.
+    pub reads: u64,
+    /// First-eligible decisions (FIFO, static priority and WFQ queues) that served a packet behind
+    /// the queue head, past a paused class.
+    pub past_head: u64,
 }
 
 impl PfcServiceProbe {
-    /// Records one `TxReady` decision at a PFC queue that read `entries` queued entries.
+    /// Records one `TxReady` decision at a PFC queue that read `entries` queued entries and
+    /// served the packet at queue position `served` (`None` when nothing was eligible).
     #[inline]
-    fn note_decision(&mut self, entries: usize) {
+    fn note_decision(&mut self, entries: usize, served: Option<usize>) {
+        let _ = served;
         #[cfg(feature = "planner-test-hooks")]
         {
-            self.decisions = self.decisions.saturating_add(1);
+            self.counts.decisions = self.counts.decisions.saturating_add(1);
+            if served.is_some_and(|position| position > 0) {
+                self.counts.past_head = self.counts.past_head.saturating_add(1);
+            }
         }
         self.note_reads(entries);
     }
@@ -1269,8 +1282,9 @@ impl PfcServiceProbe {
         let _ = entries;
         #[cfg(feature = "planner-test-hooks")]
         {
-            self.entries = self
-                .entries
+            self.counts.reads = self
+                .counts
+                .reads
                 .saturating_add(u64::try_from(entries).unwrap_or(u64::MAX));
         }
     }
@@ -5043,7 +5057,7 @@ impl<'image> TransitionState<'image> {
                 )
             } else {
                 if queue.pfc.is_some() {
-                    probed_entries = Some(queue.queue.len());
+                    probed_entries = Some((queue.queue.len(), None));
                 }
                 let mut positions = Vec::new();
                 let mut packets = Vec::new();
@@ -5072,8 +5086,8 @@ impl<'image> TransitionState<'image> {
                 }
             }
         };
-        if let Some(entries) = probed_entries {
-            self.pfc_service_probe.note_decision(entries);
+        if let Some((entries, served)) = probed_entries {
+            self.pfc_service_probe.note_decision(entries, served);
         }
         let state_slot = self.local_state_slot(node)?;
         let (payload, selected_packet, queue_slot, pfc_plan, pfc_transition, scheduler_transition) = 'service: {
