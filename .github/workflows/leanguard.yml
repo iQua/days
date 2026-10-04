@@ -71,6 +71,12 @@ jobs:
       - name: Run P10c RoCE queue-pair checks
         run: bash lean/scripts/run-p10c-roce-campaign.sh
 
+      - name: Run P10c collective differential test (keyed checker against the list-scan reference)
+        run: bash lean/scripts/run-p10c-collective-differential.sh
+
+      - name: Run P10c collective cost budget (heartbeats across a size step)
+        run: bash lean/scripts/run-p10c-collective-budget.sh
+
       - name: Run AQM fixture checks
         run: bash lean/scripts/run-aqm-fixtures.sh
 

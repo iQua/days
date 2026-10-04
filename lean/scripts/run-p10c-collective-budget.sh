@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Deterministic cost budget of the P10c collective checker (P16 lane L1): the small allocations
+# (Lean heartbeats) made by the shipped checkRows alone, which grew quadratically in the trace before
+# the checker became linear (base 26dc1d1: 225 -> 1,073 RoCE rows cost 23x, 220 -> 1,027 TCP rows
+# 22x). Each pair is one scenario at two sizes; the larger trace's heartbeats may grow by at most
+# 200% of the row ratio, and no input may exceed the per-row cap.
+#
+# Budget fixtures (lean/fixtures/p10c/budget/), Scalar traces of days at 26dc1d1:
+#   collective_roce_ring_lossy_150000.csv: configs/p15/roce_ring_lossy.toml with size = 150000
+#     (1,073 rows); its small twin collective_roce_ring_lossy_executor_accept.csv is the same
+#     ring at 40,000 B (225 rows, P15).
+#   collective_ring_allreduce_lossy_100000.csv: lossy_ring_config() of
+#     tests/collective_certificates.rs with size 100,000 and duration = 60.0 (1,027 rows); at
+#     20,000 B the same config is collective_ring_allreduce_lossy_executor_accept.csv (220 rows).
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+lean_dir="$(cd "$script_dir/.." && pwd)"
+
+cd "$lean_dir"
+lake build p10c_collective_diff
+
+diff_checker="$lean_dir/.lake/build/bin/p10c_collective_diff"
+fixture_dir="$lean_dir/fixtures/p10c"
+max_ratio_percent=200
+max_per_row=2000
+
+status=0
+echo "== RoCE lossy ring"
+"$diff_checker" budget "$max_ratio_percent" "$max_per_row" \
+  "$fixture_dir/collective_roce_ring_lossy_executor_accept.csv" \
+  "$fixture_dir/budget/collective_roce_ring_lossy_150000.csv" || status=1
+echo "== TCP lossy ring"
+"$diff_checker" budget "$max_ratio_percent" "$max_per_row" \
+  "$fixture_dir/collective_ring_allreduce_lossy_executor_accept.csv" \
+  "$fixture_dir/budget/collective_ring_allreduce_lossy_100000.csv" || status=1
+exit "$status"
