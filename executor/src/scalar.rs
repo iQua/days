@@ -2892,6 +2892,10 @@ impl<'image> TransitionState<'image> {
         Ok(())
     }
 
+    /// Kept out of line: inlined into `dispatch`, this PFC-only handler changed the code the
+    /// compiler emits for every other event, and Scalar E1, which carries no PFC, ran about 0.2%
+    /// more instructions (paired icount at P16 `b2cdd12`, `days-gpu/evidence/P16/pfcperf/`).
+    #[inline(never)]
     fn switch_pfc_remote_arrival(
         &mut self,
         node: NodeDescriptor,
@@ -7442,6 +7446,16 @@ mod tests {
         assert!(
             source.contains("#[inline(always)]\nfn record_inbound_progress("),
             "`record_inbound_progress` must be #[inline(always)]"
+        );
+    }
+
+    /// See `switch_pfc_remote_arrival`: the PFC frame handler stays out of `dispatch`.
+    #[test]
+    fn switch_pfc_remote_arrival_stays_out_of_line() {
+        let source = include_str!("scalar.rs");
+        assert!(
+            source.contains("    #[inline(never)]\n    fn switch_pfc_remote_arrival("),
+            "`switch_pfc_remote_arrival` must be #[inline(never)]"
         );
     }
 
