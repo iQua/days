@@ -1092,7 +1092,7 @@ pub(crate) struct TransitionState<'image> {
     /// Executor-local class orders of the FIFO PFC queues that have had a class paused, by state
     /// slot and queue slot (`PfcClassOrder`); `None` until the first such queue, so an image whose
     /// queues are never paused carries one empty pointer and nothing else. Never serialized.
-    switch_pfc_orders: Option<Box<BTreeMap<(usize, usize), PfcClassOrder>>>,
+    switch_pfc_orders: Option<Box<PfcClassOrders>>,
     local_node: Option<NodeDescriptor>,
     packets: BTreeMap<PayloadId, ResidentPacket>,
     observation_mode: ObservationMode,
@@ -1310,6 +1310,20 @@ impl PfcClassOrder {
     }
 }
 
+/// The class orders of a `TransitionState`'s FIFO PFC queues, by (state slot, queue slot); boxed
+/// behind one pointer so that `TransitionState` does not grow (`transition_state_keeps_main_size`).
+#[derive(Default)]
+struct PfcClassOrders(BTreeMap<(usize, usize), PfcClassOrder>);
+
+/// What construction derives from the switch queues it is given.
+struct DerivedSwitchQueues {
+    /// Each queue's byte counter, by state slot and queue slot.
+    bytes: Vec<Vec<u64>>,
+    /// The (state slot, queue slot) of each FIFO PFC queue that starts with a class paused, whose
+    /// class order construction then builds (`ensure_pfc_order`).
+    paused_fifo_queues: Vec<(usize, usize)>,
+}
+
 /// Whether any PFC class of a queue is paused.
 fn pfc_any_paused(pfc: &crate::PfcQueueState) -> bool {
     pfc.paused_by_controller
@@ -1469,8 +1483,10 @@ impl<'image> TransitionState<'image> {
 
         let hosts = HostStore::tables(image.host_states.clone());
         let switch_states = image.switch_states.clone();
-        let (switch_queue_bytes, paused_fifo_queues) =
-            derive_switch_queue_bytes(image, &switch_states, None, &packets)?;
+        let DerivedSwitchQueues {
+            bytes: switch_queue_bytes,
+            paused_fifo_queues,
+        } = derive_switch_queue_bytes(image, &switch_states, None, &packets)?;
 
         let mut state = Self {
             image,
@@ -1573,8 +1589,10 @@ impl<'image> TransitionState<'image> {
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
         }
 
-        let (switch_queue_bytes, paused_fifo_queues) =
-            derive_switch_queue_bytes(image, &switch_states, Some(node), &resident)?;
+        let DerivedSwitchQueues {
+            bytes: switch_queue_bytes,
+            paused_fifo_queues,
+        } = derive_switch_queue_bytes(image, &switch_states, Some(node), &resident)?;
 
         let mut state = Self {
             image,
@@ -5973,6 +5991,7 @@ impl<'image> TransitionState<'image> {
     fn pfc_order(&self, state_slot: usize, queue_slot: usize) -> Option<&PfcClassOrder> {
         self.switch_pfc_orders
             .as_deref()?
+            .0
             .get(&(state_slot, queue_slot))
     }
 
@@ -5983,6 +6002,7 @@ impl<'image> TransitionState<'image> {
     ) -> Option<&mut PfcClassOrder> {
         self.switch_pfc_orders
             .as_deref_mut()?
+            .0
             .get_mut(&(state_slot, queue_slot))
     }
 
@@ -6012,6 +6032,7 @@ impl<'image> TransitionState<'image> {
         let reads = queue.queue.len();
         self.switch_pfc_orders
             .get_or_insert_with(Box::default)
+            .0
             .insert((state_slot, queue_slot), order);
         Ok(reads)
     }
@@ -6973,14 +6994,12 @@ enum QueueAdmissionAction {
     Drop,
 }
 
-/// Each switch queue's byte counter, and the (state slot, queue slot) of every FIFO PFC queue that
-/// starts with a class paused, whose class order the caller builds (`ensure_pfc_order`).
 fn derive_switch_queue_bytes(
     image: &SimulationImage,
     switch_states: &[SwitchState],
     local_node: Option<NodeDescriptor>,
     packets: &BTreeMap<PayloadId, ResidentPacket>,
-) -> Result<(Vec<Vec<u64>>, Vec<(usize, usize)>), ExecutionError> {
+) -> Result<DerivedSwitchQueues, ExecutionError> {
     let mut node_ids = vec![None; switch_states.len()];
     if let Some(node) = local_node {
         if node.kind == NodeKind::Switch {
@@ -7024,7 +7043,10 @@ fn derive_switch_queue_bytes(
                 .collect()
         })
         .collect::<Result<_, _>>()?;
-    Ok((bytes, paused_fifo_queues))
+    Ok(DerivedSwitchQueues {
+        bytes,
+        paused_fifo_queues,
+    })
 }
 
 fn drop_mark_decision(

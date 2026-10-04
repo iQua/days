@@ -172,8 +172,8 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "scalar.rs",
         predicate: r#"feature = "planner-test-hooks""#,
-        count: 2,
-        purpose: "the stage-scan counting run and the stage-index equality hook exist only for standard tests",
+        count: 7,
+        purpose: "the stage-scan counting run, the stage-index equality hook, and the P16 PFC service probe (its counts field, the counts type, its two increments, and the counting run) exist only for standard tests",
     },
     AllowedFeatureGate {
         path: "stage_index.rs",
