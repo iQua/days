@@ -77,6 +77,9 @@ jobs:
       - name: Run P10c collective cost budget (heartbeats across a size step)
         run: bash lean/scripts/run-p10c-collective-budget.sh
 
+      - name: Run P10c AQM differential test (keyed continuity against the list-scan reference)
+        run: bash lean/scripts/run-p10c-aqm-differential.sh
+
       - name: Run AQM fixture checks
         run: bash lean/scripts/run-aqm-fixtures.sh
 

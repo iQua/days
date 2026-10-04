@@ -1,4 +1,5 @@
 import LeanGuard.P10c.Test.CollectiveReference
+import LeanGuard.P10c.Test.Rng
 
 /-! Differential and budget harness for the P10c collective checker (test-only; P16 lane L1).
 
@@ -18,27 +19,12 @@ import LeanGuard.P10c.Test.CollectiveReference
 
 open LeanGuard.P10c
 open LeanGuard.P10c.CollectiveEventLog
+open LeanGuard.P10c.Test
 
 def render (result : Except String Unit) : String :=
   match result with
   | .ok _ => "ACCEPT"
   | .error error => s!"REJECT: {error}"
-
-/-! ## Deterministic generator -/
-
-structure Rng where
-  state : UInt64
-
-def Rng.next (g : Rng) : UInt64 × Rng :=
-  let s := g.state + 0x9E3779B97F4A7C15
-  let z := (s ^^^ (s >>> 30)) * 0xBF58476D1CE4E5B9
-  let z := (z ^^^ (z >>> 27)) * 0x94D049BB133111EB
-  (z ^^^ (z >>> 31), ⟨s⟩)
-
-/-- A value in `[0, n)` (zero when `n = 0`). -/
-def Rng.below (g : Rng) (n : Nat) : Nat × Rng :=
-  let (value, g) := g.next
-  (if n = 0 then 0 else value.toNat % n, g)
 
 /-! ## Mutations -/
 
@@ -74,9 +60,6 @@ def Kind.name : Kind → String
   | .time => "changed-event-time"
   | .segmentSwap => "swapped-inbound-segments"
   | .segmentShift => "shifted-inbound-segment"
-
-def bump (value : Nat) (up : Bool) : Nat :=
-  if up || value = 0 then value + 1 else value - 1
 
 /-- Off by one in one counter-like field of one row. -/
 def bumpField (row : Row) (field : Nat) (up : Bool) : Row :=
@@ -214,15 +197,6 @@ def mutate (rows : Array Row) (kind : Kind) (g : Rng) : Option (Array Row) × Rn
         else ra.segmentSequence - min step ra.segmentSequence
       (some (rows.set! a { ra with segmentSequence := sequence }), g)
 
-/-- The message of a result without its line number, for the histogram. -/
-def bucket (rendered : String) : String :=
-  match rendered.splitOn ": line " with
-  | [prefix_, rest] =>
-      match rest.splitOn ": " with
-      | _ :: message => s!"{prefix_}: {": ".intercalate message}"
-      | [] => rendered
-  | _ => rendered
-
 structure Tally where
   cases : Nat := 0
   mismatches : Nat := 0
@@ -237,8 +211,8 @@ def mutateFile (seed perKind : Nat) (path : String) (tally : Tally) : IO Tally :
     | .error error => throw (IO.userError s!"{path}: {error}")
   let mut tally := tally
   let mut fileCases := 0
-  -- Each input gets its own stream, from the seed and the input's position-independent name.
-  let mut g : Rng := ⟨(seed.toUInt64 * 0x100000001B3) ^^^ (hash (System.FilePath.mk path).fileName)⟩
+  -- Each input gets its own stream, from the seed and the input's file name.
+  let mut g := Rng.forInput seed path
   for kind in Kind.all do
     let mut made := 0
     let mut attempts := 0
@@ -264,9 +238,6 @@ def mutateFile (seed perKind : Nat) (path : String) (tally : Tally) : IO Tally :
     fileCases := fileCases + made
   IO.println s!"{(System.FilePath.mk path).fileName.getD path}: rows={rows.size} mutants={fileCases}"
   pure tally
-
-def sortedEntries (map : Std.HashMap String Nat) : List (String × Nat) :=
-  (map.toList.toArray.qsort fun a b => a.2 > b.2 || (a.2 = b.2 && a.1 < b.1)).toList
 
 def runMutate (seed perKind : Nat) (paths : List String) : IO UInt32 := do
   let mut tally : Tally := {}

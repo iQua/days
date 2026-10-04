@@ -54,3 +54,7 @@ lean_exe p10c_roce_check where
 -- Test-only: the collective checker's differential harness and cost budget (not shipped).
 lean_exe p10c_collective_diff where
   root := `LeanGuard.P10cCollectiveDiffMain
+
+-- Test-only: the P10c AQM checker's differential harness (not shipped).
+lean_exe p10c_aqm_diff where
+  root := `LeanGuard.P10cAqmDiffMain
