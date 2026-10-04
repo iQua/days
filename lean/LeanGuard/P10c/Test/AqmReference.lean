@@ -10,6 +10,9 @@ namespace LeanGuard.P10c.AqmEventLog
 open LeanGuard.Shared
 open LeanGuard.P10c.Semantics
 
+def sameQueue (first second : Row) : Bool :=
+  first.nodeId = second.nodeId && first.queueId = second.queueId
+
 def checkContinuityReference (rows : List Row) : Except String Unit := do
   let rec go (previous : List Row) : List Row → Except String Unit
     | [] => pure ()
