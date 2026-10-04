@@ -1087,8 +1087,8 @@ pub(crate) struct TransitionState<'image> {
     image: &'image SimulationImage,
     hosts: HostStore,
     switch_states: Vec<SwitchState>,
-    /// Executor-local redundant state, derived on construction and never serialized.
-    switch_queue_bytes: Vec<Vec<u64>>,
+    /// Executor-local redundant state of each switch queue, by state slot and queue slot.
+    switch_queue_aux: Vec<Vec<SwitchQueueAux>>,
     local_node: Option<NodeDescriptor>,
     packets: BTreeMap<PayloadId, ResidentPacket>,
     observation_mode: ObservationMode,
@@ -1218,18 +1218,110 @@ struct PfcFramePlan {
 ///
 /// `Head` is the FIFO-order plan: every queued packet is eligible and the discipline always
 /// selects position zero, so the plan is the queue head and nothing else has to be inspected.
-/// `Eligible` is the per-packet scan that only the mechanisms which can reorder service or hold a
-/// packet back need — PFC pausing and the round-robin disciplines. The two are equivalent
-/// whenever `queue_serves_head` holds, so the fast plan is a cost reduction, not a behavior
-/// change.
+/// `PfcFirst` is the plan of a PFC queue under a head-serving discipline: the discipline selects
+/// position zero of the eligible packets, which is the first queued packet whose PFC class is not
+/// paused (`pfc_first_eligible`), so only that packet is inspected. `Eligible` is the per-packet
+/// scan that only the round-robin disciplines need, with or without PFC: they choose by class over
+/// the whole eligible list. `Head` and `PfcFirst` select exactly the packet `Eligible` would on
+/// the queues they serve, so the fast plans are a cost reduction, not a behavior change.
 enum SwitchServicePlan {
     Head(Option<PacketDescriptor>),
+    PfcFirst(Option<PfcSelection>),
     Eligible {
         positions: Vec<usize>,
         packets: Vec<PacketDescriptor>,
         priorities: Vec<usize>,
         incoming_links: Vec<Option<LinkId>>,
     },
+}
+
+/// The packet a `PfcFirst` plan serves: its queue position, record, PFC class and incoming link.
+#[derive(Clone, Copy)]
+struct PfcSelection {
+    position: usize,
+    packet: PacketDescriptor,
+    priority: usize,
+    incoming_link: Option<LinkId>,
+}
+
+/// Executor-local redundant state of one switch egress queue; derived on construction and never
+/// serialized.
+#[derive(Default)]
+struct SwitchQueueAux {
+    /// Total size of the queued packets.
+    bytes: u64,
+    /// The queue's packets by PFC class, in queue order: a FIFO queue's once one of its classes
+    /// has been paused, `None` otherwise (`PfcClassOrder`).
+    pfc_order: Option<Box<PfcClassOrder>>,
+}
+
+/// The packets of one FIFO PFC queue by PFC class, in queue order, keyed by arrival order.
+///
+/// A FIFO queue appends every admitted packet (`switch_remote_arrival`) and removes only the
+/// packet it serves, so queue order is arrival order. Numbering the packets in arrival order
+/// (`next_seq`) therefore gives every queued packet a key that increases along the queue, and each
+/// class's keys, kept in queue order, form a sorted sequence. Then:
+/// - the first queued packet whose class is not paused is the smallest front key among the
+///   classes that are not paused: one comparison per class, with no queued packet read;
+/// - its queue position is the number of keys below its own, summed over the classes by binary
+///   search, so the queue itself is not scanned either.
+///
+/// It is built from the queue when a class of the queue is first paused (a PFC PAUSE frame, or a
+/// paused class in the state the run starts from), so a queue that is never paused pays nothing;
+/// from then on every admission appends to it and every service removes the served packet. The
+/// served packet is always the front of its class: it is either the queue head, whose key is the
+/// smallest of all, or the packet the order itself selected.
+struct PfcClassOrder {
+    /// Key of the next admitted packet.
+    next_seq: u64,
+    /// Keys of each class's queued packets, in queue order.
+    classes: [std::collections::VecDeque<u64>; 8],
+}
+
+impl PfcClassOrder {
+    /// The order of an empty queue; `push` each queued packet's class, in queue order, to derive
+    /// the order of a nonempty one.
+    fn new() -> Self {
+        Self {
+            next_seq: 0,
+            classes: Default::default(),
+        }
+    }
+
+    /// Appends one admitted packet of `class`.
+    fn push(&mut self, class: usize) {
+        self.classes[class].push_back(self.next_seq);
+        self.next_seq += 1;
+    }
+
+    /// Removes the served packet, the first queued packet of `class`, and returns its key.
+    fn pop(&mut self, class: usize) -> Option<u64> {
+        self.classes[class].pop_front()
+    }
+
+    /// The queue position of the first queued packet whose class `pfc` does not pause.
+    fn first_unpaused_position(&self, pfc: &crate::PfcQueueState) -> Option<usize> {
+        let first = self
+            .classes
+            .iter()
+            .enumerate()
+            .filter(|(class, _)| !pfc.is_paused(*class))
+            .filter_map(|(_, keys)| keys.front().copied())
+            .min()?;
+        Some(
+            self.classes
+                .iter()
+                .map(|keys| keys.partition_point(|key| *key < first))
+                .sum(),
+        )
+    }
+}
+
+/// Whether any PFC class of a queue is paused.
+fn pfc_any_paused(pfc: &crate::PfcQueueState) -> bool {
+    pfc.paused_by_controller
+        .iter()
+        .any(|controllers| !controllers.is_empty())
 }
 
 /// Test-only count of the service decisions made at PFC switch queues and of the queued entries
@@ -1305,16 +1397,20 @@ fn scheduler_packets(packets: &[PacketDescriptor]) -> Vec<crate::SchedulerPacket
 /// Whether one queue's mechanisms always select the queue head with no per-packet inspection.
 ///
 /// A queue without a PFC monitor cannot report a paused priority, so every queued packet is
-/// eligible. FIFO, static priority and weighted fair queueing all maintain their service order in
-/// the queue itself, which is exactly why `scheduler_select_position` answers position zero for
-/// all three; deficit and weighted round robin choose by class and need the eligible-packet list.
-/// The match is deliberately exhaustive: a new discipline must be classified here before it can
-/// compile, rather than silently inheriting the head-only plan.
+/// eligible, and a head-serving discipline (`scheduler_serves_head`) serves the head.
 fn queue_serves_head(queue: &crate::SwitchQueueState) -> bool {
-    if queue.pfc.is_some() {
-        return false;
-    }
-    match queue.scheduler {
+    queue.pfc.is_none() && scheduler_serves_head(&queue.scheduler)
+}
+
+/// Whether a discipline always selects position zero of the eligible packets.
+///
+/// FIFO, static priority and weighted fair queueing all maintain their service order in the queue
+/// itself, which is exactly why `scheduler_select_position` answers position zero for all three;
+/// deficit and weighted round robin choose by class and need the eligible-packet list. The match
+/// is deliberately exhaustive: a new discipline must be classified here before it can compile,
+/// rather than silently inheriting the head-only and first-eligible plans.
+fn scheduler_serves_head(scheduler: &SchedulerKind) -> bool {
+    match scheduler {
         SchedulerKind::Fifo
         | SchedulerKind::StaticPriority { .. }
         | SchedulerKind::WeightedFairQueue(_) => true,
@@ -1380,13 +1476,13 @@ impl<'image> TransitionState<'image> {
 
         let hosts = HostStore::tables(image.host_states.clone());
         let switch_states = image.switch_states.clone();
-        let switch_queue_bytes = derive_switch_queue_bytes(image, &switch_states, None, &packets)?;
+        let switch_queue_aux = derive_switch_queue_aux(image, &switch_states, None, &packets)?;
 
-        Ok(Self {
+        let mut state = Self {
             image,
             hosts,
             switch_states,
-            switch_queue_bytes,
+            switch_queue_aux,
             local_node: None,
             packets,
             observation_mode,
@@ -1401,7 +1497,9 @@ impl<'image> TransitionState<'image> {
             superseded_timers: Vec::new(),
             stage_probe: StageScanProbe::default(),
             pfc_service_probe: PfcServiceProbe::default(),
-        })
+        };
+        state.seed_pfc_orders()?;
+        Ok(state)
     }
 
     pub(crate) fn new_local(
@@ -1478,14 +1576,14 @@ impl<'image> TransitionState<'image> {
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
         }
 
-        let switch_queue_bytes =
-            derive_switch_queue_bytes(image, &switch_states, Some(node), &resident)?;
+        let switch_queue_aux =
+            derive_switch_queue_aux(image, &switch_states, Some(node), &resident)?;
 
-        Ok(Self {
+        let mut state = Self {
             image,
             hosts,
             switch_states,
-            switch_queue_bytes,
+            switch_queue_aux,
             local_node: Some(node),
             packets: resident,
             observation_mode,
@@ -1500,7 +1598,9 @@ impl<'image> TransitionState<'image> {
             superseded_timers: Vec::new(),
             stage_probe: StageScanProbe::default(),
             pfc_service_probe: PfcServiceProbe::default(),
-        })
+        };
+        state.seed_pfc_orders()?;
+        Ok(state)
     }
 
     /// Records that `timer` stopped being the armed timer of a flow owned by `node`.
@@ -2531,7 +2631,7 @@ impl<'image> TransitionState<'image> {
                     node: node.id,
                     egress_link,
                 })?;
-            let queue_bytes = self.switch_queue_bytes[state_slot][queue_slot];
+            let queue_bytes = self.switch_queue_aux[state_slot][queue_slot].bytes;
             (
                 u64::try_from(queue_slot).unwrap_or(u64::MAX),
                 queue_slot,
@@ -2724,12 +2824,17 @@ impl<'image> TransitionState<'image> {
         };
 
         if disposition == ArrivalDisposition::Admitted {
-            let counter = &mut self.switch_queue_bytes[state_slot][queue_slot];
-            *counter = counter
+            let aux = &mut self.switch_queue_aux[state_slot][queue_slot];
+            aux.bytes = aux
+                .bytes
                 .checked_add(packet.size_bytes)
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
+            // Only a FIFO PFC queue keeps an order, and it appended the packet.
+            if let Some(order) = aux.pfc_order.as_deref_mut() {
+                order.push(priority);
+            }
             #[cfg(debug_assertions)]
-            self.debug_assert_switch_queue_bytes(node, state_slot, queue_slot);
+            self.debug_assert_switch_queue_aux(node, state_slot, queue_slot);
         }
 
         if mark_packet {
@@ -2794,30 +2899,8 @@ impl<'image> TransitionState<'image> {
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
         let priority = usize::from(header.priority);
-        let queued = {
-            let state = self.switch_state(node)?;
-            let queue = state
-                .queues
-                .iter()
-                .find(|queue| queue.egress_link == Some(header.controlled_link))
-                .ok_or(ExecutionError::MissingSwitchQueue {
-                    node: node.id,
-                    egress_link: Some(header.controlled_link),
-                })?;
-            queue
-                .queue
-                .iter()
-                .map(|payload| {
-                    let packet = self.packet(*payload)?;
-                    Ok((
-                        *payload,
-                        usize::from(self.flow(packet.flow)?.packet_priority(packet.kind)),
-                    ))
-                })
-                .collect::<Result<Vec<_>, ExecutionError>>()?
-        };
-        self.pfc_service_probe.note_reads(queued.len());
-        let (schedule_payload, transition) = {
+        let state_slot = self.local_state_slot(node)?;
+        let (queue_slot, may_schedule, transition) = {
             let state = self.switch_state_mut(node)?;
             let (queue_id, queue) = state
                 .queues
@@ -2837,26 +2920,18 @@ impl<'image> TransitionState<'image> {
                 .copied()
                 .collect::<Vec<_>>();
             let was_paused = pfc.is_paused(priority);
-            let schedule_payload = if header.pause {
+            let resumed = if header.pause {
                 pfc.paused_by_controller[priority].insert(event.key.origin_node);
-                None
+                false
             } else if !pfc.paused_by_controller[priority].remove(&event.key.origin_node) {
                 // Duplicate/early resume is an idempotent no-op.
-                None
+                false
             } else if pfc.is_paused(priority) {
                 // Another controller still owns the aggregate pause.
-                None
+                false
             } else {
                 debug_assert!(was_paused);
-                let payload = queued.iter().find_map(|(payload, packet_priority)| {
-                    (!pfc.is_paused(*packet_priority)).then_some(*payload)
-                });
-                if payload.is_some() && queue.in_service.is_none() && !queue.tx_ready_pending {
-                    queue.tx_ready_pending = true;
-                    payload
-                } else {
-                    None
-                }
+                true
             };
             let transition =
                 crate::MechanismTransitionRecord::PfcControl(crate::PfcControlTransitionRecord {
@@ -2874,8 +2949,44 @@ impl<'image> TransitionState<'image> {
                     before_controllers,
                     after_controllers: pfc.paused_by_controller[priority].iter().copied().collect(),
                 });
-            (schedule_payload, transition)
+            (
+                queue_id,
+                resumed && queue.in_service.is_none() && !queue.tx_ready_pending,
+                transition,
+            )
         };
+        // A paused FIFO queue keeps its class order from the first pause on.
+        let mut probed_reads = if header.pause {
+            self.ensure_pfc_order(state_slot, queue_slot)?
+        } else {
+            0
+        };
+        // A resume that unpauses the class lets an idle queue serve its first eligible packet.
+        let schedule_payload = if may_schedule {
+            let (first, reads) = {
+                let queue = &self.switch_state(node)?.queues[queue_slot];
+                let pfc = queue
+                    .pfc
+                    .as_ref()
+                    .ok_or(ExecutionError::InvalidSchedulerState(node.id))?;
+                let order = self.switch_queue_aux[state_slot][queue_slot]
+                    .pfc_order
+                    .as_deref();
+                self.pfc_first_eligible(node, queue, pfc, order)?
+            };
+            probed_reads += reads;
+            if let Some((_, payload)) = first {
+                self.switch_state_mut(node)?.queues[queue_slot].tx_ready_pending = true;
+                Some(payload)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        self.pfc_service_probe.note_reads(probed_reads);
+        #[cfg(debug_assertions)]
+        self.debug_assert_switch_queue_aux(node, state_slot, queue_slot);
         if self.observation_mode == ObservationMode::Full {
             self.mechanism_transitions.push(transition);
         }
@@ -5036,13 +5147,15 @@ impl<'image> TransitionState<'image> {
             });
         };
 
+        let state_slot = self.local_state_slot(node)?;
         let mut probed_entries = None;
         let plan = {
             let state = self.switch_state(node)?;
-            let queue = state
+            let (queue_slot, queue) = state
                 .queues
                 .iter()
-                .find(|queue| queue.egress_link == Some(egress_link))
+                .enumerate()
+                .find(|(_, queue)| queue.egress_link == Some(egress_link))
                 .ok_or(ExecutionError::MissingSwitchQueue {
                     node: node.id,
                     egress_link: Some(egress_link),
@@ -5055,6 +5168,33 @@ impl<'image> TransitionState<'image> {
                         .map(|payload| self.packet(*payload))
                         .transpose()?,
                 )
+            } else if let Some(pfc) = queue
+                .pfc
+                .as_ref()
+                .filter(|_| scheduler_serves_head(&queue.scheduler))
+            {
+                // The discipline serves position zero of the eligible packets: the first queued
+                // packet whose class is not paused. Only that packet is read.
+                let order = self.switch_queue_aux[state_slot][queue_slot]
+                    .pfc_order
+                    .as_deref();
+                let (first, reads) = self.pfc_first_eligible(node, queue, pfc, order)?;
+                let selection = first
+                    .map(|(position, payload)| {
+                        let packet = self.packet(payload)?;
+                        Ok::<_, ExecutionError>(PfcSelection {
+                            position,
+                            packet,
+                            priority: self.packet_pfc_class(packet)?,
+                            incoming_link: self.packet_incoming_link_at(packet, node.id)?,
+                        })
+                    })
+                    .transpose()?;
+                probed_entries = Some((
+                    reads + usize::from(selection.is_some()),
+                    selection.map(|selection| selection.position),
+                ));
+                SwitchServicePlan::PfcFirst(selection)
             } else {
                 if queue.pfc.is_some() {
                     probed_entries = Some((queue.queue.len(), None));
@@ -5089,8 +5229,15 @@ impl<'image> TransitionState<'image> {
         if let Some((entries, served)) = probed_entries {
             self.pfc_service_probe.note_decision(entries, served);
         }
-        let state_slot = self.local_state_slot(node)?;
-        let (payload, selected_packet, queue_slot, pfc_plan, pfc_transition, scheduler_transition) = 'service: {
+        let (
+            payload,
+            selected_packet,
+            selected_priority,
+            queue_slot,
+            pfc_plan,
+            pfc_transition,
+            scheduler_transition,
+        ) = 'service: {
             let state = self.switch_state_mut(node)?;
             let (queue_slot, queue) = state
                 .queues
@@ -5110,10 +5257,13 @@ impl<'image> TransitionState<'image> {
             }
 
             let (
+                position,
+                packet,
+                priority,
+                incoming_link,
+                scheduler_before,
+                scan_steps,
                 eligible_packets,
-                eligible_positions,
-                eligible_priorities,
-                eligible_incoming_links,
             ) = match &plan {
                 SwitchServicePlan::Head(head) => {
                     // Position zero of a queue whose every packet is eligible. The selection,
@@ -5136,26 +5286,52 @@ impl<'image> TransitionState<'image> {
                         )?;
                     }
                     queue.in_service = Some(payload);
-                    break 'service (payload, packet, queue_slot, None, None, None);
+                    break 'service (payload, packet, None, queue_slot, None, None, None);
+                }
+                SwitchServicePlan::PfcFirst(selection) => {
+                    // What the eligible-packet path computes for a head-serving discipline:
+                    // `scheduler_select_position` answers position zero of the eligible packets
+                    // without touching the scheduler, and the scheduler record is `None`.
+                    let Some(selection) = *selection else {
+                        return Ok(());
+                    };
+                    (
+                        selection.position,
+                        selection.packet,
+                        selection.priority,
+                        selection.incoming_link,
+                        None,
+                        0,
+                        &[][..],
+                    )
                 }
                 SwitchServicePlan::Eligible {
                     positions,
                     packets,
                     priorities,
                     incoming_links,
-                } => (packets, positions, priorities, incoming_links),
+                } => {
+                    let scheduler_before = matches!(
+                        queue.scheduler,
+                        SchedulerKind::DeficitRoundRobin(_) | SchedulerKind::WeightedRoundRobin(_)
+                    )
+                    .then(|| queue.scheduler.clone());
+                    let Some((eligible_position, scan_steps)) =
+                        scheduler_select_position(&mut queue.scheduler, packets, node.id)?
+                    else {
+                        return Ok(());
+                    };
+                    (
+                        positions[eligible_position],
+                        packets[eligible_position],
+                        priorities[eligible_position],
+                        incoming_links[eligible_position],
+                        scheduler_before,
+                        scan_steps,
+                        &packets[..],
+                    )
+                }
             };
-            let scheduler_before = matches!(
-                queue.scheduler,
-                SchedulerKind::DeficitRoundRobin(_) | SchedulerKind::WeightedRoundRobin(_)
-            )
-            .then(|| queue.scheduler.clone());
-            let Some((eligible_position, scan_steps)) =
-                scheduler_select_position(&mut queue.scheduler, eligible_packets, node.id)?
-            else {
-                return Ok(());
-            };
-            let position = eligible_positions[eligible_position];
             let payload = queue
                 .queue
                 .remove(position)
@@ -5169,9 +5345,6 @@ impl<'image> TransitionState<'image> {
                 )?;
             }
             queue.in_service = Some(payload);
-            let packet = eligible_packets[eligible_position];
-            let priority = eligible_priorities[eligible_position];
-            let incoming_link = eligible_incoming_links[eligible_position];
             let queue_id = u64::try_from(queue_slot).unwrap_or(u64::MAX);
             let ingress = queue.pfc.as_mut().and_then(|pfc| {
                 pfc.ingresses
@@ -5271,6 +5444,7 @@ impl<'image> TransitionState<'image> {
             (
                 payload,
                 packet,
+                Some(priority),
                 queue_slot,
                 pfc_plan,
                 pfc_transition,
@@ -5278,12 +5452,22 @@ impl<'image> TransitionState<'image> {
             )
         };
 
-        let counter = &mut self.switch_queue_bytes[state_slot][queue_slot];
-        *counter = counter
+        let aux = &mut self.switch_queue_aux[state_slot][queue_slot];
+        aux.bytes = aux
+            .bytes
             .checked_sub(selected_packet.size_bytes)
             .ok_or(ExecutionError::CounterOverflow(node.id))?;
+        // A queue keeps an order only under FIFO, where the served packet is the first of its
+        // class: the head, or the packet the order selected (`PfcClassOrder`).
+        if let (Some(order), Some(priority)) = (aux.pfc_order.as_deref_mut(), selected_priority) {
+            let served = order.pop(priority);
+            debug_assert!(
+                served.is_some(),
+                "a FIFO PFC queue served a class it holds no packet of"
+            );
+        }
         #[cfg(debug_assertions)]
-        self.debug_assert_switch_queue_bytes(node, state_slot, queue_slot);
+        self.debug_assert_switch_queue_aux(node, state_slot, queue_slot);
 
         if self.observation_mode == ObservationMode::Full {
             self.mechanism_transitions.extend(pfc_transition);
@@ -5349,13 +5533,14 @@ impl<'image> TransitionState<'image> {
         };
         let rate_bps = self.link(egress_link)?.rate_bps;
 
-        let mut probed_reads = 0_usize;
-        let eligible_next_payload = {
+        let state_slot = self.local_state_slot(node)?;
+        let (eligible_next_payload, probed_reads) = {
             let state = self.switch_state(node)?;
-            let queue = state
+            let (queue_slot, queue) = state
                 .queues
                 .iter()
-                .find(|queue| queue.egress_link == Some(egress_link))
+                .enumerate()
+                .find(|(_, queue)| queue.egress_link == Some(egress_link))
                 .ok_or(ExecutionError::MissingSwitchQueue {
                     node: node.id,
                     egress_link: Some(egress_link),
@@ -5363,14 +5548,14 @@ impl<'image> TransitionState<'image> {
             // Without a PFC monitor no priority can be paused, so the first eligible packet is
             // the queue head and no per-packet inspection is observable.
             match &queue.pfc {
-                None => queue.queue.front().copied(),
-                Some(pfc) => queue.queue.iter().find_map(|payload| {
-                    probed_reads += 1;
-                    let packet = self.packet(*payload).ok()?;
-                    let priority =
-                        usize::from(self.flow(packet.flow).ok()?.packet_priority(packet.kind));
-                    (!pfc.is_paused(priority)).then_some(*payload)
-                }),
+                None => (queue.queue.front().copied(), 0),
+                Some(pfc) => {
+                    let order = self.switch_queue_aux[state_slot][queue_slot]
+                        .pfc_order
+                        .as_deref();
+                    let (first, reads) = self.pfc_first_eligible(node, queue, pfc, order)?;
+                    (first.map(|(_, payload)| payload), reads)
+                }
             }
         };
         self.pfc_service_probe.note_reads(probed_reads);
@@ -5654,22 +5839,183 @@ impl<'image> TransitionState<'image> {
     }
 
     #[cfg(debug_assertions)]
-    fn debug_assert_switch_queue_bytes(
+    fn debug_assert_switch_queue_aux(
         &self,
         node: NodeDescriptor,
         state_slot: usize,
         queue_slot: usize,
     ) {
         let queue = &self.switch_states[state_slot].queues[queue_slot];
+        let aux = &self.switch_queue_aux[state_slot][queue_slot];
         let derived = queue.queue.iter().try_fold(0_u64, |total, payload| {
             total.checked_add(self.packets.get(payload)?.descriptor.size_bytes)
         });
         debug_assert_eq!(
             derived,
-            Some(self.switch_queue_bytes[state_slot][queue_slot]),
+            Some(aux.bytes),
             "switch {:?} queue {queue_slot} byte counter diverged from its contents",
             node.id,
         );
+        if let Some(order) = aux.pfc_order.as_deref() {
+            // The keys, merged, list the queue's classes in queue order, below the next key.
+            let mut keyed = order
+                .classes
+                .iter()
+                .enumerate()
+                .flat_map(|(class, keys)| keys.iter().map(move |key| (*key, class)))
+                .collect::<Vec<_>>();
+            keyed.sort_unstable();
+            debug_assert!(
+                order
+                    .classes
+                    .iter()
+                    .all(|keys| keys.iter().is_sorted_by(|a, b| a < b)),
+                "switch {:?} queue {queue_slot} class order is not increasing",
+                node.id,
+            );
+            debug_assert!(keyed.last().is_none_or(|(key, _)| *key < order.next_seq));
+            let classes = queue
+                .queue
+                .iter()
+                .map(|payload| {
+                    self.packet(*payload)
+                        .and_then(|packet| self.packet_pfc_class(packet))
+                        .ok()
+                })
+                .collect::<Option<Vec<_>>>();
+            debug_assert_eq!(
+                Some(
+                    keyed
+                        .into_iter()
+                        .map(|(_, class)| class)
+                        .collect::<Vec<_>>()
+                ),
+                classes,
+                "switch {:?} queue {queue_slot} class order diverged from its contents",
+                node.id,
+            );
+        }
+    }
+
+    /// A packet's PFC class: its flow's priority, or the flow's feedback class for a CNP, ACK or
+    /// NACK (`FlowDescriptor::packet_priority`).
+    fn packet_pfc_class(&self, packet: PacketDescriptor) -> Result<usize, ExecutionError> {
+        Ok(usize::from(
+            self.flow(packet.flow)?.packet_priority(packet.kind),
+        ))
+    }
+
+    /// The queue position and payload of the first queued packet whose PFC class `pfc` does not
+    /// pause, with the number of queued entries read to find it.
+    ///
+    /// This is the packet the eligible-packet plan's position zero names. With no class paused it
+    /// is the head, and nothing is read. A FIFO queue with a paused class keeps a
+    /// `PfcClassOrder`, which answers without reading the queue. Static priority and WFQ insert
+    /// by rank, so queue order is not arrival order there; their search reads from the head up to
+    /// the packet, as their admission already does. DRR and WRR choose from the whole eligible
+    /// list on `TxReady`; after a transmission or a resume they search from the head likewise.
+    fn pfc_first_eligible(
+        &self,
+        node: NodeDescriptor,
+        queue: &crate::SwitchQueueState,
+        pfc: &crate::PfcQueueState,
+        order: Option<&PfcClassOrder>,
+    ) -> Result<(Option<(usize, PayloadId)>, usize), ExecutionError> {
+        let Some(head) = queue.queue.front().copied() else {
+            return Ok((None, 0));
+        };
+        if !pfc_any_paused(pfc) {
+            return Ok((Some((0, head)), 0));
+        }
+        let Some(order) = order else {
+            debug_assert!(
+                !matches!(queue.scheduler, SchedulerKind::Fifo),
+                "switch {:?}: a FIFO PFC queue with a paused class keeps a class order",
+                node.id,
+            );
+            return self.pfc_first_eligible_by_search(queue, pfc);
+        };
+        let first = order
+            .first_unpaused_position(pfc)
+            .map(|position| {
+                queue
+                    .queue
+                    .get(position)
+                    .map(|payload| (position, *payload))
+                    .ok_or(ExecutionError::InvalidSchedulerState(node.id))
+            })
+            .transpose()?;
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            Some(first),
+            self.pfc_first_eligible_by_search(queue, pfc)
+                .ok()
+                .map(|(search, _)| search),
+            "switch {:?}: the class order and the search disagree on the first eligible packet",
+            node.id,
+        );
+        Ok((first, 0))
+    }
+
+    /// `pfc_first_eligible` by reading the queue from the head.
+    fn pfc_first_eligible_by_search(
+        &self,
+        queue: &crate::SwitchQueueState,
+        pfc: &crate::PfcQueueState,
+    ) -> Result<(Option<(usize, PayloadId)>, usize), ExecutionError> {
+        for (position, payload) in queue.queue.iter().enumerate() {
+            if !pfc.is_paused(self.packet_pfc_class(self.packet(*payload)?)?) {
+                return Ok((Some((position, *payload)), position + 1));
+            }
+        }
+        Ok((None, queue.queue.len()))
+    }
+
+    /// Gives a FIFO PFC queue its class order if it has none; returns the queued entries read.
+    fn ensure_pfc_order(
+        &mut self,
+        state_slot: usize,
+        queue_slot: usize,
+    ) -> Result<usize, ExecutionError> {
+        let (Some(queue), Some(aux)) = (
+            self.switch_states
+                .get(state_slot)
+                .and_then(|state| state.queues.get(queue_slot)),
+            self.switch_queue_aux
+                .get(state_slot)
+                .and_then(|queues| queues.get(queue_slot)),
+        ) else {
+            return Ok(0);
+        };
+        if aux.pfc_order.is_some()
+            || queue.pfc.is_none()
+            || !matches!(queue.scheduler, SchedulerKind::Fifo)
+        {
+            return Ok(0);
+        }
+        let mut order = PfcClassOrder::new();
+        for payload in &queue.queue {
+            order.push(self.packet_pfc_class(self.packet(*payload)?)?);
+        }
+        let reads = queue.queue.len();
+        self.switch_queue_aux[state_slot][queue_slot].pfc_order = Some(Box::new(order));
+        Ok(reads)
+    }
+
+    /// Gives every FIFO PFC queue that starts with a paused class its class order.
+    fn seed_pfc_orders(&mut self) -> Result<(), ExecutionError> {
+        for state_slot in 0..self.switch_states.len() {
+            for queue_slot in 0..self.switch_states[state_slot].queues.len() {
+                if self.switch_states[state_slot].queues[queue_slot]
+                    .pfc
+                    .as_ref()
+                    .is_some_and(pfc_any_paused)
+                {
+                    self.ensure_pfc_order(state_slot, queue_slot)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn link(&self, id: LinkId) -> Result<crate::LinkDescriptor, ExecutionError> {
@@ -6540,8 +6886,8 @@ fn scheduler_select_position(
         return Ok(None);
     }
     match scheduler {
-        // The three head-serving disciplines. `queue_serves_head` classifies exactly this set, and
-        // the two must be changed together.
+        // The three head-serving disciplines. `scheduler_serves_head` classifies exactly this
+        // set, and the two must be changed together.
         SchedulerKind::Fifo
         | SchedulerKind::StaticPriority { .. }
         | SchedulerKind::WeightedFairQueue(_) => Ok(Some((0, 0))),
@@ -6629,12 +6975,14 @@ enum QueueAdmissionAction {
     Drop,
 }
 
-fn derive_switch_queue_bytes(
+/// Each switch queue's byte counter; the PFC class orders are seeded afterwards
+/// (`TransitionState::seed_pfc_orders`), since they read the flow table.
+fn derive_switch_queue_aux(
     image: &SimulationImage,
     switch_states: &[SwitchState],
     local_node: Option<NodeDescriptor>,
     packets: &BTreeMap<PayloadId, ResidentPacket>,
-) -> Result<Vec<Vec<u64>>, ExecutionError> {
+) -> Result<Vec<Vec<SwitchQueueAux>>, ExecutionError> {
     let mut node_ids = vec![None; switch_states.len()];
     if let Some(node) = local_node {
         if node.kind == NodeKind::Switch {
@@ -6659,13 +7007,17 @@ fn derive_switch_queue_bytes(
                 .queues
                 .iter()
                 .map(|queue| {
-                    queue.queue.iter().try_fold(0_u64, |total, payload| {
+                    let bytes = queue.queue.iter().try_fold(0_u64, |total, payload| {
                         let packet = packets
                             .get(payload)
                             .ok_or(ExecutionError::UnknownPacket(*payload))?;
                         total
                             .checked_add(packet.descriptor.size_bytes)
                             .ok_or(ExecutionError::CounterOverflow(node))
+                    })?;
+                    Ok(SwitchQueueAux {
+                        bytes,
+                        pfc_order: None,
                     })
                 })
                 .collect()
