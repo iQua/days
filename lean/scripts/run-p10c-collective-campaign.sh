@@ -7,7 +7,8 @@ lean_dir="$(cd "$script_dir/.." && pwd)"
 cd "$lean_dir"
 lake build p10c_collective_check
 
-checker="$lean_dir/.lake/build/bin/p10c_collective_check"
+# P10C_COLLECTIVE_CHECKER substitutes a drop-in checker (run-p10c-collective-differential.sh).
+checker="${P10C_COLLECTIVE_CHECKER:-$lean_dir/.lake/build/bin/p10c_collective_check}"
 fixture_dir="$lean_dir/fixtures/p10c"
 failures=0
 checked=0
