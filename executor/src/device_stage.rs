@@ -268,6 +268,20 @@ pub(crate) fn decode_stage_rows(
     image: &SimulationImage,
     host_states: &mut [HostState],
 ) -> Result<(), &'static str> {
+    // The predecessors of inbound joins, whose rows carry the immutable credit bit that
+    // `encode_stage_region` sets; none (and no allocation) in an image without joins.
+    let mut credited = Vec::new();
+    if !image.stage_joins.is_empty() {
+        for state in &image.host_states {
+            for (_, stage) in host_stages(state) {
+                if matches!(stage.dependencies.inbound, StagePredecessors::Join { .. }) {
+                    credited.extend(stage.dependencies.inbound.iter(&image.stage_joins));
+                }
+            }
+        }
+        credited.sort_unstable();
+        credited.dedup();
+    }
     for (input, state) in image.host_states.iter().zip(host_states.iter_mut()) {
         for (position, stage) in host_stages(input) {
             let flow = input.generators[position].flow;
@@ -277,6 +291,9 @@ pub(crate) fn decode_stage_rows(
                 .ok_or("stage region is shorter than its rows")?;
             let mut expected = [0_u64; STAGE_ROW_WORDS];
             encode_row(stage, &mut expected);
+            if credited.binary_search(&flow).is_ok() {
+                expected[SR_FLAGS] |= SR_INBOUND_CREDIT;
+            }
             let flags = row[SR_FLAGS];
             let low = flags & 0xffff_ffff;
             let expected_low = expected[SR_FLAGS] & 0xffff_ffff;
@@ -540,6 +557,54 @@ mod tests {
             decoded[0].stage(0)
         ));
         assert!(!released_during_run(None, None));
+    }
+
+    /// `image()` with flow 3 (host B) also joining flows 0 and 1 from host A, 500 B each, which
+    /// host B receives over TCP: flows 0 and 1 carry the credit word of an inbound join's
+    /// predecessor (P16 H1).
+    fn join_image() -> SimulationImage {
+        let mut image = image();
+        image.nodes = vec![
+            crate::NodeDescriptor {
+                id: crate::NodeId(0),
+                kind: crate::NodeKind::Host,
+                state_slot: 0,
+            },
+            crate::NodeDescriptor {
+                id: crate::NodeId(1),
+                kind: crate::NodeKind::Host,
+                state_slot: 1,
+            },
+        ];
+        image.stage_joins = vec![FlowId(0), FlowId(1)];
+        let b = &mut image.host_states[1];
+        b.tcp_receivers = vec![
+            crate::TcpReceiverState::new(FlowId(0), 40),
+            crate::TcpReceiverState::new(FlowId(1), 40),
+        ];
+        let join = b.stages[1].as_mut().unwrap();
+        join.dependencies.inbound = StagePredecessors::Join { first: 0, count: 2 };
+        join.dependencies.inbound_predecessor_bytes = 1_000;
+        image
+    }
+
+    #[test]
+    fn a_region_with_an_inbound_join_decodes_to_its_input() {
+        let image = join_image();
+        let region = encode_stage_region(&image, true).unwrap();
+        assert_ne!(region[SR_FLAGS] & SR_INBOUND_CREDIT, 0);
+        assert_ne!(region[STAGE_ROW_WORDS + SR_FLAGS] & SR_INBOUND_CREDIT, 0);
+        let rows = &region[..7 * STAGE_ROW_WORDS];
+        let mut decoded = image.host_states.clone();
+        decode_stage_rows(rows, &image, &mut decoded).unwrap();
+        assert_eq!(decoded, image.host_states);
+        // The credit bit is immutable: a row may neither drop nor gain it.
+        let mut dropped = rows.to_vec();
+        dropped[SR_FLAGS] &= !SR_INBOUND_CREDIT;
+        assert!(decode_stage_rows(&dropped, &image, &mut image.host_states.clone()).is_err());
+        let mut gained = rows.to_vec();
+        gained[2 * STAGE_ROW_WORDS + SR_FLAGS] |= SR_INBOUND_CREDIT;
+        assert!(decode_stage_rows(&gained, &image, &mut image.host_states.clone()).is_err());
     }
 
     #[test]
