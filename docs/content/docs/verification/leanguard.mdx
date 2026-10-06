@@ -255,11 +255,18 @@ pair receives no CNP. A queue pair's ticks have no `tick` row: `p10c_roce_check`
 ## Continuous integration
 
 `.github/workflows/leanguard.yml` has two jobs. `lean-fixtures` builds the checkers, audits the
-`DaysExecutor` axioms (`lean/scripts/audit-days-executor-axioms.sh`), and runs every campaign and
-fixture script under `lean/scripts/`: the P10c collective, DCQCN and RoCE campaigns (accept
-fixtures, plus mutations each checker must reject with a named message), and the AQM, CUBIC, DRR
-and WFQ fixture and coverage scripts. `protocol-traces` runs the legacy engine on the CI fixtures
-and the legacy checkers on its traces.
+`DaysExecutor` axioms (`lean/scripts/audit-days-executor-axioms.sh`), and runs these scripts under
+`lean/scripts/`: the P10c collective, DCQCN and RoCE campaigns (`run-p10c-collective-campaign.sh`,
+`run-p10c-dcqcn-campaign.sh`, `run-p10c-roce-campaign.sh`: accept fixtures, plus mutations each
+checker must reject with a named message); the collective differential and budget and the AQM
+differential (below); and the AQM, CUBIC, DRR and WFQ fixture and coverage scripts
+(`run-aqm-fixtures.sh`, `run-aqm-coverage-fixtures.sh`, `run-cubic-fixtures.sh`,
+`run-drr-fixtures.sh`, `run-drr-coverage-fixtures.sh`, `run-wfq-fixtures.sh`,
+`run-wfq-coverage-fixtures.sh`). The P10c AQM campaign (`run-p10c-aqm-campaign.sh`) runs in CI
+only inside the AQM differential, through the differential checker. Three scripts are not CI
+steps: `run-p10c-mechanism-campaign.sh`, `run-sp-campaign.sh`, and `run-tcp-campaign.sh`, which
+takes a trace directory. `protocol-traces` runs the legacy engine on the CI fixtures and the
+legacy checkers on its traces.
 
 The P10c collective, DCQCN, RoCE and AQM checkers are linear in the row count, except the
 collective checker's TCP replay, which keeps a per-flow frontier in an ordered map and is
