@@ -8,9 +8,11 @@
 //! `evidence/P16/aicb-design.md`. All arithmetic is exact integer arithmetic.
 
 mod error;
+mod groups;
 mod parse;
 
 pub use error::AicbError;
+pub use groups::{Fidelity, GroupFamily, Groups, form_groups, render_mockncclgroup};
 pub use parse::{
     Algorithm, Column, ColumnEntry, Comm, GroupKind, Header, Record, Trace, parse_trace,
 };
