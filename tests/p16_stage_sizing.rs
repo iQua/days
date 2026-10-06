@@ -287,16 +287,85 @@ fn windowed_multi_qp(window_bytes: u64) -> SimulationImage {
     compile_text(&windowed)
 }
 
+/// `configs/p15/roce_ring_release_paused.toml` widened to `ranks` hosts on a switch line of the
+/// same links (fix round 1, review F1): one RoCE RingAllReduce over the even hosts then the odd
+/// ones, so every host sources a chain of `2 (ranks - 1)` windowless stage pairs of 100 packets,
+/// and the background pair runs from the last host to host 0, keeping class 3 paused at its host
+/// while stages there are released.
+fn widened_release_paused(ranks: usize) -> SimulationImage {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("configs/p15/roce_ring_release_paused.toml");
+    let config = std::fs::read_to_string(&path).expect("fixture must read");
+    let list = |values: &[usize]| {
+        values
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let edges = (0..ranks - 1)
+        .map(|switch| format!("[{switch}, {}]", switch + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sources = (0..ranks)
+        .step_by(2)
+        .chain((1..ranks).step_by(2))
+        .collect::<Vec<_>>();
+    let sinks = sources[1..]
+        .iter()
+        .copied()
+        .chain([sources[0]])
+        .collect::<Vec<_>>();
+    let mut widened = config;
+    for (from, to) in [
+        (
+            "edges = [[0, 1], [1, 2], [2, 3]]".to_owned(),
+            format!("edges = [{edges}]"),
+        ),
+        (
+            "hosts = [0, 1, 2, 3]".to_owned(),
+            format!("hosts = [{}]", list(&(0..ranks).collect::<Vec<_>>())),
+        ),
+        ("duration = 0.05".to_owned(), "duration = 0.2".to_owned()),
+        ("flow_count = 4".to_owned(), format!("flow_count = {ranks}")),
+        (
+            "sources = [0, 2, 1, 3]".to_owned(),
+            format!("sources = [{}]", list(&sources)),
+        ),
+        (
+            "sinks = [2, 1, 3, 0]".to_owned(),
+            format!("sinks = [{}]", list(&sinks)),
+        ),
+        (
+            "size = 400000".to_owned(),
+            format!("size = {}", 100_000 * ranks),
+        ),
+        (
+            "graph = [[3, 0]]".to_owned(),
+            format!("graph = [[{}, 0]]", ranks - 1),
+        ),
+    ] {
+        assert_eq!(widened.matches(&from).count(), 1, "{from}");
+        widened = widened.replace(&from, &to);
+    }
+    compile_text(&widened)
+}
+
 /// Capacity retries of the default device plan (design note §5.2), MEASURED on Metal (M5 Max) and
 /// CUDA (sim, RTX A4500). Before ruling G8 the windowed image took four queue retries at host 1
 /// (13 -> 28 -> 58 -> 118 -> 238 records); its three windowed pairs now plan their windows (154
 /// records) and host 1 takes none. The one retry left is host 2's (56 -> 114 records): its TCP flow
 /// on the paused class keeps today's horizon bound, which the ruling leaves to the typed retry.
 /// The windowless P15 image keeps its eight queue retries (ruling G8 leaves it as it was).
+///
+/// Fix round 1 (review F1): the 16-rank paused ring's windowless stage pairs keep their summed
+/// host-queue charge, as before ruling G7 (0 retries at `da555a9`; G7's one-chain charge had taken
+/// 3 at host 15, 202 -> 1,630 records).
 #[allow(dead_code)]
 const PINNED_RETRIES: &[(&str, usize)] = &[
     ("hostpfc_multi_qp_window_50000", 1),
     ("hostpfc_multi_qp_tcp", 8),
+    ("release_paused_ring16", 0),
 ];
 
 #[allow(dead_code)]
@@ -307,6 +376,7 @@ fn retry_images() -> Vec<(&'static str, SimulationImage)> {
             "hostpfc_multi_qp_tcp",
             lower("configs/p15/hostpfc_multi_qp_tcp.toml"),
         ),
+        ("release_paused_ring16", widened_release_paused(16)),
     ]
 }
 
@@ -315,7 +385,7 @@ mod metal {
     use days_executor::{MetalConfig, ObservationMode, run_metal_with_observations, run_scalar};
 
     #[test]
-    fn metal_windowed_queue_pairs_plan_their_windows_and_pin_their_retries() {
+    fn metal_queue_pair_images_pin_their_retries() {
         let mut retries = Vec::new();
         for (name, image) in super::retry_images() {
             let run = run_metal_with_observations(
@@ -330,7 +400,7 @@ mod metal {
             assert_eq!(run.result, expected, "{name}: Metal must equal Scalar");
             retries.push((name, run.capacity_retry_trace.len()));
         }
-        eprintln!("record=window_retries backend=metal {retries:?}");
+        eprintln!("record=queue_pair_retries backend=metal {retries:?}");
         assert_eq!(retries, super::PINNED_RETRIES);
     }
 }
@@ -340,7 +410,7 @@ mod cuda {
     use days_executor::{CudaConfig, ObservationMode, run_cuda_with_observations, run_scalar};
 
     #[test]
-    fn cuda_windowed_queue_pairs_plan_their_windows_and_pin_their_retries() {
+    fn cuda_queue_pair_images_pin_their_retries() {
         let mut retries = Vec::new();
         for (name, image) in super::retry_images() {
             let run = run_cuda_with_observations(
@@ -355,7 +425,7 @@ mod cuda {
             assert_eq!(run.result, expected, "{name}: CUDA must equal Scalar");
             retries.push((name, run.capacity_retry_trace.len()));
         }
-        eprintln!("record=window_retries backend=cuda {retries:?}");
+        eprintln!("record=queue_pair_retries backend=cuda {retries:?}");
         assert_eq!(retries, super::PINNED_RETRIES);
     }
 }
