@@ -190,10 +190,6 @@ impl DeviceEventArenaSizing {
     }
 }
 
-/// Complete host-only sizing report for a projected or exact GPU device plan.
-///
-/// Open-loop images retain the established 28 planes. TCP images add one packed auxiliary plane
-/// for receiver ranges, segment ledgers, and full-observation transition state.
 /// Words a production device plan spends on the P14 DCQCN and PFC and the P15 queue-pair and
 /// host-link PFC mechanism state.
 ///
@@ -217,6 +213,11 @@ pub struct MechanismPlaneWords {
     pub pfc_class_words: Vec<u64>,
 }
 
+/// Complete host-only sizing report for a projected or exact GPU device plan.
+///
+/// Every plan carries the established 28 planes and one packed auxiliary plane, `tcp_state`: the
+/// per-flow receiver and ledger rows, the TCP receive ranges and segment ledgers, the stage region
+/// (P16) and the RoCE receiver region (P15). Both planners allocate it for every image.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceSizingReport {
     pub planes: Vec<DevicePlaneSizing>,
@@ -765,21 +766,15 @@ pub fn size_default_device_plan(
             })
         })
         .collect::<Result<Vec<_>, DeviceSizingError>>()?;
-    if image.host_states.iter().any(|state| {
-        !state.tcp_receivers.is_empty()
-            || state
-                .generators
-                .iter()
-                .any(|generator| matches!(generator.kind, FlowGeneratorKind::Tcp(_)))
-    }) {
-        let tcp_words = packed_tcp_state_words(image, &flow_data_counts, &context)?;
-        planes.push(DevicePlaneSizing {
-            index: planes.len(),
-            name: "tcp_state",
-            words: tcp_words,
-            bytes: checked_product(tcp_words, WORD_BYTES, "TCP state plane bytes")?,
-        });
-    }
+    // Both planners allocate `tcp_state` for every image (P16 G2: an image without TCP still
+    // carries its receiver and ledger rows, and its stage and RoCE regions live there).
+    let tcp_words = packed_tcp_state_words(image, &flow_data_counts, &context)?;
+    planes.push(DevicePlaneSizing {
+        index: planes.len(),
+        name: "tcp_state",
+        words: tcp_words,
+        bytes: checked_product(tcp_words, WORD_BYTES, "TCP state plane bytes")?,
+    });
     let total_device_bytes = planes.iter().try_fold(0_usize, |total, plane| {
         total
             .checked_add(plane.bytes)
@@ -1103,7 +1098,7 @@ fn packed_tcp_state_words(
     // -flow frontier, against a 5.74 GB record arena.
     const LEDGER_META_WORDS: usize = crate::tcp_ledger_ring::TCP_LEDGER_META_WORDS;
     const LEDGER_RECORD_WORDS: usize = crate::tcp_ledger_ring::TCP_LEDGER_RECORD_WORDS;
-    let flow_count = image.flows.len().max(1);
+    let flow_count = image.flows.len();
     let receiver_range_slots = image
         .host_states
         .iter()
@@ -1115,8 +1110,7 @@ fn packed_tcp_state_words(
             total
                 .checked_add(bound.max(receiver.out_of_order.len()))
                 .ok_or_else(|| sizing_error("TCP receiver range slots overflow usize"))
-        })?
-        .max(1);
+        })?;
     let ledger = crate::tcp_ledger::seed_image(image).map_err(|conflict| {
         sizing_error(format!(
             "TCP flow {:?} sequence {} changed segment size from {} to {} bytes",
@@ -1144,12 +1138,14 @@ fn packed_tcp_state_words(
             .checked_add(bound.max(resident))
             .ok_or_else(|| sizing_error("TCP ledger record slots overflow usize"))
     })?;
-    [
+    // The planners allocate the receiver, range and ledger regions as one buffer of at least one
+    // word, then append the stage region (P16 G1) and the RoCE region (P15).
+    let packed = [
         checked_product(flow_count, RECEIVER_WORDS, "TCP receiver rows")?,
         checked_product(receiver_range_slots, RANGE_WORDS, "TCP receive ranges")?,
         checked_product(flow_count, LEDGER_META_WORDS, "TCP ledger metadata")?,
         checked_product(
-            ledger_record_slots.max(1),
+            ledger_record_slots,
             LEDGER_RECORD_WORDS,
             "TCP ledger records",
         )?,
@@ -1159,7 +1155,67 @@ fn packed_tcp_state_words(
         total
             .checked_add(words)
             .ok_or_else(|| sizing_error("TCP state plane overflows usize"))
-    })
+    })?
+    .max(1);
+    [stage_region_words(image)?, roce_region_words(image)?]
+        .into_iter()
+        .try_fold(packed, |total, words| {
+            total
+                .checked_add(words)
+                .ok_or_else(|| sizing_error("TCP state plane overflows usize"))
+        })
+}
+
+/// Words of one queue-pair receiver record in the RoCE region (`device_mechanism`).
+pub(crate) const ROCE_RECEIVER_WORDS: usize = 10;
+
+/// Words of the RoCE region at the tail of `tcp_state`: one record per queue-pair receiver, zero
+/// without any (`device_mechanism::append_roce_region`).
+pub(crate) fn roce_region_words(image: &SimulationImage) -> Result<usize, DeviceSizingError> {
+    image
+        .host_states
+        .iter()
+        .filter_map(|state| state.roce_receivers.as_deref())
+        .try_fold(0_usize, |total, receivers| {
+            total
+                .checked_add(checked_product(
+                    receivers.len(),
+                    ROCE_RECEIVER_WORDS,
+                    "RoCE region",
+                )?)
+                .ok_or_else(|| sizing_error("RoCE region overflows usize"))
+        })
+}
+
+/// Words of one stage row in the stage region (`device_stage`).
+pub(crate) const STAGE_ROW_WORDS: usize = 5;
+
+/// Words of the stage region before the RoCE region (`device_stage::encode_stage_region`): a row
+/// per flow, then one successor entry per local and per inbound predecessor; zero without stages.
+pub(crate) fn stage_region_words(image: &SimulationImage) -> Result<usize, DeviceSizingError> {
+    if image
+        .host_states
+        .iter()
+        .all(|state| state.stages.is_empty())
+    {
+        return Ok(0);
+    }
+    let successors = image
+        .host_states
+        .iter()
+        .flat_map(|state| state.stages.iter().flatten())
+        .map(|stage| {
+            usize::from(stage.dependencies.local_predecessor.is_some())
+                + usize::from(stage.dependencies.inbound_predecessor.is_some())
+        })
+        .fold(0_usize, usize::saturating_add);
+    checked_product(
+        image.flows.len().max(1),
+        STAGE_ROW_WORDS,
+        "stage region rows",
+    )?
+    .checked_add(successors)
+    .ok_or_else(|| sizing_error("stage region overflows usize"))
 }
 
 pub(crate) fn paced_single_source_queue_bound(

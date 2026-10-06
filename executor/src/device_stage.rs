@@ -26,8 +26,9 @@
 
 use crate::{CollectiveStage, HostState, SimulationImage, StageDependencies};
 
-/// Words of one flow's row in the stage region.
-pub(crate) const STAGE_ROW_WORDS: usize = 5;
+/// Words of one flow's row in the stage region. The host projection sizes the region from the
+/// same constant (`device_sizing::stage_region_words`).
+pub(crate) const STAGE_ROW_WORDS: usize = crate::device_sizing::STAGE_ROW_WORDS;
 pub(crate) const SR_FLAGS: usize = 0;
 pub(crate) const SR_INBOUND_RECEIVED: usize = 1;
 pub(crate) const SR_INBOUND_REQUIRED: usize = 2;
@@ -371,6 +372,11 @@ mod tests {
         let image = image();
         let region = encode_stage_region(&image).unwrap();
         assert_eq!(region.len(), 7 * STAGE_ROW_WORDS + 4);
+        // The host projection's size of the region (P16 G2).
+        assert_eq!(
+            crate::device_sizing::stage_region_words(&image),
+            Ok(region.len())
+        );
         assert_eq!(list(&region, 0, SR_LOCAL_SUCCESSORS), vec![1, 4]);
         assert_eq!(list(&region, 2, SR_LOCAL_SUCCESSORS), vec![3]);
         assert_eq!(list(&region, 3, SR_INBOUND_SUCCESSORS), vec![4]);
@@ -392,6 +398,7 @@ mod tests {
         }
         assert_eq!(encode_stage_region(&stageless), Ok(Vec::new()));
         assert_eq!(stage_row_words(&stageless), 0);
+        assert_eq!(crate::device_sizing::stage_region_words(&stageless), Ok(0));
         let mut words = vec![9_u64];
         assert_eq!(append_stage_region(&stageless, &mut words), Ok(None));
         assert_eq!(words, vec![9]);
