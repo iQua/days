@@ -24,26 +24,28 @@
 //! A compute stage's timer is one fallback-heap event at its source while the stage runs; at most
 //! `min(leaves, unfinished compute stages)` of a host's timers are pending at once.
 //!
-//! The host queue is the exception (fix rounds 1 and 2, review F1 and R1-F1). The per-flow
+//! The host queue is the exception (fix rounds 1 to 3, review F1, R1-F1 and R2-F1). The per-flow
 //! host-queue bound of a windowless queue pair or a TCP stage is a lookahead horizon bound, which
 //! fails whenever its host queue backs up (behind a PFC pause or a busier pacer, with Go-back-N
 //! copies or a congestion window that the backlog does not limit). The summed bounds of a host's
 //! stages absorbed that; one chain's charge did not, and the retries grew with chain length. So
-//! only a windowed queue pair, whose window bound survives a backlog (ruling G8), has its
-//! host-queue charge grouped; every other stage keeps its summed host-queue charge. Remote
-//! staging, the event heap and the outbox stay grouped for every stage.
+//! only a queue pair whose window bound survives a backlog (a window and no retransmission
+//! timeout, below) has its host-queue charge grouped; every other stage keeps its summed
+//! host-queue charge. Remote staging, the event heap and the outbox stay grouped for every stage.
 //!
 //! # Windows (ruling G8)
 //!
 //! A queue pair with a window keeps `next_psn − snd_una < w ≤ window_bytes`, so at most
-//! `ceil(window_bytes / mtu) + 1` of its data packets are unacknowledged, and so waiting in its
-//! source host's queue, at once. Its receiver sends at most one ACK or NACK per data packet, and
-//! the sender has heard of none that still wait in the receiver's host queue, so the same bound
-//! covers its feedback there. Both bounds hold however long a pause lasts. They replace the
-//! horizon bound in the host queue of a windowed pair, and its feedback joins the receiver's host
-//! queue; a windowed stage's bounds are charged with its host's chains. Windowless pairs and TCP
-//! keep today's bound. Typed capacity retries remain the recovery path for what the bounds leave
-//! out (Go-back-N duplicates behind a rewind).
+//! `ceil(window_bytes / mtu) + 1` of its data packets are unacknowledged at once. Its receiver
+//! sends at most one ACK or NACK per data packet, and the sender has heard of none that still wait
+//! in the receiver's host queue. Those counts bound the pair's host queues only while it never
+//! rewinds: a retransmission timeout that fires while its packets wait behind a backlog sends again
+//! from `snd_una` and leaves the old copies queued (fix round 3, re-review R2-F1). So the window
+//! bound applies only to a windowed pair whose retransmission timeout is off. For such a pair it
+//! replaces the horizon bound in the source host's queue, its feedback joins the receiver's host
+//! queue, and a windowed stage's bounds are charged with its host's chains. Every other queue pair
+//! and TCP keep today's bound. A pair on a lossy class can still rewind on a NACK with the timeout
+//! off; typed capacity retries remain the recovery path for that.
 //!
 //! Everything here is decided once per plan, with sorted vectors and no map iteration order.
 
@@ -77,8 +79,8 @@ pub(crate) struct SizingConcurrency {
     /// Per group: the source node and its pending compute-timer bound,
     /// `min(leaves, unfinished compute stages)`.
     compute_timers: Vec<(usize, usize)>,
-    /// Per flow: `ceil(window_bytes / mtu) + 1` for a windowed queue pair, else zero. Empty when
-    /// the image has no windowed queue pair.
+    /// Per flow: `ceil(window_bytes / mtu) + 1` for a windowed queue pair with its retransmission
+    /// timeout off, else zero. Empty when the image has no such pair.
     window_packets: Vec<usize>,
     /// Whether any host carries a stage (the stage region is planned exactly then).
     has_stages: bool,
@@ -178,13 +180,15 @@ impl SizingConcurrency {
     }
 
     /// The concurrency group in which `flow`'s host-queue source bound is charged: its stage group
-    /// for a windowed queue pair, whose window bound survives a backlog; otherwise none, so the
-    /// bound is charged alone (fix rounds 1 and 2, review F1 and R1-F1).
+    /// for a windowed queue pair with its retransmission timeout off, whose window bound survives a
+    /// backlog; otherwise none, so the bound is charged alone (fix rounds 1 to 3, review F1, R1-F1
+    /// and R2-F1).
     pub(crate) fn host_queue_group(&self, flow: usize) -> Option<u32> {
         self.window_packets(flow).and_then(|_| self.group(flow))
     }
 
-    /// `ceil(window_bytes / mtu) + 1` if `flow` is a windowed queue pair.
+    /// `ceil(window_bytes / mtu) + 1` if `flow` is a windowed queue pair with its retransmission
+    /// timeout off.
     pub(crate) fn window_packets(&self, flow: usize) -> Option<usize> {
         self.window_packets
             .get(flow)
@@ -200,15 +204,16 @@ impl SizingConcurrency {
     }
 }
 
-/// Per flow, `ceil(window_bytes / mtu) + 1` for each windowed queue pair and zero otherwise; empty
-/// when no queue pair has a window.
+/// Per flow, `ceil(window_bytes / mtu) + 1` for each windowed queue pair whose retransmission
+/// timeout is off and zero otherwise; empty when there is no such pair.
 fn window_packets(image: &SimulationImage) -> Vec<usize> {
     let mut packets = Vec::new();
     for generator in image.host_states.iter().flat_map(|state| &state.generators) {
         let FlowGeneratorKind::Roce(roce) = generator.kind else {
             continue;
         };
-        if roce.window_bytes == 0 {
+        // A timeout rewinds the pair behind a backlog, so its window bounds nothing there.
+        if roce.window_bytes == 0 || roce.rto_ns != 0 {
             continue;
         }
         if packets.is_empty() {
@@ -453,7 +458,7 @@ mod tests {
         for state in &mut image.host_states {
             state.stages.clear();
         }
-        let roce = |window_bytes| {
+        let roce = |window_bytes, rto_ns| {
             FlowGeneratorKind::Roce(crate::RoceGenerator {
                 pacer: crate::RocePacer {
                     first_pacing_time_ns: 0,
@@ -479,18 +484,21 @@ mod tests {
                 next_psn: 0,
                 snd_una: 0,
                 rto_deadline_ns: 0,
-                rto_ns: 0,
+                rto_ns,
                 window_bytes,
                 pacer_armed: true,
                 variable_window: false,
                 window_parked: false,
             })
         };
-        image.host_states[0].generators[1].kind = roce(0);
+        image.host_states[0].generators[1].kind = roce(0, 0);
         image.host_states[0].roce_receivers = Some(Box::new([]));
         // A queue pair without a window: neither rule applies.
         assert!(SizingConcurrency::for_image(&image).is_none());
-        image.host_states[0].generators[2].kind = roce(50_001);
+        // A windowed pair with a retransmission timeout rewinds behind a backlog: no bound.
+        image.host_states[0].generators[2].kind = roce(50_001, 100_000);
+        assert!(SizingConcurrency::for_image(&image).is_none());
+        image.host_states[0].generators[2].kind = roce(50_001, 0);
         let concurrency = SizingConcurrency::for_image(&image).expect("a windowed pair");
         assert!(!concurrency.has_stages());
         assert_eq!(concurrency.window_packets(1), None);
