@@ -235,6 +235,7 @@ fn generator_image(termination: GeneratorTermination) -> SimulationImage {
             payload: FIRST_PACKET,
         }],
         seed: 1,
+        stage_joins: Vec::new(),
     }
 }
 
@@ -476,6 +477,7 @@ fn multi_producer_target_image(producers: usize) -> SimulationImage {
         channels,
         initial_events,
         seed: 31,
+        stage_joins: Vec::new(),
     }
 }
 
@@ -672,6 +674,7 @@ fn fan_in_tail_drop_contention_image() -> SimulationImage {
             },
         ],
         seed: 37,
+        stage_joins: Vec::new(),
     }
 }
 
