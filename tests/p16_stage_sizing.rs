@@ -314,11 +314,16 @@ fn windowed_multi_qp(window_bytes: u64) -> SimulationImage {
 /// while stages there are released. Fix round 2 (re-review R1-F1) adds two variants of the same
 /// ring: [`Variant::NoHostPfc`] turns host-link PFC off (switch-link PFC stays), and
 /// [`Variant::Tcp`] carries the stages over TCP Reno on class 3 (the background pair stays RoCE).
+/// Fix round 3 (re-review R2-F1) gives the stage pairs alone a 20,000 B window, with their 1 ms
+/// retransmission timeout ([`Variant::StageWindow`]) or a 100 us one
+/// ([`Variant::StageWindowRto100us`]).
 #[derive(Clone, Copy)]
 enum Variant {
     Paused,
     NoHostPfc,
     Tcp,
+    StageWindow,
+    StageWindowRto100us,
 }
 
 fn widened_release_paused(ranks: usize, variant: Variant) -> SimulationImage {
@@ -380,6 +385,16 @@ fn widened_release_paused(ranks: usize, variant: Variant) -> SimulationImage {
     let variant_replacements: &[(&str, &str)] = match variant {
         Variant::Paused => &[],
         Variant::NoHostPfc => &[("host_links = true", "host_links = false")],
+        Variant::StageWindow => &[(
+            "[collective.traffic.roce]\nretransmit_timeout_ns = 1000000\nfeedback_priority = 0\n",
+            "[collective.traffic.roce]\nretransmit_timeout_ns = 1000000\nfeedback_priority = 0\n\
+             window_bytes = 20000\n",
+        )],
+        Variant::StageWindowRto100us => &[(
+            "[collective.traffic.roce]\nretransmit_timeout_ns = 1000000\nfeedback_priority = 0\n",
+            "[collective.traffic.roce]\nretransmit_timeout_ns = 100000\nfeedback_priority = 0\n\
+             window_bytes = 20000\n",
+        )],
         Variant::Tcp => &[
             (
                 "flow_type = \"RoCE\"\npriority = 3\nflow_count",
@@ -412,7 +427,10 @@ fn widened_release_paused(ranks: usize, variant: Variant) -> SimulationImage {
 /// Fix rounds 1 and 2 (review F1, re-review R1-F1): windowless stage pairs and TCP stages keep
 /// their summed host-queue charge, as before ruling G7, so the 16-rank rings take their base
 /// retries: the paused ring 0 (G7's one-chain charge had taken 3 at host 15), the ring without
-/// host-link PFC 2 (had taken 5) and the TCP ring 1 (had taken 4).
+/// host-link PFC 2 (had taken 5) and the TCP ring 1 (had taken 4). Fix round 3 (re-review
+/// R2-F1): a windowed pair with a retransmission timeout rewinds behind a backlog, so its window
+/// does not bound its queues either; the rings whose stage pairs have a window and a 1 ms or a
+/// 100 us timeout keep their base 0 and 2 (the window grouping had taken 1 and 5).
 #[allow(dead_code)]
 const PINNED_RETRIES: &[(&str, usize)] = &[
     ("hostpfc_multi_qp_window_50000", 1),
@@ -420,6 +438,8 @@ const PINNED_RETRIES: &[(&str, usize)] = &[
     ("release_paused_ring16", 0),
     ("release_paused_ring16_no_host_pfc", 2),
     ("release_paused_ring16_tcp", 1),
+    ("release_paused_ring16_stage_window", 0),
+    ("release_paused_ring16_stage_window_rto100us", 2),
 ];
 
 #[allow(dead_code)]
@@ -441,6 +461,14 @@ fn retry_images() -> Vec<(&'static str, SimulationImage)> {
         (
             "release_paused_ring16_tcp",
             widened_release_paused(16, Variant::Tcp),
+        ),
+        (
+            "release_paused_ring16_stage_window",
+            widened_release_paused(16, Variant::StageWindow),
+        ),
+        (
+            "release_paused_ring16_stage_window_rto100us",
+            widened_release_paused(16, Variant::StageWindowRto100us),
         ),
     ]
 }
