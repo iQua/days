@@ -69,6 +69,11 @@ fn the_shipped_conf_reads_every_key_once() {
     }
     assert!(INERT_KEYS.contains(&"FCT_OUTPUT_FILE"));
     assert!(RECORDED_KEYS.contains(&"GLOBAL_T"));
+    // L2_CHUNK_SIZE is not inert in SimAI (part-1 review F2): it is read as a byte chunk for
+    // extra ACKs and back-to-zero recovery, both unreachable under the required
+    // L2_ACK_INTERVAL 1 and L2_BACK_TO_ZERO 0, so it is recorded, not ignored.
+    assert!(!INERT_KEYS.contains(&"L2_CHUNK_SIZE"));
+    assert!(RECORDED_KEYS.contains(&"L2_CHUNK_SIZE"));
 }
 
 #[test]
@@ -253,6 +258,23 @@ fn fabric_refusals() {
             "not a decimal in [0, 1]",
         ),
         ("HAS_WIN 1", "HAS_WIN 2", "must be 0 or 1"),
+        // L2_ACK_INTERVAL is bytes in SimAI (rdma-hw.cc:586-595), not packets.
+        (
+            "L2_ACK_INTERVAL 1",
+            "L2_ACK_INTERVAL 4000",
+            "`L2_ACK_INTERVAL 4000` is not supported (SimAI reads it in bytes",
+        ),
+        (
+            "L2_ACK_INTERVAL 1",
+            "L2_ACK_INTERVAL 0",
+            "`L2_ACK_INTERVAL 0` is not supported",
+        ),
+        ("L2_CHUNK_SIZE 4000", "L2_CHUNK_SIZE 0", "`L2_CHUNK_SIZE 0`"),
+        (
+            "L2_CHUNK_SIZE 4000",
+            "L2_CHUNK_SIZE 4k",
+            "`L2_CHUNK_SIZE 4k`",
+        ),
         (
             "PACKET_PAYLOAD_SIZE 9000",
             "PACKET_PAYLOAD_SIZE 0",
