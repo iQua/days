@@ -81,6 +81,12 @@ pub use device_capacity::{
 };
 #[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 pub use device_mechanism::RoundKernel;
+#[cfg(any(
+    feature = "cuda-test-hooks",
+    all(feature = "metal-test-hooks", target_vendor = "apple")
+))]
+#[doc(hidden)]
+pub use device_pfc::{ResumeScanCounts, take_resume_scan_counts_for_testing};
 pub use device_sizing::{
     DeviceEventArenaSizing, DevicePlaneSizing, DeviceSizingError, DeviceSizingReport,
     MechanismPlaneWords, size_default_device_plan,

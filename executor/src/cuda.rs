@@ -110,6 +110,10 @@ const PARAM_PFC_OFFSET: usize = 31;
 const PARAM_ROCE_OFFSET: usize = 32;
 /// Params word holding the stage region offset in `tcp_state`, or `NONE` without stages (P16 G1).
 const PARAM_STAGE_OFFSET: usize = 33;
+/// Test hooks only (P16 H4): params word holding the RESUME-scan counter rows' offset in
+/// `scheduler_state`, appended after every production params word.
+#[cfg(feature = "cuda-test-hooks")]
+const PARAM_RESUME_SCAN_COUNT_OFFSET: usize = 34;
 const PACKET_ECN_FLAG: u64 = 1_u64 << 63;
 const PACKET_KIND_MASK: u64 = !PACKET_ECN_FLAG;
 
@@ -1433,6 +1437,8 @@ impl CudaExecutor {
         observation_mode: ObservationMode,
         warm_start: &CapacityWarmStart,
     ) -> Result<CudaRun, CudaError> {
+        #[cfg(feature = "cuda-test-hooks")]
+        crate::device_pfc::take_resume_scan_counts_for_testing();
         validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
         validate_config(config)?;
         let direct = self.direct_for(config.device_index)?;
@@ -4421,6 +4427,22 @@ impl CudaBuffers {
         plan: CudaPlan,
         provisioning: CudaProvisioning,
     ) -> Result<Self, CudaError> {
+        // P16 H4 (test hooks only): the RESUME-scan counter rows, one per LP, zeroed, after every
+        // production word of `scheduler_state`, at params word 34 (`P_RESUME_SCAN_COUNT_OFFSET`).
+        #[cfg(feature = "cuda-test-hooks")]
+        let plan = {
+            let mut plan = plan;
+            let offset = plan.scheduler_state.len();
+            plan.scheduler_state.resize(
+                offset
+                    + (plan.params[0] as usize)
+                        .saturating_mul(crate::device_pfc::RESUME_SCAN_COUNT_WORDS),
+                0,
+            );
+            assert_eq!(plan.params.len(), PARAM_RESUME_SCAN_COUNT_OFFSET);
+            plan.params.push(offset as u64);
+            plan
+        };
         let round_capacity = plan.round_capacity;
         let dispatch_capacity = plan.dispatch_capacity;
         let orphan_packets = plan.orphan_packets;
@@ -4593,6 +4615,14 @@ impl CudaBuffers {
         ]: [Vec<u64>; 10] = whole
             .try_into()
             .expect("one readback per decoded fixed-width plane");
+        #[cfg(feature = "cuda-test-hooks")]
+        {
+            let offset = params[PARAM_RESUME_SCAN_COUNT_OFFSET] as usize;
+            crate::device_pfc::record_resume_scan_counts(
+                &scheduler_state
+                    [offset..offset + self.node_count * crate::device_pfc::RESUME_SCAN_COUNT_WORDS],
+            );
+        }
 
         let node_count = image.nodes.len();
         let flow_count = image.flows.len();

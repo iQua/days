@@ -147,6 +147,20 @@ constexpr uint P_ROCE_OFFSET = 32;
 // P16 G1: absolute offset of the stage region in `tcp_state`, or NONE without collective or compute
 // stages. Layout in `executor/src/device_stage.rs`.
 constexpr uint P_STAGE_OFFSET = 33;
+// P16 H4 (test hooks only): the RESUME-scan counters. `CudaBuffers::new` appends one row of
+// RESUME_SCAN_COUNT_WORDS words per LP to `scheduler_state`, after every production word, and its
+// offset as params word 34: {RESUMEs scanned, queue pairs examined, parked-bitset words read}. A
+// host LP adds only to its own row, so the counters need no atomics. Production builds compile
+// `RECORD_RESUME_SCAN` to nothing.
+#ifdef DAYS_RESUME_SCAN_COUNT
+constexpr uint P_RESUME_SCAN_COUNT_OFFSET = 34;
+constexpr uint RESUME_SCAN_COUNT_WORDS = 3;
+#define RECORD_RESUME_SCAN(params, state, node, counter, amount) \
+    ((state)[(params)[P_RESUME_SCAN_COUNT_OFFSET] + (node) * RESUME_SCAN_COUNT_WORDS + (counter)] += \
+        (ulong)(amount))
+#else
+#define RECORD_RESUME_SCAN(params, state, node, counter, amount) ((void)0)
+#endif
 // P16 G1: one stage row per flow, then the successor array (`executor/src/device_stage.rs`).
 constexpr uint STAGE_ROW_WORDS = 5;
 constexpr uint SR_FLAGS = 0;
@@ -5384,7 +5398,7 @@ __device__ __forceinline__ bool roce_resume_parked(
     const ulong *params,
     ulong *node_state,
     ulong *generators,
-    const ulong *scheduler_state,
+    ulong *scheduler_state,
     ulong *fel_meta,
     ulong *fel_records,
     ulong *remote_meta,
@@ -5395,7 +5409,9 @@ __device__ __forceinline__ bool roce_resume_parked(
 ) {
     ulong list = scheduler_state[row + 4];
     ulong pairs = scheduler_state[list];
+    RECORD_RESUME_SCAN(params, scheduler_state, node, 0, 1);
     for (ulong index = 0; index < pairs; ++index) {
+        RECORD_RESUME_SCAN(params, scheduler_state, node, 1, 1);
         ulong flow = scheduler_state[list + 1 + index];
         ulong *generator = generators + flow * GENERATOR_WORDS;
         ulong total = generator[G_RATE_TOTAL];

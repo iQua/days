@@ -67,6 +67,72 @@ fn count_pfc_state_scan() {
 pub(crate) fn take_pfc_state_scans_for_testing() -> usize {
     PFC_STATE_SCANS.with(|scans| scans.replace(0))
 }
+/// Test-only (P16 H4): words per LP of the device RESUME-scan counters, `{RESUMEs scanned, queue
+/// pairs examined, parked-bitset words read}`. The instrumented kernels
+/// (`DAYS_RESUME_SCAN_COUNT`, compiled only with `metal-test-hooks` or `cuda-test-hooks`) add to a
+/// row of this many words per LP, appended to `scheduler_state` after planning; each host LP
+/// writes only its own row, so the counters need no atomics.
+#[cfg(any(
+    feature = "cuda-test-hooks",
+    all(feature = "metal-test-hooks", target_vendor = "apple")
+))]
+pub(crate) const RESUME_SCAN_COUNT_WORDS: usize = 3;
+
+/// Test-only (P16 H4): the work of the device RESUME scans of one run, summed over its LPs.
+#[cfg(any(
+    feature = "cuda-test-hooks",
+    all(feature = "metal-test-hooks", target_vendor = "apple")
+))]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResumeScanCounts {
+    /// RESUMEs that unpaused a class at a host and scanned for its parked queue pairs.
+    pub resumes: u64,
+    /// Queue pairs the scans examined (each one restarted or skipped).
+    pub pairs_examined: u64,
+    /// Parked-bitset words the scans read.
+    pub words_read: u64,
+}
+
+#[cfg(any(
+    feature = "cuda-test-hooks",
+    all(feature = "metal-test-hooks", target_vendor = "apple")
+))]
+std::thread_local! {
+    /// Test-only: the RESUME-scan counters of this thread's last successful device run.
+    static RESUME_SCAN_COUNTS: std::cell::Cell<Option<ResumeScanCounts>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: sums the per-LP counter rows `words` (`RESUME_SCAN_COUNT_WORDS` per LP) and keeps
+/// them as this thread's last run's counts.
+#[cfg(any(
+    feature = "cuda-test-hooks",
+    all(feature = "metal-test-hooks", target_vendor = "apple")
+))]
+pub(crate) fn record_resume_scan_counts(words: &[u64]) {
+    let counts = words.as_chunks::<RESUME_SCAN_COUNT_WORDS>().0.iter().fold(
+        ResumeScanCounts::default(),
+        |sum, [resumes, pairs_examined, words_read]| ResumeScanCounts {
+            resumes: sum.resumes + resumes,
+            pairs_examined: sum.pairs_examined + pairs_examined,
+            words_read: sum.words_read + words_read,
+        },
+    );
+    RESUME_SCAN_COUNTS.set(Some(counts));
+}
+
+/// Test-only: the RESUME-scan counters of this thread's last successful Metal or CUDA run, summed
+/// over its LPs; clears them.
+#[cfg(any(
+    feature = "cuda-test-hooks",
+    all(feature = "metal-test-hooks", target_vendor = "apple")
+))]
+#[doc(hidden)]
+pub fn take_resume_scan_counts_for_testing() -> Option<ResumeScanCounts> {
+    RESUME_SCAN_COUNTS.take()
+}
+
 pub(crate) const PFC_ROW_HEADER_WORDS: usize = 5;
 pub(crate) const PFC_INGRESS_WORDS: usize = 43;
 const INGRESS_LINK: usize = 0;

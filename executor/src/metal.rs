@@ -1260,7 +1260,10 @@ impl MetalExecutor {
         warm_start: &CapacityWarmStart,
     ) -> Result<MetalRun, MetalError> {
         #[cfg(feature = "metal-test-hooks")]
-        reset_dominant_arena_high_water();
+        {
+            reset_dominant_arena_high_water();
+            crate::device_pfc::take_resume_scan_counts_for_testing();
+        }
         validate(image, Backend::Metal)
             .map_err(|error| MetalError::Validation(error.to_string()))?;
         validate_config(config)?;
@@ -4100,6 +4103,8 @@ struct DominantArenaDiagnosticLayout {
     remote_high_water_offset: usize,
     node_count: usize,
     queue_high_water_offset: usize,
+    /// P16 H4: the RESUME-scan counter rows in `scheduler_state`.
+    resume_scan_offset: usize,
 }
 
 impl MetalBuffers {
@@ -4142,12 +4147,27 @@ impl MetalBuffers {
                 remote_high_water_offset as u64,
                 queue_high_water_offset as u64,
             ]);
+            // P16 H4: the RESUME-scan counter rows (params word 38), one per LP, zeroed.
+            let resume_scan_offset = plan.scheduler_state.len();
+            plan.scheduler_state.resize(
+                resume_scan_offset
+                    + (plan.params[0] as usize)
+                        .saturating_mul(crate::device_pfc::RESUME_SCAN_COUNT_WORDS),
+                0,
+            );
+            assert_eq!(
+                plan.params.len(),
+                38,
+                "the RESUME-scan counters take params word 38"
+            );
+            plan.params.push(resume_scan_offset as u64);
             DominantArenaDiagnosticLayout {
                 stream_high_water_offset,
                 stream_count: plan.stream_layout.stream_count,
                 remote_high_water_offset,
                 node_count: plan.params[0] as usize,
                 queue_high_water_offset,
+                resume_scan_offset,
             }
         };
         let round_capacity = plan.round_capacity;
@@ -4321,7 +4341,18 @@ impl MetalBuffers {
             .into());
         }
         #[cfg(feature = "metal-test-hooks")]
-        self.record_dominant_arena_high_water();
+        {
+            self.record_dominant_arena_high_water();
+            let layout = &self.dominant_arena_diagnostics;
+            crate::device_pfc::record_resume_scan_counts(
+                &self.planes[27].read_range(
+                    layout.resume_scan_offset,
+                    layout
+                        .node_count
+                        .saturating_mul(crate::device_pfc::RESUME_SCAN_COUNT_WORDS),
+                ),
+            );
+        }
 
         // T20l fix 2: on a SUCCESSFUL attempt, copy the LIVE regions rather than the arena.
         //
@@ -5468,7 +5499,7 @@ impl DirectMetal {
             .ok_or_else(|| MetalError::Unavailable("command queue creation failed".into()))?;
         #[cfg(feature = "metal-test-hooks")]
         let instrumented_source = format!(
-            "#define DAYS_DOMINANT_ARENA_HIGH_WATER 1\n{}",
+            "#define DAYS_DOMINANT_ARENA_HIGH_WATER 1\n#define DAYS_RESUME_SCAN_COUNT 1\n{}",
             include_str!("metal_kernels.metal")
         );
         #[cfg(feature = "metal-test-hooks")]

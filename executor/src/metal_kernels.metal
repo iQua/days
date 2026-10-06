@@ -170,6 +170,21 @@ constant uint P_QUEUE_HIGH_WATER_OFFSET = 37;
 #define RECORD_QUEUE_HIGH_WATER(params, meta, entity, occupancy) ((void)0)
 #endif
 
+// P16 H4 (test hooks only): the RESUME-scan counters. `MetalBuffers::new` appends one row of
+// RESUME_SCAN_COUNT_WORDS words per LP to `scheduler_state`, after every production word, and its
+// offset as params word 38, after the high-water offsets: {RESUMEs scanned, queue pairs examined,
+// parked-bitset words read}. A host LP adds only to its own row, so the counters need no atomics.
+// Production builds compile `RECORD_RESUME_SCAN` to nothing.
+#ifdef DAYS_RESUME_SCAN_COUNT
+constant uint P_RESUME_SCAN_COUNT_OFFSET = 38;
+constant uint RESUME_SCAN_COUNT_WORDS = 3;
+#define RECORD_RESUME_SCAN(params, state, node, counter, amount) \
+    ((state)[(params)[P_RESUME_SCAN_COUNT_OFFSET] + (node) * RESUME_SCAN_COUNT_WORDS + (counter)] += \
+        (ulong)(amount))
+#else
+#define RECORD_RESUME_SCAN(params, state, node, counter, amount) ((void)0)
+#endif
+
 // T21 fix 1 — the re-gridded control sweeps. `evidence/P12/aterm-fixes.md` §3.4. Transliterated
 // word for word from `cuda_kernels.cu`; see that file for the design note.
 //
@@ -5471,7 +5486,7 @@ inline bool roce_resume_parked(
     const device ulong *params,
     device ulong *node_state,
     device ulong *generators,
-    const device ulong *scheduler_state,
+    device ulong *scheduler_state,
     device ulong *fel_meta,
     device ulong *fel_records,
     device ulong *remote_meta,
@@ -5482,7 +5497,9 @@ inline bool roce_resume_parked(
 ) {
     ulong list = scheduler_state[row + 4];
     ulong pairs = scheduler_state[list];
+    RECORD_RESUME_SCAN(params, scheduler_state, node, 0, 1);
     for (ulong index = 0; index < pairs; ++index) {
+        RECORD_RESUME_SCAN(params, scheduler_state, node, 1, 1);
         ulong flow = scheduler_state[list + 1 + index];
         device ulong *generator = generators + flow * GENERATOR_WORDS;
         ulong total = generator[G_RATE_TOTAL];
