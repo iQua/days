@@ -3740,6 +3740,9 @@ fn prepare_tcp_state(
             }
         }
     }
+    // P16 G1: the stage region precedes the RoCE region, which stays the tail of `tcp_state`.
+    let stage_offset = crate::device_stage::append_stage_region(image, &mut words)
+        .map_err(|error| MetalError::Validation(error.into()))?;
     let roce_offset =
         crate::device_mechanism::append_roce_region(image, receiver_offset, &mut words);
     Ok(PreparedTcpState {
@@ -3748,7 +3751,7 @@ fn prepare_tcp_state(
             receiver_offset,
             ledger_meta_offset,
             roce_offset,
-            stage_offset: None,
+            stage_offset,
         },
     })
 }
@@ -4377,6 +4380,20 @@ impl MetalBuffers {
         let ledger_meta = self
             .tcp_state
             .read_range(ledger_meta_range.start, ledger_meta_range.len());
+        // P16 G1: the stage rows, read only when the plan holds a stage region (a stageless image
+        // issues the same reads as before).
+        let stage_rows = if params[PARAM_STAGE_OFFSET] != NONE {
+            let range = metadata_region(
+                self.tcp_state.words,
+                params[PARAM_STAGE_OFFSET] as usize,
+                crate::device_stage::stage_row_words(image),
+                "stage region rows",
+            )
+            .map_err(compaction_error)?;
+            Some(self.tcp_state.read_range(range.start, range.len()))
+        } else {
+            None
+        };
         // P15: the RoCE receiver region, read only when the plan holds one (a non-QP image issues
         // the same reads as before).
         let roce_region = if params[PARAM_ROCE_OFFSET] != NONE {
@@ -4543,6 +4560,16 @@ impl MetalBuffers {
             .expect("compaction returns one buffer per request");
 
         let mut host_states = image.host_states.clone();
+        // P16 G1: stage state first, so the queue-pair decoder knows which anchors a release moved
+        // and the parked-set recomputation sees the decoded releases (design note §1.5).
+        if let Some(rows) = &stage_rows {
+            crate::device_stage::decode_stage_rows(rows, image, &mut host_states).map_err(
+                |_| MetalError::DeviceExecution {
+                    code: 96,
+                    node: None,
+                },
+            )?;
+        }
         let mut switch_states = image.switch_states.clone();
         let mut resident = self
             .orphan_packets
@@ -4584,7 +4611,8 @@ impl MetalBuffers {
                     state.sourced_packets = node_state[base + 7];
                     state.departed_packets = node_state[base + 8];
                     state.received_packets = node_state[base + 9];
-                    for generator in &mut state.generators {
+                    let input = &image.host_states[node.state_slot as usize];
+                    for (position, generator) in state.generators.iter_mut().enumerate() {
                         let offset = generator.flow.0 as usize * GENERATOR_WORDS;
                         generator.packets_emitted = generators[offset + 2];
                         generator.bytes_emitted = generators[offset + 3];
@@ -4651,6 +4679,10 @@ impl MetalBuffers {
                                 crate::device_mechanism::decode_roce_generator(
                                     &generators[offset..offset + GENERATOR_WORDS],
                                     roce,
+                                    crate::device_stage::released_during_run(
+                                        input.stage(position),
+                                        state.stages.get(position).copied().flatten(),
+                                    ),
                                 )
                                 .map_err(|_| {
                                     MetalError::DeviceExecution {

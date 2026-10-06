@@ -261,7 +261,7 @@ impl PlainKernelRefusal {
 ///
 /// It walks only live records, by the arena metas, so its cost is linear in resident records plus
 /// one pass over the generator and receiver rows, once per plan. The first refusal in this order
-/// is returned: condition 1, then 2 by flow, then 3 by flow, then 4 by arena and slot.
+/// is returned: condition 0, then 1, then 2 by flow, then 3 by flow, then 4 by arena and slot.
 pub(crate) fn plain_round_kernel_refusal(plan: &UploadedPlan<'_>) -> Option<PlainKernelRefusal> {
     // A plan whose metas point outside its planes cannot be checked; refuse it rather than accept.
     scan_uploaded_plan(plan).unwrap_or(Some(PlainKernelRefusal::MalformedPlan))
@@ -660,12 +660,21 @@ pub(crate) fn encode_roce_generator(roce: &crate::RoceGenerator, row: &mut [u64]
 /// Restores the mutable words of one RoCE row onto the image's queue pair, checking the
 /// immutable ones (pacer configuration, the timeout, the controller configuration and both
 /// tokens: the pacing token is the row's `G_PAYLOAD`).
+///
+/// `anchor_released` (P16 G1, design note G6) is true exactly when the pair is a collective stage
+/// that was unreleased in the input image and is released in the decoded stage state: its release
+/// moved the grid anchor `G_RATE_FIRST` from zero to the release time (rulings C2, C5), so the
+/// anchor is restored from the row. Every other pair keeps the anchor immutable.
 pub(crate) fn decode_roce_generator(
     row: &[u64],
     roce: &mut crate::RoceGenerator,
+    anchor_released: bool,
 ) -> Result<(), &'static str> {
     let mut expected = [0_u64; 43];
     encode_roce_generator(roce, &mut expected);
+    if anchor_released {
+        expected[G_RATE_FIRST] = row[G_RATE_FIRST];
+    }
     let immutable = [
         G_RATE_FIRST,
         G_RATE_INTERVAL,
@@ -695,6 +704,7 @@ pub(crate) fn decode_roce_generator(
     roce.pacer_armed = flag_word(row[G_ROCE_PACER_ARMED])?;
     roce.window_parked = flag_word(row[G_ROCE_WINDOW_PARKED])?;
     roce.rto_deadline_ns = row[G_ROCE_RTO_DEADLINE];
+    roce.pacer.first_pacing_time_ns = row[G_RATE_FIRST];
     Ok(())
 }
 
@@ -1115,7 +1125,9 @@ mod tests {
     /// P16 G1: a host whose stage table is non-empty sets the stage bit, whatever its generators.
     #[test]
     fn mechanism_flags_follow_stage_presence() {
-        let mut staged = host(vec![generator_state(FlowGeneratorKind::Rate(generator().rate))]);
+        let mut staged = host(vec![generator_state(FlowGeneratorKind::Rate(
+            generator().rate,
+        ))]);
         staged.stages = vec![Some(crate::CollectiveStage {
             role: crate::StageRole::Compute(crate::ComputeStage {
                 compute_id: 0,
@@ -1495,6 +1507,17 @@ mod tests {
         assert_eq!(PlainKernelRefusal::PfcRegion.node(), None);
     }
 
+    /// P16 G1: a stage region refuses the plain kernel ahead of every other condition.
+    #[test]
+    fn a_stage_region_refuses_the_plain_kernel() {
+        let mut plan = PlanFixture::clean();
+        plan.stage_offset = 3;
+        assert_eq!(plan.refusal(), Some(PlainKernelRefusal::StageRegion));
+        assert_eq!(PlainKernelRefusal::StageRegion.node(), None);
+        plan.pfc_offset = 7;
+        assert_eq!(plan.refusal(), Some(PlainKernelRefusal::StageRegion));
+    }
+
     #[test]
     fn a_valid_dcqcn_generator_row_refuses_the_plain_kernel() {
         let mut plan = PlanFixture::clean();
@@ -1506,17 +1529,6 @@ mod tests {
             Some(PlainKernelRefusal::DcqcnGenerator { flow: 1, owner: 1 })
         );
         assert_eq!(refusal.unwrap().node(), Some(crate::NodeId(1)));
-    }
-
-    /// P16 G1: a stage region refuses the plain kernel ahead of every other condition.
-    #[test]
-    fn a_stage_region_refuses_the_plain_kernel() {
-        let mut plan = PlanFixture::clean();
-        plan.stage_offset = 3;
-        assert_eq!(plan.refusal(), Some(PlainKernelRefusal::StageRegion));
-        assert_eq!(PlainKernelRefusal::StageRegion.node(), None);
-        plan.pfc_offset = 7;
-        assert_eq!(plan.refusal(), Some(PlainKernelRefusal::StageRegion));
     }
 
     #[test]
@@ -1788,6 +1800,34 @@ mod tests {
         }
     }
 
+    /// P16 G1 (design note G6): a gated stage's queue pair holds its grid anchor at zero until its
+    /// release writes the release time. Its row decodes onto the input pair with the anchor
+    /// restored; the same change on an ordinary pair stays a corrupt row.
+    #[test]
+    fn a_released_stage_row_restores_its_grid_anchor() {
+        let mut gated = roce_generator();
+        gated.pacer.first_pacing_time_ns = 0;
+        gated.pacer_armed = false;
+        gated.next_psn = 0;
+        gated.snd_una = 0;
+        let released = crate::RoceGenerator {
+            pacer: crate::RocePacer {
+                first_pacing_time_ns: 1_234,
+                ..gated.pacer
+            },
+            pacer_armed: true,
+            ..gated
+        };
+        let mut row = [0_u64; 43];
+        row[6] = released.pacing_timer_payload.0;
+        encode_roce_generator(&released, &mut row);
+        let mut decoded = gated;
+        decode_roce_generator(&row, &mut decoded, true).expect("a released stage row decodes");
+        assert_eq!(decoded, released);
+        let mut ordinary = gated;
+        assert!(decode_roce_generator(&row, &mut ordinary, false).is_err());
+    }
+
     #[test]
     fn roce_generator_rows_round_trip_every_mutable_word() {
         let original = crate::RoceGenerator {
@@ -1807,7 +1847,7 @@ mod tests {
         decoded.window_parked = false;
         decoded.rto_deadline_ns = 0;
         decoded.controller = crate::DcqcnController::pristine(original.controller.config);
-        decode_roce_generator(&row, &mut decoded).expect("row must decode");
+        decode_roce_generator(&row, &mut decoded, false).expect("row must decode");
         assert_eq!(decoded, original);
 
         for (word, value) in [
@@ -1821,7 +1861,7 @@ mod tests {
             let mut changed = row;
             changed[word] = value;
             assert!(
-                decode_roce_generator(&changed, &mut decoded).is_err(),
+                decode_roce_generator(&changed, &mut decoded, false).is_err(),
                 "immutable word {word}"
             );
         }
@@ -1829,7 +1869,7 @@ mod tests {
             let mut changed = row;
             changed[word] = 2;
             assert!(
-                decode_roce_generator(&changed, &mut decoded).is_err(),
+                decode_roce_generator(&changed, &mut decoded, false).is_err(),
                 "flag word {word}"
             );
         }

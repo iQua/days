@@ -2137,6 +2137,9 @@ fn prepare_tcp_state(
         }
     }
 
+    // P16 G1: the stage region precedes the RoCE region, which stays the tail of `tcp_state`.
+    let stage_offset = crate::device_stage::append_stage_region(image, &mut state)
+        .map_err(|error| CudaError::Validation(error.into()))?;
     let roce_offset =
         crate::device_mechanism::append_roce_region(image, receiver_offset, &mut state);
     Ok((
@@ -2145,7 +2148,7 @@ fn prepare_tcp_state(
             receiver_offset,
             ledger_meta_offset,
             roce_offset,
-            stage_offset: None,
+            stage_offset,
         },
     ))
 }
@@ -4601,6 +4604,22 @@ impl CudaBuffers {
                 ),
             ],
         )?;
+        // P16 G1: the stage rows, read only when the plan holds a stage region (a stageless image
+        // issues the same readback requests as before).
+        let stage_rows = if params[PARAM_STAGE_OFFSET] != NONE {
+            let [rows] = bounded_plane_words(
+                stream,
+                [(
+                    tcp_plane,
+                    params[PARAM_STAGE_OFFSET] as usize,
+                    crate::device_stage::stage_row_words(image),
+                    "stage region rows",
+                )],
+            )?;
+            Some(rows)
+        } else {
+            None
+        };
         // P15: the RoCE receiver region, read only when the plan holds one (a non-QP image issues
         // the same readback requests as before).
         let roce_region = if params[PARAM_ROCE_OFFSET] != NONE {
@@ -4772,6 +4791,16 @@ impl CudaBuffers {
             .expect("compaction returns one buffer per request");
 
         let mut host_states = image.host_states.clone();
+        // P16 G1: stage state first, so the queue-pair decoder knows which anchors a release moved
+        // and the parked-set recomputation sees the decoded releases (design note §1.5).
+        if let Some(rows) = &stage_rows {
+            crate::device_stage::decode_stage_rows(rows, image, &mut host_states).map_err(
+                |_| CudaError::DeviceExecution {
+                    code: 96,
+                    node: None,
+                },
+            )?;
+        }
         let mut switch_states = image.switch_states.clone();
         let mut resident = self
             .orphan_packets
@@ -4813,7 +4842,8 @@ impl CudaBuffers {
                     state.sourced_packets = node_state[base + 7];
                     state.departed_packets = node_state[base + 8];
                     state.received_packets = node_state[base + 9];
-                    for generator in &mut state.generators {
+                    let input = &image.host_states[node.state_slot as usize];
+                    for (position, generator) in state.generators.iter_mut().enumerate() {
                         let offset = generator.flow.0 as usize * GENERATOR_WORDS;
                         generator.packets_emitted = generators[offset + 2];
                         generator.bytes_emitted = generators[offset + 3];
@@ -4878,6 +4908,10 @@ impl CudaBuffers {
                                 crate::device_mechanism::decode_roce_generator(
                                     &generators[offset..offset + GENERATOR_WORDS],
                                     roce,
+                                    crate::device_stage::released_during_run(
+                                        input.stage(position),
+                                        state.stages.get(position).copied().flatten(),
+                                    ),
                                 )
                                 .map_err(|_| {
                                     CudaError::DeviceExecution {
