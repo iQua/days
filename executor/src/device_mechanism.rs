@@ -1242,7 +1242,7 @@ mod tests {
         image.flows = (0..8).map(|id| class_flow(id, 3)).collect();
         let mut pair = generator_state(FlowGeneratorKind::Roce(roce_generator()));
         pair.flow = FlowId(5);
-        let mut parked = pair.clone();
+        let mut parked = pair;
         parked.flow = FlowId(7);
         let mut paused_host = host(vec![
             generator_state(FlowGeneratorKind::Rate(generator().rate)),
