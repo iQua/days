@@ -52,7 +52,7 @@ pub fn simai_ring_channels(ranks: &[u64], server_of: impl Fn(u64) -> u64) -> Opt
     servers.sort_unstable();
     servers.dedup();
     let nodes = servers.len();
-    if n % nodes != 0 {
+    if !n.is_multiple_of(nodes) {
         return None;
     }
     let nlocal = n / nodes;
@@ -163,7 +163,7 @@ impl SeededAllToAll {
     /// (`bytes[source * n + target]`), zero on the diagonal. `None` when `experts` is not a
     /// positive multiple of `n`, or a product overflows.
     pub fn bytes(&self, ranks: u64) -> Option<Vec<u64>> {
-        if ranks == 0 || self.experts == 0 || self.experts % ranks != 0 {
+        if ranks == 0 || self.experts == 0 || !self.experts.is_multiple_of(ranks) {
             return None;
         }
         let n = usize::try_from(ranks).ok()?;
@@ -237,7 +237,7 @@ mod tests {
         assert_eq!(channels.len(), 4);
         assert_eq!(&channels[0][..8], &[0, 2, 4, 6, 8, 10, 12, 14]);
         assert_eq!(&channels[1][..8], &[2, 4, 6, 0, 10, 12, 14, 8]);
-        assert_eq!(channels[1][31], 8 * 7 + 0);
+        assert_eq!(channels[1][31], 8 * 7);
         // One rank per server: a single ring in group order.
         let spread = [3, 11, 19, 27];
         assert_eq!(
