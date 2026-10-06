@@ -102,6 +102,11 @@ fn projected_tcp_state_is_the_planners_allocation() {
 /// them byte for byte, because such an image builds no concurrency groups. The E-corpus plans
 /// (E1, E2, E4, E5, E6), too large to allocate here, are compared word for word in the lane's
 /// evidence (`evidence/P16/stagesize/stageless-pin/`).
+///
+/// P16 H4 (ruling G9) adds the parked bitsets, `8 * ceil(Q/64)` words per host-link PFC row with
+/// `Q` queue pairs: `hostpfc_multi_qp_tcp`'s three host rows (3, 1 and 1 pairs) take 8 words
+/// each, +192 B on both backends. The other images have no host-link PFC queue pair and keep
+/// their bytes.
 const STAGELESS_PLAN_BYTES: &[(&str, usize, usize)] = &[
     (
         "configs/benchmarks/baseline/fattree_k4_f8_st.toml",
@@ -118,8 +123,8 @@ const STAGELESS_PLAN_BYTES: &[(&str, usize, usize)] = &[
     ("configs/p15/roce_gbn_lossy.toml", 360_928, 360_904),
     (
         "configs/p15/hostpfc_multi_qp_tcp.toml",
-        2_656_176,
-        2_656_152,
+        2_656_368,
+        2_656_344,
     ),
 ];
 
