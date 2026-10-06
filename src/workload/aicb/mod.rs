@@ -11,6 +11,7 @@ mod error;
 mod groups;
 mod parse;
 mod schedule;
+mod simai_conf;
 
 pub use error::AicbError;
 pub use groups::{Fidelity, GroupFamily, Groups, form_groups, render_mockncclgroup};
@@ -21,4 +22,8 @@ pub use schedule::{
     ChainItem, CollectiveOp, DataQueue, DataQueueOrder, ExpertRouting, HopBounds, ImbalanceParams,
     MatrixRef, OpId, PipelineTransfer, Plan, PlanCounters, PlanOptions, PropagationBounds, Segment,
     SegmentEnd, SimaiEnv, StageChain, StartItem, in_hang_window, plan_schedule,
+};
+pub use simai_conf::{
+    INERT_KEYS, PfcTier, RECORDED_KEYS, RailShape, SimaiConf, SimaiDcqcn, SimaiFabric, SimaiRoce,
+    derive_fabric, parse_simai_conf,
 };
