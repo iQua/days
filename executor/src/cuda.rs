@@ -3281,6 +3281,9 @@ fn derived_remote_capacities(
         let feedback_count = feedback_counts[index];
         let data_count = counts[index].saturating_sub(feedback_count);
         let group = concurrency.and_then(|concurrency| concurrency.group(index));
+        // A windowed pair with its timeout off has at most its window's packets, and as many
+        // feedback packets, in the network at once (ruling R11 (b)).
+        let window = concurrency.and_then(|concurrency| concurrency.window_packets(index));
         for (route, packet_count, packet_kind) in [
             (flow.route.as_slice(), data_count, PacketKind::Data),
             (
@@ -3291,21 +3294,22 @@ fn derived_remote_capacities(
         ] {
             for link_id in route {
                 let producer = image.links[link_id.0 as usize].source.0 as usize;
+                let bound = flow_link_round_bound(
+                    image,
+                    capacity_context,
+                    index,
+                    packet_count,
+                    packet_kind,
+                    *link_id,
+                    lookahead,
+                );
                 crate::stage_sizing::charge(
                     &mut capacities,
                     &mut charges,
                     group,
                     producer,
                     crate::stage_sizing::charge_class(packet_kind),
-                    flow_link_round_bound(
-                        image,
-                        capacity_context,
-                        index,
-                        packet_count,
-                        packet_kind,
-                        *link_id,
-                        lookahead,
-                    ),
+                    window.map_or(bound, |window| bound.min(window)),
                 );
             }
         }

@@ -288,6 +288,88 @@ fn a_longer_stage_chain_plans_no_more_staging_or_queue() {
     }
 }
 
+/// An all-to-all over `ranks` hosts after a compute group, optionally followed by a compute group
+/// that joins its completion (P16 H1), with queue pairs of `window_bytes` (0: none).
+fn all_to_all(ranks: u64, joined: bool, window_bytes: u64) -> String {
+    let base = chained_roce_rings(ranks, 1, window_bytes);
+    let hosts = (0..ranks)
+        .map(|host| host.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sinks = (0..ranks)
+        .map(|host| ((host + 1) % ranks).to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut config = base
+        .replace(
+            "collective_type = \"AllGather\"",
+            "collective_type = \"AllToAll\"",
+        )
+        .replace(&format!("sinks = [{sinks}]\n"), "");
+    if joined {
+        config.push_str(&format!(
+            "\n[[compute]]\nname = \"expert\"\nhosts = [{hosts}]\nduration_ns = 1000\nafter = \"ring0\"\n"
+        ));
+    }
+    config
+}
+
+/// Ruling R11 (a): a join does not hide its predecessors' concurrency. An all-to-all's sends at a
+/// host all run at once, and the compute stage after it waits for all of them; G7's leaf count saw
+/// one leaf there (the join) instead of the sends. The width rule plans the same remote staging
+/// with the join as without it.
+#[test]
+fn a_join_after_an_all_to_all_plans_the_all_to_alls_concurrency() {
+    let alone = compile_text(&all_to_all(4, false, 0));
+    let joined = compile_text(&all_to_all(4, true, 0));
+    let mut plans = vec![(
+        "projection",
+        size_default_device_plan(&alone).expect("projection"),
+        size_default_device_plan(&joined).expect("projection"),
+    )];
+    for ((backend, alone), (_, joined)) in exact_plans(&alone).into_iter().zip(exact_plans(&joined))
+    {
+        plans.push((backend, alone, joined));
+    }
+    for (backend, alone, joined) in plans {
+        assert_eq!(
+            plane_words(&joined, "remote_staging"),
+            plane_words(&alone, "remote_staging"),
+            "{backend}: the joined all-to-all must plan the staging of its three concurrent sends"
+        );
+    }
+}
+
+/// Ruling R11 (b): a windowed queue pair with its timeout off has at most its window's packets in
+/// the network, so its remote staging is bounded by the window: 200 one-kilobyte packets per pair,
+/// a 20,000-byte window (21 packets).
+#[test]
+fn a_windowed_pairs_staging_is_bounded_by_its_window() {
+    let windowless = compile_text(&all_to_all(4, true, 0));
+    let windowed = compile_text(&all_to_all(4, true, 20_000));
+    let mut plans = vec![(
+        "projection",
+        size_default_device_plan(&windowless).expect("projection"),
+        size_default_device_plan(&windowed).expect("projection"),
+    )];
+    for ((backend, windowless), (_, windowed)) in exact_plans(&windowless)
+        .into_iter()
+        .zip(exact_plans(&windowed))
+    {
+        plans.push((backend, windowless, windowed));
+    }
+    for (backend, windowless, windowed) in plans {
+        let (without, with) = (
+            plane_words(&windowless, "remote_staging"),
+            plane_words(&windowed, "remote_staging"),
+        );
+        assert!(
+            with * 4 < without,
+            "{backend}: windowed staging {with} words must fall well below windowless {without}"
+        );
+    }
+}
+
 /// `configs/p15/hostpfc_multi_qp_tcp.toml` with a window on every queue pair: three pairs on host
 /// 1 (and one each on hosts 2 and 3, beside host 2's TCP flow) pace 1 Gb/s each into a 1 Gb/s host
 /// link, so host 1's queue grows until the windows bind (ruling G8).
