@@ -81,8 +81,18 @@ struct SourceSwitch {
     discipline: Option<String>,
     drop: Option<String>,
     ecn_threshold: Option<ExactDecimal>,
+    /// P16 H2: an ECN step threshold per egress link rate, in packets (SimAI's ECN rows are keyed
+    /// by the port's rate); replaces `ecn_threshold` and needs `drop = "ECN_THRESHOLD"`.
+    ecn_by_rate: Option<Vec<SourceEcnRow>>,
     weights: Option<Vec<u64>>,
     priorities: Option<Vec<u64>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceEcnRow {
+    rate_bps: u64,
+    threshold_packets: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,6 +138,27 @@ struct SourcePfc {
     pause_quanta: Option<Vec<u16>>,
     refresh_interval: Option<ExactDecimal>,
     drain_interval: Option<ExactDecimal>,
+    /// P16 H2, the rail fabric only: XOFF and XON per switch tier (SimAI's threshold is one per
+    /// switch, set by its port count); replaces `xoff` and `xon`.
+    by_tier: Option<Vec<SourcePfcTier>>,
+    /// P16 H2: each monitor's headroom by its controlled link's rate, so its buffer capacity is
+    /// XOFF plus that headroom on every enabled priority; replaces `buffer_capacity`.
+    headroom_by_rate: Option<Vec<SourceHeadroomRow>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourcePfcTier {
+    tier: String,
+    xoff: Vec<u64>,
+    xon: Vec<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceHeadroomRow {
+    rate_bps: u64,
+    bytes: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -691,6 +722,8 @@ struct SupportedModel {
     queue_capacity_packets: u64,
     scheduler: SchedulerKind,
     drop_mark: DropMarkPolicy,
+    /// P16 H2: the ECN step threshold of each egress LP by its link rate, overriding `drop_mark`'s.
+    ecn_by_rate: Option<BTreeMap<u64, u64>>,
     pfc: Option<PfcLowering>,
     routing: RoutingPolicy,
     propagation: PropagationModel,
@@ -758,6 +791,12 @@ enum PropagationModel {
     FatTreeTiers(SourcePropagationTiers),
 }
 
+/// Per-priority byte thresholds of one PFC table: XOFF and XON.
+type PfcThresholds = ([u64; 8], [u64; 8]);
+
+/// XOFF, XON and buffer capacity of one ingress monitor.
+type PfcMonitorThresholds = ([u64; 8], [u64; 8], [u64; 8]);
+
 #[derive(Clone)]
 struct PfcLowering {
     xoff: [u64; 8],
@@ -765,6 +804,60 @@ struct PfcLowering {
     buffer_capacity: [u64; 8],
     /// Monitor host-to-switch links as well as switch-to-switch links.
     host_links: bool,
+    /// P16 H2: XOFF and XON of the ASW tier and the PSW tier, replacing `xoff` and `xon`.
+    tiers: Option<[PfcThresholds; 2]>,
+    /// P16 H2: headroom by controlled link rate, replacing `buffer_capacity`.
+    headroom_by_rate: Option<BTreeMap<u64, u64>>,
+}
+
+impl PfcLowering {
+    /// The thresholds of one monitor: its downstream switch's tier (on the rail fabric) and its
+    /// controlled link's rate pick XOFF, XON and the buffer capacity.
+    fn thresholds(
+        &self,
+        profile: TopologyProfile,
+        downstream_switch: u64,
+        controlled_rate_bps: u64,
+    ) -> Result<PfcMonitorThresholds, CompileError> {
+        let (xoff, xon) = match (&self.tiers, profile) {
+            (None, _) => (self.xoff, self.xon),
+            (Some(tiers), TopologyProfile::Rail(rail)) => {
+                let tier = u32::try_from(downstream_switch)
+                    .map(|switch| usize::from(!rail.is_asw(switch)))
+                    .map_err(|_| CompileError::Invalid("switch identity exceeds u32".to_owned()))?;
+                tiers[tier]
+            }
+            (Some(_), _) => {
+                return Err(CompileError::Unsupported(
+                    "unsupported `link.pfc.by_tier` off the SpectrumX rail fabric; switch tiers \
+                     are rail tiers"
+                        .to_owned(),
+                ));
+            }
+        };
+        let buffer_capacity = match &self.headroom_by_rate {
+            None => self.buffer_capacity,
+            Some(rows) => {
+                let headroom = *rows.get(&controlled_rate_bps).ok_or_else(|| {
+                    CompileError::Invalid(format!(
+                        "`link.pfc.headroom_by_rate` has no row for a {controlled_rate_bps} b/s \
+                         controlled link"
+                    ))
+                })?;
+                let mut capacity = [0; 8];
+                for priority in 0..8 {
+                    if xoff[priority] != 0 {
+                        capacity[priority] =
+                            xoff[priority].checked_add(headroom).ok_or_else(|| {
+                                CompileError::Invalid("PFC buffer capacity exceeds u64".to_owned())
+                            })?;
+                    }
+                }
+                capacity
+            }
+        };
+        Ok((xoff, xon, buffer_capacity))
+    }
 }
 
 impl SupportedModel {
@@ -892,6 +985,20 @@ impl SupportedModel {
                     mark_ecn: drop == "RED_ECN",
                 })
             }
+            "ECN_THRESHOLD" if source.switch.ecn_by_rate.is_some() => {
+                if source.switch.ecn_threshold.is_some() {
+                    return Err(CompileError::Invalid(
+                        "`switch.ecn_by_rate` replaces `switch.ecn_threshold`".to_owned(),
+                    ));
+                }
+                // Each egress LP takes its link rate's row at lowering; this policy only carries
+                // the shared capacity and unit.
+                DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
+                    unit: QueueDepthUnit::Packets,
+                    capacity: source.switch.capacity,
+                    threshold: source.switch.capacity,
+                })
+            }
             "ECN_THRESHOLD" => {
                 let threshold = exact_decimal_product_ceil(
                     scenario_text,
@@ -913,6 +1020,15 @@ impl SupportedModel {
             }
         };
 
+        let ecn_by_rate = match (&source.switch.ecn_by_rate, drop) {
+            (None, _) => None,
+            (Some(rows), "ECN_THRESHOLD") => Some(ecn_rows(rows, source.switch.capacity)?),
+            (Some(_), _) => {
+                return Err(CompileError::Invalid(
+                    "`switch.ecn_by_rate` needs `switch.drop = \"ECN_THRESHOLD\"`".to_owned(),
+                ));
+            }
+        };
         let link = source.link.unwrap_or_default();
         let mut pfc = None;
         if let Some(mode) = link.mode.as_deref() {
@@ -944,10 +1060,37 @@ impl SupportedModel {
                             .to_owned(),
                     ));
                 }
-                let mut xoff = exact_pfc_array(config.xoff.as_deref(), "xoff")?;
-                let mut xon = exact_pfc_array(config.xon.as_deref(), "xon")?;
-                let mut buffer_capacity =
-                    exact_pfc_array(config.buffer_capacity.as_deref(), "buffer_capacity")?;
+                let mut tiers = config.by_tier.as_deref().map(pfc_tiers).transpose()?;
+                let headroom_by_rate = config
+                    .headroom_by_rate
+                    .as_deref()
+                    .map(pfc_headroom_rows)
+                    .transpose()?;
+                if tiers.is_some() && (config.xoff.is_some() || config.xon.is_some()) {
+                    return Err(CompileError::Invalid(
+                        "`link.pfc.by_tier` replaces `link.pfc.xoff` and `link.pfc.xon`".to_owned(),
+                    ));
+                }
+                if headroom_by_rate.is_some() && config.buffer_capacity.is_some() {
+                    return Err(CompileError::Invalid(
+                        "`link.pfc.headroom_by_rate` replaces `link.pfc.buffer_capacity`"
+                            .to_owned(),
+                    ));
+                }
+                // With tiers, the ASW tier stands for the enabled priorities (both tiers enable
+                // the same ones); with headroom rows, XOFF stands for the per-monitor capacity.
+                let (mut xoff, mut xon) = match &tiers {
+                    Some(tiers) => tiers[0],
+                    None => (
+                        exact_pfc_array(config.xoff.as_deref(), "xoff")?,
+                        exact_pfc_array(config.xon.as_deref(), "xon")?,
+                    ),
+                };
+                let mut buffer_capacity = if headroom_by_rate.is_some() {
+                    xoff
+                } else {
+                    exact_pfc_array(config.buffer_capacity.as_deref(), "buffer_capacity")?
+                };
                 if let Some(quanta) = config.pause_quanta.as_deref() {
                     let quanta: [u16; 8] = quanta.try_into().map_err(|_| {
                         CompileError::Invalid(
@@ -959,6 +1102,10 @@ impl SupportedModel {
                             xoff[priority] = 0;
                             xon[priority] = 0;
                             buffer_capacity[priority] = 0;
+                            for (tier_xoff, tier_xon) in tiers.iter_mut().flatten() {
+                                tier_xoff[priority] = 0;
+                                tier_xon[priority] = 0;
+                            }
                         }
                     }
                 }
@@ -973,6 +1120,8 @@ impl SupportedModel {
                     xon,
                     buffer_capacity,
                     host_links: config.host_links.unwrap_or(false),
+                    tiers,
+                    headroom_by_rate,
                 });
             } else if mode != "None" {
                 return Err(CompileError::Unsupported(format!(
@@ -1065,6 +1214,7 @@ impl SupportedModel {
             queue_capacity_packets: source.switch.capacity,
             scheduler,
             drop_mark,
+            ecn_by_rate,
             pfc,
             routing,
             propagation,
@@ -1075,6 +1225,76 @@ impl SupportedModel {
             roce_keys,
         })
     }
+}
+
+/// `link.pfc.by_tier`: exactly the `asw` and `psw` tiers, each with eight XOFF and XON entries,
+/// enabling the same priorities, as `[(asw xoff, asw xon), (psw xoff, psw xon)]`.
+fn pfc_tiers(rows: &[SourcePfcTier]) -> Result<[PfcThresholds; 2], CompileError> {
+    let invalid = || {
+        CompileError::Invalid(
+            "`link.pfc.by_tier` must list the `asw` and `psw` tiers once each, with eight XOFF and \
+             XON entries enabling the same priorities"
+                .to_owned(),
+        )
+    };
+    let tier = |name: &str| -> Result<PfcThresholds, CompileError> {
+        let mut found = rows.iter().filter(|row| row.tier == name);
+        let row = found.next().ok_or_else(invalid)?;
+        if found.next().is_some() {
+            return Err(invalid());
+        }
+        let xoff: [u64; 8] = row.xoff.as_slice().try_into().map_err(|_| invalid())?;
+        let mut xon: [u64; 8] = row.xon.as_slice().try_into().map_err(|_| invalid())?;
+        for priority in 0..8 {
+            if xoff[priority] == 0 {
+                xon[priority] = 0;
+            }
+        }
+        Ok((xoff, xon))
+    };
+    if rows.len() != 2 {
+        return Err(invalid());
+    }
+    let tiers = [tier("asw")?, tier("psw")?];
+    if (0..8).any(|priority| (tiers[0].0[priority] == 0) != (tiers[1].0[priority] == 0)) {
+        return Err(invalid());
+    }
+    Ok(tiers)
+}
+
+/// `link.pfc.headroom_by_rate`: one positive headroom per distinct link rate.
+fn pfc_headroom_rows(rows: &[SourceHeadroomRow]) -> Result<BTreeMap<u64, u64>, CompileError> {
+    let mut headroom = BTreeMap::new();
+    for row in rows {
+        if row.rate_bps == 0 || row.bytes == 0 || headroom.insert(row.rate_bps, row.bytes).is_some()
+        {
+            return Err(CompileError::Invalid(
+                "`link.pfc.headroom_by_rate` needs one positive headroom per distinct positive rate"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(headroom)
+}
+
+/// `switch.ecn_by_rate`: one step threshold per distinct link rate, within the queue capacity.
+fn ecn_rows(rows: &[SourceEcnRow], capacity: u64) -> Result<BTreeMap<u64, u64>, CompileError> {
+    let mut thresholds = BTreeMap::new();
+    for row in rows {
+        if row.rate_bps == 0
+            || row.threshold_packets == 0
+            || row.threshold_packets > capacity
+            || thresholds
+                .insert(row.rate_bps, row.threshold_packets)
+                .is_some()
+        {
+            return Err(CompileError::Invalid(format!(
+                "`switch.ecn_by_rate` needs one threshold in 1..={capacity} packets per distinct \
+                 positive rate"
+            )));
+        }
+    }
+    Ok(thresholds)
 }
 
 fn exact_pfc_array(values: Option<&[u64]>, field: &str) -> Result<[u64; 8], CompileError> {
@@ -3422,13 +3642,29 @@ fn lower(
             let LpKey::SwitchPort { switch, egress } = *port else {
                 unreachable!("switch-port key set contains only switch ports")
             };
-            SwitchState {
+            // P16 H2: an ECN row per egress link rate, as SimAI keys its ECN rows by port rate.
+            let drop_mark = match (&model.ecn_by_rate, model.drop_mark) {
+                (Some(rows), DropMarkPolicy::EcnThreshold(policy)) => {
+                    let rate_bps = link_rate.of(egress);
+                    let threshold = *rows.get(&rate_bps).ok_or_else(|| {
+                        CompileError::Invalid(format!(
+                            "`switch.ecn_by_rate` has no row for a {rate_bps} b/s egress link"
+                        ))
+                    })?;
+                    DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
+                        threshold,
+                        ..policy
+                    })
+                }
+                (_, drop_mark) => drop_mark,
+            };
+            Ok(SwitchState {
                 physical_switch: switch,
                 queues: vec![SwitchQueueState {
                     egress_link: Some(ids.link(egress)),
                     scheduler: model.scheduler.clone(),
                     queue_capacity_packets: model.queue_capacity_packets,
-                    drop_mark: model.drop_mark,
+                    drop_mark,
                     pfc: None,
                     queue: VecDeque::new(),
                     in_service: None,
@@ -3438,9 +3674,9 @@ fn lower(
                 arrived_packets: 0,
                 dropped_packets: 0,
                 departed_packets: 0,
-            }
+            })
         })
-        .collect();
+        .collect::<Result<_, CompileError>>()?;
     let links = ids
         .links()
         .map(|(key, id)| LinkDescriptor {
@@ -3677,6 +3913,8 @@ fn lower(
                 }
             }
 
+            let (xoff_threshold_bytes, xon_threshold_bytes, buffer_capacity_bytes) =
+                pfc.thresholds(profile, downstream_physical, controlled.rate_bps)?;
             let downstream_slot = nodes[downstream.0 as usize].state_slot as usize;
             let downstream_queue = switch_states[downstream_slot]
                 .queues
@@ -3689,10 +3927,10 @@ fn lower(
                 .push(PfcIngressState {
                     controlled_link: controlled_id,
                     control_channel_index,
-                    buffer_capacity_bytes: pfc.buffer_capacity,
+                    buffer_capacity_bytes,
                     max_frame_bytes,
-                    xoff_threshold_bytes: pfc.xoff,
-                    xon_threshold_bytes: pfc.xon,
+                    xoff_threshold_bytes,
+                    xon_threshold_bytes,
                     occupancy_bytes: [0; 8],
                     pause_asserted: [false; 8],
                 });
