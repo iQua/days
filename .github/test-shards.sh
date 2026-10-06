@@ -28,7 +28,8 @@
 # Every test command passes `-- --show-output`, as the unsharded commands did.
 #
 # Balance (debug, from days-gpu evidence/P16/cisplit): the named targets are the slowest ones;
-# keep `rest`, where new test files land, the lightest shard.
+# keep `rest`, where new `days` test files land, the lightest shard. It also carries the one full
+# `days` build (`--no-run`) and the doctests.
 set -euo pipefail
 
 LAYOUT='
@@ -39,10 +40,10 @@ package days-validation --features test
 untested xtask
 
 shard lowering-budget days:collective_lowering_budget
-shard width-via-load days:width_via_load_fixtures days:p14_dcqcn_pfc_fixtures
+shard width-via-load-legacy days:width_via_load_fixtures days:p14_dcqcn_pfc_fixtures days-legacy
 shard roce days:p15_roce_fixtures days:p15_roce_collectives
-shard validation days-validation
-shard rest days:rest days-executor days-legacy
+shard validation-executor days-validation days-executor
+shard rest days:rest
 '
 
 # Resolves the layout against the metadata on stdin into
