@@ -438,17 +438,16 @@ fn dcqcn_collectives_stay_rejected_at_lowering() {
     );
 }
 
+/// P16 G1: the device backends accept wrapped TCP stages (identity in
+/// `tests/p16_device_collectives.rs`).
 #[test]
-fn wrapped_stages_are_refused_on_devices_with_the_collective_message() {
+fn wrapped_stages_validate_on_devices() {
     let image = compile_text(
         "tcp-device",
         &tcp_collective_config("RingAllReduce", 2, 1_000, 100),
     );
     for backend in [Backend::Metal, Backend::Cuda] {
-        assert_eq!(
-            validate(&image, backend).unwrap_err().to_string(),
-            format!("backend {backend} does not support collective generators; use Scalar or Cpu")
-        );
+        validate(&image, backend).expect("devices accept collective stages");
     }
 }
 

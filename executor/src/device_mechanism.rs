@@ -1722,6 +1722,42 @@ mod tests {
         // word shifts it by one); the host plans write it at the same index (P15).
         assert!(include_str!("cuda_kernels.cu").contains("constexpr uint P_ROCE_OFFSET = 32;"));
         assert!(include_str!("metal_kernels.metal").contains("constant uint P_ROCE_OFFSET = 33;"));
+        // P16 G1: the stage-region words and bits the kernels' stage pass reads.
+        for (backend, source, declare) in [
+            ("CUDA", include_str!("cuda_kernels.cu"), "constexpr"),
+            ("Metal", include_str!("metal_kernels.metal"), "constant"),
+        ] {
+            use crate::device_stage as stage;
+            for (name, value) in [
+                ("uint STAGE_ROW_WORDS", stage::STAGE_ROW_WORDS as u64),
+                ("uint SR_FLAGS", stage::SR_FLAGS as u64),
+                (
+                    "uint SR_INBOUND_RECEIVED",
+                    stage::SR_INBOUND_RECEIVED as u64,
+                ),
+                (
+                    "uint SR_INBOUND_REQUIRED",
+                    stage::SR_INBOUND_REQUIRED as u64,
+                ),
+                (
+                    "uint SR_LOCAL_SUCCESSORS",
+                    stage::SR_LOCAL_SUCCESSORS as u64,
+                ),
+                (
+                    "uint SR_INBOUND_SUCCESSORS",
+                    stage::SR_INBOUND_SUCCESSORS as u64,
+                ),
+                ("ulong SR_LOCAL_COMPLETE", stage::SR_LOCAL_COMPLETE),
+                ("ulong SR_INBOUND_COMPLETE", stage::SR_INBOUND_COMPLETE),
+                ("ulong SR_HAS_LOCAL", stage::SR_HAS_LOCAL),
+                ("ulong SR_HAS_INBOUND", stage::SR_HAS_INBOUND),
+                ("ulong SR_IS_STAGE", stage::SR_IS_STAGE),
+                ("uint G_COMPUTE_DURATION", G_RATE_INTERVAL as u64),
+            ] {
+                let line = format!("{declare} {name} = {value};");
+                assert!(source.contains(&line), "{backend}: `{line}`");
+            }
+        }
         // P16 G1: the stage region's params word follows the RoCE word on each backend.
         assert!(include_str!("cuda_kernels.cu").contains("constexpr uint P_STAGE_OFFSET = 33;"));
         assert!(include_str!("metal_kernels.metal").contains("constant uint P_STAGE_OFFSET = 34;"));

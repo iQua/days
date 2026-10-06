@@ -147,6 +147,18 @@ constexpr uint P_ROCE_OFFSET = 32;
 // P16 G1: absolute offset of the stage region in `tcp_state`, or NONE without collective or compute
 // stages. Layout in `executor/src/device_stage.rs`.
 constexpr uint P_STAGE_OFFSET = 33;
+// P16 G1: one stage row per flow, then the successor array (`executor/src/device_stage.rs`).
+constexpr uint STAGE_ROW_WORDS = 5;
+constexpr uint SR_FLAGS = 0;
+constexpr uint SR_INBOUND_RECEIVED = 1;
+constexpr uint SR_INBOUND_REQUIRED = 2;
+constexpr uint SR_LOCAL_SUCCESSORS = 3;
+constexpr uint SR_INBOUND_SUCCESSORS = 4;
+constexpr ulong SR_LOCAL_COMPLETE = 1;
+constexpr ulong SR_INBOUND_COMPLETE = 2;
+constexpr ulong SR_HAS_LOCAL = 16;
+constexpr ulong SR_HAS_INBOUND = 32;
+constexpr ulong SR_IS_STAGE = 64;
 constexpr uint PFC_ROW_HEADER_WORDS = 5;
 constexpr uint PFC_INGRESS_WORDS = 43;
 constexpr uint PI_LINK = 0;
@@ -340,6 +352,10 @@ constexpr uint DR_CNP_SIZE = 3;
 // The flow's receiver row holds marker 4 and, at +1, the absolute `tcp_state` offset of its
 // record in the RoCE region; words 2..6 stay zero (the readback compaction reads 4..6).
 constexpr ulong GENERATOR_KIND_ROCE = 4;
+// P16 G1: a compute stage is a Constant generator (kind 0) whose interval word is its duration
+// (the validator pins `interval_ns == duration_ns != 0`).
+constexpr ulong GENERATOR_KIND_CONSTANT = 0;
+constexpr uint G_COMPUTE_DURATION = 13;
 constexpr uint G_ROCE_NEXT_PSN = 16;
 constexpr uint G_ROCE_SND_UNA = 17;
 constexpr uint G_ROCE_WINDOW = 36;
@@ -5326,6 +5342,29 @@ __device__ __forceinline__ bool roce_data_arrival(
         fel_records, remote_meta, remote_staging, stream_state, stream_records, tcp_state);
 }
 
+// P16 G1: whether a stage's prerequisites are complete (`StageDependencies::prerequisites_complete`).
+// At every event boundary this equals the stage's `activated` (the validator pins it), so the
+// device stores no release flag.
+__device__ __forceinline__ bool stage_prerequisites(ulong flags) {
+    return ((flags & SR_HAS_LOCAL) == 0 || (flags & SR_LOCAL_COMPLETE) != 0) &&
+        ((flags & SR_HAS_INBOUND) == 0 || (flags & SR_INBOUND_COMPLETE) != 0);
+}
+
+// P16 G1: `flow` is a collective stage its prerequisites have not released. False without a stage
+// region.
+__device__ __forceinline__ bool stage_unreleased(
+    ulong flow,
+    const ulong *params,
+    const ulong *tcp_state
+) {
+    ulong region = params[P_STAGE_OFFSET];
+    if (region == NONE) {
+        return false;
+    }
+    ulong flags = tcp_state[region + flow * STAGE_ROW_WORDS + SR_FLAGS];
+    return (flags & SR_IS_STAGE) != 0 && !stage_prerequisites(flags);
+}
+
 // Host-link PFC (P15): the queue pairs a RESUME of class `priority` restarts at a host, each on its
 // next grid point strictly after the RESUME, in generator-position (`FlowId`) order.
 //
@@ -5334,9 +5373,8 @@ __device__ __forceinline__ bool roce_data_arrival(
 // function's conjuncts with `data class == priority` in place of `is_paused(class)`, because Scalar
 // takes the set after the last controller's resume has unpaused the class. A window-parked pair
 // waits for feedback, not for the RESUME (P16 ruling D7), so the scan skips it as that function
-// does. After R3 merges, the
-// specification skips queue pairs of unreleased collective stages: devices refuse stages in P15,
-// and P16 must add the same skip here.
+// does. A queue pair of a collective stage its prerequisites have not released has never ticked,
+// so no pause parked it: the scan skips it as that function does (P16 G1).
 __device__ __forceinline__ bool roce_resume_parked(
     ulong node,
     const ulong *event,
@@ -5364,7 +5402,7 @@ __device__ __forceinline__ bool roce_resume_parked(
         if (pfc_flow_data_class(flow, params, scheduler_state) != priority ||
             generator[G_ROCE_PACER_ARMED] != 0 || generator[G_ROCE_WINDOW_PARKED] != 0 ||
             generator[G_STATUS] == 3 || generator[G_ROCE_NEXT_PSN] >= total ||
-            generator[G_ROCE_SND_UNA] >= total) {
+            generator[G_ROCE_SND_UNA] >= total || stage_unreleased(flow, params, tcp_state)) {
             continue;
         }
         // A phase-0 transition: the controller's due instants before the RESUME apply first.
@@ -5511,6 +5549,219 @@ __device__ __forceinline__ bool wfq_remove_at(
     return true;
 }
 
+// P16 G1: `activate_wrapped_stage`, for a stage whose prerequisites this event completed. Its
+// generator must be `Blocked` (an unreleased stage always is; Scalar's release test requires it).
+//   TCP: `prepare_tcp_attempts` from sequence 0 with the window filled at the release time, as an
+//        ordinary flow's first window (Scalar's prepare plus install).
+//   RoCE (`start_roce_stage`): the grid is anchored at the release time and the pacer armed, its
+//        first tick at that time; the controller stays pristine and the RTO starts with a send.
+//   Compute (`start_compute_stage`): a zero-byte token names a timer at release + duration, or the
+//        stage stops without one when that passes the stop time.
+__device__ __forceinline__ bool stage_release(
+    ulong node,
+    const ulong *event,
+    ulong flow,
+    ulong *error,
+    const ulong *params,
+    ulong *node_state,
+    ulong *generators,
+    ulong *fel_meta,
+    ulong *fel_records,
+    ulong *queue_meta,
+    ulong *queue_records,
+    ulong *remote_meta,
+    ulong *remote_staging,
+    ulong *stream_state,
+    ulong *stream_records,
+    ulong *summary,
+    ulong *observation_meta,
+    ulong *observed,
+    ulong *tcp_state
+) {
+    ulong *row = generators + flow * GENERATOR_WORDS;
+    if (row[G_VALID] == 0 || row[G_OWNER] != node || row[G_STATUS] != 1) {
+        set_semantic_error(error, 102, node);
+        return false;
+    }
+    ulong now = event[E_TIME];
+    ulong kind = row[G_KIND];
+    if (kind == 1) {
+        return prepare_tcp_attempts(
+            node, flow, event, false, 0, true, false, error, params, node_state, generators,
+            fel_meta, fel_records, queue_meta, queue_records, remote_meta, remote_staging,
+            stream_state, stream_records, summary, observation_meta, observed, tcp_state);
+    }
+    if (kind == GENERATOR_KIND_ROCE) {
+        row[G_RATE_FIRST] = now;
+        row[G_ROCE_PACER_ARMED] = 1;
+        row[G_DEPARTURE] = now;
+        roce_settle(row, row[G_STATUS]);
+        return roce_emit_timers(
+            node, event, row, flow, now, NONE, error, params, node_state, fel_meta, fel_records,
+            remote_meta, remote_staging, stream_state, stream_records, tcp_state);
+    }
+    ulong deadline;
+    if (kind != GENERATOR_KIND_CONSTANT || !checked_add(now, row[G_COMPUTE_DURATION], deadline)) {
+        set_semantic_error(error, 104, node);
+        return false;
+    }
+    row[G_DEPARTURE] = deadline;
+    if (deadline > params[P_STOP_TIME]) {
+        row[G_STATUS] = 3;
+        row[G_PAYLOAD] = 0;
+        return true;
+    }
+    ulong token;
+    if (!allocate_tcp_payload(node, node_state, params, token)) {
+        set_semantic_error(error, 104, node);
+        return false;
+    }
+    row[G_STATUS] = 0;
+    row[G_PAYLOAD] = token;
+    ulong packet[EVENT_WORDS];
+    packet_clear(packet);
+    packet[PK_ID] = token;
+    packet[PK_FLOW] = flow;
+    packet[PK_KIND] = DATA_PACKET;
+    return emit_child(
+        node, event, node, PACING_TIMER, deadline, packet, error, params, node_state, fel_meta,
+        fel_records, remote_meta, remote_staging, stream_state, stream_records, tcp_state);
+}
+
+// P16 G1: `host_compute_timer`'s own transition. The local completion it causes runs in the
+// event's stage pass (`stage_after_event`), after this transition, as Scalar's does.
+__device__ __forceinline__ bool compute_timer(
+    ulong node,
+    const ulong *event,
+    ulong *error,
+    const ulong *params,
+    ulong *generators,
+    const ulong *tcp_state
+) {
+    ulong flow = event[PK_FLOW];
+    if ((tcp_state[params[P_STAGE_OFFSET] + flow * STAGE_ROW_WORDS + SR_FLAGS] & SR_IS_STAGE) ==
+        0) {
+        return true;
+    }
+    ulong *row = generators + flow * GENERATOR_WORDS;
+    if (row[G_STATUS] != 0 || row[G_PAYLOAD] != event[E_PAYLOAD] ||
+        row[G_DEPARTURE] != event[E_TIME]) {
+        set_semantic_error(error, 103, node);
+        return false;
+    }
+    row[G_STATUS] = 2;
+    return true;
+}
+
+// P16 G1: the stage pass of one host transition (`complete_local_successors` or
+// `record_inbound_progress`, then `activate_ready_collectives`), run after the transition's own
+// emissions, as Scalar releases after them. Each transition names one predecessor flow and so
+// one successor list (design note §1.2, fact C):
+//   TCP or RoCE data at its target: the receiver's in-order frontier advanced; every inbound
+//     successor not yet complete takes the new frontier (its byte count equals the frontier
+//     before the event, the validator's own relation), completing at the requirement;
+//   TCP ACK, RoCE ACK or NACK at the source, or a compute timer: once the flow is complete
+//     (cumulative ACK or `snd_una` at the total, or the timer finished), every local successor not
+//     yet complete is completed.
+// Successors are visited in ascending `FlowId` (generator-position order) and each is released as
+// its prerequisites complete; a release writes no stage row, so this equals Scalar's update-all-
+// then-release loop (facts A and B), with the same origin and payload sequence order.
+__device__ __forceinline__ bool stage_after_event(
+    ulong node,
+    const ulong *event,
+    ulong *error,
+    const ulong *params,
+    ulong *node_state,
+    ulong *generators,
+    ulong *fel_meta,
+    ulong *fel_records,
+    ulong *queue_meta,
+    ulong *queue_records,
+    ulong *remote_meta,
+    ulong *remote_staging,
+    ulong *stream_state,
+    ulong *stream_records,
+    ulong *summary,
+    ulong *observation_meta,
+    ulong *observed,
+    ulong *tcp_state
+) {
+    ulong kind = event[E_KIND];
+    ulong packet = event[PK_KIND] & PK_KIND_MASK;
+    ulong flow = event[PK_FLOW];
+    if (node_state[node * NODE_WORDS + N_KIND] != HOST || flow >= params[P_FLOW_COUNT]) {
+        return true;
+    }
+    bool inbound = kind == REMOTE_ARRIVAL &&
+        (packet == TCP_DATA_PACKET || packet == ROCE_DATA_PACKET);
+    bool local = (kind == REMOTE_ARRIVAL &&
+            (packet == TCP_ACK_PACKET || packet == ROCE_ACK_PACKET ||
+                packet == ROCE_NACK_PACKET)) ||
+        (kind == PACING_TIMER && packet == DATA_PACKET);
+    if (!inbound && !local) {
+        return true;
+    }
+    ulong region = params[P_STAGE_OFFSET];
+    ulong list = tcp_state[region + flow * STAGE_ROW_WORDS +
+        (inbound ? SR_INBOUND_SUCCESSORS : SR_LOCAL_SUCCESSORS)];
+    ulong count = list & 0xfffffffful;
+    if (count == 0) {
+        return true;
+    }
+    ulong frontier = 0;
+    if (inbound) {
+        const ulong *receiver =
+            tcp_state + params[P_TCP_RECEIVER_OFFSET] + flow * TCP_RECEIVER_WORDS;
+        frontier = packet == TCP_DATA_PACKET ? receiver[3] : tcp_state[receiver[1] + RR_EXPECTED];
+    } else {
+        const ulong *row = generators + flow * GENERATOR_WORDS;
+        bool complete = row[G_KIND] == 1 ? row[G_TCP_HIGHEST_ACK] >= row[G_TCP_TOTAL]
+            : row[G_KIND] == GENERATOR_KIND_ROCE ? row[G_ROCE_SND_UNA] >= row[G_RATE_TOTAL]
+            : row[G_KIND] == GENERATOR_KIND_CONSTANT && row[G_STATUS] == 2;
+        if (!complete) {
+            return true;
+        }
+    }
+    ulong successors = region + (list >> 32);
+    for (ulong index = 0; index < count; ++index) {
+        ulong successor = tcp_state[successors + index];
+        if (successor >= params[P_FLOW_COUNT]) {
+            set_semantic_error(error, 100, node);
+            return false;
+        }
+        ulong *stage = tcp_state + region + successor * STAGE_ROW_WORDS;
+        ulong flags = stage[SR_FLAGS];
+        if (inbound) {
+            if ((flags & SR_HAS_INBOUND) == 0 || (flags & SR_INBOUND_COMPLETE) != 0 ||
+                frontier == stage[SR_INBOUND_RECEIVED]) {
+                continue;
+            }
+            if (frontier < stage[SR_INBOUND_RECEIVED] || frontier > stage[SR_INBOUND_REQUIRED]) {
+                set_semantic_error(error, 101, node);
+                return false;
+            }
+            stage[SR_INBOUND_RECEIVED] = frontier;
+            if (frontier != stage[SR_INBOUND_REQUIRED]) {
+                continue;
+            }
+            flags |= SR_INBOUND_COMPLETE;
+        } else {
+            if ((flags & SR_HAS_LOCAL) == 0 || (flags & SR_LOCAL_COMPLETE) != 0) {
+                continue;
+            }
+            flags |= SR_LOCAL_COMPLETE;
+        }
+        stage[SR_FLAGS] = flags;
+        if (stage_prerequisites(flags) && !stage_release(
+                node, event, successor, error, params, node_state, generators, fel_meta,
+                fel_records, queue_meta, queue_records, remote_meta, remote_staging,
+                stream_state, stream_records, summary, observation_meta, observed, tcp_state)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 template <bool MECHANISMS>
 __device__ __forceinline__ bool dispatch_event(
     ulong node,
@@ -5565,6 +5816,12 @@ __device__ __forceinline__ bool dispatch_event(
                 node, event, error, params, node_state, generators, fel_meta, fel_records,
                 queue_meta, queue_records, remote_meta, remote_staging, stream_state,
                 stream_records, summary, observation_meta, observed, tcp_state);
+        }
+        // P16 G1: a compute stage's timer (Scalar's `host_compute_timer`).
+        if (MECHANISMS && params[P_STAGE_OFFSET] != NONE && flow < params[P_FLOW_COUNT] &&
+            generators[generator + G_VALID] != 0 && generators[generator + G_OWNER] == node &&
+            generators[generator + G_KIND] == GENERATOR_KIND_CONSTANT) {
+            return compute_timer(node, event, error, params, generators, tcp_state);
         }
         if (flow >= params[P_FLOW_COUNT] || generators[generator + G_VALID] == 0 ||
             generators[generator + G_OWNER] != node || generators[generator + G_KIND] != 2) {
