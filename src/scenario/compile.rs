@@ -26,7 +26,7 @@ use super::ids::{IdError, LinkKey, LpKey, PhysicalNodeKey, StableIds, dense_ids}
 use crate::topos::build::{
     HostAttachments, PairingPolicy, TopologyError, TopologyProfile, build_graph_with_profile,
 };
-use crate::topos::rail::ServerLocality;
+use crate::topos::rail::{RailProfile, ServerLocality};
 use crate::topos::route::{
     EcmpFlow, RouteTableError, RouteWorkers, compute_fat_tree_ecmp_route_table,
     compute_shortest_path_route_table_with,
@@ -99,6 +99,8 @@ enum RoutingPolicy {
     #[default]
     ShortestPath,
     FatTreeEcmp,
+    /// SimAI's per-flow Murmur3 choice of spine at the source leaf of the rail fabric (P16 H2).
+    SimAiEcmp,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1034,10 +1036,11 @@ impl SupportedModel {
         {
             None | Some("ShortestPath") => RoutingPolicy::ShortestPath,
             Some("FatTreeEcmp") => RoutingPolicy::FatTreeEcmp,
+            Some("SimAiEcmp") => RoutingPolicy::SimAiEcmp,
             Some(unsupported) => {
                 return Err(CompileError::Unsupported(format!(
                     "unsupported `routing.policy` `{unsupported}`; Days lowering supports \
-                     ShortestPath and FatTreeEcmp"
+                     ShortestPath, FatTreeEcmp and SimAiEcmp"
                 )));
             }
         };
@@ -2753,6 +2756,9 @@ fn lower(
         .iter()
         .enumerate()
         .filter(|(index, flow)| flow.compute.is_none() && notify.delay(*index).is_none());
+    // SimAI's ECMP picks the feedback path by its own hash, so its reverse routes are not the
+    // reversed forward routes; every other policy reverses the forward switch path.
+    let mut reverse_route_table = None;
     let route_table = match model.routing {
         RoutingPolicy::ShortestPath => compute_shortest_path_route_table_with(
             graph,
@@ -2765,6 +2771,21 @@ fn lower(
             }),
             route_workers,
         ),
+        RoutingPolicy::SimAiEcmp => {
+            let TopologyProfile::Rail(rail) = profile else {
+                return Err(CompileError::Unsupported(
+                    "unsupported `routing.policy = \"SimAiEcmp\"` on a topology that is not the \
+                     SpectrumX rail fabric"
+                        .to_owned(),
+                ));
+            };
+            let (forward, reverse) = simai_ecmp_route_tables(
+                rail,
+                routed_flows.map(|(index, flow)| (index, flow.source, flow.target)),
+            );
+            reverse_route_table = Some(reverse);
+            Ok(forward)
+        }
         RoutingPolicy::FatTreeEcmp => compute_fat_tree_ecmp_route_table(
             graph,
             routed_flows.map(|(index, flow)| EcmpFlow {
@@ -2815,7 +2836,10 @@ fn lower(
                 };
             }
             let switch_path = &route_table[&index];
-            let reverse_switch_path = switch_path.iter().rev().copied().collect::<Vec<_>>();
+            let reverse_switch_path = match &reverse_route_table {
+                Some(reverse) => reverse[&index].clone(),
+                None => switch_path.iter().rev().copied().collect::<Vec<_>>(),
+            };
             FlowDescriptor {
                 id: FlowId(flow_ids[&flow.key]),
                 source: ids.node(LpKey::Host(flow.source)),
@@ -3687,6 +3711,52 @@ fn lower(
         initial_events,
         seed: model.seed,
     })
+}
+
+/// SimAI's ECMP on the rail fabric (P16 H2, ruling H2-6): each routed flow is one SimAI message.
+///
+/// Message `k` between an ordered host pair, in canonical flow order, takes source port
+/// `10000 + k` (SimAI's per-pair counter, wrapping at 2^16); the source ASW hashes the data tuple
+/// to pick its PSW, and the target ASW hashes the swapped tuple for the feedback path
+/// ([`RailProfile::data_psw`], [`RailProfile::feedback_psw`]). GPUs sharing an ASW cross no PSW.
+/// The ordinal stands in for SimAI's run-time issue order (statistically equivalent, ruled; the
+/// canonical order is the stage keys' order, which the collective lowering fixes).
+fn simai_ecmp_route_tables(
+    rail: RailProfile,
+    flows: impl Iterator<Item = (usize, u64, u64)>,
+) -> (
+    BTreeMap<usize, Vec<NodeIndex>>,
+    BTreeMap<usize, Vec<NodeIndex>>,
+) {
+    let mut ordinals = BTreeMap::<(u64, u64), u64>::new();
+    let mut forward = BTreeMap::new();
+    let mut reverse = BTreeMap::new();
+    for (index, source, target) in flows {
+        let ordinal = ordinals.entry((source, target)).or_default();
+        let sport = RailProfile::simai_sport(*ordinal);
+        *ordinal += 1;
+        // Rail host identities are GPU ids below `rail.gpus`, a `u32`.
+        let (source, target) = (source as u32, target as u32);
+        let (source_asw, target_asw) = (rail.asw_of(source), rail.asw_of(target));
+        let node = |index: u32| NodeIndex::new(index as usize);
+        let path = |from: u32, psw: Option<u32>, to: u32| match psw {
+            None => vec![node(from)],
+            Some(psw) => vec![node(from), node(rail.psw_index(psw)), node(to)],
+        };
+        forward.insert(
+            index,
+            path(source_asw, rail.data_psw(source, target, sport), target_asw),
+        );
+        reverse.insert(
+            index,
+            path(
+                target_asw,
+                rail.feedback_psw(source, target, sport),
+                source_asw,
+            ),
+        );
+    }
+    (forward, reverse)
 }
 
 /// The stage identity and pristine prerequisite state of one collective stage.

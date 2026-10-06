@@ -74,6 +74,86 @@ impl RailProfile {
     }
 }
 
+/// SimAI's ECMP hash, `SwitchNode::EcmpHash` (Murmur3 x86-32) over three little-endian 32-bit
+/// words, the only length SimAI hashes: `(sip, dip, sport | dport << 16)` (ns-3-alibabacloud
+/// `switch-node.cc:63-90,142-178`). Golden vectors from SimAI's own code pin it
+/// (`tests/p16_rail_ecmp.rs`).
+pub const fn simai_ecmp_hash(words: [u32; 3], seed: u32) -> u32 {
+    let mut hash = seed;
+    let mut index = 0;
+    while index < 3 {
+        let mut k = words[index].wrapping_mul(0xcc9e_2d51);
+        k = k.rotate_left(15);
+        k = k.wrapping_mul(0x1b87_3593);
+        hash ^= k;
+        hash = hash.rotate_left(13);
+        hash = hash.wrapping_add(hash << 2).wrapping_add(0xe654_6b64);
+        index += 1;
+    }
+    hash ^= 12;
+    hash ^= hash >> 16;
+    hash = hash.wrapping_mul(0x85eb_ca6b);
+    hash ^= hash >> 13;
+    hash = hash.wrapping_mul(0xc2b2_ae35);
+    hash ^ (hash >> 16)
+}
+
+/// SimAI's address of node `id` (`node_id_to_ip`, astra-sim frontend `common.h:146-149`).
+pub const fn simai_node_ip(id: u32) -> u32 {
+    0x0b00_0001 + (id / 256) * 0x0001_0000 + (id % 256) * 0x0000_0100
+}
+
+/// SimAI's destination port of every RDMA flow (`entry.h:115`).
+pub const SIMAI_DPORT: u32 = 100;
+/// SimAI's first source port per host pair; message `k` of a pair uses `10000 + k`, wrapping as
+/// SimAI's `uint16_t` counter does (`common.h:120`, `entry.h:115-127`).
+pub const SIMAI_FIRST_SPORT: u16 = 10000;
+
+impl RailProfile {
+    /// The SimAI source port of the `ordinal`-th message between one ordered host pair.
+    pub const fn simai_sport(ordinal: u64) -> u16 {
+        // SimAI's `portNumber[src][dst]++` is a `uint16_t`: the port wraps after 65,535.
+        (SIMAI_FIRST_SPORT as u64).wrapping_add(ordinal) as u16
+    }
+
+    /// The PSW (0-based, Days order) a source ASW picks for a message `source -> target` with
+    /// source port `sport`; `None` when the two GPUs share an ASW (no PSW is crossed).
+    ///
+    /// SimAI's next-hop vector at an ASW lists the PSWs in descending node id: MEASURED from
+    /// SimAI's printed routing tables on the 128g and 1024g files (P16 H2,
+    /// `evidence/P16/railtopo-impl/psw-order/`). Entry `k` is therefore PSW `psws - 1 - k`.
+    pub const fn data_psw(&self, source: u32, target: u32, sport: u16) -> Option<u32> {
+        let asw = self.asw_of(source);
+        if asw == self.asw_of(target) {
+            return None;
+        }
+        let words = [
+            simai_node_ip(source),
+            simai_node_ip(target),
+            sport as u32 | (SIMAI_DPORT << 16),
+        ];
+        let entry = simai_ecmp_hash(words, self.simai_switch_id(asw)) % self.psws;
+        Some(self.psws - 1 - entry)
+    }
+
+    /// The PSW the target's ASW picks for the ACK or NACK of that message: SimAI swaps the
+    /// addresses and the ports (`rdma-hw.cc:430-444`) and hashes with the target ASW's seed, so the
+    /// feedback path is an independent choice, not the reverse of the data path.
+    pub const fn feedback_psw(&self, source: u32, target: u32, sport: u16) -> Option<u32> {
+        let asw = self.asw_of(target);
+        if asw == self.asw_of(source) {
+            return None;
+        }
+        let words = [
+            simai_node_ip(target),
+            simai_node_ip(source),
+            SIMAI_DPORT | ((sport as u32) << 16),
+        ];
+        let entry = simai_ecmp_hash(words, self.simai_switch_id(asw)) % self.psws;
+        Some(self.psws - 1 - entry)
+    }
+}
+
 /// One built rail fabric and its configuration (kept for rendering SimAI's header and strings).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RailTopology {
