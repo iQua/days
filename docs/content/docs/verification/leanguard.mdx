@@ -261,8 +261,10 @@ fixtures, plus mutations each checker must reject with a named message), and the
 and WFQ fixture and coverage scripts. `protocol-traces` runs the legacy engine on the CI fixtures
 and the legacy checkers on its traces.
 
-The P10c collective, DCQCN, RoCE and AQM checkers are linear in the row count: per-flow,
-per-queue and per-stage state lives in hash maps, and no check searches earlier rows per row.
+The P10c collective, DCQCN, RoCE and AQM checkers are linear in the row count, except the
+collective checker's TCP replay, which keeps a per-flow frontier in an ordered map and is
+n log n: per-flow, per-queue and per-stage state lives in hash maps, and no check searches
+earlier rows per row.
 Where P16 replaced such a search, the old list-scan functions stayed in a test-only module
 (`lean/LeanGuard/P10c/Test/`), and three `lean-fixtures` steps keep the two in agreement:
 

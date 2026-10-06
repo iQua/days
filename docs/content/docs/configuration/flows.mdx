@@ -100,7 +100,7 @@ Exact lowering supports byte-bounded Reno and CUBIC. It rejects BBR, duration-bo
 
 ## DCQCN
 
-**Scope: Days AGO.** The legacy engine's DCQCN keys are on the [Legacy flows](/docs/legacy/components/flows#dcqcn-configuration) page; the two tables share no format.
+**Scope: Days AGO.** The legacy engine's DCQCN keys are on the [Legacy flows](/docs/legacy/components/flows#dcqcn-configuration) page; the two tables differ.
 
 Days AGO runs the Mellanox form of DCQCN: the reaction point of HPCC's ns-3 model (`CC_MODE 1`) and of SimAI, in exact integer arithmetic. `[flow.traffic.dcqcn]` configures it on an unreliable `flow_type = "DCQCN"` flow and on a [RoCE queue pair](#roce-queue-pairs). Only `max_rate_gbps` is required; the other controller keys default to the values SimAI and HPCC ship.
 
@@ -128,7 +128,7 @@ rate_decrease_interval_ns = 4000
 rp_timer_ns = 900000
 fast_recovery_times = 1
 clamp_target_rate = false
-pacing_interval_ns = 1000
+pacing_interval_ns = 800          # one 1,000-byte packet per tick covers 10 Gbps
 cnp_interval_ns = 0               # unreliable flows only
 cnp_priority = 0                  # unreliable flows only; default priority
 ```
@@ -222,7 +222,7 @@ On a NACK or a timeout, the sender rewinds to the first unacknowledged byte and 
 
 **ECN echo.** Each ACK or NACK echoes the CE bit of the data packet whose arrival produced it. With `ack_every_packets` above `1`, only the packet that produces the ACK is echoed; a NACK that the NACK interval suppresses echoes nothing. The sender's controller takes one feedback per ACK or NACK whose echo is set, until the pair completes. ACKs and NACKs ride `feedback_priority`; a class other than the data class is not held back by a pause of the data class.
 
-**Window.** With `window_bytes` above `0`, the window is `w = window_bytes`, or with `variable_window` the larger of `1` and `floor(window_bytes * R_C / max_rate_gbps)` with `R_C` the controller's current rate; the product is exact and does not wrap. A pacing tick that has a packet to send and finds `next_psn - snd_una >= w` sends nothing, adds no credit and parks the pacer, as a tick in a paused class does. Only an ACK or NACK that moves `snd_una`, or a timeout, restarts it; a rate increase or a host-link RESUME does not. SimAI sets `m_win` to a bandwidth-delay product, `(2 * propagation delay + one packet's transmission time) * line rate` in bytes, of the pair's path or the largest over all host pairs; Days AGO takes the value from `window_bytes`.
+**Window.** With `window_bytes` above `0`, the window is `w = window_bytes`, or with `variable_window` the larger of `1` and `floor(window_bytes * R_C / R_max)`, with `R_C` the controller's current rate and `R_max` its `max_rate_gbps`, both in bits per second; the product is exact and does not wrap. A pacing tick that has a packet to send and finds `next_psn - snd_una >= w` sends nothing, adds no credit and parks the pacer, as a tick in a paused class does. Only an ACK or NACK that moves `snd_una`, or a timeout, restarts it; a rate increase or a host-link RESUME does not. SimAI sets `m_win` to a bandwidth-delay product, `(2 * propagation delay + one packet's transmission time) * line rate` in bytes, of the pair's path or the largest over all host pairs; Days AGO takes the value from `window_bytes`.
 
 **With the timeout off, only a NACK repairs a loss.** A NACK needs a later packet of the same queue pair to arrive out of order. If the last packet is lost, or the last ACK, or a resent packet is lost again when nothing follows it, the queue pair stalls for the rest of the run. It never completes, and the run does not report an error. This is the NACK-only Go-back-N of the HPCC ns-3 model; keep the timeout on unless you need that behavior.
 

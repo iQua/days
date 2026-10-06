@@ -80,8 +80,8 @@ reference transition.
 
 A Days AGO trace can run to tens of thousands of rows, so the P10c checkers keep their replay
 state in hash maps keyed by flow, queue or stage and never search earlier rows per row: the RoCE,
-DCQCN, collective and AQM checkers are linear in the row count (the collective checker's TCP
-replay keeps a per-flow frontier in an ordered map). Where P16 replaced a scan, the old functions
+DCQCN, collective and AQM checkers are linear in the row count, except the collective checker's
+TCP replay, which keeps a per-flow frontier in an ordered map and is n log n. Where P16 replaced a scan, the old functions
 stayed in a test-only module and a differential harness runs both on every fixture and on
 generated mutants in CI; see [Continuous integration](/docs/verification/leanguard#continuous-integration).
 
