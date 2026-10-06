@@ -97,6 +97,43 @@ fn projected_tcp_state_is_the_planners_allocation() {
     }
 }
 
+/// Exact default plan bytes (Summary) of images with no stage and no windowed queue pair, MEASURED
+/// on p16/colldev `da555a9` before P16 G2 (Metal on the Mac, CUDA on sim): rulings G7 and G8 leave
+/// them byte for byte, because such an image builds no concurrency groups. The E-corpus plans
+/// (E1, E2, E4, E5, E6), too large to allocate here, are compared word for word in the lane's
+/// evidence (`evidence/P16/stagesize/stageless-pin/`).
+const STAGELESS_PLAN_BYTES: &[(&str, usize, usize)] = &[
+    (
+        "configs/benchmarks/baseline/fattree_k4_f8_st.toml",
+        773_816,
+        773_792,
+    ),
+    (
+        "configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml",
+        1_417_280,
+        1_417_256,
+    ),
+    ("configs/p14/dcqcn_1s_zero_xoff.toml", 260_992, 260_968),
+    ("configs/p15/roce_lossless_pfc.toml", 854_400, 854_376),
+    ("configs/p15/roce_gbn_lossy.toml", 360_928, 360_904),
+    (
+        "configs/p15/hostpfc_multi_qp_tcp.toml",
+        2_656_176,
+        2_656_152,
+    ),
+];
+
+#[test]
+fn stageless_windowless_plans_keep_their_bytes() {
+    for &(relative, metal, cuda) in STAGELESS_PLAN_BYTES {
+        let image = lower(relative);
+        for (backend, exact) in exact_plans(&image) {
+            let expected = if backend == "Metal" { metal } else { cuda };
+            assert_eq!(exact.total_device_bytes, expected, "{backend} {relative}");
+        }
+    }
+}
+
 /// A RoCE AllGather ring of `ranks` hosts on one switch, `chained` times in a row: each
 /// collective follows a compute group on the same hosts (compute -> AllGather -> compute ->
 /// AllGather ...), so every host's stages form one chain of `chained * (ranks - 1)` RoCE stages.
