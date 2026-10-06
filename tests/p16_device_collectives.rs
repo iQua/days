@@ -68,14 +68,18 @@ const ANCHORS: [(&str, u64, u64); 6] = [
 ];
 
 /// Capacity retries per fixture on the default plan (`*_stage_fixtures_pin_their_capacity_retries`),
-/// MEASURED at P16 G1 commit 5 on Metal (M5 Max) and CUDA (sim, RTX A4500): none.
+/// MEASURED at P16 G1 commit 5 on Metal (M5 Max) and CUDA (sim, RTX A4500): none. P16 G2 (ruling
+/// G7) charges host 3's six ring stages of `roce_ring_release_paused` as one chain, so its host
+/// queue plans 202 records, not the summed stages' slack; host 3's windowless background pair and a
+/// released stage share the paused class there and reach 203, one queue retry (202 -> 406),
+/// MEASURED on both backends and within the design note's §5.2 bar of two.
 #[allow(dead_code)]
 const PINNED_RETRIES_METAL: &[(&str, usize)] = &[
     ("roce_ring_allreduce_lossless", 0),
     ("roce_allgather_lossless", 0),
     ("roce_ring_lossy", 0),
     ("roce_compute_dag", 0),
-    ("roce_ring_release_paused", 0),
+    ("roce_ring_release_paused", 1),
     ("roce_tcp_mixed_collectives", 0),
     ("roce_allgather_compute_lossy", 0),
     ("tcp-RingAllReduce-2", 0),
