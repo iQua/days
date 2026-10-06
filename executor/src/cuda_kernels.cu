@@ -144,6 +144,9 @@ constexpr uint P_PFC_OFFSET = 31;
 // P15 lane R4: absolute offset of the RoCE receiver region in `tcp_state`, or NONE without queue-pair
 // receivers. Layout in `executor/src/device_mechanism.rs`.
 constexpr uint P_ROCE_OFFSET = 32;
+// P16 G1: absolute offset of the stage region in `tcp_state`, or NONE without collective or compute
+// stages. Layout in `executor/src/device_stage.rs`.
+constexpr uint P_STAGE_OFFSET = 33;
 constexpr uint PFC_ROW_HEADER_WORDS = 5;
 constexpr uint PFC_INGRESS_WORDS = 43;
 constexpr uint PI_LINK = 0;

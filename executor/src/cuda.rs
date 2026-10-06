@@ -108,6 +108,8 @@ const PARAM_PFC_OFFSET: usize = 31;
 /// Params word holding the RoCE receiver region offset in `tcp_state`, or `NONE` without queue-pair
 /// receivers (P15).
 const PARAM_ROCE_OFFSET: usize = 32;
+/// Params word holding the stage region offset in `tcp_state`, or `NONE` without stages (P16 G1).
+const PARAM_STAGE_OFFSET: usize = 33;
 const PACKET_ECN_FLAG: u64 = 1_u64 << 63;
 const PACKET_KIND_MASK: u64 = !PACKET_ECN_FLAG;
 
@@ -1863,6 +1865,7 @@ impl CudaPlan {
         let plan = crate::device_mechanism::UploadedPlan {
             pfc_offset: self.params[PARAM_PFC_OFFSET],
             roce_offset: self.params[PARAM_ROCE_OFFSET],
+            stage_offset: self.params[PARAM_STAGE_OFFSET],
             receiver_offset: self.params[PARAM_RECEIVER_OFFSET],
             // `P_NODE_COUNT` and `P_FLOW_COUNT`.
             node_count: self.params[0] as usize,
@@ -1968,6 +1971,8 @@ struct TcpLayout {
     ledger_meta_offset: usize,
     /// The RoCE receiver region, a tail of `tcp_state`; `None` without queue-pair receivers.
     roce_offset: Option<usize>,
+    /// The stage region (P16 G1), just before the RoCE region; `None` without stages.
+    stage_offset: Option<usize>,
 }
 
 fn encode_control(control: TcpCongestionControl, words: &mut [u64]) {
@@ -2140,6 +2145,7 @@ fn prepare_tcp_state(
             receiver_offset,
             ledger_meta_offset,
             roce_offset,
+            stage_offset: None,
         },
     ))
 }
@@ -2822,6 +2828,7 @@ impl CudaPlan {
             streams.layout.round_scratch_offset as u64,
             pfc_offset.map_or(NONE, |offset| offset as u64),
             tcp_layout.roce_offset.map_or(NONE, |offset| offset as u64),
+            tcp_layout.stage_offset.map_or(NONE, |offset| offset as u64),
         ];
 
         Ok(Self {

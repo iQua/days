@@ -289,6 +289,19 @@ fn fingerprint(value: &impl std::fmt::Debug) -> (u64, u64) {
     (text.len() as u64, hash)
 }
 
+/// Every stage image selects the mechanisms build (design note G4): the TCP-only and compute-only
+/// images carry no other mechanism, so without the stage bit they would select the plain build.
+#[test]
+fn stage_images_select_the_mechanisms_round_kernel() {
+    for (name, image) in stage_images() {
+        assert_eq!(
+            days_executor::RoundKernel::for_image(&image),
+            days_executor::RoundKernel::Mechanisms,
+            "{name}"
+        );
+    }
+}
+
 /// The images exercise what the identity tests rely on: unreleased, released and finished stages
 /// of both transports and of compute at checkpoints, a pending compute timer, and an unreleased
 /// stage queue pair at a host whose data class is paused (the RESUME skip, design note §3.3).

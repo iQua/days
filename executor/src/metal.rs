@@ -494,8 +494,11 @@ const PARAM_LEDGER_META_OFFSET: usize = 29;
 /// Params word holding the PFC region offset in `scheduler_state`, or `NONE` without PFC state.
 const PARAM_PFC_OFFSET: usize = 32;
 /// Params word holding the RoCE receiver region offset in `tcp_state`, or `NONE` without queue-pair
-/// receivers (P15). The test-hook high-water words follow it.
+/// receivers (P15).
 const PARAM_ROCE_OFFSET: usize = 33;
+/// Params word holding the stage region offset in `tcp_state`, or `NONE` without stages (P16 G1).
+/// The test-hook high-water words follow it.
+const PARAM_STAGE_OFFSET: usize = 34;
 const PARAM_ROUND_THREADS: usize = 30;
 
 const CONTROL_ERROR: usize = 0;
@@ -1623,6 +1626,7 @@ impl MetalPlan {
         let plan = crate::device_mechanism::UploadedPlan {
             pfc_offset: self.params[PARAM_PFC_OFFSET],
             roce_offset: self.params[PARAM_ROCE_OFFSET],
+            stage_offset: self.params[PARAM_STAGE_OFFSET],
             receiver_offset: self.params[PARAM_RECEIVER_OFFSET],
             // `P_NODE_COUNT` and `P_FLOW_COUNT`.
             node_count: self.params[0] as usize,
@@ -1728,6 +1732,8 @@ struct TcpStateLayout {
     ledger_meta_offset: usize,
     /// The RoCE receiver region, a tail of `tcp_state`; `None` without queue-pair receivers.
     roce_offset: Option<usize>,
+    /// The stage region (P16 G1), just before the RoCE region; `None` without stages.
+    stage_offset: Option<usize>,
 }
 
 struct PreparedTcpState {
@@ -2393,6 +2399,10 @@ impl MetalPlan {
             tcp_state
                 .layout
                 .roce_offset
+                .map_or(NONE, |offset| offset as u64),
+            tcp_state
+                .layout
+                .stage_offset
                 .map_or(NONE, |offset| offset as u64),
         ];
 
@@ -3738,6 +3748,7 @@ fn prepare_tcp_state(
             receiver_offset,
             ledger_meta_offset,
             roce_offset,
+            stage_offset: None,
         },
     })
 }

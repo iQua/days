@@ -36,6 +36,12 @@ pub(crate) const MECHANISM_PFC: u64 = 4;
 /// Host-link PFC needs no bit of its own: host pause state lives in the PFC region, so it sets
 /// [`MECHANISM_PFC`].
 pub(crate) const MECHANISM_ROCE: u64 = 8;
+/// Mechanism bit (P16 G1): some host carries a collective or compute stage, so the plan holds the
+/// stage region (`P_STAGE_OFFSET`) and stage transitions can run. Stage presence is a property of
+/// the image's shape (no transition adds or removes a stage), so the bit holds for the whole run.
+/// A TCP-only or compute-only collective image has no other mechanism, so without this bit it
+/// would select the plain build, which compiles the stage path out.
+pub(crate) const MECHANISM_STAGES: u64 = 16;
 
 /// The two builds of the device round kernel (`days_round`), selected per run from the image.
 ///
@@ -68,6 +74,11 @@ pub(crate) fn mechanism_flags(image: &SimulationImage) -> u64 {
     // (P15: the per-mechanism walks of P14 are folded, so a TCP image walks no more than before).
     let mut flags = 0;
     for state in &image.host_states {
+        // P16 G1: the stage table is empty on a stageless host (`HostState::stages`), so this is
+        // one length test per host inside the existing walk.
+        if !state.stages.is_empty() {
+            flags |= MECHANISM_STAGES;
+        }
         if !state.dcqcn_receivers.is_empty() {
             flags |= MECHANISM_DCQCN_RECEIVERS | MECHANISM_DCQCN;
         }
@@ -141,6 +152,8 @@ pub(crate) struct UploadedPlan<'a> {
     /// `params[P_ROCE_OFFSET]`: the RoCE receiver region in `tcp_state`, or `NONE` without
     /// queue-pair receivers.
     pub(crate) roce_offset: u64,
+    /// `params[P_STAGE_OFFSET]`: the stage region in `tcp_state`, or `NONE` without stages (P16).
+    pub(crate) stage_offset: u64,
     pub(crate) node_count: usize,
     pub(crate) flow_count: usize,
     pub(crate) node_state: &'a [u64],
@@ -164,6 +177,9 @@ pub(crate) struct UploadedPlan<'a> {
 /// Why the plain round kernel may not run an uploaded plan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PlainKernelRefusal {
+    /// The plan carries a stage region (P16): the plain kernel compiles the stage path out, so it
+    /// would never release a gated stage and would drop compute timers.
+    StageRegion,
     /// The plan carries a PFC region.
     PfcRegion,
     /// The plan carries a RoCE receiver region.
@@ -200,7 +216,7 @@ impl PlainKernelRefusal {
     /// The LP the refusal concerns, where there is one.
     pub(crate) fn node(self) -> Option<crate::NodeId> {
         match self {
-            Self::PfcRegion | Self::RoceRegion | Self::MalformedPlan => None,
+            Self::StageRegion | Self::PfcRegion | Self::RoceRegion | Self::MalformedPlan => None,
             Self::DcqcnGenerator { owner, .. } | Self::RoceGenerator { owner, .. } => {
                 Some(crate::NodeId(owner))
             }
@@ -216,6 +232,9 @@ impl PlainKernelRefusal {
 ///
 /// The plain `days_round` compiles every Lane B transition out and carries no device-side stop, so
 /// the host refuses to launch it on any plan that could need one. It refuses when:
+/// 0. the stage region is present (`P_STAGE_OFFSET != NONE`, P16): the plain build compiles every
+///    stage transition out, so a gated stage would never release and a compute timer would be
+///    dropped by its `PACING_TIMER` path (wrong bytes, not lost time);
 /// 1. the PFC region is present (`P_PFC_OFFSET != NONE`);
 /// 2. a valid generator row has `G_KIND == GENERATOR_KIND_DCQCN`;
 /// 3. a receiver region exists and a flow's receiver row carries a DCQCN marker (2 or 3; the check
@@ -256,6 +275,9 @@ fn scan_uploaded_plan(plan: &UploadedPlan<'_>) -> Result<Option<PlainKernelRefus
         EVENT_WORDS, StoredEventClass, decode_event_record, stored_event_words,
     };
 
+    if plan.stage_offset != PLAN_NONE {
+        return Ok(Some(PlainKernelRefusal::StageRegion));
+    }
     if plan.pfc_offset != PLAN_NONE {
         return Ok(Some(PlainKernelRefusal::PfcRegion));
     }
@@ -1090,6 +1112,33 @@ mod tests {
         );
     }
 
+    /// P16 G1: a host whose stage table is non-empty sets the stage bit, whatever its generators.
+    #[test]
+    fn mechanism_flags_follow_stage_presence() {
+        let mut staged = host(vec![generator_state(FlowGeneratorKind::Rate(generator().rate))]);
+        staged.stages = vec![Some(crate::CollectiveStage {
+            role: crate::StageRole::Compute(crate::ComputeStage {
+                compute_id: 0,
+                group_size: 1,
+                rank: 0,
+                duration_ns: 1,
+            }),
+            dependencies: crate::StageDependencies {
+                local_predecessor: None,
+                inbound_predecessor: None,
+                inbound_predecessor_bytes: 0,
+                local_predecessor_complete: true,
+                inbound_predecessor_complete: true,
+                inbound_bytes_received: 0,
+            },
+            activated: true,
+        })];
+        assert_eq!(
+            mechanism_flags(&image(vec![host(Vec::new()), staged], Vec::new())),
+            MECHANISM_STAGES
+        );
+    }
+
     fn pfc_queue() -> crate::SwitchQueueState {
         crate::SwitchQueueState {
             egress_link: Some(crate::LinkId(0)),
@@ -1293,6 +1342,7 @@ mod tests {
     struct PlanFixture {
         pfc_offset: u64,
         roce_offset: u64,
+        stage_offset: u64,
         receiver_offset: u64,
         node_state: Vec<u64>,
         generators: Vec<u64>,
@@ -1388,6 +1438,7 @@ mod tests {
             Self {
                 pfc_offset: T_NONE,
                 roce_offset: T_NONE,
+                stage_offset: T_NONE,
                 receiver_offset: 0,
                 node_state: vec![0_u64; 2 * 11],
                 generators,
@@ -1407,6 +1458,7 @@ mod tests {
             plain_round_kernel_refusal(&UploadedPlan {
                 pfc_offset: self.pfc_offset,
                 roce_offset: self.roce_offset,
+                stage_offset: self.stage_offset,
                 receiver_offset: self.receiver_offset,
                 node_count: 2,
                 flow_count: 2,
@@ -1454,6 +1506,17 @@ mod tests {
             Some(PlainKernelRefusal::DcqcnGenerator { flow: 1, owner: 1 })
         );
         assert_eq!(refusal.unwrap().node(), Some(crate::NodeId(1)));
+    }
+
+    /// P16 G1: a stage region refuses the plain kernel ahead of every other condition.
+    #[test]
+    fn a_stage_region_refuses_the_plain_kernel() {
+        let mut plan = PlanFixture::clean();
+        plan.stage_offset = 3;
+        assert_eq!(plan.refusal(), Some(PlainKernelRefusal::StageRegion));
+        assert_eq!(PlainKernelRefusal::StageRegion.node(), None);
+        plan.pfc_offset = 7;
+        assert_eq!(plan.refusal(), Some(PlainKernelRefusal::StageRegion));
     }
 
     #[test]
@@ -1543,6 +1606,7 @@ mod tests {
         let refusal = plain_round_kernel_refusal(&UploadedPlan {
             pfc_offset: plan.pfc_offset,
             roce_offset: plan.roce_offset,
+            stage_offset: plan.stage_offset,
             receiver_offset: plan.receiver_offset,
             node_count: 2,
             flow_count: 2,
@@ -1646,6 +1710,9 @@ mod tests {
         // word shifts it by one); the host plans write it at the same index (P15).
         assert!(include_str!("cuda_kernels.cu").contains("constexpr uint P_ROCE_OFFSET = 32;"));
         assert!(include_str!("metal_kernels.metal").contains("constant uint P_ROCE_OFFSET = 33;"));
+        // P16 G1: the stage region's params word follows the RoCE word on each backend.
+        assert!(include_str!("cuda_kernels.cu").contains("constexpr uint P_STAGE_OFFSET = 33;"));
+        assert!(include_str!("metal_kernels.metal").contains("constant uint P_STAGE_OFFSET = 34;"));
     }
 
     #[test]

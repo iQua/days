@@ -115,6 +115,9 @@ constant uint P_PFC_OFFSET = 32;
 // P15 lane R4: absolute offset of the RoCE receiver region in `tcp_state`, or NONE without queue-pair
 // receivers. Layout in `executor/src/device_mechanism.rs`.
 constant uint P_ROCE_OFFSET = 33;
+// P16 G1: absolute offset of the stage region in `tcp_state`, or NONE without collective or compute
+// stages. Layout in `executor/src/device_stage.rs`.
+constant uint P_STAGE_OFFSET = 34;
 constant uint PFC_ROW_HEADER_WORDS = 5;
 constant uint PFC_INGRESS_WORDS = 43;
 constant uint PI_LINK = 0;
@@ -129,11 +132,11 @@ constant ulong PFC_FRAME_BYTES = 64;
 
 // Test-hook-only vector offsets appended to the physical metadata buffers after planning. Each
 // entity owns its own slot, so ordinary max writes preserve the actor model and need no atomics.
-// They follow every production params word, P15's RoCE offset (33) included.
+// They follow every production params word, P16's stage offset (34) included.
 #ifdef DAYS_DOMINANT_ARENA_HIGH_WATER
-constant uint P_STREAM_HIGH_WATER_OFFSET = 34;
-constant uint P_REMOTE_HIGH_WATER_OFFSET = 35;
-constant uint P_QUEUE_HIGH_WATER_OFFSET = 36;
+constant uint P_STREAM_HIGH_WATER_OFFSET = 35;
+constant uint P_REMOTE_HIGH_WATER_OFFSET = 36;
+constant uint P_QUEUE_HIGH_WATER_OFFSET = 37;
 #define RECORD_STREAM_HIGH_WATER(params, state, entity, occupancy) \
     (state)[(params)[P_STREAM_HIGH_WATER_OFFSET] + (entity)] = max( \
         (state)[(params)[P_STREAM_HIGH_WATER_OFFSET] + (entity)], \
