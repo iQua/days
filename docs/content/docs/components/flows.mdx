@@ -17,10 +17,10 @@ The source host LP owns a `FlowGeneratorState`. The compiler lowers supported tr
 
 - constant open-loop traffic for `PacketDistribution`
 - source-owned TCP Reno or CUBIC state
-- exact rate and controller state for DCQCN
+- the Mellanox-form DCQCN controller and credit pacer for unreliable DCQCN flows, and the same controller with Go-back-N sender state and the window for RoCE queue pairs
 - resolved stages for RingAllReduce and AllGather
 
-Target hosts own TCP cumulative-ACK state and DCQCN notification-point state. Generator status records whether the next emission is scheduled, blocked, finished, or stopped beyond the scenario endpoint.
+Target hosts own TCP cumulative-ACK state, the DCQCN notification point of unreliable flows, and the Go-back-N receiver of queue pairs, which echoes ECN on its ACKs and NACKs. Generator status records whether the next emission is scheduled, blocked, finished, or stopped beyond the scenario endpoint.
 
 ## What lowering accepts
 
@@ -28,7 +28,7 @@ Lowering derives flow IDs and routes from canonical semantic keys. It rejects ex
 
 ## Backend limits
 
-Scalar and CPU execute every generator family. Metal and CUDA execute constant, TCP, and DCQCN generators, including the DCQCN controller and CNP state, plus the standalone `Rate` generator that image builders can construct through the executor API (TOML lowering produces rate state only inside DCQCN). Capability validation rejects collective and compute stages before execution:
+Scalar and CPU execute every generator family. Metal and CUDA execute constant, TCP, DCQCN and RoCE queue-pair generators, including the DCQCN controller, the notification point and the queue-pair window, plus the standalone `Rate` generator that image builders can construct through the executor API (TOML lowering produces rate state only inside DCQCN). Capability validation rejects collective and compute stages before execution:
 
 ```text
 backend Metal does not support collective generators; use Scalar or Cpu

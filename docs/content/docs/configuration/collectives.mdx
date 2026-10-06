@@ -123,7 +123,7 @@ Step 1 of the first phase (reduce-scatter for `RingAllReduce`, all-gather for `A
 
 ### RoCE stages
 
-With `flow_type = "RoCE"`, each stage is a RoCE queue pair: DCQCN rate control with Go-back-N recovery, as described for [RoCE flows](/docs/configuration/flows). The collective's tables replace the flow's:
+With `flow_type = "RoCE"`, each stage is a RoCE queue pair: Mellanox-form DCQCN rate control, fed by the ECN echo on its ACKs and NACKs, with Go-back-N recovery, as described for [RoCE flows](/docs/configuration/flows#roce-queue-pairs). The collective's tables replace the flow's:
 
 ```toml
 [[collective]]
@@ -147,22 +147,19 @@ max_rate_gbps = 1.0
 g = 0.00390625
 ai_rate_gbps = 0.005
 hai_rate_gbps = 0.05
-mi_factor = 0.5
-rtt_ns = 50000
-cnp_interval_ns = 10000
+rp_timer_ns = 50000
 pacing_interval_ns = 1000
-increase_byte_threshold = 100000
 
 [collective.traffic.roce]
 retransmit_timeout_ns = 1000000
 feedback_priority = 0
 ```
 
-`configs/p15/roce_compute_dag.toml` puts this collective between two compute groups on a four-switch line with host-link PFC. Scalar and CPU at 2 workers both end it with `result_bytes=218236 result_fnv1a64=b3e9c56fa7276c1c`.
+`configs/p15/roce_compute_dag.toml` puts this collective between two compute groups on a four-switch line with host-link PFC. Scalar and CPU at 2 workers both end it with `result_bytes=212197 result_fnv1a64=e94b963fa5fd954a`.
 
 A RoCE stage differs from a TCP stage in four points:
 
-- **Start.** A stage that starts at time `t` behaves exactly like a queue pair whose `initial_delay` is `t`. Its first pacing tick is at `t`, its pacing grid is anchored at `t`, and its first DCQCN control tick is at `t + rtt_ns`. Its retransmission timeout is armed by its first packet. Before it starts, a stage sends nothing and has no pending event.
+- **Start.** A stage that starts at time `t` behaves exactly like a queue pair whose `initial_delay` is `t`. Its first pacing tick is at `t` and its pacing grid is anchored at `t`. Its DCQCN controller is pristine until the stage's first ECN echo, and its retransmission timeout is armed by its first packet. Before it starts, a stage sends nothing and has no pending event.
 - **Inbound progress.** The receiver discards out-of-order packets (Go-back-N), so only the packet whose PSN equals the receiver's expected PSN advances the inbound predecessor.
 - **Completion.** The local predecessor is complete at the first ACK that acknowledges all of its bytes. A NACK never completes a stage.
 - **Pause.** If the stage's data class is paused at its host when it starts (host-link PFC), its first tick sends nothing and parks the queue pair, and the RESUME restarts it on the grid anchored at `t`.
@@ -172,7 +169,7 @@ A RoCE stage differs from a TCP stage in four points:
 - In the final state, the stalled stage's generator is not `Finished` (its `snd_una` is below its total), and its successors' stage records still read `activated: false`.
 - In the collective trace, no local-completion row names the stalled stage as its cause.
 
-With the timeout off, a stage is safe from a stall only if neither its data nor its feedback can be dropped: no loss on its data class and none on its `feedback_priority` class. PFC on the data class alone is not enough. A switch queue's `capacity` counts packets of every class, so unprotected packets that share the queue, such as traffic on a class without PFC or a burst of 64-byte ACKs, can fill it and tail-drop protected data too. The example above protects only its data class: its ACKs, NACKs and CNPs ride class 0, which has no PFC, so other unprotected traffic on the same switches can make it stall.
+With the timeout off, a stage is safe from a stall only if neither its data nor its feedback can be dropped: no loss on its data class and none on its `feedback_priority` class. PFC on the data class alone is not enough. A switch queue's `capacity` counts packets of every class, so unprotected packets that share the queue, such as traffic on a class without PFC or a burst of 64-byte ACKs, can fill it and tail-drop protected data too. The example above protects only its data class: its ACKs and NACKs ride class 0, which has no PFC, so other unprotected traffic on the same switches can make it stall.
 
 To check a run, read `dropped_packets` in the run summary (`days` prints it in its result line). A run that dropped no packet has no stall of this kind. If it dropped packets, the two signals above show whether a stage stalled.
 
