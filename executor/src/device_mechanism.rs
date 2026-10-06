@@ -36,6 +36,12 @@ pub(crate) const MECHANISM_PFC: u64 = 4;
 /// Host-link PFC needs no bit of its own: host pause state lives in the PFC region, so it sets
 /// [`MECHANISM_PFC`].
 pub(crate) const MECHANISM_ROCE: u64 = 8;
+/// Mechanism bit (P16 G1): some host carries a collective or compute stage, so the plan holds the
+/// stage region (`P_STAGE_OFFSET`) and stage transitions can run. Stage presence is a property of
+/// the image's shape (no transition adds or removes a stage), so the bit holds for the whole run.
+/// A TCP-only or compute-only collective image has no other mechanism, so without this bit it
+/// would select the plain build, which compiles the stage path out.
+pub(crate) const MECHANISM_STAGES: u64 = 16;
 
 /// The two builds of the device round kernel (`days_round`), selected per run from the image.
 ///
@@ -68,6 +74,11 @@ pub(crate) fn mechanism_flags(image: &SimulationImage) -> u64 {
     // (P15: the per-mechanism walks of P14 are folded, so a TCP image walks no more than before).
     let mut flags = 0;
     for state in &image.host_states {
+        // P16 G1: the stage table is empty on a stageless host (`HostState::stages`), so this is
+        // one length test per host inside the existing walk.
+        if !state.stages.is_empty() {
+            flags |= MECHANISM_STAGES;
+        }
         if !state.dcqcn_receivers.is_empty() {
             flags |= MECHANISM_DCQCN_RECEIVERS | MECHANISM_DCQCN;
         }
@@ -141,6 +152,8 @@ pub(crate) struct UploadedPlan<'a> {
     /// `params[P_ROCE_OFFSET]`: the RoCE receiver region in `tcp_state`, or `NONE` without
     /// queue-pair receivers.
     pub(crate) roce_offset: u64,
+    /// `params[P_STAGE_OFFSET]`: the stage region in `tcp_state`, or `NONE` without stages (P16).
+    pub(crate) stage_offset: u64,
     pub(crate) node_count: usize,
     pub(crate) flow_count: usize,
     pub(crate) node_state: &'a [u64],
@@ -164,6 +177,9 @@ pub(crate) struct UploadedPlan<'a> {
 /// Why the plain round kernel may not run an uploaded plan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PlainKernelRefusal {
+    /// The plan carries a stage region (P16): the plain kernel compiles the stage path out, so it
+    /// would never release a gated stage and would drop compute timers.
+    StageRegion,
     /// The plan carries a PFC region.
     PfcRegion,
     /// The plan carries a RoCE receiver region.
@@ -200,7 +216,7 @@ impl PlainKernelRefusal {
     /// The LP the refusal concerns, where there is one.
     pub(crate) fn node(self) -> Option<crate::NodeId> {
         match self {
-            Self::PfcRegion | Self::RoceRegion | Self::MalformedPlan => None,
+            Self::StageRegion | Self::PfcRegion | Self::RoceRegion | Self::MalformedPlan => None,
             Self::DcqcnGenerator { owner, .. } | Self::RoceGenerator { owner, .. } => {
                 Some(crate::NodeId(owner))
             }
@@ -216,6 +232,9 @@ impl PlainKernelRefusal {
 ///
 /// The plain `days_round` compiles every Lane B transition out and carries no device-side stop, so
 /// the host refuses to launch it on any plan that could need one. It refuses when:
+/// 0. the stage region is present (`P_STAGE_OFFSET != NONE`, P16): the plain build compiles every
+///    stage transition out, so a gated stage would never release and a compute timer would be
+///    dropped by its `PACING_TIMER` path (wrong bytes, not lost time);
 /// 1. the PFC region is present (`P_PFC_OFFSET != NONE`);
 /// 2. a valid generator row has `G_KIND == GENERATOR_KIND_DCQCN`;
 /// 3. a receiver region exists and a flow's receiver row carries a DCQCN marker (2 or 3; the check
@@ -242,7 +261,7 @@ impl PlainKernelRefusal {
 ///
 /// It walks only live records, by the arena metas, so its cost is linear in resident records plus
 /// one pass over the generator and receiver rows, once per plan. The first refusal in this order
-/// is returned: condition 1, then 2 by flow, then 3 by flow, then 4 by arena and slot.
+/// is returned: condition 0, then 1, then 2 by flow, then 3 by flow, then 4 by arena and slot.
 pub(crate) fn plain_round_kernel_refusal(plan: &UploadedPlan<'_>) -> Option<PlainKernelRefusal> {
     // A plan whose metas point outside its planes cannot be checked; refuse it rather than accept.
     scan_uploaded_plan(plan).unwrap_or(Some(PlainKernelRefusal::MalformedPlan))
@@ -256,6 +275,9 @@ fn scan_uploaded_plan(plan: &UploadedPlan<'_>) -> Result<Option<PlainKernelRefus
         EVENT_WORDS, StoredEventClass, decode_event_record, stored_event_words,
     };
 
+    if plan.stage_offset != PLAN_NONE {
+        return Ok(Some(PlainKernelRefusal::StageRegion));
+    }
     if plan.pfc_offset != PLAN_NONE {
         return Ok(Some(PlainKernelRefusal::PfcRegion));
     }
@@ -638,12 +660,21 @@ pub(crate) fn encode_roce_generator(roce: &crate::RoceGenerator, row: &mut [u64]
 /// Restores the mutable words of one RoCE row onto the image's queue pair, checking the
 /// immutable ones (pacer configuration, the timeout, the controller configuration and both
 /// tokens: the pacing token is the row's `G_PAYLOAD`).
+///
+/// `anchor_released` (P16 G1, design note G6) is true exactly when the pair is a collective stage
+/// that was unreleased in the input image and is released in the decoded stage state: its release
+/// moved the grid anchor `G_RATE_FIRST` from zero to the release time (rulings C2, C5), so the
+/// anchor is restored from the row. Every other pair keeps the anchor immutable.
 pub(crate) fn decode_roce_generator(
     row: &[u64],
     roce: &mut crate::RoceGenerator,
+    anchor_released: bool,
 ) -> Result<(), &'static str> {
     let mut expected = [0_u64; 43];
     encode_roce_generator(roce, &mut expected);
+    if anchor_released {
+        expected[G_RATE_FIRST] = row[G_RATE_FIRST];
+    }
     let immutable = [
         G_RATE_FIRST,
         G_RATE_INTERVAL,
@@ -673,6 +704,7 @@ pub(crate) fn decode_roce_generator(
     roce.pacer_armed = flag_word(row[G_ROCE_PACER_ARMED])?;
     roce.window_parked = flag_word(row[G_ROCE_WINDOW_PARKED])?;
     roce.rto_deadline_ns = row[G_ROCE_RTO_DEADLINE];
+    roce.pacer.first_pacing_time_ns = row[G_RATE_FIRST];
     Ok(())
 }
 
@@ -1090,6 +1122,35 @@ mod tests {
         );
     }
 
+    /// P16 G1: a host whose stage table is non-empty sets the stage bit, whatever its generators.
+    #[test]
+    fn mechanism_flags_follow_stage_presence() {
+        let mut staged = host(vec![generator_state(FlowGeneratorKind::Rate(
+            generator().rate,
+        ))]);
+        staged.stages = vec![Some(crate::CollectiveStage {
+            role: crate::StageRole::Compute(crate::ComputeStage {
+                compute_id: 0,
+                group_size: 1,
+                rank: 0,
+                duration_ns: 1,
+            }),
+            dependencies: crate::StageDependencies {
+                local_predecessor: None,
+                inbound_predecessor: None,
+                inbound_predecessor_bytes: 0,
+                local_predecessor_complete: true,
+                inbound_predecessor_complete: true,
+                inbound_bytes_received: 0,
+            },
+            activated: true,
+        })];
+        assert_eq!(
+            mechanism_flags(&image(vec![host(Vec::new()), staged], Vec::new())),
+            MECHANISM_STAGES
+        );
+    }
+
     fn pfc_queue() -> crate::SwitchQueueState {
         crate::SwitchQueueState {
             egress_link: Some(crate::LinkId(0)),
@@ -1293,6 +1354,7 @@ mod tests {
     struct PlanFixture {
         pfc_offset: u64,
         roce_offset: u64,
+        stage_offset: u64,
         receiver_offset: u64,
         node_state: Vec<u64>,
         generators: Vec<u64>,
@@ -1388,6 +1450,7 @@ mod tests {
             Self {
                 pfc_offset: T_NONE,
                 roce_offset: T_NONE,
+                stage_offset: T_NONE,
                 receiver_offset: 0,
                 node_state: vec![0_u64; 2 * 11],
                 generators,
@@ -1407,6 +1470,7 @@ mod tests {
             plain_round_kernel_refusal(&UploadedPlan {
                 pfc_offset: self.pfc_offset,
                 roce_offset: self.roce_offset,
+                stage_offset: self.stage_offset,
                 receiver_offset: self.receiver_offset,
                 node_count: 2,
                 flow_count: 2,
@@ -1441,6 +1505,17 @@ mod tests {
         plan.pfc_offset = 7;
         assert_eq!(plan.refusal(), Some(PlainKernelRefusal::PfcRegion));
         assert_eq!(PlainKernelRefusal::PfcRegion.node(), None);
+    }
+
+    /// P16 G1: a stage region refuses the plain kernel ahead of every other condition.
+    #[test]
+    fn a_stage_region_refuses_the_plain_kernel() {
+        let mut plan = PlanFixture::clean();
+        plan.stage_offset = 3;
+        assert_eq!(plan.refusal(), Some(PlainKernelRefusal::StageRegion));
+        assert_eq!(PlainKernelRefusal::StageRegion.node(), None);
+        plan.pfc_offset = 7;
+        assert_eq!(plan.refusal(), Some(PlainKernelRefusal::StageRegion));
     }
 
     #[test]
@@ -1543,6 +1618,7 @@ mod tests {
         let refusal = plain_round_kernel_refusal(&UploadedPlan {
             pfc_offset: plan.pfc_offset,
             roce_offset: plan.roce_offset,
+            stage_offset: plan.stage_offset,
             receiver_offset: plan.receiver_offset,
             node_count: 2,
             flow_count: 2,
@@ -1569,6 +1645,35 @@ mod tests {
                 kind: 5,
             })
         );
+    }
+
+    /// P16 G1 (design note §1.2, fact C): each round body runs the stage pass exactly once per
+    /// transition, after dispatch, and nothing else calls it.
+    #[test]
+    fn each_round_body_runs_the_stage_pass_once_per_transition() {
+        let cuda = format!(
+            "{}{}",
+            include_str!("cuda_kernels.cu"),
+            include_str!("cuda_round_body.inc")
+        );
+        let metal = include_str!("metal_kernels.metal");
+        for (backend, source) in [("CUDA", cuda.as_str()), ("Metal", metal)] {
+            assert_eq!(
+                source.matches("stage_after_event(").count(),
+                2,
+                "{backend}: one definition and one call"
+            );
+            let call = source
+                .find("!stage_after_event(")
+                .unwrap_or_else(|| panic!("{backend}: the call"));
+            let dispatch = source[..call]
+                .rfind("dispatch_event")
+                .unwrap_or_else(|| panic!("{backend}: dispatch precedes the pass"));
+            assert!(
+                !source[dispatch..call].contains("while ("),
+                "{backend}: the pass follows the transition's dispatch in the same iteration"
+            );
+        }
     }
 
     /// The word indices the check uses are the kernels' own.
@@ -1646,6 +1751,45 @@ mod tests {
         // word shifts it by one); the host plans write it at the same index (P15).
         assert!(include_str!("cuda_kernels.cu").contains("constexpr uint P_ROCE_OFFSET = 32;"));
         assert!(include_str!("metal_kernels.metal").contains("constant uint P_ROCE_OFFSET = 33;"));
+        // P16 G1: the stage-region words and bits the kernels' stage pass reads.
+        for (backend, source, declare) in [
+            ("CUDA", include_str!("cuda_kernels.cu"), "constexpr"),
+            ("Metal", include_str!("metal_kernels.metal"), "constant"),
+        ] {
+            use crate::device_stage as stage;
+            for (name, value) in [
+                ("uint STAGE_ROW_WORDS", stage::STAGE_ROW_WORDS as u64),
+                ("uint SR_FLAGS", stage::SR_FLAGS as u64),
+                (
+                    "uint SR_INBOUND_RECEIVED",
+                    stage::SR_INBOUND_RECEIVED as u64,
+                ),
+                (
+                    "uint SR_INBOUND_REQUIRED",
+                    stage::SR_INBOUND_REQUIRED as u64,
+                ),
+                (
+                    "uint SR_LOCAL_SUCCESSORS",
+                    stage::SR_LOCAL_SUCCESSORS as u64,
+                ),
+                (
+                    "uint SR_INBOUND_SUCCESSORS",
+                    stage::SR_INBOUND_SUCCESSORS as u64,
+                ),
+                ("ulong SR_LOCAL_COMPLETE", stage::SR_LOCAL_COMPLETE),
+                ("ulong SR_INBOUND_COMPLETE", stage::SR_INBOUND_COMPLETE),
+                ("ulong SR_HAS_LOCAL", stage::SR_HAS_LOCAL),
+                ("ulong SR_HAS_INBOUND", stage::SR_HAS_INBOUND),
+                ("ulong SR_IS_STAGE", stage::SR_IS_STAGE),
+                ("uint G_COMPUTE_DURATION", G_RATE_INTERVAL as u64),
+            ] {
+                let line = format!("{declare} {name} = {value};");
+                assert!(source.contains(&line), "{backend}: `{line}`");
+            }
+        }
+        // P16 G1: the stage region's params word follows the RoCE word on each backend.
+        assert!(include_str!("cuda_kernels.cu").contains("constexpr uint P_STAGE_OFFSET = 33;"));
+        assert!(include_str!("metal_kernels.metal").contains("constant uint P_STAGE_OFFSET = 34;"));
     }
 
     #[test]
@@ -1721,6 +1865,34 @@ mod tests {
         }
     }
 
+    /// P16 G1 (design note G6): a gated stage's queue pair holds its grid anchor at zero until its
+    /// release writes the release time. Its row decodes onto the input pair with the anchor
+    /// restored; the same change on an ordinary pair stays a corrupt row.
+    #[test]
+    fn a_released_stage_row_restores_its_grid_anchor() {
+        let mut gated = roce_generator();
+        gated.pacer.first_pacing_time_ns = 0;
+        gated.pacer_armed = false;
+        gated.next_psn = 0;
+        gated.snd_una = 0;
+        let released = crate::RoceGenerator {
+            pacer: crate::RocePacer {
+                first_pacing_time_ns: 1_234,
+                ..gated.pacer
+            },
+            pacer_armed: true,
+            ..gated
+        };
+        let mut row = [0_u64; 43];
+        row[6] = released.pacing_timer_payload.0;
+        encode_roce_generator(&released, &mut row);
+        let mut decoded = gated;
+        decode_roce_generator(&row, &mut decoded, true).expect("a released stage row decodes");
+        assert_eq!(decoded, released);
+        let mut ordinary = gated;
+        assert!(decode_roce_generator(&row, &mut ordinary, false).is_err());
+    }
+
     #[test]
     fn roce_generator_rows_round_trip_every_mutable_word() {
         let original = crate::RoceGenerator {
@@ -1740,7 +1912,7 @@ mod tests {
         decoded.window_parked = false;
         decoded.rto_deadline_ns = 0;
         decoded.controller = crate::DcqcnController::pristine(original.controller.config);
-        decode_roce_generator(&row, &mut decoded).expect("row must decode");
+        decode_roce_generator(&row, &mut decoded, false).expect("row must decode");
         assert_eq!(decoded, original);
 
         for (word, value) in [
@@ -1754,7 +1926,7 @@ mod tests {
             let mut changed = row;
             changed[word] = value;
             assert!(
-                decode_roce_generator(&changed, &mut decoded).is_err(),
+                decode_roce_generator(&changed, &mut decoded, false).is_err(),
                 "immutable word {word}"
             );
         }
@@ -1762,7 +1934,7 @@ mod tests {
             let mut changed = row;
             changed[word] = 2;
             assert!(
-                decode_roce_generator(&changed, &mut decoded).is_err(),
+                decode_roce_generator(&changed, &mut decoded, false).is_err(),
                 "flag word {word}"
             );
         }

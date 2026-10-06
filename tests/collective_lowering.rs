@@ -621,14 +621,13 @@ fn collective_maximum_group_width_rejects_without_validator_panic() {
     );
 }
 
+/// P16 G1: the device backends accept collective stages (identity in
+/// `tests/p16_device_collectives.rs`).
 #[test]
-fn collective_device_capability_rejection_is_precise() {
+fn collective_images_validate_on_devices() {
     let image = compile_collective("AllGather");
     for backend in [Backend::Metal, Backend::Cuda] {
-        assert_eq!(
-            validate(&image, backend).unwrap_err().to_string(),
-            format!("backend {backend} does not support collective generators; use Scalar or Cpu")
-        );
+        validate(&image, backend).expect("devices accept collective stages");
     }
 }
 

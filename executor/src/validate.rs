@@ -529,7 +529,7 @@ pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), Validat
     validate_links(image)?;
     validate_flows(image, &flow_index)?;
     validate_generators(image, &flow_index)?;
-    validate_backend_capabilities(image, &flow_index, backend)?;
+    validate_backend_capabilities(image, backend)?;
     let derived_delays = validate_packets_and_derive_delays(image, &flow_index)?;
     validate_tcp_segment_ledger(image, &flow_index)?;
     validate_owned_service_state(image, &flow_index, backend)?;
@@ -552,20 +552,15 @@ pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), Validat
 
 fn validate_backend_capabilities(
     image: &SimulationImage,
-    flow_index: &FlowIndex,
     backend: Backend,
 ) -> Result<(), ValidationError> {
     if !matches!(backend, Backend::Metal | Backend::Cuda) {
         return Ok(());
     }
     // P14 Lane B: both device backends run the DCQCN reaction and notification points and PFC
-    // per-priority link pause, so neither needs a refusal here. The flow index already knows
-    // whether any generator carries a stage, so this refusal does not walk the generators again.
-    if flow_index.has_stage_generators() {
-        return Err(ValidationError::new(format!(
-            "backend {backend} does not support collective generators; use Scalar or Cpu"
-        )));
-    }
+    // per-priority link pause, so neither needs a refusal here. P16 G1: both run collective and
+    // compute stages over TCP and RoCE (`days-gpu/evidence/P16/colldev-design.md`), so stages need
+    // none either.
     // P15 lane R4: both device backends run RoCE queue pairs, host-link PFC and a feedback class
     // apart from the data class (`evidence/P15/device-design.md`), so none needs a refusal here.
     //

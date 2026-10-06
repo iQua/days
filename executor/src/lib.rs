@@ -25,6 +25,12 @@ mod device_mechanism;
 mod device_pfc;
 mod device_scheduler;
 pub mod device_sizing;
+#[cfg(any(
+    test,
+    feature = "cuda",
+    all(feature = "metal", target_vendor = "apple")
+))]
+mod device_stage;
 pub mod event;
 pub mod image;
 mod mechanism_trace;

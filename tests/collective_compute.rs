@@ -432,7 +432,7 @@ fn compute_validator_rejects_inconsistent_stage_state() {
 }
 
 #[test]
-fn compute_only_scenarios_run_on_scalar_and_cpu_and_are_refused_on_devices() {
+fn compute_only_scenarios_run_on_scalar_and_cpu_and_validate_on_devices() {
     let config = r#"
 seed = 26
 edges = [[0, 2], [1, 2]]
@@ -457,11 +457,10 @@ duration_ns = 7000
 after = "a"
 "#;
     let image = tcp::compile_text("compute-only", config);
+    // P16 G1: the device backends accept compute stages (identity in
+    // `tests/p16_device_collectives.rs`).
     for backend in [Backend::Metal, Backend::Cuda] {
-        assert_eq!(
-            validate(&image, backend).unwrap_err().to_string(),
-            format!("backend {backend} does not support collective generators; use Scalar or Cpu")
-        );
+        validate(&image, backend).expect("devices accept compute stages");
     }
     let result = run_everywhere(&image, "compute-only");
     assert!(result.pending_events.is_empty());

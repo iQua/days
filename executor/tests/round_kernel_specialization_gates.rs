@@ -31,9 +31,10 @@ fn cuda_source() -> String {
     format!("{CUDA}\n{}", cuda_round_body())
 }
 
-/// The functions P14 Lane B, P15 lane R4 (queue pairs, host-link PFC) and P16 D1 (the Mellanox-form
-/// DCQCN controller) added to both kernels.
-const LANE_B_FUNCTIONS: [&str; 42] = [
+/// The functions P14 Lane B, P15 lane R4 (queue pairs, host-link PFC), P16 D1 (the Mellanox-form
+/// DCQCN controller) and P16 G1 (collective and compute stages) added to both kernels.
+const LANE_B_FUNCTIONS: [&str; 47] = [
+    "compute_timer",
     "dcqcn_alpha_through",
     "dcqcn_cnp_arrival",
     "dcqcn_data_arrival",
@@ -75,11 +76,20 @@ const LANE_B_FUNCTIONS: [&str; 42] = [
     "roce_settle",
     "roce_timeout",
     "roce_token_packet",
+    "stage_after_event",
+    "stage_prerequisites",
+    "stage_release",
+    "stage_unreleased",
     "wfq_remove_at",
 ];
 
-/// Plane reads that exist only for Lane B: the PFC region offset and the DCQCN receiver marker.
-const LANE_B_READS: [&str; 2] = ["params[P_PFC_OFFSET]", "DCQCN_RECEIVER_NO_CNP"];
+/// Plane reads that exist only for Lane B: the PFC region offset, the DCQCN receiver marker and the
+/// stage region offset (P16 G1).
+const LANE_B_READS: [&str; 3] = [
+    "params[P_PFC_OFFSET]",
+    "DCQCN_RECEIVER_NO_CNP",
+    "params[P_STAGE_OFFSET]",
+];
 
 fn kernels() -> [(&'static str, String, &'static str); 2] {
     [

@@ -234,7 +234,7 @@ Exact lowering refuses `[flow.traffic.roce]` on other flow types, `[flow.traffic
 unsupported `cnp_interval_ns` on RoCE traffic: a queue pair's receiver echoes ECN on its ACKs and NACKs and sends no CNP (P16)
 ```
 
-Queue pairs also carry collective stages (see [Collectives](/docs/configuration/collectives#roce-stages)). Queue pairs run on Scalar, CPU, Metal, and CUDA; collective stages run on Scalar and CPU, and Metal and CUDA refuse them at validation.
+Queue pairs also carry collective stages (see [Collectives](/docs/configuration/collectives#roce-stages)). Queue pairs and collective stages run on Scalar, CPU, Metal, and CUDA.
 
 ## Days AGO field limits
 

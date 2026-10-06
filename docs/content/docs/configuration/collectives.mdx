@@ -7,7 +7,7 @@ description: Days AGO RingAllReduce and AllGather over TCP or RoCE queue pairs w
 
 | Engine | Algorithms | Transport | Backends |
 | --- | --- | --- | --- |
-| Days AGO | `RingAllReduce`, `AllGather`, plus `[[compute]]` stages | `TCP` or `RoCE` | Scalar and CPU; Metal and CUDA reject collective and compute stages at validation |
+| Days AGO | `RingAllReduce`, `AllGather`, plus `[[compute]]` stages | `TCP` or `RoCE` | Scalar, CPU, Metal, and CUDA, byte-identical |
 | Legacy Days | `Broadcast`, `Gather`, `AllReduce`, `RingAllReduce` | `PacketDistribution`, `TCP`, or feature-gated `DCQCN` | Nexosim |
 
 ## Days AGO collectives
@@ -195,11 +195,7 @@ A column that does not apply to a row is 0. The LeanGuard checker `p10c_collecti
 
 ### Backends
 
-Metal and CUDA reject any scenario that contains a collective or a compute stage, with the same message for both:
-
-```text
-backend Metal does not support collective generators; use Scalar or Cpu
-```
+Metal and CUDA run collectives and compute stages over TCP and RoCE byte-identically to Scalar: complete state and the full-observation measurement planes. They do not return the collective transition records, which are diagnostics; generate those on Scalar or CPU.
 
 ### Errors
 
@@ -214,7 +210,6 @@ collective flow_count 3 must match the 4 configured hosts when sources/sinks are
 unsupported collective `...` dependency on collective `...`; a collective may follow only a compute group
 compute `...` hosts must equal the ranks of `...` in order
 compute `...` host 7 must be a configured host attachment
-backend Metal does not support collective generators; use Scalar or Cpu
 ```
 
 ## Legacy `[[collective]]`

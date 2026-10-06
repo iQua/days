@@ -94,6 +94,15 @@
         )) {
             return;
         }
+        // P16 G1: the stage pass of this transition, after its own emissions. A transition that
+        // left a continuation in `event` (a same-time TX_READY after TX_COMPLETE) is not a stage
+        // transition, and the pass ignores the continuation's kind.
+        if (MECHANISMS && params[P_STAGE_OFFSET] != NONE && !stage_after_event(
+                node, event, state, params, node_state, generators, fel_meta, fel_records,
+                queue_meta, queue_records, remote_meta, remote_staging, stream_state,
+                stream_records, summary, observation_meta, observed, tcp_state)) {
+            return;
+        }
         if (counted_continuation && state[L_SAME_TIME_CONTINUATIONS] != NONE) {
             state[L_SAME_TIME_CONTINUATIONS] += 1;
         }

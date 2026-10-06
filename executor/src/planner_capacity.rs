@@ -101,9 +101,10 @@ impl PlannerCapacityContext {
         for packet in &image.initial_packets {
             let flow = packet.flow.0 as usize;
             let class = usize::from(!packet.kind.is_data());
-            // The DCQCN control-timer token is a zero-byte source-local timer, never a packet on
-            // a link, so it bounds no serialization interval.
-            if !packet.kind.is_timer_token() {
+            // The queue-pair pacing token and a compute stage's timer token (P16 G1) are zero-byte
+            // source-local timers, never packets on a link, so they bound no serialization
+            // interval.
+            if !packet.kind.is_timer_token() && !is_compute_timer_token(packet) {
                 update_minimum_packet_size(
                     &mut minimum_packet_sizes[flow][class],
                     packet.size_bytes,
@@ -155,7 +156,10 @@ impl PlannerCapacityContext {
                     // Device backends refuse RoCE queue pairs; one byte is conservative.
                     FlowGeneratorKind::Roce(_) => 1,
                 };
-                update_minimum_packet_size(&mut minimum_packet_sizes[flow][0], size);
+                // A compute stage's generator is a timer (P16 G1): it sources no packet.
+                if !is_compute_timer_generator(generator.kind) {
+                    update_minimum_packet_size(&mut minimum_packet_sizes[flow][0], size);
+                }
                 if let Some(feedback) = generated_feedback_size(generator.kind) {
                     update_minimum_packet_size(&mut minimum_packet_sizes[flow][1], feedback);
                 }
@@ -657,7 +661,7 @@ fn precompute_minimum_packet_sizes(
     for packet in &image.initial_packets {
         let flow = packet.flow.0 as usize;
         let class = usize::from(!packet.kind.is_data());
-        if !packet.kind.is_timer_token() {
+        if !packet.kind.is_timer_token() && !is_compute_timer_token(packet) {
             update_minimum_packet_size(&mut minimums[flow][class], packet.size_bytes);
         }
     }
@@ -689,7 +693,9 @@ fn precompute_minimum_packet_sizes(
             // Device backends refuse RoCE queue pairs; one byte is conservative.
             FlowGeneratorKind::Roce(_) => 1,
         };
-        update_minimum_packet_size(&mut minimums[flow][0], size);
+        if !is_compute_timer_generator(generator.kind) {
+            update_minimum_packet_size(&mut minimums[flow][0], size);
+        }
         if let Some(feedback) = generated_feedback_size(generator.kind) {
             update_minimum_packet_size(&mut minimums[flow][1], feedback);
         }
@@ -709,6 +715,18 @@ fn generated_feedback_size(kind: FlowGeneratorKind) -> Option<u64> {
         FlowGeneratorKind::Roce(_) => Some(1),
         FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => None,
     }
+}
+
+/// A compute stage's timer token (P16 G1): the only zero-byte `Data` packet the validator admits
+/// (`device_sizing::initial_packet_is_routed` excludes it from the routed counts on the same test).
+fn is_compute_timer_token(packet: &crate::PacketDescriptor) -> bool {
+    packet.kind == PacketKind::Data && packet.size_bytes == 0
+}
+
+/// A compute stage's generator (P16 G1): the only zero-byte Constant generator the validator
+/// admits, a timer that sources no packet.
+fn is_compute_timer_generator(kind: FlowGeneratorKind) -> bool {
+    matches!(kind, FlowGeneratorKind::Constant(constant) if constant.packet_size_bytes == 0)
 }
 
 fn update_minimum_packet_size(minimum: &mut u64, size: u64) {
@@ -764,6 +782,7 @@ fn legacy_minimum_packet_size(
             packet.flow.0 as usize == flow
                 && packet.kind.is_data() == packet_kind.is_data()
                 && !packet.kind.is_timer_token()
+                && !is_compute_timer_token(packet)
         })
         .map(|packet| packet.size_bytes)
         .chain(
@@ -787,7 +806,10 @@ fn legacy_minimum_packet_size(
                         .host_states
                         .iter()
                         .flat_map(|state| &state.generators)
-                        .filter(move |generator| generator.flow.0 as usize == flow)
+                        .filter(move |generator| {
+                            generator.flow.0 as usize == flow
+                                && !is_compute_timer_generator(generator.kind)
+                        })
                         .map(move |generator| match generator.kind {
                             FlowGeneratorKind::Constant(constant) => constant.packet_size_bytes,
                             FlowGeneratorKind::Tcp(tcp) => match tcp_minimum_packet_size {

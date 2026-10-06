@@ -33,7 +33,7 @@ Every backend that accepts a scenario produces byte-identical complete state. A 
 - **Switches:** FIFO, strict-priority, DRR, WRR, and exact-rational WFQ scheduling; TailDrop, ECN-threshold, RED, and RED-with-ECN admission; PFC.
 - **Collectives:** ring all-reduce and all-gather over TCP or RoCE queue pairs, with delay-only compute stages.
 
-DCQCN, RoCE queue pairs, and PFC run on all four backends. RED, collectives, and compute stages run on the Scalar and CPU backends; Metal and CUDA reject those scenarios at validation.
+DCQCN, RoCE queue pairs, PFC, collectives, and compute stages run on all four backends. RED runs on the Scalar and CPU backends; Metal and CUDA reject it at validation.
 
 ## What makes it exact
 
