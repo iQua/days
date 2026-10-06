@@ -10,9 +10,15 @@
 mod error;
 mod groups;
 mod parse;
+mod schedule;
 
 pub use error::AicbError;
 pub use groups::{Fidelity, GroupFamily, Groups, form_groups, render_mockncclgroup};
 pub use parse::{
     Algorithm, Column, ColumnEntry, Comm, GroupKind, Header, Record, Trace, parse_trace,
+};
+pub use schedule::{
+    ChainItem, CollectiveOp, DataQueue, DataQueueOrder, ExpertRouting, HopBounds, ImbalanceParams,
+    MatrixRef, OpId, PipelineTransfer, Plan, PlanCounters, PlanOptions, PropagationBounds, Segment,
+    SegmentEnd, SimaiEnv, StageChain, StartItem, in_hang_window, plan_schedule,
 };
