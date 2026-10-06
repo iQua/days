@@ -168,6 +168,6 @@ pub use validate::{
 #[doc(hidden)]
 pub use validate::{
     assert_validate_flow_index_equivalent_for_testing,
-    assert_validate_generator_index_equivalent_for_testing,
+    assert_validate_generator_index_equivalent_for_testing, take_generator_passes_for_testing,
     validate_flow_index_builds_stage_lookups_for_testing,
 };

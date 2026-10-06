@@ -3148,12 +3148,29 @@ fn staged_generator(state: &crate::HostState, position: usize) -> StagedGenerato
     }
 }
 
+#[cfg(feature = "planner-test-hooks")]
+std::thread_local! {
+    /// Test-only (P16 H4): passes over a host's generator table ([`staged_generators`] calls) on
+    /// this thread, so a test can pin validation's generator passes per host.
+    static GENERATOR_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only (P16 H4): this thread's passes over a host's generator table since the last call;
+/// resets them to zero.
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+pub fn take_generator_passes_for_testing() -> usize {
+    GENERATOR_PASSES.take()
+}
+
 /// `state`'s generators in table order, each with its stage record.
 ///
 /// Each generator pairs with the stage table's entry at its position, or with `None` past the
 /// table's end, exactly as [`staged_generator`] reads it, whatever the table's length. On a host
 /// without stages the table is empty, every generator pairs with `None`, and no entry is read.
 fn staged_generators(state: &crate::HostState) -> impl Iterator<Item = StagedGenerator<'_>> {
+    #[cfg(feature = "planner-test-hooks")]
+    GENERATOR_PASSES.set(GENERATOR_PASSES.get() + 1);
     let stages = state
         .stages
         .iter()
