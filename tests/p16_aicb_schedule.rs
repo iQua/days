@@ -426,10 +426,25 @@ fn the_hang_gate_refuses_under_simai_and_records_under_megatron() {
         (plan.ops.len(), plan.counters.elided_zero_all_to_all),
         (0, 1)
     );
-    // A ring whose per-message floor is 0 sends nothing in SimAI.
-    let trace = synthetic(&["r\t-1\t1\tNONE\t0\t1\tNONE\t0\t1\tREDUCESCATTER\t31\t100"]);
+    // A ring whose per-message floor is 0: SimAI builds no flow but still creates the stream,
+    // which never finishes (part-1 review F1), so the SimAI fidelity refuses it; Megatron drops
+    // it, with its process_time. W 16, TP2: DP 8 over 2 servers, 4 channels: 31 / 8 / 4 = 0.
+    for record in [
+        "r\t-1\t1\tNONE\t0\t1\tNONE\t0\t1\tREDUCESCATTER\t31\t100",
+        "r\t-1\t1\tNONE\t0\t1\tALLGATHER_EP\t15\t1\tNONE\t0\t100",
+    ] {
+        let trace = synthetic(&[record]);
+        let error = try_plan(&trace, &options(Fidelity::Simai, "A100")).unwrap_err();
+        assert!(error.starts_with("line 3:"), "{error}");
+        assert!(error.contains("floors to 0 B per message"), "{error}");
+        assert!(error.contains("never finishes"), "{error}");
+        let plan = planned(&trace, &options(Fidelity::Megatron, "A100"));
+        assert_eq!((plan.ops.len(), plan.counters.elided_ring_floor), (0, 1));
+    }
+    // The fp column is clamped to 4,096 B first, so a small fp ring is not affected.
+    let trace = synthetic(&["r\t-1\t1\tALLGATHER_EP\t15\t1\tNONE\t0\t1\tNONE\t0\t100"]);
     let plan = planned(&trace, &options(Fidelity::Simai, "A100"));
-    assert_eq!((plan.ops.len(), plan.counters.elided_ring_floor), (0, 1));
+    assert_eq!(plan.ops[0].message_bytes, 4096 / 8 / 4);
 }
 
 #[test]
