@@ -18,7 +18,6 @@ impl AicbError {
         }
     }
 
-    #[allow(dead_code)] // used by the group and schedule modules
     pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             line: None,

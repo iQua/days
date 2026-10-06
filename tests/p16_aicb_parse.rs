@@ -193,7 +193,7 @@ fn header_refusals_name_line_one() {
         (HEADER.replace(" ep: 1", ""), "missing header key `ep:`"),
         (format!("{HEADER} ga: 1"), "duplicate header key `ga:`"),
         (format!("{HEADER} bogus: 3"), "unknown header key `bogus:`"),
-        (format!("{HEADER} vpp:"), "has no value"),
+        (HEADER.replace(" pp_comm: 0", " pp_comm:"), "has no value"),
         (
             HEADER.replace("checkpoints: 0", "checkpoints: 1"),
             "checkpoints",
