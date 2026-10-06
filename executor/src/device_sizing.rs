@@ -917,7 +917,7 @@ impl CapacityContext {
                 | PacketKind::DcqcnCnp(_)
                 | PacketKind::RoceAck(_)
                 | PacketKind::RoceNack(_) => &mut minimum_feedback_sizes[packet.flow.0 as usize],
-                PacketKind::RocePacingTimer => continue,
+                PacketKind::RocePacingTimer | PacketKind::StageNotify => continue,
             };
             *minimum = (*minimum).min(packet.size_bytes);
         }
@@ -953,11 +953,12 @@ impl CapacityContext {
 /// counts that size the queue, staging and channel arenas include it. A queue pair's zero-byte
 /// pacing token never enters a queue or crosses a link, and a PFC frame travels on its reverse
 /// control lane, never on its flow's route. P16 G1: neither does a compute stage's timer token,
-/// the only zero-byte `Data` packet the validator admits.
+/// the only zero-byte `Data` packet the validator admits. P16 H2: nor a stage notify, which
+/// crosses its host pair's lane.
 pub(crate) fn initial_packet_is_routed(packet: &crate::PacketDescriptor) -> bool {
     !(matches!(
         packet.kind,
-        PacketKind::RocePacingTimer | PacketKind::Pfc(_)
+        PacketKind::RocePacingTimer | PacketKind::Pfc(_) | PacketKind::StageNotify
     ) || (packet.kind == PacketKind::Data && packet.size_bytes == 0))
 }
 
@@ -1564,7 +1565,7 @@ fn add_flow_route_capacities(
         | PacketKind::DcqcnCnp(_)
         | PacketKind::RoceAck(_)
         | PacketKind::RoceNack(_) => (flow.reverse_route.as_slice(), flow.source),
-        PacketKind::RocePacingTimer => return,
+        PacketKind::RocePacingTimer | PacketKind::StageNotify => return,
     };
     for index in 0..route.len() {
         let target = route
@@ -1595,7 +1596,7 @@ fn add_flow_route_capacities(
                     | PacketKind::DcqcnCnp(_)
                     | PacketKind::RoceAck(_)
                     | PacketKind::RoceNack(_) => context.minimum_feedback_sizes[flow_index],
-                    PacketKind::RocePacingTimer => unreachable!(),
+                    PacketKind::RocePacingTimer | PacketKind::StageNotify => unreachable!(),
                 });
             let queue = image.switch_states[image.nodes[target_slot].state_slot as usize]
                 .queues
@@ -1642,7 +1643,7 @@ fn flow_link_serialization_ns(
         | PacketKind::DcqcnCnp(_)
         | PacketKind::RoceAck(_)
         | PacketKind::RoceNack(_) => context.minimum_feedback_sizes[flow_index],
-        PacketKind::RocePacingTimer => return 0,
+        PacketKind::RocePacingTimer | PacketKind::StageNotify => return 0,
     };
     serialization_time_ns(minimum_size, image.links[link_id.0 as usize].rate_bps)
         .expect("lowered GPU image has positive finite serialization intervals")

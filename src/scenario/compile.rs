@@ -26,6 +26,7 @@ use super::ids::{IdError, LinkKey, LpKey, PhysicalNodeKey, StableIds, dense_ids}
 use crate::topos::build::{
     HostAttachments, PairingPolicy, TopologyError, TopologyProfile, build_graph_with_profile,
 };
+use crate::topos::rail::ServerLocality;
 use crate::topos::route::{
     EcmpFlow, RouteTableError, RouteWorkers, compute_fat_tree_ecmp_route_table,
     compute_shortest_path_route_table_with,
@@ -2497,6 +2498,7 @@ fn link_delay_model(
         }
         return Ok(LinkDelay::Rail {
             link_delay_ns: rail.link_delay_ns,
+            nvlink_delay_ns: rail.nvlink_delay_ns,
         });
     }
     let tiers = match propagation {
@@ -2531,7 +2533,11 @@ fn link_delay_model(
 #[derive(Clone, Copy, Debug)]
 enum LinkRate {
     Uniform(u64),
-    Rail { nic_bps: u64, uplink_bps: u64 },
+    Rail {
+        nic_bps: u64,
+        uplink_bps: u64,
+        nvlink_bps: u64,
+    },
 }
 
 impl LinkRate {
@@ -2540,6 +2546,7 @@ impl LinkRate {
             (TopologyProfile::Rail(rail), None) => Ok(Self::Rail {
                 nic_bps: rail.nic_rate_bps,
                 uplink_bps: rail.uplink_rate_bps,
+                nvlink_bps: rail.nvlink_rate_bps,
             }),
             (TopologyProfile::Rail(_), Some(_)) => Err(CompileError::Unsupported(
                 "unsupported `switch.port_rate` on a SpectrumX topology; its link rates are \
@@ -2557,7 +2564,9 @@ impl LinkRate {
             Self::Rail {
                 nic_bps,
                 uplink_bps,
+                nvlink_bps,
             } => match (key.source, key.target) {
+                (PhysicalNodeKey::Host(_), PhysicalNodeKey::Host(_)) => nvlink_bps,
                 (PhysicalNodeKey::Host(_), _) | (_, PhysicalNodeKey::Host(_)) => nic_bps,
                 (PhysicalNodeKey::Switch(_), PhysicalNodeKey::Switch(_)) => uplink_bps,
             },
@@ -2574,9 +2583,11 @@ enum LinkDelay {
         /// First aggregation-to-core switch identity: `edge_switches + aggregation_switches`.
         core_boundary: u64,
     },
-    /// The rail fabric: NIC links and ASW–PSW links share SimAI's one `latency` (P16 H2).
+    /// The rail fabric: NIC links and ASW–PSW links share SimAI's one `latency`; a same-server
+    /// notify lane is the two NVLink hops through the server's NVSwitch (P16 H2).
     Rail {
         link_delay_ns: u64,
+        nvlink_delay_ns: u64,
     },
 }
 
@@ -2584,7 +2595,13 @@ impl LinkDelay {
     fn of(self, key: LinkKey) -> u64 {
         match self {
             Self::Uniform(propagation_ns) => propagation_ns,
-            Self::Rail { link_delay_ns } => link_delay_ns,
+            Self::Rail {
+                link_delay_ns,
+                nvlink_delay_ns,
+            } => match (key.source, key.target) {
+                (PhysicalNodeKey::Host(_), PhysicalNodeKey::Host(_)) => 2 * nvlink_delay_ns,
+                _ => link_delay_ns,
+            },
             Self::FatTreeTiers {
                 tiers,
                 core_boundary,
@@ -2707,7 +2724,6 @@ fn lower(
         .map(LpKey::Host)
         .chain(switch_port_keys.iter().copied())
         .collect::<Vec<_>>();
-    let ids = StableIds::new(node_keys, link_keys.iter().copied())?;
     let CanonicalFlows {
         flows,
         collectives: collective_table,
@@ -2720,12 +2736,23 @@ fn lower(
         &hosts,
         model.seed,
     )?;
+    // Same-server collective messages on the rail fabric cross NVLink, which Days models
+    // delay-only: each lowers to a stage notify on a host-to-host lane (P16 H2, ruling H2-1).
+    let notify = NotifyLowering::plan(&flows, profile)?;
+    for &(source, target) in notify.lanes.keys() {
+        link_keys.insert(LinkKey {
+            source: PhysicalNodeKey::Host(source),
+            target: PhysicalNodeKey::Host(target),
+        });
+    }
+    let ids = StableIds::new(node_keys, link_keys.iter().copied())?;
     let flow_ids = dense_ids(flows.iter().map(|flow| flow.key.clone()))?;
-    // Compute stages send nothing and have no route; every other flow is routed.
+    // Compute stages and stage notifies send nothing over the fabric and have no route; every
+    // other flow is routed.
     let routed_flows = flows
         .iter()
         .enumerate()
-        .filter(|(_, flow)| flow.compute.is_none());
+        .filter(|(index, flow)| flow.compute.is_none() && notify.delay(*index).is_none());
     let route_table = match model.routing {
         RoutingPolicy::ShortestPath => compute_shortest_path_route_table_with(
             graph,
@@ -2776,7 +2803,7 @@ fn lower(
         .iter()
         .enumerate()
         .map(|(index, flow)| {
-            if flow.compute.is_some() {
+            if flow.compute.is_some() || notify.delay(index).is_some() {
                 return FlowDescriptor {
                     id: FlowId(flow_ids[&flow.key]),
                     source: ids.node(LpKey::Host(flow.source)),
@@ -2828,8 +2855,93 @@ fn lower(
     let mut payload_sequences = BTreeMap::<LpKey, u64>::new();
     let mut initial_packets = Vec::with_capacity(flows.len());
     let mut initial_event_inputs = Vec::<(LpKey, u64, FlowId, PayloadId, EventKind)>::new();
-    for (flow, descriptor) in flows.iter().zip(&flow_descriptors) {
+    for (index, (flow, descriptor)) in flows.iter().zip(&flow_descriptors).enumerate() {
         let source = LpKey::Host(flow.source);
+        if let Some(delay_ns) = notify.delay(index) {
+            let stage = flow
+                .collective
+                .as_deref()
+                .expect("a stage notify carries a collective stage");
+            let lane_ns = notify.lanes[&(flow.source, flow.target)];
+            // The sender's timer runs `delay - lane`; its notify then crosses the lane in `lane`.
+            let lead_ns = delay_ns - lane_ns;
+            let root = stage.local_predecessor_complete && stage.inbound_predecessor_complete;
+            let next_emission = if !root {
+                ScheduledEmission {
+                    status: GeneratorStatus::Blocked,
+                    departure_time_ns: 0,
+                    payload: PayloadId(0),
+                }
+            } else if lead_ns > model.stop_time_ns {
+                ScheduledEmission {
+                    status: GeneratorStatus::Stopped,
+                    departure_time_ns: lead_ns,
+                    payload: PayloadId(0),
+                }
+            } else {
+                // A root message starts at time zero: its notify names the sender's timer and
+                // then crosses to the target.
+                let sequence = payload_sequences.entry(source).or_default();
+                let payload = allocate_payload_id(
+                    ids.node(source),
+                    node_count,
+                    *sequence,
+                    "stage notify payload sequence",
+                )?;
+                *sequence = sequence.checked_add(1).ok_or_else(|| {
+                    CompileError::Invalid(format!(
+                        "stage notify payload sequence overflow at {source:?}"
+                    ))
+                })?;
+                initial_packets.push(PacketDescriptor {
+                    id: payload,
+                    flow: descriptor.id,
+                    size_bytes: stage.chunk_bytes,
+                    ecn_marked: false,
+                    kind: PacketKind::StageNotify,
+                });
+                initial_event_inputs.push((
+                    source,
+                    lead_ns,
+                    descriptor.id,
+                    payload,
+                    EventKind::PacingTimer,
+                ));
+                ScheduledEmission {
+                    status: GeneratorStatus::Scheduled,
+                    departure_time_ns: lead_ns,
+                    payload,
+                }
+            };
+            let (identity, dependencies) = collective_stage_record(stage, &flow_ids);
+            generators_by_source.entry(source).or_default().push((
+                FlowGeneratorState {
+                    flow: descriptor.id,
+                    packets_emitted: 0,
+                    bytes_emitted: 0,
+                    next_emission,
+                    rng_state: generator_seed(model.seed, &flow.key, &collective_table, &roce_keys),
+                    feedback: GeneratorFeedbackState {
+                        arrivals: 0,
+                        outstanding_bytes: 0,
+                        unacknowledged_bytes: 0,
+                    },
+                    kind: FlowGeneratorKind::Constant(ConstantGenerator {
+                        // A stage notify's lane latency (the image's one record of it per message).
+                        first_departure_ns: lane_ns,
+                        interval_ns: lead_ns,
+                        packet_size_bytes: stage.chunk_bytes,
+                        termination: GeneratorTermination::Bytes(stage.chunk_bytes),
+                    }),
+                },
+                Some(CollectiveStage {
+                    role: StageRole::Collective(identity),
+                    dependencies,
+                    activated: root,
+                }),
+            ));
+            continue;
+        }
         if let Some(compute) = &flow.compute {
             let root = compute.local_predecessor.is_none() && compute.inbound_predecessor.is_none();
             let next_emission = if !root {
@@ -3052,34 +3164,10 @@ fn lower(
                 payload,
             }
         };
-        let collective_stage = flow.collective.as_ref().map(|stage| {
-            let stage_flow = |key: &FlowKey| FlowId(flow_ids[key]);
-            (
-                CollectiveStageIdentity {
-                    collective_id: stage.collective_id,
-                    algorithm: stage.algorithm,
-                    topology_level: 0,
-                    topology_group: 0,
-                    group_size: stage.group_size,
-                    declared_total_bytes: stage.declared_total_bytes,
-                    rank: stage.position.rank,
-                    phase: stage.position.phase,
-                    step: stage.position.step,
-                    chunk_policy: CollectiveChunkPolicy::EqualRemainderLast,
-                    channel_policy: CollectiveChannelPolicy::RingNext,
-                    chunk_offset_bytes: stage.chunk_offset_bytes,
-                    chunk_bytes: stage.chunk_bytes,
-                },
-                StageDependencies {
-                    local_predecessor: stage.local_predecessor.as_ref().map(stage_flow),
-                    inbound_predecessor: stage.inbound_predecessor.as_ref().map(stage_flow),
-                    inbound_predecessor_bytes: stage.inbound_predecessor_bytes,
-                    local_predecessor_complete: stage.local_predecessor_complete,
-                    inbound_predecessor_complete: stage.inbound_predecessor_complete,
-                    inbound_bytes_received: 0,
-                },
-            )
-        });
+        let collective_stage = flow
+            .collective
+            .as_deref()
+            .map(|stage| collective_stage_record(stage, &flow_ids));
         generators_by_source.entry(source).or_default().push((
             FlowGeneratorState {
                 // Every collective stage is a TCP or RoCE generator whose dependencies live in this record;
@@ -3216,7 +3304,11 @@ fn lower(
     // Every receiver with its target, then one exact-length slice per target host: one
     // allocation per host that receives queue pairs.
     let mut roce_receivers = Vec::<(LpKey, RoceReceiverState)>::new();
-    for (flow, descriptor) in flows.iter().zip(&flow_descriptors) {
+    for (index, (flow, descriptor)) in flows.iter().zip(&flow_descriptors).enumerate() {
+        if notify.delay(index).is_some() {
+            // A stage notify needs no receiver state: its one arrival carries the whole chunk.
+            continue;
+        }
         if let TrafficKind::Roce(ordinal) = flow.traffic.kind {
             let roce = roce_key(&roce_keys, ordinal);
             let Termination::Bytes(total_bytes) = flow.traffic.termination else {
@@ -3337,8 +3429,8 @@ fn lower(
         .collect::<Vec<_>>();
     let mut channel_keys = BTreeSet::<(LinkId, NodeId)>::new();
     let mut min_packet_size_by_link = BTreeMap::<LinkId, u64>::new();
-    for (flow, input) in flow_descriptors.iter().zip(&flows) {
-        if packet_count(&input.traffic) == 0 {
+    for (index, (flow, input)) in flow_descriptors.iter().zip(&flows).enumerate() {
+        if packet_count(&input.traffic) == 0 || notify.delay(index).is_some() {
             continue;
         }
         let data_min_size = match input.traffic.kind {
@@ -3411,6 +3503,20 @@ fn lower(
                 })
         })
         .collect::<Result<Vec<_>, CompileError>>()?;
+    // One lane per ordered host pair with same-server messages (P16 H2): the notify crosses it in
+    // exactly its latency, out of band, as a PFC frame crosses its control lane.
+    for (&(source, target), &lane_ns) in &notify.lanes {
+        channels.push(RemoteChannel {
+            source: ids.node(LpKey::Host(source)),
+            target: ids.node(LpKey::Host(target)),
+            link: ids.link(LinkKey {
+                source: PhysicalNodeKey::Host(source),
+                target: PhysicalNodeKey::Host(target),
+            }),
+            event_kind: EventKind::RemoteArrival,
+            min_delay_ns: lane_ns,
+        });
+    }
 
     if let Some(pfc) = &model.pfc {
         let mut monitored_paths = BTreeSet::<(LinkId, NodeId)>::new();
@@ -3581,6 +3687,102 @@ fn lower(
         initial_events,
         seed: model.seed,
     })
+}
+
+/// The stage identity and pristine prerequisite state of one collective stage.
+fn collective_stage_record(
+    stage: &CollectiveStageInput,
+    flow_ids: &BTreeMap<FlowKey, u64>,
+) -> (CollectiveStageIdentity, StageDependencies) {
+    let stage_flow = |key: &FlowKey| FlowId(flow_ids[key]);
+    (
+        CollectiveStageIdentity {
+            collective_id: stage.collective_id,
+            algorithm: stage.algorithm,
+            topology_level: 0,
+            topology_group: 0,
+            group_size: stage.group_size,
+            declared_total_bytes: stage.declared_total_bytes,
+            rank: stage.position.rank,
+            phase: stage.position.phase,
+            step: stage.position.step,
+            chunk_policy: CollectiveChunkPolicy::EqualRemainderLast,
+            channel_policy: CollectiveChannelPolicy::RingNext,
+            chunk_offset_bytes: stage.chunk_offset_bytes,
+            chunk_bytes: stage.chunk_bytes,
+        },
+        StageDependencies {
+            local_predecessor: stage.local_predecessor.as_ref().map(stage_flow),
+            inbound_predecessor: stage.inbound_predecessor.as_ref().map(stage_flow),
+            inbound_predecessor_bytes: stage.inbound_predecessor_bytes,
+            local_predecessor_complete: stage.local_predecessor_complete,
+            inbound_predecessor_complete: stage.inbound_predecessor_complete,
+            inbound_bytes_received: 0,
+        },
+    )
+}
+
+/// The same-server messages of a rail image and their host-to-host notify lanes (P16 H2).
+///
+/// A collective stage whose two ranks share a server crosses NVLink, which Days models delay-only
+/// (ruling H2-1): the stage lowers to a stage notify. Its delay `d` is
+/// [`ServerLocality::nvlink_message_delay_ns`] of its chunk. Every message on one ordered host pair
+/// shares that pair's lane, whose latency is `min d - 1` over the pair's messages: the sender's
+/// timer runs `d - lane >= 1` and the notify crosses in `lane`, so arrivals on a lane follow the
+/// sender's timer order and the lane bounds the safe horizon by its slowest-to-start message.
+struct NotifyLowering {
+    /// Each flow's message delay, by canonical flow position; `None` off the rail fabric.
+    delays: Vec<Option<u64>>,
+    /// Lane latency per ordered (source, target) host pair.
+    lanes: BTreeMap<(u64, u64), u64>,
+}
+
+impl NotifyLowering {
+    fn plan(flows: &[FlowInput], profile: TopologyProfile) -> Result<Self, CompileError> {
+        let TopologyProfile::Rail(rail) = profile else {
+            return Ok(Self {
+                delays: Vec::new(),
+                lanes: BTreeMap::new(),
+            });
+        };
+        let locality = ServerLocality::new(rail);
+        let mut delays = vec![None; flows.len()];
+        let mut lanes = BTreeMap::<(u64, u64), u64>::new();
+        for (index, flow) in flows.iter().enumerate() {
+            let Some(stage) = flow.collective.as_deref() else {
+                continue;
+            };
+            if !locality.same_server(flow.source, flow.target) {
+                continue;
+            }
+            // Today's expansions send one message per rank and step, so the sender's NVLink port
+            // carries this chunk alone; a multi-channel expansion passes the port's step bytes.
+            let delay = locality
+                .nvlink_message_delay_ns(
+                    stage.chunk_bytes,
+                    stage.chunk_bytes,
+                    flow.traffic.packet_size_bytes,
+                )
+                .ok_or_else(|| {
+                    CompileError::Invalid(format!(
+                        "NVLink delay of a {}-byte message from host {} to host {} overflows",
+                        stage.chunk_bytes, flow.source, flow.target
+                    ))
+                })?;
+            delays[index] = Some(delay);
+            let lane = delay - 1;
+            lanes
+                .entry((flow.source, flow.target))
+                .and_modify(|current| *current = (*current).min(lane))
+                .or_insert(lane);
+        }
+        let delays = if lanes.is_empty() { Vec::new() } else { delays };
+        Ok(Self { delays, lanes })
+    }
+
+    fn delay(&self, index: usize) -> Option<u64> {
+        self.delays.get(index).copied().flatten()
+    }
 }
 
 /// The canonically ordered flow inputs and the collective keys their stage keys index.

@@ -413,6 +413,13 @@ pub enum GeneratorTermination {
 }
 
 /// Fixed-width parameters for the v1 constant generator.
+///
+/// Two stage kinds reuse it as a timer that sends nothing over the fabric. A compute stage (P14):
+/// zero bytes, no departure, `interval_ns` the compute duration. A stage notify (P16 H2), a
+/// collective stage whose ranks share a server: `packet_size_bytes` and the byte termination are
+/// its chunk, `interval_ns` is the sender's lead, and `first_departure_ns` is the latency of its
+/// host pair's lane, which the notify crosses after the lead. The message's NVLink delay is their
+/// sum.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConstantGenerator {
@@ -912,6 +919,11 @@ pub enum PacketKind {
     RoceNack(RoceAckHeader) = 9,
     /// A source-local zero-byte token of a RoCE pacer. It is never enqueued or transmitted.
     RocePacingTimer = 10,
+    /// A stage notify (P16 H2): one same-server collective message, which Days models delay-only.
+    /// It names the sender's timer and then crosses out of band, as a PFC frame does, on its host
+    /// pair's lane to the target host, where its `size_bytes` (the whole chunk) arrive at once. It
+    /// is never enqueued, transmitted on a link or acknowledged.
+    StageNotify = 11,
 }
 
 impl PacketKind {
@@ -949,6 +961,7 @@ impl PacketKind {
             Self::RoceAck(_) => 8,
             Self::RoceNack(_) => 9,
             Self::RocePacingTimer => 10,
+            Self::StageNotify => 11,
         }
     }
 }

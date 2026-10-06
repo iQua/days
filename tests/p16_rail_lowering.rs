@@ -30,7 +30,17 @@ fn rail_links_take_their_class_rate_and_delay() {
     let kind = |node: days_executor::NodeId| image.nodes[node.0 as usize].kind;
     let mut host_links = 0;
     let mut uplinks = 0;
+    let mut lanes = 0;
     for link in &image.links {
+        if kind(link.source) == NodeKind::Host && kind(link.target) == NodeKind::Host {
+            // A same-server notify lane: two NVLink hops (tests/p16_stage_notify.rs).
+            assert_eq!(
+                (link.rate_bps, link.propagation_ns),
+                (2_400_000_000_000, 50)
+            );
+            lanes += 1;
+            continue;
+        }
         assert_eq!(link.propagation_ns, 500, "link {:?}", link.id);
         if kind(link.source) == NodeKind::Host || kind(link.target) == NodeKind::Host {
             assert_eq!(link.rate_bps, 100_000_000_000, "NIC link {:?}", link.id);
@@ -40,8 +50,8 @@ fn rail_links_take_their_class_rate_and_delay() {
             uplinks += 1;
         }
     }
-    // 8 GPUs x 2 directions; 4 ASWs x 2 PSWs x 2 directions.
-    assert_eq!((host_links, uplinks), (16, 16));
+    // 8 GPUs x 2 directions; 4 ASWs x 2 PSWs x 2 directions; the ring's 4 same-server hops.
+    assert_eq!((host_links, uplinks, lanes), (16, 16, 4));
     assert_eq!(image.host_states.len(), 8);
 }
 

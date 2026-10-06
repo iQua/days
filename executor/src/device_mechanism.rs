@@ -103,6 +103,8 @@ pub(crate) fn mechanism_flags(image: &SimulationImage) -> u64 {
             | PacketKind::RoceAck(_)
             | PacketKind::RoceNack(_)
             | PacketKind::RocePacingTimer => flags |= MECHANISM_ROCE,
+            // A stage notify belongs to a stage, whose generator sets `MECHANISM_STAGES`.
+            PacketKind::StageNotify => {}
             PacketKind::Data
             | PacketKind::Feedback
             | PacketKind::TcpData(_)

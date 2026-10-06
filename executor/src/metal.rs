@@ -2639,6 +2639,9 @@ fn add_flow_route_capacities(
         PacketKind::RocePacingTimer => {
             unreachable!("the zero-byte RoCE pacing token is never routed")
         }
+        PacketKind::StageNotify => {
+            unreachable!("a stage notify crosses its host pair's lane, never a flow route")
+        }
     };
     for index in 0..route.len() {
         let target = route
@@ -3819,7 +3822,7 @@ fn encode_packet_metadata(kind: PacketKind, words: &mut [u64]) {
             words[2] = u64::from(header.pause);
         }
         PacketKind::DcqcnCnp(header) => words[0] = header.trigger_payload.0,
-        PacketKind::RocePacingTimer => {}
+        PacketKind::RocePacingTimer | PacketKind::StageNotify => {}
         PacketKind::RoceData(header) => {
             words[0] = header.psn;
             words[1] = header.sent_time_ns;
@@ -5280,6 +5283,7 @@ fn decode_packet_kind(value: u64, metadata: &[u64]) -> Result<PacketKind, MetalE
                 node: None,
             }),
         10 if metadata == [0, 0, 0] => Ok(PacketKind::RocePacingTimer),
+        11 if metadata == [0, 0, 0] => Ok(PacketKind::StageNotify),
         _ => Err(MetalError::DeviceExecution {
             code: 93,
             node: None,

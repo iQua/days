@@ -564,6 +564,7 @@ fn decode_packet_kind(value: u64, metadata: &[u64]) -> Result<PacketKind, CudaEr
                 node: None,
             }),
         10 if metadata == [0, 0, 0] => Ok(PacketKind::RocePacingTimer),
+        11 if metadata == [0, 0, 0] => Ok(PacketKind::StageNotify),
         _ => Err(CudaError::DeviceExecution {
             code: 93,
             node: None,
@@ -3056,6 +3057,9 @@ fn add_flow_route_capacities(
         PacketKind::RocePacingTimer => {
             unreachable!("the zero-byte RoCE pacing token is never routed")
         }
+        PacketKind::StageNotify => {
+            unreachable!("a stage notify crosses its host pair's lane, never a flow route")
+        }
     };
     for index in 0..route.len() {
         let target = route
@@ -4097,7 +4101,7 @@ fn packet_metadata(kind: PacketKind) -> [u64; 3] {
             header.echoed_sent_time_ns,
             crate::device_mechanism::roce_ack_size_echo_word(header),
         ],
-        PacketKind::RocePacingTimer => [0; 3],
+        PacketKind::RocePacingTimer | PacketKind::StageNotify => [0; 3],
     }
 }
 
