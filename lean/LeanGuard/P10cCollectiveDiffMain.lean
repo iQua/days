@@ -41,11 +41,13 @@ inductive Kind
   | time
   | segmentSwap
   | segmentShift
+  | doubleEdit
+  | equalStart
   deriving DecidableEq, Repr
 
 def Kind.all : List Kind :=
   [.counter, .drop, .swapLines, .swapOrder, .flowId, .predecessor, .node, .rank, .renameFlow,
-    .time, .segmentSwap, .segmentShift]
+    .time, .segmentSwap, .segmentShift, .doubleEdit, .equalStart]
 
 def Kind.name : Kind → String
   | .counter => "counter-off-by-one"
@@ -60,6 +62,8 @@ def Kind.name : Kind → String
   | .time => "changed-event-time"
   | .segmentSwap => "swapped-inbound-segments"
   | .segmentShift => "shifted-inbound-segment"
+  | .doubleEdit => "double-edit-mapping-and-flow"
+  | .equalStart => "equal-start-duplicate-segment"
 
 /-- Off by one in one counter-like field of one row. -/
 def bumpField (row : Row) (field : Nat) (up : Bool) : Row :=
@@ -92,8 +96,29 @@ def renameIn (old new : Nat) (value : Nat) : Nat := if value = old then new else
 
 def renameOpt (old new : Nat) (value : Option Nat) : Option Nat := value.map (renameIn old new)
 
-/-- One mutant of `rows` (in file order), or `none` when the drawn edit does not apply. -/
-def mutate (rows : Array Row) (kind : Kind) (g : Rng) : Option (Array Row) × Rng := Id.run do
+def isTcpInbound (row : Row) : Bool := row.cause = .inboundArrival && row.stageKind = .tcp
+
+/-- The pairs `(a, b)`, `a < b`, of TCP inbound rows of one stage where `a` arrives beyond the
+receiver's frontier (out of order) and `b`'s segment starts where `a`'s ends: the inputs of the
+`equalStart` kind (fix round 1, after the reviewer's `gen_replay_eqstart.py`). -/
+def equalStartPairs (rows : Array Row) : List (Nat × Nat) := Id.run do
+  let inbound := (List.range rows.size).filter fun k => (rows[k]?.map isTcpInbound).getD false
+  let mut pairs := []
+  for a in inbound do
+    let some ra := rows[a]? | continue
+    if ra.segmentSequence ≤ ra.beforeInboundBytes then continue
+    for b in inbound do
+      let some rb := rows[b]? | continue
+      if b > a && rb.flowId = ra.flowId &&
+          rb.segmentSequence = ra.segmentSequence + ra.segmentBytes then
+        pairs := (a, b) :: pairs
+  pure pairs.reverse
+
+/-- One mutant of `rows` (in file order), or `none` when the drawn edit does not apply.
+`pairs` is `equalStartPairs rows`, computed once per input; the `equalStart` kind is exhaustive
+rather than drawn: its `index`-th mutant is pair `index / 2` in order `index % 2`. -/
+def mutate (rows : Array Row) (pairs : List (Nat × Nat)) (index : Nat) (kind : Kind) (g : Rng) :
+    Option (Array Row) × Rng := Id.run do
   let n := rows.size
   if n < 2 then return (none, g)
   let some first := rows[0]? | return (none, g)
@@ -196,6 +221,60 @@ def mutate (rows : Array Row) (kind : Kind) (g : Rng) : Option (Array Row) × Rn
       let sequence := if choice % 2 = 0 then ra.segmentSequence + step
         else ra.segmentSequence - min step ra.segmentSequence
       (some (rows.set! a { ra with segmentSequence := sequence }), g)
+  | .doubleEdit =>
+      -- Fix round 1 (review M1, after `gen_continuity.py`): row `i` breaks the rank-to-node rule
+      -- against one earlier row and the flow-to-stage rule against another, at different depths,
+      -- or against one row (the tie: the flow donor is the newest row of the other rank).
+      if i = 0 then return (none, g)
+      let sameGroup' (r : Row) := r.stageKind = row.stageKind && r.collectiveId = row.collectiveId
+      let others := (List.range i).filter fun k => sameGroup' (at_ k) && (at_ k).rank != row.rank
+      if others.isEmpty then return (none, g)
+      let o := at_ others[j % others.length]!
+      let (mode, g) := g.below 4
+      let edited :=
+        match mode with
+        | 2 => { row with rank := o.rank }
+        | 3 => { row with nodeId := (rows.foldl (fun acc (r : Row) => max acc r.nodeId) 0) + 1 }
+        | _ => { row with nodeId := o.nodeId }
+      let (pick, g) := g.below n
+      let donor? :=
+        if mode = 1 then
+          ((List.range i).filter fun k => sameGroup' (at_ k) && (at_ k).rank = o.rank).getLast?.map at_
+        else
+          let candidates := (List.range i).filter fun k => (at_ k).flowId != row.flowId
+          if candidates.isEmpty then none else some (at_ candidates[pick % candidates.length]!)
+      let some donor := donor? | return (none, g)
+      (some (rows.set! i { edited with flowId := donor.flowId }), g)
+  | .equalStart =>
+      -- Fix round 1 (review M1, after `gen_replay_eqstart.py`): two pending segments of one stage
+      -- with the same start and different stops, in both orders; the stage's counters are then
+      -- recomputed from the reference frontier, so that the reference can accept.
+      let some (a, b) := pairs[index / 2]? | return (none, g)
+      let ra := at_ a
+      let rb := at_ b
+      let start := ra.segmentSequence
+      let short := ra.segmentBytes
+      let long := ra.segmentBytes + rb.segmentBytes
+      let (bytesA, bytesB) := if index % 2 = 0 then (long, short) else (short, long)
+      let mut out := (rows.set! a { ra with segmentBytes := bytesA }).set! b
+        { rb with segmentSequence := start, segmentBytes := bytesB }
+      let total := ra.inboundPredecessorBytes
+      let mut segments : List (Nat × Nat) := []
+      for k in [0:n] do
+        let r := out.getD k first
+        if r.flowId = ra.flowId then
+          let before := frontierOfReference segments
+          let inbound := isTcpInbound (at_ k)
+          if inbound then segments := segments ++ [segmentOf r]
+          let after := frontierOfReference segments
+          out := out.set! k
+            { r with
+              beforeInboundBytes := before
+              afterInboundBytes := after
+              arrivalBytes := if inbound then after - before else r.arrivalBytes
+              beforeInboundComplete := before = total
+              afterInboundComplete := after = total }
+      (some out, g)
 
 structure Tally where
   cases : Nat := 0
@@ -213,12 +292,15 @@ def mutateFile (seed perKind : Nat) (path : String) (tally : Tally) : IO Tally :
   let mut fileCases := 0
   -- Each input gets its own stream, from the seed and the input's file name.
   let mut g := Rng.forInput seed path
+  let pairs := equalStartPairs rows
   for kind in Kind.all do
+    -- Every equal-start pair, in both orders; `perKind` drawn mutants of every other kind.
+    let target := if kind = .equalStart then 2 * pairs.length else perKind
     let mut made := 0
     let mut attempts := 0
-    while made < perKind && attempts < perKind * 20 do
+    while made < target && attempts < target * 20 do
       attempts := attempts + 1
-      let (mutant, g') := mutate rows kind g
+      let (mutant, g') := mutate rows pairs made kind g
       g := g'
       if let some mutant := mutant then
         made := made + 1
