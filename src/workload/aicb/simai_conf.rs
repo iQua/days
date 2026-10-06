@@ -101,7 +101,6 @@ pub const INERT_KEYS: &[&str] = &[
     "QLEN_MON_INTERVAL",
     "ENABLE_TRACE",
     "SIMULATOR_STOP_TIME",
-    "L2_CHUNK_SIZE",
     "FAST_REACT",
     "U_TARGET",
     "MI_THRESH",
@@ -116,9 +115,13 @@ pub const INERT_KEYS: &[&str] = &[
 /// Keys that SimAI reads but whose effect Days does not reproduce; present only as recorded
 /// divergences (`GLOBAL_T` is forced to 1 by SimAI itself, `common.h:565-567`; `PAUSE_TIME` is
 /// Days' edge-triggered XOFF/XON; `DATA_RATE` and `LINK_DELAY` are unused with a topology file;
-/// `NIC_TOTAL_PAUSE_TIME` is a monitor).
+/// `NIC_TOTAL_PAUSE_TIME` is a monitor; `L2_CHUNK_SIZE`, a byte chunk that adds ACKs at chunk
+/// boundaries and sets back-to-zero recovery points (`rdma-hw.cc:532,591,602`), has no effect
+/// under the required `L2_ACK_INTERVAL 1`, which ACKs every packet, and `L2_BACK_TO_ZERO 0`;
+/// it must be a positive integer).
 pub const RECORDED_KEYS: &[&str] = &[
     "GLOBAL_T",
+    "L2_CHUNK_SIZE",
     "PAUSE_TIME",
     "DATA_RATE",
     "LINK_DELAY",
@@ -324,6 +327,8 @@ pub struct SimaiDcqcn {
 pub struct SimaiRoce {
     /// SimAI has no retransmission timeout (P15 C3).
     pub retransmit_timeout_ns: u64,
+    /// Always 1: `L2_ACK_INTERVAL` is bytes in SimAI, and only its value 1 (an ACK per packet)
+    /// is modelled.
     pub ack_every_packets: u64,
     /// ns-3's `RdmaHw` default; `SimAI.conf` does not set it.
     pub nack_interval_ns: u64,
@@ -407,10 +412,20 @@ pub fn derive_fabric(
         .integer("BUFFER_SIZE")?
         .checked_mul(1024 * 1024)
         .ok_or_else(|| AicbError::new("SimAI.conf: BUFFER_SIZE overflows"))?;
-    let ack_every_packets = conf.integer("L2_ACK_INTERVAL")?;
-    if ack_every_packets == 0 {
+    // SimAI's ACK interval is in bytes: the receiver ACKs when its next expected byte reaches a
+    // milestone that then advances by L2_ACK_INTERVAL, or lands on a multiple of L2_CHUNK_SIZE
+    // (rdma-hw.cc:586-595). At 1 every in-order packet is ACKed and the chunk test is never
+    // reached; any other value is a byte rule Days does not model (part-1 review F2).
+    conf.require_value(
+        "L2_ACK_INTERVAL",
+        1,
+        "SimAI reads it in bytes (rdma-hw.cc:586-595): 1 ACKs every packet, a larger value ACKs \
+         once per that many bytes and again at every L2_CHUNK_SIZE-byte boundary",
+    )?;
+    let ack_every_packets = 1;
+    if conf.integer("L2_CHUNK_SIZE")? == 0 {
         return Err(AicbError::new(
-            "SimAI.conf: L2_ACK_INTERVAL must be positive",
+            "SimAI.conf: `L2_CHUNK_SIZE 0` must be a positive number of bytes",
         ));
     }
 
