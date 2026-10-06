@@ -88,11 +88,13 @@ const PINNED_RETRIES_METAL: &[(&str, usize)] = &[
     ("tcp-compute-chain", 0),
     ("tcp-ring-allgather-compute-4", 0),
     ("compute-only", 0),
+    ("fanout-after-compute", 0),
+    ("one-ns-compute", 0),
 ];
 #[allow(dead_code)]
 const PINNED_RETRIES_CUDA: &[(&str, usize)] = PINNED_RETRIES_METAL;
 
-fn lower(name: &str) -> SimulationImage {
+pub fn lower(name: &str) -> SimulationImage {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("configs/p15")
         .join(name);
@@ -194,8 +196,140 @@ duration_ns = 7000
 after = "a"
 "#;
 
+/// One compute group released into three collectives on the same ranks, a TCP ring, a TCP AllGather
+/// and a RoCE AllGather: each compute timer releases three stages on its host in one event. The
+/// release order (ascending `FlowId`, Scalar's table order) decides the payload sequence and the
+/// host-queue order of the two TCP stages' first windows, so a reversed order changes bytes
+/// (design note §1.2).
+const FANOUT_AFTER_COMPUTE: &str = r#"
+seed = 26
+edges = [[0, 4], [1, 4], [2, 4], [3, 4]]
+hosts = [0, 1, 2, 3]
+duration = 0.01
+
+[switch]
+port_rate = 1000000000
+capacity = 300
+discipline = "FIFO"
+drop = "TailDrop"
+
+[[compute]]
+name = "forward"
+hosts = [0, 1, 2, 3]
+duration_ns = 3000
+
+[[collective]]
+name = "ring"
+after = "forward"
+collective_type = "RingAllReduce"
+flow_type = "TCP"
+flow_count = 4
+sources = [0, 1, 2, 3]
+sinks = [1, 2, 3, 0]
+
+[collective.traffic]
+initial_delay = 0.0
+size = 8000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[collective.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[collective]]
+name = "gather"
+after = "forward"
+collective_type = "AllGather"
+flow_type = "TCP"
+flow_count = 4
+sources = [0, 1, 2, 3]
+sinks = [1, 2, 3, 0]
+
+[collective.traffic]
+initial_delay = 0.0
+size = 6000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[collective.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[collective]]
+name = "rgather"
+after = "forward"
+collective_type = "AllGather"
+flow_type = "RoCE"
+flow_count = 4
+sources = [0, 1, 2, 3]
+sinks = [1, 2, 3, 0]
+
+[collective.traffic]
+initial_delay = 0.0
+size = 4000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[collective.traffic.dcqcn]
+max_rate_gbps = 1.0
+pacing_interval_ns = 1000
+
+[collective.traffic.roce]
+retransmit_timeout_ns = 1000000
+"#;
+
+/// The shortest compute interval, 1 ns, between collectives: a release never completes a stage in
+/// its own event (design note §1.2, fact B), so each 1 ns stage finishes one nanosecond after its
+/// release, in a later event.
+const ONE_NS_COMPUTE: &str = r#"
+seed = 26
+edges = [[0, 3], [1, 3], [2, 3]]
+hosts = [0, 1, 2]
+duration = 0.01
+
+[switch]
+port_rate = 1000000000
+capacity = 300
+discipline = "FIFO"
+drop = "TailDrop"
+
+[[compute]]
+name = "a"
+hosts = [0, 1, 2]
+duration_ns = 1
+
+[[compute]]
+name = "b"
+hosts = [0, 1, 2]
+duration_ns = 1
+after = "a"
+
+[[collective]]
+name = "ring"
+after = "b"
+collective_type = "RingAllReduce"
+flow_type = "TCP"
+flow_count = 3
+sources = [0, 1, 2]
+sinks = [1, 2, 0]
+
+[collective.traffic]
+initial_delay = 0.0
+size = 3000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[collective.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[compute]]
+name = "c"
+hosts = [0, 1, 2]
+duration_ns = 1
+after = "ring"
+"#;
+
 /// Every fixture that lowers, by name.
-fn fixtures() -> Vec<(String, SimulationImage)> {
+pub fn fixtures() -> Vec<(String, SimulationImage)> {
     let mut images = ROCE_FIXTURES
         .iter()
         .map(|name| (name.trim_end_matches(".toml").to_owned(), lower(name)))
@@ -215,6 +349,8 @@ fn fixtures() -> Vec<(String, SimulationImage)> {
             ring_allgather_compute_config(4),
         ),
         ("compute-only", COMPUTE_ONLY.to_owned()),
+        ("fanout-after-compute", FANOUT_AFTER_COMPUTE.to_owned()),
+        ("one-ns-compute", ONE_NS_COMPUTE.to_owned()),
     ] {
         images.push((label.to_owned(), tcp::compile_text(label, &config)));
     }
@@ -264,7 +400,7 @@ fn checkpoints(label: &str, image: &SimulationImage, count: u64) -> Vec<(String,
 }
 
 /// The fixtures, then checkpoints of the fixtures that carry every stage state between them.
-fn stage_images() -> Vec<(String, SimulationImage)> {
+pub fn stage_images() -> Vec<(String, SimulationImage)> {
     let fixtures = fixtures();
     let mut images = fixtures.clone();
     for (label, image) in &fixtures {
@@ -276,6 +412,7 @@ fn stage_images() -> Vec<(String, SimulationImage)> {
             "tcp-lossy-ring",
             "tcp-compute-chain",
             "tcp-ring-allgather-compute-4",
+            "fanout-after-compute",
         ]
         .contains(&label.as_str())
         {
@@ -298,7 +435,7 @@ fn stage_images() -> Vec<(String, SimulationImage)> {
     images
 }
 
-fn scalar(image: &SimulationImage, horizon: Option<u64>, mode: ObservationMode) -> RunResult {
+pub fn scalar(image: &SimulationImage, horizon: Option<u64>, mode: ObservationMode) -> RunResult {
     let mut expected =
         run_scalar_with_observations(image, horizon, mode).expect("scalar oracle must run");
     expected.diagnostics = None;
@@ -312,6 +449,69 @@ fn fingerprint(value: &impl std::fmt::Debug) -> (u64, u64) {
         (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
     });
     (text.len() as u64, hash)
+}
+
+/// Facts A and B of the release rule (design note §1.2), on Scalar: the fan-out fixture releases two
+/// stages on one host in one event, so the identity suite exercises the release order; and a 1 ns
+/// compute stage finishes exactly 1 ns after its release, in a later event than the release.
+#[test]
+fn release_order_and_one_ns_fixtures_exercise_the_release_rule() {
+    let all = fixtures();
+    let image = |label: &str| {
+        &all.iter()
+            .find(|(name, _)| name == label)
+            .unwrap_or_else(|| panic!("{label}"))
+            .1
+    };
+    let fanout =
+        run_scalar_with_observations(image("fanout-after-compute"), None, ObservationMode::Full)
+            .expect("scalar oracle must run");
+    let mut releases = std::collections::BTreeMap::<_, usize>::new();
+    for record in &fanout
+        .diagnostics
+        .as_ref()
+        .expect("full")
+        .mechanism_transitions
+    {
+        if let days_executor::MechanismTransitionRecord::Collective(record) = record {
+            if record.activated {
+                *releases.entry((record.key, record.node)).or_default() += 1;
+            }
+        }
+    }
+    assert!(
+        releases.values().any(|&count| count >= 3),
+        "some event releases three stages on one host"
+    );
+
+    let one_ns =
+        run_scalar_with_observations(image("one-ns-compute"), None, ObservationMode::Summary)
+            .expect("scalar oracle must run");
+    for host in &one_ns.host_states {
+        let deadlines = host
+            .generators
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| {
+                matches!(
+                    host.stage(*position).map(|stage| stage.role),
+                    Some(StageRole::Compute(_))
+                )
+            })
+            .map(|(_, generator)| {
+                assert_eq!(generator.next_emission.status, GeneratorStatus::Finished);
+                generator.next_emission.departure_time_ns
+            })
+            .collect::<Vec<_>>();
+        if deadlines.is_empty() {
+            continue;
+        }
+        assert_eq!(
+            &deadlines[..2],
+            &[1, 2],
+            "a at 1 ns, b released at 1 ns finishes at 2 ns"
+        );
+    }
 }
 
 /// Every stage image selects the mechanisms build (design note G4): the TCP-only and compute-only

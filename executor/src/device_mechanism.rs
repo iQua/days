@@ -1647,6 +1647,35 @@ mod tests {
         );
     }
 
+    /// P16 G1 (design note §1.2, fact C): each round body runs the stage pass exactly once per
+    /// transition, after dispatch, and nothing else calls it.
+    #[test]
+    fn each_round_body_runs_the_stage_pass_once_per_transition() {
+        let cuda = format!(
+            "{}{}",
+            include_str!("cuda_kernels.cu"),
+            include_str!("cuda_round_body.inc")
+        );
+        let metal = include_str!("metal_kernels.metal");
+        for (backend, source) in [("CUDA", cuda.as_str()), ("Metal", metal)] {
+            assert_eq!(
+                source.matches("stage_after_event(").count(),
+                2,
+                "{backend}: one definition and one call"
+            );
+            let call = source
+                .find("!stage_after_event(")
+                .unwrap_or_else(|| panic!("{backend}: the call"));
+            let dispatch = source[..call]
+                .rfind("dispatch_event")
+                .unwrap_or_else(|| panic!("{backend}: dispatch precedes the pass"));
+            assert!(
+                !source[dispatch..call].contains("while ("),
+                "{backend}: the pass follows the transition's dispatch in the same iteration"
+            );
+        }
+    }
+
     /// The word indices the check uses are the kernels' own.
     #[test]
     fn plan_check_word_indices_match_both_kernels() {
