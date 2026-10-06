@@ -285,12 +285,13 @@ fn parse_record(line: usize, text: &str) -> Result<Record, AicbError> {
             format!("depen = `{}`, expected -1", fields[1]),
         ));
     }
-    let integer = |index: usize, label: &str| {
+    // The label is formatted only on a refusal: a record allocates nothing but its name.
+    let integer = |index: usize, label: &str, suffix: &str| {
         exact_integer(fields[index], false).ok_or_else(|| {
             AicbError::at(
                 line,
                 format!(
-                    "{label} `{}` is not an exact non-negative integer that fits u64",
+                    "{label}{suffix} `{}` is not an exact non-negative integer that fits u64",
                     fields[index]
                 ),
             )
@@ -298,9 +299,9 @@ fn parse_record(line: usize, text: &str) -> Result<Record, AicbError> {
     };
     let entry = |base: usize, column: Column, label: &str| -> Result<ColumnEntry, AicbError> {
         Ok(ColumnEntry {
-            compute_ns: integer(base, &format!("{label}_compute"))?,
+            compute_ns: integer(base, label, "_compute")?,
             comm: comm_type(line, fields[base + 1], column, label)?,
-            size_bytes: integer(base + 2, &format!("{label}_comm_size"))?,
+            size_bytes: integer(base + 2, label, "_comm_size")?,
         })
     };
     Ok(Record {
@@ -309,7 +310,7 @@ fn parse_record(line: usize, text: &str) -> Result<Record, AicbError> {
         forward: entry(2, Column::Forward, "fp")?,
         input_gradient: entry(5, Column::InputGradient, "ig")?,
         weight_gradient: entry(8, Column::WeightGradient, "wg")?,
-        process_time_ns: integer(11, "process_time")?,
+        process_time_ns: integer(11, "process_time", "")?,
     })
 }
 

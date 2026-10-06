@@ -100,6 +100,7 @@ fn the_parser_allocates_the_records_and_one_name_each() {
     let (trace, calls) = calls_during(|| parse_trace(&text).unwrap());
     let records = trace.records.len() as u64;
     assert_eq!(records, 184);
+    println!("record=aicb_budget phase=parse records={records} allocation_calls={calls}");
     assert!(
         calls <= records + 1,
         "parse made {calls} allocation calls for {records} records (budget: records + 1)"
@@ -114,6 +115,9 @@ fn group_formation_allocates_independently_of_the_world_size() {
     let (groups, large_calls) =
         calls_during(|| form_groups(&large.header, Fidelity::Simai, 8).unwrap());
     assert_eq!(groups.world, 1024);
+    println!(
+        "record=aicb_budget phase=groups w128_allocation_calls={small_calls} w1024_allocation_calls={large_calls}"
+    );
     assert_eq!(
         small_calls, large_calls,
         "group formation: {small_calls} allocation calls at W 128, {large_calls} at W 1,024"
@@ -147,6 +151,10 @@ fn the_schedule_allocates_independently_of_the_world_size() {
         assert_eq!(plan.ops.len(), 279);
         calls.push(made);
     }
+    println!(
+        "record=aicb_budget phase=schedule w128_allocation_calls={} w1024_allocation_calls={}",
+        calls[0], calls[1]
+    );
     assert_eq!(
         calls[0], calls[1],
         "the schedule made {} allocation calls at W 128 and {} at W 1,024",

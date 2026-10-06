@@ -171,7 +171,13 @@ pub fn form_groups(
         )));
     }
     let dp_ep = dp / ep;
-    let mut families: [(u32, Vec<u32>); 4] = Default::default();
+    // Each family covers every rank at most once: one allocation of W slots each, whatever W is.
+    // (only for the families that exist).
+    let present = [true, dp > 1, ep > 1, dp_ep > 1];
+    let mut families: [(u32, Vec<u32>); 4] = std::array::from_fn(|kind| {
+        let capacity = if present[kind] { world as usize } else { 0 };
+        (0, Vec::with_capacity(capacity))
+    });
     for stage in 0..stages {
         let base = stage * stage_world;
         let tp_group = |index: u32, slot: u32| base + index * tp + slot;
