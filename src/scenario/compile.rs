@@ -682,7 +682,9 @@ pub fn compile_config_with_route_workers(
 struct SupportedModel {
     seed: u64,
     stop_time_ns: u64,
-    rate_bps: u64,
+    /// `switch.port_rate`, the one link rate of every topology but the rail fabric, whose
+    /// per-class rates come from its topology table (`None` there; required elsewhere).
+    rate_bps: Option<u64>,
     queue_capacity_packets: u64,
     scheduler: SchedulerKind,
     drop_mark: DropMarkPolicy,
@@ -746,6 +748,9 @@ fn canonical_roce_keys(
 /// layer a link belongs to: host attachment, edge-to-aggregation, aggregation-to-core.
 #[derive(Clone, Copy, Debug)]
 enum PropagationModel {
+    /// No delay key: zero on every topology but the rail fabric, whose topology table names its
+    /// per-class delays.
+    Undeclared,
     Uniform(u64),
     FatTreeTiers(SourcePropagationTiers),
 }
@@ -771,7 +776,12 @@ impl SupportedModel {
             1_000_000_000,
             "simulation duration",
         )?;
-        let rate_bps = parse_rate(scenario_text, source.switch.port_rate.as_ref())?;
+        let rate_bps = source
+            .switch
+            .port_rate
+            .as_ref()
+            .map(|rate| parse_rate(scenario_text, Some(rate)))
+            .transpose()?;
 
         let discipline = source
             .switch
@@ -1040,7 +1050,8 @@ impl SupportedModel {
                 ));
             }
             (_, Some(tiers)) => PropagationModel::FatTreeTiers(tiers),
-            (propagation_ns, None) => PropagationModel::Uniform(propagation_ns.unwrap_or(0)),
+            (Some(propagation_ns), None) => PropagationModel::Uniform(propagation_ns),
+            (None, None) => PropagationModel::Undeclared,
         };
 
         Ok(Self {
@@ -2476,7 +2487,20 @@ fn link_delay_model(
     propagation: PropagationModel,
     profile: TopologyProfile,
 ) -> Result<LinkDelay, CompileError> {
+    if let TopologyProfile::Rail(rail) = profile {
+        if !matches!(propagation, PropagationModel::Undeclared) {
+            return Err(CompileError::Unsupported(
+                "unsupported `link.propagation_ns` or `link.propagation_tiers` on a SpectrumX \
+                 topology; its link delays are `topology.spectrum_x.link_delay_ns`"
+                    .to_owned(),
+            ));
+        }
+        return Ok(LinkDelay::Rail {
+            link_delay_ns: rail.link_delay_ns,
+        });
+    }
     let tiers = match propagation {
+        PropagationModel::Undeclared => return Ok(LinkDelay::Uniform(0)),
         PropagationModel::Uniform(propagation_ns) => {
             return Ok(LinkDelay::Uniform(propagation_ns));
         }
@@ -2502,6 +2526,45 @@ fn link_delay_model(
     })
 }
 
+/// The link-rate model resolved against one built topology: `switch.port_rate` everywhere, or the
+/// rail fabric's per-class rates (NIC links and ASW–PSW uplinks, P16 H2).
+#[derive(Clone, Copy, Debug)]
+enum LinkRate {
+    Uniform(u64),
+    Rail { nic_bps: u64, uplink_bps: u64 },
+}
+
+impl LinkRate {
+    fn resolve(rate_bps: Option<u64>, profile: TopologyProfile) -> Result<Self, CompileError> {
+        match (profile, rate_bps) {
+            (TopologyProfile::Rail(rail), None) => Ok(Self::Rail {
+                nic_bps: rail.nic_rate_bps,
+                uplink_bps: rail.uplink_rate_bps,
+            }),
+            (TopologyProfile::Rail(_), Some(_)) => Err(CompileError::Unsupported(
+                "unsupported `switch.port_rate` on a SpectrumX topology; its link rates are \
+                 `topology.spectrum_x.nic_rate_bps` and `uplink_rate_bps`"
+                    .to_owned(),
+            )),
+            (_, Some(rate_bps)) => Ok(Self::Uniform(rate_bps)),
+            (_, None) => parse_rate("", None).map(Self::Uniform),
+        }
+    }
+
+    fn of(self, key: LinkKey) -> u64 {
+        match self {
+            Self::Uniform(rate_bps) => rate_bps,
+            Self::Rail {
+                nic_bps,
+                uplink_bps,
+            } => match (key.source, key.target) {
+                (PhysicalNodeKey::Host(_), _) | (_, PhysicalNodeKey::Host(_)) => nic_bps,
+                (PhysicalNodeKey::Switch(_), PhysicalNodeKey::Switch(_)) => uplink_bps,
+            },
+        }
+    }
+}
+
 /// Propagation model resolved against one built topology.
 #[derive(Clone, Copy, Debug)]
 enum LinkDelay {
@@ -2511,12 +2574,17 @@ enum LinkDelay {
         /// First aggregation-to-core switch identity: `edge_switches + aggregation_switches`.
         core_boundary: u64,
     },
+    /// The rail fabric: NIC links and ASW–PSW links share SimAI's one `latency` (P16 H2).
+    Rail {
+        link_delay_ns: u64,
+    },
 }
 
 impl LinkDelay {
     fn of(self, key: LinkKey) -> u64 {
         match self {
             Self::Uniform(propagation_ns) => propagation_ns,
+            Self::Rail { link_delay_ns } => link_delay_ns,
             Self::FatTreeTiers {
                 tiers,
                 core_boundary,
@@ -2544,6 +2612,7 @@ fn lower(
     route_workers: RouteWorkers,
 ) -> Result<SimulationImage, CompileError> {
     let link_delay = link_delay_model(model.propagation, profile)?;
+    let link_rate = LinkRate::resolve(model.rate_bps, profile)?;
     let roce_keys = model.roce_keys.clone();
     let switch_topology_ids = graph
         .node_indices()
@@ -3262,7 +3331,7 @@ fn lower(
             id,
             source: ids.node(LpKey::for_link_source(key)),
             target: ids.node(LpKey::for_link_target(key)),
-            rate_bps: model.rate_bps,
+            rate_bps: link_rate.of(key),
             propagation_ns: link_delay.of(key),
         })
         .collect::<Vec<_>>();

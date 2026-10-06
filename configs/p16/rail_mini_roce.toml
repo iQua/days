@@ -1,0 +1,63 @@
+# P16 H2 fixture: a miniature Spectrum-X rail fabric (tests/p16_rail_lowering.rs).
+#
+# 8 GPUs, 2 per server (servers {0,1}, {2,3}, ...), 2 NICs per ASW: a segment is 4 GPUs, so 2
+# segments x 2 rails = 4 ASWs of 2 GPUs each, and 2 PSWs. NIC links 100 Gb/s, ASW-PSW uplinks
+# 400 Gb/s, 500 ns; NVLink 2,400 Gb/s, 25 ns (delay-only). One RoCE ring all-reduce over all 8
+# GPUs in GPU order, lossless class 3 with switch and host-link PFC.
+seed = 7
+duration = 0.01
+
+[topology]
+category = "SpectrumX"
+
+[topology.spectrum_x]
+gpus = 8
+gpus_per_server = 2
+nics_per_asw = 2
+psws = 2
+gpu_type = "H100"
+nic_rate_bps = 100000000000
+uplink_rate_bps = 400000000000
+nvlink_rate_bps = 2400000000000
+link_delay_ns = 500
+nvlink_delay_ns = 25
+
+[switch]
+capacity = 3729
+discipline = "FIFO"
+drop = "ECN_THRESHOLD"
+ecn_threshold = 0.06
+
+[link]
+mode = "Pfc"
+
+[link.pfc]
+host_links = true
+buffer_capacity = [0, 0, 0, 3590844, 0, 0, 0, 0]
+xoff = [0, 0, 0, 3515844, 0, 0, 0, 0]
+xon = [0, 0, 0, 3512772, 0, 0, 0, 0]
+
+[[collective]]
+collective_type = "RingAllReduce"
+flow_type = "RoCE"
+priority = 3
+flow_count = 8
+sources = [0, 1, 2, 3, 4, 5, 6, 7]
+sinks = [1, 2, 3, 4, 5, 6, 7, 0]
+
+[collective.traffic]
+initial_delay = 0.0
+size = 640000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 9000, high = 9000 }
+
+[collective.traffic.dcqcn]
+max_rate_gbps = 100.0
+pacing_interval_ns = 720
+
+[collective.traffic.roce]
+retransmit_timeout_ns = 0
+feedback_priority = 3
+ack_size_bytes = 60
+window_bytes = 72500
+variable_window = true
