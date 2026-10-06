@@ -773,7 +773,24 @@ pub fn compile_config_with_route_workers(
     path: impl AsRef<Path>,
     route_workers: RouteWorkers,
 ) -> Result<SimulationImage, CompileError> {
-    let path = path.as_ref();
+    compile_scenario(path.as_ref(), route_workers, None)
+}
+
+/// Lowers a TOML scenario's topology, switch and link configuration (and any stage groups it
+/// declares) together with a typed workload's operations (`super::workload`, ruling R12).
+pub fn compile_config_with_workload(
+    path: impl AsRef<Path>,
+    workload: &super::workload::Workload,
+    route_workers: RouteWorkers,
+) -> Result<SimulationImage, CompileError> {
+    compile_scenario(path.as_ref(), route_workers, Some(workload))
+}
+
+fn compile_scenario(
+    path: &Path,
+    route_workers: RouteWorkers,
+    workload: Option<&super::workload::Workload>,
+) -> Result<SimulationImage, CompileError> {
     let content = fs::read_to_string(path).map_err(|source| CompileError::Read {
         path: path.display().to_string(),
         source,
@@ -784,7 +801,7 @@ pub fn compile_config_with_route_workers(
     crate::validate_config(path_str).map_err(CompileError::Unsupported)?;
 
     let source: SourceConfig = toml::from_str(&content)?;
-    let model = SupportedModel::from_source(source, &content)?;
+    let model = SupportedModel::from_source(source, &content, workload)?;
     let (graph, hosts, profile) = build_graph_with_profile(path_str)?;
 
     let image = lower(model, &graph, hosts, profile, route_workers)?;
@@ -875,7 +892,11 @@ struct PfcLowering {
 }
 
 impl SupportedModel {
-    fn from_source(source: SourceConfig, scenario_text: &str) -> Result<Self, CompileError> {
+    fn from_source(
+        source: SourceConfig,
+        scenario_text: &str,
+        workload: Option<&super::workload::Workload>,
+    ) -> Result<Self, CompileError> {
         let seed = source
             .seed
             .ok_or_else(|| CompileError::Invalid("`seed` is missing".to_owned()))?;
@@ -1117,6 +1138,17 @@ impl SupportedModel {
                 &mut roce_keys,
             )?);
         }
+        let mut computes = source
+            .compute
+            .unwrap_or_default()
+            .into_iter()
+            .map(validate_compute)
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(workload) = workload {
+            let (more_collectives, more_computes) = workload_keys(workload, &mut roce_keys)?;
+            collectives.extend(more_collectives);
+            computes.extend(more_computes);
+        }
         // After the collectives, whose keys sort them in `canonical_flows`.
         let roce_keys = canonical_roce_keys(
             roce_keys,
@@ -1124,12 +1156,6 @@ impl SupportedModel {
             &mut flow_sets,
             &mut collectives,
         );
-        let computes = source
-            .compute
-            .unwrap_or_default()
-            .into_iter()
-            .map(validate_compute)
-            .collect::<Result<Vec<_>, _>>()?;
 
         let routing = match source
             .routing
@@ -1743,6 +1769,118 @@ fn seeded_all_to_all(source: SourceAllToAll) -> Result<SeededAllToAll, CompileEr
         bytes_per_copy: source.bytes_per_copy,
         skew,
     })
+}
+
+/// The collectives and compute groups of a typed workload, validated as their TOML rendering
+/// would be: operation `i` is the stage group `@i`.
+fn workload_keys(
+    workload: &super::workload::Workload,
+    roce_keys: &mut Vec<RoceTrafficKey>,
+) -> Result<(Vec<CollectiveKey>, Vec<ComputeKey>), CompileError> {
+    use super::workload::OperationKind;
+    let transports = workload
+        .transports
+        .iter()
+        .map(|transport| {
+            toml::from_str::<SourceTraffic>(&transport.traffic)
+                .map(|traffic| (transport, traffic))
+                .map_err(CompileError::from)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let name = |index: usize| format!("@{index}");
+    let mut collectives = Vec::new();
+    let mut computes = Vec::new();
+    for (index, operation) in workload.operations.iter().enumerate() {
+        let hosts = workload.groups.get(operation.group).ok_or_else(|| {
+            CompileError::Invalid(format!("workload operation {index} names an unknown group"))
+        })?;
+        if let Some(&after) = operation
+            .after
+            .iter()
+            .find(|&&after| after >= workload.operations.len())
+        {
+            return Err(CompileError::Invalid(format!(
+                "workload operation {index} follows unknown operation {after}"
+            )));
+        }
+        let after = match operation.after.as_slice() {
+            [] => None,
+            [one] => Some(AfterGroups::One(name(*one))),
+            many => Some(AfterGroups::Many(
+                many.iter().map(|&after| name(after)).collect(),
+            )),
+        };
+        match &operation.kind {
+            OperationKind::Compute { duration_ns } => {
+                computes.push(validate_compute(SourceCompute {
+                    name: name(index),
+                    hosts: hosts.clone(),
+                    duration_ns: *duration_ns,
+                    after,
+                })?)
+            }
+            OperationKind::Collective(collective) => {
+                let (transport, template) =
+                    transports.get(collective.transport).ok_or_else(|| {
+                        CompileError::Invalid(format!(
+                            "workload operation {index} names an unknown transport"
+                        ))
+                    })?;
+                let mut traffic = template.clone();
+                traffic.size = Some(collective.bytes);
+                let ring = collective.channels.is_none()
+                    && !matches!(
+                        collective.algorithm,
+                        super::workload::Algorithm::AllToAll | super::workload::Algorithm::SendRecv
+                    );
+                let sinks = if ring {
+                    hosts
+                        .iter()
+                        .cycle()
+                        .skip(1)
+                        .take(hosts.len())
+                        .copied()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let mut key = collective_key(
+                    collective.algorithm.collective_type(),
+                    Some(transport.flow_type.as_str()),
+                    hosts.len() as u64,
+                    hosts.clone(),
+                    sinks,
+                    Some(transport.priority),
+                    None,
+                    None,
+                    None,
+                    None,
+                    traffic,
+                    collective.channels.is_some(),
+                    &transport.traffic,
+                    roce_keys,
+                )?;
+                key.name = Some(name(index));
+                key.after = after;
+                let chunk = if collective.uniform_floor {
+                    "UniformFloor"
+                } else {
+                    "EqualRemainderLast"
+                };
+                let chunk = (collective.algorithm != super::workload::Algorithm::SendRecv
+                    && collective.seeded.is_none())
+                .then_some(chunk);
+                shape_collective(
+                    &mut key,
+                    collective.channels.clone(),
+                    chunk,
+                    collective.seeded,
+                )?;
+                collectives.push(key);
+            }
+        }
+    }
+    Ok((collectives, computes))
 }
 
 fn validate_collective_set(

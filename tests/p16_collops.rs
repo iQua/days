@@ -683,6 +683,96 @@ fn the_stage_index_agrees_with_the_scans_on_joins() {
     }
 }
 
+/// A typed workload lowers exactly as its TOML rendering (operation `i` is the group `@i`): a
+/// compute, a RoCE all-to-all and a TCP ring with two afters.
+#[test]
+fn a_workload_lowers_as_its_toml_rendering() {
+    use days::scenario::workload::{
+        Algorithm, Collective, Operation, OperationKind, Transport, Workload,
+    };
+    let roce_traffic = "initial_delay = 0.0\narr_dist = { type = \"Uniform\", low = 1, high = 1 }\npkt_size_dist = { type = \"DiscreteUniform\", low = 500, high = 500 }\n\n[dcqcn]\nmax_rate_gbps = 8.0\npacing_interval_ns = 500\n\n[roce]\nretransmit_timeout_ns = 1000000\n";
+    let tcp_traffic = "initial_delay = 0.0\narr_dist = { type = \"Uniform\", low = 1, high = 1 }\npkt_size_dist = { type = \"DiscreteUniform\", low = 500, high = 500 }\n\n[tcp]\ncc_algorithm = \"TCPReno\"\n";
+    let workload = Workload {
+        groups: vec![vec![0, 1, 2, 3]],
+        transports: vec![
+            Transport {
+                flow_type: "RoCE".to_owned(),
+                priority: 0,
+                traffic: roce_traffic.to_owned(),
+            },
+            Transport {
+                flow_type: "TCP".to_owned(),
+                priority: 0,
+                traffic: tcp_traffic.to_owned(),
+            },
+        ],
+        operations: vec![
+            Operation {
+                group: 0,
+                after: vec![],
+                kind: OperationKind::Compute { duration_ns: 2_000 },
+            },
+            Operation {
+                group: 0,
+                after: vec![0],
+                kind: OperationKind::Collective(Collective {
+                    algorithm: Algorithm::AllToAll,
+                    bytes: 8_000,
+                    transport: 0,
+                    channels: None,
+                    uniform_floor: true,
+                    seeded: None,
+                }),
+            },
+            Operation {
+                group: 0,
+                after: vec![1],
+                kind: OperationKind::Compute { duration_ns: 1_000 },
+            },
+            Operation {
+                group: 0,
+                after: vec![2, 1],
+                kind: OperationKind::Collective(Collective {
+                    algorithm: Algorithm::ReduceScatter,
+                    bytes: 12_000,
+                    transport: 1,
+                    channels: None,
+                    uniform_floor: false,
+                    seeded: None,
+                }),
+            },
+        ],
+    };
+    let base = star(4, "");
+    let path = std::env::temp_dir().join(format!(
+        "days-p16-collops-workload-{}.toml",
+        std::process::id()
+    ));
+    std::fs::write(&path, &base).unwrap();
+    let lowered = days::scenario::compile_config_with_workload(
+        &path,
+        &workload,
+        days::topos::route::RouteWorkers::serial(),
+    );
+    std::fs::remove_file(&path).unwrap();
+    let lowered = lowered.unwrap_or_else(|error| panic!("the workload lowers: {error}"));
+    let rendering = star(
+        4,
+        &(compute("@0", H4, 2_000, "")
+            + &collective("@1", "AllToAll", "RoCE", H4, "after = \"@0\"\n", 8_000)
+            + &compute("@2", H4, 1_000, "after = \"@1\"")
+            + &collective(
+                "@3",
+                "ReduceScatter",
+                "TCP",
+                H4,
+                "sinks = [1, 2, 3, 0]\nafter = [\"@2\", \"@1\"]\n",
+                12_000,
+            )),
+    );
+    assert_eq!(lowered, lower("workload-rendering", &rendering));
+}
+
 #[cfg(feature = "cuda")]
 mod cuda {
     use days_executor::{CudaConfig, ObservationMode, run_cuda_with_observations};
