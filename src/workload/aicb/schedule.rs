@@ -10,10 +10,11 @@
 //! ```
 //!
 //! This module turns a parsed trace and its groups into that chain, applies SimAI's size rules in
-//! SimAI's order (the fp clamp, per-message floors, ring elision, the 0 -> 1 B rule, the wire-size
-//! hang gate), fuses each rank's delay-only stretches into segments (ruling A1), derives the data
-//! queue's LIFO order (R9) and the realized start order the ECMP ordinals follow (A7), and assigns
-//! the imbalanced arm's matrices (R7). Everything here is per trace, not per rank: every rank of a
+//! SimAI's order (the fp clamp, per-message floors, a ring that floors to 0 B refused under the
+//! SimAI fidelity and dropped under Megatron's, the 0 -> 1 B rule, the wire-size hang gate),
+//! fuses each rank's delay-only stretches into segments (ruling A1), derives the data queue's LIFO
+//! order (R9) and the realized start order the ECMP ordinals follow (A7), and assigns the
+//! imbalanced arm's matrices (R7). Everything here is per trace, not per rank: every rank of a
 //! pipeline stage runs the same chain, so nothing allocates per rank.
 
 use super::{AicbError, Algorithm, Column, Fidelity, GroupKind, Groups, Trace};
@@ -276,7 +277,8 @@ pub struct PlanCounters {
     pub fp_clamps: usize,
     /// wg columns of 0 B (a stream-less dataset SimAI never waits on).
     pub elided_zero_wg: usize,
-    /// Rings whose per-message floor is 0 (SimAI sends nothing).
+    /// Rings whose per-message floor is 0, dropped under the Megatron fidelity (with their
+    /// `process_time`); the SimAI fidelity refuses them (SimAI never finishes such a ring).
     pub elided_ring_floor: usize,
     /// All-to-alls with `S < n` under the Megatron fidelity (every pair is zero).
     pub elided_zero_all_to_all: usize,
@@ -482,6 +484,18 @@ pub fn plan_schedule(
                     Algorithm::AllToAll => {
                         counters.elided_zero_all_to_all += 1;
                         continue;
+                    }
+                    // SimAI builds no flow for the ring but still creates and counts its stream,
+                    // which never reaches exit(): the collective never finishes (part-1 review
+                    // F1; NcclTreeFlowModel.cc:233-265, :439, :608-632).
+                    _ if simai => {
+                        return Err(AicbError::at(
+                            record.line,
+                            format!(
+                                "{column:?} {:?} of {size} B on {:?} floors to 0 B per message                                  (floor(floor({size} / {n}) / {channels}) with n = {n} ranks,                                  c = {channels} channels): SimAI creates the collective's stream                                  but sends nothing, so it never finishes",
+                                comm.algorithm, comm.group
+                            ),
+                        ));
                     }
                     _ => {
                         counters.elided_ring_floor += 1;
