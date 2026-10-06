@@ -416,8 +416,9 @@ fn the_hang_gate_refuses_under_simai_and_records_under_megatron() {
     assert!(error.starts_with("line 3:"), "{error}");
     let plan = planned(&trace, &options(Fidelity::Megatron, "A100"));
     assert_eq!(plan.counters.hang_window_recorded, 1);
-    // An all-to-all below one byte per pair: 1 B under SimAI (refused), elided under Megatron.
-    let trace = synthetic(&["r\t-1\t1\tALLTOALL_EP\t7\t1\tNONE\t0\t1\tNONE\t0\t100"]);
+    // An ig all-to-all below one byte per pair (an fp one would be clamped to 4,096 B first):
+    // 1 B under SimAI (refused), elided under Megatron.
+    let trace = synthetic(&["r\t-1\t1\tNONE\t0\t1\tALLTOALL_EP\t7\t1\tNONE\t0\t100"]);
     let error = try_plan(&trace, &options(Fidelity::Simai, "A100")).unwrap_err();
     assert!(error.contains("never marks sent"), "{error}");
     let plan = planned(&trace, &options(Fidelity::Megatron, "A100"));
