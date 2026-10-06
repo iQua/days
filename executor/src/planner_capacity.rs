@@ -782,6 +782,7 @@ fn legacy_minimum_packet_size(
             packet.flow.0 as usize == flow
                 && packet.kind.is_data() == packet_kind.is_data()
                 && !packet.kind.is_timer_token()
+                && !is_compute_timer_token(packet)
         })
         .map(|packet| packet.size_bytes)
         .chain(
@@ -805,7 +806,10 @@ fn legacy_minimum_packet_size(
                         .host_states
                         .iter()
                         .flat_map(|state| &state.generators)
-                        .filter(move |generator| generator.flow.0 as usize == flow)
+                        .filter(move |generator| {
+                            generator.flow.0 as usize == flow
+                                && !is_compute_timer_generator(generator.kind)
+                        })
                         .map(move |generator| match generator.kind {
                             FlowGeneratorKind::Constant(constant) => constant.packet_size_bytes,
                             FlowGeneratorKind::Tcp(tcp) => match tcp_minimum_packet_size {
