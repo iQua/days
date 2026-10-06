@@ -24,12 +24,14 @@
 //! A compute stage's timer is one fallback-heap event at its source while the stage runs; at most
 //! `min(leaves, unfinished compute stages)` of a host's timers are pending at once.
 //!
-//! One exception keeps today's sum (fix round 1, review F1). A windowless queue pair whose data
-//! class is PFC-controlled on its host's egress link does not stay within its per-flow host-queue
-//! bound: while the class is paused, its Go-back-N copies and the packets already queued wait in
-//! the host queue. The summed bounds of such a host's stages absorbed that; one chain's charge does
-//! not, and the retries grew with chain length. Those stages are charged their summed host-queue
-//! bound, as before; their remote-staging and event-heap charges stay grouped.
+//! The host queue is the exception (fix rounds 1 and 2, review F1 and R1-F1). The per-flow
+//! host-queue bound of a windowless queue pair or a TCP stage is a lookahead horizon bound, which
+//! fails whenever its host queue backs up (behind a PFC pause or a busier pacer, with Go-back-N
+//! copies or a congestion window that the backlog does not limit). The summed bounds of a host's
+//! stages absorbed that; one chain's charge did not, and the retries grew with chain length. So
+//! only a windowed queue pair, whose window bound survives a backlog (ruling G8), has its
+//! host-queue charge grouped; every other stage keeps its summed host-queue charge. Remote
+//! staging, the event heap and the outbox stay grouped for every stage.
 //!
 //! # Windows (ruling G8)
 //!
@@ -72,9 +74,6 @@ pub(crate) struct SizingConcurrency {
     groups: Vec<u32>,
     /// Per group: the stage generations that may hold packets at once, `2 × leaves`.
     generations: Vec<usize>,
-    /// Per flow: whether it is an unfinished windowless stage queue pair whose data class its host's
-    /// egress link can pause; empty when the image has no stage.
-    pausable_windowless: Vec<bool>,
     /// Per group: the source node and its pending compute-timer bound,
     /// `min(leaves, unfinished compute stages)`.
     compute_timers: Vec<(usize, usize)>,
@@ -108,7 +107,6 @@ impl SizingConcurrency {
             groups: Vec::new(),
             generations: Vec::new(),
             compute_timers: Vec::new(),
-            pausable_windowless: Vec::new(),
             window_packets,
             has_stages,
         };
@@ -134,8 +132,6 @@ impl SizingConcurrency {
             }
         }
         let mut groups = vec![NO_GROUP; flow_count];
-        let pausable = pausable_classes(image);
-        let mut pausable_windowless = vec![false; flow_count];
         for state in &image.host_states {
             if state.stages.is_empty() {
                 continue;
@@ -156,12 +152,6 @@ impl SizingConcurrency {
                 }
                 let flow = generator.flow.0 as usize;
                 groups[flow] = group;
-                if let FlowGeneratorKind::Roce(roce) = generator.kind {
-                    pausable_windowless[flow] = roce.window_bytes == 0
-                        && pausable
-                            .binary_search(&(state.egress_link.0, image.flows[flow].priority))
-                            .is_ok();
-                }
                 source.get_or_insert(image.flows[flow].source.0 as usize);
                 leaves += usize::from(!has_successor[flow]);
                 compute += usize::from(matches!(stage.role, StageRole::Compute(_)));
@@ -172,7 +162,6 @@ impl SizingConcurrency {
             }
         }
         self.groups = groups;
-        self.pausable_windowless = pausable_windowless;
     }
 
     /// Whether any host carries a stage.
@@ -188,14 +177,11 @@ impl SizingConcurrency {
             .filter(|group| *group != NO_GROUP)
     }
 
-    /// The concurrency group in which `flow`'s host-queue source bound is charged: its stage group,
-    /// except for a windowless stage queue pair on a class its host can pause, which is charged
-    /// alone (fix round 1, review F1).
+    /// The concurrency group in which `flow`'s host-queue source bound is charged: its stage group
+    /// for a windowed queue pair, whose window bound survives a backlog; otherwise none, so the
+    /// bound is charged alone (fix rounds 1 and 2, review F1 and R1-F1).
     pub(crate) fn host_queue_group(&self, flow: usize) -> Option<u32> {
-        if self.pausable_windowless.get(flow).copied().unwrap_or(false) {
-            return None;
-        }
-        self.group(flow)
+        self.window_packets(flow).and_then(|_| self.group(flow))
     }
 
     /// `ceil(window_bytes / mtu) + 1` if `flow` is a windowed queue pair.
@@ -212,26 +198,6 @@ impl SizingConcurrency {
             capacities[source] = capacities[source].saturating_add(timers);
         }
     }
-}
-
-/// Every `(controlled link, priority)` a downstream PFC monitor can pause (a nonzero XOFF
-/// threshold), sorted; built only for stage images.
-fn pausable_classes(image: &SimulationImage) -> Vec<(u64, u8)> {
-    let mut classes = image
-        .switch_states
-        .iter()
-        .flat_map(|state| &state.queues)
-        .filter_map(|queue| queue.pfc.as_ref())
-        .flat_map(|pfc| &pfc.ingresses)
-        .flat_map(|ingress| {
-            (0..8_u8)
-                .filter(|&priority| ingress.xoff_threshold_bytes[usize::from(priority)] != 0)
-                .map(|priority| (ingress.controlled_link.0, priority))
-        })
-        .collect::<Vec<_>>();
-    classes.sort_unstable();
-    classes.dedup();
-    classes
 }
 
 /// Per flow, `ceil(window_bytes / mtu) + 1` for each windowed queue pair and zero otherwise; empty

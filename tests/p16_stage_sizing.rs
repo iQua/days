@@ -245,8 +245,8 @@ fn plane_words(report: &DeviceSizingReport, name: &str) -> usize {
 /// remote-staging arena. Three chained AllGathers plan exactly what one plans (`2 × leaves × max`
 /// per host and slot, with one leaf per host and equal per-stage bounds); the summed bound grew
 /// threefold. The host queue follows the same rule for windowed pairs (ruling G8). Windowless
-/// pairs on a class their host can pause, as here, keep their summed host-queue charge (fix
-/// round 1, review F1), so that arena grows with the chain.
+/// pairs, as here, keep their summed host-queue charge (fix rounds 1 and 2, review F1 and R1-F1),
+/// so that arena grows with the chain.
 #[test]
 fn a_longer_stage_chain_plans_no_more_staging_or_queue() {
     for window_bytes in [0, 20_000] {
