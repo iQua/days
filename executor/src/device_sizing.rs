@@ -949,6 +949,18 @@ impl CapacityContext {
     }
 }
 
+/// Whether an initial packet occupies a queue or a link of its flow's route, so the per-flow packet
+/// counts that size the queue, staging and channel arenas include it. A queue pair's zero-byte
+/// pacing token never enters a queue or crosses a link, and a PFC frame travels on its reverse
+/// control lane, never on its flow's route. P16 G1: neither does a compute stage's timer token,
+/// the only zero-byte `Data` packet the validator admits.
+pub(crate) fn initial_packet_is_routed(packet: &crate::PacketDescriptor) -> bool {
+    !(matches!(
+        packet.kind,
+        PacketKind::RocePacingTimer | PacketKind::Pfc(_)
+    ) || (packet.kind == PacketKind::Data && packet.size_bytes == 0))
+}
+
 fn flow_packet_counts(
     image: &SimulationImage,
 ) -> Result<(Vec<usize>, Vec<usize>), DeviceSizingError> {
@@ -959,9 +971,7 @@ fn flow_packet_counts(
         if matches!(packet.kind, PacketKind::TcpData(_)) && !live_payloads.contains(&packet.id) {
             continue;
         }
-        // The zero-byte DCQCN control-timer token never enters a queue or crosses a link, and a PFC
-        // frame travels on its reverse control lane, never on its flow's route.
-        if packet.kind.is_timer_token() || matches!(packet.kind, PacketKind::Pfc(_)) {
+        if !crate::device_sizing::initial_packet_is_routed(packet) {
             continue;
         }
         let counts = if packet.kind.is_data() {
@@ -2000,6 +2010,31 @@ mod tests {
         DeviceEventArenaSizing, EcnThresholdPolicy, QueueDepthUnit, TcpCongestionControl,
         TcpGenerator,
     };
+
+    /// P16 G1 (design note §4.2, item 1): a compute stage's zero-byte `Data` token names its
+    /// timer and is never routed, like a queue pair's pacing token; a sized data packet is.
+    #[test]
+    fn compute_timer_tokens_and_pacing_tokens_are_not_routed() {
+        let packet = |kind, size_bytes| crate::PacketDescriptor {
+            id: crate::PayloadId(1),
+            flow: crate::FlowId(0),
+            size_bytes,
+            ecn_marked: false,
+            kind,
+        };
+        assert!(!super::initial_packet_is_routed(&packet(
+            crate::PacketKind::Data,
+            0
+        )));
+        assert!(!super::initial_packet_is_routed(&packet(
+            crate::PacketKind::RocePacingTimer,
+            0
+        )));
+        assert!(super::initial_packet_is_routed(&packet(
+            crate::PacketKind::Data,
+            1
+        )));
+    }
 
     #[test]
     fn exact_plan_report_sums_production_plane_words() {

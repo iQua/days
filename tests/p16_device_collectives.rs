@@ -67,6 +67,31 @@ const ANCHORS: [(&str, u64, u64); 6] = [
     ),
 ];
 
+/// Capacity retries per fixture on the default plan (`*_stage_fixtures_pin_their_capacity_retries`),
+/// MEASURED at P16 G1 commit 5 on Metal (M5 Max) and CUDA (sim, RTX A4500): none.
+#[allow(dead_code)]
+const PINNED_RETRIES_METAL: &[(&str, usize)] = &[
+    ("roce_ring_allreduce_lossless", 0),
+    ("roce_allgather_lossless", 0),
+    ("roce_ring_lossy", 0),
+    ("roce_compute_dag", 0),
+    ("roce_ring_release_paused", 0),
+    ("roce_tcp_mixed_collectives", 0),
+    ("roce_allgather_compute_lossy", 0),
+    ("tcp-RingAllReduce-2", 0),
+    ("tcp-RingAllReduce-3", 0),
+    ("tcp-RingAllReduce-4", 0),
+    ("tcp-AllGather-2", 0),
+    ("tcp-AllGather-3", 0),
+    ("tcp-AllGather-4", 0),
+    ("tcp-lossy-ring", 0),
+    ("tcp-compute-chain", 0),
+    ("tcp-ring-allgather-compute-4", 0),
+    ("compute-only", 0),
+];
+#[allow(dead_code)]
+const PINNED_RETRIES_CUDA: &[(&str, usize)] = PINNED_RETRIES_METAL;
+
 fn lower(name: &str) -> SimulationImage {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("configs/p15")
@@ -410,6 +435,31 @@ mod cuda {
         }
     }
 
+    /// Deterministic capacity retries of the default plan per fixture (design note §5.2): pinned,
+    /// so a sizing change that adds a retry (each one replays the whole run) fails here.
+    #[test]
+    fn cuda_stage_fixtures_pin_their_capacity_retries() {
+        let mut retries = Vec::new();
+        for (name, image) in fixtures() {
+            let run = run_cuda_with_observations(
+                &image,
+                None,
+                CudaConfig::default(),
+                ObservationMode::Summary,
+            )
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+            retries.push((name, run.capacity_retry_trace.len()));
+        }
+        eprintln!("record=stage_retries backend=cuda {retries:?}");
+        assert_eq!(
+            retries,
+            super::PINNED_RETRIES_CUDA
+                .iter()
+                .map(|(n, r)| (n.to_string(), *r))
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn cuda_stage_fixtures_match_scalar_in_summary_mode_and_the_frozen_anchors() {
         for (name, image) in fixtures() {
@@ -469,6 +519,31 @@ mod metal {
                 }
             }
         }
+    }
+
+    /// Deterministic capacity retries of the default plan per fixture (design note §5.2): pinned,
+    /// so a sizing change that adds a retry (each one replays the whole run) fails here.
+    #[test]
+    fn metal_stage_fixtures_pin_their_capacity_retries() {
+        let mut retries = Vec::new();
+        for (name, image) in fixtures() {
+            let run = run_metal_with_observations(
+                &image,
+                None,
+                MetalConfig::default(),
+                ObservationMode::Summary,
+            )
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+            retries.push((name, run.capacity_retry_trace.len()));
+        }
+        eprintln!("record=stage_retries backend=metal {retries:?}");
+        assert_eq!(
+            retries,
+            super::PINNED_RETRIES_METAL
+                .iter()
+                .map(|(n, r)| (n.to_string(), *r))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

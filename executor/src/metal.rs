@@ -2472,12 +2472,7 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
         if matches!(packet.kind, PacketKind::TcpData(_)) && !live_payloads.contains(&packet.id) {
             continue;
         }
-        // A zero-byte pacing token never enters a queue or crosses a link, and a PFC
-        // frame travels on its reverse control lane, never on its flow's route.
-        if matches!(
-            packet.kind,
-            PacketKind::RocePacingTimer | PacketKind::Pfc(_)
-        ) {
+        if !crate::device_sizing::initial_packet_is_routed(packet) {
             continue;
         }
         let counts = if packet.kind.is_data() {
