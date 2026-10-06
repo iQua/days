@@ -265,8 +265,19 @@ fn compute_dag_releases_each_root_at_the_compute_deadline() {
     let rows = progress(&result);
     let roots = rows
         .iter()
-        .filter(|row| is_roce_row(row) && row.activated && row.local_predecessor.is_some())
-        .filter(|row| row.inbound_predecessor.is_none())
+        .filter(|row| {
+            let stage = image
+                .host_states
+                .iter()
+                .flat_map(|state| state.generators_with_stages())
+                .find(|(generator, _)| generator.flow == row.flow)
+                .and_then(|(_, stage)| stage)
+                .expect("a progress row belongs to a stage");
+            is_roce_row(row)
+                && row.activated
+                && stage.dependencies.local.one().is_some()
+                && stage.dependencies.inbound == days_executor::StagePredecessors::None
+        })
         .collect::<Vec<_>>();
     assert_eq!(roots.len(), 4, "every rank's root is gated by `forward`");
     for root in roots {
@@ -861,51 +872,69 @@ fn roce_transport(image: &SimulationImage, flow: FlowId) -> Option<(u64, u64)> {
 }
 
 /// Schema Amendment 5 (LeanGuard part 3, review M1): a compute stage whose inbound predecessor is
-/// a RoCE stage writes that queue pair's MTU and pacing interval on every progress row, so the
+/// a RoCE stage carries that queue pair's MTU and pacing interval on every certificate row, so the
 /// certificate can be replayed with the Go-back-N frontier even when the predecessor is an
 /// unlogged root (`roce_allgather_compute_lossy`, an ungated two-rank AllGather); every other
-/// compute row writes zero. Every compute inbound row of a RoCE predecessor is a packet of that
-/// pair at its PSN and advances the frontier exactly when the PSN is the frontier.
+/// compute row writes zero. The certificate writer reads them from the image (P16 H1). Every
+/// compute inbound row of a RoCE predecessor is a packet of that pair at its PSN and advances the
+/// frontier exactly when the PSN is the frontier.
 #[test]
 fn compute_rows_name_their_roce_inbound_transport() {
     for name in ["roce_compute_dag.toml", "roce_allgather_compute_lossy.toml"] {
         let image = lower(name);
         let result = run_identical(&image, name);
-        let rows: Vec<_> = progress(&result)
-            .into_iter()
-            .filter(|row| row.stage_kind == days_executor::CollectiveStageKind::Compute)
-            .collect();
+        let csv = days_executor::collective_transitions_csv(
+            &result.diagnostics.as_ref().unwrap().mechanism_transitions,
+            &image,
+        )
+        .unwrap();
+        let mut lines = csv.lines();
+        let header: Vec<&str> = lines.next().unwrap().split(',').collect();
+        let column = |name: &str| header.iter().position(|field| *field == name).unwrap();
+        let number = |fields: &[&str], name: &str| fields[column(name)].parse::<u64>().unwrap();
         let (mut transported, mut out_of_order) = (0, 0);
-        for row in &rows {
-            let expected = row
-                .inbound_predecessor
-                .and_then(|flow| roce_transport(&image, flow))
-                .unwrap_or((0, 0));
+        for line in lines {
+            let fields: Vec<&str> = line.split(',').collect();
+            if fields[column("stage_kind")] != "compute" {
+                continue;
+            }
+            let inbound = fields[column("inbound_predecessors")];
+            let expected = if inbound.is_empty() {
+                (0, 0)
+            } else {
+                roce_transport(&image, FlowId(inbound.parse().unwrap())).unwrap_or((0, 0))
+            };
             assert_eq!(
-                (row.packet_size_bytes, row.interval_ns),
+                (
+                    number(&fields, "packet_size_bytes"),
+                    number(&fields, "interval_ns")
+                ),
                 expected,
-                "{name}: compute row of flow {:?} at {:?}",
-                row.flow,
-                row.key
+                "{name}: compute row {line}"
             );
             if expected.0 == 0 {
                 continue;
             }
             transported += 1;
-            if row.cause == CollectiveActivationCause::InboundArrival {
-                let (mtu, total) = (expected.0, row.inbound_predecessor_bytes);
-                let psn = row.segment_sequence;
+            if fields[column("cause")] == "inbound_arrival" {
+                let (mtu, total) = (expected.0, number(&fields, "inbound_predecessor_bytes"));
+                let psn = number(&fields, "segment_sequence");
+                let segment = number(&fields, "segment_bytes");
                 assert!(
-                    psn % mtu == 0 && psn < total && row.segment_bytes == mtu.min(total - psn),
+                    psn % mtu == 0 && psn < total && segment == mtu.min(total - psn),
                     "{name}: compute inbound row is not its pair's packet at PSN {psn}"
                 );
-                let advance = if psn == row.before_inbound_bytes {
-                    row.segment_bytes
+                let advance = if psn == number(&fields, "before_inbound_bytes") {
+                    segment
                 } else {
                     out_of_order += 1;
                     0
                 };
-                assert_eq!(row.arrival_bytes, advance, "{name}: Go-back-N advance");
+                assert_eq!(
+                    number(&fields, "arrival_bytes"),
+                    advance,
+                    "{name}: Go-back-N advance"
+                );
             }
         }
         assert!(

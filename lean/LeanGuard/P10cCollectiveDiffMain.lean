@@ -94,7 +94,7 @@ def maxFlow (rows : Array Row) : Nat :=
 
 def renameIn (old new : Nat) (value : Nat) : Nat := if value = old then new else value
 
-def renameOpt (old new : Nat) (value : Option Nat) : Option Nat := value.map (renameIn old new)
+def renameList (old new : Nat) (value : List Nat) : List Nat := value.map (renameIn old new)
 
 def isTcpInbound (row : Row) : Bool := row.cause = .inboundArrival && row.stageKind = .tcp
 
@@ -162,11 +162,11 @@ def mutate (rows : Array Row) (pairs : List (Nat × Nat)) (index : Nat) (kind : 
       let edit (r : Row) : Row :=
         if isLocal then
           { r with
-            localPredecessorFlowId := some target
+            localPredecessors := [target]
             causeFlowId := if r.cause = .localCompletion then target else r.causeFlowId }
         else
           { r with
-            inboundPredecessorFlowId := some target
+            inboundPredecessors := [target]
             causeFlowId := if r.cause = .inboundArrival then target else r.causeFlowId }
       let (wide, g) := g.below 2
       if wide = 0 then
@@ -193,8 +193,8 @@ def mutate (rows : Array Row) (pairs : List (Nat × Nat)) (index : Nat) (kind : 
         { r with
           flowId := renameIn old target r.flowId
           causeFlowId := renameIn old target r.causeFlowId
-          localPredecessorFlowId := renameOpt old target r.localPredecessorFlowId
-          inboundPredecessorFlowId := renameOpt old target r.inboundPredecessorFlowId }), g)
+          localPredecessors := renameList old target r.localPredecessors
+          inboundPredecessors := renameList old target r.inboundPredecessors }), g)
   | .time =>
       let neighbour := if i + 1 < n then at_ (i + 1) else at_ (i - 1)
       let timeNs := if choice = 0 then other.key.timeNs else neighbour.key.timeNs

@@ -1306,8 +1306,9 @@ mod tests {
     /// at zero, its pacer parked) and its release flag is `CollectiveStage::activated`, so neither
     /// the stage record (136 B at `ade83b4`, one per generator on a stage host) nor its
     /// dependencies (56 B) nor the progress record (280 B; RoCE rows add a `stage_kind` value, not
-    /// a field) grows. Layout is the compiler's choice, so these are upper bounds on 64-bit
-    /// targets.
+    /// a field) grows. P16 H1's join counts took the progress record's two single-predecessor
+    /// fields (the certificate writer lists predecessors from the image), so it shrank to 256 B.
+    /// Layout is the compiler's choice, so these are upper bounds on 64-bit targets.
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn roce_collective_stages_grow_no_stage_record() {
@@ -1330,7 +1331,7 @@ mod tests {
             (
                 "CollectiveProgressRecord",
                 std::mem::size_of::<crate::CollectiveProgressRecord>(),
-                280,
+                256,
             ),
         ];
         for (name, size, bound) in checks {

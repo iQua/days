@@ -304,6 +304,21 @@ fn fixtures() -> Vec<(&'static str, String)> {
                     + &compute("stage1", "0, 1", 1_000, "after = \"pp\"")),
             ),
         ),
+        (
+            "rs-uniform-floor-tcp",
+            star(
+                4,
+                &(compute("fwd", H4, 2_000, "")
+                    + &collective(
+                        "rs",
+                        "ReduceScatter",
+                        "TCP",
+                        H4,
+                        "sinks = [1, 2, 3, 0]\nchunk = \"UniformFloor\"\nafter = \"fwd\"\n",
+                        10_003,
+                    )),
+            ),
+        ),
     ]
 }
 
@@ -771,6 +786,73 @@ fn a_workload_lowers_as_its_toml_rendering() {
             )),
     );
     assert_eq!(lowered, lower("workload-rendering", &rendering));
+}
+
+/// The Scalar progress certificate of every fixture is pinned under `lean/fixtures/p10c/`
+/// (`collective_collops_<label>_executor_accept.csv`), where the LeanGuard collective campaign
+/// accepts it and rejects its mutations. Set `DAYS_UPDATE_COLLECTIVE_TRACE_FIXTURES=1` to
+/// regenerate.
+#[test]
+fn the_certificates_are_scalar_generated() {
+    for (label, image) in images() {
+        let result = scalar(&image, None, ObservationMode::Full);
+        let csv = days_executor::collective_transitions_csv(
+            &result.diagnostics.as_ref().unwrap().mechanism_transitions,
+            &image,
+        )
+        .unwrap_or_else(|error| panic!("{label}: {error}"));
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("lean/fixtures/p10c")
+            .join(format!(
+                "collective_collops_{}_executor_accept.csv",
+                label.replace('-', "_")
+            ));
+        if std::env::var_os("DAYS_UPDATE_COLLECTIVE_TRACE_FIXTURES").is_some() {
+            std::fs::write(&path, &csv).unwrap();
+        }
+        assert_eq!(
+            csv,
+            std::fs::read_to_string(&path).unwrap_or_default(),
+            "{label}"
+        );
+    }
+}
+
+/// A compute stage after a TCP ring and a RoCE all-to-all has inbound predecessors of two
+/// transports, which its one pair of Amendment 5 columns cannot name: the run is exact, but its
+/// certificate cannot be written.
+#[test]
+fn a_join_of_two_transports_has_no_certificate() {
+    let image = lower(
+        "mixed-join",
+        &star(
+            4,
+            &(compute("fwd", H4, 2_000, "")
+                + &collective(
+                    "ring",
+                    "AllGather",
+                    "TCP",
+                    H4,
+                    "sinks = [1, 2, 3, 0]\nafter = \"fwd\"\n",
+                    8_000,
+                )
+                + &collective("a2a", "AllToAll", "RoCE", H4, "after = \"fwd\"\n", 8_000)
+                + &compute("post", H4, 1_000, "after = [\"ring\", \"a2a\"]")),
+        ),
+    );
+    let result = scalar(&image, None, ObservationMode::Full);
+    let error = days_executor::collective_transitions_csv(
+        &result.diagnostics.as_ref().unwrap().mechanism_transitions,
+        &image,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            days_executor::CollectiveTraceError::MixedInboundTransports { .. }
+        ),
+        "{error}"
+    );
 }
 
 #[cfg(feature = "cuda")]

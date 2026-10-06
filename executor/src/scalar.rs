@@ -328,14 +328,14 @@ struct CollectiveProgressContext {
     activated: bool,
 }
 
-/// `inbound_transport` is a compute stage's RoCE inbound predecessor's MTU and pacing interval
-/// (schema Amendment 5), or `(0, 0)`; transport stages write their own.
+/// Transport stages write their MTU (and a RoCE stage its pacing interval); a compute stage writes
+/// zero there, and the certificate writer names its inbound predecessors' transport (schema
+/// Amendment 5) from the image.
 fn collective_progress_record(
     context: CollectiveProgressContext,
     cause: PendingCollectiveProgress,
     generator: &crate::FlowGeneratorState,
     stage: Option<crate::CollectiveStage>,
-    inbound_transport: (u64, u64),
 ) -> Option<crate::CollectiveProgressRecord> {
     let stage = stage?;
     let dependencies = stage.dependencies;
@@ -359,20 +359,14 @@ fn collective_progress_record(
         packet_size_bytes: 0,
         interval_ns: 0,
         stop_time_ns: context.stop_time_ns,
-        local_predecessor: match dependencies.local {
-            crate::StagePredecessors::One(flow) => Some(flow),
-            _ => None,
-        },
-        inbound_predecessor: match dependencies.inbound {
-            crate::StagePredecessors::One(flow) => Some(flow),
-            _ => None,
-        },
         inbound_predecessor_bytes: dependencies.inbound_predecessor_bytes,
         before_local_complete: cause.before_local_completed == dependencies.local.count(),
+        before_local_completed: cause.before_local_completed,
         before_inbound_complete: cause.before_inbound_complete,
         before_inbound_bytes: cause.before_inbound_bytes,
         activated: context.activated,
         after_local_complete: dependencies.local_complete(),
+        after_local_completed: dependencies.local_completed,
         after_inbound_complete: dependencies.inbound_complete(),
         after_inbound_bytes: dependencies.inbound_bytes_received,
         after_packets_emitted: generator.packets_emitted,
@@ -399,9 +393,6 @@ fn collective_progress_record(
                 step: identity.step,
                 chunk_offset_bytes: identity.chunk_offset_bytes,
                 chunk_bytes: identity.chunk_bytes,
-                // The certificate names a transport stage's chunk here, also on a root, which has
-                // no inbound predecessor and so requires no inbound bytes.
-                inbound_predecessor_bytes: identity.chunk_bytes,
                 packet_size_bytes: tcp.mss_bytes,
                 ..record
             })
@@ -418,7 +409,6 @@ fn collective_progress_record(
                 step: identity.step,
                 chunk_offset_bytes: identity.chunk_offset_bytes,
                 chunk_bytes: identity.chunk_bytes,
-                inbound_predecessor_bytes: identity.chunk_bytes,
                 packet_size_bytes: roce.pacer.mtu_bytes,
                 interval_ns: roce.pacer.pacing_interval_ns,
                 stage_kind: crate::CollectiveStageKind::Roce,
@@ -432,8 +422,6 @@ fn collective_progress_record(
                 rank: compute.rank,
                 stage_kind: crate::CollectiveStageKind::Compute,
                 duration_ns: compute.duration_ns,
-                packet_size_bytes: inbound_transport.0,
-                interval_ns: inbound_transport.1,
                 ..record
             })
         }
@@ -2306,27 +2294,6 @@ impl<'image> TransitionState<'image> {
                 flow,
             })?;
         let stage = state.stages.stage(position);
-        // Schema Amendment 5: a compute stage after a RoCE collective names that queue pair's MTU
-        // and pacing interval. Its local predecessor is the same rank's final stage of the same
-        // collective, on this host (the validator requires both predecessors to agree), so the
-        // values are read through the stage index, keyed and in constant time.
-        let inbound_transport = stage
-            .filter(|stage| {
-                matches!(stage.role, crate::StageRole::Compute(_))
-                    && stage.dependencies.inbound != crate::StagePredecessors::None
-            })
-            .and_then(|stage| match stage.dependencies.local {
-                crate::StagePredecessors::One(flow) => Some(flow),
-                _ => None,
-            })
-            .and_then(|local| index.first_generator(local))
-            .and_then(|local| match state.generators[local].kind {
-                FlowGeneratorKind::Roce(roce) => {
-                    Some((roce.pacer.mtu_bytes, roce.pacer.pacing_interval_ns))
-                }
-                _ => None,
-            })
-            .unwrap_or((0, 0));
         let record = collective_progress_record(
             CollectiveProgressContext {
                 key: parent.key,
@@ -2338,7 +2305,6 @@ impl<'image> TransitionState<'image> {
             cause,
             &state.generators[position],
             stage,
-            inbound_transport,
         )
         .ok_or(ExecutionError::UnexpectedGeneratorEmission {
             node: node.id,

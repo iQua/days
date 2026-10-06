@@ -160,18 +160,22 @@ pub struct CollectiveProgressRecord {
     pub step: u32,
     pub chunk_offset_bytes: u64,
     pub chunk_bytes: u64,
+    /// A transport stage's MSS or MTU, and a RoCE stage's pacing interval; zero for a compute
+    /// stage (the certificate writer names its inbound predecessors' transport).
     pub packet_size_bytes: u64,
     pub interval_ns: u64,
     pub stop_time_ns: u64,
-    pub local_predecessor: Option<FlowId>,
-    pub inbound_predecessor: Option<FlowId>,
+    /// The inbound requirement: the inbound predecessors' summed totals, zero without any.
     pub inbound_predecessor_bytes: u64,
     pub before_local_complete: bool,
+    /// Local predecessors complete before this transition (a join counts several).
+    pub before_local_completed: u32,
     pub before_inbound_complete: bool,
     pub before_inbound_bytes: u64,
     /// Whether this prerequisite transition unblocked the stage and emitted its first packet.
     pub activated: bool,
     pub after_local_complete: bool,
+    pub after_local_completed: u32,
     pub after_inbound_complete: bool,
     pub after_inbound_bytes: u64,
     pub after_packets_emitted: u64,
@@ -246,10 +250,82 @@ impl MechanismTransitionRecord {
 /// The collective progress CSV (P14's schema). RoCE stages write `stage_kind = roce` rows under
 /// the same columns, as pinned by Amendment 4 of `days-gpu/plans/briefs/p15/qp-schema.md`: the MTU
 /// and pacing interval in `packet_size_bytes` and `interval_ns`, the PSN in `segment_sequence`,
-/// and the Go-back-N frontier's advance in `arrival_bytes`.
+/// and the Go-back-N frontier's advance in `arrival_bytes`. A compute stage whose inbound
+/// predecessors are RoCE queue pairs names their MTU and pacing interval there (Amendment 5).
+///
+/// P16 H1 (counted joins) replaces the single `local_predecessor_flow_id` and
+/// `inbound_predecessor_flow_id` columns by predecessor lists and appends the operation columns,
+/// read from `image`'s stage records: the row stage's `channel`, `chunk_policy` and
+/// `channel_policy`; `local_predecessors` and `inbound_predecessors` (`;`-separated flow ids,
+/// ascending) and `local_required`; the local completion count before and after; and
+/// `cause_total_bytes`, the byte total of the cause flow (zero for a compute stage); and
+/// `group_stages`, the stages of the row's collective or compute group in the image (a seeded
+/// all-to-all has no stage for a pair of zero bytes). `inbound_predecessor_bytes` is the stage's
+/// inbound requirement: the summed totals of its inbound predecessors, zero without any.
 pub fn collective_transitions_csv(
     records: &[MechanismTransitionRecord],
-) -> Result<String, MechanismTraceError> {
+    image: &crate::SimulationImage,
+) -> Result<String, CollectiveTraceError> {
+    // Every stage record, byte total and RoCE transport by flow id, gathered once.
+    let mut stages = vec![None; image.flows.len()];
+    let mut totals = vec![(0_u64, (0_u64, 0_u64)); image.flows.len()];
+    let mut group_stages = std::collections::BTreeMap::<(bool, u64), u64>::new();
+    for state in &image.host_states {
+        for (generator, stage) in state.generators_with_stages() {
+            if let Some(stage) = stage {
+                let group = match stage.role {
+                    crate::StageRole::Collective(identity) => (false, identity.collective_id),
+                    crate::StageRole::Compute(compute) => (true, compute.compute_id),
+                };
+                *group_stages.entry(group).or_default() += 1;
+            }
+            let Ok(index) = usize::try_from(generator.flow.0) else {
+                continue;
+            };
+            if index < stages.len() {
+                stages[index] = stage;
+                totals[index] = match generator.kind {
+                    crate::FlowGeneratorKind::Tcp(tcp) => (tcp.total_bytes, (0, 0)),
+                    crate::FlowGeneratorKind::Roce(roce) => (
+                        roce.pacer.total_bytes,
+                        (roce.pacer.mtu_bytes, roce.pacer.pacing_interval_ns),
+                    ),
+                    _ => (0, (0, 0)),
+                };
+            }
+        }
+    }
+    let stage_of = |flow: FlowId| {
+        usize::try_from(flow.0)
+            .ok()
+            .and_then(|index| stages.get(index).copied().flatten())
+    };
+    let totals_of = |flow: FlowId| {
+        usize::try_from(flow.0)
+            .ok()
+            .and_then(|index| totals.get(index).copied())
+            .unwrap_or_default()
+    };
+    // Amendment 5: the one transport of a compute stage's inbound predecessors.
+    let inbound_transport = |flow: FlowId, dependencies: crate::StageDependencies| {
+        let mut transports = dependencies
+            .inbound
+            .iter(&image.stage_joins)
+            .map(|predecessor| totals_of(predecessor).1);
+        let first = transports.next().unwrap_or_default();
+        if transports.all(|transport| transport == first) {
+            Ok(first)
+        } else {
+            Err(CollectiveTraceError::MixedInboundTransports { flow })
+        }
+    };
+    let list = |predecessors: crate::StagePredecessors| {
+        predecessors
+            .iter(&image.stage_joins)
+            .map(|flow| flow.0.to_string())
+            .collect::<Vec<_>>()
+            .join(";")
+    };
     let mut records = records
         .iter()
         .filter_map(|record| match record {
@@ -262,19 +338,31 @@ pub fn collective_transitions_csv(
         .windows(2)
         .find(|pair| (pair[0].key, pair[0].ordinal) == (pair[1].key, pair[1].ordinal))
     {
-        return Err(MechanismTraceError {
+        return Err(CollectiveTraceError::Duplicate(MechanismTraceError {
             mechanism: "collective",
             duplicate_key: duplicate[0].key,
-        });
+        }));
     }
 
     let mut csv = String::from(
-        "time_ns,event_phase,event_origin_node,event_origin_sequence,ordinal,node_id,flow_id,cause,cause_flow_id,arrival_bytes,collective_id,algorithm,group_size,declared_total_bytes,rank,collective_phase,step,chunk_offset_bytes,chunk_bytes,packet_size_bytes,interval_ns,stop_time_ns,local_predecessor_flow_id,inbound_predecessor_flow_id,inbound_predecessor_bytes,before_local_complete,before_inbound_complete,before_inbound_bytes,activated,after_local_complete,after_inbound_complete,after_inbound_bytes,after_packets_emitted,after_bytes_emitted,after_status,after_next_time_ns,stage_kind,duration_ns,segment_sequence,segment_bytes,ack_number,cause_origin_ns,cause_delay_ns\n",
+        "time_ns,event_phase,event_origin_node,event_origin_sequence,ordinal,node_id,flow_id,cause,cause_flow_id,arrival_bytes,collective_id,algorithm,group_size,declared_total_bytes,rank,collective_phase,step,chunk_offset_bytes,chunk_bytes,packet_size_bytes,interval_ns,stop_time_ns,inbound_predecessor_bytes,before_local_complete,before_inbound_complete,before_inbound_bytes,activated,after_local_complete,after_inbound_complete,after_inbound_bytes,after_packets_emitted,after_bytes_emitted,after_status,after_next_time_ns,stage_kind,duration_ns,segment_sequence,segment_bytes,ack_number,cause_origin_ns,cause_delay_ns,channel,chunk_policy,channel_policy,local_predecessors,inbound_predecessors,local_required,before_local_completed,after_local_completed,cause_total_bytes,group_stages\n",
     );
     for record in records {
+        let stage = stage_of(record.flow);
+        let dependencies = stage.map(|stage| stage.dependencies);
+        let identity = stage.and_then(|stage| match stage.role {
+            crate::StageRole::Collective(identity) => Some(identity),
+            crate::StageRole::Compute(_) => None,
+        });
+        let (packet_size_bytes, interval_ns) = match (record.stage_kind, dependencies) {
+            (CollectiveStageKind::Compute, Some(dependencies)) => {
+                inbound_transport(record.flow, dependencies)?
+            }
+            _ => (record.packet_size_bytes, record.interval_ns),
+        };
         writeln!(
             csv,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             record.key.time_ns,
             record.key.phase,
             record.key.origin_node.0,
@@ -294,11 +382,9 @@ pub fn collective_transitions_csv(
             record.step,
             record.chunk_offset_bytes,
             record.chunk_bytes,
-            record.packet_size_bytes,
-            record.interval_ns,
+            packet_size_bytes,
+            interval_ns,
             record.stop_time_ns,
-            optional_flow(record.local_predecessor),
-            optional_flow(record.inbound_predecessor),
             record.inbound_predecessor_bytes,
             bit(record.before_local_complete),
             bit(record.before_inbound_complete),
@@ -318,10 +404,43 @@ pub fn collective_transitions_csv(
             record.ack_number,
             record.cause_origin_ns,
             record.cause_delay_ns,
+            identity.map_or(0, |identity| identity.channel),
+            identity.map_or("", |identity| chunk_policy(identity.chunk_policy)),
+            identity.map_or("", |identity| channel_policy(identity.channel_policy)),
+            dependencies.map_or_else(String::new, |dependencies| list(dependencies.local)),
+            dependencies.map_or_else(String::new, |dependencies| list(dependencies.inbound)),
+            dependencies.map_or(0, |dependencies| dependencies.local.count()),
+            record.before_local_completed,
+            record.after_local_completed,
+            totals_of(record.cause_flow).0,
+            group_stages
+                .get(&(
+                    record.stage_kind == CollectiveStageKind::Compute,
+                    record.collective_id
+                ))
+                .copied()
+                .unwrap_or(0),
         )
         .expect("writing to String cannot fail");
     }
     Ok(csv)
+}
+
+const fn chunk_policy(policy: crate::CollectiveChunkPolicy) -> &'static str {
+    match policy {
+        crate::CollectiveChunkPolicy::EqualRemainderLast => "equal_remainder_last",
+        crate::CollectiveChunkPolicy::UniformFloor => "uniform_floor",
+        crate::CollectiveChunkPolicy::Seeded => "seeded",
+    }
+}
+
+const fn channel_policy(policy: crate::CollectiveChannelPolicy) -> &'static str {
+    match policy {
+        crate::CollectiveChannelPolicy::RingNext => "ring_next",
+        crate::CollectiveChannelPolicy::Channels => "channels",
+        crate::CollectiveChannelPolicy::AllPairs => "all_pairs",
+        crate::CollectiveChannelPolicy::Pair => "pair",
+    }
 }
 
 const fn collective_stage_kind(kind: CollectiveStageKind) -> &'static str {
@@ -356,10 +475,6 @@ const fn collective_phase(phase: CollectivePhase) -> &'static str {
         CollectivePhase::AllToAll => "all_to_all",
         CollectivePhase::SendRecv => "send_recv",
     }
-}
-
-fn optional_flow(flow: Option<FlowId>) -> String {
-    flow.map_or_else(String::new, |flow| flow.0.to_string())
 }
 
 /// The CNP arrivals at DCQCN reaction points, one row per arrival in `(time, flow, payload)`
@@ -654,6 +769,31 @@ impl fmt::Display for MechanismTraceError {
 }
 
 impl std::error::Error for MechanismTraceError {}
+
+/// Why the collective progress CSV cannot be written.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CollectiveTraceError {
+    Duplicate(MechanismTraceError),
+    /// A compute stage's inbound predecessors use different transports, which its one pair of
+    /// Amendment 5 columns cannot name.
+    MixedInboundTransports {
+        flow: FlowId,
+    },
+}
+
+impl fmt::Display for CollectiveTraceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Duplicate(error) => error.fmt(formatter),
+            Self::MixedInboundTransports { flow } => write!(
+                formatter,
+                "compute stage {flow:?} has inbound predecessors of different transports"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CollectiveTraceError {}
 
 fn canonical<T: Clone>(
     mechanism: &'static str,

@@ -172,11 +172,13 @@ mutate_case "data-arrival-phase" "$allgather" \
 mutate_case "root-gate-phase" "$chain" \
   'NR == 2 { $column["event_phase"] = 0 }' \
   'REJECT: line 2: collective progress event phase disagrees with its cause'
+# A root with nothing to wait for, logged with its local prerequisite complete from the start.
 mutate_case "ungated-root" "$chain" \
-  'NR == 2 { $column["local_predecessor_flow_id"] = "" }' \
+  'NR == 2 { $column["local_predecessors"] = ""; $column["local_required"] = 0; $column["before_local_complete"] = 1 }' \
   'REJECT: line 2: a root stage is logged only when a compute stage gates it'
+# The gate is flow 6, a 1,000-byte stage of the root's own collective, completed by its ACK.
 mutate_case "root-gate-inside-collective" "$chain" \
-  'NR == 2 { $column["local_predecessor_flow_id"] = 6; $column["cause_flow_id"] = 6 }' \
+  'NR == 2 { $column["local_predecessors"] = 6; $column["cause_flow_id"] = 6; $column["cause_total_bytes"] = 1000; $column["event_phase"] = 0 }' \
   'REJECT: line 2: a root stage'"'"'s gate must be a compute stage outside its collective'
 
 # Canonical order, ordinals, and certificate structure.
@@ -210,10 +212,10 @@ mutate_case "collective-config-discontinuity" "$allgather" \
   'NR == 3 { $column["packet_size_bytes"] = 4 }' \
   'REJECT: line 3: collective configuration discontinuity for collective_id=0'
 mutate_case "inbound-predecessor-recurrence" "$allgather" \
-  '$column["flow_id"] == 5 { $column["inbound_predecessor_flow_id"] = 99; if ($column["cause"] == "inbound_arrival") $column["cause_flow_id"] = 99 }' \
+  '$column["flow_id"] == 5 { $column["inbound_predecessors"] = 99; if ($column["cause"] == "inbound_arrival") $column["cause_flow_id"] = 99 }' \
   'REJECT: line 11: inbound predecessor identity does not match the stage recurrence'
 mutate_case "local-predecessor-recurrence" "$allgather" \
-  '$column["flow_id"] == 5 { $column["local_predecessor_flow_id"] = 99; if ($column["cause"] == "local_completion") $column["cause_flow_id"] = 99 }' \
+  '$column["flow_id"] == 5 { $column["local_predecessors"] = 99; if ($column["cause"] == "local_completion") $column["cause_flow_id"] = 99 }' \
   'REJECT: line 11: local predecessor identity does not match the stage recurrence'
 mutate_case "rank-to-node-mapping" "$allgather" \
   'NR == 3 { $column["node_id"] = 1 }' \
@@ -286,10 +288,10 @@ mutate_case "compute-timer-phase" "$chain" \
   'NR == 41 { $column["event_phase"] = 0 }' \
   'REJECT: line 41: collective progress event phase disagrees with its cause'
 mutate_case "compute-local-predecessor-rank" "$chain" \
-  '$column["flow_id"] == 18 { $column["local_predecessor_flow_id"] = 13; $column["cause_flow_id"] = 13 }' \
+  '$column["flow_id"] == 18 { $column["local_predecessors"] = 13; $column["cause_flow_id"] = 13 }' \
   'REJECT: line 41: compute local predecessor is not the same-rank stage of a compute group'
 mutate_case "compute-inbound-not-final" "$chain" \
-  '$column["flow_id"] == 12 { $column["inbound_predecessor_flow_id"] = 6; if ($column["cause"] == "inbound_arrival") $column["cause_flow_id"] = 6 }' \
+  '$column["flow_id"] == 12 { $column["inbound_predecessors"] = 6; if ($column["cause"] == "inbound_arrival") $column["cause_flow_id"] = 6 }' \
   'REJECT: line 32: compute inbound predecessor is not the previous rank'"'"'s final collective stage'
 # Review F2 (R1b): the optimizer releases 640 ns after backward's release instead of at its
 # 7000 ns timer deadline (22640); the release rows' own deadlines move consistently.
@@ -376,11 +378,64 @@ mutate_case "compute-mtu-without-interval" "$roce_dag" \
   'REJECT: line 63: compute stage inbound transport columns must be both zero or both positive (Amendment 5)'
 # P14's chain: the optimizer group follows the backward compute group and has no inbound stage.
 mutate_case "compute-transport-without-inbound-predecessor" "$chain" \
-  '$column["stage_kind"] == "compute" && $column["inbound_predecessor_flow_id"] == "" { $column["packet_size_bytes"] = 1000; $column["interval_ns"] = 1000 }' \
+  '$column["stage_kind"] == "compute" && $column["inbound_predecessors"] == "" { $column["packet_size_bytes"] = 1000; $column["interval_ns"] = 1000 }' \
   'REJECT: line 41: compute stage without an inbound predecessor carries inbound transport columns'
 mutate_case "roce-stage-coverage" "$roce_lossy" \
   '$column["flow_id"] == 7 { next }' \
   'REJECT: line 2: incomplete collective progress coverage for collective_id=0: expected 20, found 19'
+
+# P16 H1 (collops): the operations and counted joins. The certificates are the Scalar traces of
+# tests/p16_collops.rs's fixtures (the_certificates_are_scalar_generated).
+channels="$fixture_dir/collective_collops_ring_channels_2_executor_accept.csv"
+a2a_tcp="$fixture_dir/collective_collops_a2a_uniform_tcp_executor_accept.csv"
+a2a_roce="$fixture_dir/collective_collops_a2a_uniform_roce_executor_accept.csv"
+seeded="$fixture_dir/collective_collops_a2a_seeded_roce_executor_accept.csv"
+stream="$fixture_dir/collective_collops_data_stream_executor_accept.csv"
+sendrecv="$fixture_dir/collective_collops_sendrecv_executor_accept.csv"
+# Flow 12 is channel 1's root at rank 0: a UniformFloor message of floor(16003 / 4 / 2) = 2000 B.
+mutate_case "channel-uniform-floor-size" "$channels" \
+  '$column["flow_id"] == 12 { $column["chunk_bytes"] = 2001 }' \
+  'REJECT: line 3: collective chunk does not match its chunk policy'
+# Flow 4 (rank 1, channel 0, step 2) names rank 2's step-1 stage (flow 6) instead of rank 0's: rank
+# 2 would then precede both rank 1 and rank 3 on channel 0.
+mutate_case "channel-ring-not-one-ring" "$channels" \
+  '$column["flow_id"] == 4 { $column["inbound_predecessors"] = 6; if ($column["cause"] == "inbound_arrival") $column["cause_flow_id"] = 6 }' \
+  'REJECT: line 13: channel ring predecessor ranks are not one ring'
+# Flow 0 is rank 0's send to rank 1: floor(8002 / 4) = 2000 B.
+mutate_case "all-to-all-uniform-floor-size" "$a2a_tcp" \
+  '$column["flow_id"] == 0 { $column["chunk_bytes"] = 2001 }' \
+  'REJECT: line 2: collective chunk does not match its chunk policy'
+# Flow 28 (rank 0's expert compute) joins its three sends (12, 13, 14) and three receives (17, 19,
+# 21). Counting two local predecessors breaks the count against the list.
+mutate_case "join-local-required" "$a2a_roce" \
+  '$column["flow_id"] == 28 { $column["local_required"] = 2 }' \
+  'REJECT: line 14: local completion flags disagree with the local completion counts'
+# Rank 3's 2,000-byte send to rank 0 (flow 21) claims 2,500 bytes on every row it causes: the
+# join's causes then total 6,500 bytes against its 6,000-byte requirement.
+mutate_case "join-inbound-cause-totals" "$a2a_roce" \
+  '$column["cause_flow_id"] == 21 && $column["cause"] == "inbound_arrival" { $column["cause_total_bytes"] = 2500 }' \
+  'REJECT: line 14: a stage'"'"'s inbound predecessors do not deliver its inbound requirement'
+mutate_case "cause-total-changes" "$a2a_roce" \
+  '$column["flow_id"] == 28 && $column["cause_flow_id"] == 21 && ++seen == 2 { $column["cause_total_bytes"] = 2500 }' \
+  'REJECT: line 26: cause byte total disagrees with an earlier row of the same cause'
+# Flow 13 (rank 0 -> rank 2, 600 B) of the seeded dispatch is deleted, and the activation
+# ordinals of its event keys closed up.
+mutate_case "seeded-deleted-pair" "$seeded" \
+  '{ key = $column["time_ns"] SUBSEP $column["event_phase"] SUBSEP $column["event_origin_node"] SUBSEP $column["event_origin_sequence"] } $column["flow_id"] == 13 { removed[key]++; next } { $column["ordinal"] -= removed[key] }' \
+  'REJECT: line 2: incomplete collective progress coverage for collective_id=1: expected 12, found 11'
+# The compute after the dispatch at rank 0 drops its send to rank 2 (flow 13) from its join.
+mutate_case "join-missing-local-predecessor" "$seeded" \
+  '$column["local_predecessors"] == "12;13;14" { $column["local_predecessors"] = "12;14"; $column["local_required"] = 2; if ($column["after_local_completed"] > 0) $column["after_local_completed"] -= 1; if ($column["before_local_completed"] > 0) $column["before_local_completed"] -= 1 } $column["local_predecessors"] == "12;14" && $column["cause_flow_id"] == 13 { next }' \
+  'REJECT: line 15: a stage does not wait for its predecessor collective'"'"'s whole completion at its rank'
+# Rank 0's root of the second ReduceScatter follows its compute (flow 32) and the first ReduceScatter
+# (flows 2 and 11): the ACK of flow 2 is a phase-0 event.
+mutate_case "join-root-ack-phase" "$stream" \
+  '$column["flow_id"] == 12 && $column["cause_flow_id"] == 2 { $column["event_phase"] = 1 }' \
+  'REJECT: line 94: collective progress event phase disagrees with its cause'
+# The Send/Recv receiver's compute stage has no local predecessor, so it starts locally complete.
+mutate_case "sendrecv-receiver-initial-state" "$sendrecv" \
+  'NR == 3 { $column["before_local_complete"] = 0 }' \
+  'REJECT: line 3: first local prerequisite state is not initial'
 
 echo "P10c exact-integer collective campaign checks: $checked"
 exit "$failures"

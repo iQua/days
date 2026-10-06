@@ -227,7 +227,7 @@ fn compute_ring_compute_chain_has_exact_completion_times() {
             .expect("backward compute activates");
         assert_eq!(activation.stage_kind, CollectiveStageKind::Compute);
         assert_eq!(activation.duration_ns, BACKWARD_NS);
-        let local = acknowledged[&activation.local_predecessor.unwrap()];
+        let local = acknowledged[&tcp::stage_predecessors(&image)[&activation.flow].0.unwrap()];
         let inbound_rows = rows
             .iter()
             .filter(|row| {
@@ -250,9 +250,11 @@ fn compute_ring_compute_chain_has_exact_completion_times() {
         );
     }
 
-    let csv =
-        collective_transitions_csv(&result.diagnostics.as_ref().unwrap().mechanism_transitions)
-            .unwrap();
+    let csv = collective_transitions_csv(
+        &result.diagnostics.as_ref().unwrap().mechanism_transitions,
+        &image,
+    )
+    .unwrap();
     assert!(
         csv.lines()
             .next()
