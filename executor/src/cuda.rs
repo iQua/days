@@ -2007,6 +2007,7 @@ fn encode_control(control: TcpCongestionControl, words: &mut [u64]) {
 
 fn prepare_tcp_state(
     image: &SimulationImage,
+    has_stages: bool,
     capacity_context: &PlannerCapacityContext,
     data_counts: &[usize],
     capacity_caps: DeviceCapacityCaps,
@@ -2138,7 +2139,7 @@ fn prepare_tcp_state(
     }
 
     // P16 G1: the stage region precedes the RoCE region, which stays the tail of `tcp_state`.
-    let stage_offset = crate::device_stage::append_stage_region(image, &mut state)
+    let stage_offset = crate::device_stage::append_stage_region(image, has_stages, &mut state)
         .map_err(|error| CudaError::Validation(error.into()))?;
     let roce_offset =
         crate::device_mechanism::append_roce_region(image, receiver_offset, &mut state);
@@ -2246,6 +2247,9 @@ impl CudaPlan {
             TcpMinimumPacketSize::One,
             capacity_mode,
         );
+        // P16 G2: which flows share a concurrency bound (ruling G7: a host's unfinished stages),
+        // decided once. `None`, with nothing allocated, without stages or windowed queue pairs.
+        let concurrency = crate::stage_sizing::SizingConcurrency::for_image(image);
         let initial_by_payload = image
             .initial_packets
             .iter()
@@ -2265,6 +2269,8 @@ impl CudaPlan {
         let mut minimum_queue_packet_bytes = vec![u64::MAX; node_count];
         let mut legacy_fel_caps = vec![8_usize; node_count];
         let mut initial_fel_counts = vec![0_usize; node_count];
+        let mut queue_charges = crate::stage_sizing::ConcurrentCharges::default();
+        let mut fel_charges = crate::stage_sizing::ConcurrentCharges::default();
         for event in &image.initial_events {
             let target = event.target.0 as usize;
             legacy_fel_caps[target] = legacy_fel_caps[target].saturating_add(1);
@@ -2275,9 +2281,37 @@ impl CudaPlan {
             let feedback_count = flow_feedback_counts[flow_index];
             let data_count = packet_count.saturating_sub(feedback_count);
             let source_slot = flow.source.0 as usize;
-            queue_caps[source_slot] = queue_caps[source_slot].saturating_add(
-                capacity_context.source_queue_packet_bound(image, flow_index, data_count),
+            let group = concurrency
+                .as_ref()
+                .and_then(|concurrency| concurrency.group(flow_index));
+            // Ruling G8: a windowed queue pair holds at most a window of its data in its source
+            // host's queue and a window of its feedback in its receiver's, however long a pause.
+            let window = concurrency
+                .as_ref()
+                .and_then(|concurrency| concurrency.window_packets(flow_index));
+            crate::stage_sizing::charge(
+                &mut queue_caps,
+                &mut queue_charges,
+                concurrency
+                    .as_ref()
+                    .and_then(|concurrency| concurrency.host_queue_group(flow_index)),
+                source_slot,
+                crate::stage_sizing::CLASS_DATA,
+                window.map_or_else(
+                    || capacity_context.source_queue_packet_bound(image, flow_index, data_count),
+                    |window| data_count.min(window),
+                ),
             );
+            if let Some(window) = window {
+                crate::stage_sizing::charge(
+                    &mut queue_caps,
+                    &mut queue_charges,
+                    group,
+                    flow.target.0 as usize,
+                    crate::stage_sizing::CLASS_FEEDBACK,
+                    feedback_count.min(window),
+                );
+            }
             legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(4);
             if capacity_context.dcqcn_generator(image, flow_index) {
                 // A DCQCN source owns one live timer chain, pacing (the Mellanox-form controller
@@ -2303,6 +2337,8 @@ impl CudaPlan {
 
             let mut route_capacities = FlowRouteCapacities {
                 lookahead: minimum_lookahead_ns,
+                group,
+                fel_charges: &mut fel_charges,
                 fel: &mut legacy_fel_caps,
                 queue: &mut queue_caps,
                 aggregate_queue_packets: &mut aggregate_queue_packets,
@@ -2324,6 +2360,11 @@ impl CudaPlan {
                 PacketKind::Feedback,
                 &mut route_capacities,
             );
+        }
+        if let Some(concurrency) = &concurrency {
+            queue_charges.apply(concurrency, &mut queue_caps);
+            fel_charges.apply(concurrency, &mut legacy_fel_caps);
+            concurrency.add_compute_timers(&mut legacy_fel_caps);
         }
 
         for node in &image.nodes {
@@ -2428,6 +2469,9 @@ impl CudaPlan {
                     let source = descriptor.source.0 as usize;
                     capacities[source] = capacities[source].saturating_add(attempts);
                 }
+            }
+            if let Some(concurrency) = &concurrency {
+                concurrency.add_compute_timers(&mut capacities);
             }
             capacities
         } else {
@@ -2658,13 +2702,19 @@ impl CudaPlan {
             links[offset + 3] = link.propagation_ns;
         }
 
-        let remote_bound = derived_remote_capacity(
+        let mut remote_capacities = derived_remote_capacities(
             image,
             &capacity_context,
+            concurrency.as_ref(),
             &flow_packet_counts,
             &flow_feedback_counts,
             minimum_lookahead_ns,
         );
+        // The derived outbox capacity is the whole-plan sum of the per-producer capacities (their
+        // seed of 2 per node included), before any cap or floor.
+        let remote_bound = remote_capacities
+            .iter()
+            .fold(0_usize, |total, capacity| total.saturating_add(*capacity));
         let outbox_capacity = config.max_outbox_events.map_or_else(
             || {
                 crate::device_capacity::bound_derived_capacity(
@@ -2685,13 +2735,6 @@ impl CudaPlan {
         } else {
             outbox_capacity
         };
-        let mut remote_capacities = derived_remote_capacities(
-            image,
-            &capacity_context,
-            &flow_packet_counts,
-            &flow_feedback_counts,
-            minimum_lookahead_ns,
-        );
         if let Some(capacity) = config.max_outbox_events {
             remote_capacities
                 .fill(capacity.max(config.capacity_floors.remote_staging_events_per_lp));
@@ -2767,6 +2810,9 @@ impl CudaPlan {
         }
         let (mut tcp_state, tcp_layout) = prepare_tcp_state(
             image,
+            concurrency
+                .as_ref()
+                .is_some_and(|concurrency| concurrency.has_stages()),
             &capacity_context,
             &flow_data_counts,
             config.capacity_caps,
@@ -3022,6 +3068,9 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
 
 struct FlowRouteCapacities<'a> {
     lookahead: Option<u64>,
+    /// The flow's concurrency group if it is an unfinished stage (P16 G2, ruling G7).
+    group: Option<u32>,
+    fel_charges: &'a mut crate::stage_sizing::ConcurrentCharges,
     fel: &'a mut [usize],
     queue: &'a mut [usize],
     aggregate_queue_packets: &'a mut [usize],
@@ -3072,7 +3121,14 @@ fn add_flow_route_capacities(
             route[index],
             capacities.lookahead,
         );
-        capacities.fel[target_slot] = capacities.fel[target_slot].saturating_add(burst);
+        crate::stage_sizing::charge(
+            capacities.fel,
+            capacities.fel_charges,
+            capacities.group,
+            target_slot,
+            crate::stage_sizing::charge_class(packet_kind),
+            burst,
+        );
         if image.nodes[target_slot].kind == NodeKind::Switch {
             capacities.aggregate_queue_packets[target_slot] =
                 capacities.aggregate_queue_packets[target_slot].saturating_add(packet_count);
@@ -3209,60 +3265,22 @@ fn flow_link_fel_bound(
     )
 }
 
-fn derived_remote_capacity(
-    image: &SimulationImage,
-    capacity_context: &PlannerCapacityContext,
-    counts: &[usize],
-    feedback_counts: &[usize],
-    lookahead: Option<u64>,
-) -> usize {
-    image
-        .flows
-        .iter()
-        .enumerate()
-        .map(|(index, flow)| {
-            let feedback_count = feedback_counts[index];
-            let data_count = counts[index].saturating_sub(feedback_count);
-            flow.route
-                .iter()
-                .map(|link| {
-                    flow_link_round_bound(
-                        image,
-                        capacity_context,
-                        index,
-                        data_count,
-                        PacketKind::Data,
-                        *link,
-                        lookahead,
-                    )
-                })
-                .chain(flow.reverse_route.iter().map(|link| {
-                    flow_link_round_bound(
-                        image,
-                        capacity_context,
-                        index,
-                        feedback_count,
-                        PacketKind::Feedback,
-                        *link,
-                        lookahead,
-                    )
-                }))
-                .fold(0, usize::saturating_add)
-        })
-        .fold(image.nodes.len().saturating_mul(2), usize::saturating_add)
-}
-
+/// Per-producer remote staging capacities: 2 per node, plus every flow's round bound on each link
+/// it crosses, the bounds of a host's unfinished stages charged together (P16 G2, ruling G7).
 fn derived_remote_capacities(
     image: &SimulationImage,
     capacity_context: &PlannerCapacityContext,
+    concurrency: Option<&crate::stage_sizing::SizingConcurrency>,
     counts: &[usize],
     feedback_counts: &[usize],
     lookahead: Option<u64>,
 ) -> Vec<usize> {
     let mut capacities = vec![2_usize; image.nodes.len()];
+    let mut charges = crate::stage_sizing::ConcurrentCharges::default();
     for (index, flow) in image.flows.iter().enumerate() {
         let feedback_count = feedback_counts[index];
         let data_count = counts[index].saturating_sub(feedback_count);
+        let group = concurrency.and_then(|concurrency| concurrency.group(index));
         for (route, packet_count, packet_kind) in [
             (flow.route.as_slice(), data_count, PacketKind::Data),
             (
@@ -3273,17 +3291,27 @@ fn derived_remote_capacities(
         ] {
             for link_id in route {
                 let producer = image.links[link_id.0 as usize].source.0 as usize;
-                capacities[producer] = capacities[producer].saturating_add(flow_link_round_bound(
-                    image,
-                    capacity_context,
-                    index,
-                    packet_count,
-                    packet_kind,
-                    *link_id,
-                    lookahead,
-                ));
+                crate::stage_sizing::charge(
+                    &mut capacities,
+                    &mut charges,
+                    group,
+                    producer,
+                    crate::stage_sizing::charge_class(packet_kind),
+                    flow_link_round_bound(
+                        image,
+                        capacity_context,
+                        index,
+                        packet_count,
+                        packet_kind,
+                        *link_id,
+                        lookahead,
+                    ),
+                );
             }
         }
+    }
+    if let Some(concurrency) = concurrency {
+        charges.apply(concurrency, &mut capacities);
     }
     capacities
 }
