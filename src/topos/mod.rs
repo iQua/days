@@ -2,4 +2,5 @@
 
 pub mod build;
 pub mod config;
+pub mod rail;
 pub mod route;
