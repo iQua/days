@@ -3,7 +3,7 @@ title: Flows
 description: Point-to-point traffic, routing, transport, and exact-lowering limits.
 ---
 
-**Scope: Days AGO and Legacy Days.** Days accepts explicit `[[flow]]` entries and generated `[[flow_set]]` entries. Legacy Days supports the full schema below. Days AGO accepts a deterministic subset and returns a specific error for unsupported fields or mechanisms.
+**Scope: Days AGO and Legacy Days.** Days accepts explicit `[[flow]]` entries and generated `[[flow_set]]` entries. Legacy Days supports the full schema below, except the `[flow.traffic.dcqcn]` table: since P16 the two engines read different DCQCN keys, and the legacy keys are on the [Legacy flows](/docs/legacy/components/flows#dcqcn-configuration) page. Days AGO accepts a deterministic subset and returns a specific error for unsupported fields or mechanisms.
 
 ## Explicit flow
 
@@ -100,32 +100,86 @@ Exact lowering supports byte-bounded Reno and CUBIC. It rejects BBR, duration-bo
 
 ## DCQCN
 
-Legacy DCQCN requires `-p days-legacy --features dcqcn` and this table:
+**Scope: Days AGO.** The legacy engine's DCQCN keys are on the [Legacy flows](/docs/legacy/components/flows#dcqcn-configuration) page; the two tables share no format.
+
+Days AGO runs the Mellanox form of DCQCN: the reaction point of HPCC's ns-3 model (`CC_MODE 1`) and of SimAI, in exact integer arithmetic. `[flow.traffic.dcqcn]` configures it on an unreliable `flow_type = "DCQCN"` flow and on a [RoCE queue pair](#roce-queue-pairs). Only `max_rate_gbps` is required; the other controller keys default to the values SimAI and HPCC ship.
 
 ```toml
+[[flow]]
+flow_type = "DCQCN"
+priority = 0
+graph = [[0, 1]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 200000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
 [flow.traffic.dcqcn]
-rate_gbps = 10.0
-min_rate_gbps = 1.0
-max_rate_gbps = 10.0
-g = 0.5
-ai_rate_gbps = 0.5
-hai_rate_gbps = 1.0
-mi_factor = 0.5
-rtt_ns = 100000.0
-cnp_interval_ns = 50000.0
-pacing_interval_ns = 1000.0
-cnp_priority = 0
+max_rate_gbps = 10.0              # required: the line rate
+rate_gbps = 10.0                  # default max_rate_gbps
+min_rate_gbps = 0.1
+g = 0.00390625
+ai_rate_gbps = 0.05
+hai_rate_gbps = 0.1
+alpha_resume_interval_ns = 1000
+rate_decrease_interval_ns = 4000
+rp_timer_ns = 900000
+fast_recovery_times = 1
+clamp_target_rate = false
+pacing_interval_ns = 1000
+cnp_interval_ns = 0               # unreliable flows only
+cnp_priority = 0                  # unreliable flows only; default priority
 ```
 
-Rates must satisfy `min_rate_gbps <= rate_gbps <= max_rate_gbps`. `g` and `mi_factor` must lie in `0..=1`; priorities must lie in `0..=7`. Exact lowering also accepts `increase_byte_threshold`, defaulting to `10000000`, but the strict legacy loader does not accept that key.
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `max_rate_gbps` | required | The line rate: the clamp of the target rate on every increase, and the rate a variable window is scaled by. |
+| `rate_gbps` | `max_rate_gbps` | The initial current and target rate. |
+| `min_rate_gbps` | `0.1` | The floor of a rate cut. Increases are not clamped below it. |
+| `g` | `0.00390625` | The gain of the congestion estimate `alpha`, in `0..=1`. |
+| `ai_rate_gbps` | `0.05` | The additive increase step. |
+| `hai_rate_gbps` | `0.1` | The hyper increase step. |
+| `alpha_resume_interval_ns` | `1000` | The period of the `alpha` update. |
+| `rate_decrease_interval_ns` | `4000` | The period of the rate-decrease check. |
+| `rp_timer_ns` | `900000` | The period of the rate-increase timer. |
+| `fast_recovery_times` | `1` | Rate-increase fires that average the rate toward the target before the first additive step. |
+| `clamp_target_rate` | `false` | Set the target rate to the current rate on every cut. Off, a cut does that only when an increase has fired since the last cut. |
+| `pacing_interval_ns` | `1000` | The pacing tick. The pacer sends at most one packet per tick, from the credit the current rate accrues. |
+| `cnp_interval_ns` | `0` | Unreliable flows only. The receiver sends at most one CNP per interval; `0` sends one CNP per CE-marked packet. Rejected on a queue pair. |
+| `cnp_priority` | `priority` | Unreliable flows only. The PFC class the CNPs ride; a class other than the data class is not held back by a pause of the data class. Rejected on a queue pair, which sets `feedback_priority` instead. |
 
-In exact lowering, `cnp_priority` is the flow's feedback priority: the PFC class its CNPs ride. It defaults to the flow's `priority`. A different value puts CNPs in their own class, so a pause of the data class does not hold them back.
+Rates are exact decimals in gigabits per second and lower to integer bits per second. They must satisfy `min_rate_gbps <= rate_gbps <= max_rate_gbps`, and the minimum must be at least 3 bit/s. `g` is held as a 63-bit binary fraction, rounded half to even: exact for a dyadic value such as `1/256` or `1/1024`, and within `2^-64` otherwise; it accepts at most 19 significant digits and 38 decimal places. The three intervals and `pacing_interval_ns` must be positive, and `fast_recovery_times` below `4294967295`.
 
-DCQCN sources emit ECN-capable data. Use `RED_ECN` or `ECN_THRESHOLD` to create CE feedback. Lowered DCQCN, including its controller and CNP state, runs on Scalar, CPU, Metal, and CUDA. A `cnp_priority` that differs from `priority` runs on Scalar and CPU; Metal and CUDA refuse it at validation.
+The paper-form keys of earlier releases, `mi_factor`, `rtt_ns` and `increase_byte_threshold`, are gone, not deprecated. A scenario that sets one fails to lower:
+
+```text
+unsupported paper-form DCQCN key `mi_factor` (removed in P16: the Mellanox-form cut is alpha / 2); see docs/content/docs/configuration/flows.mdx
+```
+
+The rate-increase period that `rtt_ns` used to name is `rp_timer_ns`.
+
+### What the controller does
+
+The controller keeps a current rate `R_C`, a target rate `R_T`, the estimate `alpha` and a stage counter. Until its first feedback it is pristine: `R_C = R_T = rate_gbps`, `alpha = 1`, and no timer runs.
+
+- **Feedback.** On an unreliable flow, feedback is a CNP arrival. On a queue pair, it is an ACK or NACK whose ECN echo is set (see below). The first feedback at time `t` starts the `alpha` update at `t + alpha_resume_interval_ns` and then every interval, and the rate-decrease check at `t + rate_decrease_interval_ns + 1 ns` and then every `rate_decrease_interval_ns`; the first check always cuts. Every later feedback marks both the `alpha` update and the decrease check as pending; the first feedback marks only the decrease check, so the first `alpha` update decays unless a second feedback arrives before it.
+- **`alpha` update.** `alpha` becomes `(1 - g) * alpha + g` if feedback arrived since the last update, and `(1 - g) * alpha` otherwise. `alpha` is a 63-bit fraction and each update floors once.
+- **Rate-decrease check.** With feedback since the last check: `R_T` is set to `R_C` when `clamp_target_rate` is on or the stage is not 0; then `R_C = max(min_rate_gbps, floor(R_C * (1 - alpha / 2)))`, the stage returns to 0, and the rate-increase timer restarts `rp_timer_ns` after the cut.
+- **Rate-increase timer.** Every `rp_timer_ns` after the last cut: below `fast_recovery_times`, fast recovery; at it, `R_T` grows by `ai_rate_gbps`; above it, by `hai_rate_gbps`, clamped to `max_rate_gbps` in both cases. Then `R_C = floor(R_C / 2) + floor(R_T / 2)` and the stage advances. The timer keeps firing until the flow completes.
+
+The controller owns no events. Its three timers are applied at the flow's next transition (a feedback, a pacing tick, an ACK, a timeout), in the order the eager model would have run them: at one instant, feedback arrivals first, then the `alpha` update, then the rate increase, then the rate decrease, then the flow's own pacing tick or timeout. The result is identical to running the timers as events, without the per-flow event stream. One case departs from ns-3's event order: when `rp_timer_ns` equals `rate_decrease_interval_ns`, ns-3 runs the decrease check before the increase at their shared instant, and Days AGO runs the increase first. Lowering does not reject that pair of values; the shipped defaults (`900000` and `4000`) do not have it.
+
+The controller freezes when the flow completes: at the ACK that acknowledges a queue pair's last byte, or at the pacing tick that emits an unreliable flow's last byte. Feedback that arrives later changes nothing.
+
+An unreliable DCQCN flow's receiver is the notification point: a CE-marked data packet makes it send a CNP in class `cnp_priority`, at most one per `cnp_interval_ns`. The sender's pacer draws credit from `R_C` on every tick; the flow has no acknowledgments and no retransmission.
+
+DCQCN sources emit ECN-capable data. Use `RED_ECN` or `ECN_THRESHOLD` to create CE feedback. Lowered DCQCN, including its controller and the notification point, runs on Scalar, CPU, Metal, and CUDA, with any `cnp_priority`.
 
 ## RoCE queue pairs
 
-A RoCE queue pair is a reliable DCQCN flow. It uses the same exact DCQCN controller, pacing and separate CNP packet as a DCQCN flow, and adds Go-back-N reliability: a PSN on every data packet, cumulative ACKs, NACKs, and a retransmission timeout. A queue pair completes when its last byte is acknowledged. Queue pairs are an exact-lowering feature; the legacy simulator does not run them.
+A RoCE queue pair is a reliable DCQCN flow. It uses the DCQCN controller and pacer above and adds Go-back-N reliability: a PSN on every data packet, cumulative ACKs, NACKs, and a retransmission timeout. Its congestion feedback is the ECN echo its ACKs and NACKs carry; a queue pair sends no CNP. A queue pair completes when its last byte is acknowledged. Queue pairs are an exact-lowering feature; the legacy simulator does not run them.
 
 ```toml
 [[flow]]
@@ -139,19 +193,16 @@ size = 2_000_000                  # required: a queue pair is byte-bounded
 arr_dist = { type = "Uniform", low = 1, high = 1 }
 pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }   # the MTU
 
-[flow.traffic.dcqcn]              # the controller: the DCQCN keys above, without cnp_priority
-rate_gbps = 100.0
-min_rate_gbps = 0.1
+[flow.traffic.dcqcn]              # the controller: the DCQCN keys above, without cnp_interval_ns and cnp_priority
 max_rate_gbps = 100.0
-g = 0.00390625
 ai_rate_gbps = 0.02
 hai_rate_gbps = 0.2
-mi_factor = 0.5
-rtt_ns = 50000
+rp_timer_ns = 300000
 pacing_interval_ns = 80
 
 [flow.traffic.roce]
 retransmit_timeout_ns = 1_000_000
+window_bytes = 250_000
 ```
 
 | `[flow.traffic.roce]` key | Required | Meaning |
@@ -159,19 +210,31 @@ retransmit_timeout_ns = 1_000_000
 | `retransmit_timeout_ns` | yes | Fixed retransmission timeout, with no backoff. `0` turns the timeout off (see below). |
 | `ack_every_packets` | no | In-order packets per cumulative ACK; default `1`. The receiver also ACKs the last byte. |
 | `nack_interval_ns` | no | Minimum spacing of two NACKs for the same expected PSN; default `500000`. |
-| `feedback_priority` | no | PFC class of the queue pair's CNPs, ACKs and NACKs, in `0..=7`; default `priority`. |
+| `feedback_priority` | no | PFC class of the queue pair's ACKs and NACKs, in `0..=7`; default `priority`. |
 | `duplicate_ack` | no | Whether a packet below the receiver's frontier is answered with an ACK; default `true`. `false` is allowed only with `retransmit_timeout_ns = 0`. |
 | `ack_size_bytes` | no | Wire size of an ACK or NACK; default `64`. |
+| `window_bytes` | no | The most bytes the pair keeps unacknowledged in flight (SimAI `m_win`); default `0`, no window. |
+| `variable_window` | no | Scale the window with the controller's current rate (SimAI `m_var_win`); default `false`. Needs `window_bytes` above `0`. |
 
 The PSN is the byte offset of a packet's first byte. Every packet is `pkt_size_dist` bytes except a short last one, so a retransmission resends exactly the bytes of the original. The pacer sends at most one packet per `pacing_interval_ns` tick, so the tick must be short enough for the line rate: at 100 Gbps with 1,000-byte packets, at most 80 ns.
 
-On a NACK or a timeout, the sender rewinds to the first unacknowledged byte and resends everything from there (Go-back-N). Retransmissions are paced and charged to the DCQCN byte counter like first transmissions.
+On a NACK or a timeout, the sender rewinds to the first unacknowledged byte and resends everything from there (Go-back-N). Retransmissions are paced like first transmissions.
+
+**ECN echo.** Each ACK or NACK echoes the CE bit of the data packet whose arrival produced it. With `ack_every_packets` above `1`, only the packet that produces the ACK is echoed; a NACK that the NACK interval suppresses echoes nothing. The sender's controller takes one feedback per ACK or NACK whose echo is set, until the pair completes. ACKs and NACKs ride `feedback_priority`; a class other than the data class is not held back by a pause of the data class.
+
+**Window.** With `window_bytes` above `0`, the window is `w = window_bytes`, or with `variable_window` the larger of `1` and `floor(window_bytes * R_C / max_rate_gbps)` with `R_C` the controller's current rate; the product is exact and does not wrap. A pacing tick that has a packet to send and finds `next_psn - snd_una >= w` sends nothing, adds no credit and parks the pacer, as a tick in a paused class does. Only an ACK or NACK that moves `snd_una`, or a timeout, restarts it; a rate increase or a host-link RESUME does not. SimAI sets `m_win` to a bandwidth-delay product, `(2 * propagation delay + one packet's transmission time) * line rate` in bytes, of the pair's path or the largest over all host pairs; Days AGO takes the value from `window_bytes`.
 
 **With the timeout off, only a NACK repairs a loss.** A NACK needs a later packet of the same queue pair to arrive out of order. If the last packet is lost, or the last ACK, or a resent packet is lost again when nothing follows it, the queue pair stalls for the rest of the run. It never completes, and the run does not report an error. This is the NACK-only Go-back-N of the HPCC ns-3 model; keep the timeout on unless you need that behavior.
 
 With `[link.pfc] host_links = true`, a switch can pause a queue pair's host. The queue pair then stops sending in its data class until the resume; see [host links](/docs/configuration/l2#host-links).
 
-Exact lowering refuses `[flow.traffic.roce]` on other flow types, `[flow.traffic.tcp]` on a queue pair, `cnp_priority` on a queue pair (use `feedback_priority`), and duration-bounded queue pairs. Queue pairs also carry collective stages (see [Collectives](/docs/configuration/collectives#roce-stages)). They run on Scalar and CPU; Metal and CUDA refuse them at validation.
+Exact lowering refuses `[flow.traffic.roce]` on other flow types, `[flow.traffic.tcp]` on a queue pair, `cnp_priority` on a queue pair (use `feedback_priority`), `cnp_interval_ns` on a queue pair, `variable_window` without `window_bytes`, duration-bounded queue pairs, and an MTU above `4294967295` bytes. A queue pair with `cnp_interval_ns` fails with:
+
+```text
+unsupported `cnp_interval_ns` on RoCE traffic: a queue pair's receiver echoes ECN on its ACKs and NACKs and sends no CNP (P16)
+```
+
+Queue pairs also carry collective stages (see [Collectives](/docs/configuration/collectives#roce-stages)). Queue pairs run on Scalar, CPU, Metal, and CUDA; collective stages run on Scalar and CPU, and Metal and CUDA refuse them at validation.
 
 ## Days AGO field limits
 
