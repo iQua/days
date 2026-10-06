@@ -202,25 +202,24 @@ def sameConfig (first second : Row) : Bool :=
     first.maxProbabilityDenominator = second.maxProbabilityDenominator &&
     first.markEcn = second.markEcn
 
-def sameQueue (first second : Row) : Bool :=
-  first.nodeId = second.nodeId && first.queueId = second.queueId
-
+/-- Each queue's rows continue its configuration and RED state. One pass in canonical order keeps
+each queue's most recent row in a hash map: the one row per queue that the list scan it replaces
+kept (it dropped a queue's older row whenever a newer one arrived), so each row is compared with the
+same prior row, with the same requirements and messages, in O(1) expected instead of O(queues). -/
 def checkContinuity (rows : List Row) : Except String Unit := do
-  let rec go (previous : List Row) : List Row → Except String Unit
-    | [] => pure ()
-    | row :: rest => do
-        match previous.find? (sameQueue · row) with
-        | none => pure ()
-        | some prior =>
-            require row.srcLine (sameConfig prior row)
-              s!"AQM config does not continue the prior config for queue (node_id={row.nodeId}, queue_id={row.queueId})"
-            if row.policy = "red" then
-              require row.srcLine
-                (row.beforeAverageScaled = prior.afterAverageScaled &&
-                  row.beforeCounter = prior.afterCounter)
-                s!"RED before-state does not continue the prior state for queue (node_id={row.nodeId}, queue_id={row.queueId})"
-        go (row :: previous.filter (fun prior => !sameQueue prior row)) rest
-  go [] rows
+  let mut last : Std.HashMap (Nat × Nat) Row := ∅
+  for row in rows do
+    match last.get? (row.nodeId, row.queueId) with
+    | none => pure ()
+    | some prior =>
+        require row.srcLine (sameConfig prior row)
+          s!"AQM config does not continue the prior config for queue (node_id={row.nodeId}, queue_id={row.queueId})"
+        if row.policy = "red" then
+          require row.srcLine
+            (row.beforeAverageScaled = prior.afterAverageScaled &&
+              row.beforeCounter = prior.afterCounter)
+            s!"RED before-state does not continue the prior state for queue (node_id={row.nodeId}, queue_id={row.queueId})"
+    last := last.insert (row.nodeId, row.queueId) row
 
 def checkRows (rows : List Row) : Except String Unit := do
   let rows ← canonicalize rows

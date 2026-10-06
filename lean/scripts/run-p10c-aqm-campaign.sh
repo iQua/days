@@ -7,7 +7,8 @@ lean_dir="$(cd "$script_dir/.." && pwd)"
 cd "$lean_dir"
 lake build p10c_aqm_check
 
-checker="$lean_dir/.lake/build/bin/p10c_aqm_check"
+# P10C_AQM_CHECKER substitutes a drop-in checker (run-p10c-aqm-differential.sh).
+checker="${P10C_AQM_CHECKER:-$lean_dir/.lake/build/bin/p10c_aqm_check}"
 fixture_dir="$lean_dir/fixtures/p10c"
 failures=0
 checked=0
