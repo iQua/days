@@ -429,6 +429,12 @@ pub struct ConstantGenerator {
 pub enum CollectiveAlgorithm {
     RingAllReduce = 0,
     AllGather = 1,
+    /// One ring phase: rank r ends holding the reduced chunk it owns.
+    ReduceScatter = 2,
+    /// One message per ordered pair of ranks, all independent.
+    AllToAll = 3,
+    /// One message from the group's rank 0 to its rank 1.
+    SendRecv = 4,
 }
 
 /// Resolved phase tag for one collective stage.
@@ -437,6 +443,10 @@ pub enum CollectiveAlgorithm {
 pub enum CollectivePhase {
     ReduceScatter = 0,
     AllGather = 1,
+    /// An all-to-all's one phase: `step` is the offset `k` of the destination `rank + k`.
+    AllToAll = 2,
+    /// A send/recv's one phase.
+    SendRecv = 3,
 }
 
 /// Chunk partition policy retained explicitly in every stage image.
@@ -444,6 +454,11 @@ pub enum CollectivePhase {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CollectiveChunkPolicy {
     EqualRemainderLast = 0,
+    /// Every message carries `floor(floor(S / n) / c)` bytes (`c` channels), the remainder
+    /// unsent: SimAI's NCCL flow model. An all-to-all's pairs carry `floor(S / n)`.
+    UniformFloor = 1,
+    /// An all-to-all's per-pair bytes from a seeded routing matrix (`scenario::alltoall`).
+    Seeded = 2,
 }
 
 /// Logical communication-channel policy retained explicitly in every stage image.
@@ -451,6 +466,12 @@ pub enum CollectiveChunkPolicy {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CollectiveChannelPolicy {
     RingNext = 0,
+    /// Several rings over the same ranks, each its own order; `channel` names the ring.
+    Channels = 1,
+    /// Every ordered pair of ranks (an all-to-all).
+    AllPairs = 2,
+    /// The one pair rank 0 to rank 1 (a send/recv).
+    Pair = 3,
 }
 
 /// The predecessors of one kind (local or inbound) of a dependency-gated stage.

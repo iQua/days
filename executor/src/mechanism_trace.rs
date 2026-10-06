@@ -343,6 +343,9 @@ const fn collective_algorithm(algorithm: CollectiveAlgorithm) -> &'static str {
     match algorithm {
         CollectiveAlgorithm::RingAllReduce => "ring_allreduce",
         CollectiveAlgorithm::AllGather => "allgather",
+        CollectiveAlgorithm::ReduceScatter => "reduce_scatter",
+        CollectiveAlgorithm::AllToAll => "all_to_all",
+        CollectiveAlgorithm::SendRecv => "send_recv",
     }
 }
 
@@ -350,6 +353,8 @@ const fn collective_phase(phase: CollectivePhase) -> &'static str {
     match phase {
         CollectivePhase::ReduceScatter => "reduce_scatter",
         CollectivePhase::AllGather => "allgather",
+        CollectivePhase::AllToAll => "all_to_all",
+        CollectivePhase::SendRecv => "send_recv",
     }
 }
 

@@ -1,5 +1,6 @@
 //! Backend-neutral lowering from supported Days configuration into one semantic image.
 
+pub mod collective_shapes;
 mod compile;
 mod ids;
 

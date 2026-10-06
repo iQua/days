@@ -22,6 +22,7 @@ use rand::rngs::SmallRng;
 use serde::Deserialize;
 use thiserror::Error;
 
+use super::collective_shapes::{RoutingSkew, SeededAllToAll};
 use super::ids::{IdError, LinkKey, LpKey, PhysicalNodeKey, StableIds, dense_ids};
 use crate::topos::build::{
     HostAttachments, PairingPolicy, TopologyError, TopologyProfile, build_graph_with_profile,
@@ -157,8 +158,16 @@ struct SourceFlowSet {
 struct SourceCollective {
     /// Stage-group name that `after` fields may reference.
     name: Option<String>,
-    /// Compute stage group whose rank-r stage gates this collective's rank-r root stages.
-    after: Option<String>,
+    /// Stage groups whose rank-r stages gate this collective's rank-r root stages: one name, or a
+    /// list (at least one compute group, and possibly the previous collective of the stream).
+    #[serde(default)]
+    after: Option<AfterGroups>,
+    /// Ring channels: each a ring order of the `sources` hosts (instead of `sinks`).
+    channels: Option<Vec<Vec<u64>>>,
+    /// `EqualRemainderLast` (the default for rings) or `UniformFloor`.
+    chunk: Option<String>,
+    /// An all-to-all's seeded per-pair sizes (`[collective.alltoall]`); uniform without it.
+    alltoall: Option<SourceAllToAll>,
     collective_type: String,
     first_flow_id: Option<u64>,
     flow_type: Option<String>,
@@ -170,6 +179,25 @@ struct SourceCollective {
     priority: Option<u8>,
     routing: Option<toml::Value>,
     traffic: SourceTraffic,
+}
+
+/// The seeded routing matrix of an imbalanced all-to-all (`collective_shapes::SeededAllToAll`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceAllToAll {
+    seed: u64,
+    #[serde(default)]
+    matrix: u64,
+    #[serde(default)]
+    group: u64,
+    #[serde(default)]
+    transpose: bool,
+    experts: u64,
+    topk: u64,
+    tokens: u64,
+    bytes_per_copy: u64,
+    /// `Zipf1` (the default) or `Uniform`.
+    skew: Option<String>,
 }
 
 /// A delay-only compute stage group: one timer-only stage per listed host.
@@ -546,7 +574,13 @@ struct CollectiveKey {
     traffic: TrafficKey,
     /// Stage-group identity; `None` for every unnamed collective, which keeps their order.
     name: Option<String>,
-    after: Option<String>,
+    after: Option<AfterGroups>,
+    /// Ring channels as rank-index orders (`rank` is a position in `sources`); empty for one ring
+    /// (`sinks`), an all-to-all and a send/recv.
+    channels: Vec<Vec<u32>>,
+    chunk: CollectiveChunkPolicy,
+    /// An all-to-all's seeded per-pair sizes.
+    seeded: Option<SeededAllToAll>,
 }
 
 /// One delay-only compute stage group.
@@ -562,6 +596,8 @@ struct ComputeKey {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct CollectiveStagePosition {
     phase: CollectivePhase,
+    /// The ring channel; 0 for one ring, an all-to-all and a send/recv.
+    channel: u32,
     rank: u32,
     step: u32,
 }
@@ -601,6 +637,8 @@ struct CollectiveStageInput {
     group_size: u32,
     declared_total_bytes: u64,
     position: CollectiveStagePosition,
+    chunk_policy: CollectiveChunkPolicy,
+    channel_policy: CollectiveChannelPolicy,
     chunk_offset_bytes: u64,
     chunk_bytes: u64,
     local: PredecessorKeys,
@@ -1323,10 +1361,23 @@ fn collective_algorithm(name: &str) -> Result<CollectiveAlgorithm, CompileError>
     match name {
         "RingAllReduce" => Ok(CollectiveAlgorithm::RingAllReduce),
         "AllGather" => Ok(CollectiveAlgorithm::AllGather),
+        "ReduceScatter" => Ok(CollectiveAlgorithm::ReduceScatter),
+        "AllToAll" => Ok(CollectiveAlgorithm::AllToAll),
+        "SendRecv" => Ok(CollectiveAlgorithm::SendRecv),
         unsupported => Err(CompileError::Unsupported(format!(
-            "unsupported collective algorithm `{unsupported}`; T26 supports RingAllReduce and AllGather"
+            "unsupported collective algorithm `{unsupported}`; Days lowers RingAllReduce, AllGather, ReduceScatter, AllToAll and SendRecv"
         ))),
     }
+}
+
+/// Whether `algorithm` runs on rings (and so has channels and ring sinks).
+const fn is_ring_algorithm(algorithm: CollectiveAlgorithm) -> bool {
+    matches!(
+        algorithm,
+        CollectiveAlgorithm::RingAllReduce
+            | CollectiveAlgorithm::AllGather
+            | CollectiveAlgorithm::ReduceScatter
+    )
 }
 
 /// Collectives run over a reliable transport, TCP or RoCE queue pairs: a stage completes when its
@@ -1358,6 +1409,7 @@ fn collective_key(
     paths: Option<&[Vec<u64>]>,
     graph: Option<&[(u64, u64)]>,
     traffic: SourceTraffic,
+    has_channels: bool,
     scenario_text: &str,
     roce_keys: &mut Vec<RoceTrafficKey>,
 ) -> Result<CollectiveKey, CompileError> {
@@ -1386,28 +1438,59 @@ fn collective_key(
             "collective priority must be in IEEE 802.1Q range 0..=7".to_owned(),
         ));
     }
-    if flow_count == 0 || algorithm == CollectiveAlgorithm::RingAllReduce && flow_count < 2 {
+    if flow_count == 0
+        || algorithm == CollectiveAlgorithm::RingAllReduce && flow_count < 2
+        || algorithm == CollectiveAlgorithm::SendRecv && flow_count != 2
+    {
         return Err(CompileError::Invalid(match algorithm {
             CollectiveAlgorithm::RingAllReduce => {
                 "RingAllReduce flow_count must be at least 2".to_owned()
             }
-            CollectiveAlgorithm::AllGather => "AllGather flow_count must be at least 1".to_owned(),
+            CollectiveAlgorithm::SendRecv => {
+                "SendRecv flow_count must be 2: sources = [sender, receiver]".to_owned()
+            }
+            other => format!("{other:?} flow_count must be at least 1"),
         }));
     }
-    if sources.is_empty() != sinks.is_empty() {
+    if !is_ring_algorithm(algorithm) {
+        if !sinks.is_empty() {
+            return Err(CompileError::Invalid(format!(
+                "{algorithm:?} takes `sources` only: no `sinks`"
+            )));
+        }
+        if algorithm == CollectiveAlgorithm::SendRecv && sources.len() != 2 {
+            return Err(CompileError::Invalid(
+                "SendRecv requires sources = [sender, receiver]".to_owned(),
+            ));
+        }
+        if !sources.is_empty() && sources.len() != flow_count as usize {
+            return Err(CompileError::Invalid(format!(
+                "collective sources must contain flow_count={flow_count} entries"
+            )));
+        }
+    } else if has_channels {
+        // Ring channels replace `sinks`; `shape_collective` checks them against the sources.
+        if sources.len() != flow_count as usize || !sinks.is_empty() {
+            return Err(CompileError::Invalid(format!(
+                "ring channels take flow_count={flow_count} `sources` and no `sinks`"
+            )));
+        }
+    } else if sources.is_empty() != sinks.is_empty() {
         return Err(CompileError::Invalid(
             "collective sources and sinks must either both be provided or both be omitted"
                 .to_owned(),
         ));
     }
-    if !sources.is_empty()
+    if is_ring_algorithm(algorithm)
+        && !has_channels
+        && !sources.is_empty()
         && (sources.len() != flow_count as usize || sinks.len() != flow_count as usize)
     {
         return Err(CompileError::Invalid(format!(
             "collective sources and sinks must each contain flow_count={flow_count} entries"
         )));
     }
-    if !sources.is_empty() {
+    if is_ring_algorithm(algorithm) && !has_channels && !sources.is_empty() {
         for rank in 0..sources.len() {
             if sinks[rank] != sources[(rank + 1) % sources.len()] {
                 return Err(CompileError::Invalid(format!(
@@ -1438,7 +1521,7 @@ fn collective_key(
             "RingAllReduce byte size {total_bytes} must be at least flow_count {flow_count}"
         )));
     }
-    if total_bytes < flow_count {
+    if total_bytes < flow_count || algorithm == CollectiveAlgorithm::SendRecv && total_bytes == 0 {
         // EqualRemainderLast would leave an empty chunk, and a TCP flow or a RoCE queue pair must
         // carry bytes.
         let transport = if flow_kind == SourceFlowKind::Roce {
@@ -1459,7 +1542,123 @@ fn collective_key(
         traffic,
         name: None,
         after: None,
+        channels: Vec::new(),
+        chunk: CollectiveChunkPolicy::EqualRemainderLast,
+        seeded: None,
     })
+}
+
+/// Attaches a collective's ring channels, chunk policy and seeded all-to-all sizes, and checks
+/// that every message carries a byte. The compiler checks nothing SimAI-specific: SimAI's size
+/// clamps and its skipping of empty rings belong to the AICB adapter (ruling R8).
+fn shape_collective(
+    key: &mut CollectiveKey,
+    channels: Option<Vec<Vec<u64>>>,
+    chunk: Option<&str>,
+    seeded: Option<SeededAllToAll>,
+) -> Result<(), CompileError> {
+    let algorithm = key.algorithm;
+    let n = key.flow_count;
+    let Termination::Bytes(total_bytes) = key.traffic.termination else {
+        unreachable!("collective validation requires byte termination")
+    };
+    key.chunk = match chunk {
+        None => match algorithm {
+            CollectiveAlgorithm::AllToAll => CollectiveChunkPolicy::UniformFloor,
+            _ => CollectiveChunkPolicy::EqualRemainderLast,
+        },
+        Some("EqualRemainderLast") if is_ring_algorithm(algorithm) => {
+            CollectiveChunkPolicy::EqualRemainderLast
+        }
+        Some("UniformFloor") if algorithm != CollectiveAlgorithm::SendRecv => {
+            CollectiveChunkPolicy::UniformFloor
+        }
+        Some(other) => {
+            return Err(CompileError::Unsupported(format!(
+                "unsupported {algorithm:?} chunk policy `{other}`; rings take EqualRemainderLast or UniformFloor, an all-to-all UniformFloor"
+            )));
+        }
+    };
+    if let Some(channels) = channels {
+        if !is_ring_algorithm(algorithm) {
+            return Err(CompileError::Invalid(format!(
+                "{algorithm:?} has no ring channels"
+            )));
+        }
+        if !key.sinks.is_empty() || key.sources.is_empty() {
+            return Err(CompileError::Invalid(
+                "ring channels take `sources` (the ranks in order) and no `sinks`".to_owned(),
+            ));
+        }
+        if channels.is_empty() {
+            return Err(CompileError::Invalid("`channels` lists no ring".to_owned()));
+        }
+        let mut sorted = key.sources.clone();
+        sorted.sort_unstable();
+        let mut rings = Vec::with_capacity(channels.len());
+        for ring in &channels {
+            let mut members = ring.clone();
+            members.sort_unstable();
+            if members != sorted {
+                return Err(CompileError::Invalid(
+                    "every ring channel must order exactly the collective's sources".to_owned(),
+                ));
+            }
+            rings.push(
+                ring.iter()
+                    .map(|host| {
+                        let rank = key
+                            .sources
+                            .iter()
+                            .position(|source| source == host)
+                            .expect("a channel member is a source");
+                        u32::try_from(rank).expect("the group size fits u32")
+                    })
+                    .collect(),
+            );
+        }
+        if rings.len() > 1 && key.chunk != CollectiveChunkPolicy::UniformFloor {
+            return Err(CompileError::Invalid(
+                "a collective of several ring channels requires chunk = \"UniformFloor\""
+                    .to_owned(),
+            ));
+        }
+        key.channels = rings;
+    }
+    if let Some(seeded) = seeded {
+        if algorithm != CollectiveAlgorithm::AllToAll {
+            return Err(CompileError::Invalid(
+                "`[collective.alltoall]` sizes apply to an AllToAll only".to_owned(),
+            ));
+        }
+        if seeded.experts == 0 || seeded.experts % n != 0 {
+            return Err(CompileError::Invalid(format!(
+                "all-to-all experts {} must be a positive multiple of the {n} ranks",
+                seeded.experts
+            )));
+        }
+        if seeded.routed_bytes_per_source() != Some(total_bytes) {
+            return Err(CompileError::Invalid(format!(
+                "a seeded all-to-all's size {total_bytes} must equal tokens x topk x bytes_per_copy"
+            )));
+        }
+        key.chunk = CollectiveChunkPolicy::Seeded;
+        key.seeded = Some(seeded);
+    }
+    let channel_count = key.channels.len().max(1) as u64;
+    let message = match algorithm {
+        CollectiveAlgorithm::SendRecv => total_bytes,
+        _ if key.chunk == CollectiveChunkPolicy::Seeded => 1,
+        CollectiveAlgorithm::AllToAll => total_bytes / n,
+        _ if key.chunk == CollectiveChunkPolicy::UniformFloor => total_bytes / n / channel_count,
+        _ => total_bytes / n,
+    };
+    if message == 0 && n > 1 {
+        return Err(CompileError::Invalid(format!(
+            "{algorithm:?} of {total_bytes} bytes over {n} ranks and {channel_count} channels sends empty messages; every message must carry a byte"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_compute(source: SourceCompute) -> Result<ComputeKey, CompileError> {
@@ -1498,6 +1697,7 @@ fn validate_collective(
     roce_keys: &mut Vec<RoceTrafficKey>,
 ) -> Result<CollectiveKey, CompileError> {
     let (name, after) = (source.name, source.after);
+    let (channels, chunk, alltoall) = (source.channels, source.chunk, source.alltoall);
     let mut key = collective_key(
         &source.collective_type,
         source.flow_type.as_deref(),
@@ -1510,12 +1710,39 @@ fn validate_collective(
         source.paths.as_deref(),
         source.graph.as_deref(),
         source.traffic,
+        channels.is_some(),
         scenario_text,
         roce_keys,
     )?;
     key.name = name;
     key.after = after;
+    let seeded = alltoall.map(seeded_all_to_all).transpose()?;
+    shape_collective(&mut key, channels, chunk.as_deref(), seeded)?;
     Ok(key)
+}
+
+/// A `[collective.alltoall]` table's seeded matrix.
+fn seeded_all_to_all(source: SourceAllToAll) -> Result<SeededAllToAll, CompileError> {
+    let skew = match source.skew.as_deref() {
+        None | Some("Zipf1") => RoutingSkew::Zipf1,
+        Some("Uniform") => RoutingSkew::Uniform,
+        Some(other) => {
+            return Err(CompileError::Unsupported(format!(
+                "unsupported all-to-all routing skew `{other}`; Days draws Zipf1 or Uniform"
+            )));
+        }
+    };
+    Ok(SeededAllToAll {
+        seed: source.seed,
+        matrix: source.matrix,
+        group: source.group,
+        transpose: source.transpose,
+        experts: source.experts,
+        topk: source.topk,
+        tokens: source.tokens,
+        bytes_per_copy: source.bytes_per_copy,
+        skew,
+    })
 }
 
 fn validate_collective_set(
@@ -1550,6 +1777,7 @@ fn validate_collective_set(
             None,
             None,
             source.traffic.clone(),
+            false,
             scenario_text,
             roce_keys,
         )?);
@@ -3080,14 +3308,14 @@ fn lower(
                     CollectiveStageIdentity {
                         collective_id: stage.collective_id,
                         algorithm: stage.algorithm,
-                        channel: 0,
+                        channel: stage.position.channel,
                         group_size: stage.group_size,
                         declared_total_bytes: stage.declared_total_bytes,
                         rank: stage.position.rank,
                         phase: stage.position.phase,
                         step: stage.position.step,
-                        chunk_policy: CollectiveChunkPolicy::EqualRemainderLast,
-                        channel_policy: CollectiveChannelPolicy::RingNext,
+                        chunk_policy: stage.chunk_policy,
+                        channel_policy: stage.channel_policy,
                         chunk_offset_bytes: stage.chunk_offset_bytes,
                         chunk_bytes: stage.chunk_bytes,
                     },
@@ -3749,13 +3977,16 @@ fn canonical_flows(
                 )));
             }
             semantic.sources.clone_from(&participants);
-            semantic.sinks = participants
-                .iter()
-                .cycle()
-                .skip(1)
-                .take(participants.len())
-                .copied()
-                .collect();
+            // An all-to-all has no ring; every ring algorithm's ring is the host order.
+            if is_ring_algorithm(semantic.algorithm) {
+                semantic.sinks = participants
+                    .iter()
+                    .cycle()
+                    .skip(1)
+                    .take(participants.len())
+                    .copied()
+                    .collect();
+            }
         }
         for participant in semantic.sources.iter().chain(&semantic.sinks) {
             if !hosts.contains(participant) {
@@ -3792,6 +4023,16 @@ fn canonical_flows(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
+    let layouts = collective_table
+        .iter()
+        .map(CollectiveLayout::of)
+        .collect::<Result<Vec<_>, _>>()?;
+    let plan = StagePlan {
+        groups: &groups,
+        collectives: &collective_table,
+        layouts: &layouts,
+        computes: &computes,
+    };
     let mut collective_duplicates = vec![0_u64; collective_table.len()];
     let mut next_collective_id = 0_u64;
     for semantic in &collectives {
@@ -3805,30 +4046,17 @@ fn canonical_flows(
         next_collective_id = next_collective_id
             .checked_add(1)
             .ok_or_else(|| CompileError::Invalid("collective identity exceeds u64".to_owned()))?;
-        let entry = semantic.after.as_ref().map(|name| match groups[name] {
-            StageGroup::Compute(compute) => compute_ordinal(&computes, compute),
-            StageGroup::Collective(_) => {
-                unreachable!("group resolution admits compute entries only")
-            }
-        });
         expand_collective(
             &mut flows,
+            &plan,
             semantic,
             collective,
             duplicate_ordinal,
             collective_id,
-            entry,
         )?;
     }
     for (compute_id, compute) in computes.iter().enumerate() {
-        expand_compute(
-            &mut flows,
-            compute,
-            compute_id as u64,
-            &groups,
-            &collective_table,
-            &computes,
-        )?;
+        expand_compute(&mut flows, &plan, compute, compute_id as u64)?;
     }
 
     flows.sort_by(|left, right| left.key.cmp(&right.key));
@@ -3850,157 +4078,436 @@ fn collective_chunk_bounds(total: u64, group_size: u64, owner: u64) -> (u64, u64
     (offset, bytes)
 }
 
-fn collective_stage_owner(
-    algorithm: CollectiveAlgorithm,
-    phase: CollectivePhase,
-    group_size: u64,
-    rank: u64,
-    step: u64,
-) -> u64 {
+/// The owner offset of the ring recurrence: in step `s` a rank forwards the chunk its ring
+/// position `s - offset` back owns.
+const fn owner_offset(algorithm: CollectiveAlgorithm, phase: CollectivePhase) -> u64 {
     match (algorithm, phase) {
-        (CollectiveAlgorithm::RingAllReduce, CollectivePhase::AllGather) => {
-            (rank + group_size - step + 2) % group_size
-        }
-        (CollectiveAlgorithm::RingAllReduce, CollectivePhase::ReduceScatter)
-        | (CollectiveAlgorithm::AllGather, CollectivePhase::AllGather) => {
-            (rank + group_size - step + 1) % group_size
-        }
-        (CollectiveAlgorithm::AllGather, CollectivePhase::ReduceScatter) => {
-            unreachable!("AllGather has no ReduceScatter phase")
-        }
+        (CollectiveAlgorithm::RingAllReduce, CollectivePhase::AllGather) => 2,
+        _ => 1,
     }
 }
 
+/// The rank whose chunk the stage at ring `position` sends in `step` of a ring of `n`, given the
+/// ring's `order` (`order[position]` is the rank there).
+fn collective_stage_owner(
+    algorithm: CollectiveAlgorithm,
+    phase: CollectivePhase,
+    order: &[u32],
+    position: u64,
+    step: u64,
+) -> u64 {
+    let n = order.len() as u64;
+    u64::from(order[((position + n - step + owner_offset(algorithm, phase)) % n) as usize])
+}
+
+/// The phases of a ring algorithm, in order.
+fn ring_phases(algorithm: CollectiveAlgorithm) -> &'static [CollectivePhase] {
+    match algorithm {
+        CollectiveAlgorithm::RingAllReduce => {
+            &[CollectivePhase::ReduceScatter, CollectivePhase::AllGather]
+        }
+        CollectiveAlgorithm::ReduceScatter => &[CollectivePhase::ReduceScatter],
+        _ => &[CollectivePhase::AllGather],
+    }
+}
+
+/// Whether a collective expands to any stage.
+fn collective_has_stages(semantic: &CollectiveKey) -> bool {
+    semantic.flow_count > 1
+}
+
+/// The message structure of one collective key, computed once for its expansion and for the
+/// completion sets its successors wait for.
+struct CollectiveLayout {
+    /// A ring algorithm's channels: each a rank order (one ring in `sources` order without
+    /// `channels`).
+    rings: Vec<Vec<u32>>,
+    /// `positions[k][rank]`: the rank's position in channel `k`.
+    positions: Vec<Vec<u32>>,
+    /// An all-to-all's bytes per ordered pair, row-major; zero for a pair without a message.
+    pair_bytes: Vec<u64>,
+}
+
+impl CollectiveLayout {
+    fn of(semantic: &CollectiveKey) -> Result<Self, CompileError> {
+        let n = usize::try_from(semantic.flow_count)
+            .map_err(|_| CompileError::Invalid("collective group exceeds usize".to_owned()))?;
+        let mut layout = Self {
+            rings: Vec::new(),
+            positions: Vec::new(),
+            pair_bytes: Vec::new(),
+        };
+        let Termination::Bytes(total_bytes) = semantic.traffic.termination else {
+            unreachable!("collective validation requires byte termination")
+        };
+        match semantic.algorithm {
+            CollectiveAlgorithm::AllToAll => {
+                layout.pair_bytes = match semantic.seeded {
+                    Some(seeded) => seeded.bytes(semantic.flow_count).ok_or_else(|| {
+                        CompileError::Invalid("seeded all-to-all sizes overflow u64".to_owned())
+                    })?,
+                    None => {
+                        let mut bytes = vec![total_bytes / semantic.flow_count; n * n];
+                        for rank in 0..n {
+                            bytes[rank * n + rank] = 0;
+                        }
+                        bytes
+                    }
+                };
+            }
+            CollectiveAlgorithm::SendRecv => {}
+            _ => {
+                layout.rings = if semantic.channels.is_empty() {
+                    vec![(0..u32::try_from(n).expect("the group size fits u32")).collect()]
+                } else {
+                    semantic.channels.clone()
+                };
+                layout.positions = layout
+                    .rings
+                    .iter()
+                    .map(|order| {
+                        let mut positions = vec![0_u32; n];
+                        for (position, &rank) in order.iter().enumerate() {
+                            positions[rank as usize] = position as u32;
+                        }
+                        positions
+                    })
+                    .collect();
+            }
+        }
+        Ok(layout)
+    }
+
+    /// The rank before `rank` on channel `channel`.
+    fn previous(&self, channel: usize, rank: u32) -> u32 {
+        let order = &self.rings[channel];
+        let n = order.len();
+        order[(self.positions[channel][rank as usize] as usize + n - 1) % n]
+    }
+
+    /// The rank after `rank` on channel `channel`.
+    fn next(&self, channel: usize, rank: u32) -> u32 {
+        let order = &self.rings[channel];
+        let n = order.len();
+        order[(self.positions[channel][rank as usize] as usize + 1) % n]
+    }
+}
+
+/// The tables the expansions read: the stage groups and the collectives' layouts.
+struct StagePlan<'a> {
+    groups: &'a BTreeMap<String, StageGroup<'a>>,
+    collectives: &'a [CollectiveKey],
+    layouts: &'a [CollectiveLayout],
+    computes: &'a [ComputeKey],
+}
+
+/// A ring stage's chunk: `(offset, bytes)`.
+fn ring_chunk(
+    semantic: &CollectiveKey,
+    layout: &CollectiveLayout,
+    phase: CollectivePhase,
+    channel: usize,
+    rank: u32,
+    step: u64,
+) -> (u64, u64) {
+    let n = semantic.flow_count;
+    let Termination::Bytes(total_bytes) = semantic.traffic.termination else {
+        unreachable!("collective validation requires byte termination")
+    };
+    let owner = collective_stage_owner(
+        semantic.algorithm,
+        phase,
+        &layout.rings[channel],
+        u64::from(layout.positions[channel][rank as usize]),
+        step,
+    );
+    match semantic.chunk {
+        CollectiveChunkPolicy::UniformFloor => {
+            let channels = layout.rings.len() as u64;
+            let bytes = total_bytes / n / channels;
+            ((owner * channels + channel as u64) * bytes, bytes)
+        }
+        _ => collective_chunk_bounds(total_bytes, n, owner),
+    }
+}
+
+/// The stages that complete collective `ordinal` at `rank`: the rank's own last sends (local,
+/// acknowledged) and the last messages delivered to it (inbound, with their bytes). A ring's are
+/// each channel's final step; an all-to-all's are every pair from and to the rank; a send/recv's
+/// is its one message, local at the sender and inbound at the receiver. A named collective is
+/// unique, so its only instance has duplicate ordinal 0.
+fn collective_completion(
+    plan: &StagePlan<'_>,
+    ordinal: u64,
+    rank: u32,
+    local: &mut PredecessorKeys,
+    inbound: &mut PredecessorKeys,
+) -> Result<u64, CompileError> {
+    let semantic = &plan.collectives[ordinal as usize];
+    let layout = &plan.layouts[ordinal as usize];
+    let key = |phase, channel, rank, step| FlowKey::CollectiveStage {
+        collective: ordinal,
+        duplicate_ordinal: 0,
+        stage: CollectiveStagePosition {
+            phase,
+            channel,
+            rank,
+            step,
+        },
+    };
+    let n = u32::try_from(semantic.flow_count).expect("the group size fits u32");
+    let mut bytes = 0_u64;
+    let mut add = |more: u64| -> Result<(), CompileError> {
+        bytes = bytes
+            .checked_add(more)
+            .ok_or_else(|| CompileError::Invalid("inbound join bytes exceed u64".to_owned()))?;
+        Ok(())
+    };
+    match semantic.algorithm {
+        CollectiveAlgorithm::AllToAll => {
+            let size = n as usize;
+            for step in 1..n {
+                let target = (rank + step) % n;
+                if layout.pair_bytes[rank as usize * size + target as usize] != 0 {
+                    local.push(key(CollectivePhase::AllToAll, 0, rank, step));
+                }
+            }
+            for step in 1..n {
+                let source = (rank + n - step) % n;
+                let pair = layout.pair_bytes[source as usize * size + rank as usize];
+                if pair != 0 {
+                    inbound.push(key(CollectivePhase::AllToAll, 0, source, step));
+                    add(pair)?;
+                }
+            }
+        }
+        CollectiveAlgorithm::SendRecv => {
+            let message = key(CollectivePhase::SendRecv, 0, 0, 1);
+            if rank == 0 {
+                local.push(message);
+            } else {
+                let Termination::Bytes(total_bytes) = semantic.traffic.termination else {
+                    unreachable!("collective validation requires byte termination")
+                };
+                inbound.push(message);
+                add(total_bytes)?;
+            }
+        }
+        _ => {
+            let phase = *ring_phases(semantic.algorithm)
+                .last()
+                .expect("a ring algorithm has a phase");
+            let step = n - 1;
+            for channel in 0..layout.rings.len() {
+                let previous = layout.previous(channel, rank);
+                let channel_u32 = channel as u32;
+                local.push(key(phase, channel_u32, rank, step));
+                inbound.push(key(phase, channel_u32, previous, step));
+                add(ring_chunk(semantic, layout, phase, channel, previous, u64::from(step)).1)?;
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+/// The predecessors a group's rank-`rank` stage takes from the groups it names in `after`: a
+/// compute group's rank-`rank` stage, and each collective's completion at the rank.
+fn entry_predecessors(
+    plan: &StagePlan<'_>,
+    after: Option<&AfterGroups>,
+    rank: u32,
+) -> Result<(PredecessorKeys, PredecessorKeys, u64), CompileError> {
+    let mut local = PredecessorKeys::None;
+    let mut inbound = PredecessorKeys::None;
+    let mut bytes = 0_u64;
+    for name in after_names(after) {
+        match plan.groups[name] {
+            StageGroup::Compute(predecessor) => local.push(FlowKey::ComputeStage {
+                compute: compute_ordinal(plan.computes, predecessor),
+                rank,
+            }),
+            StageGroup::Collective(collective) => {
+                let ordinal = collective_ordinal(plan.collectives, collective);
+                let more = collective_completion(plan, ordinal, rank, &mut local, &mut inbound)?;
+                bytes = bytes.checked_add(more).ok_or_else(|| {
+                    CompileError::Invalid("inbound join bytes exceed u64".to_owned())
+                })?;
+            }
+        }
+    }
+    Ok((local, inbound, bytes))
+}
+
+/// Expands one collective into its stages: rings per channel and phase, an all-to-all's ordered
+/// pairs, or a send/recv's one message. Each stage waits for its rank's previous step (local) and
+/// for the previous rank's (inbound); a root (step one of the first phase, every all-to-all pair,
+/// the send) waits for the groups the collective follows.
 fn expand_collective(
     flows: &mut Vec<FlowInput>,
+    plan: &StagePlan<'_>,
     semantic: &CollectiveKey,
     collective: u64,
     duplicate_ordinal: u64,
     collective_id: u64,
-    entry: Option<u64>,
 ) -> Result<(), CompileError> {
     let n = semantic.flow_count;
     let Termination::Bytes(total_bytes) = semantic.traffic.termination else {
         unreachable!("collective validation requires byte termination")
     };
-    if semantic.algorithm == CollectiveAlgorithm::AllGather && (n == 1 || total_bytes == 0) {
+    if !collective_has_stages(semantic) || total_bytes == 0 {
         return Ok(());
     }
-    let stage_count = match semantic.algorithm {
-        CollectiveAlgorithm::RingAllReduce => {
-            n.checked_mul(n - 1).and_then(|count| count.checked_mul(2))
-        }
-        CollectiveAlgorithm::AllGather => n.checked_mul(n - 1),
-    }
-    .ok_or_else(|| CompileError::Invalid("collective stage count exceeds u64".to_owned()))?;
-    flows
-        .try_reserve_exact(usize::try_from(stage_count).map_err(|_| {
-            CompileError::Invalid(
-                "collective stage count exceeds the platform index domain".to_owned(),
-            )
-        })?)
-        .map_err(|error| {
-            CompileError::Invalid(format!("collective stage table is too large: {error}"))
-        })?;
+    let layout = &plan.layouts[collective as usize];
     let group_size = u32::try_from(n)
         .map_err(|_| CompileError::Invalid("collective group size exceeds u32".to_owned()))?;
-    let phases: &[CollectivePhase] = match semantic.algorithm {
-        CollectiveAlgorithm::RingAllReduce => {
-            &[CollectivePhase::ReduceScatter, CollectivePhase::AllGather]
-        }
-        CollectiveAlgorithm::AllGather => &[CollectivePhase::AllGather],
+    let stage_key = |stage: CollectiveStagePosition| FlowKey::CollectiveStage {
+        collective,
+        duplicate_ordinal,
+        stage,
     };
-    let final_step = u32::try_from(n - 1)
-        .map_err(|_| CompileError::Invalid("collective step exceeds u32".to_owned()))?;
-
-    for &phase in phases {
-        for rank_u64 in 0..n {
-            let rank = u32::try_from(rank_u64)
-                .map_err(|_| CompileError::Invalid("collective rank exceeds u32".to_owned()))?;
-            let previous_rank = u32::try_from((rank_u64 + n - 1) % n)
-                .expect("rank is below validated u32 group size");
-            for step_u64 in 1..n {
-                let step = u32::try_from(step_u64)
-                    .map_err(|_| CompileError::Invalid("collective step exceeds u32".to_owned()))?;
-                let owner =
-                    collective_stage_owner(semantic.algorithm, phase, n, rank_u64, step_u64);
-                let (chunk_offset_bytes, chunk_bytes) =
-                    collective_chunk_bounds(total_bytes, n, owner);
-                let position = CollectiveStagePosition { phase, rank, step };
-                let local_predecessor = if step > 1 {
-                    Some(CollectiveStagePosition {
-                        phase,
+    let channel_policy = match semantic.algorithm {
+        CollectiveAlgorithm::AllToAll => CollectiveChannelPolicy::AllPairs,
+        CollectiveAlgorithm::SendRecv => CollectiveChannelPolicy::Pair,
+        _ if semantic.channels.is_empty() => CollectiveChannelPolicy::RingNext,
+        _ => CollectiveChannelPolicy::Channels,
+    };
+    let push = |flows: &mut Vec<FlowInput>,
+                position: CollectiveStagePosition,
+                target: u64,
+                (chunk_offset_bytes, chunk_bytes): (u64, u64),
+                (local, inbound, inbound_predecessor_bytes): (
+        PredecessorKeys,
+        PredecessorKeys,
+        u64,
+    )| {
+        let mut traffic = semantic.traffic.clone();
+        traffic.termination = Termination::Bytes(chunk_bytes);
+        flows.push(FlowInput {
+            key: stage_key(position),
+            source: semantic.sources[position.rank as usize],
+            target,
+            priority: semantic.priority,
+            traffic,
+            collective: Some(Box::new(CollectiveStageInput {
+                collective_id,
+                algorithm: semantic.algorithm,
+                group_size,
+                declared_total_bytes: total_bytes,
+                position,
+                chunk_policy: semantic.chunk,
+                channel_policy,
+                chunk_offset_bytes,
+                chunk_bytes,
+                local,
+                inbound,
+                inbound_predecessor_bytes,
+            })),
+            compute: None,
+        });
+    };
+    match semantic.algorithm {
+        CollectiveAlgorithm::AllToAll => {
+            let size = usize::try_from(n).expect("the group size fits usize");
+            flows
+                .try_reserve(size * (size - 1))
+                .map_err(|error| CompileError::Invalid(format!("stage table: {error}")))?;
+            for rank in 0..group_size {
+                let entry = entry_predecessors(plan, semantic.after.as_ref(), rank)?;
+                for step in 1..group_size {
+                    let target = (rank + step) % group_size;
+                    let bytes = layout.pair_bytes[rank as usize * size + target as usize];
+                    if bytes == 0 {
+                        continue;
+                    }
+                    let position = CollectiveStagePosition {
+                        phase: CollectivePhase::AllToAll,
+                        channel: 0,
                         rank,
-                        step: step - 1,
-                    })
-                } else if semantic.algorithm == CollectiveAlgorithm::RingAllReduce
-                    && phase == CollectivePhase::AllGather
-                {
-                    Some(CollectiveStagePosition {
-                        phase: CollectivePhase::ReduceScatter,
-                        rank,
-                        step: final_step,
-                    })
-                } else {
-                    None
-                };
-                let inbound_predecessor = if step > 1 {
-                    Some(CollectiveStagePosition {
-                        phase,
-                        rank: previous_rank,
-                        step: step - 1,
-                    })
-                } else if semantic.algorithm == CollectiveAlgorithm::RingAllReduce
-                    && phase == CollectivePhase::AllGather
-                {
-                    Some(CollectiveStagePosition {
-                        phase: CollectivePhase::ReduceScatter,
-                        rank: previous_rank,
-                        step: final_step,
-                    })
-                } else {
-                    None
-                };
-                let stage_key = |stage: CollectiveStagePosition| FlowKey::CollectiveStage {
-                    collective,
-                    duplicate_ordinal,
-                    stage,
-                };
-                // A collective that follows a compute group gates each rank's root stage on that
-                // rank's compute stage, the only predecessor a root can have.
-                let entry_predecessor = entry
-                    .filter(|_| local_predecessor.is_none() && inbound_predecessor.is_none())
-                    .map(|compute| FlowKey::ComputeStage { compute, rank });
-                let local = match local_predecessor.map(stage_key).or(entry_predecessor) {
-                    Some(key) => PredecessorKeys::One(key),
-                    None => PredecessorKeys::None,
-                };
-                let (inbound, inbound_predecessor_bytes) = match inbound_predecessor {
-                    Some(position) => (PredecessorKeys::One(stage_key(position)), chunk_bytes),
-                    None => (PredecessorKeys::None, 0),
-                };
-                let mut traffic = semantic.traffic.clone();
-                traffic.termination = Termination::Bytes(chunk_bytes);
-                flows.push(FlowInput {
-                    key: stage_key(position),
-                    source: semantic.sources[rank_u64 as usize],
-                    target: semantic.sinks[rank_u64 as usize],
-                    priority: semantic.priority,
-                    traffic,
-                    collective: Some(Box::new(CollectiveStageInput {
-                        collective_id,
-                        algorithm: semantic.algorithm,
-                        group_size,
-                        declared_total_bytes: total_bytes,
+                        step,
+                    };
+                    push(
+                        flows,
                         position,
-                        chunk_offset_bytes,
-                        chunk_bytes,
-                        local,
-                        inbound,
-                        inbound_predecessor_bytes,
-                    })),
-                    compute: None,
-                });
+                        semantic.sources[target as usize],
+                        (0, bytes),
+                        entry.clone(),
+                    );
+                }
+            }
+        }
+        CollectiveAlgorithm::SendRecv => {
+            let position = CollectiveStagePosition {
+                phase: CollectivePhase::SendRecv,
+                channel: 0,
+                rank: 0,
+                step: 1,
+            };
+            let entry = entry_predecessors(plan, semantic.after.as_ref(), 0)?;
+            push(
+                flows,
+                position,
+                semantic.sources[1],
+                (0, total_bytes),
+                entry,
+            );
+        }
+        _ => {
+            let phases = ring_phases(semantic.algorithm);
+            let channels = layout.rings.len();
+            let stage_count = (phases.len() as u64)
+                .checked_mul(channels as u64)
+                .and_then(|count| count.checked_mul(n))
+                .and_then(|count| count.checked_mul(n - 1))
+                .ok_or_else(|| {
+                    CompileError::Invalid("collective stage count exceeds u64".to_owned())
+                })?;
+            flows
+                .try_reserve_exact(usize::try_from(stage_count).map_err(|_| {
+                    CompileError::Invalid(
+                        "collective stage count exceeds the platform index domain".to_owned(),
+                    )
+                })?)
+                .map_err(|error| {
+                    CompileError::Invalid(format!("collective stage table is too large: {error}"))
+                })?;
+            let final_step = group_size - 1;
+            for (phase_index, &phase) in phases.iter().enumerate() {
+                for channel in 0..channels {
+                    let channel_u32 = channel as u32;
+                    for rank in 0..group_size {
+                        let previous = layout.previous(channel, rank);
+                        let target = semantic.sources[layout.next(channel, rank) as usize];
+                        for step in 1..group_size {
+                            let chunk =
+                                ring_chunk(semantic, layout, phase, channel, rank, u64::from(step));
+                            let at = |phase, rank, step| CollectiveStagePosition {
+                                phase,
+                                channel: channel_u32,
+                                rank,
+                                step,
+                            };
+                            let predecessors = if step > 1 {
+                                (
+                                    PredecessorKeys::One(stage_key(at(phase, rank, step - 1))),
+                                    PredecessorKeys::One(stage_key(at(phase, previous, step - 1))),
+                                    chunk.1,
+                                )
+                            } else if phase_index > 0 {
+                                let first = phases[phase_index - 1];
+                                (
+                                    PredecessorKeys::One(stage_key(at(first, rank, final_step))),
+                                    PredecessorKeys::One(stage_key(at(
+                                        first, previous, final_step,
+                                    ))),
+                                    chunk.1,
+                                )
+                            } else {
+                                entry_predecessors(plan, semantic.after.as_ref(), rank)?
+                            };
+                            push(flows, at(phase, rank, step), target, chunk, predecessors);
+                        }
+                    }
+                }
             }
         }
     }
@@ -4041,60 +4548,69 @@ fn resolve_stage_groups<'a>(
             )));
         }
     }
-    for collective in collectives {
-        let Some(after) = &collective.after else {
-            continue;
-        };
-        let label = collective.name.as_deref().unwrap_or("<unnamed>");
-        match groups.get(after) {
-            None => {
-                return Err(CompileError::Invalid(format!(
-                    "collective `{label}` depends on unknown stage group `{after}`"
-                )));
-            }
-            Some(StageGroup::Collective(_)) => {
-                return Err(CompileError::Unsupported(format!(
-                    "unsupported collective `{label}` dependency on collective `{after}`; a collective may follow only a compute group"
-                )));
-            }
-            Some(StageGroup::Compute(compute)) if compute.hosts != collective.sources => {
-                return Err(CompileError::Invalid(format!(
-                    "collective `{label}` ranks must equal the hosts of `{after}` in order"
-                )));
-            }
-            Some(StageGroup::Compute(_)) => {}
-        }
-    }
-    for compute in computes {
-        let name = &compute.name;
-        let names = after_names(compute.after.as_ref());
+    // Every `after` names known groups, each once, that run on the same hosts in the same rank
+    // order; a collective follows at least one compute group (ruling R4).
+    let dependents = collectives
+        .iter()
+        .map(|collective| {
+            (
+                "collective",
+                collective.name.as_deref().unwrap_or("<unnamed>"),
+                &collective.sources,
+                collective.after.as_ref(),
+                true,
+            )
+        })
+        .chain(computes.iter().map(|compute| {
+            (
+                "compute",
+                compute.name.as_str(),
+                &compute.hosts,
+                compute.after.as_ref(),
+                false,
+            )
+        }));
+    for (kind, label, hosts, after, is_collective) in dependents {
+        let names = after_names(after);
+        let mut follows_compute = false;
         for (index, after) in names.iter().enumerate() {
             if names[..index].contains(after) {
                 return Err(CompileError::Invalid(format!(
-                    "compute `{name}` names stage group `{after}` more than once"
+                    "{kind} `{label}` names stage group `{after}` more than once"
                 )));
             }
-            let hosts = match groups.get(after) {
+            let predecessor_hosts = match groups.get(after) {
                 None => {
                     return Err(CompileError::Invalid(format!(
-                        "compute `{name}` depends on unknown stage group `{after}`"
+                        "{kind} `{label}` depends on unknown stage group `{after}`"
                     )));
                 }
-                Some(StageGroup::Compute(predecessor)) => &predecessor.hosts,
+                Some(StageGroup::Compute(predecessor)) => {
+                    follows_compute = true;
+                    &predecessor.hosts
+                }
                 Some(StageGroup::Collective(collective)) => {
-                    if collective.flow_count < 2 {
+                    if !collective_has_stages(collective) {
                         return Err(CompileError::Invalid(format!(
-                            "compute `{name}` depends on collective `{after}`, which has no stages"
+                            "{kind} `{label}` depends on collective `{after}`, which has no stages"
                         )));
                     }
                     &collective.sources
                 }
             };
-            if *hosts != compute.hosts {
-                return Err(CompileError::Invalid(format!(
-                    "compute `{name}` hosts must equal the ranks of `{after}` in order"
-                )));
+            if predecessor_hosts != hosts {
+                return Err(CompileError::Invalid(if is_collective {
+                    format!("collective `{label}` ranks must equal the hosts of `{after}` in order")
+                } else {
+                    format!("compute `{label}` hosts must equal the ranks of `{after}` in order")
+                }));
             }
+        }
+        if is_collective && !names.is_empty() && !follows_compute {
+            return Err(CompileError::Unsupported(format!(
+                "unsupported collective `{label}` dependency on collective `{}` alone; a collective follows at least one compute group",
+                names[0]
+            )));
         }
     }
     // A depth-first walk over the `after` edges, in name order, finds any cycle; groups are
@@ -4102,7 +4618,7 @@ fn resolve_stage_groups<'a>(
     let names = groups.keys().map(String::as_str).collect::<Vec<_>>();
     let afters = |index: usize| -> &[String] {
         match groups[names[index]] {
-            StageGroup::Collective(collective) => collective.after.as_slice(),
+            StageGroup::Collective(collective) => after_names(collective.after.as_ref()),
             StageGroup::Compute(compute) => after_names(compute.after.as_ref()),
         }
     };
@@ -4146,78 +4662,21 @@ fn resolve_stage_groups<'a>(
 
 /// Expands one compute group into one timer-only stage per host.
 ///
-/// After a compute group, rank r waits for that group's rank-r stage. After a collective, rank r
-/// waits for its own final stage (local, acknowledged) and the previous rank's final stage
-/// (inbound, delivered in order), which together complete the collective at rank r. After several
-/// groups, rank r waits for all of these: the stage is a join.
+/// Rank r waits for the rank-r stage of each compute group it follows and for each collective's
+/// completion at rank r (`collective_completion`): after one ring, its own final stage (local,
+/// acknowledged) and the previous rank's (inbound, delivered in order). After several groups, or
+/// after an all-to-all or a multi-channel ring, the stage is a join.
 fn expand_compute(
     flows: &mut Vec<FlowInput>,
+    plan: &StagePlan<'_>,
     compute: &ComputeKey,
     compute_id: u64,
-    groups: &BTreeMap<String, StageGroup<'_>>,
-    collective_table: &[CollectiveKey],
-    computes: &[ComputeKey],
 ) -> Result<(), CompileError> {
     let group_size = u32::try_from(compute.hosts.len())
         .expect("compute validation bounded the group size by u32");
-    let afters = after_names(compute.after.as_ref())
-        .iter()
-        .map(|name| match groups[name] {
-            StageGroup::Collective(collective) => (
-                StageGroup::Collective(collective),
-                Some(collective_ordinal(collective_table, collective)),
-            ),
-            group @ StageGroup::Compute(_) => (group, None),
-        })
-        .collect::<Vec<_>>();
     for (rank, &host) in (0_u32..).zip(&compute.hosts) {
-        let mut local = PredecessorKeys::None;
-        let mut inbound = PredecessorKeys::None;
-        let mut inbound_predecessor_bytes = 0_u64;
-        for (after, ordinal) in &afters {
-            match after {
-                StageGroup::Compute(predecessor) => local.push(FlowKey::ComputeStage {
-                    compute: compute_ordinal(computes, predecessor),
-                    rank,
-                }),
-                StageGroup::Collective(collective) => {
-                    let n = collective.flow_count;
-                    let Termination::Bytes(total_bytes) = collective.traffic.termination else {
-                        unreachable!("collective validation requires byte termination")
-                    };
-                    let final_step = u32::try_from(n - 1).expect("collective group fits u32");
-                    let previous_rank = u32::try_from((u64::from(rank) + n - 1) % n)
-                        .expect("rank is below the u32 group size");
-                    // A named collective is unique by name, so its only instance has ordinal 0.
-                    let final_stage = |rank: u32| FlowKey::CollectiveStage {
-                        collective: ordinal.expect("a collective predecessor has a table ordinal"),
-                        duplicate_ordinal: 0,
-                        stage: CollectiveStagePosition {
-                            phase: CollectivePhase::AllGather,
-                            rank,
-                            step: final_step,
-                        },
-                    };
-                    let owner = collective_stage_owner(
-                        collective.algorithm,
-                        CollectivePhase::AllGather,
-                        n,
-                        u64::from(previous_rank),
-                        u64::from(final_step),
-                    );
-                    local.push(final_stage(rank));
-                    inbound.push(final_stage(previous_rank));
-                    inbound_predecessor_bytes = inbound_predecessor_bytes
-                        .checked_add(collective_chunk_bounds(total_bytes, n, owner).1)
-                        .ok_or_else(|| {
-                            CompileError::Invalid(format!(
-                                "compute `{}` inbound bytes exceed u64",
-                                compute.name
-                            ))
-                        })?;
-                }
-            }
-        }
+        let (local, inbound, inbound_predecessor_bytes) =
+            entry_predecessors(plan, compute.after.as_ref(), rank)?;
         flows.push(FlowInput {
             key: FlowKey::ComputeStage {
                 compute: compute_id,
@@ -4413,6 +4872,10 @@ fn generator_seed(
             state = mix_seed(state ^ semantic.flow_count);
             state = mix_seed(state ^ duplicate_ordinal);
             state = mix_seed(state ^ u64::from(stage.phase as u8));
+            // Channel 0 mixes nothing, so every single-ring stage keeps its seed.
+            if stage.channel != 0 {
+                state = mix_seed(state ^ (u64::from(stage.channel) << 32));
+            }
             state = mix_seed(state ^ u64::from(stage.rank));
             state = mix_seed(state ^ u64::from(stage.step));
             state = mix_traffic_seed(state, &semantic.traffic, roce_keys);

@@ -161,13 +161,14 @@ struct StageLookups {
     generator_slots: Vec<Option<(usize, usize)>>,
     /// Generators whose flow falls outside the dense flow table, in the same order.
     unindexed_generators: Vec<(usize, usize)>,
-    /// The first collective stage generator at each `(collective, phase, rank, step)` position,
+    /// The first collective stage generator at each `(collective, phase, channel, rank, step)`
+    /// position,
     /// in the same `host_states`-then-`generators` order. Empty on an image without collectives.
     collective_stages: BTreeMap<CollectivePosition, (usize, usize)>,
 }
 
-/// A collective stage's position: `(collective_id, phase, rank, step)`.
-type CollectivePosition = (u64, crate::CollectivePhase, u32, u32);
+/// A collective stage's position: `(collective_id, phase, channel, rank, step)`.
+type CollectivePosition = (u64, crate::CollectivePhase, u32, u32, u32);
 
 /// Returns the dense flow-table slot of `id`, exactly when `flow(image, id)` resolves.
 fn dense_flow_slot(image: &SimulationImage, id: crate::FlowId) -> Option<usize> {
@@ -405,7 +406,13 @@ impl StageLookups {
                 }
                 if let Some(stage) = collective_identity(generator) {
                     collective_stages
-                        .entry((stage.collective_id, stage.phase, stage.rank, stage.step))
+                        .entry((
+                            stage.collective_id,
+                            stage.phase,
+                            stage.channel,
+                            stage.rank,
+                            stage.step,
+                        ))
                         .or_insert((host, index));
                 }
             }
@@ -1947,8 +1954,7 @@ fn validate_generators(
     let mut receiver_owners = BTreeMap::<crate::FlowId, NodeId>::new();
     let mut dcqcn_receiver_owners = BTreeMap::<crate::FlowId, NodeId>::new();
     let mut roce_receiver_owners = BTreeMap::<crate::FlowId, NodeId>::new();
-    let mut collective_positions =
-        BTreeMap::<(u64, crate::CollectivePhase, u32, u32), crate::FlowId>::new();
+    let mut collective_positions = BTreeMap::<CollectivePosition, crate::FlowId>::new();
     let mut claimed_tcp_timers = BTreeMap::<(NodeId, PayloadId, u64), crate::FlowId>::new();
     let mut compute_positions = BTreeMap::<(u64, u32), crate::FlowId>::new();
     for owner in image
@@ -2878,11 +2884,29 @@ struct CollectivePartitionState {
     algorithm: crate::CollectiveAlgorithm,
     group_size: u32,
     declared_total_bytes: u64,
+    chunk_policy: crate::CollectiveChunkPolicy,
+    channel_policy: crate::CollectiveChannelPolicy,
+    /// Stages per channel.
+    stages_by_channel: BTreeMap<u32, u64>,
+    /// One ring under `EqualRemainderLast`: each owner's chunk and its propagation count.
     bounds_by_owner: BTreeMap<u32, (u64, u64)>,
     copies_by_owner: BTreeMap<u32, u64>,
+    /// Every other policy: the chunk bytes of each stage.
+    chunk_sizes: BTreeSet<u64>,
 }
 
+/// Every collective's stages partition its declared total as its algorithm and policies say.
+///
+/// One ring under `EqualRemainderLast` (the P14 form): each owner's chunk is `EqualRemainderLast`
+/// of the declared total and is propagated by `n - 1` stages per phase. Rings under `UniformFloor`
+/// (one or several channels): every message is `floor(floor(S / n) / c)` bytes and each of the
+/// `c` channels has `n (n - 1)` stages per phase. A uniform all-to-all has `n (n - 1)` messages of
+/// `floor(S / n)`; a seeded one at most that many; a send/recv one message of `S`.
 fn validate_collective_partitions(image: &SimulationImage) -> Result<(), ValidationError> {
+    use crate::{
+        CollectiveAlgorithm as Algorithm, CollectiveChannelPolicy as Channels,
+        CollectiveChunkPolicy as Chunk,
+    };
     let mut collectives = BTreeMap::<u64, CollectivePartitionState>::new();
     for generator in image.host_states.iter().flat_map(staged_generators) {
         let Some(crate::CollectiveStage {
@@ -2892,24 +2916,6 @@ fn validate_collective_partitions(image: &SimulationImage) -> Result<(), Validat
         else {
             continue;
         };
-        let group_size = u64::from(stage.group_size);
-        let owner_offset = match (stage.algorithm, stage.phase) {
-            (crate::CollectiveAlgorithm::AllGather, crate::CollectivePhase::AllGather)
-            | (crate::CollectiveAlgorithm::RingAllReduce, crate::CollectivePhase::ReduceScatter) => {
-                1
-            }
-            (crate::CollectiveAlgorithm::RingAllReduce, crate::CollectivePhase::AllGather) => 2,
-            (crate::CollectiveAlgorithm::AllGather, crate::CollectivePhase::ReduceScatter) => {
-                return Err(ValidationError::new(format!(
-                    "flow {:?} collective partition has an invalid AllGather phase",
-                    generator.flow
-                )));
-            }
-        };
-        let owner = (u64::from(stage.rank) + group_size - u64::from(stage.step) + owner_offset)
-            % group_size;
-        let owner = u32::try_from(owner).expect("collective owner is bounded by u32 group size");
-        let bounds = (stage.chunk_offset_bytes, stage.chunk_bytes);
         let state =
             collectives
                 .entry(stage.collective_id)
@@ -2917,19 +2923,40 @@ fn validate_collective_partitions(image: &SimulationImage) -> Result<(), Validat
                     algorithm: stage.algorithm,
                     group_size: stage.group_size,
                     declared_total_bytes: stage.declared_total_bytes,
+                    chunk_policy: stage.chunk_policy,
+                    channel_policy: stage.channel_policy,
+                    stages_by_channel: BTreeMap::new(),
                     bounds_by_owner: BTreeMap::new(),
                     copies_by_owner: BTreeMap::new(),
+                    chunk_sizes: BTreeSet::new(),
                 });
         if state.algorithm != stage.algorithm
-            || stage.channel != 0
             || state.group_size != stage.group_size
             || state.declared_total_bytes != stage.declared_total_bytes
+            || state.chunk_policy != stage.chunk_policy
+            || state.channel_policy != stage.channel_policy
         {
             return Err(ValidationError::new(format!(
                 "collective partition {} metadata is inconsistent across propagation stages",
                 stage.collective_id
             )));
         }
+        *state.stages_by_channel.entry(stage.channel).or_default() += 1;
+        let one_ring = state.chunk_policy == Chunk::EqualRemainderLast
+            && state.channel_policy == Channels::RingNext;
+        if !one_ring {
+            state.chunk_sizes.insert(stage.chunk_bytes);
+            continue;
+        }
+        let group_size = u64::from(stage.group_size);
+        let owner_offset = match (stage.algorithm, stage.phase) {
+            (Algorithm::RingAllReduce, crate::CollectivePhase::AllGather) => 2,
+            _ => 1,
+        };
+        let owner = (u64::from(stage.rank) + group_size - u64::from(stage.step) + owner_offset)
+            % group_size;
+        let owner = u32::try_from(owner).expect("collective owner is bounded by u32 group size");
+        let bounds = (stage.chunk_offset_bytes, stage.chunk_bytes);
         if state
             .bounds_by_owner
             .get(&owner)
@@ -2951,42 +2978,93 @@ fn validate_collective_partitions(image: &SimulationImage) -> Result<(), Validat
     }
 
     for (collective_id, state) in collectives {
-        let expected_copies = match state.algorithm {
-            crate::CollectiveAlgorithm::AllGather => u64::from(state.group_size - 1),
-            crate::CollectiveAlgorithm::RingAllReduce => 2 * u64::from(state.group_size - 1),
+        let n = u64::from(state.group_size);
+        let phases = match state.algorithm {
+            Algorithm::RingAllReduce => 2,
+            _ => 1,
         };
-        if state.bounds_by_owner.len() != state.group_size as usize
-            || state.copies_by_owner.len() != state.group_size as usize
-            || state
-                .copies_by_owner
-                .values()
-                .any(|copies| *copies != expected_copies)
-        {
-            return Err(ValidationError::new(format!(
-                "collective partition {collective_id} does not propagate every owner exactly {expected_copies} times"
-            )));
-        }
-        let base = state.declared_total_bytes / u64::from(state.group_size);
-        for (index, (owner, (offset, bytes))) in state.bounds_by_owner.into_iter().enumerate() {
-            let owner_u64 = u64::from(owner);
-            let expected_offset = owner_u64.checked_mul(base).ok_or_else(|| {
-                ValidationError::new(format!(
-                    "collective partition {collective_id} declared-total offset exceeds u64"
-                ))
-            })?;
-            let expected_bytes = if owner + 1 == state.group_size {
-                state.declared_total_bytes - expected_offset
-            } else {
-                base
-            };
-            if usize::try_from(owner).ok() != Some(index)
-                || offset != expected_offset
-                || bytes != expected_bytes
-            {
-                return Err(ValidationError::new(format!(
-                    "collective partition {collective_id} does not match declared total {} under EqualRemainderLast at owner {owner}",
-                    state.declared_total_bytes
-                )));
+        let channels = state.stages_by_channel.len() as u64;
+        let contiguous = state
+            .stages_by_channel
+            .keys()
+            .copied()
+            .eq(0..u32::try_from(channels).unwrap_or(u32::MAX));
+        let total = state.declared_total_bytes;
+        let mismatch = |what: &str| {
+            Err(ValidationError::new(format!(
+                "collective partition {collective_id} {what}"
+            )))
+        };
+        match (state.algorithm, state.chunk_policy, state.channel_policy) {
+            (Algorithm::AllToAll, chunk, _) => {
+                let stages = state.stages_by_channel.values().sum::<u64>();
+                let uniform = chunk == Chunk::UniformFloor;
+                if channels != 1
+                    || stages > n * (n - 1)
+                    || uniform
+                        && (stages != n * (n - 1)
+                            || state.chunk_sizes.iter().any(|&bytes| bytes != total / n))
+                {
+                    return mismatch("does not send each ordered pair its floor share");
+                }
+            }
+            (Algorithm::SendRecv, ..) => {
+                if state.stages_by_channel.values().sum::<u64>() != 1
+                    || state.chunk_sizes.iter().any(|&bytes| bytes != total)
+                {
+                    return mismatch("is not one message of its declared size");
+                }
+            }
+            (_, Chunk::UniformFloor, _) => {
+                let bytes = total / n / channels.max(1);
+                if !contiguous
+                    || state.channel_policy == Channels::RingNext && channels != 1
+                    || state
+                        .stages_by_channel
+                        .values()
+                        .any(|&count| count != phases * n * (n - 1))
+                    || state.chunk_sizes.iter().any(|&chunk| chunk != bytes)
+                {
+                    return mismatch("does not send every channel its uniform-floor messages");
+                }
+            }
+            _ => {
+                let expected_copies = phases * (n - 1);
+                if state.bounds_by_owner.len() != state.group_size as usize
+                    || state.copies_by_owner.len() != state.group_size as usize
+                    || state
+                        .copies_by_owner
+                        .values()
+                        .any(|copies| *copies != expected_copies)
+                {
+                    return Err(ValidationError::new(format!(
+                        "collective partition {collective_id} does not propagate every owner exactly {expected_copies} times"
+                    )));
+                }
+                let base = total / n;
+                for (index, (owner, (offset, bytes))) in
+                    state.bounds_by_owner.into_iter().enumerate()
+                {
+                    let owner_u64 = u64::from(owner);
+                    let expected_offset = owner_u64.checked_mul(base).ok_or_else(|| {
+                        ValidationError::new(format!(
+                            "collective partition {collective_id} declared-total offset exceeds u64"
+                        ))
+                    })?;
+                    let expected_bytes = if owner + 1 == state.group_size {
+                        total - expected_offset
+                    } else {
+                        base
+                    };
+                    if usize::try_from(owner).ok() != Some(index)
+                        || offset != expected_offset
+                        || bytes != expected_bytes
+                    {
+                        return Err(ValidationError::new(format!(
+                            "collective partition {collective_id} does not match declared total {total} under EqualRemainderLast at owner {owner}"
+                        )));
+                    }
+                }
             }
         }
     }
@@ -3194,7 +3272,7 @@ fn validate_collective_stage(
     flow: &crate::FlowDescriptor,
     generator: StagedGenerator<'_>,
     stage: crate::CollectiveStage,
-    positions: &mut BTreeMap<(u64, crate::CollectivePhase, u32, u32), crate::FlowId>,
+    positions: &mut BTreeMap<CollectivePosition, crate::FlowId>,
     compute_positions: &mut BTreeMap<(u64, u32), crate::FlowId>,
 ) -> Result<(), ValidationError> {
     let dependencies = stage.dependencies;
@@ -3226,25 +3304,60 @@ fn validate_collective_stage(
     let position = (
         collective.collective_id,
         collective.phase,
+        collective.channel,
         collective.rank,
         collective.step,
     );
     if let Some(previous_flow) = positions.insert(position, flow.id) {
         return Err(ValidationError::new(format!(
-            "flow {:?} has duplicate collective stage position ({}, {:?}, {}, {}), already owned by flow {:?}",
+            "flow {:?} has duplicate collective stage position ({}, {:?}, {}, {}, {}), already owned by flow {:?}",
             flow.id,
             collective.collective_id,
             collective.phase,
+            collective.channel,
             collective.rank,
             collective.step,
             previous_flow
         )));
     }
-    if collective.chunk_policy != crate::CollectiveChunkPolicy::EqualRemainderLast
-        || collective.channel_policy != crate::CollectiveChannelPolicy::RingNext
-        || collective.algorithm == crate::CollectiveAlgorithm::AllGather
-            && collective.phase != crate::CollectivePhase::AllGather
-    {
+    use crate::{
+        CollectiveAlgorithm as Algorithm, CollectiveChannelPolicy as Channels,
+        CollectiveChunkPolicy as Chunk, CollectivePhase as Phase,
+    };
+    let ring = is_ring_algorithm(collective.algorithm);
+    let consistent = match collective.algorithm {
+        Algorithm::RingAllReduce => {
+            matches!(collective.phase, Phase::ReduceScatter | Phase::AllGather)
+        }
+        Algorithm::AllGather => collective.phase == Phase::AllGather,
+        Algorithm::ReduceScatter => collective.phase == Phase::ReduceScatter,
+        Algorithm::AllToAll => {
+            collective.phase == Phase::AllToAll
+                && collective.channel_policy == Channels::AllPairs
+                && matches!(collective.chunk_policy, Chunk::UniformFloor | Chunk::Seeded)
+        }
+        Algorithm::SendRecv => {
+            collective.phase == Phase::SendRecv
+                && collective.channel_policy == Channels::Pair
+                && collective.chunk_policy == Chunk::EqualRemainderLast
+                && collective.group_size == 2
+                && collective.rank == 0
+                && collective.step == 1
+        }
+    } && (!ring
+        || match collective.channel_policy {
+            Channels::RingNext => {
+                collective.channel == 0
+                    && matches!(
+                        collective.chunk_policy,
+                        Chunk::EqualRemainderLast | Chunk::UniformFloor
+                    )
+            }
+            Channels::Channels => collective.chunk_policy == Chunk::UniformFloor,
+            Channels::AllPairs | Channels::Pair => false,
+        })
+        && (ring || collective.channel == 0);
+    if !consistent {
         return Err(ValidationError::new(format!(
             "flow {:?} collective policy or phase is inconsistent with its algorithm",
             flow.id
@@ -3279,94 +3392,95 @@ fn validate_collective_stage(
     }
     let inline = validate_stage_dependencies(image, flow_index, state, flow, stage)?;
 
+    // A root is step one of a ring's first phase, every all-to-all pair, or the send: it follows
+    // the groups the collective follows.
+    let first_phase = collective.algorithm != Algorithm::RingAllReduce
+        || collective.phase == Phase::ReduceScatter;
+    if !ring || collective.step == 1 && first_phase {
+        return validate_entry_predecessors(
+            image,
+            flow_index,
+            flow,
+            (collective.rank, collective.group_size),
+            dependencies,
+            inline,
+        );
+    }
     let final_step = collective.group_size - 1;
-    let root = collective.step == 1
-        && (collective.algorithm == crate::CollectiveAlgorithm::AllGather
-            || collective.phase == crate::CollectivePhase::ReduceScatter);
-    let find_stage = |rank: u32| {
-        let (phase, step) = if collective.step > 1 {
-            (collective.phase, collective.step - 1)
-        } else {
-            (crate::CollectivePhase::ReduceScatter, final_step)
-        };
-        flow_index
-            .collective_stage(image, (collective.collective_id, phase, rank, step))
-            .map(|candidate| candidate.flow)
-    };
-    let previous_rank = if collective.rank == 0 {
-        collective.group_size - 1
+    let (phase, step) = if collective.step > 1 {
+        (collective.phase, collective.step - 1)
     } else {
-        collective.rank - 1
+        (Phase::ReduceScatter, final_step)
     };
-    let one = |flow: Option<crate::FlowId>| {
-        flow.map_or(
-            crate::StagePredecessors::None,
-            crate::StagePredecessors::One,
+    let expected_local = flow_index
+        .collective_stage(
+            image,
+            (
+                collective.collective_id,
+                phase,
+                collective.channel,
+                collective.rank,
+                step,
+            ),
         )
+        .map(|candidate| candidate.flow);
+    let recurrence_error = || {
+        ValidationError::new(format!(
+            "flow {:?} collective predecessor identities do not match the declared algorithm recurrence",
+            flow.id
+        ))
     };
-    if root {
-        // A root may follow the same-rank stage of a compute group on its own host, and waits for
-        // no inbound bytes.
-        let entry_is_compute = match dependencies.local {
-            crate::StagePredecessors::None => true,
-            crate::StagePredecessors::One(_) => inline.local.is_some_and(|candidate| {
-                matches!(candidate.stage.map(|stage| stage.role),
-                    Some(crate::StageRole::Compute(compute))
-                        if compute.rank == collective.rank
-                            && compute.group_size == collective.group_size)
-            }),
-            crate::StagePredecessors::Join { .. } => false,
-        };
-        if !entry_is_compute || dependencies.inbound != crate::StagePredecessors::None {
-            return Err(ValidationError::new(format!(
-                "flow {:?} collective predecessor identities do not match the declared algorithm recurrence",
-                flow.id
-            )));
-        }
-    } else {
-        let (expected_local, expected_inbound) =
-            (find_stage(collective.rank), find_stage(previous_rank));
-        if expected_local.is_none()
-            || expected_inbound.is_none()
-            || dependencies.local != one(expected_local)
-            || dependencies.inbound != one(expected_inbound)
-        {
-            return Err(ValidationError::new(format!(
-                "flow {:?} collective predecessor identities do not match the declared algorithm recurrence",
-                flow.id
-            )));
-        }
-        let local = inline
-            .local
-            .expect("an inline local predecessor was validated");
-        let inbound = inline
-            .inbound
-            .and_then(|candidate| collective_identity(candidate).map(|stage| (candidate, stage)))
-            .ok_or_else(|| {
-                ValidationError::new(format!(
-                    "flow {:?} collective inbound predecessor is missing",
-                    flow.id
-                ))
-            })?;
-        if inbound.1.chunk_bytes != collective.chunk_bytes
-            || inbound.1.chunk_offset_bytes != collective.chunk_offset_bytes
-        {
-            return Err(ValidationError::new(format!(
-                "flow {:?} collective inbound predecessor does not deliver the declared chunk to its source",
-                flow.id
-            )));
-        }
-        // One collective, one transport: its stages share one traffic key.
-        if std::mem::discriminant(&inbound.0.kind) != std::mem::discriminant(&generator.kind)
-            || std::mem::discriminant(&local.kind) != std::mem::discriminant(&generator.kind)
-        {
-            return Err(ValidationError::new(format!(
-                "flow {:?} collective predecessors use another transport",
-                flow.id
-            )));
-        }
+    if expected_local.is_none() || dependencies.local.one() != expected_local {
+        return Err(recurrence_error());
+    }
+    let local = inline
+        .local
+        .expect("an inline local predecessor was validated");
+    let inbound = inline
+        .inbound
+        .and_then(|candidate| collective_identity(candidate).map(|stage| (candidate, stage)))
+        .ok_or_else(recurrence_error)?;
+    // The inbound predecessor is the same channel's step before, on the rank before this one: on
+    // one ring (`RingNext`) exactly `rank - 1`; on a channel, whichever rank the channel orders
+    // there, whose flow delivers to this host (checked with the dependencies).
+    let previous_rank = (collective.rank + collective.group_size - 1) % collective.group_size;
+    if inbound.1.collective_id != collective.collective_id
+        || inbound.1.phase != phase
+        || inbound.1.channel != collective.channel
+        || inbound.1.step != step
+        || inbound.1.rank == collective.rank
+        || collective.channel_policy == Channels::RingNext && inbound.1.rank != previous_rank
+    {
+        return Err(recurrence_error());
+    }
+    if inbound.1.chunk_bytes != collective.chunk_bytes
+        || inbound.1.chunk_offset_bytes != collective.chunk_offset_bytes
+    {
+        return Err(ValidationError::new(format!(
+            "flow {:?} collective inbound predecessor does not deliver the declared chunk to its source",
+            flow.id
+        )));
+    }
+    // One collective, one transport: its stages share one traffic key.
+    if std::mem::discriminant(&inbound.0.kind) != std::mem::discriminant(&generator.kind)
+        || std::mem::discriminant(&local.kind) != std::mem::discriminant(&generator.kind)
+    {
+        return Err(ValidationError::new(format!(
+            "flow {:?} collective predecessors use another transport",
+            flow.id
+        )));
     }
     Ok(())
+}
+
+/// Whether `algorithm` runs on rings.
+const fn is_ring_algorithm(algorithm: crate::CollectiveAlgorithm) -> bool {
+    matches!(
+        algorithm,
+        crate::CollectiveAlgorithm::RingAllReduce
+            | crate::CollectiveAlgorithm::AllGather
+            | crate::CollectiveAlgorithm::ReduceScatter
+    )
 }
 
 /// The bytes a transport stage carries: its TCP or RoCE total; `None` for any other generator.
@@ -3611,7 +3725,14 @@ fn validate_compute_stage(
     }
 
     let inline = validate_stage_dependencies(image, flow_index, state, flow, stage)?;
-    validate_compute_predecessors(image, flow_index, flow, compute, dependencies, inline)?;
+    validate_entry_predecessors(
+        image,
+        flow_index,
+        flow,
+        (compute.rank, compute.group_size),
+        dependencies,
+        inline,
+    )?;
     // Schema Amendment 5: a compute stage after one RoCE collective names that collective's
     // transport on its progress rows, read from its local predecessor, which must then agree with
     // its inbound predecessor.
@@ -3663,21 +3784,32 @@ fn validate_compute_stage(
     Ok(())
 }
 
-/// Whether `stage` is the final stage of its collective at its rank: the last step of its
-/// algorithm's last phase.
-const fn is_final_collective_stage(stage: crate::CollectiveStageIdentity) -> bool {
-    matches!(stage.phase, crate::CollectivePhase::AllGather) && stage.step + 1 == stage.group_size
+/// Whether `stage` completes its collective at a rank (`collective_completion` in the lowering):
+/// a ring's final step of its last phase, any all-to-all pair, the send of a send/recv.
+const fn is_completion_stage(stage: crate::CollectiveStageIdentity) -> bool {
+    match stage.algorithm {
+        crate::CollectiveAlgorithm::AllToAll | crate::CollectiveAlgorithm::SendRecv => true,
+        crate::CollectiveAlgorithm::ReduceScatter => {
+            matches!(stage.phase, crate::CollectivePhase::ReduceScatter)
+                && stage.step + 1 == stage.group_size
+        }
+        _ => {
+            matches!(stage.phase, crate::CollectivePhase::AllGather)
+                && stage.step + 1 == stage.group_size
+        }
+    }
 }
 
-/// The shape of a compute stage's predecessors: it follows stage groups on its own ranks. Each
-/// local predecessor is the same-rank stage of a compute group, or the same-rank final stage of a
-/// collective; each such collective also supplies exactly one inbound predecessor, its previous
-/// rank's final stage, and no other inbound predecessor exists.
-fn validate_compute_predecessors(
+/// The shape of the predecessors of a stage that follows stage groups (a compute stage, or a
+/// collective's root): it waits for groups on its own ranks. Each local predecessor is the
+/// same-rank stage of a compute group, or a same-rank completion stage of a collective; each
+/// inbound predecessor is a completion stage of a collective that also has a same-rank local
+/// predecessor here, and on one ring (`RingNext`) the previous rank's.
+fn validate_entry_predecessors(
     image: &SimulationImage,
     flow_index: &FlowIndex,
     flow: &crate::FlowDescriptor,
-    compute: crate::ComputeStage,
+    (rank, group_size): (u32, u32),
     dependencies: crate::StageDependencies,
     inline: InlinePredecessors<'_>,
 ) -> Result<(), ValidationError> {
@@ -3687,65 +3819,59 @@ fn validate_compute_predecessors(
             flow.id
         ))
     };
-    let previous_rank = (compute.rank + compute.group_size - 1) % compute.group_size;
+    let previous_rank = (rank + group_size - 1) % group_size;
     let role_of = |candidate: Option<StagedGenerator<'_>>, id| {
         candidate
             .or_else(|| flow_index.generator_for_flow(image, id))
             .and_then(|candidate| candidate.stage)
             .map(|stage| stage.role)
     };
-    // The same-rank final stage this local predecessor is, if it is one of a collective.
-    let local_final = |id| -> Result<Option<crate::CollectiveStageIdentity>, ValidationError> {
+    // The collective this local predecessor completes at the rank, if it is a collective stage.
+    let local_collective = |id| -> Result<Option<u64>, ValidationError> {
         match role_of(inline.local, id).ok_or_else(shape_error)? {
             crate::StageRole::Compute(previous)
-                if previous.rank == compute.rank && previous.group_size == compute.group_size =>
+                if previous.rank == rank && previous.group_size == group_size =>
             {
                 Ok(None)
             }
-            crate::StageRole::Collective(final_stage)
-                if is_final_collective_stage(final_stage)
-                    && final_stage.rank == compute.rank
-                    && final_stage.group_size == compute.group_size =>
+            crate::StageRole::Collective(stage)
+                if is_completion_stage(stage)
+                    && stage.rank == rank
+                    && stage.group_size == group_size =>
             {
-                Ok(Some(final_stage))
+                Ok(Some(stage.collective_id))
             }
             _ => Err(shape_error()),
         }
     };
-    let mut collective_locals = 0_usize;
     for id in dependencies.local.iter(&image.stage_joins) {
-        if local_final(id)?.is_some() {
-            collective_locals += 1;
-        }
+        local_collective(id)?;
     }
-    let mut inbound_count = 0_usize;
     for id in dependencies.inbound.iter(&image.stage_joins) {
         let Some(crate::StageRole::Collective(inbound)) = role_of(inline.inbound, id) else {
             return Err(shape_error());
         };
-        if !is_final_collective_stage(inbound) || inbound.rank != previous_rank {
+        if !is_completion_stage(inbound)
+            || inbound.group_size != group_size
+            || inbound.channel_policy == crate::CollectiveChannelPolicy::RingNext
+                && inbound.rank != previous_rank
+        {
             return Err(shape_error());
         }
-        // Each inbound final stage pairs with this rank's final stage of the same collective.
-        let mut paired = false;
-        for local in dependencies.local.iter(&image.stage_joins) {
-            if local_final(local)?.is_some_and(|stage| {
-                stage.collective_id == inbound.collective_id
-                    && stage.phase == inbound.phase
-                    && stage.step == inbound.step
-                    && stage.channel == inbound.channel
-            }) {
-                paired = true;
-                break;
+        // A send/recv's receiver waits for the send alone; every other collective it follows
+        // also completes at this rank locally.
+        if inbound.algorithm != crate::CollectiveAlgorithm::SendRecv {
+            let mut paired = false;
+            for local in dependencies.local.iter(&image.stage_joins) {
+                if local_collective(local)? == Some(inbound.collective_id) {
+                    paired = true;
+                    break;
+                }
+            }
+            if !paired {
+                return Err(shape_error());
             }
         }
-        if !paired {
-            return Err(shape_error());
-        }
-        inbound_count += 1;
-    }
-    if inbound_count != collective_locals {
-        return Err(shape_error());
     }
     Ok(())
 }
@@ -7666,7 +7792,7 @@ mod legacy_scans {
         image: &SimulationImage,
         position: super::CollectivePosition,
     ) -> Option<StagedGenerator<'_>> {
-        let (collective_id, phase, rank, step) = position;
+        let (collective_id, phase, channel, rank, step) = position;
         image
             .host_states
             .iter()
@@ -7675,6 +7801,7 @@ mod legacy_scans {
                 super::collective_identity(*candidate).is_some_and(|stage| {
                     stage.collective_id == collective_id
                         && stage.phase == phase
+                        && stage.channel == channel
                         && stage.rank == rank
                         && stage.step == step
                 })
@@ -7848,29 +7975,22 @@ pub fn assert_validate_generator_index_equivalent_for_testing(
         };
         let other_phase = match stage.phase {
             crate::CollectivePhase::ReduceScatter => crate::CollectivePhase::AllGather,
-            crate::CollectivePhase::AllGather => crate::CollectivePhase::ReduceScatter,
+            _ => crate::CollectivePhase::ReduceScatter,
         };
+        let (id, phase, channel, rank, step) = (
+            stage.collective_id,
+            stage.phase,
+            stage.channel,
+            stage.rank,
+            stage.step,
+        );
         positions.extend([
-            (stage.collective_id, stage.phase, stage.rank, stage.step),
-            (
-                stage.collective_id.wrapping_add(1),
-                stage.phase,
-                stage.rank,
-                stage.step,
-            ),
-            (stage.collective_id, other_phase, stage.rank, stage.step),
-            (
-                stage.collective_id,
-                stage.phase,
-                stage.rank.wrapping_add(1),
-                stage.step,
-            ),
-            (
-                stage.collective_id,
-                stage.phase,
-                stage.rank,
-                stage.step.wrapping_sub(1),
-            ),
+            (id, phase, channel, rank, step),
+            (id.wrapping_add(1), phase, channel, rank, step),
+            (id, other_phase, channel, rank, step),
+            (id, phase, channel.wrapping_add(1), rank, step),
+            (id, phase, channel, rank.wrapping_add(1), step),
+            (id, phase, channel, rank, step.wrapping_sub(1)),
         ]);
     }
     positions.sort_unstable();
