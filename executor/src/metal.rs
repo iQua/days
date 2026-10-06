@@ -1909,6 +1909,14 @@ impl MetalPlan {
                 &mut route_capacities,
             );
         }
+        // P16 H2: an unfired stage notify holds a timer at its source and, without streams, its
+        // arrival in its target's heap; with streams the arrival rides its lane's stream.
+        let notify = crate::device_sizing::notify_capacities(image);
+        if let Some(notify) = &notify {
+            for &(node, count) in notify.sources.iter().chain(&notify.targets) {
+                legacy_fel_caps[node] = legacy_fel_caps[node].saturating_add(count);
+            }
+        }
 
         for node in &image.nodes {
             let slot = node.id.0 as usize;
@@ -2010,6 +2018,11 @@ impl MetalPlan {
                     );
                     let source = descriptor.source.0 as usize;
                     capacities[source] = capacities[source].saturating_add(attempts);
+                }
+            }
+            if let Some(notify) = &notify {
+                for &(node, count) in &notify.sources {
+                    capacities[node] = capacities[node].saturating_add(count);
                 }
             }
             capacities
@@ -2243,7 +2256,13 @@ impl MetalPlan {
             &flow_packet_counts,
             &flow_feedback_counts,
             minimum_lookahead_ns,
-        );
+        )
+        .saturating_add(notify.as_ref().map_or(0, |notify| {
+            notify
+                .sources
+                .iter()
+                .fold(0_usize, |total, (_, count)| total.saturating_add(*count))
+        }));
         let outbox_capacity = config.max_outbox_events.map_or_else(
             || {
                 crate::device_capacity::bound_derived_capacity(
@@ -2271,6 +2290,11 @@ impl MetalPlan {
             &flow_feedback_counts,
             minimum_lookahead_ns,
         );
+        if let Some(notify) = &notify {
+            for &(node, count) in &notify.sources {
+                remote_capacities[node] = remote_capacities[node].saturating_add(count);
+            }
+        }
         if let Some(capacity) = config.max_outbox_events {
             remote_capacities
                 .fill(capacity.max(config.capacity_floors.remote_staging_events_per_lp));
@@ -2299,6 +2323,7 @@ impl MetalPlan {
             &fel_records,
             remote_staging_slots,
             channel_capacity_floors,
+            notify.as_ref(),
         )?;
         let event_bound = derived_transition_bound(image, &flow_packet_counts)?;
         let observation_capacity = if observation_mode == ObservationMode::Full {
@@ -2345,7 +2370,7 @@ impl MetalPlan {
             tcp_state.layout.ledger_meta_offset,
             &mut tcp_state.words,
         );
-        let (inbound_meta, inbound_producers) = remote_inbound_producers(image);
+        let (inbound_meta, inbound_producers) = remote_inbound_producers(image, notify.as_ref());
         let round_capacity = config
             .max_rounds
             .unwrap_or_else(|| derived_round_bound(image, exclusive_horizon_ns, event_bound))
@@ -2895,6 +2920,7 @@ fn prepare_streams(
     fel_records: &[u64],
     remote_staging_slots: usize,
     channel_capacity_floors: &mut crate::device_capacity::ChannelCapacityFloors,
+    notify: Option<&crate::device_sizing::NotifyCapacities>,
 ) -> Result<PreparedStreams, MetalError> {
     let legacy_heap_event_slots = checked_sum_usize(legacy_fel_caps, "legacy FEL slots")?;
     let fallback_heap_event_slots = checked_sum_usize(fallback_fel_caps, "fallback FEL slots")?;
@@ -2948,6 +2974,10 @@ fn prepare_streams(
         feedback_counts,
         lookahead,
     )?;
+    // P16 H2: each unfired stage notify puts one event on its host pair's lane.
+    for &(channel, count) in notify.map_or(&[][..], |notify| &notify.lanes) {
+        channel_caps[channel] = channel_caps[channel].saturating_add(count);
+    }
     if let Some(capacity) = config.max_channel_events_per_stream {
         channel_caps.fill(capacity.max(config.capacity_floors.channel_events_per_stream));
     } else {
@@ -3332,7 +3362,10 @@ fn add_route_observation_capacities(
     }
 }
 
-fn remote_inbound_producers(image: &SimulationImage) -> (Vec<u64>, Vec<u64>) {
+fn remote_inbound_producers(
+    image: &SimulationImage,
+    notify: Option<&crate::device_sizing::NotifyCapacities>,
+) -> (Vec<u64>, Vec<u64>) {
     let mut inbound = vec![BTreeSet::new(); image.nodes.len()];
     for flow in &image.flows {
         for (route, terminal) in [
@@ -3350,6 +3383,10 @@ fn remote_inbound_producers(image: &SimulationImage) -> (Vec<u64>, Vec<u64>) {
         }
     }
     for (producer, target) in crate::device_pfc::pfc_control_lane_producers(image) {
+        inbound[target].insert(producer);
+    }
+    // P16 H2: a stage notify's lane delivers from its source host to its target host.
+    for (producer, target) in crate::device_sizing::notify_lane_producers(image, notify) {
         inbound[target].insert(producer);
     }
     let mut meta = vec![0_u64; image.nodes.len() * INBOUND_META_WORDS];

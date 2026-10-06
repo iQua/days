@@ -1,0 +1,45 @@
+# P16 H2 fixture: the miniature Spectrum-X rail fabric of rail_mini_roce.toml with a TCP AllGather
+# over its 8 GPUs (tests/p16_stage_notify.rs, tests/p16_device_notify.rs).
+#
+# Same-server ring hops (0->1, 2->3, 4->5, 6->7) are stage notifies; the others are TCP stages over
+# the fabric. The size leaves a remainder, so the last owner's chunk is 3 bytes larger: a lane
+# carries two chunk sizes (501,000 and 501,003 B, serialized in exactly 1,670 ns and in 1,671 ns),
+# so the larger chunk's lead is 2 ns.
+seed = 11
+duration = 0.01
+
+[topology]
+category = "SpectrumX"
+
+[topology.spectrum_x]
+gpus = 8
+gpus_per_server = 2
+nics_per_asw = 2
+psws = 2
+gpu_type = "H100"
+nic_rate_bps = 100000000000
+uplink_rate_bps = 400000000000
+nvlink_rate_bps = 2400000000000
+link_delay_ns = 500
+nvlink_delay_ns = 25
+
+[switch]
+capacity = 300
+discipline = "FIFO"
+drop = "TailDrop"
+
+[[collective]]
+collective_type = "AllGather"
+flow_type = "TCP"
+flow_count = 8
+sources = [0, 1, 2, 3, 4, 5, 6, 7]
+sinks = [1, 2, 3, 4, 5, 6, 7, 0]
+
+[collective.traffic]
+initial_delay = 0.0
+size = 4008003
+arr_dist = { type = "Uniform", low = 0.000001, high = 0.000001 }
+pkt_size_dist = { type = "DiscreteUniform", low = 9000, high = 9000 }
+
+[collective.traffic.tcp]
+cc_algorithm = "TCPReno"

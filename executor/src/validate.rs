@@ -655,17 +655,7 @@ fn validate_backend_capabilities(
     // P15 lane R4: both device backends run RoCE queue pairs, host-link PFC and a feedback class
     // apart from the data class (`evidence/P15/device-design.md`), so none needs a refusal here.
     //
-    // P16 H2: the stage notify runs on Scalar and Cpu first; its device port follows.
-    let notifies = image
-        .host_states
-        .iter()
-        .flat_map(staged_generators)
-        .any(is_notify_generator);
-    if notifies {
-        return Err(ValidationError::new(format!(
-            "backend {backend} does not support stage notifies yet; use Scalar or Cpu"
-        )));
-    }
+    // P16 H2: both run the stage notify (a same-server message), so it needs none either.
     for queue in image.switch_states.iter().flat_map(|state| &state.queues) {
         match queue.drop_mark {
             crate::DropMarkPolicy::TailDrop | crate::DropMarkPolicy::EcnThreshold(_) => {}

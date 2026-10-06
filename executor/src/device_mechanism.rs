@@ -142,6 +142,8 @@ const ROCE_DATA_PACKET: u64 = 7;
 const ROCE_ACK_PACKET: u64 = 8;
 const ROCE_NACK_PACKET: u64 = 9;
 const ROCE_PACING_TIMER_PACKET: u64 = 10;
+/// P16 H2: a stage notify (`PacketKind::StageNotify`).
+const STAGE_NOTIFY_PACKET: u64 = 11;
 
 /// The planes of one uploaded device plan that the plain-kernel check reads, in the word layout
 /// both device backends share (`cuda_kernels.cu` and `metal_kernels.metal`). Each backend fills it
@@ -339,6 +341,7 @@ fn scan_uploaded_plan(plan: &UploadedPlan<'_>) -> Result<Option<PlainKernelRefus
                 | ROCE_ACK_PACKET
                 | ROCE_NACK_PACKET
                 | ROCE_PACING_TIMER_PACKET
+                | STAGE_NOTIFY_PACKET
         )
         .then_some(PlainKernelRefusal::MechanismPacket { arena, lp, kind })
     };
@@ -1723,6 +1726,9 @@ mod tests {
                     "ulong ROCE_PACING_TIMER_PACKET",
                     ROCE_PACING_TIMER_PACKET as usize,
                 ),
+                ("ulong STAGE_NOTIFY_PACKET", STAGE_NOTIFY_PACKET as usize),
+                ("uint G_NOTIFY_LANE", G_RATE_FIRST),
+                ("uint G_NOTIFY_BYTES", G_RATE_PACKET_SIZE),
                 ("ulong GENERATOR_KIND_ROCE", GENERATOR_KIND_ROCE as usize),
                 ("ulong ROCE_RECEIVER_MARKER", ROCE_RECEIVER_MARKER as usize),
                 ("uint G_ROCE_NEXT_PSN", G_ROCE_NEXT_PSN),

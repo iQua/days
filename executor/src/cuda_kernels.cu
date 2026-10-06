@@ -249,6 +249,9 @@ constexpr ulong ROCE_DATA_PACKET = 7;
 constexpr ulong ROCE_ACK_PACKET = 8;
 constexpr ulong ROCE_NACK_PACKET = 9;
 constexpr ulong ROCE_PACING_TIMER_PACKET = 10;
+// P16 H2: a stage notify, a same-server message (delay-only NVLink): the sender's timer token, then
+// an out-of-band frame on its host pair's lane carrying the whole chunk.
+constexpr ulong STAGE_NOTIFY_PACKET = 11;
 constexpr ulong SCHED_FIFO = 0;
 constexpr ulong SCHED_SP = 1;
 constexpr ulong SCHED_WFQ = 2;
@@ -356,6 +359,10 @@ constexpr ulong GENERATOR_KIND_ROCE = 4;
 // (the validator pins `interval_ns == duration_ns != 0`).
 constexpr ulong GENERATOR_KIND_CONSTANT = 0;
 constexpr uint G_COMPUTE_DURATION = 13;
+// P16 H2: a stage notify's constant generator holds its lane latency in the first-departure word
+// and its chunk in the packet-size word; `G_COMPUTE_DURATION` is its lead.
+constexpr uint G_NOTIFY_LANE = 12;
+constexpr uint G_NOTIFY_BYTES = 14;
 constexpr uint G_ROCE_NEXT_PSN = 16;
 constexpr uint G_ROCE_SND_UNA = 17;
 constexpr uint G_ROCE_WINDOW = 36;
@@ -5622,7 +5629,9 @@ __device__ __forceinline__ bool stage_release(
     packet_clear(packet);
     packet[PK_ID] = token;
     packet[PK_FLOW] = flow;
-    packet[PK_KIND] = DATA_PACKET;
+    // P16 H2: a stage notify's token carries its chunk; a compute stage's is a zero-byte DATA one.
+    packet[PK_SIZE] = row[G_NOTIFY_BYTES];
+    packet[PK_KIND] = row[G_NOTIFY_BYTES] != 0 ? STAGE_NOTIFY_PACKET : DATA_PACKET;
     return emit_child(
         node, event, node, PACING_TIMER, deadline, packet, error, params, node_state, fel_meta,
         fel_records, remote_meta, remote_staging, stream_state, stream_records, tcp_state);
@@ -5651,6 +5660,45 @@ __device__ __forceinline__ bool compute_timer(
     }
     row[G_STATUS] = 2;
     return true;
+}
+
+// P16 H2: `host_notify_timer`'s own transition. The sender's stage finishes with its one message
+// emitted, and the notify leaves on its host pair's lane to the target, arriving after the lane
+// latency. The local completion it causes runs in the event's stage pass, after this emission, as
+// Scalar's does.
+__device__ __forceinline__ bool notify_timer(
+    ulong node,
+    const ulong *event,
+    ulong *error,
+    const ulong *params,
+    ulong *node_state,
+    ulong *generators,
+    const ulong *flows,
+    ulong *fel_meta,
+    ulong *fel_records,
+    ulong *remote_meta,
+    ulong *remote_staging,
+    ulong *stream_state,
+    ulong *stream_records,
+    ulong *tcp_state
+) {
+    ulong flow = event[PK_FLOW];
+    ulong *row = generators + flow * GENERATOR_WORDS;
+    ulong arrival;
+    if (params[P_STAGE_OFFSET] == NONE || flow >= params[P_FLOW_COUNT] || row[G_VALID] == 0 ||
+        row[G_OWNER] != node || row[G_KIND] != GENERATOR_KIND_CONSTANT || row[G_STATUS] != 0 ||
+        row[G_PAYLOAD] != event[E_PAYLOAD] || row[G_DEPARTURE] != event[E_TIME] ||
+        !checked_add(event[E_TIME], row[G_NOTIFY_LANE], arrival)) {
+        set_semantic_error(error, 105, node);
+        return false;
+    }
+    row[G_STATUS] = 2;
+    row[G_PACKETS] = 1;
+    row[G_BYTES] = row[G_NOTIFY_BYTES];
+    return emit_child(
+        node, event, flows[flow * FLOW_WORDS + 1], REMOTE_ARRIVAL, arrival, event, error, params,
+        node_state, fel_meta, fel_records, remote_meta, remote_staging, stream_state,
+        stream_records, tcp_state);
 }
 
 // P16 G1: the stage pass of one host transition (`complete_local_successors` or
@@ -5692,12 +5740,15 @@ __device__ __forceinline__ bool stage_after_event(
     if (node_state[node * NODE_WORDS + N_KIND] != HOST || flow >= params[P_FLOW_COUNT]) {
         return true;
     }
+    // P16 H2: a stage notify's arrival advances its inbound successors by the whole chunk, and its
+    // sender's timer completes its local successors.
     bool inbound = kind == REMOTE_ARRIVAL &&
-        (packet == TCP_DATA_PACKET || packet == ROCE_DATA_PACKET);
+        (packet == TCP_DATA_PACKET || packet == ROCE_DATA_PACKET ||
+            packet == STAGE_NOTIFY_PACKET);
     bool local = (kind == REMOTE_ARRIVAL &&
             (packet == TCP_ACK_PACKET || packet == ROCE_ACK_PACKET ||
                 packet == ROCE_NACK_PACKET)) ||
-        (kind == PACING_TIMER && packet == DATA_PACKET);
+        (kind == PACING_TIMER && (packet == DATA_PACKET || packet == STAGE_NOTIFY_PACKET));
     if (!inbound && !local) {
         return true;
     }
@@ -5709,7 +5760,9 @@ __device__ __forceinline__ bool stage_after_event(
         return true;
     }
     ulong frontier = 0;
-    if (inbound) {
+    if (inbound && packet == STAGE_NOTIFY_PACKET) {
+        frontier = event[PK_SIZE];
+    } else if (inbound) {
         const ulong *receiver =
             tcp_state + params[P_TCP_RECEIVER_OFFSET] + flow * TCP_RECEIVER_WORDS;
         frontier = packet == TCP_DATA_PACKET ? receiver[3] : tcp_state[receiver[1] + RR_EXPECTED];
@@ -5808,6 +5861,12 @@ __device__ __forceinline__ bool dispatch_event(
                 node, event, error, params, node_state, generators, fel_meta, fel_records,
                 queue_meta, queue_records, remote_meta, remote_staging, stream_state,
                 stream_records, summary, observation_meta, observed, scheduler_state, tcp_state);
+        }
+        // P16 H2: a stage notify's token names its sender's timer (Scalar's `host_notify_timer`).
+        if (MECHANISMS && (event[PK_KIND] & PK_KIND_MASK) == STAGE_NOTIFY_PACKET) {
+            return notify_timer(
+                node, event, error, params, node_state, generators, flows, fel_meta, fel_records,
+                remote_meta, remote_staging, stream_state, stream_records, tcp_state);
         }
         if (MECHANISMS && flow < params[P_FLOW_COUNT] &&
             generators[generator + G_VALID] != 0 && generators[generator + G_OWNER] == node &&
@@ -6909,6 +6968,15 @@ __device__ __forceinline__ bool dispatch_event(
                 generators, flows, fel_meta, fel_records, remote_meta, remote_staging,
                 stream_state, stream_records, summary, observation_meta, observed, arrivals,
                 tcp_state);
+        }
+        // P16 H2: a stage notify's arrival (Scalar's `host_notify_arrival`): the stage pass after
+        // this event advances its successors by the chunk; nothing else is counted or observed.
+        if (MECHANISMS && packet_kind == STAGE_NOTIFY_PACKET) {
+            if (event[PK_FLOW] >= params[P_FLOW_COUNT] || flows[flow_base + 1] != node) {
+                set_semantic_error(error, 106, node);
+                return false;
+            }
+            return true;
         }
         if (MECHANISMS && packet_kind == PFC_PACKET) {
             return pfc_frame_arrival<MECHANISMS>(

@@ -165,7 +165,13 @@ fn finished(result: &RunResult) -> bool {
 
 #[test]
 fn every_stage_finishes_and_no_notify_stays_resident() {
-    let image = mini_rail();
+    for (_, image) in notify_fixtures() {
+        every_stage_finishes(&image);
+    }
+}
+
+fn every_stage_finishes(image: &SimulationImage) {
+    let image = image.clone();
     let result =
         run_scalar_with_observations(&image, None, ObservationMode::Full).expect("scalar oracle");
     assert!(finished(&result), "every stage finishes");
@@ -197,12 +203,17 @@ fn without_diagnostics(mut result: RunResult) -> RunResult {
 
 #[test]
 fn scalar_and_cpu_agree_at_one_to_four_workers() {
-    let image = mini_rail();
+    for (_, image) in notify_fixtures() {
+        scalar_and_cpu_agree(&image);
+    }
+}
+
+fn scalar_and_cpu_agree(image: &SimulationImage) {
     for mode in [ObservationMode::Full, ObservationMode::Summary] {
-        let scalar = run_scalar_with_observations(&image, None, mode).expect("scalar");
+        let scalar = run_scalar_with_observations(image, None, mode).expect("scalar");
         for workers in 1..=4 {
             let cpu = run_cpu_with_observations(
-                &image,
+                image,
                 None,
                 CpuConfig {
                     workers,
@@ -231,43 +242,67 @@ fn checkpoint_image(original: &SimulationImage, checkpoint: &RunResult) -> Simul
     image
 }
 
-/// The images of the notify suites: the fixture, then checkpoints at horizons 1 and 100 and at `count`
-/// horizons spread over its run, which hold notifies unreleased, timed, in flight and delivered.
-pub fn notify_images(count: u64) -> Vec<(String, SimulationImage)> {
-    let image = mini_rail();
-    let end = run_scalar_with_observations(&image, None, ObservationMode::Full)
-        .expect("scalar")
-        .departures
-        .iter()
-        .map(|departure| departure.time_ns)
-        .max()
-        .expect("the fixture sends");
-    let mut images = vec![("rail_mini_roce".to_owned(), image.clone())];
-    // Horizon 1 holds the root notifies' timers (a lead of one nanosecond: one chunk size per
-    // lane), horizon 100 the root notifies in flight (on 346 ns lanes); the spread holds notifies
-    // released, delivered and later in flight.
-    let horizons = [1, 100]
+/// The notify fixtures: a RoCE ring all-reduce and a TCP AllGather on the miniature rail.
+pub fn notify_fixtures() -> Vec<(String, SimulationImage)> {
+    ["rail_mini_roce", "rail_mini_tcp_allgather"]
         .into_iter()
-        .chain((1..=count).map(|step| end * step / (count + 1) + 1));
-    for horizon in horizons {
-        let prefix = run_scalar_with_observations(&image, Some(horizon), ObservationMode::Full)
-            .expect("checkpoint prefix");
-        images.push((
-            format!("rail_mini_roce@{horizon}"),
-            checkpoint_image(&image, &prefix),
-        ));
+        .map(|name| {
+            let image = compile_config(repo_path(&format!("configs/p16/{name}.toml")))
+                .unwrap_or_else(|error| panic!("{name} must lower: {error}"));
+            (name.to_owned(), image)
+        })
+        .collect()
+}
+
+/// The images of the notify suites: each fixture, then its checkpoints at horizons 1 and 100 and at
+/// `count` horizons spread over its run, which hold notifies unreleased, timed, in flight and
+/// delivered.
+pub fn notify_images(count: u64) -> Vec<(String, SimulationImage)> {
+    let mut images = Vec::new();
+    for (name, image) in notify_fixtures() {
+        let end = run_scalar_with_observations(&image, None, ObservationMode::Full)
+            .expect("scalar")
+            .departures
+            .iter()
+            .map(|departure| departure.time_ns)
+            .max()
+            .expect("the fixture sends");
+        images.push((name.clone(), image.clone()));
+        // Horizon 1 holds the root notifies' timers (leads of one or two nanoseconds), horizon
+        // 100 the root notifies in flight (lanes of hundreds of nanoseconds); the spread holds
+        // notifies released, delivered and later in flight.
+        let horizons = [1, 100]
+            .into_iter()
+            .chain((1..=count).map(|step| end * step / (count + 1) + 1));
+        for horizon in horizons {
+            let prefix = run_scalar_with_observations(&image, Some(horizon), ObservationMode::Full)
+                .expect("checkpoint prefix");
+            images.push((
+                format!("{name}@{horizon}"),
+                checkpoint_image(&image, &prefix),
+            ));
+        }
     }
     images
 }
 
 #[test]
 fn checkpoints_with_timed_and_in_flight_notifies_resume_exactly() {
-    let original = mini_rail();
-    let uninterrupted =
-        run_scalar_with_observations(&original, None, ObservationMode::Summary).expect("scalar");
+    let uninterrupted = notify_fixtures()
+        .into_iter()
+        .map(|(name, image)| {
+            let result = run_scalar_with_observations(&image, None, ObservationMode::Summary)
+                .expect("scalar");
+            (name, result)
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
     let mut timed = 0;
     let mut in_flight = 0;
-    for (label, image) in notify_images(23).into_iter().skip(1) {
+    for (label, image) in notify_images(23)
+        .into_iter()
+        .filter(|(label, _)| label.contains('@'))
+    {
+        let uninterrupted = &uninterrupted[label.split('@').next().expect("name")];
         validate(&image, Backend::Scalar).unwrap_or_else(|error| panic!("{label}: {error}"));
         let kind_of = |payload| {
             image
@@ -331,8 +366,4 @@ fn a_notify_off_its_lane_or_with_a_wrong_lead_is_refused() {
         .route
         .push(image.host_states[0].egress_link);
     assert!(validate(&routed, Backend::Scalar).is_err());
-
-    // The device port follows; until then the devices refuse a notify image.
-    let error = validate(&image, Backend::Metal).expect_err("device refusal");
-    assert!(error.to_string().contains("stage notifies"), "{error}");
 }

@@ -580,6 +580,19 @@ pub fn size_default_device_plan(
             &mut route_capacities,
         );
     }
+    // P16 H2: the stage notifies' terms, exactly as both device planners add them.
+    let notify = notify_capacities(image);
+    let notify_sources = notify.as_ref().map_or(0, |notify| {
+        notify
+            .sources
+            .iter()
+            .fold(0_usize, |total, (_, count)| total.saturating_add(*count))
+    });
+    if let Some(notify) = &notify {
+        for &(node, count) in notify.sources.iter().chain(&notify.targets) {
+            legacy_fel_capacities[node] = legacy_fel_capacities[node].saturating_add(count);
+        }
+    }
     for node in &image.nodes {
         let slot = node.id.0 as usize;
         match node.kind {
@@ -673,12 +686,21 @@ pub fn size_default_device_plan(
         .checked_add(image.initial_events.len())
         .and_then(|slots| slots.checked_add(runtime_tcp_timer_slots))
         .and_then(|slots| slots.checked_add(dcqcn_timer_slots))
+        .and_then(|slots| slots.checked_add(notify_sources))
         .ok_or_else(|| sizing_error("fallback FEL slots overflow usize"))?;
     let legacy_heap_event_slots = checked_sum(&legacy_fel_capacities, "legacy FEL slots")?;
     let queue_slots = checked_sum(&queue_capacities, "queue slots")?;
-    let remote_capacities = derived_remote_capacities(image, &context);
+    let mut remote_capacities = derived_remote_capacities(image, &context);
+    let mut channel_capacities = derived_channel_stream_capacities(image, &context)?;
+    if let Some(notify) = &notify {
+        for &(node, count) in &notify.sources {
+            remote_capacities[node] = remote_capacities[node].saturating_add(count);
+        }
+        for &(channel, count) in &notify.lanes {
+            channel_capacities[channel] = channel_capacities[channel].saturating_add(count);
+        }
+    }
     let remote_staging_slots = checked_sum(&remote_capacities, "remote staging slots")?;
-    let channel_capacities = derived_channel_stream_capacities(image, &context)?;
     let channel_stream_event_slots = checked_sum(&channel_capacities, "channel stream slots")?;
     let service_stream_event_slots = node_count
         .checked_mul(2)
@@ -700,7 +722,7 @@ pub fn size_default_device_plan(
         })
         .ok_or_else(|| sizing_error("stream record words overflow usize"))?;
     let stream_state_words = stream_state_words(image, remote_staging_slots)?.max(1);
-    let inbound_producer_words = inbound_producer_words(image);
+    let inbound_producer_words = inbound_producer_words(image, notify.as_ref());
 
     let route_words = image
         .flows
@@ -947,6 +969,88 @@ impl CapacityContext {
             lookahead,
         })
     }
+}
+
+/// Run-time event slots the stage notifies of an image need (P16 H2), shared by both planners and
+/// the sizing projection. A notify that has not fired yet holds one timer at its source (a
+/// fallback-heap event), stages one emission in its source's outbox, and puts one event on its
+/// host pair's lane stream (or, without streams, in its target's event heap). A fired notify's
+/// remaining arrival is an initial event, which every planner already reserves.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct NotifyCapacities {
+    /// `(node slot, unfired notifies sourced there)`, ascending by node.
+    pub sources: Vec<(usize, usize)>,
+    /// `(node slot, unfired notifies targeting it)`, ascending by node.
+    pub targets: Vec<(usize, usize)>,
+    /// `(channel index, unfired notifies on that lane)`, ascending by channel.
+    pub lanes: Vec<(usize, usize)>,
+}
+
+/// The stage notifies' capacity terms, or `None` for an image without one (decided in one pass
+/// over the stage tables; a stageless image reads no generator).
+pub(crate) fn notify_capacities(image: &SimulationImage) -> Option<NotifyCapacities> {
+    use std::collections::BTreeMap;
+    let mut pairs = BTreeMap::<(crate::NodeId, crate::NodeId), usize>::new();
+    for state in image
+        .host_states
+        .iter()
+        .filter(|state| !state.stages.is_empty())
+    {
+        for (position, generator) in state.generators.iter().enumerate() {
+            let Some(stage) = state.stage(position) else {
+                continue;
+            };
+            if matches!(stage.role, crate::StageRole::Collective(_))
+                && matches!(generator.kind, crate::FlowGeneratorKind::Constant(_))
+                && matches!(
+                    generator.next_emission.status,
+                    crate::GeneratorStatus::Blocked | crate::GeneratorStatus::Scheduled
+                )
+            {
+                let flow = image.flows.get(generator.flow.0 as usize)?;
+                *pairs.entry((flow.source, flow.target)).or_default() += 1;
+            }
+        }
+    }
+    if pairs.is_empty() {
+        return None;
+    }
+    let mut sources = BTreeMap::<usize, usize>::new();
+    let mut targets = BTreeMap::<usize, usize>::new();
+    let mut lanes = BTreeMap::<usize, usize>::new();
+    for (index, channel) in image.channels.iter().enumerate() {
+        let Some(link) = image.links.get(channel.link.0 as usize) else {
+            continue;
+        };
+        if link.source != channel.source || link.target != channel.target {
+            continue;
+        }
+        if let Some(count) = pairs.remove(&(channel.source, channel.target)) {
+            *sources.entry(channel.source.0 as usize).or_default() += count;
+            *targets.entry(channel.target.0 as usize).or_default() += count;
+            lanes.insert(index, count);
+        }
+    }
+    Some(NotifyCapacities {
+        sources: sources.into_iter().collect(),
+        targets: targets.into_iter().collect(),
+        lanes: lanes.into_iter().collect(),
+    })
+}
+
+/// `(producer, target)` of every stage-notify lane: the lane's source host feeds its target host's
+/// inbound merge (P16 H2).
+pub(crate) fn notify_lane_producers<'a>(
+    image: &'a SimulationImage,
+    notify: Option<&'a NotifyCapacities>,
+) -> impl Iterator<Item = (u64, usize)> + 'a {
+    notify
+        .map_or(&[][..], |notify| &notify.lanes)
+        .iter()
+        .map(|&(channel, _)| {
+            let channel = image.channels[channel];
+            (channel.source.0, channel.target.0 as usize)
+        })
 }
 
 /// Whether an initial packet occupies a queue or a link of its flow's route, so the per-flow packet
@@ -1948,7 +2052,7 @@ fn stream_state_words(
     })
 }
 
-fn inbound_producer_words(image: &SimulationImage) -> usize {
+fn inbound_producer_words(image: &SimulationImage, notify: Option<&NotifyCapacities>) -> usize {
     let mut inbound = vec![BTreeSet::new(); image.nodes.len()];
     for flow in &image.flows {
         for (route, terminal) in [
@@ -1966,6 +2070,10 @@ fn inbound_producer_words(image: &SimulationImage) -> usize {
         }
     }
     for (producer, target) in crate::device_pfc::pfc_control_lane_producers(image) {
+        inbound[target].insert(producer);
+    }
+    // P16 H2: a stage notify's lane delivers from its source host to its target host.
+    for (producer, target) in notify_lane_producers(image, notify) {
         inbound[target].insert(producer);
     }
     inbound.iter().map(BTreeSet::len).sum()
