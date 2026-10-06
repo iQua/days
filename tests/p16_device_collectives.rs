@@ -90,6 +90,7 @@ const PINNED_RETRIES_METAL: &[(&str, usize)] = &[
     ("compute-only", 0),
     ("fanout-after-compute", 0),
     ("one-ns-compute", 0),
+    ("compute-at-stop", 0),
 ];
 #[allow(dead_code)]
 const PINNED_RETRIES_CUDA: &[(&str, usize)] = PINNED_RETRIES_METAL;
@@ -328,6 +329,32 @@ duration_ns = 1
 after = "ring"
 "#;
 
+/// A compute deadline exactly at the stop time (review F9): `a` ends at 4 us and `edge` 6 us later,
+/// at the 10 us stop, so Scalar schedules its timer (`deadline <= stop`) and finishes it at the stop.
+const COMPUTE_AT_STOP: &str = r#"
+seed = 26
+edges = [[0, 2], [1, 2]]
+hosts = [0, 1]
+duration = 0.00001
+
+[switch]
+port_rate = 8000000000
+capacity = 100
+discipline = "FIFO"
+drop = "TailDrop"
+
+[[compute]]
+name = "a"
+hosts = [0, 1]
+duration_ns = 4000
+
+[[compute]]
+name = "edge"
+hosts = [0, 1]
+duration_ns = 6000
+after = "a"
+"#;
+
 /// Every fixture that lowers, by name.
 pub fn fixtures() -> Vec<(String, SimulationImage)> {
     let mut images = ROCE_FIXTURES
@@ -351,6 +378,7 @@ pub fn fixtures() -> Vec<(String, SimulationImage)> {
         ("compute-only", COMPUTE_ONLY.to_owned()),
         ("fanout-after-compute", FANOUT_AFTER_COMPUTE.to_owned()),
         ("one-ns-compute", ONE_NS_COMPUTE.to_owned()),
+        ("compute-at-stop", COMPUTE_AT_STOP.to_owned()),
     ] {
         images.push((label.to_owned(), tcp::compile_text(label, &config)));
     }
@@ -368,9 +396,9 @@ fn checkpoint_image(original: &SimulationImage, checkpoint: &RunResult) -> Simul
     image
 }
 
-/// Checkpoints of `image` at `count` horizons spread evenly over the span of its departures, so
-/// they fall while stages are gated, running and finished.
-fn checkpoints(label: &str, image: &SimulationImage, count: u64) -> Vec<(String, SimulationImage)> {
+/// `count` horizons spread evenly over the span of `image`'s departures, so they fall while stages
+/// are gated, running and finished; empty for an image that sends nothing.
+pub fn checkpoint_horizons(image: &SimulationImage, count: u64) -> Vec<u64> {
     let full = run_scalar_with_observations(image, None, ObservationMode::Full)
         .expect("scalar oracle must run");
     let first = full
@@ -388,6 +416,13 @@ fn checkpoints(label: &str, image: &SimulationImage, count: u64) -> Vec<(String,
     };
     (1..=count)
         .map(|step| first + (last - first) * step / (count + 1) + 1)
+        .collect()
+}
+
+/// Checkpoints of `image` at its [`checkpoint_horizons`].
+fn checkpoints(label: &str, image: &SimulationImage, count: u64) -> Vec<(String, SimulationImage)> {
+    checkpoint_horizons(image, count)
+        .into_iter()
         .map(|horizon| {
             let prefix = run_scalar_with_observations(image, Some(horizon), ObservationMode::Full)
                 .expect("checkpoint prefix must run");
@@ -514,6 +549,38 @@ fn release_order_and_one_ns_fixtures_exercise_the_release_rule() {
     }
 }
 
+/// Review F9: the `compute-at-stop` fixture schedules a compute timer exactly at the stop, and Scalar
+/// finishes the stage there, so the device's `deadline <= stop` boundary is pinned by identity.
+#[test]
+fn a_compute_deadline_at_the_stop_finishes_there() {
+    let image = fixtures()
+        .into_iter()
+        .find(|(name, _)| name == "compute-at-stop")
+        .expect("compute-at-stop fixture")
+        .1;
+    let result = run_scalar_with_observations(&image, None, ObservationMode::Summary)
+        .expect("scalar oracle must run");
+    let edges = result
+        .host_states
+        .iter()
+        .flat_map(|host| {
+            host.generators
+                .iter()
+                .enumerate()
+                .filter(|(position, _)| {
+                    host.stage(*position)
+                        .is_some_and(|stage| stage.dependencies.local_predecessor.is_some())
+                })
+                .map(|(_, generator)| generator.next_emission)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(edges.len(), 2);
+    for emission in edges {
+        assert_eq!(emission.status, GeneratorStatus::Finished);
+        assert_eq!(emission.departure_time_ns, image.stop_time_ns);
+    }
+}
+
 /// Every stage image selects the mechanisms build (design note G4): the TCP-only and compute-only
 /// images carry no other mechanism, so without the stage bit they would select the plain build.
 #[test]
@@ -635,6 +702,33 @@ mod cuda {
         }
     }
 
+    /// Review F3: the device's own readback while stages are in flight. Each fixture runs on the
+    /// device to its five checkpoint horizons (gated, mid-delivery and running stages, pending
+    /// compute timers, parked stage pairs) and the complete state must equal Scalar's prefix there.
+    #[test]
+    fn cuda_stage_fixtures_match_scalar_at_their_checkpoint_horizons() {
+        let mut differing = Vec::new();
+        for (name, image) in fixtures() {
+            for horizon in super::checkpoint_horizons(&image, 5) {
+                let expected = scalar(&image, Some(horizon), ObservationMode::Full);
+                match run_cuda_with_observations(
+                    &image,
+                    Some(horizon),
+                    CudaConfig::default(),
+                    ObservationMode::Full,
+                ) {
+                    Ok(run) if run.result == expected => {}
+                    Ok(_) => differing.push(format!("{name}@{horizon}")),
+                    Err(error) => differing.push(format!("{name}@{horizon}: {error}")),
+                }
+            }
+        }
+        assert!(
+            differing.is_empty(),
+            "differing at checkpoint horizons: {differing:?}"
+        );
+    }
+
     /// Deterministic capacity retries of the default plan per fixture (design note §5.2): pinned,
     /// so a sizing change that adds a retry (each one replays the whole run) fails here.
     #[test]
@@ -719,6 +813,33 @@ mod metal {
                 }
             }
         }
+    }
+
+    /// Review F3: the device's own readback while stages are in flight. Each fixture runs on the
+    /// device to its five checkpoint horizons (gated, mid-delivery and running stages, pending
+    /// compute timers, parked stage pairs) and the complete state must equal Scalar's prefix there.
+    #[test]
+    fn metal_stage_fixtures_match_scalar_at_their_checkpoint_horizons() {
+        let mut differing = Vec::new();
+        for (name, image) in fixtures() {
+            for horizon in super::checkpoint_horizons(&image, 5) {
+                let expected = scalar(&image, Some(horizon), ObservationMode::Full);
+                match run_metal_with_observations(
+                    &image,
+                    Some(horizon),
+                    MetalConfig::default(),
+                    ObservationMode::Full,
+                ) {
+                    Ok(run) if run.result == expected => {}
+                    Ok(_) => differing.push(format!("{name}@{horizon}")),
+                    Err(error) => differing.push(format!("{name}@{horizon}: {error}")),
+                }
+            }
+        }
+        assert!(
+            differing.is_empty(),
+            "differing at checkpoint horizons: {differing:?}"
+        );
     }
 
     /// Deterministic capacity retries of the default plan per fixture (design note §5.2): pinned,
