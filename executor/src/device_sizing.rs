@@ -190,10 +190,6 @@ impl DeviceEventArenaSizing {
     }
 }
 
-/// Complete host-only sizing report for a projected or exact GPU device plan.
-///
-/// Open-loop images retain the established 28 planes. TCP images add one packed auxiliary plane
-/// for receiver ranges, segment ledgers, and full-observation transition state.
 /// Words a production device plan spends on the P14 DCQCN and PFC and the P15 queue-pair and
 /// host-link PFC mechanism state.
 ///
@@ -217,6 +213,11 @@ pub struct MechanismPlaneWords {
     pub pfc_class_words: Vec<u64>,
 }
 
+/// Complete host-only sizing report for a projected or exact GPU device plan.
+///
+/// Every plan carries the established 28 planes and one packed auxiliary plane, `tcp_state`: the
+/// per-flow receiver and ledger rows, the TCP receive ranges and segment ledgers, the stage region
+/// (P16) and the RoCE receiver region (P15). Both planners allocate it for every image.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceSizingReport {
     pub planes: Vec<DevicePlaneSizing>,
@@ -536,6 +537,10 @@ pub fn size_default_device_plan(
         .iter()
         .map(|packet| (packet.id, packet))
         .collect::<BTreeMap<_, _>>();
+    // P16 G2: the planners' concurrency groups (ruling G7), decided once.
+    let concurrency = crate::stage_sizing::SizingConcurrency::for_image(image);
+    let mut queue_charges = crate::stage_sizing::ConcurrentCharges::default();
+    let mut fel_charges = crate::stage_sizing::ConcurrentCharges::default();
 
     let mut queue_capacities = vec![1_usize; node_count];
     let mut aggregate_queue_packets = vec![0_usize; node_count];
@@ -550,14 +555,43 @@ pub fn size_default_device_plan(
         let feedback_count = flow_feedback_counts[flow_index];
         let data_count = packet_count.saturating_sub(feedback_count);
         let source_slot = flow.source.0 as usize;
-        queue_capacities[source_slot] =
-            queue_capacities[source_slot].saturating_add(context.source_queue_bounds[flow_index]);
+        let group = concurrency
+            .as_ref()
+            .and_then(|concurrency| concurrency.group(flow_index));
+        // Ruling G8: a windowed queue pair's host-queue bounds, as the planners derive them.
+        let window = concurrency
+            .as_ref()
+            .and_then(|concurrency| concurrency.window_packets(flow_index));
+        crate::stage_sizing::charge(
+            &mut queue_capacities,
+            &mut queue_charges,
+            concurrency
+                .as_ref()
+                .and_then(|concurrency| concurrency.host_queue_group(flow_index)),
+            source_slot,
+            crate::stage_sizing::CLASS_DATA,
+            window.map_or(context.source_queue_bounds[flow_index], |window| {
+                data_count.min(window)
+            }),
+        );
+        if let Some(window) = window {
+            crate::stage_sizing::charge(
+                &mut queue_capacities,
+                &mut queue_charges,
+                group,
+                flow.target.0 as usize,
+                crate::stage_sizing::CLASS_FEEDBACK,
+                feedback_count.min(window),
+            );
+        }
         legacy_fel_capacities[source_slot] = legacy_fel_capacities[source_slot].saturating_add(4);
         if context.tcp_generators[flow_index].is_some() {
             legacy_fel_capacities[source_slot] = legacy_fel_capacities[source_slot]
                 .saturating_add(tcp_fallback_timer_packet_bound(data_count));
         }
         let mut route_capacities = FlowRouteCapacities {
+            group,
+            fel_charges: &mut fel_charges,
             fel: &mut legacy_fel_capacities,
             queue: &mut queue_capacities,
             aggregate_queue_packets: &mut aggregate_queue_packets,
@@ -579,6 +613,15 @@ pub fn size_default_device_plan(
             PacketKind::Feedback,
             &mut route_capacities,
         );
+    }
+    let mut compute_timer_slots = 0_usize;
+    if let Some(concurrency) = &concurrency {
+        queue_charges.apply(concurrency, &mut queue_capacities);
+        fel_charges.apply(concurrency, &mut legacy_fel_capacities);
+        concurrency.add_compute_timers(&mut legacy_fel_capacities);
+        let mut timers = vec![0_usize; node_count];
+        concurrency.add_compute_timers(&mut timers);
+        compute_timer_slots = checked_sum(&timers, "compute timer slots")?;
     }
     for node in &image.nodes {
         let slot = node.id.0 as usize;
@@ -673,10 +716,11 @@ pub fn size_default_device_plan(
         .checked_add(image.initial_events.len())
         .and_then(|slots| slots.checked_add(runtime_tcp_timer_slots))
         .and_then(|slots| slots.checked_add(dcqcn_timer_slots))
+        .and_then(|slots| slots.checked_add(compute_timer_slots))
         .ok_or_else(|| sizing_error("fallback FEL slots overflow usize"))?;
     let legacy_heap_event_slots = checked_sum(&legacy_fel_capacities, "legacy FEL slots")?;
     let queue_slots = checked_sum(&queue_capacities, "queue slots")?;
-    let remote_capacities = derived_remote_capacities(image, &context);
+    let remote_capacities = derived_remote_capacities(image, &context, concurrency.as_ref());
     let remote_staging_slots = checked_sum(&remote_capacities, "remote staging slots")?;
     let channel_capacities = derived_channel_stream_capacities(image, &context)?;
     let channel_stream_event_slots = checked_sum(&channel_capacities, "channel stream slots")?;
@@ -765,21 +809,18 @@ pub fn size_default_device_plan(
             })
         })
         .collect::<Result<Vec<_>, DeviceSizingError>>()?;
-    if image.host_states.iter().any(|state| {
-        !state.tcp_receivers.is_empty()
-            || state
-                .generators
-                .iter()
-                .any(|generator| matches!(generator.kind, FlowGeneratorKind::Tcp(_)))
-    }) {
-        let tcp_words = packed_tcp_state_words(image, &flow_data_counts, &context)?;
-        planes.push(DevicePlaneSizing {
-            index: planes.len(),
-            name: "tcp_state",
-            words: tcp_words,
-            bytes: checked_product(tcp_words, WORD_BYTES, "TCP state plane bytes")?,
-        });
-    }
+    // Both planners allocate `tcp_state` for every image (P16 G2: an image without TCP still
+    // carries its receiver and ledger rows, and its stage and RoCE regions live there).
+    let has_stages = concurrency
+        .as_ref()
+        .is_some_and(|concurrency| concurrency.has_stages());
+    let tcp_words = packed_tcp_state_words(image, has_stages, &flow_data_counts, &context)?;
+    planes.push(DevicePlaneSizing {
+        index: planes.len(),
+        name: "tcp_state",
+        words: tcp_words,
+        bytes: checked_product(tcp_words, WORD_BYTES, "TCP state plane bytes")?,
+    });
     let total_device_bytes = planes.iter().try_fold(0_usize, |total, plane| {
         total
             .checked_add(plane.bytes)
@@ -1093,6 +1134,7 @@ fn flow_packet_counts(
 
 fn packed_tcp_state_words(
     image: &SimulationImage,
+    has_stages: bool,
     data_counts: &[usize],
     context: &CapacityContext,
 ) -> Result<usize, DeviceSizingError> {
@@ -1103,7 +1145,7 @@ fn packed_tcp_state_words(
     // -flow frontier, against a 5.74 GB record arena.
     const LEDGER_META_WORDS: usize = crate::tcp_ledger_ring::TCP_LEDGER_META_WORDS;
     const LEDGER_RECORD_WORDS: usize = crate::tcp_ledger_ring::TCP_LEDGER_RECORD_WORDS;
-    let flow_count = image.flows.len().max(1);
+    let flow_count = image.flows.len();
     let receiver_range_slots = image
         .host_states
         .iter()
@@ -1115,8 +1157,7 @@ fn packed_tcp_state_words(
             total
                 .checked_add(bound.max(receiver.out_of_order.len()))
                 .ok_or_else(|| sizing_error("TCP receiver range slots overflow usize"))
-        })?
-        .max(1);
+        })?;
     let ledger = crate::tcp_ledger::seed_image(image).map_err(|conflict| {
         sizing_error(format!(
             "TCP flow {:?} sequence {} changed segment size from {} to {} bytes",
@@ -1144,12 +1185,14 @@ fn packed_tcp_state_words(
             .checked_add(bound.max(resident))
             .ok_or_else(|| sizing_error("TCP ledger record slots overflow usize"))
     })?;
-    [
+    // The planners allocate the receiver, range and ledger regions as one buffer of at least one
+    // word, then append the stage region (P16 G1) and the RoCE region (P15).
+    let packed = [
         checked_product(flow_count, RECEIVER_WORDS, "TCP receiver rows")?,
         checked_product(receiver_range_slots, RANGE_WORDS, "TCP receive ranges")?,
         checked_product(flow_count, LEDGER_META_WORDS, "TCP ledger metadata")?,
         checked_product(
-            ledger_record_slots.max(1),
+            ledger_record_slots,
             LEDGER_RECORD_WORDS,
             "TCP ledger records",
         )?,
@@ -1159,7 +1202,71 @@ fn packed_tcp_state_words(
         total
             .checked_add(words)
             .ok_or_else(|| sizing_error("TCP state plane overflows usize"))
-    })
+    })?
+    .max(1);
+    let stage_words = if has_stages {
+        stage_region_words(image)?
+    } else {
+        0
+    };
+    [stage_words, roce_region_words(image)?]
+        .into_iter()
+        .try_fold(packed, |total, words| {
+            total
+                .checked_add(words)
+                .ok_or_else(|| sizing_error("TCP state plane overflows usize"))
+        })
+}
+
+/// Words of one queue-pair receiver record in the RoCE region (`device_mechanism`).
+pub(crate) const ROCE_RECEIVER_WORDS: usize = 10;
+
+/// Words of the RoCE region at the tail of `tcp_state`: one record per queue-pair receiver, zero
+/// without any (`device_mechanism::append_roce_region`).
+pub(crate) fn roce_region_words(image: &SimulationImage) -> Result<usize, DeviceSizingError> {
+    image
+        .host_states
+        .iter()
+        .filter_map(|state| state.roce_receivers.as_deref())
+        .try_fold(0_usize, |total, receivers| {
+            total
+                .checked_add(checked_product(
+                    receivers.len(),
+                    ROCE_RECEIVER_WORDS,
+                    "RoCE region",
+                )?)
+                .ok_or_else(|| sizing_error("RoCE region overflows usize"))
+        })
+}
+
+/// Words of one stage row in the stage region (`device_stage`).
+pub(crate) const STAGE_ROW_WORDS: usize = 5;
+
+/// Words of the stage region before the RoCE region (`device_stage::encode_stage_region`): a row
+/// per flow, then one successor entry per local and per inbound predecessor; zero without stages.
+pub(crate) fn stage_region_words(image: &SimulationImage) -> Result<usize, DeviceSizingError> {
+    if image
+        .host_states
+        .iter()
+        .all(|state| state.stages.is_empty())
+    {
+        return Ok(0);
+    }
+    let successors = image
+        .host_states
+        .iter()
+        .flat_map(|state| state.stages.iter().flatten())
+        .map(|stage| {
+            stage.dependencies.local.count() as usize + stage.dependencies.inbound.count() as usize
+        })
+        .fold(0_usize, usize::saturating_add);
+    checked_product(
+        image.flows.len().max(1),
+        STAGE_ROW_WORDS,
+        "stage region rows",
+    )?
+    .checked_add(successors)
+    .ok_or_else(|| sizing_error("stage region overflows usize"))
 }
 
 pub(crate) fn paced_single_source_queue_bound(
@@ -1536,6 +1643,9 @@ fn source_queue_bounds(
 }
 
 struct FlowRouteCapacities<'a> {
+    /// The flow's concurrency group if it is an unfinished stage (P16 G2, ruling G7).
+    group: Option<u32>,
+    fel_charges: &'a mut crate::stage_sizing::ConcurrentCharges,
     fel: &'a mut [usize],
     queue: &'a mut [usize],
     aggregate_queue_packets: &'a mut [usize],
@@ -1580,7 +1690,14 @@ fn add_flow_route_capacities(
             packet_kind,
             route[index],
         );
-        capacities.fel[target_slot] = capacities.fel[target_slot].saturating_add(burst);
+        crate::stage_sizing::charge(
+            capacities.fel,
+            capacities.fel_charges,
+            capacities.group,
+            target_slot,
+            crate::stage_sizing::charge_class(packet_kind),
+            burst,
+        );
         if image.nodes[target_slot].kind == NodeKind::Switch {
             capacities.aggregate_queue_packets[target_slot] =
                 capacities.aggregate_queue_packets[target_slot].saturating_add(packet_count);
@@ -1752,16 +1869,21 @@ fn flow_link_fel_bound(
 
 /// Per-producer remote staging capacities.
 ///
-/// The device planners keep a matching whole-plan `derived_remote_capacity` — the same sum with the
-/// same `2` per node folded in as the seed — because it is what they upload as
-/// `params[P_OUTBOX_CAPACITY]`. This module no longer needs that scalar: the streams-enabled plan
-/// it sizes carries [`STREAMS_OUTBOX_RECORD_SLOTS`] outbox records, and the capacity number is not
-/// a plane. Uncapped, `capacities.iter().sum()` reproduces it exactly.
-fn derived_remote_capacities(image: &SimulationImage, context: &CapacityContext) -> Vec<usize> {
+/// The device planners upload the uncapped sum of these capacities (2 per node included) as
+/// `params[P_OUTBOX_CAPACITY]`. This module does not need that scalar: the streams-enabled plan it
+/// sizes carries [`STREAMS_OUTBOX_RECORD_SLOTS`] outbox records, and the capacity number is not a
+/// plane. The bounds of a host's unfinished stages are charged together (P16 G2, ruling G7).
+fn derived_remote_capacities(
+    image: &SimulationImage,
+    context: &CapacityContext,
+    concurrency: Option<&crate::stage_sizing::SizingConcurrency>,
+) -> Vec<usize> {
     let mut capacities = vec![2_usize; image.nodes.len()];
+    let mut charges = crate::stage_sizing::ConcurrentCharges::default();
     for (index, flow) in image.flows.iter().enumerate() {
         let feedback_count = context.feedback_counts[index];
         let data_count = context.packet_counts[index].saturating_sub(feedback_count);
+        let group = concurrency.and_then(|concurrency| concurrency.group(index));
         for (route, packet_count, packet_kind) in [
             (flow.route.as_slice(), data_count, PacketKind::Data),
             (
@@ -1772,16 +1894,26 @@ fn derived_remote_capacities(image: &SimulationImage, context: &CapacityContext)
         ] {
             for link_id in route {
                 let producer = image.links[link_id.0 as usize].source.0 as usize;
-                capacities[producer] = capacities[producer].saturating_add(flow_link_round_bound(
-                    image,
-                    context,
-                    index,
-                    packet_count,
-                    packet_kind,
-                    *link_id,
-                ));
+                crate::stage_sizing::charge(
+                    &mut capacities,
+                    &mut charges,
+                    group,
+                    producer,
+                    crate::stage_sizing::charge_class(packet_kind),
+                    flow_link_round_bound(
+                        image,
+                        context,
+                        index,
+                        packet_count,
+                        packet_kind,
+                        *link_id,
+                    ),
+                );
             }
         }
+    }
+    if let Some(concurrency) = concurrency {
+        charges.apply(concurrency, &mut capacities);
     }
     capacities
 }

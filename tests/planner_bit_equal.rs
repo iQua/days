@@ -44,6 +44,10 @@ const FIXTURES: &[&str] = &[
     // apart from the data class (host rows, the class word).
     "configs/p15/roce_gbn_lossy.toml",
     "configs/p15/hostpfc_multi_qp_tcp.toml",
+    // P16 G2: collective and compute stages over RoCE and TCP, whose arenas are charged per host
+    // chain (ruling G7), and the outbox capacity that sums them.
+    "configs/p15/roce_compute_dag.toml",
+    "configs/p15/roce_tcp_mixed_collectives.toml",
 ];
 
 const TEST_CAPS: DeviceCapacityCaps = DeviceCapacityCaps {

@@ -68,7 +68,10 @@ const ANCHORS: [(&str, u64, u64); 6] = [
 ];
 
 /// Capacity retries per fixture on the default plan (`*_stage_fixtures_pin_their_capacity_retries`),
-/// MEASURED at P16 G1 commit 5 on Metal (M5 Max) and CUDA (sim, RTX A4500): none.
+/// MEASURED at P16 G1 commit 5 on Metal (M5 Max) and CUDA (sim, RTX A4500): none. P16 G2 keeps
+/// the summed host-queue charge for windowless stage pairs and TCP stages (fix rounds 1 and 2,
+/// review F1 and R1-F1), so host 3 of `roce_ring_release_paused` plans 470 records again against a peak of
+/// 306 and takes no retry (G7's one-chain charge had planned 202 and taken one).
 #[allow(dead_code)]
 const PINNED_RETRIES_METAL: &[(&str, usize)] = &[
     ("roce_ring_allreduce_lossless", 0),
