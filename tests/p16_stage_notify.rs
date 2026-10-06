@@ -102,7 +102,7 @@ fn same_server_stages_lower_to_notifies_on_their_lanes() {
         };
         assert_eq!(constant.packet_size_bytes, identity.chunk_bytes);
         let delay = locality
-            .nvlink_message_delay_ns(identity.chunk_bytes, identity.chunk_bytes, 9_000)
+            .nvlink_message_delay_ns(identity.chunk_bytes, 1, 9_000)
             .expect("delay");
         assert_eq!(constant.interval_ns + constant.first_departure_ns, delay);
         assert!(constant.interval_ns >= 1);

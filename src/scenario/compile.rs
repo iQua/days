@@ -4074,10 +4074,11 @@ impl NotifyLowering {
             if !locality.same_server(source, target) {
                 continue;
             }
-            // Today's expansions send one message per rank and step, so the sender's NVLink port
-            // carries this chunk alone; a multi-channel expansion passes the port's step bytes.
+            // Today's expansions are single-channel rings that span servers: an intra-server hop
+            // runs alone on the sender's NVLink port (concurrency 1, the ruled value for such
+            // hops); a multi-channel or all-to-all expansion supplies its own concurrency.
             let delay = locality
-                .nvlink_message_delay_ns(stage.chunk_bytes, stage.chunk_bytes, packet_size)
+                .nvlink_message_delay_ns(stage.chunk_bytes, 1, packet_size)
                 .ok_or_else(|| {
                     CompileError::Invalid(format!(
                         "NVLink delay of a {}-byte message from host {source} to host {target} \

@@ -354,23 +354,30 @@ impl ServerLocality {
             && self.server_of(left) == self.server_of(right)
     }
 
-    /// Delay of one same-server message of `bytes` (ruling H2-3, with concurrency).
+    /// Delay of one same-server message of `bytes` sent while `concurrency` equal messages
+    /// (this one included) share the sender's NVLink port (ruling H2-3, with concurrency).
     ///
     /// SimAI sends it through the server's NVSwitch: two NVLink hops of `nvlink_delay_ns`, the
-    /// sender's port serializing everything it carries in that step (`port_bytes`, which the
-    /// collective expansion supplies and which includes this message), and the NVSwitch
-    /// storing and forwarding the last packet (at most one MTU) once more:
-    /// `2·p + ceil(8·port_bytes·1e9 / r) + ceil(8·min(bytes, mtu)·1e9 / r)`.
-    /// `None` when `port_bytes < bytes`, `bytes == 0`, `mtu == 0`, or on overflow.
-    pub fn nvlink_message_delay_ns(&self, bytes: u64, port_bytes: u64, mtu: u64) -> Option<u64> {
-        if bytes == 0 || mtu == 0 || port_bytes < bytes {
+    /// sender's port serializing all `concurrency` messages, and the NVSwitch storing and
+    /// forwarding the last packet (at most one MTU) once more:
+    /// `2·p + ceil(8·k·bytes·1e9 / r) + ceil(8·min(bytes, mtu)·1e9 / r)`, with `r` the fabric's
+    /// own NVLink rate. The collective lowering supplies `k` per message (orchestrator ruling,
+    /// from the N1 SimAI comparison): the channel count for a collective inside one server, whose
+    /// channels start together; 1 for an intra-server hop of a ring that spans servers, whose
+    /// channels each wait on their own inter-server hop; and the number of intra-server peer sends
+    /// started at the same release for an all-to-all. SimAI's per-message start latency
+    /// (`AS_SEND_LAT`) is not modelled (a recorded divergence). `None` when `bytes`, `concurrency`
+    /// or `mtu` is zero, or on overflow.
+    pub fn nvlink_message_delay_ns(&self, bytes: u64, concurrency: u64, mtu: u64) -> Option<u64> {
+        if bytes == 0 || concurrency == 0 || mtu == 0 {
             return None;
         }
+        let port_bytes = u128::from(bytes) * u128::from(concurrency);
         let rate = u128::from(self.profile.nvlink_rate_bps);
-        let serialize = |bytes: u64| (u128::from(bytes) * 8 * NANOS_PER_SECOND).div_ceil(rate);
+        let serialize = |bytes: u128| (bytes * 8 * NANOS_PER_SECOND).div_ceil(rate);
         let total = 2 * u128::from(self.profile.nvlink_delay_ns)
             + serialize(port_bytes)
-            + serialize(bytes.min(mtu));
+            + serialize(u128::from(bytes.min(mtu)));
         u64::try_from(total).ok()
     }
 
@@ -388,11 +395,7 @@ impl ServerLocality {
         channels: u64,
         mtu: u64,
     ) -> Option<u64> {
-        if channels == 0 {
-            return None;
-        }
-        let port_bytes = message_bytes.checked_mul(channels)?;
-        steps.checked_mul(self.nvlink_message_delay_ns(message_bytes, port_bytes, mtu)?)
+        steps.checked_mul(self.nvlink_message_delay_ns(message_bytes, channels, mtu)?)
     }
 
     /// SimAI's window `maxBdp` (`HAS_WIN 1`, `GLOBAL_T 1`): the largest bandwidth-delay product

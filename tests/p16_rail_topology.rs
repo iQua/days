@@ -175,18 +175,24 @@ fn nvlink_message_delay_follows_the_ruled_formula() {
     assert!(!locality.same_server(3, 3));
     // A 2,097,152 B all-to-all chunk, alone on the port: 50 + ceil(5825.42) + 25 (one MTU).
     assert_eq!(
-        locality.nvlink_message_delay_ns(2_097_152, 2_097_152, 9_000),
+        locality.nvlink_message_delay_ns(2_097_152, 1, 9_000),
         Some(5_901)
     );
     // Three such chunks on the port at once (the flagship's intra-server all-to-all peers).
     assert_eq!(
-        locality.nvlink_message_delay_ns(2_097_152, 3 * 2_097_152, 9_000),
+        locality.nvlink_message_delay_ns(2_097_152, 3, 9_000),
         Some(17_552)
     );
     // A one-byte message: 50 + 1 + 1.
     assert_eq!(locality.nvlink_message_delay_ns(1, 1, 9_000), Some(52));
-    assert_eq!(locality.nvlink_message_delay_ns(2, 1, 9_000), None);
+    assert_eq!(locality.nvlink_message_delay_ns(2, 0, 9_000), None);
     assert_eq!(locality.nvlink_message_delay_ns(0, 1, 9_000), None);
+    // The rate is the fabric's own: on the 128g A100 file NVLink runs at 2,400 Gb/s.
+    let a100 = ServerLocality::new(RailTopology::new(&shape_128g()).unwrap().profile());
+    assert_eq!(
+        a100.nvlink_message_delay_ns(2_097_152, 1, 9_000),
+        Some(50 + 6_991 + 30)
+    );
     // A TP2 AllGather of 16,777,216 B on one server: SimAI's ring has 2 channels and 1 step, each
     // message 4,194,304 B; the port carries both channels' messages: 50 + ceil(8,388,608 x 8 /
     // 2,880) + 25.
