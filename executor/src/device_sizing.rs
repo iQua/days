@@ -565,7 +565,9 @@ pub fn size_default_device_plan(
         crate::stage_sizing::charge(
             &mut queue_capacities,
             &mut queue_charges,
-            group,
+            concurrency
+                .as_ref()
+                .and_then(|concurrency| concurrency.host_queue_group(flow_index)),
             source_slot,
             crate::stage_sizing::CLASS_DATA,
             window.map_or(context.source_queue_bounds[flow_index], |window| {

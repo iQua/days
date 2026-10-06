@@ -1875,7 +1875,9 @@ impl MetalPlan {
             crate::stage_sizing::charge(
                 &mut queue_caps,
                 &mut queue_charges,
-                group,
+                concurrency
+                    .as_ref()
+                    .and_then(|concurrency| concurrency.host_queue_group(flow_index)),
                 source_slot,
                 crate::stage_sizing::CLASS_DATA,
                 window.map_or_else(

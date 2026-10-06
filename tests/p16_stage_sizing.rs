@@ -242,28 +242,48 @@ fn plane_words(report: &DeviceSizingReport, name: &str) -> usize {
 }
 
 /// Ruling G7: a host's stages run one chain at a time, so lengthening the chain must not grow the
-/// remote-staging or host-queue arenas. Three chained AllGathers plan exactly what one plans
-/// (`2 × leaves × max` per host and slot, with one leaf per host and equal per-stage bounds); the
-/// summed bound grew threefold.
+/// remote-staging arena. Three chained AllGathers plan exactly what one plans (`2 × leaves × max`
+/// per host and slot, with one leaf per host and equal per-stage bounds); the summed bound grew
+/// threefold. The host queue follows the same rule for windowed pairs (ruling G8). Windowless
+/// pairs on a class their host can pause, as here, keep their summed host-queue charge (fix
+/// round 1, review F1), so that arena grows with the chain.
 #[test]
 fn a_longer_stage_chain_plans_no_more_staging_or_queue() {
-    let one = compile_text(&chained_roce_rings(4, 1, 0));
-    let three = compile_text(&chained_roce_rings(4, 3, 0));
-    let mut plans = vec![(
-        "projection",
-        size_default_device_plan(&one).expect("projection"),
-        size_default_device_plan(&three).expect("projection"),
-    )];
-    for ((backend, one), (_, three)) in exact_plans(&one).into_iter().zip(exact_plans(&three)) {
-        plans.push((backend, one, three));
-    }
-    for (backend, one, three) in plans {
-        for plane in ["remote_staging", "queue_records"] {
+    for window_bytes in [0, 20_000] {
+        let one = compile_text(&chained_roce_rings(4, 1, window_bytes));
+        let three = compile_text(&chained_roce_rings(4, 3, window_bytes));
+        let mut plans = vec![(
+            "projection",
+            size_default_device_plan(&one).expect("projection"),
+            size_default_device_plan(&three).expect("projection"),
+        )];
+        for ((backend, one), (_, three)) in exact_plans(&one).into_iter().zip(exact_plans(&three)) {
+            plans.push((backend, one, three));
+        }
+        for (backend, one, three) in plans {
             assert_eq!(
-                plane_words(&three, plane),
-                plane_words(&one, plane),
-                "{backend}: three chained collectives must plan the {plane} of one"
+                plane_words(&three, "remote_staging"),
+                plane_words(&one, "remote_staging"),
+                "{backend} window {window_bytes}: three chained collectives must plan the \
+                 remote staging of one"
             );
+            let (queue_one, queue_three) = (
+                plane_words(&one, "queue_records"),
+                plane_words(&three, "queue_records"),
+            );
+            if window_bytes == 0 {
+                assert!(
+                    queue_three > queue_one,
+                    "{backend}: paused windowless stage pairs keep their summed host queue \
+                     ({queue_three} vs {queue_one} words)"
+                );
+            } else {
+                assert_eq!(
+                    queue_three, queue_one,
+                    "{backend} window {window_bytes}: three chained collectives must plan the \
+                     host queue of one"
+                );
+            }
         }
     }
 }
