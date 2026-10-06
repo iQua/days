@@ -571,10 +571,19 @@ fn validate_backend_capabilities(
     // P15 lane R4: both device backends run RoCE queue pairs, host-link PFC and a feedback class
     // apart from the data class (`evidence/P15/device-design.md`), so none needs a refusal here.
     //
-    if !image.stage_joins.is_empty() {
-        return Err(ValidationError::new(format!(
-            "backend {backend} does not support stage joins; use Scalar or Cpu"
-        )));
+    // P16 H1: both device backends count stage joins, up to 65,535 local predecessors per stage;
+    // an image without a join has nothing to check.
+    for stage in image
+        .host_states
+        .iter()
+        .filter(|_| !image.stage_joins.is_empty())
+        .flat_map(|state| state.stages.iter().flatten())
+    {
+        if stage.dependencies.local.count() > 0xffff {
+            return Err(ValidationError::new(format!(
+                "backend {backend} counts at most 65535 local predecessors of a stage"
+            )));
+        }
     }
     for queue in image.switch_states.iter().flat_map(|state| &state.queues) {
         match queue.drop_mark {

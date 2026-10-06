@@ -1243,7 +1243,8 @@ pub(crate) fn roce_region_words(image: &SimulationImage) -> Result<usize, Device
 pub(crate) const STAGE_ROW_WORDS: usize = 5;
 
 /// Words of the stage region before the RoCE region (`device_stage::encode_stage_region`): a row
-/// per flow, then one successor entry per local and per inbound predecessor; zero without stages.
+/// per flow, then one successor entry per local and per inbound predecessor, and one credit word
+/// per inbound predecessor of an inbound join; zero without stages.
 pub(crate) fn stage_region_words(image: &SimulationImage) -> Result<usize, DeviceSizingError> {
     if image
         .host_states
@@ -1260,12 +1261,26 @@ pub(crate) fn stage_region_words(image: &SimulationImage) -> Result<usize, Devic
             stage.dependencies.local.count() as usize + stage.dependencies.inbound.count() as usize
         })
         .fold(0_usize, usize::saturating_add);
+    // Without an inbound join no flow carries a credit word, and nothing is collected.
+    let mut credited = Vec::new();
+    for stage in image
+        .host_states
+        .iter()
+        .flat_map(|state| state.stages.iter().flatten())
+    {
+        if let crate::StagePredecessors::Join { .. } = stage.dependencies.inbound {
+            credited.extend(stage.dependencies.inbound.iter(&image.stage_joins));
+        }
+    }
+    credited.sort_unstable();
+    credited.dedup();
     checked_product(
         image.flows.len().max(1),
         STAGE_ROW_WORDS,
         "stage region rows",
     )?
     .checked_add(successors)
+    .and_then(|words| words.checked_add(credited.len()))
     .ok_or_else(|| sizing_error("stage region overflows usize"))
 }
 

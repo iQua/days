@@ -159,6 +159,15 @@ constexpr ulong SR_INBOUND_COMPLETE = 2;
 constexpr ulong SR_HAS_LOCAL = 16;
 constexpr ulong SR_HAS_INBOUND = 32;
 constexpr ulong SR_IS_STAGE = 64;
+// P16 H1: joins. A local join counts its predecessors in flags bits 32..47 (complete) and 48..63
+// (required); an inbound join sums its predecessors' advances, each predecessor of one keeping
+// its last credited frontier in the word before its inbound list; a flow whose completion was
+// credited to its local successors carries SR_LOCAL_CREDITED.
+constexpr ulong SR_LOCAL_JOIN = 128;
+constexpr ulong SR_INBOUND_JOIN = 256;
+constexpr ulong SR_LOCAL_CREDITED = 512;
+constexpr ulong SR_INBOUND_CREDIT = 1024;
+constexpr ulong SR_JOIN_ONE = 1ul << 32;
 constexpr uint PFC_ROW_HEADER_WORDS = 5;
 constexpr uint PFC_INGRESS_WORDS = 43;
 constexpr uint PI_LINK = 0;
@@ -5721,8 +5730,25 @@ __device__ __forceinline__ bool stage_after_event(
         if (!complete) {
             return true;
         }
+        // A completion is credited once: later ACKs of a finished flow count nothing.
+        ulong *own = tcp_state + region + flow * STAGE_ROW_WORDS + SR_FLAGS;
+        if ((*own & SR_LOCAL_CREDITED) != 0) {
+            return true;
+        }
+        *own |= SR_LOCAL_CREDITED;
     }
     ulong successors = region + (list >> 32);
+    // The advance of this flow's frontier since it was last credited, for its inbound joins.
+    ulong advance = 0;
+    if (inbound && (tcp_state[region + flow * STAGE_ROW_WORDS + SR_FLAGS] & SR_INBOUND_CREDIT) != 0) {
+        ulong *credit = tcp_state + successors - 1;
+        if (frontier < *credit) {
+            set_semantic_error(error, 101, node);
+            return false;
+        }
+        advance = frontier - *credit;
+        *credit = frontier;
+    }
     for (ulong index = 0; index < count; ++index) {
         ulong successor = tcp_state[successors + index];
         if (successor >= params[P_FLOW_COUNT]) {
@@ -5732,22 +5758,39 @@ __device__ __forceinline__ bool stage_after_event(
         ulong *stage = tcp_state + region + successor * STAGE_ROW_WORDS;
         ulong flags = stage[SR_FLAGS];
         if (inbound) {
-            if ((flags & SR_HAS_INBOUND) == 0 || (flags & SR_INBOUND_COMPLETE) != 0 ||
-                frontier == stage[SR_INBOUND_RECEIVED]) {
+            if ((flags & SR_HAS_INBOUND) == 0 || (flags & SR_INBOUND_COMPLETE) != 0) {
                 continue;
             }
-            if (frontier < stage[SR_INBOUND_RECEIVED] || frontier > stage[SR_INBOUND_REQUIRED]) {
+            // A single predecessor's count is its frontier; a join adds each one's advance.
+            ulong received = (flags & SR_INBOUND_JOIN) != 0
+                ? stage[SR_INBOUND_RECEIVED] + advance : frontier;
+            if (received == stage[SR_INBOUND_RECEIVED]) {
+                continue;
+            }
+            if (received < stage[SR_INBOUND_RECEIVED] || received > stage[SR_INBOUND_REQUIRED]) {
                 set_semantic_error(error, 101, node);
                 return false;
             }
-            stage[SR_INBOUND_RECEIVED] = frontier;
-            if (frontier != stage[SR_INBOUND_REQUIRED]) {
+            stage[SR_INBOUND_RECEIVED] = received;
+            if (received != stage[SR_INBOUND_REQUIRED]) {
                 continue;
             }
             flags |= SR_INBOUND_COMPLETE;
         } else {
             if ((flags & SR_HAS_LOCAL) == 0 || (flags & SR_LOCAL_COMPLETE) != 0) {
                 continue;
+            }
+            if ((flags & SR_LOCAL_JOIN) != 0) {
+                flags += SR_JOIN_ONE;
+                ulong completed = (flags >> 32) & 0xfffful;
+                if (completed > (flags >> 48)) {
+                    set_semantic_error(error, 100, node);
+                    return false;
+                }
+                if (completed != (flags >> 48)) {
+                    stage[SR_FLAGS] = flags;
+                    continue;
+                }
             }
             flags |= SR_LOCAL_COMPLETE;
         }
