@@ -82,11 +82,16 @@ fn encode_row(stage: CollectiveStage, row: &mut [u64]) {
 }
 
 /// The whole region of `image`: rows, then the successor array; empty without stages.
+/// `has_stages` is [`image_has_stages`], decided once by the planner (P16 G2).
 ///
 /// Fails when an offset or count does not fit the 32-bit halves of a list word, or a predecessor
 /// names a flow outside the image (both rejected before upload, never truncated).
-pub(crate) fn encode_stage_region(image: &SimulationImage) -> Result<Vec<u64>, &'static str> {
-    if !image_has_stages(image) {
+pub(crate) fn encode_stage_region(
+    image: &SimulationImage,
+    has_stages: bool,
+) -> Result<Vec<u64>, &'static str> {
+    debug_assert_eq!(has_stages, image_has_stages(image));
+    if !has_stages {
         return Ok(Vec::new());
     }
     let flow_count = image.flows.len().max(1);
@@ -144,12 +149,13 @@ pub(crate) fn encode_stage_region(image: &SimulationImage) -> Result<Vec<u64>, &
 }
 
 /// Appends the stage region to `tcp_state` and returns its start, or `None` (nothing appended)
-/// when no host carries a stage.
+/// when no host carries a stage (`has_stages`, decided once by the planner).
 pub(crate) fn append_stage_region(
     image: &SimulationImage,
+    has_stages: bool,
     tcp_state: &mut Vec<u64>,
 ) -> Result<Option<usize>, &'static str> {
-    let region = encode_stage_region(image)?;
+    let region = encode_stage_region(image, has_stages)?;
     if region.is_empty() {
         return Ok(None);
     }
@@ -370,7 +376,7 @@ mod tests {
     #[test]
     fn the_region_lays_out_rows_and_ascending_successor_lists() {
         let image = image();
-        let region = encode_stage_region(&image).unwrap();
+        let region = encode_stage_region(&image, true).unwrap();
         assert_eq!(region.len(), 7 * STAGE_ROW_WORDS + 4);
         // The host projection's size of the region (P16 G2).
         assert_eq!(
@@ -396,20 +402,20 @@ mod tests {
         for state in &mut stageless.host_states {
             state.stages.clear();
         }
-        assert_eq!(encode_stage_region(&stageless), Ok(Vec::new()));
+        assert_eq!(encode_stage_region(&stageless, false), Ok(Vec::new()));
         assert_eq!(stage_row_words(&stageless), 0);
         assert_eq!(crate::device_sizing::stage_region_words(&stageless), Ok(0));
         let mut words = vec![9_u64];
-        assert_eq!(append_stage_region(&stageless, &mut words), Ok(None));
+        assert_eq!(append_stage_region(&stageless, false, &mut words), Ok(None));
         assert_eq!(words, vec![9]);
-        assert_eq!(append_stage_region(&image, &mut words), Ok(Some(1)));
+        assert_eq!(append_stage_region(&image, true, &mut words), Ok(Some(1)));
         assert_eq!(&words[1..], &region[..]);
     }
 
     #[test]
     fn decoding_restores_forward_progress_and_derives_activation() {
         let image = image();
-        let mut rows = encode_stage_region(&image).unwrap()[..7 * STAGE_ROW_WORDS].to_vec();
+        let mut rows = encode_stage_region(&image, true).unwrap()[..7 * STAGE_ROW_WORDS].to_vec();
         let mut decoded = image.host_states.clone();
         decode_stage_rows(&rows, &image, &mut decoded).unwrap();
         assert_eq!(
@@ -443,7 +449,7 @@ mod tests {
     #[test]
     fn corrupt_or_backward_rows_are_rejected() {
         let image = image();
-        let rows = encode_stage_region(&image).unwrap()[..7 * STAGE_ROW_WORDS].to_vec();
+        let rows = encode_stage_region(&image, true).unwrap()[..7 * STAGE_ROW_WORDS].to_vec();
         let corrupt = |mutate: &dyn Fn(&mut Vec<u64>)| {
             let mut rows = rows.clone();
             mutate(&mut rows);
