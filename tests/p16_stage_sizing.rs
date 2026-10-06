@@ -230,3 +230,92 @@ fn a_longer_stage_chain_plans_no_more_staging_or_queue() {
         }
     }
 }
+
+/// `configs/p15/hostpfc_multi_qp_tcp.toml` with a window on every queue pair: three pairs on host
+/// 1 (and one each on hosts 2 and 3, beside host 2's TCP flow) pace 1 Gb/s each into a 1 Gb/s host
+/// link, so host 1's queue grows until the windows bind (ruling G8).
+fn windowed_multi_qp(window_bytes: u64) -> SimulationImage {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("configs/p15/hostpfc_multi_qp_tcp.toml");
+    let config = std::fs::read_to_string(&path).expect("fixture must read");
+    let windowed = config.replace(
+        "feedback_priority = 0\n",
+        &format!("feedback_priority = 0\nwindow_bytes = {window_bytes}\n"),
+    );
+    assert_eq!(
+        windowed.matches("window_bytes").count(),
+        5,
+        "every queue pair has a window"
+    );
+    compile_text(&windowed)
+}
+
+/// Capacity retries of the default device plan (design note §5.2), MEASURED on Metal (M5 Max) and
+/// CUDA (sim, RTX A4500): the windowed pairs' host queues now hold their windows from the start,
+/// and the windowless P15 image keeps its eight queue retries (ruling G8 leaves it as it was).
+#[allow(dead_code)]
+const PINNED_RETRIES: &[(&str, usize)] = &[
+    ("hostpfc_multi_qp_window_50000", 0),
+    ("hostpfc_multi_qp_tcp", 8),
+];
+
+#[allow(dead_code)]
+fn retry_images() -> Vec<(&'static str, SimulationImage)> {
+    vec![
+        ("hostpfc_multi_qp_window_50000", windowed_multi_qp(50_000)),
+        (
+            "hostpfc_multi_qp_tcp",
+            lower("configs/p15/hostpfc_multi_qp_tcp.toml"),
+        ),
+    ]
+}
+
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
+mod metal {
+    use days_executor::{MetalConfig, ObservationMode, run_metal_with_observations, run_scalar};
+
+    #[test]
+    fn metal_windowed_queue_pairs_plan_their_windows_and_pin_their_retries() {
+        let mut retries = Vec::new();
+        for (name, image) in super::retry_images() {
+            let run = run_metal_with_observations(
+                &image,
+                None,
+                MetalConfig::default(),
+                ObservationMode::Summary,
+            )
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let mut expected = run_scalar(&image, None).expect("scalar oracle must run");
+            expected.diagnostics = None;
+            assert_eq!(run.result, expected, "{name}: Metal must equal Scalar");
+            retries.push((name, run.capacity_retry_trace.len()));
+        }
+        eprintln!("record=window_retries backend=metal {retries:?}");
+        assert_eq!(retries, super::PINNED_RETRIES);
+    }
+}
+
+#[cfg(feature = "cuda")]
+mod cuda {
+    use days_executor::{CudaConfig, ObservationMode, run_cuda_with_observations, run_scalar};
+
+    #[test]
+    fn cuda_windowed_queue_pairs_plan_their_windows_and_pin_their_retries() {
+        let mut retries = Vec::new();
+        for (name, image) in super::retry_images() {
+            let run = run_cuda_with_observations(
+                &image,
+                None,
+                CudaConfig::default(),
+                ObservationMode::Summary,
+            )
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+            let mut expected = run_scalar(&image, None).expect("scalar oracle must run");
+            expected.diagnostics = None;
+            assert_eq!(run.result, expected, "{name}: CUDA must equal Scalar");
+            retries.push((name, run.capacity_retry_trace.len()));
+        }
+        eprintln!("record=window_retries backend=cuda {retries:?}");
+        assert_eq!(retries, super::PINNED_RETRIES);
+    }
+}
