@@ -72,10 +72,6 @@ pub(crate) struct SizingConcurrency {
     /// the image has no windowed queue pair.
     window_packets: Vec<usize>,
     /// Whether any host carries a stage (the stage region is planned exactly then).
-    #[cfg_attr(
-        not(any(feature = "cuda", all(feature = "metal", target_vendor = "apple"))),
-        allow(dead_code)
-    )]
     has_stages: bool,
 }
 
@@ -160,10 +156,6 @@ impl SizingConcurrency {
     }
 
     /// Whether any host carries a stage.
-    #[cfg_attr(
-        not(any(feature = "cuda", all(feature = "metal", target_vendor = "apple"))),
-        allow(dead_code)
-    )]
     pub(crate) fn has_stages(&self) -> bool {
         self.has_stages
     }
@@ -349,10 +341,10 @@ mod tests {
         }
     }
 
-    /// Host A (node 0) owns flow 0 (a finished root), flows 1 and 4 (both after 0), flow 7 (after
-    /// 1) and flow 5 (no stage): its unfinished stages 1, 4, 7 form two chains, 1 -> 7 and 4.
-    /// Host B (node 1) owns flow 2 (a running root) and flow 3 (after 2): one chain. Host C owns
-    /// flow 6 and no stage.
+    /// Host A (node 0) owns flow 0 (a finished root), flows 1 and 4 (both after flow 0), flow 7
+    /// (after flow 1) and flow 5 (no stage): its unfinished stages 1, 4 and 7 form two chains,
+    /// 1 -> 7 and 4. Host B (node 1) owns flow 2 (a running root) and flow 3 (after flow 2): one
+    /// chain. Host C owns flow 6 and no stage.
     fn image() -> SimulationImage {
         use GeneratorStatus::{Blocked, Finished, Scheduled};
         let a = host(

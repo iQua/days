@@ -809,7 +809,10 @@ pub fn size_default_device_plan(
         .collect::<Result<Vec<_>, DeviceSizingError>>()?;
     // Both planners allocate `tcp_state` for every image (P16 G2: an image without TCP still
     // carries its receiver and ledger rows, and its stage and RoCE regions live there).
-    let tcp_words = packed_tcp_state_words(image, &flow_data_counts, &context)?;
+    let has_stages = concurrency
+        .as_ref()
+        .is_some_and(|concurrency| concurrency.has_stages());
+    let tcp_words = packed_tcp_state_words(image, has_stages, &flow_data_counts, &context)?;
     planes.push(DevicePlaneSizing {
         index: planes.len(),
         name: "tcp_state",
@@ -1129,6 +1132,7 @@ fn flow_packet_counts(
 
 fn packed_tcp_state_words(
     image: &SimulationImage,
+    has_stages: bool,
     data_counts: &[usize],
     context: &CapacityContext,
 ) -> Result<usize, DeviceSizingError> {
@@ -1198,7 +1202,12 @@ fn packed_tcp_state_words(
             .ok_or_else(|| sizing_error("TCP state plane overflows usize"))
     })?
     .max(1);
-    [stage_region_words(image)?, roce_region_words(image)?]
+    let stage_words = if has_stages {
+        stage_region_words(image)?
+    } else {
+        0
+    };
+    [stage_words, roce_region_words(image)?]
         .into_iter()
         .try_fold(packed, |total, words| {
             total
