@@ -1145,18 +1145,12 @@ fn validate_pfc(image: &SimulationImage) -> Result<BTreeSet<usize>, ValidationEr
                 }
                 let reachable_frame_bytes = derived_pfc_max_frame_bytes(image, controlled.id)?;
 
-                let reaction_ns = u128::from(controlled.propagation_ns)
-                    .checked_add(u128::from(reverse_delay))
-                    .ok_or_else(|| ValidationError::new("PFC reaction window overflows u128"))?;
-                let line_numerator = u128::from(controlled.rate_bps)
-                    .checked_mul(reaction_ns)
-                    .ok_or_else(|| {
-                        ValidationError::new("PFC line-rate headroom product overflows u128")
-                    })?;
-                let line_bytes = line_numerator
-                    .checked_add(8_000_000_000_u128 - 1)
-                    .ok_or_else(|| ValidationError::new("PFC headroom rounding overflows u128"))?
-                    / 8_000_000_000_u128;
+                let line_bytes = pfc_line_rate_bytes(
+                    controlled.rate_bps,
+                    controlled.propagation_ns,
+                    reverse_delay,
+                )
+                .map_err(ValidationError::new)?;
                 let mut derived_occupancy = [0_u64; 8];
                 for payload in &queue.queue {
                     let packet = packet(image, *payload)
@@ -1244,16 +1238,8 @@ fn validate_pfc(image: &SimulationImage) -> Result<BTreeSet<usize>, ValidationEr
                         )));
                     }
                     let available = u128::from(capacity - xoff);
-                    let required_headroom = if maximum_frame == 0 {
-                        0
-                    } else {
-                        u128::from(maximum_frame - 1)
-                            .checked_add(line_bytes)
-                            .and_then(|value| value.checked_add(u128::from(maximum_frame)))
-                            .ok_or_else(|| {
-                                ValidationError::new("PFC required headroom overflows u128")
-                            })?
-                    };
+                    let required_headroom = pfc_required_headroom_bytes(maximum_frame, line_bytes)
+                        .map_err(ValidationError::new)?;
                     if available < required_headroom {
                         return Err(ValidationError::new(format!(
                             "switch node {:?} queue {queue_index} PFC priority {priority} has {available} bytes of headroom, below derived requirement {required_headroom}",
@@ -1373,6 +1359,42 @@ fn host_class_paused(image: &SimulationImage, owner: NodeId, priority: u8) -> bo
                 .as_deref()
         })
         .is_some_and(|pfc| pfc.is_paused(usize::from(priority)))
+}
+
+/// The bytes a link can put on the wire during a PFC reaction window: one controlled-link
+/// propagation plus the reverse link's 64-byte pause-frame delay, at the controlled link's rate,
+/// rounded up. The first term of [`pfc_required_headroom_bytes`].
+pub fn pfc_line_rate_bytes(
+    controlled_rate_bps: u64,
+    controlled_propagation_ns: u64,
+    reverse_pause_delay_ns: u64,
+) -> Result<u128, &'static str> {
+    let reaction_ns = u128::from(controlled_propagation_ns)
+        .checked_add(u128::from(reverse_pause_delay_ns))
+        .ok_or("PFC reaction window overflows u128")?;
+    let line_numerator = u128::from(controlled_rate_bps)
+        .checked_mul(reaction_ns)
+        .ok_or("PFC line-rate headroom product overflows u128")?;
+    Ok(line_numerator
+        .checked_add(8_000_000_000_u128 - 1)
+        .ok_or("PFC headroom rounding overflows u128")?
+        / 8_000_000_000_u128)
+}
+
+/// The headroom above XOFF that validation requires of a PFC ingress priority whose largest
+/// reachable frame is `maximum_frame_bytes`: a frame already started when XOFF is crossed, the
+/// line-rate bytes of the reaction window ([`pfc_line_rate_bytes`]), and one more frame.
+pub fn pfc_required_headroom_bytes(
+    maximum_frame_bytes: u64,
+    line_rate_bytes: u128,
+) -> Result<u128, &'static str> {
+    if maximum_frame_bytes == 0 {
+        return Ok(0);
+    }
+    u128::from(maximum_frame_bytes - 1)
+        .checked_add(line_rate_bytes)
+        .and_then(|value| value.checked_add(u128::from(maximum_frame_bytes)))
+        .ok_or("PFC required headroom overflows u128")
 }
 
 /// The queue pairs a host's parked list must hold, by class: each queue pair whose data class is
