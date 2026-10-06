@@ -86,23 +86,89 @@ jobs:
       - name: Audit crate and feature boundaries
         run: cargo xtask audit
 
-  test:
+  # The debug test matrix runs as parallel `test-shard` jobs; .github/test-shards.sh holds the
+  # layout and checks it against `cargo metadata`, so every target that the old four
+  # `cargo test -p <package>` lines built or ran belongs to exactly one shard. This job prints the
+  # layout and hands the shard names to the matrix, so a shard added to the script cannot be left
+  # out of CI. It runs alongside lint and needs no build.
+  test-plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 75
-    needs: [changes, lint]
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.lint.result == 'success' }}
+    timeout-minutes: 10
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
 
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
 
-      - name: Run partitioned default test matrix
+      - name: Check the shard layout covers every test target once
+        id: plan
+        shell: bash
         run: |
-          cargo test -p days-executor -- --show-output
-          cargo test -p days --features test -- --show-output
-          cargo test -p days-legacy --features test -- --show-output
-          cargo test -p days-validation --features test -- --show-output
+          shards=$(.github/test-shards.sh plan)
+          echo "shards=$shards" >> "$GITHUB_OUTPUT"
+
+  test-shard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    needs: [changes, lint, test-plan]
+    # GitHub evaluates this `if` before expanding the matrix, so a skipped plan (docs-only pull
+    # request, lint failure) never feeds an empty list to fromJSON.
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' && needs.lint.result == 'success' && needs.test-plan.result == 'success' }}
+    strategy:
+      # Run every shard to the end, so one failure does not cancel and hide the others.
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.test-plan.outputs.shards) }}
+
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      # Each shard warms its own cache: the matrix entries share one job id, so without `key`
+      # they would race to save a single entry holding whichever shard's dependencies finished
+      # first.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.shard }}
+
+      - name: Run test shard ${{ matrix.shard }}
+        shell: bash
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: .github/test-shards.sh run "$SHARD"
+
+  # The required `test` check. It passes when every shard passed, or when the shards were skipped
+  # because the pull request changes only docs/**, logs/** or **.md; anything else fails: a shard
+  # that failed, was cancelled or timed out, or shards skipped by a failed lint or layout check.
+  # `always()` rather than `!cancelled()`: a skipped job satisfies a required check, so this job
+  # must always conclude. With `!cancelled()` a cancelled head run would leave `test` skipped,
+  # which reads as passing; with `always()` it fails instead (superseded runs cancelled by the
+  # concurrency group also show a failed `test`, which no ruleset reads).
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [changes, test-shard]
+    if: ${{ always() }}
+
+    steps:
+      - name: Require every test shard to pass
+        shell: bash
+        env:
+          CODE: ${{ needs.changes.outputs.code }}
+          SHARDS: ${{ needs.test-shard.result }}
+        run: |
+          echo "changes.code=$CODE test-shard.result=$SHARDS"
+          if [ "$SHARDS" = success ]; then
+            exit 0
+          fi
+          if [ "$CODE" = false ] && [ "$SHARDS" = skipped ]; then
+            echo "Docs-only change: the test shards were skipped."
+            exit 0
+          fi
+          echo "::error::test shards did not all pass (result: $SHARDS)"
+          exit 1
 
   examples:
     runs-on: ubuntu-latest
