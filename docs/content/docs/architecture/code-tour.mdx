@@ -48,7 +48,7 @@ Parallel execution:
 - `executor/src/device_scheduler.rs`: checked device scheduler arithmetic.
 - `executor/src/planner_capacity.rs`: planner capacity context shared by device paths.
 
-Mechanism-specific exact state and traces live in `executor/src/tcp.rs`, `tcp_ledger.rs`, `dcqcn.rs`, `aqm_trace.rs`, `mechanism_trace.rs`, and `tcp_trace.rs`.
+Mechanism-specific exact state and traces live in `executor/src/tcp.rs`, `tcp_ledger.rs`, `dcqcn.rs`, `roce.rs`, `aqm_trace.rs`, `mechanism_trace.rs`, and `tcp_trace.rs`.
 
 The largest committed fixture, the closed 262,144-flow `configs/benchmarks/lookahead/rq9_frontier_closed_k32.toml`, runs through the same `days` CLI as every other scenario.
 

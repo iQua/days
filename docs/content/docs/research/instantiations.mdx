@@ -25,14 +25,14 @@ The Lean build (`lean/lakefile.lean`) currently carries:
   DCQCN, PFC, CUBIC, DRR, WFQ, AQM/ECN.
 - **Days AGO families** (full `EventKey`): TCP (`tcp_check`), Static
   Priority (`sp_check`), and the `p10c_*` checkers for mechanisms, AQM,
-  DCQCN, and collectives.
+  DCQCN, collectives, and RoCE queue pairs.
 - **Cross-check**: `aqm_dcqcn_check` ties the legacy AQM and DCQCN
   vocabularies together.
 
 Backend capability boundaries apply to generation, not checking. Device
 runs do not return the diagnostic planes that hold transition records, so
-every Days AGO certificate family is produced by Scalar or CPU runs. PFC and
-DCQCN also run on Metal and CUDA, byte-identical to Scalar; RED and
+every Days AGO certificate family is produced by Scalar or CPU runs. PFC,
+DCQCN and RoCE queue pairs also run on Metal and CUDA, byte-identical to Scalar; RED and
 collective generators run on Scalar and CPU only and are rejected by the
 Metal/CUDA validator before execution.
 

@@ -114,6 +114,7 @@ Days AGO checkers:
 ./.lake/build/bin/p10c_mechanisms_check wrr <path/to/wrr_events.csv>
 ./.lake/build/bin/p10c_aqm_check <path/to/aqm_events.csv>
 ./.lake/build/bin/p10c_dcqcn_check <path/to/dcqcn_events.csv>
+./.lake/build/bin/p10c_dcqcn_check trace <path/to/dcqcn_events.csv> <path/to/dcqcn_cnp_arrivals.csv>
 ./.lake/build/bin/p10c_collective_check <path/to/collective_events.csv>
 ./.lake/build/bin/p10c_roce_check receiver <path/to/roce_receiver.csv>
 ./.lake/build/bin/p10c_roce_check sender <path/to/roce_sender.csv> <path/to/dcqcn.csv> \
@@ -135,10 +136,17 @@ format.
 - `receiver` checks each data arrival: the notification point, the in-order frontier, the ACK
   cadence, duplicates, and the NACK rate limit.
 - `sender` checks each pacing tick, ACK, NACK and timeout. It needs the DCQCN log of the same run,
-  because the controller's rate decides the sender's status, and a CNP or control tick recomputes
-  that status without a RoCE row. It also checks that every pending pacing tick, timeout and
-  control tick fires before any later event of the pair, and that a completed queue pair's control
-  tick is not re-armed.
+  because the controller's rate decides the sender's status. A queue pair's controller has no
+  events of its own: each of its transitions happens inside a sender transition, and its DCQCN
+  row carries that sender row's event key. The checker requires a DCQCN row at a sender row
+  exactly when the row is an ACK or NACK with `input_ce_echo = 1` on a pair that is not yet
+  complete (a `feedback` row), the ACK that completes the pair (an `advance` row with
+  `frozen = 1`; the controller then changes no more), or a row before whose bound a rate increase
+  or cut is due (an `advance` row). A tick's `rate_bps` must equal the controller's rate after
+  every instant due before `time_ns + 1`, and a window-blocked tick (`window_blocked = 1`, the
+  pair's unacknowledged bytes at or above its window) sends nothing, adds no credit and parks. It
+  also checks that every pending pacing tick and timeout fires before any later event of the
+  pair.
 - Host-link PFC (schema Amendments 1-3). A tick with `class_paused = 1` found the pair's data
   class (`data_class`) paused on its host: it must send nothing, add no credit and park the pacer.
   A `resume` row records a PFC RESUME restarting a pacer that a paused tick parked, on its next
@@ -163,14 +171,15 @@ format.
 - A queue pair whose first ticks find its class paused writes no rate until its first crediting
   tick. Until that tick, or the pair's first DCQCN row, reveals the rate, the checker compares
   every field exactly except a status that depends on the rate; each such status bounds the rate,
-  and the revealed rate must lie within the bounds.
+  and the revealed rate must lie within the bounds. While a pair's controller is pristine (no
+  DCQCN row yet), every rate its rows show must equal the sender log's `initial_rate_bps`.
 - `--horizon-ns <ns>` checks a prefix of a run: the logs must hold exactly the run's events with
   `time_ns < ns`. Pending events at or after the horizon need not have fired; stop decisions are
   still checked against the run's stop time.
 - `--collective <path>` (trace mode) joins the run's `collective_transitions_csv` to the queue-pair
   logs. A released RoCE collective stage's pair runs its first pacing tick at the release instant,
-  from the armed status the release row records, and its first control tick one control interval
-  later; a logged stage that is never released has no queue-pair rows; and a local completion
+  from the armed status the release row records; a logged stage that is never released has no
+  queue-pair rows; and a local completion
   caused by a RoCE pair shares its event key with that pair's ACK that brings its acknowledgment to
   the pair's total.
 
@@ -181,7 +190,9 @@ pair's packet at its PSN. A RoCE stage's rows carry its MTU; a compute stage aft
 collective carries the predecessor's MTU and pacing interval, which must equal a logged
 predecessor's.
 - `trace` runs both, then the cross-role checks. Every data arrival must be a packet the sender
-  emitted. Every ACK, NACK and CNP the sender applies must have been sent earlier by the receiver.
+  emitted. Every ACK or NACK the sender applies must have been sent earlier by the receiver, with
+  the same acknowledgment and the same ECN echo (`feedback_ce_echo` on the receiver row,
+  `input_ce_echo` on the sender row); a queue pair sends and receives no CNP.
 - `<stop_time_ns>` is the image's `stop_time_ns`. No CSV records it, and it decides whether a
   pacer's next tick is armed or stopped. With it, each decision is checked exactly, no row may lie
   after it, and no pending event at or before it may be left unfired at the end of the log.
@@ -194,6 +205,8 @@ Committed Days AGO certificate fixtures can be checked directly, for example:
 ```bash
 ./.lake/build/bin/p10c_aqm_check fixtures/p10c/aqm_executor_accept.csv
 ./.lake/build/bin/p10c_dcqcn_check fixtures/p10c/dcqcn_executor_trace_accept.csv
+./.lake/build/bin/p10c_dcqcn_check trace fixtures/p10c/dcqcn_cnp_join_t26_accept.dcqcn.csv \
+  fixtures/p10c/dcqcn_cnp_join_t26_accept.cnp.csv
 ./.lake/build/bin/p10c_mechanisms_check drr fixtures/p10c/drr_executor_accept.csv
 ./.lake/build/bin/p10c_collective_check fixtures/p10c/collective_allgather_executor_accept.csv
 ./.lake/build/bin/p10c_roce_check trace fixtures/p10c/roce_trace_timeout_executor_accept.sender.csv \
@@ -207,6 +220,68 @@ Committed Days AGO certificate fixtures can be checked directly, for example:
 The legacy checkers, `tcp_check`, and `sp_check` also accept
 `--coverage-out <path>`. `leanguard-run --coverage` uses that option and aggregates returned
 coverpoints. The `p10c_*` executables do not expose the coverage flag.
+
+## Days AGO DCQCN rows
+
+`p10c_dcqcn_check` replays `dcqcn_transitions_csv`: one row per controller transition of an
+unreliable DCQCN flow or a RoCE queue pair (schema: `days-gpu/plans/briefs/p16/dcqcn-schema.md`;
+Lean rules: `lean/LeanGuard/P10c/Dcqcn/Semantics.lean` and `DcqcnEventLog.lean`). The
+Mellanox-form controller owns no events, so each row sits at the event key of the flow transition
+that applied its timers, and `bound_ns` is the exclusive bound of the instants applied: the
+event's time at a feedback arrival (phase 0), one nanosecond later at a pacing tick or timeout
+(phase 1). The arithmetic is exact: a 63-bit fixed-point `alpha`, integer rates, one floor per
+update, a cut of `R - ceil(R * alpha / 2^64)`, and an average of `floor(R_C / 2) + floor(R_T / 2)`.
+
+- `feedback`: a CNP arrival at an unreliable flow, or an ACK or NACK with its ECN echo set at a
+  queue pair that is not complete after it. `after` must equal `on_feedback(before, time_ns)`.
+- `tick`: every pacing tick of an unreliable flow, emitting or not. `after` must equal
+  `materialize(before, time_ns + 1)`, and `after_current_rate_bps` is the rate the tick read.
+- `advance`: any other transition that applied a rate increase or a cut, or the ACK that
+  completes a queue pair.
+
+A row with `frozen = 1` (the completing ACK of a queue pair, or the `tick` that emits an unreliable
+flow's last byte) is replayed by `settle`, which applies the instants due before the bound and
+stops the controller; the flow has no later row.
+
+Each row's `before` must equal the flow's previous `after`; the first row's `before` is the pristine
+controller of the row's configuration. Rows must arrive in strictly increasing `EventKey` order.
+In `trace` mode the checker also reads `dcqcn_cnp_arrivals_csv` (`time_ns,flow_id,payload`, one
+row per CNP delivered to a reaction point): a CNP at or before its unreliable flow's freeze must
+be exactly one `feedback` row of that flow at its time; every `feedback` row of an unreliable flow
+must be such a CNP; and a CNP addressed to a flow without `tick` rows is rejected, because a queue
+pair receives no CNP. A queue pair's ticks have no `tick` row: `p10c_roce_check` ties each tick's
+`rate_bps` to the controller instead, as described above.
+
+## Continuous integration
+
+`.github/workflows/leanguard.yml` has two jobs. `lean-fixtures` builds the checkers, audits the
+`DaysExecutor` axioms (`lean/scripts/audit-days-executor-axioms.sh`), and runs these scripts under
+`lean/scripts/`: the P10c collective, DCQCN and RoCE campaigns (`run-p10c-collective-campaign.sh`,
+`run-p10c-dcqcn-campaign.sh`, `run-p10c-roce-campaign.sh`: accept fixtures, plus mutations each
+checker must reject with a named message); the collective differential and budget and the AQM
+differential (below); and the AQM, CUBIC, DRR and WFQ fixture and coverage scripts
+(`run-aqm-fixtures.sh`, `run-aqm-coverage-fixtures.sh`, `run-cubic-fixtures.sh`,
+`run-drr-fixtures.sh`, `run-drr-coverage-fixtures.sh`, `run-wfq-fixtures.sh`,
+`run-wfq-coverage-fixtures.sh`). The P10c AQM campaign (`run-p10c-aqm-campaign.sh`) runs in CI
+only inside the AQM differential, through the differential checker. Three scripts are not CI
+steps: `run-p10c-mechanism-campaign.sh`, `run-sp-campaign.sh`, and `run-tcp-campaign.sh`, which
+takes a trace directory. `protocol-traces` runs the legacy engine on the CI fixtures and the
+legacy checkers on its traces.
+
+The P10c collective, DCQCN, RoCE and AQM checkers are linear in the row count, except the
+collective checker's TCP replay, which keeps a per-flow frontier in an ordered map and is
+n log n: per-flow, per-queue and per-stage state lives in hash maps, and no check searches
+earlier rows per row.
+Where P16 replaced such a search, the old list-scan functions stayed in a test-only module
+(`lean/LeanGuard/P10c/Test/`), and three `lean-fixtures` steps keep the two in agreement:
+
+- `run-p10c-collective-differential.sh` and `run-p10c-aqm-differential.sh` run the shipped
+  checker and the reference on every campaign fixture and on generated single-row mutants
+  (`p10c_collective_diff`, `p10c_aqm_diff` in `lean/lakefile.lean`), and fail on any case where
+  the two results differ;
+- `run-p10c-collective-budget.sh` counts the shipped collective checker's small allocations (Lean
+  heartbeats) across a size step of its fixtures and fails when the count grows faster than the
+  rows allow, or when the shipped source contains a whole-trace list scan.
 
 ## Exit codes and diagnostics
 

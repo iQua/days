@@ -8,7 +8,7 @@ description: Trace-certificate checking and executable Lean models for both Days
 - **Legacy protocol certificates**: `days-legacy`, built with the `lean` Cargo feature, writes
   `*_events.csv` files. LeanGuard canonicalizes and replays those traces.
 - **Days AGO certificates and proofs**: the executor exposes exact-integer transition records for
-  TCP, AQM, DCQCN, PFC, schedulers, rate sources, and collectives. The `tcp_check`, `sp_check`, and
+  TCP, AQM, DCQCN, RoCE queue pairs, PFC, schedulers, rate sources, and collectives. The `tcp_check`, `sp_check`, and
   `p10c_*` checkers replay their CSV projections using the executor's complete `EventKey`, while
   `lean/DaysExecutor/` formalizes the image, transition, safe-horizon, and round-execution model.
 

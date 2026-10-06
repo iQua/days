@@ -18,6 +18,40 @@ If `cargo-nextest` is installed, the same package surface can be selected with `
 
 `cargo xtask audit` runs two structural checks: only `days-validation` may depend on `days-legacy`, as a test-only dev-dependency; and every backend feature gate in `executor/src` must match a registered predicate and occurrence count.
 
+## CI test shards
+
+CI runs the four commands above, in debug, as parallel `test-shard` jobs. `.github/test-shards.sh`
+holds the layout: five shards, each a list of units, where a unit is a whole package, one
+integration-test target (`days:p15_roce_fixtures`), or `days:rest`, every `days` target not named
+in another unit. `rest` first runs the package's default `--no-run` build, so every example and
+test target still compiles as the unsharded command compiled it, then runs the remaining targets,
+then the doctests.
+
+```text
+lowering-budget        days:collective_lowering_budget
+width-via-load-legacy  days:width_via_load_fixtures days:p14_dcqcn_pfc_fixtures days-legacy
+roce                   days:p15_roce_fixtures days:p15_roce_collectives
+validation-executor    days-validation days-executor
+rest                   days:rest
+```
+
+Before any shard runs, a `test-plan` job checks the layout against `cargo metadata`: every target
+the four commands build or run must belong to exactly one shard, every test named in the layout
+must exist, and every workspace member must be tested or listed as `untested` (`xtask`, which CI
+did not test before either). A new test file under `tests/` therefore lands in `rest` with no
+layout change, and the check fails on a target in no shard or in two. The required `test` check is
+an aggregate job: it passes when every shard passed, or when the shards were skipped because a
+pull request changed only `docs/**`, `logs/**` or `**.md`; a shard that failed, was cancelled or
+timed out fails it. Each shard has the 75-minute timeout the single job had.
+
+The script runs locally too (it needs `jq`):
+
+```bash
+.github/test-shards.sh plan        # check the layout; print the shard names as JSON
+.github/test-shards.sh list        # print "shard package target" for every target
+.github/test-shards.sh run roce    # run one shard's cargo commands in order
+```
+
 ## Planner equality
 
 The planner equality test compares the device planners' precomputed plans with the retained earlier planner. It builds plans on the host and needs `test` plus one device feature:
