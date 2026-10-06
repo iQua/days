@@ -2950,10 +2950,12 @@ fn validate_collective_partitions(image: &SimulationImage) -> Result<(), Validat
                 stage.collective_id
             )));
         }
-        *state.stages_by_channel.entry(stage.channel).or_default() += 1;
+        // One ring under `EqualRemainderLast` (every P14 and P15 collective) is checked by owner
+        // below and allocates nothing more; the other forms are counted by channel and size.
         let one_ring = state.chunk_policy == Chunk::EqualRemainderLast
             && state.channel_policy == Channels::RingNext;
         if !one_ring {
+            *state.stages_by_channel.entry(stage.channel).or_default() += 1;
             state.chunk_sizes.insert(stage.chunk_bytes);
             continue;
         }
