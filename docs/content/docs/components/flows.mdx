@@ -28,8 +28,4 @@ Lowering derives flow IDs and routes from canonical semantic keys. It rejects ex
 
 ## Backend limits
 
-Scalar and CPU execute every generator family. Metal and CUDA execute constant, TCP, and DCQCN generators, including the DCQCN controller and CNP state, plus the standalone `Rate` generator that image builders can construct through the executor API (TOML lowering produces rate state only inside DCQCN). Capability validation rejects collective and compute stages before execution:
-
-```text
-backend Metal does not support collective generators; use Scalar or Cpu
-```
+Scalar and CPU execute every generator family. Metal and CUDA execute constant, TCP, and DCQCN generators, including the DCQCN controller and CNP state, plus the standalone `Rate` generator that image builders can construct through the executor API (TOML lowering produces rate state only inside DCQCN). They also execute collective and compute stages over TCP and RoCE.

@@ -17,7 +17,7 @@ The current image supports:
 - constant-rate, non-preemptive links with uniform or tiered propagation
 - deterministic packet-distribution traffic, TCP Reno/CUBIC, and DCQCN
 - exact PFC per-priority pause state
-- RingAllReduce and AllGather over deterministic, byte-terminated packet-distribution traffic
+- RingAllReduce and AllGather collectives over TCP or RoCE queue pairs, and delay-only compute stages
 - shortest-path and semantic `FatTreeEcmp` routing
 
 Exact lowering retains host attachment LPs. Each host has an unbounded injection stage toward its switch and a bounded delivery queue in the reverse direction. The compiler assigns stable semantic node, link, flow, and payload IDs before constructing initial state and events.
@@ -44,7 +44,8 @@ At each round, the executor finds the global frontier, adds the minimum channel 
 | TCP Reno, TCP CUBIC | Yes | Yes | Yes | Yes |
 | PFC | Yes | Yes | Yes | Yes |
 | DCQCN | Yes | Yes | Yes | Yes |
-| Collective and compute stages | Yes | Yes | Rejected | Rejected |
+| RoCE queue pairs (Go-back-N) | Yes | Yes | Yes | Yes |
+| Collective and compute stages | Yes | Yes | Yes | Yes |
 | Zero-delay channels | Yes | Rejected | Rejected | Rejected |
 
 Metal and CUDA use checked 320-bit rational components for WFQ. Validation checks checkpoint widths and static weight bounds; runtime arithmetic faults rather than committing an overflowing result. Scalar and CPU use unbounded `BigUint` rational arithmetic.
@@ -70,7 +71,7 @@ Each layer reports errors once it has enough information:
 | Boundary | Examples |
 | --- | --- |
 | Scenario compilation | Nonzero `time_quantum_ns`; VirtualClock; BBR; unsupported flow dependencies or explicit per-flow routes; unsupported pairing/collective form |
-| Backend validation | Device RED, collective-stage, or compute-stage state; zero-lookahead parallel channel; invalid device WFQ width |
+| Backend validation | Device RED state; zero-lookahead parallel channel; invalid device WFQ width |
 | Device planning | Arithmetic/memory-size overflow or an invalid arena layout |
 | Device attempt and retry | Capacity demand beyond the current plan or configured cap, invalid readback metadata, or checked arithmetic overflow |
 

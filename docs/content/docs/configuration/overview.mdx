@@ -87,7 +87,7 @@ Legacy protocol models use Cargo features:
 - `link.mode = "Pfc"` requires `-p days-legacy --features l2_pfc`.
 - LeanGuard event CSVs require `lean` plus the protocol feature where applicable.
 
-Days AGO Scalar and CPU execute the full lowered mechanism set. Metal and CUDA reject collective stages, compute stages, and RED/RED_ECN before execution. They accept deterministic packet traffic, exact TCP Reno/CUBIC, DCQCN, PFC, FIFO/SP/WFQ/DRR/WRR, TailDrop, and ECN threshold subject to device capacity checks. The error names the unsupported mechanism and directs you to Scalar or CPU.
+Days AGO Scalar and CPU execute the full lowered mechanism set. Metal and CUDA reject RED/RED_ECN before execution. They accept deterministic packet traffic, exact TCP Reno/CUBIC, DCQCN, PFC, collective and compute stages, FIFO/SP/WFQ/DRR/WRR, TailDrop, and ECN threshold subject to device capacity checks. The error names the unsupported mechanism and directs you to Scalar or CPU.
 
 ## Reference pages
 

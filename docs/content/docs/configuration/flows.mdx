@@ -171,7 +171,7 @@ On a NACK or a timeout, the sender rewinds to the first unacknowledged byte and 
 
 With `[link.pfc] host_links = true`, a switch can pause a queue pair's host. The queue pair then stops sending in its data class until the resume; see [host links](/docs/configuration/l2#host-links).
 
-Exact lowering refuses `[flow.traffic.roce]` on other flow types, `[flow.traffic.tcp]` on a queue pair, `cnp_priority` on a queue pair (use `feedback_priority`), and duration-bounded queue pairs. Queue pairs also carry collective stages (see [Collectives](/docs/configuration/collectives#roce-stages)). They run on Scalar and CPU; Metal and CUDA refuse them at validation.
+Exact lowering refuses `[flow.traffic.roce]` on other flow types, `[flow.traffic.tcp]` on a queue pair, `cnp_priority` on a queue pair (use `feedback_priority`), and duration-bounded queue pairs. Queue pairs also carry collective stages (see [Collectives](/docs/configuration/collectives#roce-stages)); both run on all four backends.
 
 ## Days AGO field limits
 
