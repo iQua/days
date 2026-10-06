@@ -251,11 +251,14 @@ fn windowed_multi_qp(window_bytes: u64) -> SimulationImage {
 }
 
 /// Capacity retries of the default device plan (design note §5.2), MEASURED on Metal (M5 Max) and
-/// CUDA (sim, RTX A4500): the windowed pairs' host queues now hold their windows from the start,
-/// and the windowless P15 image keeps its eight queue retries (ruling G8 leaves it as it was).
+/// CUDA (sim, RTX A4500). Before ruling G8 the windowed image took four queue retries at host 1
+/// (13 -> 28 -> 58 -> 118 -> 238 records); its three windowed pairs now plan their windows (154
+/// records) and host 1 takes none. The one retry left is host 2's (56 -> 114 records): its TCP flow
+/// on the paused class keeps today's horizon bound, which the ruling leaves to the typed retry.
+/// The windowless P15 image keeps its eight queue retries (ruling G8 leaves it as it was).
 #[allow(dead_code)]
 const PINNED_RETRIES: &[(&str, usize)] = &[
-    ("hostpfc_multi_qp_window_50000", 0),
+    ("hostpfc_multi_qp_window_50000", 1),
     ("hostpfc_multi_qp_tcp", 8),
 ];
 

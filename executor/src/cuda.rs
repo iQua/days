@@ -2284,14 +2284,32 @@ impl CudaPlan {
             let group = concurrency
                 .as_ref()
                 .and_then(|concurrency| concurrency.group(flow_index));
+            // Ruling G8: a windowed queue pair holds at most a window of its data in its source
+            // host's queue and a window of its feedback in its receiver's, however long a pause.
+            let window = concurrency
+                .as_ref()
+                .and_then(|concurrency| concurrency.window_packets(flow_index));
             crate::stage_sizing::charge(
                 &mut queue_caps,
                 &mut queue_charges,
                 group,
                 source_slot,
                 crate::stage_sizing::CLASS_DATA,
-                capacity_context.source_queue_packet_bound(image, flow_index, data_count),
+                window.map_or_else(
+                    || capacity_context.source_queue_packet_bound(image, flow_index, data_count),
+                    |window| data_count.min(window),
+                ),
             );
+            if let Some(window) = window {
+                crate::stage_sizing::charge(
+                    &mut queue_caps,
+                    &mut queue_charges,
+                    group,
+                    flow.target.0 as usize,
+                    crate::stage_sizing::CLASS_FEEDBACK,
+                    feedback_count.min(window),
+                );
+            }
             legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(4);
             if capacity_context.dcqcn_generator(image, flow_index) {
                 // A DCQCN source owns one live timer chain, pacing (the Mellanox-form controller

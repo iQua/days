@@ -1,5 +1,5 @@
-//! Stage-aware arena sizing, shared by the host projection and both device planners (P16 G2;
-//! design note `evidence/P16/colldev-design.md` §4.2, ruling G7).
+//! Stage-aware and window-aware arena sizing, shared by the host projection and both device
+//! planners (P16 G2; design note `evidence/P16/colldev-design.md` §4.2, rulings G7 and G8).
 //!
 //! # Stages (ruling G7)
 //!
@@ -24,9 +24,21 @@
 //! A compute stage's timer is one fallback-heap event at its source while the stage runs; at most
 //! `min(leaves, unfinished compute stages)` of a host's timers are pending at once.
 //!
+//! # Windows (ruling G8)
+//!
+//! A queue pair with a window keeps `next_psn − snd_una < w ≤ window_bytes`, so at most
+//! `ceil(window_bytes / mtu) + 1` of its data packets are unacknowledged, and so waiting in its
+//! source host's queue, at once. Its receiver sends at most one ACK or NACK per data packet, and
+//! the sender has heard of none that still wait in the receiver's host queue, so the same bound
+//! covers its feedback there. Both bounds hold however long a pause lasts. They replace the
+//! horizon bound in the host queue of a windowed pair, and its feedback joins the receiver's host
+//! queue; a windowed stage's bounds are charged with its host's chains. Windowless pairs and TCP
+//! keep today's bound. Typed capacity retries remain the recovery path for what the bounds leave
+//! out (Go-back-N duplicates behind a rewind).
+//!
 //! Everything here is decided once per plan, with sorted vectors and no map iteration order.
 
-use crate::{GeneratorStatus, PacketKind, SimulationImage, StageRole};
+use crate::{FlowGeneratorKind, GeneratorStatus, PacketKind, SimulationImage, StageRole};
 
 const NO_GROUP: u32 = u32::MAX;
 
@@ -45,8 +57,8 @@ pub(crate) fn charge_class(kind: PacketKind) -> u8 {
 
 /// Which flows of an image share a concurrency bound, decided once per plan.
 ///
-/// `None` from [`SizingConcurrency::for_image`] means the image has no stage, and every planner
-/// then takes its unchanged path.
+/// `None` from [`SizingConcurrency::for_image`] means neither rule applies (no stage and no
+/// windowed queue pair), and every planner then takes its unchanged path.
 pub(crate) struct SizingConcurrency {
     /// Per flow: the concurrency group of an unfinished stage (one group per source host), or
     /// [`NO_GROUP`]. Empty when the image has no stage.
@@ -56,6 +68,9 @@ pub(crate) struct SizingConcurrency {
     /// Per group: the source node and its pending compute-timer bound,
     /// `min(leaves, unfinished compute stages)`.
     compute_timers: Vec<(usize, usize)>,
+    /// Per flow: `ceil(window_bytes / mtu) + 1` for a windowed queue pair, else zero. Empty when
+    /// the image has no windowed queue pair.
+    window_packets: Vec<usize>,
     /// Whether any host carries a stage (the stage region is planned exactly then).
     #[cfg_attr(
         not(any(feature = "cuda", all(feature = "metal", target_vendor = "apple"))),
@@ -65,22 +80,34 @@ pub(crate) struct SizingConcurrency {
 }
 
 impl SizingConcurrency {
-    /// Builds the groups, or returns `None` (allocating nothing) when no host carries a stage.
+    /// Builds the groups and windows, or returns `None` (allocating nothing) when no host carries
+    /// a stage and no queue pair has a window.
     pub(crate) fn for_image(image: &SimulationImage) -> Option<Self> {
-        if image
-            .host_states
-            .iter()
-            .all(|state| state.stages.is_empty())
-        {
+        let mut has_stages = false;
+        let mut has_queue_pairs = false;
+        for state in &image.host_states {
+            has_stages |= !state.stages.is_empty();
+            // Every queue pair has a receiver, so a host walk finds them without the generators.
+            has_queue_pairs |= state.roce_receivers.is_some();
+        }
+        let window_packets = if has_queue_pairs {
+            window_packets(image)
+        } else {
+            Vec::new()
+        };
+        if !has_stages && window_packets.is_empty() {
             return None;
         }
         let mut concurrency = Self {
             groups: Vec::new(),
             generations: Vec::new(),
             compute_timers: Vec::new(),
-            has_stages: true,
+            window_packets,
+            has_stages,
         };
-        concurrency.group_stages(image);
+        if has_stages {
+            concurrency.group_stages(image);
+        }
         Some(concurrency)
     }
 
@@ -149,12 +176,42 @@ impl SizingConcurrency {
             .filter(|group| *group != NO_GROUP)
     }
 
+    /// `ceil(window_bytes / mtu) + 1` if `flow` is a windowed queue pair.
+    pub(crate) fn window_packets(&self, flow: usize) -> Option<usize> {
+        self.window_packets
+            .get(flow)
+            .copied()
+            .filter(|packets| *packets != 0)
+    }
+
     /// Adds each host's pending compute-timer bound to its fallback-heap capacity.
     pub(crate) fn add_compute_timers(&self, capacities: &mut [usize]) {
         for &(source, timers) in &self.compute_timers {
             capacities[source] = capacities[source].saturating_add(timers);
         }
     }
+}
+
+/// Per flow, `ceil(window_bytes / mtu) + 1` for each windowed queue pair and zero otherwise; empty
+/// when no queue pair has a window.
+fn window_packets(image: &SimulationImage) -> Vec<usize> {
+    let mut packets = Vec::new();
+    for generator in image.host_states.iter().flat_map(|state| &state.generators) {
+        let FlowGeneratorKind::Roce(roce) = generator.kind else {
+            continue;
+        };
+        if roce.window_bytes == 0 {
+            continue;
+        }
+        if packets.is_empty() {
+            packets = vec![0; image.flows.len()];
+        }
+        packets[generator.flow.0 as usize] =
+            usize::try_from(roce.window_bytes.div_ceil(roce.pacer.mtu_bytes.max(1)))
+                .unwrap_or(usize::MAX)
+                .saturating_add(1);
+    }
+    packets
 }
 
 /// Per-flow arena bounds of stage flows, gathered so each host's stages are charged together.
@@ -380,6 +437,58 @@ mod tests {
         let mut timers = vec![0; 3];
         concurrency.add_compute_timers(&mut timers);
         assert_eq!(timers, [2, 1, 0]);
+    }
+
+    #[test]
+    fn only_windowed_queue_pairs_get_a_window_bound() {
+        let mut image = image();
+        for state in &mut image.host_states {
+            state.stages.clear();
+        }
+        let roce = |window_bytes| {
+            FlowGeneratorKind::Roce(crate::RoceGenerator {
+                pacer: crate::RocePacer {
+                    first_pacing_time_ns: 0,
+                    pacing_interval_ns: 1,
+                    mtu_bytes: 1_000,
+                    total_bytes: 1_000_000,
+                    credit_quanta: 0,
+                },
+                controller: crate::DcqcnController::pristine(crate::DcqcnControllerConfig {
+                    initial_rate_bps: 1,
+                    minimum_rate_bps: 1,
+                    maximum_rate_bps: 1,
+                    additive_rate_bps: 1,
+                    hyper_rate_bps: 1,
+                    g_q63: 1,
+                    alpha_interval_ns: 1,
+                    decrease_interval_ns: 1,
+                    increase_interval_ns: 1,
+                    fast_recovery_steps: 1,
+                    clamp_target_rate: false,
+                }),
+                pacing_timer_payload: PayloadId(9),
+                next_psn: 0,
+                snd_una: 0,
+                rto_deadline_ns: 0,
+                rto_ns: 0,
+                window_bytes,
+                pacer_armed: true,
+                variable_window: false,
+                window_parked: false,
+            })
+        };
+        image.host_states[0].generators[1].kind = roce(0);
+        image.host_states[0].roce_receivers = Some(Box::new([]));
+        // A queue pair without a window: neither rule applies.
+        assert!(SizingConcurrency::for_image(&image).is_none());
+        image.host_states[0].generators[2].kind = roce(50_001);
+        let concurrency = SizingConcurrency::for_image(&image).expect("a windowed pair");
+        assert!(!concurrency.has_stages());
+        assert_eq!(concurrency.window_packets(1), None);
+        // ceil(50,001 / 1,000) + 1.
+        assert_eq!(concurrency.window_packets(4), Some(52));
+        assert_eq!(concurrency.group(4), None);
     }
 
     #[test]

@@ -558,14 +558,30 @@ pub fn size_default_device_plan(
         let group = concurrency
             .as_ref()
             .and_then(|concurrency| concurrency.group(flow_index));
+        // Ruling G8: a windowed queue pair's host-queue bounds, as the planners derive them.
+        let window = concurrency
+            .as_ref()
+            .and_then(|concurrency| concurrency.window_packets(flow_index));
         crate::stage_sizing::charge(
             &mut queue_capacities,
             &mut queue_charges,
             group,
             source_slot,
             crate::stage_sizing::CLASS_DATA,
-            context.source_queue_bounds[flow_index],
+            window.map_or(context.source_queue_bounds[flow_index], |window| {
+                data_count.min(window)
+            }),
         );
+        if let Some(window) = window {
+            crate::stage_sizing::charge(
+                &mut queue_capacities,
+                &mut queue_charges,
+                group,
+                flow.target.0 as usize,
+                crate::stage_sizing::CLASS_FEEDBACK,
+                feedback_count.min(window),
+            );
+        }
         legacy_fel_capacities[source_slot] = legacy_fel_capacities[source_slot].saturating_add(4);
         if context.tcp_generators[flow_index].is_some() {
             legacy_fel_capacities[source_slot] = legacy_fel_capacities[source_slot]
