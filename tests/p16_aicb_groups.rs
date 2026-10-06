@@ -164,10 +164,10 @@ fn group_formation_refusals() {
             "TP = 8 x PP = 3 does not divide",
         ),
         (
-            header(128, 8, 4, 2),
+            header(128, 8, 3, 2),
             Fidelity::Megatron,
             8,
-            "EP = 4 does not divide DP = 8",
+            "EP = 3 does not divide DP = 8",
         ),
     ] {
         let error = form_groups(&header, fidelity, gps).expect_err(expected);

@@ -10,6 +10,8 @@
 //! A family stores its groups flat (all groups of one family have one size) with a rank-to-group
 //! index, so forming the groups of `W` ranks costs a fixed number of allocations.
 
+use std::fmt::Write as _;
+
 use super::{AicbError, GroupKind, Header};
 
 /// Which semantics the run reproduces (design note A4).
@@ -32,7 +34,6 @@ pub struct GroupFamily {
 const NO_GROUP: u32 = u32::MAX;
 
 impl GroupFamily {
-    #[allow(dead_code)] // RED skeleton
     fn new(world: u32, size: u32, ranks: Vec<u32>) -> Self {
         let mut group_of = vec![NO_GROUP; world as usize];
         if size > 0 {
@@ -127,16 +128,150 @@ impl Groups {
 
 /// Forms the trace's groups on `gpus_per_server`-GPU servers.
 pub fn form_groups(
-    _header: &Header,
-    _fidelity: Fidelity,
-    _gpus_per_server: u32,
+    header: &Header,
+    fidelity: Fidelity,
+    gpus_per_server: u32,
 ) -> Result<Groups, AicbError> {
-    Err(AicbError::new("group formation is not implemented"))
+    let world = header.all_gpus;
+    let tp = header.tp;
+    let ep = header.ep;
+    if gpus_per_server == 0 || !world.is_multiple_of(gpus_per_server) {
+        return Err(AicbError::new(format!(
+            "all_gpus = {world} is not a multiple of {gpus_per_server} GPUs per server"
+        )));
+    }
+    if tp < 2 {
+        return Err(AicbError::new(format!(
+            "model_parallel_NPU_group = {tp}: SimAI builds no TP or EP group below 2 and reads an \
+             empty dimension vector (simai-semantics-facts §4)"
+        )));
+    }
+    // SimAI records a TP group's server count as ceil(TP / GPUs per server); it is the true
+    // count only when TP divides the server or the server divides TP.
+    if !gpus_per_server.is_multiple_of(tp) && !tp.is_multiple_of(gpus_per_server) {
+        return Err(AicbError::new(format!(
+            "TP = {tp} neither divides nor is a multiple of {gpus_per_server} GPUs per server"
+        )));
+    }
+    let stages = match fidelity {
+        Fidelity::Simai => 1,
+        Fidelity::Megatron => header.pp,
+    };
+    if !world.is_multiple_of(tp * stages) {
+        return Err(AicbError::new(format!(
+            "TP = {tp} x PP = {stages} does not divide all_gpus = {world}"
+        )));
+    }
+    let stage_world = world / stages;
+    let dp = stage_world / tp;
+    if !dp.is_multiple_of(ep) {
+        return Err(AicbError::new(format!(
+            "EP = {ep} does not divide DP = {dp} (MockNcclGroup forms no group, \
+             MockNcclGroup.cc:42)"
+        )));
+    }
+    let dp_ep = dp / ep;
+    let mut families: [(u32, Vec<u32>); 4] = Default::default();
+    for stage in 0..stages {
+        let base = stage * stage_world;
+        let tp_group = |index: u32, slot: u32| base + index * tp + slot;
+        let tp_groups = stage_world / tp;
+        // TP: consecutive ranks.
+        families[0].0 = tp;
+        families[0]
+            .1
+            .extend((0..tp_groups).flat_map(|i| (0..tp).map(move |j| tp_group(i, j))));
+        // DP: stride W / DP = TP.
+        if dp > 1 {
+            families[1].0 = dp;
+            let stride = stage_world / dp;
+            families[1]
+                .1
+                .extend((0..stride).flat_map(|i| (0..dp).map(move |j| base + i + j * stride)));
+        }
+        // EP: slot k of EP consecutive TP groups.
+        if ep > 1 {
+            families[2].0 = ep;
+            for block in 0..tp_groups / ep {
+                for slot in 0..tp {
+                    families[2]
+                        .1
+                        .extend((block * ep..(block + 1) * ep).map(|l| tp_group(l, slot)));
+                }
+            }
+        }
+        // DP_EP: slot k of TP groups at stride EP.
+        if dp_ep > 1 {
+            families[3].0 = dp_ep;
+            for first in 0..tp_groups / dp_ep {
+                for slot in 0..tp {
+                    families[3]
+                        .1
+                        .extend((0..dp_ep).map(|l| tp_group(first + l * ep, slot)));
+                }
+            }
+        }
+    }
+    let [tp_family, dp_family, ep_family, dp_ep_family] =
+        families.map(|(size, ranks)| GroupFamily::new(world, size, ranks));
+    let pp_pairs = (0..world - stage_world)
+        .map(|rank| (rank, rank + stage_world))
+        .collect();
+    Ok(Groups {
+        fidelity,
+        world,
+        gpus_per_server,
+        stages,
+        tp: tp_family,
+        dp: dp_family,
+        ep: ep_family,
+        dp_ep: dp_ep_family,
+        pp_pairs,
+    })
 }
 
 /// The groups in the text form of `mockncclgroup_dump` (days-gpu
 /// `evidence/P16/aicb-design/tooling`), without its ring-channel lines: the header line, then
 /// for TP, DP, EP and DP_EP each group as `group <type> nNodes <n> nRanks <n> ranks …`.
-pub fn render_mockncclgroup(_groups: &Groups, _header: &Header) -> String {
-    String::new()
+pub fn render_mockncclgroup(groups: &Groups, header: &Header) -> String {
+    let dp = groups.stage_ranks() / header.tp;
+    let mut out = format!(
+        "mockncclgroup W {} gpus_per_server {} TP {} DP {} PP 1 EP {} DP_EP {}\n",
+        groups.world,
+        groups.gpus_per_server,
+        header.tp,
+        dp,
+        header.ep,
+        dp / header.ep
+    );
+    for (name, family) in [
+        ("TP", &groups.tp),
+        ("DP", &groups.dp),
+        ("EP", &groups.ep),
+        ("DP_EP", &groups.dp_ep),
+    ] {
+        for group in family.groups().take(family.len()) {
+            // MockNcclGroup.cc: a TP group records ceil(TP / GPUs per server) nodes, every other
+            // group its distinct servers (equal here: form_groups refuses the other TP shapes).
+            let mut nodes = 0;
+            let mut last = None;
+            for &rank in group {
+                let server = groups.server_of(rank);
+                if last != Some(server) {
+                    nodes += 1;
+                    last = Some(server);
+                }
+            }
+            let _ = write!(
+                out,
+                "group {name} nNodes {nodes} nRanks {} ranks",
+                group.len()
+            );
+            for rank in group {
+                let _ = write!(out, " {rank}");
+            }
+            out.push('\n');
+        }
+    }
+    out
 }
