@@ -187,6 +187,22 @@ fn nvlink_message_delay_follows_the_ruled_formula() {
     assert_eq!(locality.nvlink_message_delay_ns(1, 1, 9_000), Some(52));
     assert_eq!(locality.nvlink_message_delay_ns(2, 1, 9_000), None);
     assert_eq!(locality.nvlink_message_delay_ns(0, 1, 9_000), None);
+    // A TP2 AllGather of 16,777,216 B on one server: SimAI's ring has 2 channels and 1 step, each
+    // message 4,194,304 B; the port carries both channels' messages: 50 + ceil(8,388,608 x 8 /
+    // 2,880) + 25.
+    assert_eq!(
+        locality.single_server_collective_delay_ns(1, 4_194_304, 2, 9_000),
+        Some(23_377)
+    );
+    // Its AllReduce form takes 2(n - 1) = 2 steps.
+    assert_eq!(
+        locality.single_server_collective_delay_ns(2, 4_194_304, 2, 9_000),
+        Some(46_754)
+    );
+    assert_eq!(
+        locality.single_server_collective_delay_ns(1, 1, 0, 9_000),
+        None
+    );
 }
 
 /// FIPS 180-4 SHA-256, enough to pin the rendered files without vendoring them.

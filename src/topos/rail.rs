@@ -374,6 +374,27 @@ impl ServerLocality {
         u64::try_from(total).ok()
     }
 
+    /// Delay of a collective whose members all share one server (ruling H2-2: one delay stage per
+    /// rank): `steps` ring steps, in each of which the rank sends one `message_bytes` message on
+    /// each of `channels` channels at once through its NVLink port, so every step takes
+    /// [`Self::nvlink_message_delay_ns`] of the message with `channels` messages on the port.
+    /// SimAI's ring for an `n`-rank group on one server has `channels = n` and `n - 1` steps
+    /// (AllGather, ReduceScatter) or `2(n - 1)` (AllReduce); the collective lowering supplies them.
+    /// `None` on overflow or when a message, the channel count or the MTU is zero.
+    pub fn single_server_collective_delay_ns(
+        &self,
+        steps: u64,
+        message_bytes: u64,
+        channels: u64,
+        mtu: u64,
+    ) -> Option<u64> {
+        if channels == 0 {
+            return None;
+        }
+        let port_bytes = message_bytes.checked_mul(channels)?;
+        steps.checked_mul(self.nvlink_message_delay_ns(message_bytes, port_bytes, mtu)?)
+    }
+
     /// SimAI's window `maxBdp` (`HAS_WIN 1`, `GLOBAL_T 1`): the largest bandwidth-delay product
     /// over host pairs, `rtt · min_bw / 1e9 / 8` with `rtt = 2·Σ delay + Σ mtu·8·1e9 / bw` in
     /// SimAI's own integer steps. NVLink pairs are included, as SimAI includes them.
