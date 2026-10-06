@@ -193,6 +193,7 @@ fn aqm_image(policy: DropMarkPolicy, packet_sizes: &[u64]) -> SimulationImage {
         ],
         initial_events,
         seed: 25,
+        stage_joins: Vec::new(),
     }
 }
 

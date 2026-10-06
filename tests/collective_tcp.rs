@@ -200,8 +200,8 @@ fn tcp_collectives_lower_to_wrapped_tcp_generators() {
                 panic!("a transport stage has a collective role")
             };
             assert_eq!(tcp.total_bytes, identity.chunk_bytes);
-            let root = stage.dependencies.local_predecessor.is_none()
-                && stage.dependencies.inbound_predecessor.is_none();
+            let root = stage.dependencies.local.one().is_none()
+                && stage.dependencies.inbound.one().is_none();
             assert_eq!(identity.step == 1 && root, root, "roots are step one");
             assert_eq!(stage.activated, root);
             assert_eq!(
@@ -490,6 +490,6 @@ fn validator_rejects_an_unreleased_tcp_stage_with_sending_state() {
         validate(&released, Backend::Scalar)
             .unwrap_err()
             .to_string(),
-        format!("flow {flow:?} collective release flag disagrees with its prerequisites")
+        format!("flow {flow:?} stage release flag disagrees with its prerequisites")
     );
 }

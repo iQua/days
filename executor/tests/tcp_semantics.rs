@@ -220,6 +220,7 @@ fn tcp_image(control: TcpCongestionControl, total_bytes: u64) -> SimulationImage
             payload: FIRST,
         }],
         seed: 1,
+        stage_joins: Vec::new(),
     }
 }
 
@@ -419,6 +420,7 @@ fn switched_tcp_image(
             payload: FIRST,
         }],
         seed: 11,
+        stage_joins: Vec::new(),
     }
 }
 

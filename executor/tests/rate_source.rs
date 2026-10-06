@@ -141,6 +141,7 @@ fn rate_image(rate: RateGenerator, status: GeneratorStatus, stop_time_ns: u64) -
             payload: TOKEN,
         }],
         seed: 25,
+        stage_joins: Vec::new(),
     }
 }
 

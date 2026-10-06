@@ -640,6 +640,49 @@ fn a_join_of_unknown_or_repeated_groups_is_refused() {
     );
 }
 
+/// A join's predecessor run is validated: strictly ascending, at least two flows, inside
+/// `stage_joins`.
+#[test]
+fn corrupt_joins_are_refused() {
+    let image = lower("join-two-computes", &fixtures()[0].1);
+    days_executor::validate(&image, days_executor::Backend::Scalar).expect("the join image");
+    assert!(!image.stage_joins.is_empty());
+    let refused = |mutate: &dyn Fn(&mut SimulationImage)| {
+        let mut broken = image.clone();
+        mutate(&mut broken);
+        days_executor::validate(&broken, days_executor::Backend::Scalar)
+            .expect_err("a corrupt join must be refused")
+            .to_string()
+    };
+    assert!(refused(&|image| image.stage_joins.swap(0, 1)).contains("strictly ascending run"));
+    assert!(refused(&|image| image.stage_joins.truncate(1)).contains("strictly ascending run"));
+    let shrink = |image: &mut SimulationImage| {
+        for state in &mut image.host_states {
+            for stage in state.stages.iter_mut().flatten() {
+                if let days_executor::StagePredecessors::Join { first, .. } =
+                    stage.dependencies.local
+                {
+                    stage.dependencies.local =
+                        days_executor::StagePredecessors::Join { first, count: 1 };
+                }
+            }
+        }
+    };
+    assert!(refused(&shrink).contains("strictly ascending run"));
+}
+
+/// The Scalar stage index answers every join query as the retained scans do, on the image and
+/// after every event (`tests/scalar_stage_index.rs`).
+#[cfg(feature = "test")]
+#[test]
+fn the_stage_index_agrees_with_the_scans_on_joins() {
+    for (label, image) in images() {
+        days_executor::scalar::assert_scalar_stage_index_equivalent_for_testing(&image, None)
+            .unwrap_or_else(|mismatch| panic!("{label}: {mismatch}"))
+            .unwrap_or_else(|error| panic!("{label}: {error}"));
+    }
+}
+
 #[cfg(feature = "cuda")]
 mod cuda {
     use days_executor::{CudaConfig, ObservationMode, run_cuda_with_observations};

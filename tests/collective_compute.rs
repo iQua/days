@@ -153,11 +153,11 @@ fn compute_stages_lower_to_timer_only_generators() {
             StageRole::Collective(identity) => {
                 let root = identity.step == 1
                     && identity.phase == days_executor::CollectivePhase::ReduceScatter;
-                assert!(stage.dependencies.local_predecessor.is_some());
+                assert!(stage.dependencies.local.one().is_some());
                 if root {
-                    assert!(stage.dependencies.inbound_predecessor.is_none());
+                    assert!(stage.dependencies.inbound.one().is_none());
                     assert!(!stage.activated);
-                    let predecessor = stage.dependencies.local_predecessor.unwrap();
+                    let predecessor = stage.dependencies.local.one().unwrap();
                     assert_eq!(
                         stages[&(FORWARD_NS, identity.rank)].0,
                         predecessor,
@@ -380,13 +380,13 @@ fn compute_validator_rejects_inconsistent_stage_state() {
                 .unwrap()
                 .activated = true;
         },
-        format!("flow {backward:?} compute release flag disagrees with its prerequisites"),
+        format!("flow {backward:?} stage release flag disagrees with its prerequisites"),
     );
     reject(
         &|image| {
             let host = &mut image.host_states[slot];
             let mut dependencies = host.stage_dependencies(index).unwrap();
-            dependencies.local_predecessor = Some(forward);
+            dependencies.local = days_executor::StagePredecessors::One(forward);
             host.set_stage_dependencies(index, dependencies);
         },
         format!(
@@ -401,12 +401,7 @@ fn compute_validator_rejects_inconsistent_stage_state() {
             host.set_stage_dependencies(index, dependencies);
         },
         format!(
-            "flow {backward:?} compute inbound bytes 1 disagree with the in-order TCP frontier Some(0) of flow {:?}",
-            image.host_states[slot]
-                .stage_dependencies(index)
-                .unwrap()
-                .inbound_predecessor
-                .unwrap()
+            "flow {backward:?} stage inbound bytes 1 disagree with the in-order frontiers 0 of its inbound predecessors"
         ),
     );
     let (slot, index) = locate(&image, forward);

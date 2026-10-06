@@ -141,6 +141,7 @@ fn scalar_fifo_taildrop_matches_the_hand_checked_golden() {
             source_arrival(10, 3, P3),
         ],
         seed: 7,
+        stage_joins: Vec::new(),
     };
 
     /*

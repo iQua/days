@@ -200,6 +200,7 @@ fn rate_image() -> SimulationImage {
             payload: token,
         }],
         seed: 25,
+        stage_joins: Vec::new(),
     }
 }
 

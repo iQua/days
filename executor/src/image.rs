@@ -453,29 +453,103 @@ pub enum CollectiveChannelPolicy {
     RingNext = 0,
 }
 
+/// The predecessors of one kind (local or inbound) of a dependency-gated stage.
+///
+/// Most stages wait for at most one stage of each kind, held inline. A join (the stage after an
+/// all-to-all or a multi-channel ring, or after several stage groups) waits for several; their
+/// flows are the run `[first, first + count)` of [`SimulationImage::stage_joins`], ascending and
+/// distinct. The predecessor graph is fixed at lowering, so the run is immutable image data that
+/// no host state carries.
+#[repr(C, u8)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StagePredecessors {
+    #[default]
+    None,
+    One(FlowId),
+    Join {
+        first: u32,
+        count: u32,
+    },
+}
+
+impl StagePredecessors {
+    /// How many predecessors of this kind the stage waits for.
+    pub const fn count(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::One(_) => 1,
+            Self::Join { count, .. } => count,
+        }
+    }
+
+    /// The single predecessor held inline; `None` for no predecessor and for a join.
+    pub const fn one(self) -> Option<FlowId> {
+        match self {
+            Self::One(flow) => Some(flow),
+            _ => None,
+        }
+    }
+
+    /// A join's run of [`SimulationImage::stage_joins`] (`joins`); empty for `None` and `One`.
+    ///
+    /// A run outside `joins` yields nothing; validation rejects it before any run.
+    pub fn join_run(self, joins: &[FlowId]) -> &[FlowId] {
+        match self {
+            Self::None => &[],
+            Self::One(_) => &[],
+            Self::Join { first, count } => usize::try_from(first)
+                .ok()
+                .and_then(|first| {
+                    joins.get(first..first.checked_add(usize::try_from(count).ok()?)?)
+                })
+                .unwrap_or(&[]),
+        }
+    }
+
+    /// Each predecessor flow, in ascending order.
+    pub fn iter(self, joins: &[FlowId]) -> impl Iterator<Item = FlowId> + '_ {
+        let one = match self {
+            Self::One(flow) => Some(flow),
+            _ => None,
+        };
+        one.into_iter().chain(self.join_run(joins).iter().copied())
+    }
+}
+
 /// Prerequisite state of one dependency-gated stage, owned by the stage's source host LP.
 ///
-/// The local predecessor runs on the same host. The inbound predecessor is a stage on another host
-/// whose flow targets this host; its completion is observed through ordinary delivery at this host,
-/// so no cross-LP state is shared.
+/// Local predecessors run on the same host; the stage counts those that completed. Inbound
+/// predecessors are stages on other hosts whose flows target this host; their completion is
+/// observed through ordinary delivery at this host, so no cross-LP state is shared, and the stage
+/// counts the bytes they delivered in order. A stage is released once every local predecessor
+/// completed and every inbound byte arrived.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StageDependencies {
-    pub local_predecessor: Option<FlowId>,
-    pub inbound_predecessor: Option<FlowId>,
-    /// Bytes the inbound predecessor must deliver to this host before it counts as complete.
+    pub local: StagePredecessors,
+    pub inbound: StagePredecessors,
+    /// Bytes the inbound predecessors must deliver to this host: their totals, summed.
     pub inbound_predecessor_bytes: u64,
-    pub local_predecessor_complete: bool,
-    pub inbound_predecessor_complete: bool,
-    /// Inbound bytes delivered so far: the receiver's in-order frontier of the inbound
-    /// predecessor, TCP's next expected sequence or a RoCE queue pair's expected PSN.
+    /// Inbound bytes delivered so far: the sum of the receivers' in-order frontiers of the
+    /// inbound predecessors (TCP's next expected sequence, a RoCE queue pair's expected PSN).
     pub inbound_bytes_received: u64,
+    /// Local predecessors complete so far.
+    pub local_completed: u32,
 }
 
 impl StageDependencies {
+    /// Whether every local predecessor completed.
+    pub const fn local_complete(self) -> bool {
+        self.local_completed == self.local.count()
+    }
+
+    /// Whether every inbound predecessor delivered its bytes.
+    pub const fn inbound_complete(self) -> bool {
+        self.inbound_bytes_received == self.inbound_predecessor_bytes
+    }
+
     pub const fn prerequisites_complete(self) -> bool {
-        (self.local_predecessor.is_none() || self.local_predecessor_complete)
-            && (self.inbound_predecessor.is_none() || self.inbound_predecessor_complete)
+        self.local_complete() && self.inbound_complete()
     }
 }
 
@@ -489,8 +563,8 @@ impl StageDependencies {
 pub struct CollectiveStageIdentity {
     pub collective_id: u64,
     pub algorithm: CollectiveAlgorithm,
-    pub topology_level: u32,
-    pub topology_group: u32,
+    /// The channel (ring) this stage runs on; 0 for a single-ring collective.
+    pub channel: u32,
     pub group_size: u32,
     pub declared_total_bytes: u64,
     pub rank: u32,
@@ -1040,7 +1114,7 @@ impl RemoteChannel {
 }
 
 /// One immutable semantic image containing every host and switch logical process.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct SimulationImage {
     /// Inclusive configured simulation endpoint in integer nanoseconds.
     pub stop_time_ns: u64,
@@ -1054,6 +1128,31 @@ pub struct SimulationImage {
     pub channels: Vec<RemoteChannel>,
     pub initial_events: Vec<Event>,
     pub seed: u64,
+    /// The predecessor runs of join stages ([`StagePredecessors::Join`]), fixed at lowering and
+    /// read-only; empty, with no allocation, in an image without a join.
+    pub stage_joins: Vec<FlowId>,
+}
+
+impl fmt::Debug for SimulationImage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("SimulationImage");
+        debug
+            .field("stop_time_ns", &self.stop_time_ns)
+            .field("nodes", &self.nodes)
+            .field("host_states", &self.host_states)
+            .field("switch_states", &self.switch_states)
+            .field("flows", &self.flows)
+            .field("initial_packets", &self.initial_packets)
+            .field("links", &self.links)
+            .field("channels", &self.channels)
+            .field("initial_events", &self.initial_events)
+            .field("seed", &self.seed);
+        // Omitting the empty additive field preserves every image byte without a join.
+        if !self.stage_joins.is_empty() {
+            debug.field("stage_joins", &self.stage_joins);
+        }
+        debug.finish()
+    }
 }
 
 #[cfg(test)]

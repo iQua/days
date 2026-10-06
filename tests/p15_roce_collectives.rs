@@ -453,7 +453,7 @@ fn with_the_timeout_off_a_lost_tail_stalls_its_stage_and_successors_visibly() {
                 let Some(successor_stage) = successor_stage else {
                     continue;
                 };
-                if successor_stage.dependencies.local_predecessor == Some(generator.flow) {
+                if successor_stage.dependencies.local.one() == Some(generator.flow) {
                     assert!(!successor_stage.activated, "{:?} waits", successor.flow);
                 }
             }
@@ -720,6 +720,7 @@ fn checkpoint(image: &SimulationImage, horizon_ns: u64) -> SimulationImage {
         channels: image.channels.clone(),
         initial_events: result.pending_events,
         seed: image.seed,
+        stage_joins: image.stage_joins.clone(),
     }
 }
 
@@ -799,29 +800,31 @@ fn fingerprint(value: &impl std::fmt::Debug) -> (u64, u64) {
 /// `days` CLI reproduced on Scalar and CPU at 2 workers
 /// (`days-gpu/evidence/P15/collectives-impl/raw/anchors-mac-5752c51.txt`); re-frozen at P16 D1
 /// (2026-10-03, Mac) for the Mellanox-form controller and the ECN echo
-/// (`days-gpu/evidence/P16/dcqcn-impl/anchors.md`).
+/// (`days-gpu/evidence/P16/dcqcn-impl/anchors.md`); re-frozen at P16 H1 (2026-10-06, Mac) for the
+/// counted stage dependencies, which change only the stage records' rendering
+/// (`days-gpu/evidence/P16/collops-impl/semantic-identity-r1.txt`).
 const ANCHORS: [(&str, u64, u64); 6] = [
     (
         "roce_ring_allreduce_lossless.toml",
-        193_075,
-        0x02fc_5b57_38bf_9639,
+        188_983,
+        0xd89e_b01d_2859_4bcd,
     ),
     (
         "roce_allgather_lossless.toml",
-        123_170,
-        0xc32f_fe08_1e7b_440d,
+        121_122,
+        0x89d6_a4ac_8a89_0cd1,
     ),
-    ("roce_ring_lossy.toml", 182_347, 0xb718_c505_7453_0f5a),
-    ("roce_compute_dag.toml", 212_197, 0xe94b_963f_a5fd_954a),
+    ("roce_ring_lossy.toml", 178_255, 0xa99b_e649_848a_ddfe),
+    ("roce_compute_dag.toml", 207_245, 0x5145_dc26_3ab8_ddc6),
     (
         "roce_tcp_mixed_collectives.toml",
-        138_792,
-        0x88ff_2fe4_10cc_0df8,
+        134_700,
+        0x8a78_985e_0bd3_7700,
     ),
     (
         "roce_ring_release_paused.toml",
-        197_029,
-        0xf5e6_4cf6_d7ca_985e,
+        192_937,
+        0xc36e_d06a_809a_2f52,
     ),
 ];
 

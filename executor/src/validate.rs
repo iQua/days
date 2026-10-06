@@ -564,6 +564,11 @@ fn validate_backend_capabilities(
     // P15 lane R4: both device backends run RoCE queue pairs, host-link PFC and a feedback class
     // apart from the data class (`evidence/P15/device-design.md`), so none needs a refusal here.
     //
+    if !image.stage_joins.is_empty() {
+        return Err(ValidationError::new(format!(
+            "backend {backend} does not support stage joins; use Scalar or Cpu"
+        )));
+    }
     for queue in image.switch_states.iter().flat_map(|state| &state.queues) {
         match queue.drop_mark {
             crate::DropMarkPolicy::TailDrop | crate::DropMarkPolicy::EcnThreshold(_) => {}
@@ -2871,8 +2876,6 @@ fn validate_generators(
 #[derive(Clone)]
 struct CollectivePartitionState {
     algorithm: crate::CollectiveAlgorithm,
-    topology_level: u32,
-    topology_group: u32,
     group_size: u32,
     declared_total_bytes: u64,
     bounds_by_owner: BTreeMap<u32, (u64, u64)>,
@@ -2912,16 +2915,13 @@ fn validate_collective_partitions(image: &SimulationImage) -> Result<(), Validat
                 .entry(stage.collective_id)
                 .or_insert_with(|| CollectivePartitionState {
                     algorithm: stage.algorithm,
-                    topology_level: stage.topology_level,
-                    topology_group: stage.topology_group,
                     group_size: stage.group_size,
                     declared_total_bytes: stage.declared_total_bytes,
                     bounds_by_owner: BTreeMap::new(),
                     copies_by_owner: BTreeMap::new(),
                 });
         if state.algorithm != stage.algorithm
-            || state.topology_level != stage.topology_level
-            || state.topology_group != stage.topology_group
+            || stage.channel != 0
             || state.group_size != stage.group_size
             || state.declared_total_bytes != stage.declared_total_bytes
         {
@@ -3277,12 +3277,7 @@ fn validate_collective_stage(
             flow.id, transport_bytes, collective.chunk_bytes
         )));
     }
-    if dependencies.inbound_bytes_received > dependencies.inbound_predecessor_bytes {
-        return Err(ValidationError::new(format!(
-            "flow {:?} collective inbound bytes {} exceed required bytes {}",
-            flow.id, dependencies.inbound_bytes_received, dependencies.inbound_predecessor_bytes
-        )));
-    }
+    let inline = validate_stage_dependencies(image, flow_index, state, flow, stage)?;
 
     let final_step = collective.group_size - 1;
     let root = collective.step == 1
@@ -3303,62 +3298,49 @@ fn validate_collective_stage(
     } else {
         collective.rank - 1
     };
-    // A root may follow the same-rank stage of a compute group on its own host.
-    let entry = dependencies
-        .local_predecessor
-        .filter(|_| root)
-        .and_then(|id| flow_index.generator_for_flow(image, id))
-        .filter(|candidate| {
-            matches!(candidate.stage.map(|stage| stage.role),
-                Some(crate::StageRole::Compute(compute))
-                    if compute.rank == collective.rank && compute.group_size == collective.group_size)
-                && flow_source(image, candidate.flow) == Some(flow.source)
-        });
-    let (expected_local, expected_inbound) = if root {
-        (entry.map(|candidate| candidate.flow), None)
-    } else {
-        (find_stage(collective.rank), find_stage(previous_rank))
+    let one = |flow: Option<crate::FlowId>| {
+        flow.map_or(
+            crate::StagePredecessors::None,
+            crate::StagePredecessors::One,
+        )
     };
-    if dependencies.local_predecessor != expected_local
-        || dependencies.inbound_predecessor != expected_inbound
-    {
-        return Err(ValidationError::new(format!(
-            "flow {:?} collective predecessor identities do not match the declared algorithm recurrence",
-            flow.id
-        )));
-    }
     if root {
-        let local_complete =
-            entry.is_none_or(|entry| entry.next_emission.status == GeneratorStatus::Finished);
-        if dependencies.local_predecessor_complete != local_complete
-            || !dependencies.inbound_predecessor_complete
-            || dependencies.inbound_predecessor_bytes != collective.chunk_bytes
-            || dependencies.inbound_bytes_received != 0
-        {
+        // A root may follow the same-rank stage of a compute group on its own host, and waits for
+        // no inbound bytes.
+        let entry_is_compute = match dependencies.local {
+            crate::StagePredecessors::None => true,
+            crate::StagePredecessors::One(_) => inline.local.is_some_and(|candidate| {
+                matches!(candidate.stage.map(|stage| stage.role),
+                    Some(crate::StageRole::Compute(compute))
+                        if compute.rank == collective.rank
+                            && compute.group_size == collective.group_size)
+            }),
+            crate::StagePredecessors::Join { .. } => false,
+        };
+        if !entry_is_compute || dependencies.inbound != crate::StagePredecessors::None {
             return Err(ValidationError::new(format!(
-                "flow {:?} collective root prerequisite state is inconsistent",
+                "flow {:?} collective predecessor identities do not match the declared algorithm recurrence",
                 flow.id
             )));
         }
     } else {
-        let local = expected_local
-            .and_then(|id| flow_index.generator_for_flow(image, id))
-            .ok_or_else(|| {
-                ValidationError::new(format!(
-                    "flow {:?} collective local predecessor is missing",
-                    flow.id
-                ))
-            })?;
-        if dependencies.local_predecessor_complete
-            != (local.next_emission.status == GeneratorStatus::Finished)
+        let (expected_local, expected_inbound) =
+            (find_stage(collective.rank), find_stage(previous_rank));
+        if expected_local.is_none()
+            || expected_inbound.is_none()
+            || dependencies.local != one(expected_local)
+            || dependencies.inbound != one(expected_inbound)
         {
             return Err(ValidationError::new(format!(
-                "flow {:?} collective local completion flag disagrees with predecessor state",
+                "flow {:?} collective predecessor identities do not match the declared algorithm recurrence",
                 flow.id
             )));
         }
-        let inbound = expected_inbound
-            .and_then(|id| flow_index.generator_for_flow(image, id))
+        let local = inline
+            .local
+            .expect("an inline local predecessor was validated");
+        let inbound = inline
+            .inbound
             .and_then(|candidate| collective_identity(candidate).map(|stage| (candidate, stage)))
             .ok_or_else(|| {
                 ValidationError::new(format!(
@@ -3366,21 +3348,11 @@ fn validate_collective_stage(
                     flow.id
                 ))
             })?;
-        if inbound.1.chunk_bytes != dependencies.inbound_predecessor_bytes
+        if inbound.1.chunk_bytes != collective.chunk_bytes
             || inbound.1.chunk_offset_bytes != collective.chunk_offset_bytes
-            || self::flow(image, inbound.0.flow)
-                .is_none_or(|predecessor_flow| predecessor_flow.target != flow.source)
         {
             return Err(ValidationError::new(format!(
                 "flow {:?} collective inbound predecessor does not deliver the declared chunk to its source",
-                flow.id
-            )));
-        }
-        if dependencies.inbound_predecessor_complete
-            != (dependencies.inbound_bytes_received == dependencies.inbound_predecessor_bytes)
-        {
-            return Err(ValidationError::new(format!(
-                "flow {:?} collective inbound completion flag disagrees with received bytes",
                 flow.id
             )));
         }
@@ -3393,26 +3365,146 @@ fn validate_collective_stage(
                 flow.id
             )));
         }
-        let frontier = host_inbound_frontier(state, &inbound.0);
-        if frontier != Some(dependencies.inbound_bytes_received) {
-            return Err(ValidationError::new(format!(
-                "flow {:?} collective inbound bytes {} disagree with the in-order {} frontier {:?} of flow {:?}",
-                flow.id,
-                dependencies.inbound_bytes_received,
-                transport_label(&inbound.0),
-                frontier,
-                inbound.0.flow
-            )));
+    }
+    Ok(())
+}
+
+/// The bytes a transport stage carries: its TCP or RoCE total; `None` for any other generator.
+const fn transport_total_bytes(kind: &FlowGeneratorKind) -> Option<u64> {
+    match kind {
+        FlowGeneratorKind::Tcp(tcp) => Some(tcp.total_bytes),
+        FlowGeneratorKind::Roce(roce) => Some(roce.pacer.total_bytes),
+        _ => None,
+    }
+}
+
+/// Dependency invariants every dependency-gated stage shares, whatever its role.
+///
+/// The predecessor lists are canonical: a join names at least two flows, in a run of
+/// `stage_joins`, strictly ascending. Every local predecessor is a stage sourced at this host, and
+/// the stage counts exactly those that have finished. Every inbound predecessor is a transport
+/// stage whose flow targets this host; the stage requires their summed totals and has received
+/// exactly the sum of this host's in-order frontiers of them. The release flag is the
+/// prerequisites' conjunction.
+fn validate_stage_dependencies<'a>(
+    image: &'a SimulationImage,
+    flow_index: &FlowIndex,
+    state: &crate::HostState,
+    flow: &crate::FlowDescriptor,
+    stage: crate::CollectiveStage,
+) -> Result<InlinePredecessors<'a>, ValidationError> {
+    let dependencies = stage.dependencies;
+    for predecessors in [dependencies.local, dependencies.inbound] {
+        if let crate::StagePredecessors::Join { count, .. } = predecessors {
+            let run = predecessors.join_run(&image.stage_joins);
+            if count < 2
+                || run.len() != count as usize
+                || run.windows(2).any(|pair| pair[0] >= pair[1])
+            {
+                return Err(ValidationError::new(format!(
+                    "flow {:?} stage join is not a strictly ascending run of at least two stage_joins entries",
+                    flow.id
+                )));
+            }
         }
     }
-    let prerequisites_complete = dependencies.prerequisites_complete();
-    if stage.activated != prerequisites_complete {
+    let mut inline = InlinePredecessors::default();
+    let mut local_finished = 0_u32;
+    for id in dependencies.local.iter(&image.stage_joins) {
+        let local = flow_index
+            .generator_for_flow(image, id)
+            .filter(|candidate| {
+                candidate.stage.is_some()
+                    && candidate.flow != flow.id
+                    && flow_source(image, candidate.flow) == Some(flow.source)
+            })
+            .ok_or_else(|| {
+                ValidationError::new(format!(
+                    "flow {:?} local predecessor {id:?} is not a stage on its host",
+                    flow.id
+                ))
+            })?;
+        if local.next_emission.status == GeneratorStatus::Finished {
+            local_finished += 1;
+        }
+        if dependencies.local.one().is_some() {
+            inline.local = Some(local);
+        }
+    }
+    if dependencies.local_completed != local_finished {
         return Err(ValidationError::new(format!(
-            "flow {:?} collective release flag disagrees with its prerequisites",
+            "flow {:?} stage local completion count {} disagrees with predecessor state ({} finished)",
+            flow.id, dependencies.local_completed, local_finished
+        )));
+    }
+    let mut required = 0_u64;
+    let mut frontiers = 0_u64;
+    for id in dependencies.inbound.iter(&image.stage_joins) {
+        let inbound = flow_index
+            .generator_for_flow(image, id)
+            .filter(|candidate| {
+                collective_identity(*candidate).is_some()
+                    && self::flow(image, candidate.flow)
+                        .is_some_and(|predecessor| predecessor.target == flow.source)
+            })
+            .ok_or_else(|| {
+                ValidationError::new(format!(
+                    "flow {:?} inbound predecessor {id:?} is not a collective stage delivering to its host",
+                    flow.id
+                ))
+            })?;
+        let total = transport_total_bytes(&inbound.kind).ok_or_else(|| {
+            ValidationError::new(format!(
+                "flow {:?} inbound predecessor {id:?} is not a TCP or RoCE stage",
+                flow.id
+            ))
+        })?;
+        let frontier = host_inbound_frontier(state, &inbound).ok_or_else(|| {
+            ValidationError::new(format!(
+                "flow {:?} inbound predecessor {id:?} has no receiver on its host",
+                flow.id
+            ))
+        })?;
+        required = required.checked_add(total).ok_or_else(|| {
+            ValidationError::new(format!(
+                "flow {:?} inbound byte requirement exceeds u64",
+                flow.id
+            ))
+        })?;
+        frontiers = frontiers.checked_add(frontier).ok_or_else(|| {
+            ValidationError::new(format!("flow {:?} inbound byte count exceeds u64", flow.id))
+        })?;
+        if dependencies.inbound.one().is_some() {
+            inline.inbound = Some(inbound);
+        }
+    }
+    if dependencies.inbound_predecessor_bytes != required {
+        return Err(ValidationError::new(format!(
+            "flow {:?} stage inbound requirement {} is not its predecessors' {required} bytes",
+            flow.id, dependencies.inbound_predecessor_bytes
+        )));
+    }
+    if dependencies.inbound_bytes_received != frontiers {
+        return Err(ValidationError::new(format!(
+            "flow {:?} stage inbound bytes {} disagree with the in-order frontiers {frontiers} of its inbound predecessors",
+            flow.id, dependencies.inbound_bytes_received
+        )));
+    }
+    if stage.activated != dependencies.prerequisites_complete() {
+        return Err(ValidationError::new(format!(
+            "flow {:?} stage release flag disagrees with its prerequisites",
             flow.id
         )));
     }
-    Ok(())
+    Ok(inline)
+}
+
+/// The generators of a stage's inline (single) local and inbound predecessors, as
+/// [`validate_stage_dependencies`] found them.
+#[derive(Clone, Copy, Default)]
+struct InlinePredecessors<'a> {
+    local: Option<StagedGenerator<'a>>,
+    inbound: Option<StagedGenerator<'a>>,
 }
 
 /// The source of flow `id`. `validate_flow_ids` has established `flows[i].id == i` with unique
@@ -3440,7 +3532,6 @@ fn host_inbound_frontier(
     }
 }
 
-/// The transport of a stage generator, as validation errors name it.
 /// A RoCE queue pair's MTU and pacing interval, which a compute stage after it writes on its
 /// progress rows (schema Amendment 5); `None` for any other generator.
 const fn roce_transport(kind: &FlowGeneratorKind) -> Option<(u64, u64)> {
@@ -3449,13 +3540,6 @@ const fn roce_transport(kind: &FlowGeneratorKind) -> Option<(u64, u64)> {
             Some((roce.pacer.mtu_bytes, roce.pacer.pacing_interval_ns))
         }
         _ => None,
-    }
-}
-
-const fn transport_label(generator: &crate::FlowGeneratorState) -> &'static str {
-    match generator.kind {
-        FlowGeneratorKind::Roce(_) => "RoCE",
-        _ => "TCP",
     }
 }
 
@@ -3526,108 +3610,18 @@ fn validate_compute_stage(
         )));
     }
 
-    let local = dependencies
-        .local_predecessor
-        .map(|id| {
-            flow_index
-                .generator_for_flow(image, id)
-                .filter(|candidate| flow_source(image, candidate.flow) == Some(flow.source))
-                .ok_or_else(|| {
-                    ValidationError::new(format!(
-                        "flow {:?} compute local predecessor {id:?} is not a stage on its host",
-                        flow.id
-                    ))
-                })
-        })
-        .transpose()?;
-    let local_role = local
-        .and_then(|candidate| candidate.stage)
-        .map(|stage| stage.role);
-    match (local_role, dependencies.inbound_predecessor) {
-        (None, None) => {}
-        (Some(crate::StageRole::Compute(previous)), None)
-            if previous.rank == compute.rank && previous.group_size == compute.group_size => {}
-        (Some(crate::StageRole::Collective(final_stage)), Some(inbound_id))
-            if final_stage.rank == compute.rank
-                && final_stage.group_size == compute.group_size
-                && final_stage.phase == crate::CollectivePhase::AllGather
-                && final_stage.step + 1 == final_stage.group_size =>
-        {
-            let previous_rank = (compute.rank + compute.group_size - 1) % compute.group_size;
-            let inbound = flow_index
-                .generator_for_flow(image, inbound_id)
-                .and_then(|candidate| collective_identity(candidate).map(|stage| (candidate, stage)))
-                .filter(|(candidate, stage)| {
-                    stage.collective_id == final_stage.collective_id
-                        && stage.phase == final_stage.phase
-                        && stage.step == final_stage.step
-                        && stage.rank == previous_rank
-                        && self::flow(image, candidate.flow)
-                            .is_some_and(|flow_descriptor| flow_descriptor.target == flow.source)
-                })
-                .ok_or_else(|| {
-                    ValidationError::new(format!(
-                        "flow {:?} compute inbound predecessor is not the previous rank's final stage",
-                        flow.id
-                    ))
-                })?;
-            if inbound.1.chunk_bytes != dependencies.inbound_predecessor_bytes {
-                return Err(ValidationError::new(format!(
-                    "flow {:?} compute inbound predecessor does not deliver the declared chunk",
-                    flow.id
-                )));
-            }
-            // Schema Amendment 5: the stage's progress rows name its inbound transport from its
-            // local predecessor, the same rank's final stage of the same collective.
-            if local.map(|candidate| roce_transport(&candidate.kind))
-                != Some(roce_transport(&inbound.0.kind))
-            {
-                return Err(ValidationError::new(format!(
-                    "flow {:?} compute local and inbound predecessors disagree on the RoCE MTU or pacing interval",
-                    flow.id
-                )));
-            }
-            let frontier = host_inbound_frontier(state, &inbound.0);
-            if frontier != Some(dependencies.inbound_bytes_received) {
-                return Err(ValidationError::new(format!(
-                    "flow {:?} compute inbound bytes {} disagree with the in-order {} frontier {:?} of flow {inbound_id:?}",
-                    flow.id,
-                    dependencies.inbound_bytes_received,
-                    transport_label(&inbound.0),
-                    frontier
-                )));
-            }
-        }
-        _ => {
+    let inline = validate_stage_dependencies(image, flow_index, state, flow, stage)?;
+    validate_compute_predecessors(image, flow_index, flow, compute, dependencies, inline)?;
+    // Schema Amendment 5: a compute stage after one RoCE collective names that collective's
+    // transport on its progress rows, read from its local predecessor, which must then agree with
+    // its inbound predecessor.
+    if let (Some(local), Some(inbound)) = (inline.local, inline.inbound) {
+        if roce_transport(&local.kind) != roce_transport(&inbound.kind) {
             return Err(ValidationError::new(format!(
-                "flow {:?} compute predecessors are neither a same-rank compute stage nor a collective's final stages",
+                "flow {:?} compute local and inbound predecessors disagree on the RoCE MTU or pacing interval",
                 flow.id
             )));
         }
-    }
-    if dependencies.local_predecessor_complete
-        != local.is_none_or(|candidate| candidate.next_emission.status == GeneratorStatus::Finished)
-    {
-        return Err(ValidationError::new(format!(
-            "flow {:?} compute local completion flag disagrees with predecessor state",
-            flow.id
-        )));
-    }
-    if dependencies.inbound_bytes_received > dependencies.inbound_predecessor_bytes
-        || dependencies.inbound_predecessor_complete
-            != (dependencies.inbound_predecessor.is_none()
-                || dependencies.inbound_bytes_received == dependencies.inbound_predecessor_bytes)
-    {
-        return Err(ValidationError::new(format!(
-            "flow {:?} compute inbound completion flag disagrees with received bytes",
-            flow.id
-        )));
-    }
-    if stage.activated != dependencies.prerequisites_complete() {
-        return Err(ValidationError::new(format!(
-            "flow {:?} compute release flag disagrees with its prerequisites",
-            flow.id
-        )));
     }
     let emission = generator.next_emission;
     let consistent = match emission.status {
@@ -3665,6 +3659,93 @@ fn validate_compute_stage(
             "flow {:?} compute timer state {:?} is inconsistent with its release",
             flow.id, emission.status
         )));
+    }
+    Ok(())
+}
+
+/// Whether `stage` is the final stage of its collective at its rank: the last step of its
+/// algorithm's last phase.
+const fn is_final_collective_stage(stage: crate::CollectiveStageIdentity) -> bool {
+    matches!(stage.phase, crate::CollectivePhase::AllGather) && stage.step + 1 == stage.group_size
+}
+
+/// The shape of a compute stage's predecessors: it follows stage groups on its own ranks. Each
+/// local predecessor is the same-rank stage of a compute group, or the same-rank final stage of a
+/// collective; each such collective also supplies exactly one inbound predecessor, its previous
+/// rank's final stage, and no other inbound predecessor exists.
+fn validate_compute_predecessors(
+    image: &SimulationImage,
+    flow_index: &FlowIndex,
+    flow: &crate::FlowDescriptor,
+    compute: crate::ComputeStage,
+    dependencies: crate::StageDependencies,
+    inline: InlinePredecessors<'_>,
+) -> Result<(), ValidationError> {
+    let shape_error = || {
+        ValidationError::new(format!(
+            "flow {:?} compute predecessors are neither a same-rank compute stage nor a collective's final stages",
+            flow.id
+        ))
+    };
+    let previous_rank = (compute.rank + compute.group_size - 1) % compute.group_size;
+    let role_of = |candidate: Option<StagedGenerator<'_>>, id| {
+        candidate
+            .or_else(|| flow_index.generator_for_flow(image, id))
+            .and_then(|candidate| candidate.stage)
+            .map(|stage| stage.role)
+    };
+    // The same-rank final stage this local predecessor is, if it is one of a collective.
+    let local_final = |id| -> Result<Option<crate::CollectiveStageIdentity>, ValidationError> {
+        match role_of(inline.local, id).ok_or_else(shape_error)? {
+            crate::StageRole::Compute(previous)
+                if previous.rank == compute.rank && previous.group_size == compute.group_size =>
+            {
+                Ok(None)
+            }
+            crate::StageRole::Collective(final_stage)
+                if is_final_collective_stage(final_stage)
+                    && final_stage.rank == compute.rank
+                    && final_stage.group_size == compute.group_size =>
+            {
+                Ok(Some(final_stage))
+            }
+            _ => Err(shape_error()),
+        }
+    };
+    let mut collective_locals = 0_usize;
+    for id in dependencies.local.iter(&image.stage_joins) {
+        if local_final(id)?.is_some() {
+            collective_locals += 1;
+        }
+    }
+    let mut inbound_count = 0_usize;
+    for id in dependencies.inbound.iter(&image.stage_joins) {
+        let Some(crate::StageRole::Collective(inbound)) = role_of(inline.inbound, id) else {
+            return Err(shape_error());
+        };
+        if !is_final_collective_stage(inbound) || inbound.rank != previous_rank {
+            return Err(shape_error());
+        }
+        // Each inbound final stage pairs with this rank's final stage of the same collective.
+        let mut paired = false;
+        for local in dependencies.local.iter(&image.stage_joins) {
+            if local_final(local)?.is_some_and(|stage| {
+                stage.collective_id == inbound.collective_id
+                    && stage.phase == inbound.phase
+                    && stage.step == inbound.step
+                    && stage.channel == inbound.channel
+            }) {
+                paired = true;
+                break;
+            }
+        }
+        if !paired {
+            return Err(shape_error());
+        }
+        inbound_count += 1;
+    }
+    if inbound_count != collective_locals {
+        return Err(shape_error());
     }
     Ok(())
 }
@@ -7722,8 +7803,8 @@ pub fn assert_validate_generator_index_equivalent_for_testing(
     for generator in image.host_states.iter().flat_map(staged_generators) {
         generator_queries.push(generator.flow);
         if let Some(stage) = generator.stage {
-            generator_queries.extend(stage.dependencies.local_predecessor);
-            generator_queries.extend(stage.dependencies.inbound_predecessor);
+            generator_queries.extend(stage.dependencies.local.iter(&image.stage_joins));
+            generator_queries.extend(stage.dependencies.inbound.iter(&image.stage_joins));
         }
     }
     for packet in &image.initial_packets {

@@ -11,8 +11,8 @@ use days_executor::{
     LinkId, NodeDescriptor, NodeId, NodeKind, PacketDescriptor, PacketKind, PayloadId,
     PfcIngressState, PfcQueueState, QueueDepthUnit, RateGenerator, RedPolicyState, RemoteChannel,
     RoceGenerator, RocePacer, RoceReceiverState, ScheduledEmission, SchedulerKind, SimulationImage,
-    StageDependencies, StageRole, SwitchQueueState, SwitchState, TcpCongestionControl,
-    TcpDataHeader, TcpGenerator, TcpReceiverState, event_phase, validate,
+    StageDependencies, StagePredecessors, StageRole, SwitchQueueState, SwitchState,
+    TcpCongestionControl, TcpDataHeader, TcpGenerator, TcpReceiverState, event_phase, validate,
 };
 use num_bigint::BigUint;
 use petgraph::graph::NodeIndex;
@@ -178,8 +178,28 @@ struct SourceCompute {
     name: String,
     hosts: Vec<u64>,
     duration_ns: u64,
-    /// Stage group (compute or TCP collective) that each host's stage waits for.
-    after: Option<String>,
+    /// Stage groups (compute groups or collectives) that each host's stage waits for: one name,
+    /// or a list of names whose stages it joins.
+    #[serde(default)]
+    after: Option<AfterGroups>,
+}
+
+/// One stage-group name, or several. One name is held without a list, so a group with a single
+/// predecessor allocates nothing for it.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(untagged)]
+enum AfterGroups {
+    One(String),
+    Many(Vec<String>),
+}
+
+/// The names `after` lists, in order.
+fn after_names(after: Option<&AfterGroups>) -> &[String] {
+    match after {
+        None => &[],
+        Some(AfterGroups::One(name)) => std::slice::from_ref(name),
+        Some(AfterGroups::Many(names)) => names,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -464,7 +484,7 @@ pub fn fat_tree_ecmp_explicit_flow_hash(
         },
         duplicate_ordinal,
     };
-    generator_seed(seed ^ 0x4543_4d50_5f48_4153, &key, &[], &[])
+    generator_seed(seed ^ 0x4543_4d50_5f48_4153, &key, &[], &[], &[])
 }
 
 /// Selects the compiler-identical fat-tree ECMP hash for one flow-set member.
@@ -492,7 +512,7 @@ pub fn fat_tree_ecmp_flow_set_member_hash(
         source,
         target,
     };
-    generator_seed(seed ^ 0x4543_4d50_5f48_4153, &key, &[], &[])
+    generator_seed(seed ^ 0x4543_4d50_5f48_4153, &key, &[], &[], &[])
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -535,7 +555,8 @@ struct ComputeKey {
     name: String,
     hosts: Vec<u64>,
     duration_ns: u64,
-    after: Option<String>,
+    /// The stage groups each host's stage waits for, in the order the scenario names them.
+    after: Option<AfterGroups>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -567,10 +588,10 @@ enum FlowKey {
         duplicate_ordinal: u64,
         stage: CollectiveStagePosition,
     },
-    ComputeStage {
-        semantic: ComputeKey,
-        rank: u32,
-    },
+    /// `compute` is the ordinal of the stage's [`ComputeKey`] among the scenario's sorted compute
+    /// keys, which [`CanonicalFlows::computes`] holds; names are unique, so the mapping is
+    /// order-isomorphic, as for collectives.
+    ComputeStage { compute: u64, rank: u32 },
 }
 
 #[derive(Clone, Debug)]
@@ -582,11 +603,67 @@ struct CollectiveStageInput {
     position: CollectiveStagePosition,
     chunk_offset_bytes: u64,
     chunk_bytes: u64,
-    local_predecessor: Option<FlowKey>,
-    inbound_predecessor: Option<FlowKey>,
+    local: PredecessorKeys,
+    inbound: PredecessorKeys,
     inbound_predecessor_bytes: u64,
-    local_predecessor_complete: bool,
-    inbound_predecessor_complete: bool,
+}
+
+/// The predecessors of one kind of a stage, by flow key: inline when there is at most one, so a
+/// stage that is not a join allocates nothing for them.
+#[derive(Clone, Debug, Default)]
+enum PredecessorKeys {
+    #[default]
+    None,
+    One(FlowKey),
+    Many(Vec<FlowKey>),
+}
+
+impl PredecessorKeys {
+    fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    fn push(&mut self, key: FlowKey) {
+        *self = match std::mem::take(self) {
+            Self::None => Self::One(key),
+            Self::One(first) => Self::Many(vec![first, key]),
+            Self::Many(mut keys) => {
+                keys.push(key);
+                Self::Many(keys)
+            }
+        };
+    }
+
+    /// The image form: a join's flows are sorted and appended to `joins` as one run.
+    fn resolve(
+        &self,
+        flow_ids: &BTreeMap<FlowKey, u64>,
+        joins: &mut Vec<FlowId>,
+    ) -> Result<StagePredecessors, CompileError> {
+        Ok(match self {
+            Self::None => StagePredecessors::None,
+            Self::One(key) => StagePredecessors::One(FlowId(flow_ids[key])),
+            Self::Many(keys) => {
+                let mut flows = keys
+                    .iter()
+                    .map(|key| FlowId(flow_ids[key]))
+                    .collect::<Vec<_>>();
+                flows.sort_unstable();
+                flows.dedup();
+                let first = u32::try_from(joins.len()).map_err(|_| {
+                    CompileError::Invalid("stage join table exceeds u32".to_owned())
+                })?;
+                let count = u32::try_from(flows.len())
+                    .map_err(|_| CompileError::Invalid("stage join exceeds u32".to_owned()))?;
+                if count == 1 {
+                    StagePredecessors::One(flows[0])
+                } else {
+                    joins.extend(flows);
+                    StagePredecessors::Join { first, count }
+                }
+            }
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -595,8 +672,8 @@ struct ComputeStageInput {
     group_size: u32,
     rank: u32,
     duration_ns: u64,
-    local_predecessor: Option<FlowKey>,
-    inbound_predecessor: Option<FlowKey>,
+    local: PredecessorKeys,
+    inbound: PredecessorKeys,
     inbound_predecessor_bytes: u64,
 }
 
@@ -2642,6 +2719,7 @@ fn lower(
     let CanonicalFlows {
         flows,
         collectives: collective_table,
+        computes: compute_table,
     } = canonical_flows(
         model.explicit_flows,
         model.flow_sets,
@@ -2681,6 +2759,7 @@ fn lower(
                     model.seed ^ 0x4543_4d50_5f48_4153,
                     &flow.key,
                     &collective_table,
+                    &compute_table,
                     &roce_keys,
                 ),
             }),
@@ -2759,10 +2838,12 @@ fn lower(
     let mut payload_sequences = BTreeMap::<LpKey, u64>::new();
     let mut initial_packets = Vec::with_capacity(flows.len());
     let mut initial_event_inputs = Vec::<(LpKey, u64, FlowId, PayloadId, EventKind)>::new();
+    // The predecessor runs of join stages, in flow order.
+    let mut stage_joins = Vec::new();
     for (flow, descriptor) in flows.iter().zip(&flow_descriptors) {
         let source = LpKey::Host(flow.source);
         if let Some(compute) = &flow.compute {
-            let root = compute.local_predecessor.is_none() && compute.inbound_predecessor.is_none();
+            let root = compute.local.is_none() && compute.inbound.is_none();
             let next_emission = if !root {
                 ScheduledEmission {
                     status: GeneratorStatus::Blocked,
@@ -2810,14 +2891,21 @@ fn lower(
                     payload,
                 }
             };
-            let stage_flow = |key: &FlowKey| FlowId(flow_ids[key]);
+            let local = compute.local.resolve(&flow_ids, &mut stage_joins)?;
+            let inbound = compute.inbound.resolve(&flow_ids, &mut stage_joins)?;
             generators_by_source.entry(source).or_default().push((
                 FlowGeneratorState {
                     flow: descriptor.id,
                     packets_emitted: 0,
                     bytes_emitted: 0,
                     next_emission,
-                    rng_state: generator_seed(model.seed, &flow.key, &collective_table, &roce_keys),
+                    rng_state: generator_seed(
+                        model.seed,
+                        &flow.key,
+                        &collective_table,
+                        &compute_table,
+                        &roce_keys,
+                    ),
                     feedback: GeneratorFeedbackState {
                         arrivals: 0,
                         outstanding_bytes: 0,
@@ -2838,12 +2926,11 @@ fn lower(
                         duration_ns: compute.duration_ns,
                     }),
                     dependencies: StageDependencies {
-                        local_predecessor: compute.local_predecessor.as_ref().map(stage_flow),
-                        inbound_predecessor: compute.inbound_predecessor.as_ref().map(stage_flow),
+                        local,
+                        inbound,
                         inbound_predecessor_bytes: compute.inbound_predecessor_bytes,
-                        local_predecessor_complete: compute.local_predecessor.is_none(),
-                        inbound_predecessor_complete: compute.inbound_predecessor.is_none(),
                         inbound_bytes_received: 0,
+                        local_completed: 0,
                     },
                     activated: root,
                 }),
@@ -2856,9 +2943,11 @@ fn lower(
             TrafficKind::Roce(ordinal) => Some(roce_key(&roce_keys, ordinal)),
             _ => None,
         };
-        let collective_ready = flow.collective.as_ref().is_none_or(|stage| {
-            stage.local_predecessor_complete && stage.inbound_predecessor_complete
-        });
+        // Nothing has run at lowering, so a stage is ready exactly when it waits for nothing.
+        let collective_ready = flow
+            .collective
+            .as_ref()
+            .is_none_or(|stage| stage.local.is_none() && stage.inbound.is_none());
         // A RoCE stage that its prerequisites have not released holds its anchors at zero (ruling
         // C5); its release re-anchors the pacer and the controller at the release instant.
         let gated_roce = roce.is_some() && !collective_ready;
@@ -2983,34 +3072,35 @@ fn lower(
                 payload,
             }
         };
-        let collective_stage = flow.collective.as_ref().map(|stage| {
-            let stage_flow = |key: &FlowKey| FlowId(flow_ids[key]);
-            (
-                CollectiveStageIdentity {
-                    collective_id: stage.collective_id,
-                    algorithm: stage.algorithm,
-                    topology_level: 0,
-                    topology_group: 0,
-                    group_size: stage.group_size,
-                    declared_total_bytes: stage.declared_total_bytes,
-                    rank: stage.position.rank,
-                    phase: stage.position.phase,
-                    step: stage.position.step,
-                    chunk_policy: CollectiveChunkPolicy::EqualRemainderLast,
-                    channel_policy: CollectiveChannelPolicy::RingNext,
-                    chunk_offset_bytes: stage.chunk_offset_bytes,
-                    chunk_bytes: stage.chunk_bytes,
-                },
-                StageDependencies {
-                    local_predecessor: stage.local_predecessor.as_ref().map(stage_flow),
-                    inbound_predecessor: stage.inbound_predecessor.as_ref().map(stage_flow),
-                    inbound_predecessor_bytes: stage.inbound_predecessor_bytes,
-                    local_predecessor_complete: stage.local_predecessor_complete,
-                    inbound_predecessor_complete: stage.inbound_predecessor_complete,
-                    inbound_bytes_received: 0,
-                },
-            )
-        });
+        let collective_stage = flow
+            .collective
+            .as_ref()
+            .map(|stage| -> Result<_, CompileError> {
+                Ok((
+                    CollectiveStageIdentity {
+                        collective_id: stage.collective_id,
+                        algorithm: stage.algorithm,
+                        channel: 0,
+                        group_size: stage.group_size,
+                        declared_total_bytes: stage.declared_total_bytes,
+                        rank: stage.position.rank,
+                        phase: stage.position.phase,
+                        step: stage.position.step,
+                        chunk_policy: CollectiveChunkPolicy::EqualRemainderLast,
+                        channel_policy: CollectiveChannelPolicy::RingNext,
+                        chunk_offset_bytes: stage.chunk_offset_bytes,
+                        chunk_bytes: stage.chunk_bytes,
+                    },
+                    StageDependencies {
+                        local: stage.local.resolve(&flow_ids, &mut stage_joins)?,
+                        inbound: stage.inbound.resolve(&flow_ids, &mut stage_joins)?,
+                        inbound_predecessor_bytes: stage.inbound_predecessor_bytes,
+                        inbound_bytes_received: 0,
+                        local_completed: 0,
+                    },
+                ))
+            })
+            .transpose()?;
         generators_by_source.entry(source).or_default().push((
             FlowGeneratorState {
                 // Every collective stage is a TCP or RoCE generator whose dependencies live in this record;
@@ -3019,7 +3109,13 @@ fn lower(
                 packets_emitted: 0,
                 bytes_emitted: 0,
                 next_emission,
-                rng_state: generator_seed(model.seed, &flow.key, &collective_table, &roce_keys),
+                rng_state: generator_seed(
+                    model.seed,
+                    &flow.key,
+                    &collective_table,
+                    &compute_table,
+                    &roce_keys,
+                ),
                 feedback: GeneratorFeedbackState {
                     arrivals: 0,
                     outstanding_bytes: 0,
@@ -3511,6 +3607,7 @@ fn lower(
         channels,
         initial_events,
         seed: model.seed,
+        stage_joins,
     })
 }
 
@@ -3520,6 +3617,16 @@ struct CanonicalFlows {
     /// The normalized collective keys, sorted and distinct: `FlowKey::CollectiveStage::collective`
     /// indexes this table.
     collectives: Vec<CollectiveKey>,
+    /// The compute keys, sorted: `FlowKey::ComputeStage::compute` indexes this table.
+    computes: Vec<ComputeKey>,
+}
+
+/// Ordinal of `compute` in the sorted `table`.
+fn compute_ordinal(table: &[ComputeKey], compute: &ComputeKey) -> u64 {
+    let index = table
+        .binary_search(compute)
+        .expect("every compute key is in the compute table");
+    u64::try_from(index).expect("the compute table length fits u64")
 }
 
 /// Ordinal of `semantic` in the sorted distinct `table`.
@@ -3699,7 +3806,7 @@ fn canonical_flows(
             .checked_add(1)
             .ok_or_else(|| CompileError::Invalid("collective identity exceeds u64".to_owned()))?;
         let entry = semantic.after.as_ref().map(|name| match groups[name] {
-            StageGroup::Compute(compute) => compute.clone(),
+            StageGroup::Compute(compute) => compute_ordinal(&computes, compute),
             StageGroup::Collective(_) => {
                 unreachable!("group resolution admits compute entries only")
             }
@@ -3710,7 +3817,7 @@ fn canonical_flows(
             collective,
             duplicate_ordinal,
             collective_id,
-            entry.as_ref(),
+            entry,
         )?;
     }
     for (compute_id, compute) in computes.iter().enumerate() {
@@ -3720,6 +3827,7 @@ fn canonical_flows(
             compute_id as u64,
             &groups,
             &collective_table,
+            &computes,
         )?;
     }
 
@@ -3727,6 +3835,7 @@ fn canonical_flows(
     Ok(CanonicalFlows {
         flows,
         collectives: collective_table,
+        computes,
     })
 }
 
@@ -3768,7 +3877,7 @@ fn expand_collective(
     collective: u64,
     duplicate_ordinal: u64,
     collective_id: u64,
-    entry: Option<&ComputeKey>,
+    entry: Option<u64>,
 ) -> Result<(), CompileError> {
     let n = semantic.flow_count;
     let Termination::Bytes(total_bytes) = semantic.traffic.termination else {
@@ -3852,18 +3961,6 @@ fn expand_collective(
                 } else {
                     None
                 };
-                let local_predecessor_complete = local_predecessor.is_none_or(|predecessor| {
-                    let predecessor_owner = collective_stage_owner(
-                        semantic.algorithm,
-                        predecessor.phase,
-                        n,
-                        u64::from(predecessor.rank),
-                        u64::from(predecessor.step),
-                    );
-                    collective_chunk_bounds(total_bytes, n, predecessor_owner).1 == 0
-                });
-                let inbound_predecessor_complete =
-                    inbound_predecessor.is_none() || chunk_bytes == 0;
                 let stage_key = |stage: CollectiveStagePosition| FlowKey::CollectiveStage {
                     collective,
                     duplicate_ordinal,
@@ -3873,14 +3970,15 @@ fn expand_collective(
                 // rank's compute stage, the only predecessor a root can have.
                 let entry_predecessor = entry
                     .filter(|_| local_predecessor.is_none() && inbound_predecessor.is_none())
-                    .map(|compute| FlowKey::ComputeStage {
-                        semantic: compute.clone(),
-                        rank,
-                    });
-                let local_predecessor_complete =
-                    local_predecessor_complete && entry_predecessor.is_none();
-                let local_predecessor = local_predecessor.map(stage_key).or(entry_predecessor);
-                let inbound_predecessor = inbound_predecessor.map(stage_key);
+                    .map(|compute| FlowKey::ComputeStage { compute, rank });
+                let local = match local_predecessor.map(stage_key).or(entry_predecessor) {
+                    Some(key) => PredecessorKeys::One(key),
+                    None => PredecessorKeys::None,
+                };
+                let (inbound, inbound_predecessor_bytes) = match inbound_predecessor {
+                    Some(position) => (PredecessorKeys::One(stage_key(position)), chunk_bytes),
+                    None => (PredecessorKeys::None, 0),
+                };
                 let mut traffic = semantic.traffic.clone();
                 traffic.termination = Termination::Bytes(chunk_bytes);
                 flows.push(FlowInput {
@@ -3897,11 +3995,9 @@ fn expand_collective(
                         position,
                         chunk_offset_bytes,
                         chunk_bytes,
-                        local_predecessor,
-                        inbound_predecessor,
-                        inbound_predecessor_bytes: chunk_bytes,
-                        local_predecessor_complete,
-                        inbound_predecessor_complete,
+                        local,
+                        inbound,
+                        inbound_predecessor_bytes,
                     })),
                     compute: None,
                 });
@@ -3970,49 +4066,78 @@ fn resolve_stage_groups<'a>(
         }
     }
     for compute in computes {
-        let Some(after) = &compute.after else {
-            continue;
-        };
         let name = &compute.name;
-        let hosts = match groups.get(after) {
-            None => {
+        let names = after_names(compute.after.as_ref());
+        for (index, after) in names.iter().enumerate() {
+            if names[..index].contains(after) {
                 return Err(CompileError::Invalid(format!(
-                    "compute `{name}` depends on unknown stage group `{after}`"
+                    "compute `{name}` names stage group `{after}` more than once"
                 )));
             }
-            Some(StageGroup::Compute(predecessor)) => &predecessor.hosts,
-            Some(StageGroup::Collective(collective)) => {
-                if collective.flow_count < 2 {
+            let hosts = match groups.get(after) {
+                None => {
                     return Err(CompileError::Invalid(format!(
-                        "compute `{name}` depends on collective `{after}`, which has no stages"
+                        "compute `{name}` depends on unknown stage group `{after}`"
                     )));
                 }
-                &collective.sources
-            }
-        };
-        if *hosts != compute.hosts {
-            return Err(CompileError::Invalid(format!(
-                "compute `{name}` hosts must equal the ranks of `{after}` in order"
-            )));
-        }
-    }
-    // Each group has at most one `after`, so a cycle is a revisited name on one chain.
-    for start in groups.keys() {
-        let mut seen = BTreeSet::new();
-        let mut current = start.as_str();
-        loop {
-            if !seen.insert(current) {
+                Some(StageGroup::Compute(predecessor)) => &predecessor.hosts,
+                Some(StageGroup::Collective(collective)) => {
+                    if collective.flow_count < 2 {
+                        return Err(CompileError::Invalid(format!(
+                            "compute `{name}` depends on collective `{after}`, which has no stages"
+                        )));
+                    }
+                    &collective.sources
+                }
+            };
+            if *hosts != compute.hosts {
                 return Err(CompileError::Invalid(format!(
-                    "stage group dependencies form a cycle through `{current}`"
+                    "compute `{name}` hosts must equal the ranks of `{after}` in order"
                 )));
             }
-            let after = match groups[current] {
-                StageGroup::Collective(collective) => collective.after.as_deref(),
-                StageGroup::Compute(compute) => compute.after.as_deref(),
-            };
-            match after {
-                Some(next) => current = next,
-                None => break,
+        }
+    }
+    // A depth-first walk over the `after` edges, in name order, finds any cycle; groups are
+    // indexed by their position in name order.
+    let names = groups.keys().map(String::as_str).collect::<Vec<_>>();
+    let afters = |index: usize| -> &[String] {
+        match groups[names[index]] {
+            StageGroup::Collective(collective) => collective.after.as_slice(),
+            StageGroup::Compute(compute) => after_names(compute.after.as_ref()),
+        }
+    };
+    // 0: unvisited; 1: on the walk's path; 2: finished.
+    let mut state = vec![0_u8; names.len()];
+    let mut stack = Vec::<(usize, usize)>::new();
+    for start in 0..names.len() {
+        if state[start] != 0 {
+            continue;
+        }
+        state[start] = 1;
+        stack.push((start, 0));
+        while let Some((current, cursor)) = stack.last_mut() {
+            let current = *current;
+            if let Some(next) = afters(current).get(*cursor) {
+                *cursor += 1;
+                let next = names
+                    .binary_search(&next.as_str())
+                    .expect("group resolution checked every name");
+                match state[next] {
+                    1 => {
+                        return Err(CompileError::Invalid(format!(
+                            "stage group dependencies form a cycle through `{}`",
+                            names[next]
+                        )));
+                    }
+                    0 => {
+                        state[next] = 1;
+                        stack.push((next, 0));
+                    }
+                    _ => {}
+                }
+            } else {
+                state[current] = 2;
+                stack.pop();
             }
         }
     }
@@ -4023,70 +4148,79 @@ fn resolve_stage_groups<'a>(
 ///
 /// After a compute group, rank r waits for that group's rank-r stage. After a collective, rank r
 /// waits for its own final stage (local, acknowledged) and the previous rank's final stage
-/// (inbound, delivered in order), which together complete the collective at rank r.
+/// (inbound, delivered in order), which together complete the collective at rank r. After several
+/// groups, rank r waits for all of these: the stage is a join.
 fn expand_compute(
     flows: &mut Vec<FlowInput>,
     compute: &ComputeKey,
     compute_id: u64,
     groups: &BTreeMap<String, StageGroup<'_>>,
     collective_table: &[CollectiveKey],
+    computes: &[ComputeKey],
 ) -> Result<(), CompileError> {
     let group_size = u32::try_from(compute.hosts.len())
         .expect("compute validation bounded the group size by u32");
-    let after = compute.after.as_ref().map(|name| groups[name]);
-    let after_collective = match after {
-        Some(StageGroup::Collective(collective)) => {
-            Some(collective_ordinal(collective_table, collective))
-        }
-        Some(StageGroup::Compute(_)) | None => None,
-    };
+    let afters = after_names(compute.after.as_ref())
+        .iter()
+        .map(|name| match groups[name] {
+            StageGroup::Collective(collective) => (
+                StageGroup::Collective(collective),
+                Some(collective_ordinal(collective_table, collective)),
+            ),
+            group @ StageGroup::Compute(_) => (group, None),
+        })
+        .collect::<Vec<_>>();
     for (rank, &host) in (0_u32..).zip(&compute.hosts) {
-        let (local_predecessor, inbound_predecessor, inbound_predecessor_bytes) = match after {
-            None => (None, None, 0),
-            Some(StageGroup::Compute(predecessor)) => (
-                Some(FlowKey::ComputeStage {
-                    semantic: predecessor.clone(),
+        let mut local = PredecessorKeys::None;
+        let mut inbound = PredecessorKeys::None;
+        let mut inbound_predecessor_bytes = 0_u64;
+        for (after, ordinal) in &afters {
+            match after {
+                StageGroup::Compute(predecessor) => local.push(FlowKey::ComputeStage {
+                    compute: compute_ordinal(computes, predecessor),
                     rank,
                 }),
-                None,
-                0,
-            ),
-            Some(StageGroup::Collective(collective)) => {
-                let n = collective.flow_count;
-                let Termination::Bytes(total_bytes) = collective.traffic.termination else {
-                    unreachable!("collective validation requires byte termination")
-                };
-                let final_step = u32::try_from(n - 1).expect("collective group fits u32");
-                let previous_rank = u32::try_from((u64::from(rank) + n - 1) % n)
-                    .expect("rank is below the u32 group size");
-                // A named collective is unique by name, so its only instance has ordinal 0.
-                let final_stage = |rank: u32| FlowKey::CollectiveStage {
-                    collective: after_collective
-                        .expect("a collective predecessor has a table ordinal"),
-                    duplicate_ordinal: 0,
-                    stage: CollectiveStagePosition {
-                        phase: CollectivePhase::AllGather,
-                        rank,
-                        step: final_step,
-                    },
-                };
-                let owner = collective_stage_owner(
-                    collective.algorithm,
-                    CollectivePhase::AllGather,
-                    n,
-                    u64::from(previous_rank),
-                    u64::from(final_step),
-                );
-                (
-                    Some(final_stage(rank)),
-                    Some(final_stage(previous_rank)),
-                    collective_chunk_bounds(total_bytes, n, owner).1,
-                )
+                StageGroup::Collective(collective) => {
+                    let n = collective.flow_count;
+                    let Termination::Bytes(total_bytes) = collective.traffic.termination else {
+                        unreachable!("collective validation requires byte termination")
+                    };
+                    let final_step = u32::try_from(n - 1).expect("collective group fits u32");
+                    let previous_rank = u32::try_from((u64::from(rank) + n - 1) % n)
+                        .expect("rank is below the u32 group size");
+                    // A named collective is unique by name, so its only instance has ordinal 0.
+                    let final_stage = |rank: u32| FlowKey::CollectiveStage {
+                        collective: ordinal.expect("a collective predecessor has a table ordinal"),
+                        duplicate_ordinal: 0,
+                        stage: CollectiveStagePosition {
+                            phase: CollectivePhase::AllGather,
+                            rank,
+                            step: final_step,
+                        },
+                    };
+                    let owner = collective_stage_owner(
+                        collective.algorithm,
+                        CollectivePhase::AllGather,
+                        n,
+                        u64::from(previous_rank),
+                        u64::from(final_step),
+                    );
+                    local.push(final_stage(rank));
+                    inbound.push(final_stage(previous_rank));
+                    inbound_predecessor_bytes = inbound_predecessor_bytes
+                        .checked_add(collective_chunk_bounds(total_bytes, n, owner).1)
+                        .ok_or_else(|| {
+                            CompileError::Invalid(format!(
+                                "compute `{}` inbound bytes exceed u64",
+                                compute.name
+                            ))
+                        })?;
+                }
             }
-        };
+        }
         flows.push(FlowInput {
             key: FlowKey::ComputeStage {
-                semantic: compute.clone(),
+                compute: compute_id,
                 rank,
             },
             source: host,
@@ -4105,8 +4239,8 @@ fn expand_compute(
                 group_size,
                 rank,
                 duration_ns: compute.duration_ns,
-                local_predecessor,
-                inbound_predecessor,
+                local,
+                inbound,
                 inbound_predecessor_bytes,
             })),
         });
@@ -4221,6 +4355,7 @@ fn generator_seed(
     image_seed: u64,
     key: &FlowKey,
     collectives: &[CollectiveKey],
+    computes: &[ComputeKey],
     roce_keys: &[RoceTrafficKey],
 ) -> u64 {
     let mut state = mix_seed(image_seed ^ 0x6a09_e667_f3bc_c909);
@@ -4282,7 +4417,8 @@ fn generator_seed(
             state = mix_seed(state ^ u64::from(stage.step));
             state = mix_traffic_seed(state, &semantic.traffic, roce_keys);
         }
-        FlowKey::ComputeStage { semantic, rank } => {
+        FlowKey::ComputeStage { compute, rank } => {
+            let semantic = &computes[*compute as usize];
             state = mix_seed(state ^ 0x434f_4d50_5554_4500);
             state = semantic
                 .name

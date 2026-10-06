@@ -847,6 +847,7 @@ mod tests {
             channels: vec![RemoteChannel::for_packet_link(link, 1).unwrap()],
             initial_events,
             seed: 1,
+            stage_joins: Vec::new(),
         }
     }
 

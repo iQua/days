@@ -482,6 +482,7 @@ fn terminal_dcqcn_checkpoint_revalidates() {
         channels: image.channels.clone(),
         initial_events: result.pending_events,
         seed: image.seed,
+        stage_joins: image.stage_joins.clone(),
     };
     validate(&checkpoint, Backend::Scalar).unwrap();
     validate(&checkpoint, Backend::Cpu { workers: 4 }).unwrap();

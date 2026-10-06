@@ -451,6 +451,7 @@ fn executor_scheduler_image(scheduler: SchedulerKind) -> SimulationImage {
             })
             .collect(),
         seed: 18,
+        stage_joins: Vec::new(),
     }
 }
 

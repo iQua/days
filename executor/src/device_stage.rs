@@ -24,7 +24,7 @@
 //! predecessor completes at that host, and an inbound predecessor delivers to it. Lists and
 //! immutable words are read-only after upload.
 
-use crate::{CollectiveStage, HostState, SimulationImage, StageDependencies};
+use crate::{CollectiveStage, HostState, SimulationImage, StageDependencies, StagePredecessors};
 
 /// Words of one flow's row in the stage region.
 pub(crate) const STAGE_ROW_WORDS: usize = 5;
@@ -63,16 +63,16 @@ fn host_stages(state: &HostState) -> impl Iterator<Item = (usize, CollectiveStag
 fn encode_row(stage: CollectiveStage, row: &mut [u64]) {
     let dependencies = stage.dependencies;
     let mut flags = SR_IS_STAGE;
-    if dependencies.local_predecessor.is_some() {
+    if dependencies.local != StagePredecessors::None {
         flags |= SR_HAS_LOCAL;
     }
-    if dependencies.inbound_predecessor.is_some() {
+    if dependencies.inbound != StagePredecessors::None {
         flags |= SR_HAS_INBOUND;
     }
-    if dependencies.local_predecessor_complete {
+    if dependencies.local_complete() {
         flags |= SR_LOCAL_COMPLETE;
     }
-    if dependencies.inbound_predecessor_complete {
+    if dependencies.inbound_complete() {
         flags |= SR_INBOUND_COMPLETE;
     }
     row[SR_FLAGS] = flags;
@@ -106,10 +106,10 @@ pub(crate) fn encode_stage_region(image: &SimulationImage) -> Result<Vec<u64>, &
                 stage,
                 &mut region[index * STAGE_ROW_WORDS..(index + 1) * STAGE_ROW_WORDS],
             );
-            if let Some(predecessor) = stage.dependencies.local_predecessor {
+            if let StagePredecessors::One(predecessor) = stage.dependencies.local {
                 local.push((predecessor, flow));
             }
-            if let Some(predecessor) = stage.dependencies.inbound_predecessor {
+            if let StagePredecessors::One(predecessor) = stage.dependencies.inbound {
                 inbound.push((predecessor, flow));
             }
         }
@@ -199,20 +199,19 @@ pub(crate) fn decode_stage_rows(
             let local_complete = flags & SR_LOCAL_COMPLETE != 0;
             let inbound_complete = flags & SR_INBOUND_COMPLETE != 0;
             let received = row[SR_INBOUND_RECEIVED];
-            if (before.local_predecessor_complete && !local_complete)
-                || (before.inbound_predecessor_complete && !inbound_complete)
+            if (before.local_complete() && !local_complete)
                 || received < before.inbound_bytes_received
                 || received > before.inbound_predecessor_bytes
-                || (before.inbound_predecessor.is_some()
-                    && inbound_complete != (received == before.inbound_predecessor_bytes))
-                || (before.inbound_predecessor.is_none()
-                    && received != before.inbound_bytes_received)
+                || inbound_complete != (received == before.inbound_predecessor_bytes)
             {
                 return Err("stage row moved its dependency state backwards or inconsistently");
             }
             let dependencies = StageDependencies {
-                local_predecessor_complete: local_complete,
-                inbound_predecessor_complete: inbound_complete,
+                local_completed: if local_complete {
+                    before.local.count()
+                } else {
+                    before.local_completed
+                },
                 inbound_bytes_received: received,
                 ..before
             };
@@ -279,16 +278,19 @@ mod tests {
                 duration_ns: 1,
             }),
             dependencies: StageDependencies {
-                local_predecessor: local.map(FlowId),
-                inbound_predecessor: inbound.map(|(flow, _)| FlowId(flow)),
+                local: local.map_or(StagePredecessors::None, |flow| {
+                    StagePredecessors::One(FlowId(flow))
+                }),
+                inbound: inbound.map_or(StagePredecessors::None, |(flow, _)| {
+                    StagePredecessors::One(FlowId(flow))
+                }),
                 inbound_predecessor_bytes: inbound.map_or(0, |(_, bytes)| bytes),
-                local_predecessor_complete: local.is_none() || done,
-                inbound_predecessor_complete: inbound.is_none() || done,
                 inbound_bytes_received: if done {
                     inbound.map_or(0, |(_, bytes)| bytes)
                 } else {
                     0
                 },
+                local_completed: u32::from(local.is_some() && done),
             },
             activated: done,
         }
@@ -357,6 +359,7 @@ mod tests {
             channels: Vec::new(),
             initial_events: Vec::new(),
             seed: 0,
+            stage_joins: Vec::new(),
         }
     }
 
@@ -415,7 +418,7 @@ mod tests {
         rows[4 * STAGE_ROW_WORDS + SR_INBOUND_RECEIVED] = 300;
         decode_stage_rows(&rows, &image, &mut decoded).unwrap();
         let flow4 = decoded[0].stage(2).unwrap();
-        assert!(flow4.dependencies.local_predecessor_complete && !flow4.activated);
+        assert!(flow4.dependencies.local_complete() && !flow4.activated);
         assert_eq!(flow4.dependencies.inbound_bytes_received, 300);
         // All 700: released.
         rows[4 * STAGE_ROW_WORDS + SR_FLAGS] |= SR_INBOUND_COMPLETE;

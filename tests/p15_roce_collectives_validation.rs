@@ -31,6 +31,7 @@ fn checkpoint(image: &SimulationImage, horizon_ns: u64) -> SimulationImage {
         channels: image.channels.clone(),
         initial_events: result.pending_events,
         seed: image.seed,
+        stage_joins: image.stage_joins.clone(),
     }
 }
 
@@ -253,8 +254,7 @@ fn a_roce_stage_counts_its_receivers_frontier() {
                 .enumerate()
                 .filter_map(move |(position, stage)| {
                     let dependencies = stage.as_ref()?.dependencies;
-                    (dependencies.inbound_bytes_received > 0
-                        && !dependencies.inbound_predecessor_complete)
+                    (dependencies.inbound_bytes_received > 0 && !dependencies.inbound_complete())
                         .then_some((slot, position))
                 })
         })
@@ -265,7 +265,7 @@ fn a_roce_stage_counts_its_receivers_frontier() {
         .as_mut()
         .expect("a stage");
     stage.dependencies.inbound_bytes_received -= 1;
-    refused(&broken, "in-order RoCE frontier");
+    refused(&broken, "disagree with the in-order frontiers");
 }
 
 /// Host-link PFC (§5.3): a gated stage on a paused host is not on its parked list, and listing it
@@ -315,7 +315,7 @@ fn a_compute_stages_predecessors_share_their_roce_transport() {
         .iter()
         .flat_map(|state| state.generators_with_stages())
         .find_map(|(_, stage)| match stage?.role {
-            StageRole::Compute(_) => stage?.dependencies.inbound_predecessor,
+            StageRole::Compute(_) => stage?.dependencies.inbound.one(),
             _ => None,
         })
         .expect("a compute stage after the collective");

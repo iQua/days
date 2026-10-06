@@ -96,9 +96,9 @@ pub use image::{
     GeneratorTermination, HostPfcState, HostState, LinkDescriptor, NodeDescriptor,
     PacketDescriptor, PacketKind, PfcHeader, PfcIngressState, PfcQueueState, RateGenerator,
     RemoteChannel, RoceAckHeader, RoceDataHeader, RoceGenerator, RoceNackMark, RocePacer,
-    RoceReceiverState, ScheduledEmission, SimulationImage, StageDependencies, StageRole,
-    SwitchQueueState, SwitchState, TcpAckHeader, TcpDataHeader, TcpGenerator, TcpReceiveRange,
-    TcpReceiverState, TcpTimerState, default_propagation_ns,
+    RoceReceiverState, ScheduledEmission, SimulationImage, StageDependencies, StagePredecessors,
+    StageRole, SwitchQueueState, SwitchState, TcpAckHeader, TcpDataHeader, TcpGenerator,
+    TcpReceiveRange, TcpReceiverState, TcpTimerState, default_propagation_ns,
 };
 pub use mechanism_trace::{
     CollectiveActivationCause, CollectiveProgressRecord, CollectiveStageKind, DrrTransitionRecord,

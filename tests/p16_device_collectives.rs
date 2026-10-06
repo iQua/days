@@ -45,25 +45,25 @@ const ROCE_FIXTURES: &[&str] = &[
 const ANCHORS: [(&str, u64, u64); 6] = [
     (
         "roce_ring_allreduce_lossless.toml",
-        193_075,
-        0x02fc_5b57_38bf_9639,
+        188_983,
+        0xd89e_b01d_2859_4bcd,
     ),
     (
         "roce_allgather_lossless.toml",
-        123_170,
-        0xc32f_fe08_1e7b_440d,
+        121_122,
+        0x89d6_a4ac_8a89_0cd1,
     ),
-    ("roce_ring_lossy.toml", 182_347, 0xb718_c505_7453_0f5a),
-    ("roce_compute_dag.toml", 212_197, 0xe94b_963f_a5fd_954a),
+    ("roce_ring_lossy.toml", 178_255, 0xa99b_e649_848a_ddfe),
+    ("roce_compute_dag.toml", 207_245, 0x5145_dc26_3ab8_ddc6),
     (
         "roce_tcp_mixed_collectives.toml",
-        138_792,
-        0x88ff_2fe4_10cc_0df8,
+        134_700,
+        0x8a78_985e_0bd3_7700,
     ),
     (
         "roce_ring_release_paused.toml",
-        197_029,
-        0xf5e6_4cf6_d7ca_985e,
+        192_937,
+        0xc36e_d06a_809a_2f52,
     ),
 ];
 
@@ -569,7 +569,7 @@ fn a_compute_deadline_at_the_stop_finishes_there() {
                 .enumerate()
                 .filter(|(position, _)| {
                     host.stage(*position)
-                        .is_some_and(|stage| stage.dependencies.local_predecessor.is_some())
+                        .is_some_and(|stage| stage.dependencies.local.one().is_some())
                 })
                 .map(|(_, generator)| generator.next_emission)
         })

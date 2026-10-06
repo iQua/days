@@ -36,6 +36,7 @@ fn empty_image() -> SimulationImage {
         channels: Vec::new(),
         initial_events: Vec::new(),
         seed: 0,
+        stage_joins: Vec::new(),
     }
 }
 

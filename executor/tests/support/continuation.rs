@@ -146,5 +146,6 @@ pub fn tcp_service_continuation_image() -> SimulationImage {
             payload: FIRST,
         }],
         seed: 1,
+        stage_joins: Vec::new(),
     }
 }

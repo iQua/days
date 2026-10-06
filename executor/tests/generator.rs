@@ -139,6 +139,7 @@ fn image(status: GeneratorStatus, bytes: u64, next_payload_seq: u64) -> Simulati
             .into_iter()
             .collect(),
         seed: 1,
+        stage_joins: Vec::new(),
     }
 }
 
