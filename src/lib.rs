@@ -4,6 +4,7 @@ use std::fs;
 pub mod scenario;
 pub mod topos;
 pub mod utils;
+pub mod workload;
 
 pub fn validate_config(config_path: &str) -> Result<(), String> {
     let content = fs::read_to_string(config_path)
