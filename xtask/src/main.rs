@@ -64,8 +64,8 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "lib.rs",
         predicate: r#"any(test, feature = "cuda", all(feature = "metal", target_vendor = "apple"))"#,
-        count: 2,
-        purpose: "T20l fix 2's readback-compaction sizing module and P14 Lane B's DCQCN device-row codecs (`device_mechanism`) compile only for the crate's own unit tests and the two device backends that use them",
+        count: 3,
+        purpose: "T20l fix 2's readback-compaction sizing module, P14 Lane B's DCQCN device-row codecs (`device_mechanism`) and P16 G1's stage-region codec (`device_stage`) compile only for the crate's own unit tests and the two device backends that use them",
     },
     AllowedFeatureGate {
         path: "device_capacity.rs",
