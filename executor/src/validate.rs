@@ -2832,6 +2832,7 @@ fn validate_generators(
         }
     }
     validate_collective_partitions(image)?;
+    validate_stage_streams(image)?;
     for (receiver_flow, receiver_owner) in receiver_owners {
         match owners.get(&receiver_flow) {
             None => {
@@ -2924,6 +2925,42 @@ struct CollectivePartitionState {
     copies_by_owner: BTreeMap<u32, u64>,
     /// Every other policy: the chunk bytes of each stage.
     chunk_sizes: BTreeSet<u64>,
+}
+
+/// The stage streams name existing stage groups, strictly ascending, each on a stream other than
+/// 0 (stream 0 is the default and is never listed). Nothing to check, and nothing built, when the
+/// list is empty.
+fn validate_stage_streams(image: &SimulationImage) -> Result<(), ValidationError> {
+    let streams = &image.stage_streams;
+    if streams.is_empty() {
+        return Ok(());
+    }
+    let mut operations = BTreeSet::new();
+    for state in &image.host_states {
+        for stage in state.stages.iter().flatten() {
+            operations.insert(match stage.role {
+                crate::StageRole::Collective(identity) => {
+                    crate::StageOperation::Collective(identity.collective_id)
+                }
+                crate::StageRole::Compute(compute) => {
+                    crate::StageOperation::Compute(compute.compute_id)
+                }
+            });
+        }
+    }
+    if streams
+        .windows(2)
+        .any(|pair| pair[0].operation >= pair[1].operation)
+        || streams
+            .iter()
+            .any(|entry| entry.stream == 0 || !operations.contains(&entry.operation))
+    {
+        return Err(ValidationError::new(
+            "stage streams must name existing stage groups, ascending, on streams other than 0"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Every collective's stages partition its declared total as its algorithm and policies say.

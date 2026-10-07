@@ -141,6 +141,7 @@ fn image(status: GeneratorStatus, bytes: u64, next_payload_seq: u64) -> Simulati
         seed: 1,
         stage_joins: Vec::new(),
         seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 

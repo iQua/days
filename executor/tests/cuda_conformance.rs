@@ -237,6 +237,7 @@ fn generator_image(termination: GeneratorTermination) -> SimulationImage {
         seed: 1,
         stage_joins: Vec::new(),
         seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 
@@ -480,6 +481,7 @@ fn multi_producer_target_image(producers: usize) -> SimulationImage {
         seed: 31,
         stage_joins: Vec::new(),
         seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 
@@ -678,6 +680,7 @@ fn fan_in_tail_drop_contention_image() -> SimulationImage {
         seed: 37,
         stage_joins: Vec::new(),
         seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 

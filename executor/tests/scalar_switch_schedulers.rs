@@ -194,6 +194,7 @@ fn image(
         seed: 18,
         stage_joins: Vec::new(),
         seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 

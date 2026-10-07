@@ -185,7 +185,7 @@ impl SizingConcurrency {
             }
             if let Some(source) = source {
                 let width = if joins {
-                    scratch.width(&image.stage_joins)
+                    scratch.width(&image.stage_joins, &image.stage_streams)
                 } else {
                     leaves
                 };
@@ -234,6 +234,20 @@ impl SizingConcurrency {
     }
 }
 
+/// Each host's width (the stages it may run at once) in host order, for tests of the sizing rule;
+/// empty when the image has no stage.
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+pub fn stage_widths_for_testing(image: &SimulationImage) -> Vec<usize> {
+    SizingConcurrency::for_image(image).map_or_else(Vec::new, |concurrency| {
+        concurrency
+            .generations
+            .iter()
+            .map(|generations| generations / 2)
+            .collect()
+    })
+}
+
 /// The operation a stage belongs to: its collective, or its compute group (one stage per host).
 fn operation(stage: crate::CollectiveStage) -> u64 {
     match stage.role {
@@ -258,6 +272,8 @@ struct WidthScratch {
     edges_in: Vec<(usize, usize)>,
     /// Per operation: the chain it extends, and per chain whether its end is still open.
     chain_of: Vec<usize>,
+    /// Per operation: its issue stream (0 unless the image lists it).
+    streams: Vec<u32>,
     chain_end: Vec<usize>,
     chain_weight: Vec<usize>,
     ready: std::collections::BinaryHeap<std::cmp::Reverse<usize>>,
@@ -271,12 +287,16 @@ impl WidthScratch {
     /// stage. An operation that follows another at the host (a local predecessor in it) starts
     /// only once that one completed there. So the operations, ordered by those edges, are covered
     /// by chains whose operations never run at once; a greedy cover in topological order gives
-    /// each operation the chain of a predecessor whose chain still ends there. At most one
-    /// operation per chain runs at a time, with at most its roots active, so the width is the sum
-    /// over chains of their widest operation. On a forest of single-root operations (every P14 and
+    /// each operation the chain of a predecessor on its own issue stream whose chain still ends
+    /// there. At most one operation per chain runs at a time, with at most its roots active, so
+    /// the width is the sum over chains of their widest operation. With the image's streams (one
+    /// chain per stream, ruling R11 (a)) this is the sum of each stream's widest operation: an
+    /// operation never takes another stream's chain, which would leave its own stream's rest on a
+    /// second chain and count that stream's widest operation twice (review F9). The cover follows
+    /// only real ordering edges, so it stays sound whatever the streams say. On a forest of single-root operations (every P14 and
     /// P15 collective) this is G7's leaf count; a join (the stage after an all-to-all or a
     /// multi-channel ring) does not hide its predecessors' concurrency.
-    fn width(&mut self, joins: &[crate::FlowId]) -> usize {
+    fn width(&mut self, joins: &[crate::FlowId], streams: &[crate::StageStream]) -> usize {
         let operation_of = |unfinished: &[(crate::FlowId, u64, crate::CollectiveStage)],
                             flow: crate::FlowId| {
             unfinished
@@ -290,6 +310,19 @@ impl WidthScratch {
         self.operations.sort_unstable();
         self.operations.dedup();
         let count = self.operations.len();
+        self.streams.clear();
+        self.streams
+            .extend(self.operations.iter().map(|&operation| {
+                let id = operation / 2;
+                let operation = if operation % 2 == 0 {
+                    crate::StageOperation::Collective(id)
+                } else {
+                    crate::StageOperation::Compute(id)
+                };
+                streams
+                    .binary_search_by_key(&operation, |entry| entry.operation)
+                    .map_or(0, |index| streams[index].stream)
+            }));
         self.roots.clear();
         self.roots.resize(count, 0);
         self.edges.clear();
@@ -348,7 +381,9 @@ impl WidthScratch {
                 if to != index {
                     break;
                 }
-                if self.chain_end[self.chain_of[from]] == from {
+                if self.streams[from] == self.streams[index]
+                    && self.chain_end[self.chain_of[from]] == from
+                {
                     chain = Some(self.chain_of[from]);
                     break;
                 }
@@ -597,6 +632,7 @@ mod tests {
             seed: 0,
             stage_joins: Vec::new(),
             seeded_all_to_alls: Vec::new(),
+            stage_streams: Vec::new(),
         }
     }
 

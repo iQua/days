@@ -1156,6 +1156,24 @@ pub struct SimulationImage {
     /// its pairs' stages carry the matrix's bytes, and the progress certificate names the
     /// parameters so LeanGuard can re-derive them. Empty, with no allocation, without one.
     pub seeded_all_to_alls: Vec<SeededCollective>,
+    /// The issue stream of every stage group not on stream 0, ascending by operation (P16 H1,
+    /// ruling R11 (a)): the stage-aware sizing counts each stream's widest operation once at a
+    /// host. Empty, with no allocation, when every group is on stream 0.
+    pub stage_streams: Vec<StageStream>,
+}
+
+/// A stage group: a collective by its id, or a compute group by its id.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum StageOperation {
+    Collective(u64),
+    Compute(u64),
+}
+
+/// A stage group's issue stream (nonzero).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StageStream {
+    pub operation: StageOperation,
+    pub stream: u32,
 }
 
 /// One seeded all-to-all's routing-matrix parameters.
@@ -1185,6 +1203,9 @@ impl fmt::Debug for SimulationImage {
         }
         if !self.seeded_all_to_alls.is_empty() {
             debug.field("seeded_all_to_alls", &self.seeded_all_to_alls);
+        }
+        if !self.stage_streams.is_empty() {
+            debug.field("stage_streams", &self.stage_streams);
         }
         debug.finish()
     }

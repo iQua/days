@@ -126,6 +126,7 @@ fn image(stop_time_ns: u64) -> SimulationImage {
         seed: 1,
         stage_joins: Vec::new(),
         seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 

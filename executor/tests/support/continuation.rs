@@ -148,5 +148,6 @@ pub fn tcp_service_continuation_image() -> SimulationImage {
         seed: 1,
         stage_joins: Vec::new(),
         seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }

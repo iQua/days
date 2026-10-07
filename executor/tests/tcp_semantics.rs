@@ -222,6 +222,7 @@ fn tcp_image(control: TcpCongestionControl, total_bytes: u64) -> SimulationImage
         seed: 1,
         stage_joins: Vec::new(),
         seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 
@@ -423,6 +424,7 @@ fn switched_tcp_image(
         seed: 11,
         stage_joins: Vec::new(),
         seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 

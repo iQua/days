@@ -453,6 +453,7 @@ fn executor_scheduler_image(scheduler: SchedulerKind) -> SimulationImage {
         seed: 18,
         stage_joins: Vec::new(),
         seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 

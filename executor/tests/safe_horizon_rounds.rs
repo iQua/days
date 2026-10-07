@@ -136,6 +136,7 @@ fn image(stop_time_ns: u64, event_time_ns: u64, channel_delay_ns: u64) -> Simula
         seed: 1,
         stage_joins: Vec::new(),
         seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 
@@ -986,6 +987,7 @@ fn blocked_feedback_image() -> SimulationImage {
         seed: 9,
         stage_joins: Vec::new(),
         seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 
@@ -1214,6 +1216,7 @@ fn canonical_exchange_image() -> SimulationImage {
         seed: 10,
         stage_joins: Vec::new(),
         seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 
@@ -1631,6 +1634,7 @@ fn heterogeneous_image(seed: u64) -> SimulationImage {
         seed,
         stage_joins: Vec::new(),
         seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     };
     add_idle_switches(&mut image, idle_switches);
     image
@@ -2344,6 +2348,7 @@ fn equal_time_star_image() -> SimulationImage {
         seed: 1,
         stage_joins: Vec::new(),
         seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 
@@ -3027,6 +3032,7 @@ fn incast_image(sender_count: usize) -> SimulationImage {
         seed: 1,
         stage_joins: Vec::new(),
         seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 
@@ -3186,6 +3192,7 @@ fn high_lp_only_image(node_count: usize) -> SimulationImage {
         seed: 29,
         stage_joins: Vec::new(),
         seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 

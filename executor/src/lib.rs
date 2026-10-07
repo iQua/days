@@ -99,8 +99,9 @@ pub use image::{
     PacketDescriptor, PacketKind, PfcHeader, PfcIngressState, PfcQueueState, RateGenerator,
     RemoteChannel, RoceAckHeader, RoceDataHeader, RoceGenerator, RoceNackMark, RocePacer,
     RoceReceiverState, ScheduledEmission, SeededCollective, SimulationImage, StageDependencies,
-    StagePredecessors, StageRole, SwitchQueueState, SwitchState, TcpAckHeader, TcpDataHeader,
-    TcpGenerator, TcpReceiveRange, TcpReceiverState, TcpTimerState, default_propagation_ns,
+    StageOperation, StagePredecessors, StageRole, StageStream, SwitchQueueState, SwitchState,
+    TcpAckHeader, TcpDataHeader, TcpGenerator, TcpReceiveRange, TcpReceiverState, TcpTimerState,
+    default_propagation_ns,
 };
 pub use mechanism_trace::{
     CollectiveActivationCause, CollectiveProgressRecord, CollectiveStageKind, CollectiveTraceError,
@@ -154,6 +155,9 @@ pub use scalar::{
     TcpTransitionInput, TcpTransitionRecord, run_scalar, run_scalar_with_observations,
 };
 pub use seeded_matrix::{RoutingSkew, SeededAllToAll};
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+pub use stage_sizing::stage_widths_for_testing;
 pub use tcp::{CUBIC_WINDOW_SCALE, TcpCongestionControl, TcpPhase};
 pub use tcp_trace::{TcpTraceError, tcp_transitions_csv};
 pub use time::{TimeError, link_arrival_time_ns, serialization_time_ns};

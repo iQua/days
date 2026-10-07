@@ -236,6 +236,7 @@ fn path_image() -> SimulationImage {
         seed: 25,
         stage_joins: Vec::new(),
         seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 
@@ -1812,6 +1813,7 @@ fn circular_dependency_image() -> SimulationImage {
         seed: 25,
         stage_joins: Vec::new(),
         seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 

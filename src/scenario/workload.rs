@@ -44,6 +44,11 @@ pub struct Operation {
     /// into [`Workload::operations`]); they run on the same hosts in the same rank order. A
     /// collective follows at least one compute operation.
     pub after: Vec<usize>,
+    /// The issue stream (SimAI's queue) the operation runs on at each rank: 0 for the compute
+    /// stream, another value for a data queue. The stage-aware sizing charges each stream's widest
+    /// operation once (ruling R11 (a)), so an operation must follow the previous operation of its
+    /// stream (through `after`) at every rank it shares with it.
+    pub stream: u32,
     pub kind: OperationKind,
 }
 

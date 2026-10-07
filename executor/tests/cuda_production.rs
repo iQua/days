@@ -145,6 +145,7 @@ fn generator_image(termination: GeneratorTermination) -> SimulationImage {
         seed: 1,
         stage_joins: Vec::new(),
         seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 
@@ -320,6 +321,7 @@ fn fifo_taildrop_image() -> SimulationImage {
         seed: 7,
         stage_joins: Vec::new(),
         seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 
@@ -450,6 +452,7 @@ fn long_continuation_image() -> SimulationImage {
         seed: 19,
         stage_joins: Vec::new(),
         seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 

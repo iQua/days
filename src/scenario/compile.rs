@@ -162,6 +162,10 @@ struct SourceCollective {
     /// list (at least one compute group, and possibly the previous collective of the stream).
     #[serde(default)]
     after: Option<AfterGroups>,
+    /// The issue stream (SimAI's queue) the collective runs on at each rank, 0 by default: the
+    /// stage-aware sizing charges each stream's widest operation once (ruling R11 (a)). A
+    /// collective on another stream needs a `name`.
+    stream: Option<u32>,
     /// Ring channels: each a ring order of the `sources` hosts (instead of `sinks`).
     channels: Option<Vec<Vec<u64>>>,
     /// `EqualRemainderLast` (the default for rings) or `UniformFloor`.
@@ -210,6 +214,8 @@ struct SourceCompute {
     /// or a list of names whose stages it joins.
     #[serde(default)]
     after: Option<AfterGroups>,
+    /// The issue stream the group runs on, 0 by default (see `SourceCollective::stream`).
+    stream: Option<u32>,
 }
 
 /// One stage-group name, or several. One name is held without a list, so a group with a single
@@ -846,6 +852,8 @@ struct SupportedModel {
     flow_sets: Vec<FlowSetKey>,
     collectives: Vec<CollectiveKey>,
     computes: Vec<ComputeKey>,
+    /// The issue stream of each named stage group on a stream other than 0.
+    streams: BTreeMap<String, u32>,
     /// The scenario's distinct RoCE keys, sorted; `TrafficKind::Roce` holds an index into it.
     roce_keys: Vec<RoceTrafficKey>,
 }
@@ -1146,6 +1154,23 @@ impl SupportedModel {
             .into_iter()
             .map(|flow_set| validate_flow_set(flow_set, scenario_text, &mut roce_keys))
             .collect::<Result<Vec<_>, _>>()?;
+        // The streams are read first, so the groups still collect in place (no new table).
+        let mut streams = BTreeMap::new();
+        for collective in source.collective.iter().flatten() {
+            if let Some(stream) = collective.stream.filter(|&stream| stream != 0) {
+                let name = collective.name.clone().ok_or_else(|| {
+                    CompileError::Invalid(
+                        "a collective on a stream other than 0 needs a `name`".to_owned(),
+                    )
+                })?;
+                streams.insert(name, stream);
+            }
+        }
+        for compute in source.compute.iter().flatten() {
+            if let Some(stream) = compute.stream.filter(|&stream| stream != 0) {
+                streams.insert(compute.name.clone(), stream);
+            }
+        }
         let mut collectives = source
             .collective
             .unwrap_or_default()
@@ -1166,7 +1191,8 @@ impl SupportedModel {
             .map(validate_compute)
             .collect::<Result<Vec<_>, _>>()?;
         if let Some(workload) = workload {
-            let (more_collectives, more_computes) = workload_keys(workload, &mut roce_keys)?;
+            let (more_collectives, more_computes) =
+                workload_keys(workload, &mut roce_keys, &mut streams)?;
             collectives.extend(more_collectives);
             computes.extend(more_computes);
         }
@@ -1219,6 +1245,7 @@ impl SupportedModel {
             flow_sets,
             collectives,
             computes,
+            streams,
             roce_keys,
         })
     }
@@ -1798,6 +1825,7 @@ fn seeded_all_to_all(source: SourceAllToAll) -> Result<SeededAllToAll, CompileEr
 fn workload_keys(
     workload: &super::workload::Workload,
     roce_keys: &mut Vec<RoceTrafficKey>,
+    streams: &mut BTreeMap<String, u32>,
 ) -> Result<(Vec<CollectiveKey>, Vec<ComputeKey>), CompileError> {
     use super::workload::OperationKind;
     let transports = workload
@@ -1825,6 +1853,9 @@ fn workload_keys(
                 "workload operation {index} follows unknown operation {after}"
             )));
         }
+        if operation.stream != 0 {
+            streams.insert(name(index), operation.stream);
+        }
         let after = match operation.after.as_slice() {
             [] => None,
             [one] => Some(AfterGroups::One(name(*one))),
@@ -1839,6 +1870,7 @@ fn workload_keys(
                     hosts: hosts.clone(),
                     duration_ns: *duration_ns,
                     after,
+                    stream: None,
                 })?)
             }
             OperationKind::Collective(collective) => {
@@ -3109,11 +3141,11 @@ fn lower(
         collectives: collective_table,
         computes: compute_table,
         seeded: seeded_all_to_alls,
+        streams: stage_streams,
     } = canonical_flows(
         model.explicit_flows,
         model.flow_sets,
-        model.collectives,
-        model.computes,
+        (model.collectives, model.computes, &model.streams),
         &host_topology_ids,
         &hosts,
         model.seed,
@@ -3998,6 +4030,7 @@ fn lower(
         seed: model.seed,
         stage_joins,
         seeded_all_to_alls,
+        stage_streams,
     })
 }
 
@@ -4011,6 +4044,8 @@ struct CanonicalFlows {
     computes: Vec<ComputeKey>,
     /// Each seeded all-to-all's matrix parameters, ascending by collective id.
     seeded: Vec<days_executor::SeededCollective>,
+    /// The issue stream of each stage group on a stream other than 0, ascending.
+    streams: Vec<days_executor::StageStream>,
 }
 
 /// Ordinal of `compute` in the sorted `table`.
@@ -4032,8 +4067,11 @@ fn collective_ordinal(table: &[CollectiveKey], semantic: &CollectiveKey) -> u64 
 fn canonical_flows(
     mut explicit: Vec<ExplicitFlowKey>,
     mut flow_sets: Vec<FlowSetKey>,
-    mut collectives: Vec<CollectiveKey>,
-    mut computes: Vec<ComputeKey>,
+    (mut collectives, mut computes, streams): (
+        Vec<CollectiveKey>,
+        Vec<ComputeKey>,
+        &BTreeMap<String, u32>,
+    ),
     hosts: &BTreeSet<u64>,
     host_attachments: &HostAttachments,
     seed: u64,
@@ -4205,6 +4243,7 @@ fn canonical_flows(
     let mut collective_duplicates = vec![0_u64; collective_table.len()];
     let mut next_collective_id = 0_u64;
     let mut seeded = Vec::new();
+    let mut stage_streams = Vec::new();
     for semantic in &collectives {
         let collective = collective_ordinal(&collective_table, semantic);
         let duplicate = &mut collective_duplicates[collective as usize];
@@ -4233,9 +4272,22 @@ fn canonical_flows(
                 });
             }
         }
+        let stream = semantic.name.as_ref().and_then(|name| streams.get(name));
+        if let Some(&stream) = stream.filter(|_| collective_has_stages(semantic)) {
+            stage_streams.push(days_executor::StageStream {
+                operation: days_executor::StageOperation::Collective(collective_id),
+                stream,
+            });
+        }
     }
     for (compute_id, compute) in computes.iter().enumerate() {
         expand_compute(&mut flows, &plan, compute, compute_id as u64)?;
+        if let Some(&stream) = streams.get(&compute.name) {
+            stage_streams.push(days_executor::StageStream {
+                operation: days_executor::StageOperation::Compute(compute_id as u64),
+                stream,
+            });
+        }
     }
 
     flows.sort_by(|left, right| left.key.cmp(&right.key));
@@ -4244,6 +4296,7 @@ fn canonical_flows(
         collectives: collective_table,
         computes,
         seeded,
+        streams: stage_streams,
     })
 }
 

@@ -741,11 +741,13 @@ fn a_workload_lowers_as_its_toml_rendering() {
             Operation {
                 group: 0,
                 after: vec![],
+                stream: 0,
                 kind: OperationKind::Compute { duration_ns: 2_000 },
             },
             Operation {
                 group: 0,
                 after: vec![0],
+                stream: 0,
                 kind: OperationKind::Collective(Collective {
                     algorithm: Algorithm::AllToAll,
                     bytes: 8_000,
@@ -758,11 +760,13 @@ fn a_workload_lowers_as_its_toml_rendering() {
             Operation {
                 group: 0,
                 after: vec![1],
+                stream: 0,
                 kind: OperationKind::Compute { duration_ns: 1_000 },
             },
             Operation {
                 group: 0,
                 after: vec![2, 1],
+                stream: 1,
                 kind: OperationKind::Collective(Collective {
                     algorithm: Algorithm::ReduceScatter,
                     bytes: 12_000,
@@ -797,7 +801,7 @@ fn a_workload_lowers_as_its_toml_rendering() {
                 "ReduceScatter",
                 "TCP",
                 H4,
-                "sinks = [1, 2, 3, 0]\nafter = [\"@2\", \"@1\"]\n",
+                "sinks = [1, 2, 3, 0]\nafter = [\"@2\", \"@1\"]\nstream = 1\n",
                 12_000,
             )),
     );
