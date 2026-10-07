@@ -225,7 +225,7 @@ fn ordinary_collectives_allocate_no_more_than_feat_p16() {
 
 /// The Metal planner (the CUDA planner shares its stage sizing) allocates no more than at
 /// `feat/p16` for the same images.
-#[cfg(all(feature = "metal", target_vendor = "apple"))]
+#[cfg(all(feature = "test", feature = "metal", target_vendor = "apple"))]
 #[test]
 fn ordinary_collectives_plan_with_no_more_allocations_than_feat_p16() {
     for (label, config, base) in cases() {
