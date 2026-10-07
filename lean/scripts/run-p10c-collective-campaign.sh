@@ -451,31 +451,32 @@ mutate_case "notify-split-delivery" "$rail_ring" \
 mutate_case "notify-lead-timer" "$rail_ring" \
   'done == 0 && $column["stage_kind"] == "notify" && $column["cause"] == "local_completion" && $column["activated"] == 1 { done = 1; $column["after_next_time_ns"] += 1 }' \
   'REJECT: line 2: stage notify release does not arm its lead'"'"'s timer'
-# A notify delivery claims a RoCE carrier.
+# A notify delivery claims a RoCE carrier (and drops the notify's origin, delay and collective).
 mutate_case "notify-carrier-relabeled-roce" "$rail_ring" \
-  'done == 0 && $column["cause_kind"] == "notify" && $column["cause"] == "inbound_arrival" { done = 1; $column["cause_kind"] = "roce" }' \
+  'done == 0 && $column["cause_kind"] == "notify" && $column["cause"] == "inbound_arrival" { done = 1; $column["cause_kind"] = "roce"; $column["cause_origin_ns"] = 0; $column["cause_delay_ns"] = 0; $column["cause_collective_id"] = "" }' \
   'REJECT: line 16: cause kind disagrees with the cause stage'
 # The receiver of the first notify (line 10) completes locally a nanosecond after its timer.
 mutate_case "notify-completion-off-its-timer" "$rail_ring" \
   'NR == 10 { $column["time_ns"] = 1002 }' \
   'REJECT: line 10: compute local completion does not occur at its predecessor'"'"'s timer deadline'
 
-# P16 H1 fix round 2 (review N1): a logged notify is delivered exactly its delay (`duration_ns`,
-# accepted as given) after its release. Notify flow 0 (released at 1,000 ns, delivered at 1,068 ns)
-# claims a 99 ns delay (it arrives 31 ns early), then a 60 ns one (8 ns late).
+# P16 H1 fix round 2 (review N1): a notify is delivered exactly its delay after its release, both
+# named on its delivery rows; a logged notify's are its release row's time and its `duration_ns`
+# (accepted as given). Notify flow 0 (released at 1,000 ns, delivered at 1,068 ns, 68 ns) claims a
+# 99 ns delay on its own rows (it would arrive 31 ns early), then a 60 ns one (8 ns late).
 mutate_case "notify-early-delivery" "$rail_ring" \
   '$column["flow_id"] == 0 { $column["duration_ns"] = 99 }' \
-  'REJECT: line 16: stage notify delivery does not occur at its release plus its delay'
+  'REJECT: line 16: stage notify delivery does not name its release and delay'
 mutate_case "notify-late-delivery" "$rail_ring" \
   '$column["flow_id"] == 0 { $column["duration_ns"] = 60 }' \
-  'REJECT: line 16: stage notify delivery does not occur at its release plus its delay'
+  'REJECT: line 16: stage notify delivery does not name its release and delay'
 # A notify released by a counted join leaves at the join's completion: notify flow 0 waits for `fwd`
 # (1,000 ns) and `aux` (2,000 ns) and is delivered at 2,134 ns. Claiming a 1,134 ns delay (as if
 # released by `fwd` alone) rejects.
 rail_join="$fixture_dir/collective_collops_rail_a2a_after_join_executor_accept.csv"
 mutate_case "notify-join-release" "$rail_join" \
   '$column["flow_id"] == 0 { $column["duration_ns"] = 1134 }' \
-  'REJECT: line 146: stage notify delivery does not occur at its release plus its delay'
+  'REJECT: line 146: stage notify delivery does not name its release and delay'
 
 # An ungated root notify is not logged: it starts with its collective at the collective's initial
 # delay (2,000 ns here). Notify flow 0 (rank 0 -> 1) is delivered at 2,134 ns; it is moved 1 ns early,
@@ -487,6 +488,22 @@ mutate_case "ungated-notify-early-delivery" "$rail_ungated" \
 mutate_case "ungated-notify-late-delivery" "$rail_ungated" \
   '$column["cause"] == "inbound_arrival" && $column["cause_flow_id"] == 26 { $column["time_ns"] = 2135 }' \
   'REJECT: line 36: stage notify delivery does not occur at its origin plus its delay'
+
+# Notify flow 26's delivery moves 1 ns late with its origin (still origin + delay): it no longer
+# shares its collective's start with the other unlogged notifies.
+mutate_case "ungated-notify-shifted-delivery" "$rail_ungated" \
+  '$column["cause"] == "inbound_arrival" && $column["cause_flow_id"] == 26 { $column["time_ns"] = 2135; $column["cause_origin_ns"] = 2001 }' \
+  'REJECT: line 36: unlogged stage notifies of one collective do not share one origin'
+# Notify flow 26 claims a release 1 ns earlier on every row it causes, consistently (its sender's
+# timer completion at 2,001 ns with a 2 ns lead, its delivery at 2,134 ns with a 135 ns delay):
+# only its collective's shared start rejects it.
+mutate_case "ungated-notify-shifted-release" "$rail_ungated" \
+  '$column["cause_flow_id"] == 26 && $column["cause"] == "local_completion" { $column["cause_origin_ns"] = 1999; $column["cause_delay_ns"] = 2 } $column["cause_flow_id"] == 26 && $column["cause"] == "inbound_arrival" { $column["cause_origin_ns"] = 1999; $column["cause_delay_ns"] = 135 }' \
+  'REJECT: line 12: unlogged stage notifies of one collective do not share one origin'
+# The delivery rows of notify flow 0 name another collective.
+mutate_case "notify-cause-collective" "$rail_ring" \
+  '$column["cause_flow_id"] == 0 && $column["cause_kind"] == "notify" { $column["cause_collective_id"] = 7 }' \
+  'REJECT: line 10: stage notify cause names another collective'
 
 echo "P10c exact-integer collective campaign checks: $checked"
 exit "$failures"

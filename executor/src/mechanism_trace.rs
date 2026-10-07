@@ -268,7 +268,14 @@ impl MechanismTransitionRecord {
 /// matrix parameters (`seed;matrix;group;transpose;experts;topk;tokens;bytes_per_copy;skew`),
 /// from which LeanGuard re-derives every pair's bytes, empty on every other row; and
 /// `cause_kind`, what carries the cause flow (`tcp`, `roce`, `notify` for a stage notify, or
-/// `compute`), which decides how LeanGuard replays an arrival and binds a completion.
+/// `compute`), which decides how LeanGuard replays an arrival and binds a completion; and
+/// `cause_collective_id`, a stage-notify cause's collective, empty for any other cause.
+///
+/// P16 H1 fix round 2 (review N1): a stage notify is delay-only, delivered exactly its delay `d`
+/// (its timer's lead plus its lane) after its release. Its delivery rows name that release and
+/// delay, as timer completions do: `cause_origin_ns` = the delivery time minus `d`, and
+/// `cause_delay_ns` = `d`. (The progress record keeps zero there on every inbound row; only the
+/// certificate names the notify's.)
 /// `inbound_predecessor_bytes` is the stage's
 /// inbound requirement: the summed totals of its inbound predecessors, zero without any.
 pub fn collective_transitions_csv(
@@ -299,11 +306,23 @@ pub fn collective_transitions_csv(
                         roce.pacer.total_bytes,
                         Carrier::Roce(roce.pacer.mtu_bytes, roce.pacer.pacing_interval_ns),
                     ),
-                    // A stage notify (P16 H2) carries its chunk on a constant timer.
+                    // A stage notify (P16 H2) carries its chunk on a constant timer, delivered its
+                    // lead plus its lane after its release.
                     (
                         crate::FlowGeneratorKind::Constant(constant),
-                        Some(crate::StageRole::Collective(_)),
-                    ) => (constant.packet_size_bytes, Carrier::Notify),
+                        Some(crate::StageRole::Collective(identity)),
+                    ) => (
+                        constant.packet_size_bytes,
+                        Carrier::Notify {
+                            delay_ns: constant
+                                .interval_ns
+                                .checked_add(constant.first_departure_ns)
+                                .ok_or(CollectiveTraceError::NotifyTiming {
+                                    flow: generator.flow,
+                                })?,
+                            collective_id: identity.collective_id,
+                        },
+                    ),
                     _ => (0, Carrier::Compute),
                 };
             }
@@ -327,7 +346,7 @@ pub fn collective_transitions_csv(
             |predecessor| match totals_of(predecessor).1 {
                 Carrier::Roce(mtu, interval) => Some((mtu, interval)),
                 Carrier::Tcp => Some((0, 0)),
-                Carrier::Notify | Carrier::Compute => None,
+                Carrier::Notify { .. } | Carrier::Compute => None,
             },
         );
         let first = transports.next().unwrap_or_default();
@@ -363,7 +382,7 @@ pub fn collective_transitions_csv(
     }
 
     let mut csv = String::from(
-        "time_ns,event_phase,event_origin_node,event_origin_sequence,ordinal,node_id,flow_id,cause,cause_flow_id,arrival_bytes,collective_id,algorithm,group_size,declared_total_bytes,rank,collective_phase,step,chunk_offset_bytes,chunk_bytes,packet_size_bytes,interval_ns,stop_time_ns,inbound_predecessor_bytes,before_local_complete,before_inbound_complete,before_inbound_bytes,activated,after_local_complete,after_inbound_complete,after_inbound_bytes,after_packets_emitted,after_bytes_emitted,after_status,after_next_time_ns,stage_kind,duration_ns,segment_sequence,segment_bytes,ack_number,cause_origin_ns,cause_delay_ns,channel,chunk_policy,channel_policy,local_predecessors,inbound_predecessors,local_required,before_local_completed,after_local_completed,cause_total_bytes,group_stages,seeded_matrix,cause_kind\n",
+        "time_ns,event_phase,event_origin_node,event_origin_sequence,ordinal,node_id,flow_id,cause,cause_flow_id,arrival_bytes,collective_id,algorithm,group_size,declared_total_bytes,rank,collective_phase,step,chunk_offset_bytes,chunk_bytes,packet_size_bytes,interval_ns,stop_time_ns,inbound_predecessor_bytes,before_local_complete,before_inbound_complete,before_inbound_bytes,activated,after_local_complete,after_inbound_complete,after_inbound_bytes,after_packets_emitted,after_bytes_emitted,after_status,after_next_time_ns,stage_kind,duration_ns,segment_sequence,segment_bytes,ack_number,cause_origin_ns,cause_delay_ns,channel,chunk_policy,channel_policy,local_predecessors,inbound_predecessors,local_required,before_local_completed,after_local_completed,cause_total_bytes,group_stages,seeded_matrix,cause_kind,cause_collective_id\n",
     );
     for record in records {
         let stage = stage_of(record.flow);
@@ -372,6 +391,19 @@ pub fn collective_transitions_csv(
             crate::StageRole::Collective(identity) => Some(identity),
             crate::StageRole::Compute(_) => None,
         });
+        let carrier = totals_of(record.cause_flow).1;
+        // A stage notify's delivery names its release and delay (review N1).
+        let (cause_origin_ns, cause_delay_ns) = match (record.cause, carrier) {
+            (CollectiveActivationCause::InboundArrival, Carrier::Notify { delay_ns, .. }) => (
+                record.key.time_ns.checked_sub(delay_ns).ok_or(
+                    CollectiveTraceError::NotifyTiming {
+                        flow: record.cause_flow,
+                    },
+                )?,
+                delay_ns,
+            ),
+            _ => (record.cause_origin_ns, record.cause_delay_ns),
+        };
         let (packet_size_bytes, interval_ns) = match (record.stage_kind, dependencies) {
             (CollectiveStageKind::Compute, Some(dependencies)) => {
                 inbound_transport(record.flow, dependencies)?
@@ -380,7 +412,7 @@ pub fn collective_transitions_csv(
         };
         writeln!(
             csv,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             record.key.time_ns,
             record.key.phase,
             record.key.origin_node.0,
@@ -420,8 +452,8 @@ pub fn collective_transitions_csv(
             record.segment_sequence,
             record.segment_bytes,
             record.ack_number,
-            record.cause_origin_ns,
-            record.cause_delay_ns,
+            cause_origin_ns,
+            cause_delay_ns,
             identity.map_or(0, |identity| identity.channel),
             identity.map_or("", |identity| chunk_policy(identity.chunk_policy)),
             identity.map_or("", |identity| channel_policy(identity.channel_policy)),
@@ -450,11 +482,15 @@ pub fn collective_transitions_csv(
                 .map_or_else(String::new, |index| seeded_matrix(
                     &image.seeded_all_to_alls[index].matrix
                 )),
-            match totals_of(record.cause_flow).1 {
+            match carrier {
                 Carrier::Tcp => "tcp",
                 Carrier::Roce(..) => "roce",
-                Carrier::Notify => "notify",
+                Carrier::Notify { .. } => "notify",
                 Carrier::Compute => "compute",
+            },
+            match carrier {
+                Carrier::Notify { collective_id, .. } => collective_id.to_string(),
+                _ => String::new(),
             },
         )
         .expect("writing to String cannot fail");
@@ -468,8 +504,12 @@ enum Carrier {
     Tcp,
     /// A RoCE queue pair's MTU and pacing interval.
     Roce(u64, u64),
-    /// A stage notify (P16 H2): a same-server message delivered whole after its NVLink delay.
-    Notify,
+    /// A stage notify (P16 H2): a same-server message of a collective, delivered whole its delay
+    /// (its timer's lead plus its lane) after its release.
+    Notify {
+        delay_ns: u64,
+        collective_id: u64,
+    },
     Compute,
 }
 
@@ -847,6 +887,10 @@ pub enum CollectiveTraceError {
     MixedInboundTransports {
         flow: FlowId,
     },
+    /// A stage notify's delay overflows, or a delivery precedes it (its release would be negative).
+    NotifyTiming {
+        flow: FlowId,
+    },
 }
 
 impl fmt::Display for CollectiveTraceError {
@@ -856,6 +900,10 @@ impl fmt::Display for CollectiveTraceError {
             Self::MixedInboundTransports { flow } => write!(
                 formatter,
                 "compute stage {flow:?} has inbound predecessors of different transports"
+            ),
+            Self::NotifyTiming { flow } => write!(
+                formatter,
+                "stage notify {flow:?} has a delay or a delivery time its release cannot precede"
             ),
         }
     }

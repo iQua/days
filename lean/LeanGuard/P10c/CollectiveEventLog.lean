@@ -153,10 +153,10 @@ structure Row where
   /-- Local rows caused by a transport stage: the completing ACK's cumulative acknowledgment. -/
   ackNumber : Nat
   /-- Local rows: TCP or RoCE, when the answered segment was sent; compute, when the timer was
-  armed. -/
+  armed. A stage notify's delivery rows: its release (review N1). -/
   causeOriginNs : Nat
   /-- Local rows: TCP or RoCE, the unloaded round trip of that segment and its ACK; compute, the
-  duration. -/
+  duration. A stage notify's delivery rows: its delay. -/
   causeDelayNs : Nat
   /-- P16 H1: the ring channel of a transport stage (zero otherwise), and its collective's chunk and
   channel policies (none for a compute stage). -/
@@ -181,6 +181,9 @@ structure Row where
   /-- What carries the cause flow (`cause_kind`): a TCP flow, a RoCE queue pair, a stage notify
   (P16 H2), or a compute timer. -/
   causeKind : Collective.Carrier
+  /-- P16 H1 fix round 2 (review N1): a stage-notify cause's collective (`cause_collective_id`),
+  none for any other cause. -/
+  causeCollectiveId : Option Nat
   srcLine : Nat
   deriving DecidableEq, Repr
 
@@ -255,6 +258,7 @@ def parseRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array Strin
         groupStages := ← parseU64 (← getField idx fields "group_stages")
         seededMatrix := ← parseSeededMatrix (← getField idx fields "seeded_matrix")
         causeKind := ← parseCarrier (← getField idx fields "cause_kind")
+        causeCollectiveId := ← parseOpt parseU64 (← getField idx fields "cause_collective_id")
         srcLine := lineNo }
   match result with
   | .ok row => pure row
@@ -400,7 +404,8 @@ def checkProgress (row : Row) : Except String Unit := do
           row.segmentSequence + row.segmentBytes ≤ row.causeTotalBytes)
         "inbound segment is empty or extends past the predecessor chunk"
       require row.srcLine
-        (row.ackNumber = 0 && row.causeOriginNs = 0 && row.causeDelayNs = 0)
+        (row.ackNumber = 0 &&
+          (row.causeKind = .notify || row.causeOriginNs = 0 && row.causeDelayNs = 0))
         "inbound row carries local completion fields"
       require row.srcLine
         (row.afterLocalComplete = row.beforeLocalComplete &&
@@ -1242,18 +1247,45 @@ def checkLocalSignal (index : LookupIndex) (row : Row) : Except String Unit := d
         (row.causeDelayNs > 0 && row.key.timeNs ≥ row.causeOriginNs + row.causeDelayNs)
         "local completion precedes the earliest return of the completing acknowledgment"
 
-/-- Review N1 (P16 H1 fix round 2): a stage notify is delay-only, so a logged notify is delivered
-exactly its delay after its release: the inbound rows it causes occur at its release row's time
-(the completion that released it, a counted join's included) plus its `duration_ns`. The delay
-itself is a scenario input (`ServerLocality::nvlink_message_delay_ns`), accepted as given. An
-unlogged notify (an ungated root) starts with its collective, whose start and whose delay the
-certificate does not name, so its delivery time is not bound. -/
+/-- Review N1 (P16 H1 fix round 2): a stage notify is delay-only, delivered exactly its delay after
+its release. Its delivery rows name both (`cause_origin_ns`, `cause_delay_ns`), as a timer
+completion names its arm time and duration, and occur at their sum. A logged notify's are its
+release row's time and its `duration_ns` (the delay value itself is a scenario input,
+`ServerLocality::nvlink_message_delay_ns`, accepted as given); a released notify is logged unless
+it is an ungated root (`checkUnloggedNotifyOrigins`). Every row a notify causes names the notify's
+collective (`cause_collective_id`), and no other row names one. -/
 def checkNotifyDelivery (index : LookupIndex) (row : Row) : Except String Unit := do
-  if row.cause = .inboundArrival && row.causeKind = .notify then
-    if let some release := index.activatedByFlow.get? row.causeFlowId then
+  require row.srcLine ((row.causeKind = .notify) = row.causeCollectiveId.isSome)
+    "cause collective is not named exactly for a stage notify cause"
+  if row.causeKind = .notify then
+    let release? := index.activatedByFlow.get? row.causeFlowId
+    if let some release := release? then
       require row.srcLine
-        (release.stageKind = .notify && row.key.timeNs = release.key.timeNs + release.durationNs)
-        "stage notify delivery does not occur at its release plus its delay"
+        (release.stageKind = .notify && row.causeCollectiveId = some release.collectiveId)
+        "stage notify cause names another collective"
+    if row.cause = .inboundArrival then
+      require row.srcLine
+        (row.causeDelayNs > 0 && row.key.timeNs = row.causeOriginNs + row.causeDelayNs)
+        "stage notify delivery does not occur at its origin plus its delay"
+      if let some release := release? then
+        require row.srcLine
+          (row.causeOriginNs = release.key.timeNs && row.causeDelayNs = release.durationNs)
+          "stage notify delivery does not name its release and delay"
+
+/-- An unlogged stage notify is an ungated root: it starts with its collective, at the collective's
+initial delay, which the certificate does not name. Every row such a notify causes names that
+start as its origin (its sender's timer completion, as for any timer, and its delivery), so all
+the rows the unlogged notifies of one collective cause share one origin. -/
+def checkUnloggedNotifyOrigins (index : LookupIndex) (rows : List Row) : Except String Unit := do
+  let mut origins : Std.HashMap Nat Nat := ∅
+  for row in rows do
+    if row.causeKind = .notify && !index.activatedByFlow.contains row.causeFlowId then
+      if let some collective := row.causeCollectiveId then
+        match origins.get? collective with
+        | some origin =>
+            require row.srcLine (row.causeOriginNs = origin)
+              "unlogged stage notifies of one collective do not share one origin"
+        | none => origins := origins.insert collective row.causeOriginNs
 
 /-- Whether a row's transport columns are its group's (for its carrier): a collective's TCP or
 RoCE rows share one transport, and a compute group's stages after RoCE inbound predecessors share
@@ -1517,5 +1549,6 @@ def checkRows (rows : List Row) : Except String Unit := do
   for row in canonical do
     checkLocalSignal index row
     checkNotifyDelivery index row
+  checkUnloggedNotifyOrigins index canonical
 
 end LeanGuard.P10c.CollectiveEventLog

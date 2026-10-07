@@ -247,13 +247,37 @@ def checkInboundReplayReference (rows : List Row) (row : Row) : Except String Un
             row.arrivalBytes = after - before)
           "inbound progress does not match the receiver frontier replayed from the certified segments"
 
-/-- Binds a logged notify's delivery to its release plus its delay (see `checkNotifyDelivery`). -/
+/-- Binds a stage notify's delivery to its origin plus its delay, and a logged notify's origin and
+delay to its release (see `checkNotifyDelivery`). -/
 def checkNotifyDeliveryReference (rows : List Row) (row : Row) : Except String Unit := do
-  if row.cause = .inboundArrival && row.causeKind = .notify then
-    if let some release := findActivatedFlowReference rows row.causeFlowId then
+  require row.srcLine ((row.causeKind = .notify) = row.causeCollectiveId.isSome)
+    "cause collective is not named exactly for a stage notify cause"
+  if row.causeKind = .notify then
+    let release? := findActivatedFlowReference rows row.causeFlowId
+    if let some release := release? then
       require row.srcLine
-        (release.stageKind = .notify && row.key.timeNs = release.key.timeNs + release.durationNs)
-        "stage notify delivery does not occur at its release plus its delay"
+        (release.stageKind = .notify && row.causeCollectiveId = some release.collectiveId)
+        "stage notify cause names another collective"
+    if row.cause = .inboundArrival then
+      require row.srcLine
+        (row.causeDelayNs > 0 && row.key.timeNs = row.causeOriginNs + row.causeDelayNs)
+        "stage notify delivery does not occur at its origin plus its delay"
+      if let some release := release? then
+        require row.srcLine
+          (row.causeOriginNs = release.key.timeNs && row.causeDelayNs = release.durationNs)
+          "stage notify delivery does not name its release and delay"
+
+/-- The first row an unlogged notify of the same collective causes names the same origin (see
+`checkUnloggedNotifyOrigins`). -/
+def checkUnloggedNotifyOriginReference (rows : List Row) (row : Row) : Except String Unit := do
+  if row.causeKind = .notify && (findActivatedFlowReference rows row.causeFlowId).isNone then
+    let unlogged (other : Row) : Bool :=
+      other.causeKind = .notify && other.causeCollectiveId = row.causeCollectiveId &&
+        (findActivatedFlowReference rows other.causeFlowId).isNone
+    if row.causeCollectiveId.isSome then
+      if let some first := rows.find? unlogged then
+        require row.srcLine (row.causeOriginNs = first.causeOriginNs)
+          "unlogged stage notifies of one collective do not share one origin"
 
 /-- Binds a local completion to the event that caused it (see `checkLocalSignal`). -/
 def checkLocalSignalReference (rows : List Row) (row : Row) : Except String Unit := do
@@ -357,5 +381,6 @@ def checkRowsReference (rows : List Row) : Except String Unit := do
   for row in canonical do
     checkLocalSignalReference canonical row
     checkNotifyDeliveryReference canonical row
+  for row in canonical do checkUnloggedNotifyOriginReference canonical row
 
 end LeanGuard.P10c.CollectiveEventLog
