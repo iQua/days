@@ -227,6 +227,10 @@ const STAGE_PATH_FUNCTIONS: &[&str] = &[
     // P15 host-link PFC: a RESUME restarts its class's pause-parked queue pairs, read by
     // generator position from the host's parked list through the same counted view.
     "host_pfc_remote_arrival",
+    // P16 H2: a stage notify's sender timer completes its local successors, and its arrival
+    // advances the stages waiting on it, through the same counted view.
+    "host_notify_timer",
+    "host_notify_arrival",
 ];
 
 /// The only functions of `executor/src/scalar.rs` that may scan a host's generator or TCP-receiver

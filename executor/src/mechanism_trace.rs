@@ -135,6 +135,10 @@ pub enum CollectiveStageKind {
     Compute,
     /// A collective stage carried by a RoCE queue pair (P15; `qp-schema.md` Amendment 4).
     Roce,
+    /// A same-server collective stage carried by a stage notify (P16 H2): its row writes the chunk
+    /// as `packet_size_bytes`, the sender's lead as `interval_ns`, and the message delay (lead plus
+    /// lane) as `duration_ns`.
+    Notify,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -483,6 +487,7 @@ const fn collective_stage_kind(kind: CollectiveStageKind) -> &'static str {
         CollectiveStageKind::Tcp => "tcp",
         CollectiveStageKind::Roce => "roce",
         CollectiveStageKind::Compute => "compute",
+        CollectiveStageKind::Notify => "notify",
     }
 }
 

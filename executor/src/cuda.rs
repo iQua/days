@@ -564,6 +564,7 @@ fn decode_packet_kind(value: u64, metadata: &[u64]) -> Result<PacketKind, CudaEr
                 node: None,
             }),
         10 if metadata == [0, 0, 0] => Ok(PacketKind::RocePacingTimer),
+        11 if metadata == [0, 0, 0] => Ok(PacketKind::StageNotify),
         _ => Err(CudaError::DeviceExecution {
             code: 93,
             node: None,
@@ -2366,6 +2367,14 @@ impl CudaPlan {
             fel_charges.apply(concurrency, &mut legacy_fel_caps);
             concurrency.add_compute_timers(&mut legacy_fel_caps);
         }
+        // P16 H2: an unfired stage notify holds a timer at its source and, without streams, its
+        // arrival in its target's heap; with streams the arrival rides its lane's stream.
+        let notify = crate::device_sizing::notify_capacities(image);
+        if let Some(notify) = &notify {
+            for &(node, count) in notify.sources.iter().chain(&notify.targets) {
+                legacy_fel_caps[node] = legacy_fel_caps[node].saturating_add(count);
+            }
+        }
 
         for node in &image.nodes {
             let slot = node.id.0 as usize;
@@ -2472,6 +2481,11 @@ impl CudaPlan {
             }
             if let Some(concurrency) = &concurrency {
                 concurrency.add_compute_timers(&mut capacities);
+            }
+            if let Some(notify) = &notify {
+                for &(node, count) in &notify.sources {
+                    capacities[node] = capacities[node].saturating_add(count);
+                }
             }
             capacities
         } else {
@@ -2710,6 +2724,11 @@ impl CudaPlan {
             &flow_feedback_counts,
             minimum_lookahead_ns,
         );
+        if let Some(notify) = &notify {
+            for &(node, count) in &notify.sources {
+                remote_capacities[node] = remote_capacities[node].saturating_add(count);
+            }
+        }
         // The derived outbox capacity is the whole-plan sum of the per-producer capacities (their
         // seed of 2 per node included), before any cap or floor.
         let remote_bound = remote_capacities
@@ -2763,6 +2782,7 @@ impl CudaPlan {
             &fel_records,
             remote_staging_slots,
             channel_capacity_floors,
+            notify.as_ref(),
         )?;
         let event_bound = derived_transition_bound(image, &flow_packet_counts, pfc_state)?;
         let observation_capacity = if observation_mode == ObservationMode::Full {
@@ -2826,7 +2846,8 @@ impl CudaPlan {
             tcp_layout.ledger_meta_offset,
             &mut tcp_state,
         );
-        let (inbound_meta, inbound_producers) = remote_inbound_producers(image, pfc_state);
+        let (inbound_meta, inbound_producers) =
+            remote_inbound_producers(image, pfc_state, notify.as_ref());
         let round_capacity = config
             .max_rounds
             .unwrap_or_else(|| derived_round_bound(image, exclusive_horizon_ns, event_bound))
@@ -3105,6 +3126,9 @@ fn add_flow_route_capacities(
         PacketKind::RocePacingTimer => {
             unreachable!("the zero-byte RoCE pacing token is never routed")
         }
+        PacketKind::StageNotify => {
+            unreachable!("a stage notify crosses its host pair's lane, never a flow route")
+        }
     };
     for index in 0..route.len() {
         let target = route
@@ -3341,6 +3365,7 @@ fn prepare_streams(
     fel_records: &[u64],
     remote_staging_slots: usize,
     channel_capacity_floors: &mut crate::device_capacity::ChannelCapacityFloors,
+    notify: Option<&crate::device_sizing::NotifyCapacities>,
 ) -> Result<PreparedStreams, CudaError> {
     let legacy_heap_event_slots = checked_sum_usize(legacy_fel_caps, "legacy FEL slots")?;
     let fallback_heap_event_slots = checked_sum_usize(fallback_fel_caps, "fallback FEL slots")?;
@@ -3394,6 +3419,10 @@ fn prepare_streams(
         feedback_counts,
         lookahead,
     )?;
+    // P16 H2: each unfired stage notify puts one event on its host pair's lane.
+    for &(channel, count) in notify.map_or(&[][..], |notify| &notify.lanes) {
+        channel_caps[channel] = channel_caps[channel].saturating_add(count);
+    }
     if let Some(capacity) = config.max_channel_events_per_stream {
         channel_caps.fill(capacity.max(config.capacity_floors.channel_events_per_stream));
     } else {
@@ -3787,7 +3816,11 @@ fn add_route_observation_capacities(
     }
 }
 
-fn remote_inbound_producers(image: &SimulationImage, pfc_state: PfcState) -> (Vec<u64>, Vec<u64>) {
+fn remote_inbound_producers(
+    image: &SimulationImage,
+    pfc_state: PfcState,
+    notify: Option<&crate::device_sizing::NotifyCapacities>,
+) -> (Vec<u64>, Vec<u64>) {
     let mut inbound = vec![BTreeSet::new(); image.nodes.len()];
     for flow in &image.flows {
         for (route, terminal) in [
@@ -3808,6 +3841,10 @@ fn remote_inbound_producers(image: &SimulationImage, pfc_state: PfcState) -> (Ve
         for (producer, target) in crate::device_pfc::pfc_control_lane_producers(image) {
             inbound[target].insert(producer);
         }
+    }
+    // P16 H2: a stage notify's lane delivers from its source host to its target host.
+    for (producer, target) in crate::device_sizing::notify_lane_producers(image, notify) {
+        inbound[target].insert(producer);
     }
     let mut meta = vec![0_u64; image.nodes.len() * INBOUND_META_WORDS];
     let mut producers = Vec::new();
@@ -4129,7 +4166,7 @@ fn packet_metadata(kind: PacketKind) -> [u64; 3] {
             header.echoed_sent_time_ns,
             crate::device_mechanism::roce_ack_size_echo_word(header),
         ],
-        PacketKind::RocePacingTimer => [0; 3],
+        PacketKind::RocePacingTimer | PacketKind::StageNotify => [0; 3],
     }
 }
 

@@ -165,6 +165,11 @@ struct StageLookups {
     /// position,
     /// in the same `host_states`-then-`generators` order. Empty on an image without collectives.
     collective_stages: BTreeMap<CollectivePosition, (usize, usize)>,
+    /// The latency of the first channel along each host-to-host link, by `(source, target)`: the
+    /// stage-notify lane candidates (P16 H2), which `validate_notify_lanes` pins to one per pair.
+    notify_lanes: BTreeMap<(NodeId, NodeId), u64>,
+    /// The initial events of each stage-notify payload, as `(kind, target, time)` in event order.
+    notify_events: BTreeMap<PayloadId, Vec<(EventKind, NodeId, u64)>>,
 }
 
 /// A collective stage's position: `(collective_id, phase, channel, rank, step)`.
@@ -331,6 +336,48 @@ impl FlowIndex {
                 .is_some_and(is_compute_generator)
     }
 
+    /// The latency of the stage-notify lane from `source` to `target`, if one is declared.
+    fn notify_lane(&self, source: NodeId, target: NodeId) -> Option<u64> {
+        self.stage_lookups
+            .as_ref()?
+            .notify_lanes
+            .get(&(source, target))
+            .copied()
+    }
+
+    /// How many initial events of `kind` at `target` carry the stage-notify `payload`, at `time`
+    /// when given.
+    fn notify_event_count(
+        &self,
+        payload: PayloadId,
+        kind: EventKind,
+        target: NodeId,
+        time: Option<u64>,
+    ) -> usize {
+        self.stage_lookups
+            .as_ref()
+            .and_then(|lookups| lookups.notify_events.get(&payload))
+            .map_or(0, |events| {
+                events
+                    .iter()
+                    .filter(|(event_kind, event_target, event_time)| {
+                        *event_kind == kind
+                            && *event_target == target
+                            && time.is_none_or(|time| *event_time == time)
+                    })
+                    .count()
+            })
+    }
+
+    /// Whether a stage notify (P16 H2) owns this flow: a same-server collective message, whose
+    /// stage rides a constant timer generator. `false` without a lookup on a stageless image.
+    fn is_notify_flow(&self, image: &SimulationImage, id: crate::FlowId) -> bool {
+        self.has_stage_generators()
+            && self
+                .generator_for_flow(image, id)
+                .is_some_and(is_notify_generator)
+    }
+
     /// Yields the initial packets of `id`, in `initial_packets` order.
     ///
     /// Exactly equivalent to `initial_packets.iter().filter(|packet| packet.flow == id)`: a dense
@@ -417,10 +464,48 @@ impl StageLookups {
                 }
             }
         }
+        let is_host = |id: NodeId| {
+            usize::try_from(id.0)
+                .ok()
+                .and_then(|slot| image.nodes.get(slot))
+                .is_some_and(|node| node.id == id && node.kind == NodeKind::Host)
+        };
+        let mut notify_lanes = BTreeMap::new();
+        for channel in &image.channels {
+            let Some(link) = link(image, channel.link) else {
+                continue;
+            };
+            if is_host(link.source)
+                && is_host(link.target)
+                && channel.source == link.source
+                && channel.target == link.target
+            {
+                notify_lanes
+                    .entry((link.source, link.target))
+                    .or_insert(channel.min_delay_ns);
+            }
+        }
+        let mut notify_events = BTreeMap::<PayloadId, Vec<_>>::new();
+        if !notify_lanes.is_empty() {
+            for event in &image.initial_events {
+                if event.kind != EventKind::RetransmissionTimeout
+                    && packet(image, event.payload)
+                        .is_some_and(|packet| packet.kind == PacketKind::StageNotify)
+                {
+                    notify_events.entry(event.payload).or_default().push((
+                        event.kind,
+                        event.target,
+                        event.key.time_ns,
+                    ));
+                }
+            }
+        }
         Self {
             generator_slots,
             unindexed_generators,
             collective_stages,
+            notify_lanes,
+            notify_events,
         }
     }
 }
@@ -541,8 +626,14 @@ pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), Validat
     validate_tcp_segment_ledger(image, &flow_index)?;
     validate_owned_service_state(image, &flow_index, backend)?;
     let pfc_channels = validate_pfc(image)?;
-    validate_channels(image, backend, &derived_delays, &pfc_channels)?;
-    validate_events(image, &pfc_channels)?;
+    let lane_channels = validate_notify_lanes(image, &flow_index, &derived_delays)?;
+    let out_of_band_channels = if lane_channels.is_empty() {
+        pfc_channels
+    } else {
+        pfc_channels.union(&lane_channels).copied().collect()
+    };
+    validate_channels(image, backend, &derived_delays, &out_of_band_channels)?;
+    validate_events(image, &out_of_band_channels, &lane_channels)?;
     validate_pfc_causal_consistency(image)?;
     // `future_work` is a pure function of the image and was previously recomputed by
     // `validate_counters`. It is computed at its first consumer so that a rejection raised while
@@ -571,6 +662,7 @@ fn validate_backend_capabilities(
     // P15 lane R4: both device backends run RoCE queue pairs, host-link PFC and a feedback class
     // apart from the data class (`evidence/P15/device-design.md`), so none needs a refusal here.
     //
+    // P16 H2: both run the stage notify (a same-server message), so it needs none either.
     // P16 H1: both device backends count stage joins, up to 65,535 local predecessors per stage;
     // an image without a join has nothing to check.
     for stage in image
@@ -871,6 +963,19 @@ fn validate_flows(image: &SimulationImage, flow_index: &FlowIndex) -> Result<(),
             {
                 return Err(ValidationError::new(format!(
                     "compute flow {:?} must stay on its host with empty routes",
+                    flow.id
+                )));
+            }
+            continue;
+        }
+        if flow_index.is_notify_flow(image, flow.id) {
+            // A stage notify crosses its host pair's lane out of band: no fabric route.
+            if flow.source == flow.target
+                || !flow.route.is_empty()
+                || !flow.reverse_route.is_empty()
+            {
+                return Err(ValidationError::new(format!(
+                    "stage notify flow {:?} must join two hosts with empty routes",
                     flow.id
                 )));
             }
@@ -2135,8 +2240,9 @@ fn validate_generators(
                     &mut collective_positions,
                     &mut compute_positions,
                 )?;
-                if is_compute_generator(generator) {
-                    // `validate_compute_stage` owns every invariant of a timer-only stage.
+                if is_compute_generator(generator) || is_notify_generator(generator) {
+                    // `validate_compute_stage` and `validate_notify_timer` own every invariant of
+                    // a timer-only stage.
                     continue;
                 }
             }
@@ -3344,6 +3450,16 @@ fn is_compute_generator(generator: StagedGenerator<'_>) -> bool {
         .is_some_and(|stage| matches!(stage.role, crate::StageRole::Compute(_)))
 }
 
+/// A stage notify (P16 H2): a collective stage whose transport is a constant timer generator.
+/// Its timer names a `StageNotify` packet of the whole chunk, which then crosses out of band to
+/// the target host on the pair's lane. TCP and RoCE stages carry their own generators.
+fn is_notify_generator(generator: StagedGenerator<'_>) -> bool {
+    matches!(generator.kind, FlowGeneratorKind::Constant(_))
+        && generator
+            .stage
+            .is_some_and(|stage| matches!(stage.role, crate::StageRole::Collective(_)))
+}
+
 /// Collective identity of a stage, when the generator carries one.
 fn collective_identity(generator: StagedGenerator<'_>) -> Option<crate::CollectiveStageIdentity> {
     match generator.stage?.role {
@@ -3388,9 +3504,13 @@ fn validate_collective_stage(
     let transport_bytes = match generator.kind {
         FlowGeneratorKind::Tcp(tcp) => tcp.total_bytes,
         FlowGeneratorKind::Roce(roce) => roce.pacer.total_bytes,
+        FlowGeneratorKind::Constant(constant) => {
+            validate_notify_timer(image, flow_index, flow, generator, constant, stage)?;
+            constant.packet_size_bytes
+        }
         _ => {
             return Err(ValidationError::new(format!(
-                "flow {:?} collective stage record requires a TCP or RoCE generator",
+                "flow {:?} collective stage record requires a TCP, RoCE or stage-notify generator",
                 flow.id
             )));
         }
@@ -3555,10 +3675,14 @@ fn validate_collective_stage(
             flow.id
         )));
     }
-    // One collective, one transport: its stages share one traffic key.
-    if std::mem::discriminant(&inbound.0.kind) != std::mem::discriminant(&generator.kind)
-        || std::mem::discriminant(&local.kind) != std::mem::discriminant(&generator.kind)
-    {
+    // One collective, one fabric transport: its fabric stages share one traffic key. A stage
+    // notify (a same-server message, P16 H2) may sit next to any of them.
+    let fabric_mismatch = |other: StagedGenerator<'_>| {
+        !is_notify_generator(other)
+            && !is_notify_generator(generator)
+            && std::mem::discriminant(&other.kind) != std::mem::discriminant(&generator.kind)
+    };
+    if fabric_mismatch(inbound.0) || fabric_mismatch(local) {
         return Err(ValidationError::new(format!(
             "flow {:?} collective predecessors use another transport",
             flow.id
@@ -3577,11 +3701,15 @@ const fn is_ring_algorithm(algorithm: crate::CollectiveAlgorithm) -> bool {
     )
 }
 
-/// The bytes a transport stage carries: its TCP or RoCE total; `None` for any other generator.
-const fn transport_total_bytes(kind: &FlowGeneratorKind) -> Option<u64> {
-    match kind {
+/// The bytes a delivering stage carries: its TCP or RoCE total, or a stage notify's chunk (P16
+/// H2); `None` for any other generator.
+fn delivered_total_bytes(generator: StagedGenerator<'_>) -> Option<u64> {
+    match generator.kind {
         FlowGeneratorKind::Tcp(tcp) => Some(tcp.total_bytes),
         FlowGeneratorKind::Roce(roce) => Some(roce.pacer.total_bytes),
+        FlowGeneratorKind::Constant(constant) if is_notify_generator(generator) => {
+            Some(constant.packet_size_bytes)
+        }
         _ => None,
     }
 }
@@ -3661,13 +3789,13 @@ fn validate_stage_dependencies<'a>(
                     flow.id
                 ))
             })?;
-        let total = transport_total_bytes(&inbound.kind).ok_or_else(|| {
+        let total = delivered_total_bytes(inbound).ok_or_else(|| {
             ValidationError::new(format!(
-                "flow {:?} inbound predecessor {id:?} is not a TCP or RoCE stage",
+                "flow {:?} inbound predecessor {id:?} is not a TCP, RoCE or stage-notify stage",
                 flow.id
             ))
         })?;
-        let frontier = host_inbound_frontier(state, &inbound).ok_or_else(|| {
+        let frontier = inbound_frontier(image, state, inbound).ok_or_else(|| {
             ValidationError::new(format!(
                 "flow {:?} inbound predecessor {id:?} has no receiver on its host",
                 flow.id
@@ -3738,6 +3866,137 @@ fn host_inbound_frontier(
         _ => host_tcp_receiver(state, predecessor.flow)
             .map(|receiver| receiver.next_expected_sequence),
     }
+}
+
+/// The bytes this host holds of the inbound predecessor `predecessor`: its receiver's in-order
+/// frontier, or, for a stage notify (P16 H2), the whole chunk once the notify has arrived (its
+/// timer fired and its packet is no longer resident) and zero before.
+fn inbound_frontier(
+    image: &SimulationImage,
+    state: &crate::HostState,
+    predecessor: StagedGenerator<'_>,
+) -> Option<u64> {
+    if let (true, FlowGeneratorKind::Constant(constant)) =
+        (is_notify_generator(predecessor), predecessor.kind)
+    {
+        let emission = predecessor.next_emission;
+        let delivered = emission.status == GeneratorStatus::Finished
+            && packet(image, emission.payload)
+                .is_none_or(|resident| resident.flow != predecessor.flow);
+        return Some(if delivered {
+            constant.packet_size_bytes
+        } else {
+            0
+        });
+    }
+    host_inbound_frontier(state, predecessor.generator)
+}
+
+/// Generator and timer invariants of a stage notify (P16 H2).
+///
+/// The generator is a constant timer of the stage's chunk: `interval_ns` is the sender's lead (at
+/// least one nanosecond), `first_departure_ns` the latency of its host pair's lane (which the
+/// notify crosses after the lead), `packet_size_bytes` and the byte termination the chunk.
+/// Unreleased, it is `Blocked`; released at instant `t` (its collective's start for a root, its
+/// prerequisites' completion otherwise), its timer is due at `t + lead`, so a released notify's
+/// due time is never below its lead (review F1: the image does not record `t`, so lowering pins the
+/// sum and this pins its lower bound). Released, its notify names one `PacingTimer` at the source
+/// (`Scheduled`), or its due time passes the stop (`Stopped`); fired, it is
+/// `Finished` with one packet of the chunk emitted, and the notify is either in flight (resident,
+/// with one `RemoteArrival` at the target) or delivered (no longer resident).
+fn validate_notify_timer(
+    image: &SimulationImage,
+    flow_index: &FlowIndex,
+    flow: &crate::FlowDescriptor,
+    generator: StagedGenerator<'_>,
+    constant: crate::ConstantGenerator,
+    stage: crate::CollectiveStage,
+) -> Result<(), ValidationError> {
+    let crate::StageRole::Collective(collective) = stage.role else {
+        unreachable!("a stage notify carries a collective stage");
+    };
+    let chunk = collective.chunk_bytes;
+    let emission = generator.next_emission;
+    let fired = emission.status == GeneratorStatus::Finished;
+    if flow_index.notify_lane(flow.source, flow.target) != Some(constant.first_departure_ns)
+        || constant.interval_ns == 0
+        || constant.packet_size_bytes != chunk
+        || constant.termination != GeneratorTermination::Bytes(chunk)
+        || (generator.packets_emitted, generator.bytes_emitted)
+            != if fired { (1, chunk) } else { (0, 0) }
+    {
+        return Err(ValidationError::new(format!(
+            "flow {:?} stage notify requires a constant timer of its chunk",
+            flow.id
+        )));
+    }
+    if emission.status != GeneratorStatus::Blocked
+        && emission.departure_time_ns < constant.interval_ns
+    {
+        return Err(ValidationError::new(format!(
+            "flow {:?} stage notify timer at {} ns is earlier than its {} ns lead after any release",
+            flow.id, emission.departure_time_ns, constant.interval_ns
+        )));
+    }
+    let notify = |payload: PayloadId| {
+        packet(image, payload).filter(|resident| {
+            resident.flow == flow.id
+                && resident.size_bytes == chunk
+                && resident.kind == PacketKind::StageNotify
+                && !resident.ecn_marked
+        })
+    };
+    let events = |kind: crate::EventKind, target: NodeId, payload: PayloadId, time: Option<u64>| {
+        flow_index.notify_event_count(payload, kind, target, time)
+    };
+    let consistent = match emission.status {
+        GeneratorStatus::Blocked => {
+            !stage.activated && emission.departure_time_ns == 0 && emission.payload == PayloadId(0)
+        }
+        GeneratorStatus::Stopped => {
+            stage.activated && emission.departure_time_ns > image.stop_time_ns
+        }
+        GeneratorStatus::Scheduled => {
+            stage.activated
+                && emission.departure_time_ns <= image.stop_time_ns
+                && notify(emission.payload).is_some()
+                && events(
+                    crate::EventKind::PacingTimer,
+                    flow.source,
+                    emission.payload,
+                    Some(emission.departure_time_ns),
+                ) == 1
+                && events(
+                    crate::EventKind::RemoteArrival,
+                    flow.target,
+                    emission.payload,
+                    None,
+                ) == 0
+        }
+        GeneratorStatus::Finished => {
+            stage.activated
+                && match packet(image, emission.payload).filter(|resident| resident.flow == flow.id)
+                {
+                    None => true,
+                    Some(_) => {
+                        notify(emission.payload).is_some()
+                            && events(
+                                crate::EventKind::RemoteArrival,
+                                flow.target,
+                                emission.payload,
+                                None,
+                            ) == 1
+                    }
+                }
+        }
+    };
+    if !consistent {
+        return Err(ValidationError::new(format!(
+            "flow {:?} stage notify state {:?} is inconsistent with its release",
+            flow.id, emission.status
+        )));
+    }
+    Ok(())
 }
 
 /// A RoCE queue pair's MTU and pacing interval, which a compute stage after it writes on its
@@ -5496,9 +5755,68 @@ fn validate_channels(
     Ok(())
 }
 
+/// The host-to-host lanes of stage notifies (P16 H2), as channel indices.
+///
+/// A stage notify's lane is the channel from its source host to its target host on a link that
+/// joins exactly those hosts: one per host pair, with event kind `RemoteArrival`, a positive
+/// latency, and a link no routed packet crosses (so out-of-band delivery is all it carries). An
+/// image without stage notifies has no lanes, whatever host-to-host links it declares.
+fn validate_notify_lanes(
+    image: &SimulationImage,
+    flow_index: &FlowIndex,
+    derived_delays: &DerivedChannelDelays,
+) -> Result<BTreeSet<usize>, ValidationError> {
+    let mut lanes = BTreeSet::new();
+    if !flow_index.has_stage_generators() {
+        return Ok(lanes);
+    }
+    let mut candidates = BTreeMap::<(NodeId, NodeId), Vec<usize>>::new();
+    for flow in &image.flows {
+        if flow_index.is_notify_flow(image, flow.id) {
+            candidates.entry((flow.source, flow.target)).or_default();
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(lanes);
+    }
+    for (index, channel) in image.channels.iter().enumerate() {
+        let Some(link) = link(image, channel.link) else {
+            continue;
+        };
+        if let Some(found) = candidates.get_mut(&(link.source, link.target)) {
+            if channel.source == link.source && channel.target == link.target {
+                found.push(index);
+            }
+        }
+    }
+    for ((source, target), found) in candidates {
+        let [index] = found[..] else {
+            return Err(ValidationError::new(format!(
+                "stage notifies from {source:?} to {target:?} need exactly one lane, found {}",
+                found.len()
+            )));
+        };
+        let channel = image.channels[index];
+        if channel.event_kind != EventKind::RemoteArrival
+            || channel.min_delay_ns == 0
+            || derived_delays
+                .possible
+                .contains_key(&(channel.link, channel.target))
+        {
+            return Err(ValidationError::new(format!(
+                "channel {index} is not a stage-notify lane: it must deliver RemoteArrival after a \
+                 positive latency on a link no routed packet crosses"
+            )));
+        }
+        lanes.insert(index);
+    }
+    Ok(lanes)
+}
+
 fn validate_events(
     image: &SimulationImage,
     pfc_channels: &BTreeSet<usize>,
+    lane_channels: &BTreeSet<usize>,
 ) -> Result<(), ValidationError> {
     let declared_route_channels = image
         .channels
@@ -5630,7 +5948,19 @@ fn validate_events(
                 }
             }
             EventKind::RemoteArrival => {
-                if let PacketKind::Pfc(header) = packet.kind {
+                if packet.kind == PacketKind::StageNotify {
+                    // P16 H2: a stage notify crosses its host pair's lane, source to target.
+                    let on_lane = lane_channels.iter().any(|channel_index| {
+                        let channel = &image.channels[*channel_index];
+                        channel.source == origin.id && channel.target == event.target
+                    });
+                    if !on_lane || origin.id != flow.source || event.target != flow.target {
+                        return Err(ValidationError::new(format!(
+                            "stage notify RemoteArrival event {index} from {:?} to {:?} is not on its flow's lane",
+                            origin.id, event.target
+                        )));
+                    }
+                } else if let PacketKind::Pfc(header) = packet.kind {
                     let matching_lane = pfc_channels.iter().copied().find(|channel_index| {
                         let channel = &image.channels[*channel_index];
                         channel.source == origin.id
@@ -5688,7 +6018,10 @@ fn validate_events(
                         event.payload, flow.source
                     )));
                 }
-                if !packet.kind.is_data() && !packet.kind.is_timer_token() {
+                if !packet.kind.is_data()
+                    && !packet.kind.is_timer_token()
+                    && packet.kind != PacketKind::StageNotify
+                {
                     return Err(ValidationError::new(format!(
                         "PacingTimer event {index} references non-data payload {:?}",
                         event.payload
@@ -7712,13 +8045,16 @@ fn packet_route(flow: &FlowDescriptor, packet_kind: PacketKind) -> &[LinkId] {
         | PacketKind::DcqcnCnp(_)
         | PacketKind::RoceAck(_)
         | PacketKind::RoceNack(_) => &flow.reverse_route,
-        PacketKind::RocePacingTimer => &[],
+        PacketKind::RocePacingTimer | PacketKind::StageNotify => &[],
     }
 }
 
 fn packet_terminal(flow: &FlowDescriptor, packet_kind: PacketKind) -> NodeId {
     match packet_kind {
-        PacketKind::Data | PacketKind::TcpData(_) | PacketKind::RoceData(_) => flow.target,
+        PacketKind::Data
+        | PacketKind::TcpData(_)
+        | PacketKind::RoceData(_)
+        | PacketKind::StageNotify => flow.target,
         PacketKind::Feedback
         | PacketKind::TcpAck(_)
         | PacketKind::Pfc(_)
