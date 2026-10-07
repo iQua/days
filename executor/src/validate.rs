@@ -923,13 +923,23 @@ fn validate_flows(image: &SimulationImage, flow_index: &FlowIndex) -> Result<(),
                 .filter(|source| source.kind == NodeKind::Host)
                 .and_then(|source| image.host_states.get(source.state_slot as usize))
                 .is_some_and(|state| {
-                    scan_generators(state).any(|generator| {
-                        generator.flow == flow.id
-                            && matches!(
-                                generator.kind,
-                                FlowGeneratorKind::Dcqcn(_) | FlowGeneratorKind::Roce(_)
-                            )
-                    })
+                    let feedback_transport = |generator: &crate::FlowGeneratorState| {
+                        matches!(
+                            generator.kind,
+                            FlowGeneratorKind::Dcqcn(_) | FlowGeneratorKind::Roce(_)
+                        )
+                    };
+                    if state
+                        .generators
+                        .windows(2)
+                        .all(|pair| pair[0].flow < pair[1].flow)
+                    {
+                        ascending_generator(state, flow.id).is_some_and(feedback_transport)
+                    } else {
+                        scan_generators(state).any(|generator| {
+                            generator.flow == flow.id && feedback_transport(generator)
+                        })
+                    }
                 })
         {
             return Err(ValidationError::new(format!(
@@ -1894,7 +1904,7 @@ fn validate_roce_packets(image: &SimulationImage) -> Result<(), ValidationError>
         let (generator, roce) = image
             .host_states
             .get(source.state_slot as usize)
-            .and_then(|state| scan_generators(state).find(|generator| generator.flow == flow.id))
+            .and_then(|state| ascending_generator(state, flow.id))
             .and_then(|generator| match generator.kind {
                 FlowGeneratorKind::Roce(roce) => Some((generator, roce)),
                 _ => None,
@@ -3478,11 +3488,29 @@ pub fn take_generator_passes_for_testing() -> usize {
 }
 
 /// `state`'s generators, scanned for one flow's generator: a pass over the host's generator
-/// table, counted with [`staged_generators`]'s passes.
+/// table, counted with [`staged_generators`]'s passes. Only `validate_flows` scans, and only on
+/// a table that is not strictly ascending by flow, which `validate_generators` then rejects.
 fn scan_generators(state: &crate::HostState) -> std::slice::Iter<'_, crate::FlowGeneratorState> {
     #[cfg(feature = "planner-test-hooks")]
     GENERATOR_PASSES.set(GENERATOR_PASSES.get() + 1);
     state.generators.iter()
+}
+
+/// The generator of `flow` in `state`'s table, by binary search, for a table strictly ascending
+/// by flow: there a scan for the flow finds this generator or none (P16 H3 part 2B: a scan per
+/// lookup cost queue pairs squared per host). Every check after `validate_generators`, which
+/// requires the order, looks up this way.
+fn ascending_generator(
+    state: &crate::HostState,
+    flow: crate::FlowId,
+) -> Option<&crate::FlowGeneratorState> {
+    let index = state
+        .generators
+        .partition_point(|generator| generator.flow < flow);
+    state
+        .generators
+        .get(index)
+        .filter(|generator| generator.flow == flow)
 }
 
 /// The transport of a flow's generator, as `validate_generators` records it per flow.
@@ -4470,15 +4498,13 @@ fn validate_packets_and_derive_delays(
             let source =
                 node(image, flow.source).expect("flow validation established the source node");
             let owns_token =
-                scan_generators(&image.host_states[source.state_slot as usize]).any(|generator| {
-                    generator.flow == flow.id
-                        && match (packet.kind, generator.kind) {
-                            (PacketKind::RocePacingTimer, FlowGeneratorKind::Roce(roce)) => {
-                                roce.pacing_timer_payload == packet.id
-                            }
-                            _ => false,
+                ascending_generator(&image.host_states[source.state_slot as usize], flow.id)
+                    .is_some_and(|generator| match (packet.kind, generator.kind) {
+                        (PacketKind::RocePacingTimer, FlowGeneratorKind::Roce(roce)) => {
+                            roce.pacing_timer_payload == packet.id
                         }
-                });
+                        _ => false,
+                    });
             if packet.size_bytes != 0 || !owns_token {
                 return Err(ValidationError::new(format!(
                     "timer token {:?} must be zero-byte NotECT state owned by its queue pair",
@@ -4491,10 +4517,8 @@ fn validate_packets_and_derive_delays(
             let source =
                 node(image, flow.source).expect("flow validation established the source node");
             let is_dcqcn =
-                scan_generators(&image.host_states[source.state_slot as usize]).any(|generator| {
-                    generator.flow == flow.id
-                        && matches!(generator.kind, FlowGeneratorKind::Dcqcn(_))
-                });
+                ascending_generator(&image.host_states[source.state_slot as usize], flow.id)
+                    .is_some_and(|generator| matches!(generator.kind, FlowGeneratorKind::Dcqcn(_)));
             // A queue pair echoes ECN on its ACKs and never sends a CNP (P16 ruling D4).
             if packet.size_bytes != 64 || !is_dcqcn {
                 return Err(ValidationError::new(format!(
@@ -4522,7 +4546,7 @@ fn validate_packets_and_derive_delays(
             let source =
                 node(image, flow.source).expect("flow validation established the source node");
             let state = &image.host_states[source.state_slot as usize];
-            if !scan_generators(state).any(|generator| generator.flow == flow.id) {
+            if ascending_generator(state, flow.id).is_none() {
                 return Err(ValidationError::new(format!(
                     "feedback packet {:?} for flow {:?} has no generator at source node {:?}",
                     packet.id, flow.id, flow.source
@@ -5130,9 +5154,9 @@ fn dcqcn_data_can_still_emit_cnp(
     let Some(source) = node(image, flow.source) else {
         return false;
     };
-    if !scan_generators(&image.host_states[source.state_slot as usize]).any(|generator| {
-        generator.flow == flow.id && matches!(generator.kind, FlowGeneratorKind::Dcqcn(_))
-    }) {
+    if !ascending_generator(&image.host_states[source.state_slot as usize], flow.id)
+        .is_some_and(|generator| matches!(generator.kind, FlowGeneratorKind::Dcqcn(_)))
+    {
         return false;
     }
     if packet.ecn_marked {
