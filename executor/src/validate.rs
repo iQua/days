@@ -4171,8 +4171,10 @@ const fn previous_rank(rank: u32, group_size: u32) -> u32 {
 /// `after`, the ruling on H3's C1). Each local predecessor is a compute stage on its host, or a
 /// completion stage of a collective there (`validate_stage_dependencies` pins the host); each
 /// inbound predecessor is a completion stage of a collective delivering here that also has a
-/// local completion stage here, at the collective's rank `r` here, and on one ring (`RingNext`)
-/// it is rank `r - 1`'s. A send/recv's receiver waits for the send alone.
+/// local completion stage here when it is a ring, at the collective's rank `r` here, and on one
+/// ring (`RingNext`) it is rank `r - 1`'s. A send/recv's receiver waits for the send alone, and an
+/// all-to-all rank that sends nothing for the messages delivered to it and its release (the
+/// all-to-all's gate stages here, all local).
 fn validate_entry_predecessors(
     image: &SimulationImage,
     flow_index: &FlowIndex,
@@ -4213,9 +4215,10 @@ fn validate_entry_predecessors(
         if !is_completion_stage(inbound) {
             return Err(shape_error());
         }
-        // A send/recv's receiver waits for the send alone; every other collective it follows
-        // also completes here locally, at its rank here.
-        if inbound.algorithm != crate::CollectiveAlgorithm::SendRecv {
+        // A send/recv's receiver waits for the send alone, and an all-to-all rank that sends
+        // nothing for the messages delivered to it (and its release); a ring it follows also
+        // completes here locally, at its rank here.
+        if is_ring_algorithm(inbound.algorithm) {
             let mut rank_here = None;
             for local in dependencies.local.iter(&image.stage_joins) {
                 if let Some((collective, rank)) = local_collective(local)? {

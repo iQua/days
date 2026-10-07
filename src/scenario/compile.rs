@@ -5303,10 +5303,17 @@ fn ring_chunk(
 /// each channel's final step; an all-to-all's are every pair from and to the rank; a send/recv's
 /// is its one message, local at the sender and inbound at the receiver. A named collective is
 /// unique, so its only instance has duplicate ordinal 0.
+///
+/// An all-to-all rank that sends nothing (an all-zero row of a seeded matrix) has no own send to
+/// tie the collective's completion there to its release, so its completion also takes the
+/// all-to-all's release at the rank: its own gate stages there (the user's ruling, option 2). A
+/// gate group the dependent itself names (`direct`) is not taken twice. An ungated all-to-all has
+/// no gate, so a rank of it that neither sends nor receives completes at no stage.
 fn collective_completion(
     plan: &StagePlan<'_>,
     ordinal: u64,
     rank: u32,
+    direct: &[String],
     local: &mut PredecessorKeys,
     inbound: &mut PredecessorKeys,
 ) -> Result<u64, CompileError> {
@@ -5333,9 +5340,11 @@ fn collective_completion(
     match semantic.algorithm {
         CollectiveAlgorithm::AllToAll => {
             let size = n as usize;
+            let mut sends = false;
             for step in 1..n {
                 let target = (rank + step) % n;
                 if layout.pair_bytes[rank as usize * size + target as usize] != 0 {
+                    sends = true;
                     local.push(key(CollectivePhase::AllToAll, 0, rank, step));
                 }
             }
@@ -5346,6 +5355,19 @@ fn collective_completion(
                     inbound.push(key(CollectivePhase::AllToAll, 0, source, step));
                     add(pair)?;
                 }
+            }
+            if !sends {
+                let after = semantic.after.as_ref();
+                let ranks = AfterRanks::new(plan, after, &semantic.sources);
+                let host = semantic.sources[rank as usize];
+                add(follow_groups(
+                    plan,
+                    (after, &ranks, direct),
+                    (rank, host),
+                    direct,
+                    local,
+                    inbound,
+                )?)?;
             }
         }
         CollectiveAlgorithm::SendRecv => {
@@ -5447,8 +5469,34 @@ fn entry_predecessors(
 ) -> Result<(PredecessorKeys, PredecessorKeys, u64), CompileError> {
     let mut local = PredecessorKeys::None;
     let mut inbound = PredecessorKeys::None;
+    let bytes = follow_groups(
+        plan,
+        (after, ranks, &[]),
+        (rank, host),
+        after_names(after),
+        &mut local,
+        &mut inbound,
+    )?;
+    Ok((local, inbound, bytes))
+}
+
+/// Appends to `local` and `inbound` what a stage at `host` (rank `rank` of its group) waits for
+/// from the groups `after` names there, skipping the groups in `skip`, and returns the inbound
+/// bytes added. `direct` is the dependent's own `after` list, which a zero-send all-to-all rank's
+/// release does not take twice (`collective_completion`).
+fn follow_groups(
+    plan: &StagePlan<'_>,
+    (after, ranks, skip): (Option<&AfterGroups>, &AfterRanks, &[String]),
+    (rank, host): (u32, u64),
+    direct: &[String],
+    local: &mut PredecessorKeys,
+    inbound: &mut PredecessorKeys,
+) -> Result<u64, CompileError> {
     let mut bytes = 0_u64;
     for (index, name) in after_names(after).iter().enumerate() {
+        if skip.contains(name) {
+            continue;
+        }
         let Some(rank) = ranks.rank(index, rank, host) else {
             continue;
         };
@@ -5459,14 +5507,14 @@ fn entry_predecessors(
             }),
             StageGroup::Collective(collective) => {
                 let ordinal = collective_ordinal(plan.collectives, collective);
-                let more = collective_completion(plan, ordinal, rank, &mut local, &mut inbound)?;
+                let more = collective_completion(plan, ordinal, rank, direct, local, inbound)?;
                 bytes = bytes.checked_add(more).ok_or_else(|| {
                     CompileError::Invalid("inbound join bytes exceed u64".to_owned())
                 })?;
             }
         }
     }
-    Ok((local, inbound, bytes))
+    Ok(bytes)
 }
 
 /// Expands one collective into its stages: rings per channel and phase, an all-to-all's ordered
