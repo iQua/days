@@ -3,7 +3,7 @@ import LeanGuard.P10c.MechanismEventLog
 open LeanGuard.P10c.MechanismEventLog
 
 def usage : String :=
-  "usage: p10c_mechanisms_check <rate|pfc|drr|wrr> <events.csv>"
+  "usage: p10c_mechanisms_check <rate|pfc|drr|wrr|wfq> <events.csv>"
 
 def main (args : List String) : IO UInt32 := do
   match args with
@@ -15,6 +15,7 @@ def main (args : List String) : IO UInt32 := do
         | "pfc" => PfcLog.parseCsv content >>= PfcLog.checkRows
         | "drr" => DrrLog.parseCsv content >>= DrrLog.checkRows
         | "wrr" => WrrLog.parseCsv content >>= WrrLog.checkRows
+        | "wfq" => WfqLog.parseCsv content >>= WfqLog.checkRows
         | other => .error s!"invalid mechanism: {other}"
       match result with
       | .ok _ =>

@@ -640,4 +640,284 @@ def parseCsv (content : String) : Except String (List Row) :=
 
 end WrrLog
 
+/-!
+The Days AGO WFQ certificate (`wfq_transitions_csv`): one row per enqueue (phase 0), service start
+(`select`, phase 2) and service completion (`complete`, phase 1) at a WFQ egress queue. The checker
+replays each queue from the initial scheduler state; every row's `before` state must equal the
+replayed state, and its `after` state, virtual start and finish tag must equal the reference
+update. It tracks the waiting packets and their tags itself, so a `select` row's queue listing must
+be exactly the waiting packets, and the served packet must be the least finish tag (earliest
+enqueue among equal tags) among the listed packets whose PFC priority is not paused. The PFC
+priority of each packet and the paused set are taken from the row (the P10c PFC rules certify the
+pause frames separately).
+-/
+namespace WfqLog
+
+inductive Kind
+  | enqueue
+  | select
+  | complete
+  deriving DecidableEq, Repr
+
+def parseKind : String → Except String Kind
+  | "enqueue" => pure .enqueue
+  | "select" => pure .select
+  | "complete" => pure .complete
+  | other => throw s!"invalid WFQ kind: '{other}'"
+
+def phase : Kind → Nat
+  | .enqueue => 0
+  | .complete => 1
+  | .select => 2
+
+def kindName : Kind → String
+  | .enqueue => "enqueue"
+  | .select => "select"
+  | .complete => "complete"
+
+/-- An exact rational `numerator/denominator`, in lowest terms with a positive denominator. -/
+def parseRat (value : String) : Except String Rat := do
+  match value.splitOn "/" with
+  | [numerator, denominator] =>
+      let numerator ← parseNat numerator
+      let denominator ← parseNat denominator
+      if denominator = 0 then throw s!"zero denominator: '{value}'"
+      if Nat.gcd numerator denominator ≠ 1 then throw s!"rational not in lowest terms: '{value}'"
+      pure ((numerator : Rat) / (denominator : Rat))
+  | _ => throw s!"invalid rational: '{value}'"
+
+def parseRatList (value : String) : Except String (List Rat) := do
+  if value = "" then pure [] else value.splitOn ";" |>.mapM parseRat
+
+structure QueuedPacket where
+  payload : Nat
+  flow : Nat
+  sizeBytes : Nat
+  pfcPriority : Nat
+  finish : Rat
+  deriving DecidableEq, Repr
+
+def parseQueuedPacket (value : String) : Except String QueuedPacket := do
+  match value.splitOn ":" with
+  | [payload, flow, sizeBytes, pfcPriority, finish] =>
+      pure
+        { payload := ← parseNat payload
+          flow := ← parseNat flow
+          sizeBytes := ← parseNat sizeBytes
+          pfcPriority := ← parseNat pfcPriority
+          finish := ← parseRat finish }
+  | _ => throw s!"invalid WFQ queued packet: '{value}'"
+
+def parseQueuedPackets (value : String) : Except String (List QueuedPacket) := do
+  if value = "" then pure [] else value.splitOn ";" |>.mapM parseQueuedPacket
+
+def parseState (idx : Std.HashMap String Nat) (fields : Array String) (side : String) :
+    Except String Wfq.State := do
+  pure
+    { virtualTime := ← parseRat (← getField idx fields s!"{side}_virtual_time")
+      lastUpdatedNs := ← parseNat (← getField idx fields s!"{side}_last_updated_ns")
+      finishTimes := ← parseRatList (← getField idx fields s!"{side}_finish_tags")
+      activePackets := ← parseNatList (← getField idx fields s!"{side}_active_packets") }
+
+structure Row where
+  key : DaysExecutor.EventKey
+  kind : Kind
+  nodeId : Nat
+  queueId : Nat
+  rateBps : Nat
+  weights : List Nat
+  payload : Nat
+  flow : Nat
+  sizeBytes : Nat
+  virtualStart : Option Rat
+  finish : Rat
+  before : Wfq.State
+  queuedPackets : List QueuedPacket
+  pausedPriorities : List Nat
+  after : Wfq.State
+  srcLine : Nat
+
+def parseRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array String) :
+    Except String Row := do
+  let result : Except String Row := do
+    pure
+      { key :=
+          { timeNs := ← parseNat (← getField idx fields "time_ns")
+            phase := ← parseNat (← getField idx fields "event_phase")
+            originNode := ← parseNat (← getField idx fields "event_origin_node")
+            originSeq := ← parseNat (← getField idx fields "event_origin_sequence") }
+        kind := ← parseKind (← getField idx fields "kind")
+        nodeId := ← parseNat (← getField idx fields "node_id")
+        queueId := ← parseNat (← getField idx fields "queue_id")
+        rateBps := ← parseNat (← getField idx fields "rate_bps")
+        weights := ← parseNatList (← getField idx fields "weights")
+        payload := ← parseNat (← getField idx fields "payload")
+        flow := ← parseNat (← getField idx fields "flow_id")
+        sizeBytes := ← parseNat (← getField idx fields "size_bytes")
+        virtualStart := ← parseOpt parseRat (← getField idx fields "virtual_start")
+        finish := ← parseRat (← getField idx fields "finish_tag")
+        before := ← parseState idx fields "before"
+        queuedPackets := ← parseQueuedPackets (← getField idx fields "queued_packets")
+        pausedPriorities := ← parseNatList (← getField idx fields "paused_priorities")
+        after := ← parseState idx fields "after"
+        srcLine := lineNo }
+  match result with
+  | .ok row => pure row
+  | .error error => throw s!"line {lineNo}: {error}"
+
+/-- A packet the queue holds: waiting, or in service. -/
+structure Tagged where
+  flow : Nat
+  sizeBytes : Nat
+  finish : Rat
+  order : Nat
+  deriving Repr
+
+/-- One egress queue's replay: its configuration, its scheduler state and its packets. -/
+structure QueueReplay where
+  rateBps : Nat
+  weights : List Nat
+  state : Wfq.State
+  waiting : Std.HashMap Nat Tagged := {}
+  inService : Option (Nat × Tagged) := none
+  enqueued : Nat := 0
+
+def strictlyIncreasing : List Nat → Bool
+  | first :: second :: rest => first < second && strictlyIncreasing (second :: rest)
+  | _ => true
+
+def queueLabel (row : Row) : String :=
+  s!"queue (node_id={row.nodeId}, queue_id={row.queueId})"
+
+/-- The listed packets are exactly the waiting packets, with their flows, sizes and tags. -/
+def checkListing (row : Row) (queue : QueueReplay) : Except String (List Wfq.Waiting) := do
+  require row.srcLine (row.queuedPackets.length = queue.waiting.size)
+    s!"WFQ select lists {row.queuedPackets.length} packets; {queueLabel row} has {queue.waiting.size} waiting"
+  let (_, listed) ← row.queuedPackets.foldlM
+    (fun (seen, listed) (packet : QueuedPacket) => do
+      require row.srcLine (!seen.contains packet.payload)
+        s!"WFQ select lists payload {packet.payload} twice"
+      let tagged ←
+        match queue.waiting.get? packet.payload with
+        | none => throw s!"line {row.srcLine}: WFQ select lists payload {packet.payload}, which is not waiting"
+        | some tagged => pure tagged
+      require row.srcLine
+        (tagged.flow = packet.flow && tagged.sizeBytes = packet.sizeBytes &&
+          tagged.finish = packet.finish)
+        s!"WFQ select lists payload {packet.payload} with a flow, size or finish tag other than its enqueue's"
+      let listed :=
+        if row.pausedPriorities.contains packet.pfcPriority then listed
+        else { payload := packet.payload, finish := packet.finish, order := tagged.order } :: listed
+      pure (seen.insert packet.payload, listed))
+    ((∅ : Std.HashSet Nat), ([] : List Wfq.Waiting))
+  pure listed.reverse
+
+def step (queue : QueueReplay) (row : Row) : Except String QueueReplay := do
+  let classId := row.flow % row.weights.length
+  match row.kind with
+  | .enqueue => do
+      require row.srcLine (row.queuedPackets.isEmpty && row.pausedPriorities.isEmpty)
+        "WFQ enqueue row lists queued packets or paused priorities"
+      require row.srcLine
+        (!queue.waiting.contains row.payload &&
+          (queue.inService.map (·.1) != some row.payload))
+        s!"WFQ payload {row.payload} is enqueued twice"
+      let (after, start, finish) ←
+        Wfq.enqueue row.srcLine row.rateBps row.weights queue.state classId row.sizeBytes
+          row.key.timeNs
+      require row.srcLine (row.virtualStart = some start) "WFQ virtual start mismatch"
+      require row.srcLine (row.finish = finish) "WFQ finish tag mismatch"
+      require row.srcLine (row.after = after) "WFQ enqueue after-state mismatch"
+      pure
+        { queue with
+          state := after
+          waiting :=
+            queue.waiting.insert row.payload
+              { flow := row.flow, sizeBytes := row.sizeBytes, finish, order := queue.enqueued }
+          enqueued := queue.enqueued + 1 }
+  | .select => do
+      require row.srcLine (row.virtualStart.isNone) "WFQ select row has a virtual start"
+      require row.srcLine (strictlyIncreasing row.pausedPriorities)
+        "WFQ paused priorities must be strictly increasing"
+      require row.srcLine (queue.inService.isNone)
+        s!"WFQ select while {queueLabel row} is transmitting"
+      require row.srcLine (row.after = queue.state) "WFQ select changes the scheduler state"
+      let eligible ← checkListing row queue
+      let served ←
+        match Wfq.least eligible with
+        | none => throw s!"line {row.srcLine}: WFQ select with no eligible packet"
+        | some served => pure served
+      require row.srcLine (served.payload = row.payload)
+        s!"WFQ served payload {row.payload}, but the least finish tag among the eligible packets is payload {served.payload}"
+      let tagged ←
+        match queue.waiting.get? row.payload with
+        | none => throw s!"line {row.srcLine}: WFQ served payload {row.payload} is not waiting"
+        | some tagged => pure tagged
+      require row.srcLine
+        (tagged.flow = row.flow && tagged.sizeBytes = row.sizeBytes && tagged.finish = row.finish)
+        "WFQ served packet differs from its enqueue"
+      pure
+        { queue with
+          waiting := queue.waiting.erase row.payload
+          inService := some (row.payload, tagged) }
+  | .complete => do
+      require row.srcLine
+        (row.virtualStart.isNone && row.queuedPackets.isEmpty && row.pausedPriorities.isEmpty)
+        "WFQ complete row has a virtual start, queued packets or paused priorities"
+      let tagged ←
+        match queue.inService with
+        | some (payload, tagged) =>
+            if payload = row.payload then pure tagged
+            else throw s!"line {row.srcLine}: WFQ completes payload {row.payload}, but payload {payload} is in service"
+        | none => throw s!"line {row.srcLine}: WFQ completes payload {row.payload} with nothing in service"
+      require row.srcLine
+        (tagged.flow = row.flow && tagged.sizeBytes = row.sizeBytes && tagged.finish = row.finish)
+        "WFQ completed packet differs from its enqueue"
+      let after ←
+        Wfq.complete row.srcLine row.rateBps row.weights queue.state classId row.key.timeNs
+      require row.srcLine (row.after = after) "WFQ complete after-state mismatch"
+      pure { queue with state := after, inService := none }
+
+def checkRow (queues : Std.HashMap (Nat × Nat) QueueReplay) (row : Row) :
+    Except String (Std.HashMap (Nat × Nat) QueueReplay) := do
+  require row.srcLine (row.key.phase = phase row.kind)
+    s!"WFQ {kindName row.kind} row must have phase {phase row.kind}"
+  let classCount := row.weights.length
+  require row.srcLine (classCount > 0 && row.weights.all (· > 0))
+    "WFQ weights must be nonempty and positive"
+  require row.srcLine (row.rateBps > 0) "WFQ rate must be positive"
+  require row.srcLine
+    (row.before.finishTimes.length = classCount && row.before.activePackets.length = classCount &&
+      row.after.finishTimes.length = classCount && row.after.activePackets.length = classCount)
+    "WFQ state vector length mismatch"
+  let id := (row.nodeId, row.queueId)
+  let queue :=
+    queues.getD id { rateBps := row.rateBps, weights := row.weights, state := Wfq.initial classCount }
+  require row.srcLine (queue.rateBps = row.rateBps && queue.weights = row.weights)
+    s!"WFQ config discontinuity for {queueLabel row}"
+  require row.srcLine (row.before = queue.state)
+    s!"WFQ state discontinuity for {queueLabel row}"
+  let queue ← step queue row
+  pure (queues.insert id queue)
+
+def canonicalize (rows : List Row) : Except String (List Row) := do
+  let sorted := rows.toArray.qsort (fun a b => decide (a.key < b.key)) |>.toList
+  let rec check : List Row → Except String Unit
+    | [] | [_] => pure ()
+    | first :: second :: rest => do
+        require second.srcLine (first.key < second.key) "duplicate canonical event key"
+        check (second :: rest)
+  check sorted
+  pure sorted
+
+def checkRows (rows : List Row) : Except String Unit := do
+  let rows ← canonicalize rows
+  let _ ← rows.foldlM checkRow {}
+  pure ()
+
+def parseCsv (content : String) : Except String (List Row) :=
+  parseRows content parseRow
+
+end WfqLog
+
 end LeanGuard.P10c.MechanismEventLog

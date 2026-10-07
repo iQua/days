@@ -1,0 +1,2 @@
+exit=1
+REJECT: line 7: WFQ state discontinuity for queue (node_id=6, queue_id=0)

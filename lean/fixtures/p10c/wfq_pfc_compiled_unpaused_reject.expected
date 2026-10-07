@@ -1,0 +1,2 @@
+exit=1
+REJECT: line 233: WFQ served payload 217, but the least finish tag among the eligible packets is payload 54

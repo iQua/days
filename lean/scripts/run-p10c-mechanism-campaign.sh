@@ -12,7 +12,7 @@ fixture_dir="$lean_dir/fixtures/p10c"
 failures=0
 checked=0
 
-for mechanism in rate pfc drr wrr; do
+for mechanism in rate pfc drr wrr wfq; do
   for csv in "$fixture_dir"/"${mechanism}"_*.csv; do
     [[ -e "$csv" ]] || continue
     expected="${csv%.csv}.expected"
