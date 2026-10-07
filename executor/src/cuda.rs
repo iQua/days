@@ -6147,13 +6147,38 @@ mod tests {
     /// P16 D2 fix 1 (review M1): under Managed provisioning (an integrated GPU such as madrid's
     /// GB10) `cuMemGetInfo`'s free figure is the kernel's MemFree, which leaves out reclaimable
     /// page cache: on an idle madrid it read 83.1 GB, while a 102 GB managed allocation succeeded.
-    /// The limit there is the total, a fixed property of the device.
+    /// The limit there is derived from the total, a fixed property of the device.
+    ///
+    /// Fix 2 (review M2): the total itself is not usable, since the host keeps part of it (a
+    /// 127 GB plan on madrid's 130.6 GB was OOM-killed during upload). The limit keeps a fixed
+    /// reserve of `max(8 GiB, total / 16)`.
     #[test]
-    fn managed_provisioning_checks_plans_against_total_memory() {
+    fn managed_provisioning_checks_plans_against_total_memory_less_a_reserve() {
+        const GIB: usize = 1 << 30;
+        // madrid: total / 16 = 8,162,134,784 B is under the 8 GiB floor.
         let (free, total) = (83_136_438_272, 130_594_156_544);
         assert_eq!(
             plan_memory_limit(CudaProvisioning::Managed, free, total, None),
-            total
+            total - 8 * GIB
+        );
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Managed, free, total, None),
+            122_004_221_952
+        );
+        // A small device keeps the 8 GiB floor.
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Managed, 0, 32 * GIB, None),
+            24 * GIB
+        );
+        // A large device keeps a sixteenth.
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Managed, 0, 512 * GIB, None),
+            480 * GIB
+        );
+        // A device smaller than the reserve admits nothing.
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Managed, 0, 4 * GIB, None),
+            0
         );
         assert_eq!(
             plan_memory_limit(CudaProvisioning::Managed, free, total, Some(1_000)),
@@ -6161,7 +6186,7 @@ mod tests {
         );
         assert_eq!(
             plan_memory_limit(CudaProvisioning::Managed, free, total, Some(usize::MAX)),
-            total
+            total - 8 * GIB
         );
     }
 
