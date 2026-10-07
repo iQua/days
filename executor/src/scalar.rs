@@ -414,6 +414,24 @@ fn collective_progress_record(
                 ..record
             })
         }
+        (FlowGeneratorKind::Constant(constant), crate::StageRole::Collective(identity)) => {
+            Some(crate::CollectiveProgressRecord {
+                collective_id: identity.collective_id,
+                algorithm: Some(identity.algorithm),
+                group_size: identity.group_size,
+                declared_total_bytes: identity.declared_total_bytes,
+                rank: identity.rank,
+                phase: Some(identity.phase),
+                step: identity.step,
+                chunk_offset_bytes: identity.chunk_offset_bytes,
+                chunk_bytes: identity.chunk_bytes,
+                packet_size_bytes: constant.packet_size_bytes,
+                interval_ns: constant.interval_ns,
+                stage_kind: crate::CollectiveStageKind::Notify,
+                duration_ns: constant.interval_ns + constant.first_departure_ns,
+                ..record
+            })
+        }
         (FlowGeneratorKind::Constant(_), crate::StageRole::Compute(compute)) => {
             Some(crate::CollectiveProgressRecord {
                 collective_id: compute.compute_id,
@@ -2043,12 +2061,23 @@ impl<'image> TransitionState<'image> {
                     }),
             )
         };
-        if let (FlowGeneratorKind::Constant(_), Some(duration_ns)) = (kind, compute_duration) {
+        if let (FlowGeneratorKind::Constant(constant), duration) = (kind, compute_duration) {
+            // A compute stage's token is a zero-byte `Data` timer; a stage notify's (a collective
+            // stage on a constant generator, P16 H2) is its chunk, which crosses to the target
+            // when the lead elapses.
+            let (duration_ns, token) = match duration {
+                Some(duration_ns) => (duration_ns, (0, PacketKind::Data)),
+                None => (
+                    constant.interval_ns,
+                    (constant.packet_size_bytes, PacketKind::StageNotify),
+                ),
+            };
             return self.start_compute_stage(
                 node,
                 parent,
                 flow,
                 duration_ns,
+                token,
                 cause,
                 ordinal,
                 children,
@@ -2128,10 +2157,13 @@ impl<'image> TransitionState<'image> {
         Ok(())
     }
 
-    /// Starts a released compute interval: a source-local timer fires `duration_ns` later.
+    /// Starts a released compute interval, or a stage notify's lead: a source-local timer fires
+    /// `duration_ns` later.
     ///
-    /// The zero-byte token only names the timer event; it is never enqueued or transmitted. A
-    /// deadline beyond the stop time leaves the stage `Stopped` without an event.
+    /// The token, `(size_bytes, kind)`, names the timer event: a compute stage's zero-byte `Data`
+    /// token is never enqueued or transmitted; a stage notify's carries its chunk across its lane
+    /// when the timer fires. A deadline beyond the stop time leaves the stage `Stopped` without an
+    /// event.
     #[allow(clippy::too_many_arguments)]
     fn start_compute_stage(
         &mut self,
@@ -2139,6 +2171,7 @@ impl<'image> TransitionState<'image> {
         parent: Event,
         flow: FlowId,
         duration_ns: u64,
+        (token_size_bytes, token_kind): (u64, PacketKind),
         cause: PendingCollectiveProgress,
         ordinal: u64,
         children: &mut Vec<Event>,
@@ -2186,9 +2219,9 @@ impl<'image> TransitionState<'image> {
                 PacketDescriptor {
                     id: payload,
                     flow,
-                    size_bytes: 0,
+                    size_bytes: token_size_bytes,
                     ecn_marked: false,
-                    kind: PacketKind::Data,
+                    kind: token_kind,
                 },
                 Some(parent.key.time_ns),
             )?;
@@ -2260,6 +2293,120 @@ impl<'image> TransitionState<'image> {
                 completion,
                 &mut causes,
             );
+        }
+        self.mark_terminal(event.payload)?;
+        if !causes.is_empty() {
+            self.activate_ready_collectives(node, event, causes, children)?;
+        }
+        Ok(())
+    }
+
+    /// A stage notify's lead ends (P16 H2): the sender's stage finishes, with its one message
+    /// emitted, and its notify leaves on the lane to the target host, arriving `lane` later (the
+    /// generator's `first_departure_ns`). Then the stage's local successors are released, after
+    /// the transition's own emission, as every stage pass runs.
+    #[inline(never)]
+    fn host_notify_timer(
+        &mut self,
+        node: NodeDescriptor,
+        event: Event,
+        flow: FlowId,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
+        let mut causes = PendingCauses::default();
+        let lane_ns = {
+            let (mut state, index) = self.host_parts_mut(node)?;
+            let position = index
+                .first_generator(flow)
+                .ok_or(ExecutionError::UnknownGenerator {
+                    node: node.id,
+                    flow,
+                })?;
+            let generator = &mut state.generators[position];
+            let FlowGeneratorKind::Constant(constant) = generator.kind else {
+                return Err(ExecutionError::UnexpectedGeneratorEmission {
+                    node: node.id,
+                    flow,
+                    payload: event.payload,
+                });
+            };
+            if generator.next_emission.status != GeneratorStatus::Scheduled
+                || generator.next_emission.payload != event.payload
+                || generator.next_emission.departure_time_ns != event.key.time_ns
+            {
+                return Err(ExecutionError::UnexpectedGeneratorEmission {
+                    node: node.id,
+                    flow,
+                    payload: event.payload,
+                });
+            }
+            generator.next_emission.status = GeneratorStatus::Finished;
+            generator.packets_emitted = 1;
+            generator.bytes_emitted = constant.packet_size_bytes;
+            let completion = CompletionSignal {
+                ack_number: 0,
+                origin_ns: event.key.time_ns - constant.interval_ns,
+                delay_ns: constant.interval_ns,
+            };
+            complete_local_successors(
+                &state.generators,
+                &mut state.stages,
+                index,
+                flow,
+                completion,
+                &mut causes,
+            );
+            constant.first_departure_ns
+        };
+        let target = self.flow(flow)?.target;
+        let arrival_ns = event
+            .key
+            .time_ns
+            .checked_add(lane_ns)
+            .ok_or(ExecutionError::Time(TimeError::ArrivalOverflow))?;
+        self.emit_from_host(
+            node,
+            event,
+            ChildEmission {
+                target,
+                kind: EventKind::RemoteArrival,
+                payload: event.payload,
+                time_ns: arrival_ns,
+            },
+            children,
+        )?;
+        if !causes.is_empty() {
+            self.activate_ready_collectives(node, event, causes, children)?;
+        }
+        Ok(())
+    }
+
+    /// A stage notify arrives at its target (P16 H2): the whole chunk is delivered at once, so
+    /// the stages waiting on it as their inbound predecessor advance by it, and are released.
+    #[inline(never)]
+    fn host_notify_arrival(
+        &mut self,
+        node: NodeDescriptor,
+        event: Event,
+        packet: PacketDescriptor,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
+        let mut causes = PendingCauses::default();
+        {
+            let (mut state, index) = self.host_parts_mut(node)?;
+            record_inbound_progress(
+                &state.generators,
+                &mut state.stages,
+                index,
+                packet.flow,
+                InboundProgress::Segment {
+                    sequence: 0,
+                    bytes: packet.size_bytes,
+                    advance: packet.size_bytes,
+                },
+                node.id,
+                &mut causes,
+            )?;
         }
         self.mark_terminal(event.payload)?;
         if !causes.is_empty() {
@@ -3234,6 +3381,9 @@ impl<'image> TransitionState<'image> {
             PacketKind::Pfc(header) => {
                 return self.host_pfc_remote_arrival(node, event, header, children);
             }
+            PacketKind::StageNotify => {
+                return self.host_notify_arrival(node, event, packet, children);
+            }
             _ => {}
         }
         if packet.kind == PacketKind::Data
@@ -3866,6 +4016,10 @@ impl<'image> TransitionState<'image> {
         // A queue pair's pacing token names its own transition: no generator scan is needed.
         if packet.kind == PacketKind::RocePacingTimer {
             return self.host_roce_pacing_timer(node, event, packet, children);
+        }
+        // A stage notify's token names its sender's timer (P16 H2).
+        if packet.kind == PacketKind::StageNotify {
+            return self.host_notify_timer(node, event, packet.flow, children);
         }
         let compute_stage_owns = {
             let (state, index) = self.host_parts_mut(node)?;

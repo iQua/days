@@ -106,6 +106,8 @@ pub enum TopoCategory {
     FatTree,
     Torus,
     Dragonfly,
+    /// A rail-optimized single-ToR fabric with SimAI's `gen_Topo_Template.py` structure (P16 H2).
+    SpectrumX,
 }
 
 #[derive(Deserialize)]
@@ -134,12 +136,35 @@ pub struct DragonflyConfig {
     pub hosts_per_router: Option<usize>,
 }
 
+/// SimAI's rail-optimized single-ToR ("Spectrum-X") fabric, in exact integers (P16 H2).
+///
+/// GPU `i` sits in server `i / gpus_per_server` on rail `i % gpus_per_server`. A segment is
+/// `gpus_per_server * nics_per_asw` GPUs; each (segment, rail) pair has one leaf (ASW), and every
+/// ASW links to every one of the `psws` spines (PSW). NVLink joins the GPUs of a server through one
+/// NVSwitch; Days models it delay-only, so the NVLink class enters only the per-message delay.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SpectrumXConfig {
+    pub gpus: u64,
+    pub gpus_per_server: u64,
+    pub nics_per_asw: u64,
+    pub psws: u64,
+    /// SimAI's `gpu_type` header token (for example `H100`); it does not change the structure.
+    pub gpu_type: String,
+    pub nic_rate_bps: u64,
+    pub uplink_rate_bps: u64,
+    pub nvlink_rate_bps: u64,
+    pub link_delay_ns: u64,
+    pub nvlink_delay_ns: u64,
+}
+
 #[derive(Deserialize)]
 pub struct TopoConfig {
     pub category: TopoCategory,
     pub fat_tree: Option<FatTreeConfig>,
     pub torus: Option<TorusConfig>,
     pub dragonfly: Option<DragonflyConfig>,
+    pub spectrum_x: Option<SpectrumXConfig>,
 }
 
 #[derive(Deserialize)]

@@ -26,6 +26,7 @@ use super::ids::{IdError, LinkKey, LpKey, PhysicalNodeKey, StableIds, dense_ids}
 use crate::topos::build::{
     HostAttachments, PairingPolicy, TopologyError, TopologyProfile, build_graph_with_profile,
 };
+use crate::topos::rail::{RailProfile, ServerLocality};
 use crate::topos::route::{
     EcmpFlow, RouteTableError, RouteWorkers, compute_fat_tree_ecmp_route_table,
     compute_shortest_path_route_table_with,
@@ -80,8 +81,18 @@ struct SourceSwitch {
     discipline: Option<String>,
     drop: Option<String>,
     ecn_threshold: Option<ExactDecimal>,
+    /// P16 H2: an ECN step threshold per egress link rate, in packets (SimAI's ECN rows are keyed
+    /// by the port's rate); replaces `ecn_threshold` and needs `drop = "ECN_THRESHOLD"`.
+    ecn_by_rate: Option<Vec<SourceEcnRow>>,
     weights: Option<Vec<u64>>,
     priorities: Option<Vec<u64>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceEcnRow {
+    rate_bps: u64,
+    threshold_packets: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,6 +109,8 @@ enum RoutingPolicy {
     #[default]
     ShortestPath,
     FatTreeEcmp,
+    /// SimAI's per-flow Murmur3 choice of spine at the source leaf of the rail fabric (P16 H2).
+    SimAiEcmp,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -125,6 +138,27 @@ struct SourcePfc {
     pause_quanta: Option<Vec<u16>>,
     refresh_interval: Option<ExactDecimal>,
     drain_interval: Option<ExactDecimal>,
+    /// P16 H2, the rail fabric only: XOFF and XON per switch tier (SimAI's threshold is one per
+    /// switch, set by its port count); replaces `xoff` and `xon`.
+    by_tier: Option<Vec<SourcePfcTier>>,
+    /// P16 H2: each monitor's headroom by its controlled link's rate, so its buffer capacity is
+    /// XOFF plus that headroom on every enabled priority; replaces `buffer_capacity`.
+    headroom_by_rate: Option<Vec<SourceHeadroomRow>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourcePfcTier {
+    tier: String,
+    xoff: Vec<u64>,
+    xon: Vec<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceHeadroomRow {
+    rate_bps: u64,
+    bytes: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -587,6 +621,17 @@ struct CollectiveStageInput {
     inbound_predecessor_bytes: u64,
     local_predecessor_complete: bool,
     inbound_predecessor_complete: bool,
+    /// P16 H2: the NVLink message delay when the two ranks share a server on the rail fabric, so
+    /// the stage lowers to a stage notify; set by `NotifyLowering::plan`, `None` otherwise. Held
+    /// in the boxed sidecar, so a flow without a stage pays nothing to ask.
+    notify_delay_ns: Option<u64>,
+}
+
+impl FlowInput {
+    /// The stage notify's message delay of this flow, if it lowers to one (P16 H2).
+    fn notify_delay_ns(&self) -> Option<u64> {
+        self.collective.as_deref()?.notify_delay_ns
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -682,10 +727,14 @@ pub fn compile_config_with_route_workers(
 struct SupportedModel {
     seed: u64,
     stop_time_ns: u64,
-    rate_bps: u64,
+    /// `switch.port_rate`, the one link rate of every topology but the rail fabric, whose
+    /// per-class rates come from its topology table (`None` there; required elsewhere).
+    rate_bps: Option<u64>,
     queue_capacity_packets: u64,
     scheduler: SchedulerKind,
     drop_mark: DropMarkPolicy,
+    /// P16 H2: the ECN step threshold of each egress LP by its link rate, overriding `drop_mark`'s.
+    ecn_by_rate: Option<BTreeMap<u64, u64>>,
     pfc: Option<PfcLowering>,
     routing: RoutingPolicy,
     propagation: PropagationModel,
@@ -746,9 +795,18 @@ fn canonical_roce_keys(
 /// layer a link belongs to: host attachment, edge-to-aggregation, aggregation-to-core.
 #[derive(Clone, Copy, Debug)]
 enum PropagationModel {
+    /// No delay key: zero on every topology but the rail fabric, whose topology table names its
+    /// per-class delays.
+    Undeclared,
     Uniform(u64),
     FatTreeTiers(SourcePropagationTiers),
 }
+
+/// Per-priority byte thresholds of one PFC table: XOFF and XON.
+type PfcThresholds = ([u64; 8], [u64; 8]);
+
+/// XOFF, XON and buffer capacity of one ingress monitor.
+type PfcMonitorThresholds = ([u64; 8], [u64; 8], [u64; 8]);
 
 #[derive(Clone)]
 struct PfcLowering {
@@ -757,6 +815,60 @@ struct PfcLowering {
     buffer_capacity: [u64; 8],
     /// Monitor host-to-switch links as well as switch-to-switch links.
     host_links: bool,
+    /// P16 H2: XOFF and XON of the ASW tier and the PSW tier, replacing `xoff` and `xon`.
+    tiers: Option<[PfcThresholds; 2]>,
+    /// P16 H2: headroom by controlled link rate, replacing `buffer_capacity`.
+    headroom_by_rate: Option<BTreeMap<u64, u64>>,
+}
+
+impl PfcLowering {
+    /// The thresholds of one monitor: its downstream switch's tier (on the rail fabric) and its
+    /// controlled link's rate pick XOFF, XON and the buffer capacity.
+    fn thresholds(
+        &self,
+        profile: TopologyProfile,
+        downstream_switch: u64,
+        controlled_rate_bps: u64,
+    ) -> Result<PfcMonitorThresholds, CompileError> {
+        let (xoff, xon) = match (&self.tiers, profile) {
+            (None, _) => (self.xoff, self.xon),
+            (Some(tiers), TopologyProfile::Rail(rail)) => {
+                let tier = u32::try_from(downstream_switch)
+                    .map(|switch| usize::from(!rail.is_asw(switch)))
+                    .map_err(|_| CompileError::Invalid("switch identity exceeds u32".to_owned()))?;
+                tiers[tier]
+            }
+            (Some(_), _) => {
+                return Err(CompileError::Unsupported(
+                    "unsupported `link.pfc.by_tier` off the SpectrumX rail fabric; switch tiers \
+                     are rail tiers"
+                        .to_owned(),
+                ));
+            }
+        };
+        let buffer_capacity = match &self.headroom_by_rate {
+            None => self.buffer_capacity,
+            Some(rows) => {
+                let headroom = *rows.get(&controlled_rate_bps).ok_or_else(|| {
+                    CompileError::Invalid(format!(
+                        "`link.pfc.headroom_by_rate` has no row for a {controlled_rate_bps} b/s \
+                         controlled link"
+                    ))
+                })?;
+                let mut capacity = [0; 8];
+                for priority in 0..8 {
+                    if xoff[priority] != 0 {
+                        capacity[priority] =
+                            xoff[priority].checked_add(headroom).ok_or_else(|| {
+                                CompileError::Invalid("PFC buffer capacity exceeds u64".to_owned())
+                            })?;
+                    }
+                }
+                capacity
+            }
+        };
+        Ok((xoff, xon, buffer_capacity))
+    }
 }
 
 impl SupportedModel {
@@ -771,7 +883,12 @@ impl SupportedModel {
             1_000_000_000,
             "simulation duration",
         )?;
-        let rate_bps = parse_rate(scenario_text, source.switch.port_rate.as_ref())?;
+        let rate_bps = source
+            .switch
+            .port_rate
+            .as_ref()
+            .map(|rate| parse_rate(scenario_text, Some(rate)))
+            .transpose()?;
 
         let discipline = source
             .switch
@@ -879,6 +996,20 @@ impl SupportedModel {
                     mark_ecn: drop == "RED_ECN",
                 })
             }
+            "ECN_THRESHOLD" if source.switch.ecn_by_rate.is_some() => {
+                if source.switch.ecn_threshold.is_some() {
+                    return Err(CompileError::Invalid(
+                        "`switch.ecn_by_rate` replaces `switch.ecn_threshold`".to_owned(),
+                    ));
+                }
+                // Each egress LP takes its link rate's row at lowering; this policy only carries
+                // the shared capacity and unit.
+                DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
+                    unit: QueueDepthUnit::Packets,
+                    capacity: source.switch.capacity,
+                    threshold: source.switch.capacity,
+                })
+            }
             "ECN_THRESHOLD" => {
                 let threshold = exact_decimal_product_ceil(
                     scenario_text,
@@ -900,6 +1031,15 @@ impl SupportedModel {
             }
         };
 
+        let ecn_by_rate = match (&source.switch.ecn_by_rate, drop) {
+            (None, _) => None,
+            (Some(rows), "ECN_THRESHOLD") => Some(ecn_rows(rows, source.switch.capacity)?),
+            (Some(_), _) => {
+                return Err(CompileError::Invalid(
+                    "`switch.ecn_by_rate` needs `switch.drop = \"ECN_THRESHOLD\"`".to_owned(),
+                ));
+            }
+        };
         let link = source.link.unwrap_or_default();
         let mut pfc = None;
         if let Some(mode) = link.mode.as_deref() {
@@ -931,10 +1071,37 @@ impl SupportedModel {
                             .to_owned(),
                     ));
                 }
-                let mut xoff = exact_pfc_array(config.xoff.as_deref(), "xoff")?;
-                let mut xon = exact_pfc_array(config.xon.as_deref(), "xon")?;
-                let mut buffer_capacity =
-                    exact_pfc_array(config.buffer_capacity.as_deref(), "buffer_capacity")?;
+                let mut tiers = config.by_tier.as_deref().map(pfc_tiers).transpose()?;
+                let headroom_by_rate = config
+                    .headroom_by_rate
+                    .as_deref()
+                    .map(pfc_headroom_rows)
+                    .transpose()?;
+                if tiers.is_some() && (config.xoff.is_some() || config.xon.is_some()) {
+                    return Err(CompileError::Invalid(
+                        "`link.pfc.by_tier` replaces `link.pfc.xoff` and `link.pfc.xon`".to_owned(),
+                    ));
+                }
+                if headroom_by_rate.is_some() && config.buffer_capacity.is_some() {
+                    return Err(CompileError::Invalid(
+                        "`link.pfc.headroom_by_rate` replaces `link.pfc.buffer_capacity`"
+                            .to_owned(),
+                    ));
+                }
+                // With tiers, the ASW tier stands for the enabled priorities (both tiers enable
+                // the same ones); with headroom rows, XOFF stands for the per-monitor capacity.
+                let (mut xoff, mut xon) = match &tiers {
+                    Some(tiers) => tiers[0],
+                    None => (
+                        exact_pfc_array(config.xoff.as_deref(), "xoff")?,
+                        exact_pfc_array(config.xon.as_deref(), "xon")?,
+                    ),
+                };
+                let mut buffer_capacity = if headroom_by_rate.is_some() {
+                    xoff
+                } else {
+                    exact_pfc_array(config.buffer_capacity.as_deref(), "buffer_capacity")?
+                };
                 if let Some(quanta) = config.pause_quanta.as_deref() {
                     let quanta: [u16; 8] = quanta.try_into().map_err(|_| {
                         CompileError::Invalid(
@@ -946,6 +1113,10 @@ impl SupportedModel {
                             xoff[priority] = 0;
                             xon[priority] = 0;
                             buffer_capacity[priority] = 0;
+                            for (tier_xoff, tier_xon) in tiers.iter_mut().flatten() {
+                                tier_xoff[priority] = 0;
+                                tier_xon[priority] = 0;
+                            }
                         }
                     }
                 }
@@ -960,6 +1131,8 @@ impl SupportedModel {
                     xon,
                     buffer_capacity,
                     host_links: config.host_links.unwrap_or(false),
+                    tiers,
+                    headroom_by_rate,
                 });
             } else if mode != "None" {
                 return Err(CompileError::Unsupported(format!(
@@ -1023,10 +1196,11 @@ impl SupportedModel {
         {
             None | Some("ShortestPath") => RoutingPolicy::ShortestPath,
             Some("FatTreeEcmp") => RoutingPolicy::FatTreeEcmp,
+            Some("SimAiEcmp") => RoutingPolicy::SimAiEcmp,
             Some(unsupported) => {
                 return Err(CompileError::Unsupported(format!(
                     "unsupported `routing.policy` `{unsupported}`; Days lowering supports \
-                     ShortestPath and FatTreeEcmp"
+                     ShortestPath, FatTreeEcmp and SimAiEcmp"
                 )));
             }
         };
@@ -1040,7 +1214,8 @@ impl SupportedModel {
                 ));
             }
             (_, Some(tiers)) => PropagationModel::FatTreeTiers(tiers),
-            (propagation_ns, None) => PropagationModel::Uniform(propagation_ns.unwrap_or(0)),
+            (Some(propagation_ns), None) => PropagationModel::Uniform(propagation_ns),
+            (None, None) => PropagationModel::Undeclared,
         };
 
         Ok(Self {
@@ -1050,6 +1225,7 @@ impl SupportedModel {
             queue_capacity_packets: source.switch.capacity,
             scheduler,
             drop_mark,
+            ecn_by_rate,
             pfc,
             routing,
             propagation,
@@ -1060,6 +1236,76 @@ impl SupportedModel {
             roce_keys,
         })
     }
+}
+
+/// `link.pfc.by_tier`: exactly the `asw` and `psw` tiers, each with eight XOFF and XON entries,
+/// enabling the same priorities, as `[(asw xoff, asw xon), (psw xoff, psw xon)]`.
+fn pfc_tiers(rows: &[SourcePfcTier]) -> Result<[PfcThresholds; 2], CompileError> {
+    let invalid = || {
+        CompileError::Invalid(
+            "`link.pfc.by_tier` must list the `asw` and `psw` tiers once each, with eight XOFF and \
+             XON entries enabling the same priorities"
+                .to_owned(),
+        )
+    };
+    let tier = |name: &str| -> Result<PfcThresholds, CompileError> {
+        let mut found = rows.iter().filter(|row| row.tier == name);
+        let row = found.next().ok_or_else(invalid)?;
+        if found.next().is_some() {
+            return Err(invalid());
+        }
+        let xoff: [u64; 8] = row.xoff.as_slice().try_into().map_err(|_| invalid())?;
+        let mut xon: [u64; 8] = row.xon.as_slice().try_into().map_err(|_| invalid())?;
+        for priority in 0..8 {
+            if xoff[priority] == 0 {
+                xon[priority] = 0;
+            }
+        }
+        Ok((xoff, xon))
+    };
+    if rows.len() != 2 {
+        return Err(invalid());
+    }
+    let tiers = [tier("asw")?, tier("psw")?];
+    if (0..8).any(|priority| (tiers[0].0[priority] == 0) != (tiers[1].0[priority] == 0)) {
+        return Err(invalid());
+    }
+    Ok(tiers)
+}
+
+/// `link.pfc.headroom_by_rate`: one positive headroom per distinct link rate.
+fn pfc_headroom_rows(rows: &[SourceHeadroomRow]) -> Result<BTreeMap<u64, u64>, CompileError> {
+    let mut headroom = BTreeMap::new();
+    for row in rows {
+        if row.rate_bps == 0 || row.bytes == 0 || headroom.insert(row.rate_bps, row.bytes).is_some()
+        {
+            return Err(CompileError::Invalid(
+                "`link.pfc.headroom_by_rate` needs one positive headroom per distinct positive rate"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(headroom)
+}
+
+/// `switch.ecn_by_rate`: one step threshold per distinct link rate, within the queue capacity.
+fn ecn_rows(rows: &[SourceEcnRow], capacity: u64) -> Result<BTreeMap<u64, u64>, CompileError> {
+    let mut thresholds = BTreeMap::new();
+    for row in rows {
+        if row.rate_bps == 0
+            || row.threshold_packets == 0
+            || row.threshold_packets > capacity
+            || thresholds
+                .insert(row.rate_bps, row.threshold_packets)
+                .is_some()
+        {
+            return Err(CompileError::Invalid(format!(
+                "`switch.ecn_by_rate` needs one threshold in 1..={capacity} packets per distinct \
+                 positive rate"
+            )));
+        }
+    }
+    Ok(thresholds)
 }
 
 fn exact_pfc_array(values: Option<&[u64]>, field: &str) -> Result<[u64; 8], CompileError> {
@@ -2476,7 +2722,21 @@ fn link_delay_model(
     propagation: PropagationModel,
     profile: TopologyProfile,
 ) -> Result<LinkDelay, CompileError> {
+    if let TopologyProfile::Rail(rail) = profile {
+        if !matches!(propagation, PropagationModel::Undeclared) {
+            return Err(CompileError::Unsupported(
+                "unsupported `link.propagation_ns` or `link.propagation_tiers` on a SpectrumX \
+                 topology; its link delays are `topology.spectrum_x.link_delay_ns`"
+                    .to_owned(),
+            ));
+        }
+        return Ok(LinkDelay::Rail {
+            link_delay_ns: rail.link_delay_ns,
+            nvlink_delay_ns: rail.nvlink_delay_ns,
+        });
+    }
     let tiers = match propagation {
+        PropagationModel::Undeclared => return Ok(LinkDelay::Uniform(0)),
         PropagationModel::Uniform(propagation_ns) => {
             return Ok(LinkDelay::Uniform(propagation_ns));
         }
@@ -2502,6 +2762,52 @@ fn link_delay_model(
     })
 }
 
+/// The link-rate model resolved against one built topology: `switch.port_rate` everywhere, or the
+/// rail fabric's per-class rates (NIC links and ASW–PSW uplinks, P16 H2).
+#[derive(Clone, Copy, Debug)]
+enum LinkRate {
+    Uniform(u64),
+    Rail {
+        nic_bps: u64,
+        uplink_bps: u64,
+        nvlink_bps: u64,
+    },
+}
+
+impl LinkRate {
+    fn resolve(rate_bps: Option<u64>, profile: TopologyProfile) -> Result<Self, CompileError> {
+        match (profile, rate_bps) {
+            (TopologyProfile::Rail(rail), None) => Ok(Self::Rail {
+                nic_bps: rail.nic_rate_bps,
+                uplink_bps: rail.uplink_rate_bps,
+                nvlink_bps: rail.nvlink_rate_bps,
+            }),
+            (TopologyProfile::Rail(_), Some(_)) => Err(CompileError::Unsupported(
+                "unsupported `switch.port_rate` on a SpectrumX topology; its link rates are \
+                 `topology.spectrum_x.nic_rate_bps` and `uplink_rate_bps`"
+                    .to_owned(),
+            )),
+            (_, Some(rate_bps)) => Ok(Self::Uniform(rate_bps)),
+            (_, None) => parse_rate("", None).map(Self::Uniform),
+        }
+    }
+
+    fn of(self, key: LinkKey) -> u64 {
+        match self {
+            Self::Uniform(rate_bps) => rate_bps,
+            Self::Rail {
+                nic_bps,
+                uplink_bps,
+                nvlink_bps,
+            } => match (key.source, key.target) {
+                (PhysicalNodeKey::Host(_), PhysicalNodeKey::Host(_)) => nvlink_bps,
+                (PhysicalNodeKey::Host(_), _) | (_, PhysicalNodeKey::Host(_)) => nic_bps,
+                (PhysicalNodeKey::Switch(_), PhysicalNodeKey::Switch(_)) => uplink_bps,
+            },
+        }
+    }
+}
+
 /// Propagation model resolved against one built topology.
 #[derive(Clone, Copy, Debug)]
 enum LinkDelay {
@@ -2511,12 +2817,25 @@ enum LinkDelay {
         /// First aggregation-to-core switch identity: `edge_switches + aggregation_switches`.
         core_boundary: u64,
     },
+    /// The rail fabric: NIC links and ASW–PSW links share SimAI's one `latency`; a same-server
+    /// notify lane is the two NVLink hops through the server's NVSwitch (P16 H2).
+    Rail {
+        link_delay_ns: u64,
+        nvlink_delay_ns: u64,
+    },
 }
 
 impl LinkDelay {
     fn of(self, key: LinkKey) -> u64 {
         match self {
             Self::Uniform(propagation_ns) => propagation_ns,
+            Self::Rail {
+                link_delay_ns,
+                nvlink_delay_ns,
+            } => match (key.source, key.target) {
+                (PhysicalNodeKey::Host(_), PhysicalNodeKey::Host(_)) => 2 * nvlink_delay_ns,
+                _ => link_delay_ns,
+            },
             Self::FatTreeTiers {
                 tiers,
                 core_boundary,
@@ -2544,6 +2863,7 @@ fn lower(
     route_workers: RouteWorkers,
 ) -> Result<SimulationImage, CompileError> {
     let link_delay = link_delay_model(model.propagation, profile)?;
+    let link_rate = LinkRate::resolve(model.rate_bps, profile)?;
     let roce_keys = model.roce_keys.clone();
     let switch_topology_ids = graph
         .node_indices()
@@ -2638,9 +2958,8 @@ fn lower(
         .map(LpKey::Host)
         .chain(switch_port_keys.iter().copied())
         .collect::<Vec<_>>();
-    let ids = StableIds::new(node_keys, link_keys.iter().copied())?;
     let CanonicalFlows {
-        flows,
+        mut flows,
         collectives: collective_table,
     } = canonical_flows(
         model.explicit_flows,
@@ -2651,12 +2970,26 @@ fn lower(
         &hosts,
         model.seed,
     )?;
+    // Same-server collective messages on the rail fabric cross NVLink, which Days models
+    // delay-only: each lowers to a stage notify on a host-to-host lane (P16 H2, ruling H2-1).
+    let notify = NotifyLowering::plan(&mut flows, profile)?;
+    for &(source, target) in notify.lanes.keys() {
+        link_keys.insert(LinkKey {
+            source: PhysicalNodeKey::Host(source),
+            target: PhysicalNodeKey::Host(target),
+        });
+    }
+    let ids = StableIds::new(node_keys, link_keys.iter().copied())?;
     let flow_ids = dense_ids(flows.iter().map(|flow| flow.key.clone()))?;
-    // Compute stages send nothing and have no route; every other flow is routed.
+    // Compute stages and stage notifies send nothing over the fabric and have no route; every
+    // other flow is routed.
     let routed_flows = flows
         .iter()
         .enumerate()
-        .filter(|(_, flow)| flow.compute.is_none());
+        .filter(|(_, flow)| flow.compute.is_none() && flow.notify_delay_ns().is_none());
+    // SimAI's ECMP picks the feedback path by its own hash, so its reverse routes are not the
+    // reversed forward routes; every other policy reverses the forward switch path.
+    let mut reverse_route_table = None;
     let route_table = match model.routing {
         RoutingPolicy::ShortestPath => compute_shortest_path_route_table_with(
             graph,
@@ -2669,6 +3002,21 @@ fn lower(
             }),
             route_workers,
         ),
+        RoutingPolicy::SimAiEcmp => {
+            let TopologyProfile::Rail(rail) = profile else {
+                return Err(CompileError::Unsupported(
+                    "unsupported `routing.policy = \"SimAiEcmp\"` on a topology that is not the \
+                     SpectrumX rail fabric"
+                        .to_owned(),
+                ));
+            };
+            let (forward, reverse) = simai_ecmp_route_tables(
+                rail,
+                routed_flows.map(|(index, flow)| (index, flow.source, flow.target)),
+            );
+            reverse_route_table = Some(reverse);
+            Ok(forward)
+        }
         RoutingPolicy::FatTreeEcmp => compute_fat_tree_ecmp_route_table(
             graph,
             routed_flows.map(|(index, flow)| EcmpFlow {
@@ -2707,7 +3055,7 @@ fn lower(
         .iter()
         .enumerate()
         .map(|(index, flow)| {
-            if flow.compute.is_some() {
+            if flow.compute.is_some() || flow.notify_delay_ns().is_some() {
                 return FlowDescriptor {
                     id: FlowId(flow_ids[&flow.key]),
                     source: ids.node(LpKey::Host(flow.source)),
@@ -2719,7 +3067,10 @@ fn lower(
                 };
             }
             let switch_path = &route_table[&index];
-            let reverse_switch_path = switch_path.iter().rev().copied().collect::<Vec<_>>();
+            let reverse_switch_path = match &reverse_route_table {
+                Some(reverse) => reverse[&index].clone(),
+                None => switch_path.iter().rev().copied().collect::<Vec<_>>(),
+            };
             FlowDescriptor {
                 id: FlowId(flow_ids[&flow.key]),
                 source: ids.node(LpKey::Host(flow.source)),
@@ -2761,6 +3112,102 @@ fn lower(
     let mut initial_event_inputs = Vec::<(LpKey, u64, FlowId, PayloadId, EventKind)>::new();
     for (flow, descriptor) in flows.iter().zip(&flow_descriptors) {
         let source = LpKey::Host(flow.source);
+        if let Some(delay_ns) = flow.notify_delay_ns() {
+            let stage = flow
+                .collective
+                .as_deref()
+                .expect("a stage notify carries a collective stage");
+            let lane_ns = notify.lanes[&(flow.source, flow.target)];
+            // The sender's timer runs `delay - lane`; its notify then crosses the lane in `lane`.
+            let lead_ns = delay_ns - lane_ns;
+            let root = stage.local_predecessor_complete && stage.inbound_predecessor_complete;
+            // A root message starts with its collective, at the traffic's initial delay, as the
+            // collective's fabric roots do (review F1); its timer fires the lead after that.
+            let root_timer_ns = flow
+                .traffic
+                .initial_delay_ns
+                .checked_add(lead_ns)
+                .ok_or_else(|| {
+                    CompileError::Invalid(format!(
+                        "stage notify timer of flow {} -> {} exceeds u64",
+                        flow.source, flow.target
+                    ))
+                })?;
+            let next_emission = if !root {
+                ScheduledEmission {
+                    status: GeneratorStatus::Blocked,
+                    departure_time_ns: 0,
+                    payload: PayloadId(0),
+                }
+            } else if root_timer_ns > model.stop_time_ns {
+                ScheduledEmission {
+                    status: GeneratorStatus::Stopped,
+                    departure_time_ns: root_timer_ns,
+                    payload: PayloadId(0),
+                }
+            } else {
+                // Its notify names the sender's timer and then crosses to the target.
+                let sequence = payload_sequences.entry(source).or_default();
+                let payload = allocate_payload_id(
+                    ids.node(source),
+                    node_count,
+                    *sequence,
+                    "stage notify payload sequence",
+                )?;
+                *sequence = sequence.checked_add(1).ok_or_else(|| {
+                    CompileError::Invalid(format!(
+                        "stage notify payload sequence overflow at {source:?}"
+                    ))
+                })?;
+                initial_packets.push(PacketDescriptor {
+                    id: payload,
+                    flow: descriptor.id,
+                    size_bytes: stage.chunk_bytes,
+                    ecn_marked: false,
+                    kind: PacketKind::StageNotify,
+                });
+                initial_event_inputs.push((
+                    source,
+                    root_timer_ns,
+                    descriptor.id,
+                    payload,
+                    EventKind::PacingTimer,
+                ));
+                ScheduledEmission {
+                    status: GeneratorStatus::Scheduled,
+                    departure_time_ns: root_timer_ns,
+                    payload,
+                }
+            };
+            let (identity, dependencies) = collective_stage_record(stage, &flow_ids);
+            generators_by_source.entry(source).or_default().push((
+                FlowGeneratorState {
+                    flow: descriptor.id,
+                    packets_emitted: 0,
+                    bytes_emitted: 0,
+                    next_emission,
+                    rng_state: generator_seed(model.seed, &flow.key, &collective_table, &roce_keys),
+                    feedback: GeneratorFeedbackState {
+                        arrivals: 0,
+                        outstanding_bytes: 0,
+                        unacknowledged_bytes: 0,
+                    },
+                    kind: FlowGeneratorKind::Constant(ConstantGenerator {
+                        // A stage notify's lane latency (the image's one record of it per message).
+                        first_departure_ns: lane_ns,
+                        interval_ns: lead_ns,
+                        packet_size_bytes: stage.chunk_bytes,
+                        termination: GeneratorTermination::Bytes(stage.chunk_bytes),
+                    }),
+                },
+                Some(CollectiveStage {
+                    role: StageRole::Collective(identity),
+                    dependencies,
+                    activated: root,
+                }),
+            ));
+            continue;
+        }
         if let Some(compute) = &flow.compute {
             let root = compute.local_predecessor.is_none() && compute.inbound_predecessor.is_none();
             let next_emission = if !root {
@@ -2983,34 +3430,10 @@ fn lower(
                 payload,
             }
         };
-        let collective_stage = flow.collective.as_ref().map(|stage| {
-            let stage_flow = |key: &FlowKey| FlowId(flow_ids[key]);
-            (
-                CollectiveStageIdentity {
-                    collective_id: stage.collective_id,
-                    algorithm: stage.algorithm,
-                    topology_level: 0,
-                    topology_group: 0,
-                    group_size: stage.group_size,
-                    declared_total_bytes: stage.declared_total_bytes,
-                    rank: stage.position.rank,
-                    phase: stage.position.phase,
-                    step: stage.position.step,
-                    chunk_policy: CollectiveChunkPolicy::EqualRemainderLast,
-                    channel_policy: CollectiveChannelPolicy::RingNext,
-                    chunk_offset_bytes: stage.chunk_offset_bytes,
-                    chunk_bytes: stage.chunk_bytes,
-                },
-                StageDependencies {
-                    local_predecessor: stage.local_predecessor.as_ref().map(stage_flow),
-                    inbound_predecessor: stage.inbound_predecessor.as_ref().map(stage_flow),
-                    inbound_predecessor_bytes: stage.inbound_predecessor_bytes,
-                    local_predecessor_complete: stage.local_predecessor_complete,
-                    inbound_predecessor_complete: stage.inbound_predecessor_complete,
-                    inbound_bytes_received: 0,
-                },
-            )
-        });
+        let collective_stage = flow
+            .collective
+            .as_deref()
+            .map(|stage| collective_stage_record(stage, &flow_ids));
         generators_by_source.entry(source).or_default().push((
             FlowGeneratorState {
                 // Every collective stage is a TCP or RoCE generator whose dependencies live in this record;
@@ -3148,6 +3571,10 @@ fn lower(
     // allocation per host that receives queue pairs.
     let mut roce_receivers = Vec::<(LpKey, RoceReceiverState)>::new();
     for (flow, descriptor) in flows.iter().zip(&flow_descriptors) {
+        if flow.notify_delay_ns().is_some() {
+            // A stage notify needs no receiver state: its one arrival carries the whole chunk.
+            continue;
+        }
         if let TrafficKind::Roce(ordinal) = flow.traffic.kind {
             let roce = roce_key(&roce_keys, ordinal);
             let Termination::Bytes(total_bytes) = flow.traffic.termination else {
@@ -3256,20 +3683,44 @@ fn lower(
             }
         })
         .collect();
+    // P16 H2: an ECN row per egress link rate, as SimAI keys its ECN rows by port rate, set in one
+    // pass over the ports only when the scenario has rows (review F2: deciding it inside the map
+    // made the map fallible, and a `Result` collect has no size hint, so the vector grew by doubling
+    // on every image).
+    if let (Some(rows), DropMarkPolicy::EcnThreshold(policy)) =
+        (&model.ecn_by_rate, model.drop_mark)
+    {
+        for (port, state) in switch_port_keys.iter().zip(&mut switch_states) {
+            let LpKey::SwitchPort { egress, .. } = *port else {
+                unreachable!("switch-port key set contains only switch ports")
+            };
+            let queue = &mut state.queues[0];
+            let rate_bps = link_rate.of(egress);
+            let threshold = *rows.get(&rate_bps).ok_or_else(|| {
+                CompileError::Invalid(format!(
+                    "`switch.ecn_by_rate` has no row for a {rate_bps} b/s egress link"
+                ))
+            })?;
+            queue.drop_mark = DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
+                threshold,
+                ..policy
+            });
+        }
+    }
     let links = ids
         .links()
         .map(|(key, id)| LinkDescriptor {
             id,
             source: ids.node(LpKey::for_link_source(key)),
             target: ids.node(LpKey::for_link_target(key)),
-            rate_bps: model.rate_bps,
+            rate_bps: link_rate.of(key),
             propagation_ns: link_delay.of(key),
         })
         .collect::<Vec<_>>();
     let mut channel_keys = BTreeSet::<(LinkId, NodeId)>::new();
     let mut min_packet_size_by_link = BTreeMap::<LinkId, u64>::new();
     for (flow, input) in flow_descriptors.iter().zip(&flows) {
-        if packet_count(&input.traffic) == 0 {
+        if packet_count(&input.traffic) == 0 || input.notify_delay_ns().is_some() {
             continue;
         }
         let data_min_size = match input.traffic.kind {
@@ -3342,6 +3793,20 @@ fn lower(
                 })
         })
         .collect::<Result<Vec<_>, CompileError>>()?;
+    // One lane per ordered host pair with same-server messages (P16 H2): the notify crosses it in
+    // exactly its latency, out of band, as a PFC frame crosses its control lane.
+    for (&(source, target), &lane_ns) in &notify.lanes {
+        channels.push(RemoteChannel {
+            source: ids.node(LpKey::Host(source)),
+            target: ids.node(LpKey::Host(target)),
+            link: ids.link(LinkKey {
+                source: PhysicalNodeKey::Host(source),
+                target: PhysicalNodeKey::Host(target),
+            }),
+            event_kind: EventKind::RemoteArrival,
+            min_delay_ns: lane_ns,
+        });
+    }
 
     if let Some(pfc) = &model.pfc {
         let mut monitored_paths = BTreeSet::<(LinkId, NodeId)>::new();
@@ -3478,6 +3943,8 @@ fn lower(
                 }
             }
 
+            let (xoff_threshold_bytes, xon_threshold_bytes, buffer_capacity_bytes) =
+                pfc.thresholds(profile, downstream_physical, controlled.rate_bps)?;
             let downstream_slot = nodes[downstream.0 as usize].state_slot as usize;
             let downstream_queue = switch_states[downstream_slot]
                 .queues
@@ -3490,10 +3957,10 @@ fn lower(
                 .push(PfcIngressState {
                     controlled_link: controlled_id,
                     control_channel_index,
-                    buffer_capacity_bytes: pfc.buffer_capacity,
+                    buffer_capacity_bytes,
                     max_frame_bytes,
-                    xoff_threshold_bytes: pfc.xoff,
-                    xon_threshold_bytes: pfc.xon,
+                    xoff_threshold_bytes,
+                    xon_threshold_bytes,
                     occupancy_bytes: [0; 8],
                     pause_asserted: [false; 8],
                 });
@@ -3512,6 +3979,141 @@ fn lower(
         initial_events,
         seed: model.seed,
     })
+}
+
+/// SimAI's ECMP on the rail fabric (P16 H2, ruling H2-6): each routed flow is one SimAI message.
+///
+/// Message `k` between an ordered host pair, in canonical flow order, takes source port
+/// `10000 + k` (SimAI's per-pair counter, wrapping at 2^16); the source ASW hashes the data tuple
+/// to pick its PSW, and the target ASW hashes the swapped tuple for the feedback path
+/// ([`RailProfile::data_psw`], [`RailProfile::feedback_psw`]). GPUs sharing an ASW cross no PSW.
+/// The ordinal stands in for SimAI's run-time issue order (statistically equivalent, ruled; the
+/// canonical order is the stage keys' order, which the collective lowering fixes).
+fn simai_ecmp_route_tables(
+    rail: RailProfile,
+    flows: impl Iterator<Item = (usize, u64, u64)>,
+) -> (
+    BTreeMap<usize, Vec<NodeIndex>>,
+    BTreeMap<usize, Vec<NodeIndex>>,
+) {
+    let mut ordinals = BTreeMap::<(u64, u64), u64>::new();
+    let mut forward = BTreeMap::new();
+    let mut reverse = BTreeMap::new();
+    for (index, source, target) in flows {
+        let ordinal = ordinals.entry((source, target)).or_default();
+        let sport = RailProfile::simai_sport(*ordinal);
+        *ordinal += 1;
+        // Rail host identities are GPU ids below `rail.gpus`, a `u32`.
+        let (source, target) = (source as u32, target as u32);
+        let (source_asw, target_asw) = (rail.asw_of(source), rail.asw_of(target));
+        let node = |index: u32| NodeIndex::new(index as usize);
+        let path = |from: u32, psw: Option<u32>, to: u32| match psw {
+            None => vec![node(from)],
+            Some(psw) => vec![node(from), node(rail.psw_index(psw)), node(to)],
+        };
+        forward.insert(
+            index,
+            path(source_asw, rail.data_psw(source, target, sport), target_asw),
+        );
+        reverse.insert(
+            index,
+            path(
+                target_asw,
+                rail.feedback_psw(source, target, sport),
+                source_asw,
+            ),
+        );
+    }
+    (forward, reverse)
+}
+
+/// The stage identity and pristine prerequisite state of one collective stage.
+fn collective_stage_record(
+    stage: &CollectiveStageInput,
+    flow_ids: &BTreeMap<FlowKey, u64>,
+) -> (CollectiveStageIdentity, StageDependencies) {
+    let stage_flow = |key: &FlowKey| FlowId(flow_ids[key]);
+    (
+        CollectiveStageIdentity {
+            collective_id: stage.collective_id,
+            algorithm: stage.algorithm,
+            topology_level: 0,
+            topology_group: 0,
+            group_size: stage.group_size,
+            declared_total_bytes: stage.declared_total_bytes,
+            rank: stage.position.rank,
+            phase: stage.position.phase,
+            step: stage.position.step,
+            chunk_policy: CollectiveChunkPolicy::EqualRemainderLast,
+            channel_policy: CollectiveChannelPolicy::RingNext,
+            chunk_offset_bytes: stage.chunk_offset_bytes,
+            chunk_bytes: stage.chunk_bytes,
+        },
+        StageDependencies {
+            local_predecessor: stage.local_predecessor.as_ref().map(stage_flow),
+            inbound_predecessor: stage.inbound_predecessor.as_ref().map(stage_flow),
+            inbound_predecessor_bytes: stage.inbound_predecessor_bytes,
+            local_predecessor_complete: stage.local_predecessor_complete,
+            inbound_predecessor_complete: stage.inbound_predecessor_complete,
+            inbound_bytes_received: 0,
+        },
+    )
+}
+
+/// The same-server messages of a rail image and their host-to-host notify lanes (P16 H2).
+///
+/// A collective stage whose two ranks share a server crosses NVLink, which Days models delay-only
+/// (ruling H2-1): the stage lowers to a stage notify. Its delay `d` is
+/// [`ServerLocality::nvlink_message_delay_ns`] of its chunk. Every message on one ordered host pair
+/// shares that pair's lane, whose latency is `min d - 1` over the pair's messages: the sender's
+/// timer runs `d - lane >= 1` and the notify crosses in `lane`, so arrivals on a lane follow the
+/// sender's timer order and the lane bounds the safe horizon by its slowest-to-start message.
+struct NotifyLowering {
+    /// Lane latency per ordered (source, target) host pair.
+    lanes: BTreeMap<(u64, u64), u64>,
+}
+
+impl NotifyLowering {
+    /// Marks each same-server collective stage with its message delay (its sidecar's
+    /// `notify_delay_ns`) and collects the lanes. Off the rail fabric it touches nothing.
+    fn plan(flows: &mut [FlowInput], profile: TopologyProfile) -> Result<Self, CompileError> {
+        let TopologyProfile::Rail(rail) = profile else {
+            return Ok(Self {
+                lanes: BTreeMap::new(),
+            });
+        };
+        let locality = ServerLocality::new(rail);
+        let mut lanes = BTreeMap::<(u64, u64), u64>::new();
+        for flow in flows.iter_mut() {
+            let (source, target, packet_size) =
+                (flow.source, flow.target, flow.traffic.packet_size_bytes);
+            let Some(stage) = flow.collective.as_deref_mut() else {
+                continue;
+            };
+            if !locality.same_server(source, target) {
+                continue;
+            }
+            // Today's expansions are single-channel rings that span servers: an intra-server hop
+            // runs alone on the sender's NVLink port (concurrency 1, the ruled value for such
+            // hops); a multi-channel or all-to-all expansion supplies its own concurrency.
+            let delay = locality
+                .nvlink_message_delay_ns(stage.chunk_bytes, 1, packet_size)
+                .ok_or_else(|| {
+                    CompileError::Invalid(format!(
+                        "NVLink delay of a {}-byte message from host {source} to host {target} \
+                         overflows",
+                        stage.chunk_bytes
+                    ))
+                })?;
+            stage.notify_delay_ns = Some(delay);
+            let lane = delay - 1;
+            lanes
+                .entry((source, target))
+                .and_modify(|current| *current = (*current).min(lane))
+                .or_insert(lane);
+        }
+        Ok(Self { lanes })
+    }
 }
 
 /// The canonically ordered flow inputs and the collective keys their stage keys index.
@@ -3902,6 +4504,7 @@ fn expand_collective(
                         inbound_predecessor_bytes: chunk_bytes,
                         local_predecessor_complete,
                         inbound_predecessor_complete,
+                        notify_delay_ns: None,
                     })),
                     compute: None,
                 });
