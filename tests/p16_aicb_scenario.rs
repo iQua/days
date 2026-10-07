@@ -136,16 +136,92 @@ fn an_aicb_scenario_is_refused_when_it_is_not_what_it_names() {
     }
 }
 
+/// `(network stages by algorithm, NVLink notify stages, compute stages)`: a collective stage
+/// with a route is a network message, one without is an intra-server notify.
+fn stage_kinds(image: &SimulationImage) -> (Vec<(CollectiveAlgorithm, usize)>, usize, usize) {
+    let mut network = std::collections::BTreeMap::<u8, (CollectiveAlgorithm, usize)>::new();
+    let (mut notify, mut computes) = (0, 0);
+    for host in &image.host_states {
+        for (generator, stage) in host.generators_with_stages() {
+            match stage.map(|stage| stage.role) {
+                Some(StageRole::Collective(identity)) => {
+                    if image.flows[generator.flow.0 as usize].route.is_empty() {
+                        notify += 1;
+                    } else {
+                        network
+                            .entry(identity.algorithm as u8)
+                            .or_insert((identity.algorithm, 0))
+                            .1 += 1;
+                    }
+                }
+                Some(StageRole::Compute(_)) => computes += 1,
+                None => {}
+            }
+        }
+    }
+    (network.into_values().collect(), notify, computes)
+}
+
 #[test]
-fn chains_across_group_families_wait_for_host_matched_after() {
-    // The Megatron arm's pipeline transfers, and the smoke's all-to-all to DP_EP fork.
-    let error = variant("b4-simai.toml", |text| {
+fn the_reduced_moe_trace_lowers_across_group_families() {
+    // All-to-alls on EP, the data queue's DP_EP and DP rings after them (host-matched `after`,
+    // ruling C1). Counts from aicb_plan.py: 1,568 network and 2,208 notify messages; 11 fused
+    // segments per rank.
+    use CollectiveAlgorithm::*;
+    let image = lower(&fixture("reduced-moe-simai.toml")).unwrap_or_else(|error| panic!("{error}"));
+    let (network, notify, computes) = stage_kinds(&image);
+    let total: usize = network.iter().map(|(_, count)| count).sum();
+    assert_eq!(total, 1_568, "{network:?}");
+    assert_eq!(notify, 2_208);
+    assert_eq!(computes, 11 * 32);
+    assert!(network.iter().any(|(algorithm, _)| *algorithm == AllToAll));
+}
+
+#[test]
+#[ignore = "the MoE smoke lowers 426,112 stages; run in release (the device suites run it)"]
+fn the_smoke_lowers_across_group_families() {
+    use CollectiveAlgorithm::*;
+    let image = lower(&fixture("smoke-simai.toml")).unwrap_or_else(|error| panic!("{error}"));
+    let (network, notify, computes) = stage_kinds(&image);
+    assert_eq!(
+        network,
+        [
+            (AllGather, 128),
+            (ReduceScatter, 8_192),
+            (AllToAll, 344_064)
+        ]
+    );
+    assert_eq!(notify, 61_056);
+    assert_eq!(computes, 99 * 128);
+}
+
+#[test]
+fn the_megatron_arm_carries_pipeline_transfers() {
+    // b4 faithful: per-stage DP8 rings (16 groups x 8 ranks x 7 steps) and 64 PP pairs in each
+    // direction; three fused segments per stage (to the send, the receive and the fork).
+    use CollectiveAlgorithm::*;
+    let image = variant("b4-simai.toml", |text| {
         text.replace("fidelity = \"simai\"", "fidelity = \"megatron\"")
     })
-    .expect_err("megatron b4");
-    assert!(error.contains("ruling C1"), "{error}");
-    let error = lower(&fixture("smoke-simai.toml")).expect_err("smoke");
-    assert!(error.contains("ruling C1"), "{error}");
+    .unwrap_or_else(|error| panic!("{error}"));
+    let (network, notify, computes) = stage_kinds(&image);
+    assert_eq!(network, [(ReduceScatter, 896), (SendRecv, 128)]);
+    assert_eq!(notify, 0);
+    assert_eq!(computes, 3 * 128);
+}
+
+#[test]
+fn the_imbalanced_arm_lowers_seeded_all_to_alls() {
+    let image =
+        lower(&fixture("reduced-moe-imbalanced.toml")).unwrap_or_else(|error| panic!("{error}"));
+    assert!(
+        !image.seeded_all_to_alls.is_empty(),
+        "seeded matrices reach the image"
+    );
+    // Seeded pairs with zero copies have no stage, so the network share differs from uniform's.
+    let (network, _, _) = stage_kinds(&image);
+    let total: usize = network.iter().map(|(_, count)| count).sum();
+    assert!(total > 0);
 }
 
 #[test]
