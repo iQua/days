@@ -7,7 +7,7 @@
 | `SimAI.conf` | `1fe56bee9c2a0e0f27fdbe816c2c51c9254b5d5a6c5e05adaac347a758e77fcf` | SimAI's shipped `astra-sim-alibabacloud/inputs/config/SimAI.conf` at SimAI `f5efb5a`, verbatim. SimAI is Copyright (c) 2024 Alibaba Group, Apache License 2.0. |
 | `mockncclgroup-*.txt` | see `days-gpu/evidence/P16/aicb-design/` | SimAI's own `MockNcclGroup` (SimAI `f5efb5a`), linked standalone and dumped once per distinct group with its ring channels (`days-gpu/evidence/P16/aicb-design/tooling/mockncclgroup_dump.cc`). Arguments: flagship `1024 8 2 32`, smoke `128 8 2 32`, b4 `128 8 8 1` (W, GPUs per server, TP, EP). |
 
-The flagship trace (`flagship-tp2-ep32-w1024.txt`, sha256 `2dfd84f5e49380fe7e5ad2ca429678e5c900faa924a8a9d293f04e79301c9737`) is not committed; tests that need it read its path from `DAYS_AICB_FLAGSHIP` and are ignored by default.
+The flagship trace (`flagship-tp2-ep32-w1024.txt`, sha256 `2dfd84f5e49380fe7e5ad2ca429678e5c900faa924a8a9d293f04e79301c9737`) is not committed; `flagship-simai.toml` names it, and `tests/p16_aicb_flagship.rs` (ignored by default) copies the scenario, `SimAI.conf` and the file named by `DAYS_AICB_FLAGSHIP` into one directory.
 
 Reduced traces (generated with the vendored AICB; command in
 `days-gpu/evidence/P16/aicb-impl/tooling/gen_reduced_traces.sh`):
@@ -18,9 +18,17 @@ Reduced traces (generated with the vendored AICB; command in
 | `reduced-moe-w32-tp2-ep8.txt` | `af3236ebcfffa1003747385a40aef9c7df03fae94f9d29fb2ab8aefd4498047b` | MoE, 2 layers, hidden 128, seq 128, 16 experts, top-2, 32 GPUs, TP2, EP8, gbs 16 |
 | `reduced-moe-w256-tp2-ep8.txt` | `7943e9ad611933c2dd87af4c6fd9ca95ebbec98e791a4dfb3ef4cba3c816ff7e` | The same MoE model at 256 GPUs, gbs 128 (the large size of `host_scaling_budget`'s AICB PFC case) |
 
-Scenarios (`[workload.aicb]`, design note §5): `b4-simai.toml` (SimAI's b4 run on its 128g
-file), `reduced-dense-simai.toml` (a 32-GPU, two-segment rail), `smoke-simai.toml` (the MoE
-smoke on the 128g file), `reduced-moe-simai.toml` (the reduced MoE trace on a 32-GPU,
-two-segment rail), `reduced-moe-imbalanced.toml` (the same under the Megatron fidelity with
-imbalanced expert routing) and `reduced-moe-w256-simai.toml` (the 256-GPU reduced MoE trace on a
-sixteen-segment rail).
+Scenarios (`[workload.aicb]`, design note §5):
+
+| Scenario | Trace | Fabric | Fidelity, routing |
+|---|---|---|---|
+| `b4-simai.toml` | b4 | SimAI's 128g file | SimAI, uniform |
+| `b4-megatron.toml` | b4 | SimAI's 128g file | Megatron (per-stage groups, PP Send/Recv), uniform |
+| `smoke-simai.toml` | smoke | SimAI's 128g file | SimAI, uniform |
+| `smoke-imbalanced.toml` | smoke | SimAI's 128g file | Megatron, imbalanced (seed 11, Zipf(1)) |
+| `flagship-simai.toml` | flagship (not committed) | SimAI's 1024g file | SimAI, uniform |
+| `reduced-dense-simai.toml` | reduced dense | 32-GPU rail, two segments | SimAI, uniform |
+| `reduced-dense-megatron.toml` | reduced dense | 32-GPU rail, two segments | Megatron, uniform |
+| `reduced-moe-simai.toml` | reduced MoE (32) | 32-GPU rail, two segments | SimAI, uniform |
+| `reduced-moe-imbalanced.toml` | reduced MoE (32) | 32-GPU rail, two segments | Megatron, imbalanced (seed 11, Zipf(1)) |
+| `reduced-moe-w256-simai.toml` | reduced MoE (256) | 256-GPU rail, sixteen segments | SimAI, uniform |

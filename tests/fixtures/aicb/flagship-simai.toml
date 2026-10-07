@@ -1,0 +1,35 @@
+# P16 H3: the flagship AICB trace (Qwen3-like MoE, 48 layers, 1,024 H100s, TP2, EP32, gbs 1,024,
+# ga 2) on SimAI's 1024g Spectrum-X file, SimAI fidelity. The trace is not committed (ruling A5):
+# tests copy this scenario, SimAI.conf and the file named by DAYS_AICB_FLAGSHIP
+# (days-gpu evidence/P16/collops-design/traces/flagship-tp2-ep32-w1024.txt) into one directory.
+seed = 7
+duration = 2.0
+
+[topology]
+category = "SpectrumX"
+
+[topology.spectrum_x]
+gpus = 1024
+gpus_per_server = 8
+nics_per_asw = 64
+psws = 64
+gpu_type = "H100"
+nic_rate_bps = 400000000000
+uplink_rate_bps = 400000000000
+nvlink_rate_bps = 2880000000000
+link_delay_ns = 500
+nvlink_delay_ns = 25
+
+[workload.aicb]
+trace = "flagship-tp2-ep32-w1024.txt"
+trace_sha256 = "2dfd84f5e49380fe7e5ad2ca429678e5c900faa924a8a9d293f04e79301c9737"
+fidelity = "simai"
+expert_routing = "uniform"
+
+[workload.aicb.simai]
+conf = "SimAI.conf"
+conf_sha256 = "1fe56bee9c2a0e0f27fdbe816c2c51c9254b5d5a6c5e05adaac347a758e77fcf"
+topology = "Spectrum-X_1024g_8gps_400Gbps_H100"
+send_lat_us = 3
+nvls_enable = true
+pxn_enable = false
