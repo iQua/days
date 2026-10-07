@@ -112,7 +112,7 @@ Days AGO checkers:
 ./.lake/build/bin/p10c_mechanisms_check pfc <path/to/pfc_events.csv>
 ./.lake/build/bin/p10c_mechanisms_check drr <path/to/drr_events.csv>
 ./.lake/build/bin/p10c_mechanisms_check wrr <path/to/wrr_events.csv>
-./.lake/build/bin/p10c_mechanisms_check wfq <path/to/wfq_events.csv>
+./.lake/build/bin/p10c_mechanisms_check wfq <path/to/wfq_events.csv> [<path/to/pfc_events.csv>]
 ./.lake/build/bin/p10c_aqm_check <path/to/aqm_events.csv>
 ./.lake/build/bin/p10c_dcqcn_check <path/to/dcqcn_events.csv>
 ./.lake/build/bin/p10c_dcqcn_check trace <path/to/dcqcn_events.csv> <path/to/dcqcn_cnp_arrivals.csv>
@@ -246,20 +246,46 @@ by `elapsed_ns * rate_bps / (10^9 * W)` over the active classes' weight sum `W`.
   holds the packet; the class then loses it, and a scheduler left idle resets its virtual time and
   that class's finish tag.
 
-Each row's `before` state must equal the queue's replayed state (the first row's, the initial
-state), and its `after` state the reference update. The executor records each transition's
-`after` state from its own scheduler, after the event; `wfq_transitions_csv` writes `before` as
-the queue's state after its previous row (all zero before the first) and a completion's finish
-tag as its packet's at selection. A change to the scheduler between two rows would therefore show
-in the second row's `after`, which the checker recomputes. These are the rules of the legacy `wfq_check`
+A queue that does not start empty and idle (a run resumed from a checkpoint) opens with an
+`initial` row whose event-key columns are empty. It gives the starting scheduler state, the waiting
+packets in queue order with their finish tags and PFC classes, the in-service packet (`payload`,
+`finish_tag`, `pfc_priority`; empty when there is none) and the starting paused priorities. Their
+counts by class must equal the starting active counts. Other queues start from the empty state.
+
+Each row's `before` state must equal the queue's replayed state, and its `after` state the
+reference update. The executor records each transition's `after` state from its own scheduler,
+after the event; `wfq_transitions_csv` writes `before` as the queue's state after its previous row
+(its starting state before the first) and a completion's finish tag as its packet's at selection,
+or in the starting state. A change to the scheduler between two rows would therefore show in the
+second row's `after`, which the checker recomputes. These are the rules of the legacy `wfq_check`
 (Demers, Keshav and Shenker, with the same idle resets) up to the rate normalization; `wfq_check`
-still certifies `days-legacy`. The checker trusts each packet's PFC class and the paused set; the
-P10c PFC rules check the pause frames separately.
+still certifies `days-legacy`.
+
+PFC classes and pauses:
+
+- A packet's PFC class is fixed for its lifetime: its `enqueue` row (`pfc_priority`) or the
+  `initial` row gives it, and every `select` listing must repeat it.
+- `pfc_monitor` (on every row) says whether the queue has a PFC monitor. Without one, every class
+  is zero and no `select` may list a paused priority.
+- With one, the checker needs the run's PFC certificate (`pfc_transitions_csv`) as its second
+  argument, checks it with the P10c PFC rules, and requires each `select`'s `paused_priorities` to
+  be the queue's pause state at the select's event key: the controller sets of the queue's
+  `control` rows before that key. A priority the `initial` row starts paused must have a non-empty
+  controller set before its first `control` row; any other, an empty one.
+- What remains trusted is each packet's class itself (its flow's packet priority, written at
+  enqueue), as RoCE senders' `data_class` is.
+
+The checker does not certify timing: a completion's time is not checked against the packet's
+serialization time on the link, and service starts are not checked for work conservation. Virtual
+time depends on those times, so the certificate holds for the event times the run recorded.
 
 `sp_check` reads `sp_transitions_csv`, the same schema as its hand-written fixtures: `enqueue`
 (phase 0), `schedule` (phase 2, with the transmission's completion time) and `depart` (phase 1).
 It keys a scheduler by one number, so a Days AGO SP queue writes `scheduler_id = node_id * 2^32 +
-queue_id` and repeats `node_id` and `queue_id`. `sp_check` has no pause model, so it certifies SP
+queue_id` and repeats `node_id` and `queue_id`. A queue that starts non-empty opens with an
+`initial_in_service` row for the packet it is transmitting (with the time of its pending
+`TxComplete`) and an `initial_queued` row per waiting packet in queue order; their event-key
+columns are empty, and `sp_check` applies them before the events. `sp_check` has no pause model, so it certifies SP
 only without PFC: under PFC, a Days AGO SP queue serves the first packet whose class is not paused,
 which `sp_check` rejects as an SP order violation.
 
@@ -331,7 +357,10 @@ job regenerates each one and fails on any difference:
   AGO compiler (`compile_config`) and requires a two-worker CPU run to write the same bytes:
   TCP Reno and CUBIC (`tcp_reno.toml`, `tcp_cubic.toml`: fan-in losses, fast recovery and
   timeouts), switch-link PFC (`pfc_switch.toml`), DRR, WRR, WFQ and SP (`sched_*.toml`), and WFQ
-  under switch-link PFC (`wfq_pfc.toml`). The fixtures are `lean/fixtures/tcp/*-compiled-*.csv`,
+  under switch-link PFC (`wfq_pfc.toml`). It also resumes `sched_wfq.toml` and `sched_sp.toml`
+  from a checkpoint with packets queued and in service, and the WFQ incast (`wfq_incast.toml`)
+  from a checkpoint taken while a switch queue is paused. A WFQ certificate under PFC has its
+  run's PFC certificate beside it (`<name>.pfc.csv`), which the campaign passes to the checker. The fixtures are `lean/fixtures/tcp/*-compiled-*.csv`,
   `lean/fixtures/p10c/*_compiled_executor_accept.csv` and
   `lean/fixtures/sp/sp_compiled_executor_accept.csv`.
 - Executor tests build images by hand for cases a scenario cannot reach directly: the adversarial
@@ -358,8 +387,8 @@ the SP fixtures without `compiled` in their names, and the `*_hand_*` collective
 | AQM (ECN threshold, RED, RED_ECN) | `p10c_aqm_check` | AQM differential | `aqm_check` |
 | DRR | `p10c_mechanisms_check drr` | compiled scenario; image | `drr_check` |
 | WRR | `p10c_mechanisms_check wrr` | compiled scenario; image | none |
-| WFQ | `p10c_mechanisms_check wfq` | compiled scenarios, with and without PFC | `wfq_check` |
-| Static Priority | `sp_check` | compiled scenario without PFC; hand-written fixtures | none |
+| WFQ | `p10c_mechanisms_check wfq`, joined to the run's PFC certificate | compiled scenarios, with and without PFC, and resumed from checkpoints (one of them paused) | `wfq_check` |
+| Static Priority | `sp_check` | compiled scenario without PFC, fresh and resumed from a checkpoint; hand-written fixtures | none |
 | Rate sources | `p10c_mechanisms_check rate` | hand-built image | none |
 | FIFO scheduling | none | none | none |
 | Constant (packet-distribution) traffic | none | none | none |
@@ -368,6 +397,8 @@ Remaining gaps:
 
 - FIFO scheduling and constant traffic have no checker on either engine.
 - Static Priority under PFC: `sp_check` has no pause model (see [Days AGO WFQ and SP rows](#days-ago-wfq-and-sp-rows)).
+- WFQ timing: the `wfq` mode does not check completion times against serialization or service
+  starts for work conservation; it takes the run's event times as given.
 - Rate sources: no scenario lowers a standalone rate generator (the compiler builds one only inside
   a DCQCN flow, whose rows `p10c_dcqcn_check` certifies), so the rate certificate comes from a
   hand-built image.

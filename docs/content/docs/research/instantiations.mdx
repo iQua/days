@@ -77,7 +77,8 @@ tags as exact rationals normalized by the link rate. The checker replays
 the same Demers-Keshav-Shenker rules as `wfq_check` (the idle resets
 included), tracks the waiting packets itself, and requires each service
 start to serve the least finish tag among the packets whose PFC priority
-is not paused.
+is not paused. A packet's PFC class is fixed at its enqueue, and the paused
+set is joined to the run's PFC certificate.
 
 ### DRR scheduler (`drr_events.csv`)
 
