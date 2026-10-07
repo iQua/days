@@ -198,6 +198,10 @@ impl ResumeWork {
         Self { resumes }
     }
 
+    #[cfg(any(
+        feature = "cuda-test-hooks",
+        all(feature = "metal-test-hooks", target_vendor = "apple")
+    ))]
     fn restarts(&self) -> usize {
         self.resumes.iter().map(|(_, _, count)| count).sum()
     }
