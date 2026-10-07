@@ -4161,10 +4161,15 @@ fn canonical_flows(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let layouts = collective_table
-        .iter()
-        .map(CollectiveLayout::of)
-        .collect::<Result<Vec<_>, _>>()?;
+    // Rings in rank order (every TOML ring without `channels`) need no layout table.
+    let layouts = if collective_table.iter().any(CollectiveLayout::needed) {
+        collective_table
+            .iter()
+            .map(CollectiveLayout::of)
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
     let plan = StagePlan {
         groups: &groups,
         collectives: &collective_table,
@@ -4230,12 +4235,14 @@ const fn owner_offset(algorithm: CollectiveAlgorithm, phase: CollectivePhase) ->
 fn collective_stage_owner(
     algorithm: CollectiveAlgorithm,
     phase: CollectivePhase,
-    order: &[u32],
-    position: u64,
+    layout: &CollectiveLayout,
+    channel: usize,
+    (n, rank): (u64, u32),
     step: u64,
 ) -> u64 {
-    let n = order.len() as u64;
-    u64::from(order[((position + n - step + owner_offset(algorithm, phase)) % n) as usize])
+    let position = u64::from(layout.position(channel, rank));
+    let owner = (position + n - step + owner_offset(algorithm, phase)) % n;
+    u64::from(layout.rank_at(channel, owner as u32))
 }
 
 /// The phases of a ring algorithm, in order.
@@ -4255,10 +4262,10 @@ fn collective_has_stages(semantic: &CollectiveKey) -> bool {
 }
 
 /// The message structure of one collective key, computed once for its expansion and for the
-/// completion sets its successors wait for.
+/// completion sets its successors wait for. One ring in rank order (every TOML ring without
+/// `channels`) is the empty layout, which allocates nothing.
 struct CollectiveLayout {
-    /// A ring algorithm's channels: each a rank order (one ring in `sources` order without
-    /// `channels`).
+    /// A ring algorithm's channels: each a rank order; empty for one ring in `sources` order.
     rings: Vec<Vec<u32>>,
     /// `positions[k][rank]`: the rank's position in channel `k`.
     positions: Vec<Vec<u32>>,
@@ -4294,12 +4301,9 @@ impl CollectiveLayout {
                 };
             }
             CollectiveAlgorithm::SendRecv => {}
+            _ if semantic.channels.is_empty() => {}
             _ => {
-                layout.rings = if semantic.channels.is_empty() {
-                    vec![(0..u32::try_from(n).expect("the group size fits u32")).collect()]
-                } else {
-                    semantic.channels.clone()
-                };
+                layout.rings = semantic.channels.clone();
                 layout.positions = layout
                     .rings
                     .iter()
@@ -4316,18 +4320,38 @@ impl CollectiveLayout {
         Ok(layout)
     }
 
-    /// The rank before `rank` on channel `channel`.
-    fn previous(&self, channel: usize, rank: u32) -> u32 {
-        let order = &self.rings[channel];
-        let n = order.len();
-        order[(self.positions[channel][rank as usize] as usize + n - 1) % n]
+    /// Whether `semantic` needs a layout of its own: channel rings, or an all-to-all's pairs.
+    fn needed(semantic: &CollectiveKey) -> bool {
+        !semantic.channels.is_empty() || semantic.algorithm == CollectiveAlgorithm::AllToAll
     }
 
-    /// The rank after `rank` on channel `channel`.
-    fn next(&self, channel: usize, rank: u32) -> u32 {
-        let order = &self.rings[channel];
-        let n = order.len();
-        order[(self.positions[channel][rank as usize] as usize + 1) % n]
+    /// A ring algorithm's channel count.
+    fn channels(&self) -> usize {
+        self.rings.len().max(1)
+    }
+
+    /// `rank`'s position on channel `channel`.
+    fn position(&self, channel: usize, rank: u32) -> u32 {
+        self.positions
+            .get(channel)
+            .map_or(rank, |positions| positions[rank as usize])
+    }
+
+    /// The rank at `position` on channel `channel`.
+    fn rank_at(&self, channel: usize, position: u32) -> u32 {
+        self.rings
+            .get(channel)
+            .map_or(position, |order| order[position as usize])
+    }
+
+    /// The rank before `rank` on channel `channel` of an `n`-rank ring.
+    fn previous(&self, channel: usize, rank: u32, n: u32) -> u32 {
+        self.rank_at(channel, (self.position(channel, rank) + n - 1) % n)
+    }
+
+    /// The rank after `rank` on channel `channel` of an `n`-rank ring.
+    fn next(&self, channel: usize, rank: u32, n: u32) -> u32 {
+        self.rank_at(channel, (self.position(channel, rank) + 1) % n)
     }
 }
 
@@ -4335,8 +4359,24 @@ impl CollectiveLayout {
 struct StagePlan<'a> {
     groups: &'a BTreeMap<String, StageGroup<'a>>,
     collectives: &'a [CollectiveKey],
+    /// One per collective, or empty when every collective has the identity layout.
     layouts: &'a [CollectiveLayout],
     computes: &'a [ComputeKey],
+}
+
+/// The layout of a ring in rank order and of a send/recv.
+static IDENTITY_LAYOUT: CollectiveLayout = CollectiveLayout {
+    rings: Vec::new(),
+    positions: Vec::new(),
+    pair_bytes: Vec::new(),
+};
+
+impl StagePlan<'_> {
+    fn layout(&self, ordinal: u64) -> &CollectiveLayout {
+        self.layouts
+            .get(ordinal as usize)
+            .unwrap_or(&IDENTITY_LAYOUT)
+    }
 }
 
 /// A ring stage's chunk: `(offset, bytes)`.
@@ -4352,16 +4392,10 @@ fn ring_chunk(
     let Termination::Bytes(total_bytes) = semantic.traffic.termination else {
         unreachable!("collective validation requires byte termination")
     };
-    let owner = collective_stage_owner(
-        semantic.algorithm,
-        phase,
-        &layout.rings[channel],
-        u64::from(layout.positions[channel][rank as usize]),
-        step,
-    );
+    let owner = collective_stage_owner(semantic.algorithm, phase, layout, channel, (n, rank), step);
     match semantic.chunk {
         CollectiveChunkPolicy::UniformFloor => {
-            let channels = layout.rings.len() as u64;
+            let channels = layout.channels() as u64;
             let bytes = total_bytes / n / channels;
             ((owner * channels + channel as u64) * bytes, bytes)
         }
@@ -4382,7 +4416,7 @@ fn collective_completion(
     inbound: &mut PredecessorKeys,
 ) -> Result<u64, CompileError> {
     let semantic = &plan.collectives[ordinal as usize];
-    let layout = &plan.layouts[ordinal as usize];
+    let layout = plan.layout(ordinal);
     let key = |phase, channel, rank, step| FlowKey::CollectiveStage {
         collective: ordinal,
         duplicate_ordinal: 0,
@@ -4436,8 +4470,8 @@ fn collective_completion(
                 .last()
                 .expect("a ring algorithm has a phase");
             let step = n - 1;
-            for channel in 0..layout.rings.len() {
-                let previous = layout.previous(channel, rank);
+            for channel in 0..layout.channels() {
+                let previous = layout.previous(channel, rank, n);
                 let channel_u32 = channel as u32;
                 local.push(key(phase, channel_u32, rank, step));
                 inbound.push(key(phase, channel_u32, previous, step));
@@ -4495,7 +4529,7 @@ fn expand_collective(
     if !collective_has_stages(semantic) || total_bytes == 0 {
         return Ok(());
     }
-    let layout = &plan.layouts[collective as usize];
+    let layout = plan.layout(collective);
     let group_size = u32::try_from(n)
         .map_err(|_| CompileError::Invalid("collective group size exceeds u32".to_owned()))?;
     let stage_key = |stage: CollectiveStagePosition| FlowKey::CollectiveStage {
@@ -4591,7 +4625,7 @@ fn expand_collective(
         }
         _ => {
             let phases = ring_phases(semantic.algorithm);
-            let channels = layout.rings.len();
+            let channels = layout.channels();
             let stage_count = (phases.len() as u64)
                 .checked_mul(channels as u64)
                 .and_then(|count| count.checked_mul(n))
@@ -4613,8 +4647,9 @@ fn expand_collective(
                 for channel in 0..channels {
                     let channel_u32 = channel as u32;
                     for rank in 0..group_size {
-                        let previous = layout.previous(channel, rank);
-                        let target = semantic.sources[layout.next(channel, rank) as usize];
+                        let previous = layout.previous(channel, rank, group_size);
+                        let target =
+                            semantic.sources[layout.next(channel, rank, group_size) as usize];
                         for step in 1..group_size {
                             let chunk =
                                 ring_chunk(semantic, layout, phase, channel, rank, u64::from(step));
@@ -4751,15 +4786,35 @@ fn resolve_stage_groups<'a>(
             )));
         }
     }
-    // A depth-first walk over the `after` edges, in name order, finds any cycle; groups are
-    // indexed by their position in name order.
-    let names = groups.keys().map(String::as_str).collect::<Vec<_>>();
-    let afters = |index: usize| -> &[String] {
-        match groups[names[index]] {
+    fn afters_of<'a>(group: &StageGroup<'a>) -> &'a [String] {
+        match *group {
             StageGroup::Collective(collective) => after_names(collective.after.as_ref()),
             StageGroup::Compute(compute) => after_names(compute.after.as_ref()),
         }
-    };
+    }
+    if groups.values().all(|group| afters_of(group).len() <= 1) {
+        // Each group has at most one `after`, so a cycle is a revisited name on one chain.
+        for start in groups.keys() {
+            let mut seen = BTreeSet::new();
+            let mut current = start.as_str();
+            loop {
+                if !seen.insert(current) {
+                    return Err(CompileError::Invalid(format!(
+                        "stage group dependencies form a cycle through `{current}`"
+                    )));
+                }
+                match afters_of(&groups[current]).first() {
+                    Some(next) => current = next,
+                    None => break,
+                }
+            }
+        }
+        return Ok(groups);
+    }
+    // A join: a depth-first walk over the `after` edges, in name order, finds any cycle; groups
+    // are indexed by their position in name order.
+    let names = groups.keys().map(String::as_str).collect::<Vec<_>>();
+    let afters = |index: usize| -> &[String] { afters_of(&groups[names[index]]) };
     // 0: unvisited; 1: on the walk's path; 2: finished.
     let mut state = vec![0_u8; names.len()];
     let mut stack = Vec::<(usize, usize)>::new();

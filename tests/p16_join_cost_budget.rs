@@ -1,8 +1,9 @@
 //! P16 H1 ruling R1's hard gate, as deterministic budgets: counted joins must not make ordinary
-//! collectives cost more to simulate. On two images without a join (a TCP ring and a RoCE ring,
-//! each between two compute groups), the allocations this thread makes while lowering, validating
-//! and running Scalar (Full and Summary) may not exceed `feat/p16`'s (669e16b, measured by this
-//! test there), and the image carries an empty `stage_joins` table that owns no heap block. The
+//! collectives cost more to simulate. On four images without a join (a TCP ring and a RoCE ring,
+//! each alone and between two compute groups), the allocations this thread makes while lowering,
+//! validating and running Scalar (Full and Summary), and planning on Metal, may not exceed
+//! `feat/p16`'s (669e16b, measured by this test there), and the image carries an empty
+//! `stage_joins` table that owns no heap block. The
 //! CPU executor's LP construction (a 1 ns horizon, so no event runs) is printed but not capped:
 //! its calling-thread count varies by a few allocations with thread timing (227 to 230 and 233 to
 //! 234 at the base); the paired instruction and allocation counters cover CPU runs.
@@ -74,10 +75,10 @@ unsafe impl GlobalAlloc for ThreadCountingAllocator {
 #[global_allocator]
 static ALLOCATOR: ThreadCountingAllocator = ThreadCountingAllocator;
 
-/// A ring between two compute groups on four hosts of one switch; `transport` is the traffic's
-/// transport tables.
-fn scenario(flow_type: &str, transport: &str) -> String {
-    format!(
+/// A ring on four hosts of one switch, between two compute groups when `computes`; `transport`
+/// is the traffic's transport tables.
+fn scenario(flow_type: &str, transport: &str, computes: bool) -> String {
+    let text = format!(
         r#"
 seed = 26
 edges = [[0, 4], [1, 4], [2, 4], [3, 4]]
@@ -116,7 +117,21 @@ hosts = [0, 1, 2, 3]
 duration_ns = 1000
 after = "ring"
 "#
-    )
+    );
+    if computes {
+        text
+    } else {
+        let ring = text.find("[[collective]]").expect("a collective");
+        let end = text
+            .find("[[compute]]\nname = \"bwd\"")
+            .expect("a successor");
+        let (head, rest) = text.split_at(ring);
+        let head = &head[..head.find("[[compute]]").expect("a predecessor")];
+        format!(
+            "{head}{}",
+            rest[..end - ring].replace("after = \"fwd\"\n", "")
+        )
+    }
 }
 
 const TCP: &str = "\n[collective.traffic.tcp]\ncc_algorithm = \"TCPReno\"\n";
@@ -161,17 +176,36 @@ fn phases(label: &str, config: &str) -> ([u64; 5], SimulationImage) {
     (counts, image)
 }
 
-/// `feat/p16`'s counts (669e16b), measured by this test there: lowering, validation, Scalar
-/// (Full), Scalar (Summary).
-const TCP_BASE: [u64; 4] = [786, 170, 2125, 2072];
-const ROCE_BASE: [u64; 4] = [837, 174, 1132, 1080];
+/// The four images, with `feat/p16`'s counts (669e16b, measured by this test there): lowering,
+/// validation, Scalar (Full), Scalar (Summary), and the Metal plan.
+fn cases() -> [(&'static str, String, [u64; 5]); 4] {
+    [
+        (
+            "tcp-ring",
+            scenario("TCP", TCP, true),
+            [786, 170, 2125, 2072, 311],
+        ),
+        (
+            "roce-ring",
+            scenario("RoCE", ROCE, true),
+            [837, 174, 1132, 1080, 319],
+        ),
+        (
+            "tcp-ring-alone",
+            scenario("TCP", TCP, false),
+            [675, 178, 2053, 2000, 326],
+        ),
+        (
+            "roce-ring-alone",
+            scenario("RoCE", ROCE, false),
+            [713, 169, 1056, 1004, 314],
+        ),
+    ]
+}
 
 #[test]
 fn ordinary_collectives_allocate_no_more_than_feat_p16() {
-    for (label, config, base) in [
-        ("tcp-ring", scenario("TCP", TCP), TCP_BASE),
-        ("roce-ring", scenario("RoCE", ROCE), ROCE_BASE),
-    ] {
+    for (label, config, base) in cases() {
         let (counts, image) = phases(label, &config);
         println!(
             "{label}: allocations [lower, validate, scalar full, scalar summary, cpu] = {counts:?}"
@@ -186,5 +220,31 @@ fn ordinary_collectives_allocate_no_more_than_feat_p16() {
                 "{label} {phase}: {count} allocations, above feat/p16's {cap}"
             );
         }
+    }
+}
+
+/// The Metal planner (the CUDA planner shares its stage sizing) allocates no more than at
+/// `feat/p16` for the same images.
+#[cfg(all(feature = "metal", target_vendor = "apple"))]
+#[test]
+fn ordinary_collectives_plan_with_no_more_allocations_than_feat_p16() {
+    for (label, config, base) in cases() {
+        let (_, image) = phases(label, &config);
+        let before = allocations();
+        let report = days_executor::size_metal_plan_for_testing(
+            &image,
+            None,
+            days_executor::MetalConfig::default(),
+            ObservationMode::Summary,
+        )
+        .expect("plans");
+        let count = allocations() - before;
+        drop(report);
+        println!("{label}: Metal plan allocations = {count}");
+        assert!(
+            count <= base[4],
+            "{label} Metal plan: {count} allocations, above feat/p16's {}",
+            base[4]
+        );
     }
 }

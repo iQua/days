@@ -12,8 +12,9 @@
 //! (ruling R11 (a), [`WidthScratch::width`]): the stages of one operation (a collective, or a
 //! compute group) at the host form chains below its roots, an operation that follows another
 //! there starts only once that one completed, so a greedy chain cover of the operations sums each
-//! chain's widest operation. On a forest of single-root operations, every P14 and P15 image, the
-//! width is the leaf count, so those plans are unchanged. Finished and stopped stages send nothing
+//! chain's widest operation. An image without a join is a forest (every P14 and P15 image) and
+//! keeps G7's leaf count, computed as G2 did, so its plan and its planning cost are unchanged; on
+//! a forest of single-root operations the two counts agree. Finished and stopped stages send nothing
 //! more and are left out. Each active stage can leave at most one completed generation of stale
 //! resends behind it (the next stage's completion needs its own last packet acknowledged, and that
 //! packet left the same FIFO class queue after the stale ones). So the stages of one host occupy
@@ -129,6 +130,26 @@ impl SizingConcurrency {
 
     fn group_stages(&mut self, image: &SimulationImage) {
         let flow_count = image.flows.len();
+        // Without a join every stage has at most one local predecessor, so a host's stages form
+        // a forest whose leaves are its width (G7's count, kept so such plans cost what G2's
+        // did); with joins, the width rule ([`WidthScratch::width`]).
+        let joins = !image.stage_joins.is_empty();
+        let mut has_successor = Vec::new();
+        if !joins {
+            // Whether a stage names the flow as its local predecessor (always a stage of the same
+            // host). A successor of an unfinished stage is itself unfinished: it is released only
+            // once its predecessor completes.
+            has_successor = vec![false; flow_count];
+            for state in &image.host_states {
+                for stage in state.stages.iter().flatten() {
+                    if let Some(predecessor) = stage.dependencies.local.one() {
+                        if let Some(slot) = has_successor.get_mut(predecessor.0 as usize) {
+                            *slot = true;
+                        }
+                    }
+                }
+            }
+        }
         let mut groups = vec![NO_GROUP; flow_count];
         let mut scratch = WidthScratch::default();
         for state in &image.host_states {
@@ -136,6 +157,7 @@ impl SizingConcurrency {
                 continue;
             }
             let group = u32::try_from(self.generations.len()).unwrap_or(NO_GROUP - 1);
+            let mut leaves = 0_usize;
             let mut compute = 0_usize;
             let mut source = None;
             scratch.unfinished.clear();
@@ -153,12 +175,20 @@ impl SizingConcurrency {
                 groups[flow] = group;
                 source.get_or_insert(image.flows[flow].source.0 as usize);
                 compute += usize::from(matches!(stage.role, StageRole::Compute(_)));
-                scratch
-                    .unfinished
-                    .push((generator.flow, operation(stage), stage));
+                if joins {
+                    scratch
+                        .unfinished
+                        .push((generator.flow, operation(stage), stage));
+                } else {
+                    leaves += usize::from(!has_successor[flow]);
+                }
             }
             if let Some(source) = source {
-                let width = scratch.width(&image.stage_joins);
+                let width = if joins {
+                    scratch.width(&image.stage_joins)
+                } else {
+                    leaves
+                };
                 self.generations.push(width.saturating_mul(2));
                 self.compute_timers.push((source, width.min(compute)));
             }
