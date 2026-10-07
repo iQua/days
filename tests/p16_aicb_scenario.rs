@@ -6,8 +6,12 @@
 //! (the forward and backward TP collectives are delay-only), then the group's reduce-scatter ring
 //! on 16 servers, every message on the network.
 
+#[path = "support/aicb.rs"]
+mod aicb;
+
 use std::path::{Path, PathBuf};
 
+use aicb::stage_kinds;
 use days::scenario::compile_config;
 use days_executor::{CollectiveAlgorithm, SimulationImage, StageRole};
 
@@ -136,32 +140,6 @@ fn an_aicb_scenario_is_refused_when_it_is_not_what_it_names() {
     }
 }
 
-/// `(network stages by algorithm, NVLink notify stages, compute stages)`: a collective stage
-/// with a route is a network message, one without is an intra-server notify.
-fn stage_kinds(image: &SimulationImage) -> (Vec<(CollectiveAlgorithm, usize)>, usize, usize) {
-    let mut network = std::collections::BTreeMap::<u8, (CollectiveAlgorithm, usize)>::new();
-    let (mut notify, mut computes) = (0, 0);
-    for host in &image.host_states {
-        for (generator, stage) in host.generators_with_stages() {
-            match stage.map(|stage| stage.role) {
-                Some(StageRole::Collective(identity)) => {
-                    if image.flows[generator.flow.0 as usize].route.is_empty() {
-                        notify += 1;
-                    } else {
-                        network
-                            .entry(identity.algorithm as u8)
-                            .or_insert((identity.algorithm, 0))
-                            .1 += 1;
-                    }
-                }
-                Some(StageRole::Compute(_)) => computes += 1,
-                None => {}
-            }
-        }
-    }
-    (network.into_values().collect(), notify, computes)
-}
-
 #[test]
 fn the_reduced_moe_trace_lowers_across_group_families() {
     // All-to-alls on EP, the data queue's DP_EP and DP rings after them (host-matched `after`,
@@ -178,7 +156,6 @@ fn the_reduced_moe_trace_lowers_across_group_families() {
 }
 
 #[test]
-#[ignore = "the MoE smoke lowers 426,112 stages; run in release (the device suites run it)"]
 fn the_smoke_lowers_across_group_families() {
     use CollectiveAlgorithm::*;
     let image = lower(&fixture("smoke-simai.toml")).unwrap_or_else(|error| panic!("{error}"));
@@ -200,14 +177,24 @@ fn the_megatron_arm_carries_pipeline_transfers() {
     // b4 faithful: per-stage DP8 rings (16 groups x 8 ranks x 7 steps) and 64 PP pairs in each
     // direction; three fused segments per stage (to the send, the receive and the fork).
     use CollectiveAlgorithm::*;
-    let image = variant("b4-simai.toml", |text| {
-        text.replace("fidelity = \"simai\"", "fidelity = \"megatron\"")
-    })
-    .unwrap_or_else(|error| panic!("{error}"));
+    let image = lower(&fixture("b4-megatron.toml")).unwrap_or_else(|error| panic!("{error}"));
     let (network, notify, computes) = stage_kinds(&image);
     assert_eq!(network, [(ReduceScatter, 896), (SendRecv, 128)]);
     assert_eq!(notify, 0);
     assert_eq!(computes, 3 * 128);
+}
+
+#[test]
+fn the_reduced_dense_megatron_arm_carries_pipeline_transfers() {
+    // Per-stage DP2 rings across the stage's two servers (2 stages x 8 groups x 2 ranks x 1
+    // step) and 16 PP pairs in each direction; three fused segments per stage.
+    use CollectiveAlgorithm::*;
+    let image =
+        lower(&fixture("reduced-dense-megatron.toml")).unwrap_or_else(|error| panic!("{error}"));
+    let (network, notify, computes) = stage_kinds(&image);
+    assert_eq!(network, [(ReduceScatter, 32), (SendRecv, 32)]);
+    assert_eq!(notify, 0);
+    assert_eq!(computes, 3 * 32);
 }
 
 #[test]
@@ -222,6 +209,33 @@ fn the_imbalanced_arm_lowers_seeded_all_to_alls() {
     let (network, _, _) = stage_kinds(&image);
     let total: usize = network.iter().map(|(_, count)| count).sum();
     assert!(total > 0);
+    every_rank_sends(&image, 8);
+}
+
+#[test]
+fn the_imbalanced_smoke_lowers_seeded_all_to_alls() {
+    // The PFC arm's shape at 128 GPUs: 24 matrices on 4 EP groups, each as a dispatch, a combine
+    // and their backward all-to-alls.
+    let image = lower(&fixture("smoke-imbalanced.toml")).unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(image.seeded_all_to_alls.len(), 24 * 4 * 4);
+    every_rank_sends(&image, 32);
+}
+
+/// Every rank of every seeded all-to-all sends to another rank. A rank that sent nothing would
+/// have no stage of the all-to-all, which the compute after it cannot follow at that host (an
+/// open H1 validator item, found by the sendrecv-cert lane).
+fn every_rank_sends(image: &SimulationImage, ranks: usize) {
+    for seeded in &image.seeded_all_to_alls {
+        let bytes = seeded.matrix.bytes(ranks as u64).expect("the matrix");
+        for source in 0..ranks {
+            assert!(
+                bytes[source * ranks..(source + 1) * ranks]
+                    .iter()
+                    .any(|&pair| pair > 0),
+                "{seeded:?}: rank {source} sends nothing"
+            );
+        }
+    }
 }
 
 #[test]
