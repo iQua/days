@@ -1242,6 +1242,19 @@ def checkLocalSignal (index : LookupIndex) (row : Row) : Except String Unit := d
         (row.causeDelayNs > 0 && row.key.timeNs ≥ row.causeOriginNs + row.causeDelayNs)
         "local completion precedes the earliest return of the completing acknowledgment"
 
+/-- Review N1 (P16 H1 fix round 2): a stage notify is delay-only, so a logged notify is delivered
+exactly its delay after its release: the inbound rows it causes occur at its release row's time
+(the completion that released it, a counted join's included) plus its `duration_ns`. The delay
+itself is a scenario input (`ServerLocality::nvlink_message_delay_ns`), accepted as given. An
+unlogged notify (an ungated root) starts with its collective, whose start and whose delay the
+certificate does not name, so its delivery time is not bound. -/
+def checkNotifyDelivery (index : LookupIndex) (row : Row) : Except String Unit := do
+  if row.cause = .inboundArrival && row.causeKind = .notify then
+    if let some release := index.activatedByFlow.get? row.causeFlowId then
+      require row.srcLine
+        (release.stageKind = .notify && row.key.timeNs = release.key.timeNs + release.durationNs)
+        "stage notify delivery does not occur at its release plus its delay"
+
 /-- Whether a row's transport columns are its group's (for its carrier): a collective's TCP or
 RoCE rows share one transport, and a compute group's stages after RoCE inbound predecessors share
 their queue pairs' MTU and interval (Amendment 5; a stage after TCP or only stage notifies names
@@ -1501,6 +1514,8 @@ def checkRows (rows : List Row) : Except String Unit := do
   checkChannelRings index canonical
   for row in canonical do checkPredecessors index row
   checkInboundReplay canonical
-  for row in canonical do checkLocalSignal index row
+  for row in canonical do
+    checkLocalSignal index row
+    checkNotifyDelivery index row
 
 end LeanGuard.P10c.CollectiveEventLog

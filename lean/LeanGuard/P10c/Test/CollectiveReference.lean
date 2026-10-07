@@ -247,6 +247,14 @@ def checkInboundReplayReference (rows : List Row) (row : Row) : Except String Un
             row.arrivalBytes = after - before)
           "inbound progress does not match the receiver frontier replayed from the certified segments"
 
+/-- Binds a logged notify's delivery to its release plus its delay (see `checkNotifyDelivery`). -/
+def checkNotifyDeliveryReference (rows : List Row) (row : Row) : Except String Unit := do
+  if row.cause = .inboundArrival && row.causeKind = .notify then
+    if let some release := findActivatedFlowReference rows row.causeFlowId then
+      require row.srcLine
+        (release.stageKind = .notify && row.key.timeNs = release.key.timeNs + release.durationNs)
+        "stage notify delivery does not occur at its release plus its delay"
+
 /-- Binds a local completion to the event that caused it (see `checkLocalSignal`). -/
 def checkLocalSignalReference (rows : List Row) (row : Row) : Except String Unit := do
   if row.cause = .localCompletion then
@@ -346,6 +354,8 @@ def checkRowsReference (rows : List Row) : Except String Unit := do
   checkChannelRingsReference canonical
   for row in canonical do checkPredecessorsReference canonical row
   for row in canonical do checkInboundReplayReference canonical row
-  for row in canonical do checkLocalSignalReference canonical row
+  for row in canonical do
+    checkLocalSignalReference canonical row
+    checkNotifyDeliveryReference canonical row
 
 end LeanGuard.P10c.CollectiveEventLog
