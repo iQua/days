@@ -86,7 +86,8 @@ fn the_fixture_is_a_long_flow_image_cut_early() {
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 mod metal {
     use days_executor::{
-        MetalConfig, ObservationMode, run_metal_with_observations, size_metal_plan_for_testing,
+        MetalConfig, MetalError, ObservationMode, run_metal_with_observations,
+        size_metal_plan_for_testing,
     };
 
     use super::{
@@ -134,12 +135,61 @@ mod metal {
             );
         }
     }
+
+    /// A plan larger than the device may hold is refused before any buffer is allocated, with a
+    /// typed error naming both sizes. Before this, a plan past the GPU's working set either failed
+    /// a command buffer out of memory or, above physical memory, completed every command buffer
+    /// with lost writes, so the run spun until its round bound ran out.
+    #[test]
+    fn metal_refuses_a_plan_over_its_device_memory_limit() {
+        let image = image();
+        let first = first_event_ns(&image);
+        let horizon = first + 50_000;
+        let planned = size_metal_plan_for_testing(
+            &image,
+            Some(horizon),
+            MetalConfig::default(),
+            ObservationMode::Full,
+        )
+        .expect("the Metal plan sizes")
+        .total_device_bytes;
+        let limit = planned - 1;
+        let error = run_metal_with_observations(
+            &image,
+            Some(horizon),
+            MetalConfig {
+                max_device_bytes: Some(limit),
+                ..MetalConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .expect_err("the plan is over the limit");
+        assert_eq!(
+            error,
+            MetalError::DeviceMemoryExceeded {
+                planned_bytes: planned,
+                limit_bytes: limit,
+            }
+        );
+        let fits = run_metal_with_observations(
+            &image,
+            Some(horizon),
+            MetalConfig {
+                max_device_bytes: Some(planned),
+                ..MetalConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .expect("a plan at the limit runs");
+        assert_eq!(fits.result, scalar_full(&image, horizon));
+    }
 }
 
 #[cfg(feature = "cuda")]
 mod cuda {
     use days_executor::{
-        CudaConfig, ObservationMode, run_cuda_with_observations, size_cuda_plan_for_testing,
+        CudaConfig, CudaError, ObservationMode, run_cuda_with_observations,
+        size_cuda_plan_for_testing,
     };
 
     use super::{
@@ -186,5 +236,51 @@ mod cuda {
                 run.capacity_retry_trace
             );
         }
+    }
+
+    /// A plan larger than the device may hold is refused before any buffer is allocated, with a
+    /// typed error naming both sizes, instead of failing a plane upload out of memory.
+    #[test]
+    fn cuda_refuses_a_plan_over_its_device_memory_limit() {
+        let image = image();
+        let first = first_event_ns(&image);
+        let horizon = first + 50_000;
+        let planned = size_cuda_plan_for_testing(
+            &image,
+            Some(horizon),
+            CudaConfig::default(),
+            ObservationMode::Full,
+        )
+        .expect("the CUDA plan sizes")
+        .total_device_bytes;
+        let limit = planned - 1;
+        let error = run_cuda_with_observations(
+            &image,
+            Some(horizon),
+            CudaConfig {
+                max_device_bytes: Some(limit),
+                ..CudaConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .expect_err("the plan is over the limit");
+        assert_eq!(
+            error,
+            CudaError::DeviceMemoryExceeded {
+                planned_bytes: planned,
+                limit_bytes: limit,
+            }
+        );
+        let fits = run_cuda_with_observations(
+            &image,
+            Some(horizon),
+            CudaConfig {
+                max_device_bytes: Some(planned),
+                ..CudaConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .expect("a plan at the limit runs");
+        assert_eq!(fits.result, scalar_full(&image, horizon));
     }
 }

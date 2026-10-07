@@ -724,6 +724,13 @@ pub enum CudaError {
         code: u64,
         node: Option<NodeId>,
     },
+    /// P16 D2: the plan needs more device memory than is free on the device, or than
+    /// [`CudaConfig::max_device_bytes`] allows, so nothing was allocated. Without this check the
+    /// run failed a plane upload out of memory.
+    DeviceMemoryExceeded {
+        planned_bytes: usize,
+        limit_bytes: usize,
+    },
 }
 
 impl fmt::Display for CudaError {
@@ -796,6 +803,15 @@ impl fmt::Display for CudaError {
                     "; the image requires the mechanisms round kernel"
                 )
             }
+            Self::DeviceMemoryExceeded {
+                planned_bytes,
+                limit_bytes,
+            } => write!(
+                formatter,
+                "CUDA plan needs {planned_bytes} bytes of device memory, over its limit of \
+                 {limit_bytes} bytes; cut the run earlier, use Summary observation, or cap the \
+                 arenas"
+            ),
             Self::DeviceExecution { code, node } => {
                 write!(
                     formatter,
@@ -866,6 +882,10 @@ pub struct CudaConfig {
     pub attempts_per_graph_wave: usize,
     /// Optional hard cap overriding the conservative semantic round bound.
     pub max_rounds: Option<usize>,
+    /// Optional limit on the bytes one plan may place on the device, below the device memory free
+    /// when the attempt is planned (which always applies). A plan over the limit is refused with
+    /// [`CudaError::DeviceMemoryExceeded`] before any buffer is allocated.
+    pub max_device_bytes: Option<usize>,
     /// Test-only zero-capacity injection for device arenas without a public sizing override.
     #[doc(hidden)]
     #[cfg(feature = "cuda-test-hooks")]
@@ -894,6 +914,7 @@ impl Default for CudaConfig {
             round_threads_per_block: DEFAULT_ROUND_THREADS_PER_BLOCK,
             attempts_per_graph_wave: DEFAULT_ATTEMPTS_PER_GRAPH_WAVE,
             max_rounds: None,
+            max_device_bytes: None,
             #[cfg(feature = "cuda-test-hooks")]
             fault_injection: None,
             #[cfg(feature = "cuda-test-hooks")]
@@ -1488,6 +1509,17 @@ impl CudaExecutor {
                 if round_kernel == RoundKernel::Plain {
                     plan.refuse_plain_round_kernel()?;
                 }
+                // P16 D2: refuse, before allocating, a plan the device cannot hold. The previous
+                // attempt's buffers are already freed, so the free memory is this attempt's.
+                let limit_bytes = direct.device_memory_limit(attempt_config.max_device_bytes)?;
+                let planned_bytes = plan.device_bytes();
+                if planned_bytes > limit_bytes {
+                    return Err(CudaError::DeviceMemoryExceeded {
+                        planned_bytes,
+                        limit_bytes,
+                    }
+                    .into());
+                }
                 // The module was loaded under the guard before this run planned, so it is loaded
                 // before any buffer or graph, and no other run's module is in the context.
                 let buffers = CudaBuffers::new(&direct.stream, plan, direct.provisioning)?;
@@ -1757,36 +1789,7 @@ pub fn size_cuda_plan_for_testing(
     validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
     validate_config(config)?;
     let plan = CudaPlan::new(image, exclusive_horizon_ns, config, observation_mode)?;
-    let words = [
-        plan.control.len(),
-        plan.params.len(),
-        plan.node_state.len(),
-        plan.generators.len(),
-        plan.flows.len(),
-        plan.routes.len(),
-        plan.links.len(),
-        plan.fel_meta.len(),
-        plan.fel_records.len(),
-        plan.queue_meta.len(),
-        plan.queue_records.len(),
-        plan.in_service.len(),
-        plan.outbox.len(),
-        plan.worklist.len(),
-        plan.summary.len(),
-        plan.observed.len(),
-        plan.departures.len(),
-        plan.arrivals.len(),
-        plan.lp_state.len(),
-        plan.remote_meta.len(),
-        plan.remote_staging.len(),
-        plan.observation_meta.len(),
-        plan.inbound_meta.len(),
-        plan.inbound_producers.len(),
-        plan.merge_cursors.len(),
-        plan.stream_state.len(),
-        plan.stream_records.len(),
-        plan.scheduler_state.len(),
-    ];
+    let words = plan.plane_words();
     crate::device_sizing::exact_plan_report(
         words,
         plan.tcp_state.len(),
@@ -1865,6 +1868,51 @@ fn injected_capacity(config: CudaConfig, arena: CudaArena, default: usize) -> us
 }
 
 impl CudaPlan {
+    /// Words of the 28 established planes, in plane order.
+    fn plane_words(&self) -> [usize; 28] {
+        [
+            self.control.len(),
+            self.params.len(),
+            self.node_state.len(),
+            self.generators.len(),
+            self.flows.len(),
+            self.routes.len(),
+            self.links.len(),
+            self.fel_meta.len(),
+            self.fel_records.len(),
+            self.queue_meta.len(),
+            self.queue_records.len(),
+            self.in_service.len(),
+            self.outbox.len(),
+            self.worklist.len(),
+            self.summary.len(),
+            self.observed.len(),
+            self.departures.len(),
+            self.arrivals.len(),
+            self.lp_state.len(),
+            self.remote_meta.len(),
+            self.remote_staging.len(),
+            self.observation_meta.len(),
+            self.inbound_meta.len(),
+            self.inbound_producers.len(),
+            self.merge_cursors.len(),
+            self.stream_state.len(),
+            self.stream_records.len(),
+            self.scheduler_state.len(),
+        ]
+    }
+
+    /// Bytes the plan places on the device: every plane and `tcp_state`, as
+    /// `size_cuda_plan_for_testing` reports them (P16 D2).
+    fn device_bytes(&self) -> usize {
+        self.plane_words()
+            .into_iter()
+            .chain([self.tcp_state.len()])
+            .fold(0_usize, |total, words| {
+                total.saturating_add(words.saturating_mul(std::mem::size_of::<u64>()))
+            })
+    }
+
     /// Refuses the plain round kernel on this plan, before it is uploaded, if the plan holds any
     /// state a `MECHANISMS`-guarded kernel branch would act on
     /// ([`crate::device_mechanism::plain_round_kernel_refusal`]).
@@ -5513,6 +5561,16 @@ impl RoundModule {
 }
 
 impl DirectCuda {
+    /// The most bytes one plan may place on the device: the memory free on it now, or
+    /// `configured` when that is lower (P16 D2).
+    fn device_memory_limit(&self, configured: Option<usize>) -> Result<usize, CudaError> {
+        let (free, _total) = self
+            .context
+            .mem_get_info()
+            .map_err(|error| driver_error("device memory query", error))?;
+        Ok(configured.map_or(free, |configured| configured.min(free)))
+    }
+
     fn execution_guard(&self) -> MutexGuard<'_, ()> {
         self.execution
             .lock()
