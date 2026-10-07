@@ -1091,11 +1091,21 @@ fn physical_location(image: &SimulationImage, id: NodeId) -> PhysicalLocation {
     }
 }
 
+/// The largest frame each priority can still put on each of `links`, for the PFC headroom
+/// check: from the resident packets that can still cross the link and the generators whose
+/// route (data) or reverse route (feedback) holds it.
+///
+/// One pass over the image's packets and generators serves every controlled link: a rail
+/// switch monitors each ingress link at every egress queue, so a pass per monitor would cost
+/// O(monitors x flows) (P16 H3 part 2B).
 fn derived_pfc_max_frame_bytes(
     image: &SimulationImage,
-    controlled_link: LinkId,
-) -> Result<[u64; 8], ValidationError> {
-    let mut maximum = [0_u64; 8];
+    links: &BTreeSet<LinkId>,
+) -> Result<BTreeMap<LinkId, [u64; 8]>, ValidationError> {
+    let mut maxima = links
+        .iter()
+        .map(|&link| (link, [0_u64; 8]))
+        .collect::<BTreeMap<_, _>>();
     let resident_packets = executable_resident_packets(image);
     let live_dcqcn_cnp_flows = resident_packets
         .iter()
@@ -1104,11 +1114,18 @@ fn derived_pfc_max_frame_bytes(
         .collect::<BTreeSet<_>>();
     for packet in resident_packets {
         let flow = flow(image, packet.flow).expect("packet validation established the flow");
-        if packet_route(flow, packet.kind).contains(&controlled_link)
-            && packet_can_still_cross_link(image, packet, controlled_link)
-        {
-            let priority = usize::from(flow.packet_priority(packet.kind));
-            maximum[priority] = maximum[priority].max(packet.size_bytes);
+        let route = packet_route(flow, packet.kind);
+        for (index, &link) in route.iter().enumerate() {
+            if route[..index].contains(&link) {
+                continue;
+            }
+            let Some(maximum) = maxima.get_mut(&link) else {
+                continue;
+            };
+            if packet_can_still_cross_link(image, packet, link) {
+                let priority = usize::from(flow.packet_priority(packet.kind));
+                maximum[priority] = maximum[priority].max(packet.size_bytes);
+            }
         }
     }
     for generator in image.host_states.iter().flat_map(staged_generators) {
@@ -1116,7 +1133,7 @@ fn derived_pfc_max_frame_bytes(
         let flow = flow(image, generator.flow).expect("generator validation established the flow");
         let priority = usize::from(flow.priority);
         let feedback_priority = usize::from(flow.feedback_priority);
-        if executable && flow.route.contains(&controlled_link) {
+        if executable {
             let size = match generator.kind {
                 FlowGeneratorKind::Constant(constant) => constant.packet_size_bytes,
                 FlowGeneratorKind::Tcp(tcp) => tcp.mss_bytes,
@@ -1129,38 +1146,53 @@ fn derived_pfc_max_frame_bytes(
                     .min(dcqcn.rate.total_bytes - generator.bytes_emitted),
                 FlowGeneratorKind::Roce(roce) => roce_future_data_max_bytes(roce),
             };
-            maximum[priority] = maximum[priority].max(size);
+            for (index, link) in flow.route.iter().enumerate() {
+                if flow.route[..index].contains(link) {
+                    continue;
+                }
+                if let Some(maximum) = maxima.get_mut(link) {
+                    maximum[priority] = maximum[priority].max(size);
+                }
+            }
         }
-        if flow.reverse_route.contains(&controlled_link) {
-            match generator.kind {
-                FlowGeneratorKind::Tcp(tcp) => {
-                    if executable || tcp.bytes_in_flight != 0 {
-                        maximum[feedback_priority] =
-                            maximum[feedback_priority].max(tcp.ack_size_bytes);
-                    }
+        let feedback = match generator.kind {
+            FlowGeneratorKind::Tcp(tcp) => {
+                (executable || tcp.bytes_in_flight != 0).then_some(tcp.ack_size_bytes)
+            }
+            FlowGeneratorKind::Dcqcn(dcqcn) => (executable
+                || live_dcqcn_cnp_flows.contains(&flow.id))
+            .then_some(dcqcn.cnp_size_bytes),
+            // Every data arrival at the receiver can answer with an ACK or NACK and a CNP, so
+            // feedback is live while data can still be sent or is in flight.
+            FlowGeneratorKind::Roce(roce) => (executable || roce.snd_una < generator.bytes_emitted)
+                .then(|| roce_feedback_max_bytes(image, flow)),
+            FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => None,
+        };
+        if let Some(size) = feedback {
+            for (index, link) in flow.reverse_route.iter().enumerate() {
+                if flow.reverse_route[..index].contains(link) {
+                    continue;
                 }
-                FlowGeneratorKind::Dcqcn(dcqcn) => {
-                    if executable || live_dcqcn_cnp_flows.contains(&flow.id) {
-                        maximum[feedback_priority] =
-                            maximum[feedback_priority].max(dcqcn.cnp_size_bytes);
-                    }
+                if let Some(maximum) = maxima.get_mut(link) {
+                    maximum[feedback_priority] = maximum[feedback_priority].max(size);
                 }
-                FlowGeneratorKind::Roce(roce) => {
-                    // Every data arrival at the receiver can answer with an ACK or NACK and a
-                    // CNP, so feedback is live while data can still be sent or is in flight.
-                    if executable || roce.snd_una < generator.bytes_emitted {
-                        maximum[feedback_priority] =
-                            maximum[feedback_priority].max(roce_feedback_max_bytes(image, flow));
-                    }
-                }
-                FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => {}
             }
         }
     }
-    Ok(maximum)
+    Ok(maxima)
 }
 
 fn validate_pfc(image: &SimulationImage) -> Result<BTreeSet<usize>, ValidationError> {
+    // Every controlled link, for the frame bounds, which one pass computes on first need.
+    let controlled_links = image
+        .switch_states
+        .iter()
+        .flat_map(|state| &state.queues)
+        .filter_map(|queue| queue.pfc.as_ref())
+        .flat_map(|pfc| &pfc.ingresses)
+        .map(|ingress| ingress.controlled_link)
+        .collect::<BTreeSet<_>>();
+    let mut frame_bounds: Option<BTreeMap<LinkId, [u64; 8]>> = None;
     let mut control_lanes = BTreeSet::new();
     let mut controller_monitors = BTreeSet::<(LinkId, NodeId)>::new();
     let mut controlled_priorities = BTreeSet::<(LinkId, u8)>::new();
@@ -1269,7 +1301,14 @@ fn validate_pfc(image: &SimulationImage) -> Result<BTreeSet<usize>, ValidationEr
                         channel.min_delay_ns
                     )));
                 }
-                let reachable_frame_bytes = derived_pfc_max_frame_bytes(image, controlled.id)?;
+                if frame_bounds.is_none() {
+                    frame_bounds = Some(derived_pfc_max_frame_bytes(image, &controlled_links)?);
+                }
+                let reachable_frame_bytes = frame_bounds
+                    .as_ref()
+                    .and_then(|bounds| bounds.get(&controlled.id))
+                    .copied()
+                    .expect("every controlled link has a frame bound");
 
                 let line_bytes = pfc_line_rate_bytes(
                     controlled.rate_bps,
@@ -6968,18 +7007,6 @@ struct FutureWork {
     pfc_by_channel: Vec<u64>,
 }
 
-fn route_enters_pfc_controller(
-    image: &SimulationImage,
-    route: &[LinkId],
-    controlled_link: LinkId,
-    controller: NodeId,
-) -> bool {
-    route.windows(2).any(|pair| {
-        pair[0] == controlled_link
-            && link(image, pair[1]).is_some_and(|next| next.source == controller)
-    })
-}
-
 fn future_work(
     image: &SimulationImage,
     flow_index: &FlowIndex,
@@ -7043,6 +7070,24 @@ fn future_work(
     // Grouped after the counting loop above so that a resident whose flow is outside the dense
     // table still reaches that loop's direct index first, exactly as before.
     let resident_groups = ResidentFlowGroups::build(image, &resident_packets);
+    // The flows whose route (data) or reverse route (feedback) enters each PFC controller through
+    // each controlled link, by `(controlled link, controller)`, in flow order: one pass over the
+    // routes instead of one pass over every flow per monitor (P16 H3 part 2B).
+    let mut entering = BTreeMap::<(LinkId, NodeId), (Vec<usize>, Vec<usize>)>::new();
+    for (index, flow) in image.flows.iter().enumerate() {
+        for (route, data) in [(&flow.route, true), (&flow.reverse_route, false)] {
+            for pair in route.windows(2) {
+                let Some(next) = link(image, pair[1]) else {
+                    continue;
+                };
+                let lists = entering.entry((pair[0], next.source)).or_default();
+                let list = if data { &mut lists.0 } else { &mut lists.1 };
+                if list.last() != Some(&index) {
+                    list.push(index);
+                }
+            }
+        }
+    }
     let mut pfc_by_node = vec![0_u64; image.nodes.len()];
     let mut pfc_by_channel = vec![0_u64; image.channels.len()];
     for owner in image
@@ -7062,60 +7107,60 @@ fn future_work(
             })
         {
             let mut controller_frames = 0_u64;
-            for flow in &image.flows {
-                // Data is monitored in the flow's class, receiver feedback in its feedback class.
-                let data_monitored = ingress.xoff_threshold_bytes[usize::from(flow.priority)] != 0;
-                let feedback_monitored =
-                    ingress.xoff_threshold_bytes[usize::from(flow.feedback_priority)] != 0;
-                if !data_monitored && !feedback_monitored {
-                    continue;
-                }
+            let (data_flows, feedback_flows) = entering
+                .get(&(ingress.controlled_link, owner.id))
+                .map_or((&[][..], &[][..]), |(data, feedback)| {
+                    (data.as_slice(), feedback.as_slice())
+                });
+            // The packets of one flow and kind that can still enter the controller.
+            let reachable = |flow: &FlowDescriptor, data: bool| -> Result<u64, ValidationError> {
+                let past_resident = u64::try_from(
+                    resident_groups
+                        .group(image, &resident_packets, flow.id)
+                        .filter(|packet| {
+                            if data {
+                                packet.kind.is_data()
+                            } else {
+                                packet.kind.is_feedback()
+                            }
+                        })
+                        .filter(|packet| {
+                            !packet_can_still_cross_link(image, packet, ingress.controlled_link)
+                        })
+                        .count(),
+                )
+                .map_err(|_| ValidationError::new("PFC resident packet count exceeds u64"))?;
+                let total = if data {
+                    data_by_flow[flow.id.0 as usize]
+                } else {
+                    feedback_by_flow[flow.id.0 as usize]
+                };
+                Ok(total.checked_sub(past_resident).expect(
+                    "resident data and feedback counts are included in the per-flow totals",
+                ))
+            };
+            // Flow by flow, as the union of the two lists (both in flow order), so the counters
+            // see the same additions in the same order as a pass over every flow would.
+            let mut data_flows = data_flows.iter().copied().peekable();
+            let mut feedback_flows = feedback_flows.iter().copied().peekable();
+            while let Some(index) = match (data_flows.peek(), feedback_flows.peek()) {
+                (Some(&data), Some(&feedback)) => Some(data.min(feedback)),
+                (Some(&data), None) => Some(data),
+                (None, Some(&feedback)) => Some(feedback),
+                (None, None) => None,
+            } {
+                let flow = &image.flows[index];
                 let mut monitored_packets = 0_u64;
-                if data_monitored
-                    && route_enters_pfc_controller(
-                        image,
-                        &flow.route,
-                        ingress.controlled_link,
-                        owner.id,
-                    )
+                // Data is monitored in the flow's class, receiver feedback in its feedback class.
+                if data_flows.next_if_eq(&index).is_some()
+                    && ingress.xoff_threshold_bytes[usize::from(flow.priority)] != 0
                 {
-                    let past_resident = u64::try_from(
-                        resident_groups
-                            .group(image, &resident_packets, flow.id)
-                            .filter(|packet| packet.kind.is_data())
-                            .filter(|packet| {
-                                !packet_can_still_cross_link(image, packet, ingress.controlled_link)
-                            })
-                            .count(),
-                    )
-                    .map_err(|_| ValidationError::new("PFC resident packet count exceeds u64"))?;
-                    let reachable = data_by_flow[flow.id.0 as usize]
-                        .checked_sub(past_resident)
-                        .expect("resident data count is included in the per-flow total");
-                    add_packet_count(&mut monitored_packets, reachable)?;
+                    add_packet_count(&mut monitored_packets, reachable(flow, true)?)?;
                 }
-                if feedback_monitored
-                    && route_enters_pfc_controller(
-                        image,
-                        &flow.reverse_route,
-                        ingress.controlled_link,
-                        owner.id,
-                    )
+                if feedback_flows.next_if_eq(&index).is_some()
+                    && ingress.xoff_threshold_bytes[usize::from(flow.feedback_priority)] != 0
                 {
-                    let past_resident = u64::try_from(
-                        resident_groups
-                            .group(image, &resident_packets, flow.id)
-                            .filter(|packet| packet.kind.is_feedback())
-                            .filter(|packet| {
-                                !packet_can_still_cross_link(image, packet, ingress.controlled_link)
-                            })
-                            .count(),
-                    )
-                    .map_err(|_| ValidationError::new("PFC resident packet count exceeds u64"))?;
-                    let reachable = feedback_by_flow[flow.id.0 as usize]
-                        .checked_sub(past_resident)
-                        .expect("resident feedback count is included in the per-flow total");
-                    add_packet_count(&mut monitored_packets, reachable)?;
+                    add_packet_count(&mut monitored_packets, reachable(flow, false)?)?;
                 }
                 let frames = monitored_packets
                     .checked_mul(2)

@@ -81,5 +81,7 @@ fn validation_passes_over_each_host_generator_table_a_fixed_number_of_times() {
     );
 }
 
-/// Validation's passes over one host's generator table.
-const PASSES_PER_HOST: usize = 53;
+/// Validation's passes over one host's generator table. It was 53 until P16 H3 part 2B, when the
+/// PFC headroom check began bounding every controlled link's frames in one pass instead of one
+/// pass per PFC ingress monitor.
+const PASSES_PER_HOST: usize = 19;
