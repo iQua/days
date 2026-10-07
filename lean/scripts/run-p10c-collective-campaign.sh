@@ -290,8 +290,11 @@ mutate_case "compute-timer-phase" "$chain" \
 mutate_case "compute-local-predecessor-rank" "$chain" \
   '$column["flow_id"] == 18 { $column["local_predecessors"] = 13; $column["cause_flow_id"] = 13 }' \
   'REJECT: line 41: compute local predecessor is not a compute stage on its host'
+# Flow 5 (rank 2's ReduceScatter step 2) is delivered to host 0, as the backward stage is; flow 6,
+# the case's first choice, is delivered to another host, which checkInboundDeliveryHosts now refuses
+# first (review L4).
 mutate_case "compute-inbound-not-final" "$chain" \
-  '$column["flow_id"] == 12 { $column["inbound_predecessors"] = 6; if ($column["cause"] == "inbound_arrival") $column["cause_flow_id"] = 6 }' \
+  '$column["flow_id"] == 12 { $column["inbound_predecessors"] = 5; if ($column["cause"] == "inbound_arrival") $column["cause_flow_id"] = 5 }' \
   'REJECT: line 32: compute inbound predecessor is not the previous rank'"'"'s final collective stage'
 # Review F2 (R1b): the optimizer releases 640 ns after backward's release instead of at its
 # 7000 ns timer deadline (22640); the release rows' own deadlines move consistently.

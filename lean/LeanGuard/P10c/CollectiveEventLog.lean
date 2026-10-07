@@ -1546,6 +1546,21 @@ def checkCoverage (rows : List Row) : Except String Unit := do
     require row.srcLine (tally.activated = expected)
       s!"incomplete collective activation coverage for collective_id={row.collectiveId}: expected {expected}, found {tally.activated}"
 
+/-- A flow has one target host, so every stage that names it as an inbound predecessor runs on one
+host, the one the first naming row fixes. `checkEntryPredecessors` binds an inbound predecessor
+to its target rank's host when that rank has a logged row; a Send/Recv's receiver has none (its
+message is the collective's one stage), so without this a stage on another host could claim the
+message too (review L4 of the hostafter lane). -/
+def checkInboundDeliveryHosts (rows : List Row) : Except String Unit := do
+  let mut hosts : Std.HashMap Nat Nat := ∅
+  for row in rows do
+    for flow in row.inboundPredecessors do
+      match hosts.get? flow with
+      | some node =>
+          require row.srcLine (node = row.nodeId)
+            "an inbound predecessor is delivered to more than one host"
+      | none => hosts := hosts.insert flow row.nodeId
+
 def checkRows (rows : List Row) : Except String Unit := do
   require 1 (!rows.isEmpty) "empty collective activation trace"
   let canonical ← canonicalize rows
@@ -1555,6 +1570,7 @@ def checkRows (rows : List Row) : Except String Unit := do
   checkCoverage canonical
   let index := lookupIndex canonical
   checkChannelRings index canonical
+  checkInboundDeliveryHosts canonical
   for row in canonical do checkPredecessors index row
   checkInboundReplay canonical
   for row in canonical do

@@ -377,6 +377,14 @@ def checkContinuityReference (rows : List Row) : Except String Unit := do
         go (row :: previous) rest
   go [] rows
 
+/-- The first row naming the same inbound predecessor runs on this row's host (see
+`checkInboundDeliveryHosts`). -/
+def checkInboundDeliveryHostsReference (rows : List Row) (row : Row) : Except String Unit := do
+  for flow in row.inboundPredecessors do
+    if let some first := rows.find? (·.inboundPredecessors.contains flow) then
+      require row.srcLine (first.nodeId = row.nodeId)
+        "an inbound predecessor is delivered to more than one host"
+
 def checkRowsReference (rows : List Row) : Except String Unit := do
   require 1 (!rows.isEmpty) "empty collective activation trace"
   let canonical ← canonicalize rows
@@ -385,6 +393,7 @@ def checkRowsReference (rows : List Row) : Except String Unit := do
   for row in canonical do checkRow row
   checkCoverage canonical
   checkChannelRingsReference canonical
+  for row in canonical do checkInboundDeliveryHostsReference canonical row
   for row in canonical do checkPredecessorsReference canonical row
   for row in canonical do checkInboundReplayReference canonical row
   for row in canonical do
