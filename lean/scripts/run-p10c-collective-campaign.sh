@@ -589,5 +589,21 @@ mutate_case "sendrecv-message-targets-its-sender" "$hostafter_sendrecv" \
   '$column["flow_id"] == 0 { $column["target_node"] = 1 }' \
   'REJECT: line 5: a stage'"'"'s delivery host disagrees with its kind'
 
+# P16 a2a-zerorow (the user's ruling, option 2): an all-to-all rank that sends nothing completes at
+# its host at its release (the all-to-all's gate there) and its arrivals. In the slow-gate fixture,
+# rank 1's compute (flow 5) waits for `fwd` and `slow` there and rank 3's message; forging its
+# release at the message's last arrival (and dropping the true release at `slow`'s end) leaves its
+# local prerequisite incomplete. In the isolated-rank fixture, rank 0's compute (flow 5) waits for
+# `fwd` at host 0 (flow 9) alone; naming `fwd` at host 1 (flow 10) instead names a cause another
+# host's rows place there.
+zero_row_slow_gate="$fixture_dir/collective_collops_a2a_zero_row_slow_gate_roce_executor_accept.csv"
+mutate_case "zero-send-rank-released-before-its-gate" "$zero_row_slow_gate" \
+  'NR == 19 { next } NR == 17 { $column["activated"] = 1; $column["after_status"] = "scheduled"; $column["after_next_time_ns"] = $column["time_ns"] + 1000 }' \
+  'REJECT: line 17: collective activated bit disagrees with prerequisite state'
+isolated_rank="$fixture_dir/collective_collops_a2a_seeded_isolated_rank_roce_executor_accept.csv"
+mutate_case "isolated-rank-gate-from-another-host" "$isolated_rank" \
+  'NR == 2 { $column["local_predecessors"] = 10; $column["cause_flow_id"] = 10 }' \
+  'REJECT: line 3: the rows a cause produces name different delivery hosts'
+
 echo "P10c exact-integer collective campaign checks: $checked"
 exit "$failures"
