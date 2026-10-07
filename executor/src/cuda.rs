@@ -188,16 +188,32 @@ fn select_cuda_provisioning(
     }
 }
 
+/// The smallest share of a managed device's total memory a plan may not use (P16 D2 fix 2).
+const MANAGED_MEMORY_RESERVE_FLOOR_BYTES: usize = 8 << 30;
+
+/// The part of a managed (integrated) device's total memory a plan may not use: the larger of
+/// 8 GiB and a sixteenth of the total. The operating system, the driver and the host side of the
+/// run keep using that memory; without the reserve a 127 GB plan on madrid's 130.6 GB GB10 passed
+/// the check and the kernel OOM-killed the process during the managed upload (review M2). On
+/// madrid the floor binds: 8 GiB, a limit of 122,004,221,952 B.
+fn managed_memory_reserve(total: usize) -> usize {
+    MANAGED_MEMORY_RESERVE_FLOOR_BYTES.max(total / 16)
+}
+
 /// The device-memory limit one plan is checked against before allocation (P16 D2), from
 /// `cuMemGetInfo`'s `free` and `total` and the optional [`CudaConfig::max_device_bytes`], which
 /// can only lower it.
 ///
 /// - **Device** (a discrete GPU): `free`, the device memory a plan can still allocate.
-/// - **Managed** (an integrated GPU sharing system memory, such as GB10): `total`. There `free` is
-///   the kernel's MemFree, which leaves out reclaimable page cache, so it moves with host state:
-///   on an idle madrid it read 83.1 GB while a 102 GB managed allocation succeeded, and 127.9 GB
-///   right after (review M1). The total is a fixed property of the device, so whether a plan is
-///   refused does not depend on what the host cached last.
+/// - **Managed** (an integrated GPU sharing system memory, such as GB10): `total` less
+///   [`managed_memory_reserve`]. There `free` is the kernel's MemFree, which leaves out
+///   reclaimable page cache, so it moves with host state: on an idle madrid it read 83.1 GB while
+///   a 102 GB managed allocation succeeded, and 127.9 GB right after (review M1). The total is a
+///   fixed property of the device, so whether a plan is refused does not depend on what the host
+///   cached last.
+///
+/// Neither limit can see memory that other processes allocate after the check, so a plan under it
+/// can still run out of memory when the host is shared.
 fn plan_memory_limit(
     provisioning: CudaProvisioning,
     free: usize,
@@ -206,7 +222,7 @@ fn plan_memory_limit(
 ) -> usize {
     let device = match provisioning {
         CudaProvisioning::Device => free,
-        CudaProvisioning::Managed => total,
+        CudaProvisioning::Managed => total.saturating_sub(managed_memory_reserve(total)),
     };
     configured.map_or(device, |configured| configured.min(device))
 }
@@ -748,7 +764,7 @@ pub enum CudaError {
         node: Option<NodeId>,
     },
     /// P16 D2: the plan needs more device memory than the device's limit (free memory on a
-    /// discrete GPU, total memory under managed provisioning) or [`CudaConfig::max_device_bytes`]
+    /// discrete GPU, total memory less a fixed reserve under managed provisioning) or [`CudaConfig::max_device_bytes`]
     /// allows, so nothing was allocated. Without this check the
     /// run failed a plane upload out of memory.
     DeviceMemoryExceeded {
@@ -908,8 +924,8 @@ pub struct CudaConfig {
     pub max_rounds: Option<usize>,
     /// Optional limit on the bytes one plan may place on the device, below the device's own limit
     /// (which always applies): the memory free when the attempt is planned on a discrete GPU, the
-    /// total memory under managed provisioning. A plan over the limit is refused with
-    /// [`CudaError::DeviceMemoryExceeded`] before any buffer is allocated.
+    /// total memory less a fixed reserve under managed provisioning. A plan over the limit is
+    /// refused with [`CudaError::DeviceMemoryExceeded`] before any buffer is allocated.
     pub max_device_bytes: Option<usize>,
     /// Test-only zero-capacity injection for device arenas without a public sizing override.
     #[doc(hidden)]
