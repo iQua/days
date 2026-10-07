@@ -273,6 +273,18 @@ fn fixtures() -> Vec<(&'static str, String)> {
                     + &compute("s0b", "0, 1", 1_000, "after = [\"s0\", \"pp\"]")),
             ),
         ),
+        (
+            // An ungated Send/Recv (the sendrecv-cert lane's fix round 2): the message from host 1
+            // to host 2 starts with its collective and logs no row of its own; stage 1's next
+            // compute waits at host 2 for stage 1 and the message, at host 3 for stage 1 alone.
+            "sendrecv-ungated",
+            star(
+                4,
+                &(compute("s1", "2, 3", 1_000, "")
+                    + &collective("pp", "SendRecv", "RoCE", "1, 2", "", 9_000)
+                    + &compute("s1b", "2, 3", 1_000, "after = [\"s1\", \"pp\"]")),
+            ),
+        ),
     ]
 }
 

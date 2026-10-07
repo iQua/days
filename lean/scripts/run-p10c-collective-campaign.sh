@@ -178,7 +178,7 @@ mutate_case "ungated-root" "$chain" \
   'REJECT: line 2: a root stage is logged only when a compute stage gates it'
 # The gate is flow 6, a 1,000-byte stage of the root's own collective, completed by its ACK.
 mutate_case "root-gate-inside-collective" "$chain" \
-  'NR == 2 { $column["local_predecessors"] = 6; $column["cause_flow_id"] = 6; $column["cause_total_bytes"] = 1000; $column["cause_kind"] = "tcp"; $column["event_phase"] = 0 }' \
+  'NR == 2 { $column["local_predecessors"] = 6; $column["cause_flow_id"] = 6; $column["cause_total_bytes"] = 1000; $column["cause_kind"] = "tcp"; $column["cause_target_node"] = 1; $column["event_phase"] = 0 }' \
   'REJECT: line 2: a root stage'"'"'s gate must be a compute stage outside its collective'
 
 # Canonical order, ordinals, and certificate structure.
@@ -288,10 +288,13 @@ mutate_case "compute-timer-phase" "$chain" \
   'NR == 41 { $column["event_phase"] = 0 }' \
   'REJECT: line 41: collective progress event phase disagrees with its cause'
 mutate_case "compute-local-predecessor-rank" "$chain" \
-  '$column["flow_id"] == 18 { $column["local_predecessors"] = 13; $column["cause_flow_id"] = 13 }' \
-  'REJECT: line 41: compute local predecessor is not a compute stage on its host'
+  '$column["flow_id"] == 18 { $column["local_predecessors"] = 13; $column["cause_flow_id"] = 13; $column["cause_target_node"] = 1 }' \
+  'REJECT: line 41: a local completion'"'"'s cause delivery host disagrees with its kind'
+# Flow 5 (rank 2's ReduceScatter step 2) is delivered to host 0, as the backward stage is; flow 6,
+# the case's first choice, is delivered to another host, which checkInboundDeliveryHosts now refuses
+# first (review L4).
 mutate_case "compute-inbound-not-final" "$chain" \
-  '$column["flow_id"] == 12 { $column["inbound_predecessors"] = 6; if ($column["cause"] == "inbound_arrival") $column["cause_flow_id"] = 6 }' \
+  '$column["flow_id"] == 12 { $column["inbound_predecessors"] = 5; if ($column["cause"] == "inbound_arrival") $column["cause_flow_id"] = 5 }' \
   'REJECT: line 32: compute inbound predecessor is not the previous rank'"'"'s final collective stage'
 # Review F2 (R1b): the optimizer releases 640 ns after backward's release instead of at its
 # 7000 ns timer deadline (22640); the release rows' own deadlines move consistently.
@@ -520,8 +523,8 @@ mutate_case "ungated-notify-relabelled-to-none" "$rail_ungated" \
 # a compute stage on another host.
 hostafter_dp="$fixture_dir/collective_hostafter_dp_after_ep_executor_accept.csv"
 mutate_case "hostafter-compute-predecessor-on-another-host" "$hostafter_dp" \
-  '$column["flow_id"] == 22 { $column["local_predecessors"] = 19; $column["cause_flow_id"] = 19 }' \
-  'REJECT: line 57: compute local predecessor is not a compute stage on its host'
+  '$column["flow_id"] == 22 { $column["local_predecessors"] = 19; $column["cause_flow_id"] = 19; $column["cause_target_node"] = 1 }' \
+  'REJECT: line 57: a local completion'"'"'s cause delivery host disagrees with its kind'
 # In rail-dp-after-ep-a2a, the DP ring's root at host 4 (flow 1) follows EP instance 1's all-to-all
 # there (its sends 16, 17, 18 and receipts 21, 23, 25) and the weight gradient (39); dropping send
 # 18 from the join (and its completion row) leaves instance 1's completion at host 4 partial.
@@ -529,6 +532,62 @@ hostafter_rail="$fixture_dir/collective_hostafter_rail_dp_after_ep_a2a_executor_
 mutate_case "hostafter-join-missing-cross-family-pair" "$hostafter_rail" \
   '$column["flow_id"] == 1 { if ($column["cause_flow_id"] == 18 && $column["cause"] == "local_completion") next; $column["local_predecessors"] = "16;17;39"; $column["local_required"] = 3; if ($column["cause_flow_id"] == 17 && $column["cause"] == "local_completion") { $column["after_local_complete"] = 1 } if ($column["before_local_completed"] == 4) $column["before_local_completed"] = 3; if ($column["after_local_completed"] == 4) $column["after_local_completed"] = 3 }' \
   'REJECT: line 3: a stage does not wait for its predecessor collective'"'"'s whole completion at its rank'
+
+# Review L4 (hostafter lane): a flow has one target host. In sendrecv-across-stages the message
+# (flow 0, host 1 -> host 2) is stage 1's inbound predecessor at host 2 (flow 7). The reviewer's
+# forgery has stage 1's rank at host 3 (flow 8) claim the message too, with copied arrival rows;
+# the second has stage 0's next compute at host 0 (flow 3) claim it.
+hostafter_sendrecv="$fixture_dir/collective_hostafter_sendrecv_across_stages_executor_accept.csv"
+mutate_case "sendrecv-message-claimed-at-another-host" "$hostafter_sendrecv" \
+  'NR == 2 { ps = $column["packet_size_bytes"]; iv = $column["interval_ns"] } $column["flow_id"] == 8 && $column["cause"] == "local_completion" { $column["inbound_predecessors"] = 0; $column["inbound_predecessor_bytes"] = 9000; $column["after_inbound_complete"] = 0; $column["before_inbound_complete"] = 0; $column["activated"] = 0; $column["after_status"] = "blocked"; $column["after_next_time_ns"] = 0; $column["packet_size_bytes"] = ps; $column["interval_ns"] = iv; print; next } $column["flow_id"] == 7 && $column["cause"] == "inbound_arrival" { print; $column["node_id"] = 3; $column["flow_id"] = 8; $column["rank"] = 1; $column["local_predecessors"] = 6; $column["ordinal"] = $column["ordinal"] + 1; $column["before_local_complete"] = 1; $column["after_local_complete"] = 1; $column["target_node"] = 3; $column["cause_target_node"] = 3; print; next }' \
+  'REJECT: line 8: a row'"'"'s cause delivery host is not its cause'"'"'s recorded host'
+mutate_case "sendrecv-message-claimed-by-another-group" "$hostafter_sendrecv" \
+  'NR == 2 { ps = $column["packet_size_bytes"]; iv = $column["interval_ns"] } $column["flow_id"] == 3 && $column["cause"] == "local_completion" { $column["inbound_predecessors"] = 0; $column["inbound_predecessor_bytes"] = 9000; $column["after_inbound_complete"] = 0; $column["before_inbound_complete"] = 0; $column["activated"] = 0; $column["after_status"] = "blocked"; $column["after_next_time_ns"] = 0; $column["packet_size_bytes"] = ps; $column["interval_ns"] = iv; print; next } $column["flow_id"] == 7 && $column["cause"] == "inbound_arrival" { print; $column["node_id"] = 0; $column["flow_id"] = 3; $column["rank"] = 0; $column["collective_id"] = 1; $column["local_predecessors"] = 1; $column["ordinal"] = $column["ordinal"] + 1; $column["before_local_complete"] = 1; $column["after_local_complete"] = 1; $column["target_node"] = 0; $column["cause_target_node"] = 0; print; next }' \
+  'REJECT: line 8: a row'"'"'s cause delivery host is not its cause'"'"'s recorded host'
+
+# Review M1 (sendrecv-cert fix round 1, the reviewer's F1 and F1b): the message's only claim moves
+# from host 2's stage (flow 7, which then waits for stage 1 alone) to host 3's (flow 8), its
+# arrival rows moved, not copied; F1b also rewrites the arrival rows' event origin to host 3. Every
+# claim agrees, so only the message's recorded delivery host (`target_node`, 2) refutes them.
+mutate_case "sendrecv-message-moved-to-another-host" "$hostafter_sendrecv" \
+  '$column["flow_id"] == 7 && $column["cause"] == "local_completion" { ps = $column["packet_size_bytes"]; iv = $column["interval_ns"]; $column["inbound_predecessors"] = ""; $column["inbound_predecessor_bytes"] = 0; $column["before_inbound_complete"] = 1; $column["activated"] = 1; $column["after_inbound_complete"] = 1; $column["after_status"] = "scheduled"; $column["after_next_time_ns"] = $column["time_ns"] + $column["duration_ns"]; $column["packet_size_bytes"] = 0; $column["interval_ns"] = 0 } $column["flow_id"] == 8 && $column["cause"] == "local_completion" { $column["inbound_predecessors"] = 0; $column["inbound_predecessor_bytes"] = 9000; $column["before_inbound_complete"] = 0; $column["activated"] = 0; $column["after_inbound_complete"] = 0; $column["after_status"] = "blocked"; $column["after_next_time_ns"] = 0; $column["packet_size_bytes"] = ps; $column["interval_ns"] = iv } $column["flow_id"] == 7 && $column["cause"] == "inbound_arrival" { $column["node_id"] = 3; $column["flow_id"] = 8; $column["rank"] = 1; $column["local_predecessors"] = 6; $column["target_node"] = 3; $column["cause_target_node"] = 3 }' \
+  'REJECT: line 7: a row'"'"'s cause delivery host is not its cause'"'"'s recorded host'
+mutate_case "sendrecv-message-moved-with-its-origin" "$hostafter_sendrecv" \
+  '$column["flow_id"] == 7 && $column["cause"] == "local_completion" { ps = $column["packet_size_bytes"]; iv = $column["interval_ns"]; $column["inbound_predecessors"] = ""; $column["inbound_predecessor_bytes"] = 0; $column["before_inbound_complete"] = 1; $column["activated"] = 1; $column["after_inbound_complete"] = 1; $column["after_status"] = "scheduled"; $column["after_next_time_ns"] = $column["time_ns"] + $column["duration_ns"]; $column["packet_size_bytes"] = 0; $column["interval_ns"] = 0 } $column["flow_id"] == 8 && $column["cause"] == "local_completion" { $column["inbound_predecessors"] = 0; $column["inbound_predecessor_bytes"] = 9000; $column["before_inbound_complete"] = 0; $column["activated"] = 0; $column["after_inbound_complete"] = 0; $column["after_status"] = "blocked"; $column["after_next_time_ns"] = 0; $column["packet_size_bytes"] = ps; $column["interval_ns"] = iv } $column["flow_id"] == 7 && $column["cause"] == "inbound_arrival" { $column["node_id"] = 3; $column["flow_id"] = 8; $column["rank"] = 1; $column["local_predecessors"] = 6; $column["target_node"] = 3; $column["cause_target_node"] = 3 } $column["flow_id"] == 8 && $column["cause"] == "inbound_arrival" { $column["event_origin_node"] = 3 }' \
+  'REJECT: line 7: a row'"'"'s cause delivery host is not its cause'"'"'s recorded host'
+
+# An unlogged predecessor (an ungated root) records no delivery host; every stage naming it still
+# runs on one host. In rail-a2a-ungated, host 1's compute (flow 57) names pair 31 (delivered to
+# host 0, whose compute names it too) instead of its own pair 32 of the same size.
+rail_ungated_a2a="$fixture_dir/collective_collops_rail_a2a_ungated_executor_accept.csv"
+mutate_case "unlogged-pair-claimed-at-two-hosts" "$rail_ungated_a2a" \
+  '$column["flow_id"] == 57 { $column["inbound_predecessors"] = "0;20;26;31;38;44;50"; if ($column["cause_flow_id"] == 32) $column["cause_flow_id"] = 31 }' \
+  'REJECT: line 81: the rows a cause produces name different delivery hosts'
+
+# Fix round 2 (re-review M1, the reviewer's F3 and F4): ungated predecessors log no row, so only
+# the rows they cause record their delivery host (`cause_target_node`). F3: an ungated Send/Recv's
+# only claim moves from host 2's stage (flow 3) to host 3's (flow 4), as in F1. F4: in
+# rail-a2a-ungated, hosts 0 and 1 swap their claims on ungated pairs 31 and 32.
+hostafter_sendrecv_ungated="$fixture_dir/collective_hostafter_sendrecv_ungated_executor_accept.csv"
+mutate_case "ungated-sendrecv-message-moved-to-another-host" "$hostafter_sendrecv_ungated" \
+  '$column["flow_id"] == 3 && $column["cause"] == "local_completion" { ps = $column["packet_size_bytes"]; iv = $column["interval_ns"]; $column["inbound_predecessors"] = ""; $column["inbound_predecessor_bytes"] = 0; $column["before_inbound_complete"] = 1; $column["activated"] = 1; $column["after_inbound_complete"] = 1; $column["after_status"] = "scheduled"; $column["after_next_time_ns"] = $column["time_ns"] + $column["duration_ns"]; $column["packet_size_bytes"] = 0; $column["interval_ns"] = 0 } $column["flow_id"] == 4 && $column["cause"] == "local_completion" { $column["inbound_predecessors"] = 0; $column["inbound_predecessor_bytes"] = 9000; $column["before_inbound_complete"] = 0; $column["activated"] = 0; $column["after_inbound_complete"] = 0; $column["after_status"] = "blocked"; $column["after_next_time_ns"] = 0; $column["packet_size_bytes"] = ps; $column["interval_ns"] = iv } $column["flow_id"] == 3 && $column["cause"] == "inbound_arrival" { $column["node_id"] = 3; $column["flow_id"] = 4; $column["rank"] = 1; $column["local_predecessors"] = 2; $column["target_node"] = 3 }' \
+  'REJECT: line 4: an inbound arrival is not at its cause'"'"'s delivery host'
+mutate_case "ungated-pairs-swapped-between-hosts" "$rail_ungated_a2a" \
+  '$column["flow_id"] == 56 { $column["inbound_predecessors"] = "13;19;25;32;37;43;49"; if ($column["cause_flow_id"] == 31) $column["cause_flow_id"] = 32 } $column["flow_id"] == 57 { $column["inbound_predecessors"] = "0;20;26;31;38;44;50"; if ($column["cause_flow_id"] == 32) $column["cause_flow_id"] = 31 }' \
+  'REJECT: line 292: the rows a cause produces name different delivery hosts'
+# F4 with the swapped claims' arrival rows also naming the new hosts as the pairs' delivery hosts:
+# the pairs' senders' completions (the rows the ACKs cause there) still record the true ones.
+mutate_case "ungated-pairs-swapped-with-their-recorded-hosts" "$rail_ungated_a2a" \
+  '$column["flow_id"] == 56 { $column["inbound_predecessors"] = "13;19;25;32;37;43;49"; if ($column["cause_flow_id"] == 31) { $column["cause_flow_id"] = 32; $column["cause_target_node"] = 0 } } $column["flow_id"] == 57 { $column["inbound_predecessors"] = "0;20;26;31;38;44;50"; if ($column["cause_flow_id"] == 32) { $column["cause_flow_id"] = 31; $column["cause_target_node"] = 1 } }' \
+  'REJECT: line 292: the rows a cause produces name different delivery hosts'
+# Review L1: the target-rank and kind rules. T1: a ring stage (flow 4, rank 1, delivering to host
+# 2) records host 0. F7: the Send/Recv message records its own sender's host.
+mutate_case "ring-stage-retargeted" "$allreduce" \
+  '$column["flow_id"] == 4 { $column["target_node"] = 0 }' \
+  'REJECT: line 2: a stage'"'"'s delivery host is not its target rank'"'"'s host'
+mutate_case "sendrecv-message-targets-its-sender" "$hostafter_sendrecv" \
+  '$column["flow_id"] == 0 { $column["target_node"] = 1 }' \
+  'REJECT: line 5: a stage'"'"'s delivery host disagrees with its kind'
 
 echo "P10c exact-integer collective campaign checks: $checked"
 exit "$failures"
