@@ -837,9 +837,9 @@ def LookupIndex.entryLookups (index : LookupIndex) : EntryLookups :=
     completionsAt := fun key => index.completionsAt.getD key 0
     completionsInto := fun key => index.completionsInto.getD key 0 }
 
-/-- An entry stage (a compute stage, or a collective's root) follows whole groups: each local
-predecessor is a compute stage of the stage's rank, or a stage that completes its collective on
-the stage's host; each inbound predecessor completes its collective by delivering to that host; and
+/-- An entry stage (a compute stage, or a collective's root) follows whole groups, host-matched
+(the ruling on H3's C1: the groups need not share its ranks): each local predecessor is a compute
+stage on the stage's host, or a stage that completes its collective on the stage's host; each inbound predecessor completes its collective by delivering to that host; and
 for every group a logged predecessor belongs to, the stage names all of that group's completion
 stages there (one compute stage; a ring's channels, local and inbound; an all-to-all's pairs from
 and to the rank; the send at the sender, the message at the receiver). Groups are checked in the
@@ -854,9 +854,8 @@ def checkEntryPredecessors (lookups : EntryLookups) (row : Row) : Except String 
       localCounts := localCounts.insert group (localCounts.getD group 0 + 1)
       if predecessor.stageKind = .compute then
         if compute then
-          require row.srcLine
-            (predecessor.rank = row.rank && predecessor.groupSize = row.groupSize)
-            "compute local predecessor is not the same-rank stage of a compute group"
+          require row.srcLine (predecessor.nodeId = row.nodeId)
+            "compute local predecessor is not a compute stage on its host"
         else
           require row.srcLine (predecessor.nodeId = row.nodeId)
             "a root stage's gate is not a compute stage on its host"
