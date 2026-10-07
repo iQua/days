@@ -3,8 +3,8 @@
 //!
 //! The golden files under `tests/fixtures/aicb/` were printed by SimAI's `MockNcclGroup.cc`
 //! (SimAI `f5efb5a`) linked standalone (`evidence/P16/aicb-design/tooling/mockncclgroup_dump.cc`).
-//! They also list each group's ring channels; this test compares the groups (the channel lines
-//! are H1's `simai_ring_channels` and are compared once it lands).
+//! They also list each group's ring channels, which `ring_channels_equal_mockncclgroup_byte_for_byte`
+//! compares with H1's `simai_ring_channels`.
 
 use std::path::PathBuf;
 
@@ -179,4 +179,60 @@ fn group_formation_refusals() {
     }
     // The same PP 3 header is fine under the SimAI fidelity, which ignores PP.
     assert!(form_groups(&header(128, 8, 1, 3), Fidelity::Simai, 8).is_ok());
+}
+
+/// Every group's ring channels from H1's `simai_ring_channels`, in the golden files' form
+/// (`  channel <k> next <rank>><next> ...`, ascending rank), equal SimAI's `genringchannels`
+/// byte for byte: the full golden files, groups and channel lines.
+#[test]
+fn ring_channels_equal_mockncclgroup_byte_for_byte() {
+    use days::scenario::collective_shapes::simai_ring_channels;
+    use std::fmt::Write as _;
+    for (golden, header) in [
+        (
+            "mockncclgroup-flagship-w1024-tp2-ep32.txt",
+            header(1024, 2, 32, 1),
+        ),
+        (
+            "mockncclgroup-smoke-w128-tp2-ep32.txt",
+            header(128, 2, 32, 1),
+        ),
+        ("mockncclgroup-b4-w128-tp8-ep1.txt", header(128, 8, 1, 2)),
+    ] {
+        let groups = form_groups(&header, Fidelity::Simai, 8).expect(golden);
+        let mut rendered = String::new();
+        for line in render_mockncclgroup(&groups, &header).lines() {
+            rendered.push_str(line);
+            rendered.push('\n');
+            let Some(ranks) = line.split(" ranks ").nth(1) else {
+                continue;
+            };
+            let ranks = ranks
+                .split(' ')
+                .map(|rank| rank.parse::<u64>().unwrap())
+                .collect::<Vec<_>>();
+            let channels = simai_ring_channels(&ranks, |rank| rank / 8).expect(golden);
+            for (index, channel) in channels.iter().enumerate() {
+                let mut next = channel
+                    .iter()
+                    .enumerate()
+                    .map(|(position, &rank)| (rank, channel[(position + 1) % channel.len()]))
+                    .collect::<Vec<_>>();
+                next.sort_unstable();
+                write!(rendered, "  channel {index} next").unwrap();
+                for (rank, successor) in next {
+                    write!(rendered, " {rank}>{successor}").unwrap();
+                }
+                rendered.push('\n');
+            }
+        }
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/aicb")
+            .join(golden);
+        let expected = std::fs::read_to_string(path).unwrap();
+        assert!(
+            rendered == expected,
+            "{golden}: channels differ from SimAI's genringchannels"
+        );
+    }
 }
