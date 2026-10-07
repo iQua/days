@@ -25,7 +25,8 @@ use thiserror::Error;
 use super::collective_shapes::{RoutingSkew, SeededAllToAll};
 use super::ids::{IdError, LinkKey, LpKey, PhysicalNodeKey, StableIds, dense_ids};
 use crate::topos::build::{
-    HostAttachments, PairingPolicy, TopologyError, TopologyProfile, build_graph_with_profile,
+    HostAttachments, PairingPolicy, TopologyError, TopologyProfile,
+    build_graph_with_profile_from_str,
 };
 use crate::topos::rail::{RailProfile, ServerLocality};
 use crate::topos::route::{
@@ -62,6 +63,9 @@ impl From<IdError> for CompileError {
 
 #[derive(Debug, Deserialize)]
 struct SourceConfig {
+    /// A `[workload]` table: present only in an AICB scenario, which the adapter rewrites before
+    /// lowering, so the ordinary path refuses it.
+    workload: Option<serde::de::IgnoredAny>,
     seed: Option<u64>,
     duration: Option<ExactDecimal>,
     switch: SourceSwitch,
@@ -202,6 +206,9 @@ struct SourceCollective {
     stream: Option<u32>,
     /// Ring channels: each a ring order of the `sources` hosts (instead of `sinks`).
     channels: Option<Vec<Vec<u64>>>,
+    /// The collective's position in its workload's issue order (ruling C2): it orders the
+    /// collective's flows, and so SimAI's ECMP port ordinals, before key content.
+    issue_ordinal: Option<u64>,
     /// `EqualRemainderLast` (the default for rings) or `UniformFloor`.
     chunk: Option<String>,
     /// An all-to-all's seeded per-pair sizes (`[collective.alltoall]`); uniform without it.
@@ -606,6 +613,12 @@ struct FlowSetKey {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct CollectiveKey {
+    /// The collective's position in its workload's realized issue order (P16 ruling C2): the
+    /// leading field, so canonical flow order, and with it SimAI's per-pair ECMP port ordinals
+    /// (`simai_ecmp_route_tables`), follow issue order. `None` for every collective that does not
+    /// set it, which sort first and keep their order. Held as `ordinal + 1` in a `NonZeroU32`, which
+    /// fits the key's padding (`stage_group_keys_keep_their_size`); `Some` orders as the ordinal.
+    issue_ordinal: Option<std::num::NonZeroU32>,
     algorithm: CollectiveAlgorithm,
     flow_count: u64,
     sources: Vec<u64>,
@@ -858,23 +871,80 @@ pub fn compile_config_with_workload(
     compile_scenario(path.as_ref(), route_workers, Some(workload))
 }
 
+/// [`compile_config_with_route_workers`], with the run manifest of an AICB scenario
+/// (`[workload.aicb]`, P16 H3): `None` for every other scenario. The manifest is host metadata
+/// and never enters the image.
+pub fn compile_config_with_manifest(
+    path: impl AsRef<Path>,
+    route_workers: RouteWorkers,
+) -> Result<(SimulationImage, Option<crate::workload::aicb::AicbManifest>), CompileError> {
+    let path = path.as_ref();
+    let content = read_scenario(path)?;
+    match compile_text(&content, route_workers, None) {
+        Err(CompileError::Parse(_)) if crate::workload::aicb::is_aicb_scenario(&content) => {
+            compile_aicb(path, &content, route_workers)
+        }
+        other => other.map(|image| (image, None)),
+    }
+}
+
+fn read_scenario(path: &Path) -> Result<String, CompileError> {
+    let content = fs::read_to_string(path).map_err(|source| CompileError::Read {
+        path: path.display().to_string(),
+        source,
+    })?;
+    path.to_str()
+        .ok_or_else(|| CompileError::Invalid("configuration path is not valid UTF-8".to_owned()))?;
+    Ok(content)
+}
+
 fn compile_scenario(
     path: &Path,
     route_workers: RouteWorkers,
     workload: Option<&super::workload::Workload>,
 ) -> Result<SimulationImage, CompileError> {
-    let content = fs::read_to_string(path).map_err(|source| CompileError::Read {
-        path: path.display().to_string(),
-        source,
-    })?;
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| CompileError::Invalid("configuration path is not valid UTF-8".to_owned()))?;
-    crate::validate_config(path_str).map_err(CompileError::Unsupported)?;
+    let content = read_scenario(path)?;
+    match compile_text(&content, route_workers, workload) {
+        // An AICB scenario has no `[switch]` of its own, so it does not parse as an ordinary one.
+        Err(CompileError::Parse(_))
+            if workload.is_none() && crate::workload::aicb::is_aicb_scenario(&content) =>
+        {
+            compile_aicb(path, &content, route_workers).map(|(image, _)| image)
+        }
+        other => other,
+    }
+}
 
-    let source: SourceConfig = toml::from_str(&content)?;
-    let model = SupportedModel::from_source(source, &content, workload)?;
-    let (graph, hosts, profile) = build_graph_with_profile(path_str)?;
+/// Lowers an AICB scenario: the adapter reads the trace and `SimAI.conf` it names and returns the
+/// scenario text with the derived fabric tables and the workload IR (`crate::workload::aicb`).
+fn compile_aicb(
+    path: &Path,
+    content: &str,
+    route_workers: RouteWorkers,
+) -> Result<(SimulationImage, Option<crate::workload::aicb::AicbManifest>), CompileError> {
+    let prepared = crate::workload::aicb::prepare(path, content)
+        .map_err(|error| CompileError::Invalid(format!("AICB scenario: {error}")))?;
+    let image = compile_text(&prepared.text, route_workers, Some(&prepared.workload))?;
+    Ok((image, Some(prepared.manifest)))
+}
+
+fn compile_text(
+    content: &str,
+    route_workers: RouteWorkers,
+    workload: Option<&super::workload::Workload>,
+) -> Result<SimulationImage, CompileError> {
+    crate::validate_config_text(content).map_err(CompileError::Unsupported)?;
+
+    let source: SourceConfig = toml::from_str(content)?;
+    if source.workload.is_some() {
+        return Err(CompileError::Unsupported(
+            "a `[workload.aicb]` scenario takes its `[switch]`, `[link]` and `[routing]` tables \
+             from SimAI.conf; remove them"
+                .to_owned(),
+        ));
+    }
+    let model = SupportedModel::from_source(source, content, workload)?;
+    let (graph, hosts, profile) = build_graph_with_profile_from_str(content)?;
 
     let image = lower(model, &graph, hosts, profile, route_workers)?;
     validate(&image, Backend::Scalar).map_err(|error| {
@@ -1854,6 +1924,7 @@ fn collective_key(
         )));
     }
     Ok(CollectiveKey {
+        issue_ordinal: None,
         algorithm,
         flow_count,
         sources,
@@ -2017,6 +2088,7 @@ fn validate_collective(
 ) -> Result<CollectiveKey, CompileError> {
     let (name, after) = (source.name, source.after);
     let (channels, chunk, alltoall) = (source.channels, source.chunk, source.alltoall);
+    let issue_ordinal = source.issue_ordinal;
     let mut key = collective_key(
         &source.collective_type,
         source.flow_type.as_deref(),
@@ -2035,11 +2107,31 @@ fn validate_collective(
     )?;
     key.name = name;
     key.after = after;
+    key.issue_ordinal = issue_ordinal_key(issue_ordinal)?;
     let seeded = alltoall
         .map(|table| seeded_all_to_all(*table))
         .transpose()?;
     shape_collective(&mut key, channels, chunk.as_deref(), seeded)?;
     Ok(key)
+}
+
+/// A collective's issue ordinal as its key holds it (`ordinal + 1`), refusing one that does not
+/// fit.
+fn issue_ordinal_key(ordinal: Option<u64>) -> Result<Option<std::num::NonZeroU32>, CompileError> {
+    ordinal
+        .map(|ordinal| {
+            ordinal
+                .checked_add(1)
+                .and_then(|value| u32::try_from(value).ok())
+                .and_then(std::num::NonZeroU32::new)
+                .ok_or_else(|| {
+                    CompileError::Invalid(format!(
+                        "collective issue_ordinal {ordinal} is above {}",
+                        u32::MAX - 1
+                    ))
+                })
+        })
+        .transpose()
 }
 
 /// A `[collective.alltoall]` table's seeded matrix.
@@ -2162,6 +2254,7 @@ fn workload_keys(
                 )?;
                 key.name = Some(name(index));
                 key.after = after;
+                key.issue_ordinal = issue_ordinal_key(collective.issue_ordinal)?;
                 let chunk = if collective.uniform_floor {
                     "UniformFloor"
                 } else {

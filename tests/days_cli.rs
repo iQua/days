@@ -252,3 +252,30 @@ fn cuda_matches_the_scalar_fingerprint() {
     assert!(result[0].starts_with("record=days_result engine=cuda "));
     assert!(result[0].contains(SMOKE_RESULT), "{}", result[0]);
 }
+
+/// An AICB scenario (`[workload.aicb]`, P16 H3) prints its run manifest before its result; an
+/// ordinary scenario prints none.
+#[test]
+fn an_aicb_scenario_prints_its_workload_manifest() {
+    let (ok, stdout, stderr) = days(&[
+        "tests/fixtures/aicb/reduced-dense-simai.toml",
+        "--engine",
+        "scalar",
+        "--exclusive-horizon-ns",
+        "1000",
+    ]);
+    assert!(ok, "{stderr}");
+    let manifest = record(&stdout, "days_workload");
+    assert_eq!(manifest.len(), 1, "{stdout}");
+    assert!(
+        manifest[0]
+            .starts_with("record=days_workload adapter=aicb trace=reduced-dense-w32-tp8-pp2.txt ")
+    );
+    assert!(manifest[0].contains(" fidelity=simai "), "{}", manifest[0]);
+    let lines = stdout.lines().collect::<Vec<_>>();
+    let position = |prefix: &str| lines.iter().position(|line| line.starts_with(prefix));
+    assert!(position("record=days_workload") < position("record=days_result"));
+    let (ok, stdout, stderr) = days(&["configs/ci/executor_smoke.toml", "--engine", "scalar"]);
+    assert!(ok, "{stderr}");
+    assert!(record(&stdout, "days_workload").is_empty());
+}

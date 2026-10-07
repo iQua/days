@@ -8,3 +8,15 @@
 | `mockncclgroup-*.txt` | see `days-gpu/evidence/P16/aicb-design/` | SimAI's own `MockNcclGroup` (SimAI `f5efb5a`), linked standalone and dumped once per distinct group with its ring channels (`days-gpu/evidence/P16/aicb-design/tooling/mockncclgroup_dump.cc`). Arguments: flagship `1024 8 2 32`, smoke `128 8 2 32`, b4 `128 8 8 1` (W, GPUs per server, TP, EP). |
 
 The flagship trace (`flagship-tp2-ep32-w1024.txt`, sha256 `2dfd84f5e49380fe7e5ad2ca429678e5c900faa924a8a9d293f04e79301c9737`) is not committed; tests that need it read its path from `DAYS_AICB_FLAGSHIP` and are ignored by default.
+
+Reduced traces (generated with the vendored AICB; command in
+`days-gpu/evidence/P16/aicb-impl/tooling/gen_reduced_traces.sh`):
+
+| File | sha256 | What |
+|---|---|---|
+| `reduced-dense-w32-tp8-pp2.txt` | `b5c96935c6455dec3bc84ee18efca38b671927639d68fe7db50f33bea7241cca` | GPT-like, 4 layers (2 per stage), hidden 256, seq 128, 32 GPUs, TP8, PP2, gbs 2 |
+| `reduced-moe-w32-tp2-ep8.txt` | `af3236ebcfffa1003747385a40aef9c7df03fae94f9d29fb2ab8aefd4498047b` | MoE, 2 layers, hidden 128, seq 128, 16 experts, top-2, 32 GPUs, TP2, EP8, gbs 16 |
+
+Scenarios (`[workload.aicb]`, design note §5): `b4-simai.toml` (SimAI's b4 run on its 128g
+file), `reduced-dense-simai.toml` (a 32-GPU, two-segment rail), `smoke-simai.toml` (the MoE
+smoke on the 128g file; lowering it waits for host-matched `after`, ruling C1).

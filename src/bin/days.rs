@@ -16,7 +16,8 @@ use std::str::FromStr;
 use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
-use days::scenario::compile_config;
+use days::scenario::compile_config_with_manifest;
+use days::topos::route::RouteWorkers;
 #[cfg(any(
     test,
     all(feature = "metal", target_vendor = "apple"),
@@ -653,9 +654,13 @@ fn engine_available(engine: Engine) -> Result<(), String> {
 
 fn run(cli: &Cli) -> Result<(), String> {
     let lowering_started = Instant::now();
-    let image = compile_config(&cli.config)
+    let (image, manifest) = compile_config_with_manifest(&cli.config, RouteWorkers::available())
         .map_err(|error| format!("failed to lower {}: {error}", cli.config.display()))?;
     let lowering_ns = lowering_started.elapsed().as_nanos();
+    // An AICB scenario's run manifest (P16 H3): what the run was made from, before its result.
+    if let Some(manifest) = manifest {
+        println!("{manifest}");
+    }
     match cli.engine {
         Engine::Scalar => run_scalar_engine(cli, &image, lowering_ns),
         Engine::Cpu => run_cpu_engine(cli, &image, lowering_ns),
