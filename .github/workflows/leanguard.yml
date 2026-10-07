@@ -74,7 +74,7 @@ jobs:
       - name: Run P10c RoCE queue-pair checks
         run: bash lean/scripts/run-p10c-roce-campaign.sh
 
-      - name: Run P10c switch mechanism checks (rate, switch-link PFC, DRR, WRR)
+      - name: Run P10c switch mechanism checks (rate, switch-link PFC, DRR, WRR, WFQ)
         run: bash lean/scripts/run-p10c-mechanism-campaign.sh
 
       - name: Run SP checks
