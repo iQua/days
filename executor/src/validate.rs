@@ -929,11 +929,7 @@ fn validate_flows(image: &SimulationImage, flow_index: &FlowIndex) -> Result<(),
                             FlowGeneratorKind::Dcqcn(_) | FlowGeneratorKind::Roce(_)
                         )
                     };
-                    if state
-                        .generators
-                        .windows(2)
-                        .all(|pair| pair[0].flow < pair[1].flow)
-                    {
+                    if generators_ascend(state) {
                         ascending_generator(state, flow.id).is_some_and(feedback_transport)
                     } else {
                         scan_generators(state).any(|generator| {
@@ -3495,6 +3491,17 @@ fn scan_generators(state: &crate::HostState) -> std::slice::Iter<'_, crate::Flow
     #[cfg(feature = "planner-test-hooks")]
     GENERATOR_PASSES.set(GENERATOR_PASSES.get() + 1);
     state.generators.iter()
+}
+
+/// Whether `state`'s generator table is strictly ascending by flow: a pass over the table, counted
+/// with [`staged_generators`]'s passes.
+fn generators_ascend(state: &crate::HostState) -> bool {
+    #[cfg(feature = "planner-test-hooks")]
+    GENERATOR_PASSES.set(GENERATOR_PASSES.get() + 1);
+    state
+        .generators
+        .windows(2)
+        .all(|pair| pair[0].flow < pair[1].flow)
 }
 
 /// The generator of `flow` in `state`'s table, by binary search, for a table strictly ascending
