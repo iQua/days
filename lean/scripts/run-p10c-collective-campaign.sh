@@ -438,5 +438,27 @@ mutate_case "sendrecv-receiver-initial-state" "$sendrecv" \
   'NR == 3 { $column["before_local_complete"] = 0 }' \
   'REJECT: line 3: first local prerequisite state is not initial'
 
+# P16 H1 x H2: on a Rail topology the intra-server messages of a multi-server collective are stage
+# notifies (tests/p16_collops_rail.rs). LeanGuard checks a notify's lead timer at its sender and its
+# whole-chunk delivery at its receiver; the NVLink delivery delay (the notify's `duration_ns`) is
+# accepted as given.
+rail_ring="$fixture_dir/collective_collops_rail_ring_roce_executor_accept.csv"
+# The first notify delivery is split into two 2,000-byte halves (the second under a fresh event key).
+mutate_case "notify-split-delivery" "$rail_ring" \
+  'done == 0 && $column["cause_kind"] == "notify" && $column["cause"] == "inbound_arrival" { done = 1; saved = $0; $column["arrival_bytes"] = 2000; $column["segment_bytes"] = 2000; $column["after_inbound_bytes"] = 2000; $column["after_inbound_complete"] = 0; $column["activated"] = 0; $column["after_status"] = "blocked"; $column["after_next_time_ns"] = 0; print; $0 = saved; $column["event_origin_sequence"] += 1000; $column["segment_sequence"] = 2000; $column["segment_bytes"] = 2000; $column["arrival_bytes"] = 2000; $column["before_inbound_bytes"] = 2000 }' \
+  'REJECT: line 16: inbound stage notify does not deliver its whole chunk at once'
+# The first notify release arms its lead's timer one nanosecond late.
+mutate_case "notify-lead-timer" "$rail_ring" \
+  'done == 0 && $column["stage_kind"] == "notify" && $column["cause"] == "local_completion" && $column["activated"] == 1 { done = 1; $column["after_next_time_ns"] += 1 }' \
+  'REJECT: line 2: stage notify release does not arm its lead'"'"'s timer'
+# A notify delivery claims a RoCE carrier.
+mutate_case "notify-carrier-relabeled-roce" "$rail_ring" \
+  'done == 0 && $column["cause_kind"] == "notify" && $column["cause"] == "inbound_arrival" { done = 1; $column["cause_kind"] = "roce" }' \
+  'REJECT: line 16: cause kind disagrees with the cause stage'
+# The receiver of the first notify (line 10) completes locally a nanosecond after its timer.
+mutate_case "notify-completion-off-its-timer" "$rail_ring" \
+  'NR == 10 { $column["time_ns"] = 1002 }' \
+  'REJECT: line 10: compute local completion does not occur at its predecessor'"'"'s timer deadline'
+
 echo "P10c exact-integer collective campaign checks: $checked"
 exit "$failures"

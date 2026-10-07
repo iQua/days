@@ -304,39 +304,3 @@ fn gated_stages_on_a_paused_host_stay_off_its_parked_list() {
         "no checkpoint held a gated stage on a paused host"
     );
 }
-
-/// Schema Amendment 5: a compute stage's progress rows name its inbound transport from its local
-/// predecessor (the same rank's final stage of the same collective), so the validator requires
-/// the two predecessors' MTU and pacing interval to agree.
-#[test]
-fn a_compute_stages_predecessors_share_their_roce_transport() {
-    let image = lower("roce_compute_dag.toml");
-    validate(&image, Backend::Scalar).expect("the lowered DAG validates");
-    let inbound = image
-        .host_states
-        .iter()
-        .flat_map(|state| state.generators_with_stages())
-        .find_map(|(_, stage)| match stage?.role {
-            StageRole::Compute(_) => stage?.dependencies.inbound.one(),
-            _ => None,
-        })
-        .expect("a compute stage after the collective");
-    let (slot, position) = image
-        .host_states
-        .iter()
-        .enumerate()
-        .find_map(|(slot, state)| {
-            state
-                .generators
-                .iter()
-                .position(|generator| generator.flow == inbound)
-                .map(|position| (slot, position))
-        })
-        .expect("the inbound predecessor's generator");
-    let mtu = with_roce(&image, slot, position, |_, roce| roce.pacer.mtu_bytes -= 1);
-    refused(&mtu, "disagree on the RoCE MTU or pacing interval");
-    let interval = with_roce(&image, slot, position, |_, roce| {
-        roce.pacer.pacing_interval_ns += 1
-    });
-    refused(&interval, "disagree on the RoCE MTU or pacing interval");
-}

@@ -3464,7 +3464,11 @@ fn lower(
     } = canonical_flows(
         model.explicit_flows,
         model.flow_sets,
-        (model.collectives, model.computes, &model.streams),
+        {
+            let (collectives, computes) =
+                single_server_delays(model.collectives, model.computes, profile)?;
+            (collectives, computes, &model.streams)
+        },
         &host_topology_ids,
         &hosts,
         model.seed,
@@ -4609,6 +4613,21 @@ impl NotifyLowering {
             });
         };
         let locality = ServerLocality::new(rail);
+        // An all-to-all releases all of a rank's sends at once, so its same-server sends share the
+        // sender's NVLink port: their concurrency is how many there are (orchestrator ruling,
+        // from the N1 SimAI comparison).
+        let mut all_to_all_peers = BTreeMap::<(u64, u32), u64>::new();
+        for flow in flows.iter() {
+            if let Some(stage) = flow.collective.as_deref() {
+                if stage.algorithm == CollectiveAlgorithm::AllToAll
+                    && locality.same_server(flow.source, flow.target)
+                {
+                    *all_to_all_peers
+                        .entry((stage.collective_id, stage.position.rank))
+                        .or_default() += 1;
+                }
+            }
+        }
         let mut lanes = BTreeMap::<(u64, u64), u64>::new();
         for flow in flows.iter_mut() {
             let (source, target, packet_size) =
@@ -4619,11 +4638,20 @@ impl NotifyLowering {
             if !locality.same_server(source, target) {
                 continue;
             }
-            // Today's expansions are single-channel rings that span servers: an intra-server hop
-            // runs alone on the sender's NVLink port (concurrency 1, the ruled value for such
-            // hops); a multi-channel or all-to-all expansion supplies its own concurrency.
+            // A ring hop inside a server of a ring that spans servers runs alone on the sender's
+            // port (concurrency 1: SimAI's channels desynchronise behind their own inter-server
+            // hops), as does a send/recv; an all-to-all's same-server sends share it. A collective
+            // inside one server never reaches here: it is one delay stage per rank
+            // (`single_server_delays`).
+            let concurrency = match stage.algorithm {
+                CollectiveAlgorithm::AllToAll => all_to_all_peers
+                    .get(&(stage.collective_id, stage.position.rank))
+                    .copied()
+                    .unwrap_or(1),
+                _ => 1,
+            };
             let delay = locality
-                .nvlink_message_delay_ns(stage.chunk_bytes, 1, packet_size)
+                .nvlink_message_delay_ns(stage.chunk_bytes, concurrency, packet_size)
                 .ok_or_else(|| {
                     CompileError::Invalid(format!(
                         "NVLink delay of a {}-byte message from host {source} to host {target} \
@@ -4640,6 +4668,82 @@ impl NotifyLowering {
         }
         Ok(Self { lanes })
     }
+}
+
+/// The ring collectives of a rail image whose ranks all share one server, as compute groups
+/// (ruling H2-2: one delay stage per rank). Such a collective never leaves the server, so each
+/// rank's part is a delay: `steps` ring steps, each sending one message on every one of `c`
+/// channels at once through the rank's NVLink port
+/// ([`ServerLocality::single_server_collective_delay_ns`] with concurrency `c`, the orchestrator's
+/// ruling): SimAI's ring inside a server has `c = n` channels (or the collective's own
+/// `channels`), `n - 1` steps for an AllGather or ReduceScatter and `2 (n - 1)` for an AllReduce,
+/// and messages of `floor(floor(S / n) / c)` bytes. The group keeps the collective's name, ranks
+/// and `after`, so what follows it waits for each rank's delay. Off the rail fabric it returns its
+/// inputs unchanged.
+fn single_server_delays(
+    collectives: Vec<CollectiveKey>,
+    mut computes: Vec<ComputeKey>,
+    profile: TopologyProfile,
+) -> Result<(Vec<CollectiveKey>, Vec<ComputeKey>), CompileError> {
+    let TopologyProfile::Rail(rail) = profile else {
+        return Ok((collectives, computes));
+    };
+    let locality = ServerLocality::new(rail);
+    let single_server = |key: &CollectiveKey| {
+        is_ring_algorithm(key.algorithm)
+            && key.flow_count > 1
+            && key.sources.iter().all(|&host| {
+                locality.server_of(host).is_some()
+                    && locality.server_of(host) == locality.server_of(key.sources[0])
+            })
+    };
+    if !collectives.iter().any(single_server) {
+        return Ok((collectives, computes));
+    }
+    let mut remaining = Vec::with_capacity(collectives.len());
+    for (index, key) in collectives.into_iter().enumerate() {
+        if !single_server(&key) {
+            remaining.push(key);
+            continue;
+        }
+        let n = key.flow_count;
+        let Termination::Bytes(total_bytes) = key.traffic.termination else {
+            unreachable!("collective validation requires byte termination")
+        };
+        let channels = match key.channels().len() {
+            0 => n,
+            declared => declared as u64,
+        };
+        let steps = match key.algorithm {
+            CollectiveAlgorithm::RingAllReduce => 2 * (n - 1),
+            _ => n - 1,
+        };
+        let message = total_bytes / n / channels;
+        let duration_ns = locality
+            .single_server_collective_delay_ns(
+                steps,
+                message,
+                channels,
+                key.traffic.packet_size_bytes,
+            )
+            .filter(|&delay| delay > 0)
+            .ok_or_else(|| {
+                CompileError::Invalid(format!(
+                    "single-server collective of {total_bytes} bytes over {n} ranks and {channels} \
+                     channels has no message delay (a message of {message} bytes)"
+                ))
+            })?;
+        computes.push(ComputeKey {
+            // An unnamed collective cannot be followed; it still runs its delay.
+            name: key
+                .name
+                .unwrap_or_else(|| format!("\u{0}single-server collective {index}")),
+            hosts: key.sources,
+            duration_ns,
+            after: key.after,
+        });
+    }
+    Ok((remaining, computes))
 }
 
 /// The canonically ordered flow inputs and the collective keys their stage keys index.

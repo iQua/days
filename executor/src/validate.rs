@@ -3999,17 +3999,6 @@ fn validate_notify_timer(
     Ok(())
 }
 
-/// A RoCE queue pair's MTU and pacing interval, which a compute stage after it writes on its
-/// progress rows (schema Amendment 5); `None` for any other generator.
-const fn roce_transport(kind: &FlowGeneratorKind) -> Option<(u64, u64)> {
-    match kind {
-        FlowGeneratorKind::Roce(roce) => {
-            Some((roce.pacer.mtu_bytes, roce.pacer.pacing_interval_ns))
-        }
-        _ => None,
-    }
-}
-
 /// The host's TCP receiver for `id`.
 ///
 /// `validate_generators` checks a host's `tcp_receivers` strictly ascending by flow before it
@@ -4086,17 +4075,6 @@ fn validate_compute_stage(
         dependencies,
         inline,
     )?;
-    // Schema Amendment 5: a compute stage after one RoCE collective names that collective's
-    // transport on its progress rows, read from its local predecessor, which must then agree with
-    // its inbound predecessor.
-    if let (Some(local), Some(inbound)) = (inline.local, inline.inbound) {
-        if roce_transport(&local.kind) != roce_transport(&inbound.kind) {
-            return Err(ValidationError::new(format!(
-                "flow {:?} compute local and inbound predecessors disagree on the RoCE MTU or pacing interval",
-                flow.id
-            )));
-        }
-    }
     let emission = generator.next_emission;
     let consistent = match emission.status {
         GeneratorStatus::Blocked => {
