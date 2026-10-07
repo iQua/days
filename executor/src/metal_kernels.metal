@@ -170,6 +170,21 @@ constant uint P_QUEUE_HIGH_WATER_OFFSET = 37;
 #define RECORD_QUEUE_HIGH_WATER(params, meta, entity, occupancy) ((void)0)
 #endif
 
+// P16 H4 (test hooks only): the RESUME-scan counters. `MetalBuffers::new` appends one row of
+// RESUME_SCAN_COUNT_WORDS words per LP to `scheduler_state`, after every production word, and its
+// offset as params word 38, after the high-water offsets: {RESUMEs scanned, queue pairs examined,
+// parked-bitset words read}. A host LP adds only to its own row, so the counters need no atomics.
+// Production builds compile `RECORD_RESUME_SCAN` to nothing.
+#ifdef DAYS_RESUME_SCAN_COUNT
+constant uint P_RESUME_SCAN_COUNT_OFFSET = 38;
+constant uint RESUME_SCAN_COUNT_WORDS = 3;
+#define RECORD_RESUME_SCAN(params, state, node, counter, amount) \
+    ((state)[(params)[P_RESUME_SCAN_COUNT_OFFSET] + (node) * RESUME_SCAN_COUNT_WORDS + (counter)] += \
+        (ulong)(amount))
+#else
+#define RECORD_RESUME_SCAN(params, state, node, counter, amount) ((void)0)
+#endif
+
 // T21 fix 1 — the re-gridded control sweeps. `evidence/P12/aterm-fixes.md` §3.4. Transliterated
 // word for word from `cuda_kernels.cu`; see that file for the design note.
 //
@@ -2918,6 +2933,28 @@ inline ulong pfc_flow_data_class(
     return scheduler_state[params[P_PFC_OFFSET] + params[P_NODE_COUNT] + flow] & 0xfful;
 }
 
+// P16 H4 (ruling G9): the first word of class `priority`'s parked bitset in a host PFC row whose
+// queue-pair list `[Q, flow_0 .. flow_{Q-1}]` starts at `list`. The eight classes' bitsets follow
+// the list, class-major, `ceil(Q / 64)` words each (`executor/src/device_pfc.rs`).
+inline ulong pfc_parked_bitset(ulong list, ulong pairs, ulong priority) {
+    return list + 1 + pairs + priority * ((pairs + 63) / 64);
+}
+
+// P16 H4: sets the parked bit of a queue pair a paused tick parked, in its data class's bitset at
+// its host's PFC row `pfc_row`. The pair's slot in the row's list is bits 16.. of its class word.
+inline void pfc_mark_parked(
+    ulong pfc_row,
+    ulong flow,
+    const device ulong *params,
+    device ulong *scheduler_state
+) {
+    ulong word = scheduler_state[params[P_PFC_OFFSET] + params[P_NODE_COUNT] + flow];
+    ulong slot = word >> 16;
+    ulong list = scheduler_state[pfc_row + 4];
+    ulong bitset = pfc_parked_bitset(list, scheduler_state[list], word & 0xfful);
+    scheduler_state[bitset + slot / 64] |= 1ul << (slot % 64);
+}
+
 inline bool scheduler_first_packet_for_class(
     ulong node,
     ulong class_count,
@@ -5011,7 +5048,7 @@ inline bool roce_pacing_tick(
     device ulong *summary,
     device ulong *observation_meta,
     device ulong *observed,
-    const device ulong *scheduler_state,
+    device ulong *scheduler_state,
     device ulong *tcp_state
 ) {
     ulong node_base = node * NODE_WORDS;
@@ -5033,7 +5070,11 @@ inline bool roce_pacing_tick(
     if (pfc_row != NONE &&
         pfc_priority_paused(
             pfc_row, pfc_flow_data_class(flow, params, scheduler_state), scheduler_state)) {
-        // The pause-parked list is not stored: the RESUME scan and the readback derive it.
+        // A pair with packets left joins its class's parked bitset for the RESUME (P16 H4, Scalar's
+        // `pause_parked` insert); the readback derives the parked list itself (ruling D3).
+        if (row[G_ROCE_NEXT_PSN] < total && row[G_ROCE_SND_UNA] < total) {
+            pfc_mark_parked(pfc_row, flow, params, scheduler_state);
+        }
         roce_settle(row, 1);
         return true;
     }
@@ -5463,12 +5504,16 @@ inline bool stage_unreleased(
 // next grid point strictly after the RESUME, in generator-position (`FlowId`) order.
 //
 // Specification: `validate::expected_pause_parked`, the validator's characterization of Scalar's
-// `HostPfcState::pause_parked`. The device stores no parked set (ruling D3); the scan applies that
-// function's conjuncts with `data class == priority` in place of `is_paused(class)`, because Scalar
-// takes the set after the last controller's resume has unpaused the class. A window-parked pair
-// waits for feedback, not for the RESUME (P16 ruling D7), so the scan skips it as that function
-// does. A queue pair of a collective stage its prerequisites have not released has never ticked,
-// so no pause parked it: the scan skips it as that function does (P16 G1).
+// `HostPfcState::pause_parked`, which holds while the class is paused. P16 H4 (ruling G9): the scan
+// walks the set bits of the class's parked bitset, a superset of that set (a bit is set when a
+// paused tick parks a pair of the class with packets left, and an ACK, NACK, timeout or completion
+// leaves it set), in ascending slot order, which is ascending generator position. To each set bit
+// it applies that function's conjuncts, with the data class implied by the bitset and in place of
+// `is_paused(class)`, because Scalar takes the set after the last controller's resume has unpaused
+// the class: it skips a pair whose pacer is armed, window-parked (P16 ruling D7), stopped, has sent
+// or had acknowledged everything, or is a collective stage its prerequisites have not released
+// (P16 G1). So it restarts exactly Scalar's set in Scalar's order; a skip has no effect. The walk
+// clears each word before restarting its pairs; no restart writes the bitsets.
 inline bool roce_resume_parked(
     ulong node,
     const thread ulong *event,
@@ -5478,7 +5523,7 @@ inline bool roce_resume_parked(
     const device ulong *params,
     device ulong *node_state,
     device ulong *generators,
-    const device ulong *scheduler_state,
+    device ulong *scheduler_state,
     device ulong *fel_meta,
     device ulong *fel_records,
     device ulong *remote_meta,
@@ -5489,29 +5534,42 @@ inline bool roce_resume_parked(
 ) {
     ulong list = scheduler_state[row + 4];
     ulong pairs = scheduler_state[list];
-    for (ulong index = 0; index < pairs; ++index) {
-        ulong flow = scheduler_state[list + 1 + index];
-        device ulong *generator = generators + flow * GENERATOR_WORDS;
-        ulong total = generator[G_RATE_TOTAL];
-        if (pfc_flow_data_class(flow, params, scheduler_state) != priority ||
-            generator[G_ROCE_PACER_ARMED] != 0 || generator[G_ROCE_WINDOW_PARKED] != 0 ||
-            generator[G_STATUS] == 3 || generator[G_ROCE_NEXT_PSN] >= total ||
-            generator[G_ROCE_SND_UNA] >= total || stage_unreleased(flow, params, tcp_state)) {
+    ulong bitset = pfc_parked_bitset(list, pairs, priority);
+    ulong words = (pairs + 63) / 64;
+    RECORD_RESUME_SCAN(params, scheduler_state, node, 0, 1);
+    RECORD_RESUME_SCAN(params, scheduler_state, node, 2, words);
+    for (ulong word = 0; word < words; ++word) {
+        ulong bits = scheduler_state[bitset + word];
+        if (bits == 0) {
             continue;
         }
-        // A phase-0 transition: the controller's due instants before the RESUME apply first.
-        dcqcn_materialize_if_due(generator, false, event[E_TIME]);
-        ulong tick;
-        if (!roce_restart(generator, event[E_TIME], params[P_STOP_TIME], tick)) {
-            set_semantic_error(error, 88, node);
-            return false;
-        }
-        roce_settle(generator, generator[G_STATUS]);
-        if (!roce_emit_timers(
-                node, event, generator, flow, tick, NONE, error, params, node_state, fel_meta,
-                fel_records, remote_meta, remote_staging, stream_state, stream_records,
-                tcp_state)) {
-            return false;
+        scheduler_state[bitset + word] = 0;
+        while (bits != 0) {
+            ulong slot = word * 64 + ctz(bits);
+            bits &= bits - 1;
+            RECORD_RESUME_SCAN(params, scheduler_state, node, 1, 1);
+            ulong flow = scheduler_state[list + 1 + slot];
+            device ulong *generator = generators + flow * GENERATOR_WORDS;
+            ulong total = generator[G_RATE_TOTAL];
+            if (generator[G_ROCE_PACER_ARMED] != 0 || generator[G_ROCE_WINDOW_PARKED] != 0 ||
+                generator[G_STATUS] == 3 || generator[G_ROCE_NEXT_PSN] >= total ||
+                generator[G_ROCE_SND_UNA] >= total || stage_unreleased(flow, params, tcp_state)) {
+                continue;
+            }
+            // A phase-0 transition: the controller's due instants before the RESUME apply first.
+            dcqcn_materialize_if_due(generator, false, event[E_TIME]);
+            ulong tick;
+            if (!roce_restart(generator, event[E_TIME], params[P_STOP_TIME], tick)) {
+                set_semantic_error(error, 88, node);
+                return false;
+            }
+            roce_settle(generator, generator[G_STATUS]);
+            if (!roce_emit_timers(
+                    node, event, generator, flow, tick, NONE, error, params, node_state, fel_meta,
+                    fel_records, remote_meta, remote_staging, stream_state, stream_records,
+                    tcp_state)) {
+                return false;
+            }
         }
     }
     return true;

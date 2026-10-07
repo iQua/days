@@ -50,6 +50,13 @@ fn main() {
         env::var_os("CARGO_MANIFEST_DIR").expect("Cargo provides CARGO_MANIFEST_DIR"),
     );
     let source = manifest_dir.join("src/cuda_kernels.cu");
+    // P16 H4: test-hook builds count the device RESUME scans' work (`DAYS_RESUME_SCAN_COUNT`);
+    // production builds compile the kernels without it.
+    let hook_defines: &[&str] = if env::var_os("CARGO_FEATURE_CUDA_TEST_HOOKS").is_some() {
+        &["-DDAYS_RESUME_SCAN_COUNT=1"]
+    } else {
+        &[]
+    };
     // The two compiles are independent: run them concurrently and wait for both.
     let compiling = modules.map(|(module, output)| {
         let child = Command::new(&nvcc)
@@ -59,6 +66,7 @@ fn main() {
             .arg("-lineinfo")
             .arg("--diag-suppress=177")
             .arg(format!("-DDAYS_ROUND_MODULE={module}"))
+            .args(hook_defines)
             .arg("--generate-code=arch=compute_121,code=sm_121")
             .arg("--generate-code=arch=compute_89,code=sm_89")
             .arg("--generate-code=arch=compute_86,code=sm_86")

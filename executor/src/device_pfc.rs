@@ -8,9 +8,12 @@
 //!
 //! - `R + node`: the node's PFC queue row offset (absolute in the plane), or [`NONE`].
 //! - `R + node_count + flow`: the flow's PFC class word, `priority | ((feedback_priority ^
-//!   priority) << 8)`. Bits 0..8 are the data class; a CNP, RoCE ACK or RoCE NACK takes
-//!   `(word ^ (word >> 8)) & 0xff`, its feedback class (P15). The word equals `priority` whenever
-//!   the two classes agree, so images without a separate feedback class keep every word.
+//!   priority) << 8) | (slot << 16)`. Bits 0..8 are the data class; a CNP, RoCE ACK or RoCE NACK
+//!   takes `(word ^ (word >> 8)) & 0xff`, its feedback class (P15). Bits 16..64 hold a queue pair's
+//!   slot in its host's queue-pair list when the host has a PFC row (P16 H4), and are zero for
+//!   every other flow. The word equals `priority` whenever the two classes agree and the slot is
+//!   zero, so images without a separate feedback class or host-link PFC queue pairs keep every
+//!   word.
 //! - One row per switch queue carrying `PfcQueueState`:
 //!   - `+0` controller count `C`
 //!   - `+1` ingress-monitor count `I`
@@ -25,9 +28,19 @@
 //! - One row per host with egress pause state (`HostPfcState`, P15 host-link PFC), in the same
 //!   layout with no ingress records (`+1` is zero; hosts hold no monitors), and `+4` the absolute
 //!   offset of the host's queue-pair list `[Q, flow_0 .. flow_{Q-1}]`, in generator-position
-//!   (`FlowId`) order. A RESUME restarts pause-parked pairs by scanning this list; the parked set
-//!   itself is not stored (ruling D3): readback recomputes it with the validator's
-//!   `expected_pause_parked`.
+//!   (`FlowId`) order, followed by its parked bitsets (P16 H4, ruling G9): class-major, `8 * B`
+//!   words with `B = ceil(Q / 64)`, so `B = 0` and no word when the host has no queue pair. Bit `s`
+//!   of class `c` is set when a paused tick parks the pair at slot `s` (`list[1 + s]`) with
+//!   packets left to send, and the class's words are cleared by the RESUME that unpauses `c`,
+//!   which walks only their set bits.
+//!
+//!   The bits are derived state, a superset of Scalar's `pause_parked[c]` (mapped from generator
+//!   positions to slots): an ACK, NACK or timeout that restarts a parked pair, or completes it,
+//!   leaves its bit set until the RESUME, whose walk applies `expected_pause_parked`'s conjuncts
+//!   to every set bit and skips such a pair. So the walk restarts exactly Scalar's set, in
+//!   ascending slot order, which is ascending generator-position order. The plan initializes the
+//!   bits from the image's `pause_parked`; readback does not decode them and, as before (ruling
+//!   D3), recomputes `pause_parked` with the validator's `expected_pause_parked`.
 //!
 //! Scalar keeps `paused_by_controller: [BTreeSet<NodeId>; 8]`. A queue's possible controllers are
 //! static image data: the downstream LPs with an ingress monitor on the queue's egress link, which
@@ -67,6 +80,72 @@ fn count_pfc_state_scan() {
 pub(crate) fn take_pfc_state_scans_for_testing() -> usize {
     PFC_STATE_SCANS.with(|scans| scans.replace(0))
 }
+/// Test-only (P16 H4): words per LP of the device RESUME-scan counters, `{RESUMEs scanned, queue
+/// pairs examined, parked-bitset words read}`. The instrumented kernels
+/// (`DAYS_RESUME_SCAN_COUNT`, compiled only with `metal-test-hooks` or `cuda-test-hooks`) add to a
+/// row of this many words per LP, appended to `scheduler_state` after planning; each host LP
+/// writes only its own row, so the counters need no atomics.
+#[cfg(any(
+    feature = "cuda-test-hooks",
+    all(feature = "metal-test-hooks", target_vendor = "apple")
+))]
+pub(crate) const RESUME_SCAN_COUNT_WORDS: usize = 3;
+
+/// Test-only (P16 H4): the work of the device RESUME scans of one run, summed over its LPs.
+#[cfg(any(
+    feature = "cuda-test-hooks",
+    all(feature = "metal-test-hooks", target_vendor = "apple")
+))]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResumeScanCounts {
+    /// RESUMEs that unpaused a class at a host and scanned for its parked queue pairs.
+    pub resumes: u64,
+    /// Queue pairs the scans examined (each one restarted or skipped).
+    pub pairs_examined: u64,
+    /// Parked-bitset words the scans read.
+    pub words_read: u64,
+}
+
+#[cfg(any(
+    feature = "cuda-test-hooks",
+    all(feature = "metal-test-hooks", target_vendor = "apple")
+))]
+std::thread_local! {
+    /// Test-only: the RESUME-scan counters of this thread's last successful device run.
+    static RESUME_SCAN_COUNTS: std::cell::Cell<Option<ResumeScanCounts>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: sums the per-LP counter rows `words` (`RESUME_SCAN_COUNT_WORDS` per LP) and keeps
+/// them as this thread's last run's counts.
+#[cfg(any(
+    feature = "cuda-test-hooks",
+    all(feature = "metal-test-hooks", target_vendor = "apple")
+))]
+pub(crate) fn record_resume_scan_counts(words: &[u64]) {
+    let counts = words.as_chunks::<RESUME_SCAN_COUNT_WORDS>().0.iter().fold(
+        ResumeScanCounts::default(),
+        |sum, [resumes, pairs_examined, words_read]| ResumeScanCounts {
+            resumes: sum.resumes + resumes,
+            pairs_examined: sum.pairs_examined + pairs_examined,
+            words_read: sum.words_read + words_read,
+        },
+    );
+    RESUME_SCAN_COUNTS.set(Some(counts));
+}
+
+/// Test-only: the RESUME-scan counters of this thread's last successful Metal or CUDA run, summed
+/// over its LPs; clears them.
+#[cfg(any(
+    feature = "cuda-test-hooks",
+    all(feature = "metal-test-hooks", target_vendor = "apple")
+))]
+#[doc(hidden)]
+pub fn take_resume_scan_counts_for_testing() -> Option<ResumeScanCounts> {
+    RESUME_SCAN_COUNTS.take()
+}
+
 pub(crate) const PFC_ROW_HEADER_WORDS: usize = 5;
 pub(crate) const PFC_INGRESS_WORDS: usize = 43;
 const INGRESS_LINK: usize = 0;
@@ -155,6 +234,17 @@ fn host_queue_pairs(state: &HostState) -> impl Iterator<Item = u64> + '_ {
         .iter()
         .filter(|generator| matches!(generator.kind, FlowGeneratorKind::Roce(_)))
         .map(|generator| generator.flow.0)
+}
+
+/// Words of one class's parked bitset in a host row listing `pairs` queue pairs (P16 H4).
+pub(crate) const fn parked_bitset_words(pairs: usize) -> usize {
+    pairs.div_ceil(64)
+}
+
+/// Words of a host row's tail: the queue-pair list `[Q, flow_0 .. flow_{Q-1}]` and the parked
+/// bitsets of the eight classes.
+const fn host_row_tail_words(pairs: usize) -> usize {
+    1 + pairs + 8 * parked_bitset_words(pairs)
 }
 
 /// Every PFC row in node order: each switch LP's first queue with PFC state (the only queue a
@@ -249,7 +339,7 @@ pub(crate) fn pfc_region_words(image: &SimulationImage) -> usize {
         |total, (row, controllers)| {
             let tail = match row {
                 PfcRow::Switch(_) => row.ingress_count().saturating_mul(PFC_INGRESS_WORDS),
-                PfcRow::Host(state) => 1 + host_queue_pairs(state).count(),
+                PfcRow::Host(state) => host_row_tail_words(host_queue_pairs(state).count()),
             };
             total
                 .saturating_add(PFC_ROW_HEADER_WORDS)
@@ -296,7 +386,7 @@ pub(crate) fn append_pfc_region(
                 .ingress_count()
                 .checked_mul(PFC_INGRESS_WORDS)
                 .ok_or("PFC ingress region overflows usize")?,
-            PfcRow::Host(state) => 1 + host_queue_pairs(state).count(),
+            PfcRow::Host(state) => host_row_tail_words(host_queue_pairs(state).count()),
         };
         let end = tail
             .checked_add(tail_words)
@@ -346,12 +436,42 @@ pub(crate) fn append_pfc_region(
                 }
             }
             PfcRow::Host(state) => {
-                let mut count = 0;
-                for flow in host_queue_pairs(state) {
-                    count += 1;
-                    words[tail + count] = flow;
+                let pfc = state.pfc.as_deref().expect("a PFC row");
+                let pairs = host_queue_pairs(state).count();
+                let bitsets = tail + 1 + pairs;
+                let bitset_words = parked_bitset_words(pairs);
+                // Each class's parked positions, ascending, consumed in step with the generators.
+                let mut parked = pfc.pause_parked.each_ref().map(|set| set.iter().peekable());
+                let mut slot = 0;
+                for (position, generator) in state.generators.iter().enumerate() {
+                    if !matches!(generator.kind, FlowGeneratorKind::Roce(_)) {
+                        continue;
+                    }
+                    let flow = generator.flow.0;
+                    words[tail + 1 + slot] = flow;
+                    let class_word = usize::try_from(flow)
+                        .ok()
+                        .filter(|flow| *flow < flow_count)
+                        .map(|flow| region + node_count + flow)
+                        .ok_or("PFC queue pair references an unknown flow")?;
+                    words[class_word] |= (slot as u64) << 16;
+                    for (class, positions) in parked.iter_mut().enumerate() {
+                        if positions.next_if_eq(&&position).is_some() {
+                            words[bitsets + class * bitset_words + slot / 64] |=
+                                1_u64 << (slot % 64);
+                        }
+                    }
+                    slot += 1;
                 }
-                words[tail] = count as u64;
+                words[tail] = pairs as u64;
+                if parked
+                    .iter_mut()
+                    .any(|positions| positions.peek().is_some())
+                {
+                    return Err(format!(
+                        "host LP {lp} parks a generator position that is not a queue pair"
+                    ));
+                }
             }
         }
     }
@@ -364,7 +484,8 @@ pub(crate) fn append_pfc_region(
 /// The pause bitsets are device-written; the header and the queue-pair list are image data, checked
 /// rather than trusted. `pause_parked` is left as it is: it is a function of the restored pause
 /// sets and the queue pairs' states, which the caller recomputes once the generators are decoded
-/// (ruling D3).
+/// (ruling D3). The parked bitsets after the list (P16 H4) are derived device state, a superset of
+/// that set, and are not decoded.
 pub(crate) fn restore_host_pfc(
     words: &[u64],
     region: usize,

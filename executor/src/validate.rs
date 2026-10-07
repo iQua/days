@@ -2064,8 +2064,13 @@ fn validate_generators(
             .entry((event.target, event.payload, event.key.time_ns))
             .or_default() += 1;
     }
-    let mut owners =
-        BTreeMap::<crate::FlowId, (NodeId, GeneratorStatus, PayloadId, u64, bool)>::new();
+    // Each flow's one generator (a second is refused below): its owner, emission status, payload
+    // and time, and transport. The receiver checks read the transport here rather than rescanning
+    // every host's generators per receiver.
+    let mut owners = BTreeMap::<
+        crate::FlowId,
+        (NodeId, GeneratorStatus, PayloadId, u64, GeneratorTransport),
+    >::new();
     let mut receiver_owners = BTreeMap::<crate::FlowId, NodeId>::new();
     let mut dcqcn_receiver_owners = BTreeMap::<crate::FlowId, NodeId>::new();
     let mut roce_receiver_owners = BTreeMap::<crate::FlowId, NodeId>::new();
@@ -2200,7 +2205,7 @@ fn validate_generators(
                     generator.next_emission.status,
                     generator.next_emission.payload,
                     generator.next_emission.departure_time_ns,
-                    matches!(generator.kind, FlowGeneratorKind::Tcp(_)),
+                    GeneratorTransport::of(generator.kind),
                 ),
             ) {
                 return Err(ValidationError::new(format!(
@@ -2925,21 +2930,18 @@ fn validate_generators(
                     "host node {receiver_owner:?} owns TCP receiver state for flow {receiver_flow:?}, but the flow has no generator"
                 )));
             }
-            Some((.., false)) => {
+            Some((.., transport)) if *transport != GeneratorTransport::Tcp => {
                 return Err(ValidationError::new(format!(
                     "host node {receiver_owner:?} owns TCP receiver state for flow {receiver_flow:?}, but the flow generator is not TCP"
                 )));
             }
-            Some((.., true)) => {}
+            Some(_) => {}
         }
     }
     for (receiver_flow, receiver_owner) in dcqcn_receiver_owners {
-        let is_dcqcn = image
-            .host_states
-            .iter()
-            .flat_map(staged_generators)
-            .find(|generator| generator.flow == receiver_flow)
-            .is_some_and(|generator| matches!(generator.kind, FlowGeneratorKind::Dcqcn(_)));
+        let is_dcqcn = owners
+            .get(&receiver_flow)
+            .is_some_and(|(.., transport)| *transport == GeneratorTransport::Dcqcn);
         if !is_dcqcn {
             return Err(ValidationError::new(format!(
                 "host node {receiver_owner:?} owns DCQCN receiver state for flow {receiver_flow:?}, but the flow generator is not DCQCN"
@@ -2947,12 +2949,9 @@ fn validate_generators(
         }
     }
     for (receiver_flow, receiver_owner) in roce_receiver_owners {
-        let is_roce = image
-            .host_states
-            .iter()
-            .flat_map(staged_generators)
-            .find(|generator| generator.flow == receiver_flow)
-            .is_some_and(|generator| matches!(generator.kind, FlowGeneratorKind::Roce(_)));
+        let is_roce = owners
+            .get(&receiver_flow)
+            .is_some_and(|(.., transport)| *transport == GeneratorTransport::Roce);
         if !is_roce {
             return Err(ValidationError::new(format!(
                 "host node {receiver_owner:?} owns RoCE receiver state for flow {receiver_flow:?}, but the flow generator is not a RoCE queue pair"
@@ -2965,7 +2964,10 @@ fn validate_generators(
         .iter()
         .filter(|packet| matches!(packet.kind, PacketKind::TcpData(_) | PacketKind::TcpAck(_)))
     {
-        if !owners.get(&packet.flow).is_some_and(|(.., is_tcp)| *is_tcp) {
+        if !owners
+            .get(&packet.flow)
+            .is_some_and(|(.., transport)| *transport == GeneratorTransport::Tcp)
+        {
             return Err(ValidationError::new(format!(
                 "TCP packet {:?} for flow {:?} requires a TCP generator",
                 packet.id, packet.flow
@@ -3276,12 +3278,49 @@ fn staged_generator(state: &crate::HostState, position: usize) -> StagedGenerato
     }
 }
 
+#[cfg(feature = "planner-test-hooks")]
+std::thread_local! {
+    /// Test-only (P16 H4): passes over a host's generator table ([`staged_generators`] calls) on
+    /// this thread, so a test can pin validation's generator passes per host.
+    static GENERATOR_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only (P16 H4): this thread's passes over a host's generator table since the last call;
+/// resets them to zero.
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+pub fn take_generator_passes_for_testing() -> usize {
+    GENERATOR_PASSES.take()
+}
+
+/// The transport of a flow's generator, as `validate_generators` records it per flow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GeneratorTransport {
+    Tcp,
+    Dcqcn,
+    Roce,
+    Other,
+}
+
+impl GeneratorTransport {
+    const fn of(kind: FlowGeneratorKind) -> Self {
+        match kind {
+            FlowGeneratorKind::Tcp(_) => Self::Tcp,
+            FlowGeneratorKind::Dcqcn(_) => Self::Dcqcn,
+            FlowGeneratorKind::Roce(_) => Self::Roce,
+            FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => Self::Other,
+        }
+    }
+}
+
 /// `state`'s generators in table order, each with its stage record.
 ///
 /// Each generator pairs with the stage table's entry at its position, or with `None` past the
 /// table's end, exactly as [`staged_generator`] reads it, whatever the table's length. On a host
 /// without stages the table is empty, every generator pairs with `None`, and no entry is read.
 fn staged_generators(state: &crate::HostState) -> impl Iterator<Item = StagedGenerator<'_>> {
+    #[cfg(feature = "planner-test-hooks")]
+    GENERATOR_PASSES.set(GENERATOR_PASSES.get() + 1);
     let stages = state
         .stages
         .iter()
