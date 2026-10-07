@@ -1413,7 +1413,14 @@ impl PfcServiceProbe {
 
 /// Projects an eligible-packet list onto the record shape the round-robin certificates carry.
 fn scheduler_packets(packets: &[PacketDescriptor]) -> Vec<crate::SchedulerPacket> {
-    packets.iter().copied().map(scheduler_packet).collect()
+    packets
+        .iter()
+        .map(|packet| crate::SchedulerPacket {
+            payload: packet.id,
+            flow: packet.flow,
+            size_bytes: packet.size_bytes,
+        })
+        .collect()
 }
 
 const fn scheduler_packet(packet: PacketDescriptor) -> crate::SchedulerPacket {
