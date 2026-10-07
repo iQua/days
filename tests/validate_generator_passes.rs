@@ -6,6 +6,12 @@
 //! RESUME-scan gate (5 hosts, 8k stage queue pairs per host) it was most of the validation
 //! instructions, and at the flagship's queue-pair counts it would not finish. The counter
 //! (`planner-test-hooks`) counts calls of the per-host generator iterator.
+//!
+//! P16 H3 part 2B: the same holds for the checks that look up one flow's generator at its source
+//! host (each RoCE pacing-timer token, each CNP, feedback and RoCE packet, each flow whose
+//! feedback class differs from its data class). A scan of the host's table per lookup cost
+//! queue pairs squared per host: at the flagship (about 14,000 queue pairs per host) validation
+//! did not finish the lowering in 8 minutes.
 #![cfg(feature = "test")]
 
 use std::path::PathBuf;
