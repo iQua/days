@@ -564,5 +564,25 @@ mutate_case "unlogged-pair-claimed-at-two-hosts" "$rail_ungated_a2a" \
   '$column["flow_id"] == 57 { $column["inbound_predecessors"] = "0;20;26;31;38;44;50"; if ($column["cause_flow_id"] == 32) $column["cause_flow_id"] = 31 }' \
   'REJECT: line 5: an inbound predecessor is delivered to more than one host'
 
+# Fix round 2 (re-review M1, the reviewer's F3 and F4): ungated predecessors log no row, so only
+# the rows they cause record their delivery host (`cause_target_node`). F3: an ungated Send/Recv's
+# only claim moves from host 2's stage (flow 3) to host 3's (flow 4), as in F1. F4: in
+# rail-a2a-ungated, hosts 0 and 1 swap their claims on ungated pairs 31 and 32.
+hostafter_sendrecv_ungated="$fixture_dir/collective_hostafter_sendrecv_ungated_executor_accept.csv"
+mutate_case "ungated-sendrecv-message-moved-to-another-host" "$hostafter_sendrecv_ungated" \
+  '$column["flow_id"] == 3 && $column["cause"] == "local_completion" { ps = $column["packet_size_bytes"]; iv = $column["interval_ns"]; $column["inbound_predecessors"] = ""; $column["inbound_predecessor_bytes"] = 0; $column["before_inbound_complete"] = 1; $column["activated"] = 1; $column["after_inbound_complete"] = 1; $column["after_status"] = "scheduled"; $column["after_next_time_ns"] = $column["time_ns"] + $column["duration_ns"]; $column["packet_size_bytes"] = 0; $column["interval_ns"] = 0 } $column["flow_id"] == 4 && $column["cause"] == "local_completion" { $column["inbound_predecessors"] = 0; $column["inbound_predecessor_bytes"] = 9000; $column["before_inbound_complete"] = 0; $column["activated"] = 0; $column["after_inbound_complete"] = 0; $column["after_status"] = "blocked"; $column["after_next_time_ns"] = 0; $column["packet_size_bytes"] = ps; $column["interval_ns"] = iv } $column["flow_id"] == 3 && $column["cause"] == "inbound_arrival" { $column["node_id"] = 3; $column["flow_id"] = 4; $column["rank"] = 1; $column["local_predecessors"] = 2; $column["target_node"] = 3 }' \
+  'REJECT: line 0: an inbound arrival is not at its cause'"'"'s delivery host'
+mutate_case "ungated-pairs-swapped-between-hosts" "$rail_ungated_a2a" \
+  '$column["flow_id"] == 56 { $column["inbound_predecessors"] = "13;19;25;32;37;43;49"; if ($column["cause_flow_id"] == 31) $column["cause_flow_id"] = 32 } $column["flow_id"] == 57 { $column["inbound_predecessors"] = "0;20;26;31;38;44;50"; if ($column["cause_flow_id"] == 32) $column["cause_flow_id"] = 31 }' \
+  'REJECT: line 0: an inbound arrival is not at its cause'"'"'s delivery host'
+# Review L1: the target-rank and kind rules. T1: a ring stage (flow 4, rank 1, delivering to host
+# 2) records host 0. F7: the Send/Recv message records its own sender's host.
+mutate_case "ring-stage-retargeted" "$allreduce" \
+  '$column["flow_id"] == 4 { $column["target_node"] = 0 }' \
+  'REJECT: line 2: a stage'"'"'s delivery host is not its target rank'"'"'s host'
+mutate_case "sendrecv-message-targets-its-sender" "$hostafter_sendrecv" \
+  '$column["flow_id"] == 0 { $column["target_node"] = 1 }' \
+  'REJECT: line 5: a stage'"'"'s delivery host disagrees with its kind'
+
 echo "P10c exact-integer collective campaign checks: $checked"
 exit "$failures"
