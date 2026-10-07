@@ -3454,7 +3454,7 @@ fn validate_collective_stage(
     // The inbound predecessor is the same channel's step before, on the rank before this one: on
     // one ring (`RingNext`) exactly `rank - 1`; on a channel, whichever rank the channel orders
     // there, whose flow delivers to this host (checked with the dependencies).
-    let previous_rank = (collective.rank + collective.group_size - 1) % collective.group_size;
+    let previous_rank = previous_rank(collective.rank, collective.group_size);
     if inbound.1.collective_id != collective.collective_id
         || inbound.1.phase != phase
         || inbound.1.channel != collective.channel
@@ -3802,12 +3802,22 @@ const fn is_completion_stage(stage: crate::CollectiveStageIdentity) -> bool {
         crate::CollectiveAlgorithm::AllToAll | crate::CollectiveAlgorithm::SendRecv => true,
         crate::CollectiveAlgorithm::ReduceScatter => {
             matches!(stage.phase, crate::CollectivePhase::ReduceScatter)
-                && stage.step + 1 == stage.group_size
+                && matches!(stage.step.checked_add(1), Some(next) if next == stage.group_size)
         }
         _ => {
             matches!(stage.phase, crate::CollectivePhase::AllGather)
-                && stage.step + 1 == stage.group_size
+                && matches!(stage.step.checked_add(1), Some(next) if next == stage.group_size)
         }
+    }
+}
+
+/// The rank before `rank` on a ring of `group_size` ranks in rank order, without overflow on any
+/// metadata (an out-of-range rank is refused elsewhere).
+const fn previous_rank(rank: u32, group_size: u32) -> u32 {
+    if rank == 0 {
+        group_size.saturating_sub(1)
+    } else {
+        rank - 1
     }
 }
 
@@ -3830,7 +3840,7 @@ fn validate_entry_predecessors(
             flow.id
         ))
     };
-    let previous_rank = (rank + group_size - 1) % group_size;
+    let previous_rank = previous_rank(rank, group_size);
     let role_of = |candidate: Option<StagedGenerator<'_>>, id| {
         candidate
             .or_else(|| flow_index.generator_for_flow(image, id))
