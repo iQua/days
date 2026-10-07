@@ -24,8 +24,8 @@ The Lean build (`lean/lakefile.lean`) currently carries:
 - **Legacy-engine families** (float protocols, `(time_ns, event_id)` key):
   DCQCN, PFC, CUBIC, DRR, WFQ, AQM/ECN.
 - **Days AGO families** (full `EventKey`): TCP (`tcp_check`), Static
-  Priority (`sp_check`), and the `p10c_*` checkers for mechanisms, AQM,
-  DCQCN, collectives, and RoCE queue pairs.
+  Priority (`sp_check`), and the `p10c_*` checkers for mechanisms (rate,
+  PFC, DRR, WRR, and WFQ), AQM, DCQCN, collectives, and RoCE queue pairs.
 - **Cross-check**: `aqm_dcqcn_check` ties the legacy AQM and DCQCN
   vocabularies together.
 
@@ -70,9 +70,14 @@ generator.
 Correctness hinges on small local state and a choice rule. Checks:
 `schedule` chooses a packet with minimal finish tag; tags and virtual-time
 witnesses match the deterministic reference; scheduled packets depart
-exactly once. Days AGO computes WFQ in exact rational arithmetic but has
-no WFQ certificate family: `p10c_mechanisms_check` covers rate, PFC, DRR,
-and WRR transitions only.
+exactly once. Days AGO computes WFQ in exact rational arithmetic, and its
+certificate family is the `wfq` mode of `p10c_mechanisms_check`: one row
+per enqueue, service start and completion, with virtual time and finish
+tags as exact rationals normalized by the link rate. The checker replays
+the same Demers-Keshav-Shenker rules as `wfq_check` (the idle resets
+included), tracks the waiting packets itself, and requires each service
+start to serve the least finish tag among the packets whose PFC priority
+is not paused.
 
 ### DRR scheduler (`drr_events.csv`)
 
