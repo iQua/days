@@ -15,13 +15,18 @@ checked=0
 for mechanism in rate pfc drr wrr wfq; do
   for csv in "$fixture_dir"/"${mechanism}"_*.csv; do
     [[ -e "$csv" ]] || continue
+    # A WFQ certificate's `<name>.pfc.csv` companion is the run's PFC certificate, which the WFQ
+    # checker joins; it is not a fixture of its own.
+    [[ "$csv" == *.pfc.csv ]] && continue
+    companion=()
+    [[ -e "${csv%.csv}.pfc.csv" ]] && companion=("${csv%.csv}.pfc.csv")
     expected="${csv%.csv}.expected"
     checked=$((checked + 1))
     expected_exit="$(sed -n '1s/^exit=//p' "$expected")"
     expected_output="$(sed '1d' "$expected")"
 
     set +e
-    actual_output="$("$checker" "$mechanism" "$csv" 2>&1)"
+    actual_output="$("$checker" "$mechanism" "$csv" ${companion[@]+"${companion[@]}"} 2>&1)"
     actual_exit=$?
     set -e
 

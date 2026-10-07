@@ -1486,6 +1486,7 @@ fn wfq_record(
         after: crate::WfqReplayState::of(wfq),
         queued_packets,
         paused_priorities,
+        pfc_priority: 0,
     }))
 }
 
@@ -6083,7 +6084,12 @@ impl<'image> TransitionState<'image> {
                 let egress_link = queue
                     .egress_link
                     .ok_or(ExecutionError::InvalidSchedulerState(node.id))?;
-                wfq_record(
+                let pfc_priority = if queue.pfc.is_some() {
+                    self.flow(packet.flow)?.packet_priority(packet.kind)
+                } else {
+                    0
+                };
+                let mut record = wfq_record(
                     crate::WfqTransitionKind::Enqueue,
                     key,
                     node.id,
@@ -6095,7 +6101,11 @@ impl<'image> TransitionState<'image> {
                     Some(finish),
                     Vec::new(),
                     Vec::new(),
-                )
+                );
+                if let crate::MechanismTransitionRecord::Wfq(wfq_record) = &mut record {
+                    wfq_record.pfc_priority = pfc_priority;
+                }
+                record
             }
             _ => return Ok(()),
         };

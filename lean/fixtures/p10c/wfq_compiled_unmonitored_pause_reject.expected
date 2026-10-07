@@ -1,0 +1,2 @@
+exit=1
+REJECT: line 31: WFQ select on queue (node_id=11, queue_id=0), which has no PFC monitor, claims paused priorities

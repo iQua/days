@@ -642,24 +642,35 @@ end WrrLog
 
 /-!
 The Days AGO WFQ certificate (`wfq_transitions_csv`): one row per enqueue (phase 0), service start
-(`select`, phase 2) and service completion (`complete`, phase 1) at a WFQ egress queue. The checker
-replays each queue from the initial scheduler state; every row's `before` state must equal the
-replayed state, and its `after` state, virtual start and finish tag must equal the reference
-update. It tracks the waiting packets and their tags itself, so a `select` row's queue listing must
-be exactly the waiting packets, and the served packet must be the least finish tag (earliest
-enqueue among equal tags) among the listed packets whose PFC priority is not paused. The PFC
-priority of each packet and the paused set are taken from the row (the P10c PFC rules certify the
-pause frames separately).
+(`select`, phase 2) and service completion (`complete`, phase 1) at a WFQ egress queue, and an
+`initial` row (event-key columns empty) for a queue that does not start empty and idle.
+
+The checker replays each queue from its `initial` row, or from the empty initial state; every
+row's `before` state must equal the replayed state, and its `after` state, virtual start and
+finish tag must equal the reference update. It tracks the waiting packets, their tags and their
+PFC classes itself:
+- a packet's PFC class is fixed for its lifetime: its `enqueue` row (or the `initial` row) gives
+  it, and every listing must repeat it; on a queue without a PFC monitor (`pfc_monitor = 0`) every
+  class is zero and nothing is ever paused;
+- a `select` row must list exactly the waiting packets, with their tags and classes, and serve the
+  least finish tag (the earliest enqueue among equal tags) among those whose class is not paused;
+- on a queue with a PFC monitor the paused set must be the queue's pause state in the run's PFC
+  certificate (`p10c_mechanisms_check pfc`, checked first) at the select's event key: the
+  controller sets of its `control` rows before that key, from the starting paused set of the
+  `initial` row (a priority it lists as paused has a non-empty controller set before its first
+  `control` row, every other an empty one).
 -/
 namespace WfqLog
 
 inductive Kind
+  | initial
   | enqueue
   | select
   | complete
   deriving DecidableEq, Repr
 
 def parseKind : String → Except String Kind
+  | "initial" => pure .initial
   | "enqueue" => pure .enqueue
   | "select" => pure .select
   | "complete" => pure .complete
@@ -669,8 +680,10 @@ def phase : Kind → Nat
   | .enqueue => 0
   | .complete => 1
   | .select => 2
+  | .initial => 0
 
 def kindName : Kind → String
+  | .initial => "initial"
   | .enqueue => "enqueue"
   | .select => "select"
   | .complete => "complete"
@@ -726,36 +739,53 @@ structure Row where
   queueId : Nat
   rateBps : Nat
   weights : List Nat
-  payload : Nat
-  flow : Nat
-  sizeBytes : Nat
+  pfcMonitor : Bool
+  payload : Option Nat
+  flow : Option Nat
+  sizeBytes : Option Nat
+  pfcPriority : Option Nat
   virtualStart : Option Rat
-  finish : Rat
+  finish : Option Rat
   before : Wfq.State
   queuedPackets : List QueuedPacket
   pausedPriorities : List Nat
   after : Wfq.State
   srcLine : Nat
 
+def parseKey (kind : Kind) (idx : Std.HashMap String Nat) (fields : Array String) :
+    Except String DaysExecutor.EventKey := do
+  let columns := ["time_ns", "event_phase", "event_origin_node", "event_origin_sequence"]
+  let values ← columns.mapM (getField idx fields)
+  match kind, values with
+  | .initial, values => do
+      unless values.all (· = "") do throw "an initial row has no event key"
+      pure { timeNs := 0, phase := 0, originNode := 0, originSeq := 0 }
+  | _, [timeNs, phase, originNode, originSeq] =>
+      pure
+        { timeNs := ← parseNat timeNs
+          phase := ← parseNat phase
+          originNode := ← parseNat originNode
+          originSeq := ← parseNat originSeq }
+  | _, _ => throw "invalid event key"
+
 def parseRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array String) :
     Except String Row := do
   let result : Except String Row := do
+    let kind ← parseKind (← getField idx fields "kind")
     pure
-      { key :=
-          { timeNs := ← parseNat (← getField idx fields "time_ns")
-            phase := ← parseNat (← getField idx fields "event_phase")
-            originNode := ← parseNat (← getField idx fields "event_origin_node")
-            originSeq := ← parseNat (← getField idx fields "event_origin_sequence") }
-        kind := ← parseKind (← getField idx fields "kind")
+      { key := ← parseKey kind idx fields
+        kind
         nodeId := ← parseNat (← getField idx fields "node_id")
         queueId := ← parseNat (← getField idx fields "queue_id")
         rateBps := ← parseNat (← getField idx fields "rate_bps")
         weights := ← parseNatList (← getField idx fields "weights")
-        payload := ← parseNat (← getField idx fields "payload")
-        flow := ← parseNat (← getField idx fields "flow_id")
-        sizeBytes := ← parseNat (← getField idx fields "size_bytes")
+        pfcMonitor := ← parseBit (← getField idx fields "pfc_monitor")
+        payload := ← parseOpt parseNat (← getField idx fields "payload")
+        flow := ← parseOpt parseNat (← getField idx fields "flow_id")
+        sizeBytes := ← parseOpt parseNat (← getField idx fields "size_bytes")
+        pfcPriority := ← parseOpt parseNat (← getField idx fields "pfc_priority")
         virtualStart := ← parseOpt parseRat (← getField idx fields "virtual_start")
-        finish := ← parseRat (← getField idx fields "finish_tag")
+        finish := ← parseOpt parseRat (← getField idx fields "finish_tag")
         before := ← parseState idx fields "before"
         queuedPackets := ← parseQueuedPackets (← getField idx fields "queued_packets")
         pausedPriorities := ← parseNatList (← getField idx fields "paused_priorities")
@@ -769,6 +799,7 @@ def parseRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array Strin
 structure Tagged where
   flow : Nat
   sizeBytes : Nat
+  pfcPriority : Nat
   finish : Rat
   order : Nat
   deriving Repr
@@ -777,10 +808,27 @@ structure Tagged where
 structure QueueReplay where
   rateBps : Nat
   weights : List Nat
+  pfcMonitor : Bool
   state : Wfq.State
   waiting : Std.HashMap Nat Tagged := {}
   inService : Option (Nat × Tagged) := none
   enqueued : Nat := 0
+
+/-- One PFC priority's pause state at a queue: its controller set, or paused by a set the run
+starts with and the PFC certificate has not yet named. -/
+inductive PauseState
+  | controllers (set : List Nat)
+  | pausedAtStart
+  deriving DecidableEq, Repr
+
+def PauseState.paused : PauseState → Bool
+  | .controllers set => !set.isEmpty
+  | .pausedAtStart => true
+
+/-- The replay of every WFQ queue and of the pause state of its PFC priorities. -/
+structure Replay where
+  queues : Std.HashMap (Nat × Nat) QueueReplay := {}
+  pauses : Std.HashMap (Nat × Nat × Nat) PauseState := {}
 
 def strictlyIncreasing : List Nat → Bool
   | first :: second :: rest => first < second && strictlyIncreasing (second :: rest)
@@ -789,7 +837,17 @@ def strictlyIncreasing : List Nat → Bool
 def queueLabel (row : Row) : String :=
   s!"queue (node_id={row.nodeId}, queue_id={row.queueId})"
 
-/-- The listed packets are exactly the waiting packets, with their flows, sizes and tags. -/
+def requireField (row : Row) (name : String) : Option α → Except String α
+  | some value => pure value
+  | none => throw s!"line {row.srcLine}: WFQ {kindName row.kind} row has no {name}"
+
+/-- A packet's PFC class on a queue: any class with a monitor, zero without one. -/
+def checkClass (row : Row) (monitor : Bool) (pfcPriority : Nat) : Except String Unit :=
+  require row.srcLine (pfcPriority < 8 && (monitor || pfcPriority = 0))
+    s!"WFQ PFC class {pfcPriority} on {queueLabel row}, which {if monitor then "has" else "has no"} PFC monitor"
+
+/-- The listed packets are exactly the waiting packets, with their flows, sizes, tags and classes;
+returns those whose class is not paused. -/
 def checkListing (row : Row) (queue : QueueReplay) : Except String (List Wfq.Waiting) := do
   require row.srcLine (row.queuedPackets.length = queue.waiting.size)
     s!"WFQ select lists {row.queuedPackets.length} packets; {queueLabel row} has {queue.waiting.size} waiting"
@@ -805,6 +863,8 @@ def checkListing (row : Row) (queue : QueueReplay) : Except String (List Wfq.Wai
         (tagged.flow = packet.flow && tagged.sizeBytes = packet.sizeBytes &&
           tagged.finish = packet.finish)
         s!"WFQ select lists payload {packet.payload} with a flow, size or finish tag other than its enqueue's"
+      require row.srcLine (tagged.pfcPriority = packet.pfcPriority)
+        s!"WFQ select lists payload {packet.payload} with PFC class {packet.pfcPriority}, but it was enqueued with class {tagged.pfcPriority}"
       let listed :=
         if row.pausedPriorities.contains packet.pfcPriority then listed
         else { payload := packet.payload, finish := packet.finish, order := tagged.order } :: listed
@@ -812,33 +872,50 @@ def checkListing (row : Row) (queue : QueueReplay) : Except String (List Wfq.Wai
     ((∅ : Std.HashSet Nat), ([] : List Wfq.Waiting))
   pure listed.reverse
 
-def step (queue : QueueReplay) (row : Row) : Except String QueueReplay := do
-  let classId := row.flow % row.weights.length
+/-- The paused priorities of a queue in the replayed pause state, ascending. -/
+def pausedAt (pauses : Std.HashMap (Nat × Nat × Nat) PauseState) (node queue : Nat) : List Nat :=
+  (List.range 8).filter fun priority =>
+    (pauses.getD (node, queue, priority) (.controllers [])).paused
+
+def step (pauses : Std.HashMap (Nat × Nat × Nat) PauseState) (queue : QueueReplay) (row : Row) :
+    Except String QueueReplay := do
+  let classId := (← requireField row "flow_id" row.flow) % row.weights.length
+  let payload ← requireField row "payload" row.payload
+  let flow ← requireField row "flow_id" row.flow
+  let sizeBytes ← requireField row "size_bytes" row.sizeBytes
   match row.kind with
+  | .initial => throw s!"line {row.srcLine}: a second initial row for {queueLabel row}"
   | .enqueue => do
       require row.srcLine (row.queuedPackets.isEmpty && row.pausedPriorities.isEmpty)
         "WFQ enqueue row lists queued packets or paused priorities"
+      let pfcPriority ← requireField row "pfc_priority" row.pfcPriority
+      checkClass row queue.pfcMonitor pfcPriority
       require row.srcLine
-        (!queue.waiting.contains row.payload &&
-          (queue.inService.map (·.1) != some row.payload))
-        s!"WFQ payload {row.payload} is enqueued twice"
+        (!queue.waiting.contains payload && (queue.inService.map (·.1) != some payload))
+        s!"WFQ payload {payload} is enqueued twice"
       let (after, start, finish) ←
-        Wfq.enqueue row.srcLine row.rateBps row.weights queue.state classId row.sizeBytes
+        Wfq.enqueue row.srcLine row.rateBps row.weights queue.state classId sizeBytes
           row.key.timeNs
       require row.srcLine (row.virtualStart = some start) "WFQ virtual start mismatch"
-      require row.srcLine (row.finish = finish) "WFQ finish tag mismatch"
+      require row.srcLine (row.finish = some finish) "WFQ finish tag mismatch"
       require row.srcLine (row.after = after) "WFQ enqueue after-state mismatch"
       pure
         { queue with
           state := after
           waiting :=
-            queue.waiting.insert row.payload
-              { flow := row.flow, sizeBytes := row.sizeBytes, finish, order := queue.enqueued }
+            queue.waiting.insert payload
+              { flow, sizeBytes, pfcPriority, finish, order := queue.enqueued }
           enqueued := queue.enqueued + 1 }
   | .select => do
-      require row.srcLine (row.virtualStart.isNone) "WFQ select row has a virtual start"
+      require row.srcLine (row.virtualStart.isNone && row.pfcPriority.isNone)
+        "WFQ select row has a virtual start or a PFC class column"
       require row.srcLine (strictlyIncreasing row.pausedPriorities)
         "WFQ paused priorities must be strictly increasing"
+      let paused := pausedAt pauses row.nodeId row.queueId
+      require row.srcLine (queue.pfcMonitor || row.pausedPriorities.isEmpty)
+        s!"WFQ select on {queueLabel row}, which has no PFC monitor, claims paused priorities"
+      require row.srcLine (row.pausedPriorities = paused)
+        s!"WFQ select claims paused priorities {row.pausedPriorities}; the PFC certificate pauses {paused} on {queueLabel row}"
       require row.srcLine (queue.inService.isNone)
         s!"WFQ select while {queueLabel row} is transmitting"
       require row.srcLine (row.after = queue.state) "WFQ select changes the scheduler state"
@@ -847,40 +924,40 @@ def step (queue : QueueReplay) (row : Row) : Except String QueueReplay := do
         match Wfq.least eligible with
         | none => throw s!"line {row.srcLine}: WFQ select with no eligible packet"
         | some served => pure served
-      require row.srcLine (served.payload = row.payload)
-        s!"WFQ served payload {row.payload}, but the least finish tag among the eligible packets is payload {served.payload}"
+      require row.srcLine (served.payload = payload)
+        s!"WFQ served payload {payload}, but the least finish tag among the eligible packets is payload {served.payload}"
       let tagged ←
-        match queue.waiting.get? row.payload with
-        | none => throw s!"line {row.srcLine}: WFQ served payload {row.payload} is not waiting"
+        match queue.waiting.get? payload with
+        | none => throw s!"line {row.srcLine}: WFQ served payload {payload} is not waiting"
         | some tagged => pure tagged
       require row.srcLine
-        (tagged.flow = row.flow && tagged.sizeBytes = row.sizeBytes && tagged.finish = row.finish)
+        (tagged.flow = flow && tagged.sizeBytes = sizeBytes && some tagged.finish = row.finish)
         "WFQ served packet differs from its enqueue"
       pure
         { queue with
-          waiting := queue.waiting.erase row.payload
-          inService := some (row.payload, tagged) }
+          waiting := queue.waiting.erase payload
+          inService := some (payload, tagged) }
   | .complete => do
       require row.srcLine
-        (row.virtualStart.isNone && row.queuedPackets.isEmpty && row.pausedPriorities.isEmpty)
-        "WFQ complete row has a virtual start, queued packets or paused priorities"
+        (row.virtualStart.isNone && row.pfcPriority.isNone && row.queuedPackets.isEmpty &&
+          row.pausedPriorities.isEmpty)
+        "WFQ complete row has a virtual start, a PFC class, queued packets or paused priorities"
       let tagged ←
         match queue.inService with
-        | some (payload, tagged) =>
-            if payload = row.payload then pure tagged
-            else throw s!"line {row.srcLine}: WFQ completes payload {row.payload}, but payload {payload} is in service"
-        | none => throw s!"line {row.srcLine}: WFQ completes payload {row.payload} with nothing in service"
+        | some (inService, tagged) =>
+            if inService = payload then pure tagged
+            else throw s!"line {row.srcLine}: WFQ completes payload {payload}, but payload {inService} is in service"
+        | none => throw s!"line {row.srcLine}: WFQ completes payload {payload} with nothing in service"
       require row.srcLine
-        (tagged.flow = row.flow && tagged.sizeBytes = row.sizeBytes && tagged.finish = row.finish)
+        (tagged.flow = flow && tagged.sizeBytes = sizeBytes && some tagged.finish = row.finish)
         "WFQ completed packet differs from its enqueue"
       let after ←
         Wfq.complete row.srcLine row.rateBps row.weights queue.state classId row.key.timeNs
       require row.srcLine (row.after = after) "WFQ complete after-state mismatch"
       pure { queue with state := after, inService := none }
 
-def checkRow (queues : Std.HashMap (Nat × Nat) QueueReplay) (row : Row) :
-    Except String (Std.HashMap (Nat × Nat) QueueReplay) := do
-  require row.srcLine (row.key.phase = phase row.kind)
+def checkShape (row : Row) : Except String Unit := do
+  require row.srcLine (row.key.phase = phase row.kind || row.kind = .initial)
     s!"WFQ {kindName row.kind} row must have phase {phase row.kind}"
   let classCount := row.weights.length
   require row.srcLine (classCount > 0 && row.weights.all (· > 0))
@@ -890,15 +967,104 @@ def checkRow (queues : Std.HashMap (Nat × Nat) QueueReplay) (row : Row) :
     (row.before.finishTimes.length = classCount && row.before.activePackets.length = classCount &&
       row.after.finishTimes.length = classCount && row.after.activePackets.length = classCount)
     "WFQ state vector length mismatch"
+
+/-- A queue's starting state: its waiting packets in queue order and its in-service packet, whose
+counts by class must be the active counts, and its starting paused priorities. -/
+def checkInitial (replay : Replay) (row : Row) : Except String Replay := do
+  checkShape row
   let id := (row.nodeId, row.queueId)
-  let queue :=
-    queues.getD id { rateBps := row.rateBps, weights := row.weights, state := Wfq.initial classCount }
-  require row.srcLine (queue.rateBps = row.rateBps && queue.weights = row.weights)
+  require row.srcLine (!replay.queues.contains id) s!"two initial rows for {queueLabel row}"
+  require row.srcLine (row.before = row.after) "WFQ initial row changes its state"
+  require row.srcLine (row.virtualStart.isNone) "WFQ initial row has a virtual start"
+  require row.srcLine (strictlyIncreasing row.pausedPriorities && row.pausedPriorities.all (· < 8))
+    "WFQ paused priorities must be strictly increasing PFC priorities"
+  require row.srcLine (row.pfcMonitor || row.pausedPriorities.isEmpty)
+    s!"WFQ initial row of {queueLabel row}, which has no PFC monitor, claims paused priorities"
+  let inService ← match row.payload with
+    | none => do
+        require row.srcLine
+          (row.flow.isNone && row.sizeBytes.isNone && row.pfcPriority.isNone && row.finish.isNone)
+          "WFQ initial row describes an in-service packet without its payload"
+        pure none
+    | some payload => do
+        let tagged : Tagged :=
+          { flow := ← requireField row "flow_id" row.flow
+            sizeBytes := ← requireField row "size_bytes" row.sizeBytes
+            pfcPriority := ← requireField row "pfc_priority" row.pfcPriority
+            finish := ← requireField row "finish_tag" row.finish
+            order := 0 }
+        checkClass row row.pfcMonitor tagged.pfcPriority
+        pure (some (payload, tagged))
+  let (waiting, enqueued) ← row.queuedPackets.foldlM
+    (fun (waiting, order) (packet : QueuedPacket) => do
+      require row.srcLine
+        (!waiting.contains packet.payload && (inService.map (·.1) != some packet.payload))
+        s!"WFQ initial row lists payload {packet.payload} twice"
+      checkClass row row.pfcMonitor packet.pfcPriority
+      pure
+        (waiting.insert packet.payload
+          { flow := packet.flow
+            sizeBytes := packet.sizeBytes
+            pfcPriority := packet.pfcPriority
+            finish := packet.finish
+            order : Tagged },
+          order + 1))
+    ((∅ : Std.HashMap Nat Tagged), 0)
+  let classCount := row.weights.length
+  let held := (inService.map (·.2.flow)).toList ++ row.queuedPackets.map (·.flow)
+  let counts := (List.range classCount).map fun classId =>
+    (held.filter (· % classCount = classId)).length
+  require row.srcLine (counts = row.after.activePackets)
+    s!"WFQ initial row of {queueLabel row}: its packets by class {counts} are not its active counts"
+  let pauses := row.pausedPriorities.foldl
+    (fun pauses priority => pauses.insert (row.nodeId, row.queueId, priority) .pausedAtStart)
+    replay.pauses
+  pure
+    { queues :=
+        replay.queues.insert id
+          { rateBps := row.rateBps
+            weights := row.weights
+            pfcMonitor := row.pfcMonitor
+            state := row.after
+            waiting
+            inService
+            enqueued }
+      pauses }
+
+/-- Applies one `control` row of the PFC certificate to a WFQ queue's pause state. -/
+def applyControl (monitors : Std.HashMap (Nat × Nat) Bool) (replay : Replay) (control : PfcLog.Row) :
+    Except String Replay := do
+  match monitors.get? (control.nodeId, control.queueId) with
+  | none => pure replay
+  | some false =>
+      throw s!"pfc line {control.srcLine}: a PFC control row for WFQ queue (node_id={control.nodeId}, queue_id={control.queueId}), which has no PFC monitor"
+  | some true =>
+      let id := (control.nodeId, control.queueId, control.priority)
+      match replay.pauses.getD id (.controllers []) with
+      | .controllers set =>
+          require control.srcLine (set = control.beforeControllers)
+            s!"pfc: controllers {control.beforeControllers} before this row, but the WFQ queue's pause state holds {set}"
+      | .pausedAtStart =>
+          require control.srcLine (!control.beforeControllers.isEmpty)
+            "pfc: the WFQ initial row starts this priority paused, but no controller pauses it"
+      pure { replay with pauses := replay.pauses.insert id (.controllers control.afterControllers) }
+
+def checkRow (monitors : Std.HashMap (Nat × Nat) Bool) (replay : Replay) (row : Row) :
+    Except String Replay := do
+  checkShape row
+  let id := (row.nodeId, row.queueId)
+  let queue := replay.queues.getD id
+    { rateBps := row.rateBps
+      weights := row.weights
+      pfcMonitor := monitors.getD id false
+      state := Wfq.initial row.weights.length }
+  require row.srcLine
+    (queue.rateBps = row.rateBps && queue.weights = row.weights && queue.pfcMonitor = row.pfcMonitor)
     s!"WFQ config discontinuity for {queueLabel row}"
   require row.srcLine (row.before = queue.state)
     s!"WFQ state discontinuity for {queueLabel row}"
-  let queue ← step queue row
-  pure (queues.insert id queue)
+  let queue ← step replay.pauses queue row
+  pure { replay with queues := replay.queues.insert id queue }
 
 def canonicalize (rows : List Row) : Except String (List Row) := do
   let sorted := rows.toArray.qsort (fun a b => decide (a.key < b.key)) |>.toList
@@ -910,10 +1076,36 @@ def canonicalize (rows : List Row) : Except String (List Row) := do
   check sorted
   pure sorted
 
-def checkRows (rows : List Row) : Except String Unit := do
-  let rows ← canonicalize rows
-  let _ ← rows.foldlM checkRow {}
-  pure ()
+/-- Replays `rows`, joining every queue with a PFC monitor to `pfc`, the run's PFC certificate. -/
+def checkRows (rows : List Row) (pfc : Option (List PfcLog.Row)) : Except String Unit := do
+  let initial := rows.filter (·.kind = .initial)
+  let events ← canonicalize (rows.filter (·.kind != .initial))
+  let monitors ← rows.foldlM
+    (fun (monitors : Std.HashMap (Nat × Nat) Bool) row => do
+      let id := (row.nodeId, row.queueId)
+      require row.srcLine (monitors.getD id row.pfcMonitor = row.pfcMonitor)
+        s!"WFQ config discontinuity for {queueLabel row}"
+      pure (monitors.insert id row.pfcMonitor))
+    {}
+  let controls ← match pfc with
+    | none => do
+        match rows.find? (·.pfcMonitor) with
+        | some row =>
+            throw s!"line {row.srcLine}: {queueLabel row} has a PFC monitor: pass the run's PFC certificate"
+        | none => pure []
+    | some pfcRows => do
+        PfcLog.checkRows pfcRows
+        let sorted ← PfcLog.canonicalize pfcRows
+        pure (sorted.filter (·.kind = .control))
+  let replay ← initial.foldlM checkInitial {}
+  let rec go (replay : Replay) (controls : List PfcLog.Row) : List Row → Except String Unit
+    | [] => pure ()
+    | row :: rest => do
+        let (due, later) := controls.span (fun control => decide (control.key < row.key))
+        let replay ← due.foldlM (applyControl monitors) replay
+        let replay ← checkRow monitors replay row
+        go replay later rest
+  go replay controls events
 
 def parseCsv (content : String) : Except String (List Row) :=
   parseRows content parseRow

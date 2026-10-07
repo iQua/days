@@ -13,7 +13,8 @@
 //! and three workers must equal Scalar on every one of those runs.
 //!
 //! P16 L2 re-recorded the SP and WFQ anchors when their full-observation runs gained the Static
-//! Priority and WFQ certificate records (`MechanismTransitionRecord::Sp` and `::Wfq`). With those
+//! Priority and WFQ certificate records (`MechanismTransitionRecord::Sp` and `::Wfq`), and the WFQ
+//! anchors again when its enqueue records gained the packet's PFC class (fix round 1). With those
 //! records removed, every run still fingerprints to the `6454583` anchors (evidence:
 //! `days-gpu/evidence/P16/lgci/tooling/zz_lgci_anchor_check.rs`).
 //!
@@ -58,14 +59,14 @@ const ANCHORS: [(&str, &[(u64, u64)]); 5] = [
     (
         "WFQ",
         &[
-            (10_941_051, 0x98c9_23c7_20b7_17bb),
-            (10_236_605, 0x7960_d9d9_e849_c7b6),
-            (9_335_491, 0xac22_6b91_20ab_15b6),
-            (8_111_418, 0x1f84_342e_eade_a2bc),
-            (6_579_837, 0xaedc_8713_aa8d_ed01),
-            (5_011_238, 0x62f8_2476_a5a9_24f6),
-            (3_404_755, 0x9b89_0d3e_6252_fc20),
-            (1_807_370, 0x514e_0c69_3e09_35dc),
+            (10_993_449, 0xd7ee_fc98_2422_a827),
+            (10_281_951, 0x14df_4d06_7ced_3e60),
+            (9_374_113, 0x0ff0_b5cd_91cd_546e),
+            (8_142_865, 0x3c29_adea_e5c2_37ca),
+            (6_604_027, 0xefec_9dbf_5df8_f6c2),
+            (5_029_073, 0x61c6_bfb8_dcf7_fe81),
+            (3_416_317, 0xb70a_ae8d_b909_6ba6),
+            (1_813_110, 0x6f0c_43b7_7e76_c541),
         ],
     ),
     (

@@ -7,12 +7,20 @@ namespace LeanGuard.Sp.Semantics
 
 open LeanGuard.Shared
 
-/-- Executor SP certificate transitions. -/
+/-- Executor SP certificate transitions, and the starting state of a run resumed from a checkpoint:
+a packet waiting (`initialQueued`, in queue order) or in service (`initialInService`, with the time
+its transmission completes). -/
 inductive Kind
     | enqueue
     | schedule
     | depart
+    | initialQueued
+    | initialInService
 deriving DecidableEq, Repr
+
+def Kind.isInitial : Kind → Bool
+    | .initialQueued | .initialInService => true
+    | _ => false
 
 /-- One fully observed executor SP transition. -/
 structure Event where
@@ -64,6 +72,8 @@ def expectedPhase : Kind → Nat
     | .enqueue => 0
     | .depart => 1
     | .schedule => 2
+    | .initialQueued => 0
+    | .initialInService => 0
 
 def ensureClassConfig (lineNo : Nat) (st : SchedulerState) (e : Event) :
     Except String SchedulerState := do
@@ -167,8 +177,28 @@ def stepDepart (lineNo : Nat) (st : SchedulerState) (e : Event) :
         s!"departure_time_ns mismatch (scheduled at line {pending.scheduleLine})"
     pure { st with pending := none }
 
+/-- The starting in-service packet: pending until its transmission completes. -/
+def stepInitialInService (lineNo : Nat) (st : SchedulerState) (e : Event) :
+    Except String SchedulerState := do
+    let departure ← requireSome lineNo "departure_time_ns" e.departureTimeNs
+    match st.pending with
+    | some _ => throw s!"line {lineNo}: two initial in-service packets"
+    | none => pure ()
+    let key := packetKey e.flowId e.packetId
+    require lineNo (!queueContains key st.queue) "initial in-service packet is also queued"
+    pure
+        { st with
+          pending :=
+            some
+                { key
+                  classId := e.classId
+                  priority := e.priority
+                  sizeBytes := e.sizeBytes
+                  departureTimeNs := departure
+                  scheduleLine := lineNo } }
+
 def step (lineNo : Nat) (g : Global) (e : Event) : Except String Global := do
-    require lineNo (e.key.phase = expectedPhase e.kind)
+    require lineNo (e.kind.isInitial || e.key.phase = expectedPhase e.kind)
         s!"event_phase mismatch: got {e.key.phase}, expected {expectedPhase e.kind}"
     let st0 := g.schedulers.getD e.schedulerId {}
     let st1 ← ensureClassConfig lineNo st0 e
@@ -177,6 +207,8 @@ def step (lineNo : Nat) (g : Global) (e : Event) : Except String Global := do
         | .enqueue => stepEnqueue lineNo st1 e
         | .schedule => stepSchedule lineNo st1 e
         | .depart => stepDepart lineNo st1 e
+        | .initialQueued => stepEnqueue lineNo st1 e
+        | .initialInService => stepInitialInService lineNo st1 e
     pure { g with schedulers := g.schedulers.insert e.schedulerId st' }
 
 end LeanGuard.Sp.Semantics

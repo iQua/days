@@ -1,0 +1,2 @@
+exit=1
+REJECT: line 197: WFQ select lists payload 163 with PFC class 3, but it was enqueued with class 0

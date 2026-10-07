@@ -44,16 +44,25 @@ def parseKind (s : String) : Except String Kind :=
     | "enqueue" => pure .enqueue
     | "schedule" => pure .schedule
     | "depart" => pure .depart
+    | "initial_queued" => pure .initialQueued
+    | "initial_in_service" => pure .initialInService
     | other => throw s!"invalid kind: {other}"
+
+/-- An event row's key field; an initial row has none. -/
+def parseKeyField (kind : Kind) (value : String) : Except String Nat :=
+    if kind.isInitial then
+        if value = "" then pure 0 else throw "an initial row has no event key"
+    else
+        parseNat value
 
 def parseRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array String) :
     Except String Row := do
     let res : Except String Row := do
-        let timeNs ← parseNat (← getField idx fields "time_ns")
-        let eventPhase ← parseNat (← getField idx fields "event_phase")
-        let originNode ← parseNat (← getField idx fields "origin_node")
-        let originSeq ← parseNat (← getField idx fields "origin_seq")
         let kind ← parseKind (← getField idx fields "kind")
+        let timeNs ← parseKeyField kind (← getField idx fields "time_ns")
+        let eventPhase ← parseKeyField kind (← getField idx fields "event_phase")
+        let originNode ← parseKeyField kind (← getField idx fields "origin_node")
+        let originSeq ← parseKeyField kind (← getField idx fields "origin_seq")
         let schedulerId ← parseNat (← getField idx fields "scheduler_id")
         let classCount ← parseNat (← getField idx fields "class_count")
         let packetId ← parseNat (← getField idx fields "packet_id")
@@ -156,6 +165,7 @@ def recordCover (coverage : CoverageState) (g : Global) (r : Row) : CoverageStat
                 coverage
         if st.queue.length = 1 then covHit coverage "queue_drained" else coverage
     | .depart => covHit coverage "depart"
+    | .initialQueued | .initialInService => coverage
 
 structure ReplayState where
     g : Global := {}
@@ -178,41 +188,58 @@ def traceSpec : TraceSpec :=
 def observeCoverage (coverage : CoverageState) (state : ReplayState) (row : Row) : CoverageState :=
     recordCover coverage state.g row
 
-def replayCanonicalRowsWithCoverage (rows : List Row) (coverage : CoverageState) :
+def replayCanonicalRowsWithCoverage (start : ReplayState) (rows : List Row)
+    (coverage : CoverageState) :
     Except (String × CoverageState) (ReplayState × CoverageState) :=
-    TraceSpec.replayWithObserverM traceSpec observeCoverage traceSpec.init rows coverage
+    TraceSpec.replayWithObserverM traceSpec observeCoverage start rows coverage
 
-theorem replayCanonicalRowsWithCoverage_sound {rows : List Row} {coverage : CoverageState}
-    {state : ReplayState} {coverage' : CoverageState} :
-    replayCanonicalRowsWithCoverage rows coverage = .ok (state, coverage') →
-      TraceSpec.Replay traceSpec traceSpec.init rows state := by
+theorem replayCanonicalRowsWithCoverage_sound {start : ReplayState} {rows : List Row}
+    {coverage : CoverageState} {state : ReplayState} {coverage' : CoverageState} :
+    replayCanonicalRowsWithCoverage start rows coverage = .ok (state, coverage') →
+      TraceSpec.Replay traceSpec start rows state := by
     intro h
     exact TraceSpec.replayWithObserverM_sound traceSpec observeCoverage h
 
+/-- The starting state of a run resumed from a checkpoint: its `initial_queued` and
+`initial_in_service` rows, applied in file order to the empty state. -/
+def startState (rows : List Row) : Except String ReplayState := do
+    let g ← (rows.filter (·.kind.isInitial)).foldlM
+        (fun g row => step row.srcLine g (toEvent row)) ({} : Global)
+    pure { g }
+
 def checkRowsWithCoverage (rows : List Row) : CheckOutcome :=
-    match canonicalizeRows rows with
+    match startState rows with
     | .error error => .error (error, {})
-    | .ok sorted =>
-        match replayCanonicalRowsWithCoverage sorted {} with
-        | .error error => .error error
-        | .ok (_, coverage) => .ok coverage
+    | .ok start =>
+        match canonicalizeRows (rows.filter (!·.kind.isInitial)) with
+        | .error error => .error (error, {})
+        | .ok sorted =>
+            match replayCanonicalRowsWithCoverage start sorted {} with
+            | .error error => .error error
+            | .ok (_, coverage) => .ok coverage
 
 theorem checkRowsWithCoverage_sound {rows : List Row} {coverage : CoverageState} :
     checkRowsWithCoverage rows = .ok coverage →
-      ∃ sorted state,
-        canonicalizeRows rows = .ok sorted ∧
-        TraceSpec.Replay traceSpec traceSpec.init sorted state := by
+      ∃ start sorted state,
+        startState rows = .ok start ∧
+        canonicalizeRows (rows.filter (!·.kind.isInitial)) = .ok sorted ∧
+        TraceSpec.Replay traceSpec start sorted state := by
     intro h
     unfold checkRowsWithCoverage at h
-    cases hcanon : canonicalizeRows rows with
-    | error error => simp [hcanon] at h
-    | ok sorted =>
-        simp [hcanon] at h
-        cases hrun : replayCanonicalRowsWithCoverage sorted {} with
-        | error error => simp [hrun] at h
-        | ok pair =>
-            rcases pair with ⟨state, coverage'⟩
-            simp [hrun] at h
-            exact ⟨sorted, state, by simp, replayCanonicalRowsWithCoverage_sound hrun⟩
+    cases hstart : startState rows with
+    | error error => simp [hstart] at h
+    | ok start =>
+        simp [hstart] at h
+        cases hcanon : canonicalizeRows (rows.filter (!·.kind.isInitial)) with
+        | error error => simp [hcanon] at h
+        | ok sorted =>
+            simp [hcanon] at h
+            cases hrun : replayCanonicalRowsWithCoverage start sorted {} with
+            | error error => simp [hrun] at h
+            | ok pair =>
+                rcases pair with ⟨state, coverage'⟩
+                simp [hrun] at h
+                exact ⟨start, sorted, state, rfl, rfl,
+                    replayCanonicalRowsWithCoverage_sound hrun⟩
 
 end LeanGuard.SpEventLog
