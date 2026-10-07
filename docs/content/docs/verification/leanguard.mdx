@@ -247,7 +247,11 @@ by `elapsed_ns * rate_bps / (10^9 * W)` over the active classes' weight sum `W`.
   that class's finish tag.
 
 Each row's `before` state must equal the queue's replayed state (the first row's, the initial
-state), and its `after` state the reference update. These are the rules of the legacy `wfq_check`
+state), and its `after` state the reference update. The executor records each transition's
+`after` state from its own scheduler, after the event; `wfq_transitions_csv` writes `before` as
+the queue's state after its previous row (all zero before the first) and a completion's finish
+tag as its packet's at selection. A change to the scheduler between two rows would therefore show
+in the second row's `after`, which the checker recomputes. These are the rules of the legacy `wfq_check`
 (Demers, Keshav and Shenker, with the same idle resets) up to the rate normalization; `wfq_check`
 still certifies `days-legacy`. The checker trusts each packet's PFC class and the paused set; the
 P10c PFC rules check the pause frames separately.

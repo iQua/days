@@ -1,5 +1,6 @@
 //! Stable exact-integer certificates for stateful mechanism replay.
 
+use std::collections::BTreeMap;
 use std::fmt::{self, Write};
 
 use crate::{
@@ -168,7 +169,12 @@ pub struct WfqQueuedPacket {
 }
 
 /// One exact WFQ transition of a switch egress queue (P16 L2; the `wfq` mode of LeanGuard's
-/// `p10c_mechanisms_check`).
+/// `p10c_mechanisms_check`), recorded after the event from the executor's state.
+///
+/// The record carries the state after the transition only: the scheduler changes only at these
+/// transitions, so [`wfq_transitions_csv`] writes each row's `before` state as the queue's state
+/// after its previous row (the initial state, all zero, for its first). A change made between two
+/// rows would show in the second row's `after`, which the checker recomputes from `before`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WfqTransitionRecord {
     pub key: EventKey,
@@ -182,11 +188,12 @@ pub struct WfqTransitionRecord {
     pub packet: SchedulerPacket,
     /// The enqueued packet's virtual start, `max(virtual time, its class's last finish tag)`.
     pub virtual_start: Option<ExactRational>,
-    /// The packet's finish tag.
-    pub finish: ExactRational,
-    pub before: WfqReplayState,
+    /// The packet's finish tag; `None` at a completion, whose tag the executor has dropped (the
+    /// CSV writes the tag of the packet's selection).
+    pub finish: Option<ExactRational>,
     pub after: WfqReplayState,
-    /// At a selection: every packet waiting before it, the served one included, in queue order.
+    /// At a selection: every packet waiting before it, the served one first and then the rest in
+    /// queue order.
     pub queued_packets: Vec<WfqQueuedPacket>,
     /// At a selection: the PFC priorities paused at the queue's egress, ascending.
     pub paused_priorities: Vec<u8>,
@@ -1241,7 +1248,9 @@ pub fn wrr_transitions_csv(
 /// The WFQ certificate: one row per enqueue, service start and service completion at a WFQ
 /// egress queue, in canonical event-key order (one row per event). Exact rationals are written
 /// `numerator/denominator` in lowest terms; lists are `;`-separated; a queued packet is
-/// `payload:flow:size_bytes:pfc_priority:finish`.
+/// `payload:flow:size_bytes:pfc_priority:finish`. A row's `before` state is its queue's state
+/// after the previous row (all zero before the first), and a completion's finish tag is its
+/// packet's at selection (see [`WfqTransitionRecord`]).
 pub fn wfq_transitions_csv(
     records: &[MechanismTransitionRecord],
 ) -> Result<String, MechanismTraceError> {
@@ -1258,7 +1267,34 @@ pub fn wfq_transitions_csv(
     let mut csv = String::from(
         "time_ns,event_phase,event_origin_node,event_origin_sequence,kind,node_id,queue_id,rate_bps,weights,payload,flow_id,size_bytes,virtual_start,finish_tag,before_virtual_time,before_last_updated_ns,before_finish_tags,before_active_packets,queued_packets,paused_priorities,after_virtual_time,after_last_updated_ns,after_finish_tags,after_active_packets\n",
     );
+    // Each queue's state after its latest row, and its served packets' finish tags.
+    let mut states = BTreeMap::<(NodeId, u64), WfqReplayState>::new();
+    let mut served = BTreeMap::<(NodeId, u64, PayloadId), ExactRational>::new();
     for record in records {
+        let queue = (record.node, record.queue_id);
+        let before = states
+            .insert(queue, record.after.clone())
+            .unwrap_or_else(|| {
+                let zero = ExactRational::from_integer(0_u8.into());
+                WfqReplayState {
+                    virtual_time: zero.clone(),
+                    last_updated_ns: 0,
+                    finish_times: vec![zero; record.weights.len()],
+                    active_packets: vec![0; record.weights.len()],
+                }
+            });
+        let served_key = (record.node, record.queue_id, record.packet.payload);
+        let finish = match record.kind {
+            WfqTransitionKind::Select => {
+                let finish = record.finish.clone();
+                if let Some(tag) = &finish {
+                    served.insert(served_key, tag.clone());
+                }
+                finish
+            }
+            WfqTransitionKind::Complete => served.remove(&served_key),
+            WfqTransitionKind::Enqueue => record.finish.clone(),
+        };
         let kind = match record.kind {
             WfqTransitionKind::Enqueue => "enqueue",
             WfqTransitionKind::Select => "select",
@@ -1300,11 +1336,11 @@ pub fn wfq_transitions_csv(
             record.packet.flow.0,
             record.packet.size_bytes,
             record.virtual_start.as_ref().map_or_else(String::new, rational),
-            rational(&record.finish),
-            rational(&record.before.virtual_time),
-            record.before.last_updated_ns,
-            rationals(&record.before.finish_times),
-            naturals(&record.before.active_packets),
+            finish.as_ref().map_or_else(String::new, rational),
+            rational(&before.virtual_time),
+            before.last_updated_ns,
+            rationals(&before.finish_times),
+            naturals(&before.active_packets),
             rational(&record.after.virtual_time),
             record.after.last_updated_ns,
             rationals(&record.after.finish_times),
