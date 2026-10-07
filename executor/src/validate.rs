@@ -1193,15 +1193,7 @@ fn derived_pfc_max_frame_bytes(
 }
 
 fn validate_pfc(image: &SimulationImage) -> Result<BTreeSet<usize>, ValidationError> {
-    // Every controlled link, for the frame bounds, which one pass computes on first need.
-    let controlled_links = image
-        .switch_states
-        .iter()
-        .flat_map(|state| &state.queues)
-        .filter_map(|queue| queue.pfc.as_ref())
-        .flat_map(|pfc| &pfc.ingresses)
-        .map(|ingress| ingress.controlled_link)
-        .collect::<BTreeSet<_>>();
+    // Each controlled link's frame bound, computed for every link at the first monitor.
     let mut frame_bounds: Option<BTreeMap<LinkId, [u64; 8]>> = None;
     let mut control_lanes = BTreeSet::new();
     let mut controller_monitors = BTreeSet::<(LinkId, NodeId)>::new();
@@ -1312,6 +1304,15 @@ fn validate_pfc(image: &SimulationImage) -> Result<BTreeSet<usize>, ValidationEr
                     )));
                 }
                 if frame_bounds.is_none() {
+                    // Every controlled link, bounded in one pass at the first monitor.
+                    let controlled_links = image
+                        .switch_states
+                        .iter()
+                        .flat_map(|state| &state.queues)
+                        .filter_map(|queue| queue.pfc.as_ref())
+                        .flat_map(|pfc| &pfc.ingresses)
+                        .map(|ingress| ingress.controlled_link)
+                        .collect::<BTreeSet<_>>();
                     frame_bounds = Some(derived_pfc_max_frame_bytes(image, &controlled_links)?);
                 }
                 let reachable_frame_bytes = frame_bounds
@@ -7022,6 +7023,43 @@ struct FutureWork {
     pfc_by_channel: Vec<u64>,
 }
 
+/// The flows whose route (data) or reverse route (feedback) enters each PFC controller through
+/// its controlled link, by monitor `(controlled link, controller)`, each list in flow order: one
+/// pass over the routes instead of one pass over every flow per monitor (P16 H3 part 2B).
+fn pfc_entering_flows(
+    image: &SimulationImage,
+) -> BTreeMap<(LinkId, NodeId), (Vec<usize>, Vec<usize>)> {
+    let mut entering = image
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::Switch)
+        .flat_map(|owner| {
+            image.switch_states[owner.state_slot as usize]
+                .queues
+                .iter()
+                .filter_map(|queue| queue.pfc.as_ref())
+                .flat_map(|pfc| &pfc.ingresses)
+                .map(move |ingress| ((ingress.controlled_link, owner.id), Default::default()))
+        })
+        .collect::<BTreeMap<_, (Vec<usize>, Vec<usize>)>>();
+    for (index, flow) in image.flows.iter().enumerate() {
+        for (route, data) in [(&flow.route, true), (&flow.reverse_route, false)] {
+            for pair in route.windows(2) {
+                let Some(lists) =
+                    link(image, pair[1]).and_then(|next| entering.get_mut(&(pair[0], next.source)))
+                else {
+                    continue;
+                };
+                let list = if data { &mut lists.0 } else { &mut lists.1 };
+                if list.last() != Some(&index) {
+                    list.push(index);
+                }
+            }
+        }
+    }
+    entering
+}
+
 fn future_work(
     image: &SimulationImage,
     flow_index: &FlowIndex,
@@ -7085,24 +7123,8 @@ fn future_work(
     // Grouped after the counting loop above so that a resident whose flow is outside the dense
     // table still reaches that loop's direct index first, exactly as before.
     let resident_groups = ResidentFlowGroups::build(image, &resident_packets);
-    // The flows whose route (data) or reverse route (feedback) enters each PFC controller through
-    // each controlled link, by `(controlled link, controller)`, in flow order: one pass over the
-    // routes instead of one pass over every flow per monitor (P16 H3 part 2B).
-    let mut entering = BTreeMap::<(LinkId, NodeId), (Vec<usize>, Vec<usize>)>::new();
-    for (index, flow) in image.flows.iter().enumerate() {
-        for (route, data) in [(&flow.route, true), (&flow.reverse_route, false)] {
-            for pair in route.windows(2) {
-                let Some(next) = link(image, pair[1]) else {
-                    continue;
-                };
-                let lists = entering.entry((pair[0], next.source)).or_default();
-                let list = if data { &mut lists.0 } else { &mut lists.1 };
-                if list.last() != Some(&index) {
-                    list.push(index);
-                }
-            }
-        }
-    }
+    // Built at the first PFC monitor, so an image without one never builds it.
+    let mut entering = None;
     let mut pfc_by_node = vec![0_u64; image.nodes.len()];
     let mut pfc_by_channel = vec![0_u64; image.channels.len()];
     for owner in image
@@ -7123,6 +7145,7 @@ fn future_work(
         {
             let mut controller_frames = 0_u64;
             let (data_flows, feedback_flows) = entering
+                .get_or_insert_with(|| pfc_entering_flows(image))
                 .get(&(ingress.controlled_link, owner.id))
                 .map_or((&[][..], &[][..]), |(data, feedback)| {
                     (data.as_slice(), feedback.as_slice())
