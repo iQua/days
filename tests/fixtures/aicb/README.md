@@ -16,7 +16,11 @@ Reduced traces (generated with the vendored AICB; command in
 |---|---|---|
 | `reduced-dense-w32-tp8-pp2.txt` | `b5c96935c6455dec3bc84ee18efca38b671927639d68fe7db50f33bea7241cca` | GPT-like, 4 layers (2 per stage), hidden 256, seq 128, 32 GPUs, TP8, PP2, gbs 2 |
 | `reduced-moe-w32-tp2-ep8.txt` | `af3236ebcfffa1003747385a40aef9c7df03fae94f9d29fb2ab8aefd4498047b` | MoE, 2 layers, hidden 128, seq 128, 16 experts, top-2, 32 GPUs, TP2, EP8, gbs 16 |
+| `reduced-moe-w256-tp2-ep8.txt` | `7943e9ad611933c2dd87af4c6fd9ca95ebbec98e791a4dfb3ef4cba3c816ff7e` | The same MoE model at 256 GPUs, gbs 128 (the large size of `host_scaling_budget`'s AICB PFC case) |
 
 Scenarios (`[workload.aicb]`, design note §5): `b4-simai.toml` (SimAI's b4 run on its 128g
 file), `reduced-dense-simai.toml` (a 32-GPU, two-segment rail), `smoke-simai.toml` (the MoE
-smoke on the 128g file; lowering it waits for host-matched `after`, ruling C1).
+smoke on the 128g file), `reduced-moe-simai.toml` (the reduced MoE trace on a 32-GPU,
+two-segment rail), `reduced-moe-imbalanced.toml` (the same under the Megatron fidelity with
+imbalanced expert routing) and `reduced-moe-w256-simai.toml` (the 256-GPU reduced MoE trace on a
+sixteen-segment rail).
