@@ -272,7 +272,9 @@ impl MechanismTransitionRecord {
 /// `cause_collective_id`, a stage-notify cause's collective, empty for any other cause; and
 /// `target_node`, the host the row's stage delivers to (a compute stage's own host), which binds
 /// every stage that names it as an inbound predecessor to that host (the sendrecv-cert lane: a
-/// Send/Recv's receiver has no stage of its own to place it).
+/// Send/Recv's receiver has no stage of its own to place it); and `cause_target_node`, the host
+/// the cause flow is delivered to (a compute cause's own host), which records an ungated root's
+/// delivery host on the rows it causes, since it logs no row of its own (fix round 2).
 ///
 /// P16 H1 fix round 2 (review N1): a stage notify is delay-only, delivered exactly its delay `d`
 /// (its timer's lead plus its lane) after its release. Its delivery rows name that release and
@@ -385,7 +387,7 @@ pub fn collective_transitions_csv(
     }
 
     let mut csv = String::from(
-        "time_ns,event_phase,event_origin_node,event_origin_sequence,ordinal,node_id,flow_id,cause,cause_flow_id,arrival_bytes,collective_id,algorithm,group_size,declared_total_bytes,rank,collective_phase,step,chunk_offset_bytes,chunk_bytes,packet_size_bytes,interval_ns,stop_time_ns,inbound_predecessor_bytes,before_local_complete,before_inbound_complete,before_inbound_bytes,activated,after_local_complete,after_inbound_complete,after_inbound_bytes,after_packets_emitted,after_bytes_emitted,after_status,after_next_time_ns,stage_kind,duration_ns,segment_sequence,segment_bytes,ack_number,cause_origin_ns,cause_delay_ns,channel,chunk_policy,channel_policy,local_predecessors,inbound_predecessors,local_required,before_local_completed,after_local_completed,cause_total_bytes,group_stages,seeded_matrix,cause_kind,cause_collective_id,target_node\n",
+        "time_ns,event_phase,event_origin_node,event_origin_sequence,ordinal,node_id,flow_id,cause,cause_flow_id,arrival_bytes,collective_id,algorithm,group_size,declared_total_bytes,rank,collective_phase,step,chunk_offset_bytes,chunk_bytes,packet_size_bytes,interval_ns,stop_time_ns,inbound_predecessor_bytes,before_local_complete,before_inbound_complete,before_inbound_bytes,activated,after_local_complete,after_inbound_complete,after_inbound_bytes,after_packets_emitted,after_bytes_emitted,after_status,after_next_time_ns,stage_kind,duration_ns,segment_sequence,segment_bytes,ack_number,cause_origin_ns,cause_delay_ns,channel,chunk_policy,channel_policy,local_predecessors,inbound_predecessors,local_required,before_local_completed,after_local_completed,cause_total_bytes,group_stages,seeded_matrix,cause_kind,cause_collective_id,target_node,cause_target_node\n",
     );
     for record in records {
         let stage = stage_of(record.flow);
@@ -415,7 +417,7 @@ pub fn collective_transitions_csv(
         };
         writeln!(
             csv,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             record.key.time_ns,
             record.key.phase,
             record.key.origin_node.0,
@@ -498,6 +500,10 @@ pub fn collective_transitions_csv(
             image
                 .flows
                 .get(record.flow.0 as usize)
+                .map_or(record.node.0, |flow| flow.target.0),
+            image
+                .flows
+                .get(record.cause_flow.0 as usize)
                 .map_or(record.node.0, |flow| flow.target.0),
         )
         .expect("writing to String cannot fail");
