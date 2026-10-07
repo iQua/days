@@ -13,7 +13,9 @@
 //! toolchain's container implementations; the caps add no headroom, so a toolchain change that
 //! moves them is re-measured at the base, not absorbed.
 //!
-//! Run: `cargo test -p days --test p16_join_cost_budget` (default matrix, any profile).
+//! Run: `cargo test -p days --test p16_join_cost_budget` (default matrix, any profile). The
+//! Metal plan costs one allocation more in a debug build than in release, at `feat/p16` as here, so
+//! its test caps each profile at that profile's own measurement.
 #![allow(unsafe_code)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -177,7 +179,7 @@ fn phases(label: &str, config: &str) -> ([u64; 5], SimulationImage) {
 }
 
 /// The four images, with `feat/p16`'s counts (669e16b, measured by this test there): lowering,
-/// validation, Scalar (Full), Scalar (Summary), and the Metal plan.
+/// validation, Scalar (Full), Scalar (Summary), and the Metal plan in a release build.
 fn cases() -> [(&'static str, String, [u64; 5]); 4] {
     [
         (
@@ -223,12 +225,23 @@ fn ordinary_collectives_allocate_no_more_than_feat_p16() {
     }
 }
 
+/// The Metal plan's allocations in a debug build, in `cases()` order: one more than in release on
+/// every image (measured at `feat/p16` a305455 and at da74da4, equal in each profile).
+#[cfg(all(feature = "test", feature = "metal", target_vendor = "apple"))]
+const METAL_PLAN_DEBUG: [u64; 4] = [312, 320, 327, 315];
+
 /// The Metal planner (the CUDA planner shares its stage sizing) allocates no more than at
-/// `feat/p16` for the same images.
+/// `feat/p16` for the same images, under the cap of the build's profile.
 #[cfg(all(feature = "test", feature = "metal", target_vendor = "apple"))]
 #[test]
 fn ordinary_collectives_plan_with_no_more_allocations_than_feat_p16() {
-    for (label, config, base) in cases() {
+    for (case, (label, config, base)) in cases().into_iter().enumerate() {
+        // `cfg(debug_assertions)`: the debug build's own measured cap, release's otherwise.
+        let cap = if cfg!(debug_assertions) {
+            METAL_PLAN_DEBUG[case]
+        } else {
+            base[4]
+        };
         let (_, image) = phases(label, &config);
         let before = allocations();
         let report = days_executor::size_metal_plan_for_testing(
@@ -242,9 +255,8 @@ fn ordinary_collectives_plan_with_no_more_allocations_than_feat_p16() {
         drop(report);
         println!("{label}: Metal plan allocations = {count}");
         assert!(
-            count <= base[4],
-            "{label} Metal plan: {count} allocations, above feat/p16's {}",
-            base[4]
+            count <= cap,
+            "{label} Metal plan: {count} allocations, above feat/p16's {cap}"
         );
     }
 }
