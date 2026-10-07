@@ -460,5 +460,22 @@ mutate_case "notify-completion-off-its-timer" "$rail_ring" \
   'NR == 10 { $column["time_ns"] = 1002 }' \
   'REJECT: line 10: compute local completion does not occur at its predecessor'"'"'s timer deadline'
 
+# P16 H1 fix round 2 (review N1): a logged notify is delivered exactly its delay (`duration_ns`,
+# accepted as given) after its release. Notify flow 0 (released at 1,000 ns, delivered at 1,068 ns)
+# claims a 99 ns delay (it arrives 31 ns early), then a 60 ns one (8 ns late).
+mutate_case "notify-early-delivery" "$rail_ring" \
+  '$column["flow_id"] == 0 { $column["duration_ns"] = 99 }' \
+  'REJECT: line 16: stage notify delivery does not occur at its release plus its delay'
+mutate_case "notify-late-delivery" "$rail_ring" \
+  '$column["flow_id"] == 0 { $column["duration_ns"] = 60 }' \
+  'REJECT: line 16: stage notify delivery does not occur at its release plus its delay'
+# A notify released by a counted join leaves at the join's completion: notify flow 0 waits for `fwd`
+# (1,000 ns) and `aux` (2,000 ns) and is delivered at 2,134 ns. Claiming a 1,134 ns delay (as if
+# released by `fwd` alone) rejects.
+rail_join="$fixture_dir/collective_collops_rail_a2a_after_join_executor_accept.csv"
+mutate_case "notify-join-release" "$rail_join" \
+  '$column["flow_id"] == 0 { $column["duration_ns"] = 1134 }' \
+  'REJECT: line 146: stage notify delivery does not occur at its release plus its delay'
+
 echo "P10c exact-integer collective campaign checks: $checked"
 exit "$failures"

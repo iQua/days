@@ -183,6 +183,24 @@ fn fixtures() -> Vec<(&'static str, String)> {
                     + &compute("join", &all, "after = \"a2a\"")),
             ),
         ),
+        (
+            // Each all-to-all send is released by a counted join of two computes (`fwd` at
+            // 1,000 ns, `aux` after it at 2,000 ns): its notifies leave at the join's completion.
+            "rail-a2a-after-join",
+            scenario(
+                &(compute("fwd", &all, "")
+                    + &compute("aux", &all, "after = \"fwd\"")
+                    + &collective(
+                        "dispatch",
+                        "AllToAll",
+                        "RoCE",
+                        &all,
+                        "after = [\"fwd\", \"aux\"]\n",
+                        64_000,
+                    )
+                    + &compute("expert", &all, "after = \"dispatch\"")),
+            ),
+        ),
     ]
 }
 
