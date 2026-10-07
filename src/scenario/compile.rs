@@ -3664,29 +3664,13 @@ fn lower(
             let LpKey::SwitchPort { switch, egress } = *port else {
                 unreachable!("switch-port key set contains only switch ports")
             };
-            // P16 H2: an ECN row per egress link rate, as SimAI keys its ECN rows by port rate.
-            let drop_mark = match (&model.ecn_by_rate, model.drop_mark) {
-                (Some(rows), DropMarkPolicy::EcnThreshold(policy)) => {
-                    let rate_bps = link_rate.of(egress);
-                    let threshold = *rows.get(&rate_bps).ok_or_else(|| {
-                        CompileError::Invalid(format!(
-                            "`switch.ecn_by_rate` has no row for a {rate_bps} b/s egress link"
-                        ))
-                    })?;
-                    DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
-                        threshold,
-                        ..policy
-                    })
-                }
-                (_, drop_mark) => drop_mark,
-            };
-            Ok(SwitchState {
+            SwitchState {
                 physical_switch: switch,
                 queues: vec![SwitchQueueState {
                     egress_link: Some(ids.link(egress)),
                     scheduler: model.scheduler.clone(),
                     queue_capacity_packets: model.queue_capacity_packets,
-                    drop_mark,
+                    drop_mark: model.drop_mark,
                     pfc: None,
                     queue: VecDeque::new(),
                     in_service: None,
@@ -3696,9 +3680,33 @@ fn lower(
                 arrived_packets: 0,
                 dropped_packets: 0,
                 departed_packets: 0,
-            })
+            }
         })
-        .collect::<Result<_, CompileError>>()?;
+        .collect();
+    // P16 H2: an ECN row per egress link rate, as SimAI keys its ECN rows by port rate, set in one
+    // pass over the ports only when the scenario has rows (review F2: deciding it inside the map
+    // made the map fallible, and a `Result` collect has no size hint, so the vector grew by doubling
+    // on every image).
+    if let (Some(rows), DropMarkPolicy::EcnThreshold(policy)) =
+        (&model.ecn_by_rate, model.drop_mark)
+    {
+        for (port, state) in switch_port_keys.iter().zip(&mut switch_states) {
+            let LpKey::SwitchPort { egress, .. } = *port else {
+                unreachable!("switch-port key set contains only switch ports")
+            };
+            let queue = &mut state.queues[0];
+            let rate_bps = link_rate.of(egress);
+            let threshold = *rows.get(&rate_bps).ok_or_else(|| {
+                CompileError::Invalid(format!(
+                    "`switch.ecn_by_rate` has no row for a {rate_bps} b/s egress link"
+                ))
+            })?;
+            queue.drop_mark = DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
+                threshold,
+                ..policy
+            });
+        }
+    }
     let links = ids
         .links()
         .map(|(key, id)| LinkDescriptor {
