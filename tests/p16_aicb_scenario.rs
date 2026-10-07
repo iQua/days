@@ -246,7 +246,7 @@ fn the_manifest_records_what_the_run_was_made_from() {
         "ecn_by_rate=100000000000:112,400000000000:223",
         "pfc_asw_xoff=3515844 pfc_asw_xon=3512772 pfc_psw_xoff=4115208 pfc_psw_xon=4112136",
         "headroom_by_rate=100000000000:30574,400000000000:75000",
-        "collectives=91 operations=16 fused_segments=1 fused_single_server_ops=90",
+        "collectives=91 operations=9 fused_segments=1 fused_single_server_ops=90",
         "fp_clamps=4 elided=2 hang_window_recorded=0 data_queue=fifo data_queue_order=grad_norm",
         "ecmp_ordinals=exact",
         "as-send-lat",
