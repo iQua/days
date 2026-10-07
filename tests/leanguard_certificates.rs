@@ -4,7 +4,8 @@
 //! full-observation run writes is committed under `lean/fixtures/`, byte for byte, and a CPU run
 //! must write the same bytes. CI's LeanGuard job checks the committed certificates (expected
 //! ACCEPT) and mutations of them (expected REJECT): `run-tcp-campaign.sh` and
-//! `run-p10c-mechanism-campaign.sh` (its `wfq` mode certifies Days AGO's exact-rational WFQ). Set `DAYS_UPDATE_LEANGUARD_FIXTURES=1` to regenerate.
+//! `run-p10c-mechanism-campaign.sh` (its `wfq` mode certifies Days AGO's exact-rational WFQ), and
+//! `run-sp-campaign.sh` for Static Priority. Set `DAYS_UPDATE_LEANGUARD_FIXTURES=1` to regenerate.
 
 use std::fs;
 use std::path::Path;
@@ -13,7 +14,7 @@ use days::scenario::compile_config;
 use days_executor::{
     CpuConfig, DiagnosticPlanes, MechanismTransitionRecord, ObservationMode, drr_transitions_csv,
     pfc_transitions_csv, run_cpu_with_observations, run_scalar_with_observations,
-    tcp_transitions_csv, wfq_transitions_csv, wrr_transitions_csv,
+    sp_transitions_csv, tcp_transitions_csv, wfq_transitions_csv, wrr_transitions_csv,
 };
 
 /// Which certificate family a fixture writes.
@@ -24,6 +25,7 @@ enum Family {
     Drr,
     Wrr,
     Wfq,
+    Sp,
 }
 
 impl Family {
@@ -35,6 +37,7 @@ impl Family {
             Self::Drr => drr_transitions_csv(records).unwrap(),
             Self::Wrr => wrr_transitions_csv(records).unwrap(),
             Self::Wfq => wfq_transitions_csv(records).unwrap(),
+            Self::Sp => sp_transitions_csv(records).unwrap(),
         }
     }
 }
@@ -204,6 +207,25 @@ fn compiled_wfq_certificate_under_pfc_serves_past_paused_smaller_tags() {
         "no service start bypasses a paused smaller tag"
     );
     assert_fixture(&csv, "p10c/wfq_pfc_compiled_executor_accept.csv");
+}
+
+#[test]
+fn compiled_sp_certificate_records_enqueue_schedule_and_depart() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("configs/leanguard/sched_sp.toml");
+    let image = compile_config(&path).unwrap();
+    // `sp_check` has no pause model: the SP certificate fixture runs without PFC.
+    assert!(
+        image
+            .switch_states
+            .iter()
+            .flat_map(|state| &state.queues)
+            .all(|queue| queue.pfc.is_none())
+    );
+    let csv = certificate("sched_sp", Family::Sp);
+    for kind in ["enqueue", "schedule", "depart"] {
+        assert!(rows_with(&csv, "kind", kind) > 0, "no {kind} row");
+    }
+    assert_fixture(&csv, "sp/sp_compiled_executor_accept.csv");
 }
 
 #[test]

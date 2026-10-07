@@ -1424,6 +1424,34 @@ const fn scheduler_packet(packet: PacketDescriptor) -> crate::SchedulerPacket {
     }
 }
 
+/// The SP record of one transition of `packet` at an SP queue with class `priorities` (full
+/// observation only).
+fn sp_record(
+    kind: crate::SpTransitionKind,
+    key: EventKey,
+    node: NodeId,
+    queue_id: u64,
+    priorities: &[u64],
+    packet: PacketDescriptor,
+    departure_time_ns: Option<u64>,
+) -> Result<crate::MechanismTransitionRecord, ExecutionError> {
+    let class = scheduler_class(packet.flow, priorities.len())
+        .ok_or(ExecutionError::InvalidSchedulerState(node))?;
+    Ok(crate::MechanismTransitionRecord::Sp(
+        crate::SpTransitionRecord {
+            key,
+            node,
+            queue_id,
+            kind,
+            class_count: u64::try_from(priorities.len()).unwrap_or(u64::MAX),
+            packet: scheduler_packet(packet),
+            class_id: u64::try_from(class).unwrap_or(u64::MAX),
+            priority: priorities[class],
+            departure_time_ns,
+        },
+    ))
+}
+
 /// The exact WFQ record of `packet`'s enqueue at `wfq` (full observation only). `wfq` is the
 /// scheduler after the enqueue and `before` its state before; the packet's virtual start is its
 /// finish tag less its service, `size_bytes * 8 / weight`.
@@ -2848,9 +2876,9 @@ impl<'image> TransitionState<'image> {
             None
         };
 
-        // Full observation only: the exact WFQ enqueue record. Summary runs clone nothing.
-        let observe_wfq = self.observation_mode == ObservationMode::Full;
-        let mut wfq_transition = None;
+        // Full observation only: the WFQ or SP enqueue record. Summary runs build nothing.
+        let observe_scheduler = self.observation_mode == ObservationMode::Full;
+        let mut scheduler_transition = None;
         let (disposition, schedule_ready, mark_packet, pfc_plan, pfc_transition, aqm_transition) = {
             let state = self.switch_state_mut(node)?;
             state.arrived_packets = state
@@ -2922,16 +2950,27 @@ impl<'image> TransitionState<'image> {
             } else {
                 match &mut queue.scheduler {
                     SchedulerKind::Fifo => queue.queue.push_back(event.payload),
-                    SchedulerKind::StaticPriority { .. } => {
+                    SchedulerKind::StaticPriority { priorities } => {
                         queue.queue.insert(
                             sp_position.ok_or(ExecutionError::InvalidSchedulerState(node.id))?,
                             event.payload,
                         );
+                        if observe_scheduler {
+                            scheduler_transition = Some(sp_record(
+                                crate::SpTransitionKind::Enqueue,
+                                event.key,
+                                node.id,
+                                queue_id,
+                                priorities,
+                                packet,
+                                None,
+                            )?);
+                        }
                     }
                     SchedulerKind::WeightedFairQueue(wfq) => {
                         let rate_bps =
                             rate_bps.ok_or(ExecutionError::InvalidSchedulerState(node.id))?;
-                        let before = observe_wfq.then(|| crate::WfqReplayState::of(wfq));
+                        let before = observe_scheduler.then(|| crate::WfqReplayState::of(wfq));
                         wfq_enqueue(
                             wfq,
                             &mut queue.queue,
@@ -2941,7 +2980,7 @@ impl<'image> TransitionState<'image> {
                             node.id,
                         )?;
                         if let Some(before) = before {
-                            wfq_transition = Some(wfq_enqueue_record(
+                            scheduler_transition = Some(wfq_enqueue_record(
                                 event.key, node.id, queue_id, rate_bps, wfq, packet, before,
                             )?);
                         }
@@ -3048,7 +3087,7 @@ impl<'image> TransitionState<'image> {
 
         if self.observation_mode == ObservationMode::Full {
             self.mechanism_transitions.extend(pfc_transition);
-            self.mechanism_transitions.extend(wfq_transition);
+            self.mechanism_transitions.extend(scheduler_transition);
             if let Some((before, after, action, queued_packets_before)) = aqm_transition {
                 self.aqm_transitions.push(AqmTransitionRecord {
                     key: event.key,
@@ -5704,6 +5743,17 @@ impl<'image> TransitionState<'image> {
         let departure_time_ns = arrival_time_ns
             .checked_sub(link.propagation_ns)
             .ok_or(ExecutionError::Time(TimeError::ArrivalOverflow))?;
+        if self.observation_mode == ObservationMode::Full {
+            let sp_transition = self.sp_record_at(
+                node,
+                queue_slot,
+                crate::SpTransitionKind::Schedule,
+                event.key,
+                selected_packet,
+                departure_time_ns,
+            )?;
+            self.mechanism_transitions.extend(sp_transition);
+        }
 
         if let Some(plan) = pfc_plan {
             self.emit_pfc_frame(node, event, plan, children)?;
@@ -5773,7 +5823,7 @@ impl<'image> TransitionState<'image> {
         };
         self.pfc_service_probe.note_reads(probed_reads);
         // Full observation only: the WFQ state before and after the completion.
-        let observe_wfq = self.observation_mode == ObservationMode::Full;
+        let observe_scheduler = self.observation_mode == ObservationMode::Full;
         let mut wfq_completion = None;
         let next_payload = {
             let state = self.switch_state_mut(node)?;
@@ -5793,7 +5843,7 @@ impl<'image> TransitionState<'image> {
                 });
             }
             if let SchedulerKind::WeightedFairQueue(wfq) = &mut queue.scheduler {
-                let before = observe_wfq.then(|| {
+                let before = observe_scheduler.then(|| {
                     (
                         crate::WfqReplayState::of(wfq),
                         wfq.packet_finish_times.get(&packet.id).cloned(),
@@ -5827,8 +5877,8 @@ impl<'image> TransitionState<'image> {
             schedule_payload
         };
 
-        if let Some((before, after, weights, finish)) = wfq_completion {
-            let queue_id = self
+        if observe_scheduler {
+            let queue_slot = self
                 .switch_state(node)?
                 .queues
                 .iter()
@@ -5837,24 +5887,35 @@ impl<'image> TransitionState<'image> {
                     node: node.id,
                     egress_link: Some(egress_link),
                 })?;
-            self.mechanism_transitions
-                .push(crate::MechanismTransitionRecord::Wfq(Box::new(
-                    crate::WfqTransitionRecord {
-                        key: event.key,
-                        node: node.id,
-                        queue_id: u64::try_from(queue_id).unwrap_or(u64::MAX),
-                        kind: crate::WfqTransitionKind::Complete,
-                        rate_bps,
-                        weights,
-                        packet: scheduler_packet(packet),
-                        virtual_start: None,
-                        finish,
-                        before,
-                        after,
-                        queued_packets: Vec::new(),
-                        paused_priorities: Vec::new(),
-                    },
-                )));
+            if let Some((before, after, weights, finish)) = wfq_completion {
+                self.mechanism_transitions
+                    .push(crate::MechanismTransitionRecord::Wfq(Box::new(
+                        crate::WfqTransitionRecord {
+                            key: event.key,
+                            node: node.id,
+                            queue_id: u64::try_from(queue_slot).unwrap_or(u64::MAX),
+                            kind: crate::WfqTransitionKind::Complete,
+                            rate_bps,
+                            weights,
+                            packet: scheduler_packet(packet),
+                            virtual_start: None,
+                            finish,
+                            before,
+                            after,
+                            queued_packets: Vec::new(),
+                            paused_priorities: Vec::new(),
+                        },
+                    )));
+            }
+            let sp_transition = self.sp_record_at(
+                node,
+                queue_slot,
+                crate::SpTransitionKind::Depart,
+                event.key,
+                packet,
+                event.key.time_ns,
+            )?;
+            self.mechanism_transitions.extend(sp_transition);
         }
 
         self.record_departure(node.id, packet, event.key)?;
@@ -6123,6 +6184,33 @@ impl<'image> TransitionState<'image> {
                 paused_priorities,
             },
         ))))
+    }
+
+    /// The SP record of a service start or completion at queue `queue_slot` of `node` (full
+    /// observation only; `None` for any other discipline).
+    fn sp_record_at(
+        &self,
+        node: NodeDescriptor,
+        queue_slot: usize,
+        kind: crate::SpTransitionKind,
+        key: EventKey,
+        packet: PacketDescriptor,
+        departure_time_ns: u64,
+    ) -> Result<Option<crate::MechanismTransitionRecord>, ExecutionError> {
+        let queue = &self.switch_state(node)?.queues[queue_slot];
+        let SchedulerKind::StaticPriority { priorities } = &queue.scheduler else {
+            return Ok(None);
+        };
+        sp_record(
+            kind,
+            key,
+            node.id,
+            u64::try_from(queue_slot).unwrap_or(u64::MAX),
+            priorities,
+            packet,
+            Some(departure_time_ns),
+        )
+        .map(Some)
     }
 
     fn switch_sp_insertion_position(

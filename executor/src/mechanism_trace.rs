@@ -192,6 +192,35 @@ pub struct WfqTransitionRecord {
     pub paused_priorities: Vec<u8>,
 }
 
+/// Which Static Priority transition an [`SpTransitionRecord`] records, by the event that performs
+/// it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpTransitionKind {
+    /// An admitted packet's arrival (phase 0).
+    Enqueue,
+    /// A service start (`TxReady`, phase 2), with the time its transmission completes.
+    Schedule,
+    /// A service completion (`TxComplete`, phase 1).
+    Depart,
+}
+
+/// One Static Priority transition of a switch egress queue (P16 L2; LeanGuard's `sp_check`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpTransitionRecord {
+    pub key: EventKey,
+    pub node: NodeId,
+    pub queue_id: u64,
+    pub kind: SpTransitionKind,
+    pub class_count: u64,
+    pub packet: SchedulerPacket,
+    /// `flow % class_count`.
+    pub class_id: u64,
+    /// The class's priority; a greater value is served first.
+    pub priority: u64,
+    /// The transmission's completion time, on `Schedule` and `Depart` rows.
+    pub departure_time_ns: Option<u64>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CollectiveActivationCause {
     LocalCompletion,
@@ -293,6 +322,8 @@ pub enum MechanismTransitionRecord {
     Roce(crate::RoceTransitionRecord),
     /// An exact WFQ transition (P16 L2), boxed so the enum keeps the size of its other variants.
     Wfq(Box<WfqTransitionRecord>),
+    /// A Static Priority transition (P16 L2).
+    Sp(SpTransitionRecord),
 }
 
 impl MechanismTransitionRecord {
@@ -307,6 +338,7 @@ impl MechanismTransitionRecord {
             Self::Collective(record) => record.key,
             Self::Roce(record) => record.key(),
             Self::Wfq(record) => record.key,
+            Self::Sp(record) => record.key,
         }
     }
 
@@ -322,6 +354,7 @@ impl MechanismTransitionRecord {
             // A host RESUME yields one `resume` row per restarted queue pair at one key.
             Self::Roce(record) => (7, record.flow().0),
             Self::Wfq(_) => (8, 0),
+            Self::Sp(_) => (9, 0),
         };
         (self.key(), tag, ordinal)
     }
@@ -1276,6 +1309,57 @@ pub fn wfq_transitions_csv(
             record.after.last_updated_ns,
             rationals(&record.after.finish_times),
             naturals(&record.after.active_packets),
+        )
+        .expect("writing to String cannot fail");
+    }
+    Ok(csv)
+}
+
+/// The Static Priority certificate `sp_check` reads: one row per enqueue, schedule and depart at an
+/// SP egress queue, in canonical event-key order. `sp_check` keys a scheduler by one natural, so
+/// `scheduler_id` is `node_id * 2^32 + queue_id`; the `node_id` and `queue_id` columns repeat it
+/// for readers. A packet is identified by `(flow_id, packet_id)`, its payload.
+pub fn sp_transitions_csv(
+    records: &[MechanismTransitionRecord],
+) -> Result<String, MechanismTraceError> {
+    let records = canonical(
+        "SP",
+        records
+            .iter()
+            .filter_map(|record| match record {
+                MechanismTransitionRecord::Sp(record) => Some((record.key, *record)),
+                _ => None,
+            })
+            .collect(),
+    )?;
+    let mut csv = String::from(
+        "time_ns,event_phase,origin_node,origin_seq,kind,scheduler_id,class_count,packet_id,flow_id,class_id,priority,size_bytes,departure_time_ns,node_id,queue_id\n",
+    );
+    for record in records {
+        let kind = match record.kind {
+            SpTransitionKind::Enqueue => "enqueue",
+            SpTransitionKind::Schedule => "schedule",
+            SpTransitionKind::Depart => "depart",
+        };
+        let scheduler_id = (u128::from(record.node.0) << 32) + u128::from(record.queue_id);
+        writeln!(
+            csv,
+            "{},{},{},{},{kind},{scheduler_id},{},{},{},{},{},{},{},{},{}",
+            record.key.time_ns,
+            record.key.phase,
+            record.key.origin_node.0,
+            record.key.origin_seq,
+            record.class_count,
+            record.packet.payload.0,
+            record.packet.flow.0,
+            record.class_id,
+            record.priority,
+            record.packet.size_bytes,
+            record
+                .departure_time_ns
+                .map_or_else(String::new, |time| time.to_string()),
+            record.node.0,
+            record.queue_id,
         )
         .expect("writing to String cannot fail");
     }

@@ -1,7 +1,8 @@
-//! P16 L2 zero-cost guard: the WFQ certificate records are built only under full observation.
+//! P16 L2 zero-cost guard: the WFQ and SP certificate records are built only under full
+//! observation.
 //!
-//! A Summary-mode Scalar run of each WFQ scenario of `configs/leanguard/` must allocate no more
-//! than it did before the WFQ emitter existed (`5839da3`, measured by
+//! A Summary-mode Scalar run of each WFQ and SP scenario of `configs/leanguard/` must allocate no more
+//! than it did before the WFQ and SP emitters existed (`5839da3`, measured by
 //! `days-gpu/evidence/P16/lgci/tooling/zz_lgci_probe.rs`; the counts are the same in debug and
 //! release builds). The counters are thread-local, so tests running beside these cannot perturb
 //! them.
@@ -79,9 +80,13 @@ fn summary_run_allocations(config: &str) -> (u64, u64) {
 }
 
 #[test]
-fn summary_wfq_runs_allocate_no_more_than_before_the_wfq_certificate() {
+fn summary_wfq_and_sp_runs_allocate_no_more_than_before_their_certificates() {
     // (scenario, allocations, bytes) at 5839da3.
-    for (config, allocations, bytes) in [("sched_wfq", 88, 33_328), ("wfq_pfc", 169, 74_552)] {
+    for (config, allocations, bytes) in [
+        ("sched_wfq", 88, 33_328),
+        ("wfq_pfc", 169, 74_552),
+        ("sched_sp", 66, 29_792),
+    ] {
         let (actual_allocations, actual_bytes) = summary_run_allocations(config);
         assert!(
             actual_allocations <= allocations && actual_bytes <= bytes,
