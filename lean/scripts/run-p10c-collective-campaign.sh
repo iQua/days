@@ -477,5 +477,16 @@ mutate_case "notify-join-release" "$rail_join" \
   '$column["flow_id"] == 0 { $column["duration_ns"] = 1134 }' \
   'REJECT: line 146: stage notify delivery does not occur at its release plus its delay'
 
+# An ungated root notify is not logged: it starts with its collective at the collective's initial
+# delay (2,000 ns here). Notify flow 0 (rank 0 -> 1) is delivered at 2,134 ns; it is moved 1 ns early,
+# and notify flow 26 (rank 3 -> 1) 1 ns late.
+rail_ungated="$fixture_dir/collective_collops_rail_a2a_ungated_executor_accept.csv"
+mutate_case "ungated-notify-early-delivery" "$rail_ungated" \
+  '$column["cause"] == "inbound_arrival" && $column["cause_flow_id"] == 0 { $column["time_ns"] = 2133 }' \
+  'REJECT: line 26: stage notify delivery does not occur at its origin plus its delay'
+mutate_case "ungated-notify-late-delivery" "$rail_ungated" \
+  '$column["cause"] == "inbound_arrival" && $column["cause_flow_id"] == 26 { $column["time_ns"] = 2135 }' \
+  'REJECT: line 36: stage notify delivery does not occur at its origin plus its delay'
+
 echo "P10c exact-integer collective campaign checks: $checked"
 exit "$failures"

@@ -201,6 +201,17 @@ fn fixtures() -> Vec<(&'static str, String)> {
                     + &compute("expert", &all, "after = \"dispatch\"")),
             ),
         ),
+        (
+            // An ungated all-to-all: its sends, notifies included, start with it at its initial
+            // delay (2 us) and are not logged; the compute after it certifies them, each notify by
+            // its sender's timer completion and its delivery.
+            "rail-a2a-ungated",
+            scenario(
+                &(collective("dispatch", "AllToAll", "RoCE", &all, "", 64_000)
+                    .replace("initial_delay = 0.0", "initial_delay = 0.000002")
+                    + &compute("expert", &all, "after = \"dispatch\"")),
+            ),
+        ),
     ]
 }
 
