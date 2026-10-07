@@ -52,7 +52,10 @@ jobs:
             p10c_dcqcn_check \
             p10c_roce_check \
             aqm_check \
-            aqm_dcqcn_check
+            aqm_dcqcn_check \
+            tcp_check \
+            sp_check \
+            p10c_mechanisms_check
 
       - name: Install ripgrep
         run: |
@@ -70,6 +73,12 @@ jobs:
 
       - name: Run P10c RoCE queue-pair checks
         run: bash lean/scripts/run-p10c-roce-campaign.sh
+
+      - name: Run P10c switch mechanism checks (rate, switch-link PFC, DRR, WRR)
+        run: bash lean/scripts/run-p10c-mechanism-campaign.sh
+
+      - name: Run SP checks
+        run: bash lean/scripts/run-sp-campaign.sh
 
       - name: Run P10c collective differential test (keyed checker against the list-scan reference)
         run: bash lean/scripts/run-p10c-collective-differential.sh
