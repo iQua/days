@@ -5581,7 +5581,7 @@ enum StageGroup<'a> {
 /// the dependencies are acyclic; and they match hosts (the ruling on H3's C1, design §4.2): rank
 /// `r` of a group waits, at its host, for each listed group that runs there. So every listed
 /// group runs on at least one host where the dependent starts (all its hosts, a Send/Recv's
-/// sender alone), and every host where a collective starts runs at least one listed group.
+/// sender alone), and every host where it starts runs at least one listed group.
 fn resolve_stage_groups<'a>(
     collectives: &'a [CollectiveKey],
     computes: &'a [ComputeKey],
@@ -5686,15 +5686,15 @@ fn resolve_stage_groups<'a>(
             }
             other_hosts.push(sorted);
         }
-        // Every host where a collective starts runs a listed group (an equal list covers all).
-        if is_collective && !other_hosts.is_empty() && other_hosts.len() == names.len() {
+        // Every host where the dependent starts runs a listed group (an equal list covers all).
+        if !other_hosts.is_empty() && other_hosts.len() == names.len() {
             if let Some((rank, host)) = starts.iter().enumerate().find(|(_, host)| {
                 !other_hosts
                     .iter()
                     .any(|sorted| sorted.binary_search(host).is_ok())
             }) {
                 return Err(CompileError::Invalid(format!(
-                    "collective `{label}` rank {rank} (host {host}) starts after no operation its `after` lists"
+                    "{kind} `{label}` rank {rank} (host {host}) starts after no operation its `after` lists"
                 )));
             }
         }

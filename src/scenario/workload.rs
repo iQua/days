@@ -43,8 +43,8 @@ pub struct Operation {
     /// The operations this one follows (indices into [`Workload::operations`]), host-matched: its
     /// rank at host `h` waits, at `h`, for each listed operation that runs on `h`, through that
     /// operation's rank there (equal host lists are the special case). Each listed operation runs
-    /// on a host where this one starts, every host where a collective starts runs a listed
-    /// operation, and a collective follows at least one compute operation.
+    /// on a host where this one starts (all its hosts; a Send/Recv's sender alone), every such host
+    /// runs a listed operation, and a collective follows at least one compute operation.
     pub after: Vec<usize>,
     /// The issue stream (SimAI's queue) the operation runs on at each rank: 0 for the compute
     /// stream, another value for a data queue. The stage-aware sizing charges each stream's widest

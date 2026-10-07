@@ -404,6 +404,16 @@ fn unmatched_after_lists_are_rejected() {
             "invalid scenario: collective `dp` rank 1 (host 4) starts after no operation its `after` lists",
         ),
         (
+            // Host 5 of the compute group runs no listed operation.
+            star(
+                8,
+                &(compute("ep1", EP1, 2_000, "")
+                    + &compute("post", "4, 5", 1_000, "after = \"ep1\"")
+                    + &compute("late", "4, 0", 1_000, "after = \"post\"")),
+            ),
+            "invalid scenario: compute `late` rank 1 (host 0) starts after no operation its `after` lists",
+        ),
+        (
             // `ep1` shares no host with the compute group.
             star(
                 8,
