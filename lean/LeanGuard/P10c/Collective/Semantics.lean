@@ -90,12 +90,31 @@ inductive StageKind
   | compute
   /-- A collective stage carried by a RoCE queue pair (schema Amendment 4). -/
   | roce
+  /-- A same-server collective stage carried by a stage notify (P16 H2): a constant timer of the
+  sender's lead, then the whole chunk crosses its host pair's lane at once, delay-only. -/
+  | notify
   deriving DecidableEq, Repr, Hashable
 
-/-- A stage that moves bytes over a reliable transport, TCP or a RoCE queue pair. -/
+/-- A stage that delivers a collective message: over TCP, a RoCE queue pair, or a stage notify. -/
 def StageKind.isTransport : StageKind → Bool
-  | .tcp | .roce => true
+  | .tcp | .roce | .notify => true
   | .compute => false
+
+/-- What carries a cause flow (`cause_kind`): it decides how an arrival is replayed and how a
+completion is bound. -/
+inductive Carrier
+  | tcp
+  | roce
+  | notify
+  | compute
+  deriving DecidableEq, Repr
+
+/-- The carrier of a stage of kind `kind`. -/
+def StageKind.carrier : StageKind → Carrier
+  | .tcp => .tcp
+  | .roce => .roce
+  | .notify => .notify
+  | .compute => .compute
 
 /-- The owner offset in the lowering recurrence. -/
 def ownerOffset : Algorithm → Phase → Nat

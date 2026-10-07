@@ -136,7 +136,8 @@ the successor's local completion must happen exactly then, as a phase-1 timer ev
 def checkComputeTimerCauseReference (rows : List Row) (row : Row) : Except String Unit := do
   if row.cause = .localCompletion then
     let released? := rows.find? fun candidate =>
-      candidate.flowId = row.causeFlowId && candidate.stageKind = .compute && candidate.activated
+      candidate.flowId = row.causeFlowId &&
+        (candidate.stageKind = .compute || candidate.stageKind = .notify) && candidate.activated
     match released? with
     | none => pure ()
     | some predecessor =>
@@ -149,16 +150,21 @@ def checkCauseTotalReference (rows : List Row) (row : Row) : Except String Unit 
     ((rows.find? (·.causeFlowId = row.causeFlowId)).map (·.causeTotalBytes) =
       some row.causeTotalBytes)
     "cause byte total disagrees with an earlier row of the same cause"
+  require row.srcLine ((row.causeKind = .compute) = (row.causeTotalBytes = 0))
+    "a compute cause names no bytes, and every other cause names its total"
   if let some cause := findFlowReference rows row.causeFlowId then
     require row.srcLine (row.causeTotalBytes = ownTotal cause)
       "cause byte total disagrees with the cause stage"
+    require row.srcLine (row.causeKind = cause.stageKind.carrier)
+      "cause kind disagrees with the cause stage"
 
 def checkPredecessorsReference (rows : List Row) (row : Row) : Except String Unit := do
   checkCauseTotalReference rows row
   checkComputeTimerCauseReference rows row
   match row.stageKind, row.collectivePhase with
-  | .tcp, some phase | .roce, some phase => checkTransportPredecessorsReference rows row phase
-  | .tcp, none | .roce, none => pure ()
+  | .tcp, some phase | .roce, some phase | .notify, some phase =>
+      checkTransportPredecessorsReference rows row phase
+  | .tcp, none | .roce, none | .notify, none => pure ()
   | .compute, _ => checkComputePredecessorsReference rows row
 
 /-- The channel-ring rule, by a scan of the earlier channel rows of the same channel, then one
@@ -211,19 +217,30 @@ def checkInboundReplayReference (rows : List Row) (row : Row) : Except String Un
     let prior := rows.filter fun candidate =>
       candidate.flowId = row.flowId && candidate.cause = .inboundArrival &&
         compositeLT candidate row
+    let fabricMtu := (rows.find? fun candidate =>
+      sameGroup candidate row && candidate.stageKind = .roce).map (·.packetSizeBytes)
+    -- Each cause's frontier, replayed by that cause's own replay (a row's replay depends on its
+    -- cause's carrier, which every row of one cause shares).
     let frontierOf (cause : Nat) (extra : List Row) : Nat :=
       let segments := prior.filter (·.causeFlowId = cause) ++ extra
-      match roceInboundMtu row with
-      | some _ =>
+      match segments.head?.map (replayOf fabricMtu) with
+      | some (.goBackN _) =>
           segments.foldl (fun frontier candidate =>
             Collective.goBackNFrontier frontier candidate.segmentSequence
               candidate.segmentBytes) 0
-      | none => frontierOfReference (segments.map segmentOf)
+      | some .whole => segments.foldl (fun _ candidate => candidate.segmentBytes) 0
+      | _ => frontierOfReference (segments.map segmentOf)
     let sum := ((prior.map (·.causeFlowId)).eraseDups.map (frontierOf · [])).foldl (· + ·) 0
     let before := frontierOf row.causeFlowId []
-    match roceInboundMtu row with
-    | some mtu => checkGoBackN mtu before sum row
-    | none =>
+    match replayOf fabricMtu row with
+    | .whole =>
+        require row.srcLine
+          (row.segmentSequence = 0 && row.segmentBytes = row.causeTotalBytes &&
+            before == 0 && row.arrivalBytes = row.segmentBytes &&
+            row.beforeInboundBytes = sum && row.afterInboundBytes = sum + row.arrivalBytes)
+          "inbound stage notify does not deliver its whole chunk at once"
+    | .goBackN mtu => checkGoBackN mtu before sum row
+    | .tcp =>
         let after := frontierOf row.causeFlowId [row]
         require row.srcLine
           (row.beforeInboundBytes = sum && row.afterInboundBytes = sum + (after - before) &&
@@ -242,11 +259,12 @@ def checkLocalSignalReference (rows : List Row) (row : Row) : Except String Unit
       match released? with
       | some predecessor =>
           require row.srcLine
-            (predecessor.stageKind = .compute && row.causeOriginNs = predecessor.key.timeNs &&
-              row.causeDelayNs = predecessor.durationNs)
+            (row.causeOriginNs = predecessor.key.timeNs &&
+              (predecessor.stageKind = .compute && row.causeDelayNs = predecessor.durationNs ||
+                predecessor.stageKind = .notify && row.causeDelayNs = predecessor.intervalNs))
             "compute timer completion does not match its predecessor's release and duration"
       | none =>
-          require row.srcLine (row.causeOriginNs = 0)
+          require row.srcLine (row.causeKind = .notify || row.causeOriginNs = 0)
             "an unlogged root compute stage is armed at time zero"
     else
       let total ← requireSome row.srcLine "local predecessor byte total"
@@ -285,9 +303,9 @@ def checkContinuityReference (rows : List Row) : Except String Unit := do
         | some prior =>
             require row.srcLine (sameGroupConfig prior row)
               s!"collective configuration discontinuity for collective_id={row.collectiveId}"
-        if row.stageKind = .compute && !row.inboundPredecessors.isEmpty then
+        if row.sharesTransport then
           match previous.find? (fun prior =>
-              sameGroup prior row && !prior.inboundPredecessors.isEmpty) with
+              sameGroup prior row && prior.stageKind = row.stageKind && prior.sharesTransport) with
           | none => pure ()
           | some prior =>
               require row.srcLine

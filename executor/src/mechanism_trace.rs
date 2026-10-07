@@ -266,16 +266,18 @@ impl MechanismTransitionRecord {
 /// `group_stages`, the stages of the row's collective or compute group in the image (a seeded
 /// all-to-all has no stage for a pair of zero bytes); and `seeded_matrix`, a seeded all-to-all's
 /// matrix parameters (`seed;matrix;group;transpose;experts;topk;tokens;bytes_per_copy;skew`),
-/// from which LeanGuard re-derives every pair's bytes, empty on every other row.
+/// from which LeanGuard re-derives every pair's bytes, empty on every other row; and
+/// `cause_kind`, what carries the cause flow (`tcp`, `roce`, `notify` for a stage notify, or
+/// `compute`), which decides how LeanGuard replays an arrival and binds a completion.
 /// `inbound_predecessor_bytes` is the stage's
 /// inbound requirement: the summed totals of its inbound predecessors, zero without any.
 pub fn collective_transitions_csv(
     records: &[MechanismTransitionRecord],
     image: &crate::SimulationImage,
 ) -> Result<String, CollectiveTraceError> {
-    // Every stage record, byte total and RoCE transport by flow id, gathered once.
+    // Every stage record, byte total and carrier by flow id, gathered once.
     let mut stages = vec![None; image.flows.len()];
-    let mut totals = vec![(0_u64, (0_u64, 0_u64)); image.flows.len()];
+    let mut totals = vec![(0_u64, Carrier::Compute); image.flows.len()];
     let mut group_stages = std::collections::BTreeMap::<(bool, u64), u64>::new();
     for state in &image.host_states {
         for (generator, stage) in state.generators_with_stages() {
@@ -291,13 +293,18 @@ pub fn collective_transitions_csv(
             };
             if index < stages.len() {
                 stages[index] = stage;
-                totals[index] = match generator.kind {
-                    crate::FlowGeneratorKind::Tcp(tcp) => (tcp.total_bytes, (0, 0)),
-                    crate::FlowGeneratorKind::Roce(roce) => (
+                totals[index] = match (generator.kind, stage.map(|stage| stage.role)) {
+                    (crate::FlowGeneratorKind::Tcp(tcp), _) => (tcp.total_bytes, Carrier::Tcp),
+                    (crate::FlowGeneratorKind::Roce(roce), _) => (
                         roce.pacer.total_bytes,
-                        (roce.pacer.mtu_bytes, roce.pacer.pacing_interval_ns),
+                        Carrier::Roce(roce.pacer.mtu_bytes, roce.pacer.pacing_interval_ns),
                     ),
-                    _ => (0, (0, 0)),
+                    // A stage notify (P16 H2) carries its chunk on a constant timer.
+                    (
+                        crate::FlowGeneratorKind::Constant(constant),
+                        Some(crate::StageRole::Collective(_)),
+                    ) => (constant.packet_size_bytes, Carrier::Notify),
+                    _ => (0, Carrier::Compute),
                 };
             }
         }
@@ -311,14 +318,18 @@ pub fn collective_transitions_csv(
         usize::try_from(flow.0)
             .ok()
             .and_then(|index| totals.get(index).copied())
-            .unwrap_or_default()
+            .unwrap_or((0, Carrier::Compute))
     };
-    // Amendment 5: the one transport of a compute stage's inbound predecessors.
+    // Amendment 5: the one fabric transport of a compute stage's inbound predecessors; a stage
+    // notify delivers its chunk whole and names none.
     let inbound_transport = |flow: FlowId, dependencies: crate::StageDependencies| {
-        let mut transports = dependencies
-            .inbound
-            .iter(&image.stage_joins)
-            .map(|predecessor| totals_of(predecessor).1);
+        let mut transports = dependencies.inbound.iter(&image.stage_joins).filter_map(
+            |predecessor| match totals_of(predecessor).1 {
+                Carrier::Roce(mtu, interval) => Some((mtu, interval)),
+                Carrier::Tcp => Some((0, 0)),
+                Carrier::Notify | Carrier::Compute => None,
+            },
+        );
         let first = transports.next().unwrap_or_default();
         if transports.all(|transport| transport == first) {
             Ok(first)
@@ -352,7 +363,7 @@ pub fn collective_transitions_csv(
     }
 
     let mut csv = String::from(
-        "time_ns,event_phase,event_origin_node,event_origin_sequence,ordinal,node_id,flow_id,cause,cause_flow_id,arrival_bytes,collective_id,algorithm,group_size,declared_total_bytes,rank,collective_phase,step,chunk_offset_bytes,chunk_bytes,packet_size_bytes,interval_ns,stop_time_ns,inbound_predecessor_bytes,before_local_complete,before_inbound_complete,before_inbound_bytes,activated,after_local_complete,after_inbound_complete,after_inbound_bytes,after_packets_emitted,after_bytes_emitted,after_status,after_next_time_ns,stage_kind,duration_ns,segment_sequence,segment_bytes,ack_number,cause_origin_ns,cause_delay_ns,channel,chunk_policy,channel_policy,local_predecessors,inbound_predecessors,local_required,before_local_completed,after_local_completed,cause_total_bytes,group_stages,seeded_matrix\n",
+        "time_ns,event_phase,event_origin_node,event_origin_sequence,ordinal,node_id,flow_id,cause,cause_flow_id,arrival_bytes,collective_id,algorithm,group_size,declared_total_bytes,rank,collective_phase,step,chunk_offset_bytes,chunk_bytes,packet_size_bytes,interval_ns,stop_time_ns,inbound_predecessor_bytes,before_local_complete,before_inbound_complete,before_inbound_bytes,activated,after_local_complete,after_inbound_complete,after_inbound_bytes,after_packets_emitted,after_bytes_emitted,after_status,after_next_time_ns,stage_kind,duration_ns,segment_sequence,segment_bytes,ack_number,cause_origin_ns,cause_delay_ns,channel,chunk_policy,channel_policy,local_predecessors,inbound_predecessors,local_required,before_local_completed,after_local_completed,cause_total_bytes,group_stages,seeded_matrix,cause_kind\n",
     );
     for record in records {
         let stage = stage_of(record.flow);
@@ -369,7 +380,7 @@ pub fn collective_transitions_csv(
         };
         writeln!(
             csv,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             record.key.time_ns,
             record.key.phase,
             record.key.origin_node.0,
@@ -439,10 +450,27 @@ pub fn collective_transitions_csv(
                 .map_or_else(String::new, |index| seeded_matrix(
                     &image.seeded_all_to_alls[index].matrix
                 )),
+            match totals_of(record.cause_flow).1 {
+                Carrier::Tcp => "tcp",
+                Carrier::Roce(..) => "roce",
+                Carrier::Notify => "notify",
+                Carrier::Compute => "compute",
+            },
         )
         .expect("writing to String cannot fail");
     }
     Ok(csv)
+}
+
+/// What carries a stage's bytes, as the certificate names a cause's (`cause_kind`).
+#[derive(Clone, Copy)]
+enum Carrier {
+    Tcp,
+    /// A RoCE queue pair's MTU and pacing interval.
+    Roce(u64, u64),
+    /// A stage notify (P16 H2): a same-server message delivered whole after its NVLink delay.
+    Notify,
+    Compute,
 }
 
 /// A seeded all-to-all's matrix parameters, `;`-separated:

@@ -178,7 +178,7 @@ mutate_case "ungated-root" "$chain" \
   'REJECT: line 2: a root stage is logged only when a compute stage gates it'
 # The gate is flow 6, a 1,000-byte stage of the root's own collective, completed by its ACK.
 mutate_case "root-gate-inside-collective" "$chain" \
-  'NR == 2 { $column["local_predecessors"] = 6; $column["cause_flow_id"] = 6; $column["cause_total_bytes"] = 1000; $column["event_phase"] = 0 }' \
+  'NR == 2 { $column["local_predecessors"] = 6; $column["cause_flow_id"] = 6; $column["cause_total_bytes"] = 1000; $column["cause_kind"] = "tcp"; $column["event_phase"] = 0 }' \
   'REJECT: line 2: a root stage'"'"'s gate must be a compute stage outside its collective'
 
 # Canonical order, ordinals, and certificate structure.
@@ -366,10 +366,11 @@ roce_agc="$fixture_dir/collective_roce_allgather_compute_lossy_executor_accept.c
 mutate_case "compute-after-unlogged-roce-hole-fill" "$roce_agc" \
   'NR == 72 { $column["arrival_bytes"] = 6000; $column["after_inbound_bytes"] = 10000; $column["after_inbound_complete"] = 1 } NR >= 73 && NR <= 77 { next }' \
   "REJECT: line 72: inbound progress does not match the receiver's Go-back-N frontier"
-# Without the columns the stage is replayed as TCP, which refuses the real Go-back-N receiver.
+# Without the columns, the RoCE packets of the unlogged predecessor have no MTU to replay them
+# with (the cause's carrier, `cause_kind`, says RoCE), so the first such packet is refused.
 mutate_case "compute-after-unlogged-roce-zero-columns" "$roce_agc" \
   '$column["stage_kind"] == "compute" { $column["packet_size_bytes"] = 0; $column["interval_ns"] = 0 }' \
-  'REJECT: line 72: inbound progress does not match the receiver frontier replayed from the certified segments'
+  "REJECT: line 10: inbound RoCE packet is not the predecessor queue pair's packet at its PSN"
 mutate_case "compute-mtu-disagrees-with-logged-predecessor" "$roce_dag" \
   '$column["stage_kind"] == "compute" { $column["packet_size_bytes"] = 1500 }' \
   'REJECT: line 63: compute stage inbound transport columns disagree with its inbound predecessor'

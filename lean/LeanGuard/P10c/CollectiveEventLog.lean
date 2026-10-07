@@ -37,6 +37,13 @@ def parseChannelPolicy : String → Except String Collective.ChannelPolicy
   | "pair" => pure .pair
   | other => throw s!"invalid channel policy: '{other}'"
 
+def parseCarrier : String → Except String Collective.Carrier
+  | "tcp" => pure .tcp
+  | "roce" => pure .roce
+  | "notify" => pure .notify
+  | "compute" => pure .compute
+  | other => throw s!"invalid cause kind: '{other}'"
+
 def parseCause : String → Except String Collective.Cause
   | "local_completion" => pure .localCompletion
   | "inbound_arrival" => pure .inboundArrival
@@ -53,6 +60,7 @@ def parseStageKind : String → Except String Collective.StageKind
   | "tcp" => pure .tcp
   | "compute" => pure .compute
   | "roce" => pure .roce
+  | "notify" => pure .notify
   | other => throw s!"invalid stage kind: '{other}'"
 
 def parseBit (value : String) : Except String Bool :=
@@ -170,6 +178,9 @@ structure Row where
   /-- A seeded all-to-all's matrix parameters (`seeded_matrix`), from which every pair's bytes are
   re-derived; `none` on every other row. -/
   seededMatrix : Option Collective.SeededMatrix.Params
+  /-- What carries the cause flow (`cause_kind`): a TCP flow, a RoCE queue pair, a stage notify
+  (P16 H2), or a compute timer. -/
+  causeKind : Collective.Carrier
   srcLine : Nat
   deriving DecidableEq, Repr
 
@@ -243,6 +254,7 @@ def parseRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array Strin
         causeTotalBytes := ← parseU64 (← getField idx fields "cause_total_bytes")
         groupStages := ← parseU64 (← getField idx fields "group_stages")
         seededMatrix := ← parseSeededMatrix (← getField idx fields "seeded_matrix")
+        causeKind := ← parseCarrier (← getField idx fields "cause_kind")
         srcLine := lineNo }
   match result with
   | .ok row => pure row
@@ -303,6 +315,11 @@ def isRoot (row : Row) : Bool :=
   match row.algorithm, row.collectivePhase with
   | some algorithm, some phase => Collective.rootPosition algorithm phase row.step
   | _, _ => false
+
+/-- Whether a local completion's cause is a timer: a compute stage's interval, or a stage notify's
+lead (P16 H2); every other local cause is a transport stage's completing ACK. -/
+def Row.timerCause (row : Row) : Bool :=
+  row.causeKind = .compute || row.causeKind = .notify
 
 /-- Whether a transport row is a stage that completes its collective at its rank: a ring
 channel's last step of the last phase, any all-to-all pair, the send. -/
@@ -432,12 +449,16 @@ def policiesAgree (row : Row) (algorithm : Collective.Algorithm) : Bool :=
           | _ => false
   | _, _ => false
 
-/-- A collective stage carried by TCP or by a RoCE queue pair. The two transports share the
-partition, the predecessors, the event phases and the progress rules; they differ in the
-transport columns and in what a release writes (Amendment 4). -/
+/-- A collective stage carried by TCP, by a RoCE queue pair, or by a stage notify (P16 H2). They
+share the partition, the predecessors, the event phases and the progress rules; they differ in the
+transport columns and in what a release writes (Amendment 4). A stage notify writes its chunk as
+`packet_size_bytes`, the sender's lead as `interval_ns` and its NVLink delay (the lead plus its
+lane) as `duration_ns`: the delay is taken as given (`ServerLocality::nvlink_message_delay_ns` is
+not re-derived), but its release must arm the lead's timer. -/
 def checkTransportRow (row : Row) (algorithm : Collective.Algorithm) (phase : Collective.Phase) :
     Except String Unit := do
   let tcp := row.stageKind = .tcp
+  let notify := row.stageKind = .notify
   require row.srcLine
     (Collective.legalPosition algorithm phase row.groupSize row.rank row.step)
     "collective algorithm, phase, rank, or step is illegal"
@@ -450,6 +471,11 @@ def checkTransportRow (row : Row) (algorithm : Collective.Algorithm) (phase : Co
     require row.srcLine
       (row.packetSizeBytes > 0 && row.intervalNs = 0 && row.durationNs = 0)
       "TCP collective stage requires a positive MSS and no pacing interval or duration"
+  else if notify then
+    require row.srcLine
+      (row.packetSizeBytes = row.chunkBytes && row.intervalNs > 0 &&
+        row.durationNs ≥ row.intervalNs)
+      "stage notify requires its chunk, a positive lead and a delay of at least its lead"
   else
     require row.srcLine
       (row.packetSizeBytes > 0 && row.intervalNs > 0 && row.durationNs = 0)
@@ -501,16 +527,21 @@ def checkTransportRow (row : Row) (algorithm : Collective.Algorithm) (phase : Co
     require row.srcLine
       (row.localPredecessors.length = 1 && row.inboundPredecessors.length = 1)
       "a collective progress stage is missing a predecessor"
-  -- Only a compute timer (a phase-1 pacing event) completes a root's gate; every other cause is a
-  -- phase-0 ACK or data arrival. The cause's byte total (zero for a compute stage) tells the two
-  -- apart when a root also follows a collective.
+  -- A timer (a compute stage's interval or a stage notify's lead, a phase-1 pacing event) or a
+  -- phase-0 ACK arrival completes a local predecessor; every inbound delivery is a phase-0 arrival.
   require row.srcLine
-    (row.key.phase =
-      if row.cause = .localCompletion && root && row.causeTotalBytes = 0 then 1 else 0)
+    (row.key.phase = if row.cause = .localCompletion && row.timerCause then 1 else 0)
     "collective progress event phase disagrees with its cause"
   checkProgress row
   if row.activated then
-    if tcp then
+    if notify then
+      require row.srcLine (row.afterPacketsEmitted = 0 && row.afterBytesEmitted = 0)
+        "stage notify release has emitted counters"
+      let expected := Collective.computeTimerAfter row.key.timeNs row.intervalNs row.stopTimeNs
+      require row.srcLine
+        (row.afterStatus = expected.1 && row.afterNextTimeNs = expected.2)
+        "stage notify release does not arm its lead's timer"
+    else if tcp then
       require row.srcLine
         (Collective.tcpFirstWindow
           row.packetSizeBytes row.chunkBytes row.afterPacketsEmitted row.afterBytesEmitted)
@@ -550,12 +581,10 @@ def checkComputeRow (row : Row) : Except String Unit := do
   require row.srcLine
     ((!row.inboundPredecessors.isEmpty) = decide (row.inboundPredecessorBytes > 0))
     "compute inbound predecessor and byte count disagree"
-  -- A compute group's timer completes its successor in phase 1; a collective's ACK in phase 0,
-  -- and inbound delivery is always a phase-0 data arrival. The cause's byte total (zero for a
-  -- compute stage) tells the two local causes apart.
+  -- A timer (a compute group's, or a stage notify's lead) completes its successor in phase 1; a
+  -- collective's ACK in phase 0, and inbound delivery is always a phase-0 data arrival.
   require row.srcLine
-    (row.key.phase =
-      if row.cause = .localCompletion && row.causeTotalBytes = 0 then 1 else 0)
+    (row.key.phase = if row.cause = .localCompletion && row.timerCause then 1 else 0)
     "collective progress event phase disagrees with its cause"
   checkProgress row
   if row.activated then
@@ -574,26 +603,34 @@ def checkRow (row : Row) : Except String Unit := do
   require row.srcLine (row.key.timeNs ≤ row.stopTimeNs)
     "collective progress occurs after the simulation stop time"
   match row.stageKind, row.algorithm, row.collectivePhase with
-  | .tcp, some algorithm, some phase | .roce, some algorithm, some phase =>
+  | .tcp, some algorithm, some phase | .roce, some algorithm, some phase
+  | .notify, some algorithm, some phase =>
       checkTransportRow row algorithm phase
   | .tcp, _, _ => require row.srcLine false "TCP stage row requires an algorithm and a phase"
   | .roce, _, _ => require row.srcLine false "RoCE stage row requires an algorithm and a phase"
+  | .notify, _, _ =>
+      require row.srcLine false "stage notify row requires an algorithm and a phase"
   | .compute, _, _ => checkComputeRow row
 
-/-- Two rows belong to the same collective or the same compute group. -/
-def sameGroup (first second : Row) : Bool :=
-  first.stageKind = second.stageKind && first.collectiveId = second.collectiveId
+/-- Whether a row is a compute stage, which names a compute group rather than a collective (the
+two identity spaces). -/
+def Row.isCompute (row : Row) : Bool := row.stageKind = .compute
 
-/-- A compute group's transport columns name its stages' inbound predecessors (Amendment 5), so
-only its stages with inbound predecessors share them (`sameComputeTransport`); a Send/Recv's
-sender stage has none. -/
+/-- Two rows belong to the same collective (over any carrier: TCP, RoCE, stage notifies) or the
+same compute group. -/
+def sameGroup (first second : Row) : Bool :=
+  first.isCompute = second.isCompute && first.collectiveId = second.collectiveId
+
+/-- The configuration every row of a group shares. The transport columns are per carrier: a
+collective's fabric rows share one transport (`checkContinuity` compares them by kind), a stage
+notify's columns are its own message's, and a compute group's name its stages' inbound
+predecessors (Amendment 5), shared only by its stages with inbound predecessors. A compute
+group's rows share its duration; a collective's transport rows carry none, a notify's its own. -/
 def sameGroupConfig (first second : Row) : Bool :=
   first.algorithm = second.algorithm &&
     first.groupSize = second.groupSize &&
     first.declaredTotalBytes = second.declaredTotalBytes &&
-    (first.stageKind = .compute ||
-      first.packetSizeBytes = second.packetSizeBytes && first.intervalNs = second.intervalNs) &&
-    first.durationNs = second.durationNs &&
+    (!first.isCompute || first.durationNs = second.durationNs) &&
     first.stopTimeNs = second.stopTimeNs &&
     first.chunkPolicy = second.chunkPolicy &&
     first.channelPolicy = second.channelPolicy &&
@@ -628,20 +665,20 @@ def inboundPredecessorPosition (row : Row) (phase : Collective.Phase) : Position
   let previousRank := if row.rank = 0 then row.groupSize - 1 else row.rank - 1
   { phase := predecessor.1, channel := row.channel, rank := previousRank, step := predecessor.2 }
 
-/-- A row's group (`sameGroup`) as a hash key. -/
-abbrev GroupId := Collective.StageKind × Nat
+/-- A row's group (`sameGroup`) as a hash key: whether it is a compute group, and its id. -/
+abbrev GroupId := Bool × Nat
 
 /-- A row's stage (`sameStage`) as a hash key: its group and its position. -/
-abbrev StageId := Collective.StageKind × Nat × Option Collective.Phase × Nat × Nat × Nat
+abbrev StageId := Bool × Nat × Option Collective.Phase × Nat × Nat × Nat
 
-def groupId (row : Row) : GroupId := (row.stageKind, row.collectiveId)
+def groupId (row : Row) : GroupId := (row.isCompute, row.collectiveId)
 
 def stageId (row : Row) : StageId :=
-  (row.stageKind, row.collectiveId, row.collectivePhase, row.channel, row.rank, row.step)
+  (row.isCompute, row.collectiveId, row.collectivePhase, row.channel, row.rank, row.step)
 
 /-- The stage of `collective`'s group at `wanted`, as a hash key. -/
 def positionId (collective : Row) (wanted : Position) : StageId :=
-  (collective.stageKind, collective.collectiveId, some wanted.phase, wanted.channel, wanted.rank,
+  (collective.isCompute, collective.collectiveId, some wanted.phase, wanted.channel, wanted.rank,
     wanted.step)
 
 /-- Insert unless present, so a map built in canonical order holds each key's first row. -/
@@ -667,8 +704,8 @@ structure LookupIndex where
   byFlow : Std.HashMap Nat Row := ∅
   /-- The first activated row of each flow. -/
   activatedByFlow : Std.HashMap Nat Row := ∅
-  /-- The first activated compute row of each flow. -/
-  activatedComputeByFlow : Std.HashMap Nat Row := ∅
+  /-- The first activated row of each timer stage (a compute stage or a stage notify). -/
+  activatedTimerByFlow : Std.HashMap Nat Row := ∅
   /-- The first row at each stage (`atPosition`, for positioned rows). -/
   byStage : Std.HashMap StageId Row := ∅
   /-- The first activated row at each stage. -/
@@ -713,9 +750,9 @@ def lookupIndex (rows : List Row) : LookupIndex := Id.run do
       index := { index with
         activatedByFlow := insertFirst index.activatedByFlow row.flowId row
         activatedByStage := insertFirst index.activatedByStage (stageId row) row }
-      if row.stageKind = .compute then
+      if row.stageKind = .compute || row.stageKind = .notify then
         index := { index with
-          activatedComputeByFlow := insertFirst index.activatedComputeByFlow row.flowId row }
+          activatedTimerByFlow := insertFirst index.activatedTimerByFlow row.flowId row }
     if let some phase := row.collectivePhase then
       if !isRoot row then
         index := { index with
@@ -758,14 +795,19 @@ def requireEarlierRelease (row : Row) (predecessor : Option Row) (message : Stri
   | none => pure ()
   | some predecessor => require row.srcLine (compositeLT predecessor row) message
 
-/-- A row's cause byte total agrees with every earlier row of the same cause, and with the cause
-stage's own rows when they are logged (a compute stage's total is zero). -/
+/-- A row's cause byte total agrees with every earlier row of the same cause, and its total and
+kind agree with the cause stage's own rows when they are logged (a compute stage's total is zero);
+a compute cause names no bytes. -/
 def checkCauseTotal (index : LookupIndex) (row : Row) : Except String Unit := do
   require row.srcLine (index.causeTotals.getD row.causeFlowId row.causeTotalBytes = row.causeTotalBytes)
     "cause byte total disagrees with an earlier row of the same cause"
+  require row.srcLine ((row.causeKind = .compute) = (row.causeTotalBytes = 0))
+    "a compute cause names no bytes, and every other cause names its total"
   if let some cause := index.byFlow.get? row.causeFlowId then
     require row.srcLine (row.causeTotalBytes = ownTotal cause)
       "cause byte total disagrees with the cause stage"
+    require row.srcLine (row.causeKind = cause.stageKind.carrier)
+      "cause kind disagrees with the cause stage"
 
 /-- The lookups `checkEntryPredecessors` reads: keyed from a `LookupIndex` here, by list scans in
 the test-only reference. -/
@@ -838,8 +880,8 @@ def checkEntryPredecessors (lookups : EntryLookups) (row : Row) : Except String 
           "compute inbound predecessor is not the previous rank's final collective stage"
         else "a root stage's inbound predecessor does not complete its collective at its host")
       -- Amendment 5: a compute stage's transport columns are its RoCE inbound predecessors' own,
-      -- and zero after TCP.
-      if compute then
+      -- and zero after TCP; a stage notify delivers whole and names none.
+      if compute && predecessor.stageKind != .notify then
         require row.srcLine
           (if predecessor.stageKind = .roce then
             row.packetSizeBytes = predecessor.packetSizeBytes &&
@@ -935,12 +977,13 @@ def checkComputePredecessors (index : LookupIndex) (row : Row) : Except String U
       requireEarlierRelease row (index.activatedByFlow.get? row.causeFlowId)
         "inbound predecessor stage did not activate earlier"
 
-/-- A compute stage completes only when its timer fires. When the completed compute stage is
-logged, its release row records the timer deadline (`after_next_time_ns` = release + duration), so
-the successor's local completion must happen exactly then, as a phase-1 timer event. -/
+/-- A compute stage completes only when its timer fires, and a stage notify's sender when its lead's
+timer fires (P16 H2). When the completed stage is logged, its release row records the timer
+deadline (`after_next_time_ns` = release + duration or lead), so the successor's local completion
+must happen exactly then, as a phase-1 timer event. -/
 def checkComputeTimerCause (index : LookupIndex) (row : Row) : Except String Unit := do
   if row.cause = .localCompletion then
-    match index.activatedComputeByFlow.get? row.causeFlowId with
+    match index.activatedTimerByFlow.get? row.causeFlowId with
     | none => pure ()
     | some predecessor =>
         require row.srcLine
@@ -951,8 +994,9 @@ def checkPredecessors (index : LookupIndex) (row : Row) : Except String Unit := 
   checkCauseTotal index row
   checkComputeTimerCause index row
   match row.stageKind, row.collectivePhase with
-  | .tcp, some phase | .roce, some phase => checkTransportPredecessors index row phase
-  | .tcp, none | .roce, none => pure ()
+  | .tcp, some phase | .roce, some phase | .notify, some phase =>
+      checkTransportPredecessors index row phase
+  | .tcp, none | .roce, none | .notify, none => pure ()
   | .compute, _ => checkComputePredecessors index row
 
 /-- Whether `next` (each rank's successor, as `(rank, successor)` pairs) is one cycle through all
@@ -1043,18 +1087,29 @@ def Frontier.add (state : Frontier) (segment : Nat × Nat) : Frontier :=
   else
     { state with pending := state.pending.insert start (max stop (state.pending.getD start 0)) }
 
-/-- The MTU of the RoCE queue pair whose packets a row's inbound segments are, or `none` for TCP
-segments. A RoCE stage's inbound predecessor is a stage of its own collective (one transport per
-collective), whose MTU `sameGroupConfig` makes the row's own. A compute stage names its inbound
-predecessors' transport itself (schema Amendment 5): the MTU in `packet_size_bytes` when they are
-RoCE stages, zero for TCP. This holds whether a predecessor is logged or not (the final stage of an
-ungated two-rank AllGather is an unlogged root); when it is logged, `checkEntryPredecessors`
-requires the two to agree. -/
-def roceInboundMtu (row : Row) : Option Nat :=
-  match row.stageKind with
-  | .roce => some row.packetSizeBytes
-  | .tcp => none
-  | .compute => if row.packetSizeBytes > 0 then some row.packetSizeBytes else none
+/-- How an arriving segment is replayed, by what carries its cause (`cause_kind`). -/
+inductive Replay
+  /-- A TCP segment: TCP's in-order frontier, which merges buffered segments. -/
+  | tcp
+  /-- A RoCE packet of a queue pair with this MTU: the Go-back-N frontier. -/
+  | goBackN (mtu : Nat)
+  /-- A stage notify (P16 H2): its whole chunk at once. -/
+  | whole
+
+/-- The replay of a row's arriving segment. A RoCE cause's MTU is its queue pair's: a RoCE stage's
+inbound predecessor is a stage of its own collective (one fabric transport per collective), whose
+MTU `checkContinuity` makes the row's own; a compute stage names its inbound predecessors' fabric
+transport itself (schema Amendment 5: the MTU in `packet_size_bytes`, zero for TCP), whether a
+predecessor is logged or not (the final stage of an ungated two-rank AllGather is an unlogged
+root), and `checkEntryPredecessors` requires a logged one to agree; a stage notify's columns are
+its own message's, so its RoCE predecessor's MTU is its collective's fabric MTU (`fabricMtu`, from
+the collective's RoCE rows). -/
+def replayOf (fabricMtu : Option Nat) (row : Row) : Replay :=
+  match row.causeKind, row.stageKind with
+  | .notify, _ => .whole
+  | .roce, .notify => .goBackN (fabricMtu.getD 0)
+  | .roce, _ => .goBackN row.packetSizeBytes
+  | _, _ => .tcp
 
 /-- Schema Amendment 4: an inbound row of a RoCE predecessor certifies one data packet, which is
 the predecessor's packet at its PSN, and the advance of the receiver's Go-back-N frontier
@@ -1079,6 +1134,11 @@ advance is its predecessor's, and the stage's before and after byte counts are t
 predecessors' frontiers before and after. One pass in canonical order keeps each (stage, cause)
 `Frontier` and each stage's sum, checks the row against them, and then adds the row's segment. -/
 def checkInboundReplay (rows : List Row) : Except String Unit := do
+  -- Each collective's fabric MTU, from its first RoCE row.
+  let mut fabric : Std.HashMap GroupId Nat := ∅
+  for row in rows do
+    if row.stageKind = .roce then
+      fabric := insertFirst fabric (groupId row) row.packetSizeBytes
   let mut replays : Std.HashMap (Nat × Nat) Frontier := ∅
   let mut delivered : Std.HashMap Nat Nat := ∅
   for row in rows do
@@ -1086,13 +1146,21 @@ def checkInboundReplay (rows : List Row) : Except String Unit := do
       let key := (row.flowId, row.causeFlowId)
       let state := replays.getD key {}
       let sum := delivered.getD row.flowId 0
-      match roceInboundMtu row with
-      | some mtu =>
+      match replayOf (fabric.get? (groupId row)) row with
+      | .whole =>
+          require row.srcLine
+            (row.segmentSequence = 0 && row.segmentBytes = row.causeTotalBytes &&
+              state.frontier = 0 && row.arrivalBytes = row.segmentBytes &&
+              row.beforeInboundBytes = sum && row.afterInboundBytes = sum + row.arrivalBytes)
+            "inbound stage notify does not deliver its whole chunk at once"
+          replays := replays.insert key { frontier := row.segmentBytes }
+          delivered := delivered.insert row.flowId (sum + row.segmentBytes)
+      | .goBackN mtu =>
           checkGoBackN mtu state.frontier sum row
           let after := Collective.goBackNFrontier state.frontier row.segmentSequence row.segmentBytes
           replays := replays.insert key { frontier := after }
           delivered := delivered.insert row.flowId (sum + (after - state.frontier))
-      | none =>
+      | .tcp =>
           let next := state.add (segmentOf row)
           let advance := next.frontier - state.frontier
           require row.srcLine
@@ -1102,19 +1170,20 @@ def checkInboundReplay (rows : List Row) : Except String Unit := do
           replays := replays.insert key next
           delivered := delivered.insert row.flowId (sum + advance)
 
-/-- Whether a local completion is caused by a compute timer: its cause's byte total is zero. Every
-other local cause is a transport stage's completing ACK (TCP, or a RoCE ACK: a NACK never
-completes, since it acknowledges the receiver's frontier below the chunk). `checkCauseTotal` binds
-the total to the cause stage. -/
+/-- Whether a local completion is caused by a timer: a compute stage's interval or a stage
+notify's lead (`Row.timerCause`). Every other local cause is a transport stage's completing ACK
+(TCP, or a RoCE ACK: a NACK never completes, since it acknowledges the receiver's frontier below
+the chunk). `checkCauseTotal` binds the cause's kind and total to the cause stage. -/
 def causeIsTimer (row : Row) : Bool :=
-  row.causeTotalBytes = 0
+  row.timerCause
 
 /-- The byte total of a transport local predecessor: from the ring recurrence for a ring stage's
 previous step (`EqualRemainderLast`), its own size under `UniformFloor` (every message of a ring
 is one size), or the cause's stated total, bound to the cause stage by `checkCauseTotal`. -/
 def localPredecessorTotal (row : Row) : Option Nat :=
   match row.stageKind, row.algorithm, row.collectivePhase with
-  | .tcp, some algorithm, some phase | .roce, some algorithm, some phase =>
+  | .tcp, some algorithm, some phase | .roce, some algorithm, some phase
+  | .notify, some algorithm, some phase =>
       if isRoot row then some row.causeTotalBytes
       else if row.chunkPolicy = some .equalRemainderLast then
         let position := localPredecessorPosition row phase
@@ -1127,7 +1196,10 @@ def localPredecessorTotal (row : Row) : Option Nat :=
 /-- Binds a local completion to the event that caused it.
 
 A compute timer completes its successor exactly at arm time + duration; a logged compute
-predecessor was armed at its release, an unlogged one (a root) at time zero. A transport
+predecessor was armed at its release, an unlogged one (a root) at time zero. A stage notify
+completes its sender's successor when its lead's timer fires: arm time + lead, a logged notify
+armed at its release (an unlogged root notify starts with its collective, whose start the
+certificate does not name). A transport
 predecessor (TCP, or a RoCE queue pair) completes at the first ACK whose acknowledgment reaches its
 byte total: the row names that
 acknowledgment, which must equal the predecessor's total; the answered segment was sent after the
@@ -1144,11 +1216,12 @@ def checkLocalSignal (index : LookupIndex) (row : Row) : Except String Unit := d
       match released? with
       | some predecessor =>
           require row.srcLine
-            (predecessor.stageKind = .compute && row.causeOriginNs = predecessor.key.timeNs &&
-              row.causeDelayNs = predecessor.durationNs)
+            (row.causeOriginNs = predecessor.key.timeNs &&
+              (predecessor.stageKind = .compute && row.causeDelayNs = predecessor.durationNs ||
+                predecessor.stageKind = .notify && row.causeDelayNs = predecessor.intervalNs))
             "compute timer completion does not match its predecessor's release and duration"
       | none =>
-          require row.srcLine (row.causeOriginNs = 0)
+          require row.srcLine (row.causeKind = .notify || row.causeOriginNs = 0)
             "an unlogged root compute stage is armed at time zero"
     else
       let total ← requireSome row.srcLine "local predecessor byte total"
@@ -1169,8 +1242,18 @@ def checkLocalSignal (index : LookupIndex) (row : Row) : Except String Unit := d
         (row.causeDelayNs > 0 && row.key.timeNs ≥ row.causeOriginNs + row.causeDelayNs)
         "local completion precedes the earliest return of the completing acknowledgment"
 
+/-- Whether a row's transport columns are its group's (for its carrier): a collective's TCP or
+RoCE rows share one transport, and a compute group's stages after RoCE inbound predecessors share
+their queue pairs' MTU and interval (Amendment 5; a stage after TCP or only stage notifies names
+none). A stage notify's columns are its own message's. -/
+def Row.sharesTransport (row : Row) : Bool :=
+  row.stageKind = .tcp || row.stageKind = .roce ||
+    row.stageKind = .compute && row.packetSizeBytes > 0
+
 def sameStageConfig (first second : Row) : Bool :=
   first.nodeId = second.nodeId && first.flowId = second.flowId &&
+    first.packetSizeBytes = second.packetSizeBytes && first.intervalNs = second.intervalNs &&
+    first.durationNs = second.durationNs &&
     first.chunkOffsetBytes = second.chunkOffsetBytes &&
     first.chunkBytes = second.chunkBytes &&
     first.localPredecessors = second.localPredecessors &&
@@ -1193,8 +1276,8 @@ zero). -/
 structure ContinuityState where
   /-- The most recent row of each group. -/
   lastOfGroup : Std.HashMap GroupId Row := ∅
-  /-- The most recent row of each compute group with inbound predecessors. -/
-  lastInboundOfGroup : Std.HashMap GroupId Row := ∅
+  /-- The most recent row of each group and carrier that shares one transport (`sharesTransport`). -/
+  lastTransportOfGroup : Std.HashMap (GroupId × Collective.StageKind) Row := ∅
   /-- For each (group, rank): the node of its rows and the position of the most recent one. -/
   rankNode : Std.HashMap (GroupId × Nat) (Nat × Nat) := ∅
   /-- For each (group, node): the rank of its rows and the position of the most recent one. -/
@@ -1251,9 +1334,9 @@ def checkContinuity (rows : List Row) : Except String Unit := do
     | some prior =>
         require row.srcLine (sameGroupConfig prior row)
           s!"collective configuration discontinuity for collective_id={row.collectiveId}"
-    let inboundCompute := row.stageKind = .compute && !row.inboundPredecessors.isEmpty
-    if inboundCompute then
-      if let some prior := state.lastInboundOfGroup.get? group then
+    let transportKey := (group, row.stageKind)
+    if row.sharesTransport then
+      if let some prior := state.lastTransportOfGroup.get? transportKey then
         require row.srcLine
           (prior.packetSizeBytes = row.packetSizeBytes && prior.intervalNs = row.intervalNs)
           s!"collective configuration discontinuity for collective_id={row.collectiveId}"
@@ -1281,9 +1364,9 @@ def checkContinuity (rows : List Row) : Except String Unit := do
       "collective stage activated more than once"
     state :=
       { lastOfGroup := state.lastOfGroup.insert group row
-        lastInboundOfGroup :=
-          if inboundCompute then state.lastInboundOfGroup.insert group row
-          else state.lastInboundOfGroup
+        lastTransportOfGroup :=
+          if row.sharesTransport then state.lastTransportOfGroup.insert transportKey row
+          else state.lastTransportOfGroup
         rankNode := state.rankNode.insert (group, row.rank) (row.nodeId, position)
         nodeRank := state.nodeRank.insert (group, row.nodeId) (row.rank, position)
         flowStage := state.flowStage.insert row.flowId (stage, position)
@@ -1370,14 +1453,14 @@ def checkCoverage (rows : List Row) : Except String Unit := do
         "seeded all-to-all pair does not carry its matrix's bytes"
     let expected :=
       match row.stageKind, row.algorithm with
-      | .tcp, some algorithm | .roce, some algorithm =>
+      | .tcp, some algorithm | .roce, some algorithm | .notify, some algorithm =>
           if seeded then pairs
           else Collective.expectedActivationCountOf algorithm row.groupSize tally.channels
             tally.hasRoot
       | _, _ => row.groupSize
     let imageStages :=
       match row.stageKind, row.algorithm with
-      | .tcp, some algorithm | .roce, some algorithm =>
+      | .tcp, some algorithm | .roce, some algorithm | .notify, some algorithm =>
           if seeded then pairs
           else Collective.expectedActivationCountOf algorithm row.groupSize tally.channels true
       | _, _ => row.groupSize
