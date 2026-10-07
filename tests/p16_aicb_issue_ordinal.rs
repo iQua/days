@@ -205,3 +205,65 @@ fn ports_follow_the_issue_order_not_the_key_order() {
         "{a} -> {b}: ports in key order without ordinals"
     );
 }
+
+/// A typed workload's `issue_ordinal` lowers exactly as its TOML rendering's (the IR's
+/// equivalence with its rendering, `src/scenario/workload.rs`).
+#[test]
+fn a_workload_issue_ordinal_lowers_as_its_toml_rendering() {
+    use days::scenario::workload::{
+        Algorithm, Collective, Operation, OperationKind, Transport, Workload,
+    };
+    let (a, b) = (0, 3);
+    let traffic = TRAFFIC
+        .replace("[collective.traffic.dcqcn]", "[dcqcn]")
+        .replace("[collective.traffic.roce]", "[roce]");
+    let collective = |algorithm, bytes, ordinal| {
+        OperationKind::Collective(Collective {
+            algorithm,
+            bytes,
+            transport: 0,
+            channels: None,
+            uniform_floor: algorithm == Algorithm::AllToAll,
+            seeded: None,
+            issue_ordinal: Some(ordinal),
+        })
+    };
+    let operation = |after: Vec<usize>, kind| Operation {
+        group: 0,
+        after,
+        stream: 0,
+        kind,
+    };
+    let workload = Workload {
+        groups: vec![vec![a, b]],
+        transports: vec![Transport {
+            flow_type: "RoCE".to_owned(),
+            priority: 3,
+            traffic,
+        }],
+        operations: vec![
+            operation(vec![], OperationKind::Compute { duration_ns: 1000 }),
+            operation(vec![0], collective(Algorithm::AllToAll, 18_000, 1)),
+            operation(vec![1], OperationKind::Compute { duration_ns: 100 }),
+            operation(vec![2], collective(Algorithm::AllReduce, 36_000, 3)),
+        ],
+    };
+    let directory = tempfile::TempDir::new().expect("temp dir");
+    let path = directory.path().join("base.toml");
+    std::fs::write(&path, BASE).expect("write");
+    let lowered = days::scenario::compile_config_with_workload(
+        &path,
+        &workload,
+        days::topos::route::RouteWorkers::serial(),
+    )
+    .unwrap_or_else(|error| panic!("the workload lowers: {error}"));
+    let rendering = scenario(a, b, true)
+        .replace("name = \"c0\"", "name = \"@0\"")
+        .replace("name = \"a2a\"", "name = \"@1\"")
+        .replace("name = \"c1\"", "name = \"@2\"")
+        .replace("name = \"ring\"", "name = \"@3\"")
+        .replace("after = \"c0\"", "after = \"@0\"")
+        .replace("after = \"a2a\"", "after = \"@1\"")
+        .replace("after = \"c1\"", "after = \"@2\"");
+    assert_eq!(lowered, lower(&rendering));
+}

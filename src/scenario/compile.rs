@@ -202,6 +202,9 @@ struct SourceCollective {
     stream: Option<u32>,
     /// Ring channels: each a ring order of the `sources` hosts (instead of `sinks`).
     channels: Option<Vec<Vec<u64>>>,
+    /// The collective's position in its workload's issue order (ruling C2): it orders the
+    /// collective's flows, and so SimAI's ECMP port ordinals, before key content.
+    issue_ordinal: Option<u64>,
     /// `EqualRemainderLast` (the default for rings) or `UniformFloor`.
     chunk: Option<String>,
     /// An all-to-all's seeded per-pair sizes (`[collective.alltoall]`); uniform without it.
@@ -606,6 +609,12 @@ struct FlowSetKey {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct CollectiveKey {
+    /// The collective's position in its workload's realized issue order (P16 ruling C2): the
+    /// leading field, so canonical flow order, and with it SimAI's per-pair ECMP port ordinals
+    /// (`simai_ecmp_route_tables`), follow issue order. `None` for every collective that does not
+    /// set it, which sort first and keep their order. Held as `ordinal + 1` in a `NonZeroU32`, which
+    /// fits the key's padding (`stage_group_keys_keep_their_size`); `Some` orders as the ordinal.
+    issue_ordinal: Option<std::num::NonZeroU32>,
     algorithm: CollectiveAlgorithm,
     flow_count: u64,
     sources: Vec<u64>,
@@ -1854,6 +1863,7 @@ fn collective_key(
         )));
     }
     Ok(CollectiveKey {
+        issue_ordinal: None,
         algorithm,
         flow_count,
         sources,
@@ -2017,6 +2027,7 @@ fn validate_collective(
 ) -> Result<CollectiveKey, CompileError> {
     let (name, after) = (source.name, source.after);
     let (channels, chunk, alltoall) = (source.channels, source.chunk, source.alltoall);
+    let issue_ordinal = source.issue_ordinal;
     let mut key = collective_key(
         &source.collective_type,
         source.flow_type.as_deref(),
@@ -2035,11 +2046,31 @@ fn validate_collective(
     )?;
     key.name = name;
     key.after = after;
+    key.issue_ordinal = issue_ordinal_key(issue_ordinal)?;
     let seeded = alltoall
         .map(|table| seeded_all_to_all(*table))
         .transpose()?;
     shape_collective(&mut key, channels, chunk.as_deref(), seeded)?;
     Ok(key)
+}
+
+/// A collective's issue ordinal as its key holds it (`ordinal + 1`), refusing one that does not
+/// fit.
+fn issue_ordinal_key(ordinal: Option<u64>) -> Result<Option<std::num::NonZeroU32>, CompileError> {
+    ordinal
+        .map(|ordinal| {
+            ordinal
+                .checked_add(1)
+                .and_then(|value| u32::try_from(value).ok())
+                .and_then(std::num::NonZeroU32::new)
+                .ok_or_else(|| {
+                    CompileError::Invalid(format!(
+                        "collective issue_ordinal {ordinal} is above {}",
+                        u32::MAX - 1
+                    ))
+                })
+        })
+        .transpose()
 }
 
 /// A `[collective.alltoall]` table's seeded matrix.
@@ -2162,6 +2193,7 @@ fn workload_keys(
                 )?;
                 key.name = Some(name(index));
                 key.after = after;
+                key.issue_ordinal = issue_ordinal_key(collective.issue_ordinal)?;
                 let chunk = if collective.uniform_floor {
                     "UniformFloor"
                 } else {

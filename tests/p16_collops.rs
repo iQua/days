@@ -755,6 +755,7 @@ fn a_workload_lowers_as_its_toml_rendering() {
                     channels: None,
                     uniform_floor: true,
                     seeded: None,
+                    issue_ordinal: None,
                 }),
             },
             Operation {
@@ -774,6 +775,7 @@ fn a_workload_lowers_as_its_toml_rendering() {
                     channels: None,
                     uniform_floor: false,
                     seeded: None,
+                    issue_ordinal: None,
                 }),
             },
         ],

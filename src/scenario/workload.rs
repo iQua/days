@@ -20,7 +20,8 @@ pub struct Workload {
     /// and `pkt_size_dist`, and its `[tcp]`, or `[dcqcn]` and `[roce]`, subtables). An
     /// operation's own byte size replaces `size`.
     pub transports: Vec<Transport>,
-    /// The operations, in program order (the order H3 assigns ECMP ordinals in, ruling R13).
+    /// The operations. ECMP port ordinals follow each collective's `issue_ordinal` (ruling C2),
+    /// then key content.
     pub operations: Vec<Operation>,
 }
 
@@ -78,6 +79,10 @@ pub struct Collective {
     pub uniform_floor: bool,
     /// An all-to-all's seeded per-pair sizes; uniform without.
     pub seeded: Option<SeededAllToAll>,
+    /// The collective's position in the realized issue order (ruling C2), which orders its flows,
+    /// and so SimAI's per-pair ECMP port ordinals, before key content; `None` keeps key order.
+    /// The TOML rendering is `issue_ordinal`.
+    pub issue_ordinal: Option<u64>,
 }
 
 /// A collective algorithm.
