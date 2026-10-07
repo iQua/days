@@ -167,7 +167,7 @@ struct SourceCollective {
     /// `EqualRemainderLast` (the default for rings) or `UniformFloor`.
     chunk: Option<String>,
     /// An all-to-all's seeded per-pair sizes (`[collective.alltoall]`); uniform without it.
-    alltoall: Option<SourceAllToAll>,
+    alltoall: Option<Box<SourceAllToAll>>,
     collective_type: String,
     first_flow_id: Option<u64>,
     flow_type: Option<String>,
@@ -218,7 +218,7 @@ struct SourceCompute {
 #[serde(untagged)]
 enum AfterGroups {
     One(String),
-    Many(Vec<String>),
+    Many(Box<[String]>),
 }
 
 /// The names `after` lists, in order.
@@ -575,12 +575,33 @@ struct CollectiveKey {
     /// Stage-group identity; `None` for every unnamed collective, which keeps their order.
     name: Option<String>,
     after: Option<AfterGroups>,
-    /// Ring channels as rank-index orders (`rank` is a position in `sources`); empty for one ring
-    /// (`sinks`), an all-to-all and a send/recv.
-    channels: Vec<Vec<u32>>,
+    /// Channel rings or seeded sizes (P16 H1); `None`, holding nothing, for one ring in `sinks`
+    /// order and a uniform all-to-all or send/recv, so an ordinary key stays the size it was.
+    shape: Option<Box<CollectiveShapeKey>>,
     chunk: CollectiveChunkPolicy,
+}
+
+/// The parts of a collective key only channel rings and seeded all-to-alls have. Field order
+/// keeps the keys' order as when they were inline (channels, then the chunk, then the sizes):
+/// a seeded key is the only one with sizes and has the largest chunk policy.
+#[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+struct CollectiveShapeKey {
+    /// Ring channels as rank-index orders (`rank` is a position in `sources`).
+    channels: Vec<Vec<u32>>,
     /// An all-to-all's seeded per-pair sizes.
     seeded: Option<SeededAllToAll>,
+}
+
+impl CollectiveKey {
+    /// The ring channels; empty for one ring in `sinks` order, an all-to-all and a send/recv.
+    fn channels(&self) -> &[Vec<u32>] {
+        self.shape.as_ref().map_or(&[], |shape| &shape.channels)
+    }
+
+    /// An all-to-all's seeded per-pair sizes.
+    fn seeded(&self) -> Option<&SeededAllToAll> {
+        self.shape.as_ref().and_then(|shape| shape.seeded.as_ref())
+    }
 }
 
 /// One delay-only compute stage group.
@@ -1568,9 +1589,8 @@ fn collective_key(
         traffic,
         name: None,
         after: None,
-        channels: Vec::new(),
+        shape: None,
         chunk: CollectiveChunkPolicy::EqualRemainderLast,
-        seeded: None,
     })
 }
 
@@ -1649,7 +1669,7 @@ fn shape_collective(
                     .to_owned(),
             ));
         }
-        key.channels = rings;
+        key.shape.get_or_insert_with(Box::default).channels = rings;
     }
     if let Some(seeded) = seeded {
         if algorithm != CollectiveAlgorithm::AllToAll {
@@ -1669,9 +1689,9 @@ fn shape_collective(
             )));
         }
         key.chunk = CollectiveChunkPolicy::Seeded;
-        key.seeded = Some(seeded);
+        key.shape.get_or_insert_with(Box::default).seeded = Some(seeded);
     }
-    let channel_count = key.channels.len().max(1) as u64;
+    let channel_count = key.channels().len().max(1) as u64;
     let message = match algorithm {
         CollectiveAlgorithm::SendRecv => total_bytes,
         _ if key.chunk == CollectiveChunkPolicy::Seeded => 1,
@@ -1742,7 +1762,9 @@ fn validate_collective(
     )?;
     key.name = name;
     key.after = after;
-    let seeded = alltoall.map(seeded_all_to_all).transpose()?;
+    let seeded = alltoall
+        .map(|table| seeded_all_to_all(*table))
+        .transpose()?;
     shape_collective(&mut key, channels, chunk.as_deref(), seeded)?;
     Ok(key)
 }
@@ -4287,7 +4309,7 @@ impl CollectiveLayout {
         };
         match semantic.algorithm {
             CollectiveAlgorithm::AllToAll => {
-                layout.pair_bytes = match semantic.seeded {
+                layout.pair_bytes = match semantic.seeded() {
                     Some(seeded) => seeded.bytes(semantic.flow_count).ok_or_else(|| {
                         CompileError::Invalid("seeded all-to-all sizes overflow u64".to_owned())
                     })?,
@@ -4301,9 +4323,9 @@ impl CollectiveLayout {
                 };
             }
             CollectiveAlgorithm::SendRecv => {}
-            _ if semantic.channels.is_empty() => {}
+            _ if semantic.channels().is_empty() => {}
             _ => {
-                layout.rings = semantic.channels.clone();
+                layout.rings = semantic.channels().to_vec();
                 layout.positions = layout
                     .rings
                     .iter()
@@ -4322,7 +4344,7 @@ impl CollectiveLayout {
 
     /// Whether `semantic` needs a layout of its own: channel rings, or an all-to-all's pairs.
     fn needed(semantic: &CollectiveKey) -> bool {
-        !semantic.channels.is_empty() || semantic.algorithm == CollectiveAlgorithm::AllToAll
+        !semantic.channels().is_empty() || semantic.algorithm == CollectiveAlgorithm::AllToAll
     }
 
     /// A ring algorithm's channel count.
@@ -4540,7 +4562,7 @@ fn expand_collective(
     let channel_policy = match semantic.algorithm {
         CollectiveAlgorithm::AllToAll => CollectiveChannelPolicy::AllPairs,
         CollectiveAlgorithm::SendRecv => CollectiveChannelPolicy::Pair,
-        _ if semantic.channels.is_empty() => CollectiveChannelPolicy::RingNext,
+        _ if semantic.channels().is_empty() => CollectiveChannelPolicy::RingNext,
         _ => CollectiveChannelPolicy::Channels,
     };
     let push = |flows: &mut Vec<FlowInput>,
@@ -5148,7 +5170,28 @@ fn mix_seed(mut value: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{FlowInput, parsed_decimal};
+    use super::{AfterGroups, CollectiveKey, ComputeKey, FlowInput, parsed_decimal};
+
+    /// P16 H1 (ruling R1's gate): the operations' key fields must not grow the keys of ordinary
+    /// collectives and compute groups, which lowering holds and copies per group. `feat/p16`
+    /// (669e16b): `CollectiveKey` 248 B, `ComputeKey` 80 B. A channel ring's or a seeded
+    /// all-to-all's parts are one boxed pointer (8 B; the chunk policy fits in padding), and one
+    /// `after` name or several share the 24 B of the name they replaced.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn stage_group_keys_keep_their_size() {
+        for (name, size, bound) in [
+            ("CollectiveKey", std::mem::size_of::<CollectiveKey>(), 256),
+            ("ComputeKey", std::mem::size_of::<ComputeKey>(), 80),
+            (
+                "Option<AfterGroups>",
+                std::mem::size_of::<Option<AfterGroups>>(),
+                24,
+            ),
+        ] {
+            assert!(size <= bound, "{name} grew to {size} B, above {bound} B");
+        }
+    }
 
     /// `FlowInput` is held once per flow, sorted and moved through lowering, so its size is a
     /// per-flow memory and memory-movement cost: at the 262,144-flow frontier every 100 B is
