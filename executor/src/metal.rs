@@ -2425,13 +2425,17 @@ impl MetalPlan {
             0
         };
         let mut observation_capacities = if observation_mode == ObservationMode::Full {
-            let (counts, feedback_counts) = crate::device_sizing::observation_packet_counts(
+            let (counts, feedback_counts) = crate::planner_capacity::observation_packet_counts(
                 image,
                 &flow_packet_counts,
                 &flow_feedback_counts,
                 exclusive_horizon_ns,
             );
-            crate::device_sizing::derived_observation_capacities(image, &counts, &feedback_counts)
+            crate::planner_capacity::derived_observation_capacities(
+                image,
+                &counts,
+                &feedback_counts,
+            )
         } else {
             vec![0; node_count]
         };
