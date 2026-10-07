@@ -20,8 +20,8 @@ use days::scenario::compile_config;
 use days::topos::config::SpectrumXConfig;
 use days::topos::rail::{RailTopology, ServerLocality};
 use days_executor::{
-    CpuConfig, FlowGeneratorKind, ObservationMode, RunResult, SimulationImage, StageRole,
-    run_cpu_with_observations, run_scalar_with_observations,
+    CpuConfig, FlowGeneratorKind, ObservationMode, RunResult, SimulationImage, StageOperation,
+    StageRole, run_cpu_with_observations, run_scalar_with_observations,
 };
 
 /// 8 GPUs, 4 per server (servers {0..3} and {4..7}), on SimAI's rail fabric.
@@ -283,6 +283,59 @@ fn a_single_server_collective_is_one_delay_stage_per_rank() {
         })
         .count();
     assert_eq!(delays, 8, "two TP groups of four ranks");
+}
+
+/// A single-server collective keeps its issue stream (review F9's `stream`) as a delay group: TP on
+/// stream 1 inside the first server and the cross-server all-to-all on stream 1 each name one
+/// `stage_streams` entry, the TP one its delay stages' compute group.
+#[test]
+fn a_single_server_collective_keeps_its_stream() {
+    let (label, config) = &fixtures()[3];
+    let tagged = config
+        .replace(
+            "sinks = [1, 2, 3, 0]\nafter = \"fwd0\"\n",
+            "sinks = [1, 2, 3, 0]\nafter = \"fwd0\"\nstream = 1\n",
+        )
+        .replace(
+            "after = \"fwd\"\n\n[collective.traffic]\ninitial_delay = 0.0\nsize = 64000",
+            "after = \"fwd\"\nstream = 1\n\n[collective.traffic]\ninitial_delay = 0.0\nsize = 64000",
+        );
+    assert_eq!(tagged.matches("stream = 1").count(), 2, "both tags placed");
+    let image = lower(label, &tagged);
+    let delay = locality()
+        .single_server_collective_delay_ns(3, 40_000 / 4 / 4, 4, MTU)
+        .expect("a delay");
+    let stages = image
+        .host_states
+        .iter()
+        .flat_map(|state| state.generators_with_stages())
+        .filter_map(|(_, stage)| stage)
+        .collect::<Vec<_>>();
+    assert_eq!(image.stage_streams.len(), 2, "{:?}", image.stage_streams);
+    for entry in &image.stage_streams {
+        assert_eq!(entry.stream, 1);
+        match entry.operation {
+            StageOperation::Compute(id) => {
+                let ranks = stages
+                    .iter()
+                    .filter_map(|stage| match stage.role {
+                        StageRole::Compute(compute) if compute.compute_id == id => {
+                            Some(compute.duration_ns)
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(ranks, vec![delay; 4], "the TP group's four delay stages");
+            }
+            StageOperation::Collective(id) => {
+                assert!(stages.iter().any(|stage| matches!(
+                    stage.role,
+                    StageRole::Collective(identity) if identity.collective_id == id
+                        && identity.algorithm == days_executor::CollectiveAlgorithm::AllToAll
+                )));
+            }
+        }
+    }
 }
 
 fn scalar(image: &SimulationImage, horizon: Option<u64>, mode: ObservationMode) -> RunResult {

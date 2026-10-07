@@ -4640,9 +4640,9 @@ impl NotifyLowering {
             }
             // A ring hop inside a server of a ring that spans servers runs alone on the sender's
             // port (concurrency 1: SimAI's channels desynchronise behind their own inter-server
-            // hops), as does a send/recv; an all-to-all's same-server sends share it. A collective
-            // inside one server never reaches here: it is one delay stage per rank
-            // (`single_server_delays`).
+            // hops), as does a send/recv; an all-to-all's same-server sends share it, also when
+            // the whole all-to-all is inside one server. A ring collective inside one server never
+            // reaches here: it is one delay stage per rank (`single_server_delays`).
             let concurrency = match stage.algorithm {
                 CollectiveAlgorithm::AllToAll => all_to_all_peers
                     .get(&(stage.collective_id, stage.position.rank))
