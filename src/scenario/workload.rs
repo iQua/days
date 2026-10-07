@@ -41,9 +41,11 @@ pub struct Transport {
 pub struct Operation {
     /// Index into [`Workload::groups`].
     pub group: usize,
-    /// The operations whose rank-`r` stages each rank-`r` stage of this one waits for (indices
-    /// into [`Workload::operations`]); they run on the same hosts in the same rank order. A
-    /// collective follows at least one compute operation.
+    /// The operations this one follows (indices into [`Workload::operations`]), host-matched: its
+    /// rank at host `h` waits, at `h`, for each listed operation that runs on `h`, through that
+    /// operation's rank there (equal host lists are the special case). Each listed operation runs
+    /// on a host where this one starts (all its hosts; a Send/Recv's sender alone), every such host
+    /// runs a listed operation, and a collective follows at least one compute operation.
     pub after: Vec<usize>,
     /// The issue stream (SimAI's queue) the operation runs on at each rank: 0 for the compute
     /// stream, another value for a data queue. The stage-aware sizing charges each stream's widest

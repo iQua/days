@@ -289,7 +289,7 @@ mutate_case "compute-timer-phase" "$chain" \
   'REJECT: line 41: collective progress event phase disagrees with its cause'
 mutate_case "compute-local-predecessor-rank" "$chain" \
   '$column["flow_id"] == 18 { $column["local_predecessors"] = 13; $column["cause_flow_id"] = 13 }' \
-  'REJECT: line 41: compute local predecessor is not the same-rank stage of a compute group'
+  'REJECT: line 41: compute local predecessor is not a compute stage on its host'
 mutate_case "compute-inbound-not-final" "$chain" \
   '$column["flow_id"] == 12 { $column["inbound_predecessors"] = 6; if ($column["cause"] == "inbound_arrival") $column["cause_flow_id"] = 6 }' \
   'REJECT: line 32: compute inbound predecessor is not the previous rank'"'"'s final collective stage'
@@ -513,6 +513,22 @@ mutate_case "ungated-notify-relabelled-delivery" "$rail_ungated" \
 mutate_case "ungated-notify-relabelled-to-none" "$rail_ungated" \
   '$column["cause"] == "inbound_arrival" && $column["cause_flow_id"] == 0 { $column["cause_collective_id"] = 99 }' \
   'REJECT: line 26: the rows a stage notify causes name different collectives'
+
+# P16 host-matched `after` (the ruling on H3's C1): an entry stage waits, at its host, for the
+# groups it follows there, whatever their ranks. In dp-after-ep, `tail` at host 5 (flow 22) follows
+# `post` at host 5 (flow 21); naming `post` at host 1 (flow 19, same timer deadline) instead names
+# a compute stage on another host.
+hostafter_dp="$fixture_dir/collective_hostafter_dp_after_ep_executor_accept.csv"
+mutate_case "hostafter-compute-predecessor-on-another-host" "$hostafter_dp" \
+  '$column["flow_id"] == 22 { $column["local_predecessors"] = 19; $column["cause_flow_id"] = 19 }' \
+  'REJECT: line 57: compute local predecessor is not a compute stage on its host'
+# In rail-dp-after-ep-a2a, the DP ring's root at host 4 (flow 1) follows EP instance 1's all-to-all
+# there (its sends 16, 17, 18 and receipts 21, 23, 25) and the weight gradient (39); dropping send
+# 18 from the join (and its completion row) leaves instance 1's completion at host 4 partial.
+hostafter_rail="$fixture_dir/collective_hostafter_rail_dp_after_ep_a2a_executor_accept.csv"
+mutate_case "hostafter-join-missing-cross-family-pair" "$hostafter_rail" \
+  '$column["flow_id"] == 1 { if ($column["cause_flow_id"] == 18 && $column["cause"] == "local_completion") next; $column["local_predecessors"] = "16;17;39"; $column["local_required"] = 3; if ($column["cause_flow_id"] == 17 && $column["cause"] == "local_completion") { $column["after_local_complete"] = 1 } if ($column["before_local_completed"] == 4) $column["before_local_completed"] = 3; if ($column["after_local_completed"] == 4) $column["after_local_completed"] = 3 }' \
+  'REJECT: line 3: a stage does not wait for its predecessor collective'"'"'s whole completion at its rank'
 
 echo "P10c exact-integer collective campaign checks: $checked"
 exit "$failures"
