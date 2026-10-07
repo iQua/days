@@ -12,6 +12,11 @@
 //! the pretty `Debug` rendering that `days` prints as `result_fnv1a64`. The CPU executor at one
 //! and three workers must equal Scalar on every one of those runs.
 //!
+//! P16 L2 re-recorded the SP and WFQ anchors when their full-observation runs gained the Static
+//! Priority and WFQ certificate records (`MechanismTransitionRecord::Sp` and `::Wfq`). With those
+//! records removed, every run still fingerprints to the `6454583` anchors (evidence:
+//! `days-gpu/evidence/P16/lgci/tooling/zz_lgci_anchor_check.rs`).
+//!
 //! Run: `cargo test -p days --test p16_pfc_service_identity` (default matrix, any profile).
 
 use std::fs;
@@ -40,27 +45,27 @@ const ANCHORS: [(&str, &[(u64, u64)]); 5] = [
     (
         "SP",
         &[
-            (512_742, 0xbacc_e48d_3815_9ec9),
-            (438_167, 0xea5b_9459_5504_2d53),
-            (380_392, 0xdcbe_6277_6b1f_711a),
-            (321_764, 0x232b_3d20_2224_bf1e),
-            (260_576, 0xef6e_1306_7d47_e8a4),
-            (207_429, 0x5f7a_16fe_422d_4739),
-            (155_497, 0x4df5_3efc_e43a_b429),
-            (129_869, 0xac2d_5e51_235b_931b),
+            (1_766_707, 0x0aba_ffff_9d10_50a6),
+            (1_515_258, 0x44e0_3e6b_dbf6_4b40),
+            (1_293_846, 0xba87_5f40_1f43_a1a2),
+            (1_066_944, 0x8a98_e4c8_022e_c3a4),
+            (836_308, 0x6b70_c440_f8bc_5d3a),
+            (635_847, 0xebd0_0480_c678_33e4),
+            (431_987, 0x10c1_a6e1_cd51_591e),
+            (267_721, 0x5035_b69e_d708_56fb),
         ],
     ),
     (
         "WFQ",
         &[
-            (852_384, 0x001d_0777_0e6b_0d99),
-            (759_174, 0xdffc_9945_f359_10b3),
-            (677_804, 0xdbf9_3e7b_cab7_084c),
-            (585_631, 0x2c27_5075_e441_01ab),
-            (483_188, 0x5908_9dac_e8cc_8602),
-            (397_954, 0xb6d8_87bb_815b_1785),
-            (307_718, 0x6435_8aa3_b082_29af),
-            (225_716, 0x3516_d828_74fb_be31),
+            (10_941_051, 0x98c9_23c7_20b7_17bb),
+            (10_236_605, 0x7960_d9d9_e849_c7b6),
+            (9_335_491, 0xac22_6b91_20ab_15b6),
+            (8_111_418, 0x1f84_342e_eade_a2bc),
+            (6_579_837, 0xaedc_8713_aa8d_ed01),
+            (5_011_238, 0x62f8_2476_a5a9_24f6),
+            (3_404_755, 0x9b89_0d3e_6252_fc20),
+            (1_807_370, 0x514e_0c69_3e09_35dc),
         ],
     ),
     (

@@ -3,8 +3,8 @@
 //!
 //! A Summary-mode Scalar run of each WFQ and SP scenario of `configs/leanguard/` must allocate no more
 //! than it did before the WFQ and SP emitters existed (`5839da3`, measured by
-//! `days-gpu/evidence/P16/lgci/tooling/zz_lgci_probe.rs`; the counts are the same in debug and
-//! release builds). The counters are thread-local, so tests running beside these cannot perturb
+//! `days-gpu/evidence/P16/lgci/tooling/zz_lgci_probe.rs` and this test at `5839da3`; the counts
+//! are the same in debug and release builds, with and without the `test` feature's byte offset). The counters are thread-local, so tests running beside these cannot perturb
 //! them.
 #![allow(unsafe_code)]
 
@@ -81,12 +81,22 @@ fn summary_run_allocations(config: &str) -> (u64, u64) {
 
 #[test]
 fn summary_wfq_and_sp_runs_allocate_no_more_than_before_their_certificates() {
-    // (scenario, allocations, bytes) at 5839da3.
-    for (config, allocations, bytes) in [
-        ("sched_wfq", 88, 33_328),
-        ("wfq_pfc", 169, 74_552),
-        ("sched_sp", 66, 29_792),
-    ] {
+    // (scenario, allocations, bytes) at 5839da3, the same in debug and release. The `test`
+    // feature's probes add a few bytes to each run.
+    let caps = if cfg!(feature = "test") {
+        [
+            ("sched_wfq", 88, 33_520),
+            ("wfq_pfc", 169, 74_808),
+            ("sched_sp", 66, 29_984),
+        ]
+    } else {
+        [
+            ("sched_wfq", 88, 33_328),
+            ("wfq_pfc", 169, 74_552),
+            ("sched_sp", 66, 29_792),
+        ]
+    };
+    for (config, allocations, bytes) in caps {
         let (actual_allocations, actual_bytes) = summary_run_allocations(config);
         assert!(
             actual_allocations <= allocations && actual_bytes <= bytes,
