@@ -188,6 +188,20 @@ fn select_cuda_provisioning(
     }
 }
 
+/// The device-memory limit one plan is checked against before allocation (P16 D2), from
+/// `cuMemGetInfo`'s `free` and `total` and the optional [`CudaConfig::max_device_bytes`], which
+/// can only lower it.
+fn plan_memory_limit(
+    provisioning: CudaProvisioning,
+    free: usize,
+    total: usize,
+    configured: Option<usize>,
+) -> usize {
+    let _ = (provisioning, total);
+    let device = free;
+    configured.map_or(device, |configured| configured.min(device))
+}
+
 #[cfg(feature = "cuda-test-hooks")]
 std::thread_local! {
     static PANIC_AFTER_NEXT_EXECUTION: Cell<bool> = const { Cell::new(false) };
@@ -5566,8 +5580,7 @@ impl RoundModule {
 }
 
 impl DirectCuda {
-    /// The most bytes one plan may place on the device: the memory free on it now, or
-    /// `configured` when that is lower (P16 D2).
+    /// The most bytes one plan may place on the device ([`plan_memory_limit`]) (P16 D2).
     ///
     /// The stream is synchronized first. A discarded attempt's buffers are freed with
     /// stream-ordered `cuMemFreeAsync` when the context supports it; the freed memory stays in the
@@ -5578,11 +5591,16 @@ impl DirectCuda {
         self.stream
             .synchronize()
             .map_err(|error| driver_error("device memory query synchronization", error))?;
-        let (free, _total) = self
+        let (free, total) = self
             .context
             .mem_get_info()
             .map_err(|error| driver_error("device memory query", error))?;
-        Ok(configured.map_or(free, |configured| configured.min(free)))
+        Ok(plan_memory_limit(
+            self.provisioning,
+            free,
+            total,
+            configured,
+        ))
     }
 
     fn execution_guard(&self) -> MutexGuard<'_, ()> {
@@ -6079,7 +6097,7 @@ fn duration_ns(duration: Duration) -> u64 {
 mod tests {
     use super::{
         CudaArena, CudaError, CudaProvisioning, decode_arena, decode_device_error,
-        select_cuda_provisioning,
+        plan_memory_limit, select_cuda_provisioning,
     };
     use crate::CapacityRetryRecord;
 
@@ -6112,6 +6130,45 @@ mod tests {
         assert_eq!(
             select_cuda_provisioning(true, false, true),
             CudaProvisioning::Device
+        );
+    }
+
+    /// P16 D2 fix 1 (review M1): under Managed provisioning (an integrated GPU such as madrid's
+    /// GB10) `cuMemGetInfo`'s free figure is the kernel's MemFree, which leaves out reclaimable
+    /// page cache: on an idle madrid it read 83.1 GB, while a 102 GB managed allocation succeeded.
+    /// The limit there is the total, a fixed property of the device.
+    #[test]
+    fn managed_provisioning_checks_plans_against_total_memory() {
+        let (free, total) = (83_136_438_272, 130_594_156_544);
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Managed, free, total, None),
+            total
+        );
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Managed, free, total, Some(1_000)),
+            1_000
+        );
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Managed, free, total, Some(usize::MAX)),
+            total
+        );
+    }
+
+    /// On a discrete GPU the free figure is the memory a plan can still allocate.
+    #[test]
+    fn device_provisioning_checks_plans_against_free_memory() {
+        let (free, total) = (20_818_296_832, 21_464_350_720);
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Device, free, total, None),
+            free
+        );
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Device, free, total, Some(1_000)),
+            1_000
+        );
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Device, free, total, Some(usize::MAX)),
+            free
         );
     }
 
