@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# The trace directory is normally the committed fixtures, lean/fixtures/tcp: Days AGO Scalar
+# certificates that executor/tests/tcp_semantics.rs (adversarial images) and
+# tests/leanguard_certificates.rs (TOML scenarios lowered by the Days AGO compiler) regenerate byte
+# for byte. CI runs it on that directory.
 if [[ "$#" -ne 2 ]]; then
   echo "usage: run-tcp-campaign.sh <scalar-trace-dir> <results-dir>" >&2
   exit 2
@@ -56,11 +60,16 @@ mutate_first() {
 
 reno_recovery="$trace_dir/reno-recovery-tcp-events.csv"
 cubic_recovery="$trace_dir/cubic-recovery-tcp-events.csv"
+cubic_compiled="$trace_dir/cubic-compiled-tcp-events.csv"
 
 # This mutation leaves all redundant byte/scaled projections internally consistent. It is killed
 # only because the recorded recovery_high output no longer follows the third-duplicate input.
 mutate_first "$reno_recovery" Reno duplicate_ack before_dupacks 2 \
   recovery_high_input 2560 "$results_dir/semantic_bad_recovery_high.csv"
+
+# The CUBIC backoff at the third duplicate ACK of the compiled scenario records a wrong W_max.
+mutate_first "$cubic_compiled" CUBIC duplicate_ack before_dupacks 2 \
+  after_w_max_scaled 1 "$results_dir/semantic_bad_cubic_w_max.csv"
 
 mutate_first "$reno_recovery" Reno new_ack "" "" \
   time_ns 18446744073709551616 "$results_dir/time_u64_overflow.csv"
@@ -119,6 +128,7 @@ for trace in "${traces[@]}"; do
   run_case "$stem" 0 "$trace"
 done
 run_case semantic_bad_recovery_high 1 "$results_dir/semantic_bad_recovery_high.csv"
+run_case semantic_bad_cubic_w_max 1 "$results_dir/semantic_bad_cubic_w_max.csv"
 run_case time_u64_overflow 2 "$results_dir/time_u64_overflow.csv"
 run_case rtt_u64_overflow 2 "$results_dir/rtt_u64_overflow.csv"
 run_case epoch_u64_overflow 2 "$results_dir/epoch_u64_overflow.csv"

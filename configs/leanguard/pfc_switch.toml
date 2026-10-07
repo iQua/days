@@ -1,0 +1,56 @@
+# LeanGuard CI fixture: switch-link PFC. Hosts 0 and 1 send through switch 4 and host 3 through
+# switch 5, all to host 2; switch 5's egress to host 2 is the bottleneck, so its ingress from
+# switch 4 crosses XOFF and pauses switch 4, then drains below XON and resumes it.
+# tests/leanguard_certificates.rs lowers it and writes the Scalar certificate.
+seed = 16
+edges = [[0, 4], [1, 4], [4, 5], [3, 5], [2, 5]]
+hosts = [0, 1, 2, 3]
+duration = 0.0001
+
+[switch]
+port_rate = 8000000000
+capacity = 100
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link]
+mode = "Pfc"
+
+[link.pfc]
+xoff = [0, 0, 0, 3000, 0, 0, 0, 0]
+xon = [0, 0, 0, 1000, 0, 0, 0, 0]
+pause_quanta = [0, 0, 0, 1, 0, 0, 0, 0]
+buffer_capacity = [0, 0, 0, 100000, 0, 0, 0, 0]
+
+[[flow]]
+flow_type = "PacketDistribution"
+priority = 3
+graph = [[0, 2]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 6000
+arr_dist = { type = "Uniform", low = 0.000001, high = 0.000001 }
+pkt_size_dist = { type = "Uniform", low = 1000, high = 1000 }
+
+[[flow]]
+flow_type = "PacketDistribution"
+priority = 3
+graph = [[1, 2]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 6000
+arr_dist = { type = "Uniform", low = 0.000001, high = 0.000001 }
+pkt_size_dist = { type = "Uniform", low = 1000, high = 1000 }
+
+[[flow]]
+flow_type = "PacketDistribution"
+priority = 3
+graph = [[3, 2]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 6000
+arr_dist = { type = "Uniform", low = 0.000001, high = 0.000001 }
+pkt_size_dist = { type = "Uniform", low = 1000, high = 1000 }

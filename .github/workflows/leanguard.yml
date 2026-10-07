@@ -80,6 +80,9 @@ jobs:
       - name: Run SP checks
         run: bash lean/scripts/run-sp-campaign.sh
 
+      - name: Run TCP Reno and CUBIC checks
+        run: bash lean/scripts/run-tcp-campaign.sh lean/fixtures/tcp "$RUNNER_TEMP/tcp-campaign"
+
       - name: Run P10c collective differential test (keyed checker against the list-scan reference)
         run: bash lean/scripts/run-p10c-collective-differential.sh
 

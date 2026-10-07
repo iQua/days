@@ -3382,16 +3382,24 @@ fn scalar_adversarial_trace_covers_tcp_leanguard_transition_classes() {
             after,
         }],
     ));
-    let output_dir = std::env::var_os("DAYS_TCP_TRACE_DIR").map(std::path::PathBuf::from);
+    // Each trace is a committed LeanGuard fixture that CI's `run-tcp-campaign.sh` checks, with its
+    // mutations. Set `DAYS_UPDATE_LEANGUARD_FIXTURES=1` to regenerate.
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../lean/fixtures/tcp");
     for (algorithm, records) in traces {
         let csv = days_executor::tcp_transitions_csv(&records)
             .expect("one scalar run must have unique canonical event keys");
         assert_eq!(csv.lines().count(), records.len() + 1);
-        if let Some(directory) = &output_dir {
-            std::fs::create_dir_all(directory).expect("create requested TCP trace directory");
-            let name = format!("{}-tcp-events.csv", algorithm.to_ascii_lowercase());
-            std::fs::write(directory.join(name), csv).expect("write requested TCP LeanGuard trace");
+        let path = fixtures.join(format!("{}-tcp-events.csv", algorithm.to_ascii_lowercase()));
+        if std::env::var_os("DAYS_UPDATE_LEANGUARD_FIXTURES").is_some() {
+            std::fs::create_dir_all(&fixtures).expect("create the TCP fixture directory");
+            std::fs::write(&path, &csv).expect("write the TCP LeanGuard fixture");
         }
+        assert_eq!(
+            csv,
+            std::fs::read_to_string(&path).unwrap_or_default(),
+            "{}",
+            path.display()
+        );
     }
 }
 
