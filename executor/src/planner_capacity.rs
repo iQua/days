@@ -981,6 +981,205 @@ fn legacy_source_queue_packet_bound(
     }
 }
 
+/// P16 D2: per-flow packet counts that bound the Full-observation records of the run actually
+/// requested, in `flow_packet_counts`'s form (`totals` with feedback included, and `feedback`).
+///
+/// The planners' whole-run counts size every other arena and stay untouched; only the observation
+/// logs use these. A log keeps every record of the run, so its size grows with the run's length,
+/// and a run cut early needs only the packets that can exist before the cut. Sized from the whole
+/// run instead, b4 (1,920 queue pairs of 26,985 packets each) planned 186 GB of logs for a cutoff
+/// 1 ns past its first event.
+///
+/// The bound, per flow:
+/// - **Initial packets** (routed and live, counted exactly as `flow_packet_counts` counts them)
+///   are kept whole.
+/// - **Paced emissions:** a constant, rate, DCQCN or queue-pair generator sends at most one packet
+///   per pacing tick, its ticks are at least one interval apart, and no tick precedes the image's
+///   earliest pending event, since a Blocked generator is released only by an event and nothing
+///   happens before the first one. Between `lo = max(next tick, earliest event)` and the planning
+///   end (`planning_horizon_ns`, inclusive) it therefore sends at most `(end - lo) / interval + 1`
+///   packets; one more covers a stage release that re-anchors a queue pair's grid off its old
+///   points. A generator past its sending states sends none.
+/// - **TCP** senders have no pacing grid: their whole-run count stands.
+/// - **Feedback** is at most one packet per data packet for TCP, DCQCN and queue pairs (the
+///   whole-run counts use the same rule), plus the feedback already in flight.
+///
+/// Each count is the minimum of this bound and the whole-run count, so an image whose run ends at
+/// its stop time keeps its sizing wherever the whole-run count is already the smaller one.
+///
+/// Capacity here is refuse-or-run, never semantics: should a bound fall short, the device raises a
+/// typed observation capacity fault, the attempt is discarded, and the retry grows the logs. A
+/// count can only move a run between "runs" and "retries"; it cannot change a result.
+pub(crate) fn observation_packet_counts(
+    image: &SimulationImage,
+    totals: &[usize],
+    feedback: &[usize],
+    exclusive_horizon_ns: Option<u64>,
+) -> (Vec<usize>, Vec<usize>) {
+    let flow_count = image.flows.len();
+    let live_payloads = crate::tcp_ledger::initial_live_payloads(image);
+    let mut initial_data = vec![0_usize; flow_count];
+    let mut initial_feedback = vec![0_usize; flow_count];
+    for packet in &image.initial_packets {
+        if matches!(packet.kind, PacketKind::TcpData(_)) && !live_payloads.contains(&packet.id) {
+            continue;
+        }
+        if !crate::device_sizing::initial_packet_is_routed(packet) {
+            continue;
+        }
+        let counts = if packet.kind.is_data() {
+            &mut initial_data
+        } else {
+            &mut initial_feedback
+        };
+        counts[packet.flow.0 as usize] = counts[packet.flow.0 as usize].saturating_add(1);
+    }
+
+    let earliest = image
+        .initial_events
+        .iter()
+        .map(|event| event.key.time_ns)
+        .min();
+    let end = crate::device_sizing::planning_horizon_ns(image.stop_time_ns, exclusive_horizon_ns);
+    // `None` is an unbounded emission count (TCP, or a zero interval).
+    let mut emissions = vec![Some(0_usize); flow_count];
+    let mut feedback_per_packet = vec![0_usize; flow_count];
+    for generator in image.host_states.iter().flat_map(|state| &state.generators) {
+        let flow = generator.flow.0 as usize;
+        let status = generator.next_emission.status;
+        let sending = matches!(
+            status,
+            GeneratorStatus::Scheduled | GeneratorStatus::Blocked
+        );
+        let next = generator.next_emission.departure_time_ns;
+        // (first possible tick, interval), or `None` when the generator sends nothing more.
+        let grid = match generator.kind {
+            FlowGeneratorKind::Constant(constant) => {
+                (status == GeneratorStatus::Scheduled).then_some((next, constant.interval_ns))
+            }
+            FlowGeneratorKind::Rate(rate) => sending.then_some((next, rate.pacing_interval_ns)),
+            FlowGeneratorKind::Dcqcn(dcqcn) => {
+                sending.then_some((next, dcqcn.rate.pacing_interval_ns))
+            }
+            FlowGeneratorKind::Roce(roce) => {
+                if roce.pacer_armed {
+                    Some((next, roce.pacer.pacing_interval_ns))
+                } else if status == GeneratorStatus::Blocked {
+                    Some((
+                        roce.pacer.first_pacing_time_ns,
+                        roce.pacer.pacing_interval_ns,
+                    ))
+                } else {
+                    None
+                }
+            }
+            FlowGeneratorKind::Tcp(_) => {
+                emissions[flow] = None;
+                None
+            }
+        };
+        if matches!(
+            generator.kind,
+            FlowGeneratorKind::Tcp(_) | FlowGeneratorKind::Dcqcn(_) | FlowGeneratorKind::Roce(_)
+        ) {
+            feedback_per_packet[flow] = feedback_per_packet[flow].saturating_add(1);
+        }
+        let Some((first_tick, interval)) = grid else {
+            continue;
+        };
+        let ticks = match earliest {
+            None => Some(0),
+            Some(_) if interval == 0 => None,
+            Some(earliest) => {
+                let lo = first_tick.max(earliest);
+                Some(if lo > end {
+                    0
+                } else {
+                    usize::try_from((end - lo) / interval)
+                        .unwrap_or(usize::MAX)
+                        .saturating_add(2)
+                })
+            }
+        };
+        emissions[flow] = match (emissions[flow], ticks) {
+            (Some(total), Some(ticks)) => Some(total.saturating_add(ticks)),
+            _ => None,
+        };
+    }
+
+    let mut bounded_totals = Vec::with_capacity(flow_count);
+    let mut bounded_feedback = Vec::with_capacity(flow_count);
+    for flow in 0..flow_count {
+        let whole_feedback = feedback[flow];
+        let whole_data = totals[flow].saturating_sub(whole_feedback);
+        let data = emissions[flow].map_or(whole_data, |emitted| {
+            whole_data.min(initial_data[flow].saturating_add(emitted))
+        });
+        let feedback = whole_feedback.min(
+            initial_feedback[flow].saturating_add(data.saturating_mul(feedback_per_packet[flow])),
+        );
+        bounded_totals.push(data.saturating_add(feedback));
+        bounded_feedback.push(feedback);
+    }
+    (bounded_totals, bounded_feedback)
+}
+
+/// Per-LP record capacity of the three Full-observation logs (observed packets, departures,
+/// arrivals), from per-flow packet counts in `flow_packet_counts`'s form. Shared by both device
+/// planners, which pass [`observation_packet_counts`].
+pub(crate) fn derived_observation_capacities(
+    image: &SimulationImage,
+    counts: &[usize],
+    feedback_counts: &[usize],
+) -> Vec<usize> {
+    let mut capacities = vec![1_usize; image.nodes.len()];
+    for event in &image.initial_events {
+        let target = event.target.0 as usize;
+        capacities[target] = capacities[target].saturating_add(1);
+    }
+    for (index, flow) in image.flows.iter().enumerate() {
+        let feedback_count = feedback_counts[index];
+        let data_count = counts[index].saturating_sub(feedback_count);
+        capacities[flow.source.0 as usize] =
+            capacities[flow.source.0 as usize].saturating_add(data_count);
+        capacities[flow.target.0 as usize] =
+            capacities[flow.target.0 as usize].saturating_add(feedback_count);
+        add_route_observation_capacities(
+            image,
+            &flow.route,
+            flow.target,
+            data_count,
+            &mut capacities,
+        );
+        add_route_observation_capacities(
+            image,
+            &flow.reverse_route,
+            flow.source,
+            feedback_count,
+            &mut capacities,
+        );
+    }
+    capacities
+}
+
+fn add_route_observation_capacities(
+    image: &SimulationImage,
+    route: &[crate::LinkId],
+    terminal: crate::NodeId,
+    packet_count: usize,
+    capacities: &mut [usize],
+) {
+    for (step, link_id) in route.iter().enumerate() {
+        let producer = image.links[link_id.0 as usize].source.0 as usize;
+        capacities[producer] = capacities[producer].saturating_add(packet_count.saturating_mul(2));
+        let target = route
+            .get(step + 1)
+            .map_or(terminal, |next| image.links[next.0 as usize].source)
+            .0 as usize;
+        capacities[target] = capacities[target].saturating_add(packet_count);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{materialize_minimum_packet_sizes, update_minimum_packet_size};

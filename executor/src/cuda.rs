@@ -188,6 +188,45 @@ fn select_cuda_provisioning(
     }
 }
 
+/// The smallest share of a managed device's total memory a plan may not use (P16 D2 fix 2).
+const MANAGED_MEMORY_RESERVE_FLOOR_BYTES: usize = 8 << 30;
+
+/// The part of a managed (integrated) device's total memory a plan may not use: the larger of
+/// 8 GiB and a sixteenth of the total. The operating system, the driver and the host side of the
+/// run keep using that memory; without the reserve a 127 GB plan on madrid's 130.6 GB GB10 passed
+/// the check and the kernel OOM-killed the process during the managed upload (review M2). On
+/// madrid the floor binds: 8 GiB, a limit of 122,004,221,952 B.
+fn managed_memory_reserve(total: usize) -> usize {
+    MANAGED_MEMORY_RESERVE_FLOOR_BYTES.max(total / 16)
+}
+
+/// The device-memory limit one plan is checked against before allocation (P16 D2), from
+/// `cuMemGetInfo`'s `free` and `total` and the optional [`CudaConfig::max_device_bytes`], which
+/// can only lower it.
+///
+/// - **Device** (a discrete GPU): `free`, the device memory a plan can still allocate.
+/// - **Managed** (an integrated GPU sharing system memory, such as GB10): `total` less
+///   [`managed_memory_reserve`]. There `free` is the kernel's MemFree, which leaves out
+///   reclaimable page cache, so it moves with host state: on an idle madrid it read 83.1 GB while
+///   a 102 GB managed allocation succeeded, and 127.9 GB right after (review M1). The total is a
+///   fixed property of the device, so whether a plan is refused does not depend on what the host
+///   cached last.
+///
+/// Neither limit can see memory that other processes allocate after the check, so a plan under it
+/// can still run out of memory when the host is shared.
+fn plan_memory_limit(
+    provisioning: CudaProvisioning,
+    free: usize,
+    total: usize,
+    configured: Option<usize>,
+) -> usize {
+    let device = match provisioning {
+        CudaProvisioning::Device => free,
+        CudaProvisioning::Managed => total.saturating_sub(managed_memory_reserve(total)),
+    };
+    configured.map_or(device, |configured| configured.min(device))
+}
+
 #[cfg(feature = "cuda-test-hooks")]
 std::thread_local! {
     static PANIC_AFTER_NEXT_EXECUTION: Cell<bool> = const { Cell::new(false) };
@@ -724,6 +763,14 @@ pub enum CudaError {
         code: u64,
         node: Option<NodeId>,
     },
+    /// P16 D2: the plan needs more device memory than the device's limit (free memory on a
+    /// discrete GPU, total memory less a fixed reserve under managed provisioning) or [`CudaConfig::max_device_bytes`]
+    /// allows, so nothing was allocated. Without this check the
+    /// run failed a plane upload out of memory.
+    DeviceMemoryExceeded {
+        planned_bytes: usize,
+        limit_bytes: usize,
+    },
 }
 
 impl fmt::Display for CudaError {
@@ -796,6 +843,15 @@ impl fmt::Display for CudaError {
                     "; the image requires the mechanisms round kernel"
                 )
             }
+            Self::DeviceMemoryExceeded {
+                planned_bytes,
+                limit_bytes,
+            } => write!(
+                formatter,
+                "CUDA plan needs {planned_bytes} bytes of device memory, over its limit of \
+                 {limit_bytes} bytes; cut the run earlier, use Summary observation, or cap the \
+                 arenas"
+            ),
             Self::DeviceExecution { code, node } => {
                 write!(
                     formatter,
@@ -866,6 +922,11 @@ pub struct CudaConfig {
     pub attempts_per_graph_wave: usize,
     /// Optional hard cap overriding the conservative semantic round bound.
     pub max_rounds: Option<usize>,
+    /// Optional limit on the bytes one plan may place on the device, below the device's own limit
+    /// (which always applies): the memory free when the attempt is planned on a discrete GPU, the
+    /// total memory less a fixed reserve under managed provisioning. A plan over the limit is
+    /// refused with [`CudaError::DeviceMemoryExceeded`] before any buffer is allocated.
+    pub max_device_bytes: Option<usize>,
     /// Test-only zero-capacity injection for device arenas without a public sizing override.
     #[doc(hidden)]
     #[cfg(feature = "cuda-test-hooks")]
@@ -894,6 +955,7 @@ impl Default for CudaConfig {
             round_threads_per_block: DEFAULT_ROUND_THREADS_PER_BLOCK,
             attempts_per_graph_wave: DEFAULT_ATTEMPTS_PER_GRAPH_WAVE,
             max_rounds: None,
+            max_device_bytes: None,
             #[cfg(feature = "cuda-test-hooks")]
             fault_injection: None,
             #[cfg(feature = "cuda-test-hooks")]
@@ -1488,6 +1550,18 @@ impl CudaExecutor {
                 if round_kernel == RoundKernel::Plain {
                     plan.refuse_plain_round_kernel()?;
                 }
+                // P16 D2: refuse, before allocating, a plan the device cannot hold. The previous
+                // attempt's buffers were dropped with its closure; `device_memory_limit`
+                // synchronizes so their memory counts as free.
+                let limit_bytes = direct.device_memory_limit(attempt_config.max_device_bytes)?;
+                let planned_bytes = plan.device_bytes();
+                if planned_bytes > limit_bytes {
+                    return Err(CudaError::DeviceMemoryExceeded {
+                        planned_bytes,
+                        limit_bytes,
+                    }
+                    .into());
+                }
                 // The module was loaded under the guard before this run planned, so it is loaded
                 // before any buffer or graph, and no other run's module is in the context.
                 let buffers = CudaBuffers::new(&direct.stream, plan, direct.provisioning)?;
@@ -1757,36 +1831,7 @@ pub fn size_cuda_plan_for_testing(
     validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
     validate_config(config)?;
     let plan = CudaPlan::new(image, exclusive_horizon_ns, config, observation_mode)?;
-    let words = [
-        plan.control.len(),
-        plan.params.len(),
-        plan.node_state.len(),
-        plan.generators.len(),
-        plan.flows.len(),
-        plan.routes.len(),
-        plan.links.len(),
-        plan.fel_meta.len(),
-        plan.fel_records.len(),
-        plan.queue_meta.len(),
-        plan.queue_records.len(),
-        plan.in_service.len(),
-        plan.outbox.len(),
-        plan.worklist.len(),
-        plan.summary.len(),
-        plan.observed.len(),
-        plan.departures.len(),
-        plan.arrivals.len(),
-        plan.lp_state.len(),
-        plan.remote_meta.len(),
-        plan.remote_staging.len(),
-        plan.observation_meta.len(),
-        plan.inbound_meta.len(),
-        plan.inbound_producers.len(),
-        plan.merge_cursors.len(),
-        plan.stream_state.len(),
-        plan.stream_records.len(),
-        plan.scheduler_state.len(),
-    ];
+    let words = plan.plane_words();
     crate::device_sizing::exact_plan_report(
         words,
         plan.tcp_state.len(),
@@ -1865,6 +1910,51 @@ fn injected_capacity(config: CudaConfig, arena: CudaArena, default: usize) -> us
 }
 
 impl CudaPlan {
+    /// Words of the 28 established planes, in plane order.
+    fn plane_words(&self) -> [usize; 28] {
+        [
+            self.control.len(),
+            self.params.len(),
+            self.node_state.len(),
+            self.generators.len(),
+            self.flows.len(),
+            self.routes.len(),
+            self.links.len(),
+            self.fel_meta.len(),
+            self.fel_records.len(),
+            self.queue_meta.len(),
+            self.queue_records.len(),
+            self.in_service.len(),
+            self.outbox.len(),
+            self.worklist.len(),
+            self.summary.len(),
+            self.observed.len(),
+            self.departures.len(),
+            self.arrivals.len(),
+            self.lp_state.len(),
+            self.remote_meta.len(),
+            self.remote_staging.len(),
+            self.observation_meta.len(),
+            self.inbound_meta.len(),
+            self.inbound_producers.len(),
+            self.merge_cursors.len(),
+            self.stream_state.len(),
+            self.stream_records.len(),
+            self.scheduler_state.len(),
+        ]
+    }
+
+    /// Bytes the plan places on the device: every plane and `tcp_state`, as
+    /// `size_cuda_plan_for_testing` reports them (P16 D2).
+    fn device_bytes(&self) -> usize {
+        self.plane_words()
+            .into_iter()
+            .chain([self.tcp_state.len()])
+            .fold(0_usize, |total, words| {
+                total.saturating_add(words.saturating_mul(std::mem::size_of::<u64>()))
+            })
+    }
+
     /// Refuses the plain round kernel on this plan, before it is uploaded, if the plan holds any
     /// state a `MECHANISMS`-guarded kernel branch would act on
     /// ([`crate::device_mechanism::plain_round_kernel_refusal`]).
@@ -2803,7 +2893,17 @@ impl CudaPlan {
             injected_capacity(config, CudaArena::Departures, observation_capacity);
         let arrival_capacity = injected_capacity(config, CudaArena::Arrivals, observation_capacity);
         let mut observation_capacities = if observation_mode == ObservationMode::Full {
-            derived_observation_capacities(image, &flow_packet_counts, &flow_feedback_counts)
+            let (counts, feedback_counts) = crate::planner_capacity::observation_packet_counts(
+                image,
+                &flow_packet_counts,
+                &flow_feedback_counts,
+                exclusive_horizon_ns,
+            );
+            crate::planner_capacity::derived_observation_capacities(
+                image,
+                &counts,
+                &feedback_counts,
+            )
         } else {
             vec![0; node_count]
         };
@@ -3767,59 +3867,6 @@ fn take_words(next: &mut usize, records: usize, words: usize) -> Result<usize, C
         )
         .ok_or_else(|| CudaError::Validation("stream state size overflows usize".into()))?;
     Ok(start)
-}
-
-fn derived_observation_capacities(
-    image: &SimulationImage,
-    counts: &[usize],
-    feedback_counts: &[usize],
-) -> Vec<usize> {
-    let mut capacities = vec![1_usize; image.nodes.len()];
-    for event in &image.initial_events {
-        let target = event.target.0 as usize;
-        capacities[target] = capacities[target].saturating_add(1);
-    }
-    for (index, flow) in image.flows.iter().enumerate() {
-        let feedback_count = feedback_counts[index];
-        let data_count = counts[index].saturating_sub(feedback_count);
-        capacities[flow.source.0 as usize] =
-            capacities[flow.source.0 as usize].saturating_add(data_count);
-        capacities[flow.target.0 as usize] =
-            capacities[flow.target.0 as usize].saturating_add(feedback_count);
-        add_route_observation_capacities(
-            image,
-            &flow.route,
-            flow.target,
-            data_count,
-            &mut capacities,
-        );
-        add_route_observation_capacities(
-            image,
-            &flow.reverse_route,
-            flow.source,
-            feedback_count,
-            &mut capacities,
-        );
-    }
-    capacities
-}
-
-fn add_route_observation_capacities(
-    image: &SimulationImage,
-    route: &[crate::LinkId],
-    terminal: NodeId,
-    packet_count: usize,
-    capacities: &mut [usize],
-) {
-    for (step, link_id) in route.iter().enumerate() {
-        let producer = image.links[link_id.0 as usize].source.0 as usize;
-        capacities[producer] = capacities[producer].saturating_add(packet_count.saturating_mul(2));
-        let target = route
-            .get(step + 1)
-            .map_or(terminal, |next| image.links[next.0 as usize].source)
-            .0 as usize;
-        capacities[target] = capacities[target].saturating_add(packet_count);
-    }
 }
 
 fn remote_inbound_producers(
@@ -5560,6 +5607,29 @@ impl RoundModule {
 }
 
 impl DirectCuda {
+    /// The most bytes one plan may place on the device ([`plan_memory_limit`]) (P16 D2).
+    ///
+    /// The stream is synchronized first; the free figure it matters for is the discrete-GPU limit. A discarded attempt's buffers are freed with
+    /// stream-ordered `cuMemFreeAsync` when the context supports it; the freed memory stays in the
+    /// device's default pool, and reaches the free count only once a synchronization releases it
+    /// (release threshold 0). Without the synchronization a capacity retry could see the previous
+    /// attempt's memory as still in use and refuse a plan that fits.
+    fn device_memory_limit(&self, configured: Option<usize>) -> Result<usize, CudaError> {
+        self.stream
+            .synchronize()
+            .map_err(|error| driver_error("device memory query synchronization", error))?;
+        let (free, total) = self
+            .context
+            .mem_get_info()
+            .map_err(|error| driver_error("device memory query", error))?;
+        Ok(plan_memory_limit(
+            self.provisioning,
+            free,
+            total,
+            configured,
+        ))
+    }
+
     fn execution_guard(&self) -> MutexGuard<'_, ()> {
         self.execution
             .lock()
@@ -6054,7 +6124,7 @@ fn duration_ns(duration: Duration) -> u64 {
 mod tests {
     use super::{
         CudaArena, CudaError, CudaProvisioning, decode_arena, decode_device_error,
-        select_cuda_provisioning,
+        plan_memory_limit, select_cuda_provisioning,
     };
     use crate::CapacityRetryRecord;
 
@@ -6087,6 +6157,70 @@ mod tests {
         assert_eq!(
             select_cuda_provisioning(true, false, true),
             CudaProvisioning::Device
+        );
+    }
+
+    /// P16 D2 fix 1 (review M1): under Managed provisioning (an integrated GPU such as madrid's
+    /// GB10) `cuMemGetInfo`'s free figure is the kernel's MemFree, which leaves out reclaimable
+    /// page cache: on an idle madrid it read 83.1 GB, while a 102 GB managed allocation succeeded.
+    /// The limit there is derived from the total, a fixed property of the device.
+    ///
+    /// Fix 2 (review M2): the total itself is not usable, since the host keeps part of it (a
+    /// 127 GB plan on madrid's 130.6 GB was OOM-killed during upload). The limit keeps a fixed
+    /// reserve of `max(8 GiB, total / 16)`.
+    #[test]
+    fn managed_provisioning_checks_plans_against_total_memory_less_a_reserve() {
+        const GIB: usize = 1 << 30;
+        // madrid: total / 16 = 8,162,134,784 B is under the 8 GiB floor.
+        let (free, total) = (83_136_438_272, 130_594_156_544);
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Managed, free, total, None),
+            total - 8 * GIB
+        );
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Managed, free, total, None),
+            122_004_221_952
+        );
+        // A small device keeps the 8 GiB floor.
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Managed, 0, 32 * GIB, None),
+            24 * GIB
+        );
+        // A large device keeps a sixteenth.
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Managed, 0, 512 * GIB, None),
+            480 * GIB
+        );
+        // A device smaller than the reserve admits nothing.
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Managed, 0, 4 * GIB, None),
+            0
+        );
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Managed, free, total, Some(1_000)),
+            1_000
+        );
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Managed, free, total, Some(usize::MAX)),
+            total - 8 * GIB
+        );
+    }
+
+    /// On a discrete GPU the free figure is the memory a plan can still allocate.
+    #[test]
+    fn device_provisioning_checks_plans_against_free_memory() {
+        let (free, total) = (20_818_296_832, 21_464_350_720);
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Device, free, total, None),
+            free
+        );
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Device, free, total, Some(1_000)),
+            1_000
+        );
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Device, free, total, Some(usize::MAX)),
+            free
         );
     }
 

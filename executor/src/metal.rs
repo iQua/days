@@ -601,6 +601,15 @@ pub enum MetalError {
         code: u64,
         node: Option<NodeId>,
     },
+    /// P16 D2: the plan needs more device memory than the run may use, so nothing was allocated.
+    /// The limit is the device's recommended working set, or [`MetalConfig::max_device_bytes`]
+    /// when that is lower. Above the working set Metal either fails a command buffer out of memory
+    /// or, past physical memory, completes command buffers whose writes do not land, so a run
+    /// would spin until its round bound ran out.
+    DeviceMemoryExceeded {
+        planned_bytes: usize,
+        limit_bytes: usize,
+    },
 }
 
 impl fmt::Display for MetalError {
@@ -673,6 +682,15 @@ impl fmt::Display for MetalError {
                     "; the image requires the mechanisms round kernel"
                 )
             }
+            Self::DeviceMemoryExceeded {
+                planned_bytes,
+                limit_bytes,
+            } => write!(
+                formatter,
+                "Metal plan needs {planned_bytes} bytes of device memory, over its limit of \
+                 {limit_bytes} bytes; cut the run earlier, use Summary observation, or cap the \
+                 arenas"
+            ),
             Self::DeviceExecution { code, node } => {
                 write!(
                     formatter,
@@ -752,6 +770,10 @@ pub struct MetalConfig {
     pub rounds_per_command_buffer: usize,
     /// Optional hard cap overriding the conservative encoded round bound.
     pub max_rounds: Option<usize>,
+    /// Optional limit on the bytes one plan may place on the device, below the device's own
+    /// recommended working set (which always applies). A plan over the limit is refused with
+    /// [`MetalError::DeviceMemoryExceeded`] before any buffer is allocated.
+    pub max_device_bytes: Option<usize>,
     /// Test-only: dispatch this round kernel build instead of the one the image selects. Forcing
     /// [`RoundKernel::Plain`] onto an image with DCQCN or PFC state must fail closed.
     #[doc(hidden)]
@@ -775,6 +797,7 @@ impl Default for MetalConfig {
             round_threads_per_threadgroup: DEFAULT_ROUND_THREADS_PER_THREADGROUP,
             rounds_per_command_buffer: DEFAULT_ROUNDS_PER_COMMAND_BUFFER,
             max_rounds: None,
+            max_device_bytes: None,
             #[cfg(feature = "metal-test-hooks")]
             round_kernel_override: None,
         }
@@ -1297,6 +1320,18 @@ impl MetalExecutor {
                 if round_kernel == RoundKernel::Plain {
                     plan.refuse_plain_round_kernel()?;
                 }
+                // P16 D2: refuse, before allocating, a plan the device cannot hold.
+                let limit_bytes = self
+                    .direct
+                    .device_memory_limit(attempt_config.max_device_bytes);
+                let planned_bytes = plan.device_bytes();
+                if planned_bytes > limit_bytes {
+                    return Err(MetalError::DeviceMemoryExceeded {
+                        planned_bytes,
+                        limit_bytes,
+                    }
+                    .into());
+                }
                 let buffers = MetalBuffers::new(&self.direct.device, plan)?;
                 let _execution_guard = metal_device_execution_guard();
                 let timing = self.direct.run(&buffers, attempt_config, round_kernel)?;
@@ -1545,36 +1580,7 @@ pub fn size_metal_plan_for_testing(
     validate(image, Backend::Metal).map_err(|error| MetalError::Validation(error.to_string()))?;
     validate_config(config)?;
     let plan = MetalPlan::new(image, exclusive_horizon_ns, config, observation_mode)?;
-    let words = [
-        plan.control.len(),
-        plan.params.len(),
-        plan.node_state.len(),
-        plan.generators.len(),
-        plan.flows.len(),
-        plan.routes.len(),
-        plan.links.len(),
-        plan.fel_meta.len(),
-        plan.fel_records.len(),
-        plan.queue_meta.len(),
-        plan.queue_records.len(),
-        plan.in_service.len(),
-        plan.outbox.len(),
-        plan.worklist.len(),
-        plan.summary.len(),
-        plan.observed.len(),
-        plan.departures.len(),
-        plan.arrivals.len(),
-        plan.lp_state.len(),
-        plan.remote_meta.len(),
-        plan.remote_staging.len(),
-        plan.observation_meta.len(),
-        plan.inbound_meta.len(),
-        plan.inbound_producers.len(),
-        plan.merge_cursors.len(),
-        plan.stream_state.len(),
-        plan.stream_records.len(),
-        plan.scheduler_state.len(),
-    ];
+    let words = plan.plane_words();
     crate::device_sizing::exact_plan_report(
         words,
         plan.tcp_state.len(),
@@ -1622,6 +1628,51 @@ fn encoding_limits(rounds_per_command_buffer: usize) -> (usize, usize) {
 }
 
 impl MetalPlan {
+    /// Words of the 28 established planes, in plane order.
+    fn plane_words(&self) -> [usize; 28] {
+        [
+            self.control.len(),
+            self.params.len(),
+            self.node_state.len(),
+            self.generators.len(),
+            self.flows.len(),
+            self.routes.len(),
+            self.links.len(),
+            self.fel_meta.len(),
+            self.fel_records.len(),
+            self.queue_meta.len(),
+            self.queue_records.len(),
+            self.in_service.len(),
+            self.outbox.len(),
+            self.worklist.len(),
+            self.summary.len(),
+            self.observed.len(),
+            self.departures.len(),
+            self.arrivals.len(),
+            self.lp_state.len(),
+            self.remote_meta.len(),
+            self.remote_staging.len(),
+            self.observation_meta.len(),
+            self.inbound_meta.len(),
+            self.inbound_producers.len(),
+            self.merge_cursors.len(),
+            self.stream_state.len(),
+            self.stream_records.len(),
+            self.scheduler_state.len(),
+        ]
+    }
+
+    /// Bytes the plan places on the device: every plane and `tcp_state`, as
+    /// `size_metal_plan_for_testing` reports them (P16 D2).
+    fn device_bytes(&self) -> usize {
+        self.plane_words()
+            .into_iter()
+            .chain([self.tcp_state.len()])
+            .fold(0_usize, |total, words| {
+                total.saturating_add(words.saturating_mul(std::mem::size_of::<u64>()))
+            })
+    }
+
     /// Refuses the plain round kernel on this plan, before it is uploaded, if the plan holds any
     /// state a `MECHANISMS`-guarded kernel branch would act on
     /// ([`crate::device_mechanism::plain_round_kernel_refusal`]).
@@ -2374,7 +2425,17 @@ impl MetalPlan {
             0
         };
         let mut observation_capacities = if observation_mode == ObservationMode::Full {
-            derived_observation_capacities(image, &flow_packet_counts, &flow_feedback_counts)
+            let (counts, feedback_counts) = crate::planner_capacity::observation_packet_counts(
+                image,
+                &flow_packet_counts,
+                &flow_feedback_counts,
+                exclusive_horizon_ns,
+            );
+            crate::planner_capacity::derived_observation_capacities(
+                image,
+                &counts,
+                &feedback_counts,
+            )
         } else {
             vec![0; node_count]
         };
@@ -3335,59 +3396,6 @@ fn take_words(next: &mut usize, records: usize, words: usize) -> Result<usize, M
             })?)
             .ok_or_else(|| MetalError::Validation("stream state size overflows usize".into()))?;
     Ok(start)
-}
-
-fn derived_observation_capacities(
-    image: &SimulationImage,
-    counts: &[usize],
-    feedback_counts: &[usize],
-) -> Vec<usize> {
-    let mut capacities = vec![1_usize; image.nodes.len()];
-    for event in &image.initial_events {
-        let target = event.target.0 as usize;
-        capacities[target] = capacities[target].saturating_add(1);
-    }
-    for (index, flow) in image.flows.iter().enumerate() {
-        let feedback_count = feedback_counts[index];
-        let data_count = counts[index].saturating_sub(feedback_count);
-        capacities[flow.source.0 as usize] =
-            capacities[flow.source.0 as usize].saturating_add(data_count);
-        capacities[flow.target.0 as usize] =
-            capacities[flow.target.0 as usize].saturating_add(feedback_count);
-        add_route_observation_capacities(
-            image,
-            &flow.route,
-            flow.target,
-            data_count,
-            &mut capacities,
-        );
-        add_route_observation_capacities(
-            image,
-            &flow.reverse_route,
-            flow.source,
-            feedback_count,
-            &mut capacities,
-        );
-    }
-    capacities
-}
-
-fn add_route_observation_capacities(
-    image: &SimulationImage,
-    route: &[crate::LinkId],
-    terminal: NodeId,
-    packet_count: usize,
-    capacities: &mut [usize],
-) {
-    for (step, link_id) in route.iter().enumerate() {
-        let producer = image.links[link_id.0 as usize].source.0 as usize;
-        capacities[producer] = capacities[producer].saturating_add(packet_count.saturating_mul(2));
-        let target = route
-            .get(step + 1)
-            .map_or(terminal, |next| image.links[next.0 as usize].source)
-            .0 as usize;
-        capacities[target] = capacities[target].saturating_add(packet_count);
-    }
 }
 
 fn remote_inbound_producers(
@@ -5526,6 +5534,14 @@ struct DirectMetal {
 }
 
 impl DirectMetal {
+    /// The most bytes one plan may place on the device: the device's recommended working set, or
+    /// `configured` when that is lower (P16 D2).
+    fn device_memory_limit(&self, configured: Option<usize>) -> usize {
+        let working_set =
+            usize::try_from(self.device.recommendedMaxWorkingSetSize()).unwrap_or(usize::MAX);
+        configured.map_or(working_set, |configured| configured.min(working_set))
+    }
+
     fn new() -> Result<Self, MetalError> {
         let initialization_started = Instant::now();
         let device = MTLCreateSystemDefaultDevice().ok_or_else(|| {
