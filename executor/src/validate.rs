@@ -903,6 +903,9 @@ fn validate_links(image: &SimulationImage) -> Result<(), ValidationError> {
 }
 
 fn validate_flows(image: &SimulationImage, flow_index: &FlowIndex) -> Result<(), ValidationError> {
+    // Whether each host's generator table is strictly ascending by flow, checked once per host
+    // at its first lookup (P16 H3 part 2B).
+    let mut ascending = BTreeMap::<u32, bool>::new();
     for flow in &image.flows {
         if flow.priority > 7 {
             return Err(ValidationError::new(format!(
@@ -921,15 +924,23 @@ fn validate_flows(image: &SimulationImage, flow_index: &FlowIndex) -> Result<(),
         if flow.feedback_priority != flow.priority
             && !node(image, flow.source)
                 .filter(|source| source.kind == NodeKind::Host)
-                .and_then(|source| image.host_states.get(source.state_slot as usize))
-                .is_some_and(|state| {
+                .and_then(|source| {
+                    image
+                        .host_states
+                        .get(source.state_slot as usize)
+                        .map(|state| (source.state_slot, state))
+                })
+                .is_some_and(|(slot, state)| {
                     let feedback_transport = |generator: &crate::FlowGeneratorState| {
                         matches!(
                             generator.kind,
                             FlowGeneratorKind::Dcqcn(_) | FlowGeneratorKind::Roce(_)
                         )
                     };
-                    if generators_ascend(state) {
+                    if *ascending
+                        .entry(slot)
+                        .or_insert_with(|| generators_ascend(state))
+                    {
                         ascending_generator(state, flow.id).is_some_and(feedback_transport)
                     } else {
                         scan_generators(state).any(|generator| {
