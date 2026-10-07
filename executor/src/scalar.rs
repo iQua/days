@@ -295,7 +295,8 @@ struct PendingCollectiveProgress {
     cause: crate::CollectiveActivationCause,
     cause_flow: FlowId,
     arrival_bytes: u64,
-    before_local_complete: bool,
+    /// Local predecessors complete before this transition.
+    before_local_completed: u32,
     before_inbound_complete: bool,
     before_inbound_bytes: u64,
     /// Inbound rows: the arriving data segment `[segment_sequence, segment_sequence + segment_bytes)`.
@@ -327,14 +328,14 @@ struct CollectiveProgressContext {
     activated: bool,
 }
 
-/// `inbound_transport` is a compute stage's RoCE inbound predecessor's MTU and pacing interval
-/// (schema Amendment 5), or `(0, 0)`; transport stages write their own.
+/// Transport stages write their MTU (and a RoCE stage its pacing interval); a compute stage writes
+/// zero there, and the certificate writer names its inbound predecessors' transport (schema
+/// Amendment 5) from the image.
 fn collective_progress_record(
     context: CollectiveProgressContext,
     cause: PendingCollectiveProgress,
     generator: &crate::FlowGeneratorState,
     stage: Option<crate::CollectiveStage>,
-    inbound_transport: (u64, u64),
 ) -> Option<crate::CollectiveProgressRecord> {
     let stage = stage?;
     let dependencies = stage.dependencies;
@@ -358,15 +359,15 @@ fn collective_progress_record(
         packet_size_bytes: 0,
         interval_ns: 0,
         stop_time_ns: context.stop_time_ns,
-        local_predecessor: dependencies.local_predecessor,
-        inbound_predecessor: dependencies.inbound_predecessor,
         inbound_predecessor_bytes: dependencies.inbound_predecessor_bytes,
-        before_local_complete: cause.before_local_complete,
+        before_local_complete: cause.before_local_completed == dependencies.local.count(),
+        before_local_completed: cause.before_local_completed,
         before_inbound_complete: cause.before_inbound_complete,
         before_inbound_bytes: cause.before_inbound_bytes,
         activated: context.activated,
-        after_local_complete: dependencies.local_predecessor_complete,
-        after_inbound_complete: dependencies.inbound_predecessor_complete,
+        after_local_complete: dependencies.local_complete(),
+        after_local_completed: dependencies.local_completed,
+        after_inbound_complete: dependencies.inbound_complete(),
         after_inbound_bytes: dependencies.inbound_bytes_received,
         after_packets_emitted: generator.packets_emitted,
         after_bytes_emitted: generator.bytes_emitted,
@@ -414,6 +415,24 @@ fn collective_progress_record(
                 ..record
             })
         }
+        (FlowGeneratorKind::Constant(constant), crate::StageRole::Collective(identity)) => {
+            Some(crate::CollectiveProgressRecord {
+                collective_id: identity.collective_id,
+                algorithm: Some(identity.algorithm),
+                group_size: identity.group_size,
+                declared_total_bytes: identity.declared_total_bytes,
+                rank: identity.rank,
+                phase: Some(identity.phase),
+                step: identity.step,
+                chunk_offset_bytes: identity.chunk_offset_bytes,
+                chunk_bytes: identity.chunk_bytes,
+                packet_size_bytes: constant.packet_size_bytes,
+                interval_ns: constant.interval_ns,
+                stage_kind: crate::CollectiveStageKind::Notify,
+                duration_ns: constant.interval_ns + constant.first_departure_ns,
+                ..record
+            })
+        }
         (FlowGeneratorKind::Constant(_), crate::StageRole::Compute(compute)) => {
             Some(crate::CollectiveProgressRecord {
                 collective_id: compute.compute_id,
@@ -421,8 +440,6 @@ fn collective_progress_record(
                 rank: compute.rank,
                 stage_kind: crate::CollectiveStageKind::Compute,
                 duration_ns: compute.duration_ns,
-                packet_size_bytes: inbound_transport.0,
-                interval_ns: inbound_transport.1,
                 ..record
             })
         }
@@ -537,9 +554,9 @@ fn complete_local_successors(
             continue;
         };
         let mut dependencies = stage.dependencies;
-        if dependencies.local_predecessor != Some(completed)
-            || dependencies.local_predecessor_complete
-        {
+        // The index lists each successor once per predecessor, and a predecessor completes in
+        // exactly one event, so each local edge is counted once.
+        if dependencies.local_complete() {
             continue;
         }
         causes.push(PendingCollectiveProgress {
@@ -547,14 +564,14 @@ fn complete_local_successors(
             cause: crate::CollectiveActivationCause::LocalCompletion,
             cause_flow: completed,
             arrival_bytes: 0,
-            before_local_complete: dependencies.local_predecessor_complete,
-            before_inbound_complete: dependencies.inbound_predecessor_complete,
+            before_local_completed: dependencies.local_completed,
+            before_inbound_complete: dependencies.inbound_complete(),
             before_inbound_bytes: dependencies.inbound_bytes_received,
             segment_sequence: 0,
             segment_bytes: 0,
             completion,
         });
-        dependencies.local_predecessor_complete = true;
+        dependencies.local_completed += 1;
         stage.dependencies = dependencies;
         releasable.refresh(position, Some(*stage));
     }
@@ -598,9 +615,7 @@ fn record_inbound_progress(
             continue;
         };
         let mut dependencies = stage.dependencies;
-        if dependencies.inbound_predecessor != Some(inbound)
-            || dependencies.inbound_predecessor_complete
-        {
+        if dependencies.inbound_complete() {
             continue;
         }
         let before_inbound_bytes = dependencies.inbound_bytes_received;
@@ -614,8 +629,8 @@ fn record_inbound_progress(
             cause: crate::CollectiveActivationCause::InboundArrival,
             cause_flow: inbound,
             arrival_bytes,
-            before_local_complete: dependencies.local_predecessor_complete,
-            before_inbound_complete: dependencies.inbound_predecessor_complete,
+            before_local_completed: dependencies.local_completed,
+            before_inbound_complete: false,
             before_inbound_bytes,
             segment_sequence: sequence,
             segment_bytes: bytes,
@@ -627,9 +642,6 @@ fn record_inbound_progress(
             .ok_or(ExecutionError::CounterOverflow(node))?;
         if dependencies.inbound_bytes_received > dependencies.inbound_predecessor_bytes {
             return Err(ExecutionError::CounterOverflow(node));
-        }
-        if dependencies.inbound_bytes_received == dependencies.inbound_predecessor_bytes {
-            dependencies.inbound_predecessor_complete = true;
         }
         stage.dependencies = dependencies;
         releasable.refresh(position, Some(*stage));
@@ -955,8 +967,13 @@ pub fn assert_scalar_stage_index_equivalent_for_testing(
     };
     let (states, indices) = initial.hosts.slices();
     for (slot, (state, index)) in states.iter().zip(indices).enumerate() {
-        check_host_index(state, index.index(), image_flows.iter().copied())
-            .map_err(|mismatch| format!("host slot {slot} of the image: {mismatch}"))?;
+        check_host_index(
+            state,
+            &image.stage_joins,
+            index.index(),
+            image_flows.iter().copied(),
+        )
+        .map_err(|mismatch| format!("host slot {slot} of the image: {mismatch}"))?;
     }
     let mut first_mismatch = None;
     let run = run_scalar_events(
@@ -975,7 +992,9 @@ pub fn assert_scalar_stage_index_equivalent_for_testing(
             }
             let slot = node.state_slot as usize;
             let (states, indices) = transitions.hosts.slices();
-            if let Err(mismatch) = check_host_index(&states[slot], indices[slot].index(), []) {
+            if let Err(mismatch) =
+                check_host_index(&states[slot], &image.stage_joins, indices[slot].index(), [])
+            {
                 first_mismatch = Some(format!(
                     "host {:?} after event {:?}: {mismatch}",
                     node.id, event.key
@@ -1027,14 +1046,17 @@ enum HostStore {
 
 impl HostStore {
     /// The Scalar LP's store: the image's host states and an index built from each.
-    fn tables(states: Vec<HostState>) -> Self {
-        let indices = states.iter().map(HostStageSlot::build).collect();
+    fn tables(states: Vec<HostState>, joins: &[FlowId]) -> Self {
+        let indices = states
+            .iter()
+            .map(|state| HostStageSlot::build(state, joins))
+            .collect();
         Self::Table(Box::new(HostTables { states, indices }))
     }
 
     /// A CPU host LP's store: its one host and the index built from it.
-    fn local(state: HostState) -> Self {
-        let index = HostStageSlot::build(&state);
+    fn local(state: HostState, joins: &[FlowId]) -> Self {
+        let index = HostStageSlot::build(&state, joins);
         Self::Local(Box::new(HostEntry { state, index }))
     }
 
@@ -1481,7 +1503,7 @@ impl<'image> TransitionState<'image> {
                 .ok_or(ExecutionError::CounterOverflow(NodeId(0)))?;
         }
 
-        let hosts = HostStore::tables(image.host_states.clone());
+        let hosts = HostStore::tables(image.host_states.clone(), &image.stage_joins);
         let switch_states = image.switch_states.clone();
         let DerivedSwitchQueues {
             bytes: switch_queue_bytes,
@@ -1533,7 +1555,7 @@ impl<'image> TransitionState<'image> {
                         kind: node.kind,
                         state_slot: node.state_slot,
                     })?;
-                (HostStore::local(state), Vec::new())
+                (HostStore::local(state, &image.stage_joins), Vec::new())
             }
             NodeKind::Switch => {
                 let state = image
@@ -2043,12 +2065,23 @@ impl<'image> TransitionState<'image> {
                     }),
             )
         };
-        if let (FlowGeneratorKind::Constant(_), Some(duration_ns)) = (kind, compute_duration) {
+        if let (FlowGeneratorKind::Constant(constant), duration) = (kind, compute_duration) {
+            // A compute stage's token is a zero-byte `Data` timer; a stage notify's (a collective
+            // stage on a constant generator, P16 H2) is its chunk, which crosses to the target
+            // when the lead elapses.
+            let (duration_ns, token) = match duration {
+                Some(duration_ns) => (duration_ns, (0, PacketKind::Data)),
+                None => (
+                    constant.interval_ns,
+                    (constant.packet_size_bytes, PacketKind::StageNotify),
+                ),
+            };
             return self.start_compute_stage(
                 node,
                 parent,
                 flow,
                 duration_ns,
+                token,
                 cause,
                 ordinal,
                 children,
@@ -2128,10 +2161,13 @@ impl<'image> TransitionState<'image> {
         Ok(())
     }
 
-    /// Starts a released compute interval: a source-local timer fires `duration_ns` later.
+    /// Starts a released compute interval, or a stage notify's lead: a source-local timer fires
+    /// `duration_ns` later.
     ///
-    /// The zero-byte token only names the timer event; it is never enqueued or transmitted. A
-    /// deadline beyond the stop time leaves the stage `Stopped` without an event.
+    /// The token, `(size_bytes, kind)`, names the timer event: a compute stage's zero-byte `Data`
+    /// token is never enqueued or transmitted; a stage notify's carries its chunk across its lane
+    /// when the timer fires. A deadline beyond the stop time leaves the stage `Stopped` without an
+    /// event.
     #[allow(clippy::too_many_arguments)]
     fn start_compute_stage(
         &mut self,
@@ -2139,6 +2175,7 @@ impl<'image> TransitionState<'image> {
         parent: Event,
         flow: FlowId,
         duration_ns: u64,
+        (token_size_bytes, token_kind): (u64, PacketKind),
         cause: PendingCollectiveProgress,
         ordinal: u64,
         children: &mut Vec<Event>,
@@ -2186,9 +2223,9 @@ impl<'image> TransitionState<'image> {
                 PacketDescriptor {
                     id: payload,
                     flow,
-                    size_bytes: 0,
+                    size_bytes: token_size_bytes,
                     ecn_marked: false,
-                    kind: PacketKind::Data,
+                    kind: token_kind,
                 },
                 Some(parent.key.time_ns),
             )?;
@@ -2268,6 +2305,120 @@ impl<'image> TransitionState<'image> {
         Ok(())
     }
 
+    /// A stage notify's lead ends (P16 H2): the sender's stage finishes, with its one message
+    /// emitted, and its notify leaves on the lane to the target host, arriving `lane` later (the
+    /// generator's `first_departure_ns`). Then the stage's local successors are released, after
+    /// the transition's own emission, as every stage pass runs.
+    #[inline(never)]
+    fn host_notify_timer(
+        &mut self,
+        node: NodeDescriptor,
+        event: Event,
+        flow: FlowId,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
+        let mut causes = PendingCauses::default();
+        let lane_ns = {
+            let (mut state, index) = self.host_parts_mut(node)?;
+            let position = index
+                .first_generator(flow)
+                .ok_or(ExecutionError::UnknownGenerator {
+                    node: node.id,
+                    flow,
+                })?;
+            let generator = &mut state.generators[position];
+            let FlowGeneratorKind::Constant(constant) = generator.kind else {
+                return Err(ExecutionError::UnexpectedGeneratorEmission {
+                    node: node.id,
+                    flow,
+                    payload: event.payload,
+                });
+            };
+            if generator.next_emission.status != GeneratorStatus::Scheduled
+                || generator.next_emission.payload != event.payload
+                || generator.next_emission.departure_time_ns != event.key.time_ns
+            {
+                return Err(ExecutionError::UnexpectedGeneratorEmission {
+                    node: node.id,
+                    flow,
+                    payload: event.payload,
+                });
+            }
+            generator.next_emission.status = GeneratorStatus::Finished;
+            generator.packets_emitted = 1;
+            generator.bytes_emitted = constant.packet_size_bytes;
+            let completion = CompletionSignal {
+                ack_number: 0,
+                origin_ns: event.key.time_ns - constant.interval_ns,
+                delay_ns: constant.interval_ns,
+            };
+            complete_local_successors(
+                &state.generators,
+                &mut state.stages,
+                index,
+                flow,
+                completion,
+                &mut causes,
+            );
+            constant.first_departure_ns
+        };
+        let target = self.flow(flow)?.target;
+        let arrival_ns = event
+            .key
+            .time_ns
+            .checked_add(lane_ns)
+            .ok_or(ExecutionError::Time(TimeError::ArrivalOverflow))?;
+        self.emit_from_host(
+            node,
+            event,
+            ChildEmission {
+                target,
+                kind: EventKind::RemoteArrival,
+                payload: event.payload,
+                time_ns: arrival_ns,
+            },
+            children,
+        )?;
+        if !causes.is_empty() {
+            self.activate_ready_collectives(node, event, causes, children)?;
+        }
+        Ok(())
+    }
+
+    /// A stage notify arrives at its target (P16 H2): the whole chunk is delivered at once, so
+    /// the stages waiting on it as their inbound predecessor advance by it, and are released.
+    #[inline(never)]
+    fn host_notify_arrival(
+        &mut self,
+        node: NodeDescriptor,
+        event: Event,
+        packet: PacketDescriptor,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
+        let mut causes = PendingCauses::default();
+        {
+            let (mut state, index) = self.host_parts_mut(node)?;
+            record_inbound_progress(
+                &state.generators,
+                &mut state.stages,
+                index,
+                packet.flow,
+                InboundProgress::Segment {
+                    sequence: 0,
+                    bytes: packet.size_bytes,
+                    advance: packet.size_bytes,
+                },
+                node.id,
+                &mut causes,
+            )?;
+        }
+        self.mark_terminal(event.payload)?;
+        if !causes.is_empty() {
+            self.activate_ready_collectives(node, event, causes, children)?;
+        }
+        Ok(())
+    }
+
     /// Records one prerequisite transition of a wrapped stage under full observation.
     fn push_stage_progress(
         &mut self,
@@ -2290,24 +2441,6 @@ impl<'image> TransitionState<'image> {
                 flow,
             })?;
         let stage = state.stages.stage(position);
-        // Schema Amendment 5: a compute stage after a RoCE collective names that queue pair's MTU
-        // and pacing interval. Its local predecessor is the same rank's final stage of the same
-        // collective, on this host (the validator requires both predecessors to agree), so the
-        // values are read through the stage index, keyed and in constant time.
-        let inbound_transport = stage
-            .filter(|stage| {
-                matches!(stage.role, crate::StageRole::Compute(_))
-                    && stage.dependencies.inbound_predecessor.is_some()
-            })
-            .and_then(|stage| stage.dependencies.local_predecessor)
-            .and_then(|local| index.first_generator(local))
-            .and_then(|local| match state.generators[local].kind {
-                FlowGeneratorKind::Roce(roce) => {
-                    Some((roce.pacer.mtu_bytes, roce.pacer.pacing_interval_ns))
-                }
-                _ => None,
-            })
-            .unwrap_or((0, 0));
         let record = collective_progress_record(
             CollectiveProgressContext {
                 key: parent.key,
@@ -2319,7 +2452,6 @@ impl<'image> TransitionState<'image> {
             cause,
             &state.generators[position],
             stage,
-            inbound_transport,
         )
         .ok_or(ExecutionError::UnexpectedGeneratorEmission {
             node: node.id,
@@ -3234,6 +3366,9 @@ impl<'image> TransitionState<'image> {
             PacketKind::Pfc(header) => {
                 return self.host_pfc_remote_arrival(node, event, header, children);
             }
+            PacketKind::StageNotify => {
+                return self.host_notify_arrival(node, event, packet, children);
+            }
             _ => {}
         }
         if packet.kind == PacketKind::Data
@@ -3866,6 +4001,10 @@ impl<'image> TransitionState<'image> {
         // A queue pair's pacing token names its own transition: no generator scan is needed.
         if packet.kind == PacketKind::RocePacingTimer {
             return self.host_roce_pacing_timer(node, event, packet, children);
+        }
+        // A stage notify's token names its sender's timer (P16 H2).
+        if packet.kind == PacketKind::StageNotify {
+            return self.host_notify_timer(node, event, packet.flow, children);
         }
         let compute_stage_owns = {
             let (state, index) = self.host_parts_mut(node)?;

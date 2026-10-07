@@ -32,8 +32,9 @@ fn cuda_source() -> String {
 }
 
 /// The functions P14 Lane B, P15 lane R4 (queue pairs, host-link PFC), P16 D1 (the Mellanox-form
-/// DCQCN controller) and P16 G1 (collective and compute stages) added to both kernels.
-const LANE_B_FUNCTIONS: [&str; 47] = [
+/// DCQCN controller), P16 G1 (collective and compute stages), P16 H2 (the stage notify) and P16 H4
+/// (the parked bitsets) added to both kernels.
+const LANE_B_FUNCTIONS: [&str; 50] = [
     "compute_timer",
     "dcqcn_alpha_through",
     "dcqcn_cnp_arrival",
@@ -52,6 +53,8 @@ const LANE_B_FUNCTIONS: [&str; 47] = [
     "dcqcn_settle",
     "emit_pfc_frame",
     "flow_route_mechanisms",
+    // P16 H2: a stage notify's sender timer.
+    "notify_timer",
     "packet_egress_mechanisms",
     "packet_incoming_link",
     "packet_remote_target_mechanisms",
@@ -60,7 +63,9 @@ const LANE_B_FUNCTIONS: [&str; 47] = [
     "pfc_first_eligible",
     "pfc_flow_data_class",
     "pfc_frame_arrival",
+    "pfc_mark_parked",
     "pfc_packet_priority",
+    "pfc_parked_bitset",
     "pfc_paused_mask",
     "pfc_priority_paused",
     "pfc_queue_row",

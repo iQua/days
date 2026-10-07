@@ -265,8 +265,19 @@ fn compute_dag_releases_each_root_at_the_compute_deadline() {
     let rows = progress(&result);
     let roots = rows
         .iter()
-        .filter(|row| is_roce_row(row) && row.activated && row.local_predecessor.is_some())
-        .filter(|row| row.inbound_predecessor.is_none())
+        .filter(|row| {
+            let stage = image
+                .host_states
+                .iter()
+                .flat_map(|state| state.generators_with_stages())
+                .find(|(generator, _)| generator.flow == row.flow)
+                .and_then(|(_, stage)| stage)
+                .expect("a progress row belongs to a stage");
+            is_roce_row(row)
+                && row.activated
+                && stage.dependencies.local.one().is_some()
+                && stage.dependencies.inbound == days_executor::StagePredecessors::None
+        })
         .collect::<Vec<_>>();
     assert_eq!(roots.len(), 4, "every rank's root is gated by `forward`");
     for root in roots {
@@ -453,7 +464,7 @@ fn with_the_timeout_off_a_lost_tail_stalls_its_stage_and_successors_visibly() {
                 let Some(successor_stage) = successor_stage else {
                     continue;
                 };
-                if successor_stage.dependencies.local_predecessor == Some(generator.flow) {
+                if successor_stage.dependencies.local.one() == Some(generator.flow) {
                     assert!(!successor_stage.activated, "{:?} waits", successor.flow);
                 }
             }
@@ -720,6 +731,9 @@ fn checkpoint(image: &SimulationImage, horizon_ns: u64) -> SimulationImage {
         channels: image.channels.clone(),
         initial_events: result.pending_events,
         seed: image.seed,
+        stage_joins: image.stage_joins.clone(),
+        seeded_all_to_alls: image.seeded_all_to_alls.clone(),
+        stage_streams: image.stage_streams.clone(),
     }
 }
 
@@ -799,29 +813,31 @@ fn fingerprint(value: &impl std::fmt::Debug) -> (u64, u64) {
 /// `days` CLI reproduced on Scalar and CPU at 2 workers
 /// (`days-gpu/evidence/P15/collectives-impl/raw/anchors-mac-5752c51.txt`); re-frozen at P16 D1
 /// (2026-10-03, Mac) for the Mellanox-form controller and the ECN echo
-/// (`days-gpu/evidence/P16/dcqcn-impl/anchors.md`).
+/// (`days-gpu/evidence/P16/dcqcn-impl/anchors.md`); re-frozen at P16 H1 (2026-10-06, Mac) for the
+/// counted stage dependencies, which change only the stage records' rendering
+/// (`days-gpu/evidence/P16/collops-impl/semantic-identity-r1.txt`).
 const ANCHORS: [(&str, u64, u64); 6] = [
     (
         "roce_ring_allreduce_lossless.toml",
-        193_075,
-        0x02fc_5b57_38bf_9639,
+        188_983,
+        0xd89e_b01d_2859_4bcd,
     ),
     (
         "roce_allgather_lossless.toml",
-        123_170,
-        0xc32f_fe08_1e7b_440d,
+        121_122,
+        0x89d6_a4ac_8a89_0cd1,
     ),
-    ("roce_ring_lossy.toml", 182_347, 0xb718_c505_7453_0f5a),
-    ("roce_compute_dag.toml", 212_197, 0xe94b_963f_a5fd_954a),
+    ("roce_ring_lossy.toml", 178_255, 0xa99b_e649_848a_ddfe),
+    ("roce_compute_dag.toml", 207_245, 0x5145_dc26_3ab8_ddc6),
     (
         "roce_tcp_mixed_collectives.toml",
-        138_792,
-        0x88ff_2fe4_10cc_0df8,
+        134_700,
+        0x8a78_985e_0bd3_7700,
     ),
     (
         "roce_ring_release_paused.toml",
-        197_029,
-        0xf5e6_4cf6_d7ca_985e,
+        192_937,
+        0xc36e_d06a_809a_2f52,
     ),
 ];
 
@@ -858,51 +874,69 @@ fn roce_transport(image: &SimulationImage, flow: FlowId) -> Option<(u64, u64)> {
 }
 
 /// Schema Amendment 5 (LeanGuard part 3, review M1): a compute stage whose inbound predecessor is
-/// a RoCE stage writes that queue pair's MTU and pacing interval on every progress row, so the
+/// a RoCE stage carries that queue pair's MTU and pacing interval on every certificate row, so the
 /// certificate can be replayed with the Go-back-N frontier even when the predecessor is an
 /// unlogged root (`roce_allgather_compute_lossy`, an ungated two-rank AllGather); every other
-/// compute row writes zero. Every compute inbound row of a RoCE predecessor is a packet of that
-/// pair at its PSN and advances the frontier exactly when the PSN is the frontier.
+/// compute row writes zero. The certificate writer reads them from the image (P16 H1). Every
+/// compute inbound row of a RoCE predecessor is a packet of that pair at its PSN and advances the
+/// frontier exactly when the PSN is the frontier.
 #[test]
 fn compute_rows_name_their_roce_inbound_transport() {
     for name in ["roce_compute_dag.toml", "roce_allgather_compute_lossy.toml"] {
         let image = lower(name);
         let result = run_identical(&image, name);
-        let rows: Vec<_> = progress(&result)
-            .into_iter()
-            .filter(|row| row.stage_kind == days_executor::CollectiveStageKind::Compute)
-            .collect();
+        let csv = days_executor::collective_transitions_csv(
+            &result.diagnostics.as_ref().unwrap().mechanism_transitions,
+            &image,
+        )
+        .unwrap();
+        let mut lines = csv.lines();
+        let header: Vec<&str> = lines.next().unwrap().split(',').collect();
+        let column = |name: &str| header.iter().position(|field| *field == name).unwrap();
+        let number = |fields: &[&str], name: &str| fields[column(name)].parse::<u64>().unwrap();
         let (mut transported, mut out_of_order) = (0, 0);
-        for row in &rows {
-            let expected = row
-                .inbound_predecessor
-                .and_then(|flow| roce_transport(&image, flow))
-                .unwrap_or((0, 0));
+        for line in lines {
+            let fields: Vec<&str> = line.split(',').collect();
+            if fields[column("stage_kind")] != "compute" {
+                continue;
+            }
+            let inbound = fields[column("inbound_predecessors")];
+            let expected = if inbound.is_empty() {
+                (0, 0)
+            } else {
+                roce_transport(&image, FlowId(inbound.parse().unwrap())).unwrap_or((0, 0))
+            };
             assert_eq!(
-                (row.packet_size_bytes, row.interval_ns),
+                (
+                    number(&fields, "packet_size_bytes"),
+                    number(&fields, "interval_ns")
+                ),
                 expected,
-                "{name}: compute row of flow {:?} at {:?}",
-                row.flow,
-                row.key
+                "{name}: compute row {line}"
             );
             if expected.0 == 0 {
                 continue;
             }
             transported += 1;
-            if row.cause == CollectiveActivationCause::InboundArrival {
-                let (mtu, total) = (expected.0, row.inbound_predecessor_bytes);
-                let psn = row.segment_sequence;
+            if fields[column("cause")] == "inbound_arrival" {
+                let (mtu, total) = (expected.0, number(&fields, "inbound_predecessor_bytes"));
+                let psn = number(&fields, "segment_sequence");
+                let segment = number(&fields, "segment_bytes");
                 assert!(
-                    psn % mtu == 0 && psn < total && row.segment_bytes == mtu.min(total - psn),
+                    psn % mtu == 0 && psn < total && segment == mtu.min(total - psn),
                     "{name}: compute inbound row is not its pair's packet at PSN {psn}"
                 );
-                let advance = if psn == row.before_inbound_bytes {
-                    row.segment_bytes
+                let advance = if psn == number(&fields, "before_inbound_bytes") {
+                    segment
                 } else {
                     out_of_order += 1;
                     0
                 };
-                assert_eq!(row.arrival_bytes, advance, "{name}: Go-back-N advance");
+                assert_eq!(
+                    number(&fields, "arrival_bytes"),
+                    advance,
+                    "{name}: Go-back-N advance"
+                );
             }
         }
         assert!(

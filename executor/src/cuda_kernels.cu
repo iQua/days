@@ -147,6 +147,20 @@ constexpr uint P_ROCE_OFFSET = 32;
 // P16 G1: absolute offset of the stage region in `tcp_state`, or NONE without collective or compute
 // stages. Layout in `executor/src/device_stage.rs`.
 constexpr uint P_STAGE_OFFSET = 33;
+// P16 H4 (test hooks only): the RESUME-scan counters. `CudaBuffers::new` appends one row of
+// RESUME_SCAN_COUNT_WORDS words per LP to `scheduler_state`, after every production word, and its
+// offset as params word 34: {RESUMEs scanned, queue pairs examined, parked-bitset words read}. A
+// host LP adds only to its own row, so the counters need no atomics. Production builds compile
+// `RECORD_RESUME_SCAN` to nothing.
+#ifdef DAYS_RESUME_SCAN_COUNT
+constexpr uint P_RESUME_SCAN_COUNT_OFFSET = 34;
+constexpr uint RESUME_SCAN_COUNT_WORDS = 3;
+#define RECORD_RESUME_SCAN(params, state, node, counter, amount) \
+    ((state)[(params)[P_RESUME_SCAN_COUNT_OFFSET] + (node) * RESUME_SCAN_COUNT_WORDS + (counter)] += \
+        (ulong)(amount))
+#else
+#define RECORD_RESUME_SCAN(params, state, node, counter, amount) ((void)0)
+#endif
 // P16 G1: one stage row per flow, then the successor array (`executor/src/device_stage.rs`).
 constexpr uint STAGE_ROW_WORDS = 5;
 constexpr uint SR_FLAGS = 0;
@@ -159,6 +173,15 @@ constexpr ulong SR_INBOUND_COMPLETE = 2;
 constexpr ulong SR_HAS_LOCAL = 16;
 constexpr ulong SR_HAS_INBOUND = 32;
 constexpr ulong SR_IS_STAGE = 64;
+// P16 H1: joins. A local join counts its predecessors in flags bits 32..47 (complete) and 48..63
+// (required); an inbound join sums its predecessors' advances, each predecessor of one keeping
+// its last credited frontier in the word before its inbound list; a flow whose completion was
+// credited to its local successors carries SR_LOCAL_CREDITED.
+constexpr ulong SR_LOCAL_JOIN = 128;
+constexpr ulong SR_INBOUND_JOIN = 256;
+constexpr ulong SR_LOCAL_CREDITED = 512;
+constexpr ulong SR_INBOUND_CREDIT = 1024;
+constexpr ulong SR_JOIN_ONE = 1ul << 32;
 constexpr uint PFC_ROW_HEADER_WORDS = 5;
 constexpr uint PFC_INGRESS_WORDS = 43;
 constexpr uint PI_LINK = 0;
@@ -249,6 +272,9 @@ constexpr ulong ROCE_DATA_PACKET = 7;
 constexpr ulong ROCE_ACK_PACKET = 8;
 constexpr ulong ROCE_NACK_PACKET = 9;
 constexpr ulong ROCE_PACING_TIMER_PACKET = 10;
+// P16 H2: a stage notify, a same-server message (delay-only NVLink): the sender's timer token, then
+// an out-of-band frame on its host pair's lane carrying the whole chunk.
+constexpr ulong STAGE_NOTIFY_PACKET = 11;
 constexpr ulong SCHED_FIFO = 0;
 constexpr ulong SCHED_SP = 1;
 constexpr ulong SCHED_WFQ = 2;
@@ -356,6 +382,10 @@ constexpr ulong GENERATOR_KIND_ROCE = 4;
 // (the validator pins `interval_ns == duration_ns != 0`).
 constexpr ulong GENERATOR_KIND_CONSTANT = 0;
 constexpr uint G_COMPUTE_DURATION = 13;
+// P16 H2: a stage notify's constant generator holds its lane latency in the first-departure word
+// and its chunk in the packet-size word; `G_COMPUTE_DURATION` is its lead.
+constexpr uint G_NOTIFY_LANE = 12;
+constexpr uint G_NOTIFY_BYTES = 14;
 constexpr uint G_ROCE_NEXT_PSN = 16;
 constexpr uint G_ROCE_SND_UNA = 17;
 constexpr uint G_ROCE_WINDOW = 36;
@@ -2889,6 +2919,28 @@ __device__ __forceinline__ ulong pfc_flow_data_class(
     return scheduler_state[params[P_PFC_OFFSET] + params[P_NODE_COUNT] + flow] & 0xfful;
 }
 
+// P16 H4 (ruling G9): the first word of class `priority`'s parked bitset in a host PFC row whose
+// queue-pair list `[Q, flow_0 .. flow_{Q-1}]` starts at `list`. The eight classes' bitsets follow
+// the list, class-major, `ceil(Q / 64)` words each (`executor/src/device_pfc.rs`).
+__device__ __forceinline__ ulong pfc_parked_bitset(ulong list, ulong pairs, ulong priority) {
+    return list + 1 + pairs + priority * ((pairs + 63) / 64);
+}
+
+// P16 H4: sets the parked bit of a queue pair a paused tick parked, in its data class's bitset at
+// its host's PFC row `pfc_row`. The pair's slot in the row's list is bits 16.. of its class word.
+__device__ __forceinline__ void pfc_mark_parked(
+    ulong pfc_row,
+    ulong flow,
+    const ulong *params,
+    ulong *scheduler_state
+) {
+    ulong word = scheduler_state[params[P_PFC_OFFSET] + params[P_NODE_COUNT] + flow];
+    ulong slot = word >> 16;
+    ulong list = scheduler_state[pfc_row + 4];
+    ulong bitset = pfc_parked_bitset(list, scheduler_state[list], word & 0xfful);
+    scheduler_state[bitset + slot / 64] |= 1ul << (slot % 64);
+}
+
 template <bool MECHANISMS>
 __device__ __forceinline__ bool scheduler_first_packet_for_class(
     ulong node,
@@ -4916,7 +4968,7 @@ __device__ __forceinline__ bool roce_pacing_tick(
     ulong *summary,
     ulong *observation_meta,
     ulong *observed,
-    const ulong *scheduler_state,
+    ulong *scheduler_state,
     ulong *tcp_state
 ) {
     ulong node_base = node * NODE_WORDS;
@@ -4938,7 +4990,11 @@ __device__ __forceinline__ bool roce_pacing_tick(
     if (pfc_row != NONE &&
         pfc_priority_paused(
             pfc_row, pfc_flow_data_class(flow, params, scheduler_state), scheduler_state)) {
-        // The pause-parked list is not stored: the RESUME scan and the readback derive it.
+        // A pair with packets left joins its class's parked bitset for the RESUME (P16 H4, Scalar's
+        // `pause_parked` insert); the readback derives the parked list itself (ruling D3).
+        if (row[G_ROCE_NEXT_PSN] < total && row[G_ROCE_SND_UNA] < total) {
+            pfc_mark_parked(pfc_row, flow, params, scheduler_state);
+        }
         roce_settle(row, 1);
         return true;
     }
@@ -5369,12 +5425,16 @@ __device__ __forceinline__ bool stage_unreleased(
 // next grid point strictly after the RESUME, in generator-position (`FlowId`) order.
 //
 // Specification: `validate::expected_pause_parked`, the validator's characterization of Scalar's
-// `HostPfcState::pause_parked`. The device stores no parked set (ruling D3); the scan applies that
-// function's conjuncts with `data class == priority` in place of `is_paused(class)`, because Scalar
-// takes the set after the last controller's resume has unpaused the class. A window-parked pair
-// waits for feedback, not for the RESUME (P16 ruling D7), so the scan skips it as that function
-// does. A queue pair of a collective stage its prerequisites have not released has never ticked,
-// so no pause parked it: the scan skips it as that function does (P16 G1).
+// `HostPfcState::pause_parked`, which holds while the class is paused. P16 H4 (ruling G9): the scan
+// walks the set bits of the class's parked bitset, a superset of that set (a bit is set when a
+// paused tick parks a pair of the class with packets left, and an ACK, NACK, timeout or completion
+// leaves it set), in ascending slot order, which is ascending generator position. To each set bit
+// it applies that function's conjuncts, with the data class implied by the bitset and in place of
+// `is_paused(class)`, because Scalar takes the set after the last controller's resume has unpaused
+// the class: it skips a pair whose pacer is armed, window-parked (P16 ruling D7), stopped, has sent
+// or had acknowledged everything, or is a collective stage its prerequisites have not released
+// (P16 G1). So it restarts exactly Scalar's set in Scalar's order; a skip has no effect. The walk
+// clears each word before restarting its pairs; no restart writes the bitsets.
 __device__ __forceinline__ bool roce_resume_parked(
     ulong node,
     const ulong *event,
@@ -5384,7 +5444,7 @@ __device__ __forceinline__ bool roce_resume_parked(
     const ulong *params,
     ulong *node_state,
     ulong *generators,
-    const ulong *scheduler_state,
+    ulong *scheduler_state,
     ulong *fel_meta,
     ulong *fel_records,
     ulong *remote_meta,
@@ -5395,29 +5455,42 @@ __device__ __forceinline__ bool roce_resume_parked(
 ) {
     ulong list = scheduler_state[row + 4];
     ulong pairs = scheduler_state[list];
-    for (ulong index = 0; index < pairs; ++index) {
-        ulong flow = scheduler_state[list + 1 + index];
-        ulong *generator = generators + flow * GENERATOR_WORDS;
-        ulong total = generator[G_RATE_TOTAL];
-        if (pfc_flow_data_class(flow, params, scheduler_state) != priority ||
-            generator[G_ROCE_PACER_ARMED] != 0 || generator[G_ROCE_WINDOW_PARKED] != 0 ||
-            generator[G_STATUS] == 3 || generator[G_ROCE_NEXT_PSN] >= total ||
-            generator[G_ROCE_SND_UNA] >= total || stage_unreleased(flow, params, tcp_state)) {
+    ulong bitset = pfc_parked_bitset(list, pairs, priority);
+    ulong words = (pairs + 63) / 64;
+    RECORD_RESUME_SCAN(params, scheduler_state, node, 0, 1);
+    RECORD_RESUME_SCAN(params, scheduler_state, node, 2, words);
+    for (ulong word = 0; word < words; ++word) {
+        ulong bits = scheduler_state[bitset + word];
+        if (bits == 0) {
             continue;
         }
-        // A phase-0 transition: the controller's due instants before the RESUME apply first.
-        dcqcn_materialize_if_due(generator, false, event[E_TIME]);
-        ulong tick;
-        if (!roce_restart(generator, event[E_TIME], params[P_STOP_TIME], tick)) {
-            set_semantic_error(error, 88, node);
-            return false;
-        }
-        roce_settle(generator, generator[G_STATUS]);
-        if (!roce_emit_timers(
-                node, event, generator, flow, tick, NONE, error, params, node_state, fel_meta,
-                fel_records, remote_meta, remote_staging, stream_state, stream_records,
-                tcp_state)) {
-            return false;
+        scheduler_state[bitset + word] = 0;
+        while (bits != 0) {
+            ulong slot = word * 64 + (ulong)(__ffsll((long long)bits) - 1);
+            bits &= bits - 1;
+            RECORD_RESUME_SCAN(params, scheduler_state, node, 1, 1);
+            ulong flow = scheduler_state[list + 1 + slot];
+            ulong *generator = generators + flow * GENERATOR_WORDS;
+            ulong total = generator[G_RATE_TOTAL];
+            if (generator[G_ROCE_PACER_ARMED] != 0 || generator[G_ROCE_WINDOW_PARKED] != 0 ||
+                generator[G_STATUS] == 3 || generator[G_ROCE_NEXT_PSN] >= total ||
+                generator[G_ROCE_SND_UNA] >= total || stage_unreleased(flow, params, tcp_state)) {
+                continue;
+            }
+            // A phase-0 transition: the controller's due instants before the RESUME apply first.
+            dcqcn_materialize_if_due(generator, false, event[E_TIME]);
+            ulong tick;
+            if (!roce_restart(generator, event[E_TIME], params[P_STOP_TIME], tick)) {
+                set_semantic_error(error, 88, node);
+                return false;
+            }
+            roce_settle(generator, generator[G_STATUS]);
+            if (!roce_emit_timers(
+                    node, event, generator, flow, tick, NONE, error, params, node_state, fel_meta,
+                    fel_records, remote_meta, remote_staging, stream_state, stream_records,
+                    tcp_state)) {
+                return false;
+            }
         }
     }
     return true;
@@ -5622,7 +5695,9 @@ __device__ __forceinline__ bool stage_release(
     packet_clear(packet);
     packet[PK_ID] = token;
     packet[PK_FLOW] = flow;
-    packet[PK_KIND] = DATA_PACKET;
+    // P16 H2: a stage notify's token carries its chunk; a compute stage's is a zero-byte DATA one.
+    packet[PK_SIZE] = row[G_NOTIFY_BYTES];
+    packet[PK_KIND] = row[G_NOTIFY_BYTES] != 0 ? STAGE_NOTIFY_PACKET : DATA_PACKET;
     return emit_child(
         node, event, node, PACING_TIMER, deadline, packet, error, params, node_state, fel_meta,
         fel_records, remote_meta, remote_staging, stream_state, stream_records, tcp_state);
@@ -5651,6 +5726,45 @@ __device__ __forceinline__ bool compute_timer(
     }
     row[G_STATUS] = 2;
     return true;
+}
+
+// P16 H2: `host_notify_timer`'s own transition. The sender's stage finishes with its one message
+// emitted, and the notify leaves on its host pair's lane to the target, arriving after the lane
+// latency. The local completion it causes runs in the event's stage pass, after this emission, as
+// Scalar's does.
+__device__ __forceinline__ bool notify_timer(
+    ulong node,
+    const ulong *event,
+    ulong *error,
+    const ulong *params,
+    ulong *node_state,
+    ulong *generators,
+    const ulong *flows,
+    ulong *fel_meta,
+    ulong *fel_records,
+    ulong *remote_meta,
+    ulong *remote_staging,
+    ulong *stream_state,
+    ulong *stream_records,
+    ulong *tcp_state
+) {
+    ulong flow = event[PK_FLOW];
+    ulong *row = generators + flow * GENERATOR_WORDS;
+    ulong arrival;
+    if (params[P_STAGE_OFFSET] == NONE || flow >= params[P_FLOW_COUNT] || row[G_VALID] == 0 ||
+        row[G_OWNER] != node || row[G_KIND] != GENERATOR_KIND_CONSTANT || row[G_STATUS] != 0 ||
+        row[G_PAYLOAD] != event[E_PAYLOAD] || row[G_DEPARTURE] != event[E_TIME] ||
+        !checked_add(event[E_TIME], row[G_NOTIFY_LANE], arrival)) {
+        set_semantic_error(error, 105, node);
+        return false;
+    }
+    row[G_STATUS] = 2;
+    row[G_PACKETS] = 1;
+    row[G_BYTES] = row[G_NOTIFY_BYTES];
+    return emit_child(
+        node, event, flows[flow * FLOW_WORDS + 1], REMOTE_ARRIVAL, arrival, event, error, params,
+        node_state, fel_meta, fel_records, remote_meta, remote_staging, stream_state,
+        stream_records, tcp_state);
 }
 
 // P16 G1: the stage pass of one host transition (`complete_local_successors` or
@@ -5692,12 +5806,15 @@ __device__ __forceinline__ bool stage_after_event(
     if (node_state[node * NODE_WORDS + N_KIND] != HOST || flow >= params[P_FLOW_COUNT]) {
         return true;
     }
+    // P16 H2: a stage notify's arrival advances its inbound successors by the whole chunk, and its
+    // sender's timer completes its local successors.
     bool inbound = kind == REMOTE_ARRIVAL &&
-        (packet == TCP_DATA_PACKET || packet == ROCE_DATA_PACKET);
+        (packet == TCP_DATA_PACKET || packet == ROCE_DATA_PACKET ||
+            packet == STAGE_NOTIFY_PACKET);
     bool local = (kind == REMOTE_ARRIVAL &&
             (packet == TCP_ACK_PACKET || packet == ROCE_ACK_PACKET ||
                 packet == ROCE_NACK_PACKET)) ||
-        (kind == PACING_TIMER && packet == DATA_PACKET);
+        (kind == PACING_TIMER && (packet == DATA_PACKET || packet == STAGE_NOTIFY_PACKET));
     if (!inbound && !local) {
         return true;
     }
@@ -5709,7 +5826,9 @@ __device__ __forceinline__ bool stage_after_event(
         return true;
     }
     ulong frontier = 0;
-    if (inbound) {
+    if (inbound && packet == STAGE_NOTIFY_PACKET) {
+        frontier = event[PK_SIZE];
+    } else if (inbound) {
         const ulong *receiver =
             tcp_state + params[P_TCP_RECEIVER_OFFSET] + flow * TCP_RECEIVER_WORDS;
         frontier = packet == TCP_DATA_PACKET ? receiver[3] : tcp_state[receiver[1] + RR_EXPECTED];
@@ -5721,8 +5840,25 @@ __device__ __forceinline__ bool stage_after_event(
         if (!complete) {
             return true;
         }
+        // A completion is credited once: later ACKs of a finished flow count nothing.
+        ulong *own = tcp_state + region + flow * STAGE_ROW_WORDS + SR_FLAGS;
+        if ((*own & SR_LOCAL_CREDITED) != 0) {
+            return true;
+        }
+        *own |= SR_LOCAL_CREDITED;
     }
     ulong successors = region + (list >> 32);
+    // The advance of this flow's frontier since it was last credited, for its inbound joins.
+    ulong advance = 0;
+    if (inbound && (tcp_state[region + flow * STAGE_ROW_WORDS + SR_FLAGS] & SR_INBOUND_CREDIT) != 0) {
+        ulong *credit = tcp_state + successors - 1;
+        if (frontier < *credit) {
+            set_semantic_error(error, 101, node);
+            return false;
+        }
+        advance = frontier - *credit;
+        *credit = frontier;
+    }
     for (ulong index = 0; index < count; ++index) {
         ulong successor = tcp_state[successors + index];
         if (successor >= params[P_FLOW_COUNT]) {
@@ -5732,22 +5868,39 @@ __device__ __forceinline__ bool stage_after_event(
         ulong *stage = tcp_state + region + successor * STAGE_ROW_WORDS;
         ulong flags = stage[SR_FLAGS];
         if (inbound) {
-            if ((flags & SR_HAS_INBOUND) == 0 || (flags & SR_INBOUND_COMPLETE) != 0 ||
-                frontier == stage[SR_INBOUND_RECEIVED]) {
+            if ((flags & SR_HAS_INBOUND) == 0 || (flags & SR_INBOUND_COMPLETE) != 0) {
                 continue;
             }
-            if (frontier < stage[SR_INBOUND_RECEIVED] || frontier > stage[SR_INBOUND_REQUIRED]) {
+            // A single predecessor's count is its frontier; a join adds each one's advance.
+            ulong received = (flags & SR_INBOUND_JOIN) != 0
+                ? stage[SR_INBOUND_RECEIVED] + advance : frontier;
+            if (received == stage[SR_INBOUND_RECEIVED]) {
+                continue;
+            }
+            if (received < stage[SR_INBOUND_RECEIVED] || received > stage[SR_INBOUND_REQUIRED]) {
                 set_semantic_error(error, 101, node);
                 return false;
             }
-            stage[SR_INBOUND_RECEIVED] = frontier;
-            if (frontier != stage[SR_INBOUND_REQUIRED]) {
+            stage[SR_INBOUND_RECEIVED] = received;
+            if (received != stage[SR_INBOUND_REQUIRED]) {
                 continue;
             }
             flags |= SR_INBOUND_COMPLETE;
         } else {
             if ((flags & SR_HAS_LOCAL) == 0 || (flags & SR_LOCAL_COMPLETE) != 0) {
                 continue;
+            }
+            if ((flags & SR_LOCAL_JOIN) != 0) {
+                flags += SR_JOIN_ONE;
+                ulong completed = (flags >> 32) & 0xfffful;
+                if (completed > (flags >> 48)) {
+                    set_semantic_error(error, 100, node);
+                    return false;
+                }
+                if (completed != (flags >> 48)) {
+                    stage[SR_FLAGS] = flags;
+                    continue;
+                }
             }
             flags |= SR_LOCAL_COMPLETE;
         }
@@ -5808,6 +5961,12 @@ __device__ __forceinline__ bool dispatch_event(
                 node, event, error, params, node_state, generators, fel_meta, fel_records,
                 queue_meta, queue_records, remote_meta, remote_staging, stream_state,
                 stream_records, summary, observation_meta, observed, scheduler_state, tcp_state);
+        }
+        // P16 H2: a stage notify's token names its sender's timer (Scalar's `host_notify_timer`).
+        if (MECHANISMS && (event[PK_KIND] & PK_KIND_MASK) == STAGE_NOTIFY_PACKET) {
+            return notify_timer(
+                node, event, error, params, node_state, generators, flows, fel_meta, fel_records,
+                remote_meta, remote_staging, stream_state, stream_records, tcp_state);
         }
         if (MECHANISMS && flow < params[P_FLOW_COUNT] &&
             generators[generator + G_VALID] != 0 && generators[generator + G_OWNER] == node &&
@@ -6909,6 +7068,15 @@ __device__ __forceinline__ bool dispatch_event(
                 generators, flows, fel_meta, fel_records, remote_meta, remote_staging,
                 stream_state, stream_records, summary, observation_meta, observed, arrivals,
                 tcp_state);
+        }
+        // P16 H2: a stage notify's arrival (Scalar's `host_notify_arrival`): the stage pass after
+        // this event advances its successors by the chunk; nothing else is counted or observed.
+        if (MECHANISMS && packet_kind == STAGE_NOTIFY_PACKET) {
+            if (event[PK_FLOW] >= params[P_FLOW_COUNT] || flows[flow_base + 1] != node) {
+                set_semantic_error(error, 106, node);
+                return false;
+            }
+            return true;
         }
         if (MECHANISMS && packet_kind == PFC_PACKET) {
             return pfc_frame_arrival<MECHANISMS>(

@@ -31,6 +31,9 @@ fn checkpoint(image: &SimulationImage, horizon_ns: u64) -> SimulationImage {
         channels: image.channels.clone(),
         initial_events: result.pending_events,
         seed: image.seed,
+        stage_joins: image.stage_joins.clone(),
+        seeded_all_to_alls: image.seeded_all_to_alls.clone(),
+        stage_streams: image.stage_streams.clone(),
     }
 }
 
@@ -253,8 +256,7 @@ fn a_roce_stage_counts_its_receivers_frontier() {
                 .enumerate()
                 .filter_map(move |(position, stage)| {
                     let dependencies = stage.as_ref()?.dependencies;
-                    (dependencies.inbound_bytes_received > 0
-                        && !dependencies.inbound_predecessor_complete)
+                    (dependencies.inbound_bytes_received > 0 && !dependencies.inbound_complete())
                         .then_some((slot, position))
                 })
         })
@@ -265,7 +267,7 @@ fn a_roce_stage_counts_its_receivers_frontier() {
         .as_mut()
         .expect("a stage");
     stage.dependencies.inbound_bytes_received -= 1;
-    refused(&broken, "in-order RoCE frontier");
+    refused(&broken, "disagree with the in-order frontiers");
 }
 
 /// Host-link PFC (§5.3): a gated stage on a paused host is not on its parked list, and listing it
@@ -301,40 +303,4 @@ fn gated_stages_on_a_paused_host_stay_off_its_parked_list() {
         found > 0,
         "no checkpoint held a gated stage on a paused host"
     );
-}
-
-/// Schema Amendment 5: a compute stage's progress rows name its inbound transport from its local
-/// predecessor (the same rank's final stage of the same collective), so the validator requires
-/// the two predecessors' MTU and pacing interval to agree.
-#[test]
-fn a_compute_stages_predecessors_share_their_roce_transport() {
-    let image = lower("roce_compute_dag.toml");
-    validate(&image, Backend::Scalar).expect("the lowered DAG validates");
-    let inbound = image
-        .host_states
-        .iter()
-        .flat_map(|state| state.generators_with_stages())
-        .find_map(|(_, stage)| match stage?.role {
-            StageRole::Compute(_) => stage?.dependencies.inbound_predecessor,
-            _ => None,
-        })
-        .expect("a compute stage after the collective");
-    let (slot, position) = image
-        .host_states
-        .iter()
-        .enumerate()
-        .find_map(|(slot, state)| {
-            state
-                .generators
-                .iter()
-                .position(|generator| generator.flow == inbound)
-                .map(|position| (slot, position))
-        })
-        .expect("the inbound predecessor's generator");
-    let mtu = with_roce(&image, slot, position, |_, roce| roce.pacer.mtu_bytes -= 1);
-    refused(&mtu, "disagree on the RoCE MTU or pacing interval");
-    let interval = with_roce(&image, slot, position, |_, roce| {
-        roce.pacer.pacing_interval_ns += 1
-    });
-    refused(&interval, "disagree on the RoCE MTU or pacing interval");
 }

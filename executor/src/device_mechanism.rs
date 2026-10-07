@@ -103,6 +103,8 @@ pub(crate) fn mechanism_flags(image: &SimulationImage) -> u64 {
             | PacketKind::RoceAck(_)
             | PacketKind::RoceNack(_)
             | PacketKind::RocePacingTimer => flags |= MECHANISM_ROCE,
+            // A stage notify belongs to a stage, whose generator sets `MECHANISM_STAGES`.
+            PacketKind::StageNotify => {}
             PacketKind::Data
             | PacketKind::Feedback
             | PacketKind::TcpData(_)
@@ -140,6 +142,8 @@ const ROCE_DATA_PACKET: u64 = 7;
 const ROCE_ACK_PACKET: u64 = 8;
 const ROCE_NACK_PACKET: u64 = 9;
 const ROCE_PACING_TIMER_PACKET: u64 = 10;
+/// P16 H2: a stage notify (`PacketKind::StageNotify`).
+const STAGE_NOTIFY_PACKET: u64 = 11;
 
 /// The planes of one uploaded device plan that the plain-kernel check reads, in the word layout
 /// both device backends share (`cuda_kernels.cu` and `metal_kernels.metal`). Each backend fills it
@@ -337,6 +341,7 @@ fn scan_uploaded_plan(plan: &UploadedPlan<'_>) -> Result<Option<PlainKernelRefus
                 | ROCE_ACK_PACKET
                 | ROCE_NACK_PACKET
                 | ROCE_PACING_TIMER_PACKET
+                | STAGE_NOTIFY_PACKET
         )
         .then_some(PlainKernelRefusal::MechanismPacket { arena, lp, kind })
     };
@@ -1074,6 +1079,9 @@ mod tests {
             channels: Vec::new(),
             initial_events: Vec::new(),
             seed: 0,
+            stage_joins: Vec::new(),
+            seeded_all_to_alls: Vec::new(),
+            stage_streams: Vec::new(),
         }
     }
 
@@ -1137,12 +1145,11 @@ mod tests {
                 duration_ns: 1,
             }),
             dependencies: crate::StageDependencies {
-                local_predecessor: None,
-                inbound_predecessor: None,
+                local: crate::StagePredecessors::None,
+                inbound: crate::StagePredecessors::None,
                 inbound_predecessor_bytes: 0,
-                local_predecessor_complete: true,
-                inbound_predecessor_complete: true,
                 inbound_bytes_received: 0,
+                local_completed: 0,
             },
             activated: true,
         })];
@@ -1210,10 +1217,27 @@ mod tests {
         assert_eq!(mechanism_flags(&frame), MECHANISM_PFC);
     }
 
+    fn class_flow(id: u64, priority: u8) -> crate::FlowDescriptor {
+        crate::FlowDescriptor {
+            id: FlowId(id),
+            source: crate::NodeId(1),
+            target: crate::NodeId(0),
+            priority,
+            feedback_priority: priority,
+            route: Vec::new(),
+            reverse_route: Vec::new(),
+        }
+    }
+
     /// P15 host-link PFC (replaces the `8dff4f0` planner refusal): a host with egress pause
     /// state gets a row in the PFC region, its pause sets round-trip through the bitsets, and its
-    /// row lists the host's queue pairs in generator-position order. The parked set is not stored
+    /// row lists the host's queue pairs in generator-position order. The parked set is not decoded
     /// (ruling D3).
+    ///
+    /// P16 H4 (ruling G9): the list is followed by the eight classes' parked bitsets, `ceil(Q/64)`
+    /// words each, initialized from the image's `pause_parked` (generator positions mapped to list
+    /// slots), and each queue pair's class word carries its slot in bits 16.. . The bitsets are
+    /// derived device state, not decoded.
     #[test]
     fn host_egress_pause_state_round_trips_through_the_pfc_region() {
         let mut image = switch_image(pfc_queue());
@@ -1222,14 +1246,20 @@ mod tests {
             kind: crate::NodeKind::Host,
             state_slot: 0,
         });
+        image.flows = (0..8).map(|id| class_flow(id, 3)).collect();
         let mut pair = generator_state(FlowGeneratorKind::Roce(roce_generator()));
         pair.flow = FlowId(5);
+        let mut parked = pair;
+        parked.flow = FlowId(7);
         let mut paused_host = host(vec![
             generator_state(FlowGeneratorKind::Rate(generator().rate)),
             pair,
+            parked,
         ]);
         let mut pfc = crate::HostPfcState::default();
         pfc.paused_by_controller[3].insert(crate::NodeId(0));
+        // Generator position 2 is the second queue pair: list slot 1.
+        pfc.pause_parked[3].insert(2);
         paused_host.pfc = Some(Box::new(pfc));
         image.host_states.push(paused_host);
         assert!(crate::device_pfc::image_has_pfc(&image));
@@ -1239,17 +1269,61 @@ mod tests {
         let region = crate::device_pfc::append_pfc_region(&image, &mut words)
             .expect("host rows are planned")
             .expect("the region exists");
+        assert_eq!(
+            words.len() - region,
+            crate::device_pfc::pfc_region_words(&image)
+        );
         assert_ne!(words[region + 1], u64::MAX, "the host has a row");
         let row = words[region + 1] as usize;
         assert_eq!(words[row + 1], 0, "hosts hold no ingress monitors");
         let list = words[row + 4] as usize;
-        assert_eq!(&words[list..list + 2], &[1, 5], "one queue pair, flow 5");
+        assert_eq!(
+            &words[list..list + 3],
+            &[2, 5, 7],
+            "two queue pairs, flows 5 and 7"
+        );
+        let bitsets = list + 3;
+        assert_eq!(
+            words.len(),
+            bitsets + 8,
+            "eight classes of one parked-bitset word"
+        );
+        let parked_bits = (0..8)
+            .map(|class| words[bitsets + class])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parked_bits,
+            [0, 0, 0, 0b10, 0, 0, 0, 0],
+            "slot 1 parked on class 3"
+        );
+        let class_words = &words[region + 2..region + 2 + 8];
+        assert_eq!(class_words[5], 3, "slot 0, class 3");
+        assert_eq!(class_words[7], 3 | (1 << 16), "slot 1, class 3");
+        assert!(
+            [0, 1, 2, 3, 4, 6]
+                .iter()
+                .all(|flow| class_words[*flow] == 3),
+            "flows that are not a host's queue pair keep their class word"
+        );
 
         let mut restored = image.host_states[0].clone();
         restored.pfc = Some(Box::default());
         crate::device_pfc::restore_host_pfc(&words, region, 1, &mut restored)
             .expect("the row restores");
-        assert_eq!(restored.pfc, image.host_states[0].pfc);
+        let mut expected = image.host_states[0].pfc.clone();
+        expected.as_deref_mut().unwrap().pause_parked = Default::default();
+        assert_eq!(
+            restored.pfc, expected,
+            "the pause sets restore; the parked set is derived"
+        );
+
+        let mut stale = words.clone();
+        stale[bitsets + 3] = 0b11;
+        let mut from_stale = image.host_states[0].clone();
+        from_stale.pfc = Some(Box::default());
+        crate::device_pfc::restore_host_pfc(&stale, region, 1, &mut from_stale)
+            .expect("the parked bitsets are derived device state, not decoded");
+        assert_eq!(from_stale.pfc, restored.pfc);
 
         let mut changed = words.clone();
         changed[list + 1] = 6;
@@ -1257,6 +1331,64 @@ mod tests {
             crate::device_pfc::restore_host_pfc(&changed, region, 1, &mut restored).is_err(),
             "the queue-pair list is image data, checked rather than trusted"
         );
+
+        let mut misparked = image.clone();
+        misparked.host_states[0]
+            .pfc
+            .as_deref_mut()
+            .unwrap()
+            .pause_parked[3]
+            .insert(0);
+        assert!(
+            crate::device_pfc::append_pfc_region(&misparked, &mut Vec::new()).is_err(),
+            "a parked position must be a queue pair"
+        );
+    }
+
+    /// P16 H4: the parked bitsets take `8 * ceil(Q/64)` words per host row, so a host row without
+    /// queue pairs, and an image whose PFC is on switch queues only, plan the words they planned
+    /// before H4, with every class word unchanged. 65 pairs take two words per class.
+    #[test]
+    fn parked_bitsets_cost_nothing_without_host_link_pfc_queue_pairs() {
+        let switch_only = switch_image(pfc_queue());
+        let mut words = Vec::new();
+        let region = crate::device_pfc::append_pfc_region(&switch_only, &mut words)
+            .expect("switch rows are planned")
+            .expect("the region exists");
+        // Before H4: the node's row word, then the switch row: a 5-word header, no controller, and
+        // eight one-word pause bitsets.
+        let pre_h4_switch_row = crate::device_pfc::PFC_ROW_HEADER_WORDS + 8;
+        assert_eq!(words.len() - region, 1 + pre_h4_switch_row);
+
+        let mut tcp_host = switch_image(pfc_queue());
+        tcp_host.nodes.push(crate::NodeDescriptor {
+            id: crate::NodeId(1),
+            kind: crate::NodeKind::Host,
+            state_slot: 0,
+        });
+        tcp_host.flows = vec![class_flow(0, 3)];
+        let mut host_without_pairs = host(vec![generator_state(FlowGeneratorKind::Rate(
+            generator().rate,
+        ))]);
+        host_without_pairs.pfc = Some(Box::default());
+        tcp_host.host_states.push(host_without_pairs);
+        let mut words = Vec::new();
+        let region = crate::device_pfc::append_pfc_region(&tcp_host, &mut words)
+            .expect("host rows are planned")
+            .expect("the region exists");
+        // Before H4: the header, no controller, eight pause-bitset words and the list `[0]`.
+        let pre_h4_host_row = crate::device_pfc::PFC_ROW_HEADER_WORDS + 8 + 1;
+        assert_eq!(
+            words.len() - region,
+            2 + 1 + pre_h4_switch_row + pre_h4_host_row,
+            "a host row without queue pairs plans no bitset word"
+        );
+        assert_eq!(words[region + 2], 3, "the class word is unchanged");
+
+        assert_eq!(crate::device_pfc::parked_bitset_words(0), 0);
+        assert_eq!(crate::device_pfc::parked_bitset_words(64), 1);
+        assert_eq!(crate::device_pfc::parked_bitset_words(65), 2);
+        assert_eq!(crate::device_pfc::parked_bitset_words(11_293), 177);
     }
 
     /// The per-flow class word equals the data class when the feedback class agrees (every
@@ -1722,6 +1854,9 @@ mod tests {
                     "ulong ROCE_PACING_TIMER_PACKET",
                     ROCE_PACING_TIMER_PACKET as usize,
                 ),
+                ("ulong STAGE_NOTIFY_PACKET", STAGE_NOTIFY_PACKET as usize),
+                ("uint G_NOTIFY_LANE", G_RATE_FIRST),
+                ("uint G_NOTIFY_BYTES", G_RATE_PACKET_SIZE),
                 ("ulong GENERATOR_KIND_ROCE", GENERATOR_KIND_ROCE as usize),
                 ("ulong ROCE_RECEIVER_MARKER", ROCE_RECEIVER_MARKER as usize),
                 ("uint G_ROCE_NEXT_PSN", G_ROCE_NEXT_PSN),

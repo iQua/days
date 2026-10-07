@@ -10,8 +10,8 @@ use days_executor::{
     CollectiveAlgorithm, CollectiveChannelPolicy, CollectiveChunkPolicy, CollectivePhase,
     CollectiveStage, CollectiveStageIdentity, ConstantGenerator, FlowGeneratorKind,
     FlowGeneratorState, FlowId, GeneratorFeedbackState, GeneratorStatus, GeneratorTermination,
-    HostState, LinkId, PayloadId, ScheduledEmission, StageDependencies, StageRole,
-    TcpCongestionControl, TcpGenerator,
+    HostState, LinkId, PayloadId, ScheduledEmission, StageDependencies, StagePredecessors,
+    StageRole, TcpCongestionControl, TcpGenerator,
 };
 
 fn generator(kind: FlowGeneratorKind) -> FlowGeneratorState {
@@ -81,8 +81,7 @@ fn identity() -> CollectiveStageIdentity {
     CollectiveStageIdentity {
         collective_id: 0,
         algorithm: CollectiveAlgorithm::RingAllReduce,
-        topology_level: 0,
-        topology_group: 0,
+        channel: 0,
         group_size: 3,
         declared_total_bytes: 9,
         rank: 1,
@@ -97,12 +96,11 @@ fn identity() -> CollectiveStageIdentity {
 
 fn dependencies() -> StageDependencies {
     StageDependencies {
-        local_predecessor: Some(FlowId(4)),
-        inbound_predecessor: Some(FlowId(2)),
+        local: StagePredecessors::One(FlowId(4)),
+        inbound: StagePredecessors::One(FlowId(2)),
         inbound_predecessor_bytes: 3,
-        local_predecessor_complete: false,
-        inbound_predecessor_complete: false,
         inbound_bytes_received: 0,
+        local_completed: 0,
     }
 }
 
@@ -133,9 +131,8 @@ fn stage_dependencies_round_trip_through_the_host_table() {
     let mut wrapped = host(generator(tcp()), Some(collective_stage()));
     assert_eq!(wrapped.stage_dependencies(0), Some(dependencies()));
     let mut updated = dependencies();
-    updated.local_predecessor_complete = true;
+    updated.local_completed = 1;
     updated.inbound_bytes_received = 3;
-    updated.inbound_predecessor_complete = true;
     assert!(!dependencies().prerequisites_complete());
     assert!(updated.prerequisites_complete());
     wrapped.set_stage_dependencies(0, updated);

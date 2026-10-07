@@ -94,7 +94,7 @@ fn collective_certificates_are_scalar_generated() {
                     .any(|row| row.stage_kind == CollectiveStageKind::Compute)
             );
         }
-        let csv = collective_transitions_csv(records).unwrap();
+        let csv = collective_transitions_csv(records, &image).unwrap();
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("lean/fixtures/p10c")
             .join(fixture);

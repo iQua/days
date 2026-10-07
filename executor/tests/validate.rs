@@ -162,6 +162,9 @@ fn valid_image() -> SimulationImage {
             payload: PACKET,
         }],
         seed: 7,
+        stage_joins: Vec::new(),
+        seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 
@@ -415,6 +418,9 @@ fn host_resident_waiter_image(
             })
             .collect(),
         seed: 26,
+        stage_joins: Vec::new(),
+        seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     };
     let checkpoint = checkpoint_image(&image, 1);
     assert_eq!(checkpoint.host_states[0].in_service, Some(PayloadId(0)));
@@ -619,6 +625,9 @@ fn switch_resident_waiter_image(
             })
             .collect(),
         seed: 26,
+        stage_joins: Vec::new(),
+        seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     };
     let checkpoint = checkpoint_image(&image, 3);
     assert_eq!(

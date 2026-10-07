@@ -200,6 +200,9 @@ fn generator_image(termination: GeneratorTermination) -> SimulationImage {
             payload: GENERATOR_FIRST_PACKET,
         }],
         seed: 1,
+        stage_joins: Vec::new(),
+        seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 
@@ -494,6 +497,9 @@ fn reverse_switch_feedback_image() -> SimulationImage {
             })
             .collect(),
         seed: 1,
+        stage_joins: Vec::new(),
+        seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 
@@ -667,6 +673,9 @@ fn fifo_taildrop_image() -> SimulationImage {
             source_arrival(8, 4, FIFO_PAYLOADS[4]),
         ],
         seed: 7,
+        stage_joins: Vec::new(),
+        seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 
@@ -795,6 +804,9 @@ fn backlog_drain_image() -> SimulationImage {
             payload: packets[0].id,
         }],
         seed: 19,
+        stage_joins: Vec::new(),
+        seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 
@@ -948,6 +960,9 @@ fn uneven_multi_lp_backlog_image() -> SimulationImage {
         channels,
         initial_events,
         seed: 29,
+        stage_joins: Vec::new(),
+        seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 
@@ -1100,6 +1115,9 @@ fn long_flight_backlog_image() -> SimulationImage {
             })
             .collect(),
         seed: 23,
+        stage_joins: Vec::new(),
+        seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 

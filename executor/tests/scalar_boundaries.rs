@@ -124,6 +124,9 @@ fn image(stop_time_ns: u64) -> SimulationImage {
             source_arrival(BOUNDARY_NS + 1, 1, AFTER_BOUNDARY),
         ],
         seed: 1,
+        stage_joins: Vec::new(),
+        seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 
