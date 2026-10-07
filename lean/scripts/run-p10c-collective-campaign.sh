@@ -530,5 +530,17 @@ mutate_case "hostafter-join-missing-cross-family-pair" "$hostafter_rail" \
   '$column["flow_id"] == 1 { if ($column["cause_flow_id"] == 18 && $column["cause"] == "local_completion") next; $column["local_predecessors"] = "16;17;39"; $column["local_required"] = 3; if ($column["cause_flow_id"] == 17 && $column["cause"] == "local_completion") { $column["after_local_complete"] = 1 } if ($column["before_local_completed"] == 4) $column["before_local_completed"] = 3; if ($column["after_local_completed"] == 4) $column["after_local_completed"] = 3 }' \
   'REJECT: line 3: a stage does not wait for its predecessor collective'"'"'s whole completion at its rank'
 
+# Review L4 (hostafter lane): a flow has one target host. In sendrecv-across-stages the message
+# (flow 0, host 1 -> host 2) is stage 1's inbound predecessor at host 2 (flow 7). The reviewer's
+# forgery has stage 1's rank at host 3 (flow 8) claim the message too, with copied arrival rows;
+# the second has stage 0's next compute at host 0 (flow 3) claim it.
+hostafter_sendrecv="$fixture_dir/collective_hostafter_sendrecv_across_stages_executor_accept.csv"
+mutate_case "sendrecv-message-claimed-at-another-host" "$hostafter_sendrecv" \
+  'NR == 2 { ps = $column["packet_size_bytes"]; iv = $column["interval_ns"] } $column["flow_id"] == 8 && $column["cause"] == "local_completion" { $column["inbound_predecessors"] = 0; $column["inbound_predecessor_bytes"] = 9000; $column["after_inbound_complete"] = 0; $column["before_inbound_complete"] = 0; $column["activated"] = 0; $column["after_status"] = "blocked"; $column["after_next_time_ns"] = 0; $column["packet_size_bytes"] = ps; $column["interval_ns"] = iv; print; next } $column["flow_id"] == 7 && $column["cause"] == "inbound_arrival" { print; $column["node_id"] = 3; $column["flow_id"] = 8; $column["rank"] = 1; $column["local_predecessors"] = 6; $column["ordinal"] = $column["ordinal"] + 1; $column["before_local_complete"] = 1; $column["after_local_complete"] = 1; print; next }' \
+  'REJECT: line 3: an inbound predecessor is delivered to more than one host'
+mutate_case "sendrecv-message-claimed-by-another-group" "$hostafter_sendrecv" \
+  'NR == 2 { ps = $column["packet_size_bytes"]; iv = $column["interval_ns"] } $column["flow_id"] == 3 && $column["cause"] == "local_completion" { $column["inbound_predecessors"] = 0; $column["inbound_predecessor_bytes"] = 9000; $column["after_inbound_complete"] = 0; $column["before_inbound_complete"] = 0; $column["activated"] = 0; $column["after_status"] = "blocked"; $column["after_next_time_ns"] = 0; $column["packet_size_bytes"] = ps; $column["interval_ns"] = iv; print; next } $column["flow_id"] == 7 && $column["cause"] == "inbound_arrival" { print; $column["node_id"] = 0; $column["flow_id"] = 3; $column["rank"] = 0; $column["collective_id"] = 1; $column["local_predecessors"] = 1; $column["ordinal"] = $column["ordinal"] + 1; $column["before_local_complete"] = 1; $column["after_local_complete"] = 1; print; next }' \
+  'REJECT: line 4: an inbound predecessor is delivered to more than one host'
+
 echo "P10c exact-integer collective campaign checks: $checked"
 exit "$failures"
