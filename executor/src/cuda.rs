@@ -191,14 +191,23 @@ fn select_cuda_provisioning(
 /// The device-memory limit one plan is checked against before allocation (P16 D2), from
 /// `cuMemGetInfo`'s `free` and `total` and the optional [`CudaConfig::max_device_bytes`], which
 /// can only lower it.
+///
+/// - **Device** (a discrete GPU): `free`, the device memory a plan can still allocate.
+/// - **Managed** (an integrated GPU sharing system memory, such as GB10): `total`. There `free` is
+///   the kernel's MemFree, which leaves out reclaimable page cache, so it moves with host state:
+///   on an idle madrid it read 83.1 GB while a 102 GB managed allocation succeeded, and 127.9 GB
+///   right after (review M1). The total is a fixed property of the device, so whether a plan is
+///   refused does not depend on what the host cached last.
 fn plan_memory_limit(
     provisioning: CudaProvisioning,
     free: usize,
     total: usize,
     configured: Option<usize>,
 ) -> usize {
-    let _ = (provisioning, total);
-    let device = free;
+    let device = match provisioning {
+        CudaProvisioning::Device => free,
+        CudaProvisioning::Managed => total,
+    };
     configured.map_or(device, |configured| configured.min(device))
 }
 
@@ -738,8 +747,9 @@ pub enum CudaError {
         code: u64,
         node: Option<NodeId>,
     },
-    /// P16 D2: the plan needs more device memory than is free on the device, or than
-    /// [`CudaConfig::max_device_bytes`] allows, so nothing was allocated. Without this check the
+    /// P16 D2: the plan needs more device memory than the device's limit (free memory on a
+    /// discrete GPU, total memory under managed provisioning) or [`CudaConfig::max_device_bytes`]
+    /// allows, so nothing was allocated. Without this check the
     /// run failed a plane upload out of memory.
     DeviceMemoryExceeded {
         planned_bytes: usize,
@@ -896,8 +906,9 @@ pub struct CudaConfig {
     pub attempts_per_graph_wave: usize,
     /// Optional hard cap overriding the conservative semantic round bound.
     pub max_rounds: Option<usize>,
-    /// Optional limit on the bytes one plan may place on the device, below the device memory free
-    /// when the attempt is planned (which always applies). A plan over the limit is refused with
+    /// Optional limit on the bytes one plan may place on the device, below the device's own limit
+    /// (which always applies): the memory free when the attempt is planned on a discrete GPU, the
+    /// total memory under managed provisioning. A plan over the limit is refused with
     /// [`CudaError::DeviceMemoryExceeded`] before any buffer is allocated.
     pub max_device_bytes: Option<usize>,
     /// Test-only zero-capacity injection for device arenas without a public sizing override.
@@ -5582,7 +5593,7 @@ impl RoundModule {
 impl DirectCuda {
     /// The most bytes one plan may place on the device ([`plan_memory_limit`]) (P16 D2).
     ///
-    /// The stream is synchronized first. A discarded attempt's buffers are freed with
+    /// The stream is synchronized first; the free figure it matters for is the discrete-GPU limit. A discarded attempt's buffers are freed with
     /// stream-ordered `cuMemFreeAsync` when the context supports it; the freed memory stays in the
     /// device's default pool, and reaches the free count only once a synchronization releases it
     /// (release threshold 0). Without the synchronization a capacity retry could see the previous
