@@ -29,10 +29,16 @@ const FIXTURE: &str = "configs/p16/roce_long_flow_cutoff.toml";
 /// any packet departs, while the first packets are in flight, and after 50 departures.
 const CUTOFFS_NS: [u64; 4] = [1, 10_000, 50_000, 100_000];
 
-/// The observation logs of a cutoff run fit in 1 MiB: at most `cutoff / 1,000 ns + 2` pacing
-/// ticks per queue pair, so at most 102 data packets and as many ACKs per flow, over 24 queue pairs
-/// and routes of at most 4 links, at 256 bytes per record slot across the three logs.
-const CUTOFF_OBSERVATION_BYTES: usize = 1 << 20;
+/// The observation-log bytes a cutoff run may plan. A queue pair sends at most one packet per
+/// 1,000 ns pacing tick, and none before the first event, so by `cutoff` it has sent at most
+/// `cutoff / 1,000 + 2` data packets and as many ACKs. Each one takes a record slot at its source
+/// and three per link (an observed and a departure record at the link's source, an arrival at its
+/// target) on a route of at most 4 links: 13 per direction, 26 per pair, over 24 pairs. Each slot is
+/// 32 words across the three logs, and every LP plus every initial event adds one slot.
+fn cutoff_observation_bytes(cutoff_ns: u64) -> usize {
+    let packets = (cutoff_ns / 1_000 + 2) as usize;
+    (24 * 26 * packets + 64) * 32 * 8
+}
 
 fn image() -> SimulationImage {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(FIXTURE);
@@ -84,7 +90,7 @@ mod metal {
     };
 
     use super::{
-        CUTOFF_OBSERVATION_BYTES, CUTOFFS_NS, first_event_ns, image, observation_bytes, scalar_full,
+        CUTOFFS_NS, cutoff_observation_bytes, first_event_ns, image, observation_bytes, scalar_full,
     };
 
     #[test]
@@ -101,7 +107,7 @@ mod metal {
             .expect("the Metal plan sizes");
             let bytes = observation_bytes(&report);
             assert!(
-                bytes <= CUTOFF_OBSERVATION_BYTES,
+                bytes <= cutoff_observation_bytes(cutoff),
                 "+{cutoff} ns: {bytes} observation bytes"
             );
         }
@@ -137,7 +143,7 @@ mod cuda {
     };
 
     use super::{
-        CUTOFF_OBSERVATION_BYTES, CUTOFFS_NS, first_event_ns, image, observation_bytes, scalar_full,
+        CUTOFFS_NS, cutoff_observation_bytes, first_event_ns, image, observation_bytes, scalar_full,
     };
 
     #[test]
@@ -154,7 +160,7 @@ mod cuda {
             .expect("the CUDA plan sizes");
             let bytes = observation_bytes(&report);
             assert!(
-                bytes <= CUTOFF_OBSERVATION_BYTES,
+                bytes <= cutoff_observation_bytes(cutoff),
                 "+{cutoff} ns: {bytes} observation bytes"
             );
         }

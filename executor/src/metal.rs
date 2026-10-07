@@ -2374,7 +2374,13 @@ impl MetalPlan {
             0
         };
         let mut observation_capacities = if observation_mode == ObservationMode::Full {
-            derived_observation_capacities(image, &flow_packet_counts, &flow_feedback_counts)
+            let (counts, feedback_counts) = crate::device_sizing::observation_packet_counts(
+                image,
+                &flow_packet_counts,
+                &flow_feedback_counts,
+                exclusive_horizon_ns,
+            );
+            crate::device_sizing::derived_observation_capacities(image, &counts, &feedback_counts)
         } else {
             vec![0; node_count]
         };
@@ -3335,59 +3341,6 @@ fn take_words(next: &mut usize, records: usize, words: usize) -> Result<usize, M
             })?)
             .ok_or_else(|| MetalError::Validation("stream state size overflows usize".into()))?;
     Ok(start)
-}
-
-fn derived_observation_capacities(
-    image: &SimulationImage,
-    counts: &[usize],
-    feedback_counts: &[usize],
-) -> Vec<usize> {
-    let mut capacities = vec![1_usize; image.nodes.len()];
-    for event in &image.initial_events {
-        let target = event.target.0 as usize;
-        capacities[target] = capacities[target].saturating_add(1);
-    }
-    for (index, flow) in image.flows.iter().enumerate() {
-        let feedback_count = feedback_counts[index];
-        let data_count = counts[index].saturating_sub(feedback_count);
-        capacities[flow.source.0 as usize] =
-            capacities[flow.source.0 as usize].saturating_add(data_count);
-        capacities[flow.target.0 as usize] =
-            capacities[flow.target.0 as usize].saturating_add(feedback_count);
-        add_route_observation_capacities(
-            image,
-            &flow.route,
-            flow.target,
-            data_count,
-            &mut capacities,
-        );
-        add_route_observation_capacities(
-            image,
-            &flow.reverse_route,
-            flow.source,
-            feedback_count,
-            &mut capacities,
-        );
-    }
-    capacities
-}
-
-fn add_route_observation_capacities(
-    image: &SimulationImage,
-    route: &[crate::LinkId],
-    terminal: NodeId,
-    packet_count: usize,
-    capacities: &mut [usize],
-) {
-    for (step, link_id) in route.iter().enumerate() {
-        let producer = image.links[link_id.0 as usize].source.0 as usize;
-        capacities[producer] = capacities[producer].saturating_add(packet_count.saturating_mul(2));
-        let target = route
-            .get(step + 1)
-            .map_or(terminal, |next| image.links[next.0 as usize].source)
-            .0 as usize;
-        capacities[target] = capacities[target].saturating_add(packet_count);
-    }
 }
 
 fn remote_inbound_producers(
