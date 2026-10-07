@@ -3,8 +3,8 @@
 use std::fmt::{self, Write};
 
 use crate::{
-    CollectiveAlgorithm, CollectivePhase, DcqcnTransitionRecord, EventKey, FlowId, GeneratorStatus,
-    LinkId, NodeId, PayloadId,
+    CollectiveAlgorithm, CollectivePhase, DcqcnTransitionRecord, EventKey, ExactRational, FlowId,
+    GeneratorStatus, LinkId, NodeId, PayloadId, WfqSchedulerState,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -120,6 +120,78 @@ pub struct WrrTransitionRecord {
     pub after_current_class: u64,
 }
 
+/// Which exact WFQ transition a [`WfqTransitionRecord`] records, by the event that performs it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WfqTransitionKind {
+    /// An admitted packet's arrival (phase 0): virtual time advances (or resets on an idle
+    /// scheduler) and the packet gets its finish tag.
+    Enqueue,
+    /// A service start (`TxReady`, phase 2): the scheduler state is unchanged, and the served
+    /// packet is the waiting packet with the least finish tag among those PFC does not pause.
+    Select,
+    /// A service completion (`TxComplete`, phase 1): virtual time advances, the packet's class
+    /// leaves the active set when it was the class's last packet, and an idle scheduler resets.
+    Complete,
+}
+
+/// The exact WFQ scheduler state a transition reads and writes. Virtual time and finish tags are
+/// normalized by the queue's link rate (bits, not seconds), as in [`WfqSchedulerState`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WfqReplayState {
+    pub virtual_time: ExactRational,
+    pub last_updated_ns: u64,
+    /// Each class's last finish tag.
+    pub finish_times: Vec<ExactRational>,
+    /// Each class's queued plus in-service packets.
+    pub active_packets: Vec<u64>,
+}
+
+impl WfqReplayState {
+    pub fn of(state: &WfqSchedulerState) -> Self {
+        Self {
+            virtual_time: state.virtual_time.clone(),
+            last_updated_ns: state.last_updated_ns,
+            finish_times: state.finish_times.clone(),
+            active_packets: state.active_packets.clone(),
+        }
+    }
+}
+
+/// One packet waiting at a WFQ service decision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WfqQueuedPacket {
+    pub packet: SchedulerPacket,
+    /// The packet's PFC class (its flow's packet priority), which decides whether a paused
+    /// priority holds it back. Zero on a queue without a PFC monitor.
+    pub pfc_priority: u8,
+    pub finish: ExactRational,
+}
+
+/// One exact WFQ transition of a switch egress queue (P16 L2; the `wfq` mode of LeanGuard's
+/// `p10c_mechanisms_check`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WfqTransitionRecord {
+    pub key: EventKey,
+    pub node: NodeId,
+    pub queue_id: u64,
+    pub kind: WfqTransitionKind,
+    /// The egress link's rate, which converts elapsed nanoseconds into virtual time.
+    pub rate_bps: u64,
+    pub weights: Vec<u64>,
+    /// The packet enqueued, served, or completed.
+    pub packet: SchedulerPacket,
+    /// The enqueued packet's virtual start, `max(virtual time, its class's last finish tag)`.
+    pub virtual_start: Option<ExactRational>,
+    /// The packet's finish tag.
+    pub finish: ExactRational,
+    pub before: WfqReplayState,
+    pub after: WfqReplayState,
+    /// At a selection: every packet waiting before it, the served one included, in queue order.
+    pub queued_packets: Vec<WfqQueuedPacket>,
+    /// At a selection: the PFC priorities paused at the queue's egress, ascending.
+    pub paused_priorities: Vec<u8>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CollectiveActivationCause {
     LocalCompletion,
@@ -219,6 +291,8 @@ pub enum MechanismTransitionRecord {
     Collective(CollectiveProgressRecord),
     /// A RoCE queue pair's reliability transition (P15; schema `qp-schema.md`).
     Roce(crate::RoceTransitionRecord),
+    /// An exact WFQ transition (P16 L2), boxed so the enum keeps the size of its other variants.
+    Wfq(Box<WfqTransitionRecord>),
 }
 
 impl MechanismTransitionRecord {
@@ -232,6 +306,7 @@ impl MechanismTransitionRecord {
             Self::Dcqcn(record) => record.key,
             Self::Collective(record) => record.key,
             Self::Roce(record) => record.key(),
+            Self::Wfq(record) => record.key,
         }
     }
 
@@ -246,6 +321,7 @@ impl MechanismTransitionRecord {
             Self::Collective(record) => (6, record.ordinal),
             // A host RESUME yields one `resume` row per restarted queue pair at one key.
             Self::Roce(record) => (7, record.flow().0),
+            Self::Wfq(_) => (8, 0),
         };
         (self.key(), tag, ordinal)
     }
@@ -1127,6 +1203,92 @@ pub fn wrr_transitions_csv(
         .expect("writing to String cannot fail");
     }
     Ok(csv)
+}
+
+/// The WFQ certificate: one row per enqueue, service start and service completion at a WFQ
+/// egress queue, in canonical event-key order (one row per event). Exact rationals are written
+/// `numerator/denominator` in lowest terms; lists are `;`-separated; a queued packet is
+/// `payload:flow:size_bytes:pfc_priority:finish`.
+pub fn wfq_transitions_csv(
+    records: &[MechanismTransitionRecord],
+) -> Result<String, MechanismTraceError> {
+    let records = canonical(
+        "WFQ",
+        records
+            .iter()
+            .filter_map(|record| match record {
+                MechanismTransitionRecord::Wfq(record) => Some((record.key, record.as_ref())),
+                _ => None,
+            })
+            .collect(),
+    )?;
+    let mut csv = String::from(
+        "time_ns,event_phase,event_origin_node,event_origin_sequence,kind,node_id,queue_id,rate_bps,weights,payload,flow_id,size_bytes,virtual_start,finish_tag,before_virtual_time,before_last_updated_ns,before_finish_tags,before_active_packets,queued_packets,paused_priorities,after_virtual_time,after_last_updated_ns,after_finish_tags,after_active_packets\n",
+    );
+    for record in records {
+        let kind = match record.kind {
+            WfqTransitionKind::Enqueue => "enqueue",
+            WfqTransitionKind::Select => "select",
+            WfqTransitionKind::Complete => "complete",
+        };
+        let queued = record
+            .queued_packets
+            .iter()
+            .map(|queued| {
+                format!(
+                    "{}:{}:{}:{}:{}",
+                    queued.packet.payload.0,
+                    queued.packet.flow.0,
+                    queued.packet.size_bytes,
+                    queued.pfc_priority,
+                    rational(&queued.finish)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(";");
+        let paused = record
+            .paused_priorities
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(";");
+        writeln!(
+            csv,
+            "{},{},{},{},{kind},{},{},{},{},{},{},{},{},{},{},{},{},{},{queued},{paused},{},{},{},{}",
+            record.key.time_ns,
+            record.key.phase,
+            record.key.origin_node.0,
+            record.key.origin_seq,
+            record.node.0,
+            record.queue_id,
+            record.rate_bps,
+            naturals(&record.weights),
+            record.packet.payload.0,
+            record.packet.flow.0,
+            record.packet.size_bytes,
+            record.virtual_start.as_ref().map_or_else(String::new, rational),
+            rational(&record.finish),
+            rational(&record.before.virtual_time),
+            record.before.last_updated_ns,
+            rationals(&record.before.finish_times),
+            naturals(&record.before.active_packets),
+            rational(&record.after.virtual_time),
+            record.after.last_updated_ns,
+            rationals(&record.after.finish_times),
+            naturals(&record.after.active_packets),
+        )
+        .expect("writing to String cannot fail");
+    }
+    Ok(csv)
+}
+
+/// An exact rational in lowest terms, `numerator/denominator`.
+fn rational(value: &ExactRational) -> String {
+    format!("{}/{}", value.numer(), value.denom())
+}
+
+fn rationals(values: &[ExactRational]) -> String {
+    values.iter().map(rational).collect::<Vec<_>>().join(";")
 }
 
 const fn status(status: GeneratorStatus) -> &'static str {
