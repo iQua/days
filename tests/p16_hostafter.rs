@@ -435,6 +435,76 @@ fn unmatched_after_lists_are_rejected() {
     }
 }
 
+/// Ruling R11's width rule stays sound for host-matched joins: at every departure and stage
+/// transition time of each fixture's Scalar run, no host has more released, unfinished stages than the stage-aware sizing's
+/// width for it (`stage_widths_for_testing`, one width per host with an unfinished stage, in host
+/// order).
+#[test]
+fn the_width_rule_bounds_every_hosts_active_stages() {
+    for (label, image) in images() {
+        let widths = days_executor::stage_widths_for_testing(&image);
+        let sized = image
+            .host_states
+            .iter()
+            .map(|state| {
+                state.generators_with_stages().any(|(generator, stage)| {
+                    stage.is_some()
+                        && matches!(
+                            generator.next_emission.status,
+                            days_executor::GeneratorStatus::Scheduled
+                                | days_executor::GeneratorStatus::Blocked
+                        )
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sized.iter().filter(|&&sized| sized).count(), widths.len());
+        // Every departure and every stage progress transition (releases, completions, arrivals,
+        // stage notifies included).
+        let full = scalar(&image, None, ObservationMode::Full);
+        let mut times = full
+            .departures
+            .iter()
+            .map(|departure| departure.time_ns)
+            .chain(
+                full.diagnostics
+                    .as_ref()
+                    .expect("Full observation keeps diagnostics")
+                    .mechanism_transitions
+                    .iter()
+                    .map(|record| record.key().time_ns),
+            )
+            .collect::<Vec<_>>();
+        times.sort_unstable();
+        times.dedup();
+        let mut peaks = vec![0_usize; widths.len()];
+        for time in times {
+            let state = scalar(&image, Some(time), ObservationMode::Summary);
+            let mut group = 0;
+            for (host, sized) in state.host_states.iter().zip(&sized) {
+                if !sized {
+                    continue;
+                }
+                let active = host
+                    .generators_with_stages()
+                    .filter(|(generator, stage)| {
+                        stage.is_some_and(|stage| stage.activated)
+                            && generator.next_emission.status
+                                != days_executor::GeneratorStatus::Finished
+                    })
+                    .count();
+                peaks[group] = peaks[group].max(active);
+                assert!(
+                    active <= widths[group],
+                    "{label} at {time} ns: {active} active stages above width {}",
+                    widths[group]
+                );
+                group += 1;
+            }
+        }
+        println!("record=width label={label} widths={widths:?} peaks={peaks:?}");
+    }
+}
+
 fn scalar(image: &SimulationImage, horizon: Option<u64>, mode: ObservationMode) -> RunResult {
     run_scalar_with_observations(image, horizon, mode).expect("the Scalar oracle runs")
 }
