@@ -1510,7 +1510,8 @@ impl CudaExecutor {
                     plan.refuse_plain_round_kernel()?;
                 }
                 // P16 D2: refuse, before allocating, a plan the device cannot hold. The previous
-                // attempt's buffers are already freed, so the free memory is this attempt's.
+                // attempt's buffers were dropped with its closure; `device_memory_limit`
+                // synchronizes so their memory counts as free.
                 let limit_bytes = direct.device_memory_limit(attempt_config.max_device_bytes)?;
                 let planned_bytes = plan.device_bytes();
                 if planned_bytes > limit_bytes {
@@ -5567,7 +5568,16 @@ impl RoundModule {
 impl DirectCuda {
     /// The most bytes one plan may place on the device: the memory free on it now, or
     /// `configured` when that is lower (P16 D2).
+    ///
+    /// The stream is synchronized first. A discarded attempt's buffers are freed with
+    /// stream-ordered `cuMemFreeAsync` when the context supports it; the freed memory stays in the
+    /// device's default pool, and reaches the free count only once a synchronization releases it
+    /// (release threshold 0). Without the synchronization a capacity retry could see the previous
+    /// attempt's memory as still in use and refuse a plan that fits.
     fn device_memory_limit(&self, configured: Option<usize>) -> Result<usize, CudaError> {
+        self.stream
+            .synchronize()
+            .map_err(|error| driver_error("device memory query synchronization", error))?;
         let (free, _total) = self
             .context
             .mem_get_info()
