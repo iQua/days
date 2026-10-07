@@ -10,8 +10,10 @@ if [[ "$#" -ne 2 ]]; then
   exit 2
 fi
 
-trace_dir="$1"
-results_dir="$2"
+# Both directories may be relative to the caller's directory; the script changes into lean/.
+trace_dir="$(cd "$1" && pwd)"
+mkdir -p "$2"
+results_dir="$(cd "$2" && pwd)"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 lean_dir="$(cd "$script_dir/.." && pwd)"
 checker="$lean_dir/.lake/build/bin/tcp_check"
