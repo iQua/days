@@ -1,0 +1,351 @@
+mockncclgroup W 128 gpus_per_server 8 TP 2 DP 64 PP 1 EP 32 DP_EP 2
+group TP nNodes 1 nRanks 2 ranks 0 1
+  channel 0 next 0>1 1>0
+  channel 1 next 0>1 1>0
+group TP nNodes 1 nRanks 2 ranks 2 3
+  channel 0 next 2>3 3>2
+  channel 1 next 2>3 3>2
+group TP nNodes 1 nRanks 2 ranks 4 5
+  channel 0 next 4>5 5>4
+  channel 1 next 4>5 5>4
+group TP nNodes 1 nRanks 2 ranks 6 7
+  channel 0 next 6>7 7>6
+  channel 1 next 6>7 7>6
+group TP nNodes 1 nRanks 2 ranks 8 9
+  channel 0 next 8>9 9>8
+  channel 1 next 8>9 9>8
+group TP nNodes 1 nRanks 2 ranks 10 11
+  channel 0 next 10>11 11>10
+  channel 1 next 10>11 11>10
+group TP nNodes 1 nRanks 2 ranks 12 13
+  channel 0 next 12>13 13>12
+  channel 1 next 12>13 13>12
+group TP nNodes 1 nRanks 2 ranks 14 15
+  channel 0 next 14>15 15>14
+  channel 1 next 14>15 15>14
+group TP nNodes 1 nRanks 2 ranks 16 17
+  channel 0 next 16>17 17>16
+  channel 1 next 16>17 17>16
+group TP nNodes 1 nRanks 2 ranks 18 19
+  channel 0 next 18>19 19>18
+  channel 1 next 18>19 19>18
+group TP nNodes 1 nRanks 2 ranks 20 21
+  channel 0 next 20>21 21>20
+  channel 1 next 20>21 21>20
+group TP nNodes 1 nRanks 2 ranks 22 23
+  channel 0 next 22>23 23>22
+  channel 1 next 22>23 23>22
+group TP nNodes 1 nRanks 2 ranks 24 25
+  channel 0 next 24>25 25>24
+  channel 1 next 24>25 25>24
+group TP nNodes 1 nRanks 2 ranks 26 27
+  channel 0 next 26>27 27>26
+  channel 1 next 26>27 27>26
+group TP nNodes 1 nRanks 2 ranks 28 29
+  channel 0 next 28>29 29>28
+  channel 1 next 28>29 29>28
+group TP nNodes 1 nRanks 2 ranks 30 31
+  channel 0 next 30>31 31>30
+  channel 1 next 30>31 31>30
+group TP nNodes 1 nRanks 2 ranks 32 33
+  channel 0 next 32>33 33>32
+  channel 1 next 32>33 33>32
+group TP nNodes 1 nRanks 2 ranks 34 35
+  channel 0 next 34>35 35>34
+  channel 1 next 34>35 35>34
+group TP nNodes 1 nRanks 2 ranks 36 37
+  channel 0 next 36>37 37>36
+  channel 1 next 36>37 37>36
+group TP nNodes 1 nRanks 2 ranks 38 39
+  channel 0 next 38>39 39>38
+  channel 1 next 38>39 39>38
+group TP nNodes 1 nRanks 2 ranks 40 41
+  channel 0 next 40>41 41>40
+  channel 1 next 40>41 41>40
+group TP nNodes 1 nRanks 2 ranks 42 43
+  channel 0 next 42>43 43>42
+  channel 1 next 42>43 43>42
+group TP nNodes 1 nRanks 2 ranks 44 45
+  channel 0 next 44>45 45>44
+  channel 1 next 44>45 45>44
+group TP nNodes 1 nRanks 2 ranks 46 47
+  channel 0 next 46>47 47>46
+  channel 1 next 46>47 47>46
+group TP nNodes 1 nRanks 2 ranks 48 49
+  channel 0 next 48>49 49>48
+  channel 1 next 48>49 49>48
+group TP nNodes 1 nRanks 2 ranks 50 51
+  channel 0 next 50>51 51>50
+  channel 1 next 50>51 51>50
+group TP nNodes 1 nRanks 2 ranks 52 53
+  channel 0 next 52>53 53>52
+  channel 1 next 52>53 53>52
+group TP nNodes 1 nRanks 2 ranks 54 55
+  channel 0 next 54>55 55>54
+  channel 1 next 54>55 55>54
+group TP nNodes 1 nRanks 2 ranks 56 57
+  channel 0 next 56>57 57>56
+  channel 1 next 56>57 57>56
+group TP nNodes 1 nRanks 2 ranks 58 59
+  channel 0 next 58>59 59>58
+  channel 1 next 58>59 59>58
+group TP nNodes 1 nRanks 2 ranks 60 61
+  channel 0 next 60>61 61>60
+  channel 1 next 60>61 61>60
+group TP nNodes 1 nRanks 2 ranks 62 63
+  channel 0 next 62>63 63>62
+  channel 1 next 62>63 63>62
+group TP nNodes 1 nRanks 2 ranks 64 65
+  channel 0 next 64>65 65>64
+  channel 1 next 64>65 65>64
+group TP nNodes 1 nRanks 2 ranks 66 67
+  channel 0 next 66>67 67>66
+  channel 1 next 66>67 67>66
+group TP nNodes 1 nRanks 2 ranks 68 69
+  channel 0 next 68>69 69>68
+  channel 1 next 68>69 69>68
+group TP nNodes 1 nRanks 2 ranks 70 71
+  channel 0 next 70>71 71>70
+  channel 1 next 70>71 71>70
+group TP nNodes 1 nRanks 2 ranks 72 73
+  channel 0 next 72>73 73>72
+  channel 1 next 72>73 73>72
+group TP nNodes 1 nRanks 2 ranks 74 75
+  channel 0 next 74>75 75>74
+  channel 1 next 74>75 75>74
+group TP nNodes 1 nRanks 2 ranks 76 77
+  channel 0 next 76>77 77>76
+  channel 1 next 76>77 77>76
+group TP nNodes 1 nRanks 2 ranks 78 79
+  channel 0 next 78>79 79>78
+  channel 1 next 78>79 79>78
+group TP nNodes 1 nRanks 2 ranks 80 81
+  channel 0 next 80>81 81>80
+  channel 1 next 80>81 81>80
+group TP nNodes 1 nRanks 2 ranks 82 83
+  channel 0 next 82>83 83>82
+  channel 1 next 82>83 83>82
+group TP nNodes 1 nRanks 2 ranks 84 85
+  channel 0 next 84>85 85>84
+  channel 1 next 84>85 85>84
+group TP nNodes 1 nRanks 2 ranks 86 87
+  channel 0 next 86>87 87>86
+  channel 1 next 86>87 87>86
+group TP nNodes 1 nRanks 2 ranks 88 89
+  channel 0 next 88>89 89>88
+  channel 1 next 88>89 89>88
+group TP nNodes 1 nRanks 2 ranks 90 91
+  channel 0 next 90>91 91>90
+  channel 1 next 90>91 91>90
+group TP nNodes 1 nRanks 2 ranks 92 93
+  channel 0 next 92>93 93>92
+  channel 1 next 92>93 93>92
+group TP nNodes 1 nRanks 2 ranks 94 95
+  channel 0 next 94>95 95>94
+  channel 1 next 94>95 95>94
+group TP nNodes 1 nRanks 2 ranks 96 97
+  channel 0 next 96>97 97>96
+  channel 1 next 96>97 97>96
+group TP nNodes 1 nRanks 2 ranks 98 99
+  channel 0 next 98>99 99>98
+  channel 1 next 98>99 99>98
+group TP nNodes 1 nRanks 2 ranks 100 101
+  channel 0 next 100>101 101>100
+  channel 1 next 100>101 101>100
+group TP nNodes 1 nRanks 2 ranks 102 103
+  channel 0 next 102>103 103>102
+  channel 1 next 102>103 103>102
+group TP nNodes 1 nRanks 2 ranks 104 105
+  channel 0 next 104>105 105>104
+  channel 1 next 104>105 105>104
+group TP nNodes 1 nRanks 2 ranks 106 107
+  channel 0 next 106>107 107>106
+  channel 1 next 106>107 107>106
+group TP nNodes 1 nRanks 2 ranks 108 109
+  channel 0 next 108>109 109>108
+  channel 1 next 108>109 109>108
+group TP nNodes 1 nRanks 2 ranks 110 111
+  channel 0 next 110>111 111>110
+  channel 1 next 110>111 111>110
+group TP nNodes 1 nRanks 2 ranks 112 113
+  channel 0 next 112>113 113>112
+  channel 1 next 112>113 113>112
+group TP nNodes 1 nRanks 2 ranks 114 115
+  channel 0 next 114>115 115>114
+  channel 1 next 114>115 115>114
+group TP nNodes 1 nRanks 2 ranks 116 117
+  channel 0 next 116>117 117>116
+  channel 1 next 116>117 117>116
+group TP nNodes 1 nRanks 2 ranks 118 119
+  channel 0 next 118>119 119>118
+  channel 1 next 118>119 119>118
+group TP nNodes 1 nRanks 2 ranks 120 121
+  channel 0 next 120>121 121>120
+  channel 1 next 120>121 121>120
+group TP nNodes 1 nRanks 2 ranks 122 123
+  channel 0 next 122>123 123>122
+  channel 1 next 122>123 123>122
+group TP nNodes 1 nRanks 2 ranks 124 125
+  channel 0 next 124>125 125>124
+  channel 1 next 124>125 125>124
+group TP nNodes 1 nRanks 2 ranks 126 127
+  channel 0 next 126>127 127>126
+  channel 1 next 126>127 127>126
+group DP nNodes 16 nRanks 64 ranks 0 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30 32 34 36 38 40 42 44 46 48 50 52 54 56 58 60 62 64 66 68 70 72 74 76 78 80 82 84 86 88 90 92 94 96 98 100 102 104 106 108 110 112 114 116 118 120 122 124 126
+  channel 0 next 0>2 2>4 4>6 6>8 8>10 10>12 12>14 14>16 16>18 18>20 20>22 22>24 24>26 26>28 28>30 30>32 32>34 34>36 36>38 38>40 40>42 42>44 44>46 46>48 48>50 50>52 52>54 54>56 56>58 58>60 60>62 62>64 64>66 66>68 68>70 70>72 72>74 74>76 76>78 78>80 80>82 82>84 84>86 86>88 88>90 90>92 92>94 94>96 96>98 98>100 100>102 102>104 104>106 106>108 108>110 110>112 112>114 114>116 116>118 118>120 120>122 122>124 124>126 126>0
+  channel 1 next 0>10 2>4 4>6 6>0 8>18 10>12 12>14 14>8 16>26 18>20 20>22 22>16 24>34 26>28 28>30 30>24 32>42 34>36 36>38 38>32 40>50 42>44 44>46 46>40 48>58 50>52 52>54 54>48 56>66 58>60 60>62 62>56 64>74 66>68 68>70 70>64 72>82 74>76 76>78 78>72 80>90 82>84 84>86 86>80 88>98 90>92 92>94 94>88 96>106 98>100 100>102 102>96 104>114 106>108 108>110 110>104 112>122 114>116 116>118 118>112 120>2 122>124 124>126 126>120
+  channel 2 next 0>2 2>12 4>6 6>0 8>10 10>20 12>14 14>8 16>18 18>28 20>22 22>16 24>26 26>36 28>30 30>24 32>34 34>44 36>38 38>32 40>42 42>52 44>46 46>40 48>50 50>60 52>54 54>48 56>58 58>68 60>62 62>56 64>66 66>76 68>70 70>64 72>74 74>84 76>78 78>72 80>82 82>92 84>86 86>80 88>90 90>100 92>94 94>88 96>98 98>108 100>102 102>96 104>106 106>116 108>110 110>104 112>114 114>124 116>118 118>112 120>122 122>4 124>126 126>120
+  channel 3 next 0>2 2>4 4>14 6>0 8>10 10>12 12>22 14>8 16>18 18>20 20>30 22>16 24>26 26>28 28>38 30>24 32>34 34>36 36>46 38>32 40>42 42>44 44>54 46>40 48>50 50>52 52>62 54>48 56>58 58>60 60>70 62>56 64>66 66>68 68>78 70>64 72>74 74>76 76>86 78>72 80>82 82>84 84>94 86>80 88>90 90>92 92>102 94>88 96>98 98>100 100>110 102>96 104>106 106>108 108>118 110>104 112>114 114>116 116>126 118>112 120>122 122>124 124>6 126>120
+group DP nNodes 16 nRanks 64 ranks 1 3 5 7 9 11 13 15 17 19 21 23 25 27 29 31 33 35 37 39 41 43 45 47 49 51 53 55 57 59 61 63 65 67 69 71 73 75 77 79 81 83 85 87 89 91 93 95 97 99 101 103 105 107 109 111 113 115 117 119 121 123 125 127
+  channel 0 next 1>3 3>5 5>7 7>9 9>11 11>13 13>15 15>17 17>19 19>21 21>23 23>25 25>27 27>29 29>31 31>33 33>35 35>37 37>39 39>41 41>43 43>45 45>47 47>49 49>51 51>53 53>55 55>57 57>59 59>61 61>63 63>65 65>67 67>69 69>71 71>73 73>75 75>77 77>79 79>81 81>83 83>85 85>87 87>89 89>91 91>93 93>95 95>97 97>99 99>101 101>103 103>105 105>107 107>109 109>111 111>113 113>115 115>117 117>119 119>121 121>123 123>125 125>127 127>1
+  channel 1 next 1>11 3>5 5>7 7>1 9>19 11>13 13>15 15>9 17>27 19>21 21>23 23>17 25>35 27>29 29>31 31>25 33>43 35>37 37>39 39>33 41>51 43>45 45>47 47>41 49>59 51>53 53>55 55>49 57>67 59>61 61>63 63>57 65>75 67>69 69>71 71>65 73>83 75>77 77>79 79>73 81>91 83>85 85>87 87>81 89>99 91>93 93>95 95>89 97>107 99>101 101>103 103>97 105>115 107>109 109>111 111>105 113>123 115>117 117>119 119>113 121>3 123>125 125>127 127>121
+  channel 2 next 1>3 3>13 5>7 7>1 9>11 11>21 13>15 15>9 17>19 19>29 21>23 23>17 25>27 27>37 29>31 31>25 33>35 35>45 37>39 39>33 41>43 43>53 45>47 47>41 49>51 51>61 53>55 55>49 57>59 59>69 61>63 63>57 65>67 67>77 69>71 71>65 73>75 75>85 77>79 79>73 81>83 83>93 85>87 87>81 89>91 91>101 93>95 95>89 97>99 99>109 101>103 103>97 105>107 107>117 109>111 111>105 113>115 115>125 117>119 119>113 121>123 123>5 125>127 127>121
+  channel 3 next 1>3 3>5 5>15 7>1 9>11 11>13 13>23 15>9 17>19 19>21 21>31 23>17 25>27 27>29 29>39 31>25 33>35 35>37 37>47 39>33 41>43 43>45 45>55 47>41 49>51 51>53 53>63 55>49 57>59 59>61 61>71 63>57 65>67 67>69 69>79 71>65 73>75 75>77 77>87 79>73 81>83 83>85 85>95 87>81 89>91 91>93 93>103 95>89 97>99 99>101 101>111 103>97 105>107 107>109 109>119 111>105 113>115 115>117 117>127 119>113 121>123 123>125 125>7 127>121
+group EP nNodes 8 nRanks 32 ranks 0 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30 32 34 36 38 40 42 44 46 48 50 52 54 56 58 60 62
+  channel 0 next 0>2 2>4 4>6 6>8 8>10 10>12 12>14 14>16 16>18 18>20 20>22 22>24 24>26 26>28 28>30 30>32 32>34 34>36 36>38 38>40 40>42 42>44 44>46 46>48 48>50 50>52 52>54 54>56 56>58 58>60 60>62 62>0
+  channel 1 next 0>10 2>4 4>6 6>0 8>18 10>12 12>14 14>8 16>26 18>20 20>22 22>16 24>34 26>28 28>30 30>24 32>42 34>36 36>38 38>32 40>50 42>44 44>46 46>40 48>58 50>52 52>54 54>48 56>2 58>60 60>62 62>56
+  channel 2 next 0>2 2>12 4>6 6>0 8>10 10>20 12>14 14>8 16>18 18>28 20>22 22>16 24>26 26>36 28>30 30>24 32>34 34>44 36>38 38>32 40>42 42>52 44>46 46>40 48>50 50>60 52>54 54>48 56>58 58>4 60>62 62>56
+  channel 3 next 0>2 2>4 4>14 6>0 8>10 10>12 12>22 14>8 16>18 18>20 20>30 22>16 24>26 26>28 28>38 30>24 32>34 34>36 36>46 38>32 40>42 42>44 44>54 46>40 48>50 50>52 52>62 54>48 56>58 58>60 60>6 62>56
+group EP nNodes 8 nRanks 32 ranks 1 3 5 7 9 11 13 15 17 19 21 23 25 27 29 31 33 35 37 39 41 43 45 47 49 51 53 55 57 59 61 63
+  channel 0 next 1>3 3>5 5>7 7>9 9>11 11>13 13>15 15>17 17>19 19>21 21>23 23>25 25>27 27>29 29>31 31>33 33>35 35>37 37>39 39>41 41>43 43>45 45>47 47>49 49>51 51>53 53>55 55>57 57>59 59>61 61>63 63>1
+  channel 1 next 1>11 3>5 5>7 7>1 9>19 11>13 13>15 15>9 17>27 19>21 21>23 23>17 25>35 27>29 29>31 31>25 33>43 35>37 37>39 39>33 41>51 43>45 45>47 47>41 49>59 51>53 53>55 55>49 57>3 59>61 61>63 63>57
+  channel 2 next 1>3 3>13 5>7 7>1 9>11 11>21 13>15 15>9 17>19 19>29 21>23 23>17 25>27 27>37 29>31 31>25 33>35 35>45 37>39 39>33 41>43 43>53 45>47 47>41 49>51 51>61 53>55 55>49 57>59 59>5 61>63 63>57
+  channel 3 next 1>3 3>5 5>15 7>1 9>11 11>13 13>23 15>9 17>19 19>21 21>31 23>17 25>27 27>29 29>39 31>25 33>35 35>37 37>47 39>33 41>43 43>45 45>55 47>41 49>51 51>53 53>63 55>49 57>59 59>61 61>7 63>57
+group EP nNodes 8 nRanks 32 ranks 64 66 68 70 72 74 76 78 80 82 84 86 88 90 92 94 96 98 100 102 104 106 108 110 112 114 116 118 120 122 124 126
+  channel 0 next 64>66 66>68 68>70 70>72 72>74 74>76 76>78 78>80 80>82 82>84 84>86 86>88 88>90 90>92 92>94 94>96 96>98 98>100 100>102 102>104 104>106 106>108 108>110 110>112 112>114 114>116 116>118 118>120 120>122 122>124 124>126 126>64
+  channel 1 next 64>74 66>68 68>70 70>64 72>82 74>76 76>78 78>72 80>90 82>84 84>86 86>80 88>98 90>92 92>94 94>88 96>106 98>100 100>102 102>96 104>114 106>108 108>110 110>104 112>122 114>116 116>118 118>112 120>66 122>124 124>126 126>120
+  channel 2 next 64>66 66>76 68>70 70>64 72>74 74>84 76>78 78>72 80>82 82>92 84>86 86>80 88>90 90>100 92>94 94>88 96>98 98>108 100>102 102>96 104>106 106>116 108>110 110>104 112>114 114>124 116>118 118>112 120>122 122>68 124>126 126>120
+  channel 3 next 64>66 66>68 68>78 70>64 72>74 74>76 76>86 78>72 80>82 82>84 84>94 86>80 88>90 90>92 92>102 94>88 96>98 98>100 100>110 102>96 104>106 106>108 108>118 110>104 112>114 114>116 116>126 118>112 120>122 122>124 124>70 126>120
+group EP nNodes 8 nRanks 32 ranks 65 67 69 71 73 75 77 79 81 83 85 87 89 91 93 95 97 99 101 103 105 107 109 111 113 115 117 119 121 123 125 127
+  channel 0 next 65>67 67>69 69>71 71>73 73>75 75>77 77>79 79>81 81>83 83>85 85>87 87>89 89>91 91>93 93>95 95>97 97>99 99>101 101>103 103>105 105>107 107>109 109>111 111>113 113>115 115>117 117>119 119>121 121>123 123>125 125>127 127>65
+  channel 1 next 65>75 67>69 69>71 71>65 73>83 75>77 77>79 79>73 81>91 83>85 85>87 87>81 89>99 91>93 93>95 95>89 97>107 99>101 101>103 103>97 105>115 107>109 109>111 111>105 113>123 115>117 117>119 119>113 121>67 123>125 125>127 127>121
+  channel 2 next 65>67 67>77 69>71 71>65 73>75 75>85 77>79 79>73 81>83 83>93 85>87 87>81 89>91 91>101 93>95 95>89 97>99 99>109 101>103 103>97 105>107 107>117 109>111 111>105 113>115 115>125 117>119 119>113 121>123 123>69 125>127 127>121
+  channel 3 next 65>67 67>69 69>79 71>65 73>75 75>77 77>87 79>73 81>83 83>85 85>95 87>81 89>91 91>93 93>103 95>89 97>99 99>101 101>111 103>97 105>107 107>109 109>119 111>105 113>115 115>117 117>127 119>113 121>123 123>125 125>71 127>121
+group DP_EP nNodes 2 nRanks 2 ranks 0 64
+  channel 0 next 0>64 64>0
+group DP_EP nNodes 2 nRanks 2 ranks 1 65
+  channel 0 next 1>65 65>1
+group DP_EP nNodes 2 nRanks 2 ranks 2 66
+  channel 0 next 2>66 66>2
+group DP_EP nNodes 2 nRanks 2 ranks 3 67
+  channel 0 next 3>67 67>3
+group DP_EP nNodes 2 nRanks 2 ranks 4 68
+  channel 0 next 4>68 68>4
+group DP_EP nNodes 2 nRanks 2 ranks 5 69
+  channel 0 next 5>69 69>5
+group DP_EP nNodes 2 nRanks 2 ranks 6 70
+  channel 0 next 6>70 70>6
+group DP_EP nNodes 2 nRanks 2 ranks 7 71
+  channel 0 next 7>71 71>7
+group DP_EP nNodes 2 nRanks 2 ranks 8 72
+  channel 0 next 8>72 72>8
+group DP_EP nNodes 2 nRanks 2 ranks 9 73
+  channel 0 next 9>73 73>9
+group DP_EP nNodes 2 nRanks 2 ranks 10 74
+  channel 0 next 10>74 74>10
+group DP_EP nNodes 2 nRanks 2 ranks 11 75
+  channel 0 next 11>75 75>11
+group DP_EP nNodes 2 nRanks 2 ranks 12 76
+  channel 0 next 12>76 76>12
+group DP_EP nNodes 2 nRanks 2 ranks 13 77
+  channel 0 next 13>77 77>13
+group DP_EP nNodes 2 nRanks 2 ranks 14 78
+  channel 0 next 14>78 78>14
+group DP_EP nNodes 2 nRanks 2 ranks 15 79
+  channel 0 next 15>79 79>15
+group DP_EP nNodes 2 nRanks 2 ranks 16 80
+  channel 0 next 16>80 80>16
+group DP_EP nNodes 2 nRanks 2 ranks 17 81
+  channel 0 next 17>81 81>17
+group DP_EP nNodes 2 nRanks 2 ranks 18 82
+  channel 0 next 18>82 82>18
+group DP_EP nNodes 2 nRanks 2 ranks 19 83
+  channel 0 next 19>83 83>19
+group DP_EP nNodes 2 nRanks 2 ranks 20 84
+  channel 0 next 20>84 84>20
+group DP_EP nNodes 2 nRanks 2 ranks 21 85
+  channel 0 next 21>85 85>21
+group DP_EP nNodes 2 nRanks 2 ranks 22 86
+  channel 0 next 22>86 86>22
+group DP_EP nNodes 2 nRanks 2 ranks 23 87
+  channel 0 next 23>87 87>23
+group DP_EP nNodes 2 nRanks 2 ranks 24 88
+  channel 0 next 24>88 88>24
+group DP_EP nNodes 2 nRanks 2 ranks 25 89
+  channel 0 next 25>89 89>25
+group DP_EP nNodes 2 nRanks 2 ranks 26 90
+  channel 0 next 26>90 90>26
+group DP_EP nNodes 2 nRanks 2 ranks 27 91
+  channel 0 next 27>91 91>27
+group DP_EP nNodes 2 nRanks 2 ranks 28 92
+  channel 0 next 28>92 92>28
+group DP_EP nNodes 2 nRanks 2 ranks 29 93
+  channel 0 next 29>93 93>29
+group DP_EP nNodes 2 nRanks 2 ranks 30 94
+  channel 0 next 30>94 94>30
+group DP_EP nNodes 2 nRanks 2 ranks 31 95
+  channel 0 next 31>95 95>31
+group DP_EP nNodes 2 nRanks 2 ranks 32 96
+  channel 0 next 32>96 96>32
+group DP_EP nNodes 2 nRanks 2 ranks 33 97
+  channel 0 next 33>97 97>33
+group DP_EP nNodes 2 nRanks 2 ranks 34 98
+  channel 0 next 34>98 98>34
+group DP_EP nNodes 2 nRanks 2 ranks 35 99
+  channel 0 next 35>99 99>35
+group DP_EP nNodes 2 nRanks 2 ranks 36 100
+  channel 0 next 36>100 100>36
+group DP_EP nNodes 2 nRanks 2 ranks 37 101
+  channel 0 next 37>101 101>37
+group DP_EP nNodes 2 nRanks 2 ranks 38 102
+  channel 0 next 38>102 102>38
+group DP_EP nNodes 2 nRanks 2 ranks 39 103
+  channel 0 next 39>103 103>39
+group DP_EP nNodes 2 nRanks 2 ranks 40 104
+  channel 0 next 40>104 104>40
+group DP_EP nNodes 2 nRanks 2 ranks 41 105
+  channel 0 next 41>105 105>41
+group DP_EP nNodes 2 nRanks 2 ranks 42 106
+  channel 0 next 42>106 106>42
+group DP_EP nNodes 2 nRanks 2 ranks 43 107
+  channel 0 next 43>107 107>43
+group DP_EP nNodes 2 nRanks 2 ranks 44 108
+  channel 0 next 44>108 108>44
+group DP_EP nNodes 2 nRanks 2 ranks 45 109
+  channel 0 next 45>109 109>45
+group DP_EP nNodes 2 nRanks 2 ranks 46 110
+  channel 0 next 46>110 110>46
+group DP_EP nNodes 2 nRanks 2 ranks 47 111
+  channel 0 next 47>111 111>47
+group DP_EP nNodes 2 nRanks 2 ranks 48 112
+  channel 0 next 48>112 112>48
+group DP_EP nNodes 2 nRanks 2 ranks 49 113
+  channel 0 next 49>113 113>49
+group DP_EP nNodes 2 nRanks 2 ranks 50 114
+  channel 0 next 50>114 114>50
+group DP_EP nNodes 2 nRanks 2 ranks 51 115
+  channel 0 next 51>115 115>51
+group DP_EP nNodes 2 nRanks 2 ranks 52 116
+  channel 0 next 52>116 116>52
+group DP_EP nNodes 2 nRanks 2 ranks 53 117
+  channel 0 next 53>117 117>53
+group DP_EP nNodes 2 nRanks 2 ranks 54 118
+  channel 0 next 54>118 118>54
+group DP_EP nNodes 2 nRanks 2 ranks 55 119
+  channel 0 next 55>119 119>55
+group DP_EP nNodes 2 nRanks 2 ranks 56 120
+  channel 0 next 56>120 120>56
+group DP_EP nNodes 2 nRanks 2 ranks 57 121
+  channel 0 next 57>121 121>57
+group DP_EP nNodes 2 nRanks 2 ranks 58 122
+  channel 0 next 58>122 122>58
+group DP_EP nNodes 2 nRanks 2 ranks 59 123
+  channel 0 next 59>123 123>59
+group DP_EP nNodes 2 nRanks 2 ranks 60 124
+  channel 0 next 60>124 124>60
+group DP_EP nNodes 2 nRanks 2 ranks 61 125
+  channel 0 next 61>125 125>61
+group DP_EP nNodes 2 nRanks 2 ranks 62 126
+  channel 0 next 62>126 126>62
+group DP_EP nNodes 2 nRanks 2 ranks 63 127
+  channel 0 next 63>127 127>63
