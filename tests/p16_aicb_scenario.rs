@@ -147,3 +147,41 @@ fn chains_across_group_families_wait_for_host_matched_after() {
     let error = lower(&fixture("smoke-simai.toml")).expect_err("smoke");
     assert!(error.contains("ruling C1"), "{error}");
 }
+
+#[test]
+fn the_manifest_records_what_the_run_was_made_from() {
+    let (image, manifest) = days::scenario::compile_config_with_manifest(
+        fixture("b4-simai.toml"),
+        days::topos::route::RouteWorkers::serial(),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    let manifest = manifest.expect("an AICB scenario has a manifest");
+    assert_eq!(image, lower(&fixture("b4-simai.toml")).unwrap());
+    let line = manifest.to_string();
+    for field in [
+        "record=days_workload adapter=aicb",
+        "trace_sha256=8268ee8380f9105452428a283713a1e3451fe054635da212aaf9131c09c8a68f",
+        "records=93 tp=8 ep=1 pp=2 ga=1 all_gpus=128 fidelity=simai expert_routing=uniform",
+        "simai_conf_sha256=1fe56bee9c2a0e0f27fdbe816c2c51c9254b5d5a6c5e05adaac347a758e77fcf",
+        "simai_topology=Spectrum-X_128g_8gps_100Gbps_A100",
+        "simai_topology_sha256=db2114fe21ffb5092432407eac13bf91ba7cefcc7cfcd7471fd483b0bf7e2705",
+        "send_lat_us=3 nvls_enable=true pxn_enable=false",
+        "mtu_bytes=9000 window_bytes=72500 queue_capacity_packets=3729",
+        "ecn_by_rate=100000000000:112,400000000000:223",
+        "pfc_asw_xoff=3515844 pfc_asw_xon=3512772 pfc_psw_xoff=4115208 pfc_psw_xon=4112136",
+        "headroom_by_rate=100000000000:30574,400000000000:75000",
+        "collectives=91 operations=16 fused_segments=1 fused_single_server_ops=90",
+        "fp_clamps=4 elided=2 hang_window_recorded=0 data_queue=fifo data_queue_order=grad_norm",
+        "ecmp_ordinals=exact",
+        "as-send-lat",
+    ] {
+        assert!(line.contains(field), "the manifest lacks `{field}`: {line}");
+    }
+    // An ordinary scenario has no manifest.
+    let (_, none) = days::scenario::compile_config_with_manifest(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("configs/p16/rail_mini_roce.toml"),
+        days::topos::route::RouteWorkers::serial(),
+    )
+    .unwrap();
+    assert!(none.is_none());
+}

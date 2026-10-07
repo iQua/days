@@ -135,6 +135,16 @@ pub struct SimaiConf {
 }
 
 impl SimaiConf {
+    /// `PACKET_PAYLOAD_SIZE`, the packet payload (and Days packet size) in bytes.
+    pub fn mtu_bytes(&self) -> Result<u64, AicbError> {
+        match self.integer("PACKET_PAYLOAD_SIZE")? {
+            0 => Err(AicbError::new(
+                "SimAI.conf: PACKET_PAYLOAD_SIZE must be positive",
+            )),
+            mtu => Ok(mtu),
+        }
+    }
+
     /// The keys present, in name order.
     pub fn keys(&self) -> impl Iterator<Item = &'static str> + '_ {
         self.entries.keys().copied()

@@ -493,10 +493,16 @@ pub fn build_graph_with_profile(
     file_path: &str,
 ) -> Result<(UnGraph<usize, ()>, HostAttachments, TopologyProfile)> {
     let content = fs::read_to_string(file_path)?;
+    build_graph_with_profile_from_str(&content)
+}
 
+/// [`build_graph_with_profile`] of a scenario's text.
+pub fn build_graph_with_profile_from_str(
+    content: &str,
+) -> Result<(UnGraph<usize, ()>, HostAttachments, TopologyProfile)> {
     // Only the topology table is read here; every caller parses (and checks) the rest of the
     // scenario with its own schema.
-    let config: TopologySource = match toml::from_str::<TopologySource>(&content) {
+    let config: TopologySource = match toml::from_str::<TopologySource>(content) {
         Ok(config) => config,
         Err(err) => {
             eprintln!("Failed to deserialize: {}", err);
@@ -535,7 +541,7 @@ pub fn build_graph_with_profile(
                     .build()
             }
         },
-        None => build_custom_graph(&content),
+        None => build_custom_graph(content),
     }
 }
 

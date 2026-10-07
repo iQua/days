@@ -25,7 +25,8 @@ use thiserror::Error;
 use super::collective_shapes::{RoutingSkew, SeededAllToAll};
 use super::ids::{IdError, LinkKey, LpKey, PhysicalNodeKey, StableIds, dense_ids};
 use crate::topos::build::{
-    HostAttachments, PairingPolicy, TopologyError, TopologyProfile, build_graph_with_profile,
+    HostAttachments, PairingPolicy, TopologyError, TopologyProfile,
+    build_graph_with_profile_from_str,
 };
 use crate::topos::rail::{RailProfile, ServerLocality};
 use crate::topos::route::{
@@ -62,6 +63,9 @@ impl From<IdError> for CompileError {
 
 #[derive(Debug, Deserialize)]
 struct SourceConfig {
+    /// A `[workload]` table: present only in an AICB scenario, which the adapter rewrites before
+    /// lowering, so the ordinary path refuses it.
+    workload: Option<serde::de::IgnoredAny>,
     seed: Option<u64>,
     duration: Option<ExactDecimal>,
     switch: SourceSwitch,
@@ -867,23 +871,80 @@ pub fn compile_config_with_workload(
     compile_scenario(path.as_ref(), route_workers, Some(workload))
 }
 
+/// [`compile_config_with_route_workers`], with the run manifest of an AICB scenario
+/// (`[workload.aicb]`, P16 H3): `None` for every other scenario. The manifest is host metadata
+/// and never enters the image.
+pub fn compile_config_with_manifest(
+    path: impl AsRef<Path>,
+    route_workers: RouteWorkers,
+) -> Result<(SimulationImage, Option<crate::workload::aicb::AicbManifest>), CompileError> {
+    let path = path.as_ref();
+    let content = read_scenario(path)?;
+    match compile_text(&content, route_workers, None) {
+        Err(CompileError::Parse(_)) if crate::workload::aicb::is_aicb_scenario(&content) => {
+            compile_aicb(path, &content, route_workers)
+        }
+        other => other.map(|image| (image, None)),
+    }
+}
+
+fn read_scenario(path: &Path) -> Result<String, CompileError> {
+    let content = fs::read_to_string(path).map_err(|source| CompileError::Read {
+        path: path.display().to_string(),
+        source,
+    })?;
+    path.to_str()
+        .ok_or_else(|| CompileError::Invalid("configuration path is not valid UTF-8".to_owned()))?;
+    Ok(content)
+}
+
 fn compile_scenario(
     path: &Path,
     route_workers: RouteWorkers,
     workload: Option<&super::workload::Workload>,
 ) -> Result<SimulationImage, CompileError> {
-    let content = fs::read_to_string(path).map_err(|source| CompileError::Read {
-        path: path.display().to_string(),
-        source,
-    })?;
-    let path_str = path
-        .to_str()
-        .ok_or_else(|| CompileError::Invalid("configuration path is not valid UTF-8".to_owned()))?;
-    crate::validate_config(path_str).map_err(CompileError::Unsupported)?;
+    let content = read_scenario(path)?;
+    match compile_text(&content, route_workers, workload) {
+        // An AICB scenario has no `[switch]` of its own, so it does not parse as an ordinary one.
+        Err(CompileError::Parse(_))
+            if workload.is_none() && crate::workload::aicb::is_aicb_scenario(&content) =>
+        {
+            compile_aicb(path, &content, route_workers).map(|(image, _)| image)
+        }
+        other => other,
+    }
+}
 
-    let source: SourceConfig = toml::from_str(&content)?;
-    let model = SupportedModel::from_source(source, &content, workload)?;
-    let (graph, hosts, profile) = build_graph_with_profile(path_str)?;
+/// Lowers an AICB scenario: the adapter reads the trace and `SimAI.conf` it names and returns the
+/// scenario text with the derived fabric tables and the workload IR (`crate::workload::aicb`).
+fn compile_aicb(
+    path: &Path,
+    content: &str,
+    route_workers: RouteWorkers,
+) -> Result<(SimulationImage, Option<crate::workload::aicb::AicbManifest>), CompileError> {
+    let prepared = crate::workload::aicb::prepare(path, content)
+        .map_err(|error| CompileError::Invalid(format!("AICB scenario: {error}")))?;
+    let image = compile_text(&prepared.text, route_workers, Some(&prepared.workload))?;
+    Ok((image, Some(prepared.manifest)))
+}
+
+fn compile_text(
+    content: &str,
+    route_workers: RouteWorkers,
+    workload: Option<&super::workload::Workload>,
+) -> Result<SimulationImage, CompileError> {
+    crate::validate_config_text(content).map_err(CompileError::Unsupported)?;
+
+    let source: SourceConfig = toml::from_str(content)?;
+    if source.workload.is_some() {
+        return Err(CompileError::Unsupported(
+            "a `[workload.aicb]` scenario takes its `[switch]`, `[link]` and `[routing]` tables \
+             from SimAI.conf; remove them"
+                .to_owned(),
+        ));
+    }
+    let model = SupportedModel::from_source(source, content, workload)?;
+    let (graph, hosts, profile) = build_graph_with_profile_from_str(content)?;
 
     let image = lower(model, &graph, hosts, profile, route_workers)?;
     validate(&image, Backend::Scalar).map_err(|error| {

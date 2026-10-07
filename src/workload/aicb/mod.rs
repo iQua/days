@@ -9,16 +9,20 @@
 
 mod error;
 mod groups;
+mod lower;
 mod parse;
+mod scenario;
 mod schedule;
 mod simai_conf;
 mod topology;
 
 pub use error::AicbError;
 pub use groups::{Fidelity, GroupFamily, Groups, form_groups, render_mockncclgroup};
+pub use lower::lower_plan;
 pub use parse::{
     Algorithm, Column, ColumnEntry, Comm, GroupKind, Header, Record, Trace, parse_trace,
 };
+pub use scenario::{AicbManifest, DIVERGENCES, PreparedScenario, is_aicb_scenario, prepare};
 pub use schedule::{
     ChainItem, CollectiveOp, DataQueue, DataQueueOrder, ExpertRouting, HopBounds, ImbalanceParams,
     MatrixRef, OpId, PipelineTransfer, Plan, PlanCounters, PlanOptions, PropagationBounds, Segment,

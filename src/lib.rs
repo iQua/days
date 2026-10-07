@@ -9,7 +9,12 @@ pub mod workload;
 pub fn validate_config(config_path: &str) -> Result<(), String> {
     let content = fs::read_to_string(config_path)
         .map_err(|error| format!("Failed to read configuration file: {error}"))?;
-    let config: toml::Value = toml::from_str(&content)
+    validate_config_text(&content)
+}
+
+/// [`validate_config`] of a scenario's text.
+pub fn validate_config_text(content: &str) -> Result<(), String> {
+    let config: toml::Value = toml::from_str(content)
         .map_err(|error| format!("Failed to parse configuration file: {error}"))?;
     let legacy_key = concat!("run_batch", "_size");
 
