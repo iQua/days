@@ -1,10 +1,12 @@
 //! Stable exact-integer certificates for stateful mechanism replay.
 
+use std::collections::BTreeMap;
 use std::fmt::{self, Write};
 
 use crate::{
-    CollectiveAlgorithm, CollectivePhase, DcqcnTransitionRecord, EventKey, FlowId, GeneratorStatus,
-    LinkId, NodeId, PayloadId,
+    CollectiveAlgorithm, CollectivePhase, DcqcnTransitionRecord, EventKey, EventKind,
+    ExactRational, FlowId, GeneratorStatus, LinkId, NodeId, NodeKind, PacketDescriptor, PayloadId,
+    SchedulerKind, SimulationImage, SwitchQueueState, WfqSchedulerState,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -120,6 +122,117 @@ pub struct WrrTransitionRecord {
     pub after_current_class: u64,
 }
 
+/// Which exact WFQ transition a [`WfqTransitionRecord`] records, by the event that performs it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WfqTransitionKind {
+    /// An admitted packet's arrival (phase 0): virtual time advances (or resets on an idle
+    /// scheduler) and the packet gets its finish tag.
+    Enqueue,
+    /// A service start (`TxReady`, phase 2): the scheduler state is unchanged, and the served
+    /// packet is the waiting packet with the least finish tag among those PFC does not pause.
+    Select,
+    /// A service completion (`TxComplete`, phase 1): virtual time advances, the packet's class
+    /// leaves the active set when it was the class's last packet, and an idle scheduler resets.
+    Complete,
+}
+
+/// The exact WFQ scheduler state a transition reads and writes. Virtual time and finish tags are
+/// normalized by the queue's link rate (bits, not seconds), as in [`WfqSchedulerState`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WfqReplayState {
+    pub virtual_time: ExactRational,
+    pub last_updated_ns: u64,
+    /// Each class's last finish tag.
+    pub finish_times: Vec<ExactRational>,
+    /// Each class's queued plus in-service packets.
+    pub active_packets: Vec<u64>,
+}
+
+impl WfqReplayState {
+    pub fn of(state: &WfqSchedulerState) -> Self {
+        Self {
+            virtual_time: state.virtual_time.clone(),
+            last_updated_ns: state.last_updated_ns,
+            finish_times: state.finish_times.clone(),
+            active_packets: state.active_packets.clone(),
+        }
+    }
+}
+
+/// One packet waiting at a WFQ service decision.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WfqQueuedPacket {
+    pub packet: SchedulerPacket,
+    /// The packet's PFC class (its flow's packet priority), which decides whether a paused
+    /// priority holds it back. Zero on a queue without a PFC monitor.
+    pub pfc_priority: u8,
+    pub finish: ExactRational,
+}
+
+/// One exact WFQ transition of a switch egress queue (P16 L2; the `wfq` mode of LeanGuard's
+/// `p10c_mechanisms_check`), recorded after the event from the executor's state.
+///
+/// The record carries the state after the transition only: the scheduler changes only at these
+/// transitions, so [`wfq_transitions_csv`] writes each row's `before` state as the queue's state
+/// after its previous row (for its first, the queue's state in the image the run starts from). A
+/// change made between two rows would show in the second row's `after`, which the checker
+/// recomputes from `before`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WfqTransitionRecord {
+    pub key: EventKey,
+    pub node: NodeId,
+    pub queue_id: u64,
+    pub kind: WfqTransitionKind,
+    /// The egress link's rate, which converts elapsed nanoseconds into virtual time.
+    pub rate_bps: u64,
+    pub weights: Vec<u64>,
+    /// The packet enqueued, served, or completed.
+    pub packet: SchedulerPacket,
+    /// The enqueued packet's virtual start, `max(virtual time, its class's last finish tag)`.
+    pub virtual_start: Option<ExactRational>,
+    /// The packet's finish tag; `None` at a completion, whose tag the executor has dropped (the
+    /// CSV writes the tag of the packet's selection).
+    pub finish: Option<ExactRational>,
+    pub after: WfqReplayState,
+    /// At a selection: every packet waiting before it, the served one first and then the rest in
+    /// queue order.
+    pub queued_packets: Vec<WfqQueuedPacket>,
+    /// At a selection: the PFC priorities paused at the queue's egress, ascending.
+    pub paused_priorities: Vec<u8>,
+    /// At an enqueue: the packet's PFC class (its flow's packet priority), zero on a queue
+    /// without a PFC monitor. Zero on the other rows.
+    pub pfc_priority: u8,
+}
+
+/// Which Static Priority transition an [`SpTransitionRecord`] records, by the event that performs
+/// it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpTransitionKind {
+    /// An admitted packet's arrival (phase 0).
+    Enqueue,
+    /// A service start (`TxReady`, phase 2), with the time its transmission completes.
+    Schedule,
+    /// A service completion (`TxComplete`, phase 1).
+    Depart,
+}
+
+/// One Static Priority transition of a switch egress queue (P16 L2; LeanGuard's `sp_check`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpTransitionRecord {
+    pub key: EventKey,
+    pub node: NodeId,
+    pub queue_id: u64,
+    pub kind: SpTransitionKind,
+    pub class_count: u64,
+    pub packet: SchedulerPacket,
+    /// `flow % class_count`.
+    pub class_id: u64,
+    /// The class's priority; a greater value is served first.
+    pub priority: u64,
+    /// The transmission's completion time, on `Schedule` and `Depart` rows.
+    pub departure_time_ns: Option<u64>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CollectiveActivationCause {
     LocalCompletion,
@@ -219,6 +332,10 @@ pub enum MechanismTransitionRecord {
     Collective(CollectiveProgressRecord),
     /// A RoCE queue pair's reliability transition (P15; schema `qp-schema.md`).
     Roce(crate::RoceTransitionRecord),
+    /// An exact WFQ transition (P16 L2), boxed so the enum keeps the size of its other variants.
+    Wfq(Box<WfqTransitionRecord>),
+    /// A Static Priority transition (P16 L2).
+    Sp(SpTransitionRecord),
 }
 
 impl MechanismTransitionRecord {
@@ -232,6 +349,8 @@ impl MechanismTransitionRecord {
             Self::Dcqcn(record) => record.key,
             Self::Collective(record) => record.key,
             Self::Roce(record) => record.key(),
+            Self::Wfq(record) => record.key,
+            Self::Sp(record) => record.key,
         }
     }
 
@@ -246,6 +365,8 @@ impl MechanismTransitionRecord {
             Self::Collective(record) => (6, record.ordinal),
             // A host RESUME yields one `resume` row per restarted queue pair at one key.
             Self::Roce(record) => (7, record.flow().0),
+            Self::Wfq(_) => (8, 0),
+            Self::Sp(_) => (9, 0),
         };
         (self.key(), tag, ordinal)
     }
@@ -1140,6 +1261,452 @@ pub fn wrr_transitions_csv(
         .expect("writing to String cannot fail");
     }
     Ok(csv)
+}
+
+/// Why a WFQ or Static Priority certificate cannot be written.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SchedulerTraceError {
+    Duplicate(MechanismTraceError),
+    /// A queue's starting state names a packet, flow, link or pending completion the image lacks.
+    InitialState {
+        node: NodeId,
+        queue_id: u64,
+    },
+    /// A completion whose packet's finish tag neither its selection nor the starting state gives.
+    MissingFinishTag {
+        node: NodeId,
+        payload: PayloadId,
+    },
+}
+
+impl fmt::Display for SchedulerTraceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Duplicate(error) => error.fmt(formatter),
+            Self::InitialState { node, queue_id } => write!(
+                formatter,
+                "the starting state of queue {queue_id} of {node:?} is not in the image"
+            ),
+            Self::MissingFinishTag { node, payload } => write!(
+                formatter,
+                "no finish tag for the completion of {payload:?} at {node:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SchedulerTraceError {}
+
+impl From<MechanismTraceError> for SchedulerTraceError {
+    fn from(error: MechanismTraceError) -> Self {
+        Self::Duplicate(error)
+    }
+}
+
+/// Every switch egress queue of `image`, as `(node, queue slot, queue)`.
+fn image_switch_queues(
+    image: &SimulationImage,
+) -> impl Iterator<Item = (NodeId, u64, &SwitchQueueState)> {
+    image
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::Switch)
+        .filter_map(|node| {
+            image
+                .switch_states
+                .get(node.state_slot as usize)
+                .map(|state| (node.id, state))
+        })
+        .flat_map(|(node, state)| {
+            state
+                .queues
+                .iter()
+                .enumerate()
+                .map(move |(slot, queue)| (node, slot as u64, queue))
+        })
+}
+
+/// One packet of a queue's starting state: its descriptor and PFC class.
+fn initial_packet(
+    image: &SimulationImage,
+    queue: &SwitchQueueState,
+    payload: PayloadId,
+) -> Option<(PacketDescriptor, u8)> {
+    let packet = *image
+        .initial_packets
+        .iter()
+        .find(|packet| packet.id == payload)?;
+    let class = if queue.pfc.is_some() {
+        image
+            .flows
+            .iter()
+            .find(|flow| flow.id == packet.flow)?
+            .packet_priority(packet.kind)
+    } else {
+        0
+    };
+    Some((packet, class))
+}
+
+fn paused_priorities(queue: &SwitchQueueState) -> Vec<u8> {
+    queue.pfc.as_ref().map_or_else(Vec::new, |pfc| {
+        (0..8_u8)
+            .filter(|priority| pfc.is_paused(usize::from(*priority)))
+            .collect()
+    })
+}
+
+fn priorities_list(values: &[u8]) -> String {
+    values
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn wfq_queued_list(values: &[WfqQueuedPacket]) -> String {
+    values
+        .iter()
+        .map(|queued| {
+            format!(
+                "{}:{}:{}:{}:{}",
+                queued.packet.payload.0,
+                queued.packet.flow.0,
+                queued.packet.size_bytes,
+                queued.pfc_priority,
+                rational(&queued.finish)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// The WFQ certificate of a run of `image`: one row per enqueue, service start and service
+/// completion at a WFQ egress queue, in canonical event-key order (one row per event). Exact
+/// rationals are written `numerator/denominator` in lowest terms; lists are `;`-separated; a
+/// queued packet is `payload:flow:size_bytes:pfc_priority:finish`.
+///
+/// - A queue that does not start empty and idle (a run resumed from a checkpoint) opens with one
+///   `initial` row, its event-key columns empty: its starting state (before and after), its
+///   waiting packets in queue order with their PFC classes and finish tags, its in-service packet
+///   (`payload`, `finish_tag`, `pfc_priority`; empty when none), and its paused priorities.
+/// - A row's `before` state is its queue's state after its previous row (its starting state
+///   before the first); a completion's finish tag is its packet's at selection, or in the starting
+///   state (see [`WfqTransitionRecord`]).
+/// - `pfc_monitor` is 1 on every row of a queue with a PFC monitor; `pfc_priority` is the packet's
+///   PFC class on `enqueue` rows.
+pub fn wfq_transitions_csv(
+    records: &[MechanismTransitionRecord],
+    image: &SimulationImage,
+) -> Result<String, SchedulerTraceError> {
+    let records = canonical(
+        "WFQ",
+        records
+            .iter()
+            .filter_map(|record| match record {
+                MechanismTransitionRecord::Wfq(record) => Some((record.key, record.as_ref())),
+                _ => None,
+            })
+            .collect(),
+    )?;
+    let mut csv = String::from(
+        "time_ns,event_phase,event_origin_node,event_origin_sequence,kind,node_id,queue_id,rate_bps,weights,pfc_monitor,payload,flow_id,size_bytes,pfc_priority,virtual_start,finish_tag,before_virtual_time,before_last_updated_ns,before_finish_tags,before_active_packets,queued_packets,paused_priorities,after_virtual_time,after_last_updated_ns,after_finish_tags,after_active_packets\n",
+    );
+    // Each queue's PFC monitor, its state after its latest row, and its served packets' tags.
+    let mut monitors = BTreeMap::<(NodeId, u64), bool>::new();
+    let mut states = BTreeMap::<(NodeId, u64), WfqReplayState>::new();
+    let mut served = BTreeMap::<(NodeId, u64, PayloadId), ExactRational>::new();
+    for (node, queue_id, queue) in image_switch_queues(image) {
+        let SchedulerKind::WeightedFairQueue(wfq) = &queue.scheduler else {
+            continue;
+        };
+        monitors.insert((node, queue_id), queue.pfc.is_some());
+        let state = WfqReplayState::of(wfq);
+        let paused = paused_priorities(queue);
+        let idle = state.virtual_time == ExactRational::from_integer(0_u8.into())
+            && state.last_updated_ns == 0
+            && state
+                .finish_times
+                .iter()
+                .all(|tag| *tag == ExactRational::from_integer(0_u8.into()))
+            && state.active_packets.iter().all(|active| *active == 0)
+            && queue.queue.is_empty()
+            && queue.in_service.is_none()
+            && paused.is_empty();
+        if idle {
+            continue;
+        }
+        let invalid = SchedulerTraceError::InitialState { node, queue_id };
+        let tag = |payload: PayloadId| wfq.packet_finish_times.get(&payload).cloned();
+        let mut queued = Vec::with_capacity(queue.queue.len());
+        for payload in &queue.queue {
+            let (packet, class) = initial_packet(image, queue, *payload).ok_or(invalid)?;
+            queued.push(WfqQueuedPacket {
+                packet: SchedulerPacket {
+                    payload: packet.id,
+                    flow: packet.flow,
+                    size_bytes: packet.size_bytes,
+                },
+                pfc_priority: class,
+                finish: tag(packet.id).ok_or(invalid)?,
+            });
+        }
+        let in_service = match queue.in_service {
+            None => None,
+            Some(payload) => {
+                let (packet, class) = initial_packet(image, queue, payload).ok_or(invalid)?;
+                let finish = tag(payload).ok_or(invalid)?;
+                served.insert((node, queue_id, payload), finish.clone());
+                Some((packet, class, finish))
+            }
+        };
+        let rate_bps = queue
+            .egress_link
+            .and_then(|link| image.links.iter().find(|candidate| candidate.id == link))
+            .ok_or(invalid)?
+            .rate_bps;
+        let (payload, flow, size, class, finish) =
+            in_service.map_or_else(Default::default, |(packet, class, finish)| {
+                (
+                    packet.id.0.to_string(),
+                    packet.flow.0.to_string(),
+                    packet.size_bytes.to_string(),
+                    class.to_string(),
+                    rational(&finish),
+                )
+            });
+        writeln!(
+            csv,
+            ",,,,initial,{},{queue_id},{rate_bps},{},{},{payload},{flow},{size},{class},,{finish},{},{},{},{},{},{},{},{},{},{}",
+            node.0,
+            naturals(&wfq.weights),
+            u8::from(queue.pfc.is_some()),
+            rational(&state.virtual_time),
+            state.last_updated_ns,
+            rationals(&state.finish_times),
+            naturals(&state.active_packets),
+            wfq_queued_list(&queued),
+            priorities_list(&paused),
+            rational(&state.virtual_time),
+            state.last_updated_ns,
+            rationals(&state.finish_times),
+            naturals(&state.active_packets),
+        )
+        .expect("writing to String cannot fail");
+        states.insert((node, queue_id), state);
+    }
+    for record in records {
+        let queue = (record.node, record.queue_id);
+        let before = states
+            .insert(queue, record.after.clone())
+            .unwrap_or_else(|| {
+                let zero = ExactRational::from_integer(0_u8.into());
+                WfqReplayState {
+                    virtual_time: zero.clone(),
+                    last_updated_ns: 0,
+                    finish_times: vec![zero; record.weights.len()],
+                    active_packets: vec![0; record.weights.len()],
+                }
+            });
+        let served_key = (record.node, record.queue_id, record.packet.payload);
+        let finish = match record.kind {
+            WfqTransitionKind::Select => {
+                let finish = record.finish.clone();
+                if let Some(tag) = &finish {
+                    served.insert(served_key, tag.clone());
+                }
+                finish
+            }
+            WfqTransitionKind::Complete => Some(served.remove(&served_key).ok_or(
+                SchedulerTraceError::MissingFinishTag {
+                    node: record.node,
+                    payload: record.packet.payload,
+                },
+            )?),
+            WfqTransitionKind::Enqueue => record.finish.clone(),
+        };
+        let (kind, class) = match record.kind {
+            WfqTransitionKind::Enqueue => ("enqueue", record.pfc_priority.to_string()),
+            WfqTransitionKind::Select => ("select", String::new()),
+            WfqTransitionKind::Complete => ("complete", String::new()),
+        };
+        writeln!(
+            csv,
+            "{},{},{},{},{kind},{},{},{},{},{},{},{},{},{class},{},{},{},{},{},{},{},{},{},{},{},{}",
+            record.key.time_ns,
+            record.key.phase,
+            record.key.origin_node.0,
+            record.key.origin_seq,
+            record.node.0,
+            record.queue_id,
+            record.rate_bps,
+            naturals(&record.weights),
+            u8::from(monitors.get(&queue).copied().unwrap_or(false)),
+            record.packet.payload.0,
+            record.packet.flow.0,
+            record.packet.size_bytes,
+            record.virtual_start.as_ref().map_or_else(String::new, rational),
+            finish.as_ref().map_or_else(String::new, rational),
+            rational(&before.virtual_time),
+            before.last_updated_ns,
+            rationals(&before.finish_times),
+            naturals(&before.active_packets),
+            wfq_queued_list(&record.queued_packets),
+            priorities_list(&record.paused_priorities),
+            rational(&record.after.virtual_time),
+            record.after.last_updated_ns,
+            rationals(&record.after.finish_times),
+            naturals(&record.after.active_packets),
+        )
+        .expect("writing to String cannot fail");
+    }
+    Ok(csv)
+}
+
+/// The Static Priority certificate `sp_check` reads for a run of `image`: one row per enqueue,
+/// schedule and depart at an SP egress queue, in canonical event-key order. `sp_check` keys a
+/// scheduler by one natural, so `scheduler_id` is `node_id * 2^32 + queue_id`; the `node_id` and
+/// `queue_id` columns repeat it for readers. A packet is identified by `(flow_id, packet_id)`, its
+/// payload. A queue that starts non-empty (a run resumed from a checkpoint) opens with an
+/// `initial_in_service` row for the packet it is transmitting, with the time of its pending
+/// `TxComplete`, and an `initial_queued` row per waiting packet in queue order; their event-key
+/// columns are empty.
+pub fn sp_transitions_csv(
+    records: &[MechanismTransitionRecord],
+    image: &SimulationImage,
+) -> Result<String, SchedulerTraceError> {
+    let records = canonical(
+        "SP",
+        records
+            .iter()
+            .filter_map(|record| match record {
+                MechanismTransitionRecord::Sp(record) => Some((record.key, *record)),
+                _ => None,
+            })
+            .collect(),
+    )?;
+    let mut csv = String::from(
+        "time_ns,event_phase,origin_node,origin_seq,kind,scheduler_id,class_count,packet_id,flow_id,class_id,priority,size_bytes,departure_time_ns,node_id,queue_id\n",
+    );
+    let row = |csv: &mut String,
+               key: Option<EventKey>,
+               kind: &str,
+               node: NodeId,
+               queue_id: u64,
+               priorities: usize,
+               packet: SchedulerPacket,
+               class_id: u64,
+               priority: u64,
+               departure_time_ns: Option<u64>| {
+        let key = key.map_or_else(
+            || ",,,".to_owned(),
+            |key| {
+                format!(
+                    "{},{},{},{}",
+                    key.time_ns, key.phase, key.origin_node.0, key.origin_seq
+                )
+            },
+        );
+        let scheduler_id = (u128::from(node.0) << 32) + u128::from(queue_id);
+        writeln!(
+            csv,
+            "{key},{kind},{scheduler_id},{priorities},{},{},{class_id},{priority},{},{},{},{queue_id}",
+            packet.payload.0,
+            packet.flow.0,
+            packet.size_bytes,
+            departure_time_ns.map_or_else(String::new, |time| time.to_string()),
+            node.0,
+        )
+        .expect("writing to String cannot fail");
+    };
+    for (node, queue_id, queue) in image_switch_queues(image) {
+        let SchedulerKind::StaticPriority { priorities } = &queue.scheduler else {
+            continue;
+        };
+        let invalid = SchedulerTraceError::InitialState { node, queue_id };
+        let class_count = u64::try_from(priorities.len()).unwrap_or(u64::MAX);
+        let class_of = |packet: &PacketDescriptor| {
+            let class = packet.flow.0.checked_rem(class_count).ok_or(invalid)?;
+            Ok::<_, SchedulerTraceError>((class, priorities[class as usize]))
+        };
+        let scheduler_packet = |packet: PacketDescriptor| SchedulerPacket {
+            payload: packet.id,
+            flow: packet.flow,
+            size_bytes: packet.size_bytes,
+        };
+        if let Some(payload) = queue.in_service {
+            let (packet, _) = initial_packet(image, queue, payload).ok_or(invalid)?;
+            let departure = image
+                .initial_events
+                .iter()
+                .find(|event| {
+                    event.kind == EventKind::TxComplete
+                        && event.target == node
+                        && event.payload == payload
+                })
+                .ok_or(invalid)?
+                .key
+                .time_ns;
+            let (class, priority) = class_of(&packet)?;
+            row(
+                &mut csv,
+                None,
+                "initial_in_service",
+                node,
+                queue_id,
+                priorities.len(),
+                scheduler_packet(packet),
+                class,
+                priority,
+                Some(departure),
+            );
+        }
+        for payload in &queue.queue {
+            let (packet, _) = initial_packet(image, queue, *payload).ok_or(invalid)?;
+            let (class, priority) = class_of(&packet)?;
+            row(
+                &mut csv,
+                None,
+                "initial_queued",
+                node,
+                queue_id,
+                priorities.len(),
+                scheduler_packet(packet),
+                class,
+                priority,
+                None,
+            );
+        }
+    }
+    for record in records {
+        let kind = match record.kind {
+            SpTransitionKind::Enqueue => "enqueue",
+            SpTransitionKind::Schedule => "schedule",
+            SpTransitionKind::Depart => "depart",
+        };
+        row(
+            &mut csv,
+            Some(record.key),
+            kind,
+            record.node,
+            record.queue_id,
+            usize::try_from(record.class_count).unwrap_or(usize::MAX),
+            record.packet,
+            record.class_id,
+            record.priority,
+            record.departure_time_ns,
+        );
+    }
+    Ok(csv)
+}
+
+/// An exact rational in lowest terms, `numerator/denominator`.
+fn rational(value: &ExactRational) -> String {
+    format!("{}/{}", value.numer(), value.denom())
+}
+
+fn rationals(values: &[ExactRational]) -> String {
+    values.iter().map(rational).collect::<Vec<_>>().join(";")
 }
 
 const fn status(status: GeneratorStatus) -> &'static str {

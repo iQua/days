@@ -346,4 +346,106 @@ def schedule (lineNo : Nat) (state : State) : Except String (State × Packet) :=
 
 end Wrr
 
+/-!
+Days AGO's exact Weighted Fair Queueing (P16 L2), after Demers, Keshav and Shenker. Virtual time
+and finish tags are rationals normalized by the egress link's rate (bits rather than seconds), as
+in the executor's `WfqSchedulerState`: a packet's service is `size_bytes * 8 / weight`, and virtual
+time advances by `elapsed_ns * rate_bps / (10^9 * W)` over the active classes' weight sum `W`.
+A packet's class is `flow % class_count`.
+-/
+namespace Wfq
+
+/-- The scheduler state one transition reads and writes. -/
+structure State where
+  virtualTime : Rat
+  lastUpdatedNs : Nat
+  /-- Each class's last finish tag. -/
+  finishTimes : List Rat
+  /-- Each class's queued plus in-service packets. -/
+  activePackets : List Nat
+  deriving DecidableEq, Repr
+
+def initial (classCount : Nat) : State :=
+  { virtualTime := 0
+    lastUpdatedNs := 0
+    finishTimes := List.replicate classCount 0
+    activePackets := List.replicate classCount 0 }
+
+def activeWeightSum (weights activePackets : List Nat) : Nat :=
+  (weights.zip activePackets).foldl
+    (fun sum (weight, active) => if active = 0 then sum else sum + weight) 0
+
+/-- Virtual time at `timeNs`, advanced over the active weight sum (which must be positive). -/
+def advance (rateBps : Nat) (weights : List Nat) (state : State) (timeNs : Nat) : Rat :=
+  let weightSum := activeWeightSum weights state.activePackets
+  state.virtualTime +
+    (((timeNs - state.lastUpdatedNs) * rateBps : Nat) : Rat) / ((1_000_000_000 * weightSum : Nat) : Rat)
+
+/--
+Admit a packet of `classId` at `timeNs`: an idle scheduler resets virtual time and every class's
+finish tag to zero; otherwise virtual time advances. The packet starts at the later of virtual time
+and its class's last finish tag. Returns the state after, the virtual start and the finish tag.
+-/
+def enqueue (lineNo rateBps : Nat) (weights : List Nat) (state : State)
+    (classId sizeBytes timeNs : Nat) : Except String (State × Rat × Rat) := do
+  require lineNo (state.lastUpdatedNs ≤ timeNs) "WFQ time went backwards"
+  let weight := weights.getD classId 0
+  require lineNo (weight > 0) s!"WFQ weight of class {classId} must be positive"
+  let idle := state.activePackets.all (· = 0)
+  let virtualTime := if idle then 0 else advance rateBps weights state timeNs
+  let finishTimes := if idle then List.replicate weights.length 0 else state.finishTimes
+  let previous := finishTimes.getD classId 0
+  let start := if virtualTime < previous then previous else virtualTime
+  let finish := start + ((sizeBytes * 8 : Nat) : Rat) / (weight : Rat)
+  pure
+    ({ virtualTime
+       lastUpdatedNs := timeNs
+       finishTimes := finishTimes.set classId finish
+       activePackets :=
+         state.activePackets.set classId (state.activePackets.getD classId 0 + 1) },
+      start, finish)
+
+/--
+Complete the service of a packet of `classId` at `timeNs`: virtual time advances over the active
+set that still holds the packet, then the class loses it; a scheduler left idle resets its virtual
+time and that class's finish tag to zero.
+-/
+def complete (lineNo rateBps : Nat) (weights : List Nat) (state : State)
+    (classId timeNs : Nat) : Except String State := do
+  require lineNo (state.lastUpdatedNs ≤ timeNs) "WFQ time went backwards"
+  let active := state.activePackets.getD classId 0
+  require lineNo (active > 0) s!"WFQ class {classId} completes a packet it does not hold"
+  let virtualTime := advance rateBps weights state timeNs
+  let activePackets := state.activePackets.set classId (active - 1)
+  if activePackets.all (· = 0) then
+    pure
+      { virtualTime := 0
+        lastUpdatedNs := timeNs
+        finishTimes := state.finishTimes.set classId 0
+        activePackets }
+  else
+    pure { state with virtualTime, lastUpdatedNs := timeNs, activePackets }
+
+/-- A waiting packet: its finish tag and its enqueue ordinal at the queue. -/
+structure Waiting where
+  payload : Nat
+  finish : Rat
+  order : Nat
+  deriving Repr
+
+/-- The served packet: the least finish tag, the earliest enqueue among equal tags. -/
+def least : List Waiting → Option Waiting
+  | [] => none
+  | first :: rest =>
+      some <| rest.foldl
+        (fun best packet =>
+          if packet.finish < best.finish ||
+              (packet.finish = best.finish && packet.order < best.order) then
+            packet
+          else
+            best)
+        first
+
+end Wfq
+
 end LeanGuard.P10c.Semantics

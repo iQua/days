@@ -1,0 +1,34 @@
+# LeanGuard CI fixture: two constant flows from hosts 0 and 1 share switch 3's egress to host 2
+# under DRR. tests/leanguard_certificates.rs lowers it and writes the Scalar certificate.
+seed = 16
+edges = [[0, 3], [1, 3], [2, 3]]
+hosts = [0, 1, 2]
+duration = 0.0001
+
+[switch]
+port_rate = 8000000000
+capacity = 100
+weights = [1, 3]
+priorities = [1, 2]
+discipline = "DRR"
+drop = "TailDrop"
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[0, 2]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 6000
+arr_dist = { type = "Uniform", low = 0.0000005, high = 0.0000005 }
+pkt_size_dist = { type = "Uniform", low = 1000, high = 1000 }
+
+[[flow]]
+flow_type = "PacketDistribution"
+graph = [[1, 2]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 3000
+arr_dist = { type = "Uniform", low = 0.0000003, high = 0.0000003 }
+pkt_size_dist = { type = "Uniform", low = 500, high = 500 }

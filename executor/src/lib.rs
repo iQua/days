@@ -113,10 +113,11 @@ pub use mechanism_trace::{
     CollectiveActivationCause, CollectiveProgressRecord, CollectiveStageKind, CollectiveTraceError,
     DrrTransitionRecord, MechanismTraceError, MechanismTransitionRecord, PfcControlAction,
     PfcControlTransitionRecord, PfcOccupancyAction, PfcThresholdTransitionRecord, RateReplayConfig,
-    RateReplayState, RateTransitionRecord, SchedulerPacket, WrrTransitionRecord,
-    collective_transitions_csv, dcqcn_cnp_arrivals_csv, dcqcn_transitions_csv, drr_transitions_csv,
-    pfc_transitions_csv, rate_transitions_csv, roce_receiver_transitions_csv,
-    roce_sender_transitions_csv, wrr_transitions_csv,
+    RateReplayState, RateTransitionRecord, SchedulerPacket, SchedulerTraceError, SpTransitionKind,
+    SpTransitionRecord, WfqQueuedPacket, WfqReplayState, WfqTransitionKind, WfqTransitionRecord,
+    WrrTransitionRecord, collective_transitions_csv, dcqcn_cnp_arrivals_csv, dcqcn_transitions_csv,
+    drr_transitions_csv, pfc_transitions_csv, rate_transitions_csv, roce_receiver_transitions_csv,
+    roce_sender_transitions_csv, sp_transitions_csv, wfq_transitions_csv, wrr_transitions_csv,
 };
 #[cfg(all(
     feature = "metal",

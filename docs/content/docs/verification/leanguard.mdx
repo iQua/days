@@ -112,6 +112,7 @@ Days AGO checkers:
 ./.lake/build/bin/p10c_mechanisms_check pfc <path/to/pfc_events.csv>
 ./.lake/build/bin/p10c_mechanisms_check drr <path/to/drr_events.csv>
 ./.lake/build/bin/p10c_mechanisms_check wrr <path/to/wrr_events.csv>
+./.lake/build/bin/p10c_mechanisms_check wfq <path/to/wfq_events.csv> [<path/to/pfc_events.csv>]
 ./.lake/build/bin/p10c_aqm_check <path/to/aqm_events.csv>
 ./.lake/build/bin/p10c_dcqcn_check <path/to/dcqcn_events.csv>
 ./.lake/build/bin/p10c_dcqcn_check trace <path/to/dcqcn_events.csv> <path/to/dcqcn_cnp_arrivals.csv>
@@ -215,11 +216,78 @@ Committed Days AGO certificate fixtures can be checked directly, for example:
   --pfc fixtures/p10c/roce_trace_timeout_executor_accept.pfc.csv \
   "$(cat fixtures/p10c/roce_trace_timeout_executor_accept.stop_time_ns)"
 ./.lake/build/bin/sp_check fixtures/sp/sp_priority_and_fifo_accept.csv
+./.lake/build/bin/sp_check fixtures/sp/sp_compiled_executor_accept.csv
+./.lake/build/bin/p10c_mechanisms_check wfq fixtures/p10c/wfq_compiled_executor_accept.csv
+./.lake/build/bin/tcp_check fixtures/tcp/reno-compiled-tcp-events.csv
 ```
 
 The legacy checkers, `tcp_check`, and `sp_check` also accept
 `--coverage-out <path>`. `leanguard-run --coverage` uses that option and aggregates returned
 coverpoints. The `p10c_*` executables do not expose the coverage flag.
+
+## Days AGO WFQ and SP rows
+
+`p10c_mechanisms_check wfq` replays `wfq_transitions_csv`: one row per transition of a WFQ switch
+egress queue, at the event key of the event that performs it (Lean rules: the `Wfq` namespace of
+`lean/LeanGuard/P10c/Semantics.lean` and `WfqLog` in `MechanismEventLog.lean`). Virtual time and
+finish tags are exact rationals, written `numerator/denominator` in lowest terms and normalized by
+the egress link's rate: a packet's service is `size_bytes * 8 / weight`, and virtual time advances
+by `elapsed_ns * rate_bps / (10^9 * W)` over the active classes' weight sum `W`. A packet's class is
+`flow_id % class_count`.
+
+- `enqueue` (phase 0): an admitted arrival. An idle scheduler resets virtual time and every class's
+  finish tag to zero; otherwise virtual time advances. `virtual_start` must be the later of virtual
+  time and the class's last finish tag, and `finish_tag` the start plus the packet's service.
+- `select` (phase 2): a service start. The scheduler state is unchanged. `queued_packets` must be
+  exactly the packets waiting (served one included), each with its enqueue's finish tag and its PFC
+  class, and the served packet must have the least finish tag, the earliest enqueue among equal
+  tags, among the packets whose class is not in `paused_priorities`.
+- `complete` (phase 1): a service completion. Virtual time advances over the active set that still
+  holds the packet; the class then loses it, and a scheduler left idle resets its virtual time and
+  that class's finish tag.
+
+A queue that does not start empty and idle (a run resumed from a checkpoint) opens with an
+`initial` row whose event-key columns are empty. It gives the starting scheduler state, the waiting
+packets in queue order with their finish tags and PFC classes, the in-service packet (`payload`,
+`finish_tag`, `pfc_priority`; empty when there is none) and the starting paused priorities. Their
+counts by class must equal the starting active counts. Other queues start from the empty state.
+
+Each row's `before` state must equal the queue's replayed state, and its `after` state the
+reference update. The executor records each transition's `after` state from its own scheduler,
+after the event; `wfq_transitions_csv` writes `before` as the queue's state after its previous row
+(its starting state before the first) and a completion's finish tag as its packet's at selection,
+or in the starting state. A change to the scheduler between two rows would therefore show in the
+second row's `after`, which the checker recomputes. These are the rules of the legacy `wfq_check`
+(Demers, Keshav and Shenker, with the same idle resets) up to the rate normalization; `wfq_check`
+still certifies `days-legacy`.
+
+PFC classes and pauses:
+
+- A packet's PFC class is fixed for its lifetime: its `enqueue` row (`pfc_priority`) or the
+  `initial` row gives it, and every `select` listing must repeat it.
+- `pfc_monitor` (on every row) says whether the queue has a PFC monitor. Without one, every class
+  is zero and no `select` may list a paused priority.
+- With one, the checker needs the run's PFC certificate (`pfc_transitions_csv`) as its second
+  argument, checks it with the P10c PFC rules, and requires each `select`'s `paused_priorities` to
+  be the queue's pause state at the select's event key: the controller sets of the queue's
+  `control` rows before that key. A priority the `initial` row starts paused must have a non-empty
+  controller set before its first `control` row; any other, an empty one.
+- What remains trusted is each packet's class itself (its flow's packet priority, written at
+  enqueue), as RoCE senders' `data_class` is.
+
+The checker does not certify timing: a completion's time is not checked against the packet's
+serialization time on the link, and service starts are not checked for work conservation. Virtual
+time depends on those times, so the certificate holds for the event times the run recorded.
+
+`sp_check` reads `sp_transitions_csv`, the same schema as its hand-written fixtures: `enqueue`
+(phase 0), `schedule` (phase 2, with the transmission's completion time) and `depart` (phase 1).
+It keys a scheduler by one number, so a Days AGO SP queue writes `scheduler_id = node_id * 2^32 +
+queue_id` and repeats `node_id` and `queue_id`. A queue that starts non-empty opens with an
+`initial_in_service` row for the packet it is transmitting (with the time of its pending
+`TxComplete`) and an `initial_queued` row per waiting packet in queue order; their event-key
+columns are empty, and `sp_check` applies them before the events. `sp_check` has no pause model, so it certifies SP
+only without PFC: under PFC, a Days AGO SP queue serves the first packet whose class is not paused,
+which `sp_check` rejects as an SP order violation.
 
 ## Days AGO DCQCN rows
 
@@ -254,19 +322,89 @@ pair receives no CNP. A queue pair's ticks have no `tick` row: `p10c_roce_check`
 
 ## Continuous integration
 
-`.github/workflows/leanguard.yml` has two jobs. `lean-fixtures` builds the checkers, audits the
-`DaysExecutor` axioms (`lean/scripts/audit-days-executor-axioms.sh`), and runs these scripts under
-`lean/scripts/`: the P10c collective, DCQCN and RoCE campaigns (`run-p10c-collective-campaign.sh`,
-`run-p10c-dcqcn-campaign.sh`, `run-p10c-roce-campaign.sh`: accept fixtures, plus mutations each
-checker must reject with a named message); the collective differential and budget and the AQM
-differential (below); and the AQM, CUBIC, DRR and WFQ fixture and coverage scripts
-(`run-aqm-fixtures.sh`, `run-aqm-coverage-fixtures.sh`, `run-cubic-fixtures.sh`,
-`run-drr-fixtures.sh`, `run-drr-coverage-fixtures.sh`, `run-wfq-fixtures.sh`,
-`run-wfq-coverage-fixtures.sh`). The P10c AQM campaign (`run-p10c-aqm-campaign.sh`) runs in CI
-only inside the AQM differential, through the differential checker. Three scripts are not CI
-steps: `run-p10c-mechanism-campaign.sh`, `run-sp-campaign.sh`, and `run-tcp-campaign.sh`, which
-takes a trace directory. `protocol-traces` runs the legacy engine on the CI fixtures and the
-legacy checkers on its traces.
+`.github/workflows/leanguard.yml` has two jobs.
+
+`lean-fixtures` builds the checkers, audits the `DaysExecutor` axioms
+(`lean/scripts/audit-days-executor-axioms.sh`), and runs these scripts under `lean/scripts/`, each
+on committed fixtures: accept fixtures, plus mutations each checker must reject with a named
+message.
+
+- Days AGO certificates:
+  - the P10c collective, DCQCN and RoCE campaigns (`run-p10c-collective-campaign.sh`,
+    `run-p10c-dcqcn-campaign.sh`, `run-p10c-roce-campaign.sh`);
+  - the P10c switch-mechanism campaign (`run-p10c-mechanism-campaign.sh`): rate, switch-link PFC,
+    DRR, WRR and WFQ;
+  - Static Priority (`run-sp-campaign.sh`, with coverage);
+  - TCP Reno and CUBIC (`run-tcp-campaign.sh lean/fixtures/tcp`, which builds its mutations);
+  - the collective differential and budget and the AQM differential (below). The P10c AQM
+    campaign (`run-p10c-aqm-campaign.sh`) runs in CI only inside the AQM differential, through the
+    differential checker.
+- Legacy certificates: the AQM, CUBIC, DRR and WFQ fixture and coverage scripts
+  (`run-aqm-fixtures.sh`, `run-aqm-coverage-fixtures.sh`, `run-cubic-fixtures.sh`,
+  `run-drr-fixtures.sh`, `run-drr-coverage-fixtures.sh`, `run-wfq-fixtures.sh`,
+  `run-wfq-coverage-fixtures.sh`), on hand-written legacy-schema fixtures.
+
+`protocol-traces` runs the legacy engine (`days-legacy`) on the `configs/ci/` fixtures and the
+legacy checkers on its traces. It certifies Legacy Days only.
+
+### Where the Days AGO certificates come from
+
+The Days AGO accept fixtures named `*_executor_accept*`, `*-compiled-*` or `*_compiled_*`, and the
+TCP traces, are byte-exact certificates of Scalar full-observation runs. A Rust test in CI's `test`
+job regenerates each one and fails on any difference:
+
+- `tests/leanguard_certificates.rs` lowers the scenarios in `configs/leanguard/` through the Days
+  AGO compiler (`compile_config`) and requires a two-worker CPU run to write the same bytes:
+  TCP Reno and CUBIC (`tcp_reno.toml`, `tcp_cubic.toml`: fan-in losses, fast recovery and
+  timeouts), switch-link PFC (`pfc_switch.toml`), DRR, WRR, WFQ and SP (`sched_*.toml`), and WFQ
+  under switch-link PFC (`wfq_pfc.toml`). It also resumes `sched_wfq.toml` and `sched_sp.toml`
+  from a checkpoint with packets queued and in service, and the WFQ incast (`wfq_incast.toml`)
+  from a checkpoint taken while a switch queue is paused. A WFQ certificate under PFC has its
+  run's PFC certificate beside it (`<name>.pfc.csv`), which the campaign passes to the checker. The fixtures are `lean/fixtures/tcp/*-compiled-*.csv`,
+  `lean/fixtures/p10c/*_compiled_executor_accept.csv` and
+  `lean/fixtures/sp/sp_compiled_executor_accept.csv`.
+- Executor tests build images by hand for cases a scenario cannot reach directly: the adversarial
+  TCP recovery, timeout and saturation traces (`executor/tests/tcp_semantics.rs`), and the
+  `*_executor_accept.csv` rate, PFC, DRR and WRR certificates (`rate_source.rs`,
+  `pfc_semantics.rs`, `scalar_switch_schedulers.rs`).
+- Collective, DCQCN and RoCE certificates come from their own tests (for example
+  `tests/collective_certificates.rs`).
+
+The other accept fixtures are hand-written, such as `wrr_wrap_after_saturated_class_accept.csv`,
+the SP fixtures without `compiled` in their names, and the `*_hand_*` collective fixtures.
+
+`DAYS_UPDATE_LEANGUARD_FIXTURES=1` rewrites the TCP and compiled-scenario fixtures.
+
+### Coverage by mechanism
+
+| Mechanism | Days AGO checker | Days AGO certificates checked in CI | Legacy checker in CI |
+|---|---|---|---|
+| TCP Reno and CUBIC | `tcp_check` | compiled fan-in scenarios; adversarial images | `cubic_check` (CUBIC) |
+| DCQCN | `p10c_dcqcn_check` | campaign fixtures | `dcqcn_check`, `aqm_dcqcn_check` |
+| RoCE queue pairs, host-link PFC | `p10c_roce_check` | campaign fixtures | none |
+| Collectives, compute, joins, stage notify | `p10c_collective_check` | campaign fixtures | none |
+| Switch-link PFC | `p10c_mechanisms_check pfc` | compiled two-switch scenario; images | `pfc_check` |
+| AQM (ECN threshold, RED, RED_ECN) | `p10c_aqm_check` | AQM differential | `aqm_check` |
+| DRR | `p10c_mechanisms_check drr` | compiled scenario; image | `drr_check` |
+| WRR | `p10c_mechanisms_check wrr` | compiled scenario; image | none |
+| WFQ | `p10c_mechanisms_check wfq`, joined to the run's PFC certificate | compiled scenarios, with and without PFC, and resumed from checkpoints (one of them paused) | `wfq_check` |
+| Static Priority | `sp_check` | compiled scenario without PFC, fresh and resumed from a checkpoint; hand-written fixtures | none |
+| Rate sources | `p10c_mechanisms_check rate` | hand-built image | none |
+| FIFO scheduling | none | none | none |
+| Constant (packet-distribution) traffic | none | none | none |
+
+Remaining gaps:
+
+- FIFO scheduling and constant traffic have no checker on either engine.
+- Static Priority under PFC: `sp_check` has no pause model (see [Days AGO WFQ and SP rows](#days-ago-wfq-and-sp-rows)).
+- WFQ timing: the `wfq` mode does not check completion times against serialization or service
+  starts for work conservation; it takes the run's event times as given.
+- Rate sources: no scenario lowers a standalone rate generator (the compiler builds one only inside
+  a DCQCN flow, whose rows `p10c_dcqcn_check` certifies), so the rate certificate comes from a
+  hand-built image.
+- Backends: certificates come from Scalar and CPU runs only, because device runs return no
+  diagnostic planes. RED and RED_ECN run on Scalar and CPU only; the Metal and CUDA validators
+  refuse them before execution.
 
 The P10c collective, DCQCN, RoCE and AQM checkers are linear in the row count, except the
 collective checker's TCP replay, which keeps a per-flow frontier in an ordered map and is
