@@ -161,7 +161,8 @@ def checkPredecessorsReference (rows : List Row) (row : Row) : Except String Uni
   | .tcp, none | .roce, none => pure ()
   | .compute, _ => checkComputePredecessorsReference rows row
 
-/-- The channel-ring rule, by a scan of the earlier channel rows of the same channel. -/
+/-- The channel-ring rule, by a scan of the earlier channel rows of the same channel, then one
+walk per channel over its rows' (previous rank, rank) pairs, in first-row order. -/
 def checkChannelRingsReference (rows : List Row) : Except String Unit := do
   let inboundRank (row : Row) : Option Nat :=
     if row.channelPolicy = some .channels && !isRoot row then
@@ -180,6 +181,18 @@ def checkChannelRingsReference (rows : List Row) : Except String Unit := do
             "channel ring predecessor ranks are not one ring"
         go (row :: previous) rest
   go [] rows
+  let named := rows.filter fun row => (inboundRank row).isSome
+  let firsts := named.filter fun row =>
+    (named.find? fun other => sameGroup other row && other.channel = row.channel) = some row
+  for first in firsts do
+    let pairs := named.filterMap fun row =>
+      if sameGroup row first && row.channel = first.channel then
+        (inboundRank row).map fun before => (before, row.rank)
+      else none
+    let next := pairs.foldl (fun map (before, rank) => map.insert before rank)
+      (∅ : Std.HashMap Nat Nat)
+    require first.srcLine (singleCycle first.groupSize next)
+      "channel ring predecessor ranks are not one ring"
 
 /-- The receiver's in-order frontier after the half-open segments `[start, stop)` arrive, as
 `tcp_receive_range` computes it: sorted by start, extended from zero through every segment that

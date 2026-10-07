@@ -925,12 +925,33 @@ def checkPredecessors (index : LookupIndex) (row : Row) : Except String Unit := 
   | .tcp, none | .roce, none => pure ()
   | .compute, _ => checkComputePredecessors index row
 
-/-- The previous ranks of each channel ring form one cycle: every logged rank of a channel names
-one previous rank at every step, and no two ranks name the same one. One pass in canonical order
-keeps, per (collective, channel), each rank's previous rank and each previous rank's successor. -/
+/-- Whether `next` (each rank's successor, as `(rank, successor)` pairs) is one cycle through all
+`n` ranks: `n` known successors, and walking from the first rank returns to it after exactly `n`
+steps. A permutation of two or more cycles, or a partial map, is not one ring. -/
+def singleCycle (n : Nat) (next : Std.HashMap Nat Nat) : Bool := Id.run do
+  if n = 0 || next.size != n then return false
+  let some (start, _) := next.toList.head? | return false
+  let mut current := start
+  for step in [0:n] do
+    match next.get? current with
+    | none => return false
+    | some successor =>
+        current := successor
+        -- Back at the start before the last step: a shorter cycle.
+        if current = start && step + 1 < n then return false
+  pure (current = start)
+
+/-- Each channel ring is one ring: every logged rank of a channel names one previous rank at every
+step, no two ranks name the same one, and the successors form a single cycle through the group's
+ranks (an AllGather split into two smaller rings would not gather). One pass in canonical order
+keeps, per (collective, channel), each rank's previous rank and each previous rank's successor;
+then each channel that names any predecessor is walked once, in the order its first row appears.
+A channel whose predecessors are all unlogged roots (an ungated three-rank ring) names none. -/
 def checkChannelRings (index : LookupIndex) (rows : List Row) : Except String Unit := do
   let mut previous : Std.HashMap (GroupId × Nat × Nat) Nat := ∅
   let mut next : Std.HashMap (GroupId × Nat × Nat) Nat := ∅
+  let mut successors : Std.HashMap (GroupId × Nat) (Std.HashMap Nat Nat) := ∅
+  let mut channels : Array (GroupId × Nat × Nat × Nat) := #[]
   for row in rows do
     if row.channelPolicy = some .channels && !isRoot row then
       if let some inbound := row.inboundOne.bind index.byFlow.get? then
@@ -943,6 +964,14 @@ def checkChannelRings (index : LookupIndex) (rows : List Row) : Except String Un
           "channel ring predecessor ranks are not one ring"
         previous := previous.insert rankKey inbound.rank
         next := next.insert previousKey row.rank
+        let channel := (group, row.channel)
+        if !successors.contains channel then
+          channels := channels.push (group, row.channel, row.srcLine, row.groupSize)
+        successors := successors.insert channel
+          ((successors.getD channel ∅).insert inbound.rank row.rank)
+  for (group, channel, line, n) in channels do
+    require line (singleCycle n (successors.getD (group, channel) ∅))
+      "channel ring predecessor ranks are not one ring"
 
 def segmentOf (row : Row) : Nat × Nat :=
   (row.segmentSequence, row.segmentSequence + row.segmentBytes)
