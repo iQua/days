@@ -386,12 +386,26 @@ def checkTargetNodesReference (rows : List Row) (row : Row) : Except String Unit
       require row.srcLine (row.targetNode = first.nodeId)
         "a stage's delivery host is not its target rank's host"
 
-/-- A logged inbound predecessor is delivered to this row's host, and the first row naming the
-same inbound predecessor runs on it (see `checkInboundDeliveryHosts`). -/
+/-- A row's cause delivery host is its logged cause's recorded host, and the first row with the
+same cause names the same host (see `checkCauseTargets`). -/
+def checkCauseTargetReference (rows : List Row) (row : Row) : Except String Unit := do
+  if let some cause := findFlowReference rows row.causeFlowId then
+    require row.srcLine (row.causeTargetNode = cause.targetNode)
+      "a row's cause delivery host is not its cause's recorded host"
+  if let some first := rows.find? (·.causeFlowId = row.causeFlowId) then
+    require row.srcLine (first.causeTargetNode = row.causeTargetNode)
+      "the rows a cause produces name different delivery hosts"
+
+/-- A listed inbound predecessor is delivered to this row's host (its own recorded host, else the
+first row it causes), and the first row naming it runs on that host too (see
+`checkInboundDeliveryHosts`). -/
 def checkInboundDeliveryHostsReference (rows : List Row) (row : Row) : Except String Unit := do
   for flow in row.inboundPredecessors do
-    if let some predecessor := findFlowReference rows flow then
-      require row.srcLine (predecessor.targetNode = row.nodeId)
+    let recorded := match findFlowReference rows flow with
+      | some predecessor => some predecessor.targetNode
+      | none => (rows.find? (·.causeFlowId = flow)).map (·.causeTargetNode)
+    if let some node := recorded then
+      require row.srcLine (node = row.nodeId)
         "an inbound predecessor is not delivered to the stage's host"
     if let some first := rows.find? (·.inboundPredecessors.contains flow) then
       require row.srcLine (first.nodeId = row.nodeId)
@@ -406,6 +420,7 @@ def checkRowsReference (rows : List Row) : Except String Unit := do
   checkCoverage canonical
   checkChannelRingsReference canonical
   for row in canonical do checkTargetNodesReference canonical row
+  for row in canonical do checkCauseTargetReference canonical row
   for row in canonical do checkInboundDeliveryHostsReference canonical row
   for row in canonical do checkPredecessorsReference canonical row
   for row in canonical do checkInboundReplayReference canonical row

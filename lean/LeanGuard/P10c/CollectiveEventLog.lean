@@ -187,6 +187,9 @@ structure Row where
   /-- The host the row's stage delivers to (`target_node`; a compute stage's own host): every stage
   naming the flow as an inbound predecessor runs there (the sendrecv-cert lane). -/
   targetNode : Nat
+  /-- The host the cause flow is delivered to (`cause_target_node`; a compute cause's own host):
+  the record of an ungated root's delivery host, which logs no row of its own (fix round 2). -/
+  causeTargetNode : Nat
   srcLine : Nat
   deriving DecidableEq, Repr
 
@@ -263,6 +266,7 @@ def parseRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array Strin
         causeKind := ← parseCarrier (← getField idx fields "cause_kind")
         causeCollectiveId := ← parseOpt parseU64 (← getField idx fields "cause_collective_id")
         targetNode := ← parseU64 (← getField idx fields "target_node")
+        causeTargetNode := ← parseU64 (← getField idx fields "cause_target_node")
         srcLine := lineNo }
   match result with
   | .ok row => pure row
@@ -615,6 +619,14 @@ def checkRow (row : Row) : Except String Unit := do
   -- crosses to another host.
   require row.srcLine ((row.stageKind = .compute) = (row.targetNode = row.nodeId))
     "a stage's delivery host disagrees with its kind"
+  -- An arrival happens where its cause is delivered; a local completion's cause is a compute
+  -- stage on the host or a message from it (a transport stage's ACK, a stage notify's timer).
+  if row.cause = .inboundArrival then
+    require row.srcLine (row.causeTargetNode = row.nodeId)
+      "an inbound arrival is not at its cause's delivery host"
+  else
+    require row.srcLine ((row.causeKind = .compute) = (row.causeTargetNode = row.nodeId))
+      "a local completion's cause delivery host disagrees with its kind"
   match row.stageKind, row.algorithm, row.collectivePhase with
   | .tcp, some algorithm, some phase | .roce, some algorithm, some phase
   | .notify, some algorithm, some phase =>
@@ -1556,17 +1568,37 @@ def checkTargetNodes (index : LookupIndex) (row : Row) : Except String Unit := d
       require row.srcLine (row.targetNode = node)
         "a stage's delivery host is not its target rank's host"
 
+/-- Every row a flow causes names one delivery host for it, its own recorded `target_node` when
+it is logged; returns each cause's host (fix round 2: the rows an ungated root causes, at its
+sender and its receiver, are the only record of where it is delivered). -/
+def checkCauseTargets (index : LookupIndex) (rows : List Row) :
+    Except String (Std.HashMap Nat Nat) := do
+  let mut hosts : Std.HashMap Nat Nat := ∅
+  for row in rows do
+    if let some cause := index.byFlow.get? row.causeFlowId then
+      require row.srcLine (row.causeTargetNode = cause.targetNode)
+        "a row's cause delivery host is not its cause's recorded host"
+    match hosts.get? row.causeFlowId with
+    | some node =>
+        require row.srcLine (node = row.causeTargetNode)
+          "the rows a cause produces name different delivery hosts"
+    | none => hosts := hosts.insert row.causeFlowId row.causeTargetNode
+  pure hosts
+
 /-- Every stage that names a flow as an inbound predecessor runs on the flow's delivery host: the
-`target_node` its own rows record when it is logged (review L4 and its fix round 1: a Send/Recv's
-receiver has no stage of its own, so only the recorded host places the message). An unlogged
-predecessor (an ungated root) records none; every stage naming it still runs on one host, the
-one the first naming row fixes. -/
-def checkInboundDeliveryHosts (index : LookupIndex) (rows : List Row) : Except String Unit := do
+`target_node` its own rows record when it is logged, else the host the rows it causes record
+(`checkCauseTargets`; an ungated root). A flow neither logged nor yet the cause of a row is still
+named on one host, the one the first naming row fixes (review L4 and its fix rounds). -/
+def checkInboundDeliveryHosts (index : LookupIndex) (causeHosts : Std.HashMap Nat Nat)
+    (rows : List Row) : Except String Unit := do
   let mut hosts : Std.HashMap Nat Nat := ∅
   for row in rows do
     for flow in row.inboundPredecessors do
-      if let some predecessor := index.byFlow.get? flow then
-        require row.srcLine (predecessor.targetNode = row.nodeId)
+      let recorded := match index.byFlow.get? flow with
+        | some predecessor => some predecessor.targetNode
+        | none => causeHosts.get? flow
+      if let some node := recorded then
+        require row.srcLine (node = row.nodeId)
           "an inbound predecessor is not delivered to the stage's host"
       match hosts.get? flow with
       | some node =>
@@ -1584,7 +1616,8 @@ def checkRows (rows : List Row) : Except String Unit := do
   let index := lookupIndex canonical
   checkChannelRings index canonical
   for row in canonical do checkTargetNodes index row
-  checkInboundDeliveryHosts index canonical
+  let causeHosts ← checkCauseTargets index canonical
+  checkInboundDeliveryHosts index causeHosts canonical
   for row in canonical do checkPredecessors index row
   checkInboundReplay canonical
   for row in canonical do
