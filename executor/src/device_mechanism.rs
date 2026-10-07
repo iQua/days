@@ -1079,6 +1079,9 @@ mod tests {
             channels: Vec::new(),
             initial_events: Vec::new(),
             seed: 0,
+            stage_joins: Vec::new(),
+            seeded_all_to_alls: Vec::new(),
+            stage_streams: Vec::new(),
         }
     }
 
@@ -1142,12 +1145,11 @@ mod tests {
                 duration_ns: 1,
             }),
             dependencies: crate::StageDependencies {
-                local_predecessor: None,
-                inbound_predecessor: None,
+                local: crate::StagePredecessors::None,
+                inbound: crate::StagePredecessors::None,
                 inbound_predecessor_bytes: 0,
-                local_predecessor_complete: true,
-                inbound_predecessor_complete: true,
                 inbound_bytes_received: 0,
+                local_completed: 0,
             },
             activated: true,
         })];

@@ -12,6 +12,10 @@
 #   collective_ring_allreduce_lossy_100000.csv: lossy_ring_config() of
 #     tests/collective_certificates.rs with size 100,000 and duration = 60.0 (1,027 rows); at
 #     20,000 B the same config is collective_ring_allreduce_lossy_executor_accept.csv (220 rows).
+#   collective_collops_a2a_uniform_roce_40000.csv (P16 H1): the a2a-uniform-roce fixture of
+#     tests/p16_collops.rs (two RoCE all-to-alls, each joined by a compute stage) with size =
+#     40000 (528 rows); its small twin collective_collops_a2a_uniform_roce_executor_accept.csv is
+#     the same at 8,000 B (144 rows).
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -43,4 +47,8 @@ echo "== TCP lossy ring"
 "$diff_checker" budget "$max_ratio_percent" "$max_per_row" \
   "$fixture_dir/collective_ring_allreduce_lossy_executor_accept.csv" \
   "$fixture_dir/budget/collective_ring_allreduce_lossy_100000.csv" || status=1
+echo "== RoCE all-to-all joins"
+"$diff_checker" budget "$max_ratio_percent" "$max_per_row" \
+  "$fixture_dir/collective_collops_a2a_uniform_roce_executor_accept.csv" \
+  "$fixture_dir/budget/collective_collops_a2a_uniform_roce_40000.csv" || status=1
 exit "$status"

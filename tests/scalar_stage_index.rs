@@ -288,8 +288,9 @@ fn stage_index_matches_the_scans_on_tables_the_validator_rejects() {
                     .flatten()
                     .find(|stage| matches!(stage.role, StageRole::Collective(_)))
                     .expect("a collective stage");
-                stage.dependencies.local_predecessor_complete = true;
-                stage.dependencies.inbound_predecessor_complete = true;
+                stage.dependencies.local_completed = stage.dependencies.local.count();
+                stage.dependencies.inbound_bytes_received =
+                    stage.dependencies.inbound_predecessor_bytes;
             }),
         ),
     ];

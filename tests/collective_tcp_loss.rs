@@ -131,6 +131,7 @@ fn lossy_tcp_ring_completes_identically_through_retransmission() {
     let acknowledged = tcp::acknowledged_at(&result, &totals);
     let delivered = tcp::delivered_at(&result, &totals);
     let rows = tcp::progress(&result);
+    let predecessors = tcp::stage_predecessors(&image);
     for row in &rows {
         match row.cause {
             CollectiveActivationCause::LocalCompletion => {
@@ -152,8 +153,9 @@ fn lossy_tcp_ring_completes_identically_through_retransmission() {
             }
         }
         if row.activated {
-            let local = row.local_predecessor.map_or(0, |flow| acknowledged[&flow]);
-            let inbound = row.inbound_predecessor.map_or(0, |flow| delivered[&flow]);
+            let (local, inbound) = predecessors[&row.flow];
+            let local = local.map_or(0, |flow| acknowledged[&flow]);
+            let inbound = inbound.map_or(0, |flow| delivered[&flow]);
             assert_eq!(row.key.time_ns, local.max(inbound));
         }
     }

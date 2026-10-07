@@ -1090,6 +1090,9 @@ mod tests {
             channels: vec![],
             initial_events: vec![],
             seed: 1,
+            stage_joins: Vec::new(),
+            seeded_all_to_alls: Vec::new(),
+            stage_streams: Vec::new(),
         };
         let context = PlannerCapacityContext::new(
             &image,

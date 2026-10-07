@@ -13,12 +13,62 @@ def maxU64 : Nat := 2 ^ 64 - 1
 inductive Algorithm
   | allGather
   | ringAllReduce
+  /-- P16 H1: one ring phase. -/
+  | reduceScatter
+  /-- P16 H1: one message per ordered pair of ranks, all independent. -/
+  | allToAll
+  /-- P16 H1: one message from rank 0 to rank 1. -/
+  | sendRecv
   deriving DecidableEq, Repr
 
 inductive Phase
   | reduceScatter
   | allGather
+  /-- An all-to-all's one phase; `step` is the offset `k` of the destination `rank + k`. -/
+  | allToAll
+  | sendRecv
   deriving DecidableEq, Repr, Hashable
+
+/-- How a collective's declared total becomes its messages (P16 H1). -/
+inductive ChunkPolicy
+  | equalRemainderLast
+  /-- Every message `floor(floor(S / n) / c)` bytes over `c` channels; an all-to-all's
+  `floor(S / n)`. -/
+  | uniformFloor
+  /-- A seeded routing matrix's per-pair bytes (not re-derived here). -/
+  | seeded
+  deriving DecidableEq, Repr
+
+/-- Which messages a collective sends (P16 H1). -/
+inductive ChannelPolicy
+  | ringNext
+  | channels
+  | allPairs
+  | pair
+  deriving DecidableEq, Repr
+
+/-- Whether an algorithm runs on rings. -/
+def Algorithm.isRing : Algorithm → Bool
+  | .allGather | .ringAllReduce | .reduceScatter => true
+  | .allToAll | .sendRecv => false
+
+/-- The phase a collective's stages start in, and the one they end in. -/
+def Algorithm.firstPhase : Algorithm → Phase
+  | .ringAllReduce | .reduceScatter => .reduceScatter
+  | .allGather => .allGather
+  | .allToAll => .allToAll
+  | .sendRecv => .sendRecv
+
+def Algorithm.lastPhase : Algorithm → Phase
+  | .ringAllReduce | .allGather => .allGather
+  | .reduceScatter => .reduceScatter
+  | .allToAll => .allToAll
+  | .sendRecv => .sendRecv
+
+/-- Ring phases per channel. -/
+def Algorithm.phases : Algorithm → Nat
+  | .ringAllReduce => 2
+  | _ => 1
 
 inductive Cause
   | localCompletion
@@ -40,12 +90,31 @@ inductive StageKind
   | compute
   /-- A collective stage carried by a RoCE queue pair (schema Amendment 4). -/
   | roce
+  /-- A same-server collective stage carried by a stage notify (P16 H2): a constant timer of the
+  sender's lead, then the whole chunk crosses its host pair's lane at once, delay-only. -/
+  | notify
   deriving DecidableEq, Repr, Hashable
 
-/-- A stage that moves bytes over a reliable transport, TCP or a RoCE queue pair. -/
+/-- A stage that delivers a collective message: over TCP, a RoCE queue pair, or a stage notify. -/
 def StageKind.isTransport : StageKind → Bool
-  | .tcp | .roce => true
+  | .tcp | .roce | .notify => true
   | .compute => false
+
+/-- What carries a cause flow (`cause_kind`): it decides how an arrival is replayed and how a
+completion is bound. -/
+inductive Carrier
+  | tcp
+  | roce
+  | notify
+  | compute
+  deriving DecidableEq, Repr
+
+/-- The carrier of a stage of kind `kind`. -/
+def StageKind.carrier : StageKind → Carrier
+  | .tcp => .tcp
+  | .roce => .roce
+  | .notify => .notify
+  | .compute => .compute
 
 /-- The owner offset in the lowering recurrence. -/
 def ownerOffset : Algorithm → Phase → Nat
@@ -68,27 +137,45 @@ def legalPosition
   groupSize ≥ 2 && rank < groupSize && step > 0 && step < groupSize &&
     match algorithm with
     | .allGather => phase = .allGather
-    | .ringAllReduce => true
+    | .ringAllReduce => phase = .reduceScatter || phase = .allGather
+    | .reduceScatter => phase = .reduceScatter
+    | .allToAll => phase = .allToAll
+    | .sendRecv => phase = .sendRecv && groupSize = 2 && rank = 0 && step = 1
 
 /-- A root stage has no collective predecessor: step one of the algorithm's first phase. -/
 def rootPosition (algorithm : Algorithm) (phase : Phase) (step : Nat) : Bool :=
-  step = 1 &&
-    match algorithm, phase with
-    | .allGather, .allGather => true
-    | .ringAllReduce, .reduceScatter => true
-    | _, _ => false
+  match algorithm with
+  | .allToAll | .sendRecv => true
+  | _ => step = 1 && phase = algorithm.firstPhase
 
 /-- Non-root stages each rank runs: the ring's `2n - 3` or AllGather's `n - 2`. -/
 def nonRootStagesPerRank (algorithm : Algorithm) (groupSize : Nat) : Nat :=
   match algorithm with
-  | .allGather => groupSize - 2
+  | .allGather | .reduceScatter => groupSize - 2
   | .ringAllReduce => 2 * groupSize - 3
+  | .allToAll | .sendRecv => 0
 
 /-- Stages a complete trace of a transport collective releases. TCP and RoCE collectives carry at
 least one byte per rank, so every chunk is nonempty; a compute-gated collective also releases its
 `n` roots. -/
 def expectedActivationCount (algorithm : Algorithm) (groupSize : Nat) (gated : Bool) : Nat :=
   groupSize * nonRootStagesPerRank algorithm groupSize + (if gated then groupSize else 0)
+
+/-- P16 H1: stages a complete trace releases over `channels` ring channels; an all-to-all's
+`n (n - 1)` pairs and a send/recv's one message are all roots, logged when gated. -/
+def expectedActivationCountOf (algorithm : Algorithm) (groupSize channels : Nat) (gated : Bool) :
+    Nat :=
+  match algorithm with
+  | .allToAll => if gated then groupSize * (groupSize - 1) else 0
+  | .sendRecv => if gated then 1 else 0
+  | _ => channels * expectedActivationCount algorithm groupSize gated
+
+/-- P16 H1: the bytes of one message under `UniformFloor`: `floor(floor(S / n) / c)` for a ring of
+`c` channels, `floor(S / n)` for an all-to-all pair. -/
+def uniformFloorBytes (algorithm : Algorithm) (totalBytes groupSize channels : Nat) : Nat :=
+  match algorithm with
+  | .allToAll => totalBytes / groupSize
+  | _ => totalBytes / groupSize / channels
 
 /-- The largest initial congestion window of the executor's TCP controllers (Reno: two MSS). -/
 def maxInitialWindowSegments : Nat := 2

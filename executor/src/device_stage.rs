@@ -20,11 +20,23 @@
 //! ids are implied by list membership and come from the image. A compute stage's duration is its
 //! Constant generator's interval word (the validator pins the two equal).
 //!
+//! **Joins (P16 H1).** A stage with several local predecessors ([`SR_LOCAL_JOIN`]) counts them in
+//! its flags word: bits 48..63 hold the requirement, bits 32..47 those complete. A stage with
+//! several inbound predecessors ([`SR_INBOUND_JOIN`]) sums their in-order deliveries in
+//! [`SR_INBOUND_RECEIVED`]. Its predecessor `P` cannot set the count to its frontier, so `P`'s
+//! inbound list starts with one credit word, `P`'s frontier as last credited to its successors
+//! ([`SR_INBOUND_CREDIT`] on `P`'s row; the list word's offset points past it); each delivery adds
+//! the frontier's advance over it. A predecessor whose completion has been credited to its local
+//! successors carries [`SR_LOCAL_CREDITED`], so later ACKs of a finished flow count nothing twice.
+//! Neither credit is image state: both equal transport predicates at every boundary, so encoding
+//! derives them and readback ignores them.
+//!
 //! **Ownership.** Every mutable word of stage `S` is written only by `S`'s source host: a local
-//! predecessor completes at that host, and an inbound predecessor delivers to it. Lists and
-//! immutable words are read-only after upload.
+//! predecessor completes at that host, and an inbound predecessor delivers to it. `P`'s
+//! [`SR_LOCAL_CREDITED`] bit is written by `P`'s source and `P`'s credit word by `P`'s target, the
+//! hosts where those events happen. Lists and immutable words are read-only after upload.
 
-use crate::{CollectiveStage, HostState, SimulationImage, StageDependencies};
+use crate::{CollectiveStage, HostState, SimulationImage, StageDependencies, StagePredecessors};
 
 /// Words of one flow's row in the stage region. The host projection sizes the region from the
 /// same constant (`device_sizing::stage_region_words`).
@@ -44,8 +56,27 @@ pub(crate) const SR_HAS_LOCAL: u64 = 16;
 pub(crate) const SR_HAS_INBOUND: u64 = 32;
 /// Immutable: the row's flow is a stage.
 pub(crate) const SR_IS_STAGE: u64 = 64;
-const SR_IMMUTABLE_BITS: u64 = SR_HAS_LOCAL | SR_HAS_INBOUND | SR_IS_STAGE;
-const SR_KNOWN_BITS: u64 = SR_LOCAL_COMPLETE | SR_INBOUND_COMPLETE | SR_IMMUTABLE_BITS;
+/// Immutable: the stage counts several local predecessors in bits 32..63 of its flags.
+pub(crate) const SR_LOCAL_JOIN: u64 = 128;
+/// Immutable: the stage sums several inbound predecessors' deliveries.
+pub(crate) const SR_INBOUND_JOIN: u64 = 256;
+/// Mutable, written by this flow's source: its completion was credited to its local successors.
+pub(crate) const SR_LOCAL_CREDITED: u64 = 512;
+/// Immutable: this flow's inbound successor list is preceded by its credit word.
+pub(crate) const SR_INBOUND_CREDIT: u64 = 1024;
+/// A join's local count fields: completed in bits 32..47, required in bits 48..63.
+const SR_JOIN_COMPLETED_SHIFT: u32 = 32;
+const SR_JOIN_REQUIRED_SHIFT: u32 = 48;
+/// The largest local join a device row counts.
+pub(crate) const SR_JOIN_MAX: u32 = 0xffff;
+const SR_IMMUTABLE_BITS: u64 = SR_HAS_LOCAL
+    | SR_HAS_INBOUND
+    | SR_IS_STAGE
+    | SR_LOCAL_JOIN
+    | SR_INBOUND_JOIN
+    | SR_INBOUND_CREDIT;
+const SR_KNOWN_BITS: u64 =
+    SR_LOCAL_COMPLETE | SR_INBOUND_COMPLETE | SR_LOCAL_CREDITED | SR_IMMUTABLE_BITS;
 
 /// Whether any host carries a stage: exactly when the region is planned.
 pub(crate) fn image_has_stages(image: &SimulationImage) -> bool {
@@ -64,17 +95,25 @@ fn host_stages(state: &HostState) -> impl Iterator<Item = (usize, CollectiveStag
 fn encode_row(stage: CollectiveStage, row: &mut [u64]) {
     let dependencies = stage.dependencies;
     let mut flags = SR_IS_STAGE;
-    if dependencies.local_predecessor.is_some() {
+    if dependencies.local != StagePredecessors::None {
         flags |= SR_HAS_LOCAL;
     }
-    if dependencies.inbound_predecessor.is_some() {
+    if dependencies.inbound != StagePredecessors::None {
         flags |= SR_HAS_INBOUND;
     }
-    if dependencies.local_predecessor_complete {
+    if dependencies.local_complete() {
         flags |= SR_LOCAL_COMPLETE;
     }
-    if dependencies.inbound_predecessor_complete {
+    if dependencies.inbound_complete() {
         flags |= SR_INBOUND_COMPLETE;
+    }
+    if let StagePredecessors::Join { count, .. } = dependencies.local {
+        flags |= SR_LOCAL_JOIN
+            | (u64::from(dependencies.local_completed) << SR_JOIN_COMPLETED_SHIFT)
+            | (u64::from(count) << SR_JOIN_REQUIRED_SHIFT);
+    }
+    if let StagePredecessors::Join { .. } = dependencies.inbound {
+        flags |= SR_INBOUND_JOIN;
     }
     row[SR_FLAGS] = flags;
     row[SR_INBOUND_RECEIVED] = dependencies.inbound_bytes_received;
@@ -100,6 +139,8 @@ pub(crate) fn encode_stage_region(
         .ok_or("stage region rows overflow usize")?;
     let mut local = Vec::new();
     let mut inbound = Vec::new();
+    // The stage notifies' flows, gathered on the first join predecessor without a receiver.
+    let mut notifies = None;
     let mut region = vec![0_u64; rows];
     for state in &image.host_states {
         for (position, stage) in host_stages(state) {
@@ -112,16 +153,26 @@ pub(crate) fn encode_stage_region(
                 stage,
                 &mut region[index * STAGE_ROW_WORDS..(index + 1) * STAGE_ROW_WORDS],
             );
-            if let Some(predecessor) = stage.dependencies.local_predecessor {
-                local.push((predecessor, flow));
+            if let StagePredecessors::Join { count, .. } = stage.dependencies.local {
+                if count > SR_JOIN_MAX {
+                    return Err("a stage join exceeds the device's local count");
+                }
             }
-            if let Some(predecessor) = stage.dependencies.inbound_predecessor {
-                inbound.push((predecessor, flow));
+            let joined = matches!(stage.dependencies.inbound, StagePredecessors::Join { .. });
+            for predecessor in stage.dependencies.local.iter(&image.stage_joins) {
+                local.push((predecessor, flow, false));
+            }
+            for predecessor in stage.dependencies.inbound.iter(&image.stage_joins) {
+                inbound.push((predecessor, flow, joined));
+            }
+            // A predecessor's local credit: its completion was counted (it finished).
+            if state.generators[position].next_emission.status == crate::GeneratorStatus::Finished {
+                region[index * STAGE_ROW_WORDS + SR_FLAGS] |= SR_LOCAL_CREDITED;
             }
         }
     }
-    // Pairs are unique (one stage per flow), so the unstable sort is deterministic; each
-    // predecessor's successors come out ascending.
+    // Pairs are unique (a predecessor names a successor once), so the unstable sort is
+    // deterministic; each predecessor's successors come out ascending.
     local.sort_unstable();
     inbound.sort_unstable();
     for (pairs, word) in [
@@ -131,21 +182,79 @@ pub(crate) fn encode_stage_region(
         let mut start = 0;
         while start < pairs.len() {
             let predecessor = pairs[start].0;
-            let end = start + pairs[start..].partition_point(|(key, _)| *key == predecessor);
+            let end = start + pairs[start..].partition_point(|(key, ..)| *key == predecessor);
             let index =
                 usize::try_from(predecessor.0).map_err(|_| "predecessor flow id exceeds usize")?;
             if index >= flow_count {
                 return Err("stage predecessor is outside the image");
             }
+            // A predecessor of an inbound join keeps its credit word just before its list.
+            if word == SR_INBOUND_SUCCESSORS && pairs[start..end].iter().any(|pair| pair.2) {
+                region[index * STAGE_ROW_WORDS + SR_FLAGS] |= SR_INBOUND_CREDIT;
+                region.push(
+                    inbound_frontier(image, predecessor, &mut notifies)
+                        .ok_or("an inbound predecessor of a join has no receiver at its target")?,
+                );
+            }
             let offset =
                 u32::try_from(region.len()).map_err(|_| "stage list offset exceeds u32")?;
             let count = u32::try_from(end - start).map_err(|_| "stage list count exceeds u32")?;
             region[index * STAGE_ROW_WORDS + word] = (u64::from(offset) << 32) | u64::from(count);
-            region.extend(pairs[start..end].iter().map(|(_, successor)| successor.0));
+            region.extend(
+                pairs[start..end]
+                    .iter()
+                    .map(|(_, successor, _)| successor.0),
+            );
             start = end;
         }
     }
     Ok(region)
+}
+
+/// The in-order frontier of `flow` at its target host: TCP's next expected sequence, or a RoCE
+/// queue pair's expected PSN. A stage notify (P16 H2) has no receiver: it delivers its whole chunk
+/// in one arrival, so its credit starts at zero. An undelivered notify then advances its join by
+/// the whole chunk, and a delivered one, already counted in the join's received bytes, never
+/// arrives again. `notifies` caches every notify's flow, ascending, built on first need (an image
+/// whose joins all have receivers never builds it).
+fn inbound_frontier(
+    image: &SimulationImage,
+    flow: crate::FlowId,
+    notifies: &mut Option<Vec<crate::FlowId>>,
+) -> Option<u64> {
+    let descriptor = image.flows.get(usize::try_from(flow.0).ok()?)?;
+    let node = image
+        .nodes
+        .iter()
+        .find(|node| node.id == descriptor.target && node.kind == crate::NodeKind::Host)?;
+    let state = image.host_states.get(node.state_slot as usize)?;
+    if let Some(receivers) = state.roce_receivers.as_deref() {
+        if let Ok(position) = receivers.binary_search_by_key(&flow, |receiver| receiver.flow) {
+            return Some(receivers[position].expected_psn);
+        }
+    }
+    if let Ok(position) = state
+        .tcp_receivers
+        .binary_search_by_key(&flow, |receiver| receiver.flow)
+    {
+        return Some(state.tcp_receivers[position].next_expected_sequence);
+    }
+    let notifies = notifies.get_or_insert_with(|| {
+        let mut flows = image
+            .host_states
+            .iter()
+            .flat_map(HostState::generators_with_stages)
+            .filter(|(generator, stage)| {
+                matches!(generator.kind, crate::FlowGeneratorKind::Constant(_))
+                    && stage
+                        .is_some_and(|stage| matches!(stage.role, crate::StageRole::Collective(_)))
+            })
+            .map(|(generator, _)| generator.flow)
+            .collect::<Vec<_>>();
+        flows.sort_unstable();
+        flows
+    });
+    notifies.binary_search(&flow).is_ok().then_some(0)
 }
 
 /// Appends the stage region to `tcp_state` and returns its start, or `None` (nothing appended)
@@ -186,6 +295,20 @@ pub(crate) fn decode_stage_rows(
     image: &SimulationImage,
     host_states: &mut [HostState],
 ) -> Result<(), &'static str> {
+    // The predecessors of inbound joins, whose rows carry the immutable credit bit that
+    // `encode_stage_region` sets; none (and no allocation) in an image without joins.
+    let mut credited = Vec::new();
+    if !image.stage_joins.is_empty() {
+        for state in &image.host_states {
+            for (_, stage) in host_stages(state) {
+                if matches!(stage.dependencies.inbound, StagePredecessors::Join { .. }) {
+                    credited.extend(stage.dependencies.inbound.iter(&image.stage_joins));
+                }
+            }
+        }
+        credited.sort_unstable();
+        credited.dedup();
+    }
     for (input, state) in image.host_states.iter().zip(host_states.iter_mut()) {
         for (position, stage) in host_stages(input) {
             let flow = input.generators[position].flow;
@@ -195,9 +318,17 @@ pub(crate) fn decode_stage_rows(
                 .ok_or("stage region is shorter than its rows")?;
             let mut expected = [0_u64; STAGE_ROW_WORDS];
             encode_row(stage, &mut expected);
+            if credited.binary_search(&flow).is_ok() {
+                expected[SR_FLAGS] |= SR_INBOUND_CREDIT;
+            }
             let flags = row[SR_FLAGS];
-            if flags & !SR_KNOWN_BITS != 0
-                || flags & SR_IMMUTABLE_BITS != expected[SR_FLAGS] & SR_IMMUTABLE_BITS
+            let low = flags & 0xffff_ffff;
+            let expected_low = expected[SR_FLAGS] & 0xffff_ffff;
+            let required = flags >> SR_JOIN_REQUIRED_SHIFT;
+            let completed = (flags >> SR_JOIN_COMPLETED_SHIFT) & u64::from(SR_JOIN_MAX);
+            if low & !SR_KNOWN_BITS != 0
+                || low & SR_IMMUTABLE_BITS != expected_low & SR_IMMUTABLE_BITS
+                || required != expected[SR_FLAGS] >> SR_JOIN_REQUIRED_SHIFT
                 || row[SR_INBOUND_REQUIRED] != expected[SR_INBOUND_REQUIRED]
             {
                 return Err("stage row changed immutable words");
@@ -206,20 +337,25 @@ pub(crate) fn decode_stage_rows(
             let local_complete = flags & SR_LOCAL_COMPLETE != 0;
             let inbound_complete = flags & SR_INBOUND_COMPLETE != 0;
             let received = row[SR_INBOUND_RECEIVED];
-            if (before.local_predecessor_complete && !local_complete)
-                || (before.inbound_predecessor_complete && !inbound_complete)
+            // A join counts its completed predecessors; any other stage has its completion bit.
+            let local_completed = if flags & SR_LOCAL_JOIN != 0 {
+                u32::try_from(completed).map_err(|_| "stage join count exceeds u32")?
+            } else if local_complete {
+                before.local.count()
+            } else {
+                0
+            };
+            if local_completed < before.local_completed
+                || local_completed > before.local.count()
+                || local_complete != (local_completed == before.local.count())
                 || received < before.inbound_bytes_received
                 || received > before.inbound_predecessor_bytes
-                || (before.inbound_predecessor.is_some()
-                    && inbound_complete != (received == before.inbound_predecessor_bytes))
-                || (before.inbound_predecessor.is_none()
-                    && received != before.inbound_bytes_received)
+                || inbound_complete != (received == before.inbound_predecessor_bytes)
             {
                 return Err("stage row moved its dependency state backwards or inconsistently");
             }
             let dependencies = StageDependencies {
-                local_predecessor_complete: local_complete,
-                inbound_predecessor_complete: inbound_complete,
+                local_completed,
                 inbound_bytes_received: received,
                 ..before
             };
@@ -286,16 +422,19 @@ mod tests {
                 duration_ns: 1,
             }),
             dependencies: StageDependencies {
-                local_predecessor: local.map(FlowId),
-                inbound_predecessor: inbound.map(|(flow, _)| FlowId(flow)),
+                local: local.map_or(StagePredecessors::None, |flow| {
+                    StagePredecessors::One(FlowId(flow))
+                }),
+                inbound: inbound.map_or(StagePredecessors::None, |(flow, _)| {
+                    StagePredecessors::One(FlowId(flow))
+                }),
                 inbound_predecessor_bytes: inbound.map_or(0, |(_, bytes)| bytes),
-                local_predecessor_complete: local.is_none() || done,
-                inbound_predecessor_complete: inbound.is_none() || done,
                 inbound_bytes_received: if done {
                     inbound.map_or(0, |(_, bytes)| bytes)
                 } else {
                     0
                 },
+                local_completed: u32::from(local.is_some() && done),
             },
             activated: done,
         }
@@ -364,6 +503,9 @@ mod tests {
             channels: Vec::new(),
             initial_events: Vec::new(),
             seed: 0,
+            stage_joins: Vec::new(),
+            seeded_all_to_alls: Vec::new(),
+            stage_streams: Vec::new(),
         }
     }
 
@@ -428,7 +570,7 @@ mod tests {
         rows[4 * STAGE_ROW_WORDS + SR_INBOUND_RECEIVED] = 300;
         decode_stage_rows(&rows, &image, &mut decoded).unwrap();
         let flow4 = decoded[0].stage(2).unwrap();
-        assert!(flow4.dependencies.local_predecessor_complete && !flow4.activated);
+        assert!(flow4.dependencies.local_complete() && !flow4.activated);
         assert_eq!(flow4.dependencies.inbound_bytes_received, 300);
         // All 700: released.
         rows[4 * STAGE_ROW_WORDS + SR_FLAGS] |= SR_INBOUND_COMPLETE;
@@ -444,6 +586,54 @@ mod tests {
             decoded[0].stage(0)
         ));
         assert!(!released_during_run(None, None));
+    }
+
+    /// `image()` with flow 3 (host B) also joining flows 0 and 1 from host A, 500 B each, which
+    /// host B receives over TCP: flows 0 and 1 carry the credit word of an inbound join's
+    /// predecessor (P16 H1).
+    fn join_image() -> SimulationImage {
+        let mut image = image();
+        image.nodes = vec![
+            crate::NodeDescriptor {
+                id: crate::NodeId(0),
+                kind: crate::NodeKind::Host,
+                state_slot: 0,
+            },
+            crate::NodeDescriptor {
+                id: crate::NodeId(1),
+                kind: crate::NodeKind::Host,
+                state_slot: 1,
+            },
+        ];
+        image.stage_joins = vec![FlowId(0), FlowId(1)];
+        let b = &mut image.host_states[1];
+        b.tcp_receivers = vec![
+            crate::TcpReceiverState::new(FlowId(0), 40),
+            crate::TcpReceiverState::new(FlowId(1), 40),
+        ];
+        let join = b.stages[1].as_mut().unwrap();
+        join.dependencies.inbound = StagePredecessors::Join { first: 0, count: 2 };
+        join.dependencies.inbound_predecessor_bytes = 1_000;
+        image
+    }
+
+    #[test]
+    fn a_region_with_an_inbound_join_decodes_to_its_input() {
+        let image = join_image();
+        let region = encode_stage_region(&image, true).unwrap();
+        assert_ne!(region[SR_FLAGS] & SR_INBOUND_CREDIT, 0);
+        assert_ne!(region[STAGE_ROW_WORDS + SR_FLAGS] & SR_INBOUND_CREDIT, 0);
+        let rows = &region[..7 * STAGE_ROW_WORDS];
+        let mut decoded = image.host_states.clone();
+        decode_stage_rows(rows, &image, &mut decoded).unwrap();
+        assert_eq!(decoded, image.host_states);
+        // The credit bit is immutable: a row may neither drop nor gain it.
+        let mut dropped = rows.to_vec();
+        dropped[SR_FLAGS] &= !SR_INBOUND_CREDIT;
+        assert!(decode_stage_rows(&dropped, &image, &mut image.host_states.clone()).is_err());
+        let mut gained = rows.to_vec();
+        gained[2 * STAGE_ROW_WORDS + SR_FLAGS] |= SR_INBOUND_CREDIT;
+        assert!(decode_stage_rows(&gained, &image, &mut image.host_states.clone()).is_err());
     }
 
     #[test]

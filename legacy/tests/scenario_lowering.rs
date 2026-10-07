@@ -1392,7 +1392,7 @@ size = 2
 arr_dist = { type = "Uniform", low = 0.000000001, high = 0.000000001 }
 pkt_size_dist = { type = "Uniform", low = 1, high = 1 }
 "#,
-            "unsupported collective algorithm `Broadcast`; T26 supports RingAllReduce and AllGather",
+            "unsupported collective algorithm `Broadcast`; Days lowers RingAllReduce, AllGather, ReduceScatter, AllToAll and SendRecv",
         ),
         (
             "legacy-run-batch",

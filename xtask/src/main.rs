@@ -202,8 +202,14 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "lib.rs",
         predicate: r#"feature = "planner-test-hooks""#,
+        count: 2,
+        purpose: "validator flow-index equality hook and the P16 H1 per-host stage-width probe are exported only for standard tests",
+    },
+    AllowedFeatureGate {
+        path: "stage_sizing.rs",
+        predicate: r#"feature = "planner-test-hooks""#,
         count: 1,
-        purpose: "validator flow-index equality hook is exported only for standard tests",
+        purpose: "the P16 H1 per-host stage-width probe (ruling R11's width rule, read by `tests/p16_stage_streams.rs`) exists only for standard tests",
     },
 ];
 

@@ -75,6 +75,28 @@ pub fn compile_text(label: &str, config: &str) -> SimulationImage {
     image.unwrap_or_else(|error| panic!("{label} must lower: {error}"))
 }
 
+/// Each stage's one local and one inbound predecessor, from the image (`None` without any).
+pub fn stage_predecessors(
+    image: &SimulationImage,
+) -> BTreeMap<FlowId, (Option<FlowId>, Option<FlowId>)> {
+    image
+        .host_states
+        .iter()
+        .flat_map(|state| state.generators_with_stages())
+        .filter_map(|(generator, stage)| {
+            stage.map(|stage| {
+                (
+                    generator.flow,
+                    (
+                        stage.dependencies.local.one(),
+                        stage.dependencies.inbound.one(),
+                    ),
+                )
+            })
+        })
+        .collect()
+}
+
 pub fn progress(result: &RunResult) -> Vec<CollectiveProgressRecord> {
     result
         .diagnostics
@@ -200,8 +222,8 @@ fn tcp_collectives_lower_to_wrapped_tcp_generators() {
                 panic!("a transport stage has a collective role")
             };
             assert_eq!(tcp.total_bytes, identity.chunk_bytes);
-            let root = stage.dependencies.local_predecessor.is_none()
-                && stage.dependencies.inbound_predecessor.is_none();
+            let root = stage.dependencies.local.one().is_none()
+                && stage.dependencies.inbound.one().is_none();
             assert_eq!(identity.step == 1 && root, root, "roots are step one");
             assert_eq!(stage.activated, root);
             assert_eq!(
@@ -267,6 +289,7 @@ fn tcp_collectives_are_scalar_cpu_byte_identical_and_complete() {
             }
             let csv = collective_transitions_csv(
                 &result.diagnostics.as_ref().unwrap().mechanism_transitions,
+                &image,
             )
             .unwrap();
             let header = csv.lines().next().unwrap();
@@ -307,6 +330,7 @@ fn tcp_stage_completion_follows_ack_and_in_order_delivery() {
             assert_eq!(delivered.len(), totals.len(), "{label}");
 
             let rows = progress(&result);
+            let predecessors = stage_predecessors(&image);
             assert_eq!(
                 rows.is_empty(),
                 algorithm == "AllGather" && ranks == 2,
@@ -345,8 +369,9 @@ fn tcp_stage_completion_follows_ack_and_in_order_delivery() {
                 }
                 if row.activated {
                     activations += 1;
-                    let local = row.local_predecessor.map_or(0, |flow| acknowledged[&flow]);
-                    let inbound = row.inbound_predecessor.map_or(0, |flow| delivered[&flow]);
+                    let (local, inbound) = predecessors[&row.flow];
+                    let local = local.map_or(0, |flow| acknowledged[&flow]);
+                    let inbound = inbound.map_or(0, |flow| delivered[&flow]);
                     assert_eq!(
                         row.key.time_ns,
                         local.max(inbound),
@@ -379,6 +404,7 @@ fn stage_never_activates_before_both_predecessors_complete() {
     let result = run_everywhere(&image, "gate");
     let acknowledged = acknowledged_at(&result, &totals);
     let delivered = delivered_at(&result, &totals);
+    let predecessors = stage_predecessors(&image);
     let mut rows_by_flow = BTreeMap::<FlowId, Vec<CollectiveProgressRecord>>::new();
     for row in progress(&result) {
         rows_by_flow.entry(row.flow).or_default().push(row);
@@ -408,12 +434,9 @@ fn stage_never_activates_before_both_predecessors_complete() {
             .map(|departure| departure.time_ns)
             .min()
             .unwrap();
-        let local = activation
-            .local_predecessor
-            .map_or(0, |predecessor| acknowledged[&predecessor]);
-        let inbound = activation
-            .inbound_predecessor
-            .map_or(0, |predecessor| delivered[&predecessor]);
+        let (local, inbound) = predecessors[&activation.flow];
+        let local = local.map_or(0, |predecessor| acknowledged[&predecessor]);
+        let inbound = inbound.map_or(0, |predecessor| delivered[&predecessor]);
         assert!(first_send >= local.max(inbound), "{flow:?} sent early");
     }
 }
@@ -490,6 +513,6 @@ fn validator_rejects_an_unreleased_tcp_stage_with_sending_state() {
         validate(&released, Backend::Scalar)
             .unwrap_err()
             .to_string(),
-        format!("flow {flow:?} collective release flag disagrees with its prerequisites")
+        format!("flow {flow:?} stage release flag disagrees with its prerequisites")
     );
 }

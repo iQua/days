@@ -5,24 +5,30 @@
 //!
 //! The planners size the remote-staging, legacy event-heap and host-queue arenas by summing a
 //! per-flow bound over every flow. A host that sources `k` stages of one collective is then charged
-//! as if all `k` ran at once, although a stage is released only once its local predecessor (a
-//! stage on the same host) is complete. The unfinished stages of a host form a forest under the
-//! local-predecessor relation (a finished or stopped stage sends nothing more, so it is left out),
-//! and stages on one root-to-leaf path run one at a time. At most `leaves` stages of a host are
-//! active at once, and each can leave at most one completed generation of stale resends behind it
-//! (the next stage's completion needs its own last packet acknowledged, and that packet left the
-//! same FIFO class queue after the stale ones). So the stages of one host occupy an arena slot for
-//! at most `2 × leaves` stages at once, each within its own per-flow bound:
+//! as if all `k` ran at once, although a stage is released only once its local predecessors (stages
+//! on the same host) are complete. G7 bounded a host's active stages by the leaves of its stage
+//! forest; a join (the stage after an all-to-all or a multi-channel ring, P16 H1) makes the graph a
+//! DAG whose one leaf hides the many stages before it, so the bound is now the host's *width*
+//! (ruling R11 (a), [`WidthScratch::width`]): the stages of one operation (a collective, or a
+//! compute group) at the host form chains below its roots, an operation that follows another
+//! there starts only once that one completed, so a greedy chain cover of the operations sums each
+//! chain's widest operation. An image without a join is a forest (every P14 and P15 image) and
+//! keeps G7's leaf count, computed as G2 did, so its plan and its planning cost are unchanged; on
+//! a forest of single-root operations the two counts agree. Finished and stopped stages send nothing
+//! more and are left out. Each active stage can leave at most one completed generation of stale
+//! resends behind it (the next stage's completion needs its own last packet acknowledged, and that
+//! packet left the same FIFO class queue after the stale ones). So the stages of one host occupy
+//! an arena slot for at most `2 × width` stages at once, each within its own per-flow bound:
 //!
 //! ```text
-//! charge(host, slot, class) = min(sum of the bounds, 2 × leaves × max of the bounds)
+//! charge(host, slot, class) = min(sum of the bounds, 2 × width × max of the bounds)
 //! ```
 //!
 //! The `min` keeps every charge at or below today's sum. Non-stage flows are charged as before, and
 //! an image without stages builds nothing here, so its plan is unchanged byte for byte.
 //!
 //! A compute stage's timer is one fallback-heap event at its source while the stage runs; at most
-//! `min(leaves, unfinished compute stages)` of a host's timers are pending at once.
+//! `min(width, unfinished compute stages)` of a host's timers are pending at once.
 //!
 //! The host queue is the exception (fix rounds 1 to 3, review F1, R1-F1 and R2-F1). The per-flow
 //! host-queue bound of a windowless queue pair or a TCP stage is a lookahead horizon bound, which
@@ -46,6 +52,10 @@
 //! queue, and a windowed stage's bounds are charged with its host's chains. Every other queue pair
 //! and TCP keep today's bound. A pair on a lossy class can still rewind on a NACK with the timeout
 //! off; typed capacity retries remain the recovery path for that.
+//!
+//! The same window bounds such a pair's remote staging on every link of its routes (ruling R11
+//! (b)): at most `ceil(window_bytes / mtu) + 1` of its data packets, and as many feedback packets,
+//! are in the network at once, so each per-link charge is the smaller of that and the round bound.
 //!
 //! Everything here is decided once per plan, with sorted vectors and no map iteration order.
 
@@ -74,10 +84,10 @@ pub(crate) struct SizingConcurrency {
     /// Per flow: the concurrency group of an unfinished stage (one group per source host), or
     /// [`NO_GROUP`]. Empty when the image has no stage.
     groups: Vec<u32>,
-    /// Per group: the stage generations that may hold packets at once, `2 × leaves`.
+    /// Per group: the stage generations that may hold packets at once, `2 × width`.
     generations: Vec<usize>,
     /// Per group: the source node and its pending compute-timer bound,
-    /// `min(leaves, unfinished compute stages)`.
+    /// `min(width, unfinished compute stages)`.
     compute_timers: Vec<(usize, usize)>,
     /// Per flow: `ceil(window_bytes / mtu) + 1` for a windowed queue pair with its retransmission
     /// timeout off, else zero. Empty when the image has no such pair.
@@ -120,20 +130,28 @@ impl SizingConcurrency {
 
     fn group_stages(&mut self, image: &SimulationImage) {
         let flow_count = image.flows.len();
-        // Whether a stage names the flow as its local predecessor (always a stage of the same
-        // host). A successor of an unfinished stage is itself unfinished: it is released only
-        // once its predecessor completes.
-        let mut has_successor = vec![false; flow_count];
-        for state in &image.host_states {
-            for stage in state.stages.iter().flatten() {
-                if let Some(predecessor) = stage.dependencies.local_predecessor {
-                    if let Some(slot) = has_successor.get_mut(predecessor.0 as usize) {
-                        *slot = true;
+        // Without a join every stage has at most one local predecessor, so a host's stages form
+        // a forest whose leaves are its width (G7's count, kept so such plans cost what G2's
+        // did); with joins, the width rule ([`WidthScratch::width`]).
+        let joins = !image.stage_joins.is_empty();
+        let mut has_successor = Vec::new();
+        if !joins {
+            // Whether a stage names the flow as its local predecessor (always a stage of the same
+            // host). A successor of an unfinished stage is itself unfinished: it is released only
+            // once its predecessor completes.
+            has_successor = vec![false; flow_count];
+            for state in &image.host_states {
+                for stage in state.stages.iter().flatten() {
+                    if let Some(predecessor) = stage.dependencies.local.one() {
+                        if let Some(slot) = has_successor.get_mut(predecessor.0 as usize) {
+                            *slot = true;
+                        }
                     }
                 }
             }
         }
         let mut groups = vec![NO_GROUP; flow_count];
+        let mut scratch = WidthScratch::default();
         for state in &image.host_states {
             if state.stages.is_empty() {
                 continue;
@@ -142,6 +160,7 @@ impl SizingConcurrency {
             let mut leaves = 0_usize;
             let mut compute = 0_usize;
             let mut source = None;
+            scratch.unfinished.clear();
             for (position, generator) in state.generators.iter().enumerate() {
                 let Some(stage) = state.stage(position) else {
                     continue;
@@ -155,12 +174,23 @@ impl SizingConcurrency {
                 let flow = generator.flow.0 as usize;
                 groups[flow] = group;
                 source.get_or_insert(image.flows[flow].source.0 as usize);
-                leaves += usize::from(!has_successor[flow]);
                 compute += usize::from(matches!(stage.role, StageRole::Compute(_)));
+                if joins {
+                    scratch
+                        .unfinished
+                        .push((generator.flow, operation(stage), stage));
+                } else {
+                    leaves += usize::from(!has_successor[flow]);
+                }
             }
             if let Some(source) = source {
-                self.generations.push(leaves.saturating_mul(2));
-                self.compute_timers.push((source, leaves.min(compute)));
+                let width = if joins {
+                    scratch.width(&image.stage_joins, &image.stage_streams)
+                } else {
+                    leaves
+                };
+                self.generations.push(width.saturating_mul(2));
+                self.compute_timers.push((source, width.min(compute)));
             }
         }
         self.groups = groups;
@@ -204,6 +234,195 @@ impl SizingConcurrency {
     }
 }
 
+/// Each host's width (the stages it may run at once) in host order, for tests of the sizing rule;
+/// empty when the image has no stage.
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+pub fn stage_widths_for_testing(image: &SimulationImage) -> Vec<usize> {
+    SizingConcurrency::for_image(image).map_or_else(Vec::new, |concurrency| {
+        concurrency
+            .generations
+            .iter()
+            .map(|generations| generations / 2)
+            .collect()
+    })
+}
+
+/// The operation a stage belongs to: its collective, or its compute group (one stage per host).
+fn operation(stage: crate::CollectiveStage) -> u64 {
+    match stage.role {
+        StageRole::Collective(identity) => identity.collective_id.saturating_mul(2),
+        StageRole::Compute(compute) => compute.compute_id.saturating_mul(2).saturating_add(1),
+    }
+}
+
+/// Reused buffers of the per-host width computation (ruling R11 (a)).
+#[derive(Default)]
+struct WidthScratch {
+    /// The host's unfinished stages in ascending flow order, with their operations.
+    unfinished: Vec<(crate::FlowId, u64, crate::CollectiveStage)>,
+    /// The distinct operations, ascending.
+    operations: Vec<u64>,
+    /// Per operation: its local roots on the host (its width) and its predecessor count.
+    roots: Vec<usize>,
+    indegree: Vec<usize>,
+    /// `(predecessor operation, operation)` edges, sorted and distinct; and the same edges as
+    /// `(operation, predecessor operation)`, sorted.
+    edges: Vec<(usize, usize)>,
+    edges_in: Vec<(usize, usize)>,
+    /// Per operation: the chain it extends, and per chain whether its end is still open.
+    chain_of: Vec<usize>,
+    /// Per operation: its issue stream (0 unless the image lists it).
+    streams: Vec<u32>,
+    chain_end: Vec<usize>,
+    chain_weight: Vec<usize>,
+    ready: std::collections::BinaryHeap<std::cmp::Reverse<usize>>,
+}
+
+impl WidthScratch {
+    /// A bound on how many of the host's unfinished stages are active at once.
+    ///
+    /// The stages of one operation at a host form chains below its roots (a stage that waits for
+    /// no stage of its own operation): a ring channel's steps, an all-to-all's pairs, one compute
+    /// stage. An operation that follows another at the host (a local predecessor in it) starts
+    /// only once that one completed there. So the operations, ordered by those edges, are covered
+    /// by chains whose operations never run at once; a greedy cover in topological order gives
+    /// each operation the chain of a predecessor on its own issue stream whose chain still ends
+    /// there. At most one operation per chain runs at a time, with at most its roots active, so
+    /// the width is the sum over chains of their widest operation. With the image's streams (one
+    /// chain per stream, ruling R11 (a)) this is the sum of each stream's widest operation: an
+    /// operation never takes another stream's chain, which would leave its own stream's rest on a
+    /// second chain and count that stream's widest operation twice (review F9). The cover follows
+    /// only real ordering edges, so it stays sound whatever the streams say. On a forest of single-root operations (every P14 and
+    /// P15 collective) this is G7's leaf count; a join (the stage after an all-to-all or a
+    /// multi-channel ring) does not hide its predecessors' concurrency.
+    fn width(&mut self, joins: &[crate::FlowId], streams: &[crate::StageStream]) -> usize {
+        let operation_of = |unfinished: &[(crate::FlowId, u64, crate::CollectiveStage)],
+                            flow: crate::FlowId| {
+            unfinished
+                .binary_search_by_key(&flow, |entry| entry.0)
+                .ok()
+                .map(|index| unfinished[index].1)
+        };
+        self.operations.clear();
+        self.operations
+            .extend(self.unfinished.iter().map(|entry| entry.1));
+        self.operations.sort_unstable();
+        self.operations.dedup();
+        let count = self.operations.len();
+        self.streams.clear();
+        self.streams
+            .extend(self.operations.iter().map(|&operation| {
+                let id = operation / 2;
+                let operation = if operation % 2 == 0 {
+                    crate::StageOperation::Collective(id)
+                } else {
+                    crate::StageOperation::Compute(id)
+                };
+                streams
+                    .binary_search_by_key(&operation, |entry| entry.operation)
+                    .map_or(0, |index| streams[index].stream)
+            }));
+        self.roots.clear();
+        self.roots.resize(count, 0);
+        self.edges.clear();
+        for &(_, operation, stage) in &self.unfinished {
+            let index = self
+                .operations
+                .binary_search(&operation)
+                .expect("every unfinished stage's operation is listed");
+            let mut own_predecessor = false;
+            for predecessor in stage.dependencies.local.iter(joins) {
+                match operation_of(&self.unfinished, predecessor) {
+                    Some(other) if other == operation => own_predecessor = true,
+                    Some(other) => {
+                        let from = self
+                            .operations
+                            .binary_search(&other)
+                            .expect("every unfinished stage's operation is listed");
+                        self.edges.push((from, index));
+                    }
+                    // A finished predecessor runs no more.
+                    None => {}
+                }
+            }
+            if !own_predecessor {
+                self.roots[index] += 1;
+            }
+        }
+        self.edges.sort_unstable();
+        self.edges.dedup();
+        self.edges_in.clear();
+        self.edges_in
+            .extend(self.edges.iter().map(|&(from, to)| (to, from)));
+        self.edges_in.sort_unstable();
+        self.indegree.clear();
+        self.indegree.resize(count, 0);
+        for &(_, to) in &self.edges {
+            self.indegree[to] += 1;
+        }
+        self.ready.clear();
+        for (index, &degree) in self.indegree.iter().enumerate() {
+            if degree == 0 {
+                self.ready.push(std::cmp::Reverse(index));
+            }
+        }
+        self.chain_of.clear();
+        self.chain_of.resize(count, usize::MAX);
+        self.chain_end.clear();
+        self.chain_weight.clear();
+        // An operation's successors and predecessors are contiguous runs of the sorted edges.
+        let mut processed = 0_usize;
+        while let Some(std::cmp::Reverse(index)) = self.ready.pop() {
+            processed += 1;
+            let mut chain = None;
+            let start = self.edges_in.partition_point(|&(to, _)| to < index);
+            for &(to, from) in &self.edges_in[start..] {
+                if to != index {
+                    break;
+                }
+                if self.streams[from] == self.streams[index]
+                    && self.chain_end[self.chain_of[from]] == from
+                {
+                    chain = Some(self.chain_of[from]);
+                    break;
+                }
+            }
+            let chain = chain.unwrap_or_else(|| {
+                self.chain_end.push(index);
+                self.chain_weight.push(0);
+                self.chain_end.len() - 1
+            });
+            self.chain_of[index] = chain;
+            self.chain_end[chain] = index;
+            self.chain_weight[chain] = self.chain_weight[chain].max(self.roots[index]);
+            let start = self.edges.partition_point(|&(from, _)| from < index);
+            for position in start..self.edges.len() {
+                let (from, to) = self.edges[position];
+                if from != index {
+                    break;
+                }
+                self.indegree[to] -= 1;
+                if self.indegree[to] == 0 {
+                    self.ready.push(std::cmp::Reverse(to));
+                }
+            }
+        }
+        let width = self.chain_weight.iter().sum::<usize>();
+        if processed == count {
+            return width;
+        }
+        // A cycle (which lowering never builds) leaves operations unordered: count all their
+        // roots, so the bound stays sound.
+        width.saturating_add(
+            (0..count)
+                .filter(|&index| self.chain_of[index] == usize::MAX)
+                .map(|index| self.roots[index])
+                .sum::<usize>(),
+        )
+    }
+}
+
 /// Per flow, `ceil(window_bytes / mtu) + 1` for each windowed queue pair whose retransmission
 /// timeout is off and zero otherwise; empty when there is no such pair.
 fn window_packets(image: &SimulationImage) -> Vec<usize> {
@@ -241,7 +460,7 @@ impl ConcurrentCharges {
         }
     }
 
-    /// Adds each `(group, slot, class)`'s charge, `min(sum, 2 × leaves × max)`, to its slot.
+    /// Adds each `(group, slot, class)`'s charge, `min(sum, 2 × width × max)`, to its slot.
     pub(crate) fn apply(mut self, concurrency: &SizingConcurrency, capacities: &mut [usize]) {
         // The fold is a sum and a maximum, so the order inside one key does not matter.
         self.entries
@@ -328,12 +547,13 @@ mod tests {
                 duration_ns: 1,
             }),
             dependencies: StageDependencies {
-                local_predecessor: local.map(FlowId),
-                inbound_predecessor: None,
+                local: local.map_or(crate::StagePredecessors::None, |flow| {
+                    crate::StagePredecessors::One(FlowId(flow))
+                }),
+                inbound: crate::StagePredecessors::None,
                 inbound_predecessor_bytes: 0,
-                local_predecessor_complete: local.is_none(),
-                inbound_predecessor_complete: true,
                 inbound_bytes_received: 0,
+                local_completed: 0,
             },
             activated: local.is_none(),
         }
@@ -410,6 +630,9 @@ mod tests {
             channels: Vec::new(),
             initial_events: Vec::new(),
             seed: 0,
+            stage_joins: Vec::new(),
+            seeded_all_to_alls: Vec::new(),
+            stage_streams: Vec::new(),
         }
     }
 

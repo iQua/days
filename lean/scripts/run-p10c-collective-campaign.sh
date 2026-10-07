@@ -172,11 +172,13 @@ mutate_case "data-arrival-phase" "$allgather" \
 mutate_case "root-gate-phase" "$chain" \
   'NR == 2 { $column["event_phase"] = 0 }' \
   'REJECT: line 2: collective progress event phase disagrees with its cause'
+# A root with nothing to wait for, logged with its local prerequisite complete from the start.
 mutate_case "ungated-root" "$chain" \
-  'NR == 2 { $column["local_predecessor_flow_id"] = "" }' \
+  'NR == 2 { $column["local_predecessors"] = ""; $column["local_required"] = 0; $column["before_local_complete"] = 1 }' \
   'REJECT: line 2: a root stage is logged only when a compute stage gates it'
+# The gate is flow 6, a 1,000-byte stage of the root's own collective, completed by its ACK.
 mutate_case "root-gate-inside-collective" "$chain" \
-  'NR == 2 { $column["local_predecessor_flow_id"] = 6; $column["cause_flow_id"] = 6 }' \
+  'NR == 2 { $column["local_predecessors"] = 6; $column["cause_flow_id"] = 6; $column["cause_total_bytes"] = 1000; $column["cause_kind"] = "tcp"; $column["event_phase"] = 0 }' \
   'REJECT: line 2: a root stage'"'"'s gate must be a compute stage outside its collective'
 
 # Canonical order, ordinals, and certificate structure.
@@ -210,10 +212,10 @@ mutate_case "collective-config-discontinuity" "$allgather" \
   'NR == 3 { $column["packet_size_bytes"] = 4 }' \
   'REJECT: line 3: collective configuration discontinuity for collective_id=0'
 mutate_case "inbound-predecessor-recurrence" "$allgather" \
-  '$column["flow_id"] == 5 { $column["inbound_predecessor_flow_id"] = 99; if ($column["cause"] == "inbound_arrival") $column["cause_flow_id"] = 99 }' \
+  '$column["flow_id"] == 5 { $column["inbound_predecessors"] = 99; if ($column["cause"] == "inbound_arrival") $column["cause_flow_id"] = 99 }' \
   'REJECT: line 11: inbound predecessor identity does not match the stage recurrence'
 mutate_case "local-predecessor-recurrence" "$allgather" \
-  '$column["flow_id"] == 5 { $column["local_predecessor_flow_id"] = 99; if ($column["cause"] == "local_completion") $column["cause_flow_id"] = 99 }' \
+  '$column["flow_id"] == 5 { $column["local_predecessors"] = 99; if ($column["cause"] == "local_completion") $column["cause_flow_id"] = 99 }' \
   'REJECT: line 11: local predecessor identity does not match the stage recurrence'
 mutate_case "rank-to-node-mapping" "$allgather" \
   'NR == 3 { $column["node_id"] = 1 }' \
@@ -286,10 +288,10 @@ mutate_case "compute-timer-phase" "$chain" \
   'NR == 41 { $column["event_phase"] = 0 }' \
   'REJECT: line 41: collective progress event phase disagrees with its cause'
 mutate_case "compute-local-predecessor-rank" "$chain" \
-  '$column["flow_id"] == 18 { $column["local_predecessor_flow_id"] = 13; $column["cause_flow_id"] = 13 }' \
+  '$column["flow_id"] == 18 { $column["local_predecessors"] = 13; $column["cause_flow_id"] = 13 }' \
   'REJECT: line 41: compute local predecessor is not the same-rank stage of a compute group'
 mutate_case "compute-inbound-not-final" "$chain" \
-  '$column["flow_id"] == 12 { $column["inbound_predecessor_flow_id"] = 6; if ($column["cause"] == "inbound_arrival") $column["cause_flow_id"] = 6 }' \
+  '$column["flow_id"] == 12 { $column["inbound_predecessors"] = 6; if ($column["cause"] == "inbound_arrival") $column["cause_flow_id"] = 6 }' \
   'REJECT: line 32: compute inbound predecessor is not the previous rank'"'"'s final collective stage'
 # Review F2 (R1b): the optimizer releases 640 ns after backward's release instead of at its
 # 7000 ns timer deadline (22640); the release rows' own deadlines move consistently.
@@ -364,10 +366,11 @@ roce_agc="$fixture_dir/collective_roce_allgather_compute_lossy_executor_accept.c
 mutate_case "compute-after-unlogged-roce-hole-fill" "$roce_agc" \
   'NR == 72 { $column["arrival_bytes"] = 6000; $column["after_inbound_bytes"] = 10000; $column["after_inbound_complete"] = 1 } NR >= 73 && NR <= 77 { next }' \
   "REJECT: line 72: inbound progress does not match the receiver's Go-back-N frontier"
-# Without the columns the stage is replayed as TCP, which refuses the real Go-back-N receiver.
+# Without the columns, the RoCE packets of the unlogged predecessor have no MTU to replay them
+# with (the cause's carrier, `cause_kind`, says RoCE), so the first such packet is refused.
 mutate_case "compute-after-unlogged-roce-zero-columns" "$roce_agc" \
   '$column["stage_kind"] == "compute" { $column["packet_size_bytes"] = 0; $column["interval_ns"] = 0 }' \
-  'REJECT: line 72: inbound progress does not match the receiver frontier replayed from the certified segments'
+  "REJECT: line 10: inbound RoCE packet is not the predecessor queue pair's packet at its PSN"
 mutate_case "compute-mtu-disagrees-with-logged-predecessor" "$roce_dag" \
   '$column["stage_kind"] == "compute" { $column["packet_size_bytes"] = 1500 }' \
   'REJECT: line 63: compute stage inbound transport columns disagree with its inbound predecessor'
@@ -376,11 +379,140 @@ mutate_case "compute-mtu-without-interval" "$roce_dag" \
   'REJECT: line 63: compute stage inbound transport columns must be both zero or both positive (Amendment 5)'
 # P14's chain: the optimizer group follows the backward compute group and has no inbound stage.
 mutate_case "compute-transport-without-inbound-predecessor" "$chain" \
-  '$column["stage_kind"] == "compute" && $column["inbound_predecessor_flow_id"] == "" { $column["packet_size_bytes"] = 1000; $column["interval_ns"] = 1000 }' \
+  '$column["stage_kind"] == "compute" && $column["inbound_predecessors"] == "" { $column["packet_size_bytes"] = 1000; $column["interval_ns"] = 1000 }' \
   'REJECT: line 41: compute stage without an inbound predecessor carries inbound transport columns'
 mutate_case "roce-stage-coverage" "$roce_lossy" \
   '$column["flow_id"] == 7 { next }' \
   'REJECT: line 2: incomplete collective progress coverage for collective_id=0: expected 20, found 19'
+
+# P16 H1 (collops): the operations and counted joins. The certificates are the Scalar traces of
+# tests/p16_collops.rs's fixtures (the_certificates_are_scalar_generated).
+channels="$fixture_dir/collective_collops_ring_channels_2_executor_accept.csv"
+a2a_tcp="$fixture_dir/collective_collops_a2a_uniform_tcp_executor_accept.csv"
+a2a_roce="$fixture_dir/collective_collops_a2a_uniform_roce_executor_accept.csv"
+seeded="$fixture_dir/collective_collops_a2a_seeded_roce_executor_accept.csv"
+stream="$fixture_dir/collective_collops_data_stream_executor_accept.csv"
+sendrecv="$fixture_dir/collective_collops_sendrecv_executor_accept.csv"
+# Flow 12 is channel 1's root at rank 0: a UniformFloor message of floor(16003 / 4 / 2) = 2000 B.
+mutate_case "channel-uniform-floor-size" "$channels" \
+  '$column["flow_id"] == 12 { $column["chunk_bytes"] = 2001 }' \
+  'REJECT: line 3: collective chunk does not match its chunk policy'
+# Flow 4 (rank 1, channel 0, step 2) names rank 2's step-1 stage (flow 6) instead of rank 0's: rank
+# 2 would then precede both rank 1 and rank 3 on channel 0.
+mutate_case "channel-ring-not-one-ring" "$channels" \
+  '$column["flow_id"] == 4 { $column["inbound_predecessors"] = 6; if ($column["cause"] == "inbound_arrival") $column["cause_flow_id"] = 6 }' \
+  'REJECT: line 13: channel ring predecessor ranks are not one ring'
+# Flow 0 is rank 0's send to rank 1: floor(8002 / 4) = 2000 B.
+mutate_case "all-to-all-uniform-floor-size" "$a2a_tcp" \
+  '$column["flow_id"] == 0 { $column["chunk_bytes"] = 2001 }' \
+  'REJECT: line 2: collective chunk does not match its chunk policy'
+# Flow 28 (rank 0's expert compute) joins its three sends (12, 13, 14) and three receives (17, 19,
+# 21). Counting two local predecessors breaks the count against the list.
+mutate_case "join-local-required" "$a2a_roce" \
+  '$column["flow_id"] == 28 { $column["local_required"] = 2 }' \
+  'REJECT: line 14: local completion flags disagree with the local completion counts'
+# Rank 3's 2,000-byte send to rank 0 (flow 21) claims 2,500 bytes on every row it causes: the
+# join's causes then total 6,500 bytes against its 6,000-byte requirement.
+mutate_case "join-inbound-cause-totals" "$a2a_roce" \
+  '$column["cause_flow_id"] == 21 && $column["cause"] == "inbound_arrival" { $column["cause_total_bytes"] = 2500 }' \
+  'REJECT: line 14: a stage'"'"'s inbound predecessors do not deliver its inbound requirement'
+mutate_case "cause-total-changes" "$a2a_roce" \
+  '$column["flow_id"] == 28 && $column["cause_flow_id"] == 21 && ++seen == 2 { $column["cause_total_bytes"] = 2500 }' \
+  'REJECT: line 26: cause byte total disagrees with an earlier row of the same cause'
+# Flow 13 (rank 0 -> rank 2, 600 B) of the seeded dispatch is deleted, and the activation
+# ordinals of its event keys closed up.
+mutate_case "seeded-deleted-pair" "$seeded" \
+  '{ key = $column["time_ns"] SUBSEP $column["event_phase"] SUBSEP $column["event_origin_node"] SUBSEP $column["event_origin_sequence"] } $column["flow_id"] == 13 { removed[key]++; next } { $column["ordinal"] -= removed[key] }' \
+  'REJECT: line 2: incomplete collective progress coverage for collective_id=1: expected 12, found 11'
+# The compute after the dispatch at rank 0 drops its send to rank 2 (flow 13) from its join.
+mutate_case "join-missing-local-predecessor" "$seeded" \
+  '$column["local_predecessors"] == "12;13;14" { $column["local_predecessors"] = "12;14"; $column["local_required"] = 2; if ($column["after_local_completed"] > 0) $column["after_local_completed"] -= 1; if ($column["before_local_completed"] > 0) $column["before_local_completed"] -= 1 } $column["local_predecessors"] == "12;14" && $column["cause_flow_id"] == 13 { next }' \
+  'REJECT: line 15: a stage does not wait for its predecessor collective'"'"'s whole completion at its rank'
+# Rank 0's root of the second ReduceScatter follows its compute (flow 32) and the first ReduceScatter
+# (flows 2 and 11): the ACK of flow 2 is a phase-0 event.
+mutate_case "join-root-ack-phase" "$stream" \
+  '$column["flow_id"] == 12 && $column["cause_flow_id"] == 2 { $column["event_phase"] = 1 }' \
+  'REJECT: line 94: collective progress event phase disagrees with its cause'
+# The Send/Recv receiver's compute stage has no local predecessor, so it starts locally complete.
+mutate_case "sendrecv-receiver-initial-state" "$sendrecv" \
+  'NR == 3 { $column["before_local_complete"] = 0 }' \
+  'REJECT: line 3: first local prerequisite state is not initial'
+
+# P16 H1 x H2: on a Rail topology the intra-server messages of a multi-server collective are stage
+# notifies (tests/p16_collops_rail.rs). LeanGuard checks a notify's lead timer at its sender and its
+# whole-chunk delivery at its receiver; the NVLink delivery delay (the notify's `duration_ns`) is
+# accepted as given.
+rail_ring="$fixture_dir/collective_collops_rail_ring_roce_executor_accept.csv"
+# The first notify delivery is split into two 2,000-byte halves (the second under a fresh event key).
+mutate_case "notify-split-delivery" "$rail_ring" \
+  'done == 0 && $column["cause_kind"] == "notify" && $column["cause"] == "inbound_arrival" { done = 1; saved = $0; $column["arrival_bytes"] = 2000; $column["segment_bytes"] = 2000; $column["after_inbound_bytes"] = 2000; $column["after_inbound_complete"] = 0; $column["activated"] = 0; $column["after_status"] = "blocked"; $column["after_next_time_ns"] = 0; print; $0 = saved; $column["event_origin_sequence"] += 1000; $column["segment_sequence"] = 2000; $column["segment_bytes"] = 2000; $column["arrival_bytes"] = 2000; $column["before_inbound_bytes"] = 2000 }' \
+  'REJECT: line 16: inbound stage notify does not deliver its whole chunk at once'
+# The first notify release arms its lead's timer one nanosecond late.
+mutate_case "notify-lead-timer" "$rail_ring" \
+  'done == 0 && $column["stage_kind"] == "notify" && $column["cause"] == "local_completion" && $column["activated"] == 1 { done = 1; $column["after_next_time_ns"] += 1 }' \
+  'REJECT: line 2: stage notify release does not arm its lead'"'"'s timer'
+# A notify delivery claims a RoCE carrier (and drops the notify's origin, delay and collective).
+mutate_case "notify-carrier-relabeled-roce" "$rail_ring" \
+  'done == 0 && $column["cause_kind"] == "notify" && $column["cause"] == "inbound_arrival" { done = 1; $column["cause_kind"] = "roce"; $column["cause_origin_ns"] = 0; $column["cause_delay_ns"] = 0; $column["cause_collective_id"] = "" }' \
+  'REJECT: line 16: cause kind disagrees with the cause stage'
+# The receiver of the first notify (line 10) completes locally a nanosecond after its timer.
+mutate_case "notify-completion-off-its-timer" "$rail_ring" \
+  'NR == 10 { $column["time_ns"] = 1002 }' \
+  'REJECT: line 10: compute local completion does not occur at its predecessor'"'"'s timer deadline'
+
+# P16 H1 fix round 2 (review N1): a notify is delivered exactly its delay after its release, both
+# named on its delivery rows; a logged notify's are its release row's time and its `duration_ns`
+# (accepted as given). Notify flow 0 (released at 1,000 ns, delivered at 1,068 ns, 68 ns) claims a
+# 99 ns delay on its own rows (it would arrive 31 ns early), then a 60 ns one (8 ns late).
+mutate_case "notify-early-delivery" "$rail_ring" \
+  '$column["flow_id"] == 0 { $column["duration_ns"] = 99 }' \
+  'REJECT: line 16: stage notify delivery does not name its release and delay'
+mutate_case "notify-late-delivery" "$rail_ring" \
+  '$column["flow_id"] == 0 { $column["duration_ns"] = 60 }' \
+  'REJECT: line 16: stage notify delivery does not name its release and delay'
+# A notify released by a counted join leaves at the join's completion: notify flow 0 waits for `fwd`
+# (1,000 ns) and `aux` (2,000 ns) and is delivered at 2,134 ns. Claiming a 1,134 ns delay (as if
+# released by `fwd` alone) rejects.
+rail_join="$fixture_dir/collective_collops_rail_a2a_after_join_executor_accept.csv"
+mutate_case "notify-join-release" "$rail_join" \
+  '$column["flow_id"] == 0 { $column["duration_ns"] = 1134 }' \
+  'REJECT: line 146: stage notify delivery does not name its release and delay'
+
+# An ungated root notify is not logged: it starts with its collective at the collective's initial
+# delay (2,000 ns here). Notify flow 0 (rank 0 -> 1) is delivered at 2,134 ns; it is moved 1 ns early,
+# and notify flow 26 (rank 3 -> 1) 1 ns late.
+rail_ungated="$fixture_dir/collective_collops_rail_a2a_ungated_executor_accept.csv"
+mutate_case "ungated-notify-early-delivery" "$rail_ungated" \
+  '$column["cause"] == "inbound_arrival" && $column["cause_flow_id"] == 0 { $column["time_ns"] = 2133 }' \
+  'REJECT: line 26: stage notify delivery does not occur at its origin plus its delay'
+mutate_case "ungated-notify-late-delivery" "$rail_ungated" \
+  '$column["cause"] == "inbound_arrival" && $column["cause_flow_id"] == 26 { $column["time_ns"] = 2135 }' \
+  'REJECT: line 36: stage notify delivery does not occur at its origin plus its delay'
+
+# Notify flow 26's delivery moves 1 ns late with its origin (still origin + delay): it no longer
+# shares its collective's start with the other unlogged notifies.
+mutate_case "ungated-notify-shifted-delivery" "$rail_ungated" \
+  '$column["cause"] == "inbound_arrival" && $column["cause_flow_id"] == 26 { $column["time_ns"] = 2135; $column["cause_origin_ns"] = 2001 }' \
+  'REJECT: line 36: unlogged stage notifies of one collective do not share one origin'
+# Notify flow 26 claims a release 1 ns earlier on every row it causes, consistently (its sender's
+# timer completion at 2,001 ns with a 2 ns lead, its delivery at 2,134 ns with a 135 ns delay):
+# only its collective's shared start rejects it.
+mutate_case "ungated-notify-shifted-release" "$rail_ungated" \
+  '$column["cause_flow_id"] == 26 && $column["cause"] == "local_completion" { $column["cause_origin_ns"] = 1999; $column["cause_delay_ns"] = 2 } $column["cause_flow_id"] == 26 && $column["cause"] == "inbound_arrival" { $column["cause_origin_ns"] = 1999; $column["cause_delay_ns"] = 135 }' \
+  'REJECT: line 12: unlogged stage notifies of one collective do not share one origin'
+# The delivery rows of notify flow 0 name another collective.
+mutate_case "notify-cause-collective" "$rail_ring" \
+  '$column["cause_flow_id"] == 0 && $column["cause_kind"] == "notify" { $column["cause_collective_id"] = 7 }' \
+  'REJECT: line 10: stage notify cause names another collective'
+
+# Review N2 (fix round 3): every row a notify causes names one collective. Notify flow 0's delivery
+# row is relabelled to collective 1, then to 99 (none), while its sender's timer row keeps 0.
+mutate_case "ungated-notify-relabelled-delivery" "$rail_ungated" \
+  '$column["cause"] == "inbound_arrival" && $column["cause_flow_id"] == 0 { $column["cause_collective_id"] = 1 }' \
+  'REJECT: line 26: the rows a stage notify causes name different collectives'
+mutate_case "ungated-notify-relabelled-to-none" "$rail_ungated" \
+  '$column["cause"] == "inbound_arrival" && $column["cause_flow_id"] == 0 { $column["cause_collective_id"] = 99 }' \
+  'REJECT: line 26: the rows a stage notify causes name different collectives'
 
 echo "P10c exact-integer collective campaign checks: $checked"
 exit "$failures"

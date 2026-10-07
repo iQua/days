@@ -2,8 +2,10 @@
 //! to what they lower, not to flows times the fabric or notifies times the channels.
 //!
 //! **Scaling** (the `tests/host_scaling_budget.rs` convention). Two rail scenarios grow every
-//! entity 8x: `s` servers of 8 GPUs (`s` = 4 and 32), one 8-rank all-reduce ring inside each server
-//! (whose 112 stages per server are all stage notifies), and one TCP flow from every GPU to the
+//! entity 8x: `s` servers of 8 GPUs (`s` = 4 and 32), one 16-rank all-reduce ring over each pair of
+//! servers (14 of its 16 hops stay inside a server, so 420 of its 480 stages are stage notifies; a
+//! ring inside one server would be one delay stage per rank, ruling H2-2, P16 H1 fix round 1), and
+//! one TCP flow from every GPU to the
 //! GPU 9 places on, wrapping (the next server on the next rail, so through a PSW by SimAI's ECMP). The PSW count is fixed (2) so
 //! the ASW count grows with the GPUs. Lowering plus validation must grow by at most
 //! `sqrt(8 x 64) = 22.6` in allocated bytes, the midpoint between linear (8x) and a per-item term
@@ -106,8 +108,8 @@ discipline = "FIFO"
 drop = "TailDrop"
 "#
     );
-    for server in 0..servers {
-        let ranks = (0..8).map(|rank| server * 8 + rank).collect::<Vec<_>>();
+    for server in (0..servers).step_by(2) {
+        let ranks = (0..16).map(|rank| server * 8 + rank).collect::<Vec<_>>();
         let list = |values: &[u64]| {
             values
                 .iter()
@@ -115,9 +117,8 @@ drop = "TailDrop"
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        let sinks = ranks
-            .iter()
-            .map(|rank| server * 8 + (rank + 1) % 8)
+        let sinks = (0..16)
+            .map(|rank| server * 8 + (rank + 1) % 16)
             .collect::<Vec<_>>();
         writeln!(
             text,
@@ -125,7 +126,7 @@ drop = "TailDrop"
 [[collective]]
 collective_type = "RingAllReduce"
 flow_type = "TCP"
-flow_count = 8
+flow_count = 16
 sources = [{}]
 sinks = [{}]
 
@@ -197,7 +198,7 @@ fn lowering_bytes(servers: u64) -> (u64, usize) {
 fn rail_lowering_and_notifies_scale_with_what_they_lower() {
     let (small, small_notifies) = lowering_bytes(4);
     let (large, large_notifies) = lowering_bytes(32);
-    assert_eq!((small_notifies, large_notifies), (4 * 112, 32 * 112));
+    assert_eq!((small_notifies, large_notifies), (2 * 420, 16 * 420));
     let ratio = large as f64 / small as f64;
     eprintln!("record=rail_lowering_bytes small={small} large={large} ratio={ratio:.2}");
     assert!(

@@ -42,6 +42,7 @@ mod planner_capacity;
 mod roce;
 pub mod safe_horizon;
 pub mod scalar;
+mod seeded_matrix;
 mod stage_index;
 mod stage_sizing;
 pub mod tcp;
@@ -103,18 +104,19 @@ pub use image::{
     GeneratorTermination, HostPfcState, HostState, LinkDescriptor, NodeDescriptor,
     PacketDescriptor, PacketKind, PfcHeader, PfcIngressState, PfcQueueState, RateGenerator,
     RemoteChannel, RoceAckHeader, RoceDataHeader, RoceGenerator, RoceNackMark, RocePacer,
-    RoceReceiverState, ScheduledEmission, SimulationImage, StageDependencies, StageRole,
-    SwitchQueueState, SwitchState, TcpAckHeader, TcpDataHeader, TcpGenerator, TcpReceiveRange,
-    TcpReceiverState, TcpTimerState, default_propagation_ns,
+    RoceReceiverState, ScheduledEmission, SeededCollective, SimulationImage, StageDependencies,
+    StageOperation, StagePredecessors, StageRole, StageStream, SwitchQueueState, SwitchState,
+    TcpAckHeader, TcpDataHeader, TcpGenerator, TcpReceiveRange, TcpReceiverState, TcpTimerState,
+    default_propagation_ns,
 };
 pub use mechanism_trace::{
-    CollectiveActivationCause, CollectiveProgressRecord, CollectiveStageKind, DrrTransitionRecord,
-    MechanismTraceError, MechanismTransitionRecord, PfcControlAction, PfcControlTransitionRecord,
-    PfcOccupancyAction, PfcThresholdTransitionRecord, RateReplayConfig, RateReplayState,
-    RateTransitionRecord, SchedulerPacket, WrrTransitionRecord, collective_transitions_csv,
-    dcqcn_cnp_arrivals_csv, dcqcn_transitions_csv, drr_transitions_csv, pfc_transitions_csv,
-    rate_transitions_csv, roce_receiver_transitions_csv, roce_sender_transitions_csv,
-    wrr_transitions_csv,
+    CollectiveActivationCause, CollectiveProgressRecord, CollectiveStageKind, CollectiveTraceError,
+    DrrTransitionRecord, MechanismTraceError, MechanismTransitionRecord, PfcControlAction,
+    PfcControlTransitionRecord, PfcOccupancyAction, PfcThresholdTransitionRecord, RateReplayConfig,
+    RateReplayState, RateTransitionRecord, SchedulerPacket, WrrTransitionRecord,
+    collective_transitions_csv, dcqcn_cnp_arrivals_csv, dcqcn_transitions_csv, drr_transitions_csv,
+    pfc_transitions_csv, rate_transitions_csv, roce_receiver_transitions_csv,
+    roce_sender_transitions_csv, wrr_transitions_csv,
 };
 #[cfg(all(
     feature = "metal",
@@ -158,6 +160,10 @@ pub use scalar::{
     ObservationMode, PacketArrivalObservation, PacketDeparture, RunResult, RunSummary,
     TcpTransitionInput, TcpTransitionRecord, run_scalar, run_scalar_with_observations,
 };
+pub use seeded_matrix::{RoutingSkew, SeededAllToAll};
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+pub use stage_sizing::stage_widths_for_testing;
 pub use tcp::{CUBIC_WINDOW_SCALE, TcpCongestionControl, TcpPhase};
 pub use tcp_trace::{TcpTraceError, tcp_transitions_csv};
 pub use time::{TimeError, link_arrival_time_ns, serialization_time_ns};
