@@ -163,6 +163,74 @@ fn finished(result: &RunResult) -> bool {
     })
 }
 
+/// Review F1: a root notify starts when its collective does. The TCP AllGather fixture starts at
+/// 5 us (`initial_delay`): its root TCP stages depart then, and each root notify's timer fires its
+/// lead after it; a stop between the start and that instant stops the notify instead.
+#[test]
+fn root_notifies_start_at_the_collectives_initial_delay() {
+    let image = compile_config(repo_path("configs/p16/rail_mini_tcp_allgather.toml"))
+        .expect("fixture lowers");
+    let start = 5_000;
+    let mut roots = 0;
+    for state in &image.host_states {
+        for (position, generator) in state.generators.iter().enumerate() {
+            let Some(stage) = state.stage(position) else {
+                continue;
+            };
+            if !stage.activated {
+                continue;
+            }
+            match generator.kind {
+                FlowGeneratorKind::Constant(constant) => {
+                    assert_eq!(
+                        generator.next_emission.departure_time_ns,
+                        start + constant.interval_ns,
+                        "root notify {:?}",
+                        generator.flow
+                    );
+                    let timers = image
+                        .initial_events
+                        .iter()
+                        .filter(|event| {
+                            event.kind == EventKind::PacingTimer
+                                && event.payload == generator.next_emission.payload
+                        })
+                        .map(|event| event.key.time_ns)
+                        .collect::<Vec<_>>();
+                    assert_eq!(timers, vec![start + constant.interval_ns]);
+                    roots += 1;
+                }
+                FlowGeneratorKind::Tcp(_) => {
+                    assert_eq!(generator.next_emission.departure_time_ns, start);
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        roots, 4,
+        "the four same-server step-1 hops are root notifies"
+    );
+
+    // A stop after the start but before the lead elapses stops the root notifies.
+    let directory = tempfile::TempDir::new().expect("temp dir");
+    let path = directory.path().join("stop.toml");
+    let text = std::fs::read_to_string(repo_path("configs/p16/rail_mini_tcp_allgather.toml"))
+        .expect("fixture")
+        .replace("duration = 0.01\n", "duration = 0.000005\n");
+    std::fs::write(&path, text).expect("write");
+    let stopped = compile_config(&path).expect("lowers");
+    let statuses = stopped
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .filter(|generator| matches!(generator.kind, FlowGeneratorKind::Constant(_)))
+        .filter(|generator| generator.next_emission.status != GeneratorStatus::Blocked)
+        .map(|generator| generator.next_emission.status)
+        .collect::<Vec<_>>();
+    assert_eq!(statuses, vec![GeneratorStatus::Stopped; 4]);
+}
+
 #[test]
 fn every_stage_finishes_and_no_notify_stays_resident() {
     for (_, image) in notify_fixtures() {
@@ -359,6 +427,35 @@ fn a_notify_off_its_lane_or_with_a_wrong_lead_is_refused() {
     }
     let error = validate(&wrong_lane, Backend::Scalar).expect_err("lane mismatch");
     assert!(error.to_string().contains("stage notify"), "{error}");
+
+    // A released notify is due no earlier than its lead after its release (review F1).
+    let tcp =
+        compile_config(repo_path("configs/p16/rail_mini_tcp_allgather.toml")).expect("lowers");
+    let mut early = tcp.clone();
+    // A Scheduled root notify whose timer (event and departure alike) is moved before its lead:
+    // every other relation still holds, so only the lead bound can refuse it.
+    let (payload, lead) = early
+        .host_states
+        .iter_mut()
+        .flat_map(|state| &mut state.generators)
+        .find_map(|generator| match generator.kind {
+            FlowGeneratorKind::Constant(constant)
+                if generator.next_emission.status == GeneratorStatus::Scheduled =>
+            {
+                generator.next_emission.departure_time_ns = constant.interval_ns - 1;
+                Some((generator.next_emission.payload, constant.interval_ns))
+            }
+            _ => None,
+        })
+        .expect("the fixture has a scheduled root notify");
+    for event in &mut early.initial_events {
+        if event.payload == payload && event.kind == EventKind::PacingTimer {
+            event.key.time_ns = lead - 1;
+        }
+    }
+    early.initial_events.sort_by_key(|event| event.key);
+    let error = validate(&early, Backend::Scalar).expect_err("due before its lead");
+    assert!(error.to_string().contains("earlier than its"), "{error}");
 
     let mut routed = image.clone();
     routed.flows[flow.0 as usize].route = image.flows[0].route.clone();

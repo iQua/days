@@ -3121,21 +3121,32 @@ fn lower(
             // The sender's timer runs `delay - lane`; its notify then crosses the lane in `lane`.
             let lead_ns = delay_ns - lane_ns;
             let root = stage.local_predecessor_complete && stage.inbound_predecessor_complete;
+            // A root message starts with its collective, at the traffic's initial delay, as the
+            // collective's fabric roots do (review F1); its timer fires the lead after that.
+            let root_timer_ns = flow
+                .traffic
+                .initial_delay_ns
+                .checked_add(lead_ns)
+                .ok_or_else(|| {
+                    CompileError::Invalid(format!(
+                        "stage notify timer of flow {} -> {} exceeds u64",
+                        flow.source, flow.target
+                    ))
+                })?;
             let next_emission = if !root {
                 ScheduledEmission {
                     status: GeneratorStatus::Blocked,
                     departure_time_ns: 0,
                     payload: PayloadId(0),
                 }
-            } else if lead_ns > model.stop_time_ns {
+            } else if root_timer_ns > model.stop_time_ns {
                 ScheduledEmission {
                     status: GeneratorStatus::Stopped,
-                    departure_time_ns: lead_ns,
+                    departure_time_ns: root_timer_ns,
                     payload: PayloadId(0),
                 }
             } else {
-                // A root message starts at time zero: its notify names the sender's timer and
-                // then crosses to the target.
+                // Its notify names the sender's timer and then crosses to the target.
                 let sequence = payload_sequences.entry(source).or_default();
                 let payload = allocate_payload_id(
                     ids.node(source),
@@ -3157,14 +3168,14 @@ fn lower(
                 });
                 initial_event_inputs.push((
                     source,
-                    lead_ns,
+                    root_timer_ns,
                     descriptor.id,
                     payload,
                     EventKind::PacingTimer,
                 ));
                 ScheduledEmission {
                     status: GeneratorStatus::Scheduled,
-                    departure_time_ns: lead_ns,
+                    departure_time_ns: root_timer_ns,
                     payload,
                 }
             };

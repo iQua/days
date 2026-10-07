@@ -3614,8 +3614,12 @@ fn inbound_frontier(
 ///
 /// The generator is a constant timer of the stage's chunk: `interval_ns` is the sender's lead (at
 /// least one nanosecond), `first_departure_ns` the latency of its host pair's lane (which the
-/// notify crosses after the lead), `packet_size_bytes` and the byte termination the chunk. Unreleased, it is `Blocked`; released, its notify names one
-/// `PacingTimer` at the source (`Scheduled`), or the lead passes the stop (`Stopped`); fired, it is
+/// notify crosses after the lead), `packet_size_bytes` and the byte termination the chunk.
+/// Unreleased, it is `Blocked`; released at instant `t` (its collective's start for a root, its
+/// prerequisites' completion otherwise), its timer is due at `t + lead`, so a released notify's
+/// due time is never below its lead (review F1: the image does not record `t`, so lowering pins the
+/// sum and this pins its lower bound). Released, its notify names one `PacingTimer` at the source
+/// (`Scheduled`), or its due time passes the stop (`Stopped`); fired, it is
 /// `Finished` with one packet of the chunk emitted, and the notify is either in flight (resident,
 /// with one `RemoteArrival` at the target) or delivered (no longer resident).
 fn validate_notify_timer(
@@ -3642,6 +3646,14 @@ fn validate_notify_timer(
         return Err(ValidationError::new(format!(
             "flow {:?} stage notify requires a constant timer of its chunk",
             flow.id
+        )));
+    }
+    if emission.status != GeneratorStatus::Blocked
+        && emission.departure_time_ns < constant.interval_ns
+    {
+        return Err(ValidationError::new(format!(
+            "flow {:?} stage notify timer at {} ns is earlier than its {} ns lead after any release",
+            flow.id, emission.departure_time_ns, constant.interval_ns
         )));
     }
     let notify = |payload: PayloadId| {

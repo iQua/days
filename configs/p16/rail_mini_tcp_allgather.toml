@@ -4,7 +4,8 @@
 # Same-server ring hops (0->1, 2->3, 4->5, 6->7) are stage notifies; the others are TCP stages over
 # the fabric. The size leaves a remainder, so the last owner's chunk is 3 bytes larger: a lane
 # carries two chunk sizes (501,000 and 501,003 B, serialized in exactly 1,670 ns and in 1,671 ns),
-# so the larger chunk's lead is 2 ns.
+# so the larger chunk's lead is 2 ns. The collective starts at 5 us (initial_delay), which its
+# root notifies' timers must honour as its TCP roots do (review F1).
 seed = 11
 duration = 0.01
 
@@ -36,7 +37,7 @@ sources = [0, 1, 2, 3, 4, 5, 6, 7]
 sinks = [1, 2, 3, 4, 5, 6, 7, 0]
 
 [collective.traffic]
-initial_delay = 0.0
+initial_delay = 0.000005
 size = 4008003
 arr_dist = { type = "Uniform", low = 0.000001, high = 0.000001 }
 pkt_size_dist = { type = "DiscreteUniform", low = 9000, high = 9000 }
