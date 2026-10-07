@@ -1152,6 +1152,17 @@ pub struct SimulationImage {
     /// The predecessor runs of join stages ([`StagePredecessors::Join`]), fixed at lowering and
     /// read-only; empty, with no allocation, in an image without a join.
     pub stage_joins: Vec<FlowId>,
+    /// The parameters of every seeded all-to-all, ascending by collective id (P16 H1, ruling R7):
+    /// its pairs' stages carry the matrix's bytes, and the progress certificate names the
+    /// parameters so LeanGuard can re-derive them. Empty, with no allocation, without one.
+    pub seeded_all_to_alls: Vec<SeededCollective>,
+}
+
+/// One seeded all-to-all's routing-matrix parameters.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SeededCollective {
+    pub collective_id: u64,
+    pub matrix: crate::SeededAllToAll,
 }
 
 impl fmt::Debug for SimulationImage {
@@ -1171,6 +1182,9 @@ impl fmt::Debug for SimulationImage {
         // Omitting the empty additive field preserves every image byte without a join.
         if !self.stage_joins.is_empty() {
             debug.field("stage_joins", &self.stage_joins);
+        }
+        if !self.seeded_all_to_alls.is_empty() {
+            debug.field("seeded_all_to_alls", &self.seeded_all_to_alls);
         }
         debug.finish()
     }

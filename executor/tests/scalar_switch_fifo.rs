@@ -202,6 +202,7 @@ fn image() -> SimulationImage {
         ],
         seed: 7,
         stage_joins: Vec::new(),
+        seeded_all_to_alls: Vec::new(),
     }
 }
 

@@ -477,6 +477,7 @@ mod tests {
             initial_events: Vec::new(),
             seed: 0,
             stage_joins: Vec::new(),
+            seeded_all_to_alls: Vec::new(),
         }
     }
 

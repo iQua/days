@@ -193,6 +193,7 @@ fn image(
         initial_events,
         seed: 18,
         stage_joins: Vec::new(),
+        seeded_all_to_alls: Vec::new(),
     }
 }
 

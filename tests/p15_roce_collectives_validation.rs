@@ -32,6 +32,7 @@ fn checkpoint(image: &SimulationImage, horizon_ns: u64) -> SimulationImage {
         initial_events: result.pending_events,
         seed: image.seed,
         stage_joins: image.stage_joins.clone(),
+        seeded_all_to_alls: image.seeded_all_to_alls.clone(),
     }
 }
 

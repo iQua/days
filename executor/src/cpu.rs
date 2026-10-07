@@ -4378,6 +4378,7 @@ fn target_interleaved_outbox_image() -> SimulationImage {
             .collect(),
         seed: 1,
         stage_joins: Vec::new(),
+        seeded_all_to_alls: Vec::new(),
     }
 }
 

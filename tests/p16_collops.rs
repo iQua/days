@@ -305,6 +305,22 @@ fn fixtures() -> Vec<(&'static str, String)> {
             ),
         ),
         (
+            "a2a-seeded-sparse-roce",
+            star(
+                4,
+                &(compute("fwd", H4, 2_000, "")
+                    + &collective(
+                        "dispatch",
+                        "AllToAll",
+                        "RoCE",
+                        H4,
+                        "after = \"fwd\"\n[collective.alltoall]\nseed = 11\nmatrix = 2\ngroup = 5\ntranspose = false\nexperts = 8\ntopk = 1\ntokens = 3\nbytes_per_copy = 700\nskew = \"Uniform\"\n",
+                        2_100,
+                    )
+                    + &compute("expert", H4, 1_000, "after = \"dispatch\"")),
+            ),
+        ),
+        (
             "rs-uniform-floor-tcp",
             star(
                 4,
@@ -814,6 +830,62 @@ fn the_certificates_are_scalar_generated() {
             csv,
             std::fs::read_to_string(&path).unwrap_or_default(),
             "{label}"
+        );
+    }
+}
+
+/// A seeded all-to-all's image names its matrix (review F3): the lowering gives each ordered pair
+/// exactly the matrix's bytes and no stage to a pair of zero bytes, and an image whose table omits
+/// a seeded collective is refused.
+#[test]
+fn a_seeded_all_to_all_image_names_its_matrix() {
+    for index in [8, 11] {
+        let (label, config) = &fixtures()[index];
+        let image = lower(label, config);
+        let mut checked = 0;
+        for entry in &image.seeded_all_to_alls {
+            let bytes = entry.matrix.bytes(4).expect("the matrix derives");
+            let mut pairs = BTreeMap::new();
+            for (flow, stage) in stage_generators(&image) {
+                if let StageRole::Collective(identity) = stage.role {
+                    if identity.collective_id == entry.collective_id {
+                        let target = (identity.rank + identity.step) % 4;
+                        pairs.insert((identity.rank, target), (flow, identity.chunk_bytes));
+                    }
+                }
+            }
+            for source in 0..4_u32 {
+                for target in 0..4_u32 {
+                    let expected = bytes[(source * 4 + target) as usize];
+                    let actual = pairs.get(&(source, target)).map_or(0, |entry| entry.1);
+                    assert_eq!(actual, expected, "{label}: pair {source}->{target}");
+                }
+            }
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "{label}: the image names its seeded collectives"
+        );
+        if *label == "a2a-seeded-sparse-roce" {
+            assert!(
+                image.seeded_all_to_alls[0]
+                    .matrix
+                    .bytes(4)
+                    .unwrap()
+                    .iter()
+                    .enumerate()
+                    .any(|(index, &bytes)| index % 5 != 0 && bytes == 0),
+                "the sparse fixture has a pair without bytes"
+            );
+        }
+        let mut corrupt = image.clone();
+        corrupt.seeded_all_to_alls.clear();
+        assert!(
+            days_executor::validate(&corrupt, days_executor::Backend::Scalar)
+                .unwrap_err()
+                .to_string()
+                .contains("seeded all-to-all matrices")
         );
     }
 }

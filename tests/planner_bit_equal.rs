@@ -205,6 +205,7 @@ fn rate_image() -> SimulationImage {
         }],
         seed: 25,
         stage_joins: Vec::new(),
+        seeded_all_to_alls: Vec::new(),
     }
 }
 

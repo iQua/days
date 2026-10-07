@@ -260,7 +260,10 @@ impl MechanismTransitionRecord {
 /// ascending) and `local_required`; the local completion count before and after; and
 /// `cause_total_bytes`, the byte total of the cause flow (zero for a compute stage); and
 /// `group_stages`, the stages of the row's collective or compute group in the image (a seeded
-/// all-to-all has no stage for a pair of zero bytes). `inbound_predecessor_bytes` is the stage's
+/// all-to-all has no stage for a pair of zero bytes); and `seeded_matrix`, a seeded all-to-all's
+/// matrix parameters (`seed;matrix;group;transpose;experts;topk;tokens;bytes_per_copy;skew`),
+/// from which LeanGuard re-derives every pair's bytes, empty on every other row.
+/// `inbound_predecessor_bytes` is the stage's
 /// inbound requirement: the summed totals of its inbound predecessors, zero without any.
 pub fn collective_transitions_csv(
     records: &[MechanismTransitionRecord],
@@ -345,7 +348,7 @@ pub fn collective_transitions_csv(
     }
 
     let mut csv = String::from(
-        "time_ns,event_phase,event_origin_node,event_origin_sequence,ordinal,node_id,flow_id,cause,cause_flow_id,arrival_bytes,collective_id,algorithm,group_size,declared_total_bytes,rank,collective_phase,step,chunk_offset_bytes,chunk_bytes,packet_size_bytes,interval_ns,stop_time_ns,inbound_predecessor_bytes,before_local_complete,before_inbound_complete,before_inbound_bytes,activated,after_local_complete,after_inbound_complete,after_inbound_bytes,after_packets_emitted,after_bytes_emitted,after_status,after_next_time_ns,stage_kind,duration_ns,segment_sequence,segment_bytes,ack_number,cause_origin_ns,cause_delay_ns,channel,chunk_policy,channel_policy,local_predecessors,inbound_predecessors,local_required,before_local_completed,after_local_completed,cause_total_bytes,group_stages\n",
+        "time_ns,event_phase,event_origin_node,event_origin_sequence,ordinal,node_id,flow_id,cause,cause_flow_id,arrival_bytes,collective_id,algorithm,group_size,declared_total_bytes,rank,collective_phase,step,chunk_offset_bytes,chunk_bytes,packet_size_bytes,interval_ns,stop_time_ns,inbound_predecessor_bytes,before_local_complete,before_inbound_complete,before_inbound_bytes,activated,after_local_complete,after_inbound_complete,after_inbound_bytes,after_packets_emitted,after_bytes_emitted,after_status,after_next_time_ns,stage_kind,duration_ns,segment_sequence,segment_bytes,ack_number,cause_origin_ns,cause_delay_ns,channel,chunk_policy,channel_policy,local_predecessors,inbound_predecessors,local_required,before_local_completed,after_local_completed,cause_total_bytes,group_stages,seeded_matrix\n",
     );
     for record in records {
         let stage = stage_of(record.flow);
@@ -362,7 +365,7 @@ pub fn collective_transitions_csv(
         };
         writeln!(
             csv,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             record.key.time_ns,
             record.key.phase,
             record.key.origin_node.0,
@@ -420,10 +423,42 @@ pub fn collective_transitions_csv(
                 ))
                 .copied()
                 .unwrap_or(0),
+            identity
+                .and_then(|identity| {
+                    image
+                        .seeded_all_to_alls
+                        .binary_search_by_key(&identity.collective_id, |entry| {
+                            entry.collective_id
+                        })
+                        .ok()
+                })
+                .map_or_else(String::new, |index| seeded_matrix(
+                    &image.seeded_all_to_alls[index].matrix
+                )),
         )
         .expect("writing to String cannot fail");
     }
     Ok(csv)
+}
+
+/// A seeded all-to-all's matrix parameters, `;`-separated:
+/// `seed;matrix;group;transpose;experts;topk;tokens;bytes_per_copy;skew`.
+fn seeded_matrix(matrix: &crate::SeededAllToAll) -> String {
+    format!(
+        "{};{};{};{};{};{};{};{};{}",
+        matrix.seed,
+        matrix.matrix,
+        matrix.group,
+        u8::from(matrix.transpose),
+        matrix.experts,
+        matrix.topk,
+        matrix.tokens,
+        matrix.bytes_per_copy,
+        match matrix.skew {
+            crate::RoutingSkew::Uniform => "uniform",
+            crate::RoutingSkew::Zipf1 => "zipf1",
+        }
+    )
 }
 
 const fn chunk_policy(policy: crate::CollectiveChunkPolicy) -> &'static str {

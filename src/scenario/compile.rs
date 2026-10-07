@@ -3108,6 +3108,7 @@ fn lower(
         flows,
         collectives: collective_table,
         computes: compute_table,
+        seeded: seeded_all_to_alls,
     } = canonical_flows(
         model.explicit_flows,
         model.flow_sets,
@@ -3996,6 +3997,7 @@ fn lower(
         initial_events,
         seed: model.seed,
         stage_joins,
+        seeded_all_to_alls,
     })
 }
 
@@ -4007,6 +4009,8 @@ struct CanonicalFlows {
     collectives: Vec<CollectiveKey>,
     /// The compute keys, sorted: `FlowKey::ComputeStage::compute` indexes this table.
     computes: Vec<ComputeKey>,
+    /// Each seeded all-to-all's matrix parameters, ascending by collective id.
+    seeded: Vec<days_executor::SeededCollective>,
 }
 
 /// Ordinal of `compute` in the sorted `table`.
@@ -4200,6 +4204,7 @@ fn canonical_flows(
     };
     let mut collective_duplicates = vec![0_u64; collective_table.len()];
     let mut next_collective_id = 0_u64;
+    let mut seeded = Vec::new();
     for semantic in &collectives {
         let collective = collective_ordinal(&collective_table, semantic);
         let duplicate = &mut collective_duplicates[collective as usize];
@@ -4219,6 +4224,15 @@ fn canonical_flows(
             duplicate_ordinal,
             collective_id,
         )?;
+        // The image names the matrix of every seeded collective that has stages (ids ascend).
+        if let Some(&matrix) = semantic.seeded() {
+            if collective_has_stages(semantic) {
+                seeded.push(days_executor::SeededCollective {
+                    collective_id,
+                    matrix,
+                });
+            }
+        }
     }
     for (compute_id, compute) in computes.iter().enumerate() {
         expand_compute(&mut flows, &plan, compute, compute_id as u64)?;
@@ -4229,6 +4243,7 @@ fn canonical_flows(
         flows,
         collectives: collective_table,
         computes,
+        seeded,
     })
 }
 

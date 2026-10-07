@@ -3010,6 +3010,30 @@ fn validate_collective_partitions(image: &SimulationImage) -> Result<(), Validat
         })?;
     }
 
+    // The image names the matrix of exactly its seeded collectives, ascending by id (ruling R7).
+    // Their pair sizes are the lowering's and LeanGuard re-derives them from the certificate; the
+    // validator does not, as a matrix costs a draw per routed token copy.
+    let table = &image.seeded_all_to_alls;
+    if table
+        .windows(2)
+        .any(|pair| pair[0].collective_id >= pair[1].collective_id)
+        || table.iter().any(|entry| {
+            collectives
+                .get(&entry.collective_id)
+                .is_none_or(|state| state.chunk_policy != Chunk::Seeded)
+        })
+        || collectives.iter().any(|(collective_id, state)| {
+            state.chunk_policy == Chunk::Seeded
+                && table
+                    .binary_search_by_key(collective_id, |entry| entry.collective_id)
+                    .is_err()
+        })
+    {
+        return Err(ValidationError::new(
+            "seeded all-to-all matrices must name exactly the image's seeded collectives, ascending"
+                .to_owned(),
+        ));
+    }
     for (collective_id, state) in collectives {
         let n = u64::from(state.group_size);
         let phases = match state.algorithm {

@@ -235,6 +235,7 @@ fn path_image() -> SimulationImage {
         initial_events: vec![],
         seed: 25,
         stage_joins: Vec::new(),
+        seeded_all_to_alls: Vec::new(),
     }
 }
 
@@ -1810,6 +1811,7 @@ fn circular_dependency_image() -> SimulationImage {
         initial_events,
         seed: 25,
         stage_joins: Vec::new(),
+        seeded_all_to_alls: Vec::new(),
     }
 }
 

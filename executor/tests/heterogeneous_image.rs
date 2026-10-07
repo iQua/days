@@ -78,6 +78,7 @@ fn one_image_contains_host_and_switch_state_arenas() {
         initial_events: Vec::new(),
         seed: 7,
         stage_joins: Vec::new(),
+        seeded_all_to_alls: Vec::new(),
     };
 
     assert_eq!(image.nodes[0].kind, NodeKind::Host);

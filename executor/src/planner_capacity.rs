@@ -1091,6 +1091,7 @@ mod tests {
             initial_events: vec![],
             seed: 1,
             stage_joins: Vec::new(),
+            seeded_all_to_alls: Vec::new(),
         };
         let context = PlannerCapacityContext::new(
             &image,

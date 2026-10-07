@@ -42,6 +42,7 @@ mod planner_capacity;
 mod roce;
 pub mod safe_horizon;
 pub mod scalar;
+mod seeded_matrix;
 mod stage_index;
 mod stage_sizing;
 pub mod tcp;
@@ -97,9 +98,9 @@ pub use image::{
     GeneratorTermination, HostPfcState, HostState, LinkDescriptor, NodeDescriptor,
     PacketDescriptor, PacketKind, PfcHeader, PfcIngressState, PfcQueueState, RateGenerator,
     RemoteChannel, RoceAckHeader, RoceDataHeader, RoceGenerator, RoceNackMark, RocePacer,
-    RoceReceiverState, ScheduledEmission, SimulationImage, StageDependencies, StagePredecessors,
-    StageRole, SwitchQueueState, SwitchState, TcpAckHeader, TcpDataHeader, TcpGenerator,
-    TcpReceiveRange, TcpReceiverState, TcpTimerState, default_propagation_ns,
+    RoceReceiverState, ScheduledEmission, SeededCollective, SimulationImage, StageDependencies,
+    StagePredecessors, StageRole, SwitchQueueState, SwitchState, TcpAckHeader, TcpDataHeader,
+    TcpGenerator, TcpReceiveRange, TcpReceiverState, TcpTimerState, default_propagation_ns,
 };
 pub use mechanism_trace::{
     CollectiveActivationCause, CollectiveProgressRecord, CollectiveStageKind, CollectiveTraceError,
@@ -152,6 +153,7 @@ pub use scalar::{
     ObservationMode, PacketArrivalObservation, PacketDeparture, RunResult, RunSummary,
     TcpTransitionInput, TcpTransitionRecord, run_scalar, run_scalar_with_observations,
 };
+pub use seeded_matrix::{RoutingSkew, SeededAllToAll};
 pub use tcp::{CUBIC_WINDOW_SCALE, TcpCongestionControl, TcpPhase};
 pub use tcp_trace::{TcpTraceError, tcp_transitions_csv};
 pub use time::{TimeError, link_arrival_time_ns, serialization_time_ns};

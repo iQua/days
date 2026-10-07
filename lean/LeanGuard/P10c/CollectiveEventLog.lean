@@ -1,5 +1,6 @@
 import DaysExecutor.Event
 import LeanGuard.P10c.Collective.Semantics
+import LeanGuard.P10c.Collective.SeededMatrix
 import LeanGuard.Shared.Check
 import LeanGuard.Shared.Csv
 
@@ -76,6 +77,27 @@ def parseU32 (value : String) : Except String Nat :=
 def parseU64 (value : String) : Except String Nat :=
   parseBounded "u64" Collective.maxU64 value
 
+/-- A seeded all-to-all's matrix parameters,
+`seed;matrix;group;transpose;experts;topk;tokens;bytes_per_copy;skew`; empty for none. -/
+def parseSeededMatrix (value : String) : Except String (Option Collective.SeededMatrix.Params) := do
+  if value.isEmpty then return none
+  match value.splitOn ";" with
+  | [seed, matrix, group, transpose, experts, topk, tokens, bytesPerCopy, skew] =>
+      pure (some
+        { seed := ← parseU64 seed
+          matrix := ← parseU64 matrix
+          group := ← parseU64 group
+          transpose := ← parseBit transpose
+          experts := ← parseU64 experts
+          topk := ← parseU64 topk
+          tokens := ← parseU64 tokens
+          bytesPerCopy := ← parseU64 bytesPerCopy
+          skew := ← match skew with
+            | "zipf1" => pure .zipf1
+            | "uniform" => pure .uniform
+            | other => throw s!"invalid seeded matrix skew: '{other}'" })
+  | _ => throw s!"invalid seeded matrix parameters: '{value}'"
+
 /-- A `;`-separated list of flow ids; empty for none. -/
 def parseFlowList (value : String) : Except String (List Nat) :=
   if value.isEmpty then pure [] else (value.splitOn ";").mapM parseU64
@@ -145,6 +167,9 @@ structure Row where
   /-- The stages of the row's collective or compute group in the image (a seeded all-to-all has
   no stage for a pair of zero bytes). -/
   groupStages : Nat
+  /-- A seeded all-to-all's matrix parameters (`seeded_matrix`), from which every pair's bytes are
+  re-derived; `none` on every other row. -/
+  seededMatrix : Option Collective.SeededMatrix.Params
   srcLine : Nat
   deriving DecidableEq, Repr
 
@@ -217,6 +242,7 @@ def parseRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array Strin
         afterLocalCompleted := ← parseU32 (← getField idx fields "after_local_completed")
         causeTotalBytes := ← parseU64 (← getField idx fields "cause_total_bytes")
         groupStages := ← parseU64 (← getField idx fields "group_stages")
+        seededMatrix := ← parseSeededMatrix (← getField idx fields "seeded_matrix")
         srcLine := lineNo }
   match result with
   | .ok row => pure row
@@ -430,6 +456,8 @@ def checkTransportRow (row : Row) (algorithm : Collective.Algorithm) (phase : Co
       "RoCE collective stage requires a positive MTU and pacing interval and no duration"
   require row.srcLine (policiesAgree row algorithm)
     "collective chunk or channel policy is inconsistent with its algorithm"
+  require row.srcLine ((row.chunkPolicy = some .seeded) = row.seededMatrix.isSome)
+    "seeded matrix parameters name exactly the seeded all-to-all rows"
   let owner := Collective.stageOwner algorithm phase row.groupSize row.rank row.step
   match algorithm.isRing, row.chunkPolicy, row.channelPolicy with
   | true, some .equalRemainderLast, _ =>
@@ -503,7 +531,8 @@ def checkComputeRow (row : Row) : Except String Unit := do
   require row.srcLine
     (row.algorithm.isNone && row.collectivePhase.isNone && row.step = 0 &&
       row.declaredTotalBytes = 0 && row.chunkOffsetBytes = 0 && row.chunkBytes = 0 &&
-      row.channel = 0 && row.chunkPolicy.isNone && row.channelPolicy.isNone)
+      row.channel = 0 && row.chunkPolicy.isNone && row.channelPolicy.isNone &&
+      row.seededMatrix.isNone)
     "compute stage row carries collective fields"
   -- Amendment 5: a compute stage whose inbound predecessors are RoCE stages carries their queue
   -- pairs' MTU and pacing interval; every other compute stage writes zero in both.
@@ -568,7 +597,8 @@ def sameGroupConfig (first second : Row) : Bool :=
     first.stopTimeNs = second.stopTimeNs &&
     first.chunkPolicy = second.chunkPolicy &&
     first.channelPolicy = second.channelPolicy &&
-    first.groupStages = second.groupStages
+    first.groupStages = second.groupStages &&
+    first.seededMatrix = second.seededMatrix
 
 def sameStage (first second : Row) : Bool :=
   sameGroup first second &&
@@ -1277,6 +1307,16 @@ structure CoverageIndex where
   causes : Std.HashSet (StageId × Nat) := ∅
   causeCounts : Std.HashMap StageId Nat := ∅
   causeTotals : Std.HashMap StageId Nat := ∅
+  /-- Each seeded all-to-all's re-derived matrix (row-major bytes and its nonzero pairs), from its
+  first row's parameters (`sameGroupConfig` makes them every row's); `none` when the parameters
+  derive no matrix. -/
+  matrices : Std.HashMap GroupId (Option (Array Nat × Nat)) := ∅
+
+/-- The re-derived matrix of a seeded row's group and its pairs of nonzero bytes. -/
+def seededMatrixOf (row : Row) : Option (Array Nat × Nat) := do
+  let params ← row.seededMatrix
+  let matrix ← Collective.SeededMatrix.bytes params row.groupSize
+  pure (matrix, (matrix.toList.filter (· > 0)).length)
 
 def coverageIndex (rows : List Row) : CoverageIndex := Id.run do
   let mut index : CoverageIndex := {}
@@ -1293,6 +1333,8 @@ def coverageIndex (rows : List Row) : CoverageIndex := Id.run do
             channels := max tally.channels (row.channel + 1) }
         -- Rows are canonical, so the last insertion is the stage's final row.
         finals := index.finals.insert stage row }
+    if row.chunkPolicy = some .seeded && !index.matrices.contains (groupId row) then
+      index := { index with matrices := index.matrices.insert (groupId row) (seededMatrixOf row) }
     if row.cause = .inboundArrival && !index.causes.contains (stage, row.causeFlowId) then
       index :=
         { index with
@@ -1305,8 +1347,9 @@ def coverageIndex (rows : List Row) : CoverageIndex := Id.run do
 /-- A complete trace releases every logged stage exactly once and leaves it complete, each
 inbound predecessor having delivered its whole total. A transport collective logs its non-root
 stages, plus its roots when compute stages gate them; a compute group logs one stage per rank. The
-group's stage count in the image agrees with its algorithm, except for a seeded all-to-all, whose
-pairs of zero bytes have no stage: its roots are all gated, so it logs exactly that many. A
+group's stage count in the image agrees with its algorithm; a seeded all-to-all's is its matrix's
+nonzero pairs, re-derived from the parameters the rows name (its roots are all gated, so it logs
+each), and each pair carries exactly its matrix entry's bytes. A
 channel's messages are `UniformFloor` over the collective's channels, at their owner's slot. The
 group tallies are computed once, so the check is linear; each row is checked in canonical order,
 as by a per-row scan of its group. -/
@@ -1315,21 +1358,30 @@ def checkCoverage (rows : List Row) : Except String Unit := do
   for row in rows do
     let tally := index.groups.getD (groupId row) {}
     let seeded := row.chunkPolicy = some .seeded
+    let mut pairs := 0
+    if seeded then
+      let (matrix, nonzero) ← requireSome row.srcLine "a matrix derived from the seeded parameters"
+        (index.matrices.getD (groupId row) none)
+      pairs := nonzero
+      let n := row.groupSize
+      require row.srcLine
+        (row.chunkBytes > 0 &&
+          matrix.getD (row.rank * n + (row.rank + row.step) % n) 0 = row.chunkBytes)
+        "seeded all-to-all pair does not carry its matrix's bytes"
     let expected :=
       match row.stageKind, row.algorithm with
       | .tcp, some algorithm | .roce, some algorithm =>
-          if seeded then row.groupStages
+          if seeded then pairs
           else Collective.expectedActivationCountOf algorithm row.groupSize tally.channels
             tally.hasRoot
       | _, _ => row.groupSize
     let imageStages :=
       match row.stageKind, row.algorithm with
       | .tcp, some algorithm | .roce, some algorithm =>
-          Collective.expectedActivationCountOf algorithm row.groupSize tally.channels true
+          if seeded then pairs
+          else Collective.expectedActivationCountOf algorithm row.groupSize tally.channels true
       | _, _ => row.groupSize
-    require row.srcLine
-      (if seeded then row.groupStages ≤ row.groupSize * (row.groupSize - 1)
-        else row.groupStages = imageStages)
+    require row.srcLine (row.groupStages = imageStages)
       s!"collective stage count disagrees with its algorithm for collective_id={row.collectiveId}"
     require row.srcLine (tally.stages = expected)
       s!"incomplete collective progress coverage for collective_id={row.collectiveId}: expected {expected}, found {tally.stages}"
