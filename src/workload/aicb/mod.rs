@@ -12,6 +12,7 @@ mod groups;
 mod parse;
 mod schedule;
 mod simai_conf;
+mod topology;
 
 pub use error::AicbError;
 pub use groups::{Fidelity, GroupFamily, Groups, form_groups, render_mockncclgroup};
@@ -27,3 +28,4 @@ pub use simai_conf::{
     INERT_KEYS, PfcTier, RECORDED_KEYS, RailShape, SimaiConf, SimaiDcqcn, SimaiFabric, SimaiRoce,
     derive_fabric, parse_simai_conf,
 };
+pub use topology::{check_simai_topology, simai_topology};
