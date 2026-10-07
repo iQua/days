@@ -267,6 +267,15 @@ def checkNotifyDeliveryReference (rows : List Row) (row : Row) : Except String U
           (row.causeOriginNs = release.key.timeNs && row.causeDelayNs = release.durationNs)
           "stage notify delivery does not name its release and delay"
 
+/-- The first row the same stage notify causes names the same collective (see
+`checkNotifyCauseLabels`). -/
+def checkNotifyCauseLabelReference (rows : List Row) (row : Row) : Except String Unit := do
+  if row.causeKind = .notify then
+    if let some first := rows.find? fun other =>
+        other.causeKind = .notify && other.causeFlowId = row.causeFlowId then
+      require row.srcLine (row.causeCollectiveId = first.causeCollectiveId)
+        "the rows a stage notify causes name different collectives"
+
 /-- The first row an unlogged notify of the same collective causes names the same origin (see
 `checkUnloggedNotifyOrigins`). -/
 def checkUnloggedNotifyOriginReference (rows : List Row) (row : Row) : Except String Unit := do
@@ -381,6 +390,7 @@ def checkRowsReference (rows : List Row) : Except String Unit := do
   for row in canonical do
     checkLocalSignalReference canonical row
     checkNotifyDeliveryReference canonical row
+  for row in canonical do checkNotifyCauseLabelReference canonical row
   for row in canonical do checkUnloggedNotifyOriginReference canonical row
 
 end LeanGuard.P10c.CollectiveEventLog

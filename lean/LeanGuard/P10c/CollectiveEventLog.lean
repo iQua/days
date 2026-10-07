@@ -1272,6 +1272,18 @@ def checkNotifyDelivery (index : LookupIndex) (row : Row) : Except String Unit :
           (row.causeOriginNs = release.key.timeNs && row.causeDelayNs = release.durationNs)
           "stage notify delivery does not name its release and delay"
 
+/-- Review N2 (P16 H1 fix round 3): every row a stage notify causes names one collective, the
+first such row's (a logged notify's is also its release row's, `checkNotifyDelivery`). -/
+def checkNotifyCauseLabels (rows : List Row) : Except String Unit := do
+  let mut labels : Std.HashMap Nat (Option Nat) := ∅
+  for row in rows do
+    if row.causeKind = .notify then
+      match labels.get? row.causeFlowId with
+      | some label =>
+          require row.srcLine (row.causeCollectiveId = label)
+            "the rows a stage notify causes name different collectives"
+      | none => labels := labels.insert row.causeFlowId row.causeCollectiveId
+
 /-- An unlogged stage notify is an ungated root: it starts with its collective, at the collective's
 initial delay, which the certificate does not name. Every row such a notify causes names that
 start as its origin (its sender's timer completion, as for any timer, and its delivery), so all
@@ -1549,6 +1561,7 @@ def checkRows (rows : List Row) : Except String Unit := do
   for row in canonical do
     checkLocalSignal index row
     checkNotifyDelivery index row
+  checkNotifyCauseLabels canonical
   checkUnloggedNotifyOrigins index canonical
 
 end LeanGuard.P10c.CollectiveEventLog
