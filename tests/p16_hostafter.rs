@@ -145,7 +145,10 @@ fn fixtures() -> Vec<(&'static str, String)> {
         (
             // Two DP rings, {0, 4} (TCP) and {1, 5} (RoCE), each after both EP instances' compute
             // groups (each rank waits for the instance it is in), then a compute over their four
-            // hosts after both rings (each host waits for the ring it is in).
+            // hosts after both rings (each host waits for the ring it is in), and a compute on
+            // {4, 0} after both instances (rank 0 waits for instance 1's rank 0, rank 1 for
+            // instance 0's), and one on {5, 4} after `post` and `mix` (host 5 waits for `post`
+            // alone).
             "dp-after-ep",
             star(
                 8,
@@ -167,7 +170,9 @@ fn fixtures() -> Vec<(&'static str, String)> {
                         "after = [\"ep0\", \"ep1\"]\n",
                         6_000,
                     )
-                    + &compute("post", "0, 1, 4, 5", 1_000, "after = [\"dp0\", \"dp1\"]")),
+                    + &compute("post", "0, 1, 4, 5", 1_000, "after = [\"dp0\", \"dp1\"]")
+                    + &compute("mix", "4, 0", 500, "after = [\"ep0\", \"ep1\"]")
+                    + &compute("tail", "5, 4", 500, "after = [\"post\", \"mix\"]")),
             ),
         ),
         (
@@ -341,28 +346,41 @@ fn a_dp_ring_waits_at_each_host_for_the_ep_instance_there() {
 }
 
 /// The Send/Recv's message waits for stage 0 at the sender; stage 1's next compute waits at host
-/// 2 for stage 1 and the message (inbound) and at host 3 for stage 1 alone.
+/// 2 for stage 1 and the message (inbound) and at host 3 for stage 1 alone; stage 0's next compute
+/// at host 1 for stage 0 and the send (both local).
 #[test]
 fn a_pipeline_send_joins_only_the_hosts_it_runs_on() {
     let image = lower("sendrecv-across-stages", &fixtures()[4].1);
+    // At a host: (the first compute stage without predecessors, the one with).
+    let computes = |host| {
+        let all = stages_at(&image, host)
+            .into_iter()
+            .filter(|(role, ..)| matches!(role, StageRole::Compute(_)))
+            .collect::<Vec<_>>();
+        let first = all
+            .iter()
+            .find(|stage| stage.2.is_empty() && stage.3.is_empty())
+            .expect("the first stage")
+            .1;
+        let next = all
+            .into_iter()
+            .find(|stage| !stage.2.is_empty())
+            .expect("the next stage");
+        (first, next)
+    };
     let message = stages_at(&image, 1)
         .into_iter()
         .find(|(role, ..)| matches!(role, StageRole::Collective(_)))
         .expect("the message");
-    assert_eq!(message.2, vec![compute_flow(&image, 1, 0)]);
-    let s1 = |host| compute_flow(&image, host, 1);
-    let s1b_at = |host| {
-        stages_at(&image, host)
-            .into_iter()
-            .find(
-                |(role, ..)| matches!(role, StageRole::Compute(compute) if compute.compute_id == 2),
-            )
-            .expect("s1b")
-    };
-    let at2 = s1b_at(2);
-    assert_eq!((at2.2, at2.3), (vec![s1(2)], vec![message.1]));
-    let at3 = s1b_at(3);
-    assert_eq!((at3.2, at3.3), (vec![s1(3)], vec![]));
+    let (s0_at1, s0b_at1) = computes(1);
+    assert_eq!((message.2.clone(), message.3), (vec![s0_at1], vec![]));
+    let mut both = vec![s0_at1, message.1];
+    both.sort_unstable();
+    assert_eq!((s0b_at1.2, s0b_at1.3), (both, vec![]));
+    let (s1_at2, s1b_at2) = computes(2);
+    assert_eq!((s1b_at2.2, s1b_at2.3), (vec![s1_at2], vec![message.1]));
+    let (s1_at3, s1b_at3) = computes(3);
+    assert_eq!((s1b_at3.2, s1b_at3.3), (vec![s1_at3], vec![]));
 }
 
 /// Rejected host matches, each with a precise message.

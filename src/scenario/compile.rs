@@ -5284,17 +5284,78 @@ fn collective_completion(
     Ok(bytes)
 }
 
-/// The predecessors a group's rank-`rank` stage takes from the groups it names in `after`: a
-/// compute group's rank-`rank` stage, and each collective's completion at the rank.
+/// How a dependent group's ranks map onto the ranks of the groups its `after` lists (host-matched
+/// `after`, the ruling on H3's C1): rank `r` of the dependent, at host `h`, waits for each listed
+/// group that runs on `h`, through that group's rank at `h`. A listed group on the same hosts in
+/// the same order (every group before the ruling) maps rank `r` to rank `r`; only a group on
+/// other hosts gets a `(host, rank)` table, sorted by host, so equal host lists allocate nothing.
+struct AfterRanks {
+    /// Per listed group, in `after` order: `None` when it runs on the dependent's hosts in order.
+    /// `None` overall when every listed group does.
+    tables: Option<Vec<Option<Vec<(u64, u32)>>>>,
+}
+
+impl AfterRanks {
+    fn new(plan: &StagePlan<'_>, after: Option<&AfterGroups>, hosts: &[u64]) -> Self {
+        let names = after_names(after);
+        let hosts_of = |name: &String| match plan.groups[name] {
+            StageGroup::Compute(compute) => compute.hosts.as_slice(),
+            StageGroup::Collective(collective) => collective.sources.as_slice(),
+        };
+        if names.iter().all(|name| hosts_of(name) == hosts) {
+            return Self { tables: None };
+        }
+        let tables = names
+            .iter()
+            .map(|name| {
+                let theirs = hosts_of(name);
+                (theirs != hosts).then(|| {
+                    let mut table = (0_u32..)
+                        .zip(theirs)
+                        .map(|(rank, &host)| (host, rank))
+                        .collect::<Vec<_>>();
+                    table.sort_unstable();
+                    table
+                })
+            })
+            .collect();
+        Self {
+            tables: Some(tables),
+        }
+    }
+
+    /// The rank at `host` of the `index`-th listed group, given the dependent's rank there.
+    fn rank(&self, index: usize, rank: u32, host: u64) -> Option<u32> {
+        match self
+            .tables
+            .as_ref()
+            .and_then(|tables| tables[index].as_ref())
+        {
+            None => Some(rank),
+            Some(table) => table
+                .binary_search_by_key(&host, |&(host, _)| host)
+                .ok()
+                .map(|position| table[position].1),
+        }
+    }
+}
+
+/// The predecessors a group's rank-`rank` stage, at `host`, takes from the groups it names in
+/// `after` that run on `host`: a compute group's stage there, and each collective's completion
+/// at its rank there.
 fn entry_predecessors(
     plan: &StagePlan<'_>,
     after: Option<&AfterGroups>,
-    rank: u32,
+    ranks: &AfterRanks,
+    (rank, host): (u32, u64),
 ) -> Result<(PredecessorKeys, PredecessorKeys, u64), CompileError> {
     let mut local = PredecessorKeys::None;
     let mut inbound = PredecessorKeys::None;
     let mut bytes = 0_u64;
-    for name in after_names(after) {
+    for (index, name) in after_names(after).iter().enumerate() {
+        let Some(rank) = ranks.rank(index, rank, host) else {
+            continue;
+        };
         match plan.groups[name] {
             StageGroup::Compute(predecessor) => local.push(FlowKey::ComputeStage {
                 compute: compute_ordinal(plan.computes, predecessor),
@@ -5332,6 +5393,7 @@ fn expand_collective(
         return Ok(());
     }
     let layout = plan.layout(collective);
+    let after_ranks = AfterRanks::new(plan, semantic.after.as_ref(), &semantic.sources);
     let group_size = u32::try_from(n)
         .map_err(|_| CompileError::Invalid("collective group size exceeds u32".to_owned()))?;
     let stage_key = |stage: CollectiveStagePosition| FlowKey::CollectiveStage {
@@ -5387,7 +5449,12 @@ fn expand_collective(
                 .try_reserve(size * (size - 1))
                 .map_err(|error| CompileError::Invalid(format!("stage table: {error}")))?;
             for rank in 0..group_size {
-                let entry = entry_predecessors(plan, semantic.after.as_ref(), rank)?;
+                let entry = entry_predecessors(
+                    plan,
+                    semantic.after.as_ref(),
+                    &after_ranks,
+                    (rank, semantic.sources[rank as usize]),
+                )?;
                 for step in 1..group_size {
                     let target = (rank + step) % group_size;
                     let bytes = layout.pair_bytes[rank as usize * size + target as usize];
@@ -5417,7 +5484,12 @@ fn expand_collective(
                 rank: 0,
                 step: 1,
             };
-            let entry = entry_predecessors(plan, semantic.after.as_ref(), 0)?;
+            let entry = entry_predecessors(
+                plan,
+                semantic.after.as_ref(),
+                &after_ranks,
+                (0, semantic.sources[0]),
+            )?;
             push(
                 flows,
                 position,
@@ -5478,7 +5550,12 @@ fn expand_collective(
                                     chunk.1,
                                 )
                             } else {
-                                entry_predecessors(plan, semantic.after.as_ref(), rank)?
+                                entry_predecessors(
+                                    plan,
+                                    semantic.after.as_ref(),
+                                    &after_ranks,
+                                    (rank, semantic.sources[rank as usize]),
+                                )?
                             };
                             push(flows, at(phase, rank, step), target, chunk, predecessors);
                         }
@@ -5497,8 +5574,11 @@ enum StageGroup<'a> {
     Compute(&'a ComputeKey),
 }
 
-/// Resolves the provisional stage-group dependencies: every `after` names exactly one group, the
-/// named group runs on the same hosts in the same rank order, and the dependencies are acyclic.
+/// Resolves the provisional stage-group dependencies: every `after` names known groups, each once;
+/// the dependencies are acyclic; and they match hosts (the ruling on H3's C1, design §4.2): rank
+/// `r` of a group waits, at its host, for each listed group that runs there. So every listed
+/// group runs on at least one host where the dependent starts (all its hosts, a Send/Recv's
+/// sender alone), and every host where a collective starts runs at least one listed group.
 fn resolve_stage_groups<'a>(
     collectives: &'a [CollectiveKey],
     computes: &'a [ComputeKey],
@@ -5524,15 +5604,22 @@ fn resolve_stage_groups<'a>(
             )));
         }
     }
-    // Every `after` names known groups, each once, that run on the same hosts in the same rank
-    // order; a collective follows at least one compute group (ruling R4).
+    // Every `after` names known groups, each once, that match the dependent's hosts; a
+    // collective follows at least one compute group (ruling R4).
     let dependents = collectives
         .iter()
         .map(|collective| {
+            // A Send/Recv starts at its sender alone; every other collective at all its ranks.
+            let starts = if collective.algorithm == CollectiveAlgorithm::SendRecv {
+                &collective.sources[..1]
+            } else {
+                &collective.sources[..]
+            };
             (
                 "collective",
                 collective.name.as_deref().unwrap_or("<unnamed>"),
-                &collective.sources,
+                &collective.sources[..],
+                starts,
                 collective.after.as_ref(),
                 true,
             )
@@ -5541,14 +5628,18 @@ fn resolve_stage_groups<'a>(
             (
                 "compute",
                 compute.name.as_str(),
-                &compute.hosts,
+                &compute.hosts[..],
+                &compute.hosts[..],
                 compute.after.as_ref(),
                 false,
             )
         }));
-    for (kind, label, hosts, after, is_collective) in dependents {
+    for (kind, label, hosts, starts, after, is_collective) in dependents {
         let names = after_names(after);
         let mut follows_compute = false;
+        // The sorted hosts of each listed group that does not run on exactly the dependent's
+        // hosts in order (none for equal lists, so they allocate nothing).
+        let mut other_hosts = Vec::<Vec<u64>>::new();
         for (index, after) in names.iter().enumerate() {
             if names[..index].contains(after) {
                 return Err(CompileError::Invalid(format!(
@@ -5574,12 +5665,34 @@ fn resolve_stage_groups<'a>(
                     &collective.sources
                 }
             };
-            if predecessor_hosts != hosts {
+            if predecessor_hosts.as_slice() == hosts {
+                continue;
+            }
+            let mut sorted = predecessor_hosts.clone();
+            sorted.sort_unstable();
+            if !starts.iter().any(|host| sorted.binary_search(host).is_ok()) {
                 return Err(CompileError::Invalid(if is_collective {
-                    format!("collective `{label}` ranks must equal the hosts of `{after}` in order")
+                    format!(
+                        "collective `{label}` names stage group `{after}`, which runs on none of the hosts it starts at"
+                    )
                 } else {
-                    format!("compute `{label}` hosts must equal the ranks of `{after}` in order")
+                    format!(
+                        "compute `{label}` names stage group `{after}`, which runs on none of its hosts"
+                    )
                 }));
+            }
+            other_hosts.push(sorted);
+        }
+        // Every host where a collective starts runs a listed group (an equal list covers all).
+        if is_collective && !other_hosts.is_empty() && other_hosts.len() == names.len() {
+            if let Some((rank, host)) = starts.iter().enumerate().find(|(_, host)| {
+                !other_hosts
+                    .iter()
+                    .any(|sorted| sorted.binary_search(host).is_ok())
+            }) {
+                return Err(CompileError::Invalid(format!(
+                    "collective `{label}` rank {rank} (host {host}) starts after no operation its `after` lists"
+                )));
             }
         }
         if is_collective && !names.is_empty() && !follows_compute {
@@ -5670,9 +5783,10 @@ fn expand_compute(
 ) -> Result<(), CompileError> {
     let group_size = u32::try_from(compute.hosts.len())
         .expect("compute validation bounded the group size by u32");
+    let after_ranks = AfterRanks::new(plan, compute.after.as_ref(), &compute.hosts);
     for (rank, &host) in (0_u32..).zip(&compute.hosts) {
         let (local, inbound, inbound_predecessor_bytes) =
-            entry_predecessors(plan, compute.after.as_ref(), rank)?;
+            entry_predecessors(plan, compute.after.as_ref(), &after_ranks, (rank, host))?;
         flows.push(FlowInput {
             key: FlowKey::ComputeStage {
                 compute: compute_id,

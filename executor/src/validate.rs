@@ -3650,14 +3650,7 @@ fn validate_collective_stage(
     let first_phase = collective.algorithm != Algorithm::RingAllReduce
         || collective.phase == Phase::ReduceScatter;
     if !ring || collective.step == 1 && first_phase {
-        return validate_entry_predecessors(
-            image,
-            flow_index,
-            flow,
-            (collective.rank, collective.group_size),
-            dependencies,
-            inline,
-        );
+        return validate_entry_predecessors(image, flow_index, flow, dependencies, inline);
     }
     let final_step = collective.group_size - 1;
     let (phase, step) = if collective.step > 1 {
@@ -4056,9 +4049,9 @@ fn host_tcp_receiver(
 
 /// Invariants of one compute (delay-only) stage.
 ///
-/// The generator is a zero-byte constant timer whose interval is the compute duration. Its local
-/// predecessor is the same-rank stage of a compute group, or the same-rank final stage of a
-/// collective together with the previous rank's final stage as the inbound predecessor. A released
+/// The generator is a zero-byte constant timer whose interval is the compute duration. Its
+/// predecessors are the stages at its host of the groups it follows
+/// (`validate_entry_predecessors`). A released
 /// stage is timed (`Scheduled` with its token and one `PacingTimer`), beyond the stop (`Stopped`),
 /// or complete (`Finished`).
 #[allow(clippy::too_many_arguments)]
@@ -4106,14 +4099,7 @@ fn validate_compute_stage(
     }
 
     let inline = validate_stage_dependencies(image, flow_index, state, flow, stage)?;
-    validate_entry_predecessors(
-        image,
-        flow_index,
-        flow,
-        (compute.rank, compute.group_size),
-        dependencies,
-        inline,
-    )?;
+    validate_entry_predecessors(image, flow_index, flow, dependencies, inline)?;
     let emission = generator.next_emission;
     let consistent = match emission.status {
         GeneratorStatus::Blocked => {
@@ -4181,47 +4167,40 @@ const fn previous_rank(rank: u32, group_size: u32) -> u32 {
 }
 
 /// The shape of the predecessors of a stage that follows stage groups (a compute stage, or a
-/// collective's root): it waits for groups on its own ranks. Each local predecessor is the
-/// same-rank stage of a compute group, or a same-rank completion stage of a collective; each
-/// inbound predecessor is a completion stage of a collective that also has a same-rank local
-/// predecessor here, and on one ring (`RingNext`) the previous rank's.
+/// collective's root): it waits, at its host, for the groups it follows there (host-matched
+/// `after`, the ruling on H3's C1). Each local predecessor is a compute stage on its host, or a
+/// completion stage of a collective there (`validate_stage_dependencies` pins the host); each
+/// inbound predecessor is a completion stage of a collective delivering here that also has a
+/// local completion stage here, at the collective's rank `r` here, and on one ring (`RingNext`)
+/// it is rank `r - 1`'s. A send/recv's receiver waits for the send alone.
 fn validate_entry_predecessors(
     image: &SimulationImage,
     flow_index: &FlowIndex,
     flow: &crate::FlowDescriptor,
-    (rank, group_size): (u32, u32),
     dependencies: crate::StageDependencies,
     inline: InlinePredecessors<'_>,
 ) -> Result<(), ValidationError> {
     let shape_error = || {
         ValidationError::new(format!(
-            "flow {:?} compute predecessors are neither a same-rank compute stage nor a collective's final stages",
+            "flow {:?} entry predecessors are neither compute stages nor a collective's completion stages at its host",
             flow.id
         ))
     };
-    let previous_rank = previous_rank(rank, group_size);
     let role_of = |candidate: Option<StagedGenerator<'_>>, id| {
         candidate
             .or_else(|| flow_index.generator_for_flow(image, id))
             .and_then(|candidate| candidate.stage)
             .map(|stage| stage.role)
     };
-    // The collective this local predecessor completes at the rank, if it is a collective stage.
-    let local_collective = |id| -> Result<Option<u64>, ValidationError> {
+    // The collective this local predecessor completes here, with its rank here, if it is a
+    // collective stage.
+    let local_collective = |id| -> Result<Option<(u64, u32)>, ValidationError> {
         match role_of(inline.local, id).ok_or_else(shape_error)? {
-            crate::StageRole::Compute(previous)
-                if previous.rank == rank && previous.group_size == group_size =>
-            {
-                Ok(None)
+            crate::StageRole::Compute(_) => Ok(None),
+            crate::StageRole::Collective(stage) if is_completion_stage(stage) => {
+                Ok(Some((stage.collective_id, stage.rank)))
             }
-            crate::StageRole::Collective(stage)
-                if is_completion_stage(stage)
-                    && stage.rank == rank
-                    && stage.group_size == group_size =>
-            {
-                Ok(Some(stage.collective_id))
-            }
-            _ => Err(shape_error()),
+            crate::StageRole::Collective(_) => Err(shape_error()),
         }
     };
     for id in dependencies.local.iter(&image.stage_joins) {
@@ -4231,24 +4210,27 @@ fn validate_entry_predecessors(
         let Some(crate::StageRole::Collective(inbound)) = role_of(inline.inbound, id) else {
             return Err(shape_error());
         };
-        if !is_completion_stage(inbound)
-            || inbound.group_size != group_size
-            || inbound.channel_policy == crate::CollectiveChannelPolicy::RingNext
-                && inbound.rank != previous_rank
-        {
+        if !is_completion_stage(inbound) {
             return Err(shape_error());
         }
         // A send/recv's receiver waits for the send alone; every other collective it follows
-        // also completes at this rank locally.
+        // also completes here locally, at its rank here.
         if inbound.algorithm != crate::CollectiveAlgorithm::SendRecv {
-            let mut paired = false;
+            let mut rank_here = None;
             for local in dependencies.local.iter(&image.stage_joins) {
-                if local_collective(local)? == Some(inbound.collective_id) {
-                    paired = true;
-                    break;
+                if let Some((collective, rank)) = local_collective(local)? {
+                    if collective == inbound.collective_id {
+                        rank_here = Some(rank);
+                        break;
+                    }
                 }
             }
-            if !paired {
+            let Some(rank_here) = rank_here else {
+                return Err(shape_error());
+            };
+            if inbound.channel_policy == crate::CollectiveChannelPolicy::RingNext
+                && inbound.rank != previous_rank(rank_here, inbound.group_size)
+            {
                 return Err(shape_error());
             }
         }
