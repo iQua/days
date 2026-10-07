@@ -210,24 +210,39 @@ pub(crate) fn encode_stage_region(
 }
 
 /// The in-order frontier of `flow` at its target host: TCP's next expected sequence, or a RoCE
-/// queue pair's expected PSN.
+/// queue pair's expected PSN. A stage notify (P16 H2) has no receiver: it delivers its whole chunk
+/// in one arrival, so its credit starts at zero. An undelivered notify then advances its join by
+/// the whole chunk, and a delivered one, already counted in the join's received bytes, never
+/// arrives again.
 fn inbound_frontier(image: &SimulationImage, flow: crate::FlowId) -> Option<u64> {
     let descriptor = image.flows.get(usize::try_from(flow.0).ok()?)?;
-    let node = image
-        .nodes
-        .iter()
-        .find(|node| node.id == descriptor.target && node.kind == crate::NodeKind::Host)?;
-    let state = image.host_states.get(node.state_slot as usize)?;
+    let host = |id: crate::NodeId| {
+        let node = image
+            .nodes
+            .iter()
+            .find(|node| node.id == id && node.kind == crate::NodeKind::Host)?;
+        image.host_states.get(node.state_slot as usize)
+    };
+    let state = host(descriptor.target)?;
     if let Some(receivers) = state.roce_receivers.as_deref() {
         if let Ok(position) = receivers.binary_search_by_key(&flow, |receiver| receiver.flow) {
             return Some(receivers[position].expected_psn);
         }
     }
-    state
+    if let Ok(position) = state
         .tcp_receivers
         .binary_search_by_key(&flow, |receiver| receiver.flow)
-        .ok()
-        .map(|position| state.tcp_receivers[position].next_expected_sequence)
+    {
+        return Some(state.tcp_receivers[position].next_expected_sequence);
+    }
+    let notify = host(descriptor.source)?
+        .generators_with_stages()
+        .any(|(generator, stage)| {
+            generator.flow == flow
+                && matches!(generator.kind, crate::FlowGeneratorKind::Constant(_))
+                && stage.is_some_and(|stage| matches!(stage.role, crate::StageRole::Collective(_)))
+        });
+    notify.then_some(0)
 }
 
 /// Appends the stage region to `tcp_state` and returns its start, or `None` (nothing appended)
