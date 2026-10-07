@@ -505,5 +505,14 @@ mutate_case "notify-cause-collective" "$rail_ring" \
   '$column["cause_flow_id"] == 0 && $column["cause_kind"] == "notify" { $column["cause_collective_id"] = 7 }' \
   'REJECT: line 10: stage notify cause names another collective'
 
+# Review N2 (fix round 3): every row a notify causes names one collective. Notify flow 0's delivery
+# row is relabelled to collective 1, then to 99 (none), while its sender's timer row keeps 0.
+mutate_case "ungated-notify-relabelled-delivery" "$rail_ungated" \
+  '$column["cause"] == "inbound_arrival" && $column["cause_flow_id"] == 0 { $column["cause_collective_id"] = 1 }' \
+  'REJECT: line 26: the rows a stage notify causes name different collectives'
+mutate_case "ungated-notify-relabelled-to-none" "$rail_ungated" \
+  '$column["cause"] == "inbound_arrival" && $column["cause_flow_id"] == 0 { $column["cause_collective_id"] = 99 }' \
+  'REJECT: line 26: the rows a stage notify causes name different collectives'
+
 echo "P10c exact-integer collective campaign checks: $checked"
 exit "$failures"
