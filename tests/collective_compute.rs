@@ -331,12 +331,22 @@ fn compute_dependency_errors_are_precise() {
         "invalid scenario: stage group dependencies form a cycle through `a`"
     );
     let named = base.replace("[[collective]]\n", "[[collective]]\nname = \"ring\"\n");
-    assert_eq!(
-        lowering_error(&format!(
-            "{named}\n[[compute]]\nname = \"a\"\nhosts = [0, 1]\nduration_ns = 1\nafter = \"ring\"\n"
-        )),
-        "invalid scenario: compute `a` hosts must equal the ranks of `ring` in order"
-    );
+    // Host-matched `after` (the ruling on H3's C1): a compute on some of the ring's hosts waits
+    // for the ring at each of them, so it lowers.
+    let subset = std::env::temp_dir().join(format!(
+        "days-p14-compute-subset-{}.toml",
+        std::process::id()
+    ));
+    fs::write(
+        &subset,
+        format!(
+            "{named}\n[[compute]]\nname = \"a\"\nhosts = [1, 0]\nduration_ns = 1\nafter = \"ring\"\n"
+        ),
+    )
+    .unwrap();
+    let lowered = compile_config(&subset);
+    fs::remove_file(subset).unwrap();
+    lowered.expect("a compute on some of the ring's hosts lowers");
     assert_eq!(
         lowering_error(&format!(
             "{named}\n[[compute]]\nname = \"ring\"\nhosts = [0, 1, 2]\nduration_ns = 1\n"
@@ -392,7 +402,7 @@ fn compute_validator_rejects_inconsistent_stage_state() {
             host.set_stage_dependencies(index, dependencies);
         },
         format!(
-            "flow {backward:?} compute predecessors are neither a same-rank compute stage nor a collective's final stages"
+            "flow {backward:?} entry predecessors are neither compute stages nor a collective's completion stages at its host"
         ),
     );
     reject(
