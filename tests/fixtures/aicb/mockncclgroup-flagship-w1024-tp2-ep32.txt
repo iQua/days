@@ -1,0 +1,1835 @@
+mockncclgroup W 1024 gpus_per_server 8 TP 2 DP 512 PP 1 EP 32 DP_EP 16
+group TP nNodes 1 nRanks 2 ranks 0 1
+  channel 0 next 0>1 1>0
+  channel 1 next 0>1 1>0
+group TP nNodes 1 nRanks 2 ranks 2 3
+  channel 0 next 2>3 3>2
+  channel 1 next 2>3 3>2
+group TP nNodes 1 nRanks 2 ranks 4 5
+  channel 0 next 4>5 5>4
+  channel 1 next 4>5 5>4
+group TP nNodes 1 nRanks 2 ranks 6 7
+  channel 0 next 6>7 7>6
+  channel 1 next 6>7 7>6
+group TP nNodes 1 nRanks 2 ranks 8 9
+  channel 0 next 8>9 9>8
+  channel 1 next 8>9 9>8
+group TP nNodes 1 nRanks 2 ranks 10 11
+  channel 0 next 10>11 11>10
+  channel 1 next 10>11 11>10
+group TP nNodes 1 nRanks 2 ranks 12 13
+  channel 0 next 12>13 13>12
+  channel 1 next 12>13 13>12
+group TP nNodes 1 nRanks 2 ranks 14 15
+  channel 0 next 14>15 15>14
+  channel 1 next 14>15 15>14
+group TP nNodes 1 nRanks 2 ranks 16 17
+  channel 0 next 16>17 17>16
+  channel 1 next 16>17 17>16
+group TP nNodes 1 nRanks 2 ranks 18 19
+  channel 0 next 18>19 19>18
+  channel 1 next 18>19 19>18
+group TP nNodes 1 nRanks 2 ranks 20 21
+  channel 0 next 20>21 21>20
+  channel 1 next 20>21 21>20
+group TP nNodes 1 nRanks 2 ranks 22 23
+  channel 0 next 22>23 23>22
+  channel 1 next 22>23 23>22
+group TP nNodes 1 nRanks 2 ranks 24 25
+  channel 0 next 24>25 25>24
+  channel 1 next 24>25 25>24
+group TP nNodes 1 nRanks 2 ranks 26 27
+  channel 0 next 26>27 27>26
+  channel 1 next 26>27 27>26
+group TP nNodes 1 nRanks 2 ranks 28 29
+  channel 0 next 28>29 29>28
+  channel 1 next 28>29 29>28
+group TP nNodes 1 nRanks 2 ranks 30 31
+  channel 0 next 30>31 31>30
+  channel 1 next 30>31 31>30
+group TP nNodes 1 nRanks 2 ranks 32 33
+  channel 0 next 32>33 33>32
+  channel 1 next 32>33 33>32
+group TP nNodes 1 nRanks 2 ranks 34 35
+  channel 0 next 34>35 35>34
+  channel 1 next 34>35 35>34
+group TP nNodes 1 nRanks 2 ranks 36 37
+  channel 0 next 36>37 37>36
+  channel 1 next 36>37 37>36
+group TP nNodes 1 nRanks 2 ranks 38 39
+  channel 0 next 38>39 39>38
+  channel 1 next 38>39 39>38
+group TP nNodes 1 nRanks 2 ranks 40 41
+  channel 0 next 40>41 41>40
+  channel 1 next 40>41 41>40
+group TP nNodes 1 nRanks 2 ranks 42 43
+  channel 0 next 42>43 43>42
+  channel 1 next 42>43 43>42
+group TP nNodes 1 nRanks 2 ranks 44 45
+  channel 0 next 44>45 45>44
+  channel 1 next 44>45 45>44
+group TP nNodes 1 nRanks 2 ranks 46 47
+  channel 0 next 46>47 47>46
+  channel 1 next 46>47 47>46
+group TP nNodes 1 nRanks 2 ranks 48 49
+  channel 0 next 48>49 49>48
+  channel 1 next 48>49 49>48
+group TP nNodes 1 nRanks 2 ranks 50 51
+  channel 0 next 50>51 51>50
+  channel 1 next 50>51 51>50
+group TP nNodes 1 nRanks 2 ranks 52 53
+  channel 0 next 52>53 53>52
+  channel 1 next 52>53 53>52
+group TP nNodes 1 nRanks 2 ranks 54 55
+  channel 0 next 54>55 55>54
+  channel 1 next 54>55 55>54
+group TP nNodes 1 nRanks 2 ranks 56 57
+  channel 0 next 56>57 57>56
+  channel 1 next 56>57 57>56
+group TP nNodes 1 nRanks 2 ranks 58 59
+  channel 0 next 58>59 59>58
+  channel 1 next 58>59 59>58
+group TP nNodes 1 nRanks 2 ranks 60 61
+  channel 0 next 60>61 61>60
+  channel 1 next 60>61 61>60
+group TP nNodes 1 nRanks 2 ranks 62 63
+  channel 0 next 62>63 63>62
+  channel 1 next 62>63 63>62
+group TP nNodes 1 nRanks 2 ranks 64 65
+  channel 0 next 64>65 65>64
+  channel 1 next 64>65 65>64
+group TP nNodes 1 nRanks 2 ranks 66 67
+  channel 0 next 66>67 67>66
+  channel 1 next 66>67 67>66
+group TP nNodes 1 nRanks 2 ranks 68 69
+  channel 0 next 68>69 69>68
+  channel 1 next 68>69 69>68
+group TP nNodes 1 nRanks 2 ranks 70 71
+  channel 0 next 70>71 71>70
+  channel 1 next 70>71 71>70
+group TP nNodes 1 nRanks 2 ranks 72 73
+  channel 0 next 72>73 73>72
+  channel 1 next 72>73 73>72
+group TP nNodes 1 nRanks 2 ranks 74 75
+  channel 0 next 74>75 75>74
+  channel 1 next 74>75 75>74
+group TP nNodes 1 nRanks 2 ranks 76 77
+  channel 0 next 76>77 77>76
+  channel 1 next 76>77 77>76
+group TP nNodes 1 nRanks 2 ranks 78 79
+  channel 0 next 78>79 79>78
+  channel 1 next 78>79 79>78
+group TP nNodes 1 nRanks 2 ranks 80 81
+  channel 0 next 80>81 81>80
+  channel 1 next 80>81 81>80
+group TP nNodes 1 nRanks 2 ranks 82 83
+  channel 0 next 82>83 83>82
+  channel 1 next 82>83 83>82
+group TP nNodes 1 nRanks 2 ranks 84 85
+  channel 0 next 84>85 85>84
+  channel 1 next 84>85 85>84
+group TP nNodes 1 nRanks 2 ranks 86 87
+  channel 0 next 86>87 87>86
+  channel 1 next 86>87 87>86
+group TP nNodes 1 nRanks 2 ranks 88 89
+  channel 0 next 88>89 89>88
+  channel 1 next 88>89 89>88
+group TP nNodes 1 nRanks 2 ranks 90 91
+  channel 0 next 90>91 91>90
+  channel 1 next 90>91 91>90
+group TP nNodes 1 nRanks 2 ranks 92 93
+  channel 0 next 92>93 93>92
+  channel 1 next 92>93 93>92
+group TP nNodes 1 nRanks 2 ranks 94 95
+  channel 0 next 94>95 95>94
+  channel 1 next 94>95 95>94
+group TP nNodes 1 nRanks 2 ranks 96 97
+  channel 0 next 96>97 97>96
+  channel 1 next 96>97 97>96
+group TP nNodes 1 nRanks 2 ranks 98 99
+  channel 0 next 98>99 99>98
+  channel 1 next 98>99 99>98
+group TP nNodes 1 nRanks 2 ranks 100 101
+  channel 0 next 100>101 101>100
+  channel 1 next 100>101 101>100
+group TP nNodes 1 nRanks 2 ranks 102 103
+  channel 0 next 102>103 103>102
+  channel 1 next 102>103 103>102
+group TP nNodes 1 nRanks 2 ranks 104 105
+  channel 0 next 104>105 105>104
+  channel 1 next 104>105 105>104
+group TP nNodes 1 nRanks 2 ranks 106 107
+  channel 0 next 106>107 107>106
+  channel 1 next 106>107 107>106
+group TP nNodes 1 nRanks 2 ranks 108 109
+  channel 0 next 108>109 109>108
+  channel 1 next 108>109 109>108
+group TP nNodes 1 nRanks 2 ranks 110 111
+  channel 0 next 110>111 111>110
+  channel 1 next 110>111 111>110
+group TP nNodes 1 nRanks 2 ranks 112 113
+  channel 0 next 112>113 113>112
+  channel 1 next 112>113 113>112
+group TP nNodes 1 nRanks 2 ranks 114 115
+  channel 0 next 114>115 115>114
+  channel 1 next 114>115 115>114
+group TP nNodes 1 nRanks 2 ranks 116 117
+  channel 0 next 116>117 117>116
+  channel 1 next 116>117 117>116
+group TP nNodes 1 nRanks 2 ranks 118 119
+  channel 0 next 118>119 119>118
+  channel 1 next 118>119 119>118
+group TP nNodes 1 nRanks 2 ranks 120 121
+  channel 0 next 120>121 121>120
+  channel 1 next 120>121 121>120
+group TP nNodes 1 nRanks 2 ranks 122 123
+  channel 0 next 122>123 123>122
+  channel 1 next 122>123 123>122
+group TP nNodes 1 nRanks 2 ranks 124 125
+  channel 0 next 124>125 125>124
+  channel 1 next 124>125 125>124
+group TP nNodes 1 nRanks 2 ranks 126 127
+  channel 0 next 126>127 127>126
+  channel 1 next 126>127 127>126
+group TP nNodes 1 nRanks 2 ranks 128 129
+  channel 0 next 128>129 129>128
+  channel 1 next 128>129 129>128
+group TP nNodes 1 nRanks 2 ranks 130 131
+  channel 0 next 130>131 131>130
+  channel 1 next 130>131 131>130
+group TP nNodes 1 nRanks 2 ranks 132 133
+  channel 0 next 132>133 133>132
+  channel 1 next 132>133 133>132
+group TP nNodes 1 nRanks 2 ranks 134 135
+  channel 0 next 134>135 135>134
+  channel 1 next 134>135 135>134
+group TP nNodes 1 nRanks 2 ranks 136 137
+  channel 0 next 136>137 137>136
+  channel 1 next 136>137 137>136
+group TP nNodes 1 nRanks 2 ranks 138 139
+  channel 0 next 138>139 139>138
+  channel 1 next 138>139 139>138
+group TP nNodes 1 nRanks 2 ranks 140 141
+  channel 0 next 140>141 141>140
+  channel 1 next 140>141 141>140
+group TP nNodes 1 nRanks 2 ranks 142 143
+  channel 0 next 142>143 143>142
+  channel 1 next 142>143 143>142
+group TP nNodes 1 nRanks 2 ranks 144 145
+  channel 0 next 144>145 145>144
+  channel 1 next 144>145 145>144
+group TP nNodes 1 nRanks 2 ranks 146 147
+  channel 0 next 146>147 147>146
+  channel 1 next 146>147 147>146
+group TP nNodes 1 nRanks 2 ranks 148 149
+  channel 0 next 148>149 149>148
+  channel 1 next 148>149 149>148
+group TP nNodes 1 nRanks 2 ranks 150 151
+  channel 0 next 150>151 151>150
+  channel 1 next 150>151 151>150
+group TP nNodes 1 nRanks 2 ranks 152 153
+  channel 0 next 152>153 153>152
+  channel 1 next 152>153 153>152
+group TP nNodes 1 nRanks 2 ranks 154 155
+  channel 0 next 154>155 155>154
+  channel 1 next 154>155 155>154
+group TP nNodes 1 nRanks 2 ranks 156 157
+  channel 0 next 156>157 157>156
+  channel 1 next 156>157 157>156
+group TP nNodes 1 nRanks 2 ranks 158 159
+  channel 0 next 158>159 159>158
+  channel 1 next 158>159 159>158
+group TP nNodes 1 nRanks 2 ranks 160 161
+  channel 0 next 160>161 161>160
+  channel 1 next 160>161 161>160
+group TP nNodes 1 nRanks 2 ranks 162 163
+  channel 0 next 162>163 163>162
+  channel 1 next 162>163 163>162
+group TP nNodes 1 nRanks 2 ranks 164 165
+  channel 0 next 164>165 165>164
+  channel 1 next 164>165 165>164
+group TP nNodes 1 nRanks 2 ranks 166 167
+  channel 0 next 166>167 167>166
+  channel 1 next 166>167 167>166
+group TP nNodes 1 nRanks 2 ranks 168 169
+  channel 0 next 168>169 169>168
+  channel 1 next 168>169 169>168
+group TP nNodes 1 nRanks 2 ranks 170 171
+  channel 0 next 170>171 171>170
+  channel 1 next 170>171 171>170
+group TP nNodes 1 nRanks 2 ranks 172 173
+  channel 0 next 172>173 173>172
+  channel 1 next 172>173 173>172
+group TP nNodes 1 nRanks 2 ranks 174 175
+  channel 0 next 174>175 175>174
+  channel 1 next 174>175 175>174
+group TP nNodes 1 nRanks 2 ranks 176 177
+  channel 0 next 176>177 177>176
+  channel 1 next 176>177 177>176
+group TP nNodes 1 nRanks 2 ranks 178 179
+  channel 0 next 178>179 179>178
+  channel 1 next 178>179 179>178
+group TP nNodes 1 nRanks 2 ranks 180 181
+  channel 0 next 180>181 181>180
+  channel 1 next 180>181 181>180
+group TP nNodes 1 nRanks 2 ranks 182 183
+  channel 0 next 182>183 183>182
+  channel 1 next 182>183 183>182
+group TP nNodes 1 nRanks 2 ranks 184 185
+  channel 0 next 184>185 185>184
+  channel 1 next 184>185 185>184
+group TP nNodes 1 nRanks 2 ranks 186 187
+  channel 0 next 186>187 187>186
+  channel 1 next 186>187 187>186
+group TP nNodes 1 nRanks 2 ranks 188 189
+  channel 0 next 188>189 189>188
+  channel 1 next 188>189 189>188
+group TP nNodes 1 nRanks 2 ranks 190 191
+  channel 0 next 190>191 191>190
+  channel 1 next 190>191 191>190
+group TP nNodes 1 nRanks 2 ranks 192 193
+  channel 0 next 192>193 193>192
+  channel 1 next 192>193 193>192
+group TP nNodes 1 nRanks 2 ranks 194 195
+  channel 0 next 194>195 195>194
+  channel 1 next 194>195 195>194
+group TP nNodes 1 nRanks 2 ranks 196 197
+  channel 0 next 196>197 197>196
+  channel 1 next 196>197 197>196
+group TP nNodes 1 nRanks 2 ranks 198 199
+  channel 0 next 198>199 199>198
+  channel 1 next 198>199 199>198
+group TP nNodes 1 nRanks 2 ranks 200 201
+  channel 0 next 200>201 201>200
+  channel 1 next 200>201 201>200
+group TP nNodes 1 nRanks 2 ranks 202 203
+  channel 0 next 202>203 203>202
+  channel 1 next 202>203 203>202
+group TP nNodes 1 nRanks 2 ranks 204 205
+  channel 0 next 204>205 205>204
+  channel 1 next 204>205 205>204
+group TP nNodes 1 nRanks 2 ranks 206 207
+  channel 0 next 206>207 207>206
+  channel 1 next 206>207 207>206
+group TP nNodes 1 nRanks 2 ranks 208 209
+  channel 0 next 208>209 209>208
+  channel 1 next 208>209 209>208
+group TP nNodes 1 nRanks 2 ranks 210 211
+  channel 0 next 210>211 211>210
+  channel 1 next 210>211 211>210
+group TP nNodes 1 nRanks 2 ranks 212 213
+  channel 0 next 212>213 213>212
+  channel 1 next 212>213 213>212
+group TP nNodes 1 nRanks 2 ranks 214 215
+  channel 0 next 214>215 215>214
+  channel 1 next 214>215 215>214
+group TP nNodes 1 nRanks 2 ranks 216 217
+  channel 0 next 216>217 217>216
+  channel 1 next 216>217 217>216
+group TP nNodes 1 nRanks 2 ranks 218 219
+  channel 0 next 218>219 219>218
+  channel 1 next 218>219 219>218
+group TP nNodes 1 nRanks 2 ranks 220 221
+  channel 0 next 220>221 221>220
+  channel 1 next 220>221 221>220
+group TP nNodes 1 nRanks 2 ranks 222 223
+  channel 0 next 222>223 223>222
+  channel 1 next 222>223 223>222
+group TP nNodes 1 nRanks 2 ranks 224 225
+  channel 0 next 224>225 225>224
+  channel 1 next 224>225 225>224
+group TP nNodes 1 nRanks 2 ranks 226 227
+  channel 0 next 226>227 227>226
+  channel 1 next 226>227 227>226
+group TP nNodes 1 nRanks 2 ranks 228 229
+  channel 0 next 228>229 229>228
+  channel 1 next 228>229 229>228
+group TP nNodes 1 nRanks 2 ranks 230 231
+  channel 0 next 230>231 231>230
+  channel 1 next 230>231 231>230
+group TP nNodes 1 nRanks 2 ranks 232 233
+  channel 0 next 232>233 233>232
+  channel 1 next 232>233 233>232
+group TP nNodes 1 nRanks 2 ranks 234 235
+  channel 0 next 234>235 235>234
+  channel 1 next 234>235 235>234
+group TP nNodes 1 nRanks 2 ranks 236 237
+  channel 0 next 236>237 237>236
+  channel 1 next 236>237 237>236
+group TP nNodes 1 nRanks 2 ranks 238 239
+  channel 0 next 238>239 239>238
+  channel 1 next 238>239 239>238
+group TP nNodes 1 nRanks 2 ranks 240 241
+  channel 0 next 240>241 241>240
+  channel 1 next 240>241 241>240
+group TP nNodes 1 nRanks 2 ranks 242 243
+  channel 0 next 242>243 243>242
+  channel 1 next 242>243 243>242
+group TP nNodes 1 nRanks 2 ranks 244 245
+  channel 0 next 244>245 245>244
+  channel 1 next 244>245 245>244
+group TP nNodes 1 nRanks 2 ranks 246 247
+  channel 0 next 246>247 247>246
+  channel 1 next 246>247 247>246
+group TP nNodes 1 nRanks 2 ranks 248 249
+  channel 0 next 248>249 249>248
+  channel 1 next 248>249 249>248
+group TP nNodes 1 nRanks 2 ranks 250 251
+  channel 0 next 250>251 251>250
+  channel 1 next 250>251 251>250
+group TP nNodes 1 nRanks 2 ranks 252 253
+  channel 0 next 252>253 253>252
+  channel 1 next 252>253 253>252
+group TP nNodes 1 nRanks 2 ranks 254 255
+  channel 0 next 254>255 255>254
+  channel 1 next 254>255 255>254
+group TP nNodes 1 nRanks 2 ranks 256 257
+  channel 0 next 256>257 257>256
+  channel 1 next 256>257 257>256
+group TP nNodes 1 nRanks 2 ranks 258 259
+  channel 0 next 258>259 259>258
+  channel 1 next 258>259 259>258
+group TP nNodes 1 nRanks 2 ranks 260 261
+  channel 0 next 260>261 261>260
+  channel 1 next 260>261 261>260
+group TP nNodes 1 nRanks 2 ranks 262 263
+  channel 0 next 262>263 263>262
+  channel 1 next 262>263 263>262
+group TP nNodes 1 nRanks 2 ranks 264 265
+  channel 0 next 264>265 265>264
+  channel 1 next 264>265 265>264
+group TP nNodes 1 nRanks 2 ranks 266 267
+  channel 0 next 266>267 267>266
+  channel 1 next 266>267 267>266
+group TP nNodes 1 nRanks 2 ranks 268 269
+  channel 0 next 268>269 269>268
+  channel 1 next 268>269 269>268
+group TP nNodes 1 nRanks 2 ranks 270 271
+  channel 0 next 270>271 271>270
+  channel 1 next 270>271 271>270
+group TP nNodes 1 nRanks 2 ranks 272 273
+  channel 0 next 272>273 273>272
+  channel 1 next 272>273 273>272
+group TP nNodes 1 nRanks 2 ranks 274 275
+  channel 0 next 274>275 275>274
+  channel 1 next 274>275 275>274
+group TP nNodes 1 nRanks 2 ranks 276 277
+  channel 0 next 276>277 277>276
+  channel 1 next 276>277 277>276
+group TP nNodes 1 nRanks 2 ranks 278 279
+  channel 0 next 278>279 279>278
+  channel 1 next 278>279 279>278
+group TP nNodes 1 nRanks 2 ranks 280 281
+  channel 0 next 280>281 281>280
+  channel 1 next 280>281 281>280
+group TP nNodes 1 nRanks 2 ranks 282 283
+  channel 0 next 282>283 283>282
+  channel 1 next 282>283 283>282
+group TP nNodes 1 nRanks 2 ranks 284 285
+  channel 0 next 284>285 285>284
+  channel 1 next 284>285 285>284
+group TP nNodes 1 nRanks 2 ranks 286 287
+  channel 0 next 286>287 287>286
+  channel 1 next 286>287 287>286
+group TP nNodes 1 nRanks 2 ranks 288 289
+  channel 0 next 288>289 289>288
+  channel 1 next 288>289 289>288
+group TP nNodes 1 nRanks 2 ranks 290 291
+  channel 0 next 290>291 291>290
+  channel 1 next 290>291 291>290
+group TP nNodes 1 nRanks 2 ranks 292 293
+  channel 0 next 292>293 293>292
+  channel 1 next 292>293 293>292
+group TP nNodes 1 nRanks 2 ranks 294 295
+  channel 0 next 294>295 295>294
+  channel 1 next 294>295 295>294
+group TP nNodes 1 nRanks 2 ranks 296 297
+  channel 0 next 296>297 297>296
+  channel 1 next 296>297 297>296
+group TP nNodes 1 nRanks 2 ranks 298 299
+  channel 0 next 298>299 299>298
+  channel 1 next 298>299 299>298
+group TP nNodes 1 nRanks 2 ranks 300 301
+  channel 0 next 300>301 301>300
+  channel 1 next 300>301 301>300
+group TP nNodes 1 nRanks 2 ranks 302 303
+  channel 0 next 302>303 303>302
+  channel 1 next 302>303 303>302
+group TP nNodes 1 nRanks 2 ranks 304 305
+  channel 0 next 304>305 305>304
+  channel 1 next 304>305 305>304
+group TP nNodes 1 nRanks 2 ranks 306 307
+  channel 0 next 306>307 307>306
+  channel 1 next 306>307 307>306
+group TP nNodes 1 nRanks 2 ranks 308 309
+  channel 0 next 308>309 309>308
+  channel 1 next 308>309 309>308
+group TP nNodes 1 nRanks 2 ranks 310 311
+  channel 0 next 310>311 311>310
+  channel 1 next 310>311 311>310
+group TP nNodes 1 nRanks 2 ranks 312 313
+  channel 0 next 312>313 313>312
+  channel 1 next 312>313 313>312
+group TP nNodes 1 nRanks 2 ranks 314 315
+  channel 0 next 314>315 315>314
+  channel 1 next 314>315 315>314
+group TP nNodes 1 nRanks 2 ranks 316 317
+  channel 0 next 316>317 317>316
+  channel 1 next 316>317 317>316
+group TP nNodes 1 nRanks 2 ranks 318 319
+  channel 0 next 318>319 319>318
+  channel 1 next 318>319 319>318
+group TP nNodes 1 nRanks 2 ranks 320 321
+  channel 0 next 320>321 321>320
+  channel 1 next 320>321 321>320
+group TP nNodes 1 nRanks 2 ranks 322 323
+  channel 0 next 322>323 323>322
+  channel 1 next 322>323 323>322
+group TP nNodes 1 nRanks 2 ranks 324 325
+  channel 0 next 324>325 325>324
+  channel 1 next 324>325 325>324
+group TP nNodes 1 nRanks 2 ranks 326 327
+  channel 0 next 326>327 327>326
+  channel 1 next 326>327 327>326
+group TP nNodes 1 nRanks 2 ranks 328 329
+  channel 0 next 328>329 329>328
+  channel 1 next 328>329 329>328
+group TP nNodes 1 nRanks 2 ranks 330 331
+  channel 0 next 330>331 331>330
+  channel 1 next 330>331 331>330
+group TP nNodes 1 nRanks 2 ranks 332 333
+  channel 0 next 332>333 333>332
+  channel 1 next 332>333 333>332
+group TP nNodes 1 nRanks 2 ranks 334 335
+  channel 0 next 334>335 335>334
+  channel 1 next 334>335 335>334
+group TP nNodes 1 nRanks 2 ranks 336 337
+  channel 0 next 336>337 337>336
+  channel 1 next 336>337 337>336
+group TP nNodes 1 nRanks 2 ranks 338 339
+  channel 0 next 338>339 339>338
+  channel 1 next 338>339 339>338
+group TP nNodes 1 nRanks 2 ranks 340 341
+  channel 0 next 340>341 341>340
+  channel 1 next 340>341 341>340
+group TP nNodes 1 nRanks 2 ranks 342 343
+  channel 0 next 342>343 343>342
+  channel 1 next 342>343 343>342
+group TP nNodes 1 nRanks 2 ranks 344 345
+  channel 0 next 344>345 345>344
+  channel 1 next 344>345 345>344
+group TP nNodes 1 nRanks 2 ranks 346 347
+  channel 0 next 346>347 347>346
+  channel 1 next 346>347 347>346
+group TP nNodes 1 nRanks 2 ranks 348 349
+  channel 0 next 348>349 349>348
+  channel 1 next 348>349 349>348
+group TP nNodes 1 nRanks 2 ranks 350 351
+  channel 0 next 350>351 351>350
+  channel 1 next 350>351 351>350
+group TP nNodes 1 nRanks 2 ranks 352 353
+  channel 0 next 352>353 353>352
+  channel 1 next 352>353 353>352
+group TP nNodes 1 nRanks 2 ranks 354 355
+  channel 0 next 354>355 355>354
+  channel 1 next 354>355 355>354
+group TP nNodes 1 nRanks 2 ranks 356 357
+  channel 0 next 356>357 357>356
+  channel 1 next 356>357 357>356
+group TP nNodes 1 nRanks 2 ranks 358 359
+  channel 0 next 358>359 359>358
+  channel 1 next 358>359 359>358
+group TP nNodes 1 nRanks 2 ranks 360 361
+  channel 0 next 360>361 361>360
+  channel 1 next 360>361 361>360
+group TP nNodes 1 nRanks 2 ranks 362 363
+  channel 0 next 362>363 363>362
+  channel 1 next 362>363 363>362
+group TP nNodes 1 nRanks 2 ranks 364 365
+  channel 0 next 364>365 365>364
+  channel 1 next 364>365 365>364
+group TP nNodes 1 nRanks 2 ranks 366 367
+  channel 0 next 366>367 367>366
+  channel 1 next 366>367 367>366
+group TP nNodes 1 nRanks 2 ranks 368 369
+  channel 0 next 368>369 369>368
+  channel 1 next 368>369 369>368
+group TP nNodes 1 nRanks 2 ranks 370 371
+  channel 0 next 370>371 371>370
+  channel 1 next 370>371 371>370
+group TP nNodes 1 nRanks 2 ranks 372 373
+  channel 0 next 372>373 373>372
+  channel 1 next 372>373 373>372
+group TP nNodes 1 nRanks 2 ranks 374 375
+  channel 0 next 374>375 375>374
+  channel 1 next 374>375 375>374
+group TP nNodes 1 nRanks 2 ranks 376 377
+  channel 0 next 376>377 377>376
+  channel 1 next 376>377 377>376
+group TP nNodes 1 nRanks 2 ranks 378 379
+  channel 0 next 378>379 379>378
+  channel 1 next 378>379 379>378
+group TP nNodes 1 nRanks 2 ranks 380 381
+  channel 0 next 380>381 381>380
+  channel 1 next 380>381 381>380
+group TP nNodes 1 nRanks 2 ranks 382 383
+  channel 0 next 382>383 383>382
+  channel 1 next 382>383 383>382
+group TP nNodes 1 nRanks 2 ranks 384 385
+  channel 0 next 384>385 385>384
+  channel 1 next 384>385 385>384
+group TP nNodes 1 nRanks 2 ranks 386 387
+  channel 0 next 386>387 387>386
+  channel 1 next 386>387 387>386
+group TP nNodes 1 nRanks 2 ranks 388 389
+  channel 0 next 388>389 389>388
+  channel 1 next 388>389 389>388
+group TP nNodes 1 nRanks 2 ranks 390 391
+  channel 0 next 390>391 391>390
+  channel 1 next 390>391 391>390
+group TP nNodes 1 nRanks 2 ranks 392 393
+  channel 0 next 392>393 393>392
+  channel 1 next 392>393 393>392
+group TP nNodes 1 nRanks 2 ranks 394 395
+  channel 0 next 394>395 395>394
+  channel 1 next 394>395 395>394
+group TP nNodes 1 nRanks 2 ranks 396 397
+  channel 0 next 396>397 397>396
+  channel 1 next 396>397 397>396
+group TP nNodes 1 nRanks 2 ranks 398 399
+  channel 0 next 398>399 399>398
+  channel 1 next 398>399 399>398
+group TP nNodes 1 nRanks 2 ranks 400 401
+  channel 0 next 400>401 401>400
+  channel 1 next 400>401 401>400
+group TP nNodes 1 nRanks 2 ranks 402 403
+  channel 0 next 402>403 403>402
+  channel 1 next 402>403 403>402
+group TP nNodes 1 nRanks 2 ranks 404 405
+  channel 0 next 404>405 405>404
+  channel 1 next 404>405 405>404
+group TP nNodes 1 nRanks 2 ranks 406 407
+  channel 0 next 406>407 407>406
+  channel 1 next 406>407 407>406
+group TP nNodes 1 nRanks 2 ranks 408 409
+  channel 0 next 408>409 409>408
+  channel 1 next 408>409 409>408
+group TP nNodes 1 nRanks 2 ranks 410 411
+  channel 0 next 410>411 411>410
+  channel 1 next 410>411 411>410
+group TP nNodes 1 nRanks 2 ranks 412 413
+  channel 0 next 412>413 413>412
+  channel 1 next 412>413 413>412
+group TP nNodes 1 nRanks 2 ranks 414 415
+  channel 0 next 414>415 415>414
+  channel 1 next 414>415 415>414
+group TP nNodes 1 nRanks 2 ranks 416 417
+  channel 0 next 416>417 417>416
+  channel 1 next 416>417 417>416
+group TP nNodes 1 nRanks 2 ranks 418 419
+  channel 0 next 418>419 419>418
+  channel 1 next 418>419 419>418
+group TP nNodes 1 nRanks 2 ranks 420 421
+  channel 0 next 420>421 421>420
+  channel 1 next 420>421 421>420
+group TP nNodes 1 nRanks 2 ranks 422 423
+  channel 0 next 422>423 423>422
+  channel 1 next 422>423 423>422
+group TP nNodes 1 nRanks 2 ranks 424 425
+  channel 0 next 424>425 425>424
+  channel 1 next 424>425 425>424
+group TP nNodes 1 nRanks 2 ranks 426 427
+  channel 0 next 426>427 427>426
+  channel 1 next 426>427 427>426
+group TP nNodes 1 nRanks 2 ranks 428 429
+  channel 0 next 428>429 429>428
+  channel 1 next 428>429 429>428
+group TP nNodes 1 nRanks 2 ranks 430 431
+  channel 0 next 430>431 431>430
+  channel 1 next 430>431 431>430
+group TP nNodes 1 nRanks 2 ranks 432 433
+  channel 0 next 432>433 433>432
+  channel 1 next 432>433 433>432
+group TP nNodes 1 nRanks 2 ranks 434 435
+  channel 0 next 434>435 435>434
+  channel 1 next 434>435 435>434
+group TP nNodes 1 nRanks 2 ranks 436 437
+  channel 0 next 436>437 437>436
+  channel 1 next 436>437 437>436
+group TP nNodes 1 nRanks 2 ranks 438 439
+  channel 0 next 438>439 439>438
+  channel 1 next 438>439 439>438
+group TP nNodes 1 nRanks 2 ranks 440 441
+  channel 0 next 440>441 441>440
+  channel 1 next 440>441 441>440
+group TP nNodes 1 nRanks 2 ranks 442 443
+  channel 0 next 442>443 443>442
+  channel 1 next 442>443 443>442
+group TP nNodes 1 nRanks 2 ranks 444 445
+  channel 0 next 444>445 445>444
+  channel 1 next 444>445 445>444
+group TP nNodes 1 nRanks 2 ranks 446 447
+  channel 0 next 446>447 447>446
+  channel 1 next 446>447 447>446
+group TP nNodes 1 nRanks 2 ranks 448 449
+  channel 0 next 448>449 449>448
+  channel 1 next 448>449 449>448
+group TP nNodes 1 nRanks 2 ranks 450 451
+  channel 0 next 450>451 451>450
+  channel 1 next 450>451 451>450
+group TP nNodes 1 nRanks 2 ranks 452 453
+  channel 0 next 452>453 453>452
+  channel 1 next 452>453 453>452
+group TP nNodes 1 nRanks 2 ranks 454 455
+  channel 0 next 454>455 455>454
+  channel 1 next 454>455 455>454
+group TP nNodes 1 nRanks 2 ranks 456 457
+  channel 0 next 456>457 457>456
+  channel 1 next 456>457 457>456
+group TP nNodes 1 nRanks 2 ranks 458 459
+  channel 0 next 458>459 459>458
+  channel 1 next 458>459 459>458
+group TP nNodes 1 nRanks 2 ranks 460 461
+  channel 0 next 460>461 461>460
+  channel 1 next 460>461 461>460
+group TP nNodes 1 nRanks 2 ranks 462 463
+  channel 0 next 462>463 463>462
+  channel 1 next 462>463 463>462
+group TP nNodes 1 nRanks 2 ranks 464 465
+  channel 0 next 464>465 465>464
+  channel 1 next 464>465 465>464
+group TP nNodes 1 nRanks 2 ranks 466 467
+  channel 0 next 466>467 467>466
+  channel 1 next 466>467 467>466
+group TP nNodes 1 nRanks 2 ranks 468 469
+  channel 0 next 468>469 469>468
+  channel 1 next 468>469 469>468
+group TP nNodes 1 nRanks 2 ranks 470 471
+  channel 0 next 470>471 471>470
+  channel 1 next 470>471 471>470
+group TP nNodes 1 nRanks 2 ranks 472 473
+  channel 0 next 472>473 473>472
+  channel 1 next 472>473 473>472
+group TP nNodes 1 nRanks 2 ranks 474 475
+  channel 0 next 474>475 475>474
+  channel 1 next 474>475 475>474
+group TP nNodes 1 nRanks 2 ranks 476 477
+  channel 0 next 476>477 477>476
+  channel 1 next 476>477 477>476
+group TP nNodes 1 nRanks 2 ranks 478 479
+  channel 0 next 478>479 479>478
+  channel 1 next 478>479 479>478
+group TP nNodes 1 nRanks 2 ranks 480 481
+  channel 0 next 480>481 481>480
+  channel 1 next 480>481 481>480
+group TP nNodes 1 nRanks 2 ranks 482 483
+  channel 0 next 482>483 483>482
+  channel 1 next 482>483 483>482
+group TP nNodes 1 nRanks 2 ranks 484 485
+  channel 0 next 484>485 485>484
+  channel 1 next 484>485 485>484
+group TP nNodes 1 nRanks 2 ranks 486 487
+  channel 0 next 486>487 487>486
+  channel 1 next 486>487 487>486
+group TP nNodes 1 nRanks 2 ranks 488 489
+  channel 0 next 488>489 489>488
+  channel 1 next 488>489 489>488
+group TP nNodes 1 nRanks 2 ranks 490 491
+  channel 0 next 490>491 491>490
+  channel 1 next 490>491 491>490
+group TP nNodes 1 nRanks 2 ranks 492 493
+  channel 0 next 492>493 493>492
+  channel 1 next 492>493 493>492
+group TP nNodes 1 nRanks 2 ranks 494 495
+  channel 0 next 494>495 495>494
+  channel 1 next 494>495 495>494
+group TP nNodes 1 nRanks 2 ranks 496 497
+  channel 0 next 496>497 497>496
+  channel 1 next 496>497 497>496
+group TP nNodes 1 nRanks 2 ranks 498 499
+  channel 0 next 498>499 499>498
+  channel 1 next 498>499 499>498
+group TP nNodes 1 nRanks 2 ranks 500 501
+  channel 0 next 500>501 501>500
+  channel 1 next 500>501 501>500
+group TP nNodes 1 nRanks 2 ranks 502 503
+  channel 0 next 502>503 503>502
+  channel 1 next 502>503 503>502
+group TP nNodes 1 nRanks 2 ranks 504 505
+  channel 0 next 504>505 505>504
+  channel 1 next 504>505 505>504
+group TP nNodes 1 nRanks 2 ranks 506 507
+  channel 0 next 506>507 507>506
+  channel 1 next 506>507 507>506
+group TP nNodes 1 nRanks 2 ranks 508 509
+  channel 0 next 508>509 509>508
+  channel 1 next 508>509 509>508
+group TP nNodes 1 nRanks 2 ranks 510 511
+  channel 0 next 510>511 511>510
+  channel 1 next 510>511 511>510
+group TP nNodes 1 nRanks 2 ranks 512 513
+  channel 0 next 512>513 513>512
+  channel 1 next 512>513 513>512
+group TP nNodes 1 nRanks 2 ranks 514 515
+  channel 0 next 514>515 515>514
+  channel 1 next 514>515 515>514
+group TP nNodes 1 nRanks 2 ranks 516 517
+  channel 0 next 516>517 517>516
+  channel 1 next 516>517 517>516
+group TP nNodes 1 nRanks 2 ranks 518 519
+  channel 0 next 518>519 519>518
+  channel 1 next 518>519 519>518
+group TP nNodes 1 nRanks 2 ranks 520 521
+  channel 0 next 520>521 521>520
+  channel 1 next 520>521 521>520
+group TP nNodes 1 nRanks 2 ranks 522 523
+  channel 0 next 522>523 523>522
+  channel 1 next 522>523 523>522
+group TP nNodes 1 nRanks 2 ranks 524 525
+  channel 0 next 524>525 525>524
+  channel 1 next 524>525 525>524
+group TP nNodes 1 nRanks 2 ranks 526 527
+  channel 0 next 526>527 527>526
+  channel 1 next 526>527 527>526
+group TP nNodes 1 nRanks 2 ranks 528 529
+  channel 0 next 528>529 529>528
+  channel 1 next 528>529 529>528
+group TP nNodes 1 nRanks 2 ranks 530 531
+  channel 0 next 530>531 531>530
+  channel 1 next 530>531 531>530
+group TP nNodes 1 nRanks 2 ranks 532 533
+  channel 0 next 532>533 533>532
+  channel 1 next 532>533 533>532
+group TP nNodes 1 nRanks 2 ranks 534 535
+  channel 0 next 534>535 535>534
+  channel 1 next 534>535 535>534
+group TP nNodes 1 nRanks 2 ranks 536 537
+  channel 0 next 536>537 537>536
+  channel 1 next 536>537 537>536
+group TP nNodes 1 nRanks 2 ranks 538 539
+  channel 0 next 538>539 539>538
+  channel 1 next 538>539 539>538
+group TP nNodes 1 nRanks 2 ranks 540 541
+  channel 0 next 540>541 541>540
+  channel 1 next 540>541 541>540
+group TP nNodes 1 nRanks 2 ranks 542 543
+  channel 0 next 542>543 543>542
+  channel 1 next 542>543 543>542
+group TP nNodes 1 nRanks 2 ranks 544 545
+  channel 0 next 544>545 545>544
+  channel 1 next 544>545 545>544
+group TP nNodes 1 nRanks 2 ranks 546 547
+  channel 0 next 546>547 547>546
+  channel 1 next 546>547 547>546
+group TP nNodes 1 nRanks 2 ranks 548 549
+  channel 0 next 548>549 549>548
+  channel 1 next 548>549 549>548
+group TP nNodes 1 nRanks 2 ranks 550 551
+  channel 0 next 550>551 551>550
+  channel 1 next 550>551 551>550
+group TP nNodes 1 nRanks 2 ranks 552 553
+  channel 0 next 552>553 553>552
+  channel 1 next 552>553 553>552
+group TP nNodes 1 nRanks 2 ranks 554 555
+  channel 0 next 554>555 555>554
+  channel 1 next 554>555 555>554
+group TP nNodes 1 nRanks 2 ranks 556 557
+  channel 0 next 556>557 557>556
+  channel 1 next 556>557 557>556
+group TP nNodes 1 nRanks 2 ranks 558 559
+  channel 0 next 558>559 559>558
+  channel 1 next 558>559 559>558
+group TP nNodes 1 nRanks 2 ranks 560 561
+  channel 0 next 560>561 561>560
+  channel 1 next 560>561 561>560
+group TP nNodes 1 nRanks 2 ranks 562 563
+  channel 0 next 562>563 563>562
+  channel 1 next 562>563 563>562
+group TP nNodes 1 nRanks 2 ranks 564 565
+  channel 0 next 564>565 565>564
+  channel 1 next 564>565 565>564
+group TP nNodes 1 nRanks 2 ranks 566 567
+  channel 0 next 566>567 567>566
+  channel 1 next 566>567 567>566
+group TP nNodes 1 nRanks 2 ranks 568 569
+  channel 0 next 568>569 569>568
+  channel 1 next 568>569 569>568
+group TP nNodes 1 nRanks 2 ranks 570 571
+  channel 0 next 570>571 571>570
+  channel 1 next 570>571 571>570
+group TP nNodes 1 nRanks 2 ranks 572 573
+  channel 0 next 572>573 573>572
+  channel 1 next 572>573 573>572
+group TP nNodes 1 nRanks 2 ranks 574 575
+  channel 0 next 574>575 575>574
+  channel 1 next 574>575 575>574
+group TP nNodes 1 nRanks 2 ranks 576 577
+  channel 0 next 576>577 577>576
+  channel 1 next 576>577 577>576
+group TP nNodes 1 nRanks 2 ranks 578 579
+  channel 0 next 578>579 579>578
+  channel 1 next 578>579 579>578
+group TP nNodes 1 nRanks 2 ranks 580 581
+  channel 0 next 580>581 581>580
+  channel 1 next 580>581 581>580
+group TP nNodes 1 nRanks 2 ranks 582 583
+  channel 0 next 582>583 583>582
+  channel 1 next 582>583 583>582
+group TP nNodes 1 nRanks 2 ranks 584 585
+  channel 0 next 584>585 585>584
+  channel 1 next 584>585 585>584
+group TP nNodes 1 nRanks 2 ranks 586 587
+  channel 0 next 586>587 587>586
+  channel 1 next 586>587 587>586
+group TP nNodes 1 nRanks 2 ranks 588 589
+  channel 0 next 588>589 589>588
+  channel 1 next 588>589 589>588
+group TP nNodes 1 nRanks 2 ranks 590 591
+  channel 0 next 590>591 591>590
+  channel 1 next 590>591 591>590
+group TP nNodes 1 nRanks 2 ranks 592 593
+  channel 0 next 592>593 593>592
+  channel 1 next 592>593 593>592
+group TP nNodes 1 nRanks 2 ranks 594 595
+  channel 0 next 594>595 595>594
+  channel 1 next 594>595 595>594
+group TP nNodes 1 nRanks 2 ranks 596 597
+  channel 0 next 596>597 597>596
+  channel 1 next 596>597 597>596
+group TP nNodes 1 nRanks 2 ranks 598 599
+  channel 0 next 598>599 599>598
+  channel 1 next 598>599 599>598
+group TP nNodes 1 nRanks 2 ranks 600 601
+  channel 0 next 600>601 601>600
+  channel 1 next 600>601 601>600
+group TP nNodes 1 nRanks 2 ranks 602 603
+  channel 0 next 602>603 603>602
+  channel 1 next 602>603 603>602
+group TP nNodes 1 nRanks 2 ranks 604 605
+  channel 0 next 604>605 605>604
+  channel 1 next 604>605 605>604
+group TP nNodes 1 nRanks 2 ranks 606 607
+  channel 0 next 606>607 607>606
+  channel 1 next 606>607 607>606
+group TP nNodes 1 nRanks 2 ranks 608 609
+  channel 0 next 608>609 609>608
+  channel 1 next 608>609 609>608
+group TP nNodes 1 nRanks 2 ranks 610 611
+  channel 0 next 610>611 611>610
+  channel 1 next 610>611 611>610
+group TP nNodes 1 nRanks 2 ranks 612 613
+  channel 0 next 612>613 613>612
+  channel 1 next 612>613 613>612
+group TP nNodes 1 nRanks 2 ranks 614 615
+  channel 0 next 614>615 615>614
+  channel 1 next 614>615 615>614
+group TP nNodes 1 nRanks 2 ranks 616 617
+  channel 0 next 616>617 617>616
+  channel 1 next 616>617 617>616
+group TP nNodes 1 nRanks 2 ranks 618 619
+  channel 0 next 618>619 619>618
+  channel 1 next 618>619 619>618
+group TP nNodes 1 nRanks 2 ranks 620 621
+  channel 0 next 620>621 621>620
+  channel 1 next 620>621 621>620
+group TP nNodes 1 nRanks 2 ranks 622 623
+  channel 0 next 622>623 623>622
+  channel 1 next 622>623 623>622
+group TP nNodes 1 nRanks 2 ranks 624 625
+  channel 0 next 624>625 625>624
+  channel 1 next 624>625 625>624
+group TP nNodes 1 nRanks 2 ranks 626 627
+  channel 0 next 626>627 627>626
+  channel 1 next 626>627 627>626
+group TP nNodes 1 nRanks 2 ranks 628 629
+  channel 0 next 628>629 629>628
+  channel 1 next 628>629 629>628
+group TP nNodes 1 nRanks 2 ranks 630 631
+  channel 0 next 630>631 631>630
+  channel 1 next 630>631 631>630
+group TP nNodes 1 nRanks 2 ranks 632 633
+  channel 0 next 632>633 633>632
+  channel 1 next 632>633 633>632
+group TP nNodes 1 nRanks 2 ranks 634 635
+  channel 0 next 634>635 635>634
+  channel 1 next 634>635 635>634
+group TP nNodes 1 nRanks 2 ranks 636 637
+  channel 0 next 636>637 637>636
+  channel 1 next 636>637 637>636
+group TP nNodes 1 nRanks 2 ranks 638 639
+  channel 0 next 638>639 639>638
+  channel 1 next 638>639 639>638
+group TP nNodes 1 nRanks 2 ranks 640 641
+  channel 0 next 640>641 641>640
+  channel 1 next 640>641 641>640
+group TP nNodes 1 nRanks 2 ranks 642 643
+  channel 0 next 642>643 643>642
+  channel 1 next 642>643 643>642
+group TP nNodes 1 nRanks 2 ranks 644 645
+  channel 0 next 644>645 645>644
+  channel 1 next 644>645 645>644
+group TP nNodes 1 nRanks 2 ranks 646 647
+  channel 0 next 646>647 647>646
+  channel 1 next 646>647 647>646
+group TP nNodes 1 nRanks 2 ranks 648 649
+  channel 0 next 648>649 649>648
+  channel 1 next 648>649 649>648
+group TP nNodes 1 nRanks 2 ranks 650 651
+  channel 0 next 650>651 651>650
+  channel 1 next 650>651 651>650
+group TP nNodes 1 nRanks 2 ranks 652 653
+  channel 0 next 652>653 653>652
+  channel 1 next 652>653 653>652
+group TP nNodes 1 nRanks 2 ranks 654 655
+  channel 0 next 654>655 655>654
+  channel 1 next 654>655 655>654
+group TP nNodes 1 nRanks 2 ranks 656 657
+  channel 0 next 656>657 657>656
+  channel 1 next 656>657 657>656
+group TP nNodes 1 nRanks 2 ranks 658 659
+  channel 0 next 658>659 659>658
+  channel 1 next 658>659 659>658
+group TP nNodes 1 nRanks 2 ranks 660 661
+  channel 0 next 660>661 661>660
+  channel 1 next 660>661 661>660
+group TP nNodes 1 nRanks 2 ranks 662 663
+  channel 0 next 662>663 663>662
+  channel 1 next 662>663 663>662
+group TP nNodes 1 nRanks 2 ranks 664 665
+  channel 0 next 664>665 665>664
+  channel 1 next 664>665 665>664
+group TP nNodes 1 nRanks 2 ranks 666 667
+  channel 0 next 666>667 667>666
+  channel 1 next 666>667 667>666
+group TP nNodes 1 nRanks 2 ranks 668 669
+  channel 0 next 668>669 669>668
+  channel 1 next 668>669 669>668
+group TP nNodes 1 nRanks 2 ranks 670 671
+  channel 0 next 670>671 671>670
+  channel 1 next 670>671 671>670
+group TP nNodes 1 nRanks 2 ranks 672 673
+  channel 0 next 672>673 673>672
+  channel 1 next 672>673 673>672
+group TP nNodes 1 nRanks 2 ranks 674 675
+  channel 0 next 674>675 675>674
+  channel 1 next 674>675 675>674
+group TP nNodes 1 nRanks 2 ranks 676 677
+  channel 0 next 676>677 677>676
+  channel 1 next 676>677 677>676
+group TP nNodes 1 nRanks 2 ranks 678 679
+  channel 0 next 678>679 679>678
+  channel 1 next 678>679 679>678
+group TP nNodes 1 nRanks 2 ranks 680 681
+  channel 0 next 680>681 681>680
+  channel 1 next 680>681 681>680
+group TP nNodes 1 nRanks 2 ranks 682 683
+  channel 0 next 682>683 683>682
+  channel 1 next 682>683 683>682
+group TP nNodes 1 nRanks 2 ranks 684 685
+  channel 0 next 684>685 685>684
+  channel 1 next 684>685 685>684
+group TP nNodes 1 nRanks 2 ranks 686 687
+  channel 0 next 686>687 687>686
+  channel 1 next 686>687 687>686
+group TP nNodes 1 nRanks 2 ranks 688 689
+  channel 0 next 688>689 689>688
+  channel 1 next 688>689 689>688
+group TP nNodes 1 nRanks 2 ranks 690 691
+  channel 0 next 690>691 691>690
+  channel 1 next 690>691 691>690
+group TP nNodes 1 nRanks 2 ranks 692 693
+  channel 0 next 692>693 693>692
+  channel 1 next 692>693 693>692
+group TP nNodes 1 nRanks 2 ranks 694 695
+  channel 0 next 694>695 695>694
+  channel 1 next 694>695 695>694
+group TP nNodes 1 nRanks 2 ranks 696 697
+  channel 0 next 696>697 697>696
+  channel 1 next 696>697 697>696
+group TP nNodes 1 nRanks 2 ranks 698 699
+  channel 0 next 698>699 699>698
+  channel 1 next 698>699 699>698
+group TP nNodes 1 nRanks 2 ranks 700 701
+  channel 0 next 700>701 701>700
+  channel 1 next 700>701 701>700
+group TP nNodes 1 nRanks 2 ranks 702 703
+  channel 0 next 702>703 703>702
+  channel 1 next 702>703 703>702
+group TP nNodes 1 nRanks 2 ranks 704 705
+  channel 0 next 704>705 705>704
+  channel 1 next 704>705 705>704
+group TP nNodes 1 nRanks 2 ranks 706 707
+  channel 0 next 706>707 707>706
+  channel 1 next 706>707 707>706
+group TP nNodes 1 nRanks 2 ranks 708 709
+  channel 0 next 708>709 709>708
+  channel 1 next 708>709 709>708
+group TP nNodes 1 nRanks 2 ranks 710 711
+  channel 0 next 710>711 711>710
+  channel 1 next 710>711 711>710
+group TP nNodes 1 nRanks 2 ranks 712 713
+  channel 0 next 712>713 713>712
+  channel 1 next 712>713 713>712
+group TP nNodes 1 nRanks 2 ranks 714 715
+  channel 0 next 714>715 715>714
+  channel 1 next 714>715 715>714
+group TP nNodes 1 nRanks 2 ranks 716 717
+  channel 0 next 716>717 717>716
+  channel 1 next 716>717 717>716
+group TP nNodes 1 nRanks 2 ranks 718 719
+  channel 0 next 718>719 719>718
+  channel 1 next 718>719 719>718
+group TP nNodes 1 nRanks 2 ranks 720 721
+  channel 0 next 720>721 721>720
+  channel 1 next 720>721 721>720
+group TP nNodes 1 nRanks 2 ranks 722 723
+  channel 0 next 722>723 723>722
+  channel 1 next 722>723 723>722
+group TP nNodes 1 nRanks 2 ranks 724 725
+  channel 0 next 724>725 725>724
+  channel 1 next 724>725 725>724
+group TP nNodes 1 nRanks 2 ranks 726 727
+  channel 0 next 726>727 727>726
+  channel 1 next 726>727 727>726
+group TP nNodes 1 nRanks 2 ranks 728 729
+  channel 0 next 728>729 729>728
+  channel 1 next 728>729 729>728
+group TP nNodes 1 nRanks 2 ranks 730 731
+  channel 0 next 730>731 731>730
+  channel 1 next 730>731 731>730
+group TP nNodes 1 nRanks 2 ranks 732 733
+  channel 0 next 732>733 733>732
+  channel 1 next 732>733 733>732
+group TP nNodes 1 nRanks 2 ranks 734 735
+  channel 0 next 734>735 735>734
+  channel 1 next 734>735 735>734
+group TP nNodes 1 nRanks 2 ranks 736 737
+  channel 0 next 736>737 737>736
+  channel 1 next 736>737 737>736
+group TP nNodes 1 nRanks 2 ranks 738 739
+  channel 0 next 738>739 739>738
+  channel 1 next 738>739 739>738
+group TP nNodes 1 nRanks 2 ranks 740 741
+  channel 0 next 740>741 741>740
+  channel 1 next 740>741 741>740
+group TP nNodes 1 nRanks 2 ranks 742 743
+  channel 0 next 742>743 743>742
+  channel 1 next 742>743 743>742
+group TP nNodes 1 nRanks 2 ranks 744 745
+  channel 0 next 744>745 745>744
+  channel 1 next 744>745 745>744
+group TP nNodes 1 nRanks 2 ranks 746 747
+  channel 0 next 746>747 747>746
+  channel 1 next 746>747 747>746
+group TP nNodes 1 nRanks 2 ranks 748 749
+  channel 0 next 748>749 749>748
+  channel 1 next 748>749 749>748
+group TP nNodes 1 nRanks 2 ranks 750 751
+  channel 0 next 750>751 751>750
+  channel 1 next 750>751 751>750
+group TP nNodes 1 nRanks 2 ranks 752 753
+  channel 0 next 752>753 753>752
+  channel 1 next 752>753 753>752
+group TP nNodes 1 nRanks 2 ranks 754 755
+  channel 0 next 754>755 755>754
+  channel 1 next 754>755 755>754
+group TP nNodes 1 nRanks 2 ranks 756 757
+  channel 0 next 756>757 757>756
+  channel 1 next 756>757 757>756
+group TP nNodes 1 nRanks 2 ranks 758 759
+  channel 0 next 758>759 759>758
+  channel 1 next 758>759 759>758
+group TP nNodes 1 nRanks 2 ranks 760 761
+  channel 0 next 760>761 761>760
+  channel 1 next 760>761 761>760
+group TP nNodes 1 nRanks 2 ranks 762 763
+  channel 0 next 762>763 763>762
+  channel 1 next 762>763 763>762
+group TP nNodes 1 nRanks 2 ranks 764 765
+  channel 0 next 764>765 765>764
+  channel 1 next 764>765 765>764
+group TP nNodes 1 nRanks 2 ranks 766 767
+  channel 0 next 766>767 767>766
+  channel 1 next 766>767 767>766
+group TP nNodes 1 nRanks 2 ranks 768 769
+  channel 0 next 768>769 769>768
+  channel 1 next 768>769 769>768
+group TP nNodes 1 nRanks 2 ranks 770 771
+  channel 0 next 770>771 771>770
+  channel 1 next 770>771 771>770
+group TP nNodes 1 nRanks 2 ranks 772 773
+  channel 0 next 772>773 773>772
+  channel 1 next 772>773 773>772
+group TP nNodes 1 nRanks 2 ranks 774 775
+  channel 0 next 774>775 775>774
+  channel 1 next 774>775 775>774
+group TP nNodes 1 nRanks 2 ranks 776 777
+  channel 0 next 776>777 777>776
+  channel 1 next 776>777 777>776
+group TP nNodes 1 nRanks 2 ranks 778 779
+  channel 0 next 778>779 779>778
+  channel 1 next 778>779 779>778
+group TP nNodes 1 nRanks 2 ranks 780 781
+  channel 0 next 780>781 781>780
+  channel 1 next 780>781 781>780
+group TP nNodes 1 nRanks 2 ranks 782 783
+  channel 0 next 782>783 783>782
+  channel 1 next 782>783 783>782
+group TP nNodes 1 nRanks 2 ranks 784 785
+  channel 0 next 784>785 785>784
+  channel 1 next 784>785 785>784
+group TP nNodes 1 nRanks 2 ranks 786 787
+  channel 0 next 786>787 787>786
+  channel 1 next 786>787 787>786
+group TP nNodes 1 nRanks 2 ranks 788 789
+  channel 0 next 788>789 789>788
+  channel 1 next 788>789 789>788
+group TP nNodes 1 nRanks 2 ranks 790 791
+  channel 0 next 790>791 791>790
+  channel 1 next 790>791 791>790
+group TP nNodes 1 nRanks 2 ranks 792 793
+  channel 0 next 792>793 793>792
+  channel 1 next 792>793 793>792
+group TP nNodes 1 nRanks 2 ranks 794 795
+  channel 0 next 794>795 795>794
+  channel 1 next 794>795 795>794
+group TP nNodes 1 nRanks 2 ranks 796 797
+  channel 0 next 796>797 797>796
+  channel 1 next 796>797 797>796
+group TP nNodes 1 nRanks 2 ranks 798 799
+  channel 0 next 798>799 799>798
+  channel 1 next 798>799 799>798
+group TP nNodes 1 nRanks 2 ranks 800 801
+  channel 0 next 800>801 801>800
+  channel 1 next 800>801 801>800
+group TP nNodes 1 nRanks 2 ranks 802 803
+  channel 0 next 802>803 803>802
+  channel 1 next 802>803 803>802
+group TP nNodes 1 nRanks 2 ranks 804 805
+  channel 0 next 804>805 805>804
+  channel 1 next 804>805 805>804
+group TP nNodes 1 nRanks 2 ranks 806 807
+  channel 0 next 806>807 807>806
+  channel 1 next 806>807 807>806
+group TP nNodes 1 nRanks 2 ranks 808 809
+  channel 0 next 808>809 809>808
+  channel 1 next 808>809 809>808
+group TP nNodes 1 nRanks 2 ranks 810 811
+  channel 0 next 810>811 811>810
+  channel 1 next 810>811 811>810
+group TP nNodes 1 nRanks 2 ranks 812 813
+  channel 0 next 812>813 813>812
+  channel 1 next 812>813 813>812
+group TP nNodes 1 nRanks 2 ranks 814 815
+  channel 0 next 814>815 815>814
+  channel 1 next 814>815 815>814
+group TP nNodes 1 nRanks 2 ranks 816 817
+  channel 0 next 816>817 817>816
+  channel 1 next 816>817 817>816
+group TP nNodes 1 nRanks 2 ranks 818 819
+  channel 0 next 818>819 819>818
+  channel 1 next 818>819 819>818
+group TP nNodes 1 nRanks 2 ranks 820 821
+  channel 0 next 820>821 821>820
+  channel 1 next 820>821 821>820
+group TP nNodes 1 nRanks 2 ranks 822 823
+  channel 0 next 822>823 823>822
+  channel 1 next 822>823 823>822
+group TP nNodes 1 nRanks 2 ranks 824 825
+  channel 0 next 824>825 825>824
+  channel 1 next 824>825 825>824
+group TP nNodes 1 nRanks 2 ranks 826 827
+  channel 0 next 826>827 827>826
+  channel 1 next 826>827 827>826
+group TP nNodes 1 nRanks 2 ranks 828 829
+  channel 0 next 828>829 829>828
+  channel 1 next 828>829 829>828
+group TP nNodes 1 nRanks 2 ranks 830 831
+  channel 0 next 830>831 831>830
+  channel 1 next 830>831 831>830
+group TP nNodes 1 nRanks 2 ranks 832 833
+  channel 0 next 832>833 833>832
+  channel 1 next 832>833 833>832
+group TP nNodes 1 nRanks 2 ranks 834 835
+  channel 0 next 834>835 835>834
+  channel 1 next 834>835 835>834
+group TP nNodes 1 nRanks 2 ranks 836 837
+  channel 0 next 836>837 837>836
+  channel 1 next 836>837 837>836
+group TP nNodes 1 nRanks 2 ranks 838 839
+  channel 0 next 838>839 839>838
+  channel 1 next 838>839 839>838
+group TP nNodes 1 nRanks 2 ranks 840 841
+  channel 0 next 840>841 841>840
+  channel 1 next 840>841 841>840
+group TP nNodes 1 nRanks 2 ranks 842 843
+  channel 0 next 842>843 843>842
+  channel 1 next 842>843 843>842
+group TP nNodes 1 nRanks 2 ranks 844 845
+  channel 0 next 844>845 845>844
+  channel 1 next 844>845 845>844
+group TP nNodes 1 nRanks 2 ranks 846 847
+  channel 0 next 846>847 847>846
+  channel 1 next 846>847 847>846
+group TP nNodes 1 nRanks 2 ranks 848 849
+  channel 0 next 848>849 849>848
+  channel 1 next 848>849 849>848
+group TP nNodes 1 nRanks 2 ranks 850 851
+  channel 0 next 850>851 851>850
+  channel 1 next 850>851 851>850
+group TP nNodes 1 nRanks 2 ranks 852 853
+  channel 0 next 852>853 853>852
+  channel 1 next 852>853 853>852
+group TP nNodes 1 nRanks 2 ranks 854 855
+  channel 0 next 854>855 855>854
+  channel 1 next 854>855 855>854
+group TP nNodes 1 nRanks 2 ranks 856 857
+  channel 0 next 856>857 857>856
+  channel 1 next 856>857 857>856
+group TP nNodes 1 nRanks 2 ranks 858 859
+  channel 0 next 858>859 859>858
+  channel 1 next 858>859 859>858
+group TP nNodes 1 nRanks 2 ranks 860 861
+  channel 0 next 860>861 861>860
+  channel 1 next 860>861 861>860
+group TP nNodes 1 nRanks 2 ranks 862 863
+  channel 0 next 862>863 863>862
+  channel 1 next 862>863 863>862
+group TP nNodes 1 nRanks 2 ranks 864 865
+  channel 0 next 864>865 865>864
+  channel 1 next 864>865 865>864
+group TP nNodes 1 nRanks 2 ranks 866 867
+  channel 0 next 866>867 867>866
+  channel 1 next 866>867 867>866
+group TP nNodes 1 nRanks 2 ranks 868 869
+  channel 0 next 868>869 869>868
+  channel 1 next 868>869 869>868
+group TP nNodes 1 nRanks 2 ranks 870 871
+  channel 0 next 870>871 871>870
+  channel 1 next 870>871 871>870
+group TP nNodes 1 nRanks 2 ranks 872 873
+  channel 0 next 872>873 873>872
+  channel 1 next 872>873 873>872
+group TP nNodes 1 nRanks 2 ranks 874 875
+  channel 0 next 874>875 875>874
+  channel 1 next 874>875 875>874
+group TP nNodes 1 nRanks 2 ranks 876 877
+  channel 0 next 876>877 877>876
+  channel 1 next 876>877 877>876
+group TP nNodes 1 nRanks 2 ranks 878 879
+  channel 0 next 878>879 879>878
+  channel 1 next 878>879 879>878
+group TP nNodes 1 nRanks 2 ranks 880 881
+  channel 0 next 880>881 881>880
+  channel 1 next 880>881 881>880
+group TP nNodes 1 nRanks 2 ranks 882 883
+  channel 0 next 882>883 883>882
+  channel 1 next 882>883 883>882
+group TP nNodes 1 nRanks 2 ranks 884 885
+  channel 0 next 884>885 885>884
+  channel 1 next 884>885 885>884
+group TP nNodes 1 nRanks 2 ranks 886 887
+  channel 0 next 886>887 887>886
+  channel 1 next 886>887 887>886
+group TP nNodes 1 nRanks 2 ranks 888 889
+  channel 0 next 888>889 889>888
+  channel 1 next 888>889 889>888
+group TP nNodes 1 nRanks 2 ranks 890 891
+  channel 0 next 890>891 891>890
+  channel 1 next 890>891 891>890
+group TP nNodes 1 nRanks 2 ranks 892 893
+  channel 0 next 892>893 893>892
+  channel 1 next 892>893 893>892
+group TP nNodes 1 nRanks 2 ranks 894 895
+  channel 0 next 894>895 895>894
+  channel 1 next 894>895 895>894
+group TP nNodes 1 nRanks 2 ranks 896 897
+  channel 0 next 896>897 897>896
+  channel 1 next 896>897 897>896
+group TP nNodes 1 nRanks 2 ranks 898 899
+  channel 0 next 898>899 899>898
+  channel 1 next 898>899 899>898
+group TP nNodes 1 nRanks 2 ranks 900 901
+  channel 0 next 900>901 901>900
+  channel 1 next 900>901 901>900
+group TP nNodes 1 nRanks 2 ranks 902 903
+  channel 0 next 902>903 903>902
+  channel 1 next 902>903 903>902
+group TP nNodes 1 nRanks 2 ranks 904 905
+  channel 0 next 904>905 905>904
+  channel 1 next 904>905 905>904
+group TP nNodes 1 nRanks 2 ranks 906 907
+  channel 0 next 906>907 907>906
+  channel 1 next 906>907 907>906
+group TP nNodes 1 nRanks 2 ranks 908 909
+  channel 0 next 908>909 909>908
+  channel 1 next 908>909 909>908
+group TP nNodes 1 nRanks 2 ranks 910 911
+  channel 0 next 910>911 911>910
+  channel 1 next 910>911 911>910
+group TP nNodes 1 nRanks 2 ranks 912 913
+  channel 0 next 912>913 913>912
+  channel 1 next 912>913 913>912
+group TP nNodes 1 nRanks 2 ranks 914 915
+  channel 0 next 914>915 915>914
+  channel 1 next 914>915 915>914
+group TP nNodes 1 nRanks 2 ranks 916 917
+  channel 0 next 916>917 917>916
+  channel 1 next 916>917 917>916
+group TP nNodes 1 nRanks 2 ranks 918 919
+  channel 0 next 918>919 919>918
+  channel 1 next 918>919 919>918
+group TP nNodes 1 nRanks 2 ranks 920 921
+  channel 0 next 920>921 921>920
+  channel 1 next 920>921 921>920
+group TP nNodes 1 nRanks 2 ranks 922 923
+  channel 0 next 922>923 923>922
+  channel 1 next 922>923 923>922
+group TP nNodes 1 nRanks 2 ranks 924 925
+  channel 0 next 924>925 925>924
+  channel 1 next 924>925 925>924
+group TP nNodes 1 nRanks 2 ranks 926 927
+  channel 0 next 926>927 927>926
+  channel 1 next 926>927 927>926
+group TP nNodes 1 nRanks 2 ranks 928 929
+  channel 0 next 928>929 929>928
+  channel 1 next 928>929 929>928
+group TP nNodes 1 nRanks 2 ranks 930 931
+  channel 0 next 930>931 931>930
+  channel 1 next 930>931 931>930
+group TP nNodes 1 nRanks 2 ranks 932 933
+  channel 0 next 932>933 933>932
+  channel 1 next 932>933 933>932
+group TP nNodes 1 nRanks 2 ranks 934 935
+  channel 0 next 934>935 935>934
+  channel 1 next 934>935 935>934
+group TP nNodes 1 nRanks 2 ranks 936 937
+  channel 0 next 936>937 937>936
+  channel 1 next 936>937 937>936
+group TP nNodes 1 nRanks 2 ranks 938 939
+  channel 0 next 938>939 939>938
+  channel 1 next 938>939 939>938
+group TP nNodes 1 nRanks 2 ranks 940 941
+  channel 0 next 940>941 941>940
+  channel 1 next 940>941 941>940
+group TP nNodes 1 nRanks 2 ranks 942 943
+  channel 0 next 942>943 943>942
+  channel 1 next 942>943 943>942
+group TP nNodes 1 nRanks 2 ranks 944 945
+  channel 0 next 944>945 945>944
+  channel 1 next 944>945 945>944
+group TP nNodes 1 nRanks 2 ranks 946 947
+  channel 0 next 946>947 947>946
+  channel 1 next 946>947 947>946
+group TP nNodes 1 nRanks 2 ranks 948 949
+  channel 0 next 948>949 949>948
+  channel 1 next 948>949 949>948
+group TP nNodes 1 nRanks 2 ranks 950 951
+  channel 0 next 950>951 951>950
+  channel 1 next 950>951 951>950
+group TP nNodes 1 nRanks 2 ranks 952 953
+  channel 0 next 952>953 953>952
+  channel 1 next 952>953 953>952
+group TP nNodes 1 nRanks 2 ranks 954 955
+  channel 0 next 954>955 955>954
+  channel 1 next 954>955 955>954
+group TP nNodes 1 nRanks 2 ranks 956 957
+  channel 0 next 956>957 957>956
+  channel 1 next 956>957 957>956
+group TP nNodes 1 nRanks 2 ranks 958 959
+  channel 0 next 958>959 959>958
+  channel 1 next 958>959 959>958
+group TP nNodes 1 nRanks 2 ranks 960 961
+  channel 0 next 960>961 961>960
+  channel 1 next 960>961 961>960
+group TP nNodes 1 nRanks 2 ranks 962 963
+  channel 0 next 962>963 963>962
+  channel 1 next 962>963 963>962
+group TP nNodes 1 nRanks 2 ranks 964 965
+  channel 0 next 964>965 965>964
+  channel 1 next 964>965 965>964
+group TP nNodes 1 nRanks 2 ranks 966 967
+  channel 0 next 966>967 967>966
+  channel 1 next 966>967 967>966
+group TP nNodes 1 nRanks 2 ranks 968 969
+  channel 0 next 968>969 969>968
+  channel 1 next 968>969 969>968
+group TP nNodes 1 nRanks 2 ranks 970 971
+  channel 0 next 970>971 971>970
+  channel 1 next 970>971 971>970
+group TP nNodes 1 nRanks 2 ranks 972 973
+  channel 0 next 972>973 973>972
+  channel 1 next 972>973 973>972
+group TP nNodes 1 nRanks 2 ranks 974 975
+  channel 0 next 974>975 975>974
+  channel 1 next 974>975 975>974
+group TP nNodes 1 nRanks 2 ranks 976 977
+  channel 0 next 976>977 977>976
+  channel 1 next 976>977 977>976
+group TP nNodes 1 nRanks 2 ranks 978 979
+  channel 0 next 978>979 979>978
+  channel 1 next 978>979 979>978
+group TP nNodes 1 nRanks 2 ranks 980 981
+  channel 0 next 980>981 981>980
+  channel 1 next 980>981 981>980
+group TP nNodes 1 nRanks 2 ranks 982 983
+  channel 0 next 982>983 983>982
+  channel 1 next 982>983 983>982
+group TP nNodes 1 nRanks 2 ranks 984 985
+  channel 0 next 984>985 985>984
+  channel 1 next 984>985 985>984
+group TP nNodes 1 nRanks 2 ranks 986 987
+  channel 0 next 986>987 987>986
+  channel 1 next 986>987 987>986
+group TP nNodes 1 nRanks 2 ranks 988 989
+  channel 0 next 988>989 989>988
+  channel 1 next 988>989 989>988
+group TP nNodes 1 nRanks 2 ranks 990 991
+  channel 0 next 990>991 991>990
+  channel 1 next 990>991 991>990
+group TP nNodes 1 nRanks 2 ranks 992 993
+  channel 0 next 992>993 993>992
+  channel 1 next 992>993 993>992
+group TP nNodes 1 nRanks 2 ranks 994 995
+  channel 0 next 994>995 995>994
+  channel 1 next 994>995 995>994
+group TP nNodes 1 nRanks 2 ranks 996 997
+  channel 0 next 996>997 997>996
+  channel 1 next 996>997 997>996
+group TP nNodes 1 nRanks 2 ranks 998 999
+  channel 0 next 998>999 999>998
+  channel 1 next 998>999 999>998
+group TP nNodes 1 nRanks 2 ranks 1000 1001
+  channel 0 next 1000>1001 1001>1000
+  channel 1 next 1000>1001 1001>1000
+group TP nNodes 1 nRanks 2 ranks 1002 1003
+  channel 0 next 1002>1003 1003>1002
+  channel 1 next 1002>1003 1003>1002
+group TP nNodes 1 nRanks 2 ranks 1004 1005
+  channel 0 next 1004>1005 1005>1004
+  channel 1 next 1004>1005 1005>1004
+group TP nNodes 1 nRanks 2 ranks 1006 1007
+  channel 0 next 1006>1007 1007>1006
+  channel 1 next 1006>1007 1007>1006
+group TP nNodes 1 nRanks 2 ranks 1008 1009
+  channel 0 next 1008>1009 1009>1008
+  channel 1 next 1008>1009 1009>1008
+group TP nNodes 1 nRanks 2 ranks 1010 1011
+  channel 0 next 1010>1011 1011>1010
+  channel 1 next 1010>1011 1011>1010
+group TP nNodes 1 nRanks 2 ranks 1012 1013
+  channel 0 next 1012>1013 1013>1012
+  channel 1 next 1012>1013 1013>1012
+group TP nNodes 1 nRanks 2 ranks 1014 1015
+  channel 0 next 1014>1015 1015>1014
+  channel 1 next 1014>1015 1015>1014
+group TP nNodes 1 nRanks 2 ranks 1016 1017
+  channel 0 next 1016>1017 1017>1016
+  channel 1 next 1016>1017 1017>1016
+group TP nNodes 1 nRanks 2 ranks 1018 1019
+  channel 0 next 1018>1019 1019>1018
+  channel 1 next 1018>1019 1019>1018
+group TP nNodes 1 nRanks 2 ranks 1020 1021
+  channel 0 next 1020>1021 1021>1020
+  channel 1 next 1020>1021 1021>1020
+group TP nNodes 1 nRanks 2 ranks 1022 1023
+  channel 0 next 1022>1023 1023>1022
+  channel 1 next 1022>1023 1023>1022
+group DP nNodes 128 nRanks 512 ranks 0 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30 32 34 36 38 40 42 44 46 48 50 52 54 56 58 60 62 64 66 68 70 72 74 76 78 80 82 84 86 88 90 92 94 96 98 100 102 104 106 108 110 112 114 116 118 120 122 124 126 128 130 132 134 136 138 140 142 144 146 148 150 152 154 156 158 160 162 164 166 168 170 172 174 176 178 180 182 184 186 188 190 192 194 196 198 200 202 204 206 208 210 212 214 216 218 220 222 224 226 228 230 232 234 236 238 240 242 244 246 248 250 252 254 256 258 260 262 264 266 268 270 272 274 276 278 280 282 284 286 288 290 292 294 296 298 300 302 304 306 308 310 312 314 316 318 320 322 324 326 328 330 332 334 336 338 340 342 344 346 348 350 352 354 356 358 360 362 364 366 368 370 372 374 376 378 380 382 384 386 388 390 392 394 396 398 400 402 404 406 408 410 412 414 416 418 420 422 424 426 428 430 432 434 436 438 440 442 444 446 448 450 452 454 456 458 460 462 464 466 468 470 472 474 476 478 480 482 484 486 488 490 492 494 496 498 500 502 504 506 508 510 512 514 516 518 520 522 524 526 528 530 532 534 536 538 540 542 544 546 548 550 552 554 556 558 560 562 564 566 568 570 572 574 576 578 580 582 584 586 588 590 592 594 596 598 600 602 604 606 608 610 612 614 616 618 620 622 624 626 628 630 632 634 636 638 640 642 644 646 648 650 652 654 656 658 660 662 664 666 668 670 672 674 676 678 680 682 684 686 688 690 692 694 696 698 700 702 704 706 708 710 712 714 716 718 720 722 724 726 728 730 732 734 736 738 740 742 744 746 748 750 752 754 756 758 760 762 764 766 768 770 772 774 776 778 780 782 784 786 788 790 792 794 796 798 800 802 804 806 808 810 812 814 816 818 820 822 824 826 828 830 832 834 836 838 840 842 844 846 848 850 852 854 856 858 860 862 864 866 868 870 872 874 876 878 880 882 884 886 888 890 892 894 896 898 900 902 904 906 908 910 912 914 916 918 920 922 924 926 928 930 932 934 936 938 940 942 944 946 948 950 952 954 956 958 960 962 964 966 968 970 972 974 976 978 980 982 984 986 988 990 992 994 996 998 1000 1002 1004 1006 1008 1010 1012 1014 1016 1018 1020 1022
+  channel 0 next 0>2 2>4 4>6 6>8 8>10 10>12 12>14 14>16 16>18 18>20 20>22 22>24 24>26 26>28 28>30 30>32 32>34 34>36 36>38 38>40 40>42 42>44 44>46 46>48 48>50 50>52 52>54 54>56 56>58 58>60 60>62 62>64 64>66 66>68 68>70 70>72 72>74 74>76 76>78 78>80 80>82 82>84 84>86 86>88 88>90 90>92 92>94 94>96 96>98 98>100 100>102 102>104 104>106 106>108 108>110 110>112 112>114 114>116 116>118 118>120 120>122 122>124 124>126 126>128 128>130 130>132 132>134 134>136 136>138 138>140 140>142 142>144 144>146 146>148 148>150 150>152 152>154 154>156 156>158 158>160 160>162 162>164 164>166 166>168 168>170 170>172 172>174 174>176 176>178 178>180 180>182 182>184 184>186 186>188 188>190 190>192 192>194 194>196 196>198 198>200 200>202 202>204 204>206 206>208 208>210 210>212 212>214 214>216 216>218 218>220 220>222 222>224 224>226 226>228 228>230 230>232 232>234 234>236 236>238 238>240 240>242 242>244 244>246 246>248 248>250 250>252 252>254 254>256 256>258 258>260 260>262 262>264 264>266 266>268 268>270 270>272 272>274 274>276 276>278 278>280 280>282 282>284 284>286 286>288 288>290 290>292 292>294 294>296 296>298 298>300 300>302 302>304 304>306 306>308 308>310 310>312 312>314 314>316 316>318 318>320 320>322 322>324 324>326 326>328 328>330 330>332 332>334 334>336 336>338 338>340 340>342 342>344 344>346 346>348 348>350 350>352 352>354 354>356 356>358 358>360 360>362 362>364 364>366 366>368 368>370 370>372 372>374 374>376 376>378 378>380 380>382 382>384 384>386 386>388 388>390 390>392 392>394 394>396 396>398 398>400 400>402 402>404 404>406 406>408 408>410 410>412 412>414 414>416 416>418 418>420 420>422 422>424 424>426 426>428 428>430 430>432 432>434 434>436 436>438 438>440 440>442 442>444 444>446 446>448 448>450 450>452 452>454 454>456 456>458 458>460 460>462 462>464 464>466 466>468 468>470 470>472 472>474 474>476 476>478 478>480 480>482 482>484 484>486 486>488 488>490 490>492 492>494 494>496 496>498 498>500 500>502 502>504 504>506 506>508 508>510 510>512 512>514 514>516 516>518 518>520 520>522 522>524 524>526 526>528 528>530 530>532 532>534 534>536 536>538 538>540 540>542 542>544 544>546 546>548 548>550 550>552 552>554 554>556 556>558 558>560 560>562 562>564 564>566 566>568 568>570 570>572 572>574 574>576 576>578 578>580 580>582 582>584 584>586 586>588 588>590 590>592 592>594 594>596 596>598 598>600 600>602 602>604 604>606 606>608 608>610 610>612 612>614 614>616 616>618 618>620 620>622 622>624 624>626 626>628 628>630 630>632 632>634 634>636 636>638 638>640 640>642 642>644 644>646 646>648 648>650 650>652 652>654 654>656 656>658 658>660 660>662 662>664 664>666 666>668 668>670 670>672 672>674 674>676 676>678 678>680 680>682 682>684 684>686 686>688 688>690 690>692 692>694 694>696 696>698 698>700 700>702 702>704 704>706 706>708 708>710 710>712 712>714 714>716 716>718 718>720 720>722 722>724 724>726 726>728 728>730 730>732 732>734 734>736 736>738 738>740 740>742 742>744 744>746 746>748 748>750 750>752 752>754 754>756 756>758 758>760 760>762 762>764 764>766 766>768 768>770 770>772 772>774 774>776 776>778 778>780 780>782 782>784 784>786 786>788 788>790 790>792 792>794 794>796 796>798 798>800 800>802 802>804 804>806 806>808 808>810 810>812 812>814 814>816 816>818 818>820 820>822 822>824 824>826 826>828 828>830 830>832 832>834 834>836 836>838 838>840 840>842 842>844 844>846 846>848 848>850 850>852 852>854 854>856 856>858 858>860 860>862 862>864 864>866 866>868 868>870 870>872 872>874 874>876 876>878 878>880 880>882 882>884 884>886 886>888 888>890 890>892 892>894 894>896 896>898 898>900 900>902 902>904 904>906 906>908 908>910 910>912 912>914 914>916 916>918 918>920 920>922 922>924 924>926 926>928 928>930 930>932 932>934 934>936 936>938 938>940 940>942 942>944 944>946 946>948 948>950 950>952 952>954 954>956 956>958 958>960 960>962 962>964 964>966 966>968 968>970 970>972 972>974 974>976 976>978 978>980 980>982 982>984 984>986 986>988 988>990 990>992 992>994 994>996 996>998 998>1000 1000>1002 1002>1004 1004>1006 1006>1008 1008>1010 1010>1012 1012>1014 1014>1016 1016>1018 1018>1020 1020>1022 1022>0
+  channel 1 next 0>10 2>4 4>6 6>0 8>18 10>12 12>14 14>8 16>26 18>20 20>22 22>16 24>34 26>28 28>30 30>24 32>42 34>36 36>38 38>32 40>50 42>44 44>46 46>40 48>58 50>52 52>54 54>48 56>66 58>60 60>62 62>56 64>74 66>68 68>70 70>64 72>82 74>76 76>78 78>72 80>90 82>84 84>86 86>80 88>98 90>92 92>94 94>88 96>106 98>100 100>102 102>96 104>114 106>108 108>110 110>104 112>122 114>116 116>118 118>112 120>130 122>124 124>126 126>120 128>138 130>132 132>134 134>128 136>146 138>140 140>142 142>136 144>154 146>148 148>150 150>144 152>162 154>156 156>158 158>152 160>170 162>164 164>166 166>160 168>178 170>172 172>174 174>168 176>186 178>180 180>182 182>176 184>194 186>188 188>190 190>184 192>202 194>196 196>198 198>192 200>210 202>204 204>206 206>200 208>218 210>212 212>214 214>208 216>226 218>220 220>222 222>216 224>234 226>228 228>230 230>224 232>242 234>236 236>238 238>232 240>250 242>244 244>246 246>240 248>258 250>252 252>254 254>248 256>266 258>260 260>262 262>256 264>274 266>268 268>270 270>264 272>282 274>276 276>278 278>272 280>290 282>284 284>286 286>280 288>298 290>292 292>294 294>288 296>306 298>300 300>302 302>296 304>314 306>308 308>310 310>304 312>322 314>316 316>318 318>312 320>330 322>324 324>326 326>320 328>338 330>332 332>334 334>328 336>346 338>340 340>342 342>336 344>354 346>348 348>350 350>344 352>362 354>356 356>358 358>352 360>370 362>364 364>366 366>360 368>378 370>372 372>374 374>368 376>386 378>380 380>382 382>376 384>394 386>388 388>390 390>384 392>402 394>396 396>398 398>392 400>410 402>404 404>406 406>400 408>418 410>412 412>414 414>408 416>426 418>420 420>422 422>416 424>434 426>428 428>430 430>424 432>442 434>436 436>438 438>432 440>450 442>444 444>446 446>440 448>458 450>452 452>454 454>448 456>466 458>460 460>462 462>456 464>474 466>468 468>470 470>464 472>482 474>476 476>478 478>472 480>490 482>484 484>486 486>480 488>498 490>492 492>494 494>488 496>506 498>500 500>502 502>496 504>514 506>508 508>510 510>504 512>522 514>516 516>518 518>512 520>530 522>524 524>526 526>520 528>538 530>532 532>534 534>528 536>546 538>540 540>542 542>536 544>554 546>548 548>550 550>544 552>562 554>556 556>558 558>552 560>570 562>564 564>566 566>560 568>578 570>572 572>574 574>568 576>586 578>580 580>582 582>576 584>594 586>588 588>590 590>584 592>602 594>596 596>598 598>592 600>610 602>604 604>606 606>600 608>618 610>612 612>614 614>608 616>626 618>620 620>622 622>616 624>634 626>628 628>630 630>624 632>642 634>636 636>638 638>632 640>650 642>644 644>646 646>640 648>658 650>652 652>654 654>648 656>666 658>660 660>662 662>656 664>674 666>668 668>670 670>664 672>682 674>676 676>678 678>672 680>690 682>684 684>686 686>680 688>698 690>692 692>694 694>688 696>706 698>700 700>702 702>696 704>714 706>708 708>710 710>704 712>722 714>716 716>718 718>712 720>730 722>724 724>726 726>720 728>738 730>732 732>734 734>728 736>746 738>740 740>742 742>736 744>754 746>748 748>750 750>744 752>762 754>756 756>758 758>752 760>770 762>764 764>766 766>760 768>778 770>772 772>774 774>768 776>786 778>780 780>782 782>776 784>794 786>788 788>790 790>784 792>802 794>796 796>798 798>792 800>810 802>804 804>806 806>800 808>818 810>812 812>814 814>808 816>826 818>820 820>822 822>816 824>834 826>828 828>830 830>824 832>842 834>836 836>838 838>832 840>850 842>844 844>846 846>840 848>858 850>852 852>854 854>848 856>866 858>860 860>862 862>856 864>874 866>868 868>870 870>864 872>882 874>876 876>878 878>872 880>890 882>884 884>886 886>880 888>898 890>892 892>894 894>888 896>906 898>900 900>902 902>896 904>914 906>908 908>910 910>904 912>922 914>916 916>918 918>912 920>930 922>924 924>926 926>920 928>938 930>932 932>934 934>928 936>946 938>940 940>942 942>936 944>954 946>948 948>950 950>944 952>962 954>956 956>958 958>952 960>970 962>964 964>966 966>960 968>978 970>972 972>974 974>968 976>986 978>980 980>982 982>976 984>994 986>988 988>990 990>984 992>1002 994>996 996>998 998>992 1000>1010 1002>1004 1004>1006 1006>1000 1008>1018 1010>1012 1012>1014 1014>1008 1016>2 1018>1020 1020>1022 1022>1016
+  channel 2 next 0>2 2>12 4>6 6>0 8>10 10>20 12>14 14>8 16>18 18>28 20>22 22>16 24>26 26>36 28>30 30>24 32>34 34>44 36>38 38>32 40>42 42>52 44>46 46>40 48>50 50>60 52>54 54>48 56>58 58>68 60>62 62>56 64>66 66>76 68>70 70>64 72>74 74>84 76>78 78>72 80>82 82>92 84>86 86>80 88>90 90>100 92>94 94>88 96>98 98>108 100>102 102>96 104>106 106>116 108>110 110>104 112>114 114>124 116>118 118>112 120>122 122>132 124>126 126>120 128>130 130>140 132>134 134>128 136>138 138>148 140>142 142>136 144>146 146>156 148>150 150>144 152>154 154>164 156>158 158>152 160>162 162>172 164>166 166>160 168>170 170>180 172>174 174>168 176>178 178>188 180>182 182>176 184>186 186>196 188>190 190>184 192>194 194>204 196>198 198>192 200>202 202>212 204>206 206>200 208>210 210>220 212>214 214>208 216>218 218>228 220>222 222>216 224>226 226>236 228>230 230>224 232>234 234>244 236>238 238>232 240>242 242>252 244>246 246>240 248>250 250>260 252>254 254>248 256>258 258>268 260>262 262>256 264>266 266>276 268>270 270>264 272>274 274>284 276>278 278>272 280>282 282>292 284>286 286>280 288>290 290>300 292>294 294>288 296>298 298>308 300>302 302>296 304>306 306>316 308>310 310>304 312>314 314>324 316>318 318>312 320>322 322>332 324>326 326>320 328>330 330>340 332>334 334>328 336>338 338>348 340>342 342>336 344>346 346>356 348>350 350>344 352>354 354>364 356>358 358>352 360>362 362>372 364>366 366>360 368>370 370>380 372>374 374>368 376>378 378>388 380>382 382>376 384>386 386>396 388>390 390>384 392>394 394>404 396>398 398>392 400>402 402>412 404>406 406>400 408>410 410>420 412>414 414>408 416>418 418>428 420>422 422>416 424>426 426>436 428>430 430>424 432>434 434>444 436>438 438>432 440>442 442>452 444>446 446>440 448>450 450>460 452>454 454>448 456>458 458>468 460>462 462>456 464>466 466>476 468>470 470>464 472>474 474>484 476>478 478>472 480>482 482>492 484>486 486>480 488>490 490>500 492>494 494>488 496>498 498>508 500>502 502>496 504>506 506>516 508>510 510>504 512>514 514>524 516>518 518>512 520>522 522>532 524>526 526>520 528>530 530>540 532>534 534>528 536>538 538>548 540>542 542>536 544>546 546>556 548>550 550>544 552>554 554>564 556>558 558>552 560>562 562>572 564>566 566>560 568>570 570>580 572>574 574>568 576>578 578>588 580>582 582>576 584>586 586>596 588>590 590>584 592>594 594>604 596>598 598>592 600>602 602>612 604>606 606>600 608>610 610>620 612>614 614>608 616>618 618>628 620>622 622>616 624>626 626>636 628>630 630>624 632>634 634>644 636>638 638>632 640>642 642>652 644>646 646>640 648>650 650>660 652>654 654>648 656>658 658>668 660>662 662>656 664>666 666>676 668>670 670>664 672>674 674>684 676>678 678>672 680>682 682>692 684>686 686>680 688>690 690>700 692>694 694>688 696>698 698>708 700>702 702>696 704>706 706>716 708>710 710>704 712>714 714>724 716>718 718>712 720>722 722>732 724>726 726>720 728>730 730>740 732>734 734>728 736>738 738>748 740>742 742>736 744>746 746>756 748>750 750>744 752>754 754>764 756>758 758>752 760>762 762>772 764>766 766>760 768>770 770>780 772>774 774>768 776>778 778>788 780>782 782>776 784>786 786>796 788>790 790>784 792>794 794>804 796>798 798>792 800>802 802>812 804>806 806>800 808>810 810>820 812>814 814>808 816>818 818>828 820>822 822>816 824>826 826>836 828>830 830>824 832>834 834>844 836>838 838>832 840>842 842>852 844>846 846>840 848>850 850>860 852>854 854>848 856>858 858>868 860>862 862>856 864>866 866>876 868>870 870>864 872>874 874>884 876>878 878>872 880>882 882>892 884>886 886>880 888>890 890>900 892>894 894>888 896>898 898>908 900>902 902>896 904>906 906>916 908>910 910>904 912>914 914>924 916>918 918>912 920>922 922>932 924>926 926>920 928>930 930>940 932>934 934>928 936>938 938>948 940>942 942>936 944>946 946>956 948>950 950>944 952>954 954>964 956>958 958>952 960>962 962>972 964>966 966>960 968>970 970>980 972>974 974>968 976>978 978>988 980>982 982>976 984>986 986>996 988>990 990>984 992>994 994>1004 996>998 998>992 1000>1002 1002>1012 1004>1006 1006>1000 1008>1010 1010>1020 1012>1014 1014>1008 1016>1018 1018>4 1020>1022 1022>1016
+  channel 3 next 0>2 2>4 4>14 6>0 8>10 10>12 12>22 14>8 16>18 18>20 20>30 22>16 24>26 26>28 28>38 30>24 32>34 34>36 36>46 38>32 40>42 42>44 44>54 46>40 48>50 50>52 52>62 54>48 56>58 58>60 60>70 62>56 64>66 66>68 68>78 70>64 72>74 74>76 76>86 78>72 80>82 82>84 84>94 86>80 88>90 90>92 92>102 94>88 96>98 98>100 100>110 102>96 104>106 106>108 108>118 110>104 112>114 114>116 116>126 118>112 120>122 122>124 124>134 126>120 128>130 130>132 132>142 134>128 136>138 138>140 140>150 142>136 144>146 146>148 148>158 150>144 152>154 154>156 156>166 158>152 160>162 162>164 164>174 166>160 168>170 170>172 172>182 174>168 176>178 178>180 180>190 182>176 184>186 186>188 188>198 190>184 192>194 194>196 196>206 198>192 200>202 202>204 204>214 206>200 208>210 210>212 212>222 214>208 216>218 218>220 220>230 222>216 224>226 226>228 228>238 230>224 232>234 234>236 236>246 238>232 240>242 242>244 244>254 246>240 248>250 250>252 252>262 254>248 256>258 258>260 260>270 262>256 264>266 266>268 268>278 270>264 272>274 274>276 276>286 278>272 280>282 282>284 284>294 286>280 288>290 290>292 292>302 294>288 296>298 298>300 300>310 302>296 304>306 306>308 308>318 310>304 312>314 314>316 316>326 318>312 320>322 322>324 324>334 326>320 328>330 330>332 332>342 334>328 336>338 338>340 340>350 342>336 344>346 346>348 348>358 350>344 352>354 354>356 356>366 358>352 360>362 362>364 364>374 366>360 368>370 370>372 372>382 374>368 376>378 378>380 380>390 382>376 384>386 386>388 388>398 390>384 392>394 394>396 396>406 398>392 400>402 402>404 404>414 406>400 408>410 410>412 412>422 414>408 416>418 418>420 420>430 422>416 424>426 426>428 428>438 430>424 432>434 434>436 436>446 438>432 440>442 442>444 444>454 446>440 448>450 450>452 452>462 454>448 456>458 458>460 460>470 462>456 464>466 466>468 468>478 470>464 472>474 474>476 476>486 478>472 480>482 482>484 484>494 486>480 488>490 490>492 492>502 494>488 496>498 498>500 500>510 502>496 504>506 506>508 508>518 510>504 512>514 514>516 516>526 518>512 520>522 522>524 524>534 526>520 528>530 530>532 532>542 534>528 536>538 538>540 540>550 542>536 544>546 546>548 548>558 550>544 552>554 554>556 556>566 558>552 560>562 562>564 564>574 566>560 568>570 570>572 572>582 574>568 576>578 578>580 580>590 582>576 584>586 586>588 588>598 590>584 592>594 594>596 596>606 598>592 600>602 602>604 604>614 606>600 608>610 610>612 612>622 614>608 616>618 618>620 620>630 622>616 624>626 626>628 628>638 630>624 632>634 634>636 636>646 638>632 640>642 642>644 644>654 646>640 648>650 650>652 652>662 654>648 656>658 658>660 660>670 662>656 664>666 666>668 668>678 670>664 672>674 674>676 676>686 678>672 680>682 682>684 684>694 686>680 688>690 690>692 692>702 694>688 696>698 698>700 700>710 702>696 704>706 706>708 708>718 710>704 712>714 714>716 716>726 718>712 720>722 722>724 724>734 726>720 728>730 730>732 732>742 734>728 736>738 738>740 740>750 742>736 744>746 746>748 748>758 750>744 752>754 754>756 756>766 758>752 760>762 762>764 764>774 766>760 768>770 770>772 772>782 774>768 776>778 778>780 780>790 782>776 784>786 786>788 788>798 790>784 792>794 794>796 796>806 798>792 800>802 802>804 804>814 806>800 808>810 810>812 812>822 814>808 816>818 818>820 820>830 822>816 824>826 826>828 828>838 830>824 832>834 834>836 836>846 838>832 840>842 842>844 844>854 846>840 848>850 850>852 852>862 854>848 856>858 858>860 860>870 862>856 864>866 866>868 868>878 870>864 872>874 874>876 876>886 878>872 880>882 882>884 884>894 886>880 888>890 890>892 892>902 894>888 896>898 898>900 900>910 902>896 904>906 906>908 908>918 910>904 912>914 914>916 916>926 918>912 920>922 922>924 924>934 926>920 928>930 930>932 932>942 934>928 936>938 938>940 940>950 942>936 944>946 946>948 948>958 950>944 952>954 954>956 956>966 958>952 960>962 962>964 964>974 966>960 968>970 970>972 972>982 974>968 976>978 978>980 980>990 982>976 984>986 986>988 988>998 990>984 992>994 994>996 996>1006 998>992 1000>1002 1002>1004 1004>1014 1006>1000 1008>1010 1010>1012 1012>1022 1014>1008 1016>1018 1018>1020 1020>6 1022>1016
+group DP nNodes 128 nRanks 512 ranks 1 3 5 7 9 11 13 15 17 19 21 23 25 27 29 31 33 35 37 39 41 43 45 47 49 51 53 55 57 59 61 63 65 67 69 71 73 75 77 79 81 83 85 87 89 91 93 95 97 99 101 103 105 107 109 111 113 115 117 119 121 123 125 127 129 131 133 135 137 139 141 143 145 147 149 151 153 155 157 159 161 163 165 167 169 171 173 175 177 179 181 183 185 187 189 191 193 195 197 199 201 203 205 207 209 211 213 215 217 219 221 223 225 227 229 231 233 235 237 239 241 243 245 247 249 251 253 255 257 259 261 263 265 267 269 271 273 275 277 279 281 283 285 287 289 291 293 295 297 299 301 303 305 307 309 311 313 315 317 319 321 323 325 327 329 331 333 335 337 339 341 343 345 347 349 351 353 355 357 359 361 363 365 367 369 371 373 375 377 379 381 383 385 387 389 391 393 395 397 399 401 403 405 407 409 411 413 415 417 419 421 423 425 427 429 431 433 435 437 439 441 443 445 447 449 451 453 455 457 459 461 463 465 467 469 471 473 475 477 479 481 483 485 487 489 491 493 495 497 499 501 503 505 507 509 511 513 515 517 519 521 523 525 527 529 531 533 535 537 539 541 543 545 547 549 551 553 555 557 559 561 563 565 567 569 571 573 575 577 579 581 583 585 587 589 591 593 595 597 599 601 603 605 607 609 611 613 615 617 619 621 623 625 627 629 631 633 635 637 639 641 643 645 647 649 651 653 655 657 659 661 663 665 667 669 671 673 675 677 679 681 683 685 687 689 691 693 695 697 699 701 703 705 707 709 711 713 715 717 719 721 723 725 727 729 731 733 735 737 739 741 743 745 747 749 751 753 755 757 759 761 763 765 767 769 771 773 775 777 779 781 783 785 787 789 791 793 795 797 799 801 803 805 807 809 811 813 815 817 819 821 823 825 827 829 831 833 835 837 839 841 843 845 847 849 851 853 855 857 859 861 863 865 867 869 871 873 875 877 879 881 883 885 887 889 891 893 895 897 899 901 903 905 907 909 911 913 915 917 919 921 923 925 927 929 931 933 935 937 939 941 943 945 947 949 951 953 955 957 959 961 963 965 967 969 971 973 975 977 979 981 983 985 987 989 991 993 995 997 999 1001 1003 1005 1007 1009 1011 1013 1015 1017 1019 1021 1023
+  channel 0 next 1>3 3>5 5>7 7>9 9>11 11>13 13>15 15>17 17>19 19>21 21>23 23>25 25>27 27>29 29>31 31>33 33>35 35>37 37>39 39>41 41>43 43>45 45>47 47>49 49>51 51>53 53>55 55>57 57>59 59>61 61>63 63>65 65>67 67>69 69>71 71>73 73>75 75>77 77>79 79>81 81>83 83>85 85>87 87>89 89>91 91>93 93>95 95>97 97>99 99>101 101>103 103>105 105>107 107>109 109>111 111>113 113>115 115>117 117>119 119>121 121>123 123>125 125>127 127>129 129>131 131>133 133>135 135>137 137>139 139>141 141>143 143>145 145>147 147>149 149>151 151>153 153>155 155>157 157>159 159>161 161>163 163>165 165>167 167>169 169>171 171>173 173>175 175>177 177>179 179>181 181>183 183>185 185>187 187>189 189>191 191>193 193>195 195>197 197>199 199>201 201>203 203>205 205>207 207>209 209>211 211>213 213>215 215>217 217>219 219>221 221>223 223>225 225>227 227>229 229>231 231>233 233>235 235>237 237>239 239>241 241>243 243>245 245>247 247>249 249>251 251>253 253>255 255>257 257>259 259>261 261>263 263>265 265>267 267>269 269>271 271>273 273>275 275>277 277>279 279>281 281>283 283>285 285>287 287>289 289>291 291>293 293>295 295>297 297>299 299>301 301>303 303>305 305>307 307>309 309>311 311>313 313>315 315>317 317>319 319>321 321>323 323>325 325>327 327>329 329>331 331>333 333>335 335>337 337>339 339>341 341>343 343>345 345>347 347>349 349>351 351>353 353>355 355>357 357>359 359>361 361>363 363>365 365>367 367>369 369>371 371>373 373>375 375>377 377>379 379>381 381>383 383>385 385>387 387>389 389>391 391>393 393>395 395>397 397>399 399>401 401>403 403>405 405>407 407>409 409>411 411>413 413>415 415>417 417>419 419>421 421>423 423>425 425>427 427>429 429>431 431>433 433>435 435>437 437>439 439>441 441>443 443>445 445>447 447>449 449>451 451>453 453>455 455>457 457>459 459>461 461>463 463>465 465>467 467>469 469>471 471>473 473>475 475>477 477>479 479>481 481>483 483>485 485>487 487>489 489>491 491>493 493>495 495>497 497>499 499>501 501>503 503>505 505>507 507>509 509>511 511>513 513>515 515>517 517>519 519>521 521>523 523>525 525>527 527>529 529>531 531>533 533>535 535>537 537>539 539>541 541>543 543>545 545>547 547>549 549>551 551>553 553>555 555>557 557>559 559>561 561>563 563>565 565>567 567>569 569>571 571>573 573>575 575>577 577>579 579>581 581>583 583>585 585>587 587>589 589>591 591>593 593>595 595>597 597>599 599>601 601>603 603>605 605>607 607>609 609>611 611>613 613>615 615>617 617>619 619>621 621>623 623>625 625>627 627>629 629>631 631>633 633>635 635>637 637>639 639>641 641>643 643>645 645>647 647>649 649>651 651>653 653>655 655>657 657>659 659>661 661>663 663>665 665>667 667>669 669>671 671>673 673>675 675>677 677>679 679>681 681>683 683>685 685>687 687>689 689>691 691>693 693>695 695>697 697>699 699>701 701>703 703>705 705>707 707>709 709>711 711>713 713>715 715>717 717>719 719>721 721>723 723>725 725>727 727>729 729>731 731>733 733>735 735>737 737>739 739>741 741>743 743>745 745>747 747>749 749>751 751>753 753>755 755>757 757>759 759>761 761>763 763>765 765>767 767>769 769>771 771>773 773>775 775>777 777>779 779>781 781>783 783>785 785>787 787>789 789>791 791>793 793>795 795>797 797>799 799>801 801>803 803>805 805>807 807>809 809>811 811>813 813>815 815>817 817>819 819>821 821>823 823>825 825>827 827>829 829>831 831>833 833>835 835>837 837>839 839>841 841>843 843>845 845>847 847>849 849>851 851>853 853>855 855>857 857>859 859>861 861>863 863>865 865>867 867>869 869>871 871>873 873>875 875>877 877>879 879>881 881>883 883>885 885>887 887>889 889>891 891>893 893>895 895>897 897>899 899>901 901>903 903>905 905>907 907>909 909>911 911>913 913>915 915>917 917>919 919>921 921>923 923>925 925>927 927>929 929>931 931>933 933>935 935>937 937>939 939>941 941>943 943>945 945>947 947>949 949>951 951>953 953>955 955>957 957>959 959>961 961>963 963>965 965>967 967>969 969>971 971>973 973>975 975>977 977>979 979>981 981>983 983>985 985>987 987>989 989>991 991>993 993>995 995>997 997>999 999>1001 1001>1003 1003>1005 1005>1007 1007>1009 1009>1011 1011>1013 1013>1015 1015>1017 1017>1019 1019>1021 1021>1023 1023>1
+  channel 1 next 1>11 3>5 5>7 7>1 9>19 11>13 13>15 15>9 17>27 19>21 21>23 23>17 25>35 27>29 29>31 31>25 33>43 35>37 37>39 39>33 41>51 43>45 45>47 47>41 49>59 51>53 53>55 55>49 57>67 59>61 61>63 63>57 65>75 67>69 69>71 71>65 73>83 75>77 77>79 79>73 81>91 83>85 85>87 87>81 89>99 91>93 93>95 95>89 97>107 99>101 101>103 103>97 105>115 107>109 109>111 111>105 113>123 115>117 117>119 119>113 121>131 123>125 125>127 127>121 129>139 131>133 133>135 135>129 137>147 139>141 141>143 143>137 145>155 147>149 149>151 151>145 153>163 155>157 157>159 159>153 161>171 163>165 165>167 167>161 169>179 171>173 173>175 175>169 177>187 179>181 181>183 183>177 185>195 187>189 189>191 191>185 193>203 195>197 197>199 199>193 201>211 203>205 205>207 207>201 209>219 211>213 213>215 215>209 217>227 219>221 221>223 223>217 225>235 227>229 229>231 231>225 233>243 235>237 237>239 239>233 241>251 243>245 245>247 247>241 249>259 251>253 253>255 255>249 257>267 259>261 261>263 263>257 265>275 267>269 269>271 271>265 273>283 275>277 277>279 279>273 281>291 283>285 285>287 287>281 289>299 291>293 293>295 295>289 297>307 299>301 301>303 303>297 305>315 307>309 309>311 311>305 313>323 315>317 317>319 319>313 321>331 323>325 325>327 327>321 329>339 331>333 333>335 335>329 337>347 339>341 341>343 343>337 345>355 347>349 349>351 351>345 353>363 355>357 357>359 359>353 361>371 363>365 365>367 367>361 369>379 371>373 373>375 375>369 377>387 379>381 381>383 383>377 385>395 387>389 389>391 391>385 393>403 395>397 397>399 399>393 401>411 403>405 405>407 407>401 409>419 411>413 413>415 415>409 417>427 419>421 421>423 423>417 425>435 427>429 429>431 431>425 433>443 435>437 437>439 439>433 441>451 443>445 445>447 447>441 449>459 451>453 453>455 455>449 457>467 459>461 461>463 463>457 465>475 467>469 469>471 471>465 473>483 475>477 477>479 479>473 481>491 483>485 485>487 487>481 489>499 491>493 493>495 495>489 497>507 499>501 501>503 503>497 505>515 507>509 509>511 511>505 513>523 515>517 517>519 519>513 521>531 523>525 525>527 527>521 529>539 531>533 533>535 535>529 537>547 539>541 541>543 543>537 545>555 547>549 549>551 551>545 553>563 555>557 557>559 559>553 561>571 563>565 565>567 567>561 569>579 571>573 573>575 575>569 577>587 579>581 581>583 583>577 585>595 587>589 589>591 591>585 593>603 595>597 597>599 599>593 601>611 603>605 605>607 607>601 609>619 611>613 613>615 615>609 617>627 619>621 621>623 623>617 625>635 627>629 629>631 631>625 633>643 635>637 637>639 639>633 641>651 643>645 645>647 647>641 649>659 651>653 653>655 655>649 657>667 659>661 661>663 663>657 665>675 667>669 669>671 671>665 673>683 675>677 677>679 679>673 681>691 683>685 685>687 687>681 689>699 691>693 693>695 695>689 697>707 699>701 701>703 703>697 705>715 707>709 709>711 711>705 713>723 715>717 717>719 719>713 721>731 723>725 725>727 727>721 729>739 731>733 733>735 735>729 737>747 739>741 741>743 743>737 745>755 747>749 749>751 751>745 753>763 755>757 757>759 759>753 761>771 763>765 765>767 767>761 769>779 771>773 773>775 775>769 777>787 779>781 781>783 783>777 785>795 787>789 789>791 791>785 793>803 795>797 797>799 799>793 801>811 803>805 805>807 807>801 809>819 811>813 813>815 815>809 817>827 819>821 821>823 823>817 825>835 827>829 829>831 831>825 833>843 835>837 837>839 839>833 841>851 843>845 845>847 847>841 849>859 851>853 853>855 855>849 857>867 859>861 861>863 863>857 865>875 867>869 869>871 871>865 873>883 875>877 877>879 879>873 881>891 883>885 885>887 887>881 889>899 891>893 893>895 895>889 897>907 899>901 901>903 903>897 905>915 907>909 909>911 911>905 913>923 915>917 917>919 919>913 921>931 923>925 925>927 927>921 929>939 931>933 933>935 935>929 937>947 939>941 941>943 943>937 945>955 947>949 949>951 951>945 953>963 955>957 957>959 959>953 961>971 963>965 965>967 967>961 969>979 971>973 973>975 975>969 977>987 979>981 981>983 983>977 985>995 987>989 989>991 991>985 993>1003 995>997 997>999 999>993 1001>1011 1003>1005 1005>1007 1007>1001 1009>1019 1011>1013 1013>1015 1015>1009 1017>3 1019>1021 1021>1023 1023>1017
+  channel 2 next 1>3 3>13 5>7 7>1 9>11 11>21 13>15 15>9 17>19 19>29 21>23 23>17 25>27 27>37 29>31 31>25 33>35 35>45 37>39 39>33 41>43 43>53 45>47 47>41 49>51 51>61 53>55 55>49 57>59 59>69 61>63 63>57 65>67 67>77 69>71 71>65 73>75 75>85 77>79 79>73 81>83 83>93 85>87 87>81 89>91 91>101 93>95 95>89 97>99 99>109 101>103 103>97 105>107 107>117 109>111 111>105 113>115 115>125 117>119 119>113 121>123 123>133 125>127 127>121 129>131 131>141 133>135 135>129 137>139 139>149 141>143 143>137 145>147 147>157 149>151 151>145 153>155 155>165 157>159 159>153 161>163 163>173 165>167 167>161 169>171 171>181 173>175 175>169 177>179 179>189 181>183 183>177 185>187 187>197 189>191 191>185 193>195 195>205 197>199 199>193 201>203 203>213 205>207 207>201 209>211 211>221 213>215 215>209 217>219 219>229 221>223 223>217 225>227 227>237 229>231 231>225 233>235 235>245 237>239 239>233 241>243 243>253 245>247 247>241 249>251 251>261 253>255 255>249 257>259 259>269 261>263 263>257 265>267 267>277 269>271 271>265 273>275 275>285 277>279 279>273 281>283 283>293 285>287 287>281 289>291 291>301 293>295 295>289 297>299 299>309 301>303 303>297 305>307 307>317 309>311 311>305 313>315 315>325 317>319 319>313 321>323 323>333 325>327 327>321 329>331 331>341 333>335 335>329 337>339 339>349 341>343 343>337 345>347 347>357 349>351 351>345 353>355 355>365 357>359 359>353 361>363 363>373 365>367 367>361 369>371 371>381 373>375 375>369 377>379 379>389 381>383 383>377 385>387 387>397 389>391 391>385 393>395 395>405 397>399 399>393 401>403 403>413 405>407 407>401 409>411 411>421 413>415 415>409 417>419 419>429 421>423 423>417 425>427 427>437 429>431 431>425 433>435 435>445 437>439 439>433 441>443 443>453 445>447 447>441 449>451 451>461 453>455 455>449 457>459 459>469 461>463 463>457 465>467 467>477 469>471 471>465 473>475 475>485 477>479 479>473 481>483 483>493 485>487 487>481 489>491 491>501 493>495 495>489 497>499 499>509 501>503 503>497 505>507 507>517 509>511 511>505 513>515 515>525 517>519 519>513 521>523 523>533 525>527 527>521 529>531 531>541 533>535 535>529 537>539 539>549 541>543 543>537 545>547 547>557 549>551 551>545 553>555 555>565 557>559 559>553 561>563 563>573 565>567 567>561 569>571 571>581 573>575 575>569 577>579 579>589 581>583 583>577 585>587 587>597 589>591 591>585 593>595 595>605 597>599 599>593 601>603 603>613 605>607 607>601 609>611 611>621 613>615 615>609 617>619 619>629 621>623 623>617 625>627 627>637 629>631 631>625 633>635 635>645 637>639 639>633 641>643 643>653 645>647 647>641 649>651 651>661 653>655 655>649 657>659 659>669 661>663 663>657 665>667 667>677 669>671 671>665 673>675 675>685 677>679 679>673 681>683 683>693 685>687 687>681 689>691 691>701 693>695 695>689 697>699 699>709 701>703 703>697 705>707 707>717 709>711 711>705 713>715 715>725 717>719 719>713 721>723 723>733 725>727 727>721 729>731 731>741 733>735 735>729 737>739 739>749 741>743 743>737 745>747 747>757 749>751 751>745 753>755 755>765 757>759 759>753 761>763 763>773 765>767 767>761 769>771 771>781 773>775 775>769 777>779 779>789 781>783 783>777 785>787 787>797 789>791 791>785 793>795 795>805 797>799 799>793 801>803 803>813 805>807 807>801 809>811 811>821 813>815 815>809 817>819 819>829 821>823 823>817 825>827 827>837 829>831 831>825 833>835 835>845 837>839 839>833 841>843 843>853 845>847 847>841 849>851 851>861 853>855 855>849 857>859 859>869 861>863 863>857 865>867 867>877 869>871 871>865 873>875 875>885 877>879 879>873 881>883 883>893 885>887 887>881 889>891 891>901 893>895 895>889 897>899 899>909 901>903 903>897 905>907 907>917 909>911 911>905 913>915 915>925 917>919 919>913 921>923 923>933 925>927 927>921 929>931 931>941 933>935 935>929 937>939 939>949 941>943 943>937 945>947 947>957 949>951 951>945 953>955 955>965 957>959 959>953 961>963 963>973 965>967 967>961 969>971 971>981 973>975 975>969 977>979 979>989 981>983 983>977 985>987 987>997 989>991 991>985 993>995 995>1005 997>999 999>993 1001>1003 1003>1013 1005>1007 1007>1001 1009>1011 1011>1021 1013>1015 1015>1009 1017>1019 1019>5 1021>1023 1023>1017
+  channel 3 next 1>3 3>5 5>15 7>1 9>11 11>13 13>23 15>9 17>19 19>21 21>31 23>17 25>27 27>29 29>39 31>25 33>35 35>37 37>47 39>33 41>43 43>45 45>55 47>41 49>51 51>53 53>63 55>49 57>59 59>61 61>71 63>57 65>67 67>69 69>79 71>65 73>75 75>77 77>87 79>73 81>83 83>85 85>95 87>81 89>91 91>93 93>103 95>89 97>99 99>101 101>111 103>97 105>107 107>109 109>119 111>105 113>115 115>117 117>127 119>113 121>123 123>125 125>135 127>121 129>131 131>133 133>143 135>129 137>139 139>141 141>151 143>137 145>147 147>149 149>159 151>145 153>155 155>157 157>167 159>153 161>163 163>165 165>175 167>161 169>171 171>173 173>183 175>169 177>179 179>181 181>191 183>177 185>187 187>189 189>199 191>185 193>195 195>197 197>207 199>193 201>203 203>205 205>215 207>201 209>211 211>213 213>223 215>209 217>219 219>221 221>231 223>217 225>227 227>229 229>239 231>225 233>235 235>237 237>247 239>233 241>243 243>245 245>255 247>241 249>251 251>253 253>263 255>249 257>259 259>261 261>271 263>257 265>267 267>269 269>279 271>265 273>275 275>277 277>287 279>273 281>283 283>285 285>295 287>281 289>291 291>293 293>303 295>289 297>299 299>301 301>311 303>297 305>307 307>309 309>319 311>305 313>315 315>317 317>327 319>313 321>323 323>325 325>335 327>321 329>331 331>333 333>343 335>329 337>339 339>341 341>351 343>337 345>347 347>349 349>359 351>345 353>355 355>357 357>367 359>353 361>363 363>365 365>375 367>361 369>371 371>373 373>383 375>369 377>379 379>381 381>391 383>377 385>387 387>389 389>399 391>385 393>395 395>397 397>407 399>393 401>403 403>405 405>415 407>401 409>411 411>413 413>423 415>409 417>419 419>421 421>431 423>417 425>427 427>429 429>439 431>425 433>435 435>437 437>447 439>433 441>443 443>445 445>455 447>441 449>451 451>453 453>463 455>449 457>459 459>461 461>471 463>457 465>467 467>469 469>479 471>465 473>475 475>477 477>487 479>473 481>483 483>485 485>495 487>481 489>491 491>493 493>503 495>489 497>499 499>501 501>511 503>497 505>507 507>509 509>519 511>505 513>515 515>517 517>527 519>513 521>523 523>525 525>535 527>521 529>531 531>533 533>543 535>529 537>539 539>541 541>551 543>537 545>547 547>549 549>559 551>545 553>555 555>557 557>567 559>553 561>563 563>565 565>575 567>561 569>571 571>573 573>583 575>569 577>579 579>581 581>591 583>577 585>587 587>589 589>599 591>585 593>595 595>597 597>607 599>593 601>603 603>605 605>615 607>601 609>611 611>613 613>623 615>609 617>619 619>621 621>631 623>617 625>627 627>629 629>639 631>625 633>635 635>637 637>647 639>633 641>643 643>645 645>655 647>641 649>651 651>653 653>663 655>649 657>659 659>661 661>671 663>657 665>667 667>669 669>679 671>665 673>675 675>677 677>687 679>673 681>683 683>685 685>695 687>681 689>691 691>693 693>703 695>689 697>699 699>701 701>711 703>697 705>707 707>709 709>719 711>705 713>715 715>717 717>727 719>713 721>723 723>725 725>735 727>721 729>731 731>733 733>743 735>729 737>739 739>741 741>751 743>737 745>747 747>749 749>759 751>745 753>755 755>757 757>767 759>753 761>763 763>765 765>775 767>761 769>771 771>773 773>783 775>769 777>779 779>781 781>791 783>777 785>787 787>789 789>799 791>785 793>795 795>797 797>807 799>793 801>803 803>805 805>815 807>801 809>811 811>813 813>823 815>809 817>819 819>821 821>831 823>817 825>827 827>829 829>839 831>825 833>835 835>837 837>847 839>833 841>843 843>845 845>855 847>841 849>851 851>853 853>863 855>849 857>859 859>861 861>871 863>857 865>867 867>869 869>879 871>865 873>875 875>877 877>887 879>873 881>883 883>885 885>895 887>881 889>891 891>893 893>903 895>889 897>899 899>901 901>911 903>897 905>907 907>909 909>919 911>905 913>915 915>917 917>927 919>913 921>923 923>925 925>935 927>921 929>931 931>933 933>943 935>929 937>939 939>941 941>951 943>937 945>947 947>949 949>959 951>945 953>955 955>957 957>967 959>953 961>963 963>965 965>975 967>961 969>971 971>973 973>983 975>969 977>979 979>981 981>991 983>977 985>987 987>989 989>999 991>985 993>995 995>997 997>1007 999>993 1001>1003 1003>1005 1005>1015 1007>1001 1009>1011 1011>1013 1013>1023 1015>1009 1017>1019 1019>1021 1021>7 1023>1017
+group EP nNodes 8 nRanks 32 ranks 0 2 4 6 8 10 12 14 16 18 20 22 24 26 28 30 32 34 36 38 40 42 44 46 48 50 52 54 56 58 60 62
+  channel 0 next 0>2 2>4 4>6 6>8 8>10 10>12 12>14 14>16 16>18 18>20 20>22 22>24 24>26 26>28 28>30 30>32 32>34 34>36 36>38 38>40 40>42 42>44 44>46 46>48 48>50 50>52 52>54 54>56 56>58 58>60 60>62 62>0
+  channel 1 next 0>10 2>4 4>6 6>0 8>18 10>12 12>14 14>8 16>26 18>20 20>22 22>16 24>34 26>28 28>30 30>24 32>42 34>36 36>38 38>32 40>50 42>44 44>46 46>40 48>58 50>52 52>54 54>48 56>2 58>60 60>62 62>56
+  channel 2 next 0>2 2>12 4>6 6>0 8>10 10>20 12>14 14>8 16>18 18>28 20>22 22>16 24>26 26>36 28>30 30>24 32>34 34>44 36>38 38>32 40>42 42>52 44>46 46>40 48>50 50>60 52>54 54>48 56>58 58>4 60>62 62>56
+  channel 3 next 0>2 2>4 4>14 6>0 8>10 10>12 12>22 14>8 16>18 18>20 20>30 22>16 24>26 26>28 28>38 30>24 32>34 34>36 36>46 38>32 40>42 42>44 44>54 46>40 48>50 50>52 52>62 54>48 56>58 58>60 60>6 62>56
+group EP nNodes 8 nRanks 32 ranks 1 3 5 7 9 11 13 15 17 19 21 23 25 27 29 31 33 35 37 39 41 43 45 47 49 51 53 55 57 59 61 63
+  channel 0 next 1>3 3>5 5>7 7>9 9>11 11>13 13>15 15>17 17>19 19>21 21>23 23>25 25>27 27>29 29>31 31>33 33>35 35>37 37>39 39>41 41>43 43>45 45>47 47>49 49>51 51>53 53>55 55>57 57>59 59>61 61>63 63>1
+  channel 1 next 1>11 3>5 5>7 7>1 9>19 11>13 13>15 15>9 17>27 19>21 21>23 23>17 25>35 27>29 29>31 31>25 33>43 35>37 37>39 39>33 41>51 43>45 45>47 47>41 49>59 51>53 53>55 55>49 57>3 59>61 61>63 63>57
+  channel 2 next 1>3 3>13 5>7 7>1 9>11 11>21 13>15 15>9 17>19 19>29 21>23 23>17 25>27 27>37 29>31 31>25 33>35 35>45 37>39 39>33 41>43 43>53 45>47 47>41 49>51 51>61 53>55 55>49 57>59 59>5 61>63 63>57
+  channel 3 next 1>3 3>5 5>15 7>1 9>11 11>13 13>23 15>9 17>19 19>21 21>31 23>17 25>27 27>29 29>39 31>25 33>35 35>37 37>47 39>33 41>43 43>45 45>55 47>41 49>51 51>53 53>63 55>49 57>59 59>61 61>7 63>57
+group EP nNodes 8 nRanks 32 ranks 64 66 68 70 72 74 76 78 80 82 84 86 88 90 92 94 96 98 100 102 104 106 108 110 112 114 116 118 120 122 124 126
+  channel 0 next 64>66 66>68 68>70 70>72 72>74 74>76 76>78 78>80 80>82 82>84 84>86 86>88 88>90 90>92 92>94 94>96 96>98 98>100 100>102 102>104 104>106 106>108 108>110 110>112 112>114 114>116 116>118 118>120 120>122 122>124 124>126 126>64
+  channel 1 next 64>74 66>68 68>70 70>64 72>82 74>76 76>78 78>72 80>90 82>84 84>86 86>80 88>98 90>92 92>94 94>88 96>106 98>100 100>102 102>96 104>114 106>108 108>110 110>104 112>122 114>116 116>118 118>112 120>66 122>124 124>126 126>120
+  channel 2 next 64>66 66>76 68>70 70>64 72>74 74>84 76>78 78>72 80>82 82>92 84>86 86>80 88>90 90>100 92>94 94>88 96>98 98>108 100>102 102>96 104>106 106>116 108>110 110>104 112>114 114>124 116>118 118>112 120>122 122>68 124>126 126>120
+  channel 3 next 64>66 66>68 68>78 70>64 72>74 74>76 76>86 78>72 80>82 82>84 84>94 86>80 88>90 90>92 92>102 94>88 96>98 98>100 100>110 102>96 104>106 106>108 108>118 110>104 112>114 114>116 116>126 118>112 120>122 122>124 124>70 126>120
+group EP nNodes 8 nRanks 32 ranks 65 67 69 71 73 75 77 79 81 83 85 87 89 91 93 95 97 99 101 103 105 107 109 111 113 115 117 119 121 123 125 127
+  channel 0 next 65>67 67>69 69>71 71>73 73>75 75>77 77>79 79>81 81>83 83>85 85>87 87>89 89>91 91>93 93>95 95>97 97>99 99>101 101>103 103>105 105>107 107>109 109>111 111>113 113>115 115>117 117>119 119>121 121>123 123>125 125>127 127>65
+  channel 1 next 65>75 67>69 69>71 71>65 73>83 75>77 77>79 79>73 81>91 83>85 85>87 87>81 89>99 91>93 93>95 95>89 97>107 99>101 101>103 103>97 105>115 107>109 109>111 111>105 113>123 115>117 117>119 119>113 121>67 123>125 125>127 127>121
+  channel 2 next 65>67 67>77 69>71 71>65 73>75 75>85 77>79 79>73 81>83 83>93 85>87 87>81 89>91 91>101 93>95 95>89 97>99 99>109 101>103 103>97 105>107 107>117 109>111 111>105 113>115 115>125 117>119 119>113 121>123 123>69 125>127 127>121
+  channel 3 next 65>67 67>69 69>79 71>65 73>75 75>77 77>87 79>73 81>83 83>85 85>95 87>81 89>91 91>93 93>103 95>89 97>99 99>101 101>111 103>97 105>107 107>109 109>119 111>105 113>115 115>117 117>127 119>113 121>123 123>125 125>71 127>121
+group EP nNodes 8 nRanks 32 ranks 128 130 132 134 136 138 140 142 144 146 148 150 152 154 156 158 160 162 164 166 168 170 172 174 176 178 180 182 184 186 188 190
+  channel 0 next 128>130 130>132 132>134 134>136 136>138 138>140 140>142 142>144 144>146 146>148 148>150 150>152 152>154 154>156 156>158 158>160 160>162 162>164 164>166 166>168 168>170 170>172 172>174 174>176 176>178 178>180 180>182 182>184 184>186 186>188 188>190 190>128
+  channel 1 next 128>138 130>132 132>134 134>128 136>146 138>140 140>142 142>136 144>154 146>148 148>150 150>144 152>162 154>156 156>158 158>152 160>170 162>164 164>166 166>160 168>178 170>172 172>174 174>168 176>186 178>180 180>182 182>176 184>130 186>188 188>190 190>184
+  channel 2 next 128>130 130>140 132>134 134>128 136>138 138>148 140>142 142>136 144>146 146>156 148>150 150>144 152>154 154>164 156>158 158>152 160>162 162>172 164>166 166>160 168>170 170>180 172>174 174>168 176>178 178>188 180>182 182>176 184>186 186>132 188>190 190>184
+  channel 3 next 128>130 130>132 132>142 134>128 136>138 138>140 140>150 142>136 144>146 146>148 148>158 150>144 152>154 154>156 156>166 158>152 160>162 162>164 164>174 166>160 168>170 170>172 172>182 174>168 176>178 178>180 180>190 182>176 184>186 186>188 188>134 190>184
+group EP nNodes 8 nRanks 32 ranks 129 131 133 135 137 139 141 143 145 147 149 151 153 155 157 159 161 163 165 167 169 171 173 175 177 179 181 183 185 187 189 191
+  channel 0 next 129>131 131>133 133>135 135>137 137>139 139>141 141>143 143>145 145>147 147>149 149>151 151>153 153>155 155>157 157>159 159>161 161>163 163>165 165>167 167>169 169>171 171>173 173>175 175>177 177>179 179>181 181>183 183>185 185>187 187>189 189>191 191>129
+  channel 1 next 129>139 131>133 133>135 135>129 137>147 139>141 141>143 143>137 145>155 147>149 149>151 151>145 153>163 155>157 157>159 159>153 161>171 163>165 165>167 167>161 169>179 171>173 173>175 175>169 177>187 179>181 181>183 183>177 185>131 187>189 189>191 191>185
+  channel 2 next 129>131 131>141 133>135 135>129 137>139 139>149 141>143 143>137 145>147 147>157 149>151 151>145 153>155 155>165 157>159 159>153 161>163 163>173 165>167 167>161 169>171 171>181 173>175 175>169 177>179 179>189 181>183 183>177 185>187 187>133 189>191 191>185
+  channel 3 next 129>131 131>133 133>143 135>129 137>139 139>141 141>151 143>137 145>147 147>149 149>159 151>145 153>155 155>157 157>167 159>153 161>163 163>165 165>175 167>161 169>171 171>173 173>183 175>169 177>179 179>181 181>191 183>177 185>187 187>189 189>135 191>185
+group EP nNodes 8 nRanks 32 ranks 192 194 196 198 200 202 204 206 208 210 212 214 216 218 220 222 224 226 228 230 232 234 236 238 240 242 244 246 248 250 252 254
+  channel 0 next 192>194 194>196 196>198 198>200 200>202 202>204 204>206 206>208 208>210 210>212 212>214 214>216 216>218 218>220 220>222 222>224 224>226 226>228 228>230 230>232 232>234 234>236 236>238 238>240 240>242 242>244 244>246 246>248 248>250 250>252 252>254 254>192
+  channel 1 next 192>202 194>196 196>198 198>192 200>210 202>204 204>206 206>200 208>218 210>212 212>214 214>208 216>226 218>220 220>222 222>216 224>234 226>228 228>230 230>224 232>242 234>236 236>238 238>232 240>250 242>244 244>246 246>240 248>194 250>252 252>254 254>248
+  channel 2 next 192>194 194>204 196>198 198>192 200>202 202>212 204>206 206>200 208>210 210>220 212>214 214>208 216>218 218>228 220>222 222>216 224>226 226>236 228>230 230>224 232>234 234>244 236>238 238>232 240>242 242>252 244>246 246>240 248>250 250>196 252>254 254>248
+  channel 3 next 192>194 194>196 196>206 198>192 200>202 202>204 204>214 206>200 208>210 210>212 212>222 214>208 216>218 218>220 220>230 222>216 224>226 226>228 228>238 230>224 232>234 234>236 236>246 238>232 240>242 242>244 244>254 246>240 248>250 250>252 252>198 254>248
+group EP nNodes 8 nRanks 32 ranks 193 195 197 199 201 203 205 207 209 211 213 215 217 219 221 223 225 227 229 231 233 235 237 239 241 243 245 247 249 251 253 255
+  channel 0 next 193>195 195>197 197>199 199>201 201>203 203>205 205>207 207>209 209>211 211>213 213>215 215>217 217>219 219>221 221>223 223>225 225>227 227>229 229>231 231>233 233>235 235>237 237>239 239>241 241>243 243>245 245>247 247>249 249>251 251>253 253>255 255>193
+  channel 1 next 193>203 195>197 197>199 199>193 201>211 203>205 205>207 207>201 209>219 211>213 213>215 215>209 217>227 219>221 221>223 223>217 225>235 227>229 229>231 231>225 233>243 235>237 237>239 239>233 241>251 243>245 245>247 247>241 249>195 251>253 253>255 255>249
+  channel 2 next 193>195 195>205 197>199 199>193 201>203 203>213 205>207 207>201 209>211 211>221 213>215 215>209 217>219 219>229 221>223 223>217 225>227 227>237 229>231 231>225 233>235 235>245 237>239 239>233 241>243 243>253 245>247 247>241 249>251 251>197 253>255 255>249
+  channel 3 next 193>195 195>197 197>207 199>193 201>203 203>205 205>215 207>201 209>211 211>213 213>223 215>209 217>219 219>221 221>231 223>217 225>227 227>229 229>239 231>225 233>235 235>237 237>247 239>233 241>243 243>245 245>255 247>241 249>251 251>253 253>199 255>249
+group EP nNodes 8 nRanks 32 ranks 256 258 260 262 264 266 268 270 272 274 276 278 280 282 284 286 288 290 292 294 296 298 300 302 304 306 308 310 312 314 316 318
+  channel 0 next 256>258 258>260 260>262 262>264 264>266 266>268 268>270 270>272 272>274 274>276 276>278 278>280 280>282 282>284 284>286 286>288 288>290 290>292 292>294 294>296 296>298 298>300 300>302 302>304 304>306 306>308 308>310 310>312 312>314 314>316 316>318 318>256
+  channel 1 next 256>266 258>260 260>262 262>256 264>274 266>268 268>270 270>264 272>282 274>276 276>278 278>272 280>290 282>284 284>286 286>280 288>298 290>292 292>294 294>288 296>306 298>300 300>302 302>296 304>314 306>308 308>310 310>304 312>258 314>316 316>318 318>312
+  channel 2 next 256>258 258>268 260>262 262>256 264>266 266>276 268>270 270>264 272>274 274>284 276>278 278>272 280>282 282>292 284>286 286>280 288>290 290>300 292>294 294>288 296>298 298>308 300>302 302>296 304>306 306>316 308>310 310>304 312>314 314>260 316>318 318>312
+  channel 3 next 256>258 258>260 260>270 262>256 264>266 266>268 268>278 270>264 272>274 274>276 276>286 278>272 280>282 282>284 284>294 286>280 288>290 290>292 292>302 294>288 296>298 298>300 300>310 302>296 304>306 306>308 308>318 310>304 312>314 314>316 316>262 318>312
+group EP nNodes 8 nRanks 32 ranks 257 259 261 263 265 267 269 271 273 275 277 279 281 283 285 287 289 291 293 295 297 299 301 303 305 307 309 311 313 315 317 319
+  channel 0 next 257>259 259>261 261>263 263>265 265>267 267>269 269>271 271>273 273>275 275>277 277>279 279>281 281>283 283>285 285>287 287>289 289>291 291>293 293>295 295>297 297>299 299>301 301>303 303>305 305>307 307>309 309>311 311>313 313>315 315>317 317>319 319>257
+  channel 1 next 257>267 259>261 261>263 263>257 265>275 267>269 269>271 271>265 273>283 275>277 277>279 279>273 281>291 283>285 285>287 287>281 289>299 291>293 293>295 295>289 297>307 299>301 301>303 303>297 305>315 307>309 309>311 311>305 313>259 315>317 317>319 319>313
+  channel 2 next 257>259 259>269 261>263 263>257 265>267 267>277 269>271 271>265 273>275 275>285 277>279 279>273 281>283 283>293 285>287 287>281 289>291 291>301 293>295 295>289 297>299 299>309 301>303 303>297 305>307 307>317 309>311 311>305 313>315 315>261 317>319 319>313
+  channel 3 next 257>259 259>261 261>271 263>257 265>267 267>269 269>279 271>265 273>275 275>277 277>287 279>273 281>283 283>285 285>295 287>281 289>291 291>293 293>303 295>289 297>299 299>301 301>311 303>297 305>307 307>309 309>319 311>305 313>315 315>317 317>263 319>313
+group EP nNodes 8 nRanks 32 ranks 320 322 324 326 328 330 332 334 336 338 340 342 344 346 348 350 352 354 356 358 360 362 364 366 368 370 372 374 376 378 380 382
+  channel 0 next 320>322 322>324 324>326 326>328 328>330 330>332 332>334 334>336 336>338 338>340 340>342 342>344 344>346 346>348 348>350 350>352 352>354 354>356 356>358 358>360 360>362 362>364 364>366 366>368 368>370 370>372 372>374 374>376 376>378 378>380 380>382 382>320
+  channel 1 next 320>330 322>324 324>326 326>320 328>338 330>332 332>334 334>328 336>346 338>340 340>342 342>336 344>354 346>348 348>350 350>344 352>362 354>356 356>358 358>352 360>370 362>364 364>366 366>360 368>378 370>372 372>374 374>368 376>322 378>380 380>382 382>376
+  channel 2 next 320>322 322>332 324>326 326>320 328>330 330>340 332>334 334>328 336>338 338>348 340>342 342>336 344>346 346>356 348>350 350>344 352>354 354>364 356>358 358>352 360>362 362>372 364>366 366>360 368>370 370>380 372>374 374>368 376>378 378>324 380>382 382>376
+  channel 3 next 320>322 322>324 324>334 326>320 328>330 330>332 332>342 334>328 336>338 338>340 340>350 342>336 344>346 346>348 348>358 350>344 352>354 354>356 356>366 358>352 360>362 362>364 364>374 366>360 368>370 370>372 372>382 374>368 376>378 378>380 380>326 382>376
+group EP nNodes 8 nRanks 32 ranks 321 323 325 327 329 331 333 335 337 339 341 343 345 347 349 351 353 355 357 359 361 363 365 367 369 371 373 375 377 379 381 383
+  channel 0 next 321>323 323>325 325>327 327>329 329>331 331>333 333>335 335>337 337>339 339>341 341>343 343>345 345>347 347>349 349>351 351>353 353>355 355>357 357>359 359>361 361>363 363>365 365>367 367>369 369>371 371>373 373>375 375>377 377>379 379>381 381>383 383>321
+  channel 1 next 321>331 323>325 325>327 327>321 329>339 331>333 333>335 335>329 337>347 339>341 341>343 343>337 345>355 347>349 349>351 351>345 353>363 355>357 357>359 359>353 361>371 363>365 365>367 367>361 369>379 371>373 373>375 375>369 377>323 379>381 381>383 383>377
+  channel 2 next 321>323 323>333 325>327 327>321 329>331 331>341 333>335 335>329 337>339 339>349 341>343 343>337 345>347 347>357 349>351 351>345 353>355 355>365 357>359 359>353 361>363 363>373 365>367 367>361 369>371 371>381 373>375 375>369 377>379 379>325 381>383 383>377
+  channel 3 next 321>323 323>325 325>335 327>321 329>331 331>333 333>343 335>329 337>339 339>341 341>351 343>337 345>347 347>349 349>359 351>345 353>355 355>357 357>367 359>353 361>363 363>365 365>375 367>361 369>371 371>373 373>383 375>369 377>379 379>381 381>327 383>377
+group EP nNodes 8 nRanks 32 ranks 384 386 388 390 392 394 396 398 400 402 404 406 408 410 412 414 416 418 420 422 424 426 428 430 432 434 436 438 440 442 444 446
+  channel 0 next 384>386 386>388 388>390 390>392 392>394 394>396 396>398 398>400 400>402 402>404 404>406 406>408 408>410 410>412 412>414 414>416 416>418 418>420 420>422 422>424 424>426 426>428 428>430 430>432 432>434 434>436 436>438 438>440 440>442 442>444 444>446 446>384
+  channel 1 next 384>394 386>388 388>390 390>384 392>402 394>396 396>398 398>392 400>410 402>404 404>406 406>400 408>418 410>412 412>414 414>408 416>426 418>420 420>422 422>416 424>434 426>428 428>430 430>424 432>442 434>436 436>438 438>432 440>386 442>444 444>446 446>440
+  channel 2 next 384>386 386>396 388>390 390>384 392>394 394>404 396>398 398>392 400>402 402>412 404>406 406>400 408>410 410>420 412>414 414>408 416>418 418>428 420>422 422>416 424>426 426>436 428>430 430>424 432>434 434>444 436>438 438>432 440>442 442>388 444>446 446>440
+  channel 3 next 384>386 386>388 388>398 390>384 392>394 394>396 396>406 398>392 400>402 402>404 404>414 406>400 408>410 410>412 412>422 414>408 416>418 418>420 420>430 422>416 424>426 426>428 428>438 430>424 432>434 434>436 436>446 438>432 440>442 442>444 444>390 446>440
+group EP nNodes 8 nRanks 32 ranks 385 387 389 391 393 395 397 399 401 403 405 407 409 411 413 415 417 419 421 423 425 427 429 431 433 435 437 439 441 443 445 447
+  channel 0 next 385>387 387>389 389>391 391>393 393>395 395>397 397>399 399>401 401>403 403>405 405>407 407>409 409>411 411>413 413>415 415>417 417>419 419>421 421>423 423>425 425>427 427>429 429>431 431>433 433>435 435>437 437>439 439>441 441>443 443>445 445>447 447>385
+  channel 1 next 385>395 387>389 389>391 391>385 393>403 395>397 397>399 399>393 401>411 403>405 405>407 407>401 409>419 411>413 413>415 415>409 417>427 419>421 421>423 423>417 425>435 427>429 429>431 431>425 433>443 435>437 437>439 439>433 441>387 443>445 445>447 447>441
+  channel 2 next 385>387 387>397 389>391 391>385 393>395 395>405 397>399 399>393 401>403 403>413 405>407 407>401 409>411 411>421 413>415 415>409 417>419 419>429 421>423 423>417 425>427 427>437 429>431 431>425 433>435 435>445 437>439 439>433 441>443 443>389 445>447 447>441
+  channel 3 next 385>387 387>389 389>399 391>385 393>395 395>397 397>407 399>393 401>403 403>405 405>415 407>401 409>411 411>413 413>423 415>409 417>419 419>421 421>431 423>417 425>427 427>429 429>439 431>425 433>435 435>437 437>447 439>433 441>443 443>445 445>391 447>441
+group EP nNodes 8 nRanks 32 ranks 448 450 452 454 456 458 460 462 464 466 468 470 472 474 476 478 480 482 484 486 488 490 492 494 496 498 500 502 504 506 508 510
+  channel 0 next 448>450 450>452 452>454 454>456 456>458 458>460 460>462 462>464 464>466 466>468 468>470 470>472 472>474 474>476 476>478 478>480 480>482 482>484 484>486 486>488 488>490 490>492 492>494 494>496 496>498 498>500 500>502 502>504 504>506 506>508 508>510 510>448
+  channel 1 next 448>458 450>452 452>454 454>448 456>466 458>460 460>462 462>456 464>474 466>468 468>470 470>464 472>482 474>476 476>478 478>472 480>490 482>484 484>486 486>480 488>498 490>492 492>494 494>488 496>506 498>500 500>502 502>496 504>450 506>508 508>510 510>504
+  channel 2 next 448>450 450>460 452>454 454>448 456>458 458>468 460>462 462>456 464>466 466>476 468>470 470>464 472>474 474>484 476>478 478>472 480>482 482>492 484>486 486>480 488>490 490>500 492>494 494>488 496>498 498>508 500>502 502>496 504>506 506>452 508>510 510>504
+  channel 3 next 448>450 450>452 452>462 454>448 456>458 458>460 460>470 462>456 464>466 466>468 468>478 470>464 472>474 474>476 476>486 478>472 480>482 482>484 484>494 486>480 488>490 490>492 492>502 494>488 496>498 498>500 500>510 502>496 504>506 506>508 508>454 510>504
+group EP nNodes 8 nRanks 32 ranks 449 451 453 455 457 459 461 463 465 467 469 471 473 475 477 479 481 483 485 487 489 491 493 495 497 499 501 503 505 507 509 511
+  channel 0 next 449>451 451>453 453>455 455>457 457>459 459>461 461>463 463>465 465>467 467>469 469>471 471>473 473>475 475>477 477>479 479>481 481>483 483>485 485>487 487>489 489>491 491>493 493>495 495>497 497>499 499>501 501>503 503>505 505>507 507>509 509>511 511>449
+  channel 1 next 449>459 451>453 453>455 455>449 457>467 459>461 461>463 463>457 465>475 467>469 469>471 471>465 473>483 475>477 477>479 479>473 481>491 483>485 485>487 487>481 489>499 491>493 493>495 495>489 497>507 499>501 501>503 503>497 505>451 507>509 509>511 511>505
+  channel 2 next 449>451 451>461 453>455 455>449 457>459 459>469 461>463 463>457 465>467 467>477 469>471 471>465 473>475 475>485 477>479 479>473 481>483 483>493 485>487 487>481 489>491 491>501 493>495 495>489 497>499 499>509 501>503 503>497 505>507 507>453 509>511 511>505
+  channel 3 next 449>451 451>453 453>463 455>449 457>459 459>461 461>471 463>457 465>467 467>469 469>479 471>465 473>475 475>477 477>487 479>473 481>483 483>485 485>495 487>481 489>491 491>493 493>503 495>489 497>499 499>501 501>511 503>497 505>507 507>509 509>455 511>505
+group EP nNodes 8 nRanks 32 ranks 512 514 516 518 520 522 524 526 528 530 532 534 536 538 540 542 544 546 548 550 552 554 556 558 560 562 564 566 568 570 572 574
+  channel 0 next 512>514 514>516 516>518 518>520 520>522 522>524 524>526 526>528 528>530 530>532 532>534 534>536 536>538 538>540 540>542 542>544 544>546 546>548 548>550 550>552 552>554 554>556 556>558 558>560 560>562 562>564 564>566 566>568 568>570 570>572 572>574 574>512
+  channel 1 next 512>522 514>516 516>518 518>512 520>530 522>524 524>526 526>520 528>538 530>532 532>534 534>528 536>546 538>540 540>542 542>536 544>554 546>548 548>550 550>544 552>562 554>556 556>558 558>552 560>570 562>564 564>566 566>560 568>514 570>572 572>574 574>568
+  channel 2 next 512>514 514>524 516>518 518>512 520>522 522>532 524>526 526>520 528>530 530>540 532>534 534>528 536>538 538>548 540>542 542>536 544>546 546>556 548>550 550>544 552>554 554>564 556>558 558>552 560>562 562>572 564>566 566>560 568>570 570>516 572>574 574>568
+  channel 3 next 512>514 514>516 516>526 518>512 520>522 522>524 524>534 526>520 528>530 530>532 532>542 534>528 536>538 538>540 540>550 542>536 544>546 546>548 548>558 550>544 552>554 554>556 556>566 558>552 560>562 562>564 564>574 566>560 568>570 570>572 572>518 574>568
+group EP nNodes 8 nRanks 32 ranks 513 515 517 519 521 523 525 527 529 531 533 535 537 539 541 543 545 547 549 551 553 555 557 559 561 563 565 567 569 571 573 575
+  channel 0 next 513>515 515>517 517>519 519>521 521>523 523>525 525>527 527>529 529>531 531>533 533>535 535>537 537>539 539>541 541>543 543>545 545>547 547>549 549>551 551>553 553>555 555>557 557>559 559>561 561>563 563>565 565>567 567>569 569>571 571>573 573>575 575>513
+  channel 1 next 513>523 515>517 517>519 519>513 521>531 523>525 525>527 527>521 529>539 531>533 533>535 535>529 537>547 539>541 541>543 543>537 545>555 547>549 549>551 551>545 553>563 555>557 557>559 559>553 561>571 563>565 565>567 567>561 569>515 571>573 573>575 575>569
+  channel 2 next 513>515 515>525 517>519 519>513 521>523 523>533 525>527 527>521 529>531 531>541 533>535 535>529 537>539 539>549 541>543 543>537 545>547 547>557 549>551 551>545 553>555 555>565 557>559 559>553 561>563 563>573 565>567 567>561 569>571 571>517 573>575 575>569
+  channel 3 next 513>515 515>517 517>527 519>513 521>523 523>525 525>535 527>521 529>531 531>533 533>543 535>529 537>539 539>541 541>551 543>537 545>547 547>549 549>559 551>545 553>555 555>557 557>567 559>553 561>563 563>565 565>575 567>561 569>571 571>573 573>519 575>569
+group EP nNodes 8 nRanks 32 ranks 576 578 580 582 584 586 588 590 592 594 596 598 600 602 604 606 608 610 612 614 616 618 620 622 624 626 628 630 632 634 636 638
+  channel 0 next 576>578 578>580 580>582 582>584 584>586 586>588 588>590 590>592 592>594 594>596 596>598 598>600 600>602 602>604 604>606 606>608 608>610 610>612 612>614 614>616 616>618 618>620 620>622 622>624 624>626 626>628 628>630 630>632 632>634 634>636 636>638 638>576
+  channel 1 next 576>586 578>580 580>582 582>576 584>594 586>588 588>590 590>584 592>602 594>596 596>598 598>592 600>610 602>604 604>606 606>600 608>618 610>612 612>614 614>608 616>626 618>620 620>622 622>616 624>634 626>628 628>630 630>624 632>578 634>636 636>638 638>632
+  channel 2 next 576>578 578>588 580>582 582>576 584>586 586>596 588>590 590>584 592>594 594>604 596>598 598>592 600>602 602>612 604>606 606>600 608>610 610>620 612>614 614>608 616>618 618>628 620>622 622>616 624>626 626>636 628>630 630>624 632>634 634>580 636>638 638>632
+  channel 3 next 576>578 578>580 580>590 582>576 584>586 586>588 588>598 590>584 592>594 594>596 596>606 598>592 600>602 602>604 604>614 606>600 608>610 610>612 612>622 614>608 616>618 618>620 620>630 622>616 624>626 626>628 628>638 630>624 632>634 634>636 636>582 638>632
+group EP nNodes 8 nRanks 32 ranks 577 579 581 583 585 587 589 591 593 595 597 599 601 603 605 607 609 611 613 615 617 619 621 623 625 627 629 631 633 635 637 639
+  channel 0 next 577>579 579>581 581>583 583>585 585>587 587>589 589>591 591>593 593>595 595>597 597>599 599>601 601>603 603>605 605>607 607>609 609>611 611>613 613>615 615>617 617>619 619>621 621>623 623>625 625>627 627>629 629>631 631>633 633>635 635>637 637>639 639>577
+  channel 1 next 577>587 579>581 581>583 583>577 585>595 587>589 589>591 591>585 593>603 595>597 597>599 599>593 601>611 603>605 605>607 607>601 609>619 611>613 613>615 615>609 617>627 619>621 621>623 623>617 625>635 627>629 629>631 631>625 633>579 635>637 637>639 639>633
+  channel 2 next 577>579 579>589 581>583 583>577 585>587 587>597 589>591 591>585 593>595 595>605 597>599 599>593 601>603 603>613 605>607 607>601 609>611 611>621 613>615 615>609 617>619 619>629 621>623 623>617 625>627 627>637 629>631 631>625 633>635 635>581 637>639 639>633
+  channel 3 next 577>579 579>581 581>591 583>577 585>587 587>589 589>599 591>585 593>595 595>597 597>607 599>593 601>603 603>605 605>615 607>601 609>611 611>613 613>623 615>609 617>619 619>621 621>631 623>617 625>627 627>629 629>639 631>625 633>635 635>637 637>583 639>633
+group EP nNodes 8 nRanks 32 ranks 640 642 644 646 648 650 652 654 656 658 660 662 664 666 668 670 672 674 676 678 680 682 684 686 688 690 692 694 696 698 700 702
+  channel 0 next 640>642 642>644 644>646 646>648 648>650 650>652 652>654 654>656 656>658 658>660 660>662 662>664 664>666 666>668 668>670 670>672 672>674 674>676 676>678 678>680 680>682 682>684 684>686 686>688 688>690 690>692 692>694 694>696 696>698 698>700 700>702 702>640
+  channel 1 next 640>650 642>644 644>646 646>640 648>658 650>652 652>654 654>648 656>666 658>660 660>662 662>656 664>674 666>668 668>670 670>664 672>682 674>676 676>678 678>672 680>690 682>684 684>686 686>680 688>698 690>692 692>694 694>688 696>642 698>700 700>702 702>696
+  channel 2 next 640>642 642>652 644>646 646>640 648>650 650>660 652>654 654>648 656>658 658>668 660>662 662>656 664>666 666>676 668>670 670>664 672>674 674>684 676>678 678>672 680>682 682>692 684>686 686>680 688>690 690>700 692>694 694>688 696>698 698>644 700>702 702>696
+  channel 3 next 640>642 642>644 644>654 646>640 648>650 650>652 652>662 654>648 656>658 658>660 660>670 662>656 664>666 666>668 668>678 670>664 672>674 674>676 676>686 678>672 680>682 682>684 684>694 686>680 688>690 690>692 692>702 694>688 696>698 698>700 700>646 702>696
+group EP nNodes 8 nRanks 32 ranks 641 643 645 647 649 651 653 655 657 659 661 663 665 667 669 671 673 675 677 679 681 683 685 687 689 691 693 695 697 699 701 703
+  channel 0 next 641>643 643>645 645>647 647>649 649>651 651>653 653>655 655>657 657>659 659>661 661>663 663>665 665>667 667>669 669>671 671>673 673>675 675>677 677>679 679>681 681>683 683>685 685>687 687>689 689>691 691>693 693>695 695>697 697>699 699>701 701>703 703>641
+  channel 1 next 641>651 643>645 645>647 647>641 649>659 651>653 653>655 655>649 657>667 659>661 661>663 663>657 665>675 667>669 669>671 671>665 673>683 675>677 677>679 679>673 681>691 683>685 685>687 687>681 689>699 691>693 693>695 695>689 697>643 699>701 701>703 703>697
+  channel 2 next 641>643 643>653 645>647 647>641 649>651 651>661 653>655 655>649 657>659 659>669 661>663 663>657 665>667 667>677 669>671 671>665 673>675 675>685 677>679 679>673 681>683 683>693 685>687 687>681 689>691 691>701 693>695 695>689 697>699 699>645 701>703 703>697
+  channel 3 next 641>643 643>645 645>655 647>641 649>651 651>653 653>663 655>649 657>659 659>661 661>671 663>657 665>667 667>669 669>679 671>665 673>675 675>677 677>687 679>673 681>683 683>685 685>695 687>681 689>691 691>693 693>703 695>689 697>699 699>701 701>647 703>697
+group EP nNodes 8 nRanks 32 ranks 704 706 708 710 712 714 716 718 720 722 724 726 728 730 732 734 736 738 740 742 744 746 748 750 752 754 756 758 760 762 764 766
+  channel 0 next 704>706 706>708 708>710 710>712 712>714 714>716 716>718 718>720 720>722 722>724 724>726 726>728 728>730 730>732 732>734 734>736 736>738 738>740 740>742 742>744 744>746 746>748 748>750 750>752 752>754 754>756 756>758 758>760 760>762 762>764 764>766 766>704
+  channel 1 next 704>714 706>708 708>710 710>704 712>722 714>716 716>718 718>712 720>730 722>724 724>726 726>720 728>738 730>732 732>734 734>728 736>746 738>740 740>742 742>736 744>754 746>748 748>750 750>744 752>762 754>756 756>758 758>752 760>706 762>764 764>766 766>760
+  channel 2 next 704>706 706>716 708>710 710>704 712>714 714>724 716>718 718>712 720>722 722>732 724>726 726>720 728>730 730>740 732>734 734>728 736>738 738>748 740>742 742>736 744>746 746>756 748>750 750>744 752>754 754>764 756>758 758>752 760>762 762>708 764>766 766>760
+  channel 3 next 704>706 706>708 708>718 710>704 712>714 714>716 716>726 718>712 720>722 722>724 724>734 726>720 728>730 730>732 732>742 734>728 736>738 738>740 740>750 742>736 744>746 746>748 748>758 750>744 752>754 754>756 756>766 758>752 760>762 762>764 764>710 766>760
+group EP nNodes 8 nRanks 32 ranks 705 707 709 711 713 715 717 719 721 723 725 727 729 731 733 735 737 739 741 743 745 747 749 751 753 755 757 759 761 763 765 767
+  channel 0 next 705>707 707>709 709>711 711>713 713>715 715>717 717>719 719>721 721>723 723>725 725>727 727>729 729>731 731>733 733>735 735>737 737>739 739>741 741>743 743>745 745>747 747>749 749>751 751>753 753>755 755>757 757>759 759>761 761>763 763>765 765>767 767>705
+  channel 1 next 705>715 707>709 709>711 711>705 713>723 715>717 717>719 719>713 721>731 723>725 725>727 727>721 729>739 731>733 733>735 735>729 737>747 739>741 741>743 743>737 745>755 747>749 749>751 751>745 753>763 755>757 757>759 759>753 761>707 763>765 765>767 767>761
+  channel 2 next 705>707 707>717 709>711 711>705 713>715 715>725 717>719 719>713 721>723 723>733 725>727 727>721 729>731 731>741 733>735 735>729 737>739 739>749 741>743 743>737 745>747 747>757 749>751 751>745 753>755 755>765 757>759 759>753 761>763 763>709 765>767 767>761
+  channel 3 next 705>707 707>709 709>719 711>705 713>715 715>717 717>727 719>713 721>723 723>725 725>735 727>721 729>731 731>733 733>743 735>729 737>739 739>741 741>751 743>737 745>747 747>749 749>759 751>745 753>755 755>757 757>767 759>753 761>763 763>765 765>711 767>761
+group EP nNodes 8 nRanks 32 ranks 768 770 772 774 776 778 780 782 784 786 788 790 792 794 796 798 800 802 804 806 808 810 812 814 816 818 820 822 824 826 828 830
+  channel 0 next 768>770 770>772 772>774 774>776 776>778 778>780 780>782 782>784 784>786 786>788 788>790 790>792 792>794 794>796 796>798 798>800 800>802 802>804 804>806 806>808 808>810 810>812 812>814 814>816 816>818 818>820 820>822 822>824 824>826 826>828 828>830 830>768
+  channel 1 next 768>778 770>772 772>774 774>768 776>786 778>780 780>782 782>776 784>794 786>788 788>790 790>784 792>802 794>796 796>798 798>792 800>810 802>804 804>806 806>800 808>818 810>812 812>814 814>808 816>826 818>820 820>822 822>816 824>770 826>828 828>830 830>824
+  channel 2 next 768>770 770>780 772>774 774>768 776>778 778>788 780>782 782>776 784>786 786>796 788>790 790>784 792>794 794>804 796>798 798>792 800>802 802>812 804>806 806>800 808>810 810>820 812>814 814>808 816>818 818>828 820>822 822>816 824>826 826>772 828>830 830>824
+  channel 3 next 768>770 770>772 772>782 774>768 776>778 778>780 780>790 782>776 784>786 786>788 788>798 790>784 792>794 794>796 796>806 798>792 800>802 802>804 804>814 806>800 808>810 810>812 812>822 814>808 816>818 818>820 820>830 822>816 824>826 826>828 828>774 830>824
+group EP nNodes 8 nRanks 32 ranks 769 771 773 775 777 779 781 783 785 787 789 791 793 795 797 799 801 803 805 807 809 811 813 815 817 819 821 823 825 827 829 831
+  channel 0 next 769>771 771>773 773>775 775>777 777>779 779>781 781>783 783>785 785>787 787>789 789>791 791>793 793>795 795>797 797>799 799>801 801>803 803>805 805>807 807>809 809>811 811>813 813>815 815>817 817>819 819>821 821>823 823>825 825>827 827>829 829>831 831>769
+  channel 1 next 769>779 771>773 773>775 775>769 777>787 779>781 781>783 783>777 785>795 787>789 789>791 791>785 793>803 795>797 797>799 799>793 801>811 803>805 805>807 807>801 809>819 811>813 813>815 815>809 817>827 819>821 821>823 823>817 825>771 827>829 829>831 831>825
+  channel 2 next 769>771 771>781 773>775 775>769 777>779 779>789 781>783 783>777 785>787 787>797 789>791 791>785 793>795 795>805 797>799 799>793 801>803 803>813 805>807 807>801 809>811 811>821 813>815 815>809 817>819 819>829 821>823 823>817 825>827 827>773 829>831 831>825
+  channel 3 next 769>771 771>773 773>783 775>769 777>779 779>781 781>791 783>777 785>787 787>789 789>799 791>785 793>795 795>797 797>807 799>793 801>803 803>805 805>815 807>801 809>811 811>813 813>823 815>809 817>819 819>821 821>831 823>817 825>827 827>829 829>775 831>825
+group EP nNodes 8 nRanks 32 ranks 832 834 836 838 840 842 844 846 848 850 852 854 856 858 860 862 864 866 868 870 872 874 876 878 880 882 884 886 888 890 892 894
+  channel 0 next 832>834 834>836 836>838 838>840 840>842 842>844 844>846 846>848 848>850 850>852 852>854 854>856 856>858 858>860 860>862 862>864 864>866 866>868 868>870 870>872 872>874 874>876 876>878 878>880 880>882 882>884 884>886 886>888 888>890 890>892 892>894 894>832
+  channel 1 next 832>842 834>836 836>838 838>832 840>850 842>844 844>846 846>840 848>858 850>852 852>854 854>848 856>866 858>860 860>862 862>856 864>874 866>868 868>870 870>864 872>882 874>876 876>878 878>872 880>890 882>884 884>886 886>880 888>834 890>892 892>894 894>888
+  channel 2 next 832>834 834>844 836>838 838>832 840>842 842>852 844>846 846>840 848>850 850>860 852>854 854>848 856>858 858>868 860>862 862>856 864>866 866>876 868>870 870>864 872>874 874>884 876>878 878>872 880>882 882>892 884>886 886>880 888>890 890>836 892>894 894>888
+  channel 3 next 832>834 834>836 836>846 838>832 840>842 842>844 844>854 846>840 848>850 850>852 852>862 854>848 856>858 858>860 860>870 862>856 864>866 866>868 868>878 870>864 872>874 874>876 876>886 878>872 880>882 882>884 884>894 886>880 888>890 890>892 892>838 894>888
+group EP nNodes 8 nRanks 32 ranks 833 835 837 839 841 843 845 847 849 851 853 855 857 859 861 863 865 867 869 871 873 875 877 879 881 883 885 887 889 891 893 895
+  channel 0 next 833>835 835>837 837>839 839>841 841>843 843>845 845>847 847>849 849>851 851>853 853>855 855>857 857>859 859>861 861>863 863>865 865>867 867>869 869>871 871>873 873>875 875>877 877>879 879>881 881>883 883>885 885>887 887>889 889>891 891>893 893>895 895>833
+  channel 1 next 833>843 835>837 837>839 839>833 841>851 843>845 845>847 847>841 849>859 851>853 853>855 855>849 857>867 859>861 861>863 863>857 865>875 867>869 869>871 871>865 873>883 875>877 877>879 879>873 881>891 883>885 885>887 887>881 889>835 891>893 893>895 895>889
+  channel 2 next 833>835 835>845 837>839 839>833 841>843 843>853 845>847 847>841 849>851 851>861 853>855 855>849 857>859 859>869 861>863 863>857 865>867 867>877 869>871 871>865 873>875 875>885 877>879 879>873 881>883 883>893 885>887 887>881 889>891 891>837 893>895 895>889
+  channel 3 next 833>835 835>837 837>847 839>833 841>843 843>845 845>855 847>841 849>851 851>853 853>863 855>849 857>859 859>861 861>871 863>857 865>867 867>869 869>879 871>865 873>875 875>877 877>887 879>873 881>883 883>885 885>895 887>881 889>891 891>893 893>839 895>889
+group EP nNodes 8 nRanks 32 ranks 896 898 900 902 904 906 908 910 912 914 916 918 920 922 924 926 928 930 932 934 936 938 940 942 944 946 948 950 952 954 956 958
+  channel 0 next 896>898 898>900 900>902 902>904 904>906 906>908 908>910 910>912 912>914 914>916 916>918 918>920 920>922 922>924 924>926 926>928 928>930 930>932 932>934 934>936 936>938 938>940 940>942 942>944 944>946 946>948 948>950 950>952 952>954 954>956 956>958 958>896
+  channel 1 next 896>906 898>900 900>902 902>896 904>914 906>908 908>910 910>904 912>922 914>916 916>918 918>912 920>930 922>924 924>926 926>920 928>938 930>932 932>934 934>928 936>946 938>940 940>942 942>936 944>954 946>948 948>950 950>944 952>898 954>956 956>958 958>952
+  channel 2 next 896>898 898>908 900>902 902>896 904>906 906>916 908>910 910>904 912>914 914>924 916>918 918>912 920>922 922>932 924>926 926>920 928>930 930>940 932>934 934>928 936>938 938>948 940>942 942>936 944>946 946>956 948>950 950>944 952>954 954>900 956>958 958>952
+  channel 3 next 896>898 898>900 900>910 902>896 904>906 906>908 908>918 910>904 912>914 914>916 916>926 918>912 920>922 922>924 924>934 926>920 928>930 930>932 932>942 934>928 936>938 938>940 940>950 942>936 944>946 946>948 948>958 950>944 952>954 954>956 956>902 958>952
+group EP nNodes 8 nRanks 32 ranks 897 899 901 903 905 907 909 911 913 915 917 919 921 923 925 927 929 931 933 935 937 939 941 943 945 947 949 951 953 955 957 959
+  channel 0 next 897>899 899>901 901>903 903>905 905>907 907>909 909>911 911>913 913>915 915>917 917>919 919>921 921>923 923>925 925>927 927>929 929>931 931>933 933>935 935>937 937>939 939>941 941>943 943>945 945>947 947>949 949>951 951>953 953>955 955>957 957>959 959>897
+  channel 1 next 897>907 899>901 901>903 903>897 905>915 907>909 909>911 911>905 913>923 915>917 917>919 919>913 921>931 923>925 925>927 927>921 929>939 931>933 933>935 935>929 937>947 939>941 941>943 943>937 945>955 947>949 949>951 951>945 953>899 955>957 957>959 959>953
+  channel 2 next 897>899 899>909 901>903 903>897 905>907 907>917 909>911 911>905 913>915 915>925 917>919 919>913 921>923 923>933 925>927 927>921 929>931 931>941 933>935 935>929 937>939 939>949 941>943 943>937 945>947 947>957 949>951 951>945 953>955 955>901 957>959 959>953
+  channel 3 next 897>899 899>901 901>911 903>897 905>907 907>909 909>919 911>905 913>915 915>917 917>927 919>913 921>923 923>925 925>935 927>921 929>931 931>933 933>943 935>929 937>939 939>941 941>951 943>937 945>947 947>949 949>959 951>945 953>955 955>957 957>903 959>953
+group EP nNodes 8 nRanks 32 ranks 960 962 964 966 968 970 972 974 976 978 980 982 984 986 988 990 992 994 996 998 1000 1002 1004 1006 1008 1010 1012 1014 1016 1018 1020 1022
+  channel 0 next 960>962 962>964 964>966 966>968 968>970 970>972 972>974 974>976 976>978 978>980 980>982 982>984 984>986 986>988 988>990 990>992 992>994 994>996 996>998 998>1000 1000>1002 1002>1004 1004>1006 1006>1008 1008>1010 1010>1012 1012>1014 1014>1016 1016>1018 1018>1020 1020>1022 1022>960
+  channel 1 next 960>970 962>964 964>966 966>960 968>978 970>972 972>974 974>968 976>986 978>980 980>982 982>976 984>994 986>988 988>990 990>984 992>1002 994>996 996>998 998>992 1000>1010 1002>1004 1004>1006 1006>1000 1008>1018 1010>1012 1012>1014 1014>1008 1016>962 1018>1020 1020>1022 1022>1016
+  channel 2 next 960>962 962>972 964>966 966>960 968>970 970>980 972>974 974>968 976>978 978>988 980>982 982>976 984>986 986>996 988>990 990>984 992>994 994>1004 996>998 998>992 1000>1002 1002>1012 1004>1006 1006>1000 1008>1010 1010>1020 1012>1014 1014>1008 1016>1018 1018>964 1020>1022 1022>1016
+  channel 3 next 960>962 962>964 964>974 966>960 968>970 970>972 972>982 974>968 976>978 978>980 980>990 982>976 984>986 986>988 988>998 990>984 992>994 994>996 996>1006 998>992 1000>1002 1002>1004 1004>1014 1006>1000 1008>1010 1010>1012 1012>1022 1014>1008 1016>1018 1018>1020 1020>966 1022>1016
+group EP nNodes 8 nRanks 32 ranks 961 963 965 967 969 971 973 975 977 979 981 983 985 987 989 991 993 995 997 999 1001 1003 1005 1007 1009 1011 1013 1015 1017 1019 1021 1023
+  channel 0 next 961>963 963>965 965>967 967>969 969>971 971>973 973>975 975>977 977>979 979>981 981>983 983>985 985>987 987>989 989>991 991>993 993>995 995>997 997>999 999>1001 1001>1003 1003>1005 1005>1007 1007>1009 1009>1011 1011>1013 1013>1015 1015>1017 1017>1019 1019>1021 1021>1023 1023>961
+  channel 1 next 961>971 963>965 965>967 967>961 969>979 971>973 973>975 975>969 977>987 979>981 981>983 983>977 985>995 987>989 989>991 991>985 993>1003 995>997 997>999 999>993 1001>1011 1003>1005 1005>1007 1007>1001 1009>1019 1011>1013 1013>1015 1015>1009 1017>963 1019>1021 1021>1023 1023>1017
+  channel 2 next 961>963 963>973 965>967 967>961 969>971 971>981 973>975 975>969 977>979 979>989 981>983 983>977 985>987 987>997 989>991 991>985 993>995 995>1005 997>999 999>993 1001>1003 1003>1013 1005>1007 1007>1001 1009>1011 1011>1021 1013>1015 1015>1009 1017>1019 1019>965 1021>1023 1023>1017
+  channel 3 next 961>963 963>965 965>975 967>961 969>971 971>973 973>983 975>969 977>979 979>981 981>991 983>977 985>987 987>989 989>999 991>985 993>995 995>997 997>1007 999>993 1001>1003 1003>1005 1005>1015 1007>1001 1009>1011 1011>1013 1013>1023 1015>1009 1017>1019 1019>1021 1021>967 1023>1017
+group DP_EP nNodes 16 nRanks 16 ranks 0 64 128 192 256 320 384 448 512 576 640 704 768 832 896 960
+  channel 0 next 0>64 64>128 128>192 192>256 256>320 320>384 384>448 448>512 512>576 576>640 640>704 704>768 768>832 832>896 896>960 960>0
+group DP_EP nNodes 16 nRanks 16 ranks 1 65 129 193 257 321 385 449 513 577 641 705 769 833 897 961
+  channel 0 next 1>65 65>129 129>193 193>257 257>321 321>385 385>449 449>513 513>577 577>641 641>705 705>769 769>833 833>897 897>961 961>1
+group DP_EP nNodes 16 nRanks 16 ranks 2 66 130 194 258 322 386 450 514 578 642 706 770 834 898 962
+  channel 0 next 2>66 66>130 130>194 194>258 258>322 322>386 386>450 450>514 514>578 578>642 642>706 706>770 770>834 834>898 898>962 962>2
+group DP_EP nNodes 16 nRanks 16 ranks 3 67 131 195 259 323 387 451 515 579 643 707 771 835 899 963
+  channel 0 next 3>67 67>131 131>195 195>259 259>323 323>387 387>451 451>515 515>579 579>643 643>707 707>771 771>835 835>899 899>963 963>3
+group DP_EP nNodes 16 nRanks 16 ranks 4 68 132 196 260 324 388 452 516 580 644 708 772 836 900 964
+  channel 0 next 4>68 68>132 132>196 196>260 260>324 324>388 388>452 452>516 516>580 580>644 644>708 708>772 772>836 836>900 900>964 964>4
+group DP_EP nNodes 16 nRanks 16 ranks 5 69 133 197 261 325 389 453 517 581 645 709 773 837 901 965
+  channel 0 next 5>69 69>133 133>197 197>261 261>325 325>389 389>453 453>517 517>581 581>645 645>709 709>773 773>837 837>901 901>965 965>5
+group DP_EP nNodes 16 nRanks 16 ranks 6 70 134 198 262 326 390 454 518 582 646 710 774 838 902 966
+  channel 0 next 6>70 70>134 134>198 198>262 262>326 326>390 390>454 454>518 518>582 582>646 646>710 710>774 774>838 838>902 902>966 966>6
+group DP_EP nNodes 16 nRanks 16 ranks 7 71 135 199 263 327 391 455 519 583 647 711 775 839 903 967
+  channel 0 next 7>71 71>135 135>199 199>263 263>327 327>391 391>455 455>519 519>583 583>647 647>711 711>775 775>839 839>903 903>967 967>7
+group DP_EP nNodes 16 nRanks 16 ranks 8 72 136 200 264 328 392 456 520 584 648 712 776 840 904 968
+  channel 0 next 8>72 72>136 136>200 200>264 264>328 328>392 392>456 456>520 520>584 584>648 648>712 712>776 776>840 840>904 904>968 968>8
+group DP_EP nNodes 16 nRanks 16 ranks 9 73 137 201 265 329 393 457 521 585 649 713 777 841 905 969
+  channel 0 next 9>73 73>137 137>201 201>265 265>329 329>393 393>457 457>521 521>585 585>649 649>713 713>777 777>841 841>905 905>969 969>9
+group DP_EP nNodes 16 nRanks 16 ranks 10 74 138 202 266 330 394 458 522 586 650 714 778 842 906 970
+  channel 0 next 10>74 74>138 138>202 202>266 266>330 330>394 394>458 458>522 522>586 586>650 650>714 714>778 778>842 842>906 906>970 970>10
+group DP_EP nNodes 16 nRanks 16 ranks 11 75 139 203 267 331 395 459 523 587 651 715 779 843 907 971
+  channel 0 next 11>75 75>139 139>203 203>267 267>331 331>395 395>459 459>523 523>587 587>651 651>715 715>779 779>843 843>907 907>971 971>11
+group DP_EP nNodes 16 nRanks 16 ranks 12 76 140 204 268 332 396 460 524 588 652 716 780 844 908 972
+  channel 0 next 12>76 76>140 140>204 204>268 268>332 332>396 396>460 460>524 524>588 588>652 652>716 716>780 780>844 844>908 908>972 972>12
+group DP_EP nNodes 16 nRanks 16 ranks 13 77 141 205 269 333 397 461 525 589 653 717 781 845 909 973
+  channel 0 next 13>77 77>141 141>205 205>269 269>333 333>397 397>461 461>525 525>589 589>653 653>717 717>781 781>845 845>909 909>973 973>13
+group DP_EP nNodes 16 nRanks 16 ranks 14 78 142 206 270 334 398 462 526 590 654 718 782 846 910 974
+  channel 0 next 14>78 78>142 142>206 206>270 270>334 334>398 398>462 462>526 526>590 590>654 654>718 718>782 782>846 846>910 910>974 974>14
+group DP_EP nNodes 16 nRanks 16 ranks 15 79 143 207 271 335 399 463 527 591 655 719 783 847 911 975
+  channel 0 next 15>79 79>143 143>207 207>271 271>335 335>399 399>463 463>527 527>591 591>655 655>719 719>783 783>847 847>911 911>975 975>15
+group DP_EP nNodes 16 nRanks 16 ranks 16 80 144 208 272 336 400 464 528 592 656 720 784 848 912 976
+  channel 0 next 16>80 80>144 144>208 208>272 272>336 336>400 400>464 464>528 528>592 592>656 656>720 720>784 784>848 848>912 912>976 976>16
+group DP_EP nNodes 16 nRanks 16 ranks 17 81 145 209 273 337 401 465 529 593 657 721 785 849 913 977
+  channel 0 next 17>81 81>145 145>209 209>273 273>337 337>401 401>465 465>529 529>593 593>657 657>721 721>785 785>849 849>913 913>977 977>17
+group DP_EP nNodes 16 nRanks 16 ranks 18 82 146 210 274 338 402 466 530 594 658 722 786 850 914 978
+  channel 0 next 18>82 82>146 146>210 210>274 274>338 338>402 402>466 466>530 530>594 594>658 658>722 722>786 786>850 850>914 914>978 978>18
+group DP_EP nNodes 16 nRanks 16 ranks 19 83 147 211 275 339 403 467 531 595 659 723 787 851 915 979
+  channel 0 next 19>83 83>147 147>211 211>275 275>339 339>403 403>467 467>531 531>595 595>659 659>723 723>787 787>851 851>915 915>979 979>19
+group DP_EP nNodes 16 nRanks 16 ranks 20 84 148 212 276 340 404 468 532 596 660 724 788 852 916 980
+  channel 0 next 20>84 84>148 148>212 212>276 276>340 340>404 404>468 468>532 532>596 596>660 660>724 724>788 788>852 852>916 916>980 980>20
+group DP_EP nNodes 16 nRanks 16 ranks 21 85 149 213 277 341 405 469 533 597 661 725 789 853 917 981
+  channel 0 next 21>85 85>149 149>213 213>277 277>341 341>405 405>469 469>533 533>597 597>661 661>725 725>789 789>853 853>917 917>981 981>21
+group DP_EP nNodes 16 nRanks 16 ranks 22 86 150 214 278 342 406 470 534 598 662 726 790 854 918 982
+  channel 0 next 22>86 86>150 150>214 214>278 278>342 342>406 406>470 470>534 534>598 598>662 662>726 726>790 790>854 854>918 918>982 982>22
+group DP_EP nNodes 16 nRanks 16 ranks 23 87 151 215 279 343 407 471 535 599 663 727 791 855 919 983
+  channel 0 next 23>87 87>151 151>215 215>279 279>343 343>407 407>471 471>535 535>599 599>663 663>727 727>791 791>855 855>919 919>983 983>23
+group DP_EP nNodes 16 nRanks 16 ranks 24 88 152 216 280 344 408 472 536 600 664 728 792 856 920 984
+  channel 0 next 24>88 88>152 152>216 216>280 280>344 344>408 408>472 472>536 536>600 600>664 664>728 728>792 792>856 856>920 920>984 984>24
+group DP_EP nNodes 16 nRanks 16 ranks 25 89 153 217 281 345 409 473 537 601 665 729 793 857 921 985
+  channel 0 next 25>89 89>153 153>217 217>281 281>345 345>409 409>473 473>537 537>601 601>665 665>729 729>793 793>857 857>921 921>985 985>25
+group DP_EP nNodes 16 nRanks 16 ranks 26 90 154 218 282 346 410 474 538 602 666 730 794 858 922 986
+  channel 0 next 26>90 90>154 154>218 218>282 282>346 346>410 410>474 474>538 538>602 602>666 666>730 730>794 794>858 858>922 922>986 986>26
+group DP_EP nNodes 16 nRanks 16 ranks 27 91 155 219 283 347 411 475 539 603 667 731 795 859 923 987
+  channel 0 next 27>91 91>155 155>219 219>283 283>347 347>411 411>475 475>539 539>603 603>667 667>731 731>795 795>859 859>923 923>987 987>27
+group DP_EP nNodes 16 nRanks 16 ranks 28 92 156 220 284 348 412 476 540 604 668 732 796 860 924 988
+  channel 0 next 28>92 92>156 156>220 220>284 284>348 348>412 412>476 476>540 540>604 604>668 668>732 732>796 796>860 860>924 924>988 988>28
+group DP_EP nNodes 16 nRanks 16 ranks 29 93 157 221 285 349 413 477 541 605 669 733 797 861 925 989
+  channel 0 next 29>93 93>157 157>221 221>285 285>349 349>413 413>477 477>541 541>605 605>669 669>733 733>797 797>861 861>925 925>989 989>29
+group DP_EP nNodes 16 nRanks 16 ranks 30 94 158 222 286 350 414 478 542 606 670 734 798 862 926 990
+  channel 0 next 30>94 94>158 158>222 222>286 286>350 350>414 414>478 478>542 542>606 606>670 670>734 734>798 798>862 862>926 926>990 990>30
+group DP_EP nNodes 16 nRanks 16 ranks 31 95 159 223 287 351 415 479 543 607 671 735 799 863 927 991
+  channel 0 next 31>95 95>159 159>223 223>287 287>351 351>415 415>479 479>543 543>607 607>671 671>735 735>799 799>863 863>927 927>991 991>31
+group DP_EP nNodes 16 nRanks 16 ranks 32 96 160 224 288 352 416 480 544 608 672 736 800 864 928 992
+  channel 0 next 32>96 96>160 160>224 224>288 288>352 352>416 416>480 480>544 544>608 608>672 672>736 736>800 800>864 864>928 928>992 992>32
+group DP_EP nNodes 16 nRanks 16 ranks 33 97 161 225 289 353 417 481 545 609 673 737 801 865 929 993
+  channel 0 next 33>97 97>161 161>225 225>289 289>353 353>417 417>481 481>545 545>609 609>673 673>737 737>801 801>865 865>929 929>993 993>33
+group DP_EP nNodes 16 nRanks 16 ranks 34 98 162 226 290 354 418 482 546 610 674 738 802 866 930 994
+  channel 0 next 34>98 98>162 162>226 226>290 290>354 354>418 418>482 482>546 546>610 610>674 674>738 738>802 802>866 866>930 930>994 994>34
+group DP_EP nNodes 16 nRanks 16 ranks 35 99 163 227 291 355 419 483 547 611 675 739 803 867 931 995
+  channel 0 next 35>99 99>163 163>227 227>291 291>355 355>419 419>483 483>547 547>611 611>675 675>739 739>803 803>867 867>931 931>995 995>35
+group DP_EP nNodes 16 nRanks 16 ranks 36 100 164 228 292 356 420 484 548 612 676 740 804 868 932 996
+  channel 0 next 36>100 100>164 164>228 228>292 292>356 356>420 420>484 484>548 548>612 612>676 676>740 740>804 804>868 868>932 932>996 996>36
+group DP_EP nNodes 16 nRanks 16 ranks 37 101 165 229 293 357 421 485 549 613 677 741 805 869 933 997
+  channel 0 next 37>101 101>165 165>229 229>293 293>357 357>421 421>485 485>549 549>613 613>677 677>741 741>805 805>869 869>933 933>997 997>37
+group DP_EP nNodes 16 nRanks 16 ranks 38 102 166 230 294 358 422 486 550 614 678 742 806 870 934 998
+  channel 0 next 38>102 102>166 166>230 230>294 294>358 358>422 422>486 486>550 550>614 614>678 678>742 742>806 806>870 870>934 934>998 998>38
+group DP_EP nNodes 16 nRanks 16 ranks 39 103 167 231 295 359 423 487 551 615 679 743 807 871 935 999
+  channel 0 next 39>103 103>167 167>231 231>295 295>359 359>423 423>487 487>551 551>615 615>679 679>743 743>807 807>871 871>935 935>999 999>39
+group DP_EP nNodes 16 nRanks 16 ranks 40 104 168 232 296 360 424 488 552 616 680 744 808 872 936 1000
+  channel 0 next 40>104 104>168 168>232 232>296 296>360 360>424 424>488 488>552 552>616 616>680 680>744 744>808 808>872 872>936 936>1000 1000>40
+group DP_EP nNodes 16 nRanks 16 ranks 41 105 169 233 297 361 425 489 553 617 681 745 809 873 937 1001
+  channel 0 next 41>105 105>169 169>233 233>297 297>361 361>425 425>489 489>553 553>617 617>681 681>745 745>809 809>873 873>937 937>1001 1001>41
+group DP_EP nNodes 16 nRanks 16 ranks 42 106 170 234 298 362 426 490 554 618 682 746 810 874 938 1002
+  channel 0 next 42>106 106>170 170>234 234>298 298>362 362>426 426>490 490>554 554>618 618>682 682>746 746>810 810>874 874>938 938>1002 1002>42
+group DP_EP nNodes 16 nRanks 16 ranks 43 107 171 235 299 363 427 491 555 619 683 747 811 875 939 1003
+  channel 0 next 43>107 107>171 171>235 235>299 299>363 363>427 427>491 491>555 555>619 619>683 683>747 747>811 811>875 875>939 939>1003 1003>43
+group DP_EP nNodes 16 nRanks 16 ranks 44 108 172 236 300 364 428 492 556 620 684 748 812 876 940 1004
+  channel 0 next 44>108 108>172 172>236 236>300 300>364 364>428 428>492 492>556 556>620 620>684 684>748 748>812 812>876 876>940 940>1004 1004>44
+group DP_EP nNodes 16 nRanks 16 ranks 45 109 173 237 301 365 429 493 557 621 685 749 813 877 941 1005
+  channel 0 next 45>109 109>173 173>237 237>301 301>365 365>429 429>493 493>557 557>621 621>685 685>749 749>813 813>877 877>941 941>1005 1005>45
+group DP_EP nNodes 16 nRanks 16 ranks 46 110 174 238 302 366 430 494 558 622 686 750 814 878 942 1006
+  channel 0 next 46>110 110>174 174>238 238>302 302>366 366>430 430>494 494>558 558>622 622>686 686>750 750>814 814>878 878>942 942>1006 1006>46
+group DP_EP nNodes 16 nRanks 16 ranks 47 111 175 239 303 367 431 495 559 623 687 751 815 879 943 1007
+  channel 0 next 47>111 111>175 175>239 239>303 303>367 367>431 431>495 495>559 559>623 623>687 687>751 751>815 815>879 879>943 943>1007 1007>47
+group DP_EP nNodes 16 nRanks 16 ranks 48 112 176 240 304 368 432 496 560 624 688 752 816 880 944 1008
+  channel 0 next 48>112 112>176 176>240 240>304 304>368 368>432 432>496 496>560 560>624 624>688 688>752 752>816 816>880 880>944 944>1008 1008>48
+group DP_EP nNodes 16 nRanks 16 ranks 49 113 177 241 305 369 433 497 561 625 689 753 817 881 945 1009
+  channel 0 next 49>113 113>177 177>241 241>305 305>369 369>433 433>497 497>561 561>625 625>689 689>753 753>817 817>881 881>945 945>1009 1009>49
+group DP_EP nNodes 16 nRanks 16 ranks 50 114 178 242 306 370 434 498 562 626 690 754 818 882 946 1010
+  channel 0 next 50>114 114>178 178>242 242>306 306>370 370>434 434>498 498>562 562>626 626>690 690>754 754>818 818>882 882>946 946>1010 1010>50
+group DP_EP nNodes 16 nRanks 16 ranks 51 115 179 243 307 371 435 499 563 627 691 755 819 883 947 1011
+  channel 0 next 51>115 115>179 179>243 243>307 307>371 371>435 435>499 499>563 563>627 627>691 691>755 755>819 819>883 883>947 947>1011 1011>51
+group DP_EP nNodes 16 nRanks 16 ranks 52 116 180 244 308 372 436 500 564 628 692 756 820 884 948 1012
+  channel 0 next 52>116 116>180 180>244 244>308 308>372 372>436 436>500 500>564 564>628 628>692 692>756 756>820 820>884 884>948 948>1012 1012>52
+group DP_EP nNodes 16 nRanks 16 ranks 53 117 181 245 309 373 437 501 565 629 693 757 821 885 949 1013
+  channel 0 next 53>117 117>181 181>245 245>309 309>373 373>437 437>501 501>565 565>629 629>693 693>757 757>821 821>885 885>949 949>1013 1013>53
+group DP_EP nNodes 16 nRanks 16 ranks 54 118 182 246 310 374 438 502 566 630 694 758 822 886 950 1014
+  channel 0 next 54>118 118>182 182>246 246>310 310>374 374>438 438>502 502>566 566>630 630>694 694>758 758>822 822>886 886>950 950>1014 1014>54
+group DP_EP nNodes 16 nRanks 16 ranks 55 119 183 247 311 375 439 503 567 631 695 759 823 887 951 1015
+  channel 0 next 55>119 119>183 183>247 247>311 311>375 375>439 439>503 503>567 567>631 631>695 695>759 759>823 823>887 887>951 951>1015 1015>55
+group DP_EP nNodes 16 nRanks 16 ranks 56 120 184 248 312 376 440 504 568 632 696 760 824 888 952 1016
+  channel 0 next 56>120 120>184 184>248 248>312 312>376 376>440 440>504 504>568 568>632 632>696 696>760 760>824 824>888 888>952 952>1016 1016>56
+group DP_EP nNodes 16 nRanks 16 ranks 57 121 185 249 313 377 441 505 569 633 697 761 825 889 953 1017
+  channel 0 next 57>121 121>185 185>249 249>313 313>377 377>441 441>505 505>569 569>633 633>697 697>761 761>825 825>889 889>953 953>1017 1017>57
+group DP_EP nNodes 16 nRanks 16 ranks 58 122 186 250 314 378 442 506 570 634 698 762 826 890 954 1018
+  channel 0 next 58>122 122>186 186>250 250>314 314>378 378>442 442>506 506>570 570>634 634>698 698>762 762>826 826>890 890>954 954>1018 1018>58
+group DP_EP nNodes 16 nRanks 16 ranks 59 123 187 251 315 379 443 507 571 635 699 763 827 891 955 1019
+  channel 0 next 59>123 123>187 187>251 251>315 315>379 379>443 443>507 507>571 571>635 635>699 699>763 763>827 827>891 891>955 955>1019 1019>59
+group DP_EP nNodes 16 nRanks 16 ranks 60 124 188 252 316 380 444 508 572 636 700 764 828 892 956 1020
+  channel 0 next 60>124 124>188 188>252 252>316 316>380 380>444 444>508 508>572 572>636 636>700 700>764 764>828 828>892 892>956 956>1020 1020>60
+group DP_EP nNodes 16 nRanks 16 ranks 61 125 189 253 317 381 445 509 573 637 701 765 829 893 957 1021
+  channel 0 next 61>125 125>189 189>253 253>317 317>381 381>445 445>509 509>573 573>637 637>701 701>765 765>829 829>893 893>957 957>1021 1021>61
+group DP_EP nNodes 16 nRanks 16 ranks 62 126 190 254 318 382 446 510 574 638 702 766 830 894 958 1022
+  channel 0 next 62>126 126>190 190>254 254>318 318>382 382>446 446>510 510>574 574>638 638>702 702>766 766>830 830>894 894>958 958>1022 1022>62
+group DP_EP nNodes 16 nRanks 16 ranks 63 127 191 255 319 383 447 511 575 639 703 767 831 895 959 1023
+  channel 0 next 63>127 127>191 191>255 255>319 319>383 383>447 447>511 511>575 575>639 639>703 703>767 767>831 831>895 895>959 959>1023 1023>63

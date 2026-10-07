@@ -742,7 +742,8 @@ pub(crate) const fn roce_ack_header_of_words(metadata: &[u64]) -> Option<crate::
 pub(crate) const ROCE_RECEIVER_MARKER: u64 = 4;
 /// Words of one RoCE receiver record in the RoCE region (a tail of `tcp_state`). P16: the queue
 /// pair's receiver holds no notification point (its ACKs echo ECN), so the P15 CNP words are gone.
-pub(crate) const ROCE_RECEIVER_WORDS: usize = 10;
+/// The host projection sizes the region from the same constant (`device_sizing`).
+pub(crate) const ROCE_RECEIVER_WORDS: usize = crate::device_sizing::ROCE_RECEIVER_WORDS;
 const RR_TOTAL: usize = 0;
 const RR_ACK_EVERY: usize = 1;
 const RR_ACK_SIZE: usize = 2;
