@@ -438,7 +438,8 @@ fn unmatched_after_lists_are_rejected() {
 /// Ruling R11's width rule stays sound for host-matched joins: at every departure and stage
 /// transition time of each fixture's Scalar run, no host has more released, unfinished stages than the stage-aware sizing's
 /// width for it (`stage_widths_for_testing`, one width per host with an unfinished stage, in host
-/// order).
+/// order; a planner test hook, so with the `test` feature).
+#[cfg(feature = "test")]
 #[test]
 fn the_width_rule_bounds_every_hosts_active_stages() {
     for (label, image) in images() {

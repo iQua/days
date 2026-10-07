@@ -5292,8 +5292,11 @@ fn collective_completion(
 struct AfterRanks {
     /// Per listed group, in `after` order: `None` when it runs on the dependent's hosts in order.
     /// `None` overall when every listed group does.
-    tables: Option<Vec<Option<Vec<(u64, u32)>>>>,
+    tables: Option<Vec<Option<HostRanks>>>,
 }
+
+/// A group's `(host, rank)` pairs, sorted by host.
+type HostRanks = Vec<(u64, u32)>;
 
 impl AfterRanks {
     fn new(plan: &StagePlan<'_>, after: Option<&AfterGroups>, hosts: &[u64]) -> Self {
