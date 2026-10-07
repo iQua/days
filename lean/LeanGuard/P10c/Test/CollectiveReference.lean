@@ -62,9 +62,9 @@ def entryLookupsReference (rows : List Row) : EntryLookups :=
     completionsAt := fun (group, node) =>
       distinctStages (rows.filter fun candidate =>
         groupId candidate = group && isCompletion candidate && candidate.nodeId = node)
-    completionsInto := fun (group, rank) =>
+    completionsInto := fun (group, node) =>
       distinctStages (rows.filter fun candidate =>
-        groupId candidate = group && isCompletion candidate && targetRank candidate = some rank) }
+        groupId candidate = group && isCompletion candidate && candidate.targetNode = node) }
 
 def checkTransportPredecessorsReference (rows : List Row) (row : Row) (phase : Collective.Phase) :
     Except String Unit := do
@@ -377,10 +377,22 @@ def checkContinuityReference (rows : List Row) : Except String Unit := do
         go (row :: previous) rest
   go [] rows
 
-/-- The first row naming the same inbound predecessor runs on this row's host (see
-`checkInboundDeliveryHosts`). -/
+/-- A stage's delivery host is its target rank's host when that rank has a row (see
+`checkTargetNodes`). -/
+def checkTargetNodesReference (rows : List Row) (row : Row) : Except String Unit := do
+  if let some target := targetRank row then
+    if let some first := rows.find? fun candidate =>
+        groupId candidate = groupId row && candidate.rank = target then
+      require row.srcLine (row.targetNode = first.nodeId)
+        "a stage's delivery host is not its target rank's host"
+
+/-- A logged inbound predecessor is delivered to this row's host, and the first row naming the
+same inbound predecessor runs on it (see `checkInboundDeliveryHosts`). -/
 def checkInboundDeliveryHostsReference (rows : List Row) (row : Row) : Except String Unit := do
   for flow in row.inboundPredecessors do
+    if let some predecessor := findFlowReference rows flow then
+      require row.srcLine (predecessor.targetNode = row.nodeId)
+        "an inbound predecessor is not delivered to the stage's host"
     if let some first := rows.find? (·.inboundPredecessors.contains flow) then
       require row.srcLine (first.nodeId = row.nodeId)
         "an inbound predecessor is delivered to more than one host"
@@ -393,6 +405,7 @@ def checkRowsReference (rows : List Row) : Except String Unit := do
   for row in canonical do checkRow row
   checkCoverage canonical
   checkChannelRingsReference canonical
+  for row in canonical do checkTargetNodesReference canonical row
   for row in canonical do checkInboundDeliveryHostsReference canonical row
   for row in canonical do checkPredecessorsReference canonical row
   for row in canonical do checkInboundReplayReference canonical row
