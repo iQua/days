@@ -366,3 +366,119 @@ fn every_distribution_refuses_unknown_and_wrong_type_keys() {
     }
     assert!(accepted.is_empty(), "{}", accepted.join("\n"));
 }
+
+/// The entries of the inline table on the first `key = { ... }` line of `text`, and that line's
+/// indentation.
+fn inline_entries<'a>(text: &'a str, key: &str) -> (&'a str, Vec<&'a str>) {
+    let line = text
+        .lines()
+        .find(|line| line.trim_start().starts_with(&format!("{key} =")))
+        .unwrap_or_else(|| panic!("no `{key}` line"));
+    let indent = &line[..line.len() - line.trim_start().len()];
+    let open = line.find('{').expect("an inline table");
+    let close = line.rfind('}').expect("an inline table");
+    let entries = line[open + 1..close].split(',').map(str::trim).collect();
+    (indent, entries)
+}
+
+/// `text` with `key`'s inline table written as dotted keys (`key.type = ...`) in place.
+fn to_dotted(text: &str, key: &str) -> String {
+    let (indent, entries) = inline_entries(text, key);
+    let mut out = String::new();
+    let mut done = false;
+    for line in text.lines() {
+        if !done && line.trim_start().starts_with(&format!("{key} =")) {
+            for entry in &entries {
+                out.push_str(&format!("{indent}{key}.{entry}\n"));
+            }
+            done = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// `text` with `key`'s inline table moved to a `[<table>.<key>]` sub-table, written just before
+/// the first header after `table`'s.
+fn to_subtable(text: &str, table: &str, key: &str) -> String {
+    let (indent, entries) = inline_entries(text, key);
+    let path = table.trim_matches(['[', ']']);
+    let mut sub = format!("{indent}[{path}.{key}]\n");
+    for entry in &entries {
+        sub.push_str(&format!("{indent}{entry}\n"));
+    }
+    let mut out = String::new();
+    let (mut inside, mut done) = (false, false);
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if inside && !done && trimmed.starts_with('[') {
+            out.push_str(&sub);
+            done = true;
+        }
+        if trimmed == table {
+            inside = true;
+        }
+        if !(inside && trimmed.starts_with(&format!("{key} ="))) {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !done {
+        out.push_str(&sub);
+    }
+    out
+}
+
+/// Fix round 2 (re-review F1, ruling option (a)): a distribution written as a sub-table or as
+/// dotted keys is refused on every traffic kind, as PacketDistribution traffic already refused
+/// it, with one message naming the key and the table.
+#[test]
+fn every_distribution_refuses_sub_tables_and_dotted_keys() {
+    let mut wrong = Vec::new();
+    for (path, table) in [
+        (
+            "configs/benchmarks/baseline/fattree_k4_f8_st.toml",
+            "[flow_set.traffic]",
+        ),
+        ("configs/p14/dcqcn_t26.toml", "[flow.traffic]"),
+        (
+            "configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml",
+            "[flow_set.traffic]",
+        ),
+        ("configs/p15/roce_ring_lossy.toml", "[collective.traffic]"),
+    ] {
+        let base = std::fs::read_to_string(repository(path)).expect("read config");
+        lower_text(&base).unwrap_or_else(|error| panic!("{path} lowers: {error}"));
+        for distribution in ["arr_dist", "pkt_size_dist"] {
+            let sub_table = format!("`[{}.{distribution}]`", table.trim_matches(['[', ']']));
+            for (form, text, named) in [
+                (
+                    "dotted keys",
+                    to_dotted(&base, distribution),
+                    format!("`{table}`"),
+                ),
+                (
+                    "sub-table",
+                    to_subtable(&base, table, distribution),
+                    sub_table,
+                ),
+            ] {
+                // Valid TOML: only Days AGO's executor-distribution rule refuses it.
+                text.parse::<toml::Table>()
+                    .unwrap_or_else(|error| panic!("{path} {form}: {error}\n{text}"));
+                let expected = format!(
+                    "invalid scenario: executor distributions must use an inline TOML table in `{distribution}` (in {named})"
+                );
+                let result = lower_text(&text).map(|_| ());
+                if result.as_ref().err() != Some(&expected) {
+                    wrong.push(format!(
+                        "{path} `{distribution}` as {form}: {result:?}, expected {expected:?}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
