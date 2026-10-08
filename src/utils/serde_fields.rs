@@ -63,19 +63,18 @@ pub fn unknown_key_table(content: &str, error: &toml::de::Error) -> Option<Strin
     if !error.message().contains("unknown field") {
         return None;
     }
-    let start = error.span()?.start;
-    // Up to the end of the line the key is on, so a header naming it counts.
-    let end = content
-        .get(start..)?
-        .find('\n')
-        .map_or(content.len(), |offset| start + offset);
-    Some(table_up_to(content, end))
+    Some(table_at(content, error.span()?.start))
 }
 
-/// The table a value at byte `offset` of `content` sits in: `` `[header]` `` (the nearest table
-/// header above it), or `the root table`.
+/// The table a key at byte `offset` of `content` sits in: `` `[header]` `` (the nearest table
+/// header above it, or the header on the key's own line, which names it as a sub-table), or
+/// `the root table`.
 pub fn table_at(content: &str, offset: usize) -> String {
-    table_up_to(content, offset)
+    let end = content
+        .get(offset..)
+        .and_then(|rest| rest.find('\n'))
+        .map_or(content.len(), |line| offset + line);
+    table_up_to(content, end)
 }
 
 fn table_up_to(content: &str, end: usize) -> String {

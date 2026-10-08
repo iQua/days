@@ -2637,6 +2637,7 @@ fn validate_traffic(
             }
             let interval_ns = constant_distribution_scaled(
                 &traffic.arr_dist,
+                "arr_dist",
                 scenario_text,
                 1_000_000_000,
                 "packet arrival distribution",
@@ -2914,10 +2915,15 @@ enum ParsedSourceDistribution<'a> {
     Uniform { low: &'a str, high: &'a str },
 }
 
-fn source_distribution<'a>(
+/// The text between the braces of the distribution `name` (`arr_dist` or `pkt_size_dist`).
+/// Executor distributions are inline tables only: one written as a sub-table or as dotted keys
+/// is refused, naming the key and the table (a2aset fix round 2, ruling option (a)). Its span is
+/// then its header or its key, never a `{ ... }` value.
+fn inline_distribution<'a>(
     distribution: &SourceDistributionInfo,
+    name: &str,
     scenario_text: &'a str,
-) -> Result<ParsedSourceDistribution<'a>, CompileError> {
+) -> Result<&'a str, CompileError> {
     let literal = scenario_text
         .get(distribution.span.clone())
         .ok_or_else(|| {
@@ -2925,13 +2931,25 @@ fn source_distribution<'a>(
                 "distribution source span is outside the scenario text".to_owned(),
             )
         })?;
-    let body = literal
+    literal
         .trim()
         .strip_prefix('{')
         .and_then(|body| body.strip_suffix('}'))
         .ok_or_else(|| {
-            CompileError::Invalid("executor distributions must use an inline TOML table".to_owned())
-        })?;
+            let table =
+                crate::utils::serde_fields::table_at(scenario_text, distribution.span.start);
+            CompileError::Invalid(format!(
+                "executor distributions must use an inline TOML table in `{name}` (in {table})"
+            ))
+        })
+}
+
+fn source_distribution<'a>(
+    distribution: &SourceDistributionInfo,
+    name: &str,
+    scenario_text: &'a str,
+) -> Result<ParsedSourceDistribution<'a>, CompileError> {
+    let body = inline_distribution(distribution, name, scenario_text)?;
     let mut fields = BTreeMap::new();
     for field in body.split(',') {
         let (key, value) = field.split_once('=').ok_or_else(|| {
@@ -3010,18 +3028,11 @@ fn plain_number(value: &str, integer: bool) -> bool {
         })
 }
 
-/// Whether an inline distribution table's keys are exactly `type` and its type's fields, each
+/// Whether an inline distribution table's keys (`body`, the text between its braces) are exactly `type` and its type's fields, each
 /// once and each a plain number (a `key = value` list, as every scenario writes it): then the
 /// shared schema accepts it. Anything else goes to the schema, which also accepts what this scan
 /// cannot read.
-fn distribution_keys_are_exact(literal: &str) -> bool {
-    let Some(body) = literal
-        .trim()
-        .strip_prefix('{')
-        .and_then(|body| body.strip_suffix('}'))
-    else {
-        return false;
-    };
+fn distribution_keys_are_exact(body: &str) -> bool {
     let entries = || {
         body.split(',').map(|field| {
             field
@@ -3068,18 +3079,12 @@ fn check_distribution_keys(
         #[allow(dead_code)]
         distribution: super::DistributionInfo,
     }
-    let literal = scenario_text
-        .get(distribution.span.clone())
-        .ok_or_else(|| {
-            CompileError::Invalid(
-                "distribution source span is outside the scenario text".to_owned(),
-            )
-        })?;
+    let body = inline_distribution(distribution, name, scenario_text)?;
     // The common case, checked without allocating: exactly `type` and its type's fields.
-    if distribution_keys_are_exact(literal) {
+    if distribution_keys_are_exact(body) {
         return Ok(());
     }
-    toml::from_str::<Distribution>(&format!("distribution = {literal}")).map_err(|error| {
+    toml::from_str::<Distribution>(&format!("distribution = {{{body}}}")).map_err(|error| {
         let table = crate::utils::serde_fields::table_at(scenario_text, distribution.span.start);
         CompileError::Invalid(format!("{} in `{name}` (in {table})", error.message()))
     })?;
@@ -3110,7 +3115,7 @@ fn constant_packet_size_bytes(
     distribution: &SourceDistributionInfo,
     scenario_text: &str,
 ) -> Result<u64, CompileError> {
-    match source_distribution(distribution, scenario_text)? {
+    match source_distribution(distribution, "pkt_size_dist", scenario_text)? {
         ParsedSourceDistribution::DiscreteUniform { low, high } if low == high => {
             u64::try_from(low).map_err(|_| {
                 CompileError::Unsupported(format!(
@@ -3157,11 +3162,12 @@ fn constant_packet_size_bytes(
 
 fn constant_distribution_scaled(
     distribution: &SourceDistributionInfo,
+    name: &str,
     scenario_text: &str,
     scale: u64,
     label: &str,
 ) -> Result<u64, CompileError> {
-    match source_distribution(distribution, scenario_text)? {
+    match source_distribution(distribution, name, scenario_text)? {
         ParsedSourceDistribution::DiscreteUniform { low, high } if low == high => {
             let value = u64::try_from(low).map_err(|_| {
                 CompileError::Invalid(format!("{label} must be finite and nonnegative, got {low}"))
@@ -6498,6 +6504,15 @@ mod tests {
     /// type's, and the schema has no type the table lacks.
     #[test]
     fn distribution_fields_match_the_shared_schema() {
+        // The fast path reads the text between an inline table's braces.
+        let exact = |table: &str| {
+            super::distribution_keys_are_exact(
+                table
+                    .strip_prefix('{')
+                    .and_then(|t| t.strip_suffix('}'))
+                    .expect("braces"),
+            )
+        };
         let parse = |table: &str| {
             #[derive(serde::Deserialize)]
             struct Probe {
@@ -6539,12 +6554,12 @@ mod tests {
                     .map(|field| format!(", {field} = {value}"))
                     .collect::<String>();
                 let table = format!("{{ type = \"{kind}\"{table} }}");
-                if super::distribution_keys_are_exact(&table) {
+                if exact(&table) {
                     parse(&table).unwrap_or_else(|error| panic!("{table}: {error}"));
                 }
                 assert_eq!(
                     super::plain_number(value, integer),
-                    super::distribution_keys_are_exact(&table),
+                    exact(&table),
                     "{table}"
                 );
             }
@@ -6554,13 +6569,11 @@ mod tests {
                 .collect::<String>();
             parse(&format!("{{ type = \"{kind}\"{own} }}"))
                 .unwrap_or_else(|error| panic!("{kind} takes {fields:?}: {error}"));
-            assert!(super::distribution_keys_are_exact(&format!(
-                "{{ type = \"{kind}\"{own} }}"
-            )));
+            assert!(exact(&format!("{{ type = \"{kind}\"{own} }}")));
             for other in every_field.iter().filter(|field| !fields.contains(field)) {
                 let table = format!("{{ type = \"{kind}\"{own}, {other} = 1 }}");
                 assert!(parse(&table).is_err(), "{kind} refuses {other}");
-                assert!(!super::distribution_keys_are_exact(&table));
+                assert!(!exact(&table));
             }
         }
         let unknown = parse("{ type = \"Unknown\" }").expect_err("an unknown type");
