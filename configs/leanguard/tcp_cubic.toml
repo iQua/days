@@ -2,7 +2,7 @@
 # egress to host 5. An 8-packet TailDrop queue forces losses, so the trace covers every tcp_check
 # CUBIC coverpoint: exact new ACK and congestion avoidance, K, duplicate ACK, fast-recovery
 # entry, inflation, partial and full ACK, and timeout. tests/leanguard_certificates.rs lowers it
-# and writes the Scalar certificate lean/fixtures/tcp/tcp_cubic_executor_accept.csv.
+# and writes the Scalar certificate lean/fixtures/tcp/cubic-compiled-tcp-events.csv.
 seed = 16
 edges = [[0, 6],[1, 6],[2, 6],[3, 6],[4, 6],[5, 6]]
 hosts = [0, 1, 2, 3, 4, 5]
