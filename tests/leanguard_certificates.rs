@@ -361,6 +361,40 @@ fn compiled_aqm_certificate_names_packet_kinds_and_acks_stay_unmarked() {
     assert_fixture(&csv, "p10c/aqm_roce_acks_compiled_executor_accept.csv");
 }
 
+/// The same RoCE-ACK queue under RED_ECN: an ACK at a RED congestion signal (the RED counter resets)
+/// is admitted unmarked, where a data packet would be marked (aqmkind review M3).
+#[test]
+fn compiled_red_aqm_certificate_admits_acks_unmarked_at_red_signals() {
+    let csv = certificate("aqm_roce_acks_red", Family::Aqm);
+    let header = csv.lines().next().unwrap().split(',').collect::<Vec<_>>();
+    let column = |name: &str| header.iter().position(|field| *field == name).unwrap();
+    let rows = csv
+        .lines()
+        .skip(1)
+        .map(|line| line.split(',').collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    assert!(rows.iter().all(|row| row[column("policy")] == "red"));
+    // A RED signal resets the counter from a positive value and is not a drop.
+    let signal = |row: &Vec<&str>| {
+        row[column("before_counter")] != "0"
+            && row[column("after_counter")] == "0"
+            && row[column("action")] != "drop"
+    };
+    assert!(
+        rows.iter()
+            .any(|row| row[column("packet_kind")] == "roce_ack"
+                && signal(row)
+                && row[column("action")] == "enqueue"),
+        "no ACK is admitted unmarked at a RED signal"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row[column("packet_kind")] == "roce_data" && row[column("action")] == "mark"),
+        "no data packet is marked"
+    );
+    assert_fixture(&csv, "p10c/aqm_roce_acks_red_compiled_executor_accept.csv");
+}
+
 #[test]
 fn the_wfq_record_does_not_grow_the_mechanism_record() {
     // The WFQ record is boxed: full observation retains one `MechanismTransitionRecord` per
