@@ -10,23 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use days::scenario::compile_config;
-
-/// The legacy engine's root keys the Days AGO root accepts by name (`legacy/src/config.rs`).
-const LEGACY_ENGINE_ROOT_KEYS: [&str; 12] = [
-    "ui_interval",
-    "threading",
-    "num_threads",
-    "hot_workers",
-    "concurrency_level",
-    "log_path",
-    "csv_logging",
-    "report_interval",
-    "mailbox_capacity",
-    "legacy_e5_metrics",
-    "model_host_attachment",
-    "app_source",
-];
+use days::scenario::{LEGACY_ENGINE_ROOT_KEYS, compile_config};
 use days_executor::SimulationImage;
 
 fn repository(path: &str) -> PathBuf {

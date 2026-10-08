@@ -104,6 +104,7 @@ struct ScenarioTopology {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TopologyTable {
     category: String,
     spectrum_x: Option<SpectrumXConfig>,

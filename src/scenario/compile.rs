@@ -61,25 +61,85 @@ impl From<IdError> for CompileError {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct SourceConfig {
-    /// A `[workload]` table: present only in an AICB scenario, which the adapter rewrites before
-    /// lowering, so the ordinary path refuses it.
-    workload: Option<serde::de::IgnoredAny>,
-    seed: Option<u64>,
-    duration: Option<ExactDecimal>,
-    switch: SourceSwitch,
-    link: Option<SourceLink>,
-    time_quantum_ns: Option<u64>,
-    routing: Option<SourceRouting>,
-    flow: Option<Vec<SourceFlow>>,
-    flow_set: Option<Vec<SourceFlowSet>>,
-    collective: Option<Vec<SourceCollective>>,
-    collective_set: Option<Vec<SourceCollectiveSet>>,
-    compute: Option<Vec<SourceCompute>>,
+/// Declares the scenario root ([`SourceConfig`]) together with [`LEGACY_ENGINE_ROOT_KEYS`], so
+/// the legacy-engine keys the root accepts are written once.
+macro_rules! scenario_root {
+    ($($legacy:ident),* $(,)?) => {
+        /// The legacy engine's root keys (`legacy/src/config.rs`, `LegacyConfig`) that Days AGO
+        /// does not read: the root accepts each by its exact name and ignores it, because the
+        /// two engines read one scenario file (user ruling, Oct 8, option 1). Any other unknown
+        /// key is refused. `legacy`'s `the_days_ago_root_names_exactly_the_legacy_only_keys`
+        /// test keeps the list equal to `LegacyConfig`'s keys that the Days AGO root does not
+        /// read itself.
+        pub const LEGACY_ENGINE_ROOT_KEYS: &[&str] = &[$(stringify!($legacy)),*];
+
+        /// The scenario root. Unknown keys are refused (`deny_unknown_fields`); `topology`,
+        /// `edges` and `hosts` are read by the topology builder, and the legacy-engine keys are
+        /// accepted and ignored.
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct SourceConfig {
+            /// A `[workload]` table: present only in an AICB scenario, which the adapter
+            /// rewrites before lowering, so the ordinary path refuses it.
+            workload: Option<serde::de::IgnoredAny>,
+            seed: Option<u64>,
+            duration: Option<ExactDecimal>,
+            switch: SourceSwitch,
+            link: Option<SourceLink>,
+            time_quantum_ns: Option<u64>,
+            routing: Option<SourceRouting>,
+            flow: Option<Vec<SourceFlow>>,
+            flow_set: Option<Vec<SourceFlowSet>>,
+            collective: Option<Vec<SourceCollective>>,
+            collective_set: Option<Vec<SourceCollectiveSet>>,
+            compute: Option<Vec<SourceCompute>>,
+            /// Read by the topology builder (`topos::build`).
+            #[allow(dead_code)]
+            topology: Option<serde::de::IgnoredAny>,
+            #[allow(dead_code)]
+            edges: Option<serde::de::IgnoredAny>,
+            #[allow(dead_code)]
+            hosts: Option<serde::de::IgnoredAny>,
+            $(
+                #[allow(dead_code)]
+                $legacy: Option<serde::de::IgnoredAny>,
+            )*
+        }
+    };
+}
+
+scenario_root!(
+    ui_interval,
+    threading,
+    num_threads,
+    hot_workers,
+    concurrency_level,
+    log_path,
+    csv_logging,
+    report_interval,
+    mailbox_capacity,
+    legacy_e5_metrics,
+    model_host_attachment,
+    app_source,
+);
+
+/// The keys the scenario root accepts: those Days AGO reads, `topology`, `edges` and `hosts`
+/// (read by the topology builder), and [`LEGACY_ENGINE_ROOT_KEYS`].
+pub fn scenario_root_keys() -> &'static [&'static str] {
+    crate::utils::serde_fields::struct_fields::<SourceConfig>()
+}
+
+/// A parse error, naming the table of an unknown key: the header line the key sits under, or
+/// the root table.
+fn parse_error(content: &str, error: toml::de::Error) -> CompileError {
+    match crate::utils::serde_fields::unknown_key_table(content, &error) {
+        Some(table) => CompileError::Invalid(format!("{error}(in {table})")),
+        None => CompileError::Parse(error),
+    }
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceSwitch {
     port_rate: Option<ExactDecimal>,
     capacity: u64,
@@ -101,6 +161,7 @@ struct SourceEcnRow {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceRouting {
     policy: String,
 }
@@ -119,6 +180,7 @@ enum RoutingPolicy {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceLink {
     mode: Option<String>,
     pfc: Option<SourcePfc>,
@@ -127,6 +189,7 @@ struct SourceLink {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourcePropagationTiers {
     host_to_edge_ns: u64,
     edge_to_aggregation_ns: u64,
@@ -134,6 +197,7 @@ struct SourcePropagationTiers {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourcePfc {
     /// P15: also monitor host-to-switch links, so switches pause host NICs (default off).
     host_links: Option<bool>,
@@ -167,6 +231,7 @@ struct SourceHeadroomRow {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceFlow {
     flow_id: Option<u64>,
     starts_before: Option<Vec<u64>>,
@@ -180,6 +245,7 @@ struct SourceFlow {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceFlowSet {
     first_flow_id: Option<u64>,
     starts_before: Option<Vec<u64>>,
@@ -193,6 +259,7 @@ struct SourceFlowSet {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceCollective {
     /// Stage-group name that `after` fields may reference.
     name: Option<String>,
@@ -247,6 +314,7 @@ struct SourceAllToAll {
 
 /// A delay-only compute stage group: one timer-only stage per listed host.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceCompute {
     name: String,
     hosts: Vec<u64>,
@@ -278,6 +346,7 @@ fn after_names(after: Option<&AfterGroups>) -> &[String] {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceCollectiveSet {
     collective_type: String,
     collective_count: u64,
@@ -292,6 +361,7 @@ struct SourceCollectiveSet {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceTraffic {
     initial_delay: Option<ExactDecimal>,
     duration: Option<ExactDecimal>,
@@ -379,6 +449,7 @@ struct SourceDcqcn {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceTcp {
     cc_algorithm: String,
     #[serde(default)]
@@ -387,6 +458,7 @@ struct SourceTcp {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceCubic {
     beta: Option<ExactDecimal>,
     c: Option<ExactDecimal>,
@@ -951,7 +1023,8 @@ fn compile_text(
 ) -> Result<SimulationImage, CompileError> {
     crate::validate_config_text(content).map_err(CompileError::Unsupported)?;
 
-    let source: SourceConfig = toml::from_str(content)?;
+    let source: SourceConfig =
+        toml::from_str(content).map_err(|error| parse_error(content, error))?;
     if source.workload.is_some() {
         return Err(CompileError::Unsupported(
             "a `[workload.aicb]` scenario takes its `[switch]`, `[link]` and `[routing]` tables \
