@@ -2918,7 +2918,10 @@ enum ParsedSourceDistribution<'a> {
 /// The text between the braces of the distribution `name` (`arr_dist` or `pkt_size_dist`).
 /// Executor distributions are inline tables only: one written as a sub-table or as dotted keys
 /// is refused, naming the key and the table (a2aset fix round 2, ruling option (a)). Its span is
-/// then its header or its key, never a `{ ... }` value.
+/// then its header or its key, never a `{ ... }` value. The table must also fit on one line,
+/// without comments or a trailing comma (fix round 3): TOML 1.1 allows all three, but the exact
+/// readers split the text on `,` and `=`, so a commented-out `low = ...` would override the live
+/// value.
 fn inline_distribution<'a>(
     distribution: &SourceDistributionInfo,
     name: &str,
@@ -2931,17 +2934,23 @@ fn inline_distribution<'a>(
                 "distribution source span is outside the scenario text".to_owned(),
             )
         })?;
-    literal
+    let refuse = |rule: &str| {
+        let table = crate::utils::serde_fields::table_at(scenario_text, distribution.span.start);
+        CompileError::Invalid(format!(
+            "executor distributions must use {rule} in `{name}` (in {table})"
+        ))
+    };
+    let body = literal
         .trim()
         .strip_prefix('{')
         .and_then(|body| body.strip_suffix('}'))
-        .ok_or_else(|| {
-            let table =
-                crate::utils::serde_fields::table_at(scenario_text, distribution.span.start);
-            CompileError::Invalid(format!(
-                "executor distributions must use an inline TOML table in `{name}` (in {table})"
-            ))
-        })
+        .ok_or_else(|| refuse("an inline TOML table"))?;
+    if body.contains(['#', '\n', '\r']) || body.trim_end().ends_with(',') {
+        return Err(refuse(
+            "a one-line inline TOML table without comments or a trailing comma",
+        ));
+    }
+    Ok(body)
 }
 
 fn source_distribution<'a>(
