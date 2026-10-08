@@ -2312,7 +2312,7 @@ fn validate_collective_set(
     }
     let mut result = Vec::with_capacity(count);
     for (collective_sources, collective_sinks) in sources.into_iter().zip(sinks) {
-        result.push(collective_key(
+        let mut key = collective_key(
             &source.collective_type,
             source.flow_type.as_deref(),
             source.flow_count,
@@ -2327,7 +2327,12 @@ fn validate_collective_set(
             false,
             scenario_text,
             roce_keys,
-        )?);
+        )?;
+        // Each member is shaped as the same `[[collective]]` block without `channels`, `chunk`
+        // or `[collective.alltoall]` is (an all-to-all's UniformFloor chunk, a ring's
+        // EqualRemainderLast), which a set cannot declare.
+        shape_collective(&mut key, None, None, None)?;
+        result.push(key);
     }
     Ok(result)
 }
