@@ -1,0 +1,2 @@
+exit=1
+REJECT: line 32: packet kind of payload 50 changes between its rows: roce_data at line 21, roce_ack here

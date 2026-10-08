@@ -15,6 +15,7 @@ structure Row where
   nodeId : Nat
   queueId : Nat
   payloadId : Nat
+  packetKind : String
   queuedPacketsBefore : Nat
   queuedBytesBefore : Nat
   packetSizeBytes : Nat
@@ -54,6 +55,23 @@ def parseUnit : String → Except String Aqm.DepthUnit
   | "bytes" => pure .bytes
   | other => throw s!"invalid depth unit: '{other}'"
 
+/-- The executor's packet kinds (`aqm_trace.rs`), and whether each is a data packet, the only
+kind Days AGO marks. -/
+def dataKind : String → Except String Bool
+  | "data" | "tcp_data" | "roce_data" => pure true
+  | "feedback" | "tcp_ack" | "pfc" | "dcqcn_cnp" | "roce_ack" | "roce_nack"
+  | "roce_pacing_timer" | "stage_notify" => pure false
+  | other => throw s!"invalid packet kind: '{other}'"
+
+def parsePacketKind (value : String) : Except String String := do
+  let _ ← dataKind value
+  pure value
+
+def Row.isData (row : Row) : Bool :=
+  match dataKind row.packetKind with
+  | .ok isData => isData
+  | .error _ => false
+
 def parseAction : String → Except String Aqm.Action
   | "enqueue" => pure .enqueue
   | "mark" => pure .mark
@@ -71,6 +89,7 @@ def parseRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array Strin
         nodeId := ← parseNat (← getField idx fields "node_id")
         queueId := ← parseNat (← getField idx fields "queue_id")
         payloadId := ← parseNat (← getField idx fields "payload_id")
+        packetKind := ← parsePacketKind (← getField idx fields "packet_kind")
         queuedPacketsBefore := ← parseNat (← getField idx fields "queued_packets_before")
         queuedBytesBefore := ← parseNat (← getField idx fields "queued_bytes_before")
         packetSizeBytes := ← parseNat (← getField idx fields "packet_size_bytes")
@@ -122,7 +141,14 @@ def requireOption (line : Nat) (name : String) : Option Nat → Except String Na
   | some value => pure value
   | none => throw s!"line {line}: missing required field: {name}"
 
-def checkThreshold (row : Row) : Except String Unit := do
+/-- The admission a decision becomes for this row's packet: Days AGO marks only data packets
+(`Aqm.exemptNonData`). A parameter of the checks below, so the differential reference
+(`P10c/Test/AqmReference.lean`) can supply its own. -/
+abbrev Exemption := Row → Aqm.Action → Aqm.Action
+
+def exemption : Exemption := fun row => Aqm.exemptNonData row.isData
+
+def checkThreshold (exempt : Exemption) (row : Row) : Except String Unit := do
   let threshold ← requireOption row.srcLine "threshold" row.threshold
   require row.srcLine
     (row.minThreshold.isNone && row.maxThreshold.isNone &&
@@ -132,11 +158,12 @@ def checkThreshold (row : Row) : Except String Unit := do
     "threshold certificate contains RED-only state"
   let config : Aqm.ThresholdConfig :=
     { unit := row.depthUnit, capacity := row.capacity, threshold }
-  let expected :=
+  let expected := exempt row <|
     Aqm.thresholdDecision config row.queuedPacketsBefore row.queuedBytesBefore row.packetSizeBytes
-  require row.srcLine (row.action = expected) "threshold decision mismatch"
+  require row.srcLine (row.action = expected)
+    s!"threshold decision mismatch ({row.packetKind} packet)"
 
-def checkRed (row : Row) : Except String Unit := do
+def checkRed (exempt : Exemption) (row : Row) : Except String Unit := do
   let minimum ← requireOption row.srcLine "min_threshold" row.minThreshold
   let maximum ← requireOption row.srcLine "max_threshold" row.maxThreshold
   let numerator ←
@@ -161,12 +188,13 @@ def checkRed (row : Row) : Except String Unit := do
       markEcn := row.markEcn }
   let (after, action) :=
     Aqm.redDecision before row.queuedPacketsBefore row.queuedBytesBefore row.packetSizeBytes
-  require row.srcLine (row.action = action) "RED decision mismatch"
+  require row.srcLine (row.action = exempt row action)
+    s!"RED decision mismatch ({row.packetKind} packet)"
   require row.srcLine
     (after.averageScaled = afterAverage && after.counter = afterCounter)
     "RED after-state mismatch"
 
-def checkRow (row : Row) : Except String Unit := do
+def checkRow (exempt : Exemption) (row : Row) : Except String Unit := do
   require row.srcLine (row.eventPhase = 0) "AQM enqueue certificate must have phase 0"
   require row.srcLine (row.packetSizeBytes > 0) "packet size must be positive"
   require row.srcLine
@@ -177,8 +205,8 @@ def checkRow (row : Row) : Except String Unit := do
     (row.ecnAfter = expectedEcnAfter row.ecnBefore row.action)
     "ECN mark transition mismatch"
   match row.policy with
-  | "threshold" => checkThreshold row
-  | "red" => checkRed row
+  | "threshold" => checkThreshold exempt row
+  | "red" => checkRed exempt row
   | other => throw s!"line {row.srcLine}: invalid AQM policy: {other}"
 
 def canonicalize (rows : List Row) : Except String (List Row) := do
@@ -221,10 +249,25 @@ def checkContinuity (rows : List Row) : Except String Unit := do
             s!"RED before-state does not continue the prior state for queue (node_id={row.nodeId}, queue_id={row.queueId})"
     last := last.insert (row.nodeId, row.queueId) row
 
+def kindChangeMessage (row : Row) (firstKind : String) (firstLine : Nat) : String :=
+  s!"packet kind of payload {row.payloadId} changes between its rows: {firstKind} at line {firstLine}, {row.packetKind} here"
+
+/-- A packet's kind is the same on every row of its payload (one per queue it crosses). One pass in
+canonical order keeps each payload's first row in a hash map, so a row whose kind differs is
+rejected against that first row. -/
+def checkPacketKinds (rows : List Row) : Except String Unit := do
+  let mut first : Std.HashMap Nat (String × Nat) := ∅
+  for row in rows do
+    match first.get? row.payloadId with
+    | none => first := first.insert row.payloadId (row.packetKind, row.srcLine)
+    | some (kind, line) =>
+        require row.srcLine (kind = row.packetKind) (kindChangeMessage row kind line)
+
 def checkRows (rows : List Row) : Except String Unit := do
   let rows ← canonicalize rows
   for row in rows do
-    checkRow row
+    checkRow exemption row
   checkContinuity rows
+  checkPacketKinds rows
 
 end LeanGuard.P10c.AqmEventLog

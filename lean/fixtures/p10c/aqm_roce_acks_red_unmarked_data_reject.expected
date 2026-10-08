@@ -1,0 +1,2 @@
+exit=1
+REJECT: line 2738: RED decision mismatch (roce_data packet)

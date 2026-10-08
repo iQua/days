@@ -225,6 +225,34 @@ The legacy checkers, `tcp_check`, and `sp_check` also accept
 `--coverage-out <path>`. `leanguard-run --coverage` uses that option and aggregates returned
 coverpoints. The `p10c_*` executables do not expose the coverage flag.
 
+## Days AGO AQM rows
+
+`p10c_aqm_check` replays `aqm_transitions_csv`: one row per admission decision at a switch queue
+with an ECN-threshold or RED policy (Lean rules: the `Aqm` namespace of
+`lean/LeanGuard/P10c/Semantics.lean` and `lean/LeanGuard/P10c/AqmEventLog.lean`). Each row names the
+packet's kind (`packet_kind`: `data`, `tcp_data`, `roce_data`, `tcp_ack`, `roce_ack`, `roce_nack`,
+`dcqcn_cnp`, `feedback`, `pfc`, `roce_pacing_timer` or `stage_notify`), which the writer takes from
+the run's observed packets.
+
+- Days AGO marks only data packets (`data`, `tcp_data`, `roce_data`), as
+  [the switch configuration](/docs/configuration/switches#drop-and-ecn-policies) states. Where the
+  threshold or RED decision is a mark, any other packet is admitted unmarked, so an ACK at or above
+  the threshold, or at a RED signal, must show `enqueue` and an unchanged ECN bit. Drops, and RED's
+  average and counter update, are the same for every kind.
+- A packet's kind is the same on every row of its payload (one row per queue it crosses); a kind
+  that changes between rows is rejected.
+- What remains trusted is the kind itself: a packet relabelled consistently on all of its rows
+  cannot be told from a packet of that kind, as RoCE senders' `data_class` and WFQ's PFC classes
+  are trusted. `aqm_roce_acks_whole_packet_relabel_trusted_limit_accept.csv` pins this limit: a
+  marked data packet relabelled `roce_ack` on all three of its rows, its mark removed, is
+  accepted.
+
+The CI fixtures `aqm_roce_acks_compiled_executor_accept.csv` (`configs/leanguard/aqm_roce_acks.toml`,
+ECN threshold) and `aqm_roce_acks_red_compiled_executor_accept.csv` (`aqm_roce_acks_red.toml`,
+RED_ECN) have RoCE ACKs admitted unmarked at the threshold, or at a RED signal, of a queue that marks
+data. Their mutations must be rejected: a data packet left unmarked, a marked ACK, a relabel that
+keeps a mark, and a kind changed on one row of a packet.
+
 ## Days AGO WFQ and SP rows
 
 `p10c_mechanisms_check wfq` replays `wfq_transitions_csv`: one row per transition of a WFQ switch
@@ -397,6 +425,8 @@ Remaining gaps:
 
 - FIFO scheduling and constant traffic have no checker on either engine.
 - Static Priority under PFC: `sp_check` has no pause model (see [Days AGO WFQ and SP rows](#days-ago-wfq-and-sp-rows)).
+- AQM packet kind: `p10c_aqm_check` trusts each packet's kind; only a kind that changes between a
+  packet's rows is rejected (see [Days AGO AQM rows](#days-ago-aqm-rows)).
 - WFQ timing: the `wfq` mode does not check completion times against serialization or service
   starts for work conservation; it takes the run's event times as given.
 - Rate sources: no scenario lowers a standalone rate generator (the compiler builds one only inside

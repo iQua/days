@@ -64,6 +64,8 @@ TailDrop drops a packet when admitting it would exceed packet capacity. Capacity
 
 Legacy RED and RED_ECN use packet occupancy, thresholds at 70% and 90% of capacity, EWMA weight `2^-9`, and maximum probability `0.8`. RED drops on a congestion action. RED_ECN marks an ECN-capable packet on that action and still drops at physical overflow. Exact RED uses integer deterministic state for byte-identical execution and requires capacity of at least 10 packets.
 
+Days AGO marks only data packets (plain, TCP and RoCE data). When the ECN threshold or RED_ECN signals a mark, any other packet in the queue (a TCP or RoCE ACK, a RoCE NACK, a CNP) is admitted unmarked. Drops, and RED's average and counter update, are the same for every packet.
+
 Metal and CUDA reject lowered RED state before execution:
 
 ```text
