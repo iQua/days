@@ -23,9 +23,6 @@ This ownership is the unit used by Scalar, persistent CPU workers, Metal, and CU
 
 ## Capability checks
 
-The compiler rejects mechanisms outside the Days AGO model, such as VirtualClock. Backend validation then checks device-specific state before launch. Metal and CUDA reject:
-
-- collective and compute stages
-- RED admission state
+The compiler rejects mechanisms outside the Days AGO model, such as VirtualClock. Backend validation then checks device-specific state before launch. Metal and CUDA reject RED admission state (`RED` and `RED_ECN`); they run every other lowered mechanism, including collective and compute stages, counted joins, stage notifies, PFC on switch and host links, DCQCN, and RoCE queue pairs.
 
 Errors name the backend and direct the caller to Scalar or CPU. A capability failure returns no partial run result.
