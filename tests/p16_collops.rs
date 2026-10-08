@@ -390,6 +390,104 @@ fn fixtures() -> Vec<(&'static str, String)> {
                     + &compute("expert", H4, 1_000, "after = \"dispatch\"")),
             ),
         ),
+        (
+            // Rank 1 sends nothing in `d` (seed 9), whose gate is the ring `ar` and `g`; `expert`
+            // names `d` and `ar` itself, so rank 1's release must not take `ar` a second time
+            // (fix round 1, the direct case).
+            "a2a-zero-row-gate-named-directly",
+            star(
+                4,
+                &(compute("fwd", H4, 2_000, "")
+                    + &compute("g", H4, 100, "")
+                    + &collective(
+                        "ar",
+                        "RingAllReduce",
+                        "RoCE",
+                        H4,
+                        "sinks = [1, 2, 3, 0]\nafter = \"fwd\"\n",
+                        8_000,
+                    )
+                    + &collective(
+                        "d",
+                        "AllToAll",
+                        "RoCE",
+                        H4,
+                        "after = [\"ar\", \"g\"]\n[collective.alltoall]\nseed = 9\nmatrix = 1\ngroup = 0\ntranspose = false\nexperts = 4\ntopk = 1\ntokens = 2\nbytes_per_copy = 700\nskew = \"Uniform\"\n",
+                        1_400,
+                    )
+                    + &compute("expert", H4, 1_000, "after = [\"d\", \"ar\"]")),
+            ),
+        ),
+        (
+            // A diamond: `expert` after two all-to-alls, both zero-send at rank 1 and both after
+            // the ring `ar`: rank 1's release reaches `ar` along both, and takes it once.
+            "a2a-zero-row-diamond",
+            star(
+                4,
+                &(compute("fwd", H4, 2_000, "")
+                    + &compute("g", H4, 100, "")
+                    + &collective(
+                        "ar",
+                        "RingAllReduce",
+                        "RoCE",
+                        H4,
+                        "sinks = [1, 2, 3, 0]\nafter = \"fwd\"\n",
+                        8_000,
+                    )
+                    + &collective(
+                        "d1",
+                        "AllToAll",
+                        "RoCE",
+                        H4,
+                        "after = [\"ar\", \"g\"]\n[collective.alltoall]\nseed = 9\nmatrix = 1\ngroup = 0\ntranspose = false\nexperts = 4\ntopk = 1\ntokens = 2\nbytes_per_copy = 700\nskew = \"Uniform\"\n",
+                        1_400,
+                    )
+                    + &collective(
+                        "d2",
+                        "AllToAll",
+                        "RoCE",
+                        H4,
+                        "after = [\"ar\", \"g\"]\n[collective.alltoall]\nseed = 9\nmatrix = 1\ngroup = 0\ntranspose = false\nexperts = 4\ntopk = 1\ntokens = 2\nbytes_per_copy = 700\nskew = \"Uniform\"\n",
+                        1_400,
+                    )
+                    + &compute("expert", H4, 1_000, "after = [\"d1\", \"d2\"]")),
+            ),
+        ),
+        (
+            // A redundant chain: `d2` after `d1`, `ar` and `g`, with `d1` already after `ar` and
+            // `g`: rank 1's release of `d2` reaches `ar` directly and through `d1`.
+            "a2a-zero-row-redundant-chain",
+            star(
+                4,
+                &(compute("fwd", H4, 2_000, "")
+                    + &compute("g", H4, 100, "")
+                    + &collective(
+                        "ar",
+                        "RingAllReduce",
+                        "RoCE",
+                        H4,
+                        "sinks = [1, 2, 3, 0]\nafter = \"fwd\"\n",
+                        8_000,
+                    )
+                    + &collective(
+                        "d1",
+                        "AllToAll",
+                        "RoCE",
+                        H4,
+                        "after = [\"ar\", \"g\"]\n[collective.alltoall]\nseed = 9\nmatrix = 1\ngroup = 0\ntranspose = false\nexperts = 4\ntopk = 1\ntokens = 2\nbytes_per_copy = 700\nskew = \"Uniform\"\n",
+                        1_400,
+                    )
+                    + &collective(
+                        "d2",
+                        "AllToAll",
+                        "RoCE",
+                        H4,
+                        "after = [\"d1\", \"ar\", \"g\"]\n[collective.alltoall]\nseed = 9\nmatrix = 1\ngroup = 0\ntranspose = false\nexperts = 4\ntopk = 1\ntokens = 2\nbytes_per_copy = 700\nskew = \"Uniform\"\n",
+                        1_400,
+                    )
+                    + &compute("expert", H4, 1_000, "after = \"d2\"")),
+            ),
+        ),
     ]
 }
 
@@ -989,12 +1087,70 @@ fn a_rank_that_sends_nothing_completes_at_its_release_and_arrivals() {
     }
 }
 
+/// A zero-send rank's release is a union (fix round 1, review M1): when the same collective is
+/// reached more than once (named by the dependent itself, through two zero-send all-to-alls, or
+/// directly and through a chain), rank 1's `expert` stage names the ring `ar`'s completion at rank
+/// 1 once (its own final stage, rank 0's final stage), and its inbound byte requirement is the sum
+/// over its distinct inbound predecessors. Compute groups in name order: `expert` 0.
+#[test]
+fn a_zero_send_ranks_release_takes_each_predecessor_once() {
+    for index in [16, 17, 18] {
+        let (label, config) = &fixtures()[index];
+        let image = lower(label, config);
+        let stages = stage_generators(&image);
+        let identity_of = |flow: days_executor::FlowId| {
+            stages
+                .iter()
+                .find(|(generator, _)| generator.flow == flow)
+                .map(|(generator, stage)| (generator, *stage))
+                .expect("a stage")
+        };
+        let (_, expert) = stages
+            .iter()
+            .find(|(_, stage)| {
+                matches!(stage.role, StageRole::Compute(compute) if compute.compute_id == 0 && compute.rank == 1)
+            })
+            .expect("expert at rank 1");
+        let ring = |flows: &[days_executor::FlowId]| {
+            flows
+                .iter()
+                .filter(|&&flow| {
+                    matches!(identity_of(flow).1.role, StageRole::Collective(identity)
+                        if identity.algorithm == days_executor::CollectiveAlgorithm::RingAllReduce)
+                })
+                .count()
+        };
+        let local = expert
+            .dependencies
+            .local
+            .iter(&image.stage_joins)
+            .collect::<Vec<_>>();
+        let inbound = expert
+            .dependencies
+            .inbound
+            .iter(&image.stage_joins)
+            .collect::<Vec<_>>();
+        assert_eq!((ring(&local), ring(&inbound)), (1, 1), "{label}: `ar` once");
+        let bytes = inbound
+            .iter()
+            .map(|&flow| match identity_of(flow).1.role {
+                StageRole::Collective(identity) => identity.chunk_bytes,
+                StageRole::Compute(_) => 0,
+            })
+            .sum::<u64>();
+        assert_eq!(
+            expert.dependencies.inbound_predecessor_bytes, bytes,
+            "{label}: the distinct inbound predecessors' bytes"
+        );
+    }
+}
+
 /// A seeded all-to-all's image names its matrix (review F3): the lowering gives each ordered pair
 /// exactly the matrix's bytes and no stage to a pair of zero bytes, and an image whose table omits
 /// a seeded collective is refused.
 #[test]
 fn a_seeded_all_to_all_image_names_its_matrix() {
-    for index in [8, 11, 13, 14, 15] {
+    for index in [8, 11, 13, 14, 15, 16, 17, 18] {
         let (label, config) = &fixtures()[index];
         let image = lower(label, config);
         let mut checked = 0;
