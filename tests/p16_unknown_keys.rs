@@ -482,3 +482,108 @@ fn every_distribution_refuses_sub_tables_and_dotted_keys() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+/// `text` with the first `key = { ... }` line replaced by `write(indent, entries)`.
+fn rewrite_inline(text: &str, key: &str, write: impl Fn(&str, &[&str]) -> String) -> String {
+    let (indent, entries) = inline_entries(text, key);
+    let mut out = String::new();
+    let mut done = false;
+    for line in text.lines() {
+        if !done && line.trim_start().starts_with(&format!("{key} =")) {
+            out.push_str(&write(indent, &entries));
+            done = true;
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Fix round 3 (re-review G1 and G2, orchestrator ruling): an executor distribution is a one-line
+/// inline table without comments or a trailing comma. TOML 1.1 allows all three in an inline
+/// table, but the exact reader splits the text on `,` and `=`, so a commented-out line would
+/// override the live values. Each form is refused, on every traffic kind, naming the key and the
+/// table.
+#[test]
+fn every_distribution_refuses_comments_newlines_and_trailing_commas() {
+    let mut wrong = Vec::new();
+    for (path, table) in [
+        (
+            "configs/benchmarks/baseline/fattree_k4_f8_st.toml",
+            "[flow_set.traffic]",
+        ),
+        ("configs/p14/dcqcn_t26.toml", "[flow.traffic]"),
+        (
+            "configs/benchmarks/tcp/fattree_k4_tcp_cubic_f16_smoke.toml",
+            "[flow_set.traffic]",
+        ),
+        ("configs/p15/roce_ring_lossy.toml", "[collective.traffic]"),
+    ] {
+        let base = std::fs::read_to_string(repository(path)).expect("read config");
+        lower_text(&base).unwrap_or_else(|error| panic!("{path} lowers: {error}"));
+        for distribution in ["arr_dist", "pkt_size_dist"] {
+            let forms: [(&str, String); 4] = [
+                (
+                    "a commented-out line",
+                    rewrite_inline(&base, distribution, |indent, entries| {
+                        let live = entries.join(", ");
+                        let old = entries
+                            .iter()
+                            .map(|entry| match entry.split_once('=') {
+                                Some((key, _)) if key.trim() != "type" => format!("{key}= 7"),
+                                _ => (*entry).to_owned(),
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!(
+                            "{indent}{distribution} = {{\n{indent}  {live}\n{indent}  # {old}\n{indent}}}"
+                        )
+                    }),
+                ),
+                (
+                    "several lines",
+                    rewrite_inline(&base, distribution, |indent, entries| {
+                        let lines = entries
+                            .iter()
+                            .map(|entry| format!("{indent}  {entry}"))
+                            .collect::<Vec<_>>()
+                            .join(",\n");
+                        format!("{indent}{distribution} = {{\n{lines}\n{indent}}}")
+                    }),
+                ),
+                (
+                    "several lines and a trailing comma",
+                    rewrite_inline(&base, distribution, |indent, entries| {
+                        let lines = entries
+                            .iter()
+                            .map(|entry| format!("{indent}  {entry},\n"))
+                            .collect::<String>();
+                        format!("{indent}{distribution} = {{\n{lines}{indent}}}")
+                    }),
+                ),
+                (
+                    "one line and a trailing comma",
+                    rewrite_inline(&base, distribution, |indent, entries| {
+                        format!("{indent}{distribution} = {{ {}, }}", entries.join(", "))
+                    }),
+                ),
+            ];
+            for (form, text) in forms {
+                // Valid TOML 1.1: only Days AGO's executor-distribution rule refuses it.
+                text.parse::<toml::Table>()
+                    .unwrap_or_else(|error| panic!("{path} {form}: {error}\n{text}"));
+                let expected = format!(
+                    "invalid scenario: executor distributions must use a one-line inline TOML table without comments or a trailing comma in `{distribution}` (in `{table}`)"
+                );
+                let result = lower_text(&text).map(|_| ());
+                if result.as_ref().err() != Some(&expected) {
+                    wrong.push(format!(
+                        "{path} `{distribution}` with {form}: {result:?}, expected {expected:?}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
