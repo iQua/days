@@ -335,6 +335,159 @@ fn fixtures() -> Vec<(&'static str, String)> {
                     )),
             ),
         ),
+        (
+            // A seeded matrix with an all-zero row: rank 1 sends nothing (and receives 700 B from
+            // rank 3), so its compute after the all-to-all waits for that arrival alone.
+            "a2a-seeded-zero-row-roce",
+            star(
+                4,
+                &(compute("fwd", H4, 2_000, "")
+                    + &collective(
+                        "dispatch",
+                        "AllToAll",
+                        "RoCE",
+                        H4,
+                        "after = \"fwd\"\n[collective.alltoall]\nseed = 9\nmatrix = 1\ngroup = 0\ntranspose = false\nexperts = 4\ntopk = 1\ntokens = 2\nbytes_per_copy = 700\nskew = \"Uniform\"\n",
+                        1_400,
+                    )
+                    + &compute("expert", H4, 1_000, "after = \"dispatch\"")),
+            ),
+        ),
+        (
+            // Rank 0 neither sends nor receives (seed 7): its compute after the all-to-all waits
+            // for the all-to-all's release at host 0, the `fwd` stage there.
+            "a2a-seeded-isolated-rank-roce",
+            star(
+                4,
+                &(compute("fwd", H4, 2_000, "")
+                    + &collective(
+                        "dispatch",
+                        "AllToAll",
+                        "RoCE",
+                        H4,
+                        "after = \"fwd\"\n[collective.alltoall]\nseed = 7\nmatrix = 1\ngroup = 0\ntranspose = false\nexperts = 4\ntopk = 1\ntokens = 2\nbytes_per_copy = 700\nskew = \"Uniform\"\n",
+                        1_400,
+                    )
+                    + &compute("expert", H4, 1_000, "after = \"dispatch\"")),
+            ),
+        ),
+        (
+            // Seed 9's matrix with a slow gate at the rank that sends nothing: rank 1's all-to-all
+            // is released only when `slow` ends there, long after rank 3's message arrives.
+            "a2a-zero-row-slow-gate-roce",
+            star(
+                4,
+                &(compute("fwd", H4, 2_000, "")
+                    + &compute("slow", "1", 50_000, "")
+                    + &collective(
+                        "dispatch",
+                        "AllToAll",
+                        "RoCE",
+                        H4,
+                        "after = [\"fwd\", \"slow\"]\n[collective.alltoall]\nseed = 9\nmatrix = 1\ngroup = 0\ntranspose = false\nexperts = 4\ntopk = 1\ntokens = 2\nbytes_per_copy = 700\nskew = \"Uniform\"\n",
+                        1_400,
+                    )
+                    + &compute("expert", H4, 1_000, "after = \"dispatch\"")),
+            ),
+        ),
+        (
+            // Rank 1 sends nothing in `d` (seed 9), whose gate is the ring `ar` and `g`; `expert`
+            // names `d` and `ar` itself, so rank 1's release must not take `ar` a second time
+            // (fix round 1, the direct case).
+            "a2a-zero-row-gate-named-directly",
+            star(
+                4,
+                &(compute("fwd", H4, 2_000, "")
+                    + &compute("g", H4, 100, "")
+                    + &collective(
+                        "ar",
+                        "RingAllReduce",
+                        "RoCE",
+                        H4,
+                        "sinks = [1, 2, 3, 0]\nafter = \"fwd\"\n",
+                        8_000,
+                    )
+                    + &collective(
+                        "d",
+                        "AllToAll",
+                        "RoCE",
+                        H4,
+                        "after = [\"ar\", \"g\"]\n[collective.alltoall]\nseed = 9\nmatrix = 1\ngroup = 0\ntranspose = false\nexperts = 4\ntopk = 1\ntokens = 2\nbytes_per_copy = 700\nskew = \"Uniform\"\n",
+                        1_400,
+                    )
+                    + &compute("expert", H4, 1_000, "after = [\"d\", \"ar\"]")),
+            ),
+        ),
+        (
+            // A diamond: `expert` after two all-to-alls, both zero-send at rank 1 and both after
+            // the ring `ar`: rank 1's release reaches `ar` along both, and takes it once.
+            "a2a-zero-row-diamond",
+            star(
+                4,
+                &(compute("fwd", H4, 2_000, "")
+                    + &compute("g", H4, 100, "")
+                    + &collective(
+                        "ar",
+                        "RingAllReduce",
+                        "RoCE",
+                        H4,
+                        "sinks = [1, 2, 3, 0]\nafter = \"fwd\"\n",
+                        8_000,
+                    )
+                    + &collective(
+                        "d1",
+                        "AllToAll",
+                        "RoCE",
+                        H4,
+                        "after = [\"ar\", \"g\"]\n[collective.alltoall]\nseed = 9\nmatrix = 1\ngroup = 0\ntranspose = false\nexperts = 4\ntopk = 1\ntokens = 2\nbytes_per_copy = 700\nskew = \"Uniform\"\n",
+                        1_400,
+                    )
+                    + &collective(
+                        "d2",
+                        "AllToAll",
+                        "RoCE",
+                        H4,
+                        "after = [\"ar\", \"g\"]\n[collective.alltoall]\nseed = 9\nmatrix = 1\ngroup = 0\ntranspose = false\nexperts = 4\ntopk = 1\ntokens = 2\nbytes_per_copy = 700\nskew = \"Uniform\"\n",
+                        1_400,
+                    )
+                    + &compute("expert", H4, 1_000, "after = [\"d1\", \"d2\"]")),
+            ),
+        ),
+        (
+            // A redundant chain: `d2` after `d1`, `ar` and `g`, with `d1` already after `ar` and
+            // `g`: rank 1's release of `d2` reaches `ar` directly and through `d1`.
+            "a2a-zero-row-redundant-chain",
+            star(
+                4,
+                &(compute("fwd", H4, 2_000, "")
+                    + &compute("g", H4, 100, "")
+                    + &collective(
+                        "ar",
+                        "RingAllReduce",
+                        "RoCE",
+                        H4,
+                        "sinks = [1, 2, 3, 0]\nafter = \"fwd\"\n",
+                        8_000,
+                    )
+                    + &collective(
+                        "d1",
+                        "AllToAll",
+                        "RoCE",
+                        H4,
+                        "after = [\"ar\", \"g\"]\n[collective.alltoall]\nseed = 9\nmatrix = 1\ngroup = 0\ntranspose = false\nexperts = 4\ntopk = 1\ntokens = 2\nbytes_per_copy = 700\nskew = \"Uniform\"\n",
+                        1_400,
+                    )
+                    + &collective(
+                        "d2",
+                        "AllToAll",
+                        "RoCE",
+                        H4,
+                        "after = [\"d1\", \"ar\", \"g\"]\n[collective.alltoall]\nseed = 9\nmatrix = 1\ngroup = 0\ntranspose = false\nexperts = 4\ntopk = 1\ntokens = 2\nbytes_per_copy = 700\nskew = \"Uniform\"\n",
+                        1_400,
+                    )
+                    + &compute("expert", H4, 1_000, "after = \"d2\"")),
+            ),
+        ),
     ]
 }
 
@@ -840,12 +993,164 @@ fn the_certificates_are_scalar_generated() {
     }
 }
 
+/// A rank that sends nothing in a seeded all-to-all (an all-zero matrix row) has no own send to
+/// tie the collective's completion there to its release, so its completion at its host is its
+/// release (the all-to-all's own gate stages there) and the messages delivered to it (the user's
+/// ruling, option 2). Compute groups are numbered in name order: `expert` 0, `fwd` 1, `slow` 2.
+#[test]
+fn a_rank_that_sends_nothing_completes_at_its_release_and_arrivals() {
+    // (fixture, the rank that sends nothing, its gate compute ids, its inbound message count, the
+    // compute whose completion releases its `expert` stage, or none for an arrival)
+    for (index, quiet, gates, messages, releaser) in [
+        (14, 0, vec![1], 0, Some(1)),
+        (13, 1, vec![1], 1, None),
+        (15, 1, vec![1, 2], 1, Some(2)),
+    ] {
+        let (label, config) = &fixtures()[index];
+        let image = lower(label, config);
+        let full = scalar(&image, None, ObservationMode::Full);
+        let stages = stage_generators(&image);
+        let compute_flow = |id: u64, rank: u32| {
+            stages
+                .iter()
+                .find_map(|(generator, stage)| match stage.role {
+                    StageRole::Compute(compute)
+                        if compute.compute_id == id
+                            && compute.group_size == 4
+                            && compute.rank == rank =>
+                    {
+                        Some(generator.flow)
+                    }
+                    StageRole::Compute(compute)
+                        if compute.compute_id == id && compute.group_size == 1 =>
+                    {
+                        Some(generator.flow)
+                    }
+                    _ => None,
+                })
+                .expect("the gate stage")
+        };
+        for (generator, stage) in &stages {
+            let StageRole::Compute(compute) = stage.role else {
+                continue;
+            };
+            if compute.compute_id != 0 {
+                continue;
+            }
+            let local = stage
+                .dependencies
+                .local
+                .iter(&image.stage_joins)
+                .collect::<Vec<_>>();
+            let inbound = stage
+                .dependencies
+                .inbound
+                .iter(&image.stage_joins)
+                .collect::<Vec<_>>();
+            if compute.rank != quiet {
+                // A rank that sends waits for its own sends, never its gate.
+                assert!(!local.is_empty(), "{label} rank {}", compute.rank);
+                assert!(!local.contains(&compute_flow(1, compute.rank)), "{label}");
+                continue;
+            }
+            let mut expected = gates
+                .iter()
+                .map(|&id| compute_flow(id, compute.rank))
+                .collect::<Vec<_>>();
+            expected.sort_unstable();
+            assert_eq!(local, expected, "{label}: the gate at the quiet rank");
+            assert_eq!(inbound.len(), messages, "{label}: its messages");
+            let released = full
+                .diagnostics
+                .as_ref()
+                .expect("Full observation keeps the diagnostic planes")
+                .mechanism_transitions
+                .iter()
+                .filter_map(|record| match record {
+                    MechanismTransitionRecord::Collective(row) => Some(*row),
+                    _ => None,
+                })
+                .find(|row| row.flow == generator.flow && row.activated)
+                .expect("the quiet rank's compute is released");
+            match releaser {
+                None => assert_eq!(released.cause, CollectiveActivationCause::InboundArrival),
+                Some(id) => {
+                    assert_eq!(released.cause, CollectiveActivationCause::LocalCompletion);
+                    assert_eq!(
+                        released.cause_flow,
+                        compute_flow(id, compute.rank),
+                        "{label}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A zero-send rank's release is a union (fix round 1, review M1): when the same collective is
+/// reached more than once (named by the dependent itself, through two zero-send all-to-alls, or
+/// directly and through a chain), rank 1's `expert` stage names the ring `ar`'s completion at rank
+/// 1 once (its own final stage, rank 0's final stage), and its inbound byte requirement is the sum
+/// over its distinct inbound predecessors. Compute groups in name order: `expert` 0.
+#[test]
+fn a_zero_send_ranks_release_takes_each_predecessor_once() {
+    for index in [16, 17, 18] {
+        let (label, config) = &fixtures()[index];
+        let image = lower(label, config);
+        let stages = stage_generators(&image);
+        let identity_of = |flow: days_executor::FlowId| {
+            stages
+                .iter()
+                .find(|(generator, _)| generator.flow == flow)
+                .map(|(generator, stage)| (generator, *stage))
+                .expect("a stage")
+        };
+        let (_, expert) = stages
+            .iter()
+            .find(|(_, stage)| {
+                matches!(stage.role, StageRole::Compute(compute) if compute.compute_id == 0 && compute.rank == 1)
+            })
+            .expect("expert at rank 1");
+        let ring = |flows: &[days_executor::FlowId]| {
+            flows
+                .iter()
+                .filter(|&&flow| {
+                    matches!(identity_of(flow).1.role, StageRole::Collective(identity)
+                        if identity.algorithm == days_executor::CollectiveAlgorithm::RingAllReduce)
+                })
+                .count()
+        };
+        let local = expert
+            .dependencies
+            .local
+            .iter(&image.stage_joins)
+            .collect::<Vec<_>>();
+        let inbound = expert
+            .dependencies
+            .inbound
+            .iter(&image.stage_joins)
+            .collect::<Vec<_>>();
+        assert_eq!((ring(&local), ring(&inbound)), (1, 1), "{label}: `ar` once");
+        let bytes = inbound
+            .iter()
+            .map(|&flow| match identity_of(flow).1.role {
+                StageRole::Collective(identity) => identity.chunk_bytes,
+                StageRole::Compute(_) => 0,
+            })
+            .sum::<u64>();
+        assert_eq!(
+            expert.dependencies.inbound_predecessor_bytes, bytes,
+            "{label}: the distinct inbound predecessors' bytes"
+        );
+    }
+}
+
 /// A seeded all-to-all's image names its matrix (review F3): the lowering gives each ordered pair
 /// exactly the matrix's bytes and no stage to a pair of zero bytes, and an image whose table omits
 /// a seeded collective is refused.
 #[test]
 fn a_seeded_all_to_all_image_names_its_matrix() {
-    for index in [8, 11] {
+    for index in [8, 11, 13, 14, 15, 16, 17, 18] {
         let (label, config) = &fixtures()[index];
         let image = lower(label, config);
         let mut checked = 0;

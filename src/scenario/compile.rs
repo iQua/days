@@ -746,6 +746,22 @@ impl PredecessorKeys {
         matches!(self, Self::None)
     }
 
+    /// Appends `key`; under `dedup` only when it is not already listed. Returns whether it was
+    /// appended. Only a zero-send all-to-all rank's release (`collective_completion`) dedups: the
+    /// ordinary paths name each group once, so their keys are distinct and they pay nothing.
+    fn insert(&mut self, key: FlowKey, dedup: bool) -> bool {
+        let listed = dedup
+            && match self {
+                Self::None => false,
+                Self::One(first) => *first == key,
+                Self::Many(keys) => keys.contains(&key),
+            };
+        if !listed {
+            self.push(key);
+        }
+        !listed
+    }
+
     fn push(&mut self, key: FlowKey) {
         *self = match std::mem::take(self) {
             Self::None => Self::One(key),
@@ -5303,10 +5319,20 @@ fn ring_chunk(
 /// each channel's final step; an all-to-all's are every pair from and to the rank; a send/recv's
 /// is its one message, local at the sender and inbound at the receiver. A named collective is
 /// unique, so its only instance has duplicate ordinal 0.
+///
+/// An all-to-all rank that sends nothing (an all-zero row of a seeded matrix) has no own send to
+/// tie the collective's completion there to its release, so its completion also takes the
+/// all-to-all's release at the rank: its own gate stages there (the user's ruling, option 2). A
+/// gate group the dependent itself names (`direct`) is not taken twice, and every key the release
+/// adds is deduplicated (`dedup`), so a collective reached along several paths (a diamond of
+/// zero-send all-to-alls, or directly and through a chain) adds its stages and bytes once: the
+/// predecessor set is a union (review M1). An ungated all-to-all has no gate, so a rank of it that
+/// neither sends nor receives completes at no stage.
 fn collective_completion(
     plan: &StagePlan<'_>,
     ordinal: u64,
     rank: u32,
+    (direct, dedup): (&[String], bool),
     local: &mut PredecessorKeys,
     inbound: &mut PredecessorKeys,
 ) -> Result<u64, CompileError> {
@@ -5333,31 +5359,48 @@ fn collective_completion(
     match semantic.algorithm {
         CollectiveAlgorithm::AllToAll => {
             let size = n as usize;
+            let mut sends = false;
             for step in 1..n {
                 let target = (rank + step) % n;
                 if layout.pair_bytes[rank as usize * size + target as usize] != 0 {
-                    local.push(key(CollectivePhase::AllToAll, 0, rank, step));
+                    sends = true;
+                    local.insert(key(CollectivePhase::AllToAll, 0, rank, step), dedup);
                 }
             }
             for step in 1..n {
                 let source = (rank + n - step) % n;
                 let pair = layout.pair_bytes[source as usize * size + rank as usize];
-                if pair != 0 {
-                    inbound.push(key(CollectivePhase::AllToAll, 0, source, step));
+                if pair != 0
+                    && inbound.insert(key(CollectivePhase::AllToAll, 0, source, step), dedup)
+                {
                     add(pair)?;
                 }
+            }
+            if !sends {
+                let after = semantic.after.as_ref();
+                let ranks = AfterRanks::new(plan, after, &semantic.sources);
+                let host = semantic.sources[rank as usize];
+                add(follow_groups(
+                    plan,
+                    (after, &ranks, direct),
+                    (rank, host),
+                    (direct, true),
+                    local,
+                    inbound,
+                )?)?;
             }
         }
         CollectiveAlgorithm::SendRecv => {
             let message = key(CollectivePhase::SendRecv, 0, 0, 1);
             if rank == 0 {
-                local.push(message);
+                local.insert(message, dedup);
             } else {
                 let Termination::Bytes(total_bytes) = semantic.traffic.termination else {
                     unreachable!("collective validation requires byte termination")
                 };
-                inbound.push(message);
-                add(total_bytes)?;
+                if inbound.insert(message, dedup) {
+                    add(total_bytes)?;
+                }
             }
         }
         _ => {
@@ -5368,9 +5411,10 @@ fn collective_completion(
             for channel in 0..layout.channels() {
                 let previous = layout.previous(channel, rank, n);
                 let channel_u32 = channel as u32;
-                local.push(key(phase, channel_u32, rank, step));
-                inbound.push(key(phase, channel_u32, previous, step));
-                add(ring_chunk(semantic, layout, phase, channel, previous, u64::from(step)).1)?;
+                local.insert(key(phase, channel_u32, rank, step), dedup);
+                if inbound.insert(key(phase, channel_u32, previous, step), dedup) {
+                    add(ring_chunk(semantic, layout, phase, channel, previous, u64::from(step)).1)?;
+                }
             }
         }
     }
@@ -5447,26 +5491,59 @@ fn entry_predecessors(
 ) -> Result<(PredecessorKeys, PredecessorKeys, u64), CompileError> {
     let mut local = PredecessorKeys::None;
     let mut inbound = PredecessorKeys::None;
+    let bytes = follow_groups(
+        plan,
+        (after, ranks, &[]),
+        (rank, host),
+        (after_names(after), false),
+        &mut local,
+        &mut inbound,
+    )?;
+    Ok((local, inbound, bytes))
+}
+
+/// Appends to `local` and `inbound` what a stage at `host` (rank `rank` of its group) waits for
+/// from the groups `after` names there, skipping the groups in `skip`, and returns the inbound
+/// bytes added. `direct` is the dependent's own `after` list, which a zero-send all-to-all rank's
+/// release does not take twice, and `dedup` is set inside such a release, whose keys may repeat
+/// (`collective_completion`).
+fn follow_groups(
+    plan: &StagePlan<'_>,
+    (after, ranks, skip): (Option<&AfterGroups>, &AfterRanks, &[String]),
+    (rank, host): (u32, u64),
+    (direct, dedup): (&[String], bool),
+    local: &mut PredecessorKeys,
+    inbound: &mut PredecessorKeys,
+) -> Result<u64, CompileError> {
     let mut bytes = 0_u64;
     for (index, name) in after_names(after).iter().enumerate() {
+        if skip.contains(name) {
+            continue;
+        }
         let Some(rank) = ranks.rank(index, rank, host) else {
             continue;
         };
         match plan.groups[name] {
-            StageGroup::Compute(predecessor) => local.push(FlowKey::ComputeStage {
-                compute: compute_ordinal(plan.computes, predecessor),
-                rank,
-            }),
+            StageGroup::Compute(predecessor) => {
+                local.insert(
+                    FlowKey::ComputeStage {
+                        compute: compute_ordinal(plan.computes, predecessor),
+                        rank,
+                    },
+                    dedup,
+                );
+            }
             StageGroup::Collective(collective) => {
                 let ordinal = collective_ordinal(plan.collectives, collective);
-                let more = collective_completion(plan, ordinal, rank, &mut local, &mut inbound)?;
+                let more =
+                    collective_completion(plan, ordinal, rank, (direct, dedup), local, inbound)?;
                 bytes = bytes.checked_add(more).ok_or_else(|| {
                     CompileError::Invalid("inbound join bytes exceed u64".to_owned())
                 })?;
             }
         }
     }
-    Ok((local, inbound, bytes))
+    Ok(bytes)
 }
 
 /// Expands one collective into its stages: rings per channel and phase, an all-to-all's ordered
