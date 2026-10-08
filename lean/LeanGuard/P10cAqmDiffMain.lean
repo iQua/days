@@ -114,9 +114,12 @@ def mutate (rows : Array Row) (kind : Kind) (g : Rng) : Option (Array Row) × Rn
       let (field, g) := g.below 6
       (some (rows.set! i (bumpConfig row field (choice % 2 = 0))), g)
   | .packetKind =>
-      -- A data packet relabeled an ACK, or any other packet relabeled data.
-      let kind := if row.isData then "roce_ack" else "roce_data"
-      (some (rows.set! i { row with packetKind := kind }), g)
+      -- Any of the executor's kinds other than the row's, so the shipped and the reference kind
+      -- tables are both exercised.
+      let kinds := ["data", "feedback", "tcp_data", "tcp_ack", "pfc", "dcqcn_cnp", "roce_data",
+        "roce_ack", "roce_nack", "roce_pacing_timer", "stage_notify"].filter (· != row.packetKind)
+      let (k, g) := g.below kinds.length
+      (some (rows.set! i { row with packetKind := kinds.getD k "roce_ack" }), g)
 
 structure Tally where
   cases : Nat := 0
