@@ -13,9 +13,9 @@ use std::path::Path;
 use days::scenario::compile_config;
 use days_executor::{
     CpuConfig, DiagnosticPlanes, MechanismTransitionRecord, ObservationMode, RunResult,
-    SimulationImage, drr_transitions_csv, pfc_transitions_csv, run_cpu_with_observations,
-    run_scalar_with_observations, sp_transitions_csv, tcp_transitions_csv, wfq_transitions_csv,
-    wrr_transitions_csv,
+    SimulationImage, aqm_transitions_csv, drr_transitions_csv, pfc_transitions_csv,
+    run_cpu_with_observations, run_scalar_with_observations, sp_transitions_csv,
+    tcp_transitions_csv, wfq_transitions_csv, wrr_transitions_csv,
 };
 
 /// Which certificate family a fixture writes.
@@ -27,11 +27,13 @@ enum Family {
     Wrr,
     Wfq,
     Sp,
+    Aqm,
 }
 
 impl Family {
     /// The certificate of a run of `image` (WFQ and SP certificates start from its queues).
-    fn csv(self, diagnostics: &DiagnosticPlanes, image: &SimulationImage) -> String {
+    fn csv(self, result: &RunResult, image: &SimulationImage) -> String {
+        let diagnostics: &DiagnosticPlanes = result.diagnostics.as_ref().unwrap();
         let records = &diagnostics.mechanism_transitions;
         match self {
             Self::Tcp => tcp_transitions_csv(&diagnostics.tcp_transitions).unwrap(),
@@ -40,6 +42,9 @@ impl Family {
             Self::Wrr => wrr_transitions_csv(records).unwrap(),
             Self::Wfq => wfq_transitions_csv(records, image).unwrap(),
             Self::Sp => sp_transitions_csv(records, image).unwrap(),
+            Self::Aqm => {
+                aqm_transitions_csv(&diagnostics.aqm_transitions, &result.observed_packets).unwrap()
+            }
         }
     }
 }
@@ -74,9 +79,9 @@ fn certificates(name: &str, image: &SimulationImage, families: &[Family]) -> Vec
     families
         .iter()
         .map(|family| {
-            let csv = family.csv(scalar.diagnostics.as_ref().unwrap(), image);
+            let csv = family.csv(&scalar, image);
             assert_eq!(
-                family.csv(cpu.result.diagnostics.as_ref().unwrap(), image),
+                family.csv(&cpu.result, image),
                 csv,
                 "{name}: CPU and Scalar certificates differ"
             );
@@ -322,6 +327,38 @@ fn resumed_wfq_incast_certificate_starts_paused() {
     );
     assert_fixture(&wfq, "p10c/wfq_incast_resumed_executor_accept.csv");
     assert_fixture(&pfc, "p10c/wfq_incast_resumed_executor_accept.pfc.csv");
+}
+
+/// RoCE ACKs share an ECN-threshold queue with data: Days AGO marks only data packets, so the
+/// certificate names each packet's kind and some ACKs are admitted unmarked at or above the
+/// threshold, where a data packet would be marked.
+#[test]
+fn compiled_aqm_certificate_names_packet_kinds_and_acks_stay_unmarked() {
+    let csv = certificate("aqm_roce_acks", Family::Aqm);
+    let header = csv.lines().next().unwrap().split(',').collect::<Vec<_>>();
+    let column = |name: &str| header.iter().position(|field| *field == name).unwrap();
+    let rows = csv
+        .lines()
+        .skip(1)
+        .map(|line| line.split(',').collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let at_threshold = |row: &Vec<&str>| {
+        row[column("queued_packets_before")].parse::<u64>().unwrap() + 1
+            >= row[column("threshold")].parse::<u64>().unwrap()
+    };
+    assert!(
+        rows.iter()
+            .any(|row| row[column("packet_kind")] == "roce_ack"
+                && at_threshold(row)
+                && row[column("action")] == "enqueue"),
+        "no ACK is admitted unmarked at or above the threshold"
+    );
+    assert!(
+        rows.iter().any(|row| row[column("packet_kind")] == "roce_data"
+            && row[column("action")] == "mark"),
+        "no data packet is marked"
+    );
+    assert_fixture(&csv, "p10c/aqm_roce_acks_compiled_executor_accept.csv");
 }
 
 #[test]

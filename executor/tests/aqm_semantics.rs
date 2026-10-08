@@ -1,12 +1,12 @@
 use std::collections::VecDeque;
 
 use days_executor::{
-    AqmTransitionAction, ArrivalDisposition, Backend, CpuConfig, DiagnosticPlanes, DropMarkPolicy,
-    EcnThresholdPolicy, Event, EventKey, EventKind, FlowDescriptor, FlowId, HostState,
-    LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketDescriptor,
-    PacketKind, PayloadId, QueueDepthUnit, RedPolicyState, RemoteChannel, RunResult, SchedulerKind,
-    SimulationImage, SwitchQueueState, SwitchState, aqm_transitions_csv, event_phase,
-    run_cpu_with_observations, run_scalar_with_observations, validate,
+    AqmTraceError, AqmTransitionAction, ArrivalDisposition, Backend, CpuConfig, DiagnosticPlanes,
+    DropMarkPolicy, EcnThresholdPolicy, Event, EventKey, EventKind, FlowDescriptor, FlowId,
+    HostState, LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, ObservationMode,
+    PacketDescriptor, PacketKind, PayloadId, QueueDepthUnit, RedPolicyState, RemoteChannel,
+    RunResult, SchedulerKind, SimulationImage, SwitchQueueState, SwitchState, aqm_transitions_csv,
+    event_phase, run_cpu_with_observations, run_scalar_with_observations, validate,
 };
 #[cfg(feature = "cuda")]
 use days_executor::{CudaConfig, run_cuda_with_observations};
@@ -349,7 +349,11 @@ fn packet_ecn_forces_traced_drop_when_post_enqueue_byte_sum_is_unrepresentable()
     assert_eq!(transition.after, policy);
     assert_eq!(transition.action, AqmTransitionAction::Drop);
 
-    let csv = aqm_transitions_csv(&diagnostics(&result).aqm_transitions).unwrap();
+    let csv = aqm_transitions_csv(
+        &diagnostics(&result).aqm_transitions,
+        &result.observed_packets,
+    )
+    .unwrap();
     assert_eq!(
         csv,
         include_str!(
@@ -398,7 +402,11 @@ fn packet_red_updates_ewma_then_traces_hidden_byte_domain_drop() {
     );
     assert_eq!(transition.action, AqmTransitionAction::Drop);
 
-    let csv = aqm_transitions_csv(&diagnostics(&result).aqm_transitions).unwrap();
+    let csv = aqm_transitions_csv(
+        &diagnostics(&result).aqm_transitions,
+        &result.observed_packets,
+    )
+    .unwrap();
     assert_eq!(
         csv,
         include_str!("../../lean/fixtures/p10c/aqm_red_packet_byte_overflow_executor_accept.csv"),
@@ -417,7 +425,11 @@ fn aqm_certificate_records_enqueue_mark_and_drop_with_exact_state() {
         &[1, 1, 1, 1],
     );
     let result = run_scalar_with_observations(&image, Some(5), ObservationMode::Full).unwrap();
-    let csv = aqm_transitions_csv(&diagnostics(&result).aqm_transitions).unwrap();
+    let csv = aqm_transitions_csv(
+        &diagnostics(&result).aqm_transitions,
+        &result.observed_packets,
+    )
+    .unwrap();
     assert_eq!(
         csv,
         include_str!("../../lean/fixtures/p10c/aqm_executor_accept.csv"),
@@ -426,7 +438,7 @@ fn aqm_certificate_records_enqueue_mark_and_drop_with_exact_state() {
     let rows = csv.lines().collect::<Vec<_>>();
 
     assert_eq!(rows.len(), 5);
-    assert!(rows.iter().all(|row| row.split(',').count() == 26));
+    assert!(rows.iter().all(|row| row.split(',').count() == 27));
     assert!(rows[1].ends_with(",enqueue"));
     assert!(rows[3].contains(",0,1,threshold,packets,2,2,"), "{csv}");
     assert!(rows[3].ends_with(",mark"));
@@ -434,10 +446,9 @@ fn aqm_certificate_records_enqueue_mark_and_drop_with_exact_state() {
 
     let duplicate = diagnostics(&result).aqm_transitions[0];
     assert_eq!(
-        aqm_transitions_csv(&[duplicate, duplicate])
-            .expect_err("duplicate canonical transition keys must be rejected")
-            .duplicate_key,
-        diagnostics(&result).aqm_transitions[0].key
+        aqm_transitions_csv(&[duplicate, duplicate], &result.observed_packets)
+            .expect_err("duplicate canonical transition keys must be rejected"),
+        AqmTraceError::DuplicateKey(diagnostics(&result).aqm_transitions[0].key)
     );
 }
 
@@ -458,7 +469,11 @@ fn red_certificate_is_generated_byte_for_byte_by_the_scalar_oracle() {
         &[1],
     );
     let result = run_scalar_with_observations(&image, Some(2), ObservationMode::Full).unwrap();
-    let csv = aqm_transitions_csv(&diagnostics(&result).aqm_transitions).unwrap();
+    let csv = aqm_transitions_csv(
+        &diagnostics(&result).aqm_transitions,
+        &result.observed_packets,
+    )
+    .unwrap();
 
     assert_eq!(
         csv,
