@@ -15,11 +15,12 @@ drop = "TailDrop"
 
 | Field | Type | Requirement |
 | --- | --- | --- |
-| `port_rate` | number | Required. Bits per second. Exact lowering requires a positive integer bps value representable in `u64`. |
+| `port_rate` | number | Required, except on the Spectrum-X topology, which refuses it (its link rates are in `[topology.spectrum_x]`). Bits per second. Exact lowering requires a positive integer bps value representable in `u64`. |
 | `capacity` | integer | Required. Packet capacity for configured switch queues. |
 | `discipline` | string | Required. Selects the scheduler. |
 | `drop` | string | Required. Selects admission or ECN marking. |
 | `ecn_threshold` | fraction | Valid only with `drop = "ECN_THRESHOLD"`; must satisfy `0 < value <= 1`. |
+| `ecn_by_rate` | array of tables | Days AGO only. One ECN step threshold in packets per egress link rate; replaces `ecn_threshold`. See [ECN thresholds by link rate](#ecn-thresholds-by-link-rate). |
 | `weights` | integer array | Used by WFQ, DRR, and WRR. |
 | `priorities` | integer array | Used by SP. |
 | `vticks` | number array | Used by legacy VirtualClock. |
@@ -69,6 +70,23 @@ Metal and CUDA reject lowered RED state before execution:
 ```text
 backend Cuda does not support RED admission; use Scalar or Cpu
 ```
+
+### ECN thresholds by link rate
+
+**Scope: Days AGO.** A fabric whose links run at different rates can mark at a different depth per rate, as SimAI's `KMIN_MAP` and `KMAX_MAP` rows do. `switch.ecn_by_rate` lists one step threshold, in packets, per egress link rate; every egress link's rate must have a row, and each threshold must lie in `1..=capacity`:
+
+```toml
+[switch]
+capacity = 3729
+discipline = "FIFO"
+drop = "ECN_THRESHOLD"
+ecn_by_rate = [
+    { rate_bps = 100000000000, threshold_packets = 112 },
+    { rate_bps = 400000000000, threshold_packets = 223 },
+]
+```
+
+Each egress queue marks at or above the threshold of its own link rate, as `ecn_threshold` does with one fraction. The table needs `drop = "ECN_THRESHOLD"` and replaces `ecn_threshold`; a scenario that sets both fails to lower ("`switch.ecn_by_rate` replaces `switch.ecn_threshold`"). The AICB adapter derives these rows from `SimAI.conf` at the midpoint of SimAI's marking ramp; see [Workloads](/docs/configuration/workloads).
 
 ## ECN-capable transports
 

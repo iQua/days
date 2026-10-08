@@ -35,14 +35,15 @@ The strict legacy loader accepts the following root keys. Unknown root keys fail
 | `mailbox_capacity` | Actor mailbox capacity | Legacy |
 | `log_path`, `csv_logging`, `report_interval` | CSV reports and protocol traces | Legacy logger |
 | `legacy_e5_metrics` | Opt-in E5 TCP correctness rows | Legacy |
-| `edges`, `hosts`, `topology` | Network graph and host attachments | Both |
+| `edges`, `hosts`, `topology` | Network graph and host attachments | Both; the `SpectrumX` category is Days AGO only |
 | `switch` | Port rate, queue, scheduler, and AQM policy | Both, with capability differences |
 | `link` | PFC and propagation | Both, with capability differences |
 | `model_host_attachment` | Explicit host injection/delivery stages | Legacy |
-| `routing` | Scenario-wide `ShortestPath` or `FatTreeEcmp` | Both |
+| `routing` | Scenario-wide `ShortestPath`, `FatTreeEcmp`, or `SimAiEcmp` | Both; `SimAiEcmp` is Days AGO only |
 | `flow`, `flow_set` | Point-to-point traffic | Both, with a smaller exact subset |
 | `collective`, `collective_set` | Collective traffic | Both, with different algorithm sets |
 | `compute` | Delay-only compute stages that collectives can wait for | Days AGO; the legacy loader rejects the key |
+| `workload` | An AICB/SimAI training trace as the scenario's traffic | Days AGO; the legacy loader rejects the key |
 | `app_source` | Actor-managed byte buffers for TCP Broadcast/RingAllReduce | Legacy |
 
 See the pages in this section for field-level constraints. A key can belong to the vocabulary and still fail when its value or combination is inactive. The strict loader rejects examples such as `switch.ecn_threshold` without `drop = "ECN_THRESHOLD"`, `[link.pfc]` without `link.mode = "Pfc"`, and `[app_source]` without a supported TCP collective.
@@ -96,4 +97,5 @@ Days AGO Scalar and CPU execute the full lowered mechanism set. Metal and CUDA r
 - [Switches and queues](/docs/configuration/switches)
 - [Flows](/docs/configuration/flows)
 - [Collectives](/docs/configuration/collectives)
+- [Workloads](/docs/configuration/workloads)
 - [L2 and PFC](/docs/configuration/l2)
