@@ -605,5 +605,13 @@ mutate_case "isolated-rank-gate-from-another-host" "$isolated_rank" \
   'NR == 2 { $column["local_predecessors"] = 10; $column["cause_flow_id"] = 10 }' \
   'REJECT: line 3: the rows a cause produces name different delivery hosts'
 
+# Fix round 1 (review M1): in the diamond, rank 1's `expert` (flow 33) reaches the ring `ar` along
+# both zero-send all-to-alls and requires `ar`'s 2,000 B once (3,400 B in all); claiming the
+# requirement the double count gave (5,400 B) leaves its inbound never complete.
+zero_row_diamond="$fixture_dir/collective_collops_a2a_zero_row_diamond_executor_accept.csv"
+mutate_case "zero-send-release-counted-twice" "$zero_row_diamond" \
+  '$column["flow_id"] == 33 { $column["inbound_predecessor_bytes"] = 5400 }' \
+  'REJECT: line 180: after inbound completion flag disagrees with the delivered total'
+
 echo "P10c exact-integer collective campaign checks: $checked"
 exit "$failures"
