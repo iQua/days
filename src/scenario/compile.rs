@@ -61,25 +61,85 @@ impl From<IdError> for CompileError {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct SourceConfig {
-    /// A `[workload]` table: present only in an AICB scenario, which the adapter rewrites before
-    /// lowering, so the ordinary path refuses it.
-    workload: Option<serde::de::IgnoredAny>,
-    seed: Option<u64>,
-    duration: Option<ExactDecimal>,
-    switch: SourceSwitch,
-    link: Option<SourceLink>,
-    time_quantum_ns: Option<u64>,
-    routing: Option<SourceRouting>,
-    flow: Option<Vec<SourceFlow>>,
-    flow_set: Option<Vec<SourceFlowSet>>,
-    collective: Option<Vec<SourceCollective>>,
-    collective_set: Option<Vec<SourceCollectiveSet>>,
-    compute: Option<Vec<SourceCompute>>,
+/// Declares the scenario root ([`SourceConfig`]) together with [`LEGACY_ENGINE_ROOT_KEYS`], so
+/// the legacy-engine keys the root accepts are written once.
+macro_rules! scenario_root {
+    ($($legacy:ident),* $(,)?) => {
+        /// The legacy engine's root keys (`legacy/src/config.rs`, `LegacyConfig`) that Days AGO
+        /// does not read: the root accepts each by its exact name and ignores it, because the
+        /// two engines read one scenario file (user ruling, Oct 8, option 1). Any other unknown
+        /// key is refused. `legacy`'s `the_days_ago_root_names_exactly_the_legacy_only_keys`
+        /// test keeps the list equal to `LegacyConfig`'s keys that the Days AGO root does not
+        /// read itself.
+        pub const LEGACY_ENGINE_ROOT_KEYS: &[&str] = &[$(stringify!($legacy)),*];
+
+        /// The scenario root. Unknown keys are refused (`deny_unknown_fields`); `topology`,
+        /// `edges` and `hosts` are read by the topology builder, and the legacy-engine keys are
+        /// accepted and ignored.
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct SourceConfig {
+            /// A `[workload]` table: present only in an AICB scenario, which the adapter
+            /// rewrites before lowering, so the ordinary path refuses it.
+            workload: Option<serde::de::IgnoredAny>,
+            seed: Option<u64>,
+            duration: Option<ExactDecimal>,
+            switch: SourceSwitch,
+            link: Option<SourceLink>,
+            time_quantum_ns: Option<u64>,
+            routing: Option<SourceRouting>,
+            flow: Option<Vec<SourceFlow>>,
+            flow_set: Option<Vec<SourceFlowSet>>,
+            collective: Option<Vec<SourceCollective>>,
+            collective_set: Option<Vec<SourceCollectiveSet>>,
+            compute: Option<Vec<SourceCompute>>,
+            /// Read by the topology builder (`topos::build`).
+            #[allow(dead_code)]
+            topology: Option<serde::de::IgnoredAny>,
+            #[allow(dead_code)]
+            edges: Option<serde::de::IgnoredAny>,
+            #[allow(dead_code)]
+            hosts: Option<serde::de::IgnoredAny>,
+            $(
+                #[allow(dead_code)]
+                $legacy: Option<serde::de::IgnoredAny>,
+            )*
+        }
+    };
+}
+
+scenario_root!(
+    ui_interval,
+    threading,
+    num_threads,
+    hot_workers,
+    concurrency_level,
+    log_path,
+    csv_logging,
+    report_interval,
+    mailbox_capacity,
+    legacy_e5_metrics,
+    model_host_attachment,
+    app_source,
+);
+
+/// The keys the scenario root accepts: those Days AGO reads, `topology`, `edges` and `hosts`
+/// (read by the topology builder), and [`LEGACY_ENGINE_ROOT_KEYS`].
+pub fn scenario_root_keys() -> &'static [&'static str] {
+    crate::utils::serde_fields::struct_fields::<SourceConfig>()
+}
+
+/// A parse error, naming the table of an unknown key: the header line the key sits under, or
+/// the root table.
+fn parse_error(content: &str, error: toml::de::Error) -> CompileError {
+    match crate::utils::serde_fields::unknown_key_table(content, &error) {
+        Some(table) => CompileError::Invalid(format!("{error}(in {table})")),
+        None => CompileError::Parse(error),
+    }
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceSwitch {
     port_rate: Option<ExactDecimal>,
     capacity: u64,
@@ -101,6 +161,7 @@ struct SourceEcnRow {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceRouting {
     policy: String,
 }
@@ -119,6 +180,7 @@ enum RoutingPolicy {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceLink {
     mode: Option<String>,
     pfc: Option<SourcePfc>,
@@ -127,6 +189,7 @@ struct SourceLink {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourcePropagationTiers {
     host_to_edge_ns: u64,
     edge_to_aggregation_ns: u64,
@@ -134,6 +197,7 @@ struct SourcePropagationTiers {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourcePfc {
     /// P15: also monitor host-to-switch links, so switches pause host NICs (default off).
     host_links: Option<bool>,
@@ -167,6 +231,7 @@ struct SourceHeadroomRow {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceFlow {
     flow_id: Option<u64>,
     starts_before: Option<Vec<u64>>,
@@ -180,6 +245,7 @@ struct SourceFlow {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceFlowSet {
     first_flow_id: Option<u64>,
     starts_before: Option<Vec<u64>>,
@@ -193,6 +259,7 @@ struct SourceFlowSet {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceCollective {
     /// Stage-group name that `after` fields may reference.
     name: Option<String>,
@@ -247,6 +314,7 @@ struct SourceAllToAll {
 
 /// A delay-only compute stage group: one timer-only stage per listed host.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceCompute {
     name: String,
     hosts: Vec<u64>,
@@ -278,6 +346,7 @@ fn after_names(after: Option<&AfterGroups>) -> &[String] {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceCollectiveSet {
     collective_type: String,
     collective_count: u64,
@@ -292,6 +361,7 @@ struct SourceCollectiveSet {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceTraffic {
     initial_delay: Option<ExactDecimal>,
     duration: Option<ExactDecimal>,
@@ -379,6 +449,7 @@ struct SourceDcqcn {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceTcp {
     cc_algorithm: String,
     #[serde(default)]
@@ -387,6 +458,7 @@ struct SourceTcp {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceCubic {
     beta: Option<ExactDecimal>,
     c: Option<ExactDecimal>,
@@ -951,7 +1023,8 @@ fn compile_text(
 ) -> Result<SimulationImage, CompileError> {
     crate::validate_config_text(content).map_err(CompileError::Unsupported)?;
 
-    let source: SourceConfig = toml::from_str(content)?;
+    let source: SourceConfig =
+        toml::from_str(content).map_err(|error| parse_error(content, error))?;
     if source.workload.is_some() {
         return Err(CompileError::Unsupported(
             "a `[workload.aicb]` scenario takes its `[switch]`, `[link]` and `[routing]` tables \
@@ -2312,7 +2385,7 @@ fn validate_collective_set(
     }
     let mut result = Vec::with_capacity(count);
     for (collective_sources, collective_sinks) in sources.into_iter().zip(sinks) {
-        result.push(collective_key(
+        let mut key = collective_key(
             &source.collective_type,
             source.flow_type.as_deref(),
             source.flow_count,
@@ -2327,7 +2400,12 @@ fn validate_collective_set(
             false,
             scenario_text,
             roce_keys,
-        )?);
+        )?;
+        // Each member is shaped as the same `[[collective]]` block without `channels`, `chunk`
+        // or `[collective.alltoall]` is (an all-to-all's UniformFloor chunk, a ring's
+        // EqualRemainderLast), which a set cannot declare.
+        shape_collective(&mut key, None, None, None)?;
+        result.push(key);
     }
     Ok(result)
 }
@@ -2559,6 +2637,7 @@ fn validate_traffic(
             }
             let interval_ns = constant_distribution_scaled(
                 &traffic.arr_dist,
+                "arr_dist",
                 scenario_text,
                 1_000_000_000,
                 "packet arrival distribution",
@@ -2800,6 +2879,11 @@ fn validate_traffic(
         termination,
         kind,
     })
+    .and_then(|key| {
+        check_distribution_keys(&traffic.arr_dist, "arr_dist", scenario_text)?;
+        check_distribution_keys(&traffic.pkt_size_dist, "pkt_size_dist", scenario_text)?;
+        Ok(key)
+    })
 }
 
 fn validate_cubic_profile(
@@ -2831,10 +2915,18 @@ enum ParsedSourceDistribution<'a> {
     Uniform { low: &'a str, high: &'a str },
 }
 
-fn source_distribution<'a>(
+/// The text between the braces of the distribution `name` (`arr_dist` or `pkt_size_dist`).
+/// Executor distributions are inline tables only: one written as a sub-table or as dotted keys
+/// is refused, naming the key and the table (a2aset fix round 2, ruling option (a)). Its span is
+/// then its header or its key, never a `{ ... }` value. The table must also fit on one line,
+/// without comments or a trailing comma (fix round 3): TOML 1.1 allows all three, but the exact
+/// readers split the text on `,` and `=`, so a commented-out `low = ...` would override the live
+/// value.
+fn inline_distribution<'a>(
     distribution: &SourceDistributionInfo,
+    name: &str,
     scenario_text: &'a str,
-) -> Result<ParsedSourceDistribution<'a>, CompileError> {
+) -> Result<&'a str, CompileError> {
     let literal = scenario_text
         .get(distribution.span.clone())
         .ok_or_else(|| {
@@ -2842,13 +2934,31 @@ fn source_distribution<'a>(
                 "distribution source span is outside the scenario text".to_owned(),
             )
         })?;
+    let refuse = |rule: &str| {
+        let table = crate::utils::serde_fields::table_at(scenario_text, distribution.span.start);
+        CompileError::Invalid(format!(
+            "executor distributions must use {rule} in `{name}` (in {table})"
+        ))
+    };
     let body = literal
         .trim()
         .strip_prefix('{')
         .and_then(|body| body.strip_suffix('}'))
-        .ok_or_else(|| {
-            CompileError::Invalid("executor distributions must use an inline TOML table".to_owned())
-        })?;
+        .ok_or_else(|| refuse("an inline TOML table"))?;
+    if body.contains(['#', '\n', '\r']) || body.trim_end().ends_with(',') {
+        return Err(refuse(
+            "a one-line inline TOML table without comments or a trailing comma",
+        ));
+    }
+    Ok(body)
+}
+
+fn source_distribution<'a>(
+    distribution: &SourceDistributionInfo,
+    name: &str,
+    scenario_text: &'a str,
+) -> Result<ParsedSourceDistribution<'a>, CompileError> {
+    let body = inline_distribution(distribution, name, scenario_text)?;
     let mut fields = BTreeMap::new();
     for field in body.split(',') {
         let (key, value) = field.split_once('=').ok_or_else(|| {
@@ -2896,6 +3006,100 @@ fn source_distribution<'a>(
     }
 }
 
+/// The fields of each distribution type and whether they are integers: those of
+/// [`super::DistributionInfo`], the shared strict schema (`distribution_fields_match_the_shared_schema`
+/// keeps the two equal). Only [`check_distribution_keys`]'s allocation-free fast path reads them.
+const DISTRIBUTION_FIELDS: [(&str, &[&str], bool); 3] = [
+    ("DiscreteUniform", &["low", "high"], true),
+    ("Exp", &["lambda"], false),
+    ("Uniform", &["low", "high"], false),
+];
+
+/// Whether `value`, a value of a document TOML already parsed, is a number the shared schema
+/// takes: a decimal integer, or (unless `integer`) any TOML float or integer. Hex, octal, and
+/// binary integers, and every non-number (string, table, array, boolean, date), say no and go
+/// to the schema.
+fn plain_number(value: &str, integer: bool) -> bool {
+    let unsigned = value.strip_prefix(['+', '-']).unwrap_or(value);
+    if integer {
+        return !unsigned.is_empty() && unsigned.bytes().all(|b| b.is_ascii_digit() || b == b'_');
+    }
+    if unsigned == "inf" || unsigned == "nan" {
+        return true;
+    }
+    let bytes = unsigned.as_bytes();
+    !bytes.is_empty()
+        && bytes[0].is_ascii_digit()
+        && bytes.iter().enumerate().all(|(index, &b)| match b {
+            b'0'..=b'9' | b'_' | b'.' | b'e' | b'E' => true,
+            b'+' | b'-' => matches!(bytes[index - 1], b'e' | b'E'),
+            _ => false,
+        })
+}
+
+/// Whether an inline distribution table's keys (`body`, the text between its braces) are exactly `type` and its type's fields, each
+/// once and each a plain number (a `key = value` list, as every scenario writes it): then the
+/// shared schema accepts it. Anything else goes to the schema, which also accepts what this scan
+/// cannot read.
+fn distribution_keys_are_exact(body: &str) -> bool {
+    let entries = || {
+        body.split(',').map(|field| {
+            field
+                .split_once('=')
+                .map(|(key, value)| (key.trim(), value.trim()))
+        })
+    };
+    let Some(kind) = entries().find_map(|entry| {
+        entry
+            .filter(|(key, _)| *key == "type")
+            .and_then(|(_, value)| value.strip_prefix('"')?.strip_suffix('"'))
+    }) else {
+        return false;
+    };
+    let Some((_, fields, integer)) = DISTRIBUTION_FIELDS.iter().find(|(name, ..)| *name == kind)
+    else {
+        return false;
+    };
+    let mut count = 0;
+    for entry in entries() {
+        let Some((key, value)) = entry else {
+            return false;
+        };
+        if key != "type" && !(fields.contains(&key) && plain_number(value, *integer)) {
+            return false;
+        }
+        count += 1;
+    }
+    count == fields.len() + 1
+}
+
+/// Refuses a distribution table whose keys are not exactly its type's: the shared, strict schema
+/// (`DistributionInfo`, also legacy's) refuses an unknown key or one of another type, which
+/// [`source_distribution`] (reading only the keys a type needs) and the traffic kinds that ignore
+/// a distribution would drop (a2aset fix round 1, review M1). `name` is the table's key.
+fn check_distribution_keys(
+    distribution: &SourceDistributionInfo,
+    name: &str,
+    scenario_text: &str,
+) -> Result<(), CompileError> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Distribution {
+        #[allow(dead_code)]
+        distribution: super::DistributionInfo,
+    }
+    let body = inline_distribution(distribution, name, scenario_text)?;
+    // The common case, checked without allocating: exactly `type` and its type's fields.
+    if distribution_keys_are_exact(body) {
+        return Ok(());
+    }
+    toml::from_str::<Distribution>(&format!("distribution = {{{body}}}")).map_err(|error| {
+        let table = crate::utils::serde_fields::table_at(scenario_text, distribution.span.start);
+        CompileError::Invalid(format!("{} in `{name}` (in {table})", error.message()))
+    })?;
+    Ok(())
+}
+
 fn exact_i64_literal(literal: &str, label: &str) -> Result<i64, CompileError> {
     let normalized = literal.trim().replace('_', "");
     let (negative, unsigned) = if let Some(unsigned) = normalized.strip_prefix('-') {
@@ -2920,7 +3124,7 @@ fn constant_packet_size_bytes(
     distribution: &SourceDistributionInfo,
     scenario_text: &str,
 ) -> Result<u64, CompileError> {
-    match source_distribution(distribution, scenario_text)? {
+    match source_distribution(distribution, "pkt_size_dist", scenario_text)? {
         ParsedSourceDistribution::DiscreteUniform { low, high } if low == high => {
             u64::try_from(low).map_err(|_| {
                 CompileError::Unsupported(format!(
@@ -2967,11 +3171,12 @@ fn constant_packet_size_bytes(
 
 fn constant_distribution_scaled(
     distribution: &SourceDistributionInfo,
+    name: &str,
     scenario_text: &str,
     scale: u64,
     label: &str,
 ) -> Result<u64, CompileError> {
-    match source_distribution(distribution, scenario_text)? {
+    match source_distribution(distribution, name, scenario_text)? {
         ParsedSourceDistribution::DiscreteUniform { low, high } if low == high => {
             let value = u64::try_from(low).map_err(|_| {
                 CompileError::Invalid(format!("{label} must be finite and nonnegative, got {low}"))
@@ -6300,6 +6505,93 @@ mod tests {
         assert_eq!(
             negative,
             "unsupported probe `1e-9223372036854775809`; exact representation requires an integer scaled value"
+        );
+    }
+
+    /// `DISTRIBUTION_FIELDS` (the allocation-free fast path's table) equals the shared strict
+    /// schema `DistributionInfo`: each type takes exactly its listed fields, refuses every other
+    /// type's, and the schema has no type the table lacks.
+    #[test]
+    fn distribution_fields_match_the_shared_schema() {
+        // The fast path reads the text between an inline table's braces.
+        let exact = |table: &str| {
+            super::distribution_keys_are_exact(
+                table
+                    .strip_prefix('{')
+                    .and_then(|t| t.strip_suffix('}'))
+                    .expect("braces"),
+            )
+        };
+        let parse = |table: &str| {
+            #[derive(serde::Deserialize)]
+            struct Probe {
+                #[allow(dead_code)]
+                distribution: crate::scenario::DistributionInfo,
+            }
+            toml::from_str::<Probe>(&format!("distribution = {table}"))
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        let every_field = super::DISTRIBUTION_FIELDS
+            .iter()
+            .flat_map(|(_, fields, _)| fields.iter().copied())
+            .collect::<std::collections::BTreeSet<_>>();
+        for (kind, fields, integer) in super::DISTRIBUTION_FIELDS {
+            // Values: the fast path says yes only where the schema does.
+            for value in [
+                "1",
+                "-2",
+                "+3",
+                "1_000",
+                "1.5",
+                "-0.25",
+                "1e3",
+                "2.5E-3",
+                "inf",
+                "-nan",
+                "0x10",
+                "0o7",
+                "true",
+                "\"1\"",
+                "[1]",
+                "{ a = 1 }",
+                "1979-05-27",
+                "07:32:00",
+            ] {
+                let table = fields
+                    .iter()
+                    .map(|field| format!(", {field} = {value}"))
+                    .collect::<String>();
+                let table = format!("{{ type = \"{kind}\"{table} }}");
+                if exact(&table) {
+                    parse(&table).unwrap_or_else(|error| panic!("{table}: {error}"));
+                }
+                assert_eq!(
+                    super::plain_number(value, integer),
+                    exact(&table),
+                    "{table}"
+                );
+            }
+            let own = fields
+                .iter()
+                .map(|field| format!(", {field} = 1"))
+                .collect::<String>();
+            parse(&format!("{{ type = \"{kind}\"{own} }}"))
+                .unwrap_or_else(|error| panic!("{kind} takes {fields:?}: {error}"));
+            assert!(exact(&format!("{{ type = \"{kind}\"{own} }}")));
+            for other in every_field.iter().filter(|field| !fields.contains(field)) {
+                let table = format!("{{ type = \"{kind}\"{own}, {other} = 1 }}");
+                assert!(parse(&table).is_err(), "{kind} refuses {other}");
+                assert!(!exact(&table));
+            }
+        }
+        let unknown = parse("{ type = \"Unknown\" }").expect_err("an unknown type");
+        for (kind, ..) in super::DISTRIBUTION_FIELDS {
+            assert!(unknown.contains(&format!("`{kind}`")), "{unknown}");
+        }
+        assert_eq!(
+            unknown.matches('`').count(),
+            2 * (super::DISTRIBUTION_FIELDS.len() + 1)
         );
     }
 }

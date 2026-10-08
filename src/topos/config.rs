@@ -111,6 +111,7 @@ pub enum TopoCategory {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FatTreeConfig {
     pub k: usize,
     #[serde(default)]
@@ -118,6 +119,7 @@ pub struct FatTreeConfig {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TorusConfig {
     pub dim: usize,
     pub n: usize,
@@ -129,6 +131,7 @@ pub struct TorusConfig {
 /// `global_ports_per_router` (h) global ports; the group count is the balanced `g = a*h + 1`, so
 /// every pair of groups is joined by exactly one global link. `hosts_per_router` (p) defaults to 1.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DragonflyConfig {
     pub routers_per_group: usize,
     pub global_ports_per_router: usize,
@@ -159,6 +162,7 @@ pub struct SpectrumXConfig {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TopoConfig {
     pub category: TopoCategory,
     pub fat_tree: Option<FatTreeConfig>,

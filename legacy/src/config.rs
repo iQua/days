@@ -1136,3 +1136,42 @@ pub(crate) fn validate(file_path: &str) -> Result<(), String> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::LegacyConfig;
+
+    /// The Days AGO root accepts, by name and ignoring them, exactly the legacy root keys it does
+    /// not read itself (`days::scenario::LEGACY_ENGINE_ROOT_KEYS`; P16 a2aset part 2, user ruling
+    /// Oct 8, option 1). A key added to or removed from `LegacyConfig` must be added to or removed
+    /// from that list.
+    #[test]
+    fn the_days_ago_root_names_exactly_the_legacy_only_keys() {
+        let legacy = days::utils::serde_fields::struct_fields::<LegacyConfig>()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let listed = days::scenario::LEGACY_ENGINE_ROOT_KEYS
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let root = days::scenario::scenario_root_keys()
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert!(!legacy.is_empty(), "LegacyConfig's fields are probed");
+        assert_eq!(listed.len(), days::scenario::LEGACY_ENGINE_ROOT_KEYS.len());
+        assert!(
+            listed.is_subset(&root),
+            "the Days AGO root accepts every listed key"
+        );
+        let days_ago = root.difference(&listed).copied().collect::<BTreeSet<_>>();
+        let legacy_only = legacy
+            .difference(&days_ago)
+            .copied()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(legacy_only, listed);
+    }
+}
