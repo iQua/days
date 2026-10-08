@@ -8,13 +8,18 @@
 //!   Send/Recv), and the MoE trace (32 GPUs, TP2, EP8) under the SimAI fidelity and under the
 //!   Megatron fidelity with imbalanced expert routing.
 //! - **Tier (ii):** SimAI's b4 trace (SimAI and Megatron fidelity) and the MoE smoke (SimAI
-//!   fidelity, and Megatron fidelity with imbalanced routing) lower in full and run to a cutoff past the start of their first cross-host collectives (the end of the
-//!   first fused segment plus 10 us): CPU under Full and Summary, the devices under Summary. Full
+//!   fidelity, and Megatron fidelity with imbalanced routing) lower in full and run to a cutoff
+//!   past the start of their first cross-host collectives (the end of the first fused segment
+//!   plus 10 us): CPU under Full and Summary, the devices under Summary. Full
 //!   observation on a device sizes its logs for the whole run, not the cutoff: b4's 1,920 ring
 //!   stages of 26,985 packets each exhaust CUDA's 20 GB on sim (result-plane upload out of memory)
 //!   and stall Metal; that device-side finding is recorded in the lane report. The devices' Full
 //!   identity on an AICB image is tier (i)'s. The flagship's cutoff runs are
 //!   `tests/p16_aicb_flagship.rs`'s.
+//! - **Devices:** every device tier runs under the `days` CLI's stock capacity caps
+//!   (`days::STOCK_CAPACITY_CAPS`; user ruling Oct 8, P16 ecnbytes). The byte-unit ECN queues
+//!   (32 MiB) make the uncapped default plan bound each switch queue by 32 MiB / 60 B records:
+//!   59.3 GB for the smoke and 11.6 GB for b4, against 2.8 GB and 70 MB capped.
 //! - **Tier (iii):** b4 to completion, every stage finished, Scalar against CPU (`#[ignore]`:
 //!   51.8 M data packets; run it explicitly as the acceptance test). Devices: the `#[ignore]`
 //!   tests in the device modules.
@@ -190,6 +195,13 @@ fn b4_runs_to_completion() {
 mod cuda {
     use days_executor::{CudaConfig, ObservationMode, run_cuda_with_observations};
 
+    fn cuda_config() -> CudaConfig {
+        CudaConfig {
+            capacity_caps: days::STOCK_CAPACITY_CAPS,
+            ..CudaConfig::default()
+        }
+    }
+
     use super::{
         B4, TIER_TWO, lower, scalar, tier_one_images, tier_two, unfinished, without_diagnostics,
     };
@@ -200,10 +212,9 @@ mod cuda {
             for horizon in [None, Some(image.stop_time_ns / 2)] {
                 for mode in [ObservationMode::Full, ObservationMode::Summary] {
                     let expected = without_diagnostics(scalar(&image, horizon, mode));
-                    let actual =
-                        run_cuda_with_observations(&image, horizon, CudaConfig::default(), mode)
-                            .unwrap_or_else(|error| panic!("{label}: {error}"))
-                            .result;
+                    let actual = run_cuda_with_observations(&image, horizon, cuda_config(), mode)
+                        .unwrap_or_else(|error| panic!("{label}: {error}"))
+                        .result;
                     assert_eq!(actual, expected, "{label} horizon={horizon:?} {mode:?}");
                 }
             }
@@ -216,10 +227,9 @@ mod cuda {
             let (image, horizon) = tier_two(name);
             let mode = ObservationMode::Summary;
             let expected = without_diagnostics(scalar(&image, Some(horizon), mode));
-            let actual =
-                run_cuda_with_observations(&image, Some(horizon), CudaConfig::default(), mode)
-                    .unwrap_or_else(|error| panic!("{name}: {error}"))
-                    .result;
+            let actual = run_cuda_with_observations(&image, Some(horizon), cuda_config(), mode)
+                .unwrap_or_else(|error| panic!("{name}: {error}"))
+                .result;
             assert_eq!(actual, expected, "{name}@{horizon} {mode:?}");
         }
     }
@@ -230,14 +240,10 @@ mod cuda {
         let image = lower(B4);
         let expected = scalar(&image, None, ObservationMode::Summary);
         assert_eq!(unfinished(&expected), 0);
-        let actual = run_cuda_with_observations(
-            &image,
-            None,
-            CudaConfig::default(),
-            ObservationMode::Summary,
-        )
-        .expect("CUDA runs b4")
-        .result;
+        let actual =
+            run_cuda_with_observations(&image, None, cuda_config(), ObservationMode::Summary)
+                .expect("CUDA runs b4")
+                .result;
         assert_eq!(actual, without_diagnostics(expected));
     }
 }
@@ -245,6 +251,13 @@ mod cuda {
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 mod metal {
     use days_executor::{MetalConfig, ObservationMode, run_metal_with_observations};
+
+    fn metal_config() -> MetalConfig {
+        MetalConfig {
+            capacity_caps: days::STOCK_CAPACITY_CAPS,
+            ..MetalConfig::default()
+        }
+    }
 
     use super::{
         B4, TIER_TWO, lower, scalar, tier_one_images, tier_two, unfinished, without_diagnostics,
@@ -256,10 +269,9 @@ mod metal {
             for horizon in [None, Some(image.stop_time_ns / 2)] {
                 for mode in [ObservationMode::Full, ObservationMode::Summary] {
                     let expected = without_diagnostics(scalar(&image, horizon, mode));
-                    let actual =
-                        run_metal_with_observations(&image, horizon, MetalConfig::default(), mode)
-                            .unwrap_or_else(|error| panic!("{label}: {error}"))
-                            .result;
+                    let actual = run_metal_with_observations(&image, horizon, metal_config(), mode)
+                        .unwrap_or_else(|error| panic!("{label}: {error}"))
+                        .result;
                     assert_eq!(actual, expected, "{label} horizon={horizon:?} {mode:?}");
                 }
             }
@@ -272,10 +284,9 @@ mod metal {
             let (image, horizon) = tier_two(name);
             let mode = ObservationMode::Summary;
             let expected = without_diagnostics(scalar(&image, Some(horizon), mode));
-            let actual =
-                run_metal_with_observations(&image, Some(horizon), MetalConfig::default(), mode)
-                    .unwrap_or_else(|error| panic!("{name}: {error}"))
-                    .result;
+            let actual = run_metal_with_observations(&image, Some(horizon), metal_config(), mode)
+                .unwrap_or_else(|error| panic!("{name}: {error}"))
+                .result;
             assert_eq!(actual, expected, "{name}@{horizon} {mode:?}");
         }
     }
@@ -286,14 +297,10 @@ mod metal {
         let image = lower(B4);
         let expected = scalar(&image, None, ObservationMode::Summary);
         assert_eq!(unfinished(&expected), 0);
-        let actual = run_metal_with_observations(
-            &image,
-            None,
-            MetalConfig::default(),
-            ObservationMode::Summary,
-        )
-        .expect("Metal runs b4")
-        .result;
+        let actual =
+            run_metal_with_observations(&image, None, metal_config(), ObservationMode::Summary)
+                .expect("Metal runs b4")
+                .result;
         assert_eq!(actual, without_diagnostics(expected));
     }
 }
