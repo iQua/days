@@ -21,9 +21,13 @@ description: Map shared, exact-executor, and legacy subsystems to the Rust sourc
 
 - `src/topos/config.rs`: topology, switch, link, host-attachment, and routing configuration types.
 - `src/topos/build.rs`: FatTree, Torus, Dragonfly, and custom graph builders; returns `HostAttachments` and `TopologyProfile` with the graph.
+- `src/topos/rail.rs`: the Spectrum-X rail builder, its SimAI-format renderer, SimAI's Murmur3 ECMP hash, and `ServerLocality` (server membership, the delay-only NVLink formula, SimAI's `maxBdp` window).
 - `src/topos/route.rs`: shortest path, per-flow ECMP, explicit path, and semantic FatTree ECMP implementations.
 - `src/scenario/compile.rs`: exact-model validation and lowering into `SimulationImage`.
 - `src/scenario/ids.rs`: stable semantic LP, link, flow, packet, and payload ID assignment.
+- `src/scenario/workload.rs`: the typed workload IR (groups, transports, operations with host-matched `after` lists) that TOML stage groups and the AICB adapter both lower through.
+- `src/scenario/collective_shapes.rs`: SimAI's ring channels and per-message byte rules, shared by lowering and the adapter.
+- `src/workload/aicb/`: the AICB/SimAI workload adapter: trace parser, `MockNcclGroup` group formation, schedule planner, `SimAI.conf` reader, and the `[workload.aicb]` scenario table.
 
 ## Days AGO executor
 
@@ -43,6 +47,9 @@ Parallel execution:
 - `executor/src/metal.rs` and `executor/src/metal_kernels.metal`: Metal planning, execution, retry, gather, and readback.
 - `executor/src/cuda.rs` and `executor/src/cuda_kernels.cu`: CUDA planning, execution, retry, gather, and readback.
 - `executor/src/device_sizing.rs`: shared arena sizing.
+- `executor/src/stage_sizing.rs`: the stage-aware (width) and window-aware bounds the planners apply to stage flows.
+- `executor/src/device_pfc.rs`: the device PFC rows, including the per-class parked bitsets of host-link PFC.
+- `executor/src/seeded_matrix.rs`: the seeded routing matrix of an imbalanced all-to-all.
 - `executor/src/device_capacity.rs`: caps, per-entity floors, retries, and `CapacityWarmStart`.
 - `executor/src/device_compaction.rs`: canonical live-record readback plans.
 - `executor/src/device_scheduler.rs`: checked device scheduler arithmetic.

@@ -16,13 +16,15 @@ Four backends run the same image:
 | Metal | Apple GPUs (not the M1 family) |
 | CUDA | NVIDIA GPUs (built for sm_86, sm_89 and sm_121) |
 
-Modeled mechanisms: closed-loop TCP Reno and CUBIC, DCQCN with CNP, PFC, ECN,
-RED, strict-priority, DRR, and exact-rational WFQ scheduling, and ring
-all-reduce and all-gather collectives over TCP with delay-only compute stages,
-over fat-tree, torus, and dragonfly topologies. DCQCN and PFC run on all four
-backends. RED, collectives, and compute stages run on the Scalar and CPU
-backends only; Metal and CUDA reject those scenarios at validation with a
-message naming the backend, never with a silent fallback.
+Modeled mechanisms: closed-loop TCP Reno and CUBIC, Mellanox-form DCQCN, RoCE
+queue pairs with Go-back-N, PFC, ECN, RED, strict-priority, DRR, WRR, and
+exact-rational WFQ scheduling; ring all-reduce, all-gather, reduce-scatter,
+all-to-all, and send/receive collectives over TCP or RoCE queue pairs with
+delay-only compute stages; fat-tree, torus, dragonfly, and Spectrum-X rail
+topologies; and AICB/SimAI training traces as workloads. Everything except RED
+runs on all four backends. RED runs on the Scalar and CPU backends only; Metal
+and CUDA reject it at validation with a message naming the backend, never with
+a silent fallback.
 
 ## Quick start
 
