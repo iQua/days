@@ -64,6 +64,12 @@ def thresholdDecision
   else
     .enqueue
 
+/-- Days AGO marks only data packets: a mark decision on any other packet (an ACK, NACK or CNP)
+admits it unmarked. Drops and the RED state update are the same for every packet. -/
+def exemptNonData (isData : Bool) : Action → Action
+  | .mark => if isData then .mark else .enqueue
+  | action => action
+
 def redDecision
     (state : RedState)
     (queuedPackets queuedBytes packetSizeBytes : Nat) : RedState × Action :=

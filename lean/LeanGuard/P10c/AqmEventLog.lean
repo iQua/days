@@ -15,6 +15,7 @@ structure Row where
   nodeId : Nat
   queueId : Nat
   payloadId : Nat
+  packetKind : String
   queuedPacketsBefore : Nat
   queuedBytesBefore : Nat
   packetSizeBytes : Nat
@@ -54,6 +55,23 @@ def parseUnit : String → Except String Aqm.DepthUnit
   | "bytes" => pure .bytes
   | other => throw s!"invalid depth unit: '{other}'"
 
+/-- The executor's packet kinds (`aqm_trace.rs`), and whether each is a data packet, the only
+kind Days AGO marks. -/
+def dataKind : String → Except String Bool
+  | "data" | "tcp_data" | "roce_data" => pure true
+  | "feedback" | "tcp_ack" | "pfc" | "dcqcn_cnp" | "roce_ack" | "roce_nack"
+  | "roce_pacing_timer" | "stage_notify" => pure false
+  | other => throw s!"invalid packet kind: '{other}'"
+
+def parsePacketKind (value : String) : Except String String := do
+  let _ ← dataKind value
+  pure value
+
+def Row.isData (row : Row) : Bool :=
+  match dataKind row.packetKind with
+  | .ok isData => isData
+  | .error _ => false
+
 def parseAction : String → Except String Aqm.Action
   | "enqueue" => pure .enqueue
   | "mark" => pure .mark
@@ -71,6 +89,7 @@ def parseRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array Strin
         nodeId := ← parseNat (← getField idx fields "node_id")
         queueId := ← parseNat (← getField idx fields "queue_id")
         payloadId := ← parseNat (← getField idx fields "payload_id")
+        packetKind := ← parsePacketKind (← getField idx fields "packet_kind")
         queuedPacketsBefore := ← parseNat (← getField idx fields "queued_packets_before")
         queuedBytesBefore := ← parseNat (← getField idx fields "queued_bytes_before")
         packetSizeBytes := ← parseNat (← getField idx fields "packet_size_bytes")
@@ -132,9 +151,10 @@ def checkThreshold (row : Row) : Except String Unit := do
     "threshold certificate contains RED-only state"
   let config : Aqm.ThresholdConfig :=
     { unit := row.depthUnit, capacity := row.capacity, threshold }
-  let expected :=
+  let expected := Aqm.exemptNonData row.isData <|
     Aqm.thresholdDecision config row.queuedPacketsBefore row.queuedBytesBefore row.packetSizeBytes
-  require row.srcLine (row.action = expected) "threshold decision mismatch"
+  require row.srcLine (row.action = expected)
+    s!"threshold decision mismatch ({row.packetKind} packet)"
 
 def checkRed (row : Row) : Except String Unit := do
   let minimum ← requireOption row.srcLine "min_threshold" row.minThreshold
@@ -161,7 +181,8 @@ def checkRed (row : Row) : Except String Unit := do
       markEcn := row.markEcn }
   let (after, action) :=
     Aqm.redDecision before row.queuedPacketsBefore row.queuedBytesBefore row.packetSizeBytes
-  require row.srcLine (row.action = action) "RED decision mismatch"
+  require row.srcLine (row.action = Aqm.exemptNonData row.isData action)
+    s!"RED decision mismatch ({row.packetKind} packet)"
   require row.srcLine
     (after.averageScaled = afterAverage && after.counter = afterCounter)
     "RED after-state mismatch"
