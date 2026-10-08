@@ -310,3 +310,59 @@ fn the_root_accepts_and_ignores_the_legacy_engine_keys() {
         assert_eq!(image, expected, "`{key}` must not change the image");
     }
 }
+
+/// `text` with `entry` added to the inline table on the first line assigning `key`.
+fn add_to_inline(text: &str, key: &str, entry: &str) -> String {
+    let mut out = String::new();
+    let mut done = false;
+    for line in text.lines() {
+        if !done && line.trim_start().starts_with(&format!("{key} =")) {
+            let close = line.rfind('}').expect("an inline table");
+            out.push_str(&format!("{}, {entry} {}", &line[..close], &line[close..]));
+            done = true;
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    assert!(done, "no `{key}` line");
+    out
+}
+
+/// Fix round 1 (review M1): the inline distribution tables refuse an unknown key and a key of
+/// another distribution type, in both a `[[flow]]` and a `[[flow_set]]` traffic table, naming the
+/// key, the distribution and its table.
+#[test]
+fn every_distribution_refuses_unknown_and_wrong_type_keys() {
+    let mut accepted = Vec::new();
+    for (path, table) in [
+        ("configs/p14/dcqcn_t26.toml", "[flow.traffic]"),
+        (
+            "configs/benchmarks/baseline/fattree_k4_f8_st.toml",
+            "[flow_set.traffic]",
+        ),
+    ] {
+        let base = std::fs::read_to_string(repository(path)).expect("read config");
+        lower_text(&base).unwrap_or_else(|error| panic!("{path} lowers: {error}"));
+        for (distribution, entry, key) in [
+            ("arr_dist", "hgih = 3", "hgih"),
+            ("arr_dist", "lambda = 2", "lambda"),
+            ("pkt_size_dist", "bogus = 1", "bogus"),
+            ("pkt_size_dist", "lambda = 2", "lambda"),
+        ] {
+            let label = format!("`{key}` in `{distribution}` (in `{table}`)");
+            match lower_text(&add_to_inline(&base, distribution, entry)) {
+                Ok(_) => accepted.push(format!("{label}: accepted")),
+                Err(error) => {
+                    if !error.contains(&format!("unknown field `{key}`"))
+                        || !error.contains(&format!("in `{distribution}`"))
+                        || !error.contains(&format!("(in `{table}`)"))
+                    {
+                        accepted.push(format!("{label}: refused without naming it: {error}"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(accepted.is_empty(), "{}", accepted.join("\n"));
+}
