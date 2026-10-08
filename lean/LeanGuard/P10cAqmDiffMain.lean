@@ -26,9 +26,11 @@ inductive Kind
   | queue
   | node
   | config
+  | packetKind
   deriving DecidableEq, Repr
 
-def Kind.all : List Kind := [.counter, .drop, .swapLines, .swapOrder, .queue, .node, .config]
+def Kind.all : List Kind :=
+  [.counter, .drop, .swapLines, .swapOrder, .queue, .node, .config, .packetKind]
 
 def Kind.name : Kind → String
   | .counter => "counter-off-by-one"
@@ -38,6 +40,7 @@ def Kind.name : Kind → String
   | .queue => "changed-queue"
   | .node => "changed-node"
   | .config => "changed-config"
+  | .packetKind => "relabeled-packet-kind"
 
 def bumpOpt (value : Option Nat) (up : Bool) : Option Nat := value.map (bump · up)
 
@@ -110,6 +113,10 @@ def mutate (rows : Array Row) (kind : Kind) (g : Rng) : Option (Array Row) × Rn
   | .config =>
       let (field, g) := g.below 6
       (some (rows.set! i (bumpConfig row field (choice % 2 = 0))), g)
+  | .packetKind =>
+      -- A data packet relabeled an ACK, or any other packet relabeled data.
+      let kind := if row.isData then "roce_ack" else "roce_data"
+      (some (rows.set! i { row with packetKind := kind }), g)
 
 structure Tally where
   cases : Nat := 0

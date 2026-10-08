@@ -225,6 +225,24 @@ The legacy checkers, `tcp_check`, and `sp_check` also accept
 `--coverage-out <path>`. `leanguard-run --coverage` uses that option and aggregates returned
 coverpoints. The `p10c_*` executables do not expose the coverage flag.
 
+## Days AGO AQM rows
+
+`p10c_aqm_check` replays `aqm_transitions_csv`: one row per admission decision at a switch queue
+with an ECN-threshold or RED policy (Lean rules: the `Aqm` namespace of
+`lean/LeanGuard/P10c/Semantics.lean` and `lean/LeanGuard/P10c/AqmEventLog.lean`). Each row names the
+packet's kind (`packet_kind`: `data`, `tcp_data`, `roce_data`, `tcp_ack`, `roce_ack`, `roce_nack`,
+`dcqcn_cnp`, `feedback`, `pfc`, `roce_pacing_timer` or `stage_notify`), which the writer takes from
+the run's observed packets. Days AGO marks only data packets (`data`, `tcp_data`, `roce_data`), as
+[the switch configuration](/docs/configuration/switches) describes. Where the threshold or RED
+decision is a mark, any other packet is admitted unmarked, so an ACK at or above the threshold
+must show `enqueue` and an unchanged ECN bit. Drops, and RED's average and counter update, are the
+same for every kind.
+
+The CI fixture `aqm_roce_acks_compiled_executor_accept.csv` (`configs/leanguard/aqm_roce_acks.toml`)
+has RoCE ACKs admitted unmarked at the threshold of a queue that marks data. Its mutations must be
+rejected: a data packet unmarked at the threshold, a marked ACK, and a packet-kind relabel in
+either direction.
+
 ## Days AGO WFQ and SP rows
 
 `p10c_mechanisms_check wfq` replays `wfq_transitions_csv`: one row per transition of a WFQ switch
