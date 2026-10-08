@@ -1,9 +1,9 @@
 ---
 title: Topology & Routing
-description: Custom, FatTree, Torus, and Dragonfly graphs with propagation and routing.
+description: Custom, FatTree, Torus, Dragonfly, and Spectrum-X graphs with propagation and routing.
 ---
 
-**Scope: Days AGO and Legacy Days.** `src/topos/build.rs` builds an undirected switch graph plus explicit host-to-switch attachments. Days accepts one of four topology forms.
+**Scope: Days AGO and Legacy Days.** `src/topos/build.rs` builds an undirected switch graph plus explicit host-to-switch attachments. Days accepts one of five topology forms; the legacy runtime refuses the fifth, Spectrum-X.
 
 ## Custom graph
 
@@ -62,6 +62,150 @@ groups = routers_per_group * global_ports_per_router + 1
 
 Routers form an all-to-all graph inside each group, and each group pair receives one global link.
 
+## Spectrum-X
+
+**Scope: Days AGO.** `SpectrumX` is SimAI's rail-optimized single-ToR fabric, the structure its `gen_Topo_Template.py` writes, built natively from its parameters in exact integers (`src/topos/rail.rs`). The legacy runtime refuses it ("the legacy runtime does not support the SpectrumX topology").
+
+```toml
+[topology]
+category = "SpectrumX"
+
+[topology.spectrum_x]
+gpus = 128
+gpus_per_server = 8
+nics_per_asw = 64
+psws = 64
+gpu_type = "A100"
+nic_rate_bps = 100000000000
+uplink_rate_bps = 400000000000
+nvlink_rate_bps = 2400000000000
+link_delay_ns = 500
+nvlink_delay_ns = 25
+```
+
+| Key | Meaning |
+| --- | --- |
+| `gpus` | The host count. GPU `i` is host `i`, in server `i / gpus_per_server` on rail `i % gpus_per_server`. |
+| `gpus_per_server` | GPUs per server; must divide `gpus`. |
+| `nics_per_asw` | NICs per leaf switch. A segment is `gpus_per_server * nics_per_asw` GPUs; each (segment, rail) pair has one leaf switch (ASW). `gpus` must be a whole number of segments. |
+| `psws` | Spine switches (PSWs). Every ASW links to every PSW. |
+| `gpu_type` | SimAI's header token, such as `H100` or `A100`. It is rendered, and the AICB adapter reads it for one SimAI refusal; it does not change the structure. |
+| `nic_rate_bps`, `uplink_rate_bps`, `nvlink_rate_bps` | The rates of the host-to-ASW links, the ASW-to-PSW links, and NVLink, in bits per second. |
+| `link_delay_ns`, `nvlink_delay_ns` | The propagation delay of every network link, and of one NVLink hop. |
+
+All keys are required, and unknown keys are rejected. The builder refuses a ragged last segment, a server count that does not divide the GPU count, and identities beyond `u32`. The fabric's link rates and delays live in this table, so a Spectrum-X scenario must not set `switch.port_rate` ("unsupported `switch.port_rate` on a SpectrumX topology; its link rates are `topology.spectrum_x.nic_rate_bps` and `uplink_rate_bps`") or `link.propagation_ns` and `link.propagation_tiers` ("unsupported `link.propagation_ns` or `link.propagation_tiers` on a SpectrumX topology; its link delays are `topology.spectrum_x.link_delay_ns`"). `switch.port_rate` stays required on every other topology.
+
+The lowered graph holds the ASWs and PSWs; each GPU host attaches to its ASW through one link, so hosts keep one egress. Host ids and switch hash seeds use SimAI's node numbering (GPUs, then NVSwitches, then ASWs, then PSWs), and `RailTopology::render_simai` writes the fabric in SimAI's topology-file grammar. The renders of SimAI's shipped `Spectrum-X_1024g_8gps_400Gbps_H100`, `_512g_8gps_400Gbps_H100` and `_128g_8gps_100Gbps_A100` files are byte-equal to those files; `tests/p16_rail_topology.rs` pins their SHA-256 digests. The switch parameters of SimAI's runs (ECN rows by link rate, PFC thresholds by switch tier, headroom by link rate) have their own tables; see [Switches](/docs/configuration/switches#ecn-thresholds-by-link-rate) and [L2 and PFC](/docs/configuration/l2#thresholds-by-switch-tier-on-the-rail-fabric).
+
+### NVLink is delay-only
+
+NVSwitches are not instantiated: Days AGO models a message between two GPUs of one server as a delay, with no queue, no PFC and no ECN. A message of `b` bytes sent while `k` equal messages (this one included) share the sender's NVLink port takes
+
+```text
+2 * nvlink_delay_ns + ceil(8 * k * b * 1e9 / nvlink_rate_bps) + ceil(8 * min(b, mtu) * 1e9 / nvlink_rate_bps)
+```
+
+nanoseconds: two NVLink hops through the server's NVSwitch, the sender's port serializing all `k` messages, and the NVSwitch forwarding the last packet once more (`ServerLocality::nvlink_message_delay_ns`). The collective lowering supplies `k`: the channel count for a collective whose ranks all share one server (its channels start together); 1 for the same-server hop of a ring that spans servers (each channel waits on its own inter-server hop); and the number of same-server sends a rank releases at once for an all-to-all. This matches the per-GPU port sharing measured in SimAI: with `k`, Days AGO's tensor-parallel time is within 0.1% of SimAI's on the dense b4 and MoE smoke traces (`days-gpu/evidence/P16/nvlink-contention.md`). SimAI's per-message start latency (`AS_SEND_LAT`) is not modelled; it is a recorded divergence.
+
+Two lowerings use the formula:
+
+- A collective whose ranks all share one server (every tensor-parallel collective) lowers to one delay stage per rank: `n - 1` steps (`AllGather`, `ReduceScatter`) or `2 (n - 1)` steps (`RingAllReduce`), each the delay of one message with `k = n`. The ranks do not synchronize with one another.
+- A same-server message of a collective that spans servers (a ring hop, an all-to-all pair) lowers to a **stage notify**. The sender's timer runs the message delay minus the lane latency; the notify then crosses a host-to-host lane, one per ordered host pair, in that latency, and its whole chunk arrives at the receiver at once. A lane's latency is the smallest delay of its pair's messages minus 1 ns, so arrivals on a lane are in order. The lane latency enters the global safe-horizon lookahead: 346 ns on `configs/p16/rail_mini_tcp_allgather.toml` (below the fabric's 502 ns), and at least 5,900 ns on the 1,024-GPU and 128-GPU SimAI shapes, where the network's 502 ns stays the minimum. Stage notifies run on Scalar, CPU, Metal and CUDA.
+
+Only collective stages use NVLink. An explicit `[[flow]]` between two GPUs of one server is routed over the NIC fabric like any other flow: the two GPUs are on different rails, so the route goes through both ASWs and a PSW.
+
+### SimAI ECMP
+
+```toml
+[routing]
+policy = "SimAiEcmp"
+```
+
+`SimAiEcmp` is SimAI's per-flow choice of spine, available on Spectrum-X only ("unsupported `routing.policy = \"SimAiEcmp\"` on a topology that is not the SpectrumX rail fabric"). The source ASW hashes the message's SimAI addresses and ports with Murmur3 (x86, 32-bit) over three little-endian words, `(ip(src), ip(dst), sport | 100 << 16)`, seeded with the ASW's SimAI node id, where `ip(i) = 0x0b000001 + (i / 256) * 0x10000 + (i % 256) * 0x100`. The data route is host, source ASW, PSW `h % psws`, target ASW, host. SimAI's next-hop list holds the PSWs in descending node id, measured from its printed routing tables on the 128-GPU and 1,024-GPU files, so entry `k` is PSW `psws - 1 - k`. The ACK or NACK path is hashed independently at the target ASW with the addresses and ports swapped; it is not the reverse of the data path. Two GPUs on one ASW (same rail and segment) use the two-link route both ways, with no hash.
+
+The source port of message `k` between one ordered host pair is `10000 + k`, wrapping at `2^16` as SimAI's counter does. Messages are numbered per ordered pair in canonical flow order: a collective's `issue_ordinal` first, then the key's content, so a workload that sets issue ordinals (the AICB adapter does) numbers its messages in SimAI's issue order. Routes and reverse routes are fixed at lowering; the executor sees ordinary per-flow routes. `tests/p16_rail_ecmp.rs` pins the hash against 56 golden vectors produced by SimAI's own code.
+
+### Example
+
+`configs/p16/rail_mini_roce.toml` is a miniature rail: 8 GPUs, 2 per server, 2 NICs per ASW (so 2 segments, 2 rails, 4 ASWs) and 2 PSWs, with a RoCE ring all-reduce over all 8 GPUs, SimAI ECMP, and the switch rows of SimAI's runs. Its same-server hops (0→1, 2→3, 4→5, 6→7) are stage notifies; the other four cross the fabric.
+
+```toml
+seed = 7
+duration = 0.01
+
+[topology]
+category = "SpectrumX"
+
+[topology.spectrum_x]
+gpus = 8
+gpus_per_server = 2
+nics_per_asw = 2
+psws = 2
+gpu_type = "H100"
+nic_rate_bps = 100000000000
+uplink_rate_bps = 400000000000
+nvlink_rate_bps = 2400000000000
+link_delay_ns = 500
+nvlink_delay_ns = 25
+
+[routing]
+policy = "SimAiEcmp"
+
+[switch]
+capacity = 3729
+discipline = "FIFO"
+drop = "ECN_THRESHOLD"
+ecn_by_rate = [
+    { rate_bps = 100000000000, threshold_packets = 112 },
+    { rate_bps = 400000000000, threshold_packets = 223 },
+]
+
+[link]
+mode = "Pfc"
+
+[link.pfc]
+host_links = true
+by_tier = [
+    { tier = "asw", xoff = [0, 0, 0, 4168818, 0, 0, 0, 0], xon = [0, 0, 0, 4165746, 0, 0, 0, 0] },
+    { tier = "psw", xoff = [0, 0, 0, 4154756, 0, 0, 0, 0], xon = [0, 0, 0, 4151684, 0, 0, 0, 0] },
+]
+headroom_by_rate = [
+    { rate_bps = 100000000000, bytes = 30574 },
+    { rate_bps = 400000000000, bytes = 75000 },
+]
+
+[[collective]]
+collective_type = "RingAllReduce"
+flow_type = "RoCE"
+priority = 3
+flow_count = 8
+sources = [0, 1, 2, 3, 4, 5, 6, 7]
+sinks = [1, 2, 3, 4, 5, 6, 7, 0]
+
+[collective.traffic]
+initial_delay = 0.0
+size = 640000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 9000, high = 9000 }
+
+[collective.traffic.dcqcn]
+max_rate_gbps = 100.0
+pacing_interval_ns = 720
+
+[collective.traffic.roce]
+retransmit_timeout_ns = 0
+feedback_priority = 3
+ack_size_bytes = 60
+window_bytes = 72500
+variable_window = true
+```
+
+```bash
+cargo run --release --bin days -- --engine scalar configs/p16/rail_mini_roce.toml
+```
+
+The Scalar run ends with `result_bytes=660814 result_fnv1a64=fa51f90e3bf8b4bf`. `window_bytes = 72500` is SimAI's `maxBdp` for a 128-GPU, 100 Gb/s fabric, which `ServerLocality::max_bdp_bytes` computes (236,000 B for the 1,024-GPU, 400 Gb/s one); the AICB adapter sets it from the topology.
+
 ## Propagation
 
 Uniform propagation works in legacy and exact execution:
@@ -82,16 +226,16 @@ edge_to_aggregation_ns = 2000
 aggregation_to_core_ns = 4000
 ```
 
-`propagation_ns` and `propagation_tiers` are mutually exclusive. Tiered propagation applies only to FatTree exact lowering; legacy rejects it. Legacy PFC also rejects `propagation_ns` because its PFC link pipeline has no propagation stage.
+`propagation_ns` and `propagation_tiers` are mutually exclusive. Tiered propagation applies only to FatTree exact lowering; legacy rejects it. Legacy PFC also rejects `propagation_ns` because its PFC link pipeline has no propagation stage. On Spectrum-X, both keys are refused: its delays are `link_delay_ns` and `nvlink_delay_ns`.
 
 ## Scenario-wide routing
 
 ```toml
 [routing]
-policy = "ShortestPath" # or "FatTreeEcmp"
+policy = "ShortestPath" # or "FatTreeEcmp", "SimAiEcmp"
 ```
 
-`ShortestPath` is the default. `FatTreeEcmp` selects a deterministic equal-cost FatTree route from semantic flow identity. It requires a FatTree and the deterministic traffic forms accepted by its lowering path.
+`ShortestPath` is the default. `FatTreeEcmp` selects a deterministic equal-cost FatTree route from semantic flow identity. It requires a FatTree and the deterministic traffic forms accepted by its lowering path. `SimAiEcmp` requires Spectrum-X; see [SimAI ECMP](#simai-ecmp).
 
 Do not combine root `[routing]` with per-flow `routing` or `path`, or with `flow_set.routing`. Legacy also rejects root routing when the scenario contains collectives. Exact collective lowering derives its own deterministic routes.
 
