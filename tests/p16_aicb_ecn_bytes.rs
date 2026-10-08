@@ -92,3 +92,87 @@ fn the_reduced_traces_mark_by_queue_bytes() {
         assert_byte_thresholds(name);
     }
 }
+
+/// `configs/p16/rail_mini_roce.toml` with `edit` applied, lowered from a scratch directory.
+fn rail_variant(name: &str, edit: impl Fn(String) -> String) -> Result<SimulationImage, String> {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("configs/p16/rail_mini_roce.toml");
+    let text = edit(std::fs::read_to_string(path).expect("read the rail fixture"));
+    let scratch =
+        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("ecn_bytes_{name}.toml"));
+    std::fs::write(&scratch, text).expect("write the variant");
+    days::scenario::compile_config(&scratch).map_err(|error| error.to_string())
+}
+
+fn in_bytes(text: String) -> String {
+    text.replace(
+        "capacity = 3729\n",
+        "capacity = 3729\necn_capacity_bytes = 33554432\n",
+    )
+    .replace("threshold_packets = 112", "threshold_bytes = 1000000")
+    .replace("threshold_packets = 223", "threshold_bytes = 2000000")
+}
+
+#[test]
+fn ecn_rows_in_bytes_lower_a_byte_policy_and_keep_the_packet_capacity() {
+    let image = rail_variant("bytes", in_bytes).unwrap_or_else(|error| panic!("{error}"));
+    for (rate, policy, _) in ecn_policies(&image) {
+        let threshold = if rate == 100 * G {
+            1_000_000
+        } else {
+            2_000_000
+        };
+        assert_eq!(policy, bytes(threshold), "{rate} b/s");
+    }
+    assert!(
+        image
+            .switch_states
+            .iter()
+            .flat_map(|state| &state.queues)
+            .all(|queue| queue.queue_capacity_packets == 3729)
+    );
+}
+
+#[test]
+fn ecn_rows_refuse_mixed_units_and_thresholds_beyond_the_byte_capacity() {
+    for (name, edit, expected) in [
+        (
+            "mixed",
+            Box::new(|text: String| {
+                in_bytes(text).replace("threshold_bytes = 2000000", "threshold_packets = 223")
+            }) as Box<dyn Fn(String) -> String>,
+            "rows are in bytes here",
+        ),
+        (
+            "packets_with_byte_capacity",
+            Box::new(|text: String| {
+                text.replace(
+                    "capacity = 3729\n",
+                    "capacity = 3729\necn_capacity_bytes = 33554432\n",
+                )
+            }),
+            "rows are in bytes here",
+        ),
+        (
+            "beyond",
+            Box::new(|text: String| {
+                in_bytes(text).replace("threshold_bytes = 2000000", "threshold_bytes = 40000000")
+            }),
+            "1..=33554432 bytes",
+        ),
+        (
+            "no_rows",
+            Box::new(|text: String| {
+                let mut text = in_bytes(text);
+                let start = text.find("ecn_by_rate = [").expect("rows");
+                let end = start + text[start..].find("]\n").expect("rows end") + 2;
+                text.replace_range(start..end, "ecn_threshold = 0.8\n");
+                text
+            }),
+            "`switch.ecn_capacity_bytes` needs `switch.ecn_by_rate` rows in bytes",
+        ),
+    ] {
+        let error = rail_variant(name, edit).expect_err(name);
+        assert!(error.contains(expected), "{name}: {error}");
+    }
+}

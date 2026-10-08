@@ -355,9 +355,13 @@ pub struct SimaiRoce {
 pub struct SimaiFabric {
     /// `PACKET_PAYLOAD_SIZE`: the constant packet size.
     pub mtu_bytes: u64,
-    /// `ceil(BUFFER_SIZE MiB / MTU)` packets per switch egress queue.
+    /// `ceil(BUFFER_SIZE MiB / MTU)` packets per switch egress queue: the queue's packet capacity,
+    /// which only the device planners read (as a sizing hint) under the ECN policy.
     pub queue_capacity_packets: u64,
-    /// ECN step threshold in packets per egress link rate, at the K-ramp midpoint.
+    /// `BUFFER_SIZE` in bytes: the byte capacity of each egress queue's ECN policy.
+    pub queue_capacity_bytes: u64,
+    /// ECN step threshold in bytes of queue per egress link rate, at the K-ramp midpoint (SimAI
+    /// and real switches count queue depth in bytes; P16 ecnbytes, user ruling Oct 8).
     pub ecn_by_rate: BTreeMap<u64, u64>,
     pub pfc_asw: PfcTier,
     pub pfc_psw: PfcTier,
@@ -510,8 +514,9 @@ pub fn derive_fabric(
     )?;
     let pfc_psw = tier(&[(shape.uplink_rate_bps, asws)], "PSW")?;
 
-    // ECN steps at the K-ramp midpoint (KMIN/KMAX in KB), one per egress link rate; SimAI asserts
-    // an entry for every port rate (`common.h:850-855`).
+    // ECN steps at the K-ramp midpoint (KMIN/KMAX in KB) in bytes of queue, one per egress link
+    // rate; SimAI asserts an entry for every port rate (`common.h:850-855`). Marking stays a step
+    // at enqueue (recorded divergence `ecn-step`: no ramp, no dequeue marking).
     let (kmin_line, kmin) = conf.rate_map("KMIN_MAP")?;
     let (kmax_line, kmax) = conf.rate_map("KMAX_MAP")?;
     let (pmax_line, pmax) = conf.rate_map("PMAX_MAP")?;
@@ -531,9 +536,17 @@ pub fn derive_fabric(
                 format!("SimAI.conf: KMIN {kmin} above KMAX {kmax} at {rate} b/s"),
             ));
         }
-        let midpoint = (u128::from(kmin) + u128::from(kmax)) * 500;
-        let threshold = u64::try_from(midpoint.div_ceil(u128::from(mtu)))
+        let threshold = u64::try_from((u128::from(kmin) + u128::from(kmax)) * 500)
             .map_err(|_| AicbError::new("SimAI.conf: an ECN threshold overflows"))?;
+        if threshold == 0 || threshold > buffer_bytes {
+            return Err(AicbError::at(
+                kmin_line,
+                format!(
+                    "SimAI.conf: the ECN threshold {threshold} B at {rate} b/s is outside \
+                     1..=BUFFER_SIZE ({buffer_bytes} B)"
+                ),
+            ));
+        }
         ecn_by_rate.insert(rate, threshold);
         let reverse = link_arrival_time_ns(0, 64, rate, shape.link_delay_ns)
             .map_err(|error| AicbError::new(format!("a pause frame's delay: {error}")))?;
@@ -586,6 +599,7 @@ pub fn derive_fabric(
     Ok(SimaiFabric {
         mtu_bytes: mtu,
         queue_capacity_packets: buffer_bytes.div_ceil(mtu),
+        queue_capacity_bytes: buffer_bytes,
         ecn_by_rate,
         pfc_asw,
         pfc_psw,

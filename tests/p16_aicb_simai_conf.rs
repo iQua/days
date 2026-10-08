@@ -81,7 +81,9 @@ fn the_1024g_fabric_equals_g1_and_h2() {
     let fabric = derive_fabric(&conf(&shipped()), &RAIL_1024G, 236_000).unwrap();
     assert_eq!(fabric.mtu_bytes, 9000);
     assert_eq!(fabric.queue_capacity_packets, 3729);
-    assert_eq!(fabric.ecn_by_rate, BTreeMap::from([(400 * G, 223)]));
+    assert_eq!(fabric.queue_capacity_bytes, 33_554_432);
+    // The K-ramp midpoint (KMIN 800 KB, KMAX 3,200 KB at 400 Gb/s) in bytes of queue.
+    assert_eq!(fabric.ecn_by_rate, BTreeMap::from([(400 * G, 2_000_000)]));
     assert_eq!(
         fabric.pfc_asw,
         PfcTier {
@@ -129,7 +131,7 @@ fn the_128g_fabric_equals_g1_and_h2() {
     let fabric = derive_fabric(&conf(&shipped()), &RAIL_128G, 72_500).unwrap();
     assert_eq!(
         fabric.ecn_by_rate,
-        BTreeMap::from([(100 * G, 112), (400 * G, 223)])
+        BTreeMap::from([(100 * G, 1_000_000), (400 * G, 2_000_000)])
     );
     assert_eq!(
         fabric.pfc_asw,
