@@ -146,9 +146,14 @@ struct SourceSwitch {
     discipline: Option<String>,
     drop: Option<String>,
     ecn_threshold: Option<ExactDecimal>,
-    /// P16 H2: an ECN step threshold per egress link rate, in packets (SimAI's ECN rows are keyed
-    /// by the port's rate); replaces `ecn_threshold` and needs `drop = "ECN_THRESHOLD"`.
+    /// P16 H2: an ECN step threshold per egress link rate (SimAI's ECN rows are keyed by the
+    /// port's rate); replaces `ecn_threshold` and needs `drop = "ECN_THRESHOLD"`. Every row is in
+    /// packets (`threshold_packets`, within `capacity`) or every row is in bytes
+    /// (`threshold_bytes`, within `ecn_capacity_bytes`; P16 ecnbytes).
     ecn_by_rate: Option<Vec<SourceEcnRow>>,
+    /// P16 ecnbytes: the byte capacity of a byte-unit ECN policy (`ecn_by_rate` rows in bytes).
+    /// `capacity` stays the queue's packet capacity.
+    ecn_capacity_bytes: Option<u64>,
     weights: Option<Vec<u64>>,
     priorities: Option<Vec<u64>>,
 }
@@ -157,7 +162,8 @@ struct SourceSwitch {
 #[serde(deny_unknown_fields)]
 struct SourceEcnRow {
     rate_bps: u64,
-    threshold_packets: u64,
+    threshold_packets: Option<u64>,
+    threshold_bytes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1328,10 +1334,14 @@ impl SupportedModel {
                 }
                 // Each egress LP takes its link rate's row at lowering; this policy only carries
                 // the shared capacity and unit.
+                let (unit, capacity) = match source.switch.ecn_capacity_bytes {
+                    None => (QueueDepthUnit::Packets, source.switch.capacity),
+                    Some(bytes) => (QueueDepthUnit::Bytes, bytes),
+                };
                 DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
-                    unit: QueueDepthUnit::Packets,
-                    capacity: source.switch.capacity,
-                    threshold: source.switch.capacity,
+                    unit,
+                    capacity,
+                    threshold: capacity,
                 })
             }
             "ECN_THRESHOLD" => {
@@ -1355,9 +1365,14 @@ impl SupportedModel {
             }
         };
 
-        let ecn_by_rate = match (&source.switch.ecn_by_rate, drop) {
+        if source.switch.ecn_capacity_bytes.is_some() && source.switch.ecn_by_rate.is_none() {
+            return Err(CompileError::Invalid(
+                "`switch.ecn_capacity_bytes` needs `switch.ecn_by_rate` rows in bytes".to_owned(),
+            ));
+        }
+        let ecn_by_rate = match (&source.switch.ecn_by_rate, drop_mark) {
             (None, _) => None,
-            (Some(rows), "ECN_THRESHOLD") => Some(ecn_rows(rows, source.switch.capacity)?),
+            (Some(rows), DropMarkPolicy::EcnThreshold(policy)) => Some(ecn_rows(rows, policy)?),
             (Some(_), _) => {
                 return Err(CompileError::Invalid(
                     "`switch.ecn_by_rate` needs `switch.drop = \"ECN_THRESHOLD\"`".to_owned(),
@@ -1636,19 +1651,35 @@ fn pfc_headroom_rows(rows: &[SourceHeadroomRow]) -> Result<BTreeMap<u64, u64>, C
     Ok(headroom)
 }
 
-/// `switch.ecn_by_rate`: one step threshold per distinct link rate, within the queue capacity.
-fn ecn_rows(rows: &[SourceEcnRow], capacity: u64) -> Result<BTreeMap<u64, u64>, CompileError> {
+/// `switch.ecn_by_rate`: one step threshold per distinct link rate, in the policy's unit (packets
+/// without `switch.ecn_capacity_bytes`, bytes with it), within the policy's capacity.
+fn ecn_rows(
+    rows: &[SourceEcnRow],
+    policy: EcnThresholdPolicy,
+) -> Result<BTreeMap<u64, u64>, CompileError> {
+    let (unit, key) = match policy.unit {
+        QueueDepthUnit::Packets => ("packets", "threshold_packets"),
+        QueueDepthUnit::Bytes => ("bytes", "threshold_bytes"),
+    };
+    let capacity = policy.capacity;
     let mut thresholds = BTreeMap::new();
     for row in rows {
+        let threshold = match (policy.unit, row.threshold_packets, row.threshold_bytes) {
+            (QueueDepthUnit::Packets, Some(threshold), None)
+            | (QueueDepthUnit::Bytes, None, Some(threshold)) => threshold,
+            _ => {
+                return Err(CompileError::Invalid(format!(
+                    "`switch.ecn_by_rate` rows are in {unit} here: each row needs `{key}` alone"
+                )));
+            }
+        };
         if row.rate_bps == 0
-            || row.threshold_packets == 0
-            || row.threshold_packets > capacity
-            || thresholds
-                .insert(row.rate_bps, row.threshold_packets)
-                .is_some()
+            || threshold == 0
+            || threshold > capacity
+            || thresholds.insert(row.rate_bps, threshold).is_some()
         {
             return Err(CompileError::Invalid(format!(
-                "`switch.ecn_by_rate` needs one threshold in 1..={capacity} packets per distinct \
+                "`switch.ecn_by_rate` needs one threshold in 1..={capacity} {unit} per distinct \
                  positive rate"
             )));
         }

@@ -33,16 +33,7 @@ const FNV1A64_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 /// Stock device capacity caps; `--channel-events-per-stream` overrides one lane.
-const CAPACITY_CAPS: DeviceCapacityCaps = DeviceCapacityCaps {
-    fallback_fel_events_per_lp: Some(16_384),
-    queue_packets_per_lp: Some(2_048),
-    channel_events_per_stream: Some(2_048),
-    remote_staging_events_per_lp: Some(2_048),
-    outbox_events_total: Some(2_000_000),
-    tcp_receiver_ranges_per_flow: Some(64),
-    tcp_ledger_segments_per_flow: Some(4_096),
-    observation_events_per_lp: Some(512),
-};
+const CAPACITY_CAPS: DeviceCapacityCaps = days::STOCK_CAPACITY_CAPS;
 
 const DEFAULT_MAX_CAPACITY_RETRIES: usize = 16;
 const DEFAULT_ROUND_THREADS_PER_BLOCK: usize = 256;
