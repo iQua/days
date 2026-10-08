@@ -69,13 +69,24 @@ pub fn unknown_key_table(content: &str, error: &toml::de::Error) -> Option<Strin
         .get(start..)?
         .find('\n')
         .map_or(content.len(), |offset| start + offset);
+    Some(table_up_to(content, end))
+}
+
+/// The table a value at byte `offset` of `content` sits in: `` `[header]` `` (the nearest table
+/// header above it), or `the root table`.
+pub fn table_at(content: &str, offset: usize) -> String {
+    table_up_to(content, offset)
+}
+
+fn table_up_to(content: &str, end: usize) -> String {
     let header = content
-        .get(..end)?
+        .get(..end)
+        .unwrap_or(content)
         .lines()
         .rev()
         .map(str::trim)
         .find(|line| is_header(line));
-    Some(header.map_or_else(|| "the root table".to_owned(), |line| format!("`{line}`")))
+    header.map_or_else(|| "the root table".to_owned(), |line| format!("`{line}`"))
 }
 
 /// Whether a trimmed line is a table header (`[a.b]` or `[[a]]`, a trailing comment allowed), not

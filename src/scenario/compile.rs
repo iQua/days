@@ -2878,6 +2878,11 @@ fn validate_traffic(
         termination,
         kind,
     })
+    .and_then(|key| {
+        check_distribution_keys(&traffic.arr_dist, "arr_dist", scenario_text)?;
+        check_distribution_keys(&traffic.pkt_size_dist, "pkt_size_dist", scenario_text)?;
+        Ok(key)
+    })
 }
 
 fn validate_cubic_profile(
@@ -2972,6 +2977,113 @@ fn source_distribution<'a>(
             "unsupported distribution type `{unsupported}`"
         ))),
     }
+}
+
+/// The fields of each distribution type and whether they are integers: those of
+/// [`super::DistributionInfo`], the shared strict schema (`distribution_fields_match_the_shared_schema`
+/// keeps the two equal). Only [`check_distribution_keys`]'s allocation-free fast path reads them.
+const DISTRIBUTION_FIELDS: [(&str, &[&str], bool); 3] = [
+    ("DiscreteUniform", &["low", "high"], true),
+    ("Exp", &["lambda"], false),
+    ("Uniform", &["low", "high"], false),
+];
+
+/// Whether `value`, a value of a document TOML already parsed, is a number the shared schema
+/// takes: a decimal integer, or (unless `integer`) any TOML float or integer. Hex, octal, and
+/// binary integers, and every non-number (string, table, array, boolean, date), say no and go
+/// to the schema.
+fn plain_number(value: &str, integer: bool) -> bool {
+    let unsigned = value.strip_prefix(['+', '-']).unwrap_or(value);
+    if integer {
+        return !unsigned.is_empty() && unsigned.bytes().all(|b| b.is_ascii_digit() || b == b'_');
+    }
+    if unsigned == "inf" || unsigned == "nan" {
+        return true;
+    }
+    let bytes = unsigned.as_bytes();
+    !bytes.is_empty()
+        && bytes[0].is_ascii_digit()
+        && bytes.iter().enumerate().all(|(index, &b)| match b {
+            b'0'..=b'9' | b'_' | b'.' | b'e' | b'E' => true,
+            b'+' | b'-' => matches!(bytes[index - 1], b'e' | b'E'),
+            _ => false,
+        })
+}
+
+/// Whether an inline distribution table's keys are exactly `type` and its type's fields, each
+/// once and each a plain number (a `key = value` list, as every scenario writes it): then the
+/// shared schema accepts it. Anything else goes to the schema, which also accepts what this scan
+/// cannot read.
+fn distribution_keys_are_exact(literal: &str) -> bool {
+    let Some(body) = literal
+        .trim()
+        .strip_prefix('{')
+        .and_then(|body| body.strip_suffix('}'))
+    else {
+        return false;
+    };
+    let entries = || {
+        body.split(',').map(|field| {
+            field
+                .split_once('=')
+                .map(|(key, value)| (key.trim(), value.trim()))
+        })
+    };
+    let Some(kind) = entries().find_map(|entry| {
+        entry
+            .filter(|(key, _)| *key == "type")
+            .and_then(|(_, value)| value.strip_prefix('"')?.strip_suffix('"'))
+    }) else {
+        return false;
+    };
+    let Some((_, fields, integer)) = DISTRIBUTION_FIELDS.iter().find(|(name, ..)| *name == kind)
+    else {
+        return false;
+    };
+    let mut count = 0;
+    for entry in entries() {
+        let Some((key, value)) = entry else {
+            return false;
+        };
+        if key != "type" && !(fields.contains(&key) && plain_number(value, *integer)) {
+            return false;
+        }
+        count += 1;
+    }
+    count == fields.len() + 1
+}
+
+/// Refuses a distribution table whose keys are not exactly its type's: the shared, strict schema
+/// (`DistributionInfo`, also legacy's) refuses an unknown key or one of another type, which
+/// [`source_distribution`] (reading only the keys a type needs) and the traffic kinds that ignore
+/// a distribution would drop (a2aset fix round 1, review M1). `name` is the table's key.
+fn check_distribution_keys(
+    distribution: &SourceDistributionInfo,
+    name: &str,
+    scenario_text: &str,
+) -> Result<(), CompileError> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Distribution {
+        #[allow(dead_code)]
+        distribution: super::DistributionInfo,
+    }
+    let literal = scenario_text
+        .get(distribution.span.clone())
+        .ok_or_else(|| {
+            CompileError::Invalid(
+                "distribution source span is outside the scenario text".to_owned(),
+            )
+        })?;
+    // The common case, checked without allocating: exactly `type` and its type's fields.
+    if distribution_keys_are_exact(literal) {
+        return Ok(());
+    }
+    toml::from_str::<Distribution>(&format!("distribution = {literal}")).map_err(|error| {
+        let table = crate::utils::serde_fields::table_at(scenario_text, distribution.span.start);
+        CompileError::Invalid(format!("{} in `{name}` (in {table})", error.message()))
+    })?;
+    Ok(())
 }
 
 fn exact_i64_literal(literal: &str, label: &str) -> Result<i64, CompileError> {
@@ -6378,6 +6490,86 @@ mod tests {
         assert_eq!(
             negative,
             "unsupported probe `1e-9223372036854775809`; exact representation requires an integer scaled value"
+        );
+    }
+
+    /// `DISTRIBUTION_FIELDS` (the allocation-free fast path's table) equals the shared strict
+    /// schema `DistributionInfo`: each type takes exactly its listed fields, refuses every other
+    /// type's, and the schema has no type the table lacks.
+    #[test]
+    fn distribution_fields_match_the_shared_schema() {
+        let parse = |table: &str| {
+            #[derive(serde::Deserialize)]
+            struct Probe {
+                #[allow(dead_code)]
+                distribution: crate::scenario::DistributionInfo,
+            }
+            toml::from_str::<Probe>(&format!("distribution = {table}"))
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        let every_field = super::DISTRIBUTION_FIELDS
+            .iter()
+            .flat_map(|(_, fields, _)| fields.iter().copied())
+            .collect::<std::collections::BTreeSet<_>>();
+        for (kind, fields, integer) in super::DISTRIBUTION_FIELDS {
+            // Values: the fast path says yes only where the schema does.
+            for value in [
+                "1",
+                "-2",
+                "+3",
+                "1_000",
+                "1.5",
+                "-0.25",
+                "1e3",
+                "2.5E-3",
+                "inf",
+                "-nan",
+                "0x10",
+                "0o7",
+                "true",
+                "\"1\"",
+                "[1]",
+                "{ a = 1 }",
+                "1979-05-27",
+                "07:32:00",
+            ] {
+                let table = fields
+                    .iter()
+                    .map(|field| format!(", {field} = {value}"))
+                    .collect::<String>();
+                let table = format!("{{ type = \"{kind}\"{table} }}");
+                if super::distribution_keys_are_exact(&table) {
+                    parse(&table).unwrap_or_else(|error| panic!("{table}: {error}"));
+                }
+                assert_eq!(
+                    super::plain_number(value, integer),
+                    super::distribution_keys_are_exact(&table),
+                    "{table}"
+                );
+            }
+            let own = fields
+                .iter()
+                .map(|field| format!(", {field} = 1"))
+                .collect::<String>();
+            parse(&format!("{{ type = \"{kind}\"{own} }}"))
+                .unwrap_or_else(|error| panic!("{kind} takes {fields:?}: {error}"));
+            assert!(super::distribution_keys_are_exact(&format!(
+                "{{ type = \"{kind}\"{own} }}"
+            )));
+            for other in every_field.iter().filter(|field| !fields.contains(field)) {
+                let table = format!("{{ type = \"{kind}\"{own}, {other} = 1 }}");
+                assert!(parse(&table).is_err(), "{kind} refuses {other}");
+                assert!(!super::distribution_keys_are_exact(&table));
+            }
+        }
+        let unknown = parse("{ type = \"Unknown\" }").expect_err("an unknown type");
+        for (kind, ..) in super::DISTRIBUTION_FIELDS {
+            assert!(unknown.contains(&format!("`{kind}`")), "{unknown}");
+        }
+        assert_eq!(
+            unknown.matches('`').count(),
+            2 * (super::DISTRIBUTION_FIELDS.len() + 1)
         );
     }
 }
