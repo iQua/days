@@ -243,7 +243,7 @@ jobs:
           }
           scaling -p days --features test --test host_scaling_budget -- \
             ci_scaling_frontier_host_phases ci_scaling_topology_host_phases \
-            ci_scaling_collective_stage_validation
+            ci_scaling_collective_stage_validation ci_scaling_aicb_pfc_validation
 
   metal-check:
     runs-on: macos-15

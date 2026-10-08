@@ -301,6 +301,8 @@ pub struct Plan {
     /// message is issued once a data op can be in flight (design note §0.1 item 5).
     pub ecmp_ordinals_exact: bool,
     pub counters: PlanCounters,
+    /// Bytes of each pipeline transfer (`pp_comm`; 0 without pipeline stages).
+    pub pipeline_bytes: u64,
 }
 
 /// Whether SimAI would never raise "sent" for a message of `bytes` (design note §3.6).
@@ -579,6 +581,11 @@ pub fn plan_schedule(
         start_order,
         ecmp_ordinals_exact,
         counters,
+        pipeline_bytes: if groups.stages > 1 {
+            trace.header.pp_comm_bytes
+        } else {
+            0
+        },
     })
 }
 

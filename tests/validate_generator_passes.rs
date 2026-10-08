@@ -6,6 +6,12 @@
 //! RESUME-scan gate (5 hosts, 8k stage queue pairs per host) it was most of the validation
 //! instructions, and at the flagship's queue-pair counts it would not finish. The counter
 //! (`planner-test-hooks`) counts calls of the per-host generator iterator.
+//!
+//! P16 H3 part 2B: the same holds for the checks that look up one flow's generator at its source
+//! host (each RoCE pacing-timer token, each CNP, feedback and RoCE packet, each flow whose
+//! feedback class differs from its data class). A scan of the host's table per lookup cost
+//! queue pairs squared per host: at the flagship (about 14,000 queue pairs per host) validation
+//! did not finish the lowering in 8 minutes.
 #![cfg(feature = "test")]
 
 use std::path::PathBuf;
@@ -81,5 +87,8 @@ fn validation_passes_over_each_host_generator_table_a_fixed_number_of_times() {
     );
 }
 
-/// Validation's passes over one host's generator table.
-const PASSES_PER_HOST: usize = 53;
+/// Validation's passes over one host's generator table. It was 53 until P16 H3 part 2B, when the
+/// PFC headroom check began bounding every controlled link's frames in one pass instead of one
+/// pass per PFC ingress monitor (19), and validate_flows began checking each host's table order
+/// once (20).
+const PASSES_PER_HOST: usize = 20;

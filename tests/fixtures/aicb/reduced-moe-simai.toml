@@ -1,0 +1,34 @@
+# P16 H3: the reduced MoE AICB trace (32 GPUs, TP2, EP8, 16 experts, top-2; tooling
+# days-gpu evidence/P16/aicb-impl/tooling/gen_reduced_traces.sh) on a 32-GPU rail of two
+# segments (16 ASWs, 4 PSWs), SimAI fidelity: the all-to-alls, the mixed DP rings and the
+# DP_EP rings cross the spine.
+seed = 7
+duration = 0.01
+
+[topology]
+category = "SpectrumX"
+
+[topology.spectrum_x]
+gpus = 32
+gpus_per_server = 8
+nics_per_asw = 2
+psws = 4
+gpu_type = "A100"
+nic_rate_bps = 100000000000
+uplink_rate_bps = 400000000000
+nvlink_rate_bps = 2400000000000
+link_delay_ns = 500
+nvlink_delay_ns = 25
+
+[workload.aicb]
+trace = "reduced-moe-w32-tp2-ep8.txt"
+trace_sha256 = "af3236ebcfffa1003747385a40aef9c7df03fae94f9d29fb2ab8aefd4498047b"
+fidelity = "simai"
+expert_routing = "uniform"
+
+[workload.aicb.simai]
+conf = "SimAI.conf"
+conf_sha256 = "1fe56bee9c2a0e0f27fdbe816c2c51c9254b5d5a6c5e05adaac347a758e77fcf"
+send_lat_us = 3
+nvls_enable = true
+pxn_enable = false

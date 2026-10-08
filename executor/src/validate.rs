@@ -903,6 +903,9 @@ fn validate_links(image: &SimulationImage) -> Result<(), ValidationError> {
 }
 
 fn validate_flows(image: &SimulationImage, flow_index: &FlowIndex) -> Result<(), ValidationError> {
+    // Whether each host's generator table is strictly ascending by flow, checked once per host
+    // at its first lookup (P16 H3 part 2B).
+    let mut ascending = BTreeMap::<u32, bool>::new();
     for flow in &image.flows {
         if flow.priority > 7 {
             return Err(ValidationError::new(format!(
@@ -921,15 +924,29 @@ fn validate_flows(image: &SimulationImage, flow_index: &FlowIndex) -> Result<(),
         if flow.feedback_priority != flow.priority
             && !node(image, flow.source)
                 .filter(|source| source.kind == NodeKind::Host)
-                .and_then(|source| image.host_states.get(source.state_slot as usize))
-                .is_some_and(|state| {
-                    state.generators.iter().any(|generator| {
-                        generator.flow == flow.id
-                            && matches!(
-                                generator.kind,
-                                FlowGeneratorKind::Dcqcn(_) | FlowGeneratorKind::Roce(_)
-                            )
-                    })
+                .and_then(|source| {
+                    image
+                        .host_states
+                        .get(source.state_slot as usize)
+                        .map(|state| (source.state_slot, state))
+                })
+                .is_some_and(|(slot, state)| {
+                    let feedback_transport = |generator: &crate::FlowGeneratorState| {
+                        matches!(
+                            generator.kind,
+                            FlowGeneratorKind::Dcqcn(_) | FlowGeneratorKind::Roce(_)
+                        )
+                    };
+                    if *ascending
+                        .entry(slot)
+                        .or_insert_with(|| generators_ascend(state))
+                    {
+                        ascending_generator(state, flow.id).is_some_and(feedback_transport)
+                    } else {
+                        scan_generators(state).any(|generator| {
+                            generator.flow == flow.id && feedback_transport(generator)
+                        })
+                    }
                 })
         {
             return Err(ValidationError::new(format!(
@@ -1091,11 +1108,21 @@ fn physical_location(image: &SimulationImage, id: NodeId) -> PhysicalLocation {
     }
 }
 
+/// The largest frame each priority can still put on each of `links`, for the PFC headroom
+/// check: from the resident packets that can still cross the link and the generators whose
+/// route (data) or reverse route (feedback) holds it.
+///
+/// One pass over the image's packets and generators serves every controlled link: a rail
+/// switch monitors each ingress link at every egress queue, so a pass per monitor would cost
+/// O(monitors x flows) (P16 H3 part 2B).
 fn derived_pfc_max_frame_bytes(
     image: &SimulationImage,
-    controlled_link: LinkId,
-) -> Result<[u64; 8], ValidationError> {
-    let mut maximum = [0_u64; 8];
+    links: &BTreeSet<LinkId>,
+) -> Result<BTreeMap<LinkId, [u64; 8]>, ValidationError> {
+    let mut maxima = links
+        .iter()
+        .map(|&link| (link, [0_u64; 8]))
+        .collect::<BTreeMap<_, _>>();
     let resident_packets = executable_resident_packets(image);
     let live_dcqcn_cnp_flows = resident_packets
         .iter()
@@ -1104,11 +1131,18 @@ fn derived_pfc_max_frame_bytes(
         .collect::<BTreeSet<_>>();
     for packet in resident_packets {
         let flow = flow(image, packet.flow).expect("packet validation established the flow");
-        if packet_route(flow, packet.kind).contains(&controlled_link)
-            && packet_can_still_cross_link(image, packet, controlled_link)
-        {
-            let priority = usize::from(flow.packet_priority(packet.kind));
-            maximum[priority] = maximum[priority].max(packet.size_bytes);
+        let route = packet_route(flow, packet.kind);
+        for (index, &link) in route.iter().enumerate() {
+            if route[..index].contains(&link) {
+                continue;
+            }
+            let Some(maximum) = maxima.get_mut(&link) else {
+                continue;
+            };
+            if packet_can_still_cross_link(image, packet, link) {
+                let priority = usize::from(flow.packet_priority(packet.kind));
+                maximum[priority] = maximum[priority].max(packet.size_bytes);
+            }
         }
     }
     for generator in image.host_states.iter().flat_map(staged_generators) {
@@ -1116,7 +1150,7 @@ fn derived_pfc_max_frame_bytes(
         let flow = flow(image, generator.flow).expect("generator validation established the flow");
         let priority = usize::from(flow.priority);
         let feedback_priority = usize::from(flow.feedback_priority);
-        if executable && flow.route.contains(&controlled_link) {
+        if executable {
             let size = match generator.kind {
                 FlowGeneratorKind::Constant(constant) => constant.packet_size_bytes,
                 FlowGeneratorKind::Tcp(tcp) => tcp.mss_bytes,
@@ -1129,38 +1163,45 @@ fn derived_pfc_max_frame_bytes(
                     .min(dcqcn.rate.total_bytes - generator.bytes_emitted),
                 FlowGeneratorKind::Roce(roce) => roce_future_data_max_bytes(roce),
             };
-            maximum[priority] = maximum[priority].max(size);
+            for (index, link) in flow.route.iter().enumerate() {
+                if flow.route[..index].contains(link) {
+                    continue;
+                }
+                if let Some(maximum) = maxima.get_mut(link) {
+                    maximum[priority] = maximum[priority].max(size);
+                }
+            }
         }
-        if flow.reverse_route.contains(&controlled_link) {
-            match generator.kind {
-                FlowGeneratorKind::Tcp(tcp) => {
-                    if executable || tcp.bytes_in_flight != 0 {
-                        maximum[feedback_priority] =
-                            maximum[feedback_priority].max(tcp.ack_size_bytes);
-                    }
+        let feedback = match generator.kind {
+            FlowGeneratorKind::Tcp(tcp) => {
+                (executable || tcp.bytes_in_flight != 0).then_some(tcp.ack_size_bytes)
+            }
+            FlowGeneratorKind::Dcqcn(dcqcn) => (executable
+                || live_dcqcn_cnp_flows.contains(&flow.id))
+            .then_some(dcqcn.cnp_size_bytes),
+            // Every data arrival at the receiver can answer with an ACK or NACK and a CNP, so
+            // feedback is live while data can still be sent or is in flight.
+            FlowGeneratorKind::Roce(roce) => (executable || roce.snd_una < generator.bytes_emitted)
+                .then(|| roce_feedback_max_bytes(image, flow)),
+            FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => None,
+        };
+        if let Some(size) = feedback {
+            for (index, link) in flow.reverse_route.iter().enumerate() {
+                if flow.reverse_route[..index].contains(link) {
+                    continue;
                 }
-                FlowGeneratorKind::Dcqcn(dcqcn) => {
-                    if executable || live_dcqcn_cnp_flows.contains(&flow.id) {
-                        maximum[feedback_priority] =
-                            maximum[feedback_priority].max(dcqcn.cnp_size_bytes);
-                    }
+                if let Some(maximum) = maxima.get_mut(link) {
+                    maximum[feedback_priority] = maximum[feedback_priority].max(size);
                 }
-                FlowGeneratorKind::Roce(roce) => {
-                    // Every data arrival at the receiver can answer with an ACK or NACK and a
-                    // CNP, so feedback is live while data can still be sent or is in flight.
-                    if executable || roce.snd_una < generator.bytes_emitted {
-                        maximum[feedback_priority] =
-                            maximum[feedback_priority].max(roce_feedback_max_bytes(image, flow));
-                    }
-                }
-                FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => {}
             }
         }
     }
-    Ok(maximum)
+    Ok(maxima)
 }
 
 fn validate_pfc(image: &SimulationImage) -> Result<BTreeSet<usize>, ValidationError> {
+    // Each controlled link's frame bound, computed for every link at the first monitor.
+    let mut frame_bounds: Option<BTreeMap<LinkId, [u64; 8]>> = None;
     let mut control_lanes = BTreeSet::new();
     let mut controller_monitors = BTreeSet::<(LinkId, NodeId)>::new();
     let mut controlled_priorities = BTreeSet::<(LinkId, u8)>::new();
@@ -1269,7 +1310,23 @@ fn validate_pfc(image: &SimulationImage) -> Result<BTreeSet<usize>, ValidationEr
                         channel.min_delay_ns
                     )));
                 }
-                let reachable_frame_bytes = derived_pfc_max_frame_bytes(image, controlled.id)?;
+                if frame_bounds.is_none() {
+                    // Every controlled link, bounded in one pass at the first monitor.
+                    let controlled_links = image
+                        .switch_states
+                        .iter()
+                        .flat_map(|state| &state.queues)
+                        .filter_map(|queue| queue.pfc.as_ref())
+                        .flat_map(|pfc| &pfc.ingresses)
+                        .map(|ingress| ingress.controlled_link)
+                        .collect::<BTreeSet<_>>();
+                    frame_bounds = Some(derived_pfc_max_frame_bytes(image, &controlled_links)?);
+                }
+                let reachable_frame_bytes = frame_bounds
+                    .as_ref()
+                    .and_then(|bounds| bounds.get(&controlled.id))
+                    .copied()
+                    .expect("every controlled link has a frame bound");
 
                 let line_bytes = pfc_line_rate_bytes(
                     controlled.rate_bps,
@@ -1855,12 +1912,7 @@ fn validate_roce_packets(image: &SimulationImage) -> Result<(), ValidationError>
         let (generator, roce) = image
             .host_states
             .get(source.state_slot as usize)
-            .and_then(|state| {
-                state
-                    .generators
-                    .iter()
-                    .find(|generator| generator.flow == flow.id)
-            })
+            .and_then(|state| ascending_generator(state, flow.id))
             .and_then(|generator| match generator.kind {
                 FlowGeneratorKind::Roce(roce) => Some((generator, roce)),
                 _ => None,
@@ -3443,6 +3495,43 @@ pub fn take_generator_passes_for_testing() -> usize {
     GENERATOR_PASSES.take()
 }
 
+/// `state`'s generators, scanned for one flow's generator: a pass over the host's generator
+/// table, counted with [`staged_generators`]'s passes. Only `validate_flows` scans, and only on
+/// a table that is not strictly ascending by flow, which `validate_generators` then rejects.
+fn scan_generators(state: &crate::HostState) -> std::slice::Iter<'_, crate::FlowGeneratorState> {
+    #[cfg(feature = "planner-test-hooks")]
+    GENERATOR_PASSES.set(GENERATOR_PASSES.get() + 1);
+    state.generators.iter()
+}
+
+/// Whether `state`'s generator table is strictly ascending by flow: a pass over the table, counted
+/// with [`staged_generators`]'s passes.
+fn generators_ascend(state: &crate::HostState) -> bool {
+    #[cfg(feature = "planner-test-hooks")]
+    GENERATOR_PASSES.set(GENERATOR_PASSES.get() + 1);
+    state
+        .generators
+        .windows(2)
+        .all(|pair| pair[0].flow < pair[1].flow)
+}
+
+/// The generator of `flow` in `state`'s table, by binary search, for a table strictly ascending
+/// by flow: there a scan for the flow finds this generator or none (P16 H3 part 2B: a scan per
+/// lookup cost queue pairs squared per host). Every check after `validate_generators`, which
+/// requires the order, looks up this way.
+fn ascending_generator(
+    state: &crate::HostState,
+    flow: crate::FlowId,
+) -> Option<&crate::FlowGeneratorState> {
+    let index = state
+        .generators
+        .partition_point(|generator| generator.flow < flow);
+    state
+        .generators
+        .get(index)
+        .filter(|generator| generator.flow == flow)
+}
+
 /// The transport of a flow's generator, as `validate_generators` records it per flow.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GeneratorTransport {
@@ -4427,18 +4516,14 @@ fn validate_packets_and_derive_delays(
         if packet.kind.is_timer_token() {
             let source =
                 node(image, flow.source).expect("flow validation established the source node");
-            let owns_token = image.host_states[source.state_slot as usize]
-                .generators
-                .iter()
-                .any(|generator| {
-                    generator.flow == flow.id
-                        && match (packet.kind, generator.kind) {
-                            (PacketKind::RocePacingTimer, FlowGeneratorKind::Roce(roce)) => {
-                                roce.pacing_timer_payload == packet.id
-                            }
-                            _ => false,
+            let owns_token =
+                ascending_generator(&image.host_states[source.state_slot as usize], flow.id)
+                    .is_some_and(|generator| match (packet.kind, generator.kind) {
+                        (PacketKind::RocePacingTimer, FlowGeneratorKind::Roce(roce)) => {
+                            roce.pacing_timer_payload == packet.id
                         }
-                });
+                        _ => false,
+                    });
             if packet.size_bytes != 0 || !owns_token {
                 return Err(ValidationError::new(format!(
                     "timer token {:?} must be zero-byte NotECT state owned by its queue pair",
@@ -4450,13 +4535,9 @@ fn validate_packets_and_derive_delays(
         if matches!(packet.kind, PacketKind::DcqcnCnp(_)) {
             let source =
                 node(image, flow.source).expect("flow validation established the source node");
-            let is_dcqcn = image.host_states[source.state_slot as usize]
-                .generators
-                .iter()
-                .any(|generator| {
-                    generator.flow == flow.id
-                        && matches!(generator.kind, FlowGeneratorKind::Dcqcn(_))
-                });
+            let is_dcqcn =
+                ascending_generator(&image.host_states[source.state_slot as usize], flow.id)
+                    .is_some_and(|generator| matches!(generator.kind, FlowGeneratorKind::Dcqcn(_)));
             // A queue pair echoes ECN on its ACKs and never sends a CNP (P16 ruling D4).
             if packet.size_bytes != 64 || !is_dcqcn {
                 return Err(ValidationError::new(format!(
@@ -4484,11 +4565,7 @@ fn validate_packets_and_derive_delays(
             let source =
                 node(image, flow.source).expect("flow validation established the source node");
             let state = &image.host_states[source.state_slot as usize];
-            if !state
-                .generators
-                .iter()
-                .any(|generator| generator.flow == flow.id)
-            {
+            if ascending_generator(state, flow.id).is_none() {
                 return Err(ValidationError::new(format!(
                     "feedback packet {:?} for flow {:?} has no generator at source node {:?}",
                     packet.id, flow.id, flow.source
@@ -5096,12 +5173,8 @@ fn dcqcn_data_can_still_emit_cnp(
     let Some(source) = node(image, flow.source) else {
         return false;
     };
-    if !image.host_states[source.state_slot as usize]
-        .generators
-        .iter()
-        .any(|generator| {
-            generator.flow == flow.id && matches!(generator.kind, FlowGeneratorKind::Dcqcn(_))
-        })
+    if !ascending_generator(&image.host_states[source.state_slot as usize], flow.id)
+        .is_some_and(|generator| matches!(generator.kind, FlowGeneratorKind::Dcqcn(_)))
     {
         return false;
     }
@@ -6968,16 +7041,41 @@ struct FutureWork {
     pfc_by_channel: Vec<u64>,
 }
 
-fn route_enters_pfc_controller(
+/// The flows whose route (data) or reverse route (feedback) enters each PFC controller through
+/// its controlled link, by monitor `(controlled link, controller)`, each list in flow order: one
+/// pass over the routes instead of one pass over every flow per monitor (P16 H3 part 2B).
+fn pfc_entering_flows(
     image: &SimulationImage,
-    route: &[LinkId],
-    controlled_link: LinkId,
-    controller: NodeId,
-) -> bool {
-    route.windows(2).any(|pair| {
-        pair[0] == controlled_link
-            && link(image, pair[1]).is_some_and(|next| next.source == controller)
-    })
+) -> BTreeMap<(LinkId, NodeId), (Vec<usize>, Vec<usize>)> {
+    let mut entering = image
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::Switch)
+        .flat_map(|owner| {
+            image.switch_states[owner.state_slot as usize]
+                .queues
+                .iter()
+                .filter_map(|queue| queue.pfc.as_ref())
+                .flat_map(|pfc| &pfc.ingresses)
+                .map(move |ingress| ((ingress.controlled_link, owner.id), Default::default()))
+        })
+        .collect::<BTreeMap<_, (Vec<usize>, Vec<usize>)>>();
+    for (index, flow) in image.flows.iter().enumerate() {
+        for (route, data) in [(&flow.route, true), (&flow.reverse_route, false)] {
+            for pair in route.windows(2) {
+                let Some(lists) =
+                    link(image, pair[1]).and_then(|next| entering.get_mut(&(pair[0], next.source)))
+                else {
+                    continue;
+                };
+                let list = if data { &mut lists.0 } else { &mut lists.1 };
+                if list.last() != Some(&index) {
+                    list.push(index);
+                }
+            }
+        }
+    }
+    entering
 }
 
 fn future_work(
@@ -7043,6 +7141,8 @@ fn future_work(
     // Grouped after the counting loop above so that a resident whose flow is outside the dense
     // table still reaches that loop's direct index first, exactly as before.
     let resident_groups = ResidentFlowGroups::build(image, &resident_packets);
+    // Built at the first PFC monitor, so an image without one never builds it.
+    let mut entering = None;
     let mut pfc_by_node = vec![0_u64; image.nodes.len()];
     let mut pfc_by_channel = vec![0_u64; image.channels.len()];
     for owner in image
@@ -7062,60 +7162,61 @@ fn future_work(
             })
         {
             let mut controller_frames = 0_u64;
-            for flow in &image.flows {
-                // Data is monitored in the flow's class, receiver feedback in its feedback class.
-                let data_monitored = ingress.xoff_threshold_bytes[usize::from(flow.priority)] != 0;
-                let feedback_monitored =
-                    ingress.xoff_threshold_bytes[usize::from(flow.feedback_priority)] != 0;
-                if !data_monitored && !feedback_monitored {
-                    continue;
-                }
+            let (data_flows, feedback_flows) = entering
+                .get_or_insert_with(|| pfc_entering_flows(image))
+                .get(&(ingress.controlled_link, owner.id))
+                .map_or((&[][..], &[][..]), |(data, feedback)| {
+                    (data.as_slice(), feedback.as_slice())
+                });
+            // The packets of one flow and kind that can still enter the controller.
+            let reachable = |flow: &FlowDescriptor, data: bool| -> Result<u64, ValidationError> {
+                let past_resident = u64::try_from(
+                    resident_groups
+                        .group(image, &resident_packets, flow.id)
+                        .filter(|packet| {
+                            if data {
+                                packet.kind.is_data()
+                            } else {
+                                packet.kind.is_feedback()
+                            }
+                        })
+                        .filter(|packet| {
+                            !packet_can_still_cross_link(image, packet, ingress.controlled_link)
+                        })
+                        .count(),
+                )
+                .map_err(|_| ValidationError::new("PFC resident packet count exceeds u64"))?;
+                let total = if data {
+                    data_by_flow[flow.id.0 as usize]
+                } else {
+                    feedback_by_flow[flow.id.0 as usize]
+                };
+                Ok(total.checked_sub(past_resident).expect(
+                    "resident data and feedback counts are included in the per-flow totals",
+                ))
+            };
+            // Flow by flow, as the union of the two lists (both in flow order), so the counters
+            // see the same additions in the same order as a pass over every flow would.
+            let mut data_flows = data_flows.iter().copied().peekable();
+            let mut feedback_flows = feedback_flows.iter().copied().peekable();
+            while let Some(index) = match (data_flows.peek(), feedback_flows.peek()) {
+                (Some(&data), Some(&feedback)) => Some(data.min(feedback)),
+                (Some(&data), None) => Some(data),
+                (None, Some(&feedback)) => Some(feedback),
+                (None, None) => None,
+            } {
+                let flow = &image.flows[index];
                 let mut monitored_packets = 0_u64;
-                if data_monitored
-                    && route_enters_pfc_controller(
-                        image,
-                        &flow.route,
-                        ingress.controlled_link,
-                        owner.id,
-                    )
+                // Data is monitored in the flow's class, receiver feedback in its feedback class.
+                if data_flows.next_if_eq(&index).is_some()
+                    && ingress.xoff_threshold_bytes[usize::from(flow.priority)] != 0
                 {
-                    let past_resident = u64::try_from(
-                        resident_groups
-                            .group(image, &resident_packets, flow.id)
-                            .filter(|packet| packet.kind.is_data())
-                            .filter(|packet| {
-                                !packet_can_still_cross_link(image, packet, ingress.controlled_link)
-                            })
-                            .count(),
-                    )
-                    .map_err(|_| ValidationError::new("PFC resident packet count exceeds u64"))?;
-                    let reachable = data_by_flow[flow.id.0 as usize]
-                        .checked_sub(past_resident)
-                        .expect("resident data count is included in the per-flow total");
-                    add_packet_count(&mut monitored_packets, reachable)?;
+                    add_packet_count(&mut monitored_packets, reachable(flow, true)?)?;
                 }
-                if feedback_monitored
-                    && route_enters_pfc_controller(
-                        image,
-                        &flow.reverse_route,
-                        ingress.controlled_link,
-                        owner.id,
-                    )
+                if feedback_flows.next_if_eq(&index).is_some()
+                    && ingress.xoff_threshold_bytes[usize::from(flow.feedback_priority)] != 0
                 {
-                    let past_resident = u64::try_from(
-                        resident_groups
-                            .group(image, &resident_packets, flow.id)
-                            .filter(|packet| packet.kind.is_feedback())
-                            .filter(|packet| {
-                                !packet_can_still_cross_link(image, packet, ingress.controlled_link)
-                            })
-                            .count(),
-                    )
-                    .map_err(|_| ValidationError::new("PFC resident packet count exceeds u64"))?;
-                    let reachable = feedback_by_flow[flow.id.0 as usize]
-                        .checked_sub(past_resident)
-                        .expect("resident feedback count is included in the per-flow total");
-                    add_packet_count(&mut monitored_packets, reachable)?;
+                    add_packet_count(&mut monitored_packets, reachable(flow, false)?)?;
                 }
                 let frames = monitored_packets
                     .checked_mul(2)

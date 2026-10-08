@@ -47,12 +47,19 @@
 //! Scalar stage validation and lowering of one ring all-reduce at 96 and 192 ranks (see
 //! [`ci_scaling_collective_stage_validation`]).
 //!
+//! # AICB PFC case
+//!
+//! Lowering and Scalar validation of the reduced MoE AICB trace at 32 and 256 GPUs, on rails
+//! whose switches monitor PFC per ingress link and egress queue (see
+//! [`ci_scaling_aicb_pfc_validation`]).
+//!
 //! # Running
 //!
 //! Every timing case is `#[ignore]`d, so the default debug matrix runs only the derivation check.
 //! The CI-sized cases run in the `scaling` CI job:
 //! `cargo test --release -p days --features test --test host_scaling_budget -- --ignored --exact
-//! --test-threads=1 --nocapture ci_scaling_frontier_host_phases ci_scaling_collective_stage_validation`
+//! --test-threads=1 --nocapture ci_scaling_frontier_host_phases ci_scaling_topology_host_phases
+//! ci_scaling_collective_stage_validation ci_scaling_aicb_pfc_validation`
 //! On Apple hardware, `--features test,metal` and `frontier_metal_plan_at_ci_sizes` time the Metal
 //! plan at the CI sizes. The full frontier case is an explicit run only:
 //! `cargo test --release -p days --features test,metal --test host_scaling_budget -- --ignored
@@ -86,6 +93,11 @@ const EIGHTFOLD_STEP_MAX_RATIO_MILLI: u128 = 22_600;
 /// Geometric midpoint of the linear (4x) and quadratic (16x) ratios for a 4x size step, in
 /// thousandths.
 const FOURFOLD_STEP_MAX_RATIO_MILLI: u128 = 8_000;
+
+/// The AICB PFC case's bound, in thousandths: the geometric midpoint of its linear ratio (37.5x,
+/// the flows: 4,128 to 154,880) and its monitors-by-flows ratio (330x: the PFC ingress monitors
+/// grow 667 to 5,888, 8.8x).
+const AICB_STEP_MAX_RATIO_MILLI: u128 = 111_000;
 
 /// A phase effectively free at the small size must not divide by noise.
 const RATIO_FLOOR: Duration = Duration::from_millis(1);
@@ -172,6 +184,18 @@ const TOPOLOGY_PHASES: [(Phase, bool); 3] = [
     (Phase::DefaultSizing, true),
 ];
 
+/// The AICB PFC case: the reduced MoE trace at 32 and 256 GPUs (see
+/// [`ci_scaling_aicb_pfc_validation`]).
+const CI_AICB: Case = Case {
+    name: "aicb_pfc_ci",
+    unit: "gpus",
+    small: 32,
+    large: 256,
+    small_repetitions: 5,
+    large_repetitions: 2,
+    max_ratio_milli: AICB_STEP_MAX_RATIO_MILLI,
+};
+
 /// A lowered scenario and the config it came from.
 struct Scenario {
     path: PathBuf,
@@ -213,6 +237,23 @@ impl Scenario {
             "k={k}: flow count"
         );
         scenario
+    }
+
+    /// An AICB fixture, lowered in place (its trace and SimAI.conf are relative to it).
+    fn aicb(fixture: &str, flows: usize, monitors: usize) -> Self {
+        let path = repo_path(&format!("tests/fixtures/aicb/{fixture}"));
+        let image =
+            compile_config(&path).unwrap_or_else(|error| panic!("lower {fixture}: {error}"));
+        assert_eq!(image.flows.len(), flows, "{fixture}: flow count");
+        let pfc_monitors: usize = image
+            .switch_states
+            .iter()
+            .flat_map(|state| &state.queues)
+            .filter_map(|queue| queue.pfc.as_ref())
+            .map(|pfc| pfc.ingresses.len())
+            .sum();
+        assert_eq!(pfc_monitors, monitors, "{fixture}: PFC ingress monitors");
+        Self { path, image }
     }
 
     fn ring_all_reduce(ranks: usize) -> Self {
@@ -675,6 +716,27 @@ fn ci_scaling_collective_stage_validation() {
     let case = &CI_COLLECTIVE;
     let small = Scenario::ring_all_reduce(case.small);
     let large = Scenario::ring_all_reduce(case.large);
+    let mut failures = Vec::new();
+    for phase in [(Phase::Lowering, true), (Phase::ScalarValidation, true)] {
+        gate(case, phase, &small, &large, &mut failures);
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Lowering (which validates) and Scalar validation of the reduced MoE AICB trace at 32 and 256
+/// GPUs: 4,128 and 154,880 flows (37.5x), 667 and 5,888 PFC ingress monitors (8.8x). A rail switch
+/// monitors each ingress link at every egress queue, so its monitors grow with the square of its
+/// ports. The PFC headroom check bounds the frame each monitor's controlled link can still carry,
+/// and the future-work check asks which flows enter each monitor: a pass over the image's packets
+/// and generators per monitor makes both O(monitors x flows), 330x at this step, against 37.5x
+/// for work linear in the flows. The bound, 111, is their geometric midpoint. That cost took the
+/// MoE smoke's lowering (426,112 flows, 18,944 monitors) to 225 s (P16 H3 part 2B).
+#[test]
+#[ignore = "CI scaling gate (the `scaling` job): run with --release --test-threads=1"]
+fn ci_scaling_aicb_pfc_validation() {
+    let case = &CI_AICB;
+    let small = Scenario::aicb("reduced-moe-simai.toml", 4_128, 667);
+    let large = Scenario::aicb("reduced-moe-w256-simai.toml", 154_880, 5_888);
     let mut failures = Vec::new();
     for phase in [(Phase::Lowering, true), (Phase::ScalarValidation, true)] {
         gate(case, phase, &small, &large, &mut failures);

@@ -178,8 +178,8 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "validate.rs",
         predicate: r#"feature = "planner-test-hooks""#,
-        count: 7,
-        purpose: "pre-index validator scans, their two equality hooks and the stage-lookup probe exist only for standard tests, as does P16 H4's generator-pass probe (its per-thread counter, its increment and its take)",
+        count: 9,
+        purpose: "pre-index validator scans, their two equality hooks and the stage-lookup probe exist only for standard tests, as does P16 H4's generator-pass probe (its per-thread counter, its increments in `staged_generators` and in P16 H3's `scan_generators` and `generators_ascend`, and its take)",
     },
     AllowedFeatureGate {
         path: "scalar.rs",

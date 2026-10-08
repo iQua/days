@@ -6,8 +6,12 @@
 //! (the forward and backward TP collectives are delay-only), then the group's reduce-scatter ring
 //! on 16 servers, every message on the network.
 
+#[path = "support/aicb.rs"]
+mod aicb;
+
 use std::path::{Path, PathBuf};
 
+use aicb::stage_kinds;
 use days::scenario::compile_config;
 use days_executor::{CollectiveAlgorithm, SimulationImage, StageRole};
 
@@ -137,15 +141,101 @@ fn an_aicb_scenario_is_refused_when_it_is_not_what_it_names() {
 }
 
 #[test]
-fn chains_across_group_families_wait_for_host_matched_after() {
-    // The Megatron arm's pipeline transfers, and the smoke's all-to-all to DP_EP fork.
-    let error = variant("b4-simai.toml", |text| {
-        text.replace("fidelity = \"simai\"", "fidelity = \"megatron\"")
-    })
-    .expect_err("megatron b4");
-    assert!(error.contains("ruling C1"), "{error}");
-    let error = lower(&fixture("smoke-simai.toml")).expect_err("smoke");
-    assert!(error.contains("ruling C1"), "{error}");
+fn the_reduced_moe_trace_lowers_across_group_families() {
+    // All-to-alls on EP, the data queue's DP_EP and DP rings after them (host-matched `after`,
+    // ruling C1). Counts from aicb_plan.py: 1,568 network and 2,208 notify messages; 11 fused
+    // segments per rank.
+    use CollectiveAlgorithm::*;
+    let image = lower(&fixture("reduced-moe-simai.toml")).unwrap_or_else(|error| panic!("{error}"));
+    let (network, notify, computes) = stage_kinds(&image);
+    let total: usize = network.iter().map(|(_, count)| count).sum();
+    assert_eq!(total, 1_568, "{network:?}");
+    assert_eq!(notify, 2_208);
+    assert_eq!(computes, 11 * 32);
+    assert!(network.iter().any(|(algorithm, _)| *algorithm == AllToAll));
+}
+
+#[test]
+fn the_smoke_lowers_across_group_families() {
+    use CollectiveAlgorithm::*;
+    let image = lower(&fixture("smoke-simai.toml")).unwrap_or_else(|error| panic!("{error}"));
+    let (network, notify, computes) = stage_kinds(&image);
+    assert_eq!(
+        network,
+        [
+            (AllGather, 128),
+            (ReduceScatter, 8_192),
+            (AllToAll, 344_064)
+        ]
+    );
+    assert_eq!(notify, 61_056);
+    assert_eq!(computes, 99 * 128);
+}
+
+#[test]
+fn the_megatron_arm_carries_pipeline_transfers() {
+    // b4 faithful: per-stage DP8 rings (16 groups x 8 ranks x 7 steps) and 64 PP pairs in each
+    // direction; three fused segments per stage (to the send, the receive and the fork).
+    use CollectiveAlgorithm::*;
+    let image = lower(&fixture("b4-megatron.toml")).unwrap_or_else(|error| panic!("{error}"));
+    let (network, notify, computes) = stage_kinds(&image);
+    assert_eq!(network, [(ReduceScatter, 896), (SendRecv, 128)]);
+    assert_eq!(notify, 0);
+    assert_eq!(computes, 3 * 128);
+}
+
+#[test]
+fn the_reduced_dense_megatron_arm_carries_pipeline_transfers() {
+    // Per-stage DP2 rings across the stage's two servers (2 stages x 8 groups x 2 ranks x 1
+    // step) and 16 PP pairs in each direction; three fused segments per stage.
+    use CollectiveAlgorithm::*;
+    let image =
+        lower(&fixture("reduced-dense-megatron.toml")).unwrap_or_else(|error| panic!("{error}"));
+    let (network, notify, computes) = stage_kinds(&image);
+    assert_eq!(network, [(ReduceScatter, 32), (SendRecv, 32)]);
+    assert_eq!(notify, 0);
+    assert_eq!(computes, 3 * 32);
+}
+
+#[test]
+fn the_imbalanced_arm_lowers_seeded_all_to_alls() {
+    let image =
+        lower(&fixture("reduced-moe-imbalanced.toml")).unwrap_or_else(|error| panic!("{error}"));
+    assert!(
+        !image.seeded_all_to_alls.is_empty(),
+        "seeded matrices reach the image"
+    );
+    // Seeded pairs with zero copies have no stage, so the network share differs from uniform's.
+    let (network, _, _) = stage_kinds(&image);
+    let total: usize = network.iter().map(|(_, count)| count).sum();
+    assert!(total > 0);
+    every_rank_sends(&image, 8);
+}
+
+#[test]
+fn the_imbalanced_smoke_lowers_seeded_all_to_alls() {
+    // The PFC arm's shape at 128 GPUs: 24 matrices on 4 EP groups, each as a dispatch, a combine
+    // and their backward all-to-alls.
+    let image = lower(&fixture("smoke-imbalanced.toml")).unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(image.seeded_all_to_alls.len(), 24 * 4 * 4);
+    every_rank_sends(&image, 32);
+}
+
+/// Every rank of every seeded all-to-all sends to another rank. A rank that sent nothing would
+/// have no stage of the all-to-all, which the compute after it cannot follow at that host (an
+/// open H1 validator item, found by the sendrecv-cert lane).
+fn every_rank_sends(image: &SimulationImage, ranks: usize) {
+    for seeded in &image.seeded_all_to_alls {
+        let bytes = seeded.matrix.bytes(ranks as u64).expect("the matrix");
+        for source in 0..ranks {
+            assert!(
+                bytes[source * ranks..(source + 1) * ranks]
+                    .iter()
+                    .any(|&pair| pair > 0),
+                "{seeded:?}: rank {source} sends nothing"
+            );
+        }
+    }
 }
 
 #[test]
@@ -170,7 +260,7 @@ fn the_manifest_records_what_the_run_was_made_from() {
         "ecn_by_rate=100000000000:112,400000000000:223",
         "pfc_asw_xoff=3515844 pfc_asw_xon=3512772 pfc_psw_xoff=4115208 pfc_psw_xon=4112136",
         "headroom_by_rate=100000000000:30574,400000000000:75000",
-        "collectives=91 operations=16 fused_segments=1 fused_single_server_ops=90",
+        "collectives=91 operations=9 fused_segments=1 fused_single_server_ops=90",
         "fp_clamps=4 elided=2 hang_window_recorded=0 data_queue=fifo data_queue_order=grad_norm",
         "ecmp_ordinals=exact",
         "as-send-lat",
