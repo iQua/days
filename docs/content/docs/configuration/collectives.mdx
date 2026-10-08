@@ -1,18 +1,20 @@
 ---
 title: Collectives
-description: Days AGO RingAllReduce and AllGather over TCP or RoCE queue pairs with delay-only compute stages, and the legacy collective expansion.
+description: Days AGO ring, all-to-all and send/receive collectives over TCP or RoCE queue pairs, with delay-only compute stages and host-matched dependencies, and the legacy collective expansion.
 ---
 
 **Scope: Days AGO and Legacy Days.** Both engines model collective traffic, not application payload arithmetic, and they accept different algorithms.
 
 | Engine | Algorithms | Transport | Backends |
 | --- | --- | --- | --- |
-| Days AGO | `RingAllReduce`, `AllGather`, plus `[[compute]]` stages | `TCP` or `RoCE` | Scalar, CPU, Metal, and CUDA, byte-identical |
+| Days AGO | `RingAllReduce`, `AllGather`, `ReduceScatter`, `AllToAll`, `SendRecv`, plus `[[compute]]` stages | `TCP` or `RoCE` | Scalar, CPU, Metal, and CUDA, byte-identical |
 | Legacy Days | `Broadcast`, `Gather`, `AllReduce`, `RingAllReduce` | `PacketDistribution`, `TCP`, or feature-gated `DCQCN` | Nexosim |
 
 ## Days AGO collectives
 
-Days AGO lowers each collective into stage flows in the `SimulationImage`. Every step of every rank is an ordinary TCP flow or RoCE queue pair that carries one chunk, together with a record of the stages it waits for. Days AGO implements `RingAllReduce` and `AllGather` only, over `flow_type = "TCP"` or `flow_type = "RoCE"`. A `[[compute]]` group adds one delay-only stage per host, which a collective can wait for or be waited on by.
+Days AGO lowers each collective into stage flows in the `SimulationImage`. Every message of every rank is an ordinary TCP flow or RoCE queue pair that carries one chunk, together with the list of stages it waits for. A `[[compute]]` group adds one delay-only stage per host. Groups wait for one another through `after` lists, matched by host: rank `r` of a group waits, at its host, for each listed group that runs on that host. A stage with several predecessors of one kind is a counted join; it starts when every predecessor is complete.
+
+On the Spectrum-X rail fabric, a message between two GPUs of one server does not enter the network: it lowers to a stage notify, a delay-only NVLink message. See [Spectrum-X](/docs/configuration/topology#spectrum-x). An AICB training trace lowers through the same stage groups from a `[workload.aicb]` table; see [Workloads](/docs/configuration/workloads).
 
 This scenario runs a forward compute stage on three hosts, then a TCP ring all-reduce, then a backward compute stage:
 
@@ -65,24 +67,31 @@ cargo run --release --bin days -- chain.toml --engine scalar
 cargo run --release --bin days -- chain.toml --engine cpu --workers 2
 ```
 
-Both runs end with `result_bytes=72398 result_fnv1a64=2e71360eb637278c`. With `--engine metal`, the run stops at validation (see [Backends](#backends)).
+Both runs end with `result_bytes=69710 result_fnv1a64=bf4bb10a72685679`. `--engine metal` and `--engine cuda` run it too (see [Backends](#backends)).
 
 ### `[[collective]]` fields
 
 | Field | Rule |
 | --- | --- |
-| `name` | Optional. A stage-group name that `after` fields can reference. Names must be unique across `[[collective]]` and `[[compute]]`. |
-| `after` | Optional. The name of a `[[compute]]` group. Each rank's first stage waits for that group's stage of the same rank. A collective may follow only a compute group, and its ranks (`sources`) must equal the group's `hosts` in order. |
-| `collective_type` | `RingAllReduce` or `AllGather`. |
+| `name` | A stage-group name that `after` fields can reference. Optional, except on a `stream` other than 0. Names must be unique across `[[collective]]` and `[[compute]]`. |
+| `after` | Optional. One stage-group name, or a list of names. Rank `r` of the collective waits, at its host, for each listed group that runs on that host, through that group's stage there; see [Host-matched `after`](#host-matched-after). At least one listed group must be a compute group. |
+| `stream` | Optional, default `0`. The issue stream the collective runs on at each rank (SimAI's queue). The image records a nonzero stream for device sizing; see [Internals](/docs/internals#device-planning-and-bounded-arenas). |
+| `collective_type` | `RingAllReduce`, `AllGather`, `ReduceScatter`, `AllToAll`, or `SendRecv`. |
 | `flow_type` | `TCP` or `RoCE`. Any other value is rejected, and so is an omitted `flow_type`: a stage completes when its last byte is acknowledged, which `PacketDistribution` and unreliable `DCQCN` flows cannot report. |
-| `flow_count` | The rank count. At least 2 for `RingAllReduce`, at least 1 for `AllGather`. |
-| `sources`, `sinks` | Optional. Supply both or neither; each must have `flow_count` entries. |
+| `flow_count` | The rank count. At least 2 for `RingAllReduce`, exactly 2 for `SendRecv`, at least 1 otherwise. |
+| `sources`, `sinks` | The ranks in order. A ring algorithm takes both or neither, in ring-next order, or `sources` with `channels`; see [Endpoints](#endpoints). `AllToAll` takes `sources` only, or neither. `SendRecv` takes `sources = [sender, receiver]` and no `sinks`. |
+| `channels` | Ring algorithms only. A list of rings, each an order of all the `sources`; it replaces `sinks`. Several channels need `chunk = "UniformFloor"`. |
+| `chunk` | `EqualRemainderLast` (the default for rings) or `UniformFloor` (the only policy of an all-to-all, and its default). `SendRecv` takes neither. See [Stages and messages](#stages-and-messages). |
+| `alltoall` | `AllToAll` only. The `[collective.alltoall]` table of a seeded, imbalanced all-to-all; see [Seeded all-to-all](#seeded-all-to-all). |
+| `issue_ordinal` | Optional. The collective's position in its workload's issue order. It orders the collective's flows ahead of the key's content, which decides the ECMP source ports of `SimAiEcmp`. The AICB adapter sets it; a TOML scenario can leave it out. Values above `4294967294` are refused. |
 | `priority` | Optional 802.1Q priority in `0..=7`; default `0`. |
-| `traffic` | A byte `size` of at least `flow_count`, and a constant `pkt_size_dist`, which sets the segment size (MSS) of every TCP stage or the MTU of every RoCE stage. `arr_dist` must be present but does not affect TCP or RoCE stages. `initial_delay` sets when the first stages start if the collective has no `after`. Duration-terminated traffic is rejected. |
+| `traffic` | A byte `size`, and a constant `pkt_size_dist`, which sets the segment size (MSS) of every TCP stage or the MTU of every RoCE stage. `arr_dist` must be present but does not affect TCP or RoCE stages. `initial_delay` sets when the first stages start if the collective has no `after`. Duration-terminated traffic is rejected. |
 | `traffic.tcp` | TCP only. `cc_algorithm = "TCPReno"` or `"TCPCubic"`, with the same limits as a TCP [flow](/docs/configuration/flows#tcp). |
 | `traffic.dcqcn`, `traffic.roce` | RoCE only, both required. The same tables as a RoCE queue-pair [flow](/docs/configuration/flows), with the same defaults and limits. `retransmit_timeout_ns = 0` is accepted; see [RoCE stages](#roce-stages). |
 
-Lowering rejects `first_flow_id`, `graph`, `routing`, and `paths`: flow identity comes from the collective stage key, and routes come from the topology. `[[collective_set]]` does not accept `name` or `after`.
+Lowering rejects `first_flow_id`, `graph`, `routing`, and `paths`: flow identity comes from the collective stage key, and routes come from the topology.
+
+`[[collective_set]]` accepts the ring algorithms and `SendRecv` with per-member `sources` and `sinks` lists, but none of `name`, `after`, `stream`, `channels`, `chunk`, or `alltoall`. A set of `AllToAll` members fails validation ("collective policy or phase is inconsistent with its algorithm"); declare each all-to-all as its own `[[collective]]`.
 
 ### `[[compute]]` fields
 
@@ -91,35 +100,172 @@ Lowering rejects `first_flow_id`, `graph`, `routing`, and `paths`: flow identity
 | `name` | Required, and unique across `[[collective]]` and `[[compute]]`. |
 | `hosts` | Required. One stage runs on each listed host, and a host's rank is its position in the list. Hosts must be distinct configured host attachments. |
 | `duration_ns` | Required. The stage's duration in integer nanoseconds; must be positive. |
-| `after` | Optional. The name of a compute group or a collective. `hosts` must equal the ranks of that group in order. |
+| `after` | Optional. One stage-group name, or a list of compute groups and collectives whose stages at this host the compute stage joins; see [Host-matched `after`](#host-matched-after). |
+| `stream` | Optional, default `0`; as for a collective. |
 
 Lowering rejects an unknown or duplicate name and a cycle of `after` references.
 
+### Host-matched `after`
+
+`after` is resolved host by host. For each host `h` where the dependent group starts, and for each listed group `G` that runs on `h`, the dependent's stage at `h` waits for `G`'s completion at `h`. A collective starts on all its ranks; a `SendRecv` starts at its sender only. When a listed group runs on exactly the dependent's hosts in the same order, rank `r` waits for rank `r`; otherwise the match is by host, and the two groups may have different sizes and orders.
+
+Three rules bound the lists:
+
+- every host where the dependent starts must run at least one listed group, or lowering fails with "`{kind}` `x` rank r (host h) starts after no operation its `after` lists";
+- every listed group must run on at least one of those hosts ("collective `x` names stage group `y`, which runs on none of the hosts it starts at"; "compute `x` names stage group `y`, which runs on none of its hosts");
+- a collective's list must contain at least one compute group ("unsupported collective `x` dependency on collective `y` alone; a collective follows at least one compute group"). A collective with no `after` starts at its traffic's `initial_delay` and needs no compute group.
+
+This scenario runs two expert compute groups on disjoint host pairs, then a data-parallel all-gather over all four hosts whose ranks interleave the pairs, then an optimizer stage:
+
+```toml
+[[compute]]
+name = "ep0"
+hosts = [0, 1]
+duration_ns = 2000
+
+[[compute]]
+name = "ep1"
+hosts = [2, 3]
+duration_ns = 3000
+
+[[collective]]
+name = "dp"
+after = ["ep0", "ep1"]
+collective_type = "AllGather"
+flow_type = "TCP"
+flow_count = 4
+sources = [0, 2, 1, 3]
+sinks = [2, 1, 3, 0]
+
+[collective.traffic]
+initial_delay = 0.0
+size = 8000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 500, high = 500 }
+
+[collective.traffic.tcp]
+cc_algorithm = "TCPReno"
+
+[[compute]]
+name = "opt"
+hosts = [0, 1, 2, 3]
+duration_ns = 1000
+after = "dp"
+```
+
+Hosts 0 and 1 start their all-gather roots when `ep0` ends at 2,000 ns; hosts 2 and 3 when `ep1` ends at 3,000 ns. On the four-host star of the first example, Scalar and CPU end it with `result_bytes=76218 result_fnv1a64=4b6275b54d5c3678`.
+
+A data-parallel chain uses the same lists: a collective can name the compute group that releases it and the previous collective of its stream, so the second collective starts at each host only once the first has completed there:
+
+```toml
+[[collective]]
+name = "rs2"
+after = ["wg2", "rs1"]
+stream = 1
+collective_type = "ReduceScatter"
+flow_type = "TCP"
+flow_count = 4
+sources = [0, 1, 2, 3]
+sinks = [1, 2, 3, 0]
+```
+
 ### Endpoints
 
-With explicit endpoints, the ring must be in ring-next order: `sinks[i] == sources[(i + 1) % n]`. Every participant must be a configured host, and the sources must be distinct.
+For a ring algorithm with explicit endpoints, the ring must be in ring-next order: `sinks[i] == sources[(i + 1) % n]`. Every participant must be a configured host, and the sources must be distinct. If `sources` and `sinks` are omitted, the ring uses every configured host in ascending host-ID order, and each host sends to the next one, wrapping around at the end. `flow_count` must then equal the number of configured hosts.
 
-If `sources` and `sinks` are omitted, the ring uses every configured host in ascending host-ID order, and each host sends to the next one, wrapping around at the end. `flow_count` must then equal the number of configured hosts.
+With `channels`, the collective runs several rings over the same ranks at once, as SimAI's NCCL ring channels do. Each channel is a ring order of all the `sources`, and `sinks` is omitted:
 
-### Stages and chunks
+```toml
+[[collective]]
+name = "ag"
+after = "fwd"
+collective_type = "AllGather"
+flow_type = "TCP"
+flow_count = 4
+sources = [0, 1, 2, 3]
+channels = [[0, 1, 2, 3], [0, 2, 1, 3]]
+chunk = "UniformFloor"
+```
 
-The declared byte `size` is split into `flow_count` chunks of `size / flow_count` bytes each; the last chunk also carries the remainder. Each rank sends one chunk per step over `flow_count - 1` steps:
+An all-to-all's `sources` are its ranks; omitted, they are every configured host in ascending order. A `SendRecv`'s `sources` are `[sender, receiver]`.
 
-- `RingAllReduce` runs a reduce-scatter phase and then an all-gather phase, so it lowers to `2 * n * (n - 1)` stage flows.
-- `AllGather` runs one all-gather phase, `n * (n - 1)` stage flows. A one-rank `AllGather` lowers to no stages.
+### Stages and messages
 
-A stage flow is a TCP flow or a RoCE queue pair from `sources[rank]` to `sinks[rank]` that carries its chunk, using the collective's transport settings. Because a stage must carry at least one byte, `size` must be at least `flow_count` for both algorithms.
+Each algorithm lowers to a fixed set of stages. `S` is the declared byte `size`, `n` the rank count, and `c` the channel count (1 without `channels`):
+
+| Algorithm | Stages | Bytes per message |
+| --- | --- | --- |
+| `AllGather` | `n (n - 1)` per channel: each rank sends one chunk per step over `n - 1` steps | see the chunk policy |
+| `ReduceScatter` | `n (n - 1)` per channel, the reduce-scatter phase alone | see the chunk policy |
+| `RingAllReduce` | `2 n (n - 1)` per channel: a reduce-scatter phase, then an all-gather phase | see the chunk policy |
+| `AllToAll` | one per ordered pair `(r, r + k mod n)`, `k` in `1..n-1`: `n (n - 1)` for a uniform all-to-all, fewer when a seeded pair is empty | `floor(S / n)` per pair; seeded sizes from the matrix |
+| `SendRecv` | one, from `sources[0]` to `sources[1]` | `S` |
+
+The two chunk policies differ in how `S` is divided:
+
+- `EqualRemainderLast` (rings, the default): `S` is split into `n` chunks of `S / n` bytes, and the last chunk also carries the remainder, so the ring moves exactly `S` bytes per phase.
+- `UniformFloor` (rings with several channels, and every all-to-all): every message is `floor(floor(S / n) / c)` bytes for a ring and `floor(S / n)` for an all-to-all, SimAI's rule; the remainder is not sent.
+
+A stage flow is a TCP flow or a RoCE queue pair from the stage's source to its target that carries its message, using the collective's transport settings. Because a message must carry at least one byte, `S` must be at least `n` for every algorithm, and a `UniformFloor` ring needs `floor(floor(S / n) / c) >= 1`; otherwise lowering fails with "AllGather of 7 bytes over 4 ranks and 2 channels sends empty messages; every message must carry a byte".
+
+### Seeded all-to-all
+
+`[collective.alltoall]` gives an all-to-all per-pair sizes from a seeded token-routing model, the imbalanced-routing arm of an MoE workload:
+
+```toml
+[[collective]]
+name = "dispatch"
+after = "fwd"
+collective_type = "AllToAll"
+flow_type = "RoCE"
+flow_count = 4
+sources = [0, 1, 2, 3]
+
+[collective.alltoall]
+seed = 7
+matrix = 0
+transpose = false
+experts = 8
+topk = 2
+tokens = 16
+bytes_per_copy = 100
+skew = "Zipf1"
+```
+
+| Key | Rule |
+| --- | --- |
+| `seed` | Required. |
+| `matrix`, `group` | Optional, default `0`. They tell apart the matrices of one scenario (a layer and microbatch; an expert-parallel group): the expert permutation is drawn once per `(seed, matrix, group)`. |
+| `transpose` | Optional, default `false`. `true` sends the transpose of the matrix: an MoE combine sends back what its dispatch sent, so a dispatch and combine pair shares `seed`, `matrix`, and `group` and differs in `transpose`. |
+| `experts` | Required. A positive multiple of `flow_count`; expert `e` lives on rank `e / (experts / n)`. |
+| `topk`, `tokens` | Required. Each source rank routes `tokens * topk` expert copies. |
+| `bytes_per_copy` | Required. The traffic `size` must equal `tokens * topk * bytes_per_copy`. |
+| `skew` | `Zipf1` (the default) or `Uniform`. |
+
+The matrix is integer arithmetic throughout: a SplitMix64 stream keyed by `(seed, matrix, group, source)`, a seeded permutation of the experts, popularity weights `floor(2^40 / (p + 1))` for the expert at popularity rank `p` under `Zipf1` (equal weights under `Uniform`), and `tokens * topk` draws mapped to experts through the integer cumulative weights. A pair's bytes are its copies times `bytes_per_copy`; copies to the source itself are not sent, and a pair with zero copies has no stage. Two lowerings of one scenario give the same matrix on every backend. The example above moves 3,200 bytes per source rank; Scalar and CPU end the four-host dispatch and combine pair with `result_bytes=166613 result_fnv1a64=8e30564277979b40`.
 
 ### When a stage starts
 
-A stage starts once both of its predecessors are complete:
+Each stage lists its predecessors, in two kinds:
 
-- The **local predecessor** is the same rank's previous step. For the first step of the all-gather phase of `RingAllReduce`, it is the rank's last reduce-scatter step. It is complete at the first acknowledgement that covers all of its bytes.
-- The **inbound predecessor** is the previous rank's previous step, which sends to this rank. It is complete when this host's in-order receive frontier for that stage reaches the stage's chunk size. Retransmitted or out-of-order bytes count only once the frontier covers them.
+- a **local predecessor** is a stage at the same host. It is complete at the first acknowledgement that covers all of its bytes (TCP and RoCE), or when its timer fires (a compute stage, or the lead of a stage notify);
+- an **inbound predecessor** is a stage delivered to this host. It is complete when the host's in-order receive frontier for that stage reaches the stage's whole message. Retransmitted or out-of-order bytes count only once the frontier covers them, and a partial delivery changes no stage state.
 
-A stage starts at the event that completes its later predecessor. A TCP stage sends its first congestion window from sequence 0 at that instant; a RoCE stage starts as described in [RoCE stages](#roce-stages).
+A stage keeps a count of its completed predecessors of each kind and starts at the event that brings both counts to their requirement. A TCP stage sends its first congestion window from sequence 0 at that instant; a RoCE stage starts as described in [RoCE stages](#roce-stages).
 
-Step 1 of the first phase (reduce-scatter for `RingAllReduce`, all-gather for `AllGather`) has no predecessor in the collective. Without `after`, it starts at the traffic's `initial_delay`. With `after`, its local predecessor is the same rank's stage in the named compute group.
+For a ring step, the local predecessor is the same rank's previous step on the same channel (for the first all-gather step of `RingAllReduce`, the rank's last reduce-scatter step), and the inbound predecessor is the previous rank's previous step on the same channel. The first step of each channel has no predecessor in the collective: with `after`, it waits for the listed groups' stages at its host; without, it starts at the traffic's `initial_delay`.
+
+Every stage of an all-to-all is a root: a rank's sends start together, at its release by the listed groups at its host. A `SendRecv`'s one stage starts at its sender's release.
+
+### Completion
+
+A group that lists a collective in its `after` waits, at each host, for the collective's completion there:
+
+- **Rings.** At rank `r`'s host: the acknowledgement that completes `r`'s final stage on each channel (local), and the delivery of the final stage that targets the host on each channel (inbound). With `c` channels that is `c + c` predecessors.
+- **All-to-all.** The acknowledgement of every message the rank sends (local) and the delivery of every message that targets the host (inbound). A seeded rank that sends nothing completes at the all-to-all's release at its host (the groups the all-to-all's own `after` names there) and the delivery of its arrivals; a group listed both by the all-to-all and by the dependent counts once.
+- **Send/receive.** At the sender, the acknowledgement of the message (local); at the receiver, its delivery (inbound). The receiver's next group lists the `SendRecv` as any other predecessor, and the coverage rules of [Host-matched `after`](#host-matched-after) apply at the sender only.
+
+Two limits of the zero-send case are recorded rather than fixed: in an all-to-all with no `after`, a rank that neither sends nor receives starts at time 0 rather than at `initial_delay`; and the `after` lists are not part of the LeanGuard certificate, so a certificate that consistently drops such a rank's gate is accepted (see [LeanGuard](/docs/verification/leanguard#coverage-by-mechanism)).
 
 ### RoCE stages
 
@@ -155,7 +301,7 @@ retransmit_timeout_ns = 1000000
 feedback_priority = 0
 ```
 
-`configs/p15/roce_compute_dag.toml` puts this collective between two compute groups on a four-switch line with host-link PFC. Scalar and CPU at 2 workers both end it with `result_bytes=212197 result_fnv1a64=e94b963fa5fd954a`.
+`configs/p15/roce_compute_dag.toml` puts this collective between two compute groups on a four-switch line with host-link PFC. Scalar and CPU at 2 workers both end it with `result_bytes=207245 result_fnv1a64=5145dc263ab8ddc6`.
 
 A RoCE stage differs from a TCP stage in four points:
 
@@ -178,37 +324,45 @@ To check a run, read `dropped_packets` in the run summary (`days` prints it in i
 A compute stage is a timer on its host; it sends no packets and has no route. It finishes `duration_ns` after it starts:
 
 - A compute group without `after` starts at time 0.
-- After a compute group, rank `r` starts when that group's rank-`r` stage finishes.
-- After a collective, rank `r` waits for two signals: the acknowledgement that completes its own final all-gather stage, and the in-order delivery at its host of rank `r - 1`'s final all-gather stage.
+- With `after`, the stage at host `h` starts when every listed group has completed at `h`: a compute group's stage there when its timer fires, and a collective as described in [Completion](#completion).
 
-In the example, every `forward` stage finishes at 5,000 ns, and each `backward` stage finishes 7,000 ns after it starts. A stage whose finish time falls after the scenario's stop time does not finish.
+In the first example, every `forward` stage finishes at 5,000 ns, and each `backward` stage finishes 7,000 ns after it starts. A stage whose finish time falls after the scenario's stop time does not finish.
 
 ### Traces
 
-With Full observation, Scalar and CPU record one row per collective progress event; `collective_transitions_csv` in the executor library serializes them. `stage_kind` is `tcp`, `roce` or `compute`, and `duration_ns` is the compute duration (0 on TCP and RoCE rows). `packet_size_bytes` is the MSS on TCP rows and the MTU on RoCE rows; `interval_ns` is 0 on TCP rows and the pacing interval on RoCE rows. A compute row whose inbound predecessor is a RoCE stage carries that queue pair's MTU and pacing interval in the same two columns, so a checker can replay its inbound packets as the Go-back-N frontier even when the predecessor itself is not logged; every other compute row writes 0 in both. Compute rows leave `algorithm` and `collective_phase` empty. Five further columns certify completion signals:
+With Full observation, Scalar and CPU record one row per collective progress event; `collective_transitions_csv` in the executor library serializes them. `stage_kind` is `tcp`, `roce`, `compute`, or `notify`, and `duration_ns` is the compute duration, or a notify's delay (0 on TCP and RoCE rows). `packet_size_bytes` is the MSS on TCP rows and the MTU on RoCE rows; `interval_ns` is 0 on TCP rows and the pacing interval on RoCE rows. A compute row whose inbound predecessor is a RoCE stage carries that queue pair's MTU and pacing interval in the same two columns, so a checker can replay its inbound packets as the Go-back-N frontier even when the predecessor itself is not logged; every other compute row writes 0 in both. Compute rows leave `algorithm` and `collective_phase` empty.
+
+The dependency columns name the stage's predecessors and its progress through them: `local_predecessors` and `inbound_predecessors` (flow ids, `;`-separated), `local_required`, `before_local_completed` and `after_local_completed` (the local count), the inbound flags and byte columns, and `cause_total_bytes`, the whole size of the predecessor a row's cause belongs to. `channel`, `chunk_policy`, `channel_policy` and `group_stages` describe the collective's shape, and `seeded_matrix` names a seeded all-to-all's matrix, which the checker re-derives. Five further columns certify completion signals:
 
 - `segment_sequence`, `segment_bytes`: on inbound rows, the data segment that arrived (its TCP sequence number or RoCE PSN, and its size). `arrival_bytes` is how far it advanced the receiver's in-order frontier, which is 0 for a duplicate or out-of-order packet;
 - `ack_number`, `cause_origin_ns`, `cause_delay_ns`: on a local completion caused by an acknowledgement, the acknowledgement number, the send time it echoes, and the unloaded round trip;
 - `cause_origin_ns`, `cause_delay_ns`: on a local completion caused by a compute timer, the time the timer was armed and its duration.
 
-A column that does not apply to a row is 0. The LeanGuard checker `p10c_collective_check` checks these traces; see [LeanGuard](/docs/verification/leanguard).
+Four columns bind each row to the flows it names: `cause_kind` (`tcp`, `roce`, `compute`, or `notify`: what carries the cause), `cause_collective_id` (the collective of a notify cause), and the two delivery hosts `target_node` (the host the row's own stage delivers to; a compute stage's own host) and `cause_target_node` (the host the cause is delivered to). A column that does not apply to a row is 0. The LeanGuard checker `p10c_collective_check` checks these traces; see [LeanGuard](/docs/verification/leanguard).
 
 ### Backends
 
-Metal and CUDA run collectives and compute stages over TCP and RoCE byte-identically to Scalar: complete state and the full-observation measurement planes. They do not return the collective transition records, which are diagnostics; generate those on Scalar or CPU.
+Metal and CUDA run collectives, compute stages, counted joins and stage notifies over TCP and RoCE byte-identically to Scalar: complete state and the full-observation measurement planes. They do not return the collective transition records, which are diagnostics; generate those on Scalar or CPU.
 
 ### Errors
 
 The compiler and the validator name the rejected field or backend:
 
 ```text
-unsupported collective algorithm `...`; T26 supports RingAllReduce and AllGather
+unsupported collective algorithm `...`; Days lowers RingAllReduce, AllGather, ReduceScatter, AllToAll and SendRecv
 unsupported collective flow type `...`; collectives require a reliable transport, flow_type = "TCP" or "RoCE" (a RoCE queue pair is DCQCN with Go-back-N)
+SendRecv flow_count must be 2: sources = [sender, receiver]
+AllToAll takes `sources` only: no `sinks`
 TCP collective byte size 2 must be at least flow_count 3
-RoCE collective byte size 2 must be at least flow_count 3
+a collective of several ring channels requires chunk = "UniformFloor"
+every ring channel must order exactly the collective's sources
+`[collective.alltoall]` sizes apply to an AllToAll only
+a seeded all-to-all's size 3000 must equal tokens x topk x bytes_per_copy
 collective flow_count 3 must match the 4 configured hosts when sources/sinks are omitted
-unsupported collective `...` dependency on collective `...`; a collective may follow only a compute group
-compute `...` hosts must equal the ranks of `...` in order
+a collective on a stream other than 0 needs a `name`
+compute `...` rank 2 (host 2) starts after no operation its `after` lists
+collective `...` names stage group `...`, which runs on none of the hosts it starts at
+unsupported collective `...` dependency on collective `...` alone; a collective follows at least one compute group
 compute `...` host 7 must be a configured host attachment
 ```
 
@@ -273,7 +427,7 @@ arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
 pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 }
 ```
 
-`collective_count` gives the number of members in the set. Each nested source/sink list must contain `flow_count` endpoints. Legacy reserves a contiguous concrete-flow range for each member; RingAllReduce uses its expanded flow count for that reservation. Days AGO also accepts `[[collective_set]]` for its two algorithms, with the same per-member rules as `[[collective]]`.
+`collective_count` gives the number of members in the set. Each nested source/sink list must contain `flow_count` endpoints. Legacy reserves a contiguous concrete-flow range for each member; RingAllReduce uses its expanded flow count for that reservation. Days AGO also accepts `[[collective_set]]` for its ring algorithms and `SendRecv`, with the per-member rules of `[[collective]]` and without its stage-group keys (see [`[[collective]]` fields](#collective-fields)).
 
 ## Legacy TCP application buffers
 
