@@ -130,15 +130,17 @@ fn as_blocks(kind: &str, flow: &str, groups: &[Vec<u64>], size: u64) -> String {
         .collect()
 }
 
-/// `(label, hosts, kind, transport, member groups, size)`.
-fn fixtures() -> Vec<(
+/// A fixture: `(label, hosts, kind, transport, member groups, size)`.
+type Fixture = (
     &'static str,
     u64,
     &'static str,
     &'static str,
     Vec<Vec<u64>>,
     u64,
-)> {
+);
+
+fn fixtures() -> Vec<Fixture> {
     vec![
         // The W2 docs lane's reproducer: two 2-rank TCP all-to-alls.
         (
