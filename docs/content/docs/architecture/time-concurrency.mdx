@@ -23,7 +23,7 @@ The global scalar backend pops this order from one calendar. Round scalar, CPU, 
 
 Each LP is single-owner during a round. Remote events are invisible until the canonical barrier merge. CPU workers retain whole-LP ownership rather than sharing mutable protocol state per event; device plans preserve the same LP and event identities in bounded arenas.
 
-The minimum channel lookahead counts every channel, including the host-to-host lanes that carry stage notifies on the Spectrum-X fabric. A lane's latency is the smallest NVLink message delay of its host pair minus 1 ns: 346 ns on `configs/p16/rail_mini_tcp_allgather.toml`, below that fabric's 502 ns network channels, and at least 5,900 ns on the 1,024-GPU and 128-GPU SimAI shapes, where the network's 502 ns stays the minimum.
+The minimum channel lookahead counts every channel, including the host-to-host lanes that carry stage notifies on the Spectrum-X fabric. A lane's latency is the smallest NVLink message delay of its host pair minus 1 ns: `configs/p16/rail_mini_roce.toml` runs with `certified_lookahead_ns=346`, below that fabric's 502 ns network channels, and on the 1,024-GPU and 128-GPU SimAI shapes the lanes are at least 5,900 ns, so the network's 502 ns stays the minimum.
 
 ## Legacy time
 

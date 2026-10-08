@@ -118,6 +118,17 @@ Three rules bound the lists:
 This scenario runs two expert compute groups on disjoint host pairs, then a data-parallel all-gather over all four hosts whose ranks interleave the pairs, then an optimizer stage:
 
 ```toml
+seed = 26
+edges = [[0, 4], [1, 4], [2, 4], [3, 4]]
+hosts = [0, 1, 2, 3]
+duration = 0.05
+
+[switch]
+port_rate = 8000000000
+capacity = 200
+discipline = "FIFO"
+drop = "TailDrop"
+
 [[compute]]
 name = "ep0"
 hosts = [0, 1]
@@ -153,7 +164,7 @@ duration_ns = 1000
 after = "dp"
 ```
 
-Hosts 0 and 1 start their all-gather roots when `ep0` ends at 2,000 ns; hosts 2 and 3 when `ep1` ends at 3,000 ns. On the four-host star of the first example, Scalar and CPU end it with `result_bytes=76218 result_fnv1a64=4b6275b54d5c3678`.
+Hosts 0 and 1 start their all-gather roots when `ep0` ends at 2,000 ns; hosts 2 and 3 when `ep1` ends at 3,000 ns. Scalar and CPU end this scenario with `result_bytes=76218 result_fnv1a64=4b6275b54d5c3678`.
 
 A data-parallel chain uses the same lists: a collective can name the compute group that releases it and the previous collective of its stream, so the second collective starts at each host only once the first has completed there:
 
@@ -242,7 +253,7 @@ skew = "Zipf1"
 | `bytes_per_copy` | Required. The traffic `size` must equal `tokens * topk * bytes_per_copy`. |
 | `skew` | `Zipf1` (the default) or `Uniform`. |
 
-The matrix is integer arithmetic throughout: a SplitMix64 stream keyed by `(seed, matrix, group, source)`, a seeded permutation of the experts, popularity weights `floor(2^40 / (p + 1))` for the expert at popularity rank `p` under `Zipf1` (equal weights under `Uniform`), and `tokens * topk` draws mapped to experts through the integer cumulative weights. A pair's bytes are its copies times `bytes_per_copy`; copies to the source itself are not sent, and a pair with zero copies has no stage. Two lowerings of one scenario give the same matrix on every backend. The example above moves 3,200 bytes per source rank; Scalar and CPU end the four-host dispatch and combine pair with `result_bytes=166613 result_fnv1a64=8e30564277979b40`.
+The matrix is integer arithmetic throughout: a SplitMix64 stream keyed by `(seed, matrix, group, source)`, a seeded permutation of the experts, popularity weights `floor(2^40 / (p + 1))` for the expert at popularity rank `p` under `Zipf1` (equal weights under `Uniform`), and `tokens * topk` draws mapped to experts through the integer cumulative weights. A pair's bytes are its copies times `bytes_per_copy`; copies to the source itself are not sent, and a pair with zero copies has no stage. The matrix is computed at lowering, so every backend runs the same sizes. The example above routes 3,200 bytes per source rank (`16 * 2 * 100`); a combine that answers it sets `transpose = true` with the same `seed`, `matrix` and `group`.
 
 ### When a stage starts
 
