@@ -13,11 +13,13 @@ use days::workload::aicb::{
 
 const G: u64 = 1_000_000_000;
 
-fn step(threshold: u64) -> SimaiEcn {
+/// SimAI.conf's ramp at one rate: KMIN and KMAX in KB of queue, times 1,000 (`ConfigEcn`), and
+/// PMAX as its decimal text.
+fn ramp(kmin_kb: u64, kmax_kb: u64, pmax: &str) -> SimaiEcn {
     SimaiEcn {
-        kmin_bytes: threshold,
-        kmax_bytes: threshold,
-        pmax: "1".to_owned(),
+        kmin_bytes: kmin_kb * 1_000,
+        kmax_bytes: kmax_kb * 1_000,
+        pmax: pmax.to_owned(),
     }
 }
 
@@ -91,10 +93,10 @@ fn the_1024g_fabric_equals_g1_and_h2() {
     assert_eq!(fabric.mtu_bytes, 9000);
     assert_eq!(fabric.queue_capacity_packets, 3729);
     assert_eq!(fabric.queue_capacity_bytes, 33_554_432);
-    // The K-ramp midpoint (KMIN 800 KB, KMAX 3,200 KB at 400 Gb/s) in bytes of queue.
+    // SimAI.conf's ramp at 400 Gb/s: KMIN 800 KB, KMAX 3,200 KB, PMAX 0.2.
     assert_eq!(
         fabric.ecn_by_rate,
-        BTreeMap::from([(400 * G, step(2_000_000))])
+        BTreeMap::from([(400 * G, ramp(800, 3_200, "0.2"))])
     );
     assert_eq!(
         fabric.pfc_asw,
@@ -143,7 +145,10 @@ fn the_128g_fabric_equals_g1_and_h2() {
     let fabric = derive_fabric(&conf(&shipped()), &RAIL_128G, 72_500).unwrap();
     assert_eq!(
         fabric.ecn_by_rate,
-        BTreeMap::from([(100 * G, step(1_000_000)), (400 * G, step(2_000_000))])
+        BTreeMap::from([
+            (100 * G, ramp(400, 1_600, "0.2")),
+            (400 * G, ramp(800, 3_200, "0.2"))
+        ])
     );
     assert_eq!(
         fabric.pfc_asw,
@@ -296,6 +301,23 @@ fn fabric_refusals() {
         ),
         ("BUFFER_SIZE 32", "BUFFER_SIZE 1", "exceed BUFFER_SIZE"),
         ("RP_TIMER 900", "", "`RP_TIMER` is missing"),
+        // P16 ecnramp: SimAI's ramp lowers as is, so PMAX must be a decimal in (0, 1] and KMAX
+        // within BUFFER_SIZE.
+        (
+            "400000000000 0.2 1600000000000",
+            "400000000000 1.5 1600000000000",
+            "pmax must be a decimal in (0, 1], got `1.5`",
+        ),
+        (
+            "400000000000 0.2 1600000000000",
+            "400000000000 0 1600000000000",
+            "pmax must be a decimal in (0, 1], got `0`",
+        ),
+        (
+            "400000000000 3200 1600000000000",
+            "400000000000 40000 1600000000000",
+            "KMAX 40000 KB at 400000000000 b/s is above BUFFER_SIZE",
+        ),
     ] {
         assert!(shipped.contains(from), "{from}");
         let text = shipped.replace(from, to);

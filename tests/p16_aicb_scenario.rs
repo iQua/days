@@ -258,7 +258,7 @@ fn the_manifest_records_what_the_run_was_made_from() {
         "send_lat_us=3 nvls_enable=true pxn_enable=false",
         "mtu_bytes=9000 window_bytes=72500 queue_capacity_packets=3729",
         "queue_capacity_bytes=33554432",
-        "ecn_ramp_by_rate=100000000000:1000000/1000000/1,400000000000:2000000/2000000/1",
+        "ecn_ramp_by_rate=100000000000:400000/1600000/0.2,400000000000:800000/3200000/0.2",
         "pfc_asw_xoff=3515844 pfc_asw_xon=3512772 pfc_psw_xoff=4115208 pfc_psw_xon=4112136",
         "headroom_by_rate=100000000000:30574,400000000000:75000",
         "collectives=91 operations=9 fused_segments=1 fused_single_server_ops=90",

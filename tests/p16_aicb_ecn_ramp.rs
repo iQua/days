@@ -2,9 +2,9 @@
 //! to the ECN ramp in bytes of queue, over a byte capacity of `BUFFER_SIZE`, as SimAI and real
 //! switches count queue depth.
 //!
-//! Each egress rate's row is a byte step at the K-ramp midpoint, `(KMIN + KMAX) / 2` KB:
-//! 1,000,000 B on a 100 Gb/s egress and 2,000,000 B on a 400 Gb/s one, against SimAI's 32 MiB
-//! `BUFFER_SIZE`.
+//! Each egress rate's row is SimAI.conf's own ramp: KMIN and KMAX in KB times 1,000, PMAX as an
+//! exact fraction: 400,000 / 1,600,000 B at 1/5 on a 100 Gb/s egress and 800,000 / 3,200,000 B at
+//! 1/5 on a 400 Gb/s one, against SimAI's 32 MiB `BUFFER_SIZE`.
 
 #[path = "support/aicb.rs"]
 mod aicb;
@@ -32,17 +32,17 @@ fn ecn_policies(image: &SimulationImage) -> BTreeMap<(u64, String), usize> {
 }
 
 fn expected(rate: u64) -> EcnRampPolicy {
-    let threshold = match rate {
-        rate if rate == 100 * G => 1_000_000,
-        rate if rate == 400 * G => 2_000_000,
+    let (kmin_bytes, kmax_bytes) = match rate {
+        rate if rate == 100 * G => (400_000, 1_600_000),
+        rate if rate == 400 * G => (800_000, 3_200_000),
         other => panic!("unexpected egress rate {other}"),
     };
     EcnRampPolicy {
         capacity_bytes: 33_554_432,
-        kmin_bytes: threshold,
-        kmax_bytes: threshold,
+        kmin_bytes,
+        kmax_bytes,
         pmax_numerator: 1,
-        pmax_denominator: 1,
+        pmax_denominator: 5,
     }
 }
 

@@ -107,8 +107,9 @@ fn uniform_policy(image: &SimulationImage) -> DropMarkPolicy {
 }
 
 /// Ruling 6a: every packet-unit ECN config converts to a byte step at `threshold x S` with a byte
-/// capacity of `capacity x S`, S its data packet size; `aqm_roce_acks_red` becomes the ramp
-/// `aqm_roce_acks_ramp` and `fattree` (RED drop) becomes TailDrop.
+/// capacity of `capacity x S`, S its data packet size; `rail_mini_roce` takes SimAI.conf's ramps,
+/// `aqm_roce_acks_red` becomes the ramp `aqm_roce_acks_ramp` and `fattree` (RED drop) becomes
+/// TailDrop.
 #[test]
 fn every_converted_config_lowers_to_its_byte_policy() {
     let steps: &[(&str, u64, u64)] = &[
@@ -195,11 +196,23 @@ fn every_converted_config_lowers_to_its_byte_policy() {
 
     let rail = days::scenario::compile_config(repo("configs/p16/rail_mini_roce.toml"))
         .expect("rail_mini_roce lowers");
-    // SimAI.conf's K-ramp midpoints as byte steps (ecnbytes), at 100 Gb/s on the 8 GPU links and
-    // 400 Gb/s on the 16 uplinks and PSW downlinks.
+    // SimAI.conf's ramps, at 100 Gb/s on the 8 GPU links and 400 Gb/s on the 16 uplinks and PSW
+    // downlinks.
     let expected = BTreeMap::from([
-        ((100 * G, format!("{:?}", step(33_554_432, 1_000_000))), 8),
-        ((400 * G, format!("{:?}", step(33_554_432, 2_000_000))), 16),
+        (
+            (
+                100 * G,
+                format!("{:?}", ramp(33_554_432, 400_000, 1_600_000, 1, 5)),
+            ),
+            8,
+        ),
+        (
+            (
+                400 * G,
+                format!("{:?}", ramp(33_554_432, 800_000, 3_200_000, 1, 5)),
+            ),
+            16,
+        ),
     ]);
     assert_eq!(policies(&rail), expected);
 }

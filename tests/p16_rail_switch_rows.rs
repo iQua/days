@@ -1,6 +1,6 @@
 //! P16 H2 (ruling H2-7): the switch parameters of the SimAI-identical arms, lowered per port.
 //!
-//! `configs/p16/rail_mini_roce.toml` sets ECN step rows by egress link rate, PFC XOFF and XON by
+//! `configs/p16/rail_mini_roce.toml` sets ECN ramp rows by egress link rate, PFC XOFF and XON by
 //! switch tier (ASW, PSW), and PFC headroom by controlled-link rate. The image and every backend
 //! already hold these per egress LP and per ingress monitor; these tests pin what lowering writes.
 
@@ -52,8 +52,8 @@ fn ecn_rows_follow_the_egress_rate() {
     assert_eq!(
         seen.into_iter().collect::<Vec<_>>(),
         vec![
-            ((100_000_000_000, 1_000_000, 1_000_000, 1, 1), 8),
-            ((400_000_000_000, 2_000_000, 2_000_000, 1, 1), 16)
+            ((100_000_000_000, 400_000, 1_600_000, 1, 5), 8),
+            ((400_000_000_000, 800_000, 3_200_000, 1, 5), 16)
         ]
     );
 }
@@ -104,7 +104,7 @@ fn the_rows_are_refused_where_they_are_ambiguous_or_incomplete() {
         ),
         (
             text.replace(
-                "    { rate_bps = 100000000000, kmin_bytes = 1_000_000, kmax_bytes = 1_000_000, pmax = 1 },\n",
+                "    { rate_bps = 100000000000, kmin_bytes = 400_000, kmax_bytes = 1_600_000, pmax = 0.2 },\n",
                 "",
             ),
             "ecn_by_rate",
