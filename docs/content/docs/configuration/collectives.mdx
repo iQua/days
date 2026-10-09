@@ -438,7 +438,7 @@ arr_dist = { type = "Uniform", low = 1.0, high = 1.0 }
 pkt_size_dist = { type = "DiscreteUniform", low = 512, high = 512 }
 ```
 
-`collective_count` gives the number of members in the set. Each nested source/sink list must contain `flow_count` endpoints. Legacy reserves a contiguous concrete-flow range for each member; RingAllReduce uses its expanded flow count for that reservation. Days AGO also accepts `[[collective_set]]` for its ring algorithms and `SendRecv`, with the per-member rules of `[[collective]]` and without its stage-group keys (see [`[[collective]]` fields](#collective-fields)).
+`collective_count` gives the number of members in the set. Each nested source/sink list must contain `flow_count` endpoints. Legacy reserves a contiguous concrete-flow range for each member; RingAllReduce uses its expanded flow count for that reservation. Days AGO also accepts `[[collective_set]]` for all five of its algorithms, with the per-member rules of `[[collective]]` and without its stage-group keys (see [`[[collective]]` fields](#collective-fields)).
 
 ## Legacy TCP application buffers
 
