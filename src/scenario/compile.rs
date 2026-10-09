@@ -6592,7 +6592,25 @@ fn mix_seed(mut value: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{AfterGroups, CollectiveKey, ComputeKey, FlowInput, parsed_decimal};
+    use super::{
+        AfterGroups, CollectiveKey, ComputeKey, FlowInput, RoceTrafficKey, SourceFlow, SourceRoce,
+        SourceTraffic, parsed_decimal,
+    };
+
+    /// P17 lane nocc: `congestion_control` is a one-byte enum in `SourceRoce`'s padding, so every
+    /// source traffic table, and the flow and collective tables that hold one, keep their size
+    /// and lowering allocates exactly what it did on `main` (3ebb462: `SourceRoce` 88 B,
+    /// `SourceTraffic` 544 B, `SourceFlow` 720 B; a `String` key grew `SourceFlow` by 24 B and
+    /// cost a 4-flow scenario one allocation and 2,976 B while lowering,
+    /// `days-gpu/evidence/P17/nocc/raw/counters`). A RoCE key is held once per distinct key.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn the_congestion_control_key_costs_the_source_tables_nothing() {
+        assert_eq!(std::mem::size_of::<SourceRoce>(), 88);
+        assert_eq!(std::mem::size_of::<SourceTraffic>(), 544);
+        assert_eq!(std::mem::size_of::<SourceFlow>(), 720);
+        assert!(std::mem::size_of::<RoceTrafficKey>() <= 160);
+    }
 
     /// P16 H1 (ruling R1's gate): the operations' key fields must not grow the keys of ordinary
     /// collectives and compute groups, which lowering holds and copies per group. `feat/p16`
