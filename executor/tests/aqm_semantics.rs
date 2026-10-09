@@ -382,12 +382,16 @@ fn ramp_certificate_is_generated_byte_for_byte_by_the_scalar_oracle() {
         include_str!("../../lean/fixtures/p10c/aqm_ramp_executor_accept.csv")
     );
 }
+
 #[test]
-fn device_backends_accept_the_ecn_step() {
+fn device_backends_accept_the_ecn_step_and_ramp() {
     let step = aqm_image(ramp(4, 2, 2, 1, 1), &[1]);
+    let between = aqm_image(ramp(4, 1, 3, 1, 2), &[1]);
     for backend in [Backend::Metal, Backend::Cuda] {
         validate(&step, backend)
             .unwrap_or_else(|error| panic!("{backend} must accept the ECN step: {error}"));
+        validate(&between, backend)
+            .unwrap_or_else(|error| panic!("{backend} must accept the ECN ramp: {error}"));
     }
 
     let mut marked_packet = aqm_image(DropMarkPolicy::TailDrop, &[1]);
@@ -411,6 +415,20 @@ fn adversarial_device_ecn_images() -> Vec<SimulationImage> {
     let prefix = run_scalar_with_observations(&byte_threshold, Some(7), ObservationMode::Full)
         .expect("ECN checkpoint prefix must execute");
     let checkpoint = checkpoint_image(&byte_threshold, &prefix);
+    // The ramp: draws inside (kmin, kmax), marks above, tail drops past the byte capacity, mixed
+    // sizes, the widest span, and a checkpoint taken mid-ramp.
+    let ramp_marks = ramp_image(ramp(100_000, 300, 3_000, 1, 2), 40, 100);
+    let ramp_drops = ramp_image(ramp(3_200, 300, 3_000, 4, 5), 40, 100);
+    let mut ramp_mixed = aqm_image(
+        ramp(10_000, 50, 2_000, 2, 3),
+        &[100, 1, 250, 7, 999, 64, 300, 1_000, 3, 500, 128, 900],
+    );
+    ramp_mixed.stop_time_ns = 1_000_000_000;
+    let ramp_widest = hidden_byte_overflow_image(ramp(u64::MAX, 1, u64::MAX / 3, 1, 3));
+    let ramp_prefix =
+        run_scalar_with_observations(&ramp_marks, Some(20_000), ObservationMode::Full)
+            .expect("ramp checkpoint prefix must execute");
+    let ramp_checkpoint = checkpoint_image(&ramp_marks, &ramp_prefix);
     vec![
         packet_threshold,
         byte_threshold,
@@ -419,12 +437,17 @@ fn adversarial_device_ecn_images() -> Vec<SimulationImage> {
         taildrop_overflow,
         retained_mark,
         checkpoint,
+        ramp_marks,
+        ramp_drops,
+        ramp_mixed,
+        ramp_widest,
+        ramp_checkpoint,
     ]
 }
 
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 #[test]
-fn metal_ecn_step_and_persistent_marks_match_scalar() {
+fn metal_ecn_ramp_and_persistent_marks_match_scalar() {
     for (image_index, image) in adversarial_device_ecn_images().into_iter().enumerate() {
         for horizon in [Some(7), None] {
             let expected =
@@ -459,7 +482,7 @@ fn metal_ecn_step_and_persistent_marks_match_scalar() {
 
 #[cfg(feature = "cuda")]
 #[test]
-fn cuda_ecn_step_and_persistent_marks_match_scalar() {
+fn cuda_ecn_ramp_and_persistent_marks_match_scalar() {
     for image in adversarial_device_ecn_images() {
         for horizon in [Some(7), None] {
             let expected =
