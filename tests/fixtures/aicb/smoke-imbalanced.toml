@@ -2,7 +2,7 @@
 # Megatron fidelity (PP 1: SimAI's groups) with imbalanced expert routing (seeded, Zipf(1);
 # 128 experts, top-8, tokens_per_rank = seq 4,096 / TP 2).
 seed = 7
-duration = 0.5
+duration = 1.0
 
 [topology]
 category = "SpectrumX"

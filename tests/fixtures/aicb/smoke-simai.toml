@@ -1,7 +1,7 @@
 # P16 H3: the MoE smoke trace (Qwen3-30B-A3B-like, 12 layers, 128 GPUs, TP2, EP32, gbs 128) on
 # SimAI's 128g fabric, SimAI fidelity. Lowering it needs host-matched `after` (ruling C1).
 seed = 7
-duration = 0.5
+duration = 1.0
 
 [topology]
 category = "SpectrumX"
