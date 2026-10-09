@@ -7,6 +7,7 @@ pub mod workload;
 
 use serde::Deserialize;
 
+pub(crate) use compile::decimal_probability;
 pub use compile::{
     CompileError, FatTreeEcmpTermination, FatTreeEcmpTrafficKey, FatTreeEcmpTransport,
     LEGACY_ENGINE_ROOT_KEYS, compile_config, compile_config_with_manifest,

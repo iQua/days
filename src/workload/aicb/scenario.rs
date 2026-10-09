@@ -247,7 +247,7 @@ impl fmt::Display for AicbManifest {
 pub const DIVERGENCES: [&str; 9] = [
     "static-pfc-thresholds",
     "per-queue-capacity",
-    "ecn-step",
+    "ecn-enqueue",
     "no-52b-header",
     "credit-pacer",
     "edge-triggered-pause",

@@ -523,9 +523,10 @@ pub fn derive_fabric(
     )?;
     let pfc_psw = tier(&[(shape.uplink_rate_bps, asws)], "PSW")?;
 
-    // ECN steps at the K-ramp midpoint (KMIN/KMAX in KB) in bytes of queue, one per egress link
-    // rate; SimAI asserts an entry for every port rate (`common.h:850-855`). Marking stays a step
-    // at enqueue (recorded divergence `ecn-step`: no ramp, no dequeue marking).
+    // SimAI.conf's ECN ramp per egress link rate (KMIN/KMAX in KB, times 1,000 as `ConfigEcn`
+    // does; PMAX as its exact decimal text); SimAI asserts an entry for every port rate
+    // (`common.h:850-855`). Days AGO decides at enqueue on the depth after admission, where SimAI
+    // marks at dequeue on the depth after departure (recorded divergence `ecn-enqueue`).
     let (kmin_line, kmin) = conf.rate_map("KMIN_MAP")?;
     let (kmax_line, kmax) = conf.rate_map("KMAX_MAP")?;
     let (pmax_line, pmax) = conf.rate_map("PMAX_MAP")?;
@@ -538,30 +539,39 @@ pub fn derive_fabric(
         let kmax = integer(rate_entry(&kmax, rate, kmax_line, "KMAX_MAP")?).ok_or_else(|| {
             AicbError::at(kmax_line, "SimAI.conf: a KMAX_MAP value is not an integer")
         })?;
-        rate_entry(&pmax, rate, pmax_line, "PMAX_MAP")?;
+        let pmax = rate_entry(&pmax, rate, pmax_line, "PMAX_MAP")?;
+        crate::scenario::decimal_probability(pmax).map_err(|reason| {
+            AicbError::at(
+                pmax_line,
+                format!("SimAI.conf: `PMAX_MAP` at {rate} b/s: {reason}"),
+            )
+        })?;
         if kmin > kmax {
             return Err(AicbError::at(
                 kmin_line,
                 format!("SimAI.conf: KMIN {kmin} above KMAX {kmax} at {rate} b/s"),
             ));
         }
-        let threshold = u64::try_from((u128::from(kmin) + u128::from(kmax)) * 500)
-            .map_err(|_| AicbError::new("SimAI.conf: an ECN threshold overflows"))?;
-        if threshold == 0 || threshold > buffer_bytes {
+        let bytes = |kb: u64| {
+            kb.checked_mul(1_000)
+                .ok_or_else(|| AicbError::new("SimAI.conf: an ECN threshold overflows"))
+        };
+        let (kmin_bytes, kmax_bytes) = (bytes(kmin)?, bytes(kmax)?);
+        if kmax_bytes > buffer_bytes {
             return Err(AicbError::at(
-                kmin_line,
+                kmax_line,
                 format!(
-                    "SimAI.conf: the ECN threshold {threshold} B at {rate} b/s is outside \
-                     1..=BUFFER_SIZE ({buffer_bytes} B)"
+                    "SimAI.conf: KMAX {kmax} KB at {rate} b/s is above BUFFER_SIZE \
+                     ({buffer_bytes} B)"
                 ),
             ));
         }
         ecn_by_rate.insert(
             rate,
             SimaiEcn {
-                kmin_bytes: threshold,
-                kmax_bytes: threshold,
-                pmax: "1".to_owned(),
+                kmin_bytes,
+                kmax_bytes,
+                pmax: pmax.to_owned(),
             },
         );
         let reverse = link_arrival_time_ns(0, 64, rate, shape.link_delay_ns)
