@@ -3208,38 +3208,39 @@ __device__ __forceinline__ bool switch_admission_action(
         action = taildrop_capacity != 0 && waiting >= taildrop_capacity ? 2 : 0;
         return true;
     }
-    // P16 ecnramp (ruling 1a): the ECN ramp, step included, is a mechanism. The plain build
-    // admits by TailDrop alone and stops on any other policy.
-    if (!MECHANISMS || policy != AQM_ECN) {
-        set_semantic_error(error, 58, node);
-        return false;
-    }
-    // `ecn_ramp_decision`: tail drop past the byte capacity; no draw for a packet that is not
-    // ECN-capable data; no mark below kmin; a mark at or above kmax; in between a mark iff
-    // mulhi(u, span) < pmax_num * (d - kmin), u = mix(queue_key ^ payload).
-    ulong post_bytes = queued_bytes + packet[PK_SIZE];
-    ulong capacity = scheduler_state[scheduler_base + S_AQM_CAPACITY];
-    ulong kmin = scheduler_state[scheduler_base + S_AQM_KMIN];
-    ulong record = scheduler_state[scheduler_base + S_AQM_RECORD];
-    if (post_bytes > capacity) {
-        action = 2;
+    // P16 ecnramp (ruling 1a): the ECN ramp, step included, is a mechanism, guarded like every
+    // other one. The plain build admits by TailDrop alone (the host selects the mechanisms build
+    // for any ECN queue, `MECHANISM_ECN`); any other policy word is malformed.
+    if (MECHANISMS && policy == AQM_ECN) {
+        // `ecn_ramp_decision`: tail drop past the byte capacity; no draw for a packet that is not
+        // ECN-capable data; no mark below kmin; a mark at or above kmax; in between a mark iff
+        // mulhi(u, span) < pmax_num * (d - kmin), u = mix(queue_key ^ payload).
+        ulong post_bytes = queued_bytes + packet[PK_SIZE];
+        ulong capacity = scheduler_state[scheduler_base + S_AQM_CAPACITY];
+        ulong kmin = scheduler_state[scheduler_base + S_AQM_KMIN];
+        ulong record = scheduler_state[scheduler_base + S_AQM_RECORD];
+        if (post_bytes > capacity) {
+            action = 2;
+            return true;
+        }
+        ulong kind = packet[PK_KIND] & PK_KIND_MASK;
+        if ((kind != DATA_PACKET && kind != TCP_DATA_PACKET && kind != ROCE_DATA_PACKET) ||
+            post_bytes < kmin) {
+            action = 0;
+            return true;
+        }
+        ulong kmax = scheduler_state[record + AQM_RECORD_KMAX];
+        if (post_bytes >= kmax) {
+            action = 1;
+            return true;
+        }
+        ulong draw = splitmix64(scheduler_state[record + AQM_RECORD_QUEUE_KEY] ^ packet[PK_ID]);
+        ulong bound = scheduler_state[record + AQM_RECORD_PMAX_NUMERATOR] * (post_bytes - kmin);
+        action = __umul64hi(draw, scheduler_state[record + AQM_RECORD_SPAN]) < bound ? 1 : 0;
         return true;
     }
-    ulong kind = packet[PK_KIND] & PK_KIND_MASK;
-    if ((kind != DATA_PACKET && kind != TCP_DATA_PACKET && kind != ROCE_DATA_PACKET) ||
-        post_bytes < kmin) {
-        action = 0;
-        return true;
-    }
-    ulong kmax = scheduler_state[record + AQM_RECORD_KMAX];
-    if (post_bytes >= kmax) {
-        action = 1;
-        return true;
-    }
-    ulong draw = splitmix64(scheduler_state[record + AQM_RECORD_QUEUE_KEY] ^ packet[PK_ID]);
-    ulong bound = scheduler_state[record + AQM_RECORD_PMAX_NUMERATOR] * (post_bytes - kmin);
-    action = __umul64hi(draw, scheduler_state[record + AQM_RECORD_SPAN]) < bound ? 1 : 0;
-    return true;
+    set_semantic_error(error, 58, node);
+    return false;
 }
 
 __device__ __forceinline__ void local_rational_zero(uint *numerator, uint *denominator) {
