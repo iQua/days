@@ -678,14 +678,6 @@ fn validate_backend_capabilities(
         }
     }
     for queue in image.switch_states.iter().flat_map(|state| &state.queues) {
-        match queue.drop_mark {
-            crate::DropMarkPolicy::TailDrop | crate::DropMarkPolicy::EcnThreshold(_) => {}
-            crate::DropMarkPolicy::Red(_) => {
-                return Err(ValidationError::new(format!(
-                    "backend {backend} does not support RED admission; use Scalar or Cpu"
-                )));
-            }
-        }
         match queue.scheduler {
             SchedulerKind::Fifo
             | SchedulerKind::StaticPriority { .. }
@@ -5614,11 +5606,6 @@ fn validate_drop_mark_policy(
     queue_index: usize,
     queue: &crate::SwitchQueueState,
 ) -> Result<(), ValidationError> {
-    let queued_packets = u64::try_from(queue.queue.len()).map_err(|_| {
-        ValidationError::new(format!(
-            "switch node {owner:?} queue {queue_index} packet depth exceeds u64"
-        ))
-    })?;
     let queued_bytes = queue.queue.iter().try_fold(0_u64, |total, payload| {
         let size = packet(image, *payload)
             .expect("packet validation precedes drop/mark validation")
@@ -5631,74 +5618,16 @@ fn validate_drop_mark_policy(
     })?;
     match queue.drop_mark {
         crate::DropMarkPolicy::TailDrop => Ok(()),
-        crate::DropMarkPolicy::EcnThreshold(config) => {
-            if config.capacity == 0 || config.threshold == 0 || config.threshold > config.capacity {
+        crate::DropMarkPolicy::EcnRamp(policy) => {
+            crate::ecn_ramp::ecn_ramp_policy_check(&policy).map_err(|reason| {
+                ValidationError::new(format!(
+                    "switch node {owner:?} queue {queue_index} ECN ramp {reason}"
+                ))
+            })?;
+            if queued_bytes > policy.capacity_bytes {
                 return Err(ValidationError::new(format!(
-                    "switch node {owner:?} queue {queue_index} ECN threshold must satisfy 0 < threshold <= capacity"
-                )));
-            }
-            let depth = match config.unit {
-                crate::QueueDepthUnit::Packets => queued_packets,
-                crate::QueueDepthUnit::Bytes => queued_bytes,
-            };
-            if depth > config.capacity {
-                return Err(ValidationError::new(format!(
-                    "switch node {owner:?} queue {queue_index} ECN depth {depth} exceeds policy capacity {}",
-                    config.capacity
-                )));
-            }
-            Ok(())
-        }
-        crate::DropMarkPolicy::Red(state) => {
-            if state.capacity == 0
-                || state.min_threshold >= state.max_threshold
-                || state.max_threshold > state.capacity
-                || state.max_probability_numerator == 0
-                || state.max_probability_denominator == 0
-                || state.max_probability_numerator > state.max_probability_denominator
-            {
-                return Err(ValidationError::new(format!(
-                    "switch node {owner:?} queue {queue_index} RED requires 0 <= min < max <= capacity and 0 < max probability <= 1"
-                )));
-            }
-            let depth = match state.unit {
-                crate::QueueDepthUnit::Packets => queued_packets,
-                crate::QueueDepthUnit::Bytes => queued_bytes,
-            };
-            if depth > state.capacity {
-                return Err(ValidationError::new(format!(
-                    "switch node {owner:?} queue {queue_index} RED depth {depth} exceeds policy capacity {}",
-                    state.capacity
-                )));
-            }
-            let maximum_average = u128::from(state.capacity)
-                .checked_mul(1_u128 << 32)
-                .ok_or_else(|| {
-                    ValidationError::new(format!(
-                        "switch node {owner:?} queue {queue_index} RED average bound exceeds u128"
-                    ))
-                })?;
-            if state.average_scaled > maximum_average {
-                return Err(ValidationError::new(format!(
-                    "switch node {owner:?} queue {queue_index} RED average {} exceeds scaled capacity {maximum_average}",
-                    state.average_scaled
-                )));
-            }
-            let probability_numerator = BigUint::from(state.max_probability_numerator);
-            let worst_spacing_numerator = BigUint::from(state.max_probability_denominator)
-                * BigUint::from(state.max_threshold - state.min_threshold)
-                * BigUint::from(1_u128 << 32);
-            let worst_spacing =
-                (&worst_spacing_numerator + &probability_numerator - 1_u8) / probability_numerator;
-            if worst_spacing > BigUint::from(u64::MAX) {
-                return Err(ValidationError::new(format!(
-                    "switch node {owner:?} queue {queue_index} RED worst-case signal spacing exceeds u64 counter state"
-                )));
-            }
-            if BigUint::from(state.counter) >= worst_spacing {
-                return Err(ValidationError::new(format!(
-                    "switch node {owner:?} queue {queue_index} RED counter {} is not below its worst-case signal spacing",
-                    state.counter
+                    "switch node {owner:?} queue {queue_index} ECN ramp depth {queued_bytes} exceeds its byte capacity {}",
+                    policy.capacity_bytes
                 )));
             }
             Ok(())

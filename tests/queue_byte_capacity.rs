@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use days::scenario::compile_config;
-use days_executor::{DropMarkPolicy, EcnThresholdPolicy, QueueDepthUnit, SimulationImage};
+use days_executor::{DropMarkPolicy, EcnRampPolicy, SimulationImage};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BytePolicyTransform {
@@ -71,10 +71,12 @@ fn apply_probe_byte_policy(
         .iter_mut()
         .flat_map(|state| &mut state.queues)
     {
-        queue.drop_mark = DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
-            unit: QueueDepthUnit::Bytes,
-            capacity: capacity_bytes,
-            threshold: capacity_bytes,
+        queue.drop_mark = DropMarkPolicy::EcnRamp(EcnRampPolicy {
+            capacity_bytes,
+            kmin_bytes: capacity_bytes,
+            kmax_bytes: capacity_bytes,
+            pmax_numerator: 1,
+            pmax_denominator: 1,
         });
     }
 
@@ -94,12 +96,12 @@ fn k16_probe_policy_is_derived_exactly() {
     assert_eq!(transform.queues, 5_120);
     assert_eq!(transform.capacity_bytes, 93_440);
     for queue in image.switch_states.iter().flat_map(|state| &state.queues) {
-        let DropMarkPolicy::EcnThreshold(policy) = queue.drop_mark else {
+        let DropMarkPolicy::EcnRamp(policy) = queue.drop_mark else {
             panic!("every switch queue must use the derived byte policy")
         };
-        assert_eq!(policy.unit, QueueDepthUnit::Bytes);
-        assert_eq!(policy.capacity, 93_440);
-        assert_eq!(policy.threshold, 93_440);
+        assert_eq!(policy.capacity_bytes, 93_440);
+        assert_eq!(policy.kmin_bytes, 93_440);
+        assert_eq!(policy.kmax_bytes, 93_440);
     }
 }
 

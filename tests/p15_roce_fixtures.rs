@@ -537,28 +537,33 @@ fn scalar_anchor(name: &str) -> (u64, u64) {
 /// the Mellanox-form controller, the ECN echo (no CNP) and the queue-pair window fields
 /// (`days-gpu/evidence/P16/dcqcn-impl/anchors.md`): the anchors the device lane proves Metal and CUDA
 /// against. `run_identical` shows CPU at 1-4 workers equal to Scalar; the `days` CLI cross-check
-/// (Scalar and CPU at 2 workers) is `days-gpu/evidence/P15/qp-impl/sim/p15_anchors.tsv`.
+/// (Scalar and CPU at 2 workers) is `days-gpu/evidence/P15/qp-impl/sim/p15_anchors.tsv`. Every
+/// anchor re-frozen at P16 ecnramp (2026-10-08, Mac) for the byte ECN step; with `drop_mark`
+/// normalized, `roce_cnp_under_pfc` and `roce_feedback_priority` mark fewer data packets (ACKs now
+/// count their 60 B toward the 50,000 B step) and the rest are unchanged
+/// (`days-gpu/evidence/P16/ecnramp/refreeze-compare-c6.txt`).
 const ANCHORS: [(&str, u64, u64); 7] = [
-    ("roce_lossless_pfc.toml", 45_211, 0x86d4_4c03_e8a2_fe87),
-    ("roce_gbn_lossy.toml", 45_468, 0xb0bb_425a_1abc_c97f),
-    ("roce_timeout.toml", 34_182, 0x8e8e_74eb_ee72_2ced),
-    ("roce_nack_only.toml", 34_161, 0xfa68_ecea_f3fb_dba3),
-    ("roce_cnp_under_pfc.toml", 56_702, 0x55d3_b5d2_ce26_fd5b),
-    ("roce_feedback_priority.toml", 56_749, 0xf5d8_63d1_7bfd_52b6),
-    ("roce_mixed_tcp.toml", 51_617, 0x1259_f21e_71bb_205e),
+    ("roce_lossless_pfc.toml", 46_261, 0xaa03_bbd8_1cd7_b0c5),
+    ("roce_gbn_lossy.toml", 46_488, 0x9159_37dc_3c0c_15fb),
+    ("roce_timeout.toml", 35_202, 0xf44b_63d3_0ee8_dda7),
+    ("roce_nack_only.toml", 35_181, 0xdd48_bebf_f7f0_7cb1),
+    ("roce_cnp_under_pfc.toml", 57_734, 0x3c48_4c47_67f1_0add),
+    ("roce_feedback_priority.toml", 57_735, 0xd800_ffac_5e0b_8d64),
+    ("roce_mixed_tcp.toml", 52_647, 0x435d_d558_548d_35aa),
 ];
 
 /// Host-link PFC anchors (`p15/hostpfc`, frozen at `c26865f` on the Mac; the sim gate's CLI
-/// confirms them on Linux, Scalar and CPU at 2 workers); re-frozen at P16 D1 with the others.
+/// confirms them on Linux, Scalar and CPU at 2 workers); re-frozen at P16 D1 and ecnramp with the
+/// others.
 const HOST_PFC_ANCHORS: [(&str, u64, u64); 2] = [
     (
         "hostpfc_incast_lossless.toml",
-        66_858,
-        0x7533_75b4_1b13_00cf,
+        67_898,
+        0x2974_fef5_6bb8_bae3,
     ),
     // Fix round 1: the Summary anchor of the multi-QP and TCP variant (frozen on the Mac at
     // c762428's code; the sim gate's CLI confirms it on Linux).
-    ("hostpfc_multi_qp_tcp.toml", 77_170, 0x13f3_943d_8d1c_1069),
+    ("hostpfc_multi_qp_tcp.toml", 78_210, 0x1a69_bd0c_f289_d7e5),
 ];
 
 #[test]
@@ -605,7 +610,8 @@ fn hpcc_fixture_matches_its_frozen_anchor() {
     assert_eq!(
         scalar_anchor("hpcc_incast64_dragonfly.toml"),
         // Re-frozen at c26865f: the fixture re-sized for host-link PFC (hostpfc-design.md §10.2);
-        // re-frozen at P16 D1 for the Mellanox-form controller and the ECN echo.
-        (1_237_835, 0x6dcb_f0e0_afac_8968)
+        // re-frozen at P16 D1 for the Mellanox-form controller and the ECN echo; re-frozen at P16
+        // ecnramp for the byte ECN step (unchanged with `drop_mark` normalized).
+        (1_279_643, 0x0fcd_2d1c_bac1_a04e)
     );
 }

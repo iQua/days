@@ -5,16 +5,15 @@ use std::path::Path;
 use days_executor::{
     Backend, CollectiveAlgorithm, CollectiveChannelPolicy, CollectiveChunkPolicy, CollectivePhase,
     CollectiveStage, CollectiveStageIdentity, ComputeStage, ConstantGenerator, DcqcnController,
-    DcqcnControllerConfig, DcqcnGenerator, DcqcnReceiverState, DropMarkPolicy, EcnThresholdPolicy,
+    DcqcnControllerConfig, DcqcnGenerator, DcqcnReceiverState, DropMarkPolicy, EcnRampPolicy,
     Event, EventKey, EventKind, FlowDescriptor, FlowGeneratorKind, FlowGeneratorState, FlowId,
     GeneratorFeedbackState, GeneratorStatus, GeneratorTermination, HostState, LinkDescriptor,
     LinkId, NodeDescriptor, NodeId, NodeKind, PacketDescriptor, PacketKind, PayloadId,
-    PfcIngressState, PfcQueueState, QueueDepthUnit, RateGenerator, RedPolicyState, RemoteChannel,
-    RoceGenerator, RocePacer, RoceReceiverState, ScheduledEmission, SchedulerKind, SimulationImage,
-    StageDependencies, StagePredecessors, StageRole, SwitchQueueState, SwitchState,
-    TcpCongestionControl, TcpDataHeader, TcpGenerator, TcpReceiverState, event_phase, validate,
+    PfcIngressState, PfcQueueState, RateGenerator, RemoteChannel, RoceGenerator, RocePacer,
+    RoceReceiverState, ScheduledEmission, SchedulerKind, SimulationImage, StageDependencies,
+    StagePredecessors, StageRole, SwitchQueueState, SwitchState, TcpCongestionControl,
+    TcpDataHeader, TcpGenerator, TcpReceiverState, event_phase, validate,
 };
-use num_bigint::BigUint;
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 use rand::SeedableRng;
@@ -145,14 +144,15 @@ struct SourceSwitch {
     capacity: u64,
     discipline: Option<String>,
     drop: Option<String>,
-    ecn_threshold: Option<ExactDecimal>,
-    /// P16 H2: an ECN step threshold per egress link rate (SimAI's ECN rows are keyed by the
-    /// port's rate); replaces `ecn_threshold` and needs `drop = "ECN_THRESHOLD"`. Every row is in
-    /// packets (`threshold_packets`, within `capacity`) or every row is in bytes
-    /// (`threshold_bytes`, within `ecn_capacity_bytes`; P16 ecnbytes).
+    /// P16 ecnramp: the ECN ramp of every switch queue (`kmin_bytes`, `kmax_bytes`, `pmax`), with
+    /// `ecn_capacity_bytes`; exclusive with `ecn_by_rate`.
+    ecn: Option<SourceEcn>,
+    /// P16 H2 and ecnramp: one ECN ramp per egress link rate (SimAI keys its ECN rows by the
+    /// port's rate), with `ecn_capacity_bytes`; exclusive with `ecn`.
     ecn_by_rate: Option<Vec<SourceEcnRow>>,
-    /// P16 ecnbytes: the byte capacity of a byte-unit ECN policy (`ecn_by_rate` rows in bytes).
-    /// `capacity` stays the queue's packet capacity.
+    /// The byte capacity an ECN queue tail-drops at (SimAI's `BUFFER_SIZE`); `capacity` stays the
+    /// TailDrop packet capacity, which on an ECN queue only the device planners read, as a
+    /// per-queue packet hint.
     ecn_capacity_bytes: Option<u64>,
     weights: Option<Vec<u64>>,
     priorities: Option<Vec<u64>>,
@@ -160,10 +160,19 @@ struct SourceSwitch {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct SourceEcn {
+    kmin_bytes: u64,
+    kmax_bytes: u64,
+    pmax: ExactDecimal,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceEcnRow {
     rate_bps: u64,
-    threshold_packets: Option<u64>,
-    threshold_bytes: Option<u64>,
+    kmin_bytes: u64,
+    kmax_bytes: u64,
+    pmax: ExactDecimal,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1057,8 +1066,9 @@ struct SupportedModel {
     queue_capacity_packets: u64,
     scheduler: SchedulerKind,
     drop_mark: DropMarkPolicy,
-    /// P16 H2: the ECN step threshold of each egress LP by its link rate, overriding `drop_mark`'s.
-    ecn_by_rate: Option<BTreeMap<u64, u64>>,
+    /// P16 H2 and ecnramp: the ECN ramp of each egress LP by its link rate, overriding
+    /// `drop_mark`.
+    ecn_by_rate: Option<BTreeMap<u64, EcnRampPolicy>>,
     pfc: Option<PfcLowering>,
     routing: RoutingPolicy,
     propagation: PropagationModel,
@@ -1289,95 +1299,57 @@ impl SupportedModel {
 
         let drop = source.switch.drop.as_deref().ok_or_else(|| {
             CompileError::Unsupported(
-                "unsupported drop policy: `switch.drop` is missing; Days executor supports TailDrop, RED, RED_ECN, and ECN_THRESHOLD"
+                "unsupported drop policy: `switch.drop` is missing; Days AGO's only drop rule is TailDrop"
                     .to_owned(),
             )
         })?;
-        let drop_mark = match drop {
-            "TailDrop" => DropMarkPolicy::TailDrop,
-            "RED" | "RED_ECN" => {
-                if source.switch.capacity < 10 {
-                    return Err(CompileError::Invalid(
-                        "RED packet capacity must be at least 10 to represent 70%/90% thresholds"
-                            .to_owned(),
-                    ));
-                }
-                let min_threshold = u64::try_from(u128::from(source.switch.capacity) * 7 / 10)
-                    .map_err(|_| {
-                        CompileError::Invalid(
-                            "RED 70% packet threshold exceeds the u64 state domain".to_owned(),
-                        )
-                    })?;
-                let max_threshold = u64::try_from(u128::from(source.switch.capacity) * 9 / 10)
-                    .map_err(|_| {
-                        CompileError::Invalid(
-                            "RED 90% packet threshold exceeds the u64 state domain".to_owned(),
-                        )
-                    })?;
-                DropMarkPolicy::Red(RedPolicyState {
-                    unit: QueueDepthUnit::Packets,
-                    capacity: source.switch.capacity,
-                    min_threshold,
-                    max_threshold,
-                    max_probability_numerator: 4,
-                    max_probability_denominator: 5,
-                    average_scaled: 0,
-                    counter: 0,
-                    mark_ecn: drop == "RED_ECN",
-                })
-            }
-            "ECN_THRESHOLD" if source.switch.ecn_by_rate.is_some() => {
-                if source.switch.ecn_threshold.is_some() {
-                    return Err(CompileError::Invalid(
-                        "`switch.ecn_by_rate` replaces `switch.ecn_threshold`".to_owned(),
-                    ));
-                }
-                // Each egress LP takes its link rate's row at lowering; this policy only carries
-                // the shared capacity and unit.
-                let (unit, capacity) = match source.switch.ecn_capacity_bytes {
-                    None => (QueueDepthUnit::Packets, source.switch.capacity),
-                    Some(bytes) => (QueueDepthUnit::Bytes, bytes),
-                };
-                DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
-                    unit,
-                    capacity,
-                    threshold: capacity,
-                })
-            }
-            "ECN_THRESHOLD" => {
-                let threshold = exact_decimal_product_ceil(
-                    scenario_text,
-                    source.switch.ecn_threshold.as_ref(),
-                    "0.8",
-                    source.switch.capacity,
-                    "switch.ecn_threshold",
-                )?;
-                DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
-                    unit: QueueDepthUnit::Packets,
-                    capacity: source.switch.capacity,
-                    threshold,
-                })
-            }
-            unsupported => {
-                return Err(CompileError::Unsupported(format!(
-                    "unsupported drop policy `{unsupported}`; Days executor supports TailDrop, RED, RED_ECN, and ECN_THRESHOLD"
-                )));
-            }
-        };
-
-        if source.switch.ecn_capacity_bytes.is_some() && source.switch.ecn_by_rate.is_none() {
-            return Err(CompileError::Invalid(
-                "`switch.ecn_capacity_bytes` needs `switch.ecn_by_rate` rows in bytes".to_owned(),
-            ));
+        if drop != "TailDrop" {
+            return Err(CompileError::Unsupported(format!(
+                "unsupported drop policy `{drop}`; Days AGO's only drop rule is TailDrop (RED, \
+                 RED_ECN and ECN_THRESHOLD were removed in P16): ECN marking is `switch.ecn` or \
+                 `switch.ecn_by_rate`, with `switch.ecn_capacity_bytes`"
+            )));
         }
-        let ecn_by_rate = match (&source.switch.ecn_by_rate, drop_mark) {
-            (None, _) => None,
-            (Some(rows), DropMarkPolicy::EcnThreshold(policy)) => Some(ecn_rows(rows, policy)?),
-            (Some(_), _) => {
+        let (drop_mark, ecn_by_rate) = match (
+            &source.switch.ecn,
+            &source.switch.ecn_by_rate,
+            source.switch.ecn_capacity_bytes,
+        ) {
+            (None, None, None) => (DropMarkPolicy::TailDrop, None),
+            (None, None, Some(_)) => {
                 return Err(CompileError::Invalid(
-                    "`switch.ecn_by_rate` needs `switch.drop = \"ECN_THRESHOLD\"`".to_owned(),
+                    "`switch.ecn_capacity_bytes` needs `switch.ecn` or `switch.ecn_by_rate`"
+                        .to_owned(),
                 ));
             }
+            (Some(_), Some(_), _) => {
+                return Err(CompileError::Invalid(
+                    "`switch.ecn` and `switch.ecn_by_rate` are exclusive".to_owned(),
+                ));
+            }
+            (_, _, None) => {
+                return Err(CompileError::Invalid(
+                    "ECN marking needs `switch.ecn_capacity_bytes`, the byte capacity an ECN \
+                     queue tail-drops at"
+                        .to_owned(),
+                ));
+            }
+            (Some(ecn), None, Some(capacity_bytes)) => (
+                DropMarkPolicy::EcnRamp(ecn_ramp_policy(
+                    scenario_text,
+                    capacity_bytes,
+                    ecn.kmin_bytes,
+                    ecn.kmax_bytes,
+                    &ecn.pmax,
+                    "switch.ecn",
+                )?),
+                None,
+            ),
+            (None, Some(rows), Some(capacity_bytes)) => (
+                // Each egress LP takes its link rate's row at lowering.
+                DropMarkPolicy::TailDrop,
+                Some(ecn_rows(scenario_text, rows, capacity_bytes)?),
+            ),
         };
         let link = source.link.unwrap_or_default();
         let mut pfc = None;
@@ -1651,40 +1623,89 @@ fn pfc_headroom_rows(rows: &[SourceHeadroomRow]) -> Result<BTreeMap<u64, u64>, C
     Ok(headroom)
 }
 
-/// `switch.ecn_by_rate`: one step threshold per distinct link rate, in the policy's unit (packets
-/// without `switch.ecn_capacity_bytes`, bytes with it), within the policy's capacity.
+/// `switch.ecn_by_rate`: one ECN ramp per distinct egress link rate, sharing the byte capacity.
 fn ecn_rows(
+    scenario_text: &str,
     rows: &[SourceEcnRow],
-    policy: EcnThresholdPolicy,
-) -> Result<BTreeMap<u64, u64>, CompileError> {
-    let (unit, key) = match policy.unit {
-        QueueDepthUnit::Packets => ("packets", "threshold_packets"),
-        QueueDepthUnit::Bytes => ("bytes", "threshold_bytes"),
-    };
-    let capacity = policy.capacity;
-    let mut thresholds = BTreeMap::new();
+    capacity_bytes: u64,
+) -> Result<BTreeMap<u64, EcnRampPolicy>, CompileError> {
+    let mut policies = BTreeMap::new();
     for row in rows {
-        let threshold = match (policy.unit, row.threshold_packets, row.threshold_bytes) {
-            (QueueDepthUnit::Packets, Some(threshold), None)
-            | (QueueDepthUnit::Bytes, None, Some(threshold)) => threshold,
-            _ => {
-                return Err(CompileError::Invalid(format!(
-                    "`switch.ecn_by_rate` rows are in {unit} here: each row needs `{key}` alone"
-                )));
-            }
-        };
-        if row.rate_bps == 0
-            || threshold == 0
-            || threshold > capacity
-            || thresholds.insert(row.rate_bps, threshold).is_some()
-        {
-            return Err(CompileError::Invalid(format!(
-                "`switch.ecn_by_rate` needs one threshold in 1..={capacity} {unit} per distinct \
-                 positive rate"
-            )));
+        let policy = ecn_ramp_policy(
+            scenario_text,
+            capacity_bytes,
+            row.kmin_bytes,
+            row.kmax_bytes,
+            &row.pmax,
+            "switch.ecn_by_rate",
+        )?;
+        if row.rate_bps == 0 || policies.insert(row.rate_bps, policy).is_some() {
+            return Err(CompileError::Invalid(
+                "`switch.ecn_by_rate` needs one row per distinct positive rate".to_owned(),
+            ));
         }
     }
-    Ok(thresholds)
+    Ok(policies)
+}
+
+/// One ECN ramp from its scenario keys: `pmax` is an exact decimal in `(0, 1]`, reduced to lowest
+/// terms, and the policy must pass the executor's own check (`ecn_ramp_policy_check`).
+fn ecn_ramp_policy(
+    scenario_text: &str,
+    capacity_bytes: u64,
+    kmin_bytes: u64,
+    kmax_bytes: u64,
+    pmax: &ExactDecimal,
+    label: &str,
+) -> Result<EcnRampPolicy, CompileError> {
+    let literal = exact_decimal_literal(scenario_text, pmax, label)?;
+    let (pmax_numerator, pmax_denominator) = decimal_probability(literal)
+        .map_err(|reason| CompileError::Invalid(format!("`{label}` {reason}")))?;
+    let policy = EcnRampPolicy {
+        capacity_bytes,
+        kmin_bytes,
+        kmax_bytes,
+        pmax_numerator,
+        pmax_denominator,
+    };
+    days_executor::ecn_ramp::ecn_ramp_policy_check(&policy)
+        .map_err(|reason| CompileError::Invalid(format!("`{label}` {reason}")))?;
+    Ok(policy)
+}
+
+/// A decimal literal in `(0, 1]` as an exact fraction in lowest terms (`0.2` is `1/5`), shared by
+/// the scenario's `pmax` and SimAI.conf's `PMAX_MAP`.
+pub(crate) fn decimal_probability(literal: &str) -> Result<(u64, u64), String> {
+    let invalid = || format!("pmax must be a decimal in (0, 1], got `{}`", literal.trim());
+    let parsed = parsed_decimal(literal, "pmax").map_err(|_| invalid())?;
+    if parsed.negative || parsed.digits.chars().all(|digit| digit == '0') {
+        return Err(invalid());
+    }
+    let digits = parsed.digits.parse::<u128>().map_err(|_| invalid())?;
+    let (numerator, denominator) = if parsed.power >= 0 {
+        let power = u32::try_from(parsed.power).map_err(|_| invalid())?;
+        let scale = 10_u128.checked_pow(power).ok_or_else(invalid)?;
+        (digits.checked_mul(scale).ok_or_else(invalid)?, 1)
+    } else {
+        let power = u32::try_from(parsed.power.unsigned_abs()).map_err(|_| invalid())?;
+        (digits, 10_u128.checked_pow(power).ok_or_else(invalid)?)
+    };
+    if numerator > denominator {
+        return Err(invalid());
+    }
+    let divisor = gcd_u128(numerator, denominator);
+    let reduced = (numerator / divisor, denominator / divisor);
+    Ok((
+        u64::try_from(reduced.0).map_err(|_| invalid())?,
+        u64::try_from(reduced.1).map_err(|_| invalid())?,
+    ))
+}
+
+const fn gcd_u128(mut left: u128, mut right: u128) -> u128 {
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    left
 }
 
 fn exact_pfc_array(values: Option<&[u64]>, field: &str) -> Result<[u64; 8], CompileError> {
@@ -3409,48 +3430,6 @@ fn exact_decimal_is_zero(
     Ok(value.digits == "0")
 }
 
-fn exact_decimal_product_ceil(
-    scenario_text: &str,
-    value: Option<&ExactDecimal>,
-    default: &str,
-    capacity: u64,
-    label: &str,
-) -> Result<u64, CompileError> {
-    let literal = match value {
-        Some(value) => exact_decimal_literal(scenario_text, value, label)?,
-        None => default,
-    };
-    let parsed = parsed_decimal(literal, label)?;
-    let invalid = || {
-        CompileError::Invalid(
-            "ECN threshold requires finite 0 < switch.ecn_threshold <= 1 and positive capacity"
-                .to_owned(),
-        )
-    };
-    if capacity == 0 || parsed.negative || parsed.digits == "0" {
-        return Err(invalid());
-    }
-    if parsed.power >= 0 {
-        if parsed.digits == "1" && parsed.power == 0 {
-            return Ok(capacity);
-        }
-        return Err(invalid());
-    }
-    let denominator_power = usize::try_from(parsed.power.unsigned_abs()).map_err(|_| invalid())?;
-    if parsed.digits.len() > denominator_power {
-        return Err(invalid());
-    }
-    if denominator_power > parsed.digits.len().saturating_add(20) {
-        return Ok(1);
-    }
-    let denominator_power = u32::try_from(denominator_power).map_err(|_| invalid())?;
-    let numerator = parsed.digits.parse::<BigUint>().map_err(|_| invalid())?;
-    let denominator = BigUint::from(10_u8).pow(denominator_power);
-    let product = numerator * BigUint::from(capacity);
-    let threshold = (&product + &denominator - BigUint::from(1_u8)) / denominator;
-    u64::try_from(threshold).map_err(|_| invalid())
-}
-
 fn integer_radix(literal: &str) -> Option<(u32, &str)> {
     literal
         .strip_prefix("0x")
@@ -4561,24 +4540,18 @@ fn lower(
     // pass over the ports only when the scenario has rows (review F2: deciding it inside the map
     // made the map fallible, and a `Result` collect has no size hint, so the vector grew by doubling
     // on every image).
-    if let (Some(rows), DropMarkPolicy::EcnThreshold(policy)) =
-        (&model.ecn_by_rate, model.drop_mark)
-    {
+    if let Some(rows) = &model.ecn_by_rate {
         for (port, state) in switch_port_keys.iter().zip(&mut switch_states) {
             let LpKey::SwitchPort { egress, .. } = *port else {
                 unreachable!("switch-port key set contains only switch ports")
             };
-            let queue = &mut state.queues[0];
             let rate_bps = link_rate.of(egress);
-            let threshold = *rows.get(&rate_bps).ok_or_else(|| {
+            let policy = *rows.get(&rate_bps).ok_or_else(|| {
                 CompileError::Invalid(format!(
                     "`switch.ecn_by_rate` has no row for a {rate_bps} b/s egress link"
                 ))
             })?;
-            queue.drop_mark = DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
-                threshold,
-                ..policy
-            });
+            state.queues[0].drop_mark = DropMarkPolicy::EcnRamp(policy);
         }
     }
     let links = ids

@@ -166,47 +166,49 @@ const fn fixture(
 /// tick, frozen controllers ignore later CNPs. The five single-flow zero-XOFF fixtures see no CE,
 /// so their controllers stay pristine and their final states, and anchors, now coincide (their
 /// durations differed only in control ticks). `leanguard_pfc_executable` (no DCQCN) is unmoved.
-/// Old and new values: `days-gpu/evidence/P16/dcqcn-impl/anchors.md`.
+/// Old and new values: `days-gpu/evidence/P16/dcqcn-impl/anchors.md`. Re-frozen at P16 ecnramp
+/// (2026-10-08, Mac) for the byte ECN step: every ECN fixture's result is unchanged with the
+/// queues' `drop_mark` normalized (`days-gpu/evidence/P16/ecnramp/refreeze-compare-c6.txt`).
 const FIXTURES: [Fixture; 9] = [
     fixture(
         "dcqcn_t26.toml",
         (0, 0, 2, 0, 22),
-        (8_337, 0x88f8f102984b0f8e),
+        (8_745, 0x55e76169e22a133e),
     ),
     fixture(
         "dcqcn_t26_pfc.toml",
         (4, 2, 2, 40, 22),
-        (16_486, 0xeddf443ad909fd4f),
+        (16_894, 0x357370434ce30d6f),
     ),
     fixture(
         "dcqcn_simple_zero_xoff.toml",
         (4, 0, 0, 0, 200),
-        (16_450, 0x5b33b4b35e8f42e5),
+        (16_866, 0x17fd70e855fdd4d1),
     ),
     fixture(
         "dcqcn_1s_zero_xoff.toml",
         (4, 0, 0, 0, 200),
-        (16_450, 0x5b33b4b35e8f42e5),
+        (16_866, 0x17fd70e855fdd4d1),
     ),
     fixture(
         "dcqcn_2s_zero_xoff.toml",
         (4, 0, 0, 0, 200),
-        (16_450, 0x5b33b4b35e8f42e5),
+        (16_866, 0x17fd70e855fdd4d1),
     ),
     fixture(
         "dcqcn_10s_zero_xoff.toml",
         (4, 0, 0, 0, 200),
-        (16_450, 0x5b33b4b35e8f42e5),
+        (16_866, 0x17fd70e855fdd4d1),
     ),
     fixture(
         "dcqcn_multi_zero_xoff.toml",
         (10, 0, 195, 0, 400),
-        (47_336, 0xbccc6a4c5c6883c1),
+        (48_376, 0xa3115549d08e89ad),
     ),
     fixture(
         "leanguard_dcqcn_zero_xoff.toml",
         (4, 0, 0, 0, 200),
-        (16_450, 0x5b33b4b35e8f42e5),
+        (16_866, 0x17fd70e855fdd4d1),
     ),
     fixture(
         "leanguard_pfc_executable.toml",

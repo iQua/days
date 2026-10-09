@@ -40,20 +40,12 @@ unsupported scheduler `VirtualClock`; Days executor supports FIFO, SP, WFQ, DRR,
 
 | Policy | Scalar/CPU | Metal/CUDA |
 | --- | --- | --- |
-| `TailDrop` | yes | yes |
-| `ECN_THRESHOLD` | yes | yes |
-| `RED` | yes | rejected |
-| `RED_ECN` | yes | rejected |
+| TailDrop at the packet capacity | yes | yes |
+| ECN ramp (`switch.ecn`, `switch.ecn_by_rate`) | yes | yes |
 
-The configured topology uses packet capacity. Capacity zero means unlimited TailDrop. ECN threshold stores `ceil(fraction * capacity)` and marks at or above that integer depth. Non-data control packets remain unmarked and admitted unless physical capacity overflows.
+A TailDrop queue drops a packet that would exceed its packet capacity; capacity zero means unlimited. An ECN queue drops a packet that would exceed its byte capacity (`ecn_capacity_bytes`) and marks ECN-capable data on the Kmin/Kmax/Pmax ramp over its byte depth after admission, with a stateless hash draw between the thresholds. The step is the ramp with `kmin = kmax` and `pmax = 1`. Packets that are not ECN-capable data (ACKs, NACKs, CNPs, PFC frames) are never marked and never draw. The rule, its exact integer form and the draw are on [Switches & Queues](/docs/configuration/switches).
 
-RED uses packet thresholds at 70% and 90% of capacity, maximum probability `4/5`, and a `2^32` fixed-point EWMA. It replaces the random draw with a deterministic counter and signals inside the open threshold region when `counter * p(avg) >= 1`. RED requires capacity of at least ten packets.
-
-Metal and CUDA reject RED during backend validation:
-
-```text
-backend Metal does not support RED admission; use Scalar or Cpu
-```
+The policy is immutable: no queue carries marking state, so checkpoints and device readback hold none. RED and RED_ECN were removed in P16; Days AGO refuses them, and `ECN_THRESHOLD`, at lowering.
 
 ## PFC queue state
 

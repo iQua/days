@@ -23,8 +23,9 @@ capacity = 300
 weights = [3, 1, 2]
 priorities = [3, 2, 1]
 discipline = "WRR"
-drop = "ECN_THRESHOLD"
-ecn_threshold = 1.0
+drop = "TailDrop"
+ecn_capacity_bytes = 300_000
+ecn = { kmin_bytes = 300_000, kmax_bytes = 300_000, pmax = 1 }
 
 [link]
 mode = "Pfc"

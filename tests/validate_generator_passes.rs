@@ -25,7 +25,8 @@ fn ring_image(k: usize) -> SimulationImage {
     let mut text = String::from(
         "seed = 42\nedges = [[0, 1], [1, 2], [2, 3], [3, 4]]\nhosts = [0, 1, 2, 3, 4]\n\
          duration = 2.0\n\n[switch]\nport_rate = 1000000000\ncapacity = 300\n\
-         discipline = \"FIFO\"\ndrop = \"ECN_THRESHOLD\"\necn_threshold = 1.0\n\n\
+         discipline = \"FIFO\"\ndrop = \"TailDrop\"\necn_capacity_bytes = 300000\n\
+         ecn = { kmin_bytes = 300000, kmax_bytes = 300000, pmax = 1 }\n\n\
          [link]\nmode = \"Pfc\"\n\n[link.pfc]\nhost_links = true\n\
          buffer_capacity = [0, 0, 0, 100000, 0, 0, 0, 0]\nxoff = [0, 0, 0, 20000, 0, 0, 0, 0]\n\
          xon = [0, 0, 0, 10000, 0, 0, 0, 0]\n",

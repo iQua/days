@@ -5,6 +5,8 @@
 //! LeanGuard re-derives the same matrix from the progress certificate (pure `Nat` arithmetic in
 //! `lean/LeanGuard/P10c/Collective/SeededMatrix.lean`). Every draw is an integer.
 
+use crate::splitmix::mix;
+
 /// The skew of the seeded routing matrix's expert popularity.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum RoutingSkew {
@@ -35,14 +37,6 @@ pub struct SeededAllToAll {
     pub tokens: u64,
     pub bytes_per_copy: u64,
     pub skew: RoutingSkew,
-}
-
-/// SplitMix64's output function.
-const fn mix(mut value: u64) -> u64 {
-    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
 }
 
 /// A SplitMix64 stream.

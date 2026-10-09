@@ -1,15 +1,13 @@
-//! Stable CSV projection for exact LeanGuard RED/ECN enqueue replay.
+//! Stable CSV projection of the ECN ramp's enqueue decisions for LeanGuard (`p10c_aqm_check`),
+//! which recomputes each decision and its stateless draw from the row and the image seed.
 
 use std::fmt::{self, Write};
 
 use std::collections::BTreeMap;
 
-use crate::{
-    AqmTransitionAction, AqmTransitionRecord, DropMarkPolicy, PacketDescriptor, PacketKind,
-    PayloadId, QueueDepthUnit,
-};
+use crate::{AqmTransitionAction, AqmTransitionRecord, PacketDescriptor, PacketKind, PayloadId};
 
-const HEADER: &str = "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,queue_id,payload_id,packet_kind,queued_packets_before,queued_bytes_before,packet_size_bytes,ecn_before,ecn_after,policy,depth_unit,capacity,threshold,min_threshold,max_threshold,max_probability_numerator,max_probability_denominator,mark_ecn,before_average_scaled,before_counter,after_average_scaled,after_counter,action\n";
+const HEADER: &str = "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,queue_id,payload_id,packet_kind,queued_bytes_before,packet_size_bytes,ecn_before,ecn_after,seed,capacity_bytes,kmin_bytes,kmax_bytes,pmax_numerator,pmax_denominator,action\n";
 
 /// Why an AQM certificate cannot be written.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,15 +33,17 @@ impl fmt::Display for AqmTraceError {
 
 impl std::error::Error for AqmTraceError {}
 
-/// Serializes full-observation scalar/CPU AQM transitions in canonical event-key order.
+/// Serializes full-observation Scalar/CPU ECN-ramp transitions in canonical event-key order.
 ///
 /// `packets` are the run's observed packets (`RunResult::observed_packets`), which name each
 /// transition's `packet_kind`: Days AGO marks only data packets (`PacketKind::is_data`), so an ACK,
-/// NACK or CNP admitted where a data packet would be marked is enqueued unmarked, and the checker
-/// needs the kind to tell the two apart.
+/// NACK or CNP admitted where a data packet could be marked is enqueued unmarked, and the checker
+/// needs the kind to tell the two apart. `seed` is the image seed (`SimulationImage::seed`), the
+/// root of every draw.
 pub fn aqm_transitions_csv(
     records: &[AqmTransitionRecord],
     packets: &[PacketDescriptor],
+    seed: u64,
 ) -> Result<String, AqmTraceError> {
     let mut records = records.to_vec();
     records.sort_by_key(|record| record.key);
@@ -66,60 +66,10 @@ pub fn aqm_transitions_csv(
                 .get(&record.payload)
                 .ok_or(AqmTraceError::UnknownPacket(record.payload))?,
         );
-        let (
-            policy,
-            unit,
-            capacity,
-            threshold,
-            minimum,
-            maximum,
-            numerator,
-            denominator,
-            mark_ecn,
-            before_average,
-            before_counter,
-            after_average,
-            after_counter,
-        ) = match (record.before, record.after) {
-            (DropMarkPolicy::EcnThreshold(before), DropMarkPolicy::EcnThreshold(after))
-                if before == after =>
-            {
-                (
-                    "threshold",
-                    unit(before.unit),
-                    before.capacity,
-                    Some(before.threshold),
-                    None,
-                    None,
-                    None,
-                    None,
-                    false,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-            }
-            (DropMarkPolicy::Red(before), DropMarkPolicy::Red(after)) => (
-                "red",
-                unit(before.unit),
-                before.capacity,
-                None,
-                Some(before.min_threshold),
-                Some(before.max_threshold),
-                Some(before.max_probability_numerator),
-                Some(before.max_probability_denominator),
-                before.mark_ecn,
-                Some(before.average_scaled),
-                Some(before.counter),
-                Some(after.average_scaled),
-                Some(after.counter),
-            ),
-            _ => unreachable!("AQM transition records preserve their closed policy variant"),
-        };
+        let policy = record.policy;
         writeln!(
             csv,
-            "{},{},{},{},{},{},{},{kind},{},{},{},{},{},{policy},{unit},{capacity},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{kind},{},{},{},{},{seed},{},{},{},{},{},{}",
             record.key.time_ns,
             record.key.phase,
             record.key.origin_node.0,
@@ -127,21 +77,15 @@ pub fn aqm_transitions_csv(
             record.node.0,
             record.queue_id,
             record.payload.0,
-            record.queued_packets_before,
             record.queued_bytes_before,
             record.packet_size_bytes,
             bit(record.ecn_before),
             bit(record.ecn_after),
-            optional(threshold),
-            optional(minimum),
-            optional(maximum),
-            optional(numerator),
-            optional(denominator),
-            bit(mark_ecn),
-            optional(before_average),
-            optional(before_counter),
-            optional(after_average),
-            optional(after_counter),
+            policy.capacity_bytes,
+            policy.kmin_bytes,
+            policy.kmax_bytes,
+            policy.pmax_numerator,
+            policy.pmax_denominator,
             action(record.action),
         )
         .expect("writing to String cannot fail");
@@ -167,13 +111,6 @@ const fn packet_kind(kind: PacketKind) -> &'static str {
     }
 }
 
-const fn unit(unit: QueueDepthUnit) -> &'static str {
-    match unit {
-        QueueDepthUnit::Packets => "packets",
-        QueueDepthUnit::Bytes => "bytes",
-    }
-}
-
 const fn bit(value: bool) -> u8 {
     if value { 1 } else { 0 }
 }
@@ -184,10 +121,6 @@ const fn action(action: AqmTransitionAction) -> &'static str {
         AqmTransitionAction::Mark => "mark",
         AqmTransitionAction::Drop => "drop",
     }
-}
-
-fn optional<T: ToString>(value: Option<T>) -> String {
-    value.map_or_else(String::new, |value| value.to_string())
 }
 
 #[cfg(test)]

@@ -13,7 +13,7 @@ The current image supports:
 - one LP per host and one LP per switch egress queue
 - integer nanosecond time with no timestamp quantization
 - FIFO, strict priority, WFQ, DRR, and WRR scheduling
-- TailDrop, RED, RED with ECN, and ECN-threshold admission
+- TailDrop admission and the ECN ramp (Kmin/Kmax/Pmax in bytes, stateless draw)
 - constant-rate, non-preemptive links with uniform or tiered propagation
 - deterministic packet-distribution traffic, TCP Reno/CUBIC, DCQCN, and RoCE queue pairs
 - exact PFC per-priority pause state
@@ -39,8 +39,7 @@ At each round, the executor finds the global frontier, adds the minimum channel 
 | Capability | Scalar | CPU | Metal | CUDA |
 | --- | --- | --- | --- | --- |
 | FIFO, strict priority, WFQ, DRR, WRR | Yes | Yes | Yes | Yes |
-| TailDrop, ECN threshold | Yes | Yes | Yes | Yes |
-| RED, RED with ECN | Yes | Yes | Rejected | Rejected |
+| TailDrop, ECN ramp | Yes | Yes | Yes | Yes |
 | TCP Reno, TCP CUBIC | Yes | Yes | Yes | Yes |
 | PFC | Yes | Yes | Yes | Yes |
 | DCQCN | Yes | Yes | Yes | Yes |
@@ -71,7 +70,7 @@ Each layer reports errors once it has enough information:
 | Boundary | Examples |
 | --- | --- |
 | Scenario compilation | Nonzero `time_quantum_ns`; VirtualClock; BBR; unsupported flow dependencies or explicit per-flow routes; unsupported pairing/collective form |
-| Backend validation | Device RED state; zero-lookahead parallel channel; invalid device WFQ width |
+| Backend validation | Zero-lookahead parallel channel; invalid device WFQ width; device queue capacity beyond 32 bits |
 | Device planning | Arithmetic/memory-size overflow or an invalid arena layout |
 | Device attempt and retry | Capacity demand beyond the current plan or configured cap, invalid readback metadata, or checked arithmetic overflow |
 

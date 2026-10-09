@@ -1,2 +1,0 @@
-exit=1
-REJECT: line 12: packet kind of payload 0 changes between its rows: data at line 2, roce_ack here

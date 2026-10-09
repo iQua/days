@@ -51,7 +51,8 @@ fn gate_toml(k: usize, classes: &[u8], rto_ns: u64) -> String {
          hosts = [0, 1, 2, 3, 4]\n\
          duration = 2.0\n\n\
          [switch]\nport_rate = 1000000000\ncapacity = 300\ndiscipline = \"FIFO\"\n\
-         drop = \"ECN_THRESHOLD\"\necn_threshold = 1.0\n\n\
+         drop = \"TailDrop\"\necn_capacity_bytes = 300000\n\
+         ecn = {{ kmin_bytes = 300000, kmax_bytes = 300000, pmax = 1 }}\n\n\
          [link]\nmode = \"Pfc\"\n\n\
          [link.pfc]\nhost_links = true\nbuffer_capacity = {}\nxoff = {}\nxon = {}\n",
         2 * k * (RANKS - 1),

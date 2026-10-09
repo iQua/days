@@ -1,6 +1,6 @@
 //! P16 H2 (ruling H2-7): the switch parameters of the SimAI-identical arms, lowered per port.
 //!
-//! `configs/p16/rail_mini_roce.toml` sets ECN step rows by egress link rate, PFC XOFF and XON by
+//! `configs/p16/rail_mini_roce.toml` sets ECN ramp rows by egress link rate, PFC XOFF and XON by
 //! switch tier (ASW, PSW), and PFC headroom by controlled-link rate. The image and every backend
 //! already hold these per egress LP and per ingress monitor; these tests pin what lowering writes.
 
@@ -29,20 +29,32 @@ fn fixture_text() -> String {
 #[test]
 fn ecn_rows_follow_the_egress_rate() {
     let image = lower_text(&fixture_text()).expect("lowers");
-    let mut seen = std::collections::BTreeMap::<(u64, u64), usize>::new();
+    let mut seen = std::collections::BTreeMap::<(u64, u64, u64, u64, u64), usize>::new();
     for state in &image.switch_states {
         let queue = &state.queues[0];
         let link = image.links[queue.egress_link.expect("egress").0 as usize];
-        let DropMarkPolicy::EcnThreshold(policy) = queue.drop_mark else {
-            panic!("ECN step expected");
+        let DropMarkPolicy::EcnRamp(policy) = queue.drop_mark else {
+            panic!("ECN ramp expected");
         };
-        assert_eq!(policy.capacity, 3729);
-        *seen.entry((link.rate_bps, policy.threshold)).or_default() += 1;
+        assert_eq!(policy.capacity_bytes, 33_554_432);
+        assert_eq!(queue.queue_capacity_packets, 3729);
+        *seen
+            .entry((
+                link.rate_bps,
+                policy.kmin_bytes,
+                policy.kmax_bytes,
+                policy.pmax_numerator,
+                policy.pmax_denominator,
+            ))
+            .or_default() += 1;
     }
     // ASW downlinks to the 8 GPUs at 100G; ASW uplinks and PSW downlinks at 400G (4 x 2 x 2).
     assert_eq!(
         seen.into_iter().collect::<Vec<_>>(),
-        vec![((100_000_000_000, 112), 8), ((400_000_000_000, 223), 16)]
+        vec![
+            ((100_000_000_000, 400_000, 1_600_000, 1, 5), 8),
+            ((400_000_000_000, 800_000, 3_200_000, 1, 5), 16)
+        ]
     );
 }
 
@@ -87,12 +99,12 @@ fn the_rows_are_refused_where_they_are_ambiguous_or_incomplete() {
     let text = fixture_text();
     let cases = [
         (
-            text.replace("drop = \"ECN_THRESHOLD\"", "drop = \"TailDrop\""),
-            "ECN_THRESHOLD",
+            text.replace("ecn_capacity_bytes = 33_554_432\n", ""),
+            "ecn_capacity_bytes",
         ),
         (
             text.replace(
-                "    { rate_bps = 100000000000, threshold_packets = 112 },\n",
+                "    { rate_bps = 100000000000, kmin_bytes = 400_000, kmax_bytes = 1_600_000, pmax = 0.2 },\n",
                 "",
             ),
             "ecn_by_rate",

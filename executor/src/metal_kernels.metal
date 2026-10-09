@@ -226,9 +226,13 @@ constant uint S_LAST_UPDATED = 4;
 constant uint S_VIRTUAL_TIME = 5;
 constant uint S_IN_SERVICE_TAG = 15;
 constant uint S_AQM_KIND = 25;
-constant uint S_AQM_UNIT = 26;
+constant uint S_AQM_RECORD = 26;
 constant uint S_AQM_CAPACITY = 27;
-constant uint S_AQM_THRESHOLD = 28;
+constant uint S_AQM_KMIN = 28;
+constant uint AQM_RECORD_KMAX = 0;
+constant uint AQM_RECORD_PMAX_NUMERATOR = 1;
+constant uint AQM_RECORD_SPAN = 2;
+constant uint AQM_RECORD_QUEUE_KEY = 3;
 
 constant uint SC_VALUE = 0;
 constant uint SC_ACTIVE = 1;
@@ -279,8 +283,6 @@ constant ulong SCHED_DRR = 3;
 constant ulong SCHED_WRR = 4;
 constant ulong AQM_TAILDROP = 0;
 constant ulong AQM_ECN = 1;
-constant ulong AQM_PACKETS = 0;
-constant ulong AQM_BYTES = 1;
 
 // Generator/controller ABI. CUBIC keeps exact 10^9-nanosegment fixed point and all transition
 // arithmetic below uses the existing multi-limb integer primitives; no floating point is used.
@@ -3195,6 +3197,14 @@ inline bool wrr_select_position(
     return false;
 }
 
+// `splitmix::mix`: SplitMix64's output function (the ECN ramp's draw, `ecn_ramp.rs`).
+inline ulong splitmix64(ulong value) {
+    value += 0x9e3779b97f4a7c15ul;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ul;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebul;
+    return value ^ (value >> 31);
+}
+
 inline bool switch_admission_action(
     ulong node,
     const thread ulong *packet,
@@ -3213,29 +3223,43 @@ inline bool switch_admission_action(
         action = 2;
         return true;
     }
-    ulong post_bytes = queued_bytes + packet[PK_SIZE];
     if (policy == AQM_TAILDROP) {
         action = taildrop_capacity != 0 && waiting >= taildrop_capacity ? 2 : 0;
         return true;
     }
-    if (policy != AQM_ECN) {
-        set_semantic_error(error, 58, node);
-        return false;
+    // P16 ecnramp (ruling 1a): the ECN ramp, step included, is a mechanism, guarded like every
+    // other one. The plain build admits by TailDrop alone (the host selects the mechanisms build
+    // for any ECN queue, `MECHANISM_ECN`); any other policy word is malformed.
+    if (DAYS_MECHANISMS && policy == AQM_ECN) {
+        // `ecn_ramp_decision`: tail drop past the byte capacity; no draw for a packet that is not
+        // ECN-capable data; no mark below kmin; a mark at or above kmax; in between a mark iff
+        // mulhi(u, span) < pmax_num * (d - kmin), u = mix(queue_key ^ payload).
+        ulong post_bytes = queued_bytes + packet[PK_SIZE];
+        ulong capacity = scheduler_state[scheduler_base + S_AQM_CAPACITY];
+        ulong kmin = scheduler_state[scheduler_base + S_AQM_KMIN];
+        ulong record = scheduler_state[scheduler_base + S_AQM_RECORD];
+        if (post_bytes > capacity) {
+            action = 2;
+            return true;
+        }
+        ulong kind = packet[PK_KIND] & PK_KIND_MASK;
+        if ((kind != DATA_PACKET && kind != TCP_DATA_PACKET && kind != ROCE_DATA_PACKET) ||
+            post_bytes < kmin) {
+            action = 0;
+            return true;
+        }
+        ulong kmax = scheduler_state[record + AQM_RECORD_KMAX];
+        if (post_bytes >= kmax) {
+            action = 1;
+            return true;
+        }
+        ulong draw = splitmix64(scheduler_state[record + AQM_RECORD_QUEUE_KEY] ^ packet[PK_ID]);
+        ulong bound = scheduler_state[record + AQM_RECORD_PMAX_NUMERATOR] * (post_bytes - kmin);
+        action = mulhi(draw, scheduler_state[record + AQM_RECORD_SPAN]) < bound ? 1 : 0;
+        return true;
     }
-
-    ulong capacity = scheduler_state[scheduler_base + S_AQM_CAPACITY];
-    ulong threshold = scheduler_state[scheduler_base + S_AQM_THRESHOLD];
-    ulong unit = scheduler_state[scheduler_base + S_AQM_UNIT];
-    if (capacity == 0 || threshold == 0 || threshold > capacity || unit > AQM_BYTES) {
-        set_semantic_error(error, 58, node);
-        return false;
-    }
-    ulong post_depth = waiting + 1;
-    if (unit == AQM_BYTES) {
-        post_depth = post_bytes;
-    }
-    action = post_depth > capacity ? 2 : (post_depth >= threshold ? 1 : 0);
-    return true;
+    set_semantic_error(error, 58, node);
+    return false;
 }
 
 inline void local_rational_zero(thread uint *numerator, thread uint *denominator) {
@@ -6808,10 +6832,8 @@ inline bool dispatch_event(
                 arrivals
             );
         }
-        ulong packet_kind = event[PK_KIND] & PK_KIND_MASK;
-        if (admission == 1 &&
-            (packet_kind == DATA_PACKET || packet_kind == TCP_DATA_PACKET ||
-             (DAYS_MECHANISMS && packet_kind == ROCE_DATA_PACKET))) {
+        // Admission marks only ECN-capable data, and only in the mechanisms build.
+        if (DAYS_MECHANISMS && admission == 1) {
             event[PK_KIND] |= PK_ECN_FLAG;
         }
         ulong scheduler_kind = scheduler_state[scheduler_base + S_KIND];

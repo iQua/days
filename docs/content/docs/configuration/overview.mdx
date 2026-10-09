@@ -45,7 +45,7 @@ The strict legacy loader accepts the following root keys. Unknown root keys fail
 | `compute` | Delay-only compute stages that collectives can wait for | Days AGO; the legacy loader rejects the key |
 | `app_source` | Actor-managed byte buffers for TCP Broadcast/RingAllReduce | Legacy |
 
-See the pages in this section for field-level constraints. A key can belong to the vocabulary and still fail when its value or combination is inactive. The strict loader rejects examples such as `switch.ecn_threshold` without `drop = "ECN_THRESHOLD"`, `[link.pfc]` without `link.mode = "Pfc"`, and `[app_source]` without a supported TCP collective.
+See the pages in this section for field-level constraints. A key can belong to the vocabulary and still fail when its value or combination is inactive. The strict loader rejects examples such as `switch.ecn_capacity_bytes` without `switch.ecn` or `switch.ecn_by_rate`, `[link.pfc]` without `link.mode = "Pfc"`, and `[app_source]` without a supported TCP collective.
 
 ## Minimal scenario
 
@@ -87,7 +87,7 @@ Legacy protocol models use Cargo features:
 - `link.mode = "Pfc"` requires `-p days-legacy --features l2_pfc`.
 - LeanGuard event CSVs require `lean` plus the protocol feature where applicable.
 
-Days AGO Scalar and CPU execute the full lowered mechanism set. Metal and CUDA reject RED/RED_ECN before execution. They accept deterministic packet traffic, exact TCP Reno/CUBIC, DCQCN, RoCE queue pairs, PFC, collective and compute stages, FIFO/SP/WFQ/DRR/WRR, TailDrop, and ECN threshold subject to device capacity checks. The error names the unsupported mechanism and directs you to Scalar or CPU.
+Days AGO Scalar and CPU execute the full lowered mechanism set. Metal and CUDA accept deterministic packet traffic, exact TCP Reno/CUBIC, DCQCN, RoCE queue pairs, PFC, collective and compute stages, FIFO/SP/WFQ/DRR/WRR, TailDrop, and the ECN ramp, subject to device capacity checks. The error names the unsupported mechanism and directs you to Scalar or CPU.
 
 ## Reference pages
 

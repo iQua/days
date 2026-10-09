@@ -616,8 +616,9 @@ duration = 0.01
 port_rate = 1000000000
 capacity = 300
 discipline = "FIFO"
-drop = "ECN_THRESHOLD"
-ecn_threshold = 1.0
+drop = "TailDrop"
+ecn_capacity_bytes = 300_000
+ecn = { kmin_bytes = 300_000, kmax_bytes = 300_000, pmax = 1 }
 "#;
     let dcqcn = |table: &str| {
         format!(
@@ -815,29 +816,31 @@ fn fingerprint(value: &impl std::fmt::Debug) -> (u64, u64) {
 /// (2026-10-03, Mac) for the Mellanox-form controller and the ECN echo
 /// (`days-gpu/evidence/P16/dcqcn-impl/anchors.md`); re-frozen at P16 H1 (2026-10-06, Mac) for the
 /// counted stage dependencies, which change only the stage records' rendering
-/// (`days-gpu/evidence/P16/collops-impl/semantic-identity-r1.txt`).
+/// (`days-gpu/evidence/P16/collops-impl/semantic-identity-r1.txt`); re-frozen at P16 ecnramp
+/// (2026-10-08, Mac) for the byte ECN step, which changes only the queues' `drop_mark` rendering
+/// here (`days-gpu/evidence/P16/ecnramp/refreeze-compare-c6.txt`).
 const ANCHORS: [(&str, u64, u64); 6] = [
     (
         "roce_ring_allreduce_lossless.toml",
-        188_983,
-        0xd89e_b01d_2859_4bcd,
+        190_023,
+        0x7991_1130_0edc_753d,
     ),
     (
         "roce_allgather_lossless.toml",
-        121_122,
-        0x89d6_a4ac_8a89_0cd1,
+        122_162,
+        0xa7d6_51e8_b84f_7b01,
     ),
-    ("roce_ring_lossy.toml", 178_255, 0xa99b_e649_848a_ddfe),
-    ("roce_compute_dag.toml", 207_245, 0x5145_dc26_3ab8_ddc6),
+    ("roce_ring_lossy.toml", 179_008, 0x62fd_2636_40b6_c9c1),
+    ("roce_compute_dag.toml", 208_285, 0xb946_2a2b_3cbe_0b26),
     (
         "roce_tcp_mixed_collectives.toml",
-        134_700,
-        0x8a78_985e_0bd3_7700,
+        136_572,
+        0xbd42_30ab_406e_c194,
     ),
     (
         "roce_ring_release_paused.toml",
-        192_937,
-        0xc36e_d06a_809a_2f52,
+        193_977,
+        0xcee3_a626_84e9_2076,
     ),
 ];
 

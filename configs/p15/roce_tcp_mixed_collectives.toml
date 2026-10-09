@@ -14,8 +14,9 @@ duration = 0.05
 port_rate = 1000000000
 capacity = 300
 discipline = "FIFO"
-drop = "ECN_THRESHOLD"
-ecn_threshold = 1.0
+drop = "TailDrop"
+ecn_capacity_bytes = 300_000
+ecn = { kmin_bytes = 300_000, kmax_bytes = 300_000, pmax = 1 }
 
 [[collective]]
 collective_type = "RingAllReduce"

@@ -13,8 +13,9 @@ duration = 0.001
 port_rate = 1000000000
 capacity = 20
 discipline = "FIFO"
-drop = "ECN_THRESHOLD"
-ecn_threshold = 0.25
+drop = "TailDrop"
+ecn_capacity_bytes = 20_000
+ecn = { kmin_bytes = 5_000, kmax_bytes = 5_000, pmax = 1 }
 
 [link]
 mode = "Pfc"

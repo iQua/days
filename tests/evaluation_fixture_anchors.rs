@@ -483,9 +483,20 @@ fn f_topo_is_a_balanced_dragonfly_no_fat_tree_arithmetic_can_address() {
 fn aqm_fixture_marks_below_a_tight_threshold_under_a_32_to_1_incast() {
     let name = "f_aqm_alias_incast32.toml";
     let config = fixture_table(name);
-    assert_eq!(config["switch"]["drop"].as_str(), Some("ECN_THRESHOLD"));
+    assert_eq!(config["switch"]["drop"].as_str(), Some("TailDrop"));
     assert_eq!(config["switch"]["capacity"].as_integer(), Some(64));
-    assert_eq!(config["switch"]["ecn_threshold"].as_float(), Some(0.125));
+    assert_eq!(
+        config["switch"]["ecn_capacity_bytes"].as_integer(),
+        Some(64 * 512)
+    );
+    assert_eq!(
+        config["switch"]["ecn"]["kmin_bytes"].as_integer(),
+        Some(8 * 512)
+    );
+    assert_eq!(
+        config["switch"]["ecn"]["kmax_bytes"].as_integer(),
+        Some(8 * 512)
+    );
     assert_eq!(
         config["routing"]["policy"].as_str(),
         Some("FatTreeEcmp"),
@@ -565,8 +576,8 @@ showcase_anchor!(
 showcase_anchor!(
     aqm_anchor_is_identical_across_local_backends,
     "f_aqm_alias_incast32.toml",
-    761_961,
-    0x3460_b70a_a889_a1c9
+    827_241,
+    0x8b3c_a55f_7c1f_9e1d
 );
 
 // -------------------------------------------------------------------------------------------

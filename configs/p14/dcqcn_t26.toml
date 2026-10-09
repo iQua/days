@@ -12,8 +12,9 @@ hosts = [0, 1]
 port_rate = 100_000_000_000
 capacity = 1
 discipline = "FIFO"
-drop = "ECN_THRESHOLD"
-ecn_threshold = 1.0
+drop = "TailDrop"
+ecn_capacity_bytes = 1_000
+ecn = { kmin_bytes = 1_000, kmax_bytes = 1_000, pmax = 1 }
 
 [link]
 propagation_ns = 100

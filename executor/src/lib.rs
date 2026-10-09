@@ -31,6 +31,7 @@ pub mod device_sizing;
     all(feature = "metal", target_vendor = "apple")
 ))]
 mod device_stage;
+pub mod ecn_ramp;
 pub mod event;
 pub mod image;
 mod mechanism_trace;
@@ -43,6 +44,7 @@ mod roce;
 pub mod safe_horizon;
 pub mod scalar;
 mod seeded_matrix;
+mod splitmix;
 mod stage_index;
 mod stage_sizing;
 pub mod tcp;
@@ -144,9 +146,8 @@ pub use metal::{
 #[doc(hidden)]
 pub use metal::{mechanism_plane_words_metal_for_testing, size_metal_plan_for_testing};
 pub use model::{
-    DropMarkPolicy, DrrSchedulerState, EcnThresholdPolicy, ExactRational, NodeKind, QueueDepthUnit,
-    RedPolicyState, SchedulerKind, TransitionHandler, WfqSchedulerState, WrrSchedulerState,
-    resolve_transition,
+    DropMarkPolicy, DrrSchedulerState, EcnRampPolicy, ExactRational, NodeKind, SchedulerKind,
+    TransitionHandler, WfqSchedulerState, WrrSchedulerState, resolve_transition,
 };
 pub use roce::{
     RoceEmission, RocePacerState, RoceReceiverAction, RoceReceiverRecord, RoceReceiverView,

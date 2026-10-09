@@ -6,8 +6,8 @@
 # GPUs in GPU order, lossless class 3 with switch and host-link PFC, routed by SimAI's ECMP.
 #
 # The switch parameters follow SimAI.conf as the SimAI-identical arms set them (P16 H2, ruling
-# H2-7): ECN step rows by egress rate at the K-ramp midpoint (100G 1,000,000 B -> 112 packets,
-# 400G 2,000,000 B -> 223 packets); PFC XOFF per tier at an empty shared pool, shift 3,
+# H2-7; ecnbytes, ecnramp): SimAI.conf's ECN ramps by egress rate in bytes (100G 400,000 to
+# 1,600,000 B, 400G 800,000 to 3,200,000 B, Pmax 0.2) over a 32 MiB byte capacity; PFC XOFF per tier at an empty shared pool, shift 3,
 # (32 MiB - sum(3 rate delay / 8) - ports x 4096) >> 3 (ASW: 2 x 100G + 2 x 400G ports, 4,168,818;
 # PSW: 4 x 400G ports, 4,154,756), XON 3,072 lower; headroom by controlled-link rate (400G
 # 75,000 B; 100G 30,574 B, the Days minimum above SimAI's 18,750).
@@ -35,10 +35,11 @@ policy = "SimAiEcmp"
 [switch]
 capacity = 3729
 discipline = "FIFO"
-drop = "ECN_THRESHOLD"
+drop = "TailDrop"
+ecn_capacity_bytes = 33_554_432
 ecn_by_rate = [
-    { rate_bps = 100000000000, threshold_packets = 112 },
-    { rate_bps = 400000000000, threshold_packets = 223 },
+    { rate_bps = 100000000000, kmin_bytes = 400_000, kmax_bytes = 1_600_000, pmax = 0.2 },
+    { rate_bps = 400000000000, kmin_bytes = 800_000, kmax_bytes = 3_200_000, pmax = 0.2 },
 ]
 
 [link]

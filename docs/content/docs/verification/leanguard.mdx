@@ -228,30 +228,36 @@ coverpoints. The `p10c_*` executables do not expose the coverage flag.
 ## Days AGO AQM rows
 
 `p10c_aqm_check` replays `aqm_transitions_csv`: one row per admission decision at a switch queue
-with an ECN-threshold or RED policy (Lean rules: the `Aqm` namespace of
-`lean/LeanGuard/P10c/Semantics.lean` and `lean/LeanGuard/P10c/AqmEventLog.lean`). Each row names the
-packet's kind (`packet_kind`: `data`, `tcp_data`, `roce_data`, `tcp_ack`, `roce_ack`, `roce_nack`,
-`dcqcn_cnp`, `feedback`, `pfc`, `roce_pacing_timer` or `stage_notify`), which the writer takes from
-the run's observed packets.
+with an ECN ramp (Lean rules: the `Aqm` namespace of `lean/LeanGuard/P10c/Semantics.lean` and
+`lean/LeanGuard/P10c/AqmEventLog.lean`). Each row names the packet's kind (`packet_kind`: `data`,
+`tcp_data`, `roce_data`, `tcp_ack`, `roce_ack`, `roce_nack`, `dcqcn_cnp`, `feedback`, `pfc`,
+`roce_pacing_timer` or `stage_notify`), which the writer takes from the run's observed packets, its
+byte depth before admission and its size, the run's `seed`, and the queue's ramp
+(`capacity_bytes`, `kmin_bytes`, `kmax_bytes`, `pmax_numerator`, `pmax_denominator`).
 
-- Days AGO marks only data packets (`data`, `tcp_data`, `roce_data`), as
-  [the switch configuration](/docs/configuration/switches#drop-and-ecn-policies) states. Where the
-  threshold or RED decision is a mark, any other packet is admitted unmarked, so an ACK at or above
-  the threshold, or at a RED signal, must show `enqueue` and an unchanged ECN bit. Drops, and RED's
-  average and counter update, are the same for every kind.
+- The checker recomputes every decision. It derives the draw from the seed, the queue
+  (`node_id`, `queue_id`) and the payload, exactly as the executor does
+  ([the switch configuration](/docs/configuration/switches#days-ago-the-ecn-ramp)), and applies the
+  ramp in integer arithmetic. It also checks that the policy is well formed, that each queue's
+  policy and the run's seed stay constant, and that the ECN bit changes exactly on a mark.
+- Days AGO marks only data packets (`data`, `tcp_data`, `roce_data`). Any other packet is admitted
+  unmarked at any depth below the byte capacity, so an ACK inside or above the ramp must show
+  `enqueue` and an unchanged ECN bit.
 - A packet's kind is the same on every row of its payload (one row per queue it crosses); a kind
   that changes between rows is rejected.
 - What remains trusted is the kind itself: a packet relabelled consistently on all of its rows
   cannot be told from a packet of that kind, as RoCE senders' `data_class` and WFQ's PFC classes
   are trusted. `aqm_roce_acks_whole_packet_relabel_trusted_limit_accept.csv` pins this limit: a
-  marked data packet relabelled `roce_ack` on all three of its rows, its mark removed, is
-  accepted.
+  marked data packet relabelled `roce_ack` on all of its rows, its mark removed, is accepted.
 
 The CI fixtures `aqm_roce_acks_compiled_executor_accept.csv` (`configs/leanguard/aqm_roce_acks.toml`,
-ECN threshold) and `aqm_roce_acks_red_compiled_executor_accept.csv` (`aqm_roce_acks_red.toml`,
-RED_ECN) have RoCE ACKs admitted unmarked at the threshold, or at a RED signal, of a queue that marks
-data. Their mutations must be rejected: a data packet left unmarked, a marked ACK, a relabel that
-keeps a mark, and a kind changed on one row of a packet.
+a byte step) and `aqm_roce_acks_ramp_compiled_executor_accept.csv` (`aqm_roce_acks_ramp.toml`, a
+ramp with `pmax = 4/5`) have RoCE ACKs admitted unmarked in a queue that marks data, and the ramp
+fixture has data both marked and unmarked between its thresholds. Their mutations must be rejected:
+a data packet left unmarked, a marked ACK, a relabel that keeps a mark, a draw flipped either way, a
+changed seed, and a kind changed on one row of a packet. The AQM differential's reference decides
+independently: it writes SplitMix64 out and applies the ramp in its rational form, with no high
+multiply.
 
 ## Days AGO WFQ and SP rows
 
@@ -412,7 +418,7 @@ the SP fixtures without `compiled` in their names, and the `*_hand_*` collective
 | RoCE queue pairs, host-link PFC | `p10c_roce_check` | campaign fixtures | none |
 | Collectives, compute, joins, stage notify | `p10c_collective_check` | campaign fixtures | none |
 | Switch-link PFC | `p10c_mechanisms_check pfc` | compiled two-switch scenario; images | `pfc_check` |
-| AQM (ECN threshold, RED, RED_ECN) | `p10c_aqm_check` | AQM differential | `aqm_check` |
+| AQM (the ECN ramp) | `p10c_aqm_check` | AQM differential | `aqm_check` |
 | DRR | `p10c_mechanisms_check drr` | compiled scenario; image | `drr_check` |
 | WRR | `p10c_mechanisms_check wrr` | compiled scenario; image | none |
 | WFQ | `p10c_mechanisms_check wfq`, joined to the run's PFC certificate | compiled scenarios, with and without PFC, and resumed from checkpoints (one of them paused) | `wfq_check` |
@@ -433,8 +439,7 @@ Remaining gaps:
   a DCQCN flow, whose rows `p10c_dcqcn_check` certifies), so the rate certificate comes from a
   hand-built image.
 - Backends: certificates come from Scalar and CPU runs only, because device runs return no
-  diagnostic planes. RED and RED_ECN run on Scalar and CPU only; the Metal and CUDA validators
-  refuse them before execution.
+  diagnostic planes.
 
 The P10c collective, DCQCN, RoCE and AQM checkers are linear in the row count, except the
 collective checker's TCP replay, which keeps a per-flow frontier in an ordered map and is

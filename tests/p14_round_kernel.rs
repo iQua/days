@@ -293,7 +293,7 @@ fn active_dcqcn_generator_checkpoints_select_the_mechanisms_round_kernel() {
     }
 }
 
-/// `dcqcn_t26` behind a 1 Gbps bottleneck with a one-packet ECN threshold: CE-marked data keeps
+/// `dcqcn_t26` behind a 1 Gbps bottleneck with a one-packet (1,000 B) ECN step: CE-marked data keeps
 /// arriving at the notification point, between the 10 Gbps generator's ticks and after it
 /// finishes. `flow_size` replaces the flow's 20,000 B `size` line, to lengthen the active phase.
 fn dcqcn_t26_bottleneck(flow_size: Option<&str>) -> SimulationImage {
@@ -302,7 +302,10 @@ fn dcqcn_t26_bottleneck(flow_size: Option<&str>) -> SimulationImage {
     let mut variant = source
         .replace("port_rate = 100_000_000_000", "port_rate = 1_000_000_000")
         .replace("capacity = 1\n", "capacity = 100\n")
-        .replace("ecn_threshold = 1.0", "ecn_threshold = 0.01");
+        .replace(
+            "ecn_capacity_bytes = 1_000\n",
+            "ecn_capacity_bytes = 100_000\n",
+        );
     if let Some(size) = flow_size {
         assert!(variant.contains("size = 20_000"));
         variant = variant.replace("size = 20_000", size);
