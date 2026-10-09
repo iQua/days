@@ -395,8 +395,10 @@ struct SourceTraffic {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SourceRoce {
-    /// P17 lane nocc: `"dcqcn"` (the default) or `"none"`.
-    congestion_control: Option<String>,
+    /// P17 lane nocc: `"dcqcn"` (the default) or `"none"`. A one-byte enum, so the source table
+    /// keeps its size and parsing allocates nothing for it; serde refuses any other value, naming
+    /// it, the expected ones and the table.
+    congestion_control: Option<SourceCongestionControl>,
     /// Required: a fixed retransmission timeout, or `0` for none (NACK-only recovery: a lost last
     /// packet then stalls the queue pair for the rest of the run).
     retransmit_timeout_ns: Option<u64>,
@@ -409,6 +411,14 @@ struct SourceRoce {
     window_bytes: Option<u64>,
     /// P16 ruling D7: scale the window with the controller's rate (SimAI `m_var_win`).
     variable_window: Option<bool>,
+}
+
+/// `[flow.traffic.roce] congestion_control`.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum SourceCongestionControl {
+    Dcqcn,
+    None,
 }
 
 #[derive(Clone, Debug)]
@@ -2844,15 +2854,7 @@ fn validate_traffic(
             })?;
             // P17 lane nocc (rulings R2, R3): `"dcqcn"` (the default) takes its controller and
             // pacer from the DCQCN table; `"none"` has no DCQCN table and paces at line rate.
-            let line_rate = match roce.congestion_control.as_deref() {
-                None | Some("dcqcn") => false,
-                Some("none") => true,
-                Some(other) => {
-                    return Err(CompileError::Unsupported(format!(
-                        "unsupported `congestion_control = \"{other}\"` in `[flow.traffic.roce]` or `[flow_set.traffic.roce]`; use \"dcqcn\" (the default) or \"none\""
-                    )));
-                }
-            };
+            let line_rate = roce.congestion_control == Some(SourceCongestionControl::None);
             let dcqcn = if line_rate {
                 if traffic.dcqcn.is_some() {
                     return Err(CompileError::Unsupported(
