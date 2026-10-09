@@ -12,6 +12,7 @@ import LeanGuard.P10c.Test.Rng
 
 open LeanGuard.P10c.AqmEventLog
 open LeanGuard.P10c.Test
+open LeanGuard.P10c.Semantics
 
 def render (result : Except String Unit) : String :=
   match result with
@@ -27,10 +28,11 @@ inductive Kind
   | node
   | config
   | packetKind
+  | action
   deriving DecidableEq, Repr
 
 def Kind.all : List Kind :=
-  [.counter, .drop, .swapLines, .swapOrder, .queue, .node, .config, .packetKind]
+  [.counter, .drop, .swapLines, .swapOrder, .queue, .node, .config, .packetKind, .action]
 
 def Kind.name : Kind → String
   | .counter => "counter-off-by-one"
@@ -41,29 +43,26 @@ def Kind.name : Kind → String
   | .node => "changed-node"
   | .config => "changed-config"
   | .packetKind => "relabeled-packet-kind"
+  | .action => "changed-action"
 
-def bumpOpt (value : Option Nat) (up : Bool) : Option Nat := value.map (bump · up)
-
+/-- A one-unit change of an input of the row's decision or key (ECN ramp: the depth, the size,
+the payload and seed the draw derives from, the event key). -/
 def bumpField (row : Row) (field : Nat) (up : Bool) : Row :=
   match field with
-  | 0 => { row with queuedPacketsBefore := bump row.queuedPacketsBefore up }
-  | 1 => { row with queuedBytesBefore := bump row.queuedBytesBefore up }
-  | 2 => { row with packetSizeBytes := bump row.packetSizeBytes up }
-  | 3 => { row with beforeAverageScaled := bumpOpt row.beforeAverageScaled up }
-  | 4 => { row with beforeCounter := bumpOpt row.beforeCounter up }
-  | 5 => { row with afterAverageScaled := bumpOpt row.afterAverageScaled up }
-  | 6 => { row with afterCounter := bumpOpt row.afterCounter up }
-  | 7 => { row with timeNs := bump row.timeNs up }
+  | 0 => { row with queuedBytesBefore := bump row.queuedBytesBefore up }
+  | 1 => { row with packetSizeBytes := bump row.packetSizeBytes up }
+  | 2 => { row with payloadId := bump row.payloadId up }
+  | 3 => { row with seed := bump row.seed up }
+  | 4 => { row with timeNs := bump row.timeNs up }
   | _ => { row with originSeq := bump row.originSeq up }
 
 def bumpConfig (row : Row) (field : Nat) (up : Bool) : Row :=
   match field with
-  | 0 => { row with capacity := bump row.capacity up }
-  | 1 => { row with threshold := bumpOpt row.threshold up }
-  | 2 => { row with minThreshold := bumpOpt row.minThreshold up }
-  | 3 => { row with maxThreshold := bumpOpt row.maxThreshold up }
-  | 4 => { row with maxProbabilityNumerator := bumpOpt row.maxProbabilityNumerator up }
-  | _ => { row with markEcn := !row.markEcn }
+  | 0 => { row with capacityBytes := bump row.capacityBytes up }
+  | 1 => { row with kminBytes := bump row.kminBytes up }
+  | 2 => { row with kmaxBytes := bump row.kmaxBytes up }
+  | 3 => { row with pmaxNumerator := bump row.pmaxNumerator up }
+  | _ => { row with pmaxDenominator := bump row.pmaxDenominator up }
 
 def mutate (rows : Array Row) (kind : Kind) (g : Rng) : Option (Array Row) × Rng := Id.run do
   let n := rows.size
@@ -77,7 +76,7 @@ def mutate (rows : Array Row) (kind : Kind) (g : Rng) : Option (Array Row) × Rn
   let other := at_ j
   match kind with
   | .counter =>
-      let (field, g) := g.below 9
+      let (field, g) := g.below 6
       (some (rows.set! i (bumpField row field (choice % 2 = 0))), g)
   | .drop =>
       if n < 2 then return (none, g)
@@ -111,7 +110,7 @@ def mutate (rows : Array Row) (kind : Kind) (g : Rng) : Option (Array Row) × Rn
       let target := if choice = 0 then row.nodeId + 1 else other.nodeId
       (some (rows.set! i { row with nodeId := target }), g)
   | .config =>
-      let (field, g) := g.below 6
+      let (field, g) := g.below 5
       (some (rows.set! i (bumpConfig row field (choice % 2 = 0))), g)
   | .packetKind =>
       -- Any of the executor's kinds other than the row's, so the shipped and the reference kind
@@ -120,6 +119,12 @@ def mutate (rows : Array Row) (kind : Kind) (g : Rng) : Option (Array Row) × Rn
         "roce_ack", "roce_nack", "roce_pacing_timer", "stage_notify"].filter (· != row.packetKind)
       let (k, g) := g.below kinds.length
       (some (rows.set! i { row with packetKind := kinds.getD k "roce_ack" }), g)
+  | .action =>
+      -- Another action, with the ECN bit it implies, so the decision itself is what differs.
+      let actions := [Aqm.Action.enqueue, .mark, .drop].filter (· != row.action)
+      let action := actions.getD (choice % 2) .enqueue
+      (some (rows.set! i
+        { row with action, ecnAfter := expectedEcnAfter row.ecnBefore action }), g)
 
 structure Tally where
   cases : Nat := 0
