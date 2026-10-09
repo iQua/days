@@ -36,6 +36,7 @@
 #   37 after_next_psn  38 after_snd_una  39 after_bytes_emitted  40 after_packets_emitted
 #   41 after_credit_quanta  42 after_rto_deadline_ns  43 after_pacer  44 after_next_tick_ns
 #   45 after_status
+#   46 congestion_control (P17 Amendment 7: `dcqcn` or `none`; appended, so 1..45 keep their places)
 # Every sender log carries data_class, so every sender case passes its PFC log (--pfc); the hand
 # fixtures without host PFC have a header-only one.
 #
@@ -625,6 +626,86 @@ mutate_executor "nack-only-suppressed-sent" nack_only receiver \
   '$17 == "nack_suppressed"' '$17 = "nack"' \
   'REJECT: receiver: line LINE: RoCE receiver action mismatch'
 
+# --- P17 lane nocc: queue pairs without congestion control (qp-schema Amendment 7) -------------
+# Executor traces (days-gpu evidence/P17/nocc/tooling/p17_lg_csvs.rs) of the configs in
+# days-gpu evidence/P17/nocc/tooling/p17-lg-configs/ (configs/p17/nocc_marked, nocc_mixed and
+# nocc_gbn_lossy at size 40,000 B with a 4 to 12 KB ECN ramp), at p17/nocc, checked by the
+# executor-trace loop above: roce_trace_nocc_echo (4 pairs without congestion control echoing CE
+# under PFC, all complete), roce_trace_nocc_mixed (2 DCQCN pairs, flows 1 and 3, cutting beside 2
+# without, flows 0 and 2) and roce_trace_nocc_lossy (no PFC: drops, NACKs and timeouts). A pair
+# without congestion control has no DCQCN row: its echoes, its completion and time change nothing,
+# and its rate is its configured one throughout.
+# mutate_nocc <label> <name> <sender|dcqcn> <awk program> <expected REJECT line>
+mutate_nocc() {
+  local label="$1"
+  local name="$2"
+  local role="$3"
+  local program="$4"
+  local expected_output="$5"
+  local base="$fixture_dir/roce_trace_${name}_executor_accept"
+  local mutated="$campaign_tmp/nocc-$role.csv"
+  local sender="$base.sender.csv"
+  local dcqcn="$base.dcqcn.csv"
+  awk -F, -v OFS=, "$program" "$base.$role.csv" > "$mutated"
+  case "$role" in
+    sender) sender="$mutated" ;;
+    dcqcn) dcqcn="$mutated" ;;
+  esac
+  mutations=$((mutations + 1))
+  if check_case "nocc/$label" 1 "$expected_output" \
+      trace "$sender" "$base.receiver.csv" "$dcqcn" --pfc "$base.pfc.csv" \
+      "$(cat "$base.stop_time_ns")"; then
+    mutations_caught=$((mutations_caught + 1))
+  fi
+}
+mutate_nocc "pairs-relabelled-dcqcn" nocc_echo sender \
+  'NR > 1 { $46 = "dcqcn" } { print }' \
+  'REJECT: sender: line 164: RoCE ACK or NACK echoes CE on an incomplete queue pair but has no DCQCN feedback row (node_id=1, flow_id=1)'
+mutate_nocc "lossy-pairs-relabelled-dcqcn" nocc_lossy sender \
+  'NR > 1 { $46 = "dcqcn" } { print }' \
+  'REJECT: sender: line 127: RoCE ACK or NACK echoes CE on an incomplete queue pair but has no DCQCN feedback row (node_id=1, flow_id=1)'
+mutate_nocc "dcqcn-pair-relabelled-none" nocc_mixed sender \
+  'NR > 1 && $6 == 1 { $46 = "none" } { print }' \
+  'REJECT: dcqcn: line 2: DCQCN row of a queue pair without congestion control (node_id=1, flow_id=1)'
+# A feedback row for pair 0 (no congestion control) at its first echoing ACK (350168, 0, 4, 137),
+# consistent on its own terms (a first feedback: next alpha tick at +1,000 ns, next decrease check
+# at +4,001 ns), joined at a sender row that may not have one.
+nocc_mixed_base="$fixture_dir/roce_trace_nocc_mixed_executor_accept"
+{
+  head -1 "$nocc_mixed_base.dcqcn.csv"
+  {
+    tail -n +2 "$nocc_mixed_base.dcqcn.csv"
+    awk -F, -v OFS=, 'NR == 2 { $1 = 350168; $2 = 0; $3 = 4; $4 = 137; $5 = 0; $6 = 0; $8 = 350168; $38 = 351168; $39 = 354169; print }' \
+      "$nocc_mixed_base.dcqcn.csv"
+  } | sort -t, -k1,1n -k2,2n -k3,3n -k4,4n
+} > "$campaign_tmp/nocc-fed.dcqcn.csv"
+mutations=$((mutations + 1))
+if check_case "nocc/dcqcn-row-of-a-pair-without-congestion-control" 1 \
+    'REJECT: dcqcn: line 6: DCQCN row of a queue pair without congestion control (node_id=0, flow_id=0)' \
+    trace "$nocc_mixed_base.sender.csv" "$nocc_mixed_base.receiver.csv" \
+    "$campaign_tmp/nocc-fed.dcqcn.csv" --pfc "$nocc_mixed_base.pfc.csv" \
+    "$(cat "$nocc_mixed_base.stop_time_ns")"; then
+  mutations_caught=$((mutations_caught + 1))
+fi
+mutate_nocc "rate-not-the-configured-rate" nocc_echo sender \
+  'NR > 1 && $6 == 0 { $18 = 999999998; $19 = 999999998 } { print }' \
+  'REJECT: sender: line 2: RoCE rate of a pair whose controller is pristine is not its initial_rate_bps (node_id=0, flow_id=0)'
+mutate_nocc "rate-moves-mid-trace" nocc_echo sender \
+  'NR > 1 && $6 == 0 && $7 == "tick" && ++ticks == 3 { $20 = 999999998 } { print }' \
+  "REJECT: sender: line 10: RoCE tick rate differs from the DCQCN controller's current rate"
+mutate_nocc "two-rates" nocc_echo sender \
+  'NR > 1 && $6 == 1 { $18 = 2000000000 } { print }' \
+  'REJECT: sender: line 3: invalid RoCE sender configuration'
+mutate_nocc "mode-spliced-mid-trace" nocc_echo sender \
+  'NR == 40 { $46 = "dcqcn" } { print }' \
+  'REJECT: sender: line 40: RoCE sender config discontinuity (node_id=2, flow_id=2)'
+mutate_nocc "unknown-mode" nocc_echo sender \
+  'NR == 2 { $46 = "hpcc" } { print }' \
+  "REJECT: sender: line 2: invalid RoCE congestion_control: 'hpcc'"
+mutate_nocc "mode-column-missing" nocc_echo sender \
+  '{ NF = 45; print }' \
+  'REJECT: sender: line 1: sender log lacks P16 sender schema column(s): congestion_control'
+
 # --- Pending events must fire (review H1) -----------------------------------------------------
 # A full run executes exactly the events with time <= stop_time_ns (scalar.rs run loop), so a
 # pair's pending pacing tick or timeout must appear as a row before any later row of the pair,
@@ -901,7 +982,7 @@ check_case "roce_sender_resume_accept.csv (stop inferred)" 0 "ACCEPT" \
 # restarts flow 7 at 8500, beyond stop 8000: stopped.
 resume_order='REJECT: sender: line 9: RoCE resume rows sharing an event key must be of one node in strictly increasing flow_id order'
 mutate_amended "resume-of-unpaused-pair" "$resume" "$resume_dcqcn" "$resume_pfc" "$resume_stop" \
-  'NR == 14 { print "7600,0,9,1,1,3,resume,0,0,3,1000,2000,1000,1000,0,0,0,8000000000,8000000000,,,,0,,,,,2000,0,2000,2,0,,parked,,blocked,2000,0,2000,2,0,,parked,,blocked" } { print }' \
+  'NR == 14 { print "7600,0,9,1,1,3,resume,0,0,3,1000,2000,1000,1000,0,0,0,8000000000,8000000000,,,,0,,,,,2000,0,2000,2,0,,parked,,blocked,2000,0,2000,2,0,,parked,,blocked,dcqcn" } { print }' \
   'REJECT: sender: line 14: RoCE resume of a queue pair not parked by a pause (node_id=1, flow_id=3)'
 mutate_amended "two-resume-rows-for-one-flow" "$resume" "$resume_dcqcn" "$resume_pfc" "$resume_stop" \
   'NR == 8 { print } { print }' \

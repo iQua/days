@@ -241,6 +241,11 @@ def parsePacer : String → Except String Roce.Pacer
   | "stopped" => pure .stopped
   | other => throw s!"invalid RoCE pacer state: '{other}'"
 
+def parseCongestionControl : String → Except String Roce.CongestionControl
+  | "dcqcn" => pure .dcqcn
+  | "none" => pure .none
+  | other => throw s!"invalid RoCE congestion_control: '{other}'"
+
 def parseStatus : String → Except String Roce.Status
   | "scheduled" => pure .scheduled
   | "blocked" => pure .blocked
@@ -295,6 +300,7 @@ def parseSenderRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array
   let variableWindow ← parseBit (← getField idx fields "variable_window")
   let maximumRateBps ← parseU64 (← getField idx fields "maximum_rate_bps")
   let initialRateBps ← parseU64 (← getField idx fields "initial_rate_bps")
+  let congestionControl ← parseCongestionControl (← getField idx fields "congestion_control")
   let dataClass ← do
     let value ← parseNat (← getField idx fields "data_class")
     if value ≤ 7 then pure value else throw s!"data_class exceeds 7: '{value}'"
@@ -326,7 +332,8 @@ def parseSenderRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array
           windowBytes := windowBytes
           variableWindow := variableWindow
           maximumRateBps := maximumRateBps
-          initialRateBps := initialRateBps }
+          initialRateBps := initialRateBps
+          congestionControl := congestionControl }
       rateBps := ← parseOptU64 (← getField idx fields "rate_bps")
       inputAcknowledgment := ← parseOptU64 (← getField idx fields "input_acknowledgment")
       inputCeEcho := ← parseOpt parseBit (← getField idx fields "input_ce_echo")
@@ -337,8 +344,9 @@ def parseSenderRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array
       after := ← parseSenderState "after" idx fields
       srcLine := lineNo }
 
-/-- The P16 sender schema (`roce_sender_transitions_csv`; `qp-schema-amendment-6.md` and
-`dcqcn-schema.md` Amendment 1): every column the executor writes. -/
+/-- The sender schema (`roce_sender_transitions_csv`; `qp-schema-amendment-6.md`,
+`dcqcn-schema.md` Amendment 1, and P17's Amendment 7, the `congestion_control` column appended as
+column 46): every column the executor writes. -/
 def senderSchema : List String := [
     "time_ns",
     "event_phase",
@@ -384,7 +392,8 @@ def senderSchema : List String := [
     "after_rto_deadline_ns",
     "after_pacer",
     "after_next_tick_ns",
-    "after_status"]
+    "after_status",
+    "congestion_control"]
 
 /-- The sender log must carry every column of `senderSchema`; the missing ones are named. P16 fix
 round 4 (the user's ruling) removed the pre-P16 sender layouts: no other format is read. -/
@@ -629,6 +638,13 @@ def checkControllerJoin (row : SenderRow) (controllerRow : Option DcqcnEventLog.
   let feedback := (row.kind = .ack || row.kind = .nack) && row.inputCeEcho = some true &&
     row.after.sndUna < total
   let froze := !completeBefore && row.after.sndUna ≥ total
+  -- Amendment 7 (P17): a pair without congestion control has no controller. No DCQCN row of it
+  -- may exist; an echo, its completion and the passage of time change nothing; its rate stays
+  -- its configured one (the pristine-rate tie in `checkSenderItem` holds on every row).
+  if row.config.congestionControl = .none then
+    if let some d := controllerRow then
+      throw s!"dcqcn: line {d.srcLine}: DCQCN row of a queue pair without congestion control (node_id={d.nodeId}, flow_id={d.flowId})"
+    return (knownRate, controller)
   match controllerRow with
   | none =>
       at_ (!feedback)
