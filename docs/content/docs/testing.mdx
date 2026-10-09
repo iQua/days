@@ -28,12 +28,20 @@ test target still compiles as the unsharded command compiled it, then runs the r
 then the doctests.
 
 ```text
-lowering-budget        days:collective_lowering_budget
-width-via-load-legacy  days:width_via_load_fixtures days:p14_dcqcn_pfc_fixtures days-legacy
-roce                   days:p15_roce_fixtures days:p15_roce_collectives
-validation-executor    days-validation days-executor
-rest                   days:rest
+validation              days-validation
+width-via-load          days:width_via_load_fixtures days:p16_aicb_scenario
+roce-fixtures-executor  days:p15_roce_fixtures days-executor
+roce-collectives        days:p15_roce_collectives days:p16_aicb_runs
+                        days:executor_small_lookahead days:p16_roce_window
+rest                    days:rest days-legacy
 ```
+
+The layout balances the shards' times on GitHub's hosted runners. The slowest shard sets CI's
+wall time, and it cannot be shorter than the largest unit: `days-validation`, whose
+`width_via_load_full` test alone takes 5 to 9 minutes there. The predicted slowest shard is about
+20 seconds longer than that unit. The named `days` targets are the slow ones moved out of `rest`.
+`rest` is kept about a minute under the slowest shard, so new test files can land there without
+lengthening CI. In each shard the `days` unit runs first, so a later package reuses its build.
 
 Before any shard runs, a `test-plan` job checks the layout against `cargo metadata`: every target
 the four commands build or run must belong to exactly one shard, every test named in the layout
@@ -49,7 +57,7 @@ The script runs locally too (it needs `jq`):
 ```bash
 .github/test-shards.sh plan        # check the layout; print the shard names as JSON
 .github/test-shards.sh list        # print "shard package target" for every target
-.github/test-shards.sh run roce    # run one shard's cargo commands in order
+.github/test-shards.sh run rest    # run one shard's cargo commands in order
 ```
 
 ## Planner equality
