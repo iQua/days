@@ -107,6 +107,12 @@ fn projected_tcp_state_is_the_planners_allocation() {
 /// `Q` queue pairs: `hostpfc_multi_qp_tcp`'s three host rows (3, 1 and 1 pairs) take 8 words
 /// each, +192 B on both backends. The other images have no host-link PFC queue pair and keep
 /// their bytes.
+///
+/// P16 ecnramp re-pins the four ECN images (the TailDrop images keep their bytes). Each ECN
+/// switch LP appends a 4-word ECN record to the scheduler plane (+32 B). An ECN queue now
+/// tail-drops at a byte capacity, so its queue arena is bounded by `capacity_bytes / minimum
+/// packet bytes`, not by a packet capacity: `roce_gbn_lossy` grows by 307,200 B and
+/// `hostpfc_multi_qp_tcp` by 2,853,088 B (`days-gpu/evidence/P16/ecnramp/plan-bytes-*.log`).
 const STAGELESS_PLAN_BYTES: &[(&str, usize, usize)] = &[
     (
         "configs/benchmarks/baseline/fattree_k4_f8_st.toml",
@@ -118,13 +124,13 @@ const STAGELESS_PLAN_BYTES: &[(&str, usize, usize)] = &[
         1_417_280,
         1_417_256,
     ),
-    ("configs/p14/dcqcn_1s_zero_xoff.toml", 260_992, 260_968),
-    ("configs/p15/roce_lossless_pfc.toml", 854_400, 854_376),
-    ("configs/p15/roce_gbn_lossy.toml", 360_928, 360_904),
+    ("configs/p14/dcqcn_1s_zero_xoff.toml", 261_120, 261_096),
+    ("configs/p15/roce_lossless_pfc.toml", 854_720, 854_696),
+    ("configs/p15/roce_gbn_lossy.toml", 668_352, 668_328),
     (
         "configs/p15/hostpfc_multi_qp_tcp.toml",
-        2_656_368,
-        2_656_344,
+        5_509_776,
+        5_509_752,
     ),
 ];
 
@@ -142,7 +148,10 @@ fn stageless_windowless_plans_keep_their_bytes() {
 /// A RoCE AllGather ring of `ranks` hosts on one switch, `chained` times in a row: each
 /// collective follows a compute group on the same hosts (compute -> AllGather -> compute ->
 /// AllGather ...), so every host's stages form one chain of `chained * (ranks - 1)` RoCE stages.
-/// Every AllGather sends the same chunk over the same ring routes.
+/// Every AllGather sends the same chunk over the same ring routes. The switch tail-drops at 300
+/// packets (P16 ecnramp: the ECN step at capacity it had marked only full queues; a byte capacity
+/// would bound the switch queues by bytes over the smallest packet, which grows with the chain and
+/// hides the host-queue property these tests pin).
 fn chained_roce_rings(ranks: u64, chained: usize, window_bytes: u64) -> String {
     let switch = ranks;
     let edges = (0..ranks)
@@ -174,8 +183,6 @@ port_rate = 1000000000
 capacity = 300
 discipline = "FIFO"
 drop = "TailDrop"
-ecn_capacity_bytes = 300_000
-ecn = {{ kmin_bytes = 300_000, kmax_bytes = 300_000, pmax = 1 }}
 
 [link]
 mode = "Pfc"
