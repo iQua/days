@@ -8386,37 +8386,66 @@ extern "C" __global__ void days_exchange_merge(DAYS_BUFFERS) {
         return;
     }
     if (params[P_STREAMS_ENABLED] != 0) {
+        // P17 merge (`days-gpu/evidence/P17/merge/design.md`): processing keeps the LP's active
+        // list exact for every local push, pop and timer removal; only the scatter's remote
+        // delivery leaves a channel that went from empty to non-empty without an entry. So the
+        // merge keeps the maintained list and appends exactly those channels.
+        //
+        // A channel's batch word counts the records its unique producer appended this round
+        // (zeroed by the reset), and the scatter added it to the channel's count. `count == batch`
+        // with `batch != 0` therefore means the channel was empty after processing and is
+        // non-empty now, which by the list invariant is exactly a channel without an entry.
+        // Inbound channels are the declared list's prefix, ending at the LP's service stream.
+        //
+        // The list's order is not canonical: every reader is order-independent (event keys are
+        // unique; `fel_peek` takes a strict minimum, the continuation predicate is universal),
+        // and the list is device scratch, never read back. The heap entry is moved back to index
+        // 0, where every merge left it before P17, so `active_find(NONE)` costs what it did.
+        //
+        // No capacity check: the list holds at most one entry per stream the LP owns plus the
+        // heap entry, and its region holds `stream_state[meta + 1] + 1` entries.
         ulong meta =
             params[P_LP_STREAM_META_OFFSET] +
             ulong(target) * LP_STREAM_META_WORDS;
         ulong declared = stream_state[meta];
         ulong declared_count = stream_state[meta + 1];
         ulong active = stream_state[meta + 2];
-        ulong active_count = 0;
+        ulong active_count = stream_state[meta + 3];
         RECORD_MERGE(params, stream_state, target, MA_INVOCATIONS, 1);
-        if (fel_meta[ulong(target) * META_WORDS + 3] != 0) {
-            ulong entry = active + active_count * ACTIVE_STREAM_ENTRY_WORDS;
-            active_count += 1;
-            stream_state[entry] = NONE;
-            ulong record =
-                fel_meta[ulong(target) * META_WORDS] * EVENT_WORDS;
-            for (uint word = 0; word < 4; ++word) {
-                stream_state[entry + 1 + word] = fel_records[record + word];
+        if (
+            active_count > 1 &&
+            fel_meta[ulong(target) * META_WORDS + 3] != 0 &&
+            stream_state[active] != NONE
+        ) {
+            for (ulong index = 1; index < active_count; ++index) {
+                ulong entry = active + index * ACTIVE_STREAM_ENTRY_WORDS;
+                if (stream_state[entry] == NONE) {
+                    for (uint word = 0; word < ACTIVE_STREAM_ENTRY_WORDS; ++word) {
+                        ulong value = stream_state[active + word];
+                        stream_state[active + word] = stream_state[entry + word];
+                        stream_state[entry + word] = value;
+                    }
+                    break;
+                }
             }
         }
         for (ulong index = 0; index < declared_count; ++index) {
             ulong stream = stream_state[declared + index];
             RECORD_MERGE(params, stream_state, target, MA_STREAMS_READ, 1);
-            if (stream_state[stream * META_WORDS + 3] != 0) {
-                ulong entry =
-                    active + active_count * ACTIVE_STREAM_ENTRY_WORDS;
+            if (stream >= params[P_SERVICE_STREAM_BASE]) {
+                break;
+            }
+            ulong batch = stream_state[
+                params[P_CHANNEL_BATCH_OFFSET] + stream * CHANNEL_BATCH_WORDS
+            ];
+            ulong stream_base = stream * META_WORDS;
+            if (batch != 0 && stream_state[stream_base + 3] == batch) {
+                ulong entry = active + active_count * ACTIVE_STREAM_ENTRY_WORDS;
                 active_count += 1;
                 RECORD_MERGE(params, stream_state, target, MA_APPENDED, 1);
                 stream_state[entry] = stream;
-                ulong stream_base = stream * META_WORDS;
                 ulong capacity = stream_state[stream_base + 1];
-                ulong physical =
-                    stream_state[stream_base + 2] % max(capacity, 1ul);
+                ulong physical = stream_state[stream_base + 2] % max(capacity, 1ul);
                 ulong record = stream_record_offset(
                     stream,
                     physical,
@@ -8424,8 +8453,7 @@ extern "C" __global__ void days_exchange_merge(DAYS_BUFFERS) {
                     stream_state
                 );
                 for (uint word = 0; word < 4; ++word) {
-                    stream_state[entry + 1 + word] =
-                        stream_records[record + word];
+                    stream_state[entry + 1 + word] = stream_records[record + word];
                 }
             }
         }
