@@ -8682,7 +8682,8 @@ kernel void days_exchange_merge(
         // (zeroed by the reset), and the scatter added it to the channel's count. `count == batch`
         // with `batch != 0` therefore means the channel was empty after processing and is
         // non-empty now, which by the list invariant is exactly a channel without an entry.
-        // Inbound channels are the declared list's prefix, ending at the LP's service stream.
+        // The LP's stream list holds its inbound channels, ascending, then its service stream;
+        // `stream_state[meta + 1]` counts every stream the LP owns, generators included.
         //
         // The list's order is not canonical: every reader is order-independent (event keys are
         // unique; `fel_peek` takes a strict minimum, the continuation predicate is universal),

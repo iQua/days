@@ -113,6 +113,10 @@ fn projected_tcp_state_is_the_planners_allocation() {
 /// tail-drops at a byte capacity, so its queue arena is bounded by `capacity_bytes / minimum
 /// packet bytes`, not by a packet capacity: `roce_gbn_lossy` grows by 307,200 B and
 /// `hostpfc_multi_qp_tcp` by 2,853,088 B (`days-gpu/evidence/P16/ecnramp/plan-bytes-*.log`).
+///
+/// P17 merge moves every image by a derived amount, applied in the test: the LP stream lists no
+/// longer store the generator stream ids, one 8-byte word per distinct generator flow
+/// ([`p17_generator_id_bytes`]).
 const STAGELESS_PLAN_BYTES: &[(&str, usize, usize)] = &[
     (
         "configs/benchmarks/baseline/fattree_k4_f8_st.toml",
@@ -134,12 +138,26 @@ const STAGELESS_PLAN_BYTES: &[(&str, usize, usize)] = &[
     ),
 ];
 
+/// P17 merge: the bytes of the generator stream ids the LP stream lists no longer store, one word
+/// per distinct generator flow.
+fn p17_generator_id_bytes(image: &SimulationImage) -> usize {
+    image
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .map(|generator| generator.flow)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        * std::mem::size_of::<u64>()
+}
+
 #[test]
 fn stageless_windowless_plans_keep_their_bytes() {
     for &(relative, metal, cuda) in STAGELESS_PLAN_BYTES {
         let image = lower(relative);
         for (backend, exact) in exact_plans(&image) {
-            let expected = if backend == "Metal" { metal } else { cuda };
+            let expected =
+                if backend == "Metal" { metal } else { cuda } - p17_generator_id_bytes(&image);
             assert_eq!(exact.total_device_bytes, expected, "{backend} {relative}");
         }
     }

@@ -3619,9 +3619,17 @@ fn prepare_streams(
         }
     }
 
+    // P17 merge: the device reads only each LP's inbound channels and the service stream that
+    // ends them (`days_exchange_merge`), so only that prefix of the sorted list is stored. The
+    // LP's metadata keeps the whole list's length, the number of streams it owns, which sizes its
+    // active list (one entry per owned stream plus the heap entry).
+    let lp_stream_id_prefix =
+        |streams: &[u64]| streams.partition_point(|&stream| stream < generator_stream_base as u64);
     let lp_stream_id_words = lp_streams
         .iter()
-        .try_fold(0_usize, |total, streams| total.checked_add(streams.len()))
+        .try_fold(0_usize, |total, streams| {
+            total.checked_add(lp_stream_id_prefix(streams))
+        })
         .ok_or_else(|| CudaError::Validation("LP stream-list size overflows usize".into()))?;
     let lp_active_id_words = lp_streams
         .iter()
@@ -3668,8 +3676,9 @@ fn prepare_streams(
         state[meta] = declared_cursor as u64;
         state[meta + 1] = streams.len() as u64;
         state[meta + 2] = active_cursor as u64;
-        state[declared_cursor..declared_cursor + streams.len()].copy_from_slice(streams);
-        declared_cursor += streams.len();
+        let prefix = &streams[..lp_stream_id_prefix(streams)];
+        state[declared_cursor..declared_cursor + prefix.len()].copy_from_slice(prefix);
+        declared_cursor += prefix.len();
         let fel_count = fel_meta[node * ARENA_META_WORDS + 3];
         if fel_count != 0 {
             state[active_cursor] = NONE;
