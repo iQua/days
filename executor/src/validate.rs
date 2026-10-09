@@ -5635,7 +5635,21 @@ fn validate_drop_mark_policy(
         })
     })?;
     match queue.drop_mark {
-        crate::DropMarkPolicy::TailDrop | crate::DropMarkPolicy::EcnRamp(_) => Ok(()),
+        crate::DropMarkPolicy::TailDrop => Ok(()),
+        crate::DropMarkPolicy::EcnRamp(policy) => {
+            crate::ecn_ramp::ecn_ramp_policy_check(&policy).map_err(|reason| {
+                ValidationError::new(format!(
+                    "switch node {owner:?} queue {queue_index} ECN ramp {reason}"
+                ))
+            })?;
+            if queued_bytes > policy.capacity_bytes {
+                return Err(ValidationError::new(format!(
+                    "switch node {owner:?} queue {queue_index} ECN ramp depth {queued_bytes} exceeds its byte capacity {}",
+                    policy.capacity_bytes
+                )));
+            }
+            Ok(())
+        }
         crate::DropMarkPolicy::EcnThreshold(config) => {
             if config.capacity == 0 || config.threshold == 0 || config.threshold > config.capacity {
                 return Err(ValidationError::new(format!(

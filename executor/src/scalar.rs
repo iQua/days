@@ -2871,6 +2871,7 @@ impl<'image> TransitionState<'image> {
             None
         };
 
+        let ecn_seed = self.image.seed;
         let (disposition, schedule_ready, mark_packet, pfc_plan, pfc_transition, aqm_transition) = {
             let state = self.switch_state_mut(node)?;
             state.arrived_packets = state
@@ -2905,18 +2906,30 @@ impl<'image> TransitionState<'image> {
                 (QueueAdmissionAction::Drop, None)
             } else {
                 let before = queue.drop_mark;
-                let action = drop_mark_decision(
-                    &mut queue.drop_mark,
-                    queue.queue_capacity_packets,
-                    queue_len,
-                    queue_bytes,
-                    packet.size_bytes,
-                    node.id,
-                )?;
-                let action = if action == QueueAdmissionAction::Mark && !packet.kind.is_data() {
-                    QueueAdmissionAction::Enqueue
+                let action = if let crate::DropMarkPolicy::EcnRamp(policy) = &queue.drop_mark {
+                    ecn_ramp_action(
+                        policy,
+                        queue_bytes,
+                        packet,
+                        ecn_seed,
+                        node.id,
+                        queue_id,
+                        event.payload,
+                    )
                 } else {
-                    action
+                    let action = drop_mark_decision(
+                        &mut queue.drop_mark,
+                        queue.queue_capacity_packets,
+                        queue_len,
+                        queue_bytes,
+                        packet.size_bytes,
+                        node.id,
+                    )?;
+                    if action == QueueAdmissionAction::Mark && !packet.kind.is_data() {
+                        QueueAdmissionAction::Enqueue
+                    } else {
+                        action
+                    }
                 };
                 let transition = (before != crate::DropMarkPolicy::TailDrop).then_some((
                     before,
@@ -7538,6 +7551,32 @@ fn derive_switch_queue_bytes(
     })
 }
 
+/// The ECN ramp's decision for one arrival (`crate::ecn_ramp`); the draw, keyed by the image
+/// seed, the switch LP, the queue slot and the arrival's payload, is computed only inside the ramp
+/// for ECN-capable data.
+fn ecn_ramp_action(
+    policy: &crate::EcnRampPolicy,
+    queued_bytes: u64,
+    packet: PacketDescriptor,
+    seed: u64,
+    node: NodeId,
+    queue_id: u64,
+    payload: PayloadId,
+) -> QueueAdmissionAction {
+    use crate::ecn_ramp::{EcnRampAction, ecn_draw, ecn_queue_key, ecn_ramp_decision};
+    match ecn_ramp_decision(
+        policy,
+        queued_bytes,
+        packet.size_bytes,
+        packet.kind.is_data(),
+        || ecn_draw(ecn_queue_key(seed, node.0, queue_id), payload.0),
+    ) {
+        EcnRampAction::Enqueue => QueueAdmissionAction::Enqueue,
+        EcnRampAction::Mark => QueueAdmissionAction::Mark,
+        EcnRampAction::Drop => QueueAdmissionAction::Drop,
+    }
+}
+
 fn drop_mark_decision(
     policy: &mut crate::DropMarkPolicy,
     taildrop_capacity_packets: u64,
@@ -7576,7 +7615,9 @@ fn drop_mark_decision(
                 QueueAdmissionAction::Enqueue
             })
         }
-        crate::DropMarkPolicy::EcnRamp(_) => Ok(QueueAdmissionAction::Enqueue),
+        crate::DropMarkPolicy::EcnRamp(_) => {
+            unreachable!("the switch arrival decides an ECN ramp with its draw inputs")
+        }
         crate::DropMarkPolicy::Red(state) => {
             // Let S=2^32, A' = floor((511*A + sample*S)/512), and
             // p(A') = p_num*(A'-min*S)/(p_den*(max-min)*S). In the open threshold

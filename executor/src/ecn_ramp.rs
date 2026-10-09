@@ -86,3 +86,40 @@ pub fn ecn_ramp_decision(
         EcnRampAction::Enqueue
     }
 }
+
+/// The ECN ramp's well-formedness: a positive byte capacity,
+/// `1 <= kmin <= kmax <= capacity`, `0 < Pmax <= 1` in lowest terms, `Pmax = 1` for a step
+/// (`kmin == kmax`, so a step has one representation), and a span `pmax_den * (kmax - kmin)` that
+/// fits `u64` (the device's high multiply takes it as one word).
+pub fn ecn_ramp_policy_check(policy: &crate::EcnRampPolicy) -> Result<(), &'static str> {
+    if policy.capacity_bytes == 0 {
+        return Err("needs a positive byte capacity");
+    }
+    if policy.kmin_bytes == 0
+        || policy.kmin_bytes > policy.kmax_bytes
+        || policy.kmax_bytes > policy.capacity_bytes
+    {
+        return Err("needs 1 <= kmin <= kmax <= capacity bytes");
+    }
+    let (numerator, denominator) = (policy.pmax_numerator, policy.pmax_denominator);
+    if numerator == 0 || numerator > denominator {
+        return Err("needs 0 < pmax <= 1");
+    }
+    if gcd(numerator, denominator) != 1 {
+        return Err("needs pmax in lowest terms");
+    }
+    if policy.kmin_bytes == policy.kmax_bytes && numerator != denominator {
+        return Err("step (kmin == kmax) needs pmax = 1");
+    }
+    if ecn_ramp_span(policy).is_none() {
+        return Err("span pmax_denominator * (kmax - kmin) exceeds u64");
+    }
+    Ok(())
+}
+
+const fn gcd(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    left
+}
