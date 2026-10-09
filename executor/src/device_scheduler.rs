@@ -23,10 +23,20 @@ pub(crate) const SCHEDULER_QUEUE_TAG_OFFSET: usize = 3;
 pub(crate) const SCHEDULER_LAST_UPDATED: usize = 4;
 pub(crate) const SCHEDULER_VIRTUAL_TIME: usize = 5;
 pub(crate) const SCHEDULER_IN_SERVICE_TAG: usize = 15;
+/// The ECN ramp of a switch LP (`crate::ecn_ramp`): kind 0 is TailDrop, kind 1 the ramp, whose
+/// byte capacity and `kmin` sit in the node block and whose `AQM_RECORD_WORDS`-word record
+/// (`kmax`, `pmax` numerator, the span `pmax_den * (kmax - kmin)`, the draw's queue key) is
+/// appended to the plane, only for ECN nodes, at the offset in `SCHEDULER_AQM_RECORD`.
 pub(crate) const SCHEDULER_AQM_KIND: usize = 25;
-pub(crate) const SCHEDULER_AQM_UNIT: usize = 26;
+pub(crate) const SCHEDULER_AQM_RECORD: usize = 26;
 pub(crate) const SCHEDULER_AQM_CAPACITY: usize = 27;
-pub(crate) const SCHEDULER_AQM_THRESHOLD: usize = 28;
+pub(crate) const SCHEDULER_AQM_KMIN: usize = 28;
+
+pub(crate) const AQM_RECORD_WORDS: usize = 4;
+pub(crate) const AQM_RECORD_KMAX: usize = 0;
+pub(crate) const AQM_RECORD_PMAX_NUMERATOR: usize = 1;
+pub(crate) const AQM_RECORD_SPAN: usize = 2;
+pub(crate) const AQM_RECORD_QUEUE_KEY: usize = 3;
 
 pub(crate) const SCHEDULER_CLASS_WORDS: usize = 12;
 pub(crate) const SCHEDULER_CLASS_VALUE: usize = 0;
@@ -52,6 +62,11 @@ pub(crate) fn device_scheduler_word_count(
         let Some(queue) = image.switch_states[node.state_slot as usize].queues.first() else {
             continue;
         };
+        if matches!(queue.drop_mark, DropMarkPolicy::EcnRamp(_)) {
+            words = words
+                .checked_add(AQM_RECORD_WORDS)
+                .ok_or_else(|| "device ECN record arena size overflows usize".to_owned())?;
+        }
         let class_count = match &queue.scheduler {
             SchedulerKind::Fifo => 0,
             SchedulerKind::StaticPriority { priorities } => priorities.len(),
@@ -116,14 +131,11 @@ pub(crate) fn prepare_device_schedulers(
         match queue.drop_mark {
             DropMarkPolicy::TailDrop => {}
             DropMarkPolicy::EcnRamp(policy) => {
-                debug_assert_eq!(
-                    policy.kmin_bytes, policy.kmax_bytes,
-                    "device validation admits only the ECN step until the device ramp lands"
-                );
                 words[node_base + SCHEDULER_AQM_KIND] = 1;
-                words[node_base + SCHEDULER_AQM_UNIT] = 1;
+                words[node_base + SCHEDULER_AQM_RECORD] = words.len() as u64;
                 words[node_base + SCHEDULER_AQM_CAPACITY] = policy.capacity_bytes;
-                words[node_base + SCHEDULER_AQM_THRESHOLD] = policy.kmin_bytes;
+                words[node_base + SCHEDULER_AQM_KMIN] = policy.kmin_bytes;
+                words.extend(ecn_record(&policy, image.seed, node.id.0)?);
             }
         }
         words[node_base + SCHEDULER_KIND] = u64::from(queue.scheduler.code());
@@ -278,8 +290,25 @@ pub(crate) fn read_rational(words: &[u64], offset: usize) -> Result<ExactRationa
     Ok(ExactRational::new_raw(numerator, denominator))
 }
 
+/// The ECN ramp's appended record for switch LP `node` (`SCHEDULER_AQM_RECORD`).
+fn ecn_record(
+    policy: &crate::EcnRampPolicy,
+    seed: u64,
+    node: u64,
+) -> Result<[u64; AQM_RECORD_WORDS], String> {
+    let mut record = [0; AQM_RECORD_WORDS];
+    record[AQM_RECORD_KMAX] = policy.kmax_bytes;
+    record[AQM_RECORD_PMAX_NUMERATOR] = policy.pmax_numerator;
+    record[AQM_RECORD_SPAN] = crate::ecn_ramp::ecn_ramp_span(policy)
+        .ok_or_else(|| "device ECN ramp span exceeds u64".to_owned())?;
+    // A switch LP owns one queue (validation), so its slot is 0.
+    record[AQM_RECORD_QUEUE_KEY] = crate::ecn_ramp::ecn_queue_key(seed, node, 0);
+    Ok(record)
+}
+
 pub(crate) fn restore_device_scheduler(
     node: usize,
+    seed: u64,
     queue_meta: &[u64],
     words: &[u64],
     queue: &mut SwitchQueueState,
@@ -303,14 +332,15 @@ pub(crate) fn restore_device_scheduler(
             }
         }
         DropMarkPolicy::EcnRamp(policy) => {
+            let record = usize::try_from(words[node_base + SCHEDULER_AQM_RECORD])
+                .map_err(|_| "device ECN record offset overflows usize".to_owned())?;
+            let expected = ecn_record(&policy, seed, node as u64)?;
             if words[node_base + SCHEDULER_AQM_KIND] != 1
-                || words[node_base + SCHEDULER_AQM_UNIT] != 1
                 || words[node_base + SCHEDULER_AQM_CAPACITY] != policy.capacity_bytes
-                || words[node_base + SCHEDULER_AQM_THRESHOLD] != policy.kmin_bytes
+                || words[node_base + SCHEDULER_AQM_KMIN] != policy.kmin_bytes
+                || words.get(record..record + AQM_RECORD_WORDS) != Some(&expected[..])
             {
-                return Err(
-                    "device ECN threshold configuration changed during execution".to_owned(),
-                );
+                return Err("device ECN ramp configuration changed during execution".to_owned());
             }
         }
     }

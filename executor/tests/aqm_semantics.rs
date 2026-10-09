@@ -423,7 +423,7 @@ fn adversarial_device_ecn_images() -> Vec<SimulationImage> {
         ramp(10_000, 50, 2_000, 2, 3),
         &[100, 1, 250, 7, 999, 64, 300, 1_000, 3, 500, 128, 900],
     );
-    ramp_mixed.stop_time_ns = 1_000_000_000;
+    ramp_mixed.stop_time_ns = 1_000_000;
     let ramp_widest = hidden_byte_overflow_image(ramp(u64::MAX, 1, u64::MAX / 3, 1, 3));
     let ramp_prefix =
         run_scalar_with_observations(&ramp_marks, Some(20_000), ObservationMode::Full)
@@ -535,7 +535,7 @@ fn ramp(
 /// and drain at 80 Mb/s, so the post-admission depth climbs by `size` per arrival.
 fn ramp_image(policy: DropMarkPolicy, count: usize, size: u64) -> SimulationImage {
     let mut image = aqm_image(policy, &vec![size; count]);
-    image.stop_time_ns = 1_000_000_000;
+    image.stop_time_ns = 1_000_000;
     image
 }
 

@@ -229,9 +229,13 @@ constexpr uint S_LAST_UPDATED = 4;
 constexpr uint S_VIRTUAL_TIME = 5;
 constexpr uint S_IN_SERVICE_TAG = 15;
 constexpr uint S_AQM_KIND = 25;
-constexpr uint S_AQM_UNIT = 26;
+constexpr uint S_AQM_RECORD = 26;
 constexpr uint S_AQM_CAPACITY = 27;
-constexpr uint S_AQM_THRESHOLD = 28;
+constexpr uint S_AQM_KMIN = 28;
+constexpr uint AQM_RECORD_KMAX = 0;
+constexpr uint AQM_RECORD_PMAX_NUMERATOR = 1;
+constexpr uint AQM_RECORD_SPAN = 2;
+constexpr uint AQM_RECORD_QUEUE_KEY = 3;
 
 constexpr uint SC_VALUE = 0;
 constexpr uint SC_ACTIVE = 1;
@@ -282,8 +286,6 @@ constexpr ulong SCHED_DRR = 3;
 constexpr ulong SCHED_WRR = 4;
 constexpr ulong AQM_TAILDROP = 0;
 constexpr ulong AQM_ECN = 1;
-constexpr ulong AQM_PACKETS = 0;
-constexpr ulong AQM_BYTES = 1;
 
 // Generator row ABI. Common words 0..10 and kind tag 11 are shared with the scalar image;
 // TCP owns words 12..30 and the controller tag/state at 31..42.
@@ -3175,6 +3177,15 @@ __device__ __forceinline__ bool wrr_select_position(
     return false;
 }
 
+// `splitmix::mix`: SplitMix64's output function (the ECN ramp's draw, `ecn_ramp.rs`).
+__device__ __forceinline__ ulong splitmix64(ulong value) {
+    value += 0x9e3779b97f4a7c15ull;
+    value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ull;
+    value = (value ^ (value >> 27)) * 0x94d049bb133111ebull;
+    return value ^ (value >> 31);
+}
+
+template <bool MECHANISMS>
 __device__ __forceinline__ bool switch_admission_action(
     ulong node,
     const ulong *packet,
@@ -3193,28 +3204,41 @@ __device__ __forceinline__ bool switch_admission_action(
         action = 2;
         return true;
     }
-    ulong post_bytes = queued_bytes + packet[PK_SIZE];
     if (policy == AQM_TAILDROP) {
         action = taildrop_capacity != 0 && waiting >= taildrop_capacity ? 2 : 0;
         return true;
     }
-    if (policy != AQM_ECN) {
+    // P16 ecnramp (ruling 1a): the ECN ramp, step included, is a mechanism. The plain build
+    // admits by TailDrop alone and stops on any other policy.
+    if (!MECHANISMS || policy != AQM_ECN) {
         set_semantic_error(error, 58, node);
         return false;
     }
-
+    // `ecn_ramp_decision`: tail drop past the byte capacity; no draw for a packet that is not
+    // ECN-capable data; no mark below kmin; a mark at or above kmax; in between a mark iff
+    // mulhi(u, span) < pmax_num * (d - kmin), u = mix(queue_key ^ payload).
+    ulong post_bytes = queued_bytes + packet[PK_SIZE];
     ulong capacity = scheduler_state[scheduler_base + S_AQM_CAPACITY];
-    ulong threshold = scheduler_state[scheduler_base + S_AQM_THRESHOLD];
-    ulong unit = scheduler_state[scheduler_base + S_AQM_UNIT];
-    if (capacity == 0 || threshold == 0 || threshold > capacity || unit > AQM_BYTES) {
-        set_semantic_error(error, 58, node);
-        return false;
+    ulong kmin = scheduler_state[scheduler_base + S_AQM_KMIN];
+    ulong record = scheduler_state[scheduler_base + S_AQM_RECORD];
+    if (post_bytes > capacity) {
+        action = 2;
+        return true;
     }
-    ulong post_depth = waiting + 1;
-    if (unit == AQM_BYTES) {
-        post_depth = post_bytes;
+    ulong kind = packet[PK_KIND] & PK_KIND_MASK;
+    if ((kind != DATA_PACKET && kind != TCP_DATA_PACKET && kind != ROCE_DATA_PACKET) ||
+        post_bytes < kmin) {
+        action = 0;
+        return true;
     }
-    action = post_depth > capacity ? 2 : (post_depth >= threshold ? 1 : 0);
+    ulong kmax = scheduler_state[record + AQM_RECORD_KMAX];
+    if (post_bytes >= kmax) {
+        action = 1;
+        return true;
+    }
+    ulong draw = splitmix64(scheduler_state[record + AQM_RECORD_QUEUE_KEY] ^ packet[PK_ID]);
+    ulong bound = scheduler_state[record + AQM_RECORD_PMAX_NUMERATOR] * (post_bytes - kmin);
+    action = __umul64hi(draw, scheduler_state[record + AQM_RECORD_SPAN]) < bound ? 1 : 0;
     return true;
 }
 
@@ -6690,7 +6714,7 @@ __device__ __forceinline__ bool dispatch_event(
              scheduler_state[pfc_ingress + PI_OCCUPANCY + pfc_priority] + event[PK_SIZE] >
                 scheduler_state[pfc_ingress + PI_CAPACITY + pfc_priority])) {
             admission = 2;
-        } else if (!switch_admission_action(
+        } else if (!switch_admission_action<MECHANISMS>(
             node,
             event,
             semantic_capacity,
@@ -6719,10 +6743,8 @@ __device__ __forceinline__ bool dispatch_event(
                 arrivals
             );
         }
-        ulong packet_kind = event[PK_KIND] & PK_KIND_MASK;
-        if (admission == 1 &&
-            (packet_kind == DATA_PACKET || packet_kind == TCP_DATA_PACKET ||
-             (MECHANISMS && packet_kind == ROCE_DATA_PACKET))) {
+        // Admission marks only ECN-capable data, and only in the mechanisms build.
+        if (MECHANISMS && admission == 1) {
             event[PK_KIND] |= PK_ECN_FLAG;
         }
         ulong scheduler_kind = scheduler_state[scheduler_base + S_KIND];

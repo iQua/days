@@ -4854,8 +4854,14 @@ impl MetalBuffers {
                         switch_queue.queue = queue.iter().map(|packet| packet.id).collect();
                         switch_queue.in_service = service.map(|packet| packet.id);
                         switch_queue.tx_ready_pending = node_state[base + 3] != 0;
-                        restore_device_scheduler(lp, &queue_meta, &scheduler_state, switch_queue)
-                            .map_err(MetalError::Validation)?;
+                        restore_device_scheduler(
+                            lp,
+                            image.seed,
+                            &queue_meta,
+                            &scheduler_state,
+                            switch_queue,
+                        )
+                        .map_err(MetalError::Validation)?;
                         if params[PARAM_PFC_OFFSET] != NONE {
                             crate::device_pfc::restore_pfc_queue(
                                 &scheduler_state,

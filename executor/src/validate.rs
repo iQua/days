@@ -678,14 +678,6 @@ fn validate_backend_capabilities(
         }
     }
     for queue in image.switch_states.iter().flat_map(|state| &state.queues) {
-        match queue.drop_mark {
-            crate::DropMarkPolicy::EcnRamp(policy) if policy.kmin_bytes < policy.kmax_bytes => {
-                return Err(ValidationError::new(format!(
-                    "backend {backend} does not support the ECN ramp between kmin and kmax yet"
-                )));
-            }
-            crate::DropMarkPolicy::TailDrop | crate::DropMarkPolicy::EcnRamp(_) => {}
-        }
         match queue.scheduler {
             SchedulerKind::Fifo
             | SchedulerKind::StaticPriority { .. }
