@@ -29,7 +29,7 @@ pub use schedule::{
     SegmentEnd, SimaiEnv, StageChain, StartItem, in_hang_window, plan_schedule,
 };
 pub use simai_conf::{
-    INERT_KEYS, PfcTier, RECORDED_KEYS, RailShape, SimaiConf, SimaiDcqcn, SimaiFabric, SimaiRoce,
-    derive_fabric, parse_simai_conf,
+    INERT_KEYS, PfcTier, RECORDED_KEYS, RailShape, SimaiConf, SimaiDcqcn, SimaiEcn, SimaiFabric,
+    SimaiRoce, derive_fabric, parse_simai_conf,
 };
 pub use topology::{check_simai_topology, simai_topology};

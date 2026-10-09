@@ -505,6 +505,10 @@ pub fn build_graph_with_profile_from_str(
     let config: TopologySource = match toml::from_str::<TopologySource>(content) {
         Ok(config) => config,
         Err(err) => {
+            // The topology tables refuse unknown keys (P16 a2aset part 2); name the table.
+            if let Some(table) = crate::utils::serde_fields::unknown_key_table(content, &err) {
+                return Err(TopologyError::InvalidConfig(format!("{err}(in {table})")));
+            }
             eprintln!("Failed to deserialize: {}", err);
             return Err(TopologyError::TomlParseError(err));
         }
@@ -545,7 +549,9 @@ pub fn build_graph_with_profile_from_str(
     }
 }
 
-/// The part of a scenario file the topology builders read.
+/// The part of a scenario file the topology builders read: a partial view of the root, whose
+/// unknown keys the scenario root refuses (`scenario::compile`); the topology tables themselves
+/// refuse unknown keys.
 #[derive(Deserialize)]
 struct TopologySource {
     topology: Option<TopoConfig>,

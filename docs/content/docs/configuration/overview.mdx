@@ -24,7 +24,7 @@ Days AGO represents time in integer nanoseconds. It rejects values that cannot b
 
 ## Root keys
 
-The strict legacy loader accepts the following root keys. Unknown root keys fail validation.
+The strict legacy loader accepts the following root keys. Unknown root keys fail validation in both engines: Days AGO refuses an unknown key in every table, naming the key and the table it sits in (`TOML parse error ... unknown field ... (in [table])`), and accepts without reading exactly the twelve root keys that only the legacy engine uses: `ui_interval`, `threading`, `num_threads`, `hot_workers`, `concurrency_level`, `log_path`, `csv_logging`, `report_interval`, `mailbox_capacity`, `legacy_e5_metrics`, `model_host_attachment`, and `app_source` (`LEGACY_ENGINE_ROOT_KEYS` in `src/scenario/compile.rs`; a test keeps the list equal to the legacy loader's). Days AGO also requires every `arr_dist` and `pkt_size_dist` to be a one-line inline table with no comment and no trailing comma.
 
 | Keys | Purpose | Scope |
 | --- | --- | --- |
@@ -46,7 +46,7 @@ The strict legacy loader accepts the following root keys. Unknown root keys fail
 | `workload` | An AICB/SimAI training trace as the scenario's traffic | Days AGO; the legacy loader rejects the key |
 | `app_source` | Actor-managed byte buffers for TCP Broadcast/RingAllReduce | Legacy |
 
-See the pages in this section for field-level constraints. A key can belong to the vocabulary and still fail when its value or combination is inactive. The strict loader rejects examples such as `switch.ecn_threshold` without `drop = "ECN_THRESHOLD"`, `[link.pfc]` without `link.mode = "Pfc"`, and `[app_source]` without a supported TCP collective.
+See the pages in this section for field-level constraints. A key can belong to the vocabulary and still fail when its value or combination is inactive. The strict loader rejects examples such as `switch.ecn_capacity_bytes` without `switch.ecn` or `switch.ecn_by_rate`, `[link.pfc]` without `link.mode = "Pfc"`, and `[app_source]` without a supported TCP collective.
 
 ## Minimal scenario
 
@@ -88,7 +88,7 @@ Legacy protocol models use Cargo features:
 - `link.mode = "Pfc"` requires `-p days-legacy --features l2_pfc`.
 - LeanGuard event CSVs require `lean` plus the protocol feature where applicable.
 
-Days AGO Scalar and CPU execute the full lowered mechanism set. Metal and CUDA reject RED/RED_ECN before execution. They accept deterministic packet traffic, exact TCP Reno/CUBIC, DCQCN, RoCE queue pairs, PFC, collective and compute stages, FIFO/SP/WFQ/DRR/WRR, TailDrop, and ECN threshold subject to device capacity checks. The error names the unsupported mechanism and directs you to Scalar or CPU.
+Days AGO Scalar and CPU execute the full lowered mechanism set. Metal and CUDA accept deterministic packet traffic, exact TCP Reno/CUBIC, DCQCN, RoCE queue pairs, PFC, collective and compute stages, FIFO/SP/WFQ/DRR/WRR, TailDrop, and the ECN ramp, subject to device capacity checks. The error names the unsupported mechanism and directs you to Scalar or CPU.
 
 ## Reference pages
 

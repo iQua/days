@@ -5,16 +5,15 @@ use std::path::Path;
 use days_executor::{
     Backend, CollectiveAlgorithm, CollectiveChannelPolicy, CollectiveChunkPolicy, CollectivePhase,
     CollectiveStage, CollectiveStageIdentity, ComputeStage, ConstantGenerator, DcqcnController,
-    DcqcnControllerConfig, DcqcnGenerator, DcqcnReceiverState, DropMarkPolicy, EcnThresholdPolicy,
+    DcqcnControllerConfig, DcqcnGenerator, DcqcnReceiverState, DropMarkPolicy, EcnRampPolicy,
     Event, EventKey, EventKind, FlowDescriptor, FlowGeneratorKind, FlowGeneratorState, FlowId,
     GeneratorFeedbackState, GeneratorStatus, GeneratorTermination, HostState, LinkDescriptor,
     LinkId, NodeDescriptor, NodeId, NodeKind, PacketDescriptor, PacketKind, PayloadId,
-    PfcIngressState, PfcQueueState, QueueDepthUnit, RateGenerator, RedPolicyState, RemoteChannel,
-    RoceGenerator, RocePacer, RoceReceiverState, ScheduledEmission, SchedulerKind, SimulationImage,
-    StageDependencies, StagePredecessors, StageRole, SwitchQueueState, SwitchState,
-    TcpCongestionControl, TcpDataHeader, TcpGenerator, TcpReceiverState, event_phase, validate,
+    PfcIngressState, PfcQueueState, RateGenerator, RemoteChannel, RoceGenerator, RocePacer,
+    RoceReceiverState, ScheduledEmission, SchedulerKind, SimulationImage, StageDependencies,
+    StagePredecessors, StageRole, SwitchQueueState, SwitchState, TcpCongestionControl,
+    TcpDataHeader, TcpGenerator, TcpReceiverState, event_phase, validate,
 };
-use num_bigint::BigUint;
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 use rand::SeedableRng;
@@ -61,46 +60,123 @@ impl From<IdError> for CompileError {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct SourceConfig {
-    /// A `[workload]` table: present only in an AICB scenario, which the adapter rewrites before
-    /// lowering, so the ordinary path refuses it.
-    workload: Option<serde::de::IgnoredAny>,
-    seed: Option<u64>,
-    duration: Option<ExactDecimal>,
-    switch: SourceSwitch,
-    link: Option<SourceLink>,
-    time_quantum_ns: Option<u64>,
-    routing: Option<SourceRouting>,
-    flow: Option<Vec<SourceFlow>>,
-    flow_set: Option<Vec<SourceFlowSet>>,
-    collective: Option<Vec<SourceCollective>>,
-    collective_set: Option<Vec<SourceCollectiveSet>>,
-    compute: Option<Vec<SourceCompute>>,
+/// Declares the scenario root ([`SourceConfig`]) together with [`LEGACY_ENGINE_ROOT_KEYS`], so
+/// the legacy-engine keys the root accepts are written once.
+macro_rules! scenario_root {
+    ($($legacy:ident),* $(,)?) => {
+        /// The legacy engine's root keys (`legacy/src/config.rs`, `LegacyConfig`) that Days AGO
+        /// does not read: the root accepts each by its exact name and ignores it, because the
+        /// two engines read one scenario file (user ruling, Oct 8, option 1). Any other unknown
+        /// key is refused. `legacy`'s `the_days_ago_root_names_exactly_the_legacy_only_keys`
+        /// test keeps the list equal to `LegacyConfig`'s keys that the Days AGO root does not
+        /// read itself.
+        pub const LEGACY_ENGINE_ROOT_KEYS: &[&str] = &[$(stringify!($legacy)),*];
+
+        /// The scenario root. Unknown keys are refused (`deny_unknown_fields`); `topology`,
+        /// `edges` and `hosts` are read by the topology builder, and the legacy-engine keys are
+        /// accepted and ignored.
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct SourceConfig {
+            /// A `[workload]` table: present only in an AICB scenario, which the adapter
+            /// rewrites before lowering, so the ordinary path refuses it.
+            workload: Option<serde::de::IgnoredAny>,
+            seed: Option<u64>,
+            duration: Option<ExactDecimal>,
+            switch: SourceSwitch,
+            link: Option<SourceLink>,
+            time_quantum_ns: Option<u64>,
+            routing: Option<SourceRouting>,
+            flow: Option<Vec<SourceFlow>>,
+            flow_set: Option<Vec<SourceFlowSet>>,
+            collective: Option<Vec<SourceCollective>>,
+            collective_set: Option<Vec<SourceCollectiveSet>>,
+            compute: Option<Vec<SourceCompute>>,
+            /// Read by the topology builder (`topos::build`).
+            #[allow(dead_code)]
+            topology: Option<serde::de::IgnoredAny>,
+            #[allow(dead_code)]
+            edges: Option<serde::de::IgnoredAny>,
+            #[allow(dead_code)]
+            hosts: Option<serde::de::IgnoredAny>,
+            $(
+                #[allow(dead_code)]
+                $legacy: Option<serde::de::IgnoredAny>,
+            )*
+        }
+    };
+}
+
+scenario_root!(
+    ui_interval,
+    threading,
+    num_threads,
+    hot_workers,
+    concurrency_level,
+    log_path,
+    csv_logging,
+    report_interval,
+    mailbox_capacity,
+    legacy_e5_metrics,
+    model_host_attachment,
+    app_source,
+);
+
+/// The keys the scenario root accepts: those Days AGO reads, `topology`, `edges` and `hosts`
+/// (read by the topology builder), and [`LEGACY_ENGINE_ROOT_KEYS`].
+pub fn scenario_root_keys() -> &'static [&'static str] {
+    crate::utils::serde_fields::struct_fields::<SourceConfig>()
+}
+
+/// A parse error, naming the table of an unknown key: the header line the key sits under, or
+/// the root table.
+fn parse_error(content: &str, error: toml::de::Error) -> CompileError {
+    match crate::utils::serde_fields::unknown_key_table(content, &error) {
+        Some(table) => CompileError::Invalid(format!("{error}(in {table})")),
+        None => CompileError::Parse(error),
+    }
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceSwitch {
     port_rate: Option<ExactDecimal>,
     capacity: u64,
     discipline: Option<String>,
     drop: Option<String>,
-    ecn_threshold: Option<ExactDecimal>,
-    /// P16 H2: an ECN step threshold per egress link rate, in packets (SimAI's ECN rows are keyed
-    /// by the port's rate); replaces `ecn_threshold` and needs `drop = "ECN_THRESHOLD"`.
+    /// P16 ecnramp: the ECN ramp of every switch queue (`kmin_bytes`, `kmax_bytes`, `pmax`), with
+    /// `ecn_capacity_bytes`; exclusive with `ecn_by_rate`.
+    ecn: Option<SourceEcn>,
+    /// P16 H2 and ecnramp: one ECN ramp per egress link rate (SimAI keys its ECN rows by the
+    /// port's rate), with `ecn_capacity_bytes`; exclusive with `ecn`.
     ecn_by_rate: Option<Vec<SourceEcnRow>>,
+    /// The byte capacity an ECN queue tail-drops at (SimAI's `BUFFER_SIZE`); `capacity` stays the
+    /// TailDrop packet capacity, which on an ECN queue only the device planners read, as a
+    /// per-queue packet hint.
+    ecn_capacity_bytes: Option<u64>,
     weights: Option<Vec<u64>>,
     priorities: Option<Vec<u64>>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SourceEcnRow {
-    rate_bps: u64,
-    threshold_packets: u64,
+struct SourceEcn {
+    kmin_bytes: u64,
+    kmax_bytes: u64,
+    pmax: ExactDecimal,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceEcnRow {
+    rate_bps: u64,
+    kmin_bytes: u64,
+    kmax_bytes: u64,
+    pmax: ExactDecimal,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceRouting {
     policy: String,
 }
@@ -119,6 +195,7 @@ enum RoutingPolicy {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceLink {
     mode: Option<String>,
     pfc: Option<SourcePfc>,
@@ -127,6 +204,7 @@ struct SourceLink {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourcePropagationTiers {
     host_to_edge_ns: u64,
     edge_to_aggregation_ns: u64,
@@ -134,6 +212,7 @@ struct SourcePropagationTiers {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourcePfc {
     /// P15: also monitor host-to-switch links, so switches pause host NICs (default off).
     host_links: Option<bool>,
@@ -167,6 +246,7 @@ struct SourceHeadroomRow {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceFlow {
     flow_id: Option<u64>,
     starts_before: Option<Vec<u64>>,
@@ -180,6 +260,7 @@ struct SourceFlow {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceFlowSet {
     first_flow_id: Option<u64>,
     starts_before: Option<Vec<u64>>,
@@ -193,6 +274,7 @@ struct SourceFlowSet {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceCollective {
     /// Stage-group name that `after` fields may reference.
     name: Option<String>,
@@ -247,6 +329,7 @@ struct SourceAllToAll {
 
 /// A delay-only compute stage group: one timer-only stage per listed host.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceCompute {
     name: String,
     hosts: Vec<u64>,
@@ -278,6 +361,7 @@ fn after_names(after: Option<&AfterGroups>) -> &[String] {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceCollectiveSet {
     collective_type: String,
     collective_count: u64,
@@ -292,6 +376,7 @@ struct SourceCollectiveSet {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceTraffic {
     initial_delay: Option<ExactDecimal>,
     duration: Option<ExactDecimal>,
@@ -379,6 +464,7 @@ struct SourceDcqcn {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceTcp {
     cc_algorithm: String,
     #[serde(default)]
@@ -387,6 +473,7 @@ struct SourceTcp {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceCubic {
     beta: Option<ExactDecimal>,
     c: Option<ExactDecimal>,
@@ -951,7 +1038,8 @@ fn compile_text(
 ) -> Result<SimulationImage, CompileError> {
     crate::validate_config_text(content).map_err(CompileError::Unsupported)?;
 
-    let source: SourceConfig = toml::from_str(content)?;
+    let source: SourceConfig =
+        toml::from_str(content).map_err(|error| parse_error(content, error))?;
     if source.workload.is_some() {
         return Err(CompileError::Unsupported(
             "a `[workload.aicb]` scenario takes its `[switch]`, `[link]` and `[routing]` tables \
@@ -978,8 +1066,9 @@ struct SupportedModel {
     queue_capacity_packets: u64,
     scheduler: SchedulerKind,
     drop_mark: DropMarkPolicy,
-    /// P16 H2: the ECN step threshold of each egress LP by its link rate, overriding `drop_mark`'s.
-    ecn_by_rate: Option<BTreeMap<u64, u64>>,
+    /// P16 H2 and ecnramp: the ECN ramp of each egress LP by its link rate, overriding
+    /// `drop_mark`.
+    ecn_by_rate: Option<BTreeMap<u64, EcnRampPolicy>>,
     pfc: Option<PfcLowering>,
     routing: RoutingPolicy,
     propagation: PropagationModel,
@@ -1210,86 +1299,57 @@ impl SupportedModel {
 
         let drop = source.switch.drop.as_deref().ok_or_else(|| {
             CompileError::Unsupported(
-                "unsupported drop policy: `switch.drop` is missing; Days executor supports TailDrop, RED, RED_ECN, and ECN_THRESHOLD"
+                "unsupported drop policy: `switch.drop` is missing; Days AGO's only drop rule is TailDrop"
                     .to_owned(),
             )
         })?;
-        let drop_mark = match drop {
-            "TailDrop" => DropMarkPolicy::TailDrop,
-            "RED" | "RED_ECN" => {
-                if source.switch.capacity < 10 {
-                    return Err(CompileError::Invalid(
-                        "RED packet capacity must be at least 10 to represent 70%/90% thresholds"
-                            .to_owned(),
-                    ));
-                }
-                let min_threshold = u64::try_from(u128::from(source.switch.capacity) * 7 / 10)
-                    .map_err(|_| {
-                        CompileError::Invalid(
-                            "RED 70% packet threshold exceeds the u64 state domain".to_owned(),
-                        )
-                    })?;
-                let max_threshold = u64::try_from(u128::from(source.switch.capacity) * 9 / 10)
-                    .map_err(|_| {
-                        CompileError::Invalid(
-                            "RED 90% packet threshold exceeds the u64 state domain".to_owned(),
-                        )
-                    })?;
-                DropMarkPolicy::Red(RedPolicyState {
-                    unit: QueueDepthUnit::Packets,
-                    capacity: source.switch.capacity,
-                    min_threshold,
-                    max_threshold,
-                    max_probability_numerator: 4,
-                    max_probability_denominator: 5,
-                    average_scaled: 0,
-                    counter: 0,
-                    mark_ecn: drop == "RED_ECN",
-                })
-            }
-            "ECN_THRESHOLD" if source.switch.ecn_by_rate.is_some() => {
-                if source.switch.ecn_threshold.is_some() {
-                    return Err(CompileError::Invalid(
-                        "`switch.ecn_by_rate` replaces `switch.ecn_threshold`".to_owned(),
-                    ));
-                }
-                // Each egress LP takes its link rate's row at lowering; this policy only carries
-                // the shared capacity and unit.
-                DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
-                    unit: QueueDepthUnit::Packets,
-                    capacity: source.switch.capacity,
-                    threshold: source.switch.capacity,
-                })
-            }
-            "ECN_THRESHOLD" => {
-                let threshold = exact_decimal_product_ceil(
-                    scenario_text,
-                    source.switch.ecn_threshold.as_ref(),
-                    "0.8",
-                    source.switch.capacity,
-                    "switch.ecn_threshold",
-                )?;
-                DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
-                    unit: QueueDepthUnit::Packets,
-                    capacity: source.switch.capacity,
-                    threshold,
-                })
-            }
-            unsupported => {
-                return Err(CompileError::Unsupported(format!(
-                    "unsupported drop policy `{unsupported}`; Days executor supports TailDrop, RED, RED_ECN, and ECN_THRESHOLD"
-                )));
-            }
-        };
-
-        let ecn_by_rate = match (&source.switch.ecn_by_rate, drop) {
-            (None, _) => None,
-            (Some(rows), "ECN_THRESHOLD") => Some(ecn_rows(rows, source.switch.capacity)?),
-            (Some(_), _) => {
+        if drop != "TailDrop" {
+            return Err(CompileError::Unsupported(format!(
+                "unsupported drop policy `{drop}`; Days AGO's only drop rule is TailDrop (RED, \
+                 RED_ECN and ECN_THRESHOLD were removed in P16): ECN marking is `switch.ecn` or \
+                 `switch.ecn_by_rate`, with `switch.ecn_capacity_bytes`"
+            )));
+        }
+        let (drop_mark, ecn_by_rate) = match (
+            &source.switch.ecn,
+            &source.switch.ecn_by_rate,
+            source.switch.ecn_capacity_bytes,
+        ) {
+            (None, None, None) => (DropMarkPolicy::TailDrop, None),
+            (None, None, Some(_)) => {
                 return Err(CompileError::Invalid(
-                    "`switch.ecn_by_rate` needs `switch.drop = \"ECN_THRESHOLD\"`".to_owned(),
+                    "`switch.ecn_capacity_bytes` needs `switch.ecn` or `switch.ecn_by_rate`"
+                        .to_owned(),
                 ));
             }
+            (Some(_), Some(_), _) => {
+                return Err(CompileError::Invalid(
+                    "`switch.ecn` and `switch.ecn_by_rate` are exclusive".to_owned(),
+                ));
+            }
+            (_, _, None) => {
+                return Err(CompileError::Invalid(
+                    "ECN marking needs `switch.ecn_capacity_bytes`, the byte capacity an ECN \
+                     queue tail-drops at"
+                        .to_owned(),
+                ));
+            }
+            (Some(ecn), None, Some(capacity_bytes)) => (
+                DropMarkPolicy::EcnRamp(ecn_ramp_policy(
+                    scenario_text,
+                    capacity_bytes,
+                    ecn.kmin_bytes,
+                    ecn.kmax_bytes,
+                    &ecn.pmax,
+                    "switch.ecn",
+                )?),
+                None,
+            ),
+            (None, Some(rows), Some(capacity_bytes)) => (
+                // Each egress LP takes its link rate's row at lowering.
+                DropMarkPolicy::TailDrop,
+                Some(ecn_rows(scenario_text, rows, capacity_bytes)?),
+            ),
         };
         let link = source.link.unwrap_or_default();
         let mut pfc = None;
@@ -1563,24 +1623,89 @@ fn pfc_headroom_rows(rows: &[SourceHeadroomRow]) -> Result<BTreeMap<u64, u64>, C
     Ok(headroom)
 }
 
-/// `switch.ecn_by_rate`: one step threshold per distinct link rate, within the queue capacity.
-fn ecn_rows(rows: &[SourceEcnRow], capacity: u64) -> Result<BTreeMap<u64, u64>, CompileError> {
-    let mut thresholds = BTreeMap::new();
+/// `switch.ecn_by_rate`: one ECN ramp per distinct egress link rate, sharing the byte capacity.
+fn ecn_rows(
+    scenario_text: &str,
+    rows: &[SourceEcnRow],
+    capacity_bytes: u64,
+) -> Result<BTreeMap<u64, EcnRampPolicy>, CompileError> {
+    let mut policies = BTreeMap::new();
     for row in rows {
-        if row.rate_bps == 0
-            || row.threshold_packets == 0
-            || row.threshold_packets > capacity
-            || thresholds
-                .insert(row.rate_bps, row.threshold_packets)
-                .is_some()
-        {
-            return Err(CompileError::Invalid(format!(
-                "`switch.ecn_by_rate` needs one threshold in 1..={capacity} packets per distinct \
-                 positive rate"
-            )));
+        let policy = ecn_ramp_policy(
+            scenario_text,
+            capacity_bytes,
+            row.kmin_bytes,
+            row.kmax_bytes,
+            &row.pmax,
+            "switch.ecn_by_rate",
+        )?;
+        if row.rate_bps == 0 || policies.insert(row.rate_bps, policy).is_some() {
+            return Err(CompileError::Invalid(
+                "`switch.ecn_by_rate` needs one row per distinct positive rate".to_owned(),
+            ));
         }
     }
-    Ok(thresholds)
+    Ok(policies)
+}
+
+/// One ECN ramp from its scenario keys: `pmax` is an exact decimal in `(0, 1]`, reduced to lowest
+/// terms, and the policy must pass the executor's own check (`ecn_ramp_policy_check`).
+fn ecn_ramp_policy(
+    scenario_text: &str,
+    capacity_bytes: u64,
+    kmin_bytes: u64,
+    kmax_bytes: u64,
+    pmax: &ExactDecimal,
+    label: &str,
+) -> Result<EcnRampPolicy, CompileError> {
+    let literal = exact_decimal_literal(scenario_text, pmax, label)?;
+    let (pmax_numerator, pmax_denominator) = decimal_probability(literal)
+        .map_err(|reason| CompileError::Invalid(format!("`{label}` {reason}")))?;
+    let policy = EcnRampPolicy {
+        capacity_bytes,
+        kmin_bytes,
+        kmax_bytes,
+        pmax_numerator,
+        pmax_denominator,
+    };
+    days_executor::ecn_ramp::ecn_ramp_policy_check(&policy)
+        .map_err(|reason| CompileError::Invalid(format!("`{label}` {reason}")))?;
+    Ok(policy)
+}
+
+/// A decimal literal in `(0, 1]` as an exact fraction in lowest terms (`0.2` is `1/5`), shared by
+/// the scenario's `pmax` and SimAI.conf's `PMAX_MAP`.
+pub(crate) fn decimal_probability(literal: &str) -> Result<(u64, u64), String> {
+    let invalid = || format!("pmax must be a decimal in (0, 1], got `{}`", literal.trim());
+    let parsed = parsed_decimal(literal, "pmax").map_err(|_| invalid())?;
+    if parsed.negative || parsed.digits.chars().all(|digit| digit == '0') {
+        return Err(invalid());
+    }
+    let digits = parsed.digits.parse::<u128>().map_err(|_| invalid())?;
+    let (numerator, denominator) = if parsed.power >= 0 {
+        let power = u32::try_from(parsed.power).map_err(|_| invalid())?;
+        let scale = 10_u128.checked_pow(power).ok_or_else(invalid)?;
+        (digits.checked_mul(scale).ok_or_else(invalid)?, 1)
+    } else {
+        let power = u32::try_from(parsed.power.unsigned_abs()).map_err(|_| invalid())?;
+        (digits, 10_u128.checked_pow(power).ok_or_else(invalid)?)
+    };
+    if numerator > denominator {
+        return Err(invalid());
+    }
+    let divisor = gcd_u128(numerator, denominator);
+    let reduced = (numerator / divisor, denominator / divisor);
+    Ok((
+        u64::try_from(reduced.0).map_err(|_| invalid())?,
+        u64::try_from(reduced.1).map_err(|_| invalid())?,
+    ))
+}
+
+const fn gcd_u128(mut left: u128, mut right: u128) -> u128 {
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    left
 }
 
 fn exact_pfc_array(values: Option<&[u64]>, field: &str) -> Result<[u64; 8], CompileError> {
@@ -2312,7 +2437,7 @@ fn validate_collective_set(
     }
     let mut result = Vec::with_capacity(count);
     for (collective_sources, collective_sinks) in sources.into_iter().zip(sinks) {
-        result.push(collective_key(
+        let mut key = collective_key(
             &source.collective_type,
             source.flow_type.as_deref(),
             source.flow_count,
@@ -2327,7 +2452,12 @@ fn validate_collective_set(
             false,
             scenario_text,
             roce_keys,
-        )?);
+        )?;
+        // Each member is shaped as the same `[[collective]]` block without `channels`, `chunk`
+        // or `[collective.alltoall]` is (an all-to-all's UniformFloor chunk, a ring's
+        // EqualRemainderLast), which a set cannot declare.
+        shape_collective(&mut key, None, None, None)?;
+        result.push(key);
     }
     Ok(result)
 }
@@ -2559,6 +2689,7 @@ fn validate_traffic(
             }
             let interval_ns = constant_distribution_scaled(
                 &traffic.arr_dist,
+                "arr_dist",
                 scenario_text,
                 1_000_000_000,
                 "packet arrival distribution",
@@ -2800,6 +2931,11 @@ fn validate_traffic(
         termination,
         kind,
     })
+    .and_then(|key| {
+        check_distribution_keys(&traffic.arr_dist, "arr_dist", scenario_text)?;
+        check_distribution_keys(&traffic.pkt_size_dist, "pkt_size_dist", scenario_text)?;
+        Ok(key)
+    })
 }
 
 fn validate_cubic_profile(
@@ -2831,10 +2967,18 @@ enum ParsedSourceDistribution<'a> {
     Uniform { low: &'a str, high: &'a str },
 }
 
-fn source_distribution<'a>(
+/// The text between the braces of the distribution `name` (`arr_dist` or `pkt_size_dist`).
+/// Executor distributions are inline tables only: one written as a sub-table or as dotted keys
+/// is refused, naming the key and the table (a2aset fix round 2, ruling option (a)). Its span is
+/// then its header or its key, never a `{ ... }` value. The table must also fit on one line,
+/// without comments or a trailing comma (fix round 3): TOML 1.1 allows all three, but the exact
+/// readers split the text on `,` and `=`, so a commented-out `low = ...` would override the live
+/// value.
+fn inline_distribution<'a>(
     distribution: &SourceDistributionInfo,
+    name: &str,
     scenario_text: &'a str,
-) -> Result<ParsedSourceDistribution<'a>, CompileError> {
+) -> Result<&'a str, CompileError> {
     let literal = scenario_text
         .get(distribution.span.clone())
         .ok_or_else(|| {
@@ -2842,13 +2986,31 @@ fn source_distribution<'a>(
                 "distribution source span is outside the scenario text".to_owned(),
             )
         })?;
+    let refuse = |rule: &str| {
+        let table = crate::utils::serde_fields::table_at(scenario_text, distribution.span.start);
+        CompileError::Invalid(format!(
+            "executor distributions must use {rule} in `{name}` (in {table})"
+        ))
+    };
     let body = literal
         .trim()
         .strip_prefix('{')
         .and_then(|body| body.strip_suffix('}'))
-        .ok_or_else(|| {
-            CompileError::Invalid("executor distributions must use an inline TOML table".to_owned())
-        })?;
+        .ok_or_else(|| refuse("an inline TOML table"))?;
+    if body.contains(['#', '\n', '\r']) || body.trim_end().ends_with(',') {
+        return Err(refuse(
+            "a one-line inline TOML table without comments or a trailing comma",
+        ));
+    }
+    Ok(body)
+}
+
+fn source_distribution<'a>(
+    distribution: &SourceDistributionInfo,
+    name: &str,
+    scenario_text: &'a str,
+) -> Result<ParsedSourceDistribution<'a>, CompileError> {
+    let body = inline_distribution(distribution, name, scenario_text)?;
     let mut fields = BTreeMap::new();
     for field in body.split(',') {
         let (key, value) = field.split_once('=').ok_or_else(|| {
@@ -2896,6 +3058,100 @@ fn source_distribution<'a>(
     }
 }
 
+/// The fields of each distribution type and whether they are integers: those of
+/// [`super::DistributionInfo`], the shared strict schema (`distribution_fields_match_the_shared_schema`
+/// keeps the two equal). Only [`check_distribution_keys`]'s allocation-free fast path reads them.
+const DISTRIBUTION_FIELDS: [(&str, &[&str], bool); 3] = [
+    ("DiscreteUniform", &["low", "high"], true),
+    ("Exp", &["lambda"], false),
+    ("Uniform", &["low", "high"], false),
+];
+
+/// Whether `value`, a value of a document TOML already parsed, is a number the shared schema
+/// takes: a decimal integer, or (unless `integer`) any TOML float or integer. Hex, octal, and
+/// binary integers, and every non-number (string, table, array, boolean, date), say no and go
+/// to the schema.
+fn plain_number(value: &str, integer: bool) -> bool {
+    let unsigned = value.strip_prefix(['+', '-']).unwrap_or(value);
+    if integer {
+        return !unsigned.is_empty() && unsigned.bytes().all(|b| b.is_ascii_digit() || b == b'_');
+    }
+    if unsigned == "inf" || unsigned == "nan" {
+        return true;
+    }
+    let bytes = unsigned.as_bytes();
+    !bytes.is_empty()
+        && bytes[0].is_ascii_digit()
+        && bytes.iter().enumerate().all(|(index, &b)| match b {
+            b'0'..=b'9' | b'_' | b'.' | b'e' | b'E' => true,
+            b'+' | b'-' => matches!(bytes[index - 1], b'e' | b'E'),
+            _ => false,
+        })
+}
+
+/// Whether an inline distribution table's keys (`body`, the text between its braces) are exactly `type` and its type's fields, each
+/// once and each a plain number (a `key = value` list, as every scenario writes it): then the
+/// shared schema accepts it. Anything else goes to the schema, which also accepts what this scan
+/// cannot read.
+fn distribution_keys_are_exact(body: &str) -> bool {
+    let entries = || {
+        body.split(',').map(|field| {
+            field
+                .split_once('=')
+                .map(|(key, value)| (key.trim(), value.trim()))
+        })
+    };
+    let Some(kind) = entries().find_map(|entry| {
+        entry
+            .filter(|(key, _)| *key == "type")
+            .and_then(|(_, value)| value.strip_prefix('"')?.strip_suffix('"'))
+    }) else {
+        return false;
+    };
+    let Some((_, fields, integer)) = DISTRIBUTION_FIELDS.iter().find(|(name, ..)| *name == kind)
+    else {
+        return false;
+    };
+    let mut count = 0;
+    for entry in entries() {
+        let Some((key, value)) = entry else {
+            return false;
+        };
+        if key != "type" && !(fields.contains(&key) && plain_number(value, *integer)) {
+            return false;
+        }
+        count += 1;
+    }
+    count == fields.len() + 1
+}
+
+/// Refuses a distribution table whose keys are not exactly its type's: the shared, strict schema
+/// (`DistributionInfo`, also legacy's) refuses an unknown key or one of another type, which
+/// [`source_distribution`] (reading only the keys a type needs) and the traffic kinds that ignore
+/// a distribution would drop (a2aset fix round 1, review M1). `name` is the table's key.
+fn check_distribution_keys(
+    distribution: &SourceDistributionInfo,
+    name: &str,
+    scenario_text: &str,
+) -> Result<(), CompileError> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Distribution {
+        #[allow(dead_code)]
+        distribution: super::DistributionInfo,
+    }
+    let body = inline_distribution(distribution, name, scenario_text)?;
+    // The common case, checked without allocating: exactly `type` and its type's fields.
+    if distribution_keys_are_exact(body) {
+        return Ok(());
+    }
+    toml::from_str::<Distribution>(&format!("distribution = {{{body}}}")).map_err(|error| {
+        let table = crate::utils::serde_fields::table_at(scenario_text, distribution.span.start);
+        CompileError::Invalid(format!("{} in `{name}` (in {table})", error.message()))
+    })?;
+    Ok(())
+}
+
 fn exact_i64_literal(literal: &str, label: &str) -> Result<i64, CompileError> {
     let normalized = literal.trim().replace('_', "");
     let (negative, unsigned) = if let Some(unsigned) = normalized.strip_prefix('-') {
@@ -2920,7 +3176,7 @@ fn constant_packet_size_bytes(
     distribution: &SourceDistributionInfo,
     scenario_text: &str,
 ) -> Result<u64, CompileError> {
-    match source_distribution(distribution, scenario_text)? {
+    match source_distribution(distribution, "pkt_size_dist", scenario_text)? {
         ParsedSourceDistribution::DiscreteUniform { low, high } if low == high => {
             u64::try_from(low).map_err(|_| {
                 CompileError::Unsupported(format!(
@@ -2967,11 +3223,12 @@ fn constant_packet_size_bytes(
 
 fn constant_distribution_scaled(
     distribution: &SourceDistributionInfo,
+    name: &str,
     scenario_text: &str,
     scale: u64,
     label: &str,
 ) -> Result<u64, CompileError> {
-    match source_distribution(distribution, scenario_text)? {
+    match source_distribution(distribution, name, scenario_text)? {
         ParsedSourceDistribution::DiscreteUniform { low, high } if low == high => {
             let value = u64::try_from(low).map_err(|_| {
                 CompileError::Invalid(format!("{label} must be finite and nonnegative, got {low}"))
@@ -3171,48 +3428,6 @@ fn exact_decimal_is_zero(
 ) -> Result<bool, CompileError> {
     let value = parsed_decimal(exact_decimal_literal(scenario_text, value, label)?, label)?;
     Ok(value.digits == "0")
-}
-
-fn exact_decimal_product_ceil(
-    scenario_text: &str,
-    value: Option<&ExactDecimal>,
-    default: &str,
-    capacity: u64,
-    label: &str,
-) -> Result<u64, CompileError> {
-    let literal = match value {
-        Some(value) => exact_decimal_literal(scenario_text, value, label)?,
-        None => default,
-    };
-    let parsed = parsed_decimal(literal, label)?;
-    let invalid = || {
-        CompileError::Invalid(
-            "ECN threshold requires finite 0 < switch.ecn_threshold <= 1 and positive capacity"
-                .to_owned(),
-        )
-    };
-    if capacity == 0 || parsed.negative || parsed.digits == "0" {
-        return Err(invalid());
-    }
-    if parsed.power >= 0 {
-        if parsed.digits == "1" && parsed.power == 0 {
-            return Ok(capacity);
-        }
-        return Err(invalid());
-    }
-    let denominator_power = usize::try_from(parsed.power.unsigned_abs()).map_err(|_| invalid())?;
-    if parsed.digits.len() > denominator_power {
-        return Err(invalid());
-    }
-    if denominator_power > parsed.digits.len().saturating_add(20) {
-        return Ok(1);
-    }
-    let denominator_power = u32::try_from(denominator_power).map_err(|_| invalid())?;
-    let numerator = parsed.digits.parse::<BigUint>().map_err(|_| invalid())?;
-    let denominator = BigUint::from(10_u8).pow(denominator_power);
-    let product = numerator * BigUint::from(capacity);
-    let threshold = (&product + &denominator - BigUint::from(1_u8)) / denominator;
-    u64::try_from(threshold).map_err(|_| invalid())
 }
 
 fn integer_radix(literal: &str) -> Option<(u32, &str)> {
@@ -4325,24 +4540,18 @@ fn lower(
     // pass over the ports only when the scenario has rows (review F2: deciding it inside the map
     // made the map fallible, and a `Result` collect has no size hint, so the vector grew by doubling
     // on every image).
-    if let (Some(rows), DropMarkPolicy::EcnThreshold(policy)) =
-        (&model.ecn_by_rate, model.drop_mark)
-    {
+    if let Some(rows) = &model.ecn_by_rate {
         for (port, state) in switch_port_keys.iter().zip(&mut switch_states) {
             let LpKey::SwitchPort { egress, .. } = *port else {
                 unreachable!("switch-port key set contains only switch ports")
             };
-            let queue = &mut state.queues[0];
             let rate_bps = link_rate.of(egress);
-            let threshold = *rows.get(&rate_bps).ok_or_else(|| {
+            let policy = *rows.get(&rate_bps).ok_or_else(|| {
                 CompileError::Invalid(format!(
                     "`switch.ecn_by_rate` has no row for a {rate_bps} b/s egress link"
                 ))
             })?;
-            queue.drop_mark = DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
-                threshold,
-                ..policy
-            });
+            state.queues[0].drop_mark = DropMarkPolicy::EcnRamp(policy);
         }
     }
     let links = ids
@@ -6300,6 +6509,93 @@ mod tests {
         assert_eq!(
             negative,
             "unsupported probe `1e-9223372036854775809`; exact representation requires an integer scaled value"
+        );
+    }
+
+    /// `DISTRIBUTION_FIELDS` (the allocation-free fast path's table) equals the shared strict
+    /// schema `DistributionInfo`: each type takes exactly its listed fields, refuses every other
+    /// type's, and the schema has no type the table lacks.
+    #[test]
+    fn distribution_fields_match_the_shared_schema() {
+        // The fast path reads the text between an inline table's braces.
+        let exact = |table: &str| {
+            super::distribution_keys_are_exact(
+                table
+                    .strip_prefix('{')
+                    .and_then(|t| t.strip_suffix('}'))
+                    .expect("braces"),
+            )
+        };
+        let parse = |table: &str| {
+            #[derive(serde::Deserialize)]
+            struct Probe {
+                #[allow(dead_code)]
+                distribution: crate::scenario::DistributionInfo,
+            }
+            toml::from_str::<Probe>(&format!("distribution = {table}"))
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        let every_field = super::DISTRIBUTION_FIELDS
+            .iter()
+            .flat_map(|(_, fields, _)| fields.iter().copied())
+            .collect::<std::collections::BTreeSet<_>>();
+        for (kind, fields, integer) in super::DISTRIBUTION_FIELDS {
+            // Values: the fast path says yes only where the schema does.
+            for value in [
+                "1",
+                "-2",
+                "+3",
+                "1_000",
+                "1.5",
+                "-0.25",
+                "1e3",
+                "2.5E-3",
+                "inf",
+                "-nan",
+                "0x10",
+                "0o7",
+                "true",
+                "\"1\"",
+                "[1]",
+                "{ a = 1 }",
+                "1979-05-27",
+                "07:32:00",
+            ] {
+                let table = fields
+                    .iter()
+                    .map(|field| format!(", {field} = {value}"))
+                    .collect::<String>();
+                let table = format!("{{ type = \"{kind}\"{table} }}");
+                if exact(&table) {
+                    parse(&table).unwrap_or_else(|error| panic!("{table}: {error}"));
+                }
+                assert_eq!(
+                    super::plain_number(value, integer),
+                    exact(&table),
+                    "{table}"
+                );
+            }
+            let own = fields
+                .iter()
+                .map(|field| format!(", {field} = 1"))
+                .collect::<String>();
+            parse(&format!("{{ type = \"{kind}\"{own} }}"))
+                .unwrap_or_else(|error| panic!("{kind} takes {fields:?}: {error}"));
+            assert!(exact(&format!("{{ type = \"{kind}\"{own} }}")));
+            for other in every_field.iter().filter(|field| !fields.contains(field)) {
+                let table = format!("{{ type = \"{kind}\"{own}, {other} = 1 }}");
+                assert!(parse(&table).is_err(), "{kind} refuses {other}");
+                assert!(!exact(&table));
+            }
+        }
+        let unknown = parse("{ type = \"Unknown\" }").expect_err("an unknown type");
+        for (kind, ..) in super::DISTRIBUTION_FIELDS {
+            assert!(unknown.contains(&format!("`{kind}`")), "{unknown}");
+        }
+        assert_eq!(
+            unknown.matches('`').count(),
+            2 * (super::DISTRIBUTION_FIELDS.len() + 1)
         );
     }
 }

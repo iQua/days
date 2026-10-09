@@ -175,7 +175,7 @@ The controller freezes when the flow completes: at the ACK that acknowledges a q
 
 An unreliable DCQCN flow's receiver is the notification point: a CE-marked data packet makes it send a CNP in class `cnp_priority`, at most one per `cnp_interval_ns`. The sender's pacer draws credit from `R_C` on every tick; the flow has no acknowledgments and no retransmission.
 
-DCQCN sources emit ECN-capable data. Use `RED_ECN` or `ECN_THRESHOLD` to create CE feedback. Lowered DCQCN, including its controller and the notification point, runs on Scalar, CPU, Metal, and CUDA, with any `cnp_priority`.
+DCQCN sources emit ECN-capable data. Use the ECN ramp (`switch.ecn` or `switch.ecn_by_rate`) to create CE feedback. Lowered DCQCN, including its controller and the notification point, runs on Scalar, CPU, Metal, and CUDA, with any `cnp_priority`.
 
 ## RoCE queue pairs
 

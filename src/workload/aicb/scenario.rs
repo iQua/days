@@ -104,6 +104,7 @@ struct ScenarioTopology {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TopologyTable {
     category: String,
     spectrum_x: Option<SpectrumXConfig>,
@@ -130,7 +131,9 @@ pub struct AicbManifest {
     pub mtu_bytes: u64,
     pub window_bytes: u64,
     pub queue_capacity_packets: u64,
-    pub ecn_by_rate: Vec<(u64, u64)>,
+    pub queue_capacity_bytes: u64,
+    /// The ECN ramp by egress link rate: `(rate, kmin_bytes, kmax_bytes, pmax)`.
+    pub ecn_by_rate: Vec<(u64, u64, u64, String)>,
     pub pfc_asw: (u64, u64),
     pub pfc_psw: (u64, u64),
     pub headroom_by_rate: Vec<(u64, u64)>,
@@ -197,7 +200,8 @@ impl fmt::Display for AicbManifest {
         };
         write!(
             f,
-            " mtu_bytes={} window_bytes={} queue_capacity_packets={} ecn_by_rate={} \
+            " mtu_bytes={} window_bytes={} queue_capacity_packets={} queue_capacity_bytes={} \
+             ecn_ramp_by_rate={} \
              pfc_asw_xoff={} pfc_asw_xon={} pfc_psw_xoff={} pfc_psw_xon={} headroom_by_rate={} \
              collectives={} operations={} fused_segments={} fused_single_server_ops={} \
              fp_clamps={} elided={} hang_window_recorded={} data_queue={} data_queue_order={} \
@@ -205,7 +209,12 @@ impl fmt::Display for AicbManifest {
             self.mtu_bytes,
             self.window_bytes,
             self.queue_capacity_packets,
-            rows(&self.ecn_by_rate),
+            self.queue_capacity_bytes,
+            self.ecn_by_rate
+                .iter()
+                .map(|(rate, kmin, kmax, pmax)| format!("{rate}:{kmin}/{kmax}/{pmax}"))
+                .collect::<Vec<_>>()
+                .join(","),
             self.pfc_asw.0,
             self.pfc_asw.1,
             self.pfc_psw.0,
@@ -238,7 +247,7 @@ impl fmt::Display for AicbManifest {
 pub const DIVERGENCES: [&str; 9] = [
     "static-pfc-thresholds",
     "per-queue-capacity",
-    "ecn-step",
+    "ecn-enqueue",
     "no-52b-header",
     "credit-pacer",
     "edge-triggered-pause",
@@ -452,7 +461,12 @@ pub fn prepare(path: &Path, text: &str) -> Result<PreparedScenario, AicbError> {
         mtu_bytes: fabric.mtu_bytes,
         window_bytes: fabric.roce.window_bytes,
         queue_capacity_packets: fabric.queue_capacity_packets,
-        ecn_by_rate: fabric.ecn_by_rate.iter().map(|(&r, &v)| (r, v)).collect(),
+        queue_capacity_bytes: fabric.queue_capacity_bytes,
+        ecn_by_rate: fabric
+            .ecn_by_rate
+            .iter()
+            .map(|(&rate, ecn)| (rate, ecn.kmin_bytes, ecn.kmax_bytes, ecn.pmax.clone()))
+            .collect(),
         pfc_asw: (fabric.pfc_asw.xoff_bytes, fabric.pfc_asw.xon_bytes),
         pfc_psw: (fabric.pfc_psw.xoff_bytes, fabric.pfc_psw.xon_bytes),
         headroom_by_rate: fabric
@@ -592,15 +606,24 @@ fn fabric_tables(fabric: &SimaiFabric) -> String {
     };
     format!(
         "\n[routing]\npolicy = \"SimAiEcmp\"\n\n\
-         [switch]\ncapacity = {capacity}\ndiscipline = \"FIFO\"\ndrop = \"ECN_THRESHOLD\"\n\
-         ecn_by_rate = [{ecn}]\n\n\
+         [switch]\ncapacity = {capacity}\ndiscipline = \"FIFO\"\ndrop = \"TailDrop\"\n\
+         ecn_capacity_bytes = {capacity_bytes}\necn_by_rate = [{ecn}]\n\n\
          [link]\nmode = \"Pfc\"\n\n\
          [link.pfc]\nhost_links = true\n\
          by_tier = [{{ tier = \"asw\", xoff = {asw_xoff}, xon = {asw_xon} }}, \
          {{ tier = \"psw\", xoff = {psw_xoff}, xon = {psw_xon} }}]\n\
          headroom_by_rate = [{headroom}]\n",
         capacity = fabric.queue_capacity_packets,
-        ecn = rows(&fabric.ecn_by_rate, "threshold_packets"),
+        capacity_bytes = fabric.queue_capacity_bytes,
+        ecn = fabric
+            .ecn_by_rate
+            .iter()
+            .map(|(rate, ecn)| format!(
+                "{{ rate_bps = {rate}, kmin_bytes = {}, kmax_bytes = {}, pmax = {} }}",
+                ecn.kmin_bytes, ecn.kmax_bytes, ecn.pmax
+            ))
+            .collect::<Vec<_>>()
+            .join(", "),
         asw_xoff = class(fabric.pfc_asw.xoff_bytes),
         asw_xon = class(fabric.pfc_asw.xon_bytes),
         psw_xoff = class(fabric.pfc_psw.xoff_bytes),

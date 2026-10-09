@@ -91,7 +91,7 @@ Both runs end with `result_bytes=69710 result_fnv1a64=bf4bb10a72685679`. `--engi
 
 Lowering rejects `first_flow_id`, `graph`, `routing`, and `paths`: flow identity comes from the collective stage key, and routes come from the topology.
 
-`[[collective_set]]` accepts the ring algorithms and `SendRecv` with per-member `sources` and `sinks` lists, but none of `name`, `after`, `stream`, `channels`, `chunk`, or `alltoall`. A set of `AllToAll` members fails validation ("collective policy or phase is inconsistent with its algorithm"); declare each all-to-all as its own `[[collective]]`.
+`[[collective_set]]` accepts the five algorithms with per-member `sources` and `sinks` lists (an all-to-all or send/receive member takes `sources` only); each member lowers as the same `[[collective]]` would. A set has no `name`, `after`, `stream`, `channels`, `chunk`, or `alltoall` key. Like every Days AGO table, it refuses an unknown key, naming the key and the table it sits in, so a stage-group key written on a set, or a misspelled key anywhere, fails to lower rather than being ignored. The only keys Days AGO accepts without reading are the legacy engine's twelve root keys (listed on [Overview](/docs/configuration/overview#root-keys)). A `traffic` table's `arr_dist` and `pkt_size_dist` must be one-line inline tables with no comment and no trailing comma.
 
 ### `[[compute]]` fields
 
@@ -312,7 +312,7 @@ retransmit_timeout_ns = 1000000
 feedback_priority = 0
 ```
 
-`configs/p15/roce_compute_dag.toml` puts this collective between two compute groups on a four-switch line with host-link PFC. Scalar and CPU at 2 workers both end it with `result_bytes=207245 result_fnv1a64=5145dc263ab8ddc6`.
+`configs/p15/roce_compute_dag.toml` puts this collective between two compute groups on a four-switch line with host-link PFC and an ECN step. Scalar and CPU at 2 workers both end it with `result_bytes=208285 result_fnv1a64=b9462a2b3cbe0b26`.
 
 A RoCE stage differs from a TCP stage in four points:
 

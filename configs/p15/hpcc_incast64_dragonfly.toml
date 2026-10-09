@@ -17,7 +17,8 @@
 # the 64 sender links, so each link pauses at 60,256 B, resumes 3,072 B lower, and has 37,500 B of
 # headroom (buffer 97,756 B; the validator's derived requirement is about 27.2 KB). The 64
 # buffers sum to 6.3 MB, well inside the 100,000-packet (104.8 MB) queue; an ECN step at 954
-# packets (the midpoint of HPCC's 400 KB..1.6 MB ramp). ACKs and NACKs ride the data class 3, as
+# packets (the midpoint of HPCC's 400 KB..1.6 MB ramp), in bytes since P16 ecnramp: 954 x 1,048 =
+# 999,792 B over a 104,800,000 B capacity. ACKs and NACKs ride the data class 3, as
 # at HPCC's switch, where `AckHighPrio` is never set (P16 ruling D16; MEASURED in
 # evidence/P16/dcqcn-impl/hpcc-ackq-sim/). The QP is HPCC's profile: no retransmission timeout,
 # duplicates dropped silently, a 60-byte ACK/NACK echoing ECN, an ACK per packet, a 500 us NACK
@@ -40,8 +41,9 @@ hosts_per_router = 65
 port_rate = 100_000_000_000
 capacity = 100_000
 discipline = "FIFO"
-drop = "ECN_THRESHOLD"
-ecn_threshold = 0.00954
+drop = "TailDrop"
+ecn_capacity_bytes = 104_800_000
+ecn = { kmin_bytes = 999_792, kmax_bytes = 999_792, pmax = 1 }
 
 [link]
 mode = "Pfc"

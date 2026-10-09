@@ -13,7 +13,9 @@
 //! ECMP counts (29,824 pairs, at most 895 messages each) and exactness condition (b), then runs to
 //! a cutoff past the start of the first cross-host collectives: Scalar against CPU (4 workers)
 //! under Full and Summary observation. Each device test lowers again and runs to the same cutoff
-//! under Summary observation, with the `days` CLI's stock capacity caps.
+//! under Summary observation, with the `days` CLI's stock capacity caps
+//! (`days::STOCK_CAPACITY_CAPS`): the flagship's default device plan is 120 GiB (83.5 GB of it
+//! remote staging), beyond the Mac's 128 GB and every GPU here.
 
 #[path = "support/aicb.rs"]
 mod aicb;
@@ -72,21 +74,6 @@ fn the_flagship_lowers_in_full_and_runs_to_its_cutoff_on_cpu() {
     }
 }
 
-/// The `days` CLI's stock device capacity caps. The flagship's default device plan is 120 GiB
-/// (83.5 GB of it remote staging), beyond the Mac's 128 GB and every GPU here; capped, Metal runs
-/// it.
-#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
-const CAPACITY_CAPS: days_executor::DeviceCapacityCaps = days_executor::DeviceCapacityCaps {
-    fallback_fel_events_per_lp: Some(16_384),
-    queue_packets_per_lp: Some(2_048),
-    channel_events_per_stream: Some(2_048),
-    remote_staging_events_per_lp: Some(2_048),
-    outbox_events_total: Some(2_000_000),
-    tcp_receiver_ranges_per_flow: Some(64),
-    tcp_ledger_segments_per_flow: Some(4_096),
-    observation_events_per_lp: Some(512),
-};
-
 /// The flagship's Scalar result at its cutoff under Summary observation, without diagnostics,
 /// and the cutoff.
 #[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
@@ -108,7 +95,7 @@ fn cuda_runs_the_flagship_to_its_cutoff_as_scalar() {
         &image,
         Some(horizon),
         days_executor::CudaConfig {
-            capacity_caps: CAPACITY_CAPS,
+            capacity_caps: days::STOCK_CAPACITY_CAPS,
             ..days_executor::CudaConfig::default()
         },
         ObservationMode::Summary,
@@ -128,7 +115,7 @@ fn metal_runs_the_flagship_to_its_cutoff_as_scalar() {
         &image,
         Some(horizon),
         days_executor::MetalConfig {
-            capacity_caps: CAPACITY_CAPS,
+            capacity_caps: days::STOCK_CAPACITY_CAPS,
             ..days_executor::MetalConfig::default()
         },
         ObservationMode::Summary,

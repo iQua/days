@@ -237,6 +237,40 @@ The legacy checkers, `tcp_check`, and `sp_check` also accept
 `--coverage-out <path>`. `leanguard-run --coverage` uses that option and aggregates returned
 coverpoints. The `p10c_*` executables do not expose the coverage flag.
 
+## Days AGO AQM rows
+
+`p10c_aqm_check` replays `aqm_transitions_csv`: one row per admission decision at a switch queue
+with an ECN ramp (Lean rules: the `Aqm` namespace of `lean/LeanGuard/P10c/Semantics.lean` and
+`lean/LeanGuard/P10c/AqmEventLog.lean`). Each row names the packet's kind (`packet_kind`: `data`,
+`tcp_data`, `roce_data`, `tcp_ack`, `roce_ack`, `roce_nack`, `dcqcn_cnp`, `feedback`, `pfc`,
+`roce_pacing_timer` or `stage_notify`), which the writer takes from the run's observed packets, its
+byte depth before admission and its size, the run's `seed`, and the queue's ramp
+(`capacity_bytes`, `kmin_bytes`, `kmax_bytes`, `pmax_numerator`, `pmax_denominator`).
+
+- The checker recomputes every decision. It derives the draw from the seed, the queue
+  (`node_id`, `queue_id`) and the payload, exactly as the executor does
+  ([the switch configuration](/docs/configuration/switches#days-ago-the-ecn-ramp)), and applies the
+  ramp in integer arithmetic. It also checks that the policy is well formed, that each queue's
+  policy and the run's seed stay constant, and that the ECN bit changes exactly on a mark.
+- Days AGO marks only data packets (`data`, `tcp_data`, `roce_data`). Any other packet is admitted
+  unmarked at any depth below the byte capacity, so an ACK inside or above the ramp must show
+  `enqueue` and an unchanged ECN bit.
+- A packet's kind is the same on every row of its payload (one row per queue it crosses); a kind
+  that changes between rows is rejected.
+- What remains trusted is the kind itself: a packet relabelled consistently on all of its rows
+  cannot be told from a packet of that kind, as RoCE senders' `data_class` and WFQ's PFC classes
+  are trusted. `aqm_roce_acks_whole_packet_relabel_trusted_limit_accept.csv` pins this limit: a
+  marked data packet relabelled `roce_ack` on all of its rows, its mark removed, is accepted.
+
+The CI fixtures `aqm_roce_acks_compiled_executor_accept.csv` (`configs/leanguard/aqm_roce_acks.toml`,
+a byte step) and `aqm_roce_acks_ramp_compiled_executor_accept.csv` (`aqm_roce_acks_ramp.toml`, a
+ramp with `pmax = 4/5`) have RoCE ACKs admitted unmarked in a queue that marks data, and the ramp
+fixture has data both marked and unmarked between its thresholds. Their mutations must be rejected:
+a data packet left unmarked, a marked ACK, a relabel that keeps a mark, a draw flipped either way, a
+changed seed, and a kind changed on one row of a packet. The AQM differential's reference decides
+independently: it writes SplitMix64 out and applies the ramp in its rational form, with no high
+multiply.
+
 ## Days AGO WFQ and SP rows
 
 `p10c_mechanisms_check wfq` replays `wfq_transitions_csv`: one row per transition of a WFQ switch
@@ -374,15 +408,18 @@ a Rust test in CI's `test` job, which fails on any difference:
   `sched_wfq.toml` and `sched_sp.toml` from a checkpoint with packets queued and in service, and
   the WFQ incast (`wfq_incast.toml`) from a checkpoint taken while a switch queue is paused. A WFQ
   certificate under PFC has its run's PFC certificate beside it (`<name>.pfc.csv`), which the
-  campaign passes to the checker. The fixtures are `lean/fixtures/tcp/*-compiled-*.csv`,
+  campaign passes to the checker. It also writes the two AQM certificates of `aqm_roce_acks.toml`
+  (an ECN step on a queue that RoCE ACKs share with data) and `aqm_roce_acks_ramp.toml` (the
+  ramp), which pin that ACKs stay unmarked and that every data packet's decision follows the
+  draw. The fixtures are `lean/fixtures/tcp/*-compiled-*.csv`,
   `lean/fixtures/p10c/*_compiled_executor_accept.csv`, the `*_resumed_executor_accept.csv` files
   and `lean/fixtures/sp/sp_compiled_executor_accept.csv`.
 - Executor tests build images by hand for cases a scenario cannot reach directly: the adversarial
   TCP recovery, timeout and saturation traces (`executor/tests/tcp_semantics.rs`); the
   `rate_executor_accept`, `pfc_executor_accept`, `drr_executor_accept` and `wrr_executor_accept`
   certificates (`rate_source.rs`, `pfc_semantics.rs`, `scalar_switch_schedulers.rs`); and the
-  `aqm_executor_accept`, `aqm_red_executor_accept` and two packet-byte-overflow AQM certificates
-  (`aqm_semantics.rs`).
+  `aqm_executor_accept`, `aqm_ramp_executor_accept` and `aqm_ramp_byte_overflow_executor_accept`
+  AQM certificates (`aqm_semantics.rs`).
 - The collective certificates are the Scalar traces of the scenarios in
   `tests/collective_certificates.rs` (the four P14 fixtures), `tests/p16_collops.rs`
   (`collective_collops_*`), `tests/p16_collops_rail.rs` (the rail fixtures among them) and
@@ -390,11 +427,9 @@ a Rust test in CI's `test` job, which fails on any difference:
   `dcqcn_executor_trace_accept.csv`.
 
 The remaining accept fixtures are committed outputs that no Rust test regenerates: the
-`roce_trace_*_executor_accept` logs (Scalar runs of `configs/p15/` scenarios, written by
-`days-gpu` tooling at P15), the four `collective_roce_*_executor_accept` P15 traces,
-`aqm_red_fattree4_executor_accept.csv` (the first 1,000 rows of a larger run) and
-`aqm_red_distinct_queues_accept.csv`, and the DCQCN queue-pair, tick-grid, coincident-prefix and
-CNP-join fixtures. The hand-written fixtures are `wrr_wrap_after_saturated_class_accept.csv`, the
+`roce_trace_*_executor_accept` logs (Scalar runs of `configs/p15/` and `configs/p16/` scenarios,
+written by `days-gpu` tooling), the four `collective_roce_*_executor_accept` P15 traces, and the
+DCQCN queue-pair, tick-grid, coincident-prefix and CNP-join fixtures. The hand-written fixtures are `wrr_wrap_after_saturated_class_accept.csv`, the
 SP fixtures without `compiled` in their names, the `roce_sender_*` and `roce_receiver_*` fixtures,
 and the `*_hand_*` collective fixtures.
 
@@ -415,7 +450,7 @@ run describes a different scenario and is accepted. Every CI step below is in
 | DCQCN, Mellanox form | Every controller transition of an unreliable flow or a queue pair: feedback, tick and advance rows against the exact integer reference (63-bit `alpha`, floored rates, freeze at completion); in `trace` mode, each CNP of the arrivals log is exactly one feedback row of its flow and no CNP reaches a queue pair (`p10c_dcqcn_check`; `run-p10c-dcqcn-campaign.sh`). | Scalar: `dcqcn_executor_trace_accept.csv` (regenerated by `tests/dcqcn_lowering.rs`); the queue-pair, tick-grid, coincident-prefix and CNP-join fixtures (committed, not regenerated by a Rust test). | A queue pair's ticks have no `tick` row; their rates are tied to the controller only through `p10c_roce_check`. The configuration is checked for continuity between rows, not against the scenario. |
 | RoCE queue pairs, with host-link PFC at the pacer | Each data arrival at the receiver (notification point, frontier, ACK cadence, duplicates, NACK rate limit); each pacing tick, ACK, NACK and timeout at the sender, with the tick's rate tied to the DCQCN log; window-blocked and paused ticks; `resume` rows against the host PAUSE and RESUME records; the cross-role join of sent packets and applied feedback (`p10c_roce_check`; `run-p10c-roce-campaign.sh`). | Scalar: the `roce_trace_*_executor_accept` logs of `configs/p15/` scenarios (timeout, NACK-only, host-PFC prefix, window prefix, RoCE DAG prefix, mixed RoCE and TCP), not regenerated by a Rust test; hand-written sender and receiver fixtures with their mutations. | Trusts each row's `data_class` and the host PFC records themselves; a parked pair that cannot restart is trusted to write no `resume` row; a prefix certificate leaves pending events after its horizon unchecked. |
 | PFC | Switch-link PFC: each PAUSE and RESUME against the per-link thresholds and the controller sets of its queue (`p10c_mechanisms_check pfc`; `run-p10c-mechanism-campaign.sh`). Host-link PFC: the pause and resume of a host's pacers, in the RoCE row above, and the paused priorities of a WFQ queue, in the WFQ row. | Scalar, with the two-worker CPU run required to match: `pfc_compiled_executor_accept.csv` from `configs/leanguard/pfc_switch.toml`. Scalar: `pfc_executor_accept.csv` from a hand-built image (`executor/tests/pfc_semantics.rs`). | A forged `control` row that names a controller and link the run does not have is accepted (the rules check internal consistency, not the switch threshold records that emitted the frame). The pause state that a resumed queue starts with is trusted when no later control row names its priority. |
-| ECN and RED marking | Each queue's frozen parameters, the legality of every mark or drop decision against the threshold or the RED state, and the queue accounting (`p10c_aqm_check`; in CI only inside `run-p10c-aqm-differential.sh`, which runs the shipped checker and its list-scan reference on every fixture and on generated mutants). | Scalar: `aqm_executor_accept`, `aqm_red_executor_accept` and the two packet-byte-overflow certificates (regenerated by `executor/tests/aqm_semantics.rs`); `aqm_red_fattree4_executor_accept` (the first 1,000 rows of a larger Scalar run) and `aqm_red_distinct_queues_accept` (committed, not regenerated by a Rust test). | RED and RED_ECN run on Scalar and CPU only (Metal and CUDA refuse them), so no device runs these mechanisms. The ECN step by link rate is certified as a per-queue threshold. |
+| ECN marking (the Kmin/Kmax/Pmax ramp) | Each queue's frozen ramp parameters and byte capacity; every admission decision recomputed from the queue's byte depth, the packet's kind and the stateless draw (the mark or drop the row records must equal the recomputed one); non-data packets (ACKs, NACKs, CNPs, PFC frames) never marked; each payload's kind constant across its rows (`p10c_aqm_check`; in CI inside `run-p10c-aqm-differential.sh`, which runs the whole AQM campaign through the shipped checker and its list-scan reference, plus generated mutants). | Scalar, with the two-worker CPU run required to match: `aqm_roce_acks.toml` (a step; RoCE ACKs share a marking queue with data) and `aqm_roce_acks_ramp.toml` (`configs/leanguard/`, `tests/leanguard_certificates.rs`). Scalar: `aqm_executor_accept`, `aqm_ramp_executor_accept` and `aqm_ramp_byte_overflow_executor_accept` from hand-built images (`executor/tests/aqm_semantics.rs`). | The packet kind is writer-trusted, as RoCE `data_class` is: a consistent relabel of all of a packet's rows is accepted (pinned by `aqm_roce_acks_whole_packet_relabel_trusted_limit_accept.csv`); binding the kind to the RoCE certificates through `flow_id` is not done. A seed rewritten consistently on every row is accepted. |
 | WFQ | Every enqueue, service start and completion of a WFQ queue in exact rationals: virtual time, start and finish tags, the least-tag choice among unpaused classes, each packet's fixed PFC class, and each `select`'s paused set against the run's PFC certificate; resumed queues from their `initial` row (`p10c_mechanisms_check wfq`; `run-p10c-mechanism-campaign.sh`). | Scalar, with the two-worker CPU run required to match: `sched_wfq.toml` fresh and resumed, `wfq_pfc.toml` with its PFC certificate, `wfq_incast.toml` resumed while paused with its PFC certificate. | Service timing is not certified: a completion's time is not checked against the packet's serialization time and service starts are not checked for work conservation, so the certificate holds for the event times the run recorded. The packet's class at enqueue is trusted. |
 | Static Priority | Every enqueue, schedule and departure of an SP queue: larger priority first, FIFO within a priority, the scheduled completion time; resumed queues from their `initial_*` rows (`sp_check`; `run-sp-campaign.sh`, with coverage). | Scalar, with the two-worker CPU run required to match: `sched_sp.toml` fresh and resumed; hand-written fixtures. | No pause model: SP under PFC is not certified (a valid Days AGO run under PFC is rejected as an order violation), so the SP scenario has no PFC monitor. |
 | DRR | Each selection against the per-class quanta and deficits; state continuity between rows (`p10c_mechanisms_check drr`; `run-p10c-mechanism-campaign.sh`). | Scalar, with the two-worker CPU run required to match: `sched_drr.toml`; Scalar: a hand-built image (`executor/tests/scalar_switch_schedulers.rs`). | None recorded beyond the common one. |
@@ -432,6 +467,8 @@ Remaining gaps:
 
 - FIFO scheduling and constant traffic have no checker on either engine.
 - Static Priority under PFC: `sp_check` has no pause model (see [Days AGO WFQ and SP rows](#days-ago-wfq-and-sp-rows)).
+- AQM packet kind: `p10c_aqm_check` trusts each packet's kind; only a kind that changes between a
+  packet's rows is rejected (see [Days AGO AQM rows](#days-ago-aqm-rows)).
 - WFQ timing: the `wfq` mode does not check completion times against serialization or service
   starts for work conservation (no link-busy model, no transmission time); it takes the run's
   event times as given, so the certificate holds only if they are correct.
@@ -444,9 +481,8 @@ Remaining gaps:
   hand-built image.
 - Backends: certificates come from Scalar runs only (the `configs/leanguard/` ones also require a
   two-worker CPU run to write the same bytes), because device runs return no diagnostic planes.
-  RED and RED_ECN run on Scalar and CPU only; the Metal and CUDA validators refuse them before
-  execution.
 - Ungated roots in the collective certificate: see the Send/Recv and all-to-all rows above.
+- The AQM certificate's packet kind is writer-trusted: see the ECN row above.
 
 The P10c collective, DCQCN, RoCE and AQM checkers are linear in the row count, except the
 collective checker's TCP replay, which keeps a per-flow frontier in an ordered map and is

@@ -33,8 +33,8 @@ Backend capability boundaries apply to generation, not checking. Device
 runs do not return the diagnostic planes that hold transition records, so
 every Days AGO certificate family is produced by Scalar or CPU runs. PFC,
 DCQCN, RoCE queue pairs, and collective and compute stages also run on Metal
-and CUDA, byte-identical to Scalar; RED runs on Scalar and CPU only and is
-rejected by the Metal/CUDA validator before execution.
+and CUDA, byte-identical to Scalar, as does the ECN ramp; RED and RED_ECN were
+removed from Days AGO in P16 and are refused at lowering.
 
 ## Summary table (legacy families)
 

@@ -42,6 +42,11 @@ pub(crate) const MECHANISM_ROCE: u64 = 8;
 /// A TCP-only or compute-only collective image has no other mechanism, so without this bit it
 /// would select the plain build, which compiles the stage path out.
 pub(crate) const MECHANISM_STAGES: u64 = 16;
+/// Mechanism bit (P16 ecnramp, ruling 1a): some switch queue marks on the ECN ramp
+/// (`crate::ecn_ramp`), so the plan holds ECN records and admission can draw. The plain build
+/// admits by TailDrop alone; the ECN path, step and ramp, compiles only into the mechanisms build.
+/// A queue's policy never changes during a run, so the bit holds for the whole run.
+pub(crate) const MECHANISM_ECN: u64 = 32;
 
 /// The two builds of the device round kernel (`days_round`), selected per run from the image.
 ///
@@ -57,7 +62,7 @@ pub enum RoundKernel {
 }
 
 impl RoundKernel {
-    /// The mechanisms build if and only if the image holds any DCQCN or PFC state.
+    /// The mechanisms build if and only if the image holds any mechanism state (`mechanism_flags`).
     pub fn for_image(image: &SimulationImage) -> Self {
         if mechanism_flags(image) == 0 {
             Self::Plain
@@ -113,6 +118,15 @@ pub(crate) fn mechanism_flags(image: &SimulationImage) -> u64 {
     }
     if crate::device_pfc::image_has_pfc(image) {
         flags |= MECHANISM_PFC;
+    }
+    // One pass over the switch queues, stopping at the first ECN queue.
+    if image
+        .switch_states
+        .iter()
+        .flat_map(|state| &state.queues)
+        .any(|queue| matches!(queue.drop_mark, crate::DropMarkPolicy::EcnRamp(_)))
+    {
+        flags |= MECHANISM_ECN;
     }
     flags
 }
@@ -1215,6 +1229,29 @@ mod tests {
             })],
         );
         assert_eq!(mechanism_flags(&frame), MECHANISM_PFC);
+    }
+
+    /// ECN (step or ramp) is a mechanism: a TailDrop queue keeps the plain build.
+    #[test]
+    fn mechanism_flags_follow_the_ecn_ramp() {
+        let mut taildrop = pfc_queue();
+        taildrop.pfc = None;
+        assert_eq!(mechanism_flags(&switch_image(taildrop.clone())), 0);
+        for (kmin_bytes, kmax_bytes, pmax_numerator, pmax_denominator) in
+            [(100, 100, 1, 1), (100, 300, 1, 5)]
+        {
+            let mut ecn = taildrop.clone();
+            ecn.drop_mark = crate::DropMarkPolicy::EcnRamp(crate::EcnRampPolicy {
+                capacity_bytes: 1_000,
+                kmin_bytes,
+                kmax_bytes,
+                pmax_numerator,
+                pmax_denominator,
+            });
+            let image = switch_image(ecn);
+            assert_eq!(mechanism_flags(&image), MECHANISM_ECN);
+            assert_eq!(RoundKernel::for_image(&image), RoundKernel::Mechanisms);
+        }
     }
 
     fn class_flow(id: u64, priority: u8) -> crate::FlowDescriptor {

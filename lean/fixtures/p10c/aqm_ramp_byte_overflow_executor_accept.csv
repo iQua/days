@@ -1,0 +1,2 @@
+time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,queue_id,payload_id,packet_kind,queued_bytes_before,packet_size_bytes,ecn_before,ecn_after,seed,capacity_bytes,kmin_bytes,kmax_bytes,pmax_numerator,pmax_denominator,action
+0,0,0,1,1,0,3,data,18446744073709551615,1,0,0,25,18446744073709551615,18446744073709551615,18446744073709551615,1,1,drop

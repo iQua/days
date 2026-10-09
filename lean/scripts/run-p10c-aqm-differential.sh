@@ -7,7 +7,8 @@
 #
 # aqm_red_fattree4_executor_accept.csv is the first 1,000 rows (39 RED queues) of the
 # aqm_transitions_csv of a Scalar run of days at 26dc1d1 on configs/fattree.toml with k = 4,
-# 16 flows, a 20-packet capacity and 10 us arrivals for 20 ms.
+# 16 flows, a 20-packet capacity and 10 us arrivals for 20 ms. Every one of its packets is a
+# PacketDistribution data packet, so P16 aqmkind added its `packet_kind` column as `data`.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

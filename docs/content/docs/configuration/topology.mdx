@@ -95,7 +95,7 @@ nvlink_delay_ns = 25
 
 All keys are required, and unknown keys are rejected. The builder refuses a ragged last segment, a server count that does not divide the GPU count, and identities beyond `u32`. The fabric's link rates and delays live in this table, so a Spectrum-X scenario must not set `switch.port_rate` ("unsupported `switch.port_rate` on a SpectrumX topology; its link rates are `topology.spectrum_x.nic_rate_bps` and `uplink_rate_bps`") or `link.propagation_ns` and `link.propagation_tiers` ("unsupported `link.propagation_ns` or `link.propagation_tiers` on a SpectrumX topology; its link delays are `topology.spectrum_x.link_delay_ns`"). `switch.port_rate` stays required on every other topology.
 
-The lowered graph holds the ASWs and PSWs; each GPU host attaches to its ASW through one link, so hosts keep one egress. Host ids and switch hash seeds use SimAI's node numbering (GPUs, then NVSwitches, then ASWs, then PSWs), and `RailTopology::render_simai` writes the fabric in SimAI's topology-file grammar. The renders of SimAI's shipped `Spectrum-X_1024g_8gps_400Gbps_H100`, `_512g_8gps_400Gbps_H100` and `_128g_8gps_100Gbps_A100` files are byte-equal to those files; `tests/p16_rail_topology.rs` pins their SHA-256 digests. The switch parameters of SimAI's runs (ECN rows by link rate, PFC thresholds by switch tier, headroom by link rate) have their own tables; see [Switches](/docs/configuration/switches#ecn-thresholds-by-link-rate) and [L2 and PFC](/docs/configuration/l2#thresholds-by-switch-tier-on-the-rail-fabric).
+The lowered graph holds the ASWs and PSWs; each GPU host attaches to its ASW through one link, so hosts keep one egress. Host ids and switch hash seeds use SimAI's node numbering (GPUs, then NVSwitches, then ASWs, then PSWs), and `RailTopology::render_simai` writes the fabric in SimAI's topology-file grammar. The renders of SimAI's shipped `Spectrum-X_1024g_8gps_400Gbps_H100`, `_512g_8gps_400Gbps_H100` and `_128g_8gps_100Gbps_A100` files are byte-equal to those files; `tests/p16_rail_topology.rs` pins their SHA-256 digests. The switch parameters of SimAI's runs (an ECN ramp per link rate over a byte capacity, PFC thresholds by switch tier, headroom by link rate) have their own tables; see [Switches](/docs/configuration/switches#days-ago-the-ecn-ramp) and [L2 and PFC](/docs/configuration/l2#thresholds-by-switch-tier-on-the-rail-fabric).
 
 ### NVLink is delay-only
 
@@ -127,7 +127,7 @@ The source port of message `k` between one ordered host pair is `10000 + k`, wra
 
 ### Example
 
-`configs/p16/rail_mini_roce.toml` is a miniature rail: 8 GPUs, 2 per server, 2 NICs per ASW (so 2 segments, 2 rails, 4 ASWs) and 2 PSWs, with a RoCE ring all-reduce over all 8 GPUs, SimAI ECMP, and the switch rows of SimAI's runs. Its same-server hops (0→1, 2→3, 4→5, 6→7) are stage notifies; the other four cross the fabric.
+`configs/p16/rail_mini_roce.toml` is a miniature rail: 8 GPUs, 2 per server, 2 NICs per ASW (so 2 segments, 2 rails, 4 ASWs) and 2 PSWs, with a RoCE ring all-reduce over all 8 GPUs, SimAI ECMP, and the switch rows of SimAI's runs (SimAI's shipped ECN ramps per link rate over its 32 MiB buffer). Its same-server hops (0→1, 2→3, 4→5, 6→7) are stage notifies; the other four cross the fabric.
 
 ```toml
 seed = 7
@@ -154,10 +154,11 @@ policy = "SimAiEcmp"
 [switch]
 capacity = 3729
 discipline = "FIFO"
-drop = "ECN_THRESHOLD"
+drop = "TailDrop"
+ecn_capacity_bytes = 33_554_432
 ecn_by_rate = [
-    { rate_bps = 100000000000, threshold_packets = 112 },
-    { rate_bps = 400000000000, threshold_packets = 223 },
+    { rate_bps = 100000000000, kmin_bytes = 400_000, kmax_bytes = 1_600_000, pmax = 0.2 },
+    { rate_bps = 400000000000, kmin_bytes = 800_000, kmax_bytes = 3_200_000, pmax = 0.2 },
 ]
 
 [link]
@@ -204,7 +205,7 @@ variable_window = true
 cargo run --release --bin days -- --engine scalar configs/p16/rail_mini_roce.toml
 ```
 
-The Scalar run ends with `result_bytes=660814 result_fnv1a64=fa51f90e3bf8b4bf`. `window_bytes = 72500` is SimAI's `maxBdp` for a 128-GPU, 100 Gb/s fabric, which `ServerLocality::max_bdp_bytes` computes (236,000 B for the 1,024-GPU, 400 Gb/s one); the AICB adapter sets it from the topology.
+The Scalar run ends with `result_bytes=663358 result_fnv1a64=e7519b333b17eb1b`. `window_bytes = 72500` is SimAI's `maxBdp` for a 128-GPU, 100 Gb/s fabric, which `ServerLocality::max_bdp_bytes` computes (236,000 B for the 1,024-GPU, 400 Gb/s one); the AICB adapter sets it from the topology.
 
 ## Propagation
 

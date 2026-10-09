@@ -13,9 +13,9 @@ use std::path::Path;
 use days::scenario::compile_config;
 use days_executor::{
     CpuConfig, DiagnosticPlanes, MechanismTransitionRecord, ObservationMode, RunResult,
-    SimulationImage, drr_transitions_csv, pfc_transitions_csv, run_cpu_with_observations,
-    run_scalar_with_observations, sp_transitions_csv, tcp_transitions_csv, wfq_transitions_csv,
-    wrr_transitions_csv,
+    SimulationImage, aqm_transitions_csv, drr_transitions_csv, pfc_transitions_csv,
+    run_cpu_with_observations, run_scalar_with_observations, sp_transitions_csv,
+    tcp_transitions_csv, wfq_transitions_csv, wrr_transitions_csv,
 };
 
 /// Which certificate family a fixture writes.
@@ -27,11 +27,13 @@ enum Family {
     Wrr,
     Wfq,
     Sp,
+    Aqm,
 }
 
 impl Family {
     /// The certificate of a run of `image` (WFQ and SP certificates start from its queues).
-    fn csv(self, diagnostics: &DiagnosticPlanes, image: &SimulationImage) -> String {
+    fn csv(self, result: &RunResult, image: &SimulationImage) -> String {
+        let diagnostics: &DiagnosticPlanes = result.diagnostics.as_ref().unwrap();
         let records = &diagnostics.mechanism_transitions;
         match self {
             Self::Tcp => tcp_transitions_csv(&diagnostics.tcp_transitions).unwrap(),
@@ -40,6 +42,12 @@ impl Family {
             Self::Wrr => wrr_transitions_csv(records).unwrap(),
             Self::Wfq => wfq_transitions_csv(records, image).unwrap(),
             Self::Sp => sp_transitions_csv(records, image).unwrap(),
+            Self::Aqm => aqm_transitions_csv(
+                &diagnostics.aqm_transitions,
+                &result.observed_packets,
+                image.seed,
+            )
+            .unwrap(),
         }
     }
 }
@@ -74,9 +82,9 @@ fn certificates(name: &str, image: &SimulationImage, families: &[Family]) -> Vec
     families
         .iter()
         .map(|family| {
-            let csv = family.csv(scalar.diagnostics.as_ref().unwrap(), image);
+            let csv = family.csv(&scalar, image);
             assert_eq!(
-                family.csv(cpu.result.diagnostics.as_ref().unwrap(), image),
+                family.csv(&cpu.result, image),
                 csv,
                 "{name}: CPU and Scalar certificates differ"
             );
@@ -322,6 +330,84 @@ fn resumed_wfq_incast_certificate_starts_paused() {
     );
     assert_fixture(&wfq, "p10c/wfq_incast_resumed_executor_accept.csv");
     assert_fixture(&pfc, "p10c/wfq_incast_resumed_executor_accept.pfc.csv");
+}
+
+/// RoCE ACKs share an ECN-step queue with data: Days AGO marks only data packets, so the
+/// certificate names each packet's kind and some ACKs are admitted unmarked at or above the
+/// step, where a data packet would be marked.
+#[test]
+fn compiled_aqm_certificate_names_packet_kinds_and_acks_stay_unmarked() {
+    let csv = certificate("aqm_roce_acks", Family::Aqm);
+    let header = csv.lines().next().unwrap().split(',').collect::<Vec<_>>();
+    let column = |name: &str| header.iter().position(|field| *field == name).unwrap();
+    let rows = csv
+        .lines()
+        .skip(1)
+        .map(|line| line.split(',').collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let at_threshold = |row: &Vec<&str>| {
+        row[column("queued_bytes_before")].parse::<u64>().unwrap()
+            + row[column("packet_size_bytes")].parse::<u64>().unwrap()
+            >= row[column("kmax_bytes")].parse::<u64>().unwrap()
+    };
+    assert!(
+        rows.iter()
+            .any(|row| row[column("packet_kind")] == "roce_ack"
+                && at_threshold(row)
+                && row[column("action")] == "enqueue"),
+        "no ACK is admitted unmarked at or above the threshold"
+    );
+    assert!(
+        rows.iter().any(|row| row[column("packet_kind")] == "roce_data"
+            && row[column("action")] == "mark"),
+        "no data packet is marked"
+    );
+    assert_fixture(&csv, "p10c/aqm_roce_acks_compiled_executor_accept.csv");
+}
+
+/// The same RoCE-ACK queue on an ECN ramp (P16 ecnramp; it was RED_ECN): inside the ramp a data
+/// arrival is marked or not by its draw, and an ACK never draws and is admitted unmarked
+/// (aqmkind review M3).
+#[test]
+fn compiled_ramp_aqm_certificate_draws_for_data_and_admits_acks_unmarked() {
+    let csv = certificate("aqm_roce_acks_ramp", Family::Aqm);
+    let header = csv.lines().next().unwrap().split(',').collect::<Vec<_>>();
+    let column = |name: &str| header.iter().position(|field| *field == name).unwrap();
+    let rows = csv
+        .lines()
+        .skip(1)
+        .map(|line| line.split(',').collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let field = |row: &Vec<&str>, name: &str| row[column(name)].parse::<u64>().unwrap();
+    let inside = |row: &Vec<&str>| {
+        let depth = field(row, "queued_bytes_before") + field(row, "packet_size_bytes");
+        depth > field(row, "kmin_bytes") && depth < field(row, "kmax_bytes")
+    };
+    assert!(
+        rows.iter()
+            .all(|row| field(row, "kmin_bytes") < field(row, "kmax_bytes"))
+    );
+    let count = |kind: &str, action: &str| {
+        rows.iter()
+            .filter(|row| {
+                row[column("packet_kind")] == kind && inside(row) && row[column("action")] == action
+            })
+            .count()
+    };
+    assert!(
+        count("roce_ack", "enqueue") > 0,
+        "no ACK admitted inside the ramp"
+    );
+    assert_eq!(count("roce_ack", "mark"), 0, "an ACK is marked");
+    assert!(
+        count("roce_data", "mark") > 0,
+        "no data packet marked inside the ramp"
+    );
+    assert!(
+        count("roce_data", "enqueue") > 0,
+        "no data packet admitted unmarked inside the ramp"
+    );
+    assert_fixture(&csv, "p10c/aqm_roce_acks_ramp_compiled_executor_accept.csv");
 }
 
 #[test]

@@ -17,14 +17,14 @@ Four backends run the same image:
 | CUDA | NVIDIA GPUs (built for sm_86, sm_89 and sm_121) |
 
 Modeled mechanisms: closed-loop TCP Reno and CUBIC, Mellanox-form DCQCN, RoCE
-queue pairs with Go-back-N, PFC, ECN, RED, strict-priority, DRR, WRR, and
-exact-rational WFQ scheduling; ring all-reduce, all-gather, reduce-scatter,
-all-to-all, and send/receive collectives over TCP or RoCE queue pairs with
-delay-only compute stages; fat-tree, torus, dragonfly, and Spectrum-X rail
-topologies; and AICB/SimAI training traces as workloads. Everything except RED
-runs on all four backends. RED runs on the Scalar and CPU backends only; Metal
-and CUDA reject it at validation with a message naming the backend, never with
-a silent fallback.
+queue pairs with Go-back-N, PFC, ECN marking on a Kmin/Kmax/Pmax ramp,
+strict-priority, DRR, WRR, and exact-rational WFQ scheduling; ring all-reduce,
+all-gather, reduce-scatter, all-to-all, and send/receive collectives over TCP
+or RoCE queue pairs with delay-only compute stages; fat-tree, torus, dragonfly,
+and Spectrum-X rail topologies; and AICB/SimAI training traces as workloads.
+Every mechanism Days AGO lowers runs on all four backends; a scenario outside
+its model is refused at lowering with a message naming the field, never with a
+silent fallback.
 
 ## Quick start
 

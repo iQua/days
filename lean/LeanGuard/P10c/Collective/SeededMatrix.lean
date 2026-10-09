@@ -1,5 +1,7 @@
 import Std
 
+import LeanGuard.P10c.SplitMix
+
 /-! The seeded per-pair routing matrix of an imbalanced all-to-all (P16 H1, ruling R7), re-derived
 in pure `Nat` arithmetic from the parameters a progress certificate names, exactly as the
 executor's `seeded_matrix.rs` (`SeededAllToAll::bytes`) derives it: a SplitMix64 stream keyed by
@@ -10,22 +12,7 @@ every checked step of the Rust code yields `none` here when it would overflow. -
 
 namespace LeanGuard.P10c.Collective.SeededMatrix
 
-def modulus : Nat := 2 ^ 64
-
-def maxU64 : Nat := modulus - 1
-
-def wrap (value : Nat) : Nat := value % modulus
-
-def golden : Nat := 0x9e3779b97f4a7c15
-
-/-- SplitMix64's output function after its increment. -/
-def finish (value : Nat) : Nat :=
-  let value := wrap ((value ^^^ (value >>> 30)) * 0xbf58476d1ce4e5b9)
-  let value := wrap ((value ^^^ (value >>> 27)) * 0x94d049bb133111eb)
-  value ^^^ (value >>> 31)
-
-/-- `mix` of `seeded_matrix.rs`: SplitMix64's output function of one value. -/
-def mix (value : Nat) : Nat := finish (wrap (value + golden))
+open LeanGuard.P10c.SplitMix
 
 /-- A SplitMix64 stream. -/
 structure Stream where

@@ -15,8 +15,9 @@ log_path = "logs/dcqcn_10s"
 port_rate = 1000000000
 capacity = 512
 discipline = "FIFO"
-drop = "ECN_THRESHOLD"
-ecn_threshold = 0.2
+drop = "TailDrop"
+ecn_capacity_bytes = 512_000
+ecn = { kmin_bytes = 103_000, kmax_bytes = 103_000, pmax = 1 }
 
 [link]
 mode = "Pfc"
