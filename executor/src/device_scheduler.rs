@@ -125,8 +125,10 @@ pub(crate) fn prepare_device_schedulers(
                 words[node_base + SCHEDULER_AQM_CAPACITY] = config.capacity;
                 words[node_base + SCHEDULER_AQM_THRESHOLD] = config.threshold;
             }
-            DropMarkPolicy::Red(_) => {
-                unreachable!("device validation rejects RED before scheduler packing")
+            DropMarkPolicy::Red(_) | DropMarkPolicy::EcnRamp(_) => {
+                unreachable!(
+                    "device validation rejects RED and the ECN ramp before scheduler packing"
+                )
             }
         }
         words[node_base + SCHEDULER_KIND] = u64::from(queue.scheduler.code());
@@ -320,7 +322,7 @@ pub(crate) fn restore_device_scheduler(
                 );
             }
         }
-        DropMarkPolicy::Red(_) => {
+        DropMarkPolicy::Red(_) | DropMarkPolicy::EcnRamp(_) => {
             return Err("device scheduler restore encountered unsupported RED state".to_owned());
         }
     }

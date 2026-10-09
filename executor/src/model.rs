@@ -139,6 +139,7 @@ pub enum DropMarkPolicy {
     TailDrop,
     EcnThreshold(EcnThresholdPolicy),
     Red(RedPolicyState),
+    EcnRamp(EcnRampPolicy),
 }
 
 impl WfqSchedulerState {

@@ -685,6 +685,11 @@ fn validate_backend_capabilities(
                     "backend {backend} does not support RED admission; use Scalar or Cpu"
                 )));
             }
+            crate::DropMarkPolicy::EcnRamp(_) => {
+                return Err(ValidationError::new(format!(
+                    "backend {backend} does not support the ECN ramp"
+                )));
+            }
         }
         match queue.scheduler {
             SchedulerKind::Fifo
@@ -5630,7 +5635,7 @@ fn validate_drop_mark_policy(
         })
     })?;
     match queue.drop_mark {
-        crate::DropMarkPolicy::TailDrop => Ok(()),
+        crate::DropMarkPolicy::TailDrop | crate::DropMarkPolicy::EcnRamp(_) => Ok(()),
         crate::DropMarkPolicy::EcnThreshold(config) => {
             if config.capacity == 0 || config.threshold == 0 || config.threshold > config.capacity {
                 return Err(ValidationError::new(format!(

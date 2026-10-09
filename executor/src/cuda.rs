@@ -2510,7 +2510,9 @@ impl CudaPlan {
                                 .max(initial)
                                 .max(1);
                             }
-                            crate::DropMarkPolicy::TailDrop | crate::DropMarkPolicy::Red(_) => {}
+                            crate::DropMarkPolicy::TailDrop
+                            | crate::DropMarkPolicy::Red(_)
+                            | crate::DropMarkPolicy::EcnRamp(_) => {}
                         }
                     }
                 }

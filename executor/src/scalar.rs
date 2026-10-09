@@ -7576,6 +7576,7 @@ fn drop_mark_decision(
                 QueueAdmissionAction::Enqueue
             })
         }
+        crate::DropMarkPolicy::EcnRamp(_) => Ok(QueueAdmissionAction::Enqueue),
         crate::DropMarkPolicy::Red(state) => {
             // Let S=2^32, A' = floor((511*A + sample*S)/512), and
             // p(A') = p_num*(A'-min*S)/(p_den*(max-min)*S). In the open threshold
