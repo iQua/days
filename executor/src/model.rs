@@ -96,6 +96,21 @@ pub struct EcnThresholdPolicy {
     pub threshold: u64,
 }
 
+/// ECN marking on a Kmin/Kmax/Pmax ramp over the instantaneous byte depth, decided at enqueue
+/// (P16 ecnramp). The rule, its exact integer form and the stateless draw are in
+/// [`crate::ecn_ramp`]; the step is the special case `kmin_bytes == kmax_bytes`, `pmax = 1`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EcnRampPolicy {
+    /// Tail drop: an arrival whose post-admission byte depth exceeds this is dropped.
+    pub capacity_bytes: u64,
+    pub kmin_bytes: u64,
+    pub kmax_bytes: u64,
+    /// `Pmax = pmax_numerator / pmax_denominator`, in lowest terms, `0 < Pmax <= 1`.
+    pub pmax_numerator: u64,
+    pub pmax_denominator: u64,
+}
+
 /// Exact deterministic RED state.
 ///
 /// Between the thresholds, `counter` replaces the legacy random draw. The discrete signaling
