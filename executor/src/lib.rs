@@ -35,6 +35,11 @@ pub mod ecn_ramp;
 pub mod event;
 pub mod image;
 mod mechanism_trace;
+#[cfg(any(
+    feature = "cuda-test-hooks",
+    all(feature = "metal-test-hooks", target_vendor = "apple")
+))]
+mod merge_audit;
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 pub mod metal;
 pub mod model;
@@ -121,6 +126,12 @@ pub use mechanism_trace::{
     drr_transitions_csv, pfc_transitions_csv, rate_transitions_csv, roce_receiver_transitions_csv,
     roce_sender_transitions_csv, sp_transitions_csv, wfq_transitions_csv, wrr_transitions_csv,
 };
+#[cfg(any(
+    feature = "cuda-test-hooks",
+    all(feature = "metal-test-hooks", target_vendor = "apple")
+))]
+#[doc(hidden)]
+pub use merge_audit::{MergeAuditRow, take_merge_audit_for_testing};
 #[cfg(all(
     feature = "metal",
     feature = "planner-test-hooks",

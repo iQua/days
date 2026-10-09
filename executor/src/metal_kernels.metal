@@ -193,6 +193,27 @@ constant uint RESUME_SCAN_COUNT_WORDS = 3;
 #else
 #define RECORD_RESUME_SCAN(params, state, node, counter, amount) ((void)0)
 #endif
+// P17 merge (test hooks only): the exchange-merge counters and active-set audit. `MetalBuffers::new`
+// appends one row of MERGE_AUDIT_WORDS words per LP to `stream_state`, after every production word,
+// then one word per flow holding the flow's source LP (the audit's generator-ownership table), and
+// the region's offset as params word 39, after the RESUME-scan offset. Each merge thread adds only to
+// its own LP's row, so the counters need no atomics. Production builds compile `RECORD_MERGE` to
+// nothing and carry no audit. Transliterated from `cuda_kernels.cu` (params word 35 there).
+#ifdef DAYS_MERGE_AUDIT
+constant uint P_MERGE_AUDIT_OFFSET = 39;
+constant uint MERGE_AUDIT_WORDS = 6;
+constant uint MA_INVOCATIONS = 0;
+constant uint MA_STREAMS_READ = 1;
+constant uint MA_APPENDED = 2;
+constant uint MA_MISMATCHES = 3;
+constant uint MA_NONEMPTY_STREAMS = 4;
+constant uint MA_STREAM_ENTRIES = 5;
+#define RECORD_MERGE(params, state, node, counter, amount) \
+    ((state)[(params)[P_MERGE_AUDIT_OFFSET] + (node) * MERGE_AUDIT_WORDS + (counter)] += \
+        (ulong)(amount))
+#else
+#define RECORD_MERGE(params, state, node, counter, amount) ((void)0)
+#endif
 
 // T21 fix 1 — the re-gridded control sweeps. `evidence/P12/aterm-fixes.md` §3.4. Transliterated
 // word for word from `cuda_kernels.cu`; see that file for the design note.
@@ -8527,6 +8548,106 @@ kernel void days_exchange_scatter(
     }
 }
 
+#ifdef DAYS_MERGE_AUDIT
+// P17 merge (test hooks only): transliteration of `merge_audit` in `cuda_kernels.cu`; see that
+// function's header for invariant E and why the per-LP checks plus the two global sums prove the
+// list is the full rebuild's set.
+void merge_audit(
+    ulong node,
+    const device ulong *params,
+    const device ulong *fel_meta,
+    const device ulong *fel_records,
+    device ulong *stream_state,
+    const device ulong *stream_records
+) {
+    ulong meta = params[P_LP_STREAM_META_OFFSET] + node * LP_STREAM_META_WORDS;
+    ulong declared = stream_state[meta];
+    ulong declared_count = stream_state[meta + 1];
+    ulong active = stream_state[meta + 2];
+    ulong count = stream_state[meta + 3];
+    ulong mismatches = 0;
+    ulong stream_entries = 0;
+    ulong none_entries = 0;
+    bool heap = fel_meta[node * META_WORDS + 3] != 0;
+    if (count > declared_count + 1) {
+        mismatches += 1;
+        count = declared_count + 1;
+    }
+    for (ulong index = 0; index < count; ++index) {
+        ulong entry = active + index * ACTIVE_STREAM_ENTRY_WORDS;
+        ulong stream = stream_state[entry];
+        for (ulong earlier = 0; earlier < index; ++earlier) {
+            if (stream_state[active + earlier * ACTIVE_STREAM_ENTRY_WORDS] == stream) {
+                mismatches += 1;
+            }
+        }
+        ulong record = NONE;
+        bool from_heap = false;
+        if (stream == NONE) {
+            none_entries += 1;
+            if (heap) {
+                record = fel_meta[node * META_WORDS] * EVENT_WORDS;
+                from_heap = true;
+            }
+        } else {
+            stream_entries += 1;
+            bool owned = false;
+            if (stream < params[P_SERVICE_STREAM_BASE]) {
+                for (ulong slot = 0; slot < declared_count; ++slot) {
+                    ulong declared_stream = stream_state[declared + slot];
+                    if (declared_stream >= params[P_SERVICE_STREAM_BASE]) {
+                        break;
+                    }
+                    owned = owned || declared_stream == stream;
+                }
+            } else if (stream < params[P_GENERATOR_STREAM_BASE]) {
+                owned = stream == params[P_SERVICE_STREAM_BASE] + node;
+            } else if (stream < params[P_STREAM_COUNT]) {
+                // The hooks region's per-flow source table follows the LP rows.
+                owned = stream_state[
+                    params[P_MERGE_AUDIT_OFFSET] +
+                    params[P_NODE_COUNT] * MERGE_AUDIT_WORDS +
+                    stream - params[P_GENERATOR_STREAM_BASE]
+                ] == node;
+            }
+            if (owned && stream_state[stream * META_WORDS + 3] != 0) {
+                ulong capacity = stream_state[stream * META_WORDS + 1];
+                ulong physical = stream_state[stream * META_WORDS + 2] % max(capacity, 1ul);
+                record = stream_record_offset(stream, physical, params, stream_state);
+            }
+        }
+        if (record == NONE) {
+            mismatches += 1;
+            continue;
+        }
+        for (uint word = 0; word < 4; ++word) {
+            ulong expected = from_heap ? fel_records[record + word] : stream_records[record + word];
+            if (stream_state[entry + 1 + word] != expected) {
+                mismatches += 1;
+                break;
+            }
+        }
+    }
+    if (heap != (none_entries != 0)) {
+        mismatches += 1;
+    }
+    if (heap && stream_state[active] != NONE) {
+        mismatches += 1;
+    }
+    ulong nonempty = 0;
+    for (
+        ulong stream = node;
+        stream < params[P_STREAM_COUNT];
+        stream += params[P_NODE_COUNT]
+    ) {
+        nonempty += ulong(stream_state[stream * META_WORDS + 3] != 0);
+    }
+    RECORD_MERGE(params, stream_state, node, MA_MISMATCHES, mismatches);
+    RECORD_MERGE(params, stream_state, node, MA_NONEMPTY_STREAMS, nonempty);
+    RECORD_MERGE(params, stream_state, node, MA_STREAM_ENTRIES, stream_entries);
+}
+#endif
+
 kernel void days_exchange_merge(
     device ulong *control [[buffer(0)]],
     const device ulong *params [[buffer(1)]],
@@ -8559,6 +8680,7 @@ kernel void days_exchange_merge(
         ulong declared_count = stream_state[meta + 1];
         ulong active = stream_state[meta + 2];
         ulong active_count = 0;
+        RECORD_MERGE(params, stream_state, target, MA_INVOCATIONS, 1);
         if (fel_meta[ulong(target) * META_WORDS + 3] != 0) {
             ulong entry = active + active_count * ACTIVE_STREAM_ENTRY_WORDS;
             active_count += 1;
@@ -8571,10 +8693,12 @@ kernel void days_exchange_merge(
         }
         for (ulong index = 0; index < declared_count; ++index) {
             ulong stream = stream_state[declared + index];
+            RECORD_MERGE(params, stream_state, target, MA_STREAMS_READ, 1);
             if (stream_state[stream * META_WORDS + 3] != 0) {
                 ulong entry =
                     active + active_count * ACTIVE_STREAM_ENTRY_WORDS;
                 active_count += 1;
+                RECORD_MERGE(params, stream_state, target, MA_APPENDED, 1);
                 stream_state[entry] = stream;
                 ulong stream_base = stream * META_WORDS;
                 ulong capacity = stream_state[stream_base + 1];
@@ -8593,6 +8717,16 @@ kernel void days_exchange_merge(
             }
         }
         stream_state[meta + 3] = active_count;
+#ifdef DAYS_MERGE_AUDIT
+        merge_audit(
+            target,
+            params,
+            fel_meta,
+            fel_records,
+            stream_state,
+            stream_records
+        );
+#endif
         return;
     }
     ulong inbound_base = ulong(target) * INBOUND_META_WORDS;

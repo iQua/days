@@ -51,9 +51,10 @@ fn main() {
     );
     let source = manifest_dir.join("src/cuda_kernels.cu");
     // P16 H4: test-hook builds count the device RESUME scans' work (`DAYS_RESUME_SCAN_COUNT`);
-    // production builds compile the kernels without it.
+    // P17 merge: they also count and audit the exchange merge (`DAYS_MERGE_AUDIT`). Production
+    // builds compile the kernels without either.
     let hook_defines: &[&str] = if env::var_os("CARGO_FEATURE_CUDA_TEST_HOOKS").is_some() {
-        &["-DDAYS_RESUME_SCAN_COUNT=1"]
+        &["-DDAYS_RESUME_SCAN_COUNT=1", "-DDAYS_MERGE_AUDIT=1"]
     } else {
         &[]
     };

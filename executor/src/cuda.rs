@@ -114,6 +114,10 @@ const PARAM_STAGE_OFFSET: usize = 33;
 /// `scheduler_state`, appended after every production params word.
 #[cfg(feature = "cuda-test-hooks")]
 const PARAM_RESUME_SCAN_COUNT_OFFSET: usize = 34;
+/// Test hooks only (P17 merge): params word holding the merge-audit region's offset in
+/// `stream_state` (`merge_audit.rs`), appended after the RESUME-scan offset.
+#[cfg(feature = "cuda-test-hooks")]
+const PARAM_MERGE_AUDIT_OFFSET: usize = 35;
 const PACKET_ECN_FLAG: u64 = 1_u64 << 63;
 const PACKET_KIND_MASK: u64 = !PACKET_ECN_FLAG;
 
@@ -1501,7 +1505,10 @@ impl CudaExecutor {
         warm_start: &CapacityWarmStart,
     ) -> Result<CudaRun, CudaError> {
         #[cfg(feature = "cuda-test-hooks")]
-        crate::device_pfc::take_resume_scan_counts_for_testing();
+        {
+            crate::device_pfc::take_resume_scan_counts_for_testing();
+            crate::merge_audit::reset();
+        }
         validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
         validate_config(config)?;
         let direct = self.direct_for(config.device_index)?;
@@ -4529,6 +4536,13 @@ impl CudaBuffers {
             );
             assert_eq!(plan.params.len(), PARAM_RESUME_SCAN_COUNT_OFFSET);
             plan.params.push(offset as u64);
+            // P17 merge: the merge counter rows and the flow-source table (params word 35).
+            let merge_audit_offset = plan.stream_state.len();
+            let region =
+                crate::merge_audit::hook_region(plan.params[0] as usize, &plan.flows, FLOW_WORDS);
+            plan.stream_state.extend(region);
+            assert_eq!(plan.params.len(), PARAM_MERGE_AUDIT_OFFSET);
+            plan.params.push(merge_audit_offset as u64);
             plan
         };
         let round_capacity = plan.round_capacity;
@@ -4710,6 +4724,20 @@ impl CudaBuffers {
                 &scheduler_state
                     [offset..offset + self.node_count * crate::device_pfc::RESUME_SCAN_COUNT_WORDS],
             );
+        }
+        #[cfg(feature = "cuda-test-hooks")]
+        {
+            let [rows] = bounded_plane_words(
+                stream,
+                [(
+                    &self.planes[25],
+                    params[PARAM_MERGE_AUDIT_OFFSET] as usize,
+                    self.node_count
+                        .saturating_mul(crate::merge_audit::MERGE_AUDIT_WORDS),
+                    "merge audit rows",
+                )],
+            )?;
+            crate::merge_audit::record(&rows);
         }
 
         let node_count = image.nodes.len();
