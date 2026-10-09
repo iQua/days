@@ -208,7 +208,7 @@ fn the_high_multiply_equals_the_rational_reference() {
                 .max(1);
             let queued = state % top;
             state = splitmix(state);
-            let data = state % 8 != 0;
+            let data = !state.is_multiple_of(8);
             let expected = reference(&policy, queued, size, data, u);
             let actual = ecn_ramp_decision(&policy, queued, size, data, || u);
             assert_eq!(
