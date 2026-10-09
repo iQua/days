@@ -13,7 +13,7 @@ description: How shared graph configuration becomes an exact image or legacy mod
 - `HostAttachments`, which maps semantic host IDs to attachment switches
 - `TopologyProfile`, used by topology-specific routing and lowering
 
-Supported inputs are FatTree, Torus, Dragonfly, and custom `edges`/`hosts` graphs. Host IDs are not assumed to be switch IDs; all flow pairing and routing resolves them through `HostAttachments`.
+Supported inputs are FatTree, Torus, Dragonfly, Spectrum-X (`src/topos/rail.rs`, Days AGO only), and custom `edges`/`hosts` graphs. Host IDs are not assumed to be switch IDs; all flow pairing and routing resolves them through `HostAttachments`.
 
 ## 2A. Compile a Days AGO image
 
@@ -25,9 +25,9 @@ Supported inputs are FatTree, Torus, Dragonfly, and custom `edges`/`hosts` graph
 4. forward and reverse channels with rate and propagation delay bounds
 5. flow generators, TCP/DCQCN state, collective generators, packets, and initial events
 
-Exact scheduling supports FIFO, strict priority, WFQ, DRR, and WRR. The exact compiler rejects VirtualClock. Exact routing supports shortest path and `FatTreeEcmp`; the latter requires a canonical FatTree and derives a stable semantic flow hash rather than using construction order.
+Exact scheduling supports FIFO, strict priority, WFQ, DRR, and WRR. The exact compiler rejects VirtualClock. Exact routing supports shortest path, `FatTreeEcmp`, and `SimAiEcmp`. `FatTreeEcmp` requires a canonical FatTree and derives a stable semantic flow hash rather than using construction order; `SimAiEcmp` requires the Spectrum-X fabric and hashes each flow's SimAI addresses and port with Murmur3, as SimAI does.
 
-Flow sets support `Random`, `SwitchOffsetHalf`, and `SameSwitchNext` pairing. Days AGO collectives support RingAllReduce and AllGather only, over byte-terminated TCP, and `[[compute]]` adds delay-only compute stages; see [Collectives](/docs/configuration/collectives).
+Flow sets support `Random`, `SwitchOffsetHalf`, and `SameSwitchNext` pairing. Days AGO collectives are `RingAllReduce`, `AllGather`, `ReduceScatter`, `AllToAll`, and `SendRecv`, over byte-terminated TCP or RoCE queue pairs, and `[[compute]]` adds delay-only compute stages; see [Collectives](/docs/configuration/collectives). An AICB trace lowers through the same path from a `[workload.aicb]` table; see [Workloads](/docs/configuration/workloads).
 
 Callers pass the completed `SimulationImage` to `executor::validate(image, backend)`. Image invariants are backend-independent; capability checks then reject mechanisms not ported to the selected device.
 

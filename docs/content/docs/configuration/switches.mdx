@@ -15,7 +15,7 @@ drop = "TailDrop"
 
 | Field | Type | Requirement |
 | --- | --- | --- |
-| `port_rate` | number | Required. Bits per second. Exact lowering requires a positive integer bps value representable in `u64`. |
+| `port_rate` | number | Required, except on the Spectrum-X topology, which refuses it (its link rates are in `[topology.spectrum_x]`). Bits per second. Exact lowering requires a positive integer bps value representable in `u64`. |
 | `capacity` | integer | Required. Packet capacity of a TailDrop queue. In Days AGO an ECN queue tail-drops at `ecn_capacity_bytes` instead; there `capacity` only informs the device planners' per-queue packet sizing. |
 | `discipline` | string | Required. Selects the scheduler. |
 | `drop` | string | Required. Selects the drop rule. Days AGO accepts only `TailDrop`. |
@@ -92,7 +92,7 @@ The draw is stateless: `u = mix(queue_key ^ payload_id)`, where `queue_key = mix
 
 The ramp runs on Scalar, CPU, Metal and CUDA with byte-identical results. On Metal and CUDA it is part of the mechanisms build of the round kernel, so an image without ECN runs the plain build, which admits by tail drop alone. LeanGuard's `p10c_aqm_check` recomputes every decision and its draw from the AQM certificate (see [LeanGuard](/docs/verification/leanguard)).
 
-The SimAI fidelity lowers `SimAI.conf`'s `KMIN_MAP`, `KMAX_MAP` and `PMAX_MAP` rows into `ecn_by_rate` (KB times 1,000), and `BUFFER_SIZE` into `ecn_capacity_bytes`. Days AGO decides at enqueue, where SimAI marks at dequeue; both decision points exist in switch hardware.
+The SimAI fidelity lowers `SimAI.conf`'s `KMIN_MAP`, `KMAX_MAP` and `PMAX_MAP` rows into `ecn_by_rate` (KB times 1,000), and `BUFFER_SIZE` into `ecn_capacity_bytes`; see [Workloads](/docs/configuration/workloads#what-simaiconf-sets). Days AGO decides at enqueue, where SimAI marks at dequeue; both decision points exist in switch hardware.
 
 ### Legacy
 

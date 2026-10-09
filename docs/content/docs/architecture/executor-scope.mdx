@@ -9,16 +9,16 @@ description: Implemented model coverage, safe-horizon execution, and backend cap
 
 The current image supports:
 
-- static FatTree, Torus, Dragonfly, and custom topologies
+- static FatTree, Torus, Dragonfly, Spectrum-X rail, and custom topologies
 - one LP per host and one LP per switch egress queue
 - integer nanosecond time with no timestamp quantization
 - FIFO, strict priority, WFQ, DRR, and WRR scheduling
-- TailDrop admission and the ECN ramp (Kmin/Kmax/Pmax in bytes, stateless draw)
-- constant-rate, non-preemptive links with uniform or tiered propagation
+- TailDrop admission and the ECN ramp (Kmin/Kmax/Pmax in bytes, stateless draw), one ramp or one per link rate
+- constant-rate, non-preemptive links with uniform, tiered, or per-link-class propagation and rate
 - deterministic packet-distribution traffic, TCP Reno/CUBIC, DCQCN, and RoCE queue pairs
-- exact PFC per-priority pause state
-- RingAllReduce and AllGather collectives over TCP or RoCE queue pairs, and delay-only compute stages
-- shortest-path and semantic `FatTreeEcmp` routing
+- exact PFC per-priority pause state on switch links and host links
+- `RingAllReduce`, `AllGather`, `ReduceScatter`, `AllToAll`, and `SendRecv` collectives over TCP or RoCE queue pairs, delay-only compute stages, counted joins between stage groups, and delay-only stage notifies for same-server messages on the rail fabric
+- shortest-path, semantic `FatTreeEcmp`, and SimAI Murmur3 `SimAiEcmp` routing
 
 Exact lowering retains host attachment LPs. Each host has an unbounded injection stage toward its switch and a bounded delivery queue in the reverse direction. The compiler assigns stable semantic node, link, flow, and payload IDs before constructing initial state and events.
 
@@ -41,10 +41,10 @@ At each round, the executor finds the global frontier, adds the minimum channel 
 | FIFO, strict priority, WFQ, DRR, WRR | Yes | Yes | Yes | Yes |
 | TailDrop, ECN ramp | Yes | Yes | Yes | Yes |
 | TCP Reno, TCP CUBIC | Yes | Yes | Yes | Yes |
-| PFC | Yes | Yes | Yes | Yes |
+| PFC, on switch links and host links | Yes | Yes | Yes | Yes |
 | DCQCN | Yes | Yes | Yes | Yes |
 | RoCE queue pairs (Go-back-N) | Yes | Yes | Yes | Yes |
-| Collective and compute stages | Yes | Yes | Yes | Yes |
+| Collective and compute stages, counted joins, stage notifies | Yes | Yes | Yes | Yes |
 | Zero-delay channels | Yes | Rejected | Rejected | Rejected |
 
 Metal and CUDA use checked 320-bit rational components for WFQ. Validation checks checkpoint widths and static weight bounds; runtime arithmetic faults rather than committing an overflowing result. Scalar and CPU use unbounded `BigUint` rational arithmetic.
@@ -53,7 +53,7 @@ Device `RunResult` values contain the canonical state and measurement surface. S
 
 ## Device planning, retry, and readback
 
-The Metal and CUDA planners derive all arena sizes before a kernel attempt. Large record arenas are striped by their owning LP, stream, receiver class, or flow. Plane-wide and per-entity caps remain explicit and are checked before use.
+The Metal and CUDA planners derive all arena sizes before a kernel attempt. Large record arenas are striped by their owning LP, stream, receiver class, or flow. Plane-wide and per-entity caps remain explicit and are checked before use. Stage flows are charged by how many of a host's stages can be active at once, not by their count, and a windowed queue pair with its timeout off by its window; Full-observation logs are sized for the requested run, not the whole scenario. A plan that needs more device memory than the device's limit is refused before anything is allocated, with a typed `DeviceMemoryExceeded` error. See [Internals](/docs/internals#device-planning-and-bounded-arenas).
 
 Capacity overflow is refuse-or-run: a failed attempt emits no partial result. The host records the reported demand, raises only the relevant capacity floor, replans, and retries up to `max_capacity_retries`. A successful run returns the converged floors as `CapacityWarmStart`.
 
@@ -69,11 +69,11 @@ Each layer reports errors once it has enough information:
 
 | Boundary | Examples |
 | --- | --- |
-| Scenario compilation | Nonzero `time_quantum_ns`; VirtualClock; BBR; unsupported flow dependencies or explicit per-flow routes; unsupported pairing/collective form |
+| Scenario compilation | An unknown key in any table (named with its table); nonzero `time_quantum_ns`; VirtualClock; the legacy drop policies `RED`, `RED_ECN` and `ECN_THRESHOLD`; BBR; unsupported flow dependencies or explicit per-flow routes; unsupported pairing/collective form; an `after` list that leaves a host uncovered; an AICB scenario whose trace, `SimAI.conf` or topology fails a check |
 | Backend validation | Zero-lookahead parallel channel; invalid device WFQ width; device queue capacity beyond 32 bits |
-| Device planning | Arithmetic/memory-size overflow or an invalid arena layout |
+| Device planning | Arithmetic/memory-size overflow, an invalid arena layout, or a plan over the device's memory limit (`DeviceMemoryExceeded`, before any allocation) |
 | Device attempt and retry | Capacity demand beyond the current plan or configured cap, invalid readback metadata, or checked arithmetic overflow |
 
-Compilation and validation errors name the rejected field, mechanism, or backend and, for device-only gaps, direct callers to scalar or CPU. Unsupported configuration is never silently ignored.
+Compilation and validation errors name the rejected field, mechanism, or backend and, for device-only gaps, direct callers to scalar or CPU. Unsupported configuration is never silently ignored: every Days AGO table refuses an unknown key, naming the key and the table, and the only keys accepted without being read are the legacy engine's twelve root keys (`LEGACY_ENGINE_ROOT_KEYS`; see [Overview](/docs/configuration/overview#root-keys)).
 
 See [/docs/internals](/docs/internals) for the code-level round, capacity, warm-start, and compaction paths.

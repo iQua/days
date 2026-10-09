@@ -18,7 +18,7 @@ The source host LP owns a `FlowGeneratorState`. The compiler lowers supported tr
 - constant open-loop traffic for `PacketDistribution`
 - source-owned TCP Reno or CUBIC state
 - the Mellanox-form DCQCN controller and credit pacer for unreliable DCQCN flows, and the same controller with Go-back-N sender state and the window for RoCE queue pairs
-- resolved stages for RingAllReduce and AllGather
+- resolved stages for the collectives (`RingAllReduce`, `AllGather`, `ReduceScatter`, `AllToAll`, and `SendRecv`), the timers of compute stages, and, on the Spectrum-X fabric, the stage notifies that carry same-server messages
 
 Target hosts own TCP cumulative-ACK state, the DCQCN notification point of unreliable flows, and the Go-back-N receiver of queue pairs, which echoes ECN on its ACKs and NACKs. Generator status records whether the next emission is scheduled, blocked, finished, or stopped beyond the scenario endpoint.
 

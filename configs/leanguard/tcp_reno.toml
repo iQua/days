@@ -2,7 +2,7 @@
 # egress to host 4. A 10-packet TailDrop queue forces losses, so the trace covers every tcp_check
 # Reno coverpoint: new ACK, duplicate ACK, fast-recovery entry, inflation, partial and full ACK,
 # and timeout. tests/leanguard_certificates.rs lowers it and writes the Scalar certificate
-# lean/fixtures/tcp/tcp_reno_executor_accept.csv.
+# lean/fixtures/tcp/reno-compiled-tcp-events.csv.
 seed = 16
 edges = [[0, 5],[1, 5],[2, 5],[3, 5],[4, 5]]
 hosts = [0, 1, 2, 3, 4]
