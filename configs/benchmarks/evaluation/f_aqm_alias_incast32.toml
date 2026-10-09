@@ -29,9 +29,11 @@
 # regime there is. Just under, the occupancy oscillates across the 8-packet threshold and the
 # marking decision is genuinely per-packet.
 #
-# THE THRESHOLD. 64-packet queue, `ecn_threshold = 0.125`, i.e. mark from the 8th packet on. Tight
-# by design: at 8 of 64 the marking point sits far below the drop point, so the run exercises the
-# marking boundary and the drop boundary as two separate events.
+# THE THRESHOLD. A 64-packet (32,768 B) queue with an ECN step at 4,096 B, i.e. mark from the 8th
+# 512 B packet on (P16 ecnramp converted `ecn_threshold = 0.125` of 64 packets to bytes; every
+# packet is 512 B, so the trajectory is unchanged). Tight by design: at 8 of 64 the marking point
+# sits far below the drop point, so the run exercises the marking boundary and the drop boundary
+# as two separate events.
 #
 # ROUTING. `FatTreeEcmp`, so the 32 senders do not also pile onto one core switch on the way in.
 # Without it the single-path table would add a second, incidental bottleneck upstream and the
@@ -53,8 +55,9 @@ port_rate = 100_000_000_000
 capacity = 64
 weights = [1]
 discipline = "FIFO"
-drop = "ECN_THRESHOLD"
-ecn_threshold = 0.125
+drop = "TailDrop"
+ecn_capacity_bytes = 32_768
+ecn = { kmin_bytes = 4_096, kmax_bytes = 4_096, pmax = 1 }
 
 [link]
 propagation_ns = 1000

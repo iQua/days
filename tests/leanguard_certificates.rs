@@ -42,9 +42,12 @@ impl Family {
             Self::Wrr => wrr_transitions_csv(records).unwrap(),
             Self::Wfq => wfq_transitions_csv(records, image).unwrap(),
             Self::Sp => sp_transitions_csv(records, image).unwrap(),
-            Self::Aqm => {
-                aqm_transitions_csv(&diagnostics.aqm_transitions, &result.observed_packets).unwrap()
-            }
+            Self::Aqm => aqm_transitions_csv(
+                &diagnostics.aqm_transitions,
+                &result.observed_packets,
+                image.seed,
+            )
+            .unwrap(),
         }
     }
 }
@@ -329,9 +332,9 @@ fn resumed_wfq_incast_certificate_starts_paused() {
     assert_fixture(&pfc, "p10c/wfq_incast_resumed_executor_accept.pfc.csv");
 }
 
-/// RoCE ACKs share an ECN-threshold queue with data: Days AGO marks only data packets, so the
+/// RoCE ACKs share an ECN-step queue with data: Days AGO marks only data packets, so the
 /// certificate names each packet's kind and some ACKs are admitted unmarked at or above the
-/// threshold, where a data packet would be marked.
+/// step, where a data packet would be marked.
 #[test]
 fn compiled_aqm_certificate_names_packet_kinds_and_acks_stay_unmarked() {
     let csv = certificate("aqm_roce_acks", Family::Aqm);
@@ -343,8 +346,9 @@ fn compiled_aqm_certificate_names_packet_kinds_and_acks_stay_unmarked() {
         .map(|line| line.split(',').collect::<Vec<_>>())
         .collect::<Vec<_>>();
     let at_threshold = |row: &Vec<&str>| {
-        row[column("queued_packets_before")].parse::<u64>().unwrap() + 1
-            >= row[column("threshold")].parse::<u64>().unwrap()
+        row[column("queued_bytes_before")].parse::<u64>().unwrap()
+            + row[column("packet_size_bytes")].parse::<u64>().unwrap()
+            >= row[column("kmax_bytes")].parse::<u64>().unwrap()
     };
     assert!(
         rows.iter()
@@ -361,11 +365,12 @@ fn compiled_aqm_certificate_names_packet_kinds_and_acks_stay_unmarked() {
     assert_fixture(&csv, "p10c/aqm_roce_acks_compiled_executor_accept.csv");
 }
 
-/// The same RoCE-ACK queue under RED_ECN: an ACK at a RED congestion signal (the RED counter resets)
-/// is admitted unmarked, where a data packet would be marked (aqmkind review M3).
+/// The same RoCE-ACK queue on an ECN ramp (P16 ecnramp; it was RED_ECN): inside the ramp a data
+/// arrival is marked or not by its draw, and an ACK never draws and is admitted unmarked
+/// (aqmkind review M3).
 #[test]
-fn compiled_red_aqm_certificate_admits_acks_unmarked_at_red_signals() {
-    let csv = certificate("aqm_roce_acks_red", Family::Aqm);
+fn compiled_ramp_aqm_certificate_draws_for_data_and_admits_acks_unmarked() {
+    let csv = certificate("aqm_roce_acks_ramp", Family::Aqm);
     let header = csv.lines().next().unwrap().split(',').collect::<Vec<_>>();
     let column = |name: &str| header.iter().position(|field| *field == name).unwrap();
     let rows = csv
@@ -373,26 +378,36 @@ fn compiled_red_aqm_certificate_admits_acks_unmarked_at_red_signals() {
         .skip(1)
         .map(|line| line.split(',').collect::<Vec<_>>())
         .collect::<Vec<_>>();
-    assert!(rows.iter().all(|row| row[column("policy")] == "red"));
-    // A RED signal resets the counter from a positive value and is not a drop.
-    let signal = |row: &Vec<&str>| {
-        row[column("before_counter")] != "0"
-            && row[column("after_counter")] == "0"
-            && row[column("action")] != "drop"
+    let field = |row: &Vec<&str>, name: &str| row[column(name)].parse::<u64>().unwrap();
+    let inside = |row: &Vec<&str>| {
+        let depth = field(row, "queued_bytes_before") + field(row, "packet_size_bytes");
+        depth > field(row, "kmin_bytes") && depth < field(row, "kmax_bytes")
     };
     assert!(
         rows.iter()
-            .any(|row| row[column("packet_kind")] == "roce_ack"
-                && signal(row)
-                && row[column("action")] == "enqueue"),
-        "no ACK is admitted unmarked at a RED signal"
+            .all(|row| field(row, "kmin_bytes") < field(row, "kmax_bytes"))
+    );
+    let count = |kind: &str, action: &str| {
+        rows.iter()
+            .filter(|row| {
+                row[column("packet_kind")] == kind && inside(row) && row[column("action")] == action
+            })
+            .count()
+    };
+    assert!(
+        count("roce_ack", "enqueue") > 0,
+        "no ACK admitted inside the ramp"
+    );
+    assert_eq!(count("roce_ack", "mark"), 0, "an ACK is marked");
+    assert!(
+        count("roce_data", "mark") > 0,
+        "no data packet marked inside the ramp"
     );
     assert!(
-        rows.iter()
-            .any(|row| row[column("packet_kind")] == "roce_data" && row[column("action")] == "mark"),
-        "no data packet is marked"
+        count("roce_data", "enqueue") > 0,
+        "no data packet admitted unmarked inside the ramp"
     );
-    assert_fixture(&csv, "p10c/aqm_roce_acks_red_compiled_executor_accept.csv");
+    assert_fixture(&csv, "p10c/aqm_roce_acks_ramp_compiled_executor_accept.csv");
 }
 
 #[test]

@@ -1,15 +1,14 @@
 use std::collections::VecDeque;
 
 use days_executor::{
-    Backend, CpuConfig, DropMarkPolicy, DrrTransitionRecord, EcnThresholdPolicy, Event, EventKey,
+    Backend, CpuConfig, DropMarkPolicy, DrrTransitionRecord, EcnRampPolicy, Event, EventKey,
     EventKind, FlowDescriptor, FlowGeneratorKind, FlowGeneratorState, FlowId,
     GeneratorFeedbackState, GeneratorStatus, HostState, LinkDescriptor, LinkId,
     MechanismTransitionRecord, NodeDescriptor, NodeId, NodeKind, ObservationMode, PacketDescriptor,
-    PacketKind, PayloadId, QueueDepthUnit, RemoteChannel, ScheduledEmission, SchedulerKind,
-    SchedulerPacket, SimulationImage, SwitchQueueState, SwitchState, TcpAckHeader,
-    TcpCongestionControl, TcpDataHeader, TcpGenerator, TcpReceiverState, TcpTimerState,
-    drr_transitions_csv, event_phase, run_cpu_with_observations, run_scalar_with_observations,
-    validate, wrr_transitions_csv,
+    PacketKind, PayloadId, RemoteChannel, ScheduledEmission, SchedulerKind, SchedulerPacket,
+    SimulationImage, SwitchQueueState, SwitchState, TcpAckHeader, TcpCongestionControl,
+    TcpDataHeader, TcpGenerator, TcpReceiverState, TcpTimerState, drr_transitions_csv, event_phase,
+    run_cpu_with_observations, run_scalar_with_observations, validate, wrr_transitions_csv,
 };
 // Only `assert_device_full_result_eq` names this type, and that helper is device-gated.
 #[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
@@ -711,10 +710,12 @@ fn byte_capacity_overflow_drops_before_unneeded_post_sum() {
     image.channels[0] = RemoteChannel::for_packet_link(image.links[0], 1).unwrap();
     image.channels[1] = RemoteChannel::for_packet_link(image.links[1], 1).unwrap();
     let queue = &mut image.switch_states[0].queues[0];
-    queue.drop_mark = DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
-        unit: QueueDepthUnit::Bytes,
-        capacity: u64::MAX,
-        threshold: u64::MAX,
+    queue.drop_mark = DropMarkPolicy::EcnRamp(EcnRampPolicy {
+        capacity_bytes: u64::MAX,
+        kmin_bytes: u64::MAX,
+        kmax_bytes: u64::MAX,
+        pmax_numerator: 1,
+        pmax_denominator: 1,
     });
     queue.queue.push_back(PayloadId(0));
     queue.tx_ready_pending = true;

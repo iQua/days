@@ -79,7 +79,9 @@ pub enum AqmTransitionAction {
     Drop,
 }
 
-/// One non-TailDrop enqueue decision, keyed by the event that caused it.
+/// One ECN-ramp enqueue decision, keyed by the event that caused it. The policy is immutable, so
+/// one copy names it; LeanGuard recomputes the decision and its draw from the row and the image
+/// seed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AqmTransitionRecord {
     pub key: EventKey,
@@ -87,13 +89,11 @@ pub struct AqmTransitionRecord {
     /// Stable index of the queue within the node-owned switch state.
     pub queue_id: u64,
     pub payload: PayloadId,
-    pub queued_packets_before: u64,
     pub queued_bytes_before: u64,
     pub packet_size_bytes: u64,
     pub ecn_before: bool,
     pub ecn_after: bool,
-    pub before: crate::DropMarkPolicy,
-    pub after: crate::DropMarkPolicy,
+    pub policy: crate::EcnRampPolicy,
     pub action: AqmTransitionAction,
 }
 
@@ -2905,39 +2905,30 @@ impl<'image> TransitionState<'image> {
             let (action, aqm_transition) = if pfc_overflow {
                 (QueueAdmissionAction::Drop, None)
             } else {
-                let before = queue.drop_mark;
-                let action = if let crate::DropMarkPolicy::EcnRamp(policy) = &queue.drop_mark {
-                    ecn_ramp_action(
-                        policy,
-                        queue_bytes,
-                        packet,
-                        ecn_seed,
-                        node.id,
-                        queue_id,
-                        event.payload,
-                    )
-                } else {
-                    let action = drop_mark_decision(
-                        &mut queue.drop_mark,
-                        queue.queue_capacity_packets,
-                        queue_len,
-                        queue_bytes,
-                        packet.size_bytes,
-                        node.id,
-                    )?;
-                    if action == QueueAdmissionAction::Mark && !packet.kind.is_data() {
-                        QueueAdmissionAction::Enqueue
-                    } else {
-                        action
+                match &queue.drop_mark {
+                    crate::DropMarkPolicy::TailDrop => (
+                        taildrop_action(
+                            queue.queue_capacity_packets,
+                            queue_len,
+                            queue_bytes,
+                            packet.size_bytes,
+                            node.id,
+                        )?,
+                        None,
+                    ),
+                    crate::DropMarkPolicy::EcnRamp(policy) => {
+                        let action = ecn_ramp_action(
+                            policy,
+                            queue_bytes,
+                            packet,
+                            ecn_seed,
+                            node.id,
+                            queue_id,
+                            event.payload,
+                        );
+                        (action, Some((*policy, action)))
                     }
-                };
-                let transition = (before != crate::DropMarkPolicy::TailDrop).then_some((
-                    before,
-                    queue.drop_mark,
-                    action,
-                    queue_len,
-                ));
-                (action, transition)
+                }
             };
             if action == QueueAdmissionAction::Drop {
                 state.dropped_packets = state
@@ -3075,19 +3066,17 @@ impl<'image> TransitionState<'image> {
 
         if self.observation_mode == ObservationMode::Full {
             self.mechanism_transitions.extend(pfc_transition);
-            if let Some((before, after, action, queued_packets_before)) = aqm_transition {
+            if let Some((policy, action)) = aqm_transition {
                 self.aqm_transitions.push(AqmTransitionRecord {
                     key: event.key,
                     node: node.id,
                     queue_id,
                     payload: event.payload,
-                    queued_packets_before,
                     queued_bytes_before: queue_bytes,
                     packet_size_bytes: packet.size_bytes,
                     ecn_before: packet_ecn_before,
                     ecn_after: packet.ecn_marked,
-                    before,
-                    after,
+                    policy,
                     action: match action {
                         QueueAdmissionAction::Enqueue => AqmTransitionAction::Enqueue,
                         QueueAdmissionAction::Mark => AqmTransitionAction::Mark,
@@ -7577,9 +7566,10 @@ fn ecn_ramp_action(
     }
 }
 
-fn drop_mark_decision(
-    policy: &mut crate::DropMarkPolicy,
-    taildrop_capacity_packets: u64,
+/// Tail drop at the queue's packet capacity (zero is unbounded); an arrival whose byte total is
+/// unrepresentable also drops.
+fn taildrop_action(
+    capacity_packets: u64,
     queued_packets: u64,
     queued_bytes: u64,
     packet_size_bytes: u64,
@@ -7588,108 +7578,15 @@ fn drop_mark_decision(
     let post_packets = queued_packets
         .checked_add(1)
         .ok_or(ExecutionError::CounterOverflow(node))?;
-    let post_bytes = queued_bytes.checked_add(packet_size_bytes);
-    match policy {
-        crate::DropMarkPolicy::TailDrop => Ok(
-            if post_bytes.is_none()
-                || taildrop_capacity_packets != 0 && post_packets > taildrop_capacity_packets
-            {
-                QueueAdmissionAction::Drop
-            } else {
-                QueueAdmissionAction::Enqueue
-            },
-        ),
-        crate::DropMarkPolicy::EcnThreshold(config) => {
-            let Some(post_bytes) = post_bytes else {
-                return Ok(QueueAdmissionAction::Drop);
-            };
-            let post_depth = match config.unit {
-                crate::QueueDepthUnit::Packets => post_packets,
-                crate::QueueDepthUnit::Bytes => post_bytes,
-            };
-            Ok(if config.capacity != 0 && post_depth > config.capacity {
-                QueueAdmissionAction::Drop
-            } else if post_depth >= config.threshold {
-                QueueAdmissionAction::Mark
-            } else {
-                QueueAdmissionAction::Enqueue
-            })
-        }
-        crate::DropMarkPolicy::EcnRamp(_) => {
-            unreachable!("the switch arrival decides an ECN ramp with its draw inputs")
-        }
-        crate::DropMarkPolicy::Red(state) => {
-            // Let S=2^32, A' = floor((511*A + sample*S)/512), and
-            // p(A') = p_num*(A'-min*S)/(p_den*(max-min)*S). In the open threshold
-            // interval, increment c and signal exactly when c*p(A') >= 1, then reset c.
-            // At/below min resets without signaling; at/above max signals and resets.
-            const RED_AVERAGE_SCALE: u128 = 1_u128 << 32;
-            let sample_depth = match state.unit {
-                crate::QueueDepthUnit::Packets => queued_packets,
-                crate::QueueDepthUnit::Bytes => queued_bytes,
-            };
-            let post_depth = match state.unit {
-                crate::QueueDepthUnit::Packets => Some(post_packets),
-                crate::QueueDepthUnit::Bytes => post_bytes,
-            };
-            let weighted_previous = state
-                .average_scaled
-                .checked_mul(511)
-                .ok_or(ExecutionError::InvalidSchedulerState(node))?;
-            let weighted_sample = u128::from(sample_depth)
-                .checked_mul(RED_AVERAGE_SCALE)
-                .ok_or(ExecutionError::InvalidSchedulerState(node))?;
-            state.average_scaled = weighted_previous
-                .checked_add(weighted_sample)
-                .ok_or(ExecutionError::InvalidSchedulerState(node))?
-                / 512;
-
-            if post_bytes.is_none()
-                || post_depth.is_none_or(|depth| state.capacity != 0 && depth > state.capacity)
-            {
-                return Ok(QueueAdmissionAction::Drop);
-            }
-            let min_scaled = u128::from(state.min_threshold)
-                .checked_mul(RED_AVERAGE_SCALE)
-                .ok_or(ExecutionError::InvalidSchedulerState(node))?;
-            let max_scaled = u128::from(state.max_threshold)
-                .checked_mul(RED_AVERAGE_SCALE)
-                .ok_or(ExecutionError::InvalidSchedulerState(node))?;
-            let signal = if state.average_scaled <= min_scaled {
-                state.counter = 0;
-                false
-            } else if state.average_scaled >= max_scaled {
-                state.counter = 0;
-                true
-            } else {
-                state.counter = state
-                    .counter
-                    .checked_add(1)
-                    .ok_or(ExecutionError::InvalidSchedulerState(node))?;
-                let left = BigUint::from(state.counter)
-                    * BigUint::from(state.max_probability_numerator)
-                    * BigUint::from(state.average_scaled - min_scaled);
-                let right = BigUint::from(state.max_probability_denominator)
-                    * BigUint::from(state.max_threshold - state.min_threshold)
-                    * BigUint::from(RED_AVERAGE_SCALE);
-                if left >= right {
-                    state.counter = 0;
-                    true
-                } else {
-                    false
-                }
-            };
-            Ok(if signal {
-                if state.mark_ecn {
-                    QueueAdmissionAction::Mark
-                } else {
-                    QueueAdmissionAction::Drop
-                }
-            } else {
-                QueueAdmissionAction::Enqueue
-            })
-        }
-    }
+    Ok(
+        if queued_bytes.checked_add(packet_size_bytes).is_none()
+            || capacity_packets != 0 && post_packets > capacity_packets
+        {
+            QueueAdmissionAction::Drop
+        } else {
+            QueueAdmissionAction::Enqueue
+        },
+    )
 }
 
 fn tcp_receive_range(receiver: &mut crate::TcpReceiverState, start: u64, end: u64) {

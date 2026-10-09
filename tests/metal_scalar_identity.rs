@@ -4,9 +4,9 @@ use std::path::PathBuf;
 
 use days::scenario::compile_config;
 use days_executor::{
-    DropMarkPolicy, EcnThresholdPolicy, MetalConfig, MetalRun, ObservationMode, QueueDepthUnit,
-    SimulationImage, run_metal, run_metal_with_observations, run_scalar,
-    run_scalar_with_observations, size_default_device_plan,
+    DropMarkPolicy, EcnRampPolicy, MetalConfig, MetalRun, ObservationMode, SimulationImage,
+    run_metal, run_metal_with_observations, run_scalar, run_scalar_with_observations,
+    size_default_device_plan,
 };
 
 const BASELINE_FIXTURES: [&str; 2] = [
@@ -25,10 +25,12 @@ fn apply_byte_ecn_policy(image: &mut SimulationImage) -> usize {
         .flat_map(|state| &mut state.queues)
     {
         assert_eq!(queue.drop_mark, DropMarkPolicy::TailDrop);
-        queue.drop_mark = DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
-            unit: QueueDepthUnit::Bytes,
-            capacity: 4_000,
-            threshold: 1_000,
+        queue.drop_mark = DropMarkPolicy::EcnRamp(EcnRampPolicy {
+            capacity_bytes: 4_000,
+            kmin_bytes: 1_000,
+            kmax_bytes: 1_000,
+            pmax_numerator: 1,
+            pmax_denominator: 1,
         });
         queue_count += 1;
     }

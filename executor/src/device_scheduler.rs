@@ -8,8 +8,7 @@
 use num_bigint::BigUint;
 
 use crate::{
-    DropMarkPolicy, ExactRational, NodeKind, QueueDepthUnit, SchedulerKind, SimulationImage,
-    SwitchQueueState,
+    DropMarkPolicy, ExactRational, NodeKind, SchedulerKind, SimulationImage, SwitchQueueState,
 };
 
 pub(crate) const RATIONAL_LIMBS: usize = 5;
@@ -116,19 +115,15 @@ pub(crate) fn prepare_device_schedulers(
         };
         match queue.drop_mark {
             DropMarkPolicy::TailDrop => {}
-            DropMarkPolicy::EcnThreshold(config) => {
+            DropMarkPolicy::EcnRamp(policy) => {
+                debug_assert_eq!(
+                    policy.kmin_bytes, policy.kmax_bytes,
+                    "device validation admits only the ECN step until the device ramp lands"
+                );
                 words[node_base + SCHEDULER_AQM_KIND] = 1;
-                words[node_base + SCHEDULER_AQM_UNIT] = match config.unit {
-                    QueueDepthUnit::Packets => 0,
-                    QueueDepthUnit::Bytes => 1,
-                };
-                words[node_base + SCHEDULER_AQM_CAPACITY] = config.capacity;
-                words[node_base + SCHEDULER_AQM_THRESHOLD] = config.threshold;
-            }
-            DropMarkPolicy::Red(_) | DropMarkPolicy::EcnRamp(_) => {
-                unreachable!(
-                    "device validation rejects RED and the ECN ramp before scheduler packing"
-                )
+                words[node_base + SCHEDULER_AQM_UNIT] = 1;
+                words[node_base + SCHEDULER_AQM_CAPACITY] = policy.capacity_bytes;
+                words[node_base + SCHEDULER_AQM_THRESHOLD] = policy.kmin_bytes;
             }
         }
         words[node_base + SCHEDULER_KIND] = u64::from(queue.scheduler.code());
@@ -307,23 +302,16 @@ pub(crate) fn restore_device_scheduler(
                 return Err("device queue admission policy changed from TailDrop".to_owned());
             }
         }
-        DropMarkPolicy::EcnThreshold(config) => {
-            let expected_unit = match config.unit {
-                QueueDepthUnit::Packets => 0,
-                QueueDepthUnit::Bytes => 1,
-            };
+        DropMarkPolicy::EcnRamp(policy) => {
             if words[node_base + SCHEDULER_AQM_KIND] != 1
-                || words[node_base + SCHEDULER_AQM_UNIT] != expected_unit
-                || words[node_base + SCHEDULER_AQM_CAPACITY] != config.capacity
-                || words[node_base + SCHEDULER_AQM_THRESHOLD] != config.threshold
+                || words[node_base + SCHEDULER_AQM_UNIT] != 1
+                || words[node_base + SCHEDULER_AQM_CAPACITY] != policy.capacity_bytes
+                || words[node_base + SCHEDULER_AQM_THRESHOLD] != policy.kmin_bytes
             {
                 return Err(
                     "device ECN threshold configuration changed during execution".to_owned(),
                 );
             }
-        }
-        DropMarkPolicy::Red(_) | DropMarkPolicy::EcnRamp(_) => {
-            return Err("device scheduler restore encountered unsupported RED state".to_owned());
         }
     }
     match &mut queue.scheduler {

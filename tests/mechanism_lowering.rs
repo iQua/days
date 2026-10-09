@@ -10,7 +10,13 @@ use days_executor::{
 #[test]
 fn scheduler_and_aqm_lowering_cartesian_matrix_is_explicit() {
     for discipline in ["DRR", "WRR"] {
-        for drop_policy in ["TailDrop", "RED", "RED_ECN", "ECN_THRESHOLD"] {
+        for (drop_policy, marking) in [
+            ("TailDrop", ""),
+            (
+                "ECN",
+                "ecn_capacity_bytes = 100000\necn = { kmin_bytes = 20000, kmax_bytes = 60000, pmax = 0.2 }",
+            ),
+        ] {
             let path = std::env::temp_dir().join(format!(
                 "days-t25-{}-{discipline}-{drop_policy}.toml",
                 std::process::id()
@@ -27,8 +33,8 @@ port_rate = 8000000000
 capacity = 100
 weights = [1, 2]
 discipline = "{discipline}"
-drop = "{drop_policy}"
-ecn_threshold = 0.2
+drop = "TailDrop"
+{marking}
 
 [[flow]]
 flow_type = "PacketDistribution"
@@ -61,10 +67,16 @@ pkt_size_dist = {{ type = "Uniform", low = 1000, high = 1000 }}
                 }
                 match (drop_policy, queue.drop_mark) {
                     ("TailDrop", DropMarkPolicy::TailDrop) => {}
-                    ("RED", DropMarkPolicy::Red(state)) => assert!(!state.mark_ecn),
-                    ("RED_ECN", DropMarkPolicy::Red(state)) => assert!(state.mark_ecn),
-                    ("ECN_THRESHOLD", DropMarkPolicy::EcnThreshold(state)) => {
-                        assert_eq!(state.threshold, 20);
+                    ("ECN", DropMarkPolicy::EcnRamp(policy)) => {
+                        assert_eq!(
+                            (
+                                policy.kmin_bytes,
+                                policy.kmax_bytes,
+                                policy.pmax_numerator,
+                                policy.pmax_denominator
+                            ),
+                            (20_000, 60_000, 1, 5)
+                        );
                     }
                     _ => panic!("unexpected AQM policy for {drop_policy}"),
                 }
@@ -93,38 +105,6 @@ drop = "TailDrop"
     assert_eq!(
         error.to_string(),
         "unsupported scheduler `VirtualClock`; Days executor supports FIFO, SP, WFQ, DRR, and WRR"
-    );
-}
-
-#[test]
-fn red_lowering_reports_the_largest_toml_integer_capacity_without_panicking() {
-    let path = std::env::temp_dir().join(format!("days-t25-red-max-{}.toml", std::process::id()));
-    fs::write(
-        &path,
-        r#"
-seed = 25
-edges = [[0, 1]]
-hosts = [0, 1]
-duration = 0.00001
-
-[switch]
-port_rate = 8000000000
-capacity = 9223372036854775807
-discipline = "FIFO"
-drop = "RED"
-"#,
-    )
-    .expect("temporary RED boundary fixture must be writable");
-
-    let result = std::panic::catch_unwind(|| compile_config(&path));
-    fs::remove_file(&path).expect("temporary RED boundary fixture must be removable");
-    let error = result
-        .expect("maximum-range RED lowering must return a diagnostic instead of panicking")
-        .expect_err("the derived RED counter range exceeds the executor state domain")
-        .to_string();
-    assert!(
-        error.contains("RED worst-case signal spacing exceeds u64 counter state"),
-        "expected the post-lowering representability diagnostic, got: {error}"
     );
 }
 

@@ -78,24 +78,6 @@ impl WrrSchedulerState {
     }
 }
 
-/// Queue-depth unit used by deterministic admission and marking policies.
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum QueueDepthUnit {
-    Packets = 0,
-    Bytes = 1,
-}
-
-/// Deterministic ECN threshold configuration.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct EcnThresholdPolicy {
-    pub unit: QueueDepthUnit,
-    pub capacity: u64,
-    /// The arriving packet is marked when post-enqueue depth is at least this value.
-    pub threshold: u64,
-}
-
 /// ECN marking on a Kmin/Kmax/Pmax ramp over the instantaneous byte depth, decided at enqueue
 /// (P16 ecnramp). The rule, its exact integer form and the stateless draw are in
 /// [`crate::ecn_ramp`]; the step is the special case `kmin_bytes == kmax_bytes`, `pmax = 1`.
@@ -111,34 +93,13 @@ pub struct EcnRampPolicy {
     pub pmax_denominator: u64,
 }
 
-/// Exact deterministic RED state.
-///
-/// Between the thresholds, `counter` replaces the legacy random draw. The discrete signaling
-/// rule is documented beside `drop_mark_decision` in the scalar transition.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RedPolicyState {
-    pub unit: QueueDepthUnit,
-    pub capacity: u64,
-    pub min_threshold: u64,
-    pub max_threshold: u64,
-    pub max_probability_numerator: u64,
-    pub max_probability_denominator: u64,
-    /// Queue-average numerator at the fixed scale `2^32`.
-    pub average_scaled: u128,
-    pub counter: u64,
-    /// Signal by setting the packet mark instead of dropping it.
-    pub mark_ecn: bool,
-}
-
-/// Admission/marking hook evaluated exactly once on switch enqueue.
+/// Admission and marking, evaluated exactly once on switch enqueue.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum DropMarkPolicy {
-    /// Preserve the v1 packet-capacity TailDrop behavior.
+    /// Tail drop at the queue's packet capacity (`SwitchQueueState::queue_capacity_packets`).
     #[default]
     TailDrop,
-    EcnThreshold(EcnThresholdPolicy),
-    Red(RedPolicyState),
+    /// ECN marking on the ramp, with tail drop at its byte capacity (`crate::ecn_ramp`).
     EcnRamp(EcnRampPolicy),
 }
 

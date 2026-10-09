@@ -332,7 +332,8 @@ fn device_planners_are_bit_equal_to_legacy_planning_across_fixture_families() {
                 "ecn-threshold",
                 &[(
                     "drop = \"TailDrop\"",
-                    "drop = \"ECN_THRESHOLD\"\necn_threshold = 0.5",
+                    "drop = \"TailDrop\"\necn_capacity_bytes = 100000\n\
+                     ecn = { kmin_bytes = 50000, kmax_bytes = 50000, pmax = 1 }",
                 )],
             ),
         ),
@@ -673,51 +674,43 @@ fn unsupported_device_families_are_rejected_before_planning() {
     }
 
     // P14 Lane B: DCQCN with (inert) PFC state now runs on both device backends, so its planner
-    // must plan it, bit-equal to legacy planning, instead of rejecting it. RED admission remains
-    // device-unsupported and keeps the rejection branch exercised.
+    // must plan it, bit-equal to legacy planning, instead of rejecting it. A TailDrop packet
+    // capacity beyond the devices' 32-bit queue limit keeps the rejection branch exercised (it was
+    // RED admission until P16 ecnramp removed RED).
     let dcqcn = compile_dcqcn_inert_pfc_fixture();
-    let mut red = dcqcn.clone();
-    for queue in red
+    let mut oversized = dcqcn.clone();
+    for queue in oversized
         .switch_states
         .iter_mut()
         .flat_map(|state| &mut state.queues)
     {
-        queue.drop_mark = days_executor::DropMarkPolicy::Red(days_executor::RedPolicyState {
-            unit: days_executor::QueueDepthUnit::Packets,
-            capacity: 64,
-            min_threshold: 8,
-            max_threshold: 32,
-            max_probability_numerator: 1,
-            max_probability_denominator: 10,
-            average_scaled: 0,
-            counter: 0,
-            mark_ecn: false,
-        });
+        queue.drop_mark = days_executor::DropMarkPolicy::TailDrop;
+        queue.queue_capacity_packets = u64::from(u32::MAX) + 1;
     }
     planner_rejections += 1;
 
     #[cfg(all(feature = "metal", target_vendor = "apple"))]
     assert!(
         assert_metal_planner_bit_equal_for_testing(
-            &red,
+            &oversized,
             None,
             metal_config(true, true),
             ObservationMode::Summary,
         )
-        .is_err_and(|error| error.to_string().contains("RED admission")),
-        "Metal must reject RED before planning"
+        .is_err_and(|error| error.to_string().contains("exceeds backend Metal limit")),
+        "Metal must reject an oversized queue before planning"
     );
 
     #[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
     assert!(
         assert_cuda_planner_bit_equal_for_testing(
-            &red,
+            &oversized,
             None,
             cuda_config(true, true),
             ObservationMode::Summary,
         )
-        .is_err_and(|error| error.to_string().contains("RED admission")),
-        "CUDA must reject RED before planning"
+        .is_err_and(|error| error.to_string().contains("exceeds backend Cuda limit")),
+        "CUDA must reject an oversized queue before planning"
     );
 
     #[cfg(all(feature = "metal", target_vendor = "apple"))]

@@ -146,9 +146,8 @@ pub use metal::{
 #[doc(hidden)]
 pub use metal::{mechanism_plane_words_metal_for_testing, size_metal_plan_for_testing};
 pub use model::{
-    DropMarkPolicy, DrrSchedulerState, EcnRampPolicy, EcnThresholdPolicy, ExactRational, NodeKind,
-    QueueDepthUnit, RedPolicyState, SchedulerKind, TransitionHandler, WfqSchedulerState,
-    WrrSchedulerState, resolve_transition,
+    DropMarkPolicy, DrrSchedulerState, EcnRampPolicy, ExactRational, NodeKind, SchedulerKind,
+    TransitionHandler, WfqSchedulerState, WrrSchedulerState, resolve_transition,
 };
 pub use roce::{
     RoceEmission, RocePacerState, RoceReceiverAction, RoceReceiverRecord, RoceReceiverView,

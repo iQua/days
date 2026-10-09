@@ -2041,7 +2041,7 @@ impl MetalPlan {
                                         .unwrap_or(usize::MAX),
                                 );
                             }
-                            crate::DropMarkPolicy::EcnThreshold(policy) => {
+                            crate::DropMarkPolicy::EcnRamp(policy) => {
                                 queue_caps[slot] = crate::device_sizing::ecn_queue_packet_bound(
                                     aggregate_queue_packets[slot],
                                     policy,
@@ -2050,9 +2050,7 @@ impl MetalPlan {
                                 .max(initial)
                                 .max(1);
                             }
-                            crate::DropMarkPolicy::TailDrop
-                            | crate::DropMarkPolicy::Red(_)
-                            | crate::DropMarkPolicy::EcnRamp(_) => {}
+                            crate::DropMarkPolicy::TailDrop => {}
                         }
                     }
                 }
@@ -2808,9 +2806,9 @@ fn add_flow_route_capacities(
             let queue = image.switch_states[image.nodes[target_slot].state_slot as usize]
                 .queues
                 .first();
-            let contribution = if queue.is_some_and(|queue| {
-                matches!(queue.drop_mark, crate::DropMarkPolicy::EcnThreshold(_))
-            }) {
+            let contribution = if queue
+                .is_some_and(|queue| matches!(queue.drop_mark, crate::DropMarkPolicy::EcnRamp(_)))
+            {
                 capacity_context.horizon_queue_packet_bound(
                     image,
                     flow_index,

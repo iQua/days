@@ -14,8 +14,8 @@ use days_executor::{
 };
 #[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 use days_executor::{
-    CapacityWarmStart, DeviceCapacityCaps, DropMarkPolicy, EcnThresholdPolicy,
-    MechanismTransitionRecord, QueueDepthUnit, RunResult,
+    CapacityWarmStart, DeviceCapacityCaps, DropMarkPolicy, EcnRampPolicy,
+    MechanismTransitionRecord, RunResult,
 };
 #[cfg(feature = "cuda")]
 use days_executor::{CudaArena, CudaConfig, CudaError, CudaExecutor, run_cuda_with_observations};
@@ -2421,10 +2421,12 @@ fn reachable_tcp_ack_ecn_image() -> SimulationImage {
         unreachable!()
     };
     tcp.total_bytes = MSS;
-    image.switch_states[1].queues[0].drop_mark = DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
-        unit: QueueDepthUnit::Packets,
-        capacity: 64,
-        threshold: 1,
+    image.switch_states[1].queues[0].drop_mark = DropMarkPolicy::EcnRamp(EcnRampPolicy {
+        capacity_bytes: u64::MAX,
+        kmin_bytes: 1,
+        kmax_bytes: 1,
+        pmax_numerator: 1,
+        pmax_denominator: 1,
     });
     image
 }
@@ -2444,10 +2446,12 @@ fn ack_descendant_forward_ecn_checkpoint() -> SimulationImage {
         unreachable!()
     };
     tcp.total_bytes = 2 * MSS;
-    image.switch_states[0].queues[0].drop_mark = DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
-        unit: QueueDepthUnit::Packets,
-        capacity: 64,
-        threshold: 1,
+    image.switch_states[0].queues[0].drop_mark = DropMarkPolicy::EcnRamp(EcnRampPolicy {
+        capacity_bytes: u64::MAX,
+        kmin_bytes: 1,
+        kmax_bytes: 1,
+        pmax_numerator: 1,
+        pmax_denominator: 1,
     });
     let prefix = run_scalar_with_observations(&image, Some(459), ObservationMode::Summary)
         .expect("prefix must leave the first ACK at the source-arrival boundary");
@@ -2470,10 +2474,12 @@ fn data_descendant_chain_forward_ecn_checkpoint() -> SimulationImage {
         unreachable!()
     };
     tcp.total_bytes = 2 * MSS;
-    image.switch_states[0].queues[0].drop_mark = DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
-        unit: QueueDepthUnit::Packets,
-        capacity: 64,
-        threshold: 1,
+    image.switch_states[0].queues[0].drop_mark = DropMarkPolicy::EcnRamp(EcnRampPolicy {
+        capacity_bytes: u64::MAX,
+        kmin_bytes: 1,
+        kmax_bytes: 1,
+        pmax_numerator: 1,
+        pmax_denominator: 1,
     });
     let prefix = run_scalar_with_observations(&image, Some(42), ObservationMode::Summary)
         .expect("prefix must leave data in flight after its first forward admission");
@@ -2497,10 +2503,12 @@ fn ack_descendant_chain_reverse_ecn_checkpoint() -> SimulationImage {
         unreachable!()
     };
     tcp.total_bytes = 2 * MSS;
-    image.switch_states[1].queues[0].drop_mark = DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
-        unit: QueueDepthUnit::Packets,
-        capacity: 64,
-        threshold: 1,
+    image.switch_states[1].queues[0].drop_mark = DropMarkPolicy::EcnRamp(EcnRampPolicy {
+        capacity_bytes: u64::MAX,
+        kmin_bytes: 1,
+        kmax_bytes: 1,
+        pmax_numerator: 1,
+        pmax_denominator: 1,
     });
     let prefix = run_scalar_with_observations(&image, Some(459), ObservationMode::Summary)
         .expect("prefix must leave the first ACK at the source-arrival boundary");

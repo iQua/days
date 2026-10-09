@@ -7,7 +7,7 @@ use days_executor::{
     run_scalar_with_observations, validate,
 };
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
-use days_executor::{DropMarkPolicy, EcnThresholdPolicy, QueueDepthUnit};
+use days_executor::{DropMarkPolicy, EcnRampPolicy};
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 use days_executor::{MetalConfig, run_metal_with_observations};
 use num_bigint::BigUint;
@@ -649,10 +649,12 @@ fn switch_resident_waiter_image(
 
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 fn resident_waiter_cases() -> Vec<(SimulationImage, u64, NodeId, PayloadId, bool)> {
-    let ecn = DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
-        unit: QueueDepthUnit::Packets,
-        capacity: 64,
-        threshold: 1,
+    let ecn = DropMarkPolicy::EcnRamp(EcnRampPolicy {
+        capacity_bytes: u64::MAX,
+        kmin_bytes: 1,
+        kmax_bytes: 1,
+        pmax_numerator: 1,
+        pmax_denominator: 1,
     });
     let planes = [
         (SchedulerKind::Fifo, ecn, true),

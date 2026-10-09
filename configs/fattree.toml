@@ -17,7 +17,7 @@ log_path = "logs/fattree"
     capacity = 1000
     weights = [1]
     discipline = "FIFO"
-    drop = "RED"
+    drop = "TailDrop"
 
 [[flow_set]]
     flow_type = "PacketDistribution"

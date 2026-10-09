@@ -667,7 +667,7 @@ pub fn size_default_device_plan(
                                 usize::try_from(queue.queue_capacity_packets).unwrap_or(usize::MAX),
                             );
                         }
-                        crate::DropMarkPolicy::EcnThreshold(policy) => {
+                        crate::DropMarkPolicy::EcnRamp(policy) => {
                             queue_capacities[slot] = ecn_queue_packet_bound(
                                 aggregate_queue_packets[slot],
                                 policy,
@@ -676,9 +676,7 @@ pub fn size_default_device_plan(
                             .max(initial)
                             .max(1);
                         }
-                        crate::DropMarkPolicy::TailDrop
-                        | crate::DropMarkPolicy::Red(_)
-                        | crate::DropMarkPolicy::EcnRamp(_) => {}
+                        crate::DropMarkPolicy::TailDrop => {}
                     }
                 }
             }
@@ -1623,27 +1621,20 @@ pub(crate) fn horizon_queue_packet_bound(
     whole_flow_packets.min(emissions.saturating_add(residency).saturating_add(2))
 }
 
-/// Converts a finite ECN admission limit into an outward-safe queue-record bound.
+/// Converts the ECN ramp's byte capacity into an outward-safe queue-record bound.
 ///
 /// The admission decision reads the waiting queue before enqueue and accepts only when the
-/// post-enqueue depth is at most `C`. For a byte policy, if every routed or resident packet is at
-/// least `m` bytes, `waiting * m <= queued_bytes <= C`, hence
-/// `waiting <= floor(C / m)`. The packet policy gives `waiting <= C` directly. Intersecting that
+/// post-enqueue byte depth is at most `C`. If every routed or resident packet is at least `m`
+/// bytes, `waiting * m <= queued_bytes <= C`, hence `waiting <= floor(C / m)`. Intersecting that
 /// queue-level invariant with the aggregate finite-flow packet count is safe across horizons;
 /// summing per-flow horizon arrivals is not, because waiting packets persist between horizons.
 /// The in-service packet is stored in its own plane and therefore is not part of this bound.
 pub(crate) fn ecn_queue_packet_bound(
     aggregate_flow_packets: usize,
-    policy: crate::EcnThresholdPolicy,
+    policy: crate::EcnRampPolicy,
     minimum_packet_bytes: u64,
 ) -> usize {
-    if policy.capacity == 0 {
-        return aggregate_flow_packets;
-    }
-    let semantic_packet_limit = match policy.unit {
-        crate::QueueDepthUnit::Packets => policy.capacity,
-        crate::QueueDepthUnit::Bytes => policy.capacity / minimum_packet_bytes.max(1),
-    };
+    let semantic_packet_limit = policy.capacity_bytes / minimum_packet_bytes.max(1);
     aggregate_flow_packets.min(usize::try_from(semantic_packet_limit).unwrap_or(usize::MAX))
 }
 
@@ -1839,9 +1830,9 @@ fn add_flow_route_capacities(
             let queue = image.switch_states[image.nodes[target_slot].state_slot as usize]
                 .queues
                 .first();
-            let contribution = if queue.is_some_and(|queue| {
-                matches!(queue.drop_mark, crate::DropMarkPolicy::EcnThreshold(_))
-            }) {
+            let contribution = if queue
+                .is_some_and(|queue| matches!(queue.drop_mark, crate::DropMarkPolicy::EcnRamp(_)))
+            {
                 let link = image.links[route[index].0 as usize];
                 horizon_queue_packet_bound(
                     packet_count,
@@ -2268,10 +2259,7 @@ mod tests {
         horizon_queue_packet_bound, paced_single_source_queue_bound, planning_horizon_ns,
         tcp_fallback_timer_packet_bound, tcp_ledger_segment_bound, tcp_receiver_range_bound,
     };
-    use crate::{
-        DeviceEventArenaSizing, EcnThresholdPolicy, QueueDepthUnit, TcpCongestionControl,
-        TcpGenerator,
-    };
+    use crate::{DeviceEventArenaSizing, EcnRampPolicy, TcpCongestionControl, TcpGenerator};
 
     /// P16 G1 (design note §4.2, item 1): a compute stage's zero-byte `Data` token names its
     /// timer and is never routed, like a queue pair's pacing token; a sized data packet is.
@@ -2411,10 +2399,12 @@ mod tests {
         assert_eq!(1 + 8 * per_flow_horizon, 801);
 
         let whole_flow_packets = 8 * 65_536;
-        let byte_policy = EcnThresholdPolicy {
-            unit: QueueDepthUnit::Bytes,
-            capacity: 262_144,
-            threshold: 262_144,
+        let byte_policy = EcnRampPolicy {
+            capacity_bytes: 262_144,
+            kmin_bytes: 262_144,
+            kmax_bytes: 262_144,
+            pmax_numerator: 1,
+            pmax_denominator: 1,
         };
         assert_eq!(
             ecn_queue_packet_bound(whole_flow_packets, byte_policy, 256),
@@ -2424,28 +2414,6 @@ mod tests {
             ecn_queue_packet_bound(800, byte_policy, 256),
             800,
             "the semantic bound remains capped by the aggregate finite-flow count"
-        );
-
-        let packet_policy = EcnThresholdPolicy {
-            unit: QueueDepthUnit::Packets,
-            capacity: 777,
-            threshold: 700,
-        };
-        assert_eq!(
-            ecn_queue_packet_bound(whole_flow_packets, packet_policy, 1),
-            777
-        );
-        assert_eq!(
-            ecn_queue_packet_bound(
-                whole_flow_packets,
-                EcnThresholdPolicy {
-                    capacity: 0,
-                    ..byte_policy
-                },
-                256,
-            ),
-            whole_flow_packets,
-            "zero capacity is the unbounded semantic policy"
         );
     }
 
@@ -2458,10 +2426,12 @@ mod tests {
         assert_eq!(
             ecn_queue_packet_bound(
                 2_000,
-                EcnThresholdPolicy {
-                    unit: QueueDepthUnit::Bytes,
-                    capacity: 1_024,
-                    threshold: 1_024,
+                EcnRampPolicy {
+                    capacity_bytes: 1_024,
+                    kmin_bytes: 1_024,
+                    kmax_bytes: 1_024,
+                    pmax_numerator: 1,
+                    pmax_denominator: 1,
                 },
                 minimum,
             ),

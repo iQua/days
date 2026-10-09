@@ -7,10 +7,19 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use days::workload::aicb::{
-    INERT_KEYS, PfcTier, RECORDED_KEYS, RailShape, SimaiConf, derive_fabric, parse_simai_conf,
+    INERT_KEYS, PfcTier, RECORDED_KEYS, RailShape, SimaiConf, SimaiEcn, derive_fabric,
+    parse_simai_conf,
 };
 
 const G: u64 = 1_000_000_000;
+
+fn step(threshold: u64) -> SimaiEcn {
+    SimaiEcn {
+        kmin_bytes: threshold,
+        kmax_bytes: threshold,
+        pmax: "1".to_owned(),
+    }
+}
 
 fn shipped() -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/aicb/SimAI.conf");
@@ -83,7 +92,10 @@ fn the_1024g_fabric_equals_g1_and_h2() {
     assert_eq!(fabric.queue_capacity_packets, 3729);
     assert_eq!(fabric.queue_capacity_bytes, 33_554_432);
     // The K-ramp midpoint (KMIN 800 KB, KMAX 3,200 KB at 400 Gb/s) in bytes of queue.
-    assert_eq!(fabric.ecn_by_rate, BTreeMap::from([(400 * G, 2_000_000)]));
+    assert_eq!(
+        fabric.ecn_by_rate,
+        BTreeMap::from([(400 * G, step(2_000_000))])
+    );
     assert_eq!(
         fabric.pfc_asw,
         PfcTier {
@@ -131,7 +143,7 @@ fn the_128g_fabric_equals_g1_and_h2() {
     let fabric = derive_fabric(&conf(&shipped()), &RAIL_128G, 72_500).unwrap();
     assert_eq!(
         fabric.ecn_by_rate,
-        BTreeMap::from([(100 * G, 1_000_000), (400 * G, 2_000_000)])
+        BTreeMap::from([(100 * G, step(1_000_000)), (400 * G, step(2_000_000))])
     );
     assert_eq!(
         fabric.pfc_asw,
