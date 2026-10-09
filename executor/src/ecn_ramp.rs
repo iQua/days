@@ -23,6 +23,7 @@
 //! (`lean/LeanGuard/P10c/Semantics.lean`, namespace `Aqm`).
 
 use crate::EcnRampPolicy;
+use crate::splitmix::mix;
 
 /// Separates the ramp's draw from the image seed's other uses (`"ECN_RAMP"` in ASCII).
 pub const ECN_RAMP_DOMAIN: u64 = 0x4543_4e5f_5241_4d50;
@@ -36,13 +37,13 @@ pub enum EcnRampAction {
 }
 
 /// The per-queue key of the draw.
-pub const fn ecn_queue_key(_seed: u64, _node: u64, _queue: u64) -> u64 {
-    0
+pub const fn ecn_queue_key(seed: u64, node: u64, queue: u64) -> u64 {
+    mix(mix(mix(seed ^ ECN_RAMP_DOMAIN) ^ node) ^ queue)
 }
 
 /// The draw of one arrival at the queue with key `key`.
-pub const fn ecn_draw(_key: u64, _payload: u64) -> u64 {
-    0
+pub const fn ecn_draw(key: u64, payload: u64) -> u64 {
+    mix(key ^ payload)
 }
 
 /// `pmax_den * (kmax - kmin)`, the ramp's span; `None` when it does not fit `u64` (validation
@@ -56,11 +57,32 @@ pub const fn ecn_ramp_span(policy: &EcnRampPolicy) -> Option<u64> {
 /// The decision for an arrival of `size_bytes` at a queue holding `queued_bytes`. `draw` is
 /// called at most once, and only inside the ramp for ECN-capable data.
 pub fn ecn_ramp_decision(
-    _policy: &EcnRampPolicy,
-    _queued_bytes: u64,
-    _size_bytes: u64,
-    _ecn_capable: bool,
-    _draw: impl FnOnce() -> u64,
+    policy: &EcnRampPolicy,
+    queued_bytes: u64,
+    size_bytes: u64,
+    ecn_capable: bool,
+    draw: impl FnOnce() -> u64,
 ) -> EcnRampAction {
-    EcnRampAction::Enqueue
+    let Some(depth) = queued_bytes.checked_add(size_bytes) else {
+        return EcnRampAction::Drop;
+    };
+    if depth > policy.capacity_bytes {
+        return EcnRampAction::Drop;
+    }
+    if !ecn_capable || depth < policy.kmin_bytes {
+        return EcnRampAction::Enqueue;
+    }
+    if depth >= policy.kmax_bytes {
+        return EcnRampAction::Mark;
+    }
+    // kmin <= depth < kmax, so kmin < kmax; validation bounds `span` by `u64::MAX`, and
+    // `pmax_num * (depth - kmin) < pmax_num * (kmax - kmin) <= span`.
+    let span =
+        u128::from(policy.pmax_denominator) * u128::from(policy.kmax_bytes - policy.kmin_bytes);
+    let bound = u128::from(policy.pmax_numerator) * u128::from(depth - policy.kmin_bytes);
+    if (u128::from(draw()) * span) >> 64 < bound {
+        EcnRampAction::Mark
+    } else {
+        EcnRampAction::Enqueue
+    }
 }
