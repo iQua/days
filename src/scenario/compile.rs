@@ -9,10 +9,10 @@ use days_executor::{
     Event, EventKey, EventKind, FlowDescriptor, FlowGeneratorKind, FlowGeneratorState, FlowId,
     GeneratorFeedbackState, GeneratorStatus, GeneratorTermination, HostState, LinkDescriptor,
     LinkId, NodeDescriptor, NodeId, NodeKind, PacketDescriptor, PacketKind, PayloadId,
-    PfcIngressState, PfcQueueState, RateGenerator, RemoteChannel, RoceGenerator, RocePacer,
-    RoceReceiverState, ScheduledEmission, SchedulerKind, SimulationImage, StageDependencies,
-    StagePredecessors, StageRole, SwitchQueueState, SwitchState, TcpCongestionControl,
-    TcpDataHeader, TcpGenerator, TcpReceiverState, event_phase, validate,
+    PfcIngressState, PfcQueueState, RateGenerator, RemoteChannel, RoceCongestionControl,
+    RoceGenerator, RocePacer, RoceReceiverState, ScheduledEmission, SchedulerKind, SimulationImage,
+    StageDependencies, StagePredecessors, StageRole, SwitchQueueState, SwitchState,
+    TcpCongestionControl, TcpDataHeader, TcpGenerator, TcpReceiverState, event_phase, validate,
 };
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
@@ -388,11 +388,15 @@ struct SourceTraffic {
     roce: Option<SourceRoce>,
 }
 
-/// `[flow.traffic.roce]`: the Go-back-N reliability of a RoCE queue pair. The pair's controller
-/// and pacer come from `[flow.traffic.dcqcn]`.
+/// `[flow.traffic.roce]`: the Go-back-N reliability of a RoCE queue pair, and its congestion
+/// control. Under DCQCN (the default) the pair's controller and pacer come from
+/// `[flow.traffic.dcqcn]`; without congestion control (P17) the pair paces at its host's line
+/// rate and has no DCQCN table.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SourceRoce {
+    /// P17 lane nocc: `"dcqcn"` (the default) or `"none"`.
+    congestion_control: Option<String>,
     /// Required: a fixed retransmission timeout, or `0` for none (NACK-only recovery: a lost last
     /// packet then stalls the queue pair for the rest of the run).
     retransmit_timeout_ns: Option<u64>,
@@ -498,12 +502,11 @@ enum TrafficKind {
     Roce(u64),
 }
 
-/// The full semantic key of one RoCE queue pair: its DCQCN controller and pacer, and its
-/// Go-back-N reliability. `dcqcn.cnp_priority` holds the pair's feedback priority (CNP, ACK and
-/// NACK).
+/// The full semantic key of one RoCE queue pair: its congestion control and pacer, and its
+/// Go-back-N reliability.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct RoceTrafficKey {
-    dcqcn: DcqcnTrafficKey,
+    control: RoceControlKey,
     retransmit_timeout_ns: u64,
     ack_every_packets: u64,
     nack_interval_ns: u64,
@@ -511,6 +514,28 @@ struct RoceTrafficKey {
     ack_size_bytes: u64,
     window_bytes: u64,
     variable_window: bool,
+}
+
+/// A queue pair's congestion control (P17 lane nocc). `Dcqcn` is the first variant and holds the
+/// pre-P17 key unchanged, so the keys of a scenario without `"none"` order exactly as before P17.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum RoceControlKey {
+    /// The DCQCN controller and pacer; `cnp_priority` holds the pair's feedback priority (ACK and
+    /// NACK).
+    Dcqcn(DcqcnTrafficKey),
+    /// No congestion control: the pacer runs at the source host's line rate, one MTU per
+    /// `ceil(MTU * 8e9 / rate)` ns, resolved at lowering ([`roce_pacer`]).
+    LineRate { feedback_priority: u8 },
+}
+
+impl RoceControlKey {
+    /// The class of the pair's ACKs and NACKs.
+    const fn feedback_priority(self) -> u8 {
+        match self {
+            Self::Dcqcn(dcqcn) => dcqcn.cnp_priority,
+            Self::LineRate { feedback_priority } => feedback_priority,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -552,7 +577,7 @@ impl TrafficKey {
     fn feedback_priority(&self, priority: u8, roce_keys: &[RoceTrafficKey]) -> u8 {
         match self.kind {
             TrafficKind::Dcqcn(dcqcn) => dcqcn.cnp_priority,
-            TrafficKind::Roce(ordinal) => roce_key(roce_keys, ordinal).dcqcn.cnp_priority,
+            TrafficKind::Roce(ordinal) => roce_key(roce_keys, ordinal).control.feedback_priority(),
             TrafficKind::Constant | TrafficKind::Tcp(_) => priority,
         }
     }
@@ -2811,30 +2836,58 @@ fn validate_traffic(
                     "unsupported TCP options on RoCE traffic".to_owned(),
                 ));
             }
-            let dcqcn = traffic.dcqcn.ok_or_else(|| {
-                CompileError::Invalid(
-                    "RoCE traffic must provide `[flow.traffic.dcqcn]` or `[flow_set.traffic.dcqcn]` for its controller"
-                        .to_owned(),
-                )
-            })?;
-            if dcqcn.cnp_priority.is_some() {
-                return Err(CompileError::Unsupported(
-                    "unsupported `cnp_priority` on RoCE traffic; set the ACK and NACK class with `[flow.traffic.roce] feedback_priority`"
-                        .to_owned(),
-                ));
-            }
-            if dcqcn.cnp_interval_ns.is_some() {
-                return Err(CompileError::Unsupported(
-                    "unsupported `cnp_interval_ns` on RoCE traffic: a queue pair's receiver echoes ECN on its ACKs and NACKs and sends no CNP (P16)"
-                        .to_owned(),
-                ));
-            }
             let roce = traffic.roce.ok_or_else(|| {
                 CompileError::Invalid(
                     "RoCE traffic must provide `[flow.traffic.roce]` or `[flow_set.traffic.roce]` with `retransmit_timeout_ns`"
                         .to_owned(),
                 )
             })?;
+            // P17 lane nocc (rulings R2, R3): `"dcqcn"` (the default) takes its controller and
+            // pacer from the DCQCN table; `"none"` has no DCQCN table and paces at line rate.
+            let line_rate = match roce.congestion_control.as_deref() {
+                None | Some("dcqcn") => false,
+                Some("none") => true,
+                Some(other) => {
+                    return Err(CompileError::Unsupported(format!(
+                        "unsupported `congestion_control = \"{other}\"` in `[flow.traffic.roce]` or `[flow_set.traffic.roce]`; use \"dcqcn\" (the default) or \"none\""
+                    )));
+                }
+            };
+            let dcqcn = if line_rate {
+                if traffic.dcqcn.is_some() {
+                    return Err(CompileError::Unsupported(
+                        "unsupported `[flow.traffic.dcqcn]` or `[flow_set.traffic.dcqcn]` with `congestion_control = \"none\"` in `[flow.traffic.roce]`: a queue pair without congestion control has no DCQCN controller and paces at its host's line rate; remove the `traffic.dcqcn` table"
+                            .to_owned(),
+                    ));
+                }
+                if roce.variable_window == Some(true) {
+                    return Err(CompileError::Unsupported(
+                        "unsupported `variable_window = true` with `congestion_control = \"none\"` in `[flow.traffic.roce]`: a variable window scales with the DCQCN rate, which a queue pair without congestion control does not have; use a fixed `window_bytes`"
+                            .to_owned(),
+                    ));
+                }
+                None
+            } else {
+                let dcqcn = traffic.dcqcn.ok_or_else(|| {
+                    CompileError::Invalid(
+                        "RoCE traffic must provide `[flow.traffic.dcqcn]` or `[flow_set.traffic.dcqcn]` for its controller, or set `congestion_control = \"none\"` in `[flow.traffic.roce]`"
+                            .to_owned(),
+                    )
+                })?;
+                if dcqcn.cnp_priority.is_some() {
+                    return Err(CompileError::Unsupported(
+                        "unsupported `cnp_priority` on RoCE traffic; set the ACK and NACK class with `[flow.traffic.roce] feedback_priority`"
+                            .to_owned(),
+                    ));
+                }
+                if dcqcn.cnp_interval_ns.is_some() {
+                    return Err(CompileError::Unsupported(
+                        "unsupported `cnp_interval_ns` on RoCE traffic: a queue pair's receiver echoes ECN on its ACKs and NACKs and sends no CNP (P16)"
+                            .to_owned(),
+                    ));
+                }
+                Some(dcqcn)
+            };
             let size = traffic.size.ok_or_else(|| {
                 CompileError::Unsupported(
                     "unsupported duration-terminated RoCE traffic; the executor requires an exact byte `size`"
@@ -2858,8 +2911,14 @@ fn validate_traffic(
                     "RoCE `feedback_priority` must be in IEEE 802.1Q range 0..=7".to_owned(),
                 ));
             }
-            let mut controller = dcqcn_traffic_key(&dcqcn, priority, scenario_text)?;
-            controller.cnp_priority = feedback_priority;
+            let control = match dcqcn {
+                Some(dcqcn) => {
+                    let mut controller = dcqcn_traffic_key(&dcqcn, priority, scenario_text)?;
+                    controller.cnp_priority = feedback_priority;
+                    RoceControlKey::Dcqcn(controller)
+                }
+                None => RoceControlKey::LineRate { feedback_priority },
+            };
             let retransmit_timeout_ns = roce.retransmit_timeout_ns.ok_or_else(|| {
                 CompileError::Invalid(
                     "RoCE traffic must set `retransmit_timeout_ns`: a fixed timeout, or 0 for none (with no timeout a lost last packet stalls the queue pair for the rest of the run)"
@@ -2894,7 +2953,7 @@ fn validate_traffic(
                 ));
             }
             let key = RoceTrafficKey {
-                dcqcn: controller,
+                control,
                 retransmit_timeout_ns,
                 ack_every_packets,
                 nack_interval_ns: roce.nack_interval_ns.unwrap_or(500_000),
@@ -2910,9 +2969,15 @@ fn validate_traffic(
                     roce_keys.push(key);
                     roce_keys.len() - 1
                 });
+            // A line-rate pacer's interval depends on the host's link, known only at lowering
+            // ([`roce_pacer`]); the key's interval is then zero, a constant in its seed.
+            let interval_ns = match control {
+                RoceControlKey::Dcqcn(controller) => controller.pacing_interval_ns,
+                RoceControlKey::LineRate { .. } => 0,
+            };
             (
                 TrafficKind::Roce(u64::try_from(ordinal).expect("key count fits u64")),
-                controller.pacing_interval_ns,
+                interval_ns,
                 Termination::Bytes(size),
             )
         }
@@ -4147,6 +4212,16 @@ fn lower(
             TrafficKind::Roce(ordinal) => Some(roce_key(&roce_keys, ordinal)),
             _ => None,
         };
+        // Its pacer: the DCQCN key's, or (P17) the source host's line rate.
+        let pacer = roce
+            .map(|roce| {
+                let egress = LinkKey {
+                    source: PhysicalNodeKey::Host(flow.source),
+                    target: PhysicalNodeKey::Switch(host_attachment_switches[&flow.source]),
+                };
+                roce_pacer(roce, &flow.traffic, link_rate.of(egress))
+            })
+            .transpose()?;
         // Nothing has run at lowering, so a stage is ready exactly when it waits for nothing.
         let collective_ready = flow
             .collective
@@ -4253,16 +4328,17 @@ fn lower(
             ));
             // A DCQCN flow's or queue pair's status predicts its first tick: it sends iff one
             // tick of credit covers the first packet (the validator's next-tick rule).
-            let paced_key = match flow.traffic.kind {
-                TrafficKind::Dcqcn(config) => Some(config),
-                _ => roce.map(|roce| roce.dcqcn),
+            let paced = match flow.traffic.kind {
+                TrafficKind::Dcqcn(config) => {
+                    Some((config.initial_rate_bps, config.pacing_interval_ns))
+                }
+                _ => pacer.map(|pacer| (pacer.controller.current_rate_bps, pacer.interval_ns)),
             };
             ScheduledEmission {
-                status: match (paced_key, &flow.traffic.termination) {
-                    (Some(key), Termination::Bytes(total_bytes)) => {
+                status: match (paced, &flow.traffic.termination) {
+                    (Some((rate_bps, interval_ns)), Termination::Bytes(total_bytes)) => {
                         let first_packet = flow.traffic.packet_size_bytes.min(*total_bytes);
-                        let tick_credit =
-                            u128::from(key.initial_rate_bps) * u128::from(key.pacing_interval_ns);
+                        let tick_credit = u128::from(rate_bps) * u128::from(interval_ns);
                         let cost = u128::from(first_packet) * 8 * 1_000_000_000;
                         if tick_credit >= cost {
                             GeneratorStatus::Scheduled
@@ -4354,18 +4430,19 @@ fn lower(
                         }
                         TrafficKind::Roce(_) => {
                             let roce = roce.expect("a RoCE flow carries its key");
+                            let pacer = pacer.expect("a RoCE flow carries its pacer");
                             let Termination::Bytes(total_bytes) = flow.traffic.termination else {
                                 unreachable!("RoCE validation requires byte termination")
                             };
                             FlowGeneratorKind::Roce(RoceGenerator {
                                 pacer: RocePacer {
                                     first_pacing_time_ns: anchor_ns,
-                                    pacing_interval_ns: roce.dcqcn.pacing_interval_ns,
+                                    pacing_interval_ns: pacer.interval_ns,
                                     mtu_bytes: flow.traffic.packet_size_bytes,
                                     total_bytes,
                                     credit_quanta: 0,
                                 },
-                                controller: lowered_dcqcn_controller(roce.dcqcn),
+                                controller: pacer.controller,
                                 pacing_timer_payload: next_emission.payload,
                                 next_psn: 0,
                                 snd_una: 0,
@@ -4375,6 +4452,7 @@ fn lower(
                                 window_bytes: roce.window_bytes,
                                 variable_window: roce.variable_window,
                                 window_parked: false,
+                                congestion_control: pacer.congestion_control,
                             })
                         }
                     }
@@ -6268,6 +6346,61 @@ fn lowered_dcqcn_controller(config: DcqcnTrafficKey) -> DcqcnController {
         .expect("validated DCQCN controller configuration")
 }
 
+/// A queue pair's lowered pacer: its controller, its pacing interval and its mode.
+#[derive(Clone, Copy)]
+struct RocePacerKey {
+    controller: DcqcnController,
+    interval_ns: u64,
+    congestion_control: RoceCongestionControl,
+}
+
+/// The pacer of a queue pair whose source host's egress link runs at `line_rate_bps`: the DCQCN
+/// key's controller and interval, or (P17 lane nocc, ruling R2a) the inert fixed-rate controller
+/// at the line rate with one MTU per `ceil(MTU * 8e9 / line rate)` ns, the AICB pacer's rule
+/// (`workload::aicb::simai_conf`). One packet per tick at most, so this is the line rate exactly
+/// when the MTU's bits divide by the rate, and one MTU per interval just below it otherwise.
+fn roce_pacer(
+    roce: RoceTrafficKey,
+    traffic: &TrafficKey,
+    line_rate_bps: u64,
+) -> Result<RocePacerKey, CompileError> {
+    match roce.control {
+        RoceControlKey::Dcqcn(dcqcn) => Ok(RocePacerKey {
+            controller: lowered_dcqcn_controller(dcqcn),
+            interval_ns: dcqcn.pacing_interval_ns,
+            congestion_control: RoceCongestionControl::Dcqcn,
+        }),
+        RoceControlKey::LineRate { .. } => {
+            let controller = DcqcnController::fixed_rate(line_rate_bps);
+            controller.config.validate().map_err(|_| {
+                CompileError::Invalid(format!(
+                    "a queue pair without congestion control needs a host line rate of at least 3 bit/s, got {line_rate_bps}"
+                ))
+            })?;
+            let interval_ns = u64::try_from(
+                (u128::from(traffic.packet_size_bytes) * 8 * 1_000_000_000)
+                    .div_ceil(u128::from(line_rate_bps)),
+            )
+            .map_err(|_| {
+                CompileError::Invalid(
+                    "the line-rate pacing interval of a queue pair exceeds u64".to_owned(),
+                )
+            })?;
+            // The input-time bound the parse-time check applies to a DCQCN key's interval.
+            let packets = packet_count(traffic);
+            interval_ns
+                .checked_mul(packets.saturating_sub(1))
+                .and_then(|extent| traffic.initial_delay_ns.checked_add(extent))
+                .ok_or_else(|| CompileError::Invalid("packet input time exceeds u64".to_owned()))?;
+            Ok(RocePacerKey {
+                controller,
+                interval_ns,
+                congestion_control: RoceCongestionControl::None,
+            })
+        }
+    }
+}
+
 fn packet_count(traffic: &TrafficKey) -> u64 {
     if matches!(
         traffic.kind,
@@ -6415,15 +6548,27 @@ fn mix_traffic_seed(mut state: u64, traffic: &TrafficKey, roce_keys: &[RoceTraff
         // depend on the other RoCE keys of the scenario.
         TrafficKind::Roce(ordinal) => {
             let roce = roce_key(roce_keys, ordinal);
-            let dcqcn = roce.dcqcn;
             state = mix_seed(state ^ 0x524f_4345_5f51_5000);
-            for value in dcqcn.seed_words().into_iter().chain([
+            // A DCQCN pair mixes its 14 controller words, exactly as before P17; a pair without
+            // congestion control mixes one tag word and its feedback class in their place.
+            match roce.control {
+                RoceControlKey::Dcqcn(dcqcn) => {
+                    for value in dcqcn.seed_words() {
+                        state = mix_seed(state ^ value);
+                    }
+                }
+                RoceControlKey::LineRate { feedback_priority } => {
+                    state = mix_seed(state ^ 0x4e4f_4343_4c49_4e45);
+                    state = mix_seed(state ^ u64::from(feedback_priority));
+                }
+            }
+            for value in [
                 roce.retransmit_timeout_ns,
                 roce.ack_every_packets,
                 roce.nack_interval_ns,
                 u64::from(roce.duplicate_ack),
                 roce.ack_size_bytes,
-            ]) {
+            ] {
                 state = mix_seed(state ^ value);
             }
             // A window joins the key's content only when it is on, so queue pairs without one

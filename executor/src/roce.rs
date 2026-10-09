@@ -467,6 +467,7 @@ mod tests {
             window_bytes: window,
             variable_window,
             window_parked: false,
+            congestion_control: crate::RoceCongestionControl::Dcqcn,
         }
     }
 

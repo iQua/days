@@ -222,6 +222,29 @@ impl DcqcnController {
         }
     }
 
+    /// The inert controller of a RoCE queue pair without congestion control (P17 lane nocc,
+    /// ruling R1a): pristine at `rate_bps`, with every rate `rate_bps`, no gain or increase steps,
+    /// and every interval `u64::MAX`. Its sender never feeds it (it ignores the ECN echo), so it
+    /// is never armed: `due_ns()` is `u64::MAX`, `settle` returns at once, and the pacer reads
+    /// `current_rate_bps = rate_bps` on every tick. The configuration passes [`Self::new`]'s
+    /// checks for `rate_bps >= 3`, so it needs no path of its own in validation or the device
+    /// codecs; validation pins a pair without congestion control to exactly this value.
+    pub const fn fixed_rate(rate_bps: u64) -> Self {
+        Self::pristine(DcqcnControllerConfig {
+            initial_rate_bps: rate_bps,
+            minimum_rate_bps: rate_bps,
+            maximum_rate_bps: rate_bps,
+            additive_rate_bps: 0,
+            hyper_rate_bps: 0,
+            g_q63: 0,
+            alpha_interval_ns: u64::MAX,
+            decrease_interval_ns: u64::MAX,
+            increase_interval_ns: u64::MAX,
+            fast_recovery_steps: 0,
+            clamp_target_rate: false,
+        })
+    }
+
     /// The earliest rate-changing instant (an armed rate-increase timer or a pending decrease
     /// check), or `u64::MAX` when there is none. Alpha ticks never change the rate.
     #[inline(always)]

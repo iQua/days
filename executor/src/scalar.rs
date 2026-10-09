@@ -4897,7 +4897,13 @@ impl<'image> TransitionState<'image> {
                 }
                 tick_ns = restart_roce_pacer(generator, &mut roce, now, stop_time_ns)?;
             }
-            let froze = snd_una_before < total && roce.snd_una >= total;
+            // A pair without congestion control (P17) has no controller to freeze or feed: its
+            // inert controller is never armed, and its sender ignores the ECN echo, so neither
+            // transition runs and no DCQCN record is written. The mode is tested last, so a DCQCN
+            // pair pays for it only at its completion and on an echoing ACK or NACK.
+            let froze = snd_una_before < total
+                && roce.snd_una >= total
+                && roce.congestion_control == crate::RoceCongestionControl::Dcqcn;
             if froze {
                 let settled = roce.controller.settle(now);
                 advance.alpha_ticks += settled.alpha_ticks;
@@ -4906,7 +4912,9 @@ impl<'image> TransitionState<'image> {
             }
             // The ECN echo is the pair's congestion feedback (ruling D4), ignored once the pair is
             // complete (ruling D11), as HPCC's `QpComplete` precedes `cnp_received_mlx`.
-            let feedback = header.ce_echo && roce.snd_una < total;
+            let feedback = header.ce_echo
+                && roce.snd_una < total
+                && roce.congestion_control == crate::RoceCongestionControl::Dcqcn;
             if feedback {
                 let fed = roce.controller.on_feedback(now);
                 advance.alpha_ticks += fed.alpha_ticks;
