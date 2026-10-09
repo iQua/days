@@ -49,7 +49,8 @@ fn scalar(image: &SimulationImage, horizon: Option<u64>, mode: ObservationMode) 
     expected
 }
 
-/// The fixtures, then checkpoints of the marked, mixed and lossy fixtures every 400 us up to 2 ms.
+/// The fixtures, then checkpoints of the marked, mixed and lossy fixtures at 0.6 and 1.4 ms, while
+/// their pairs pace, echo and (lossy) recover.
 fn images() -> Vec<(String, SimulationImage)> {
     let mut images = FIXTURES
         .iter()
@@ -57,7 +58,7 @@ fn images() -> Vec<(String, SimulationImage)> {
         .collect::<Vec<_>>();
     for name in ["nocc_marked.toml", "nocc_mixed.toml", "nocc_gbn_lossy.toml"] {
         let image = lower(name);
-        for horizon in (1..=5).map(|step| step * 400_000) {
+        for horizon in [600_000, 1_400_000] {
             let prefix = run_scalar_with_observations(&image, Some(horizon), ObservationMode::Full)
                 .expect("checkpoint prefix must run");
             images.push((

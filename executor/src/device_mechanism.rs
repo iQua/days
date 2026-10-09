@@ -1913,6 +1913,7 @@ mod tests {
                 ("uint G_ROCE_WINDOW", G_ROCE_WINDOW),
                 ("uint G_ROCE_VARIABLE_WINDOW", G_ROCE_VARIABLE_WINDOW),
                 ("uint G_ROCE_WINDOW_PARKED", G_ROCE_WINDOW_PARKED),
+                ("uint G_ROCE_CONGESTION_CONTROL", G_ROCE_CONGESTION_CONTROL),
                 ("uint G_ROCE_PACER_ARMED", G_ROCE_PACER_ARMED),
                 ("uint G_ROCE_RTO_DEADLINE", G_ROCE_RTO_DEADLINE),
                 ("uint G_ROCE_RTO", G_ROCE_RTO),
