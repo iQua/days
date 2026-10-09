@@ -28,8 +28,8 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "cuda.rs",
         predicate: r#"feature = "cuda-test-hooks""#,
-        count: 42,
-        purpose: "CUDA-only fault injection, capacity, and worklist-compaction hooks, the P14 round-kernel override that forces either `days_round` build (the config field, its default, and its one read), the P14 round-3 one-module-per-run probes (the launched-kernel record on the timing and the run and its two fills, the three handle-identity helpers that build it, the module-contents probe, and the mixed-array record probe), the P14 round-4 live-round-module count: its atomic import, the per-device counter and its initialisation, each loaded module's entry (the field, its registration, the entry type and its two impls), and the count at graph capture on the timing and the run with its read and two fills, the P14 cuda-host per-thread run-step probe (its record body and its take), and the P16 H4 RESUME-scan counters (their params word, the reset at run start, the counter rows appended at upload, and their read at readback)",
+        count: 44,
+        purpose: "CUDA-only fault injection, capacity, and worklist-compaction hooks, the P14 round-kernel override that forces either `days_round` build (the config field, its default, and its one read), the P14 round-3 one-module-per-run probes (the launched-kernel record on the timing and the run and its two fills, the three handle-identity helpers that build it, the module-contents probe, and the mixed-array record probe), the P14 round-4 live-round-module count: its atomic import, the per-device counter and its initialisation, each loaded module's entry (the field, its registration, the entry type and its two impls), and the count at graph capture on the timing and the run with its read and two fills, the P14 cuda-host per-thread run-step probe (its record body and its take), the P16 H4 RESUME-scan counters (their params word, the reset at run start, the counter rows appended at upload, and their read at readback), and the P17 merge audit (its params word and its rows' read at readback; its reset and upload share the RESUME-scan blocks)",
     },
     AllowedFeatureGate {
         path: "metal.rs",
@@ -64,8 +64,8 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "lib.rs",
         predicate: r#"any(feature = "cuda-test-hooks", all(feature = "metal-test-hooks", target_vendor = "apple"))"#,
-        count: 1,
-        purpose: "the P16 H4 RESUME-scan counters are exported only with a device test-hook build",
+        count: 3,
+        purpose: "the P16 H4 RESUME-scan counters, and the P17 merge-audit module and its rows, are compiled and exported only with a device test-hook build",
     },
     AllowedFeatureGate {
         path: "metal.rs",
