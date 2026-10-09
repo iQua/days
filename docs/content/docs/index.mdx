@@ -30,10 +30,10 @@ Every backend that accepts a scenario produces byte-identical complete state. A 
 
 - **Topologies:** fat-tree, torus, dragonfly, and custom graphs.
 - **Transport:** deterministic packet-distribution sources, closed-loop TCP Reno and CUBIC, Mellanox-form DCQCN (the controller of HPCC's ns-3 model and SimAI) on unreliable flows, and RoCE queue pairs with Go-back-N reliability and ECN echo.
-- **Switches:** FIFO, strict-priority, DRR, WRR, and exact-rational WFQ scheduling; TailDrop, ECN-threshold, RED, and RED-with-ECN admission; PFC.
+- **Switches:** FIFO, strict-priority, DRR, WRR, and exact-rational WFQ scheduling; TailDrop admission and ECN marking on a Kmin/Kmax/Pmax ramp; PFC.
 - **Collectives:** ring all-reduce and all-gather over TCP or RoCE queue pairs, with delay-only compute stages.
 
-DCQCN, RoCE queue pairs, PFC, collectives, and compute stages run on all four backends. RED runs on the Scalar and CPU backends; Metal and CUDA reject it at validation.
+DCQCN, RoCE queue pairs, PFC, the ECN ramp, collectives, and compute stages run on all four backends.
 
 ## What makes it exact
 
