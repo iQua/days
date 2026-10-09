@@ -1,2 +1,2 @@
 exit=1
-REJECT: line 37: threshold decision mismatch (roce_data packet)
+REJECT: line 49: ECN ramp decision mismatch (roce_data packet)
